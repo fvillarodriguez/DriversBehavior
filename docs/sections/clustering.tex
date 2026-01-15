@@ -1,0 +1,185 @@
+\section{Clustering}
+\label{sec:clustering}
+
+\subsection{Objetivo}
+El objetivo del módulo de \textit{clustering} es agrupar conductores (identificados por su matrícula) según indicadores de comportamiento observados en los registros de detección (\texttt{flujos}). Estos grupos se usan tanto para análisis exploratorio como para construir variables agregadas por pórtico/intervalo que alimentan modelos posteriores.
+
+\subsection{Datos y preprocesamiento}
+Partimos de un conjunto de observaciones $\{r_j\}_{j=1}^N$, donde cada registro contiene, al menos:
+\[
+ r_j = (t_j, p_j, \ell_j, v_j, \text{plate}_j),
+\]
+con $t$ tiempo, $p$ pórtico, $\ell$ carril, $v$ velocidad y \text{plate} la matrícula.
+
+\paragraph{Normalización de matrícula}
+Se normaliza como texto en mayúsculas y se eliminan valores inválidos (\texttt{""}, \texttt{nan}, \texttt{null}, \texttt{none}). En la implementación se filtran matrículas con largo fuera de $[5,6]$.
+
+\paragraph{Limpieza de carril y duplicados}
+El carril se convierte a numérico y se filtra a $\ell \in \{1,2,3\}$. Además, se eliminan duplicados exactos usando la llave:
+\[
+(\text{plate}, p, \ell, t).
+\]
+
+\paragraph{Tratamiento de atípicos en velocidad}
+Para cada grupo $(p,\ell)$ se calculan cuantiles $q_\alpha$ y $q_\beta$ sobre la velocidad. Dependiendo del modo:
+\begin{itemize}
+  \item \textbf{Winsorización}: $v \leftarrow \min(\max(v, q_\alpha), q_\beta)$.
+  \item \textbf{Filtrado}: se descartan observaciones con $v \notin [q_\alpha, q_\beta]$.
+  \item \textbf{Sin acción}: no se modifica $v$.
+\end{itemize}
+
+\subsection{Ingeniería de \textit{features} por conductor}
+\label{subsec:driver-features}
+Para cada conductor $i$ (matrícula), se construye un vector de variables $x_i \in \mathbb{R}^d$ a partir de agregaciones sobre sus pasadas. En la implementación, estas variables se guardan en \texttt{Resultados/cluster\_features*.duckdb} (tabla \texttt{cluster\_features}).
+
+\subsubsection{Conteos, velocidad media y uso de carril}
+Sea $N_i$ el número de pasadas del conductor $i$:
+\[
+N_i = \sum_{j=1}^N \mathbf{1}[\text{plate}_j=i].
+\]
+La velocidad media se define como:
+\[
+\overline{v}_i = \frac{1}{N_i}\sum_{j:\,\text{plate}_j=i} v_j.
+\]
+Para el uso de carril, definimos proporciones:
+\[
+\pi_{i,k} = \frac{1}{N_i}\sum_{j:\,\text{plate}_j=i} \mathbf{1}[\ell_j = k], \quad k\in\{1,2,3\}.
+\]
+
+\subsubsection{Velocidad relativa}
+Se define una velocidad media de referencia por intervalo de 5 minutos y pórtico:
+\[
+\overline{v}_{p,\tau}=\frac{1}{|\mathcal{I}_{p,\tau}|}\sum_{j\in\mathcal{I}_{p,\tau}} v_j,\quad
+\mathcal{I}_{p,\tau}=\{j:\,p_j=p,\ \lfloor t_j\rfloor_{5\text{min}}=\tau\}.
+\]
+Para cada pasada, la velocidad relativa es:
+\[
+\rho_j = \frac{v_j}{\overline{v}_{p_j,\lfloor t_j\rfloor_{5\text{min}}}},
+\]
+y por conductor:
+\[
+\overline{\rho}_i = \frac{1}{|\mathcal{J}_i|}\sum_{j\in\mathcal{J}_i}\rho_j,\quad
+\mathcal{J}_i=\{j:\,\text{plate}_j=i\}.
+\]
+
+\subsubsection{Headway (brecha temporal)}
+Para cada grupo $(p,\ell)$ (y opcionalmente por mes), se ordenan registros por $(t,\text{plate})$. El \textit{headway} de la observación $j$ se calcula como:
+\[
+h_j = t_j - t_{j-1},
+\]
+en segundos, donde $j-1$ es el registro anterior dentro del mismo grupo. Headways mayores que un umbral $h_{\max}$ (por defecto 60s) se tratan como faltantes. El \textit{headway} medio por conductor:
+\[
+\overline{h}_i = \frac{1}{|\mathcal{H}_i|}\sum_{j\in\mathcal{H}_i} h_j,\quad
+\mathcal{H}_i=\{j:\,\text{plate}_j=i,\ h_j>0,\ h_j\le h_{\max}\}.
+\]
+
+\subsubsection{TTC y tasa de conflictos}
+Sea $\Delta v_j = v_j - v_{j-1}$ la diferencia de velocidades entre el vehículo $j$ y el anterior en el mismo $(p,\ell)$. Para cierres (\(\Delta v_j>0\)) se define el \textit{Time-To-Collision}:
+\[
+\mathrm{TTC}_j = \frac{h_j\,v_j}{\Delta v_j}.
+\]
+Para cada pórtico $p$ se define un umbral $\tau_p$ (en el código: \texttt{TTC\_MAX\_BY\_PORTICO}). Se contabiliza un conflicto si $\mathrm{TTC}_j < \tau_{p_j}$, y la tasa por conductor:
+\[
+\mathrm{conflict\_rate}_i = \frac{\sum_{j\in\mathcal{C}_i}\mathbf{1}[\mathrm{TTC}_j < \tau_{p_j}]}{|\mathcal{C}_i|},\quad
+\mathcal{C}_i=\{j:\,\text{plate}_j=i,\ h_j>0\}.
+\]
+En la implementación, para evitar valores extremos, se acota $\mathrm{TTC}_j$ por arriba a $\tau_{p_j}$.
+
+\subsubsection{Cambios de carril}
+Ordenando las pasadas del conductor $i$ por tiempo (y opcionalmente por mes), se define:
+\[
+\mathrm{lane\_changes}_i = \sum_{m=2}^{N_i}\mathbf{1}[\ell_{i,m}\neq \ell_{i,m-1}],
+\quad
+\mathrm{lane\_change\_rate}_i = \frac{\mathrm{lane\_changes}_i}{\max(N_i-1,1)}.
+\]
+
+\subsubsection{Ponderación mensual (opcional)}
+Cuando se activa ponderación mensual, se calculan variables por mes y luego se consolidan por matrícula mediante promedio ponderado por $N_{i,m}$ (pasadas del conductor $i$ en el mes $m$):
+\[
+\overline{x}_i = \frac{\sum_m N_{i,m}\,x_{i,m}}{\sum_m N_{i,m}}.
+\]
+
+\subsubsection{Actividad temporal}
+Para caracterizar cuán ``persistente'' es un conductor en el tiempo, se calculan métricas de actividad:
+\[
+n^{(\text{days})}_i = \left|\left\{\lfloor t_j\rfloor_{\text{día}}:\ \text{plate}_j=i\right\}\right|,\quad
+n^{(\text{weeks})}_i = \left|\left\{\lfloor t_j\rfloor_{\text{semana}}:\ \text{plate}_j=i\right\}\right|,\quad
+n^{(\text{months})}_i = \left|\left\{\lfloor t_j\rfloor_{\text{mes}}:\ \text{plate}_j=i\right\}\right|.
+\]
+
+\subsection{Preparación de datos para clustering}
+Se selecciona un subconjunto de columnas numéricas (\textit{features}) y se descartan filas con valores faltantes o infinitos en dichas columnas. Antes de clusterizar se estandarizan las variables con \textit{z-score}:
+\[
+z=\frac{x-\mu}{\sigma},
+\]
+usando \texttt{sklearn.preprocessing.StandardScaler}.
+
+\subsection{Métodos de clustering}
+\subsubsection{K-means}
+K-means busca particionar los datos en $K$ clusters minimizando la suma de distancias cuadráticas intra-cluster:
+\[
+\min_{\{c_i\},\{\mu_k\}} \sum_{i=1}^{n} \left\lVert x_i - \mu_{c_i}\right\rVert^2.
+\]
+En la implementación se usa \texttt{sklearn.cluster.KMeans} y, para evaluación rápida de $K$, opcionalmente \texttt{MiniBatchKMeans}.
+
+\paragraph{Selección de $K$ (métricas)}
+Se calculan métricas para $K \in [K_{\min},K_{\max}]$:
+\begin{itemize}
+  \item \textbf{Silhouette}: $s(i)=\frac{b(i)-a(i)}{\max(a(i),b(i))}$.
+  \item \textbf{Davies--Bouldin}: promedio de la razón entre dispersión intra-cluster y separación inter-cluster.
+  \item \textbf{Calinski--Harabasz}: razón entre dispersión inter-cluster e intra-cluster.
+\end{itemize}
+
+\subsubsection{Gaussian Mixture Models (GMM)}
+Un GMM modela la densidad como mezcla:
+\[
+p(x)=\sum_{k=1}^{K}\pi_k\,\mathcal{N}(x\mid\mu_k,\Sigma_k),
+\]
+estimada típicamente vía EM. La selección de $K$ se apoya en criterios de información:
+\[
+\mathrm{AIC}=-2\log L + 2p,\qquad
+\mathrm{BIC}=-2\log L + p\log n,
+\]
+donde $L$ es la verosimilitud, $p$ el número de parámetros y $n$ el número de muestras.
+
+\subsubsection{HDBSCAN}
+HDBSCAN es un método basado en densidad que construye una jerarquía de clusters y extrae agrupaciones estables. Parámetros típicos:
+\begin{itemize}
+  \item \texttt{min\_cluster\_size}: tamaño mínimo de cluster.
+  \item \texttt{min\_samples}: control de robustez ante ruido.
+\end{itemize}
+Las observaciones marcadas como ruido reciben etiqueta \(-1\).
+
+\subsection{Conductores frecuentes vs. raros (opcional)}
+Para mejorar robustez cuando existen matrículas con pocas pasadas, el flujo de trabajo permite entrenar el modelo en \textit{conductores frecuentes} (por ejemplo, $N_i \geq N_{\min}$) y luego asignar etiquetas a los raros con un umbral de confianza:
+\begin{itemize}
+  \item \textbf{K-means}: se calcula la distancia mínima al centroide más cercano; si supera un percentil $q$ estimado en el set frecuente, se etiqueta como desconocido (\(-1\)).
+  \item \textbf{GMM}: se calcula la probabilidad posterior máxima; si es menor que un umbral $\gamma$, se etiqueta como desconocido (\(-1\)).
+\end{itemize}
+Se guarda además un \textit{confidence score} (\texttt{confidence\_score}) y un indicador \texttt{is\_rare}.
+
+\subsection{Salidas y artefactos}
+El módulo genera archivos en \texttt{Resultados/}:
+\begin{itemize}
+  \item Variables por matrícula en DuckDB: \texttt{cluster\_features*.duckdb}.
+  \item Etiquetas por matrícula: \texttt{cluster\_kmeans\_kK.csv}, \texttt{cluster\_gmm\_kK.csv}, \texttt{cluster\_hdbscan.csv}.
+  \item Resumen por cluster (\textit{centroides}): \texttt{cluster\_summary*.csv}.
+  \item Estadísticos descriptivos por cluster: \texttt{cluster\_descriptive*.csv}.
+\end{itemize}
+
+\subsection{Variables de clusters agregadas por pórtico e intervalo}
+\label{subsec:cluster-features-macro}
+Además del clustering por matrícula, se construyen variables agregadas por pórtico/intervalo a partir de una tabla de etiquetas (\texttt{plate} \(\rightarrow\) \texttt{cluster\_label}). Para cada pórtico $p$, intervalo $\tau$ y cluster $c$:
+\[
+n_{p,\tau,c}=\#\{j:\,p_j=p,\ \lfloor t_j\rfloor_{\Delta}=\tau,\ \text{cluster}(\text{plate}_j)=c\},
+\qquad
+\mathrm{share}_{p,\tau,c}=\frac{n_{p,\tau,c}}{\sum_{c'}n_{p,\tau,c'}}.
+\]
+Opcionalmente se agregan:
+\begin{itemize}
+  \item \textbf{Flow por hora}: \(\mathrm{flow}_{p,\tau,c}=n_{p,\tau,c}\cdot \frac{60}{\Delta}\cdot\frac{1}{L}\), donde $\Delta$ es el tamaño del intervalo (minutos) y $L$ el número de carriles asumidos.
+  \item \textbf{Velocidad media} por cluster: \(\overline{v}_{p,\tau,c}\).
+  \item \textbf{Densidad}: \(\mathrm{density}_{p,\tau,c}=\mathrm{flow}_{p,\tau,c}/\overline{v}_{p,\tau,c}\) (con manejo defensivo cuando \(\overline{v}\le 0\)).
+  \item \textbf{Variaciones temporales}: \(\Delta \mathrm{speed}\), \(\Delta \mathrm{density}\) vía diferencias entre intervalos consecutivos.
+  \item \textbf{Entropía de mezcla de clusters}: \(H_{p,\tau}=-\sum_c \mathrm{share}_{p,\tau,c}\log(\mathrm{share}_{p,\tau,c})\).
+\end{itemize}
