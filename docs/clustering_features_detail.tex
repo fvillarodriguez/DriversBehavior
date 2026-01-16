@@ -1,0 +1,201 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{float}
+
+\geometry{a4paper, margin=2.5cm}
+
+\title{Detalle del Cálculo de Variables para Clustering}
+\author{Equipo SUMO}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introducción}
+Este documento detalla el proceso de ingeniería de características (*feature engineering*) utilizado para agrupar conductores (patentes) en función de su comportamiento en la autopista. El objetivo es transformar los registros brutos de flujos vehiculares en un vector de características único por patente.
+
+\section{Preprocesamiento de Datos}
+Antes de calcular las variables, los datos de flujo ($F$) pasan por una etapa de limpieza:
+
+\begin{enumerate}
+    \item \textbf{Normalización de Patentes:} Se eliminan caracteres no alfanuméricos y se estandariza a mayúsculas. Patentes inválidas (ej. "NULL", "NAN") o con longitud fuera del rango $[5, 6]$ son descartadas.
+    \item \textbf{Filtrado de Carriles:} Se consideran únicamente los carriles 1, 2 y 3.
+    \item \textbf{Eliminación de Duplicados:} Se eliminan registros duplicados considerando la tupla $(Patente, Portico, Carril, Timestamp)$.
+    \item \textbf{Tratamiento de Outliers (Velocidad):} Se aplica \textit{Winsorization} a la velocidad por cada grupo de $(Portico, Carril)$, limitando los valores extremos a los percentiles $1\%$ y $99\%$.
+\end{enumerate}
+
+\section{Cálculo de Variables (Nivel Evento)}
+Para cada evento $i$ (un paso de un vehículo por un pórtico), se calculan métricas intermedias. Sea $v_i$ la velocidad del evento $i$ en el instante $t_i$.
+
+\subsection{Headway ($h_i$)}
+El \textit{headway} se calcula como la diferencia de tiempo con el vehículo precedente ($i-1$) en el \textbf{mismo carril y pórtico}. Se requiere que los datos estén ordenados temporalmente.
+
+\begin{equation}
+    h_i = t_i - t_{i-1}
+\end{equation}
+
+Si $h_i > 60$ segundos, se considera que no hay interacción cercana y el valor se descarta (NaN) para efectos de cálculo de conflicto, aunque puede contabilizarse en promedios si se desea.
+
+\subsection{Velocidad Relativa Indexada ($v_{rel, i}$)}
+Para normalizar el comportamiento según las condiciones del tráfico, se compara la velocidad del vehículo con la velocidad promedio del flujo en ese pórtico durante un intervalo de 5 minutos, denotada como $\bar{V}_{5min}$.
+
+\begin{equation}
+    v_{rel, i} = \frac{v_i}{\bar{V}_{5min}}
+\end{equation}
+
+\begin{itemize}
+    \item $v_{rel, i} > 1$: Conductor más rápido que el flujo promedio.
+    \item $v_{rel, i} < 1$: Conductor más lento que el flujo promedio.
+\end{itemize}
+
+\subsection{Conflicto y TTC (Time To Collision)}
+Se evalúa el riesgo de colisión con el vehículo precedente. El $TTC_i$ se calcula solo si el vehículo $i$ viaja más rápido que el vehículo anterior ($v_i > v_{i-1}$) y el headway es válido.
+
+\begin{equation}
+    TTC_i = \frac{h_i \cdot v_i}{v_i - v_{i-1}}
+\end{equation}
+
+Se define un evento de \textbf{conflicto} ($c_i$) si el $TTC_i$ es menor a un umbral específico por pórtico ($TTC_{max}$), definido empíricamente.
+
+\begin{equation}
+    c_i = \begin{cases} 
+    1 & \text{si } TTC_i < TTC_{max} \\
+    0 & \text{si } TTC_i \ge TTC_{max} \text{ o } v_i \le v_{i-1}
+    \end{cases}
+\end{equation}
+
+\section{Agregación por Patante}
+El objetivo es obtener un vector único por conductor $P$. El proceso de agregación puede realizarse de dos formas: Global o Ponderada Mensual.
+
+Sea $N_P$ el número total de pasadas registradas para la patente $P$.
+
+\subsection{Variables Agregadas}
+
+\subsubsection{Velocidad Promedio ($\bar{v}_P$)}
+\begin{equation}
+    \bar{v}_P = \frac{1}{N_P} \sum_{i \in P} v_i
+\end{equation}
+
+\subsubsection{Velocidad Relativa Promedio ($\bar{v}_{rel, P}$)}
+\begin{equation}
+    \bar{v}_{rel, P} = \frac{1}{N_{rel}} \sum_{i \in P} v_{rel, i}
+\end{equation}
+Donde $N_{rel}$ es el número de eventos con velocidad relativa válida.
+
+\subsubsection{Headway Promedio ($\bar{h}_P$)}
+\begin{equation}
+    \bar{h}_P = \frac{1}{N_{h}} \sum_{i \in P, h_i \le 60} h_i
+\end{equation}
+
+\subsubsection{Tasa de Conflicto ($CR_P$)}
+Proporción de eventos con headway válido que resultaron en conflicto.
+\begin{equation}
+    CR_P = \frac{\sum_{i \in P} c_i}{N_{h}}
+\end{equation}
+
+\subsubsection{Uso de Carriles ($Lane_k$)}
+Proporción de uso del carril $k \in \{1, 2, 3\}$.
+\begin{equation}
+    Lane_k = \frac{\text{Conteo de pasadas en carril } k}{N_P}
+\end{equation}
+
+\subsubsection{Tasa de Cambio de Pista ($LCR_P$)}
+Se estima contando cuántas veces el vehículo cambió de carril entre pórticos consecutivos. Sea $L_j$ el carril en el evento $j$ (ordenado por tiempo).
+\begin{equation}
+    Cambios = \sum_{j=2}^{N_P} \mathbb{I}(L_j \neq L_{j-1})
+\end{equation}
+\begin{equation}
+    LCR_P = \frac{Cambios}{N_P - 1}    
+\end{equation}
+*Nota: Esta métrica es aproximada ya que asume continuidad entre pórticos registrados.*
+
+\subsection{Estrategias de Consolidación}
+
+\subsubsection{1. Agregación Global (Default)}
+Se aplican las fórmulas anteriores sobre \textbf{todos} los registros históricos de la patente $P$ como un solo conjunto.
+
+\subsubsection{2. Ponderación Mensual}
+Se calculan primero los promedios $X_{P, m}$ para cada mes $m$, y luego se ponderan por la cantidad de viajes en ese mes ($N_{P, m}$).
+
+Sea $X$ una variable cualquiera (ej. Velocidad, Conflict Rate). El valor final ponderado es:
+
+\begin{equation}
+    X_{P, final} = \frac{\sum_{m} \left( X_{P, m} \cdot N_{P, m} \right)}{\sum_{m} N_{P, m}}
+\end{equation}
+
+Esto asegura que los meses con mayor actividad tengan mayor influencia, pero permite calcular métricas mensuales intermedias si se requiere análisis temporal.
+
+\section{Definición de Conductores Frecuentes}
+Para el entrenamiento del modelo de clustering, se separan los usuarios en:
+\begin{itemize}
+    \item \textbf{Frecuentes:} Usuarios con suficiente historia para caracterizar su comportamiento. Criterios típicos:
+    \begin{itemize}
+        \item $N_P \ge 20$ pasadas totales.
+        \item Días activos $\ge 5$.
+    \end{itemize}
+    \item \textbf{Infrecuentes:} Usuarios con pocos datos. No se usan para entrenar, pero pueden ser asignados a un cluster posteriormente usando el modelo entrenado (o quedar como "Desconocido").
+\end{itemize}
+
+\section{Implementación en Python}
+La lógica de cálculo descrita anteriormente está implementada principalmente en el módulo \texttt{src/clustering.py}. A continuación se detalla el flujo de ejecución de las funciones clave para fines de auditoría.
+
+\subsection{Limpieza de Datos: \texttt{clean\_flujos\_for\_clustering}}
+Esta función recibe el DataFrame de flujos brutos y realiza la preparación inicial:
+\begin{enumerate}
+    \item \textbf{Validación de Columnas:} Se asegura que existan las columnas esenciales (timestamp, velocidad, pórtico, carril, patente).
+    \item \textbf{Limpieza de Patentes:} Se normalizan las patentes (alfanuméricos, mayúsculas) y se filtran aquellas con longitud inválida (fuera del rango $[5, 6]$).
+    \item \textbf{Filtrado Básico:} Se eliminan filas con datos nulos en campos críticos y se conservan solo los carriles 1, 2 y 3.
+    \item \textbf{Deduplicación:} Se eliminan duplicados exactos de la tupla (Patente, Pórtico, Carril, Timestamp). Si existen duplicados con diferentes velocidades, se prioriza determinísticamente (ordenamiento merge sort presenvando el primero).
+    \item \textbf{Winsorization:} Se limitan los valores extremos de velocidad por grupo (Pórtico, Carril) usando los percentiles definidos (default $1\%$ y $99\%$).
+\end{enumerate}
+
+\subsection{Cálculo de Features: \texttt{Clusterization}}
+Esta es la función principal que orquesta el cálculo de variables.
+
+\subsubsection{1. Métricas Simples y Pre-cálculo}
+Se calculan métricas que no requieren ordenamiento temporal complejo:
+\begin{itemize}
+    \item \textbf{Total de Pasadas (\texttt{total\_passes}):} Conteo simple de registros por patente.
+    \item \textbf{Velocidad Promedio (\texttt{avg\_speed\_kmh}):} Promedio aritmético de la velocidad.
+    \item \textbf{Uso de Carril:} Se construye una tabla pivote para contar pasadas por carril y dividir por el total.
+\end{itemize}
+
+\subsubsection{2. Velocidad Relativa}
+\begin{itemize}
+    \item Se calcula la velocidad promedio del flujo en ventanas de 5 minutos por pórtico (\texttt{interval\_speed\_mean}).
+    \item Se cruza este promedio con cada evento para calcular \texttt{relative\_speed} $= v_i / \bar{V}_{5min}$.
+\end{itemize}
+
+\subsubsection{3. Métricas de Interacción (Headway, Conflicto)}
+Esta etapa es crítica y sensitiva al orden de los datos:
+\begin{enumerate}
+    \item \textbf{Ordenamiento:} Los datos se ordenan estrictamente por Pórtico, Carril y Timestamp.
+    \item \textbf{Operaciones Vectorizadas (Shift):} Se crean columnas desplazadas (\texttt{shift(1)}) para comparar el evento actual con el vehículo inmediatamente anterior en el mismo carril/pórtico.
+    \item \textbf{Cálculo de Headway:} Diferencia de tiempo entre el evento actual y el anterior. Se descartan (NaN) los headways mayores a \texttt{max\_headway\_s} (60s).
+    \item \textbf{Cálculo de Conflicto:}
+        \begin{itemize}
+            \item Se calcula $TTC = \frac{Headway \cdot v_{actual}}{v_{actual} - v_{anterior}}$.
+            \item Solo es válido si $v_{actual} > v_{anterior}$.
+            \item Se marca conflicto si $TTC < TTC_{max}$ (donde $TTC_{max}$ depende del pórtico).
+        \end{itemize} 
+    \item \textbf{Agregación:} Se suman y cuentan los eventos válidos por patente para obtener promedios.
+\end{enumerate}
+
+\subsubsection{4. Cambios de Pista (\texttt{Lane Changes})}
+\begin{itemize}
+    \item Se ordenan los datos por Patente y Timestamp.
+    \item Se compara el carril actual con el anterior. Si son diferentes (y es la misma patente), se cuenta como cambio.
+    \item La tasa se normaliza por ($N_P - 1$).
+\end{itemize}
+
+\subsubsection{5. Ponderación (Si aplica)}
+Si se activa \texttt{monthly\_weighting}, las métricas se calculan primero agrupando por Patente-Mes, y luego se hace un promedio ponderado por la cantidad de viajes del mes para obtener el valor final de la patente.
+
+\end{document}

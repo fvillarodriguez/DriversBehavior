@@ -1,0 +1,12 @@
+pyarrow
+pandas
+tqdm
+duckdb
+scikit-learn
+numpy
+streamlit
+plotly
+pytest
+imbalanced-learn
+xgboost
+optuna

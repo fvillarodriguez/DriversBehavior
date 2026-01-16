@@ -1,0 +1,141 @@
+\section{Predicción de accidentes}
+\label{sec:accident-prediction}
+
+\subsection{Objetivo}
+El objetivo es construir y evaluar modelos que predigan la ocurrencia de un accidente en un pórtico, utilizando variables agregadas a partir de detecciones vehiculares (\texttt{flujos}) y, opcionalmente, variables derivadas de \textit{clusters} de conductores.
+
+\subsection{Fuentes de datos}
+\paragraph{Flujos (detecciones)} Cada registro de detección contiene, al menos, un timestamp $t$, un pórtico $p$, una categoría vehicular $c$ y una velocidad $v$. En el sistema, los flujos se almacenan en DuckDB y se consultan por rango temporal.
+
+\paragraph{Eventos (accidentes)} Los accidentes provienen de archivos de eventos. Se filtran por tipo \textit{Accidente} y por \textit{Vía} (por defecto, vía expresa). Luego se construye una marca temporal \texttt{accidente\_time} y se mapea la localización (km, eje, calzada) a pórticos cercanos usando \texttt{Datos/Porticos.csv}. El pórtico asignado se guarda como \texttt{ultimo\_portico}.
+
+\subsection{Discretización temporal y notación}
+Se discretiza el tiempo en intervalos de tamaño $\Delta$ minutos. Para una observación con timestamp $t$, definimos el inicio de intervalo como:
+\[
+\tau(t)=\left\lfloor \frac{t}{\Delta}\right\rfloor \Delta.
+\]
+Las variables se agregan por par $(p,\tau)$, donde $p$ es el pórtico.
+
+\subsection{Ingeniería de variables (features)}
+\subsubsection{Variables macro de flujo}
+Para cada pórtico $p$, intervalo $\tau$ y categoría $c$, definimos:
+\[
+n_{p,\tau,c} = \#\{\text{detecciones en }(p,\tau,c)\}, \qquad
+\overline{v}_{p,\tau,c} = \frac{1}{n_{p,\tau,c}}\sum v.
+\]
+Con $L$ carriles para normalización, se calcula flujo por hora y densidad:
+\[
+q_{p,\tau,c} = \frac{60}{\Delta}\frac{n_{p,\tau,c}}{L},\qquad
+k_{p,\tau,c} = \frac{q_{p,\tau,c}}{\overline{v}_{p,\tau,c}}.
+\]
+Opcionalmente se agregan variables dinámicas vía primera diferencia temporal por pórtico:
+\[
+\Delta \overline{v}_{p,\tau,c}=\overline{v}_{p,\tau,c}-\overline{v}_{p,\tau-\Delta,c},\qquad
+\Delta k_{p,\tau,c}=k_{p,\tau,c}-k_{p,\tau-\Delta,c}.
+\]
+Finalmente se construye una matriz ancha (\textit{wide}) con columnas del estilo
+\texttt{flow\_<cat>}, \texttt{speed\_<cat>}, \texttt{density\_<cat>}, etc.
+
+\subsubsection{Variables de clusters agregadas (opcional)}
+Si existe un archivo de etiquetas por matrícula (\texttt{plate} $\to$ \texttt{cluster\_label}), se unen las detecciones con su cluster correspondiente y se agregan por $(p,\tau,\kappa)$, donde $\kappa$ es el identificador de cluster:
+\[
+n_{p,\tau,\kappa}=\#\{\text{detecciones en }(p,\tau,\kappa)\},\qquad
+\mathrm{share}_{p,\tau,\kappa}=\frac{n_{p,\tau,\kappa}}{\sum_{\kappa'}n_{p,\tau,\kappa'}}.
+\]
+Se derivan, opcionalmente, flujo, velocidad media, densidad y diferencias temporales por cluster, y una medida de mezcla:
+\[
+H_{p,\tau}=-\sum_{\kappa}\mathrm{share}_{p,\tau,\kappa}\log(\mathrm{share}_{p,\tau,\kappa}).
+\]
+Estas variables se almacenan como columnas \texttt{cluster\_share\_*}, \texttt{cluster\_flow\_*}, \texttt{cluster\_speed\_*}, etc.
+
+\subsection{Definición del target (etiqueta)}
+\label{subsec:target}
+Sea un accidente con timestamp $t_a$ y pórtico asignado $p_a$. El sistema define un \textit{lead time} de un intervalo: el accidente se etiqueta en el intervalo anterior
+\[
+\tau_a = \tau(t_a) - \Delta,
+\]
+y el target se define como:
+\[
+y_{p,\tau}=
+\begin{cases}
+1, & \text{si existe un accidente con }(p_a,\tau_a)=(p,\tau),\\
+0, & \text{en caso contrario.}
+\end{cases}
+\]
+Con esto, $y_{p,\tau}=1$ representa ``ocurrirá un accidente en el siguiente intervalo''.
+
+\subsection{Construcción del dataset}
+El dataset final contiene, por fila, un par $(p,\tau)$ con variables numéricas y \texttt{target}. La construcción es:
+\begin{enumerate}
+  \item Calcular variables macro de flujo por $(p,\tau)$.
+  \item (Opcional) Calcular variables de clusters por $(p,\tau)$ y unirlas por llave \texttt{(portico, interval\_start)}.
+  \item Agregar \texttt{target} mediante unión con el conjunto de pares $(p_a,\tau_a)$.
+\end{enumerate}
+
+\subsection{Partición temporal (train/validación/test)}
+Para evitar \textit{leakage} temporal, se realiza un \textit{split} por tiempo usando la columna \texttt{interval\_start}: el conjunto de timestamps se ordena y se asigna el tramo final al test (proporción \texttt{test\_size}). En entrenamiento estándar, además se separa validación desde el bloque de train/val con \texttt{val\_size}.
+
+\subsection{Manejo de desbalance}
+La ocurrencia de accidentes es rara ($y=1$). Se utilizan dos estrategias:
+\begin{itemize}
+  \item \textbf{Ponderación de clases}: por ejemplo, Random Forest con \texttt{class\_weight="balanced"}.
+  \item \textbf{SMOTE (opcional)}: se genera un dataset balanceado aplicando SMOTE \emph{solo sobre el conjunto de entrenamiento}. Las filas sintéticas se marcan con \texttt{synthetic=True} y no se usan para validación de umbral.
+\end{itemize}
+
+\subsection{Modelos}
+Se consideran los siguientes modelos:
+\begin{itemize}
+  \item \textbf{Random Forest}: ensamble de árboles con ponderación de clases.
+  \item \textbf{XGBoost}: gradiente boosting con objetivo binario logístico.
+  \item \textbf{SVM}: clasificador con escalamiento (\texttt{StandardScaler}) y salida probabilística.
+\end{itemize}
+Cada modelo produce un \textit{score} $s(x)\in\mathbb{R}$ (probabilidad o función de decisión).
+
+\subsection{Calibración de umbral con FAR}
+Se define el \textit{false alarm rate} (FAR) y la sensibilidad:
+\[
+\mathrm{FAR}=\frac{FP}{FP+TN},\qquad
+\mathrm{Sens}=\frac{TP}{TP+FN}.
+\]
+Se selecciona un umbral $\theta$ en el set de validación usando la curva ROC. Con un objetivo $\mathrm{FAR}\le \alpha$, se elige:
+\[
+\theta = \arg\max_{\theta:\ \mathrm{FAR}(\theta)\le \alpha}\ \mathrm{Sens}(\theta),
+\]
+y luego se evalúa en test con $\hat{y}=\mathbf{1}[s(x)\ge \theta]$.
+
+\subsection{Métricas de evaluación}
+En test se reportan, entre otras:
+\[
+\text{Accuracy},\ \text{Precision},\ \text{Recall},\ F1,\ \mathrm{FAR},\ \mathrm{Sens},\ \mathrm{ROC\text{-}AUC},
+\]
+además de la matriz de confusión.
+
+\subsection{Selección de variables y optimización}
+\paragraph{Importancia de variables} Se calcula un ranking de importancia con Random Forest (\texttt{feature\_importances\_}) para ordenar variables.
+
+\paragraph{Optuna + SMOTE} Se optimizan hiperparámetros del modelo y de SMOTE. Para cada trial:
+\begin{enumerate}
+  \item Aplicar SMOTE sobre train.
+  \item Entrenar el modelo.
+  \item Calibrar el umbral con FAR en validación.
+  \item Evaluar el desempeño (p.\,ej. F1) y seleccionar el mejor trial.
+\end{enumerate}
+
+\subsection{Experimentos: efecto de variables de cluster}
+Para evidenciar el efecto de incluir clusters, se comparan dos escenarios:
+\begin{itemize}
+  \item \textbf{Base}: top-$K$ variables del ranking base (sin clusters).
+  \item \textbf{Base+Cluster}: top-$K$ variables del ranking combinado (con clusters).
+\end{itemize}
+Se repite para $K=5,10,\dots$ hasta el máximo disponible, registrando métricas por configuración.
+
+\subsection{Artefactos}
+El flujo genera artefactos en \texttt{Resultados/} (nombres con timestamp/sufijo):
+\begin{itemize}
+  \item Features de flujo: \texttt{accident\_flow\_features\_*.csv} y/o \texttt{.duckdb}.
+  \item Features de clusters: \texttt{accident\_cluster\_features\_*.csv}.
+  \item Datasets balanceados: \texttt{accident\_balanced\_*.csv}.
+  \item Resultados Optuna: \texttt{optuna\_*.json} y \texttt{optuna\_*\_trials.csv}.
+  \item Resultados de experimentos iterativos: \texttt{experiments\_results\_*.csv}.
+\end{itemize}
+

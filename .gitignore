@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+
+# Dataset and Large Files
+sumo-main/
+Datos/
+Resultados/
+Archivo.zip
+
+# MACOS
+.DS_Store
+
+# Streamlit
+.streamlit/
