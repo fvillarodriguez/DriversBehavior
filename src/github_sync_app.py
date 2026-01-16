@@ -1,5 +1,6 @@
 import streamlit as st
 import src.git_sync as git_sync
+import time
 
 def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
     if set_page_config:
@@ -19,8 +20,20 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
                 if not remote_url:
                     st.error("Por favor ingresa una URL remota.")
                 else:
+                    st.subheader("Live Logs")
+                    log_placeholder = st.empty()
+                    logs = []
+                    
                     with st.spinner("Inicializando repositorio..."):
-                        success, logs = git_sync.initialize_repo(remote_url)
+                        gen = git_sync.initialize_repo_stream(remote_url)
+                        success = False
+                        try:
+                            while True:
+                                msg = next(gen)
+                                logs.append(msg)
+                                log_placeholder.code("\n".join(logs), language="text")
+                        except StopIteration as e:
+                            success = e.value
                     
                     st.session_state["sync_logs"] = logs
                     if success:
@@ -29,11 +42,6 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
                             st.rerun()
                     else:
                         st.error("Hubo un error en la inicialización. Revisa los logs.")
-        
-        st.subheader("Logs")
-        logs = st.session_state.get("sync_logs", [])
-        if logs:
-            st.code("\n".join(logs), language="text")
         
         return # Detener renderizado del resto si no es repo
 
@@ -68,24 +76,50 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
     
     with col1:
         if st.button("🔄 Sync Now", type="primary", use_container_width=True):
+            st.session_state["sync_logs"] = [] # Clear previous logs
+            
+            with col2:
+                st.subheader("Live Logs")
+                log_placeholder = st.empty()
+            
+            logs = []
             with st.spinner("Synchronizing with GitHub..."):
-                success, logs = git_sync.sync_with_github()
-                
-            if success:
-                st.success("Synchronization successful!")
-            else:
-                st.error("Synchronization failed. check logs below.")
+                gen = git_sync.sync_with_github_stream()
+                success = False
+                try:
+                    while True:
+                        msg = next(gen)
+                        logs.append(msg)
+                        log_placeholder.code("\n".join(logs), language="text")
+                except StopIteration as e:
+                    success = e.value
+                except Exception as e:
+                    logs.append(f"Error inesperado: {e}")
+                    log_placeholder.code("\n".join(logs), language="text")
+                    success = False
             
             st.session_state["sync_logs"] = logs
+            
+            with col1:
+                if success:
+                    st.success("Success!")
+                else:
+                    st.error("Failed.")
 
+    # Mostrar logs persistentes si no se está ejecutando (o después de ejecutarse)
+    if "sync_logs" in st.session_state and st.session_state["sync_logs"]:
+         # Solo si no acabamos de actualizar el placeholder (para evitar duplicados visuales es complicado en streamlit sin rerender, 
+         # pero aquí estamos redibujando. El placeholder de arriba se pierde en el rerun si no lo guardamos).
+         # Simplemente mostramos el log final en col2 si no estamos en medio de una acción.
+         # Streamlit reruns on interaction.
+         pass
+         
+    # Para persistencia visual tras interacción
     with col2:
-        st.subheader("Logs")
-        logs = st.session_state.get("sync_logs", [])
-        if logs:
-            log_text = "\n".join(logs)
-            st.code(log_text, language="text")
-        else:
-            st.info("No logs available. Run sync to see output.")
+        if "sync_logs" in st.session_state and st.session_state["sync_logs"]:
+             if not logs: # Si no estamos en el bucle de ejecución
+                 st.subheader("Logs (Last Run)")
+                 st.code("\n".join(st.session_state["sync_logs"]), language="text")
 
     if show_exit_button:
         if st.button("Exit"):
