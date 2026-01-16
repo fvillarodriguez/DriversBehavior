@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -196,18 +196,78 @@ def _load_events_db() -> pd.DataFrame:
     return df[EVENTS_DB_COLUMNS].copy()
 
 
-def _read_event_files(selected_names: Sequence[str]) -> pd.DataFrame:
-    frames: List[pd.DataFrame] = []
+def _scan_event_types(selected_names: Sequence[str]) -> List[str]:
+    """Scans selected files to find unique event types."""
+    types = set()
     for name in selected_names:
         path = DATA_DIR / name
         try:
-            frames.append(
-                pd.read_csv(path, sep=None, engine="python", encoding="utf-8")
-            )
+            # Read only a small sample or specific columns to be faster? 
+            # Ideally we need all types, so we must read the whole file but only that column.
+            # We don't know the exact column name for "Tipo" yet, so we read header first.
+            df_iter = pd.read_csv(
+                path, sep=None, engine="python", encoding="utf-8", 
+                iterator=True, chunksize=5000
+            ) 
+            # We just need the first chunk to find the column name usually, 
+            # but types might be spread out. 
+            # Let's read the whole thing but only one column if possible.
+            # Since engine="python" with sep=None doesn't support usecols well with unknown separators 
+            # sometimes, let's stick to reading chunks.
+            
+            tipo_col = None
+            for chunk in df_iter:
+                if tipo_col is None:
+                    tipo_col = buscar_columna(chunk, "Tipo")
+                
+                if tipo_col and tipo_col in chunk.columns:
+                     unique_vals = chunk[tipo_col].dropna().astype(str).str.strip().unique()
+                     types.update(unique_vals)
+        except Exception:
+            # Try latin-1 fallback or just skip
+             try:
+                df_iter = pd.read_csv(
+                    path, sep=None, engine="python", encoding="latin-1", 
+                    iterator=True, chunksize=5000
+                )
+                tipo_col = None
+                for chunk in df_iter:
+                    if tipo_col is None:
+                        tipo_col = buscar_columna(chunk, "Tipo")
+                    if tipo_col and tipo_col in chunk.columns:
+                         unique_vals = chunk[tipo_col].dropna().astype(str).str.strip().unique()
+                         types.update(unique_vals)
+             except Exception:
+                 pass
+                 
+    return sorted(list(types))
+
+
+def _read_event_files(
+    selected_names: Sequence[str], 
+    allowed_types: Optional[Sequence[str]] = None
+) -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    # Normalize allowed_types for case-insensitive matching
+    allowed_set = set(t.lower() for t in allowed_types) if allowed_types else None
+    
+    for name in selected_names:
+        path = DATA_DIR / name
+        try:
+            # We need to read the full file to filter correctly usually
+            df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8")
         except UnicodeDecodeError:
-            frames.append(
-                pd.read_csv(path, sep=None, engine="python", encoding="latin-1")
-            )
+            df = pd.read_csv(path, sep=None, engine="python", encoding="latin-1")
+            
+        if allowed_set is not None:
+            tipo_col = buscar_columna(df, "Tipo")
+            if tipo_col:
+                # Filter
+                mask = df[tipo_col].astype(str).str.strip().str.lower().isin(allowed_set)
+                df = df[mask]
+        
+        frames.append(df)
+            
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -505,9 +565,10 @@ def _render_filters(
                 key="events_start_date",
             )
         with col2:
+            default_end = min(max_dt.date(), start_date + timedelta(days=30))
             end_date = st.date_input(
                 "Fecha fin",
-                value=max_dt.date(),
+                value=default_end,
                 min_value=min_dt.date(),
                 max_value=max_dt.date(),
                 key="events_end_date",
@@ -678,6 +739,7 @@ def _render_map(
     *,
     show_points: bool = True,
     show_heatmap: bool = False,
+    show_satellite: bool = False,
 ) -> None:
     layers = []
     
@@ -688,6 +750,18 @@ def _render_map(
         zoom=10,
         pitch=0,
     )
+
+    # 0. Satellite Layer (Bottom-most)
+    if show_satellite:
+        satellite_layer = pdk.Layer(
+            "TileLayer",
+            data="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            min_zoom=0,
+            max_zoom=19,
+            tileSize=256,
+            render_sub_layers=True,
+        )
+        layers.append(satellite_layer)
 
     # 1. Highway Layer (Background)
     if highway_geo is not None and not highway_geo.empty:
@@ -794,7 +868,7 @@ def _render_map(
 
     st.pydeck_chart(
         pdk.Deck(
-            map_style="mapbox://styles/mapbox/light-v9",
+            map_style="mapbox://styles/mapbox/light-v9" if not show_satellite else None,
             initial_view_state=initial_view_state,
             layers=layers,
             tooltip={
@@ -1221,10 +1295,47 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
     else:
         st.info("No se encontraron archivos de eventos en la carpeta Datos.")
 
-    if st.button("Cargar eventos"):
+    allowed_types = None
+    
+    # UI for Type Detection
+    col_scan, col_load = st.columns([1, 2])
+    with col_scan:
+        if st.button("Detectar tipos de eventos"):
+            if not selected_names:
+                st.warning("Seleccione archivos para escanear.")
+            else:
+                with st.spinner("Escaneando tipos de eventos..."):
+                    types_found = _scan_event_types(selected_names)
+                    st.session_state["detected_event_types"] = types_found
+                    # Reset previous selection if types change significantly? 
+                    # For now keep it simple.
+                    st.success(f"Se encontraron {len(types_found)} tipos.")
+
+    # Show multiselect if types are detected
+    if "detected_event_types" in st.session_state and st.session_state["detected_event_types"]:
+        all_types = st.session_state["detected_event_types"]
+        # Default to all if not set, or maintain selection?
+        # Let's default to all to avoid filtering everything out by mistake
+        selected_types_filter = st.multiselect(
+            "Filtrar por tipo (antes de cargar)",
+            options=all_types,
+            default=all_types,
+            help="Seleccione los tipos de eventos que desea cargar. Si no selecciona ninguno, no se cargará nada."
+        )
+        allowed_types = selected_types_filter
+
+    with col_load:
+        load_clicked = st.button("Cargar eventos")
+
+    if load_clicked:
         if not selected_names:
             st.warning("Seleccione al menos un archivo de eventos.")
             return
+            
+        if allowed_types is not None and not allowed_types:
+             st.warning("Ha activado el filtro por tipo pero no seleccionó ninguno. Seleccione al menos uno.")
+             return
+
         # Barra de progreso y status
         progress_bar = st.progress(0, text="Iniciando carga de eventos...")
         
@@ -1244,7 +1355,11 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
             # 2. Leer archivos de eventos (30%)
             progress_bar.progress(30, text="Leyendo archivos de eventos...")
             try:
-                raw_df = _read_event_files(selected_names)
+                raw_df = _read_event_files(selected_names, allowed_types=allowed_types)
+                if raw_df.empty:
+                    st.warning("No se encontraron eventos con los filtros seleccionados.")
+                    progress_bar.empty()
+                    return
             except Exception as exc:
                 st.error(f"No se pudieron leer los eventos: {exc}")
                 progress_bar.empty()
@@ -1390,23 +1505,25 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
     layer_options = [
         "Accidentes (puntos)",
         "Mapa de calor",
+        "Satelite (Esri)",
     ]
     selected_layers = st.multiselect(
         "Capas del mapa",
         options=layer_options,
-        default=layer_options,
+        default=["Accidentes (puntos)", "Satelite (Esri)"],
         key="events_map_layers",
     )
     show_points = "Accidentes (puntos)" in selected_layers
     show_heatmap = "Mapa de calor" in selected_layers
+    show_satellite = "Satelite (Esri)" in selected_layers
 
     _render_map(
         mapped_df,
         heat_df,
         highway_geo,
-        porticos_df,
         show_points=show_points,
         show_heatmap=show_heatmap,
+        show_satellite=show_satellite,
     )
 
     if not filtered_df.empty:
