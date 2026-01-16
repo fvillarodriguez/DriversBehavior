@@ -1,0 +1,185 @@
+\section{Clustering}
+\label{sec:clustering}
+
+\subsection{Objective}
+The objective of the \textit{clustering} module is to group drivers (identified by their license plate) according to behavioral indicators observed in detection records (\texttt{flujos}). These groups are used both for exploratory analysis and to build gantry/interval aggregated variables that feed downstream models.
+
+\subsection{Data and preprocessing}
+We start from a set of observations $\{r_j\}_{j=1}^N$, where each record contains, at minimum:
+\[
+ r_j = (t_j, p_j, \ell_j, v_j, \text{plate}_j),
+\]
+with $t$ time, $p$ gantry, $\ell$ lane, $v$ speed, and \text{plate} the license plate.
+
+\paragraph{License plate normalization}
+Plates are normalized as uppercase text and invalid values are removed (\texttt{""}, \texttt{nan}, \texttt{null}, \texttt{none}). In the implementation, plates with length outside $[5,6]$ are filtered out.
+
+\paragraph{Lane cleaning and duplicates}
+Lane is converted to numeric and filtered to $\ell \in \{1,2,3\}$. In addition, exact duplicates are removed using the key:
+\[
+(\text{plate}, p, \ell, t).
+\]
+
+\paragraph{Speed outlier handling}
+For each $(p,\ell)$ group, quantiles $q_\alpha$ and $q_\beta$ are computed on speed. Depending on the mode:
+\begin{itemize}
+  \item \textbf{Winsorization}: $v \leftarrow \min(\max(v, q_\alpha), q_\beta)$.
+  \item \textbf{Filtering}: observations with $v \notin [q_\alpha, q_\beta]$ are discarded.
+  \item \textbf{No action}: $v$ is not modified.
+\end{itemize}
+
+\subsection{Driver-level \textit{feature} engineering}
+\label{subsec:driver-features}
+For each driver $i$ (license plate), a vector of variables $x_i \in \mathbb{R}^d$ is built from aggregations over their passes. In the implementation, these variables are stored in \texttt{Resultados/cluster\_features*.duckdb} (table \texttt{cluster\_features}).
+
+\subsubsection{Counts, mean speed, and lane usage}
+Let $N_i$ be the number of passes of driver $i$:
+\[
+N_i = \sum_{j=1}^N \mathbf{1}[\text{plate}_j=i].
+\]
+Mean speed is defined as:
+\[
+\overline{v}_i = \frac{1}{N_i}\sum_{j:\,\text{plate}_j=i} v_j.
+\]
+For lane usage, we define proportions:
+\[
+\pi_{i,k} = \frac{1}{N_i}\sum_{j:\,\text{plate}_j=i} \mathbf{1}[\ell_j = k], \quad k\in\{1,2,3\}.
+\]
+
+\subsubsection{Relative speed}
+A reference mean speed is defined per 5-minute interval and gantry:
+\[
+\overline{v}_{p,\tau}=\frac{1}{|\mathcal{I}_{p,\tau}|}\sum_{j\in\mathcal{I}_{p,\tau}} v_j,\quad
+\mathcal{I}_{p,\tau}=\{j:\,p_j=p,\ \lfloor t_j\rfloor_{5\text{min}}=\tau\}.
+\]
+For each pass, relative speed is:
+\[
+\rho_j = \frac{v_j}{\overline{v}_{p_j,\lfloor t_j\rfloor_{5\text{min}}}},
+\]
+and per driver:
+\[
+\overline{\rho}_i = \frac{1}{|\mathcal{J}_i|}\sum_{j\in\mathcal{J}_i}\rho_j,\quad
+\mathcal{J}_i=\{j:\,\text{plate}_j=i\}.
+\]
+
+\subsubsection{Headway (time gap)}
+For each $(p,\ell)$ group (and optionally by month), records are ordered by $(t,\text{plate})$. The \textit{headway} for observation $j$ is computed as:
+\[
+h_j = t_j - t_{j-1},
+\]
+in seconds, where $j-1$ is the previous record within the same group. Headways greater than a threshold $h_{\max}$ (default 60s) are treated as missing. The mean \textit{headway} per driver:
+\[
+\overline{h}_i = \frac{1}{|\mathcal{H}_i|}\sum_{j\in\mathcal{H}_i} h_j,\quad
+\mathcal{H}_i=\{j:\,\text{plate}_j=i,\ h_j>0,\ h_j\le h_{\max}\}.
+\]
+
+\subsubsection{TTC and conflict rate}
+Let $\Delta v_j = v_j - v_{j-1}$ be the speed difference between vehicle $j$ and the preceding one in the same $(p,\ell)$. For closing situations (\(\Delta v_j>0\)), the \textit{Time-To-Collision} is defined as:
+\[
+\mathrm{TTC}_j = \frac{h_j\,v_j}{\Delta v_j}.
+\]
+For each gantry $p$, a threshold $\tau_p$ (in code: \texttt{TTC\_MAX\_BY\_PORTICO}) is defined. A conflict is counted if $\mathrm{TTC}_j < \tau_{p_j}$, and the rate per driver is:
+\[
+\mathrm{conflict\_rate}_i = \frac{\sum_{j\in\mathcal{C}_i}\mathbf{1}[\mathrm{TTC}_j < \tau_{p_j}]}{|\mathcal{C}_i|},\quad
+\mathcal{C}_i=\{j:\,\text{plate}_j=i,\ h_j>0\}.
+\]
+In the implementation, to avoid extreme values, $\mathrm{TTC}_j$ is capped above at $\tau_{p_j}$.
+
+\subsubsection{Lane changes}
+Ordering driver $i$'s passes by time (and optionally by month), we define:
+\[
+\mathrm{lane\_changes}_i = \sum_{m=2}^{N_i}\mathbf{1}[\ell_{i,m}\neq \ell_{i,m-1}],
+\quad
+\mathrm{lane\_change\_rate}_i = \frac{\mathrm{lane\_changes}_i}{\max(N_i-1,1)}.
+\]
+
+\subsubsection{Monthly weighting (optional)}
+When monthly weighting is enabled, variables are computed per month and then consolidated per plate via a weighted average by $N_{i,m}$ (passes of driver $i$ in month $m$):
+\[
+\overline{x}_i = \frac{\sum_m N_{i,m}\,x_{i,m}}{\sum_m N_{i,m}}.
+\]
+
+\subsubsection{Temporal activity}
+To characterize how ``persistent'' a driver is over time, activity metrics are computed:
+\[
+n^{(\text{days})}_i = \left|\left\{\lfloor t_j\rfloor_{\text{day}}:\ \text{plate}_j=i\right\}\right|,\quad
+n^{(\text{weeks})}_i = \left|\left\{\lfloor t_j\rfloor_{\text{week}}:\ \text{plate}_j=i\right\}\right|,\quad
+n^{(\text{months})}_i = \left|\left\{\lfloor t_j\rfloor_{\text{month}}:\ \text{plate}_j=i\right\}\right|.
+\]
+
+\subsection{Data preparation for clustering}
+A subset of numeric columns (\textit{features}) is selected and rows with missing or infinite values in those columns are dropped. Before clustering, variables are standardized using \textit{z-score}:
+\[
+z=\frac{x-\mu}{\sigma},
+\]
+using \texttt{sklearn.preprocessing.StandardScaler}.
+
+\subsection{Clustering methods}
+\subsubsection{K-means}
+K-means seeks to partition the data into $K$ clusters by minimizing the sum of within-cluster squared distances:
+\[
+\min_{\{c_i\},\{\mu_k\}} \sum_{i=1}^{n} \left\lVert x_i - \mu_{c_i}\right\rVert^2.
+\]
+In the implementation, \texttt{sklearn.cluster.KMeans} is used and, for quick evaluation of $K$, optionally \texttt{MiniBatchKMeans}.
+
+\paragraph{Selecting $K$ (metrics)}
+Metrics are computed for $K \in [K_{\min},K_{\max}]$:
+\begin{itemize}
+  \item \textbf{Silhouette}: $s(i)=\frac{b(i)-a(i)}{\max(a(i),b(i))}$.
+  \item \textbf{Davies--Bouldin}: average ratio between within-cluster dispersion and between-cluster separation.
+  \item \textbf{Calinski--Harabasz}: ratio between between-cluster and within-cluster dispersion.
+\end{itemize}
+
+\subsubsection{Gaussian Mixture Models (GMM)}
+A GMM models the density as a mixture:
+\[
+p(x)=\sum_{k=1}^{K}\pi_k\,\mathcal{N}(x\mid\mu_k,\Sigma_k),
+\]
+typically estimated via EM. The selection of $K$ is supported by information criteria:
+\[
+\mathrm{AIC}=-2\log L + 2p,\qquad
+\mathrm{BIC}=-2\log L + p\log n,
+\]
+where $L$ is the likelihood, $p$ the number of parameters, and $n$ the number of samples.
+
+\subsubsection{HDBSCAN}
+HDBSCAN is a density-based method that builds a hierarchy of clusters and extracts stable groupings. Typical parameters:
+\begin{itemize}
+  \item \texttt{min\_cluster\_size}: minimum cluster size.
+  \item \texttt{min\_samples}: controls robustness to noise.
+\end{itemize}
+Observations marked as noise receive label \(-1\).
+
+\subsection{Frequent vs. rare drivers (optional)}
+To improve robustness when there are plates with few passes, the workflow can train the model on \textit{frequent drivers} (e.g., $N_i \geq N_{\min}$) and then assign labels to rare drivers with a confidence threshold:
+\begin{itemize}
+  \item \textbf{K-means}: compute the minimum distance to the nearest centroid; if it exceeds a percentile $q$ estimated on the frequent set, label as unknown (\(-1\)).
+  \item \textbf{GMM}: compute the maximum posterior probability; if it is below a threshold $\gamma$, label as unknown (\(-1\)).
+\end{itemize}
+A \textit{confidence score} (\texttt{confidence\_score}) and an \texttt{is\_rare} indicator are also saved.
+
+\subsection{Outputs and artifacts}
+The module generates files in \texttt{Resultados/}:
+\begin{itemize}
+  \item Per-plate variables in DuckDB: \texttt{cluster\_features*.duckdb}.
+  \item Per-plate labels: \texttt{cluster\_kmeans\_kK.csv}, \texttt{cluster\_gmm\_kK.csv}, \texttt{cluster\_hdbscan.csv}.
+  \item Per-cluster summary (\textit{centroids}): \texttt{cluster\_summary*.csv}.
+  \item Descriptive statistics per cluster: \texttt{cluster\_descriptive*.csv}.
+\end{itemize}
+
+\subsection{Cluster variables aggregated by gantry and interval}
+\label{subsec:cluster-features-macro}
+In addition to plate-level clustering, gantry/interval aggregated variables are built from a label table (\texttt{plate} \(\rightarrow\) \texttt{cluster\_label}). For each gantry $p$, interval $\tau$, and cluster $c$:
+\[
+n_{p,\tau,c}=\#\{j:\,p_j=p,\ \lfloor t_j\rfloor_{\Delta}=\tau,\ \text{cluster}(\text{plate}_j)=c\},
+\qquad
+\mathrm{share}_{p,\tau,c}=\frac{n_{p,\tau,c}}{\sum_{c'}n_{p,\tau,c'}}.
+\]
+Optionally, the following are aggregated:
+\begin{itemize}
+  \item \textbf{Hourly flow}: \(\mathrm{flow}_{p,\tau,c}=n_{p,\tau,c}\cdot \frac{60}{\Delta}\cdot\frac{1}{L}\), where $\Delta$ is the interval size (minutes) and $L$ is the assumed number of lanes.
+  \item \textbf{Mean speed} per cluster: \(\overline{v}_{p,\tau,c}\).
+  \item \textbf{Density}: \(\mathrm{density}_{p,\tau,c}=\mathrm{flow}_{p,\tau,c}/\overline{v}_{p,\tau,c}\) (with defensive handling when \(\overline{v}\le 0\)).
+  \item \textbf{Temporal variations}: \(\Delta \mathrm{speed}\), \(\Delta \mathrm{density}\) via differences between consecutive intervals.
+  \item \textbf{Cluster-mixing entropy}: \(H_{p,\tau}=-\sum_c \mathrm{share}_{p,\tau,c}\log(\mathrm{share}_{p,\tau,c})\).
+\end{itemize}

@@ -1,0 +1,201 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{float}
+
+\geometry{a4paper, margin=2.5cm}
+
+\title{Details of Feature Computation for Clustering}
+\author{SUMO Team}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+This document details the *feature engineering* process used to cluster drivers (license plates) based on their behavior on the highway. The goal is to transform raw vehicle flow records into a single feature vector per license plate.
+
+\section{Data Preprocessing}
+Before computing the variables, the flow data ($F$) go through a cleaning stage:
+
+\begin{enumerate}
+    \item \textbf{License Plate Normalization:} Non-alphanumeric characters are removed and the plate is standardized to uppercase. Invalid plates (e.g., "NULL", "NAN") or plates with length outside the range $[5, 6]$ are discarded.
+    \item \textbf{Lane Filtering:} Only lanes 1, 2, and 3 are considered.
+    \item \textbf{Duplicate Removal:} Duplicate records are removed considering the tuple $(Plate, Gantry, Lane, Timestamp)$.
+    \item \textbf{Outlier Handling (Speed):} \textit{Winsorization} is applied to speed for each $(Gantry, Lane)$ group, capping extreme values at the $1\%$ and $99\%$ percentiles.
+\end{enumerate}
+
+\section{Variable Computation (Event Level)}
+For each event $i$ (a vehicle passing through a gantry), intermediate metrics are computed. Let $v_i$ be the speed of event $i$ at time $t_i$.
+
+\subsection{Headway ($h_i$)}
+\textit{Headway} is computed as the time difference with the preceding vehicle ($i-1$) in the \textbf{same lane and gantry}. The data must be temporally ordered.
+
+\begin{equation}
+    h_i = t_i - t_{i-1}
+\end{equation}
+
+If $h_i > 60$ seconds, it is assumed there is no close interaction and the value is discarded (NaN) for conflict computation purposes, although it may be included in averages if desired.
+
+\subsection{Indexed Relative Speed ($v_{rel, i}$)}
+To normalize behavior according to traffic conditions, the vehicle speed is compared with the average flow speed at that gantry over a 5-minute interval, denoted $\bar{V}_{5min}$.
+
+\begin{equation}
+    v_{rel, i} = \frac{v_i}{\bar{V}_{5min}}
+\end{equation}
+
+\begin{itemize}
+    \item $v_{rel, i} > 1$: Driver is faster than the average flow.
+    \item $v_{rel, i} < 1$: Driver is slower than the average flow.
+\end{itemize}
+
+\subsection{Conflict and TTC (Time To Collision)}
+Collision risk with the preceding vehicle is evaluated. $TTC_i$ is computed only if vehicle $i$ is traveling faster than the previous vehicle ($v_i > v_{i-1}$) and the headway is valid.
+
+\begin{equation}
+    TTC_i = \frac{h_i \cdot v_i}{v_i - v_{i-1}}
+\end{equation}
+
+A \textbf{conflict} event ($c_i$) is defined if $TTC_i$ is below a gantry-specific threshold ($TTC_{max}$), defined empirically.
+
+\begin{equation}
+    c_i = \begin{cases} 
+    1 & \text{if } TTC_i < TTC_{max} \\
+    0 & \text{if } TTC_i \ge TTC_{max} \text{ or } v_i \le v_{i-1}
+    \end{cases}
+\end{equation}
+
+\section{Aggregation by License Plate}
+The goal is to obtain a single vector per driver $P$. The aggregation process can be performed in two ways: Global or Monthly-Weighted.
+
+Let $N_P$ be the total number of recorded passes for license plate $P$.
+
+\subsection{Aggregated Variables}
+
+\subsubsection{Average Speed ($\bar{v}_P$)}
+\begin{equation}
+    \bar{v}_P = \frac{1}{N_P} \sum_{i \in P} v_i
+\end{equation}
+
+\subsubsection{Average Relative Speed ($\bar{v}_{rel, P}$)}
+\begin{equation}
+    \bar{v}_{rel, P} = \frac{1}{N_{rel}} \sum_{i \in P} v_{rel, i}
+\end{equation}
+Where $N_{rel}$ is the number of events with valid relative speed.
+
+\subsubsection{Average Headway ($\bar{h}_P$)}
+\begin{equation}
+    \bar{h}_P = \frac{1}{N_{h}} \sum_{i \in P, h_i \le 60} h_i
+\end{equation}
+
+\subsubsection{Conflict Rate ($CR_P$)}
+Proportion of events with valid headway that resulted in a conflict.
+\begin{equation}
+    CR_P = \frac{\sum_{i \in P} c_i}{N_{h}}
+\end{equation}
+
+\subsubsection{Lane Usage ($Lane_k$)}
+Proportion of usage of lane $k \in \{1, 2, 3\}$.
+\begin{equation}
+    Lane_k = \frac{\text{Count of passes in lane } k}{N_P}
+\end{equation}
+
+\subsubsection{Lane Change Rate ($LCR_P$)}
+Estimated by counting how many times the vehicle changed lanes between consecutive gantries. Let $L_j$ be the lane in event $j$ (time-ordered).
+\begin{equation}
+    Changes = \sum_{j=2}^{N_P} \mathbb{I}(L_j \neq L_{j-1})
+\end{equation}
+\begin{equation}
+    LCR_P = \frac{Changes}{N_P - 1}    
+\end{equation}
+*Note: This metric is approximate, as it assumes continuity between recorded gantries.*
+
+\subsection{Consolidation Strategies}
+
+\subsubsection{1. Global Aggregation (Default)}
+The formulas above are applied over \textbf{all} historical records for license plate $P$ as a single set.
+
+\subsubsection{2. Monthly Weighting}
+Monthly averages $X_{P, m}$ are computed first for each month $m$, and then weighted by the number of trips in that month ($N_{P, m}$).
+
+Let $X$ be any variable (e.g., Speed, Conflict Rate). The final weighted value is:
+
+\begin{equation}
+    X_{P, final} = \frac{\sum_{m} \left( X_{P, m} \cdot N_{P, m} \right)}{\sum_{m} N_{P, m}}
+\end{equation}
+
+This ensures that months with higher activity have greater influence, while still allowing intermediate monthly metrics if temporal analysis is required.
+
+\section{Definition of Frequent Drivers}
+For clustering model training, users are separated into:
+\begin{itemize}
+    \item \textbf{Frequent:} Users with enough history to characterize their behavior. Typical criteria:
+    \begin{itemize}
+        \item $N_P \ge 20$ total passes.
+        \item Active days $\ge 5$.
+    \end{itemize}
+    \item \textbf{Infrequent:} Users with few data points. They are not used for training, but can be assigned to a cluster later using the trained model (or remain as "Unknown").
+\end{itemize}
+
+\section{Python Implementation}
+The computation logic described above is implemented mainly in the module \texttt{src/clustering.py}. Below, we detail the execution flow of the key functions for auditing purposes.
+
+\subsection{Data Cleaning: \texttt{clean\_flujos\_for\_clustering}}
+This function takes the raw flow DataFrame and performs the initial preparation:
+\begin{enumerate}
+    \item \textbf{Column Validation:} Ensures that essential columns exist (timestamp, speed, gantry, lane, license plate).
+    \item \textbf{License Plate Cleaning:} Plates are normalized (alphanumeric, uppercase) and filtered if their length is invalid (outside the range $[5, 6]$).
+    \item \textbf{Basic Filtering:} Rows with null values in critical fields are removed and only lanes 1, 2, and 3 are kept.
+    \item \textbf{Deduplication:} Exact duplicates of the tuple (Plate, Gantry, Lane, Timestamp) are removed. If duplicates exist with different speeds, a deterministic priority is applied (merge sort ordering preserving the first).
+    \item \textbf{Winsorization:} Extreme speed values are capped by group (Gantry, Lane) using the defined percentiles (default $1\%$ and $99\%$).
+\end{enumerate}
+
+\subsection{Feature Computation: \texttt{Clusterization}}
+This is the main function that orchestrates feature computation.
+
+\subsubsection{1. Simple Metrics and Pre-computation}
+Metrics that do not require complex temporal ordering are computed:
+\begin{itemize}
+    \item \textbf{Total Passes (\texttt{total\_passes}):} Simple count of records per license plate.
+    \item \textbf{Average Speed (\texttt{avg\_speed\_kmh}):} Arithmetic mean of speed.
+    \item \textbf{Lane Usage:} A pivot table is built to count passes per lane and divide by the total.
+\end{itemize}
+
+\subsubsection{2. Relative Speed}
+\begin{itemize}
+    \item The average flow speed is computed in 5-minute windows per gantry (\texttt{interval\_speed\_mean}).
+    \item This average is joined to each event to compute \texttt{relative\_speed} $= v_i / \bar{V}_{5min}$.
+\end{itemize}
+
+\subsubsection{3. Interaction Metrics (Headway, Conflict)}
+This stage is critical and sensitive to data ordering:
+\begin{enumerate}
+    \item \textbf{Sorting:} Data are strictly sorted by Gantry, Lane, and Timestamp.
+    \item \textbf{Vectorized Operations (Shift):} Shifted columns (\texttt{shift(1)}) are created to compare the current event with the immediately preceding vehicle in the same lane/gantry.
+    \item \textbf{Headway Computation:} Time difference between the current and previous event. Headways greater than \texttt{max\_headway\_s} (60s) are discarded (NaN).
+    \item \textbf{Conflict Computation:}
+        \begin{itemize}
+            \item Compute $TTC = \frac{Headway \cdot v_{current}}{v_{current} - v_{previous}}$.
+            \item Valid only if $v_{current} > v_{previous}$.
+            \item Mark conflict if $TTC < TTC_{max}$ (where $TTC_{max}$ depends on the gantry).
+        \end{itemize} 
+    \item \textbf{Aggregation:} Valid events are summed and counted by license plate to obtain averages.
+\end{enumerate}
+
+\subsubsection{4. Lane Changes (\texttt{Lane Changes})}
+\begin{itemize}
+    \item Data are sorted by License Plate and Timestamp.
+    \item The current lane is compared with the previous one. If they differ (and it is the same plate), it is counted as a change.
+    \item The rate is normalized by ($N_P - 1$).
+\end{itemize}
+
+\subsubsection{5. Weighting (If applicable)}
+If \texttt{monthly\_weighting} is enabled, metrics are computed first by grouping by Plate-Month, and then a weighted average is taken using the number of trips in the month to obtain the final value for the plate.
+
+\end{document}
