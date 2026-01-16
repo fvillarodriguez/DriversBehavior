@@ -69,6 +69,25 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
                     st.rerun() # Recargar para mostrar la clave
                 else:
                     st.error(msg)
+    
+    with st.expander("Configuración de Identidad Git (Nombre y Email)"):
+        current_name, current_email = git_sync.get_git_user()
+        col_name, col_email = st.columns(2)
+        with col_name:
+            new_name = st.text_input("Nombre de Usuario", value=current_name, help="Ej. Felipe Villar")
+        with col_email:
+            new_email = st.text_input("Email", value=current_email, help="Ej. felipe@example.com")
+            
+        if st.button("Guardar Configuración"):
+            if new_name and new_email:
+                success, msg = git_sync.configure_git_user(new_name, new_email)
+                if success:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+            else:
+                st.warning("Por favor ingresa ambos campos.")
 
     st.divider()
 

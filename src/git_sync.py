@@ -181,6 +181,28 @@ def generate_ssh_key(email: str = "", overwrite: bool = False) -> Tuple[bool, st
     if success: return True, f"Clave generada en {key_path}"
     else: return False, "Error generando clave"
 
+def get_git_user() -> Tuple[str, str]:
+    """Retorna (name, email) configurados globalmente o localmente."""
+    try:
+        name = subprocess.check_output(["git", "config", "user.name"], text=True).strip()
+    except:
+        name = ""
+    try:
+        email = subprocess.check_output(["git", "config", "user.email"], text=True).strip()
+    except:
+        email = ""
+    return name, email
+
+def configure_git_user(name: str, email: str) -> Tuple[bool, str]:
+    """Configura user.name y user.email localmente para este repositorio."""
+    try:
+        run_command(["git", "config", "user.name", name], "Configurando user.name")
+        run_command(["git", "config", "user.email", email], "Configurando user.email")
+        return True, "Usuario Git configurado exitosamente."
+    except Exception as e:
+        return False, f"Error configurando git: {e}"
+
+
 def sync_with_github_stream() -> Generator[str, None, bool]:
     yield "Iniciando Sincronización con GitHub..."
     
