@@ -1890,34 +1890,35 @@ def _aggregate_weekly_batches_by_month(
         df[count_cols] = df[count_cols].fillna(0)
 
     group_cols = ["plate", "batch_month"]
+    group_keys = [df[col] for col in group_cols]
     grouped = df.groupby(group_cols, sort=False)
     total_passes = grouped["total_passes"].sum()
 
     speed_sum = (df["avg_speed_kmh"] * df["total_passes"]).groupby(
-        group_cols, sort=False
+        group_keys, sort=False
     ).sum()
     lane1_sum = (df["lane_prop_1"] * df["total_passes"]).groupby(
-        group_cols, sort=False
+        group_keys, sort=False
     ).sum()
     lane2_sum = (df["lane_prop_2"] * df["total_passes"]).groupby(
-        group_cols, sort=False
+        group_keys, sort=False
     ).sum()
     lane3_sum = (df["lane_prop_3"] * df["total_passes"]).groupby(
-        group_cols, sort=False
+        group_keys, sort=False
     ).sum()
 
     if {"rel_speed_count", "headway_count", "conflict_count"}.issubset(df.columns):
         rel_count = grouped["rel_speed_count"].sum()
         rel_sum = (df["avg_relative_speed"] * df["rel_speed_count"]).groupby(
-            group_cols, sort=False
+            group_keys, sort=False
         ).sum()
         headway_count = grouped["headway_count"].sum()
         headway_sum = (df["avg_headway_s"] * df["headway_count"]).groupby(
-            group_cols, sort=False
+            group_keys, sort=False
         ).sum()
         conflict_count = grouped["conflict_count"].sum()
         conflict_sum = (df["conflict_rate"] * df["conflict_count"]).groupby(
-            group_cols, sort=False
+            group_keys, sort=False
         ).sum()
         rel_den = rel_count.replace(0, pd.NA)
         headway_den = headway_count.replace(0, pd.NA)
@@ -1928,13 +1929,13 @@ def _aggregate_weekly_batches_by_month(
     else:
         avg_relative_speed = (
             df["avg_relative_speed"] * df["total_passes"]
-        ).groupby(group_cols, sort=False).sum() / total_passes
+        ).groupby(group_keys, sort=False).sum() / total_passes
         avg_headway = (
             df["avg_headway_s"] * df["total_passes"]
-        ).groupby(group_cols, sort=False).sum() / total_passes
+        ).groupby(group_keys, sort=False).sum() / total_passes
         conflict_rate = (
             df["conflict_rate"] * df["total_passes"]
-        ).groupby(group_cols, sort=False).sum() / total_passes
+        ).groupby(group_keys, sort=False).sum() / total_passes
 
     lane_changes_sum = grouped["lane_changes"].sum()
     if lane_changes_extra_by_month:
