@@ -478,17 +478,22 @@ def _estimate_batch_ranges(
     )
 
 
-def _build_sample_selection(summary) -> Tuple[FlowSampleSelection, bool, bool]:
-    row_limit = None
-    date_start = None
-    date_end = None
-    range_valid = True
-
-    mode = st.radio(
+def _build_sample_mode_selector() -> str:
+    return st.radio(
         "Muestreo",
         ["Todo", "Rango de fechas", "Porcentaje"],
         horizontal=True,
     )
+
+
+def _build_sample_inputs(
+    summary,
+    mode: str,
+) -> Tuple[FlowSampleSelection, bool, bool]:
+    row_limit = None
+    date_start = None
+    date_end = None
+    range_valid = True
 
     if mode == "Rango de fechas":
         default_start, default_end = _date_defaults(summary)
@@ -617,35 +622,40 @@ def _render_feature_loader() -> Optional[pd.DataFrame]:
     if summary is None or summary.row_count == 0:
         return _get_features()
 
-    sample, percent_mode, range_valid = _build_sample_selection(summary)
-
+    mode = _build_sample_mode_selector()
+    
     use_batches = st.checkbox(
         "Procesar por lotes (mes/semana)",
         value=False,
-        disabled=percent_mode,
     )
-    if percent_mode:
-        st.info("El muestreo por porcentaje no es compatible con lotes.")
 
-    batch_mode = "month"
-    monthly_weighting = False
-    if use_batches:
-        batch_mode = st.radio("Modo de lotes", ["month", "week"], horizontal=True)
-        monthly_weighting = st.checkbox(
-            "Ponderar variables por mes antes de consolidar",
-            value=False,
-        )
-        if batch_mode == "week" and monthly_weighting:
-            st.caption(
-                "Las semanas se consolidan por mes antes de generar la base final."
+    with st.form("cluster_features_form"):
+        sample, percent_mode, range_valid = _build_sample_inputs(summary, mode)
+        
+        if percent_mode and use_batches:
+             st.warning("El muestreo por porcentaje no ignora la opcion de lotes (no compatible).")
+
+        batch_mode = "month"
+        monthly_weighting = False
+        if use_batches:
+            batch_mode = st.radio("Modo de lotes", ["month", "week"], horizontal=True)
+            monthly_weighting = st.checkbox(
+                "Ponderar variables por mes antes de consolidar",
+                value=False,
             )
-    else:
-        monthly_weighting = st.checkbox(
-            "Ponderar variables por mes antes de consolidar",
-            value=False,
-        )
+            if batch_mode == "week" and monthly_weighting:
+                st.caption(
+                    "Las semanas se consolidan por mes antes de generar la base final."
+                )
+        else:
+            monthly_weighting = st.checkbox(
+                "Ponderar variables por mes antes de consolidar",
+                value=False,
+            )
 
-    if st.button("Calcular variables", disabled=not range_valid):
+        run_calculation = st.form_submit_button("Calcular variables", disabled=not range_valid)
+
+    if run_calculation:
         fc = FlowColumns()
         progress_container = st.container()
         batch_db_path = None

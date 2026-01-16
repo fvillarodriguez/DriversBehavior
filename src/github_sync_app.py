@@ -128,15 +128,48 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
                 else:
                     st.error("Failed.")
 
+    st.divider()
+    st.subheader("Opciones Avanzadas")
+    
+    with st.expander("Restablecer copia desde Github (Hard Reset)", expanded=False):
+        st.warning("⚠️ CUIDADO: Esta opción borrará TODOS sus cambios locales no guardados (commits pendientes o archivos modificados en el directorio de trabajo) y dejará la carpeta idéntica a `origin/main`.")
+        
+        if st.button("🚨 Restablecer copia desde Github", type="secondary", help="git fetch origin && git reset --hard origin/main"):
+            st.session_state["sync_logs"] = []
+            
+            # Re-use log placeholder if possible, or create new one
+            log_placeholder = st.empty()
+            logs = []
+            
+            with st.spinner("Restableciendo repositorio..."):
+                gen = git_sync.force_reset_stream()
+                success = False
+                try:
+                    while True:
+                        msg = next(gen)
+                        logs.append(msg)
+                        log_placeholder.code("\n".join(logs), language="text")
+                except StopIteration as e:
+                    success = e.value
+                except Exception as e:
+                    logs.append(f"Error inesperado: {e}")
+                    log_placeholder.code("\n".join(logs), language="text")
+                    success = False
+
+            if success:
+                st.success("Repositorio restablecido correctamente.")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("Hubo un error al restablecer. Revise los logs.")
+
     # Mostrar logs persistentes si no se está ejecutando (o después de ejecutarse)
     if "sync_logs" in st.session_state and st.session_state["sync_logs"]:
-         # Solo si no acabamos de actualizar el placeholder (para evitar duplicados visuales es complicado en streamlit sin rerender, 
-         # pero aquí estamos redibujando. El placeholder de arriba se pierde en el rerun si no lo guardamos).
-         # Simplemente mostramos el log final en col2 si no estamos en medio de una acción.
-         # Streamlit reruns on interaction.
          pass
          
     # Para persistencia visual tras interacción
+    # (Reuse valid logic if needed, but the main log viewer is above)
+
     with col2:
         if "sync_logs" in st.session_state and st.session_state["sync_logs"]:
              if not logs: # Si no estamos en el bucle de ejecución

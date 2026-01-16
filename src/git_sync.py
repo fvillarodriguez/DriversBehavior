@@ -247,6 +247,67 @@ def sync_with_github() -> Tuple[bool, List[str]]:
         success = e.value
     return success, logs
 
+def force_reset_stream() -> Generator[str, None, bool]:
+    """
+    Descarga todo de origin y hace un reset --hard para igualar la copia local al remoto.
+    CUIDADO: Esto borra cambios locales no commiteados.
+    """
+    yield "🔵 Starting Force Reset (Fetch + Reset --hard)..."
+
+    # 1. Fetch
+    yield "🔵 Fetching from origin..."
+    try:
+        # yield from returns the return value of the subgenerator
+        success = yield from run_command_stream(["git", "fetch", "origin"], "Fetch")
+        if not success:
+            yield "❌ Fetch failed."
+            return False
+    except Exception as e:
+        yield f"❌ Error executing fetch: {e}"
+        return False
+
+    # 2. Determine Branch
+    current_branch = "main"
+    try:
+        res = subprocess.run(
+            ["git", "branch", "--show-current"], 
+            capture_output=True, 
+            text=True, 
+            check=False
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            current_branch = res.stdout.strip()
+    except Exception:
+        yield "⚠️ Could not auto-detect branch. Assuming 'main'."
+
+    target = f"origin/{current_branch}"
+    yield f"🔵 Hard resetting local branch '{current_branch}' to '{target}'..."
+    
+    # 3. Reset --hard
+    try:
+        success = yield from run_command_stream(["git", "reset", "--hard", target], "Reset Hard")
+        if not success:
+            yield "❌ Reset failed."
+            return False
+    except Exception as e:
+        yield f"❌ Error executing reset: {e}"
+        return False
+
+    yield "✅ Repository successfully reset to match remote."
+    return True
+
+def force_reset() -> Tuple[bool, List[str]]:
+    logs = []
+    success = False
+    gen = force_reset_stream()
+    try:
+        while True:
+            msg = next(gen)
+            logs.append(msg)
+    except StopIteration as e:
+        success = e.value
+    return success, logs
+
 if __name__ == "__main__":
     s, l = sync_with_github()
     for line in l: print(line)

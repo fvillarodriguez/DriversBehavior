@@ -534,112 +534,179 @@ def _render_filters(
     events_df: pd.DataFrame, porticos_df: pd.DataFrame
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     filtered = events_df.copy()
-
+    
+    # Pre-calculate options to use inside form
     tipo_options = sorted(
-        [t for t in filtered["tipo_evento"].dropna().unique()]
+         [t for t in filtered["tipo_evento"].dropna().unique()]
     )
     default_types = [t for t in tipo_options if _is_accident_type(t)]
     if not default_types:
         default_types = tipo_options
-    selected_types = st.multiselect(
-        "Tipo de evento",
-        options=tipo_options,
-        default=default_types,
-        key="events_type_filter",
-    )
-    if selected_types:
-        filtered = filtered[filtered["tipo_evento"].isin(selected_types)]
 
     min_dt = filtered["evento_time"].min()
     max_dt = filtered["evento_time"].max()
-    if pd.isna(min_dt) or pd.isna(max_dt):
-        st.info("No hay fechas validas para aplicar filtro temporal.")
-    else:
+    
+    # We need to compute segments options *before* the form to populate the selectbox? 
+    # No, the selectbox options depend on the filtered counts, which depend on the form inputs.
+    # PROB: We can't know the new counts until we have the new filter values.
+    # BUT: In st.form, we can't update options dynamically.
+    # SOLUTION: This form will control Type, Date, AND Tramo. 
+    # The Tramo options will be based on the state *before* the current changes. 
+    # This means counts might be "one step behind" or "stale" until updated.
+    
+    # Actually, to avoid the label mismatch issue, maybe we should strip counts from the key/value?
+    # Or just accept that updating Type might reset Tramo selection if labels change.
+
+    with st.form("events_filters_form"):
+        selected_types = st.multiselect(
+            "Tipo de evento",
+            options=tipo_options,
+            default=default_types,
+            key="events_type_filter",
+        )
+        
         col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input(
-                "Fecha inicio",
-                value=min_dt.date(),
-                min_value=min_dt.date(),
-                max_value=max_dt.date(),
-                key="events_start_date",
+        if pd.isna(min_dt) or pd.isna(max_dt):
+            st.info("No hay fechas validas para aplicar filtro temporal.")
+            start_date = datetime.today().date()
+            end_date = datetime.today().date()
+        else:
+             with col1:
+                start_date = st.date_input(
+                    "Fecha inicio",
+                    value=min_dt.date(),
+                    min_value=min_dt.date(),
+                    max_value=max_dt.date(),
+                    key="events_start_date",
+                )
+             with col2:
+                default_end = min(max_dt.date(), start_date + timedelta(days=30))
+                end_date = st.date_input(
+                    "Fecha fin",
+                    value=default_end,
+                    min_value=min_dt.date(),
+                    max_value=max_dt.date(),
+                    key="events_end_date",
+                )
+        
+        # We need to temporarily apply filters to calculate counts for the dropdown, 
+        # BUT we can't use the *new* values inside the form before submitting?
+        # Actually, we can't. The values inside the form blocks are the 'current' UI state, 
+        # but the code executes linearly. 
+        # If we want the dropdown to reflect the *current* df (before form keys change), 
+        # we strictly use the passed events_df.
+        
+        # To make this robust: 
+        # We should probably calculate the Tramo options OUTSIDE the filter logic 
+        # based on the *previous* run's filtered df? No, that's messy.
+        
+        # Let's calculate Tramo options based on the CURRENT events_df (unfiltered by the NEW types).
+        # Wait, if we use events_df (raw), the counts will be total.
+        # If we use filtered (by default types?), it might be wrong.
+        
+        # Let's do this: 
+        # 1. Apply logic based on *session state* values if available? 
+        # st.multiselect returns the current value.
+        
+        # Simpler approach: Calculate options based on *current* filtered dataframe (which is events_df at start of fn).
+        # This means counts are "Total" initially.
+        # If the user filters, the next run will have filtered df? No, this function re-starts from events_df every time.
+        
+        # Okay, the standard pattern for dependant filters in a form is: THEY DON'T WORK WELL.
+        # But we can try to separate them?
+        # If we separate them, we have 2 buttons.
+        
+        # Let's keep it simple. The Tramo options will be generated from the *Full* dataset (or currently cached filters?)
+        # Actually, let's just generate them from the fully filtered data *if we knew it*.
+        # Since we don't, we'll generate them from the *current widgets state*?
+        # No, widgets inside form don't update variable until submit.
+        
+        # For now, let's calculating options based on the *previous* filtered state is hard because we don't return it to session state.
+        # Let's construct options based on `events_df` (unfiltered) or similar.
+        
+        # Current implementation of `_render_filters` applies filters sequentially. 
+        # `filtered` is modified line by line.
+        
+        # If we put everything in a form, we effectively define the input widgets.
+        # Then we create the Submit button.
+        # Then we apply logic.
+        
+        # The problem is `tramo_choice` widget needs `options` argument.
+        # These options depend on `counts_df` which depends on `filtered`...
+        # If we compute `filtered` using the widget values (which we can read!), we can build the options.
+        # `selected_types` variable *has* the value (either default or user selected).
+        # So we CAN apply filters logic *inside* the form context to build the next widget?
+        # YES. Streamlit runs top to bottom.
+        
+        if selected_types:
+            filtered = filtered[filtered["tipo_evento"].isin(selected_types)]
+
+        if not (pd.isna(min_dt) or pd.isna(max_dt)):
+            start_ts = pd.Timestamp(datetime.combine(start_date, datetime.min.time()))
+            end_ts = pd.Timestamp(datetime.combine(end_date, datetime.max.time()))
+            filtered = filtered[
+                (filtered["evento_time"] >= start_ts)
+                & (filtered["evento_time"] <= end_ts)
+            ]
+
+        # Now build segments/tramo options based on this `filtered` (which uses current widget states)
+        segments_df = _build_segments_df(porticos_df)
+        tramo_options = ["Toda la autopista"]
+        tramo_lookup = {}
+        
+        if not segments_df.empty:
+            segments_df["portico_inicio"] = segments_df["portico_inicio"].astype(str).str.strip()
+            segments_df["portico_fin"] = segments_df["portico_fin"].astype(str).str.strip()
+            
+            # Using our local `filtered` which reflects current selections!
+            # Wait! `filtered["portico_inicio"]` might fail if we didn't prep it.
+            filtered["portico_inicio"] = filtered["portico_inicio"].fillna("").astype(str).str.strip()
+            filtered["portico_fin"] = filtered["portico_fin"].fillna("").astype(str).str.strip()
+
+            counts_df = (
+                filtered.groupby(
+                    ["eje", "calzada", "portico_inicio", "portico_fin"],
+                    dropna=False,
+                )
+                .size()
+                .reset_index(name="eventos")
             )
-        with col2:
-            default_end = min(max_dt.date(), start_date + timedelta(days=30))
-            end_date = st.date_input(
-                "Fecha fin",
-                value=default_end,
-                min_value=min_dt.date(),
-                max_value=max_dt.date(),
-                key="events_end_date",
+            counts_df["portico_inicio"] = counts_df["portico_inicio"].astype(str).str.strip()
+            counts_df["portico_fin"] = counts_df["portico_fin"].astype(str).str.strip()
+            
+            segments_df = segments_df.merge(
+                counts_df,
+                left_on=["Eje", "Calzada", "portico_inicio", "portico_fin"],
+                right_on=["eje", "calzada", "portico_inicio", "portico_fin"],
+                how="left",
             )
-        start_ts = pd.Timestamp(datetime.combine(start_date, datetime.min.time()))
-        end_ts = pd.Timestamp(datetime.combine(end_date, datetime.max.time()))
-        filtered = filtered[
-            (filtered["evento_time"] >= start_ts)
-            & (filtered["evento_time"] <= end_ts)
-        ]
+            segments_df["eventos"] = segments_df["eventos"].fillna(0).astype(int)
+            segments_df = segments_df.sort_values(["Eje", "Calzada", "orden_inicio"]).reset_index(drop=True)
+            
+            for row in segments_df.itertuples(index=False):
+                label = (
+                    f"{row.Eje} | {row.Calzada} | "
+                    f"{row.portico_inicio} -> {row.portico_fin} "
+                    f"({row.eventos} eventos)"
+                )
+                tramo_options.append(label)
+                tramo_lookup[label] = (
+                    row.Eje,
+                    row.Calzada,
+                    row.portico_inicio,
+                    row.portico_fin,
+                )
 
-    segments_df = _build_segments_df(porticos_df)
-    if segments_df.empty:
-        return filtered, segments_df
-
-    # --- FIX: Ensure merge keys are string to avoid object vs float64 error ---
-    segments_df["portico_inicio"] = segments_df["portico_inicio"].astype(str).str.strip()
-    segments_df["portico_fin"] = segments_df["portico_fin"].astype(str).str.strip()
-    
-    filtered["portico_inicio"] = filtered["portico_inicio"].fillna("").astype(str).str.strip()
-    filtered["portico_fin"] = filtered["portico_fin"].fillna("").astype(str).str.strip()
-    # --------------------------------------------------------------------------
-
-    counts_df = (
-        filtered.groupby(
-            ["eje", "calzada", "portico_inicio", "portico_fin"],
-            dropna=False,
+        tramo_choice = st.selectbox(
+            "Tramo de autopista",
+            options=tramo_options,
+            key="events_tramo_filter",
         )
-        .size()
-        .reset_index(name="eventos")
-    )
-    
-    # Ensure counts_df also has string keys
-    counts_df["portico_inicio"] = counts_df["portico_inicio"].astype(str).str.strip()
-    counts_df["portico_fin"] = counts_df["portico_fin"].astype(str).str.strip()
-    
-    segments_df = segments_df.merge(
-        counts_df,
-        left_on=["Eje", "Calzada", "portico_inicio", "portico_fin"],
-        right_on=["eje", "calzada", "portico_inicio", "portico_fin"],
-        how="left",
-    )
-    segments_df["eventos"] = (
-        segments_df["eventos"].fillna(0).astype(int)
-    )
-    segments_df = segments_df.sort_values(
-        ["Eje", "Calzada", "orden_inicio"]
-    ).reset_index(drop=True)
+        
+        submitted = st.form_submit_button("Actualizar filtros")
 
-    tramo_options = ["Toda la autopista"]
-    tramo_lookup: Dict[str, Tuple[str, str, str, str]] = {}
-    for row in segments_df.itertuples(index=False):
-        label = (
-            f"{row.Eje} | {row.Calzada} | "
-            f"{row.portico_inicio} -> {row.portico_fin} "
-            f"({row.eventos} eventos)"
-        )
-        tramo_options.append(label)
-        tramo_lookup[label] = (
-            row.Eje,
-            row.Calzada,
-            row.portico_inicio,
-            row.portico_fin,
-        )
-
-    tramo_choice = st.selectbox(
-        "Tramo de autopista",
-        options=tramo_options,
-        key="events_tramo_filter",
-    )
-    if tramo_choice != "Toda la autopista":
+    # Apply Logic based on final inputs
+    if tramo_choice != "Toda la autopista" and tramo_choice in tramo_lookup:
         eje, calzada, portico_inicio, portico_fin = tramo_lookup[tramo_choice]
         filtered = filtered[
             (filtered["eje"] == eje)

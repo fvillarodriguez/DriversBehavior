@@ -231,8 +231,18 @@ def _date_defaults(summary) -> Tuple[datetime.date, datetime.date]:
     return today, today
 
 
-def _build_flow_sample_selection(
+def _build_flow_sample_mode_selector(key_prefix: str) -> str:
+    return st.radio(
+        "Muestreo",
+        ["Todo", "Rango de fechas", "Porcentaje"],
+        horizontal=True,
+        key=f"{key_prefix}_sample_mode",
+    )
+
+
+def _build_flow_sample_inputs(
     summary: Optional[object],
+    mode: str,
     *,
     key_prefix: str,
 ) -> Tuple[FlowSampleSelection, bool, bool]:
@@ -240,13 +250,6 @@ def _build_flow_sample_selection(
     date_start = None
     date_end = None
     range_valid = True
-
-    mode = st.radio(
-        "Muestreo",
-        ["Todo", "Rango de fechas", "Porcentaje"],
-        horizontal=True,
-        key=f"{key_prefix}_sample_mode",
-    )
 
     if mode == "Rango de fechas":
         default_start, default_end = _date_defaults(summary)
@@ -3135,143 +3138,155 @@ def _render_variables_tab() -> None:
     if summary is None:
         return
 
-    sample, percent_mode, range_valid = _build_flow_sample_selection(
-        summary, key_prefix="acc_flow"
-    )
-
-    accidents_df = st.session_state.get("accidents_df")
-    tramo_tuple = _build_tramo_selector(
-        accidents_df,
-        date_start=sample.date_start,
-        date_end=sample.date_end,
-        allowed_porticos=None,
-        key="acc_flow_tramo_choice",
-    )
-
+    mode = _build_flow_sample_mode_selector(key_prefix="acc_flow")
+    
+    # Dynamic toggles outside form
     use_batches = st.checkbox(
         "Procesar por lotes (mes/semana)",
         value=False,
-        disabled=percent_mode,
         key="acc_flow_use_batches",
     )
-    if percent_mode:
-        st.info("El muestreo por porcentaje no es compatible con lotes.")
-
-    batch_mode = "month"
-    if use_batches:
-        batch_mode = st.radio(
-            "Modo de lotes",
-            ["month", "week"],
-            horizontal=True,
-            key="acc_flow_batch_mode",
-        )
-    keep_flow_in_memory = st.checkbox(
-        "Mantener flujos en memoria (usa RAM)",
-        value=False,
-        disabled=not use_batches,
-        key="acc_flow_keep_flows",
-    )
-
-    metric_options = {
-        "Flow": "flow",
-        "Speed": "speed",
-        "Speed_std": "speed_std",
-        "Density": "density",
-        "Delta.Speed": "delta_speed",
-        "Delta.Density": "delta_density",
-    }
-    metrics_selected = st.multiselect(
-        "Variables",
-        list(metric_options.keys()),
-        default=list(metric_options.keys()),
-        key="acc_flow_metrics",
-    )
-    metrics = [metric_options[key] for key in metrics_selected]
-
-    category_options = ["Light", "Heavy", "Motorcycles"]
-    categories = st.multiselect(
-        "Tipos de vehiculo",
-        category_options,
-        default=category_options,
-        key="acc_flow_categories",
-    )
-
-    lanes = st.number_input(
-        "Carriles para normalizar Flow",
-        min_value=1,
-        value=3,
-        step=1,
-        key="acc_flow_lanes",
-    )
-
+    
     include_cluster_vars = st.checkbox(
         "Incluir variables de cluster",
         value=bool(st.session_state.get("acc_flow_include_cluster_vars", False)),
         key="acc_flow_include_cluster_vars",
     )
-    cluster_choice = "(sin clusters)"
-    cluster_vars: List[str] = []
-    if include_cluster_vars:
-        cluster_files = _list_cluster_label_files()
-        if not cluster_files:
-            st.warning("No se encontraron archivos cluster_*.csv en Resultados.")
-        else:
-            cluster_names = [path.name for path in cluster_files]
-            cluster_choice = st.selectbox(
-                "Archivo de etiquetas de cluster",
-                options=["(ninguno)"] + cluster_names,
-                key="acc_flow_cluster_choice",
-            )
-        cluster_var_options = [
-            "Proporciones por cluster",
-            "Flow por tipo de cluster",
-            "Entropia de cluster",
-            "Speed por tipo de cluster",
-            "Density por tipo de cluster",
-            "Delta.Speed por tipo de cluster",
-            "Delta.Density por tipo de cluster",
-        ]
-        existing_vars = st.session_state.get("acc_flow_cluster_vars")
-        default_vars = ["Proporciones por cluster"]
-        if isinstance(existing_vars, list):
-            normalized: List[str] = []
-            for item in existing_vars:
-                if item in {
-                    "Conteos por cluster",
-                    "Conteo por cluster",
-                    "Conteo por tipo de cluster",
-                }:
-                    normalized.append("Flow por tipo de cluster")
-                elif item in {"Speed por cluster"}:
-                    normalized.append("Speed por tipo de cluster")
-                elif item in {"Density por cluster"}:
-                    normalized.append("Density por tipo de cluster")
-                elif item in {
-                    "Delta-Speed por tipo de cluster",
-                    "Delta.Speed por cluster",
-                    "Delta-Speed por cluster",
-                }:
-                    normalized.append("Delta.Speed por tipo de cluster")
-                elif item in {
-                    "Delta-Density por tipo de cluster",
-                    "Delta.Density por cluster",
-                    "Delta-Density por cluster",
-                }:
-                    normalized.append("Delta.Density por tipo de cluster")
-                else:
-                    normalized.append(item)
-            st.session_state["acc_flow_cluster_vars"] = normalized
-            default_vars = normalized
-        multiselect_kwargs = {
-            "label": "Variables de cluster",
-            "options": cluster_var_options,
-            "key": "acc_flow_cluster_vars",
-        }
-        if "acc_flow_cluster_vars" not in st.session_state:
-            multiselect_kwargs["default"] = default_vars
-        cluster_vars = st.multiselect(**multiselect_kwargs)
 
-    if st.button("Calcular features (5 min)", disabled=not range_valid):
+    with st.form("acc_flow_features_form"):
+        sample, percent_mode, range_valid = _build_flow_sample_inputs(
+            summary, mode, key_prefix="acc_flow"
+        )
+        if percent_mode and use_batches:
+             st.warning("El muestreo por porcentaje no ignora la opcion de lotes (no compatible).")
+
+        accidents_df = st.session_state.get("accidents_df")
+        tramo_tuple = _build_tramo_selector(
+            accidents_df,
+            date_start=sample.date_start,
+            date_end=sample.date_end,
+            allowed_porticos=None,
+            key="acc_flow_tramo_choice",
+        )
+
+        batch_mode = "month"
+        if use_batches:
+            batch_mode = st.radio(
+                "Modo de lotes",
+                ["month", "week"],
+                horizontal=True,
+                key="acc_flow_batch_mode",
+            )
+        
+        keep_flow_in_memory = st.checkbox(
+            "Mantener flujos en memoria (usa RAM)",
+            value=False,
+            disabled=not use_batches,
+            key="acc_flow_keep_flows",
+        )
+
+        metric_options = {
+            "Flow": "flow",
+            "Speed": "speed",
+            "Speed_std": "speed_std",
+            "Density": "density",
+            "Delta.Speed": "delta_speed",
+            "Delta.Density": "delta_density",
+        }
+        metrics_selected = st.multiselect(
+            "Variables",
+            list(metric_options.keys()),
+            default=list(metric_options.keys()),
+            key="acc_flow_metrics",
+        )
+        metrics = [metric_options[key] for key in metrics_selected]
+
+        category_options = ["Light", "Heavy", "Motorcycles"]
+        categories = st.multiselect(
+            "Tipos de vehiculo",
+            category_options,
+            default=category_options,
+            key="acc_flow_categories",
+        )
+
+        lanes = st.number_input(
+            "Carriles para normalizar Flow",
+            min_value=1,
+            value=3,
+            step=1,
+            key="acc_flow_lanes",
+        )
+
+        cluster_choice = "(sin clusters)"
+        cluster_vars: List[str] = []
+        
+        if include_cluster_vars:
+            cluster_files = _list_cluster_label_files()
+            if not cluster_files:
+                st.warning("No se encontraron archivos cluster_*.csv en Resultados.")
+            else:
+                cluster_names = [path.name for path in cluster_files]
+                cluster_choice = st.selectbox(
+                    "Archivo de etiquetas de cluster",
+                    options=["(ninguno)"] + cluster_names,
+                    key="acc_flow_cluster_choice",
+                )
+            cluster_var_options = [
+                "Proporciones por cluster",
+                "Flow por tipo de cluster",
+                "Entropia de cluster",
+                "Speed por tipo de cluster",
+                "Density por tipo de cluster",
+                "Delta.Speed por tipo de cluster",
+                "Delta.Density por tipo de cluster",
+            ]
+            existing_vars = st.session_state.get("acc_flow_cluster_vars")
+            default_vars = ["Proporciones por cluster"]
+            if isinstance(existing_vars, list):
+                normalized: List[str] = []
+                for item in existing_vars:
+                    if item in {
+                        "Conteos por cluster",
+                        "Conteo por cluster",
+                        "Conteo por tipo de cluster",
+                    }:
+                        normalized.append("Flow por tipo de cluster")
+                    elif item in {"Speed por cluster"}:
+                        normalized.append("Speed por tipo de cluster")
+                    elif item in {"Density por cluster"}:
+                        normalized.append("Density por tipo de cluster")
+                    elif item in {
+                        "Delta-Speed por tipo de cluster",
+                        "Delta.Speed por cluster",
+                        "Delta-Speed por cluster",
+                    }:
+                        normalized.append("Delta.Speed por tipo de cluster")
+                    elif item in {
+                        "Delta-Density por tipo de cluster",
+                        "Delta.Density por cluster",
+                        "Delta-Density por cluster",
+                    }:
+                        normalized.append("Delta.Density por tipo de cluster")
+                    else:
+                        normalized.append(item)
+                st.session_state["acc_flow_cluster_vars"] = normalized
+                default_vars = normalized
+            multiselect_kwargs = {
+                "label": "Variables de cluster",
+                "options": cluster_var_options,
+                "key": "acc_flow_cluster_vars",
+            }
+            if "acc_flow_cluster_vars" not in st.session_state:
+                multiselect_kwargs["default"] = default_vars
+            cluster_vars = st.multiselect(**multiselect_kwargs)
+
+        col_upd, col_run = st.columns(2)
+        with col_upd:
+            update_filters = st.form_submit_button("Actualizar filtros")
+        with col_run:
+            run_calculation = st.form_submit_button("Calcular features (5 min)", disabled=not range_valid)
+
+    if run_calculation:
         if duckdb is None:
             st.error("duckdb no esta instalado. Ejecute `pip install duckdb`.")
             return
