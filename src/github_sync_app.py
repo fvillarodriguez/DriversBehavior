@@ -8,6 +8,9 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
 
     st.title("GitHub Synchronization")
     st.markdown("Sync your local code with the remote GitHub repository.")
+    
+    logs = [] # Initialize logs to avoid UnboundLocalError
+
 
     # Verificar si es un repo git
     if not git_sync.is_git_repo():

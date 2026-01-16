@@ -5,6 +5,7 @@ Streamlit app to manage the flow database (DuckDB).
 from __future__ import annotations
 
 import fnmatch
+import inspect
 import os
 import sys
 from datetime import datetime
@@ -30,6 +31,36 @@ from utils import (  # noqa: E402
 DATA_DIR = ROOT_DIR / "Datos"
 DB_PATH = DATA_DIR / "flujos.duckdb"
 FLOW_PATTERNS = ("flujo*.csv",)
+
+
+def _supports_progress() -> bool:
+    try:
+        sig = inspect.signature(import_flujos_to_duckdb)
+    except (ValueError, TypeError):
+        return False
+    return "progress_callback" in sig.parameters
+
+
+def _run_import(
+    *,
+    csv_path: Path,
+    replace: bool,
+    progress_callback: Optional[object],
+) -> int:
+    kwargs = {
+        "csv_path": str(csv_path),
+        "db_path": DB_PATH,
+        "replace": replace,
+    }
+    if progress_callback is not None and _supports_progress():
+        kwargs["progress_callback"] = progress_callback
+    try:
+        return import_flujos_to_duckdb(**kwargs)
+    except TypeError as exc:
+        if "progress_callback" in str(exc):
+            kwargs.pop("progress_callback", None)
+            return import_flujos_to_duckdb(**kwargs)
+        raise
 
 
 def _format_ts(value) -> str:
@@ -156,16 +187,25 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
     with tabs[0]:
         st.write("Importa un CSV y lo anexa a la tabla actual.")
         source, selected_path, uploaded = _select_csv_source("append")
+        progress_placeholder = st.empty()
+        progress_status = st.empty()
         if st.button("Importar y anexar", key="append_button"):
             csv_path = _resolve_csv_path(source, selected_path, uploaded)
             if csv_path is None:
                 st.stop()
+            progress_bar = progress_placeholder.progress(0.0)
+
+            def _update_progress(ratio: float, message: str) -> None:
+                progress_bar.progress(ratio)
+                progress_status.caption(message)
+
             with st.spinner("Importando datos..."):
-                inserted = import_flujos_to_duckdb(
-                    csv_path=str(csv_path),
-                    db_path=DB_PATH,
+                inserted = _run_import(
+                    csv_path=csv_path,
                     replace=False,
+                    progress_callback=_update_progress,
                 )
+            progress_bar.progress(1.0)
             if inserted:
                 st.success(f"Se agregaron {inserted:,} filas.")
             else:
@@ -189,12 +229,21 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
             csv_path = _resolve_csv_path(source, selected_path, uploaded)
             if csv_path is None:
                 st.stop()
+            progress_placeholder = st.empty()
+            progress_status = st.empty()
+            progress_bar = progress_placeholder.progress(0.0)
+
+            def _update_progress(ratio: float, message: str) -> None:
+                progress_bar.progress(ratio)
+                progress_status.caption(message)
+
             with st.spinner("Reemplazando datos..."):
-                inserted = import_flujos_to_duckdb(
-                    csv_path=str(csv_path),
-                    db_path=DB_PATH,
+                inserted = _run_import(
+                    csv_path=csv_path,
                     replace=True,
+                    progress_callback=_update_progress,
                 )
+            progress_bar.progress(1.0)
             st.success(f"Se cargaron {inserted:,} filas nuevas.")
             with summary_container.container():
                 _render_summary()

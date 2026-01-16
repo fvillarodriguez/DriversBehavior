@@ -8,7 +8,7 @@ normalizar datos de flujos y pórticos.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import fnmatch
 import io
@@ -316,7 +316,14 @@ def _connect_duckdb(read_only: bool = False, db_path: Optional[Path] = None):
     _ensure_duckdb_available()
     path = _get_duckdb_path(db_path)
     ro_flag = read_only and path.exists()
-    return duckdb.connect(str(path), read_only=ro_flag)
+    try:
+        return duckdb.connect(str(path), read_only=ro_flag)
+    except duckdb.ConnectionException as exc:
+        # DuckDB does not allow a read-only connection if another connection
+        # already exists with a different configuration (e.g., read-write).
+        if ro_flag and "different configuration" in str(exc):
+            return duckdb.connect(str(path), read_only=False)
+        raise
 
 
 def _create_flow_table(conn) -> None:
@@ -338,6 +345,9 @@ def _flow_date_parse_expr(column: str = "fecha_txt") -> str:
         f"try_strptime({column}, '%d-%m-%Y %H:%M:%S'),"
         f"try_strptime({column}, '%Y-%m-%d %H:%M:%S'),"
         f"try_strptime({column}, '%Y/%m/%d %H:%M:%S'),"
+        f"try_strptime({column}, '%Y-%m-%dT%H:%M:%SZ'),"
+        f"try_strptime({column}, '%Y-%m-%dT%H:%M:%S.%fZ'),"
+        f"try_strptime({column}, '%Y-%m-%dT%H:%M:%S%z'),"
         f"try_strptime({column}, '%d/%m/%Y %H:%M'),"
         f"try_strptime({column}, '%Y-%m-%d %H:%M')"
         ")"
@@ -383,11 +393,15 @@ def _flow_csv_select_sql() -> str:
     """
 
 
+ProgressCallback = Callable[[float, str], None]
+
+
 def import_flujos_to_duckdb(
     csv_path: Optional[str] = None,
     *,
     replace: bool = False,
     db_path: Optional[Path] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> int:
     """
     Importa un archivo CSV de flujos hacia la base DuckDB.
@@ -398,25 +412,50 @@ def import_flujos_to_duckdb(
         return 0
 
     csv_path = str(Path(csv_path).resolve())
+
+    def _report(ratio: float, message: str) -> None:
+        if progress_callback is None:
+            return
+        ratio_clamped = min(max(ratio, 0.0), 1.0)
+        try:
+            progress_callback(ratio_clamped, message)
+        except Exception:
+            pass
+
+    def _stage(message: str, value: float) -> None:
+        _report(value, message)
+
     conn = _connect_duckdb(read_only=False, db_path=db_path)
     select_sql = _flow_csv_select_sql()
+    inserted = 0
+    success = False
     try:
+        _stage("Iniciando importación de flujos", 0.0)
+        _stage("Validando archivo CSV seleccionado", 0.05)
         if replace:
+            _stage("Eliminando tabla actual", 0.1)
             conn.execute(f"DROP TABLE IF EXISTS {FLOW_TABLE_NAME}")
+            _stage("Leyendo CSV y construyendo tabla", 0.25)
             conn.execute(f"CREATE TABLE {FLOW_TABLE_NAME} AS {select_sql}", [csv_path])
+            _stage("Contando filas importadas", 0.65)
             inserted = conn.execute(
                 f"SELECT COUNT(*) FROM {FLOW_TABLE_NAME}"
             ).fetchone()[0]
+            _stage("Tabla reemplazada satisfactoriamente", 0.85)
         else:
+            _stage("Asegurando estructura de la tabla", 0.12)
             _create_flow_table(conn)
+            _stage("Cargando CSV en tabla temporal", 0.3)
             conn.execute(
                 f"CREATE OR REPLACE TEMP TABLE __new_flujos AS {select_sql}",
                 [csv_path],
             )
+            _stage("Contando filas nuevas", 0.55)
             inserted = conn.execute(
                 "SELECT COUNT(*) FROM __new_flujos"
             ).fetchone()[0]
             if inserted:
+                _stage("Insertando registros en la tabla principal", 0.7)
                 conn.execute(
                     f"""
                     INSERT INTO {FLOW_TABLE_NAME} (FECHA, VELOCIDAD, CATEGORIA,
@@ -426,10 +465,19 @@ def import_flujos_to_duckdb(
                     FROM __new_flujos
                     """
                 )
+            else:
+                _stage("No se encontraron filas nuevas para insertar", 0.7)
             conn.execute("DROP TABLE __new_flujos")
+            _stage("Tabla temporal eliminada", 0.8)
+        success = True
+        _stage("Validando resultado final", 0.95)
         return int(inserted or 0)
     finally:
         conn.close()
+        if success:
+            _stage("Importación completada", 1.0)
+        else:
+            _stage("Importación interrumpida", 1.0)
 
 
 def clear_flow_table(db_path: Optional[Path] = None) -> int:
@@ -449,26 +497,46 @@ def clear_flow_table(db_path: Optional[Path] = None) -> int:
         conn.close()
 
 
+def _fetch_summary_row(conn) -> Tuple[int, Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS total,
+            MIN(FECHA) AS min_ts,
+            MAX(FECHA) AS max_ts
+        FROM {FLOW_TABLE_NAME}
+        """
+    ).fetchone()
+    return row
+
+
 def get_flow_db_summary(db_path: Optional[Path] = None) -> FlowDBSummary:
     """
     Retorna métricas básicas de la tabla de flujos en DuckDB.
     """
 
-    conn = _connect_duckdb(read_only=False, db_path=db_path)
     db_file = _get_duckdb_path(db_path)
+    row: Optional[Tuple[int, Optional[pd.Timestamp], Optional[pd.Timestamp]]] = None
     try:
-        _create_flow_table(conn)
-        row = conn.execute(
-            f"""
-            SELECT
-                COUNT(*) AS total,
-                MIN(FECHA) AS min_ts,
-                MAX(FECHA) AS max_ts
-            FROM {FLOW_TABLE_NAME}
-            """
-        ).fetchone()
-    finally:
-        conn.close()
+        conn = _connect_duckdb(read_only=True, db_path=db_path)
+        try:
+            row = _fetch_summary_row(conn)
+        finally:
+            conn.close()
+    except Exception as exc:
+        catalog_exc = getattr(duckdb, "CatalogException", None)
+        if catalog_exc is not None and isinstance(exc, catalog_exc):
+            conn = _connect_duckdb(read_only=False, db_path=db_path)
+            try:
+                _create_flow_table(conn)
+                row = _fetch_summary_row(conn)
+            finally:
+                conn.close()
+        else:
+            raise
+
+    if row is None:
+        raise RuntimeError("Unable to obtain flow table summary.")
 
     min_ts = pd.to_datetime(row[1]) if row[1] is not None else None
     max_ts = pd.to_datetime(row[2]) if row[2] is not None else None
