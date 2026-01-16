@@ -191,20 +191,20 @@ def sync_with_github_stream() -> Generator[str, None, bool]:
         return False
 
     if not check_git_status():
-        yield "✨ No hay cambios locales para enviar."
-        return True
-
-    # 2. Add
-    success = yield from run_command_stream(["git", "add", "."], "Agregando archivos")
-    if not success: return False
-
-    # 3. Commit
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    success = yield from run_command_stream(["git", "commit", "-m", f"Auto-sync: {ts}"], "Haciendo commit")
-    if not success: return False
+        yield "✨ No hay cambios locales *nuevos* para crear commit."
+        # No retornamos aquí, seguimos para hacer push de commits previos si los hay.
+    else:
+        # 2. Add
+        success = yield from run_command_stream(["git", "add", "."], "Agregando archivos")
+        if not success: return False
+    
+        # 3. Commit
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        success = yield from run_command_stream(["git", "commit", "-m", f"Auto-sync: {ts}"], "Haciendo commit")
+        if not success: return False
 
     # 4. Push
-    success = yield from run_command_stream(["git", "push", "-u", "origin", "main"], "Enviando cambios")
+    success = yield from run_command_stream(["git", "push", "-u", "origin", "main"], "Enviando cambios (push)")
     if not success:
         yield "Error al hacer push."
         return False
