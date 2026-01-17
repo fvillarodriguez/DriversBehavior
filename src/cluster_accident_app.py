@@ -63,7 +63,7 @@ DATA_DIR = ROOT_DIR / "Datos"
 HISTORY_PATH = RESULTS_DIR / "experiment_history.jsonl"
 MODELS_DIR = RESULTS_DIR / "model_history"
 CLUSTER_LABEL_PATTERN = re.compile(
-    r"^cluster_(?P<method>kmeans|gmm|hdbscan)(?:_k(?P<k>\d+))?\.csv$"
+    r"^cluster_(?P<method>kmeans|gmm|hdbscan)(?:_k(?P<k>\d+))?(?:.*)?\.csv$"
 )
 
 
@@ -3143,13 +3143,13 @@ def _render_variables_tab() -> None:
     # Dynamic toggles outside form
     use_batches = st.checkbox(
         "Procesar por lotes (mes/semana)",
-        value=False,
+        value=True,
         key="acc_flow_use_batches",
     )
     
     include_cluster_vars = st.checkbox(
         "Incluir variables de cluster",
-        value=bool(st.session_state.get("acc_flow_include_cluster_vars", False)),
+        value=bool(st.session_state.get("acc_flow_include_cluster_vars", True)),
         key="acc_flow_include_cluster_vars",
     )
 
@@ -3241,7 +3241,7 @@ def _render_variables_tab() -> None:
                 "Delta.Density por tipo de cluster",
             ]
             existing_vars = st.session_state.get("acc_flow_cluster_vars")
-            default_vars = ["Proporciones por cluster"]
+            default_vars = cluster_var_options
             if isinstance(existing_vars, list):
                 normalized: List[str] = []
                 for item in existing_vars:

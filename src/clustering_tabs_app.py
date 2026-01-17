@@ -71,10 +71,10 @@ REQUIRED_FEATURE_COLS = {
 RUN_LOG_PATH = RESULTS_DIR / "cluster_run_log.jsonl"
 COLOR_MAP_PATH = RESULTS_DIR / "cluster_color_map.csv"
 CLUSTER_LABEL_PATTERN = re.compile(
-    r"^cluster_(?P<method>kmeans|gmm|hdbscan)(?:_k(?P<k>\d+))?\.csv$"
+    r"^cluster_(?P<method>kmeans|gmm|hdbscan)(?:_k(?P<k>\d+))?(?:.*)?\.csv$"
 )
 SUMMARY_PATTERN = re.compile(
-    r"^cluster_summary(?:_(?P<method>kmeans|gmm|hdbscan))?(?:_k(?P<k>\d+))?\.csv$"
+    r"^cluster_summary(?:_(?P<method>kmeans|gmm|hdbscan))?(?:_k(?P<k>\d+))?(?:.*)?\.csv$"
 )
 
 
@@ -875,9 +875,9 @@ def _render_kmeans(
     feature_cols: List[str],
 ) -> None:
     # 1. Retrieve Frequent/Rare split settings
-    min_days = st.session_state.get("freq_min_days", 5)
+    min_days = st.session_state.get("freq_min_days", 1)
     min_months = st.session_state.get("freq_min_months", 1)
-    min_passes = st.session_state.get("freq_min_passes", 0)
+    min_passes = st.session_state.get("freq_min_passes", 20)
     
     # 2. Split Data
     # We need to split based on original features (metadata), then align with cluster_df
@@ -1129,9 +1129,9 @@ def _render_gmm(
     feature_cols: List[str],
 ) -> None:
     # 1. Retrieve Frequent/Rare split settings
-    min_days = st.session_state.get("freq_min_days", 5)
+    min_days = st.session_state.get("freq_min_days", 1)
     min_months = st.session_state.get("freq_min_months", 1)
-    min_passes = st.session_state.get("freq_min_passes", 0)
+    min_passes = st.session_state.get("freq_min_passes", 20)
     
     # 2. Split Data
     freq_full, rare_full = split_frequent_drivers(
@@ -1326,9 +1326,9 @@ def _render_hdbscan(
     cluster_df: pd.DataFrame,
     feature_cols: List[str],
 ) -> None:
-    min_days = st.session_state.get("freq_min_days", 5)
+    min_days = st.session_state.get("freq_min_days", 1)
     min_months = st.session_state.get("freq_min_months", 1)
-    min_passes = st.session_state.get("freq_min_passes", 0)
+    min_passes = st.session_state.get("freq_min_passes", 20)
 
     freq_full, rare_full = split_frequent_drivers(
         features_df,
@@ -1438,14 +1438,14 @@ def _render_clustering_section(features_df: pd.DataFrame) -> None:
         min_passes = c1.number_input(
             "Mínimo de pasadas (total_passes)",
             min_value=0,
-            value=int(st.session_state.get("freq_min_passes", 0)),
+            value=int(st.session_state.get("freq_min_passes", 20)),
             step=1,
             key="cluster_train_min_passes",
         )
         min_days = c2.number_input(
             "Mínimo de días activos (n_days_active)",
             min_value=1,
-            value=int(st.session_state.get("freq_min_days", 5)),
+            value=int(st.session_state.get("freq_min_days", 1)),
             step=1,
             key="cluster_train_min_days",
         )
@@ -1509,14 +1509,14 @@ def _render_k_optimo_experiment(features_df: pd.DataFrame) -> None:
         min_passes = c1.number_input(
             "Mínimo de pasadas (total_passes)",
             min_value=0,
-            value=int(st.session_state.get("freq_min_passes", 0)),
+            value=int(st.session_state.get("freq_min_passes", 20)),
             step=1,
             key="k_optimo_min_passes",
         )
         min_days = c2.number_input(
             "Mínimo de días activos (n_days_active)",
             min_value=1,
-            value=int(st.session_state.get("freq_min_days", 5)),
+            value=int(st.session_state.get("freq_min_days", 1)),
             step=1,
             key="k_optimo_min_days",
         )
@@ -2747,14 +2747,14 @@ def _render_gmm_comparison_section() -> None:
         min_passes = c1.number_input(
             "Mínimo de pasadas (total_passes)",
             min_value=0,
-            value=int(st.session_state.get("freq_min_passes", 0)),
+            value=int(st.session_state.get("freq_min_passes", 20)),
             step=1,
             key="char_gmm_min_passes",
         )
         min_days = c2.number_input(
             "Mínimo de días activos (n_days_active)",
             min_value=1,
-            value=int(st.session_state.get("freq_min_days", 5)),
+            value=int(st.session_state.get("freq_min_days", 1)),
             step=1,
             key="char_gmm_min_days",
         )

@@ -312,18 +312,65 @@ def _render_visualization(path: Path) -> None:
             "Tabla",
             options=tables["name"].tolist(),
         )
+        # Get columns for filter
+        try:
+            col_info = con.execute(f"PRAGMA table_info('{table_name}')").fetchdf()
+            col_names = col_info["name"].tolist()
+        except Exception:
+            col_names = []
+            col_info = pd.DataFrame()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            filter_col = st.selectbox(
+                "Filtrar por columna",
+                options=["(ninguna)"] + col_names,
+            )
+        with c2:
+            filter_val = st.text_input(
+                "Valor del filtro",
+                placeholder="Escribe el valor...",
+                help="Texto: busca 'Contiene'. Numeros: busca 'Igual a'.",
+                disabled=(filter_col == "(ninguna)")
+            )
+
+        sql_where = ""
+        if filter_col != "(ninguna)" and filter_val:
+            # Determine type
+            ctype = ""
+            if not col_info.empty:
+                matches = col_info[col_info["name"] == filter_col]
+                if not matches.empty:
+                    ctype = str(matches.iloc[0]["type"]).upper()
+            
+            is_text = any(t in ctype for t in ["VARCHAR", "STRING", "TEXT", "CHAR"])
+            
+            # Simple SQL generation
+            # Check if user typed an operator
+            if any(filter_val.strip().startswith(op) for op in [">", "<", "=", "!"]):
+                 sql_where = f"{filter_col} {filter_val}"
+            else:
+                 # Default to generalized contains search
+                 sql_where = f"CAST({filter_col} AS VARCHAR) ILIKE '%{filter_val}%'"
+
         try:
             query = f"SELECT * FROM {table_name}"
+            if sql_where:
+                query += f" WHERE {sql_where}"
+
+                
             if max_rows is not None:
                 query = f"{query} LIMIT {int(max_rows)}"
+            
             df = con.execute(query).fetchdf()
         except Exception as exc:
-            st.error(f"No se pudo leer la tabla: {exc}")
+            st.error(f"Error en consulta SQL: {exc}")
             con.close()
             return
         con.close()
-        filtered = _apply_filters(df)
-        _preview_table(filtered)
+
+        # Direct preview without extra in-memory filters (since SQL handles it)
+        _preview_table(df)
         return
 
     try:
