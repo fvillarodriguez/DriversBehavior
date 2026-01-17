@@ -48,7 +48,7 @@ def _render_home() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="SUMO Streamlit", layout="wide")
+    st.set_page_config(page_title="Drivers Behavior", layout="wide", page_icon="🚗")
 
     st.sidebar.title("Menu")
     

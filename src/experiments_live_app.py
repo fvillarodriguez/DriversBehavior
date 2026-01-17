@@ -22,7 +22,7 @@ def _list_live_db_files() -> list[Path]:
         return []
     return sorted(
         RESULTS_DIR.glob("experiment_live_*.sqlite"),
-        key=lambda p: p.name,
+        key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
 

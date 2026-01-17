@@ -7,6 +7,7 @@ __pycache__/
 
 # Dataset and Large Files
 sumo-main/
+sumo-docs/
 Datos/
 Resultados/
 simulación/

@@ -349,6 +349,7 @@ class ExperimentsRunner:
         progress_bar = None, # Streamlit progress object
         dataset_name: str = "unknown",
         features_name: str = "unknown",
+        min_k: int = 5,
         max_k_limit: int = 1000,
         result_callback: Optional[Callable[[Dict[str, object]], None]] = None,
     ) -> List[Dict[str, object]]:
@@ -377,10 +378,19 @@ class ExperimentsRunner:
 
         # Calculate range based on total K (Base + Cluster when available).
         limit_total = combined_limit if use_combined else base_limit
-        k_values = list(range(step_size, limit_total + 1, step_size))
-        if not k_values or k_values[-1] < limit_total:
-            if limit_total > 0:
-                k_values.append(limit_total)
+        
+        # Generate K values
+        k_values = list(range(min_k, limit_total + 1, step_size))
+        # Ensure we don't miss the last bit if step doesn't land on it (optional, but requested implicitly by covering range)
+        if not k_values or (k_values[-1] < limit_total and (limit_total - k_values[-1] > step_size // 2)):
+             pass # Stick to step size; usually we don't force the exact limit unless it's close.
+        
+        if not k_values:
+             # Fallback if min_k > limit_total
+             if limit_total >= 1:
+                 k_values = [limit_total]
+             else:
+                 k_values = []
 
         cluster_set = set(cluster_feature_names or [])
         

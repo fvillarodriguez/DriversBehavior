@@ -728,6 +728,121 @@ def _load_porticos_from_feature_file(path: Path) -> Optional[set[str]]:
         return None
 
 
+def _get_feature_date_range(path: Path) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    cache = st.session_state.setdefault("flow_features_date_range_cache", {})
+    key = str(path)
+    if key in cache:
+        cached = cache.get(key)
+        if cached is None:
+            return None
+        return cached
+
+    if path.suffix.lower() == ".duckdb":
+        if duckdb is None:
+            cache[key] = None
+            return None
+        try:
+            con = duckdb.connect(str(path), read_only=True)
+            table_rows = con.execute("SHOW TABLES").fetchall()
+            tables = [row[0] for row in table_rows]
+            table_name = _pick_duckdb_table(
+                tables,
+                ["flow_features", "cluster_features", "features"],
+            )
+            if not table_name:
+                con.close()
+                cache[key] = None
+                return None
+            table_ref = _duckdb_quote_identifier(table_name)
+            cols_info = con.execute(f"DESCRIBE {table_ref}").fetchall()
+            columns = {row[0] for row in cols_info}
+            if "interval_start" not in columns:
+                con.close()
+                cache[key] = None
+                return None
+            row = con.execute(
+                f"SELECT MIN(interval_start), MAX(interval_start) FROM {table_ref}"
+            ).fetchone()
+            con.close()
+            if not row:
+                cache[key] = None
+                return None
+            min_ts, max_ts = row
+        except Exception:
+            cache[key] = None
+            return None
+    else:
+        try:
+            import csv
+            sample = ""
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    sample = f.read(2048)
+            except Exception:
+                sample = ""
+            sep = ","
+            if sample:
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",;")
+                    sep = dialect.delimiter
+                except csv.Error:
+                    sep = ","
+            header = pd.read_csv(path, sep=sep, nrows=0, engine="python")
+            if "interval_start" not in header.columns:
+                cache[key] = None
+                return None
+            df = pd.read_csv(
+                path,
+                sep=sep,
+                usecols=["interval_start"],
+                engine="python",
+                low_memory=False,
+            )
+            min_ts = df["interval_start"].min()
+            max_ts = df["interval_start"].max()
+        except Exception:
+            cache[key] = None
+            return None
+
+    min_ts = pd.to_datetime(min_ts, errors="coerce")
+    max_ts = pd.to_datetime(max_ts, errors="coerce")
+    if pd.isna(min_ts) or pd.isna(max_ts):
+        cache[key] = None
+        return None
+    cache[key] = (min_ts, max_ts)
+    return min_ts, max_ts
+
+
+def _get_feature_max_window_days(path: Path) -> Optional[int]:
+    date_range = _get_feature_date_range(path)
+    if not date_range:
+        return None
+    min_ts, max_ts = date_range
+    delta_days = (max_ts.normalize() - min_ts.normalize()).days + 1
+    return max(1, int(delta_days))
+
+
+def _load_accidents_for_event(path: Path) -> Optional[pd.DataFrame]:
+    cache = st.session_state.setdefault("accidents_by_event_cache", {})
+    key = str(path)
+    if key in cache:
+        return cache.get(key)
+    try:
+        raw_df = read_csv_with_progress(str(path))
+        porticos_df = load_porticos()
+        if porticos_df is None or porticos_df.empty:
+            cache[key] = None
+            return None
+        acc_df, _ = process_accidentes_df(
+            raw_df, porticos_df, return_excluded=True
+        )
+    except Exception:
+        cache[key] = None
+        return None
+    cache[key] = acc_df
+    return acc_df
+
+
 def _build_batch_ranges(
     start_ts: pd.Timestamp,
     end_ts: pd.Timestamp,
@@ -831,6 +946,7 @@ def _list_experiment_result_files() -> List[Path]:
         "experiments_results_*.csv",
         "find_samples_sizes_results_*.csv",
         "best_highway_section_results_*.csv",
+        "best_highway_section_k_results_*.csv",
     ]
     files: List[Path] = []
     for pattern in patterns:
@@ -2997,10 +3113,56 @@ def _render_variables_tab() -> None:
                         "No se pudo leer porticos del archivo para filtrar tramos."
                     )
                     allowed_porticos = set()
+            accidents_df_existing = st.session_state.get("accidents_df")
+            date_start_ts = None
+            date_end_inclusive = None
+            date_end_exclusive = None
+            if (
+                isinstance(accidents_df_existing, pd.DataFrame)
+                and not accidents_df_existing.empty
+                and "accidente_time" in accidents_df_existing.columns
+            ):
+                acc_times = pd.to_datetime(
+                    accidents_df_existing["accidente_time"], errors="coerce"
+                ).dropna()
+                if not acc_times.empty:
+                    min_date = acc_times.min().date()
+                    max_date = acc_times.max().date()
+                    c_date1, c_date2 = st.columns(2)
+                    with c_date1:
+                        date_start_input = st.date_input(
+                            "Fecha inicio",
+                            value=min_date,
+                            key="acc_flow_existing_date_start",
+                        )
+                    with c_date2:
+                        date_end_input = st.date_input(
+                            "Fecha fin",
+                            value=max_date,
+                            key="acc_flow_existing_date_end",
+                        )
+                    if date_start_input and date_end_input:
+                        if date_start_input > date_end_input:
+                            st.error(
+                                "La fecha de inicio no puede ser mayor que la fecha final."
+                            )
+                        else:
+                            date_start_ts = pd.Timestamp(date_start_input)
+                            date_end_exclusive = (
+                                pd.Timestamp(date_end_input) + pd.Timedelta(days=1)
+                            )
+                            date_end_inclusive = date_end_exclusive - pd.Timedelta(
+                                nanoseconds=1
+                            )
+            else:
+                st.info(
+                    "Cargue accidentes en la pestana Eventos para habilitar "
+                    "el filtro de fechas."
+                )
             tramo_tuple = _build_tramo_selector(
-                st.session_state.get("accidents_df"),
-                date_start=None,
-                date_end=None,
+                accidents_df_existing,
+                date_start=date_start_ts,
+                date_end=date_end_inclusive,
                 allowed_porticos=allowed_porticos,
                 key="acc_flow_tramo_choice_existing",
             )
@@ -3046,6 +3208,13 @@ def _render_variables_tab() -> None:
                                         "portico_inicio/portico_fin, ultimo_portico)."
                                     )
                                     return
+                                if "interval_start" in columns:
+                                    if date_start_ts is not None:
+                                        clauses.append("interval_start >= ?")
+                                        params.append(date_start_ts)
+                                    if date_end_exclusive is not None:
+                                        clauses.append("interval_start < ?")
+                                        params.append(date_end_exclusive)
                                 query = f"SELECT * FROM {table_ref}"
                                 if clauses:
                                     query += " WHERE " + " AND ".join(clauses)
@@ -6395,7 +6564,7 @@ def _render_find_samples_sizes_experiment() -> None:
     st.subheader("Find samples sizes")
     st.caption(
         "Busca el tramo y ventana temporal con mayor densidad de accidentes, "
-        "usa ese periodo como train y el resto como val/test."
+        "usa ese periodo como dataset total para train/val/test."
     )
 
     event_files = _list_event_files()
@@ -6418,24 +6587,44 @@ def _render_find_samples_sizes_experiment() -> None:
         key="exp_samples_feature_file",
     )
 
+    selected_features_path = next(
+        (p for p in feature_files if p.name == selected_features), None
+    )
+    max_window_default = 180
+    if selected_features_path:
+        max_window_days = _get_feature_max_window_days(selected_features_path)
+        if max_window_days is not None:
+            max_window_default = max_window_days
+    if st.session_state.get("exp_samples_feature_file_prev") != selected_features:
+        st.session_state["exp_samples_window_max"] = int(max_window_default)
+        st.session_state["exp_samples_feature_file_prev"] = selected_features
+
     st.markdown("**Busqueda de ventana temporal**")
     col_w1, col_w2, col_w3 = st.columns(3)
     with col_w1:
         min_window_days = st.number_input(
             "Ventana min (dias)",
             min_value=1,
-            value=30,
+            value=180,
             step=1,
             key="exp_samples_window_min",
         )
     with col_w2:
-        max_window_days = st.number_input(
-            "Ventana max (dias)",
-            min_value=1,
-            value=180,
-            step=1,
-            key="exp_samples_window_max",
-        )
+        if "exp_samples_window_max" in st.session_state:
+            max_window_days = st.number_input(
+                "Ventana max (dias)",
+                min_value=1,
+                step=1,
+                key="exp_samples_window_max",
+            )
+        else:
+            max_window_days = st.number_input(
+                "Ventana max (dias)",
+                min_value=1,
+                value=int(max_window_default),
+                step=1,
+                key="exp_samples_window_max",
+            )
     with col_w3:
         step_window_days = st.number_input(
             "Paso (dias)",
@@ -6445,14 +6634,39 @@ def _render_find_samples_sizes_experiment() -> None:
             key="exp_samples_window_step",
         )
 
+    st.markdown("**Segmente de Autopista**")
+    selected_event_path = next(
+        (p for p in event_files if p.name == selected_event), None
+    )
+    accidents_df_for_tramo = None
+    if selected_event_path:
+        accidents_df_for_tramo = _load_accidents_for_event(selected_event_path)
+
+    # Pre-read allowed porticos if possible or just pass None
+    allowed_porticos = None
+    if selected_features_path:
+        allowed_porticos = _load_porticos_from_feature_file(selected_features_path)
+
+    tramo_tuple = _build_tramo_selector(
+        accidents_df_for_tramo,
+        date_start=None,
+        date_end=None,
+        allowed_porticos=allowed_porticos,
+        key="exp_samples_tramo_choice",
+    )
+    
     col_s1, col_s2, col_s3 = st.columns(3)
     with col_s1:
+        # Disable max_segments if a specific tramo is selected
+        tramo_selected = tramo_tuple is not None
         max_segments = st.number_input(
             "Max segmentos a evaluar (0 = todos)",
             min_value=0,
             value=25,
             step=1,
             key="exp_samples_max_segments",
+            disabled=tramo_selected,
+            help="Deshabilitado si se selecciona un tramo especifico."
         )
     with col_s2:
         min_accidents_window = st.number_input(
@@ -6508,32 +6722,27 @@ def _render_find_samples_sizes_experiment() -> None:
         )
         objective_key = objective_cfg["key"]
         objective_direction = objective_cfg["direction"]
+    
     use_cluster_features = st.checkbox(
         "Incluir variables de cluster (si existen)",
         value=True,
         key="exp_samples_use_cluster",
     )
-    st.markdown("**Feature selection**")
-    use_feature_selection = st.checkbox(
-        "Usar seleccion de features (top %)",
-        value=False,
-        key="exp_samples_use_feature_selection",
-    )
-    feature_percent = 100
-    if use_feature_selection:
-        feature_percent = st.slider(
-            "Porcentaje de variables mas importantes",
-            5,
-            100,
-            30,
-            5,
-            key="exp_samples_feature_percent",
-        )
+    
+    st.markdown("**Feature selection (Iteracion K)**")
+    col_k1, col_k2, col_k3 = st.columns(3)
+    with col_k1:
+        min_k_val = st.number_input("Min K", 1, 1000, 1, key="exp_samp_min_k")
+    with col_k2:
+        max_k_val = st.number_input("Max K", 1, 1000, 8, key="exp_samp_max_k")
+    with col_k3:
+        step_k_val = st.number_input("Step K", 1, 100, 5, key="exp_samp_step_k")
 
     st.markdown("**Configuracion del modelo**")
     model_choice = st.selectbox(
         "Modelo para Experimento",
         ["Random Forest", "XGBoost", "SVM"],
+        index=1,
         key="exp_samples_model_choice",
     )
     col_n1, col_n2 = st.columns(2)
@@ -6558,14 +6767,14 @@ def _render_find_samples_sizes_experiment() -> None:
     threshold_strategy = "optuna"
     threshold_strategy_label = "Optimizar threshold"
     with st.expander("Configuracion avanzada (parametros y rangos)"):
-        st.markdown("**Split de datos (del resto)**")
+        st.markdown("**Split de datos (sobre ventana)**")
         c_split1, c_split2 = st.columns(2)
         with c_split1:
             val_size = st.slider(
                 "Validation Size (relativo)",
                 0.1,
                 0.9,
-                0.4,
+                0.2,
                 0.05,
                 key="exp_samples_val_size",
             )
@@ -6574,7 +6783,7 @@ def _render_find_samples_sizes_experiment() -> None:
                 "Test Size (relativo)",
                 0.1,
                 0.9,
-                0.6,
+                0.2,
                 0.05,
                 key="exp_samples_test_size",
             )
@@ -6591,9 +6800,11 @@ def _render_find_samples_sizes_experiment() -> None:
             "Optimizar threshold": "optuna",
             "Calibrar por FAR": "far",
         }
+        threshold_labels = list(threshold_options.keys())
         threshold_strategy_label = st.selectbox(
             "Estrategia de umbral",
-            list(threshold_options.keys()),
+            threshold_labels,
+            index=threshold_labels.index("Calibrar por FAR"),
             key="exp_samples_threshold_strategy",
         )
         threshold_strategy = threshold_options[threshold_strategy_label]
@@ -6788,6 +6999,9 @@ def _render_find_samples_sizes_experiment() -> None:
         if min_window_days > max_window_days:
             st.error("La ventana minima no puede ser mayor que la maxima.")
             return
+        if int(min_k_val) > int(max_k_val):
+            st.error("Min K no puede ser mayor que Max K.")
+            return
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         exp_db_path = _init_experiment_db(
             "Find samples sizes",
@@ -6807,11 +7021,12 @@ def _render_find_samples_sizes_experiment() -> None:
                 "window_min_days": int(min_window_days),
                 "window_max_days": int(max_window_days),
                 "window_step_days": int(step_window_days),
-                "max_segments": int(max_segments),
+                "max_segments": 1 if tramo_tuple else int(max_segments),
                 "eval_top_n": int(eval_top_n),
                 "use_cluster_features": bool(use_cluster_features),
-                "feature_selection_enabled": bool(use_feature_selection),
-                "feature_selection_percent": int(feature_percent),
+                "min_k": int(min_k_val),
+                "max_k": int(max_k_val),
+                "step_k": int(step_k_val),
             },
         )
         if exp_db_path:
@@ -6907,6 +7122,21 @@ def _render_find_samples_sizes_experiment() -> None:
         if features_df.empty:
             st.error("No hay datos de features para los tramos.")
             return
+        available_feature_cols = _get_feature_cols(features_df)
+        if not use_cluster_features:
+            cluster_cols = set(_get_cluster_cols(features_df))
+            available_feature_cols = [
+                c for c in available_feature_cols if c not in cluster_cols
+            ]
+        if not available_feature_cols:
+            st.error("No hay variables numericas disponibles para entrenar.")
+            return
+        if int(min_k_val) > len(available_feature_cols):
+            st.error(
+                "Min K es mayor que la cantidad de variables disponibles "
+                f"({len(available_feature_cols)})."
+            )
+            return
 
         acc_seg = accidents_df.copy()
         acc_seg["accidente_time"] = pd.to_datetime(
@@ -6945,6 +7175,19 @@ def _render_find_samples_sizes_experiment() -> None:
         ).merge(
             counts_df, on=["portico_last", "portico_next"], how="left"
         )
+        # Apply specific Tramo filtering
+        if tramo_tuple:
+             eje, calzada, p_start, p_end = tramo_tuple
+             p_start_n = _normalize_portico_code(p_start)
+             p_end_n = _normalize_portico_code(p_end)
+             segments_df = segments_df[
+                 (segments_df["portico_last"] == p_start_n) &
+                 (segments_df["portico_next"] == p_end_n)
+             ]
+             if segments_df.empty:
+                 st.error(f"El tramo seleccionado {p_start}->{p_end} no existe en las features.")
+                 return
+
         segments_df["accidents_total"] = (
             segments_df["accidents_total"].fillna(0).astype(int)
         )
@@ -6971,7 +7214,7 @@ def _render_find_samples_sizes_experiment() -> None:
         except Exception:
             pass
 
-        if max_segments and max_segments > 0:
+        if not tramo_tuple and max_segments and max_segments > 0:
             segments_df = segments_df.sort_values(
                 "accidents_total", ascending=False
             ).head(int(max_segments))
@@ -7057,13 +7300,14 @@ def _render_find_samples_sizes_experiment() -> None:
         st.markdown("**Top candidatos**")
         st.dataframe(candidates_df.head(int(top_show)), width="stretch")
 
-        val_weight = float(val_size)
-        test_weight = float(test_size)
-        if val_weight <= 0 or test_weight <= 0:
+        val_ratio = float(val_size)
+        test_ratio = float(test_size)
+        if val_ratio <= 0 or test_ratio <= 0:
             st.error("Validation/Test deben ser mayores que 0.")
             return
-        test_ratio = test_weight / (val_weight + test_weight)
-        val_ratio = 1 - test_ratio
+        if val_ratio + test_ratio >= 1:
+            st.error("Validation + Test debe ser menor que 1.")
+            return
 
         search_space = {
             "smote": {
@@ -7085,9 +7329,8 @@ def _render_find_samples_sizes_experiment() -> None:
                 "candidate_rank": int(rank),
                 "objective_metric": objective_key,
                 "objective_label": objective_label,
+                "objective_direction": objective_direction,
                 "run_id": run_id,
-                "feature_selection_enabled": bool(use_feature_selection),
-                "feature_selection_percent": int(feature_percent),
                 "dataset_name": selected_event,
                 "features_name": selected_features,
                 "segment_portico_last": row["portico_last"],
@@ -7107,17 +7350,20 @@ def _render_find_samples_sizes_experiment() -> None:
                 "n_trials": int(n_trials),
                 "timeout": int(timeout),
                 "far_target": float(far_target),
-                "val_weight": float(val_weight),
-                "test_weight": float(test_weight),
-                "rest_val_ratio": float(val_ratio),
-                "rest_test_ratio": float(test_ratio),
+                "window_train_ratio": float(1 - val_ratio - test_ratio),
+                "window_val_ratio": float(val_ratio),
+                "window_test_ratio": float(test_ratio),
                 "use_cluster_features": bool(use_cluster_features),
+                "min_k": int(min_k_val),
+                "max_k": int(max_k_val),
+                "step_k": int(step_k_val),
                 "search_space_config": json.dumps(search_space),
             }
 
         def _evaluate_candidate(
             row: pd.Series, *, rank: int
-        ) -> Tuple[Dict[str, object], Optional[object]]:
+        ) -> Tuple[List[Dict[str, object]], List[Optional[object]]]:
+            # Updated signature to match what we implemented earlier (List return)
             payload = _build_candidate_payload(row, rank=rank)
             seg_mask = (
                 (features_df["portico_last"] == row["portico_last"])
@@ -7133,7 +7379,7 @@ def _render_find_samples_sizes_experiment() -> None:
             segment_features = features_df.loc[seg_mask].copy()
             if segment_features.empty:
                 payload["error"] = "No hay features para el tramo."
-                return payload, None
+                return [payload], [None]
 
             segment_accidents = acc_seg.loc[
                 (acc_seg["portico_last"] == row["portico_last"])
@@ -7145,35 +7391,38 @@ def _render_find_samples_sizes_experiment() -> None:
             )
             if segment_base_df.empty:
                 payload["error"] = "Dataset vacio tras merge."
-                return payload, None
+                return [payload], [None]
 
-            train_mask = (
+            window_mask = (
                 (segment_base_df["interval_start"] >= row["window_start"])
                 & (segment_base_df["interval_start"] <= row["window_end"])
             )
-            train_df = segment_base_df.loc[train_mask].copy()
-            rest_df = segment_base_df.loc[~train_mask].copy()
-            if train_df.empty or rest_df.empty:
-                payload["error"] = "No hay datos suficientes en train/rest."
-                return payload, None
+            window_df = segment_base_df.loc[window_mask].copy()
+            if window_df.empty:
+                payload["error"] = "No hay datos dentro de la ventana."
+                return [payload], [None]
 
             try:
+                train_df, holdout_df = _temporal_train_test_split(
+                    window_df, test_size=float(val_ratio + test_ratio)
+                )
+                holdout_test_ratio = test_ratio / (val_ratio + test_ratio)
                 val_df, test_df = _temporal_train_test_split(
-                    rest_df, test_size=float(test_ratio)
+                    holdout_df, test_size=float(holdout_test_ratio)
                 )
             except Exception as exc:
-                payload["error"] = f"Split val/test fallo: {exc}"
-                return payload, None
+                payload["error"] = f"Split temporal fallo: {exc}"
+                return [payload], [None]
 
             if train_df["target"].nunique() < 2:
                 payload["error"] = "Train solo tiene una clase."
-                return payload, None
+                return [payload], [None]
             if val_df["target"].nunique() < 2:
                 payload["error"] = "Val solo tiene una clase."
-                return payload, None
+                return [payload], [None]
             if test_df["target"].nunique() < 2:
                 payload["error"] = "Test solo tiene una clase."
-                return payload, None
+                return [payload], [None]
 
             all_feature_cols = _get_feature_cols(segment_base_df)
             if not use_cluster_features:
@@ -7183,54 +7432,89 @@ def _render_find_samples_sizes_experiment() -> None:
                 ]
             if not all_feature_cols:
                 payload["error"] = "No hay variables numericas para entrenar."
-                return payload, None
+                return [payload], [None]
 
             runner = ExperimentsRunner()
             selected_feature_cols = all_feature_cols
-            if use_feature_selection:
-                try:
-                    importance_df = runner.calculate_feature_importance(
-                        segment_base_df, all_feature_cols
-                    )
-                    ordered = importance_df["variable"].tolist()
-                    top_n = max(
-                        1,
-                        int(
-                            round(
-                                len(ordered)
-                                * (float(feature_percent) / 100.0)
-                            )
-                        ),
-                    )
-                    selected_feature_cols = ordered[:top_n]
-                    payload["feature_selection_total"] = len(all_feature_cols)
-                    payload["feature_selection_selected"] = len(selected_feature_cols)
-                except Exception as exc:
-                    payload["error"] = f"Feature selection fallo: {exc}"
-                    return payload, None
+            
+            # Feature Selection (Importance) - Calculate once
+            # Always calculate importance for K selection
             try:
-                result = runner.run_optimization_loop(
-                    train_df=train_df,
-                    val_df=val_df,
-                    test_df=test_df,
-                    feature_cols=selected_feature_cols,
-                    model_choice=model_choice,
-                    n_trials=int(n_trials),
-                    timeout=int(timeout),
-                    far_target=float(far_target),
-                    search_space_config=search_space,
-                    objective_key=objective_key,
-                    objective_direction=objective_direction,
-                    threshold_strategy=threshold_strategy,
-                    return_model=True,
+                importance_df = runner.calculate_feature_importance(
+                    segment_base_df, all_feature_cols
                 )
+                ordered = importance_df["variable"].tolist()
             except Exception as exc:
-                payload["error"] = f"Error en entrenamiento: {exc}"
-                return payload, None
+                payload["error"] = f"Feature selection fallo: {exc}"
+                return [payload], [None]
 
-            model_obj = result.pop("model", None)
-            payload.update(result)
-            return payload, model_obj
+            # K Iteration Loop
+            k_results: List[Dict[str, object]] = []
+            k_models: List[Optional[object]] = []
+            
+            # Determine K loop range
+            min_k = int(min_k_val)
+            max_k = int(max_k_val)
+            step_k = int(step_k_val)
+            total_features = len(ordered)
+
+            if total_features < min_k:
+                payload["error"] = (
+                    "Min K es mayor que la cantidad de variables disponibles "
+                    f"({total_features})."
+                )
+                return [payload], [None]
+
+            eff_max_k = min(max_k, total_features)
+            k_values = list(range(min_k, eff_max_k + 1, step_k))
+            if k_values and k_values[-1] != eff_max_k:
+                k_values.append(eff_max_k)
+            if not k_values:
+                payload["error"] = "No hay valores de K validos para entrenar."
+                return [payload], [None]
+
+            for k_curr in k_values:
+                # Clone payload for this K
+                p_k = payload.copy()
+                p_k["k"] = int(k_curr)
+                p_k["k_features"] = int(k_curr)
+                
+                curr_features = ordered[:k_curr]
+                if not curr_features:
+                     continue
+                
+                try:
+                    result = runner.run_optimization_loop(
+                        train_df=train_df,
+                        val_df=val_df,
+                        test_df=test_df,
+                        feature_cols=curr_features,
+                        model_choice=model_choice,
+                        n_trials=int(n_trials),
+                        timeout=int(timeout),
+                        far_target=float(far_target),
+                        search_space_config=search_space,
+                        objective_key=objective_key,
+                        objective_direction=objective_direction,
+                        threshold_strategy=threshold_strategy,
+                        return_model=True,
+                    )
+                except Exception as exc:
+                    p_k["error"] = f"Error en entrenamiento K={k_curr}: {exc}"
+                    k_results.append(p_k)
+                    k_models.append(None)
+                    continue
+
+                model_obj = result.pop("model", None)
+                p_k.update(result)
+                k_results.append(p_k)
+                k_models.append(model_obj)
+
+            if not k_results:
+                 payload["error"] = "No se generaron resultados para ningun K."
+                 return [payload], [None]
+                 
+            return k_results, k_models
 
         eval_limit = max(1, int(eval_top_n))
         eval_limit = min(eval_limit, len(candidates_df))
@@ -7239,10 +7523,11 @@ def _render_find_samples_sizes_experiment() -> None:
         eval_results: List[Dict[str, object]] = []
         eval_models: List[Optional[object]] = []
         for idx, (_, row) in enumerate(eval_candidates.iterrows(), start=1):
-            payload, model_obj = _evaluate_candidate(row, rank=idx)
-            eval_results.append(payload)
-            eval_models.append(model_obj)
-            _append_experiment_result(exp_db_path, payload)
+            payloads_k, models_k = _evaluate_candidate(row, rank=idx)
+            eval_results.extend(payloads_k)
+            eval_models.extend(models_k)
+            for p in payloads_k:
+                _append_experiment_result(exp_db_path, p)
             progress_eval.progress(
                 int(idx / eval_limit * 100),
                 text=f"Evaluando candidatos... {idx}/{eval_limit}",
@@ -7274,6 +7559,7 @@ def _render_find_samples_sizes_experiment() -> None:
             best_candidates = best_candidates.dropna(subset=[metric_key])
         best_row = None
         best_rank = None
+        best_idx = None
         if best_candidates.empty:
             st.warning(
                 "No se pudo seleccionar un mejor candidato por la metrica objetivo."
@@ -7288,17 +7574,19 @@ def _render_find_samples_sizes_experiment() -> None:
                     best_candidates[metric_key].idxmax()
                 ]
             best_rank = int(best_row.get("candidate_rank", 0))
+            best_idx = best_row.name
 
         res_df["is_best"] = False
-        if best_rank:
-            res_df.loc[
-                res_df["candidate_rank"] == best_rank, "is_best"
-            ] = True
+        if best_idx is not None:
+             try:
+                res_df.loc[best_idx, "is_best"] = True
+             except KeyError:
+                pass
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_path = None
-        if best_rank and best_rank <= len(eval_models):
-            best_model = eval_models[best_rank - 1]
+        if best_idx is not None and 0 <= best_idx < len(eval_models):
+            best_model = eval_models[best_idx]
             if best_model is not None:
                 try:
                     import joblib  # type: ignore
@@ -7310,9 +7598,10 @@ def _render_find_samples_sizes_experiment() -> None:
                     st.warning(f"No se pudo guardar el modelo: {exc}")
 
         if model_path:
-            res_df.loc[
-                res_df["candidate_rank"] == best_rank, "model_path"
-            ] = model_path
+            try:
+                res_df.loc[best_idx, "model_path"] = model_path
+            except KeyError:
+                pass
             if best_row is not None:
                 best_row = best_row.copy()
                 best_row["model_path"] = model_path
@@ -7321,11 +7610,15 @@ def _render_find_samples_sizes_experiment() -> None:
         st.dataframe(res_df, width="stretch")
 
         if best_row is not None:
+            best_k = best_row.get("k")
+            if best_k is None or pd.isna(best_k):
+                best_k = best_row.get("k_features", "?")
             st.success(
                 "Mejor mix segun "
                 f"{objective_label}: "
                 f"{best_row['segment_portico_last']} -> {best_row['segment_portico_next']} | "
-                f"{best_row['window_start']} a {best_row['window_end']}"
+                f"{best_row['window_start']} a {best_row['window_end']} | "
+                f"K={best_k}"
             )
             if model_path:
                 st.caption(f"Modelo guardado: {model_path}")
@@ -8233,6 +8526,24 @@ def _render_best_highway_section_experiment() -> None:
         if best_row is not None:
             res_df.loc[best_row.name, "is_best"] = True
 
+        res_df["is_best_segment"] = False
+        if {
+            "segment_portico_last",
+            "segment_portico_next",
+            metric_key,
+        }.issubset(res_df.columns):
+            seg_valid = res_df.copy()
+            if "error" in seg_valid.columns:
+                seg_valid = seg_valid[seg_valid["error"].isna()]
+            seg_valid = seg_valid.dropna(subset=[metric_key])
+            if not seg_valid.empty:
+                group_cols = ["segment_portico_last", "segment_portico_next"]
+                if metric_direction == "min":
+                    best_idx = seg_valid.groupby(group_cols)[metric_key].idxmin()
+                else:
+                    best_idx = seg_valid.groupby(group_cols)[metric_key].idxmax()
+                res_df.loc[best_idx, "is_best_segment"] = True
+
         if "type" in res_df.columns and metric_key in res_df.columns:
             for dtype, group in res_df.groupby("type"):
                 group_ok = group.copy()
@@ -8279,6 +8590,998 @@ def _render_best_highway_section_experiment() -> None:
         res_df.to_csv(res_path, index=False)
         st.success(f"Resultados guardados en {res_path}")
 
+
+def _render_best_highway_section_k_experiment() -> None:
+    st.subheader("Best mix Highway section & K")
+    st.caption(
+        "Recorre todos los tramos con datos, aplica seleccion de features, "
+        "Optuna, SMOTE y entrenamiento para Base y Base + Cluster, "
+        "iterando sobre distintos K."
+    )
+
+    event_files = _list_event_files()
+    if not event_files:
+        st.warning("No hay archivos de eventos (accidents) en Datos.")
+        return
+    event_names = [p.name for p in event_files]
+    selected_event = st.selectbox(
+        "Archivo de Eventos", event_names, key="exp_best_section_k_event_file"
+    )
+
+    feature_files = _list_flow_feature_files()
+    if not feature_files:
+        st.warning("No hay archivos de features en Resultados.")
+        return
+    feature_names = [p.name for p in feature_files]
+    selected_features = st.selectbox(
+        "Archivo de Features (Flow + Cluster)",
+        feature_names,
+        key="exp_best_section_k_feature_file",
+    )
+
+    objective_options = {
+        "F1": {"key": "best_f1", "direction": "maximize"},
+        "ROC-AUC": {"key": "roc_auc", "direction": "maximize"},
+        "Accuracy": {"key": "accuracy", "direction": "maximize"},
+        "Recall": {"key": "recall", "direction": "maximize"},
+        "Precision": {"key": "precision", "direction": "maximize"},
+        "FNR (menor es mejor)": {"key": "fnr", "direction": "minimize"},
+        "FAR - Sensibilidad (menor es mejor)": {
+            "key": "far_sens",
+            "direction": "minimize",
+        },
+    }
+    objective_label = st.selectbox(
+        "Metrica objetivo (mejor mix)",
+        list(objective_options.keys()),
+        key="exp_best_section_k_objective_metric",
+    )
+    objective_cfg = objective_options.get(
+        objective_label, {"key": "best_f1", "direction": "maximize"}
+    )
+    objective_key = objective_cfg["key"]
+    objective_direction = objective_cfg["direction"]
+
+    st.markdown("**Feature selection (K)**")
+    col_k1, col_k2, col_k3 = st.columns(3)
+    with col_k1:
+        k_min = st.number_input(
+            "K Min",
+            min_value=1,
+            max_value=200,
+            value=10,
+            step=1,
+            key="exp_best_section_k_min",
+        )
+    with col_k2:
+        k_max = st.number_input(
+            "K Max",
+            min_value=1,
+            max_value=200,
+            value=50,
+            step=1,
+            key="exp_best_section_k_max",
+        )
+    with col_k3:
+        k_step = st.number_input(
+            "Paso K",
+            min_value=1,
+            max_value=50,
+            value=5,
+            step=1,
+            key="exp_best_section_k_step",
+        )
+
+    st.markdown("**Configuracion del modelo**")
+    model_choice = st.selectbox(
+        "Modelo para Experimento",
+        ["Random Forest", "XGBoost", "SVM"],
+        key="exp_best_section_k_model_choice",
+    )
+
+    col_n1, col_n2 = st.columns(2)
+    with col_n1:
+        n_trials = st.number_input(
+            "Optuna Trials por tramo",
+            min_value=5,
+            value=30,
+            step=5,
+            key="exp_best_section_k_n_trials",
+        )
+    with col_n2:
+        timeout = st.number_input(
+            "Optuna Timeout (seg) por tramo",
+            min_value=10,
+            value=3600,
+            step=10,
+            key="exp_best_section_k_timeout",
+        )
+
+    far_target = 0.2
+    threshold_strategy = "optuna"
+    threshold_strategy_label = "Optimizar threshold"
+    with st.expander("Configuracion avanzada (parametros y rangos)"):
+        st.markdown("**Split de datos**")
+        c_split1, c_split2 = st.columns(2)
+        with c_split1:
+            val_size = st.slider(
+                "Validation Size (sobre train)",
+                0.1,
+                0.9,
+                0.2,
+                0.05,
+                key="exp_best_section_k_val_size",
+            )
+        with c_split2:
+            test_size = st.slider(
+                "Test Size (sobre total)",
+                0.1,
+                0.9,
+                0.2,
+                0.05,
+                key="exp_best_section_k_test_size",
+            )
+        st.markdown("**Calibracion de umbral**")
+        far_target = st.slider(
+            "FAR target",
+            min_value=0.0,
+            max_value=0.5,
+            value=0.2,
+            step=0.01,
+            key="exp_best_section_k_far_target",
+        )
+        threshold_options = {
+            "Optimizar threshold": "optuna",
+            "Calibrar por FAR": "far",
+        }
+        threshold_strategy_label = st.selectbox(
+            "Estrategia de umbral",
+            list(threshold_options.keys()),
+            key="exp_best_section_k_threshold_strategy",
+        )
+        threshold_strategy = threshold_options[threshold_strategy_label]
+
+        st.markdown("**Rango SMOTE**")
+        c_smote1, c_smote2 = st.columns(2)
+        with c_smote1:
+            smote_k_min = st.number_input(
+                "K Neighbors Min",
+                1,
+                20,
+                1,
+                key="exp_best_section_k_smote_k_min",
+            )
+            smote_k_max = st.number_input(
+                "K Neighbors Max",
+                1,
+                20,
+                10,
+                key="exp_best_section_k_smote_k_max",
+            )
+        with c_smote2:
+            smote_str_min = st.slider(
+                "Sampling Strategy Min",
+                0.1,
+                1.0,
+                0.1,
+                0.1,
+                key="exp_best_section_k_smote_str_min",
+            )
+            smote_str_max = st.slider(
+                "Sampling Strategy Max",
+                0.1,
+                1.0,
+                1.0,
+                0.1,
+                key="exp_best_section_k_smote_str_max",
+            )
+
+        st.markdown(f"**Rangos para {model_choice}**")
+        model_ranges = {}
+        if model_choice == "Random Forest":
+            c_rf1, c_rf2 = st.columns(2)
+            with c_rf1:
+                rf_ne_min = st.number_input(
+                    "N Estimators Min",
+                    10,
+                    1000,
+                    50,
+                    step=10,
+                    key="exp_best_section_k_rf_ne_min",
+                )
+                rf_ne_max = st.number_input(
+                    "N Estimators Max",
+                    10,
+                    1000,
+                    300,
+                    step=10,
+                    key="exp_best_section_k_rf_ne_max",
+                )
+            with c_rf2:
+                rf_md_min = st.number_input(
+                    "Max Depth Min",
+                    1,
+                    50,
+                    3,
+                    key="exp_best_section_k_rf_md_min",
+                )
+                rf_md_max = st.number_input(
+                    "Max Depth Max",
+                    1,
+                    50,
+                    15,
+                    key="exp_best_section_k_rf_md_max",
+                )
+            model_ranges = {
+                "n_estimators": {"min": rf_ne_min, "max": rf_ne_max},
+                "max_depth": {"min": rf_md_min, "max": rf_md_max},
+            }
+        elif model_choice == "XGBoost":
+            c_xgb1, c_xgb2 = st.columns(2)
+            with c_xgb1:
+                xgb_ne_min = st.number_input(
+                    "N Estimators Min",
+                    10,
+                    1000,
+                    50,
+                    step=10,
+                    key="exp_best_section_k_xgb_ne_min",
+                )
+                xgb_ne_max = st.number_input(
+                    "N Estimators Max",
+                    10,
+                    1000,
+                    300,
+                    step=10,
+                    key="exp_best_section_k_xgb_ne_max",
+                )
+                xgb_lr_min = st.number_input(
+                    "Learning Rate Min",
+                    0.001,
+                    1.0,
+                    0.01,
+                    format="%.3f",
+                    key="exp_best_section_k_xgb_lr_min",
+                )
+                xgb_lr_max = st.number_input(
+                    "Learning Rate Max",
+                    0.001,
+                    1.0,
+                    0.3,
+                    format="%.3f",
+                    key="exp_best_section_k_xgb_lr_max",
+                )
+            with c_xgb2:
+                xgb_md_min = st.number_input(
+                    "Max Depth Min",
+                    1,
+                    50,
+                    3,
+                    key="exp_best_section_k_xgb_md_min",
+                )
+                xgb_md_max = st.number_input(
+                    "Max Depth Max",
+                    1,
+                    50,
+                    15,
+                    key="exp_best_section_k_xgb_md_max",
+                )
+                xgb_sub_min = st.slider(
+                    "Subsample Min",
+                    0.1,
+                    1.0,
+                    0.5,
+                    0.1,
+                    key="exp_best_section_k_xgb_sub_min",
+                )
+                xgb_sub_max = st.slider(
+                    "Subsample Max",
+                    0.1,
+                    1.0,
+                    1.0,
+                    0.1,
+                    key="exp_best_section_k_xgb_sub_max",
+                )
+                xgb_col_min = st.slider(
+                    "Colsample ByTree Min",
+                    0.1,
+                    1.0,
+                    0.5,
+                    0.1,
+                    key="exp_best_section_k_xgb_col_min",
+                )
+                xgb_col_max = st.slider(
+                    "Colsample ByTree Max",
+                    0.1,
+                    1.0,
+                    1.0,
+                    0.1,
+                    key="exp_best_section_k_xgb_col_max",
+                )
+            model_ranges = {
+                "n_estimators": {"min": xgb_ne_min, "max": xgb_ne_max},
+                "max_depth": {"min": xgb_md_min, "max": xgb_md_max},
+                "learning_rate": {"min": xgb_lr_min, "max": xgb_lr_max},
+                "subsample": {"min": xgb_sub_min, "max": xgb_sub_max},
+                "colsample_bytree": {"min": xgb_col_min, "max": xgb_col_max},
+            }
+        elif model_choice == "SVM":
+            c_svm1, c_svm2 = st.columns(2)
+            with c_svm1:
+                svm_c_min = st.number_input(
+                    "C Min",
+                    0.01,
+                    1000.0,
+                    0.1,
+                    format="%.2f",
+                    key="exp_best_section_k_svm_c_min",
+                )
+            with c_svm2:
+                svm_c_max = st.number_input(
+                    "C Max",
+                    0.01,
+                    1000.0,
+                    50.0,
+                    format="%.2f",
+                    key="exp_best_section_k_svm_c_max",
+                )
+            model_ranges = {"C": {"min": svm_c_min, "max": svm_c_max}}
+
+    if st.button("Iniciar experimento", key="exp_best_section_k_run"):
+        if int(k_min) > int(k_max):
+            st.error("K Min no puede ser mayor que K Max.")
+            return
+        if int(k_step) <= 0:
+            st.error("Paso K debe ser mayor que 0.")
+            return
+
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        exp_db_path = _init_experiment_db(
+            "Best mix Highway section & K",
+            {
+                "run_id": run_id,
+                "dataset_name": selected_event,
+                "features_name": selected_features,
+                "model_choice": model_choice,
+                "objective_label": objective_label,
+                "objective_metric": objective_key,
+                "objective_direction": objective_direction,
+                "k_min": int(k_min),
+                "k_max": int(k_max),
+                "k_step": int(k_step),
+                "far_target": float(far_target),
+                "threshold_strategy": threshold_strategy,
+                "threshold_strategy_label": threshold_strategy_label,
+                "val_size": float(val_size),
+                "test_size": float(test_size),
+            },
+        )
+        if exp_db_path:
+            st.caption(f"DB live: {exp_db_path}")
+
+        accidents_path = next(p for p in event_files if p.name == selected_event)
+        features_path = next(p for p in feature_files if p.name == selected_features)
+
+        try:
+            raw_accidents_df = read_csv_with_progress(str(accidents_path))
+        except Exception as exc:
+            st.error(f"Error cargando accidentes: {exc}")
+            return
+
+        try:
+            porticos_df = load_porticos()
+            if porticos_df is None or porticos_df.empty:
+                st.error("No se pudieron cargar los porticos (Porticos.csv).")
+                return
+        except Exception as exc:
+            st.error(f"Error cargando porticos: {exc}")
+            return
+
+        try:
+            accidents_df, excluded = process_accidentes_df(
+                raw_accidents_df, porticos_df, return_excluded=True
+            )
+            if accidents_df.empty:
+                st.warning(
+                    "No quedaron accidentes validos tras el procesamiento."
+                )
+                return
+            st.success(
+                f"Accidentes procesados: {len(accidents_df)} (Excluidos: {len(excluded)})"
+            )
+        except Exception as exc:
+            st.error(f"Error procesando accidentes: {exc}")
+            return
+
+        if features_path.suffix.lower() != ".duckdb":
+            st.error("El archivo de features debe ser .duckdb.")
+            return
+        if duckdb is None:
+            st.error("duckdb no esta instalado.")
+            return
+
+        con = None
+        try:
+            con = duckdb.connect(str(features_path), read_only=True)
+            table_rows = con.execute("SHOW TABLES").fetchall()
+            tables = [row[0] for row in table_rows]
+            table_name = _pick_duckdb_table(tables, ["flow_features", "features"])
+            if not table_name:
+                st.error("La base de datos de features esta vacia.")
+                return
+            table_ref = _duckdb_quote_identifier(table_name)
+            cols_info = con.execute(f"DESCRIBE {table_ref}").fetchall()
+            columns = {row[0] for row in cols_info}
+            segment_cols = None
+            if {"portico_last", "portico_next"}.issubset(columns):
+                segment_cols = ("portico_last", "portico_next")
+            elif {"portico_inicio", "portico_fin"}.issubset(columns):
+                segment_cols = ("portico_inicio", "portico_fin")
+            if not segment_cols:
+                st.error(
+                    "El archivo de features no contiene columnas de tramo "
+                    "(portico_last/portico_next o portico_inicio/portico_fin)."
+                )
+                return
+
+            last_col, next_col = segment_cols
+            last_ref = _duckdb_quote_identifier(last_col)
+            next_ref = _duckdb_quote_identifier(next_col)
+            segments_df = con.execute(
+                f"SELECT DISTINCT {last_ref} AS portico_last, {next_ref} AS portico_next "
+                f"FROM {table_ref} "
+                f"WHERE {last_ref} IS NOT NULL AND {next_ref} IS NOT NULL"
+            ).df()
+        except Exception as exc:
+            st.error(f"Error leyendo features: {exc}")
+            return
+        finally:
+            if con is not None:
+                con.close()
+
+        if segments_df is None or segments_df.empty:
+            st.warning("No se encontraron tramos en el archivo de features.")
+            return
+
+        segments_df = segments_df.copy()
+        segments_df["portico_last_raw"] = segments_df["portico_last"].astype(str).str.strip()
+        segments_df["portico_next_raw"] = segments_df["portico_next"].astype(str).str.strip()
+        segments_df["portico_last"] = _normalize_portico_series(
+            segments_df["portico_last_raw"]
+        )
+        segments_df["portico_next"] = _normalize_portico_series(
+            segments_df["portico_next_raw"]
+        )
+        segments_df = segments_df.dropna(subset=["portico_last", "portico_next"])
+        if segments_df.empty:
+            st.warning("No hay tramos validos en el archivo de features.")
+            return
+
+        try:
+            seg_meta = get_portico_segments(porticos_df)
+            if seg_meta is not None and not seg_meta.empty:
+                seg_meta = seg_meta.copy()
+                seg_meta["portico_last"] = _normalize_portico_series(
+                    seg_meta["portico_last"]
+                )
+                seg_meta["portico_next"] = _normalize_portico_series(
+                    seg_meta["portico_next"]
+                )
+                segments_df = segments_df.merge(
+                    seg_meta[["eje", "calzada", "portico_last", "portico_next"]],
+                    on=["portico_last", "portico_next"],
+                    how="left",
+                )
+        except Exception:
+            pass
+
+        acc_seg = accidents_df.copy()
+        acc_seg["portico_last"] = _normalize_portico_series(
+            acc_seg["ultimo_portico"]
+        )
+        acc_seg["portico_next"] = _normalize_portico_series(
+            acc_seg["proximo_portico"]
+        )
+        acc_seg = acc_seg.dropna(
+            subset=["portico_last", "portico_next", "accidente_time"]
+        )
+        acc_groups = {
+            key: group.copy()
+            for key, group in acc_seg.groupby(["portico_last", "portico_next"])
+        }
+
+        cluster_cols_available = _get_cluster_cols(
+            pd.DataFrame(columns=list(columns))
+        )
+        has_cluster_available = bool(cluster_cols_available)
+
+        search_space = {
+            "smote": {
+                "k_neighbors": {"min": smote_k_min, "max": smote_k_max},
+                "sampling_strategy": {
+                    "min": smote_str_min,
+                    "max": smote_str_max,
+                },
+            },
+            "model": model_ranges,
+        }
+
+        runner = ExperimentsRunner()
+        results: List[Dict[str, object]] = []
+        total_segments = len(segments_df)
+        progress_bar = st.progress(0, text="Procesando tramos...")
+        con = None
+        table_ref = _duckdb_quote_identifier(table_name)
+        seg_columns = set(columns)
+
+        try:
+            con = duckdb.connect(str(features_path), read_only=True)
+
+            for idx, row in enumerate(segments_df.itertuples(index=False), start=1):
+                seg_last = getattr(row, "portico_last", None)
+                seg_next = getattr(row, "portico_next", None)
+                seg_last_raw = getattr(row, "portico_last_raw", seg_last)
+                seg_next_raw = getattr(row, "portico_next_raw", seg_next)
+                eje = getattr(row, "eje", None)
+                calzada = getattr(row, "calzada", None)
+
+                payload_common = {
+                    "experiment": "Best mix Highway section & K",
+                    "type": "Base",
+                    "run_id": run_id,
+                    "dataset_name": selected_event,
+                    "features_name": selected_features,
+                    "segment_portico_last": seg_last,
+                    "segment_portico_next": seg_next,
+                    "segment_eje": eje,
+                    "segment_calzada": calzada,
+                    "segment_index": int(idx),
+                    "objective_metric": objective_key,
+                    "objective_label": objective_label,
+                    "model_choice": model_choice,
+                    "n_trials": int(n_trials),
+                    "timeout": int(timeout),
+                    "far_target": float(far_target),
+                    "threshold_strategy": threshold_strategy,
+                    "threshold_strategy_label": threshold_strategy_label,
+                    "val_size": float(val_size),
+                    "test_size": float(test_size),
+                    "search_space_config": json.dumps(search_space),
+                    "k_min": int(k_min),
+                    "k_max": int(k_max),
+                    "k_step": int(k_step),
+                }
+
+                progress_bar.progress(
+                    int(idx / total_segments * 100),
+                    text=f"Procesando tramo {idx}/{total_segments}",
+                )
+
+                accidents_segment = acc_groups.get((seg_last, seg_next))
+                if accidents_segment is None or accidents_segment.empty:
+                    payload_base = dict(payload_common)
+                    payload_base["error"] = "No hay accidentes en el tramo."
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = "No hay accidentes en el tramo."
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+
+                tramo_tuple = (eje, calzada, seg_last_raw, seg_next_raw)
+                clauses, params, filter_ok = _build_tramo_duckdb_filters(
+                    tramo_tuple, seg_columns
+                )
+                if not filter_ok:
+                    payload_base = dict(payload_common)
+                    payload_base["error"] = (
+                        "No se pudo filtrar el tramo en el archivo de features."
+                    )
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = payload_base["error"]
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+                try:
+                    query = f"SELECT * FROM {table_ref}"
+                    if clauses:
+                        query += " WHERE " + " AND ".join(clauses)
+                    segment_features = con.execute(query, params).df()
+                except Exception as exc:
+                    payload_base = dict(payload_common)
+                    payload_base["error"] = (
+                        f"Error cargando features del tramo: {exc}"
+                    )
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = payload_base["error"]
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+
+                if segment_features is None or segment_features.empty:
+                    payload_base = dict(payload_common)
+                    payload_base["error"] = "No hay features para el tramo."
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = payload_base["error"]
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+
+                if segment_cols != ("portico_last", "portico_next"):
+                    segment_features = segment_features.rename(
+                        columns={
+                            segment_cols[0]: "portico_last",
+                            segment_cols[1]: "portico_next",
+                        }
+                    )
+
+                if "interval_start" not in segment_features.columns:
+                    payload_base = dict(payload_common)
+                    payload_base["error"] = "Las features no tienen interval_start."
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = payload_base["error"]
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+
+                segment_features = segment_features.copy()
+                segment_features["interval_start"] = pd.to_datetime(
+                    segment_features["interval_start"], errors="coerce"
+                )
+
+                segment_base_df = add_accident_target(
+                    segment_features, accidents_segment
+                )
+                if segment_base_df.empty:
+                    payload_base = dict(payload_common)
+                    payload_base["error"] = "Dataset vacio tras merge."
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = payload_base["error"]
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+
+                if test_size <= 0 or test_size >= 1:
+                    st.error("Test size debe estar entre 0 y 1.")
+                    progress_bar.empty()
+                    return
+                if val_size <= 0 or val_size >= 1:
+                    st.error("Validation size debe estar entre 0 y 1.")
+                    progress_bar.empty()
+                    return
+                val_ratio = float(val_size)
+
+                try:
+                    train_df, test_df = _temporal_train_test_split(
+                        segment_base_df, test_size=float(test_size)
+                    )
+                    train_opt_df, val_df = _temporal_train_test_split(
+                        train_df, test_size=float(val_ratio)
+                    )
+                except Exception as exc:
+                    payload_base = dict(payload_common)
+                    payload_base["error"] = f"Split fallo: {exc}"
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = payload_base["error"]
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+
+                if (
+                    train_df.empty
+                    or val_df.empty
+                    or test_df.empty
+                    or train_df["target"].nunique() < 2
+                    or val_df["target"].nunique() < 2
+                    or test_df["target"].nunique() < 2
+                ):
+                    payload_base = dict(payload_common)
+                    payload_base["error"] = "Split sin clases suficientes."
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = payload_base["error"]
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+
+                all_feature_cols = _get_feature_cols(segment_base_df)
+                cluster_cols = _get_cluster_cols(segment_base_df)
+                base_cols = [c for c in all_feature_cols if c not in cluster_cols]
+
+                cluster_set = set(cluster_cols)
+                combined_ordered: List[str] = []
+                base_ordered_from_combined: List[str] = []
+                importance_error = None
+                if not all_feature_cols:
+                    importance_error = "No hay variables numericas para entrenar."
+                else:
+                    try:
+                        combined_importance_df = (
+                            runner.calculate_feature_importance(
+                                segment_base_df, all_feature_cols
+                            )
+                        )
+                        combined_ordered = combined_importance_df[
+                            "variable"
+                        ].tolist()
+                        base_ordered_from_combined = [
+                            col for col in combined_ordered if col in base_cols
+                        ]
+                        if not combined_ordered:
+                            importance_error = (
+                                "No hay variables numericas para entrenar."
+                            )
+                    except Exception as exc:
+                        importance_error = f"Feature selection fallo: {exc}"
+
+                def _run_dataset(
+                    payload_seed: Dict[str, object],
+                    *,
+                    dataset_type: str,
+                    candidate_cols: List[str],
+                    selected_cols_override: Optional[List[str]] = None,
+                ) -> Dict[str, object]:
+                    payload = dict(payload_seed)
+                    payload["type"] = dataset_type
+                    payload["feature_selection_total"] = int(len(candidate_cols))
+                    if not candidate_cols:
+                        payload["error"] = "No hay variables numericas para entrenar."
+                        return payload
+                    if not selected_cols_override:
+                        payload["error"] = (
+                            "No hay ranking de importancia para seleccionar "
+                            "variables."
+                        )
+                        return payload
+                    selected_cols = [
+                        col
+                        for col in selected_cols_override
+                        if col in candidate_cols
+                    ]
+                    if not selected_cols:
+                        payload["error"] = (
+                            "No hay variables numericas para entrenar."
+                        )
+                        return payload
+
+                    payload["feature_selection_selected"] = int(len(selected_cols))
+
+                    try:
+                        result = runner.run_optimization_loop(
+                            train_df=train_opt_df,
+                            val_df=val_df,
+                            test_df=test_df,
+                            feature_cols=selected_cols,
+                            model_choice=model_choice,
+                            n_trials=int(n_trials),
+                            timeout=int(timeout),
+                            far_target=float(far_target),
+                            search_space_config=search_space,
+                            objective_key=objective_key,
+                            objective_direction=objective_direction,
+                            threshold_strategy=threshold_strategy,
+                        )
+                        payload.update(result)
+                    except Exception as exc:
+                        payload["error"] = f"Error en Optuna: {exc}"
+                    return payload
+
+                if importance_error:
+                    payload_base = dict(payload_common)
+                    payload_base["type"] = "Base"
+                    payload_base["feature_selection_total"] = int(len(base_cols))
+                    payload_base["error"] = importance_error
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["feature_selection_total"] = int(
+                            len(all_feature_cols)
+                        )
+                        payload_cluster["error"] = importance_error
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+
+                total_available = len(combined_ordered)
+                k_values = list(
+                    range(int(k_min), int(k_max) + 1, int(k_step))
+                )
+                if k_values and k_values[-1] != int(k_max):
+                    k_values.append(int(k_max))
+                if not k_values:
+                    k_values = [int(k_min)]
+                k_values = [
+                    k for k in k_values if k > 0 and k <= total_available
+                ]
+                if not k_values:
+                    err_msg = (
+                        "Rango K excede numero de variables disponibles."
+                    )
+                    payload_base = dict(payload_common)
+                    payload_base["type"] = "Base"
+                    payload_base["error"] = err_msg
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                    if has_cluster_available:
+                        payload_cluster = dict(payload_common)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = err_msg
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    continue
+
+                for k_val in k_values:
+                    combined_selected_cols = combined_ordered[:k_val]
+                    cluster_in_top_n = sum(
+                        1
+                        for col in combined_selected_cols
+                        if col in cluster_set
+                    )
+                    base_target_n = k_val - cluster_in_top_n
+                    base_target_n = min(
+                        base_target_n, len(base_ordered_from_combined)
+                    )
+
+                    payload_common_k = dict(payload_common)
+                    payload_common_k["k"] = int(k_val)
+
+                    if base_target_n <= 0:
+                        payload_base = dict(payload_common_k)
+                        payload_base["type"] = "Base"
+                        payload_base["feature_selection_total"] = int(len(base_cols))
+                        payload_base["error"] = (
+                            "K total sin variables base disponibles."
+                        )
+                    else:
+                        base_selected_cols = base_ordered_from_combined[:base_target_n]
+                        payload_base = _run_dataset(
+                            payload_common_k,
+                            dataset_type="Base",
+                            candidate_cols=base_cols,
+                            selected_cols_override=base_selected_cols,
+                        )
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+
+                    if cluster_cols:
+                        payload_cluster = _run_dataset(
+                            payload_common_k,
+                            dataset_type="Base + Cluster",
+                            candidate_cols=all_feature_cols,
+                            selected_cols_override=combined_selected_cols,
+                        )
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+                    elif has_cluster_available:
+                        payload_cluster = dict(payload_common_k)
+                        payload_cluster["type"] = "Base + Cluster"
+                        payload_cluster["error"] = (
+                            "No hay columnas de cluster en el dataset."
+                        )
+                        results.append(payload_cluster)
+                        _append_experiment_result(exp_db_path, payload_cluster)
+
+        finally:
+            if con is not None:
+                con.close()
+
+        progress_bar.empty()
+
+        if not results:
+            st.warning("No se generaron resultados.")
+            return
+
+        res_df = pd.DataFrame(results)
+        metric_key = objective_key
+        metric_direction = (
+            "min" if objective_direction == "minimize" else "max"
+        )
+        if metric_key == "far_sens":
+            if {"far", "sensitivity"}.issubset(res_df.columns):
+                res_df = res_df.copy()
+                res_df["far_sens"] = (
+                    res_df["far"] - (res_df["sensitivity"] * 1e-3)
+                )
+            else:
+                st.warning(
+                    "No se encontro FAR/Sensibilidad para calcular la metrica."
+                )
+        valid_df = res_df.copy()
+        if "error" in valid_df.columns:
+            valid_df = valid_df[valid_df["error"].isna()]
+        if metric_key in valid_df.columns:
+            valid_df = valid_df.dropna(subset=[metric_key])
+        best_row = None
+        if not valid_df.empty and metric_key in valid_df.columns:
+            if metric_direction == "min":
+                best_row = valid_df.loc[valid_df[metric_key].idxmin()]
+            else:
+                best_row = valid_df.loc[valid_df[metric_key].idxmax()]
+
+        res_df["is_best"] = False
+        if best_row is not None:
+            res_df.loc[best_row.name, "is_best"] = True
+
+        if "type" in res_df.columns and metric_key in res_df.columns:
+            for dtype, group in res_df.groupby("type"):
+                group_ok = group.copy()
+                if "error" in group_ok.columns:
+                    group_ok = group_ok[group_ok["error"].isna()]
+                group_ok = group_ok.dropna(subset=[metric_key])
+                if group_ok.empty:
+                    continue
+                if metric_direction == "min":
+                    best_idx = group_ok[metric_key].idxmin()
+                else:
+                    best_idx = group_ok[metric_key].idxmax()
+                res_df.loc[best_idx, "is_best_type"] = True
+
+        st.subheader("Resultados")
+        st.dataframe(res_df, width="stretch")
+
+        if best_row is not None:
+            st.success(
+                "Mejor mix segun "
+                f"{objective_label}: "
+                f"{best_row.get('segment_portico_last', '?')} -> {best_row.get('segment_portico_next', '?')} "
+                f"| K={best_row.get('k', '?')} "
+                f"({best_row.get('type', '-')})"
+            )
+            best_payload = dict(best_row)
+            _append_experiment_best(exp_db_path, best_payload)
+
+            cm = best_row.get("confusion_matrix")
+            if isinstance(cm, list) and cm:
+                cm_data = cm
+                if len(cm) == 4 and not isinstance(cm[0], (list, tuple)):
+                    tn, fp, fn, tp = cm
+                    cm_data = [[tn, fp], [fn, tp]]
+                cm_df = pd.DataFrame(
+                    cm_data,
+                    index=["Actual 0", "Actual 1"],
+                    columns=["Pred 0", "Pred 1"],
+                )
+                st.caption("Matriz de confusion (mejor mix)")
+                st.dataframe(cm_df, width="stretch")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        res_path = RESULTS_DIR / f"best_highway_section_k_results_{stamp}.csv"
+        res_df.to_csv(res_path, index=False)
+        st.success(f"Resultados guardados en {res_path}")
+
+
 def _render_experiments_tab() -> None:
     st.header("Experimentos")
 
@@ -8316,7 +9619,7 @@ def _render_experiments_tab() -> None:
                 # Attempt to extract timestamp from filename: experiments_results_YYYYMMDD_HHMMSS.csv
                 # Pattern: experiments_results_{timestamp}.csv
                 match = re.search(
-                    r"(?:experiments_results|find_samples_sizes_results|best_highway_section_results)_(\d{8}_\d{6})\.csv",
+                    r"(?:experiments_results|find_samples_sizes_results|best_highway_section_results|best_highway_section_k_results)_(\d{8}_\d{6})\.csv",
                     sel_past,
                 )
                 timestamp = match.group(1) if match else None
@@ -8352,6 +9655,7 @@ def _render_experiments_tab() -> None:
                     past_df = pd.read_csv(path)
                     is_find_samples = False
                     is_best_section = False
+                    is_best_section_k = False
                     if "experiment" in past_df.columns:
                         is_find_samples = past_df["experiment"].astype(str).str.contains(
                             "find samples", case=False, na=False
@@ -8359,6 +9663,13 @@ def _render_experiments_tab() -> None:
                         is_best_section = past_df["experiment"].astype(str).str.contains(
                             "best highway section", case=False, na=False
                         ).any()
+                        is_best_section_k = past_df["experiment"].astype(str).str.contains(
+                            "best mix highway section", case=False, na=False
+                        ).any()
+                        if not is_best_section_k:
+                            is_best_section_k = past_df["experiment"].astype(str).str.contains(
+                                "highway section & k", case=False, na=False
+                            ).any()
                     if not is_find_samples and "type" in past_df.columns:
                         is_find_samples = past_df["type"].astype(str).str.contains(
                             "find samples", case=False, na=False
@@ -8375,6 +9686,10 @@ def _render_experiments_tab() -> None:
                         "best_highway_section_results_"
                     ):
                         is_best_section = True
+                    if not is_best_section_k and path.name.startswith(
+                        "best_highway_section_k_results_"
+                    ):
+                        is_best_section_k = True
 
                     if is_find_samples:
                         st.caption("Experimento detectado: Find samples sizes")
@@ -8558,6 +9873,260 @@ def _render_experiments_tab() -> None:
                                     except ImportError:
                                         pass
                             with tab_data:
+                                st.dataframe(past_df, width="stretch")
+                    elif is_best_section_k:
+                        st.caption("Experimento detectado: Best mix Highway section & K")
+                        plot_df = past_df.copy()
+                        if "far_sens" not in plot_df.columns and {
+                            "far",
+                            "sensitivity",
+                        }.issubset(plot_df.columns):
+                            plot_df["far_sens"] = (
+                                plot_df["far"]
+                                - (plot_df["sensitivity"] * 1e-3)
+                            )
+                        metric_options = {
+                            "best_f1": "F1",
+                            "accuracy": "Accuracy",
+                            "recall": "Recall",
+                            "precision": "Precision",
+                            "roc_auc": "ROC-AUC",
+                            "fnr": "FNR (menor es mejor)",
+                            "far_sens": "FAR - Sensibilidad (menor es mejor)",
+                        }
+                        available_metrics = {
+                            k: v
+                            for k, v in metric_options.items()
+                            if k in plot_df.columns
+                        }
+                        if not available_metrics:
+                            st.info("No hay métricas disponibles para graficar.")
+                            st.dataframe(past_df, width="stretch")
+                        else:
+                            dataset_types = []
+                            if "type" in plot_df.columns:
+                                dataset_types = sorted(
+                                    [
+                                        t
+                                        for t in plot_df["type"]
+                                        .dropna()
+                                        .unique()
+                                        .tolist()
+                                        if t
+                                    ]
+                                )
+                            selected_type = "Todos"
+                            if dataset_types:
+                                selected_type = st.selectbox(
+                                    "Dataset",
+                                    ["Todos"] + dataset_types,
+                                    key="history_best_section_k_type",
+                                )
+                            metric_labels = list(available_metrics.values())
+                            selected_metric_label = st.selectbox(
+                                "Métrica a graficar",
+                                metric_labels,
+                                key="history_best_section_k_metric",
+                            )
+                            metric_key = next(
+                                k
+                                for k, v in available_metrics.items()
+                                if v == selected_metric_label
+                            )
+
+                            if "error" in plot_df.columns:
+                                plot_df = plot_df[
+                                    plot_df["error"].isna()
+                                    | (plot_df["error"] == "")
+                                ]
+                            if selected_type != "Todos" and "type" in plot_df.columns:
+                                plot_df = plot_df[plot_df["type"] == selected_type]
+                            if metric_key in plot_df.columns:
+                                plot_df = plot_df.dropna(subset=[metric_key])
+
+                            if "k" in plot_df.columns:
+                                plot_df = plot_df.copy()
+                                plot_df["k"] = pd.to_numeric(
+                                    plot_df["k"], errors="coerce"
+                                )
+                                plot_df = plot_df.dropna(subset=["k"])
+                            else:
+                                st.info("No hay columna 'k' para graficar.")
+                                st.dataframe(past_df, width="stretch")
+                                plot_df = pd.DataFrame()
+
+                            best_row = None
+                            if not plot_df.empty and metric_key in plot_df.columns:
+                                if metric_key in {"fnr", "far_sens"}:
+                                    best_row = plot_df.loc[plot_df[metric_key].idxmin()]
+                                else:
+                                    best_row = plot_df.loc[plot_df[metric_key].idxmax()]
+
+                            if best_row is not None:
+                                st.markdown("**Resultado óptimo**")
+                                objective_label = best_row.get("objective_label")
+                                if objective_label:
+                                    st.caption(f"Objetivo: {objective_label}")
+                                st.caption(
+                                    f"{best_row.get('segment_portico_last', '?')} -> {best_row.get('segment_portico_next', '?')} "
+                                    f"| K={best_row.get('k', '?')} "
+                                    f"| {best_row.get('type', '-')}"
+                                )
+                                metrics_cols = [
+                                    "best_f1",
+                                    "accuracy",
+                                    "recall",
+                                    "precision",
+                                    "roc_auc",
+                                    "fnr",
+                                    "far_sens",
+                                ]
+                                metrics_payload = {
+                                    key: best_row.get(key)
+                                    for key in metrics_cols
+                                    if key in best_row
+                                }
+                                if metrics_payload:
+                                    st.json(metrics_payload)
+                                cm = best_row.get("confusion_matrix")
+                                if cm:
+                                    try:
+                                        import ast
+                                        if isinstance(cm, str):
+                                            cm = ast.literal_eval(cm)
+                                        if isinstance(cm, list) and len(cm) == 4:
+                                            tn, fp, fn, tp = cm
+                                            cm = [[tn, fp], [fn, tp]]
+                                        if isinstance(cm, list) and len(cm) == 2:
+                                            cm_df = pd.DataFrame(
+                                                cm,
+                                                index=["Actual 0", "Actual 1"],
+                                                columns=["Pred 0", "Pred 1"],
+                                            )
+                                            st.caption("Matriz de confusion")
+                                            st.dataframe(cm_df, width="stretch")
+                                    except Exception:
+                                        st.text(f"CM Raw: {cm}")
+
+                            if {
+                                "segment_portico_last",
+                                "segment_portico_next",
+                                metric_key,
+                            }.issubset(plot_df.columns):
+                                if plot_df.empty:
+                                    st.info("No hay datos para graficar.")
+                                    st.dataframe(past_df, width="stretch")
+                                else:
+                                    plot_df = plot_df.copy()
+                                    plot_df["section_label"] = (
+                                        plot_df["segment_portico_last"].astype(str)
+                                        + " -> "
+                                        + plot_df["segment_portico_next"].astype(str)
+                                    )
+
+                                    group_cols = [
+                                        "segment_portico_last",
+                                        "segment_portico_next",
+                                    ]
+                                    if metric_key in {"fnr", "far_sens"}:
+                                        best_idx = plot_df.groupby(group_cols)[metric_key].idxmin()
+                                    else:
+                                        best_idx = plot_df.groupby(group_cols)[metric_key].idxmax()
+                                    best_sections = plot_df.loc[best_idx].copy()
+
+                                    tab_viz, tab_data = st.tabs(
+                                        ["Gráfico", "Datos"]
+                                    )
+                                    with tab_viz:
+                                        try:
+                                            import altair as alt
+                                            color_enc = alt.value("#1f77b4")
+                                            if "type" in best_sections.columns:
+                                                color_enc = alt.Color(
+                                                    "type:N", title="Dataset"
+                                                )
+                                            chart = (
+                                                alt.Chart(best_sections)
+                                                .mark_bar()
+                                                .encode(
+                                                    x=alt.X(
+                                                        "section_label:N",
+                                                        sort="-y",
+                                                        axis=alt.Axis(
+                                                            title="Tramo",
+                                                            labelAngle=-35,
+                                                        ),
+                                                    ),
+                                                    y=alt.Y(
+                                                        metric_key,
+                                                        axis=alt.Axis(
+                                                            title=available_metrics[metric_key]
+                                                        ),
+                                                    ),
+                                                    color=color_enc,
+                                                    tooltip=[
+                                                        "section_label",
+                                                        "k",
+                                                        metric_key,
+                                                        "type",
+                                                    ],
+                                                )
+                                            ).interactive()
+                                            st.altair_chart(chart, width="stretch")
+                                        except ImportError:
+                                            st.warning("Altair no instalado.")
+
+                                        section_labels = sorted(
+                                            best_sections["section_label"]
+                                            .dropna()
+                                            .unique()
+                                            .tolist()
+                                        )
+                                        if section_labels:
+                                            selected_section = st.selectbox(
+                                                "Seleccionar tramo",
+                                                section_labels,
+                                                key="history_best_section_k_section",
+                                            )
+                                            section_df = plot_df[
+                                                plot_df["section_label"] == selected_section
+                                            ]
+                                            if not section_df.empty:
+                                                try:
+                                                    import altair as alt
+                                                    color_enc = alt.value("#1f77b4")
+                                                    if "type" in section_df.columns:
+                                                        color_enc = alt.Color(
+                                                            "type:N", title="Dataset"
+                                                        )
+                                                    line = (
+                                                        alt.Chart(section_df)
+                                                        .mark_line(point=True)
+                                                        .encode(
+                                                            x=alt.X(
+                                                                "k:Q",
+                                                                axis=alt.Axis(title="K"),
+                                                            ),
+                                                            y=alt.Y(
+                                                                metric_key,
+                                                                axis=alt.Axis(
+                                                                    title=available_metrics[metric_key]
+                                                                ),
+                                                            ),
+                                                            color=color_enc,
+                                                            tooltip=[
+                                                                "k",
+                                                                metric_key,
+                                                                "type",
+                                                            ],
+                                                        )
+                                                    ).interactive()
+                                                    st.altair_chart(line, width="stretch")
+                                                except ImportError:
+                                                    st.warning("Altair no instalado.")
+                                    with tab_data:
+                                        st.dataframe(past_df, width="stretch")
+                            else:
                                 st.dataframe(past_df, width="stretch")
                     elif is_best_section:
                         st.caption("Experimento detectado: Best highway section")
@@ -8860,7 +10429,12 @@ def _render_experiments_tab() -> None:
         st.subheader("Configuracion de Experimento")
         exp_kind = st.radio(
             "Tipo de experimento",
-            ["Features sampler", "Find samples sizes", "Best highway section"],
+            [
+                "Features sampler",
+                "Find samples sizes",
+                "Best highway section",
+                "Best mix Highway section & K",
+            ],
             key="exp_kind_choice",
         )
         if exp_kind == "Find samples sizes":
@@ -8868,6 +10442,9 @@ def _render_experiments_tab() -> None:
             return
         if exp_kind == "Best highway section":
             _render_best_highway_section_experiment()
+            return
+        if exp_kind == "Best mix Highway section & K":
+            _render_best_highway_section_k_experiment()
             return
 
         st.subheader("Features sampler")
