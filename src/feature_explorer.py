@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import os
 from pathlib import Path
+import math
 from typing import List, Optional, Tuple
 
 import pandas as pd
@@ -192,7 +193,7 @@ def render_feature_explorer() -> None:
     # Actually, simpler: if duck_tables exist, prefer them or show them mixed?
     # The user said "features de GNN en duckdb...no csv!", so let's show tables if available.
     
-    options = []
+    options = [{"type": "none", "name": None, "label": "Seleccione una fuente"}]
     for t in duck_tables:
         options.append({"type": "duckdb", "name": t, "label": f"[DB]  {t}"})
     for f in feature_files:
@@ -206,7 +207,12 @@ def render_feature_explorer() -> None:
         options,
         format_func=lambda x: x["label"],
         key="feature_explorer_source",
+        index=0,
     )
+
+    if selected_option["type"] == "none":
+        st.info("Seleccione una fuente para cargar features.")
+        return
 
 
     portico_files = glob.glob(os.path.join(data_dir, "*orticos.csv"))
@@ -276,6 +282,15 @@ def render_feature_explorer() -> None:
             portico_col_name=portico_col_name,
             accident_df=accident_df,
         )
+        default_max_points = 20000 if chart_type == "Dispersion 3D" else 50000
+        max_points = st.number_input(
+            "Max puntos a graficar",
+            min_value=1000,
+            max_value=200000,
+            value=default_max_points,
+            step=1000,
+            key="feature_explorer_max_points",
+        )
 
     required_vars = (
         selected_variables
@@ -297,7 +312,16 @@ def render_feature_explorer() -> None:
         st.warning("No hay datos para los filtros seleccionados.")
         return
 
-    df_to_plot = filtered_df.copy()
+    df_to_plot = filtered_df
+    if len(filtered_df) > max_points:
+        stride = max(1, int(math.ceil(len(filtered_df) / max_points)))
+        df_to_plot = filtered_df.iloc[::stride].copy()
+        st.caption(
+            f"Se muestrean {len(df_to_plot):,} de {len(filtered_df):,} filas "
+            f"(stride={stride})."
+        )
+    else:
+        df_to_plot = filtered_df.copy()
     vars_to_normalize = (
         selected_variables
         if chart_type != "Dispersion 3D"
