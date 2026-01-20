@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import traceback
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,7 @@ if str(ROOT_DIR) not in sys.path:
 AUTO_BATCH_RANGE_DAYS = 14
 AUTO_BATCH_ROW_THRESHOLD = 2_000_000
 DATA_DIR = ROOT_DIR / "Datos"
+FORCE_SNAPSHOT_FEATURES = True
 
 # --- Imports from SRC ---
 # We assume app.py has added the parent dir to sys.path
@@ -38,7 +40,6 @@ from src.utils import (
     DEFAULT_DUCKDB_FILE,
     FLOW_TABLE_NAME,
     _slugify,
-    add_accident_target,
     buscar_columna,
     find_candidate_porticos,
     load_accidentes,
@@ -448,6 +449,210 @@ def _rename_vehicle_type_suffixes(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=rename_map)
 
 
+SNAPSHOT_GROUP_OPTIONS = {
+    "Velocidad base": "speed_stats",
+    "Flujo total + slow pct": "flow_base",
+    "Flow por categoria": "flow_cat",
+    "Mix por categoria": "mix_cat",
+    "Carriles": "lane_stats",
+    "Ventanas / Lags / Pendientes": "window_features",
+    "Gradientes espaciales": "spatial_gradients",
+    "Codificacion temporal": "temporal_encodings",
+}
+SNAPSHOT_GROUP_KEYS = list(SNAPSHOT_GROUP_OPTIONS.values())
+SNAPSHOT_SPEED_COLUMNS = [
+    "speed_mean",
+    "speed_std",
+    "speed_var",
+    "speed_median",
+    "speed_min",
+    "speed_max",
+    "speed_q25",
+    "speed_q75",
+    "speed_q10",
+    "speed_q90",
+    "speed_iqr",
+    "speed_harmonic",
+    "speed_entropy",
+]
+SNAPSHOT_FLOW_COLUMNS = ["flow_total", "slow_pct"]
+SNAPSHOT_LANE_COLUMNS = [
+    "lane_speed_mean_std",
+    "lane_flow_std",
+    "lane_count",
+]
+SNAPSHOT_TEMPORAL_COLUMNS = ["tod_sin", "tod_cos", "dow_sin", "dow_cos"]
+SNAPSHOT_WINDOW_SUFFIXES = ("_w_mean", "_w_std", "_lag1", "_lag2", "_slope")
+SNAPSHOT_GRADIENT_SUFFIXES = ("_grad_upstream", "_grad_downstream")
+SNAPSHOT_WINDOW_DEFAULT_COLS = [
+    "speed_mean",
+    "speed_std",
+    "speed_var",
+    "speed_median",
+    "speed_harmonic",
+    "flow_total",
+    "slow_pct",
+]
+SNAPSHOT_WINDOW_COL_OPTIONS = [
+    "speed_mean",
+    "speed_std",
+    "speed_var",
+    "speed_median",
+    "speed_min",
+    "speed_max",
+    "speed_q25",
+    "speed_q75",
+    "speed_q10",
+    "speed_q90",
+    "speed_iqr",
+    "speed_harmonic",
+    "speed_entropy",
+    "flow_total",
+    "slow_pct",
+    "lane_speed_mean_std",
+    "lane_flow_std",
+    "lane_count",
+]
+SNAPSHOT_GRADIENT_DEFAULT_COLS = ["speed_mean", "speed_mean_w_mean"]
+
+
+def _filter_flow_features(
+    df_pm: Optional[pd.DataFrame],
+    gen_params: Dict[str, object],
+) -> Optional[pd.DataFrame]:
+    if df_pm is None or df_pm.empty:
+        return df_pm
+    metrics = gen_params.get("metrics") or []
+    categories = gen_params.get("categories") or []
+    global_metrics = gen_params.get("global_metrics") or []
+    if not metrics and not global_metrics:
+        return df_pm
+
+    metric_map = {
+        "Flow": "flujo",
+        "Flow (veh/h)": "flujo_hph",
+        "Speed (Mean)": "velocidad_media",
+        "Speed (Std)": "velocidad_std",
+        "Speed (Harmonic)": "velocidad_harmonica",
+        "Speed (Median)": "velocidad_mediana",
+        "Speed (Q25)": "velocidad_q25",
+        "Speed (Q75)": "velocidad_q75",
+        "Speed (IQR)": "velocidad_iqr",
+        "Speed (MAD)": "velocidad_mad",
+        "Speed (CV)": "velocidad_cv",
+        "Speed (Skew)": "velocidad_skew",
+        "Speed (Kurtosis)": "velocidad_kurt_exceso",
+        "Speed (Entropy)": "velocidad_entropy",
+        "Robust Flow (Median)": "flujo_mediana_subbins",
+        "Robust Flow (Trimmed)": "flujo_media_recortada",
+        "Robust Flow (Winsor)": "flujo_media_winsor",
+        "Density": "densidad",
+        "Gap Time-Space": "brecha_ts",
+        "Flow Diff (dot_q)": "dot_q",
+        "Smooth Speed": "smooth_v",
+    }
+    cat_number_map = {"Light": 1, "Heavy": 2, "Motorcycles": 3}
+    keep_cols = ["portico", "ts_min"]
+    lanes = gen_params.get("lanes", 3)
+
+    if categories and metrics:
+        selected_prefixes = []
+        for cat_ui in categories:
+            cat_num = cat_number_map.get(cat_ui)
+            if cat_num is None:
+                continue
+            for met_ui, met_db in metric_map.items():
+                if met_ui in metrics:
+                    selected_prefixes.append(met_db)
+                    col_name = f"{met_db}_{cat_num}"
+                    if col_name in df_pm.columns:
+                        if met_ui == "Flow" and lanes > 0:
+                            df_pm[col_name] = df_pm[col_name] / lanes
+                        keep_cols.append(col_name)
+        for met_db in set(selected_prefixes):
+            if not any(col.startswith(f"{met_db}_") for col in keep_cols):
+                keep_cols.extend(
+                    [c for c in df_pm.columns if c.startswith(f"{met_db}_")]
+                )
+
+    global_map = {
+        "Total Flow": "flujo_total",
+        "Total Density": "densidad_total",
+        "Global Harmonic Speed": "v_armonica",
+        "Heavy Prop.": "prop_pesados",
+        "Congestion Index": "indice_congestion",
+        "Mix Entropy": "entropia_mezcla",
+        "Capacity (est)": "q_max_p95",
+        "V/C Ratio": "vc_ratio",
+        "FreeFlow Speed (Night)": "v_freeflow_p95_noche",
+        "Relative FF Speed": "v_rel_ff",
+        "Speed Drop": "v_drop",
+        "Slow Share (30%)": "slowshare_0p30",
+        "Slow Share (50%)": "slowshare_0p50",
+        "Slow Share (70%)": "slowshare_0p70",
+        "FD Envelope": "envolvente_FD",
+        "Critical Density (k_crit)": "k_crit",
+        "Density Ratio (k/k_crit)": "dens_ratio",
+        "FD Residual": "resid_FD",
+        "Capacity Slack": "slack_cap",
+        "Outlier Rate": "outlier_rate",
+        "Missing Rate": "missing_rate",
+    }
+    if global_metrics:
+        for glob_ui, glob_db in global_map.items():
+            if glob_ui in global_metrics and glob_db in df_pm.columns:
+                keep_cols.append(glob_db)
+
+    available_cols = [c for c in keep_cols if c in df_pm.columns]
+    df_pm = df_pm[available_cols].copy()
+    df_pm = _rename_vehicle_type_suffixes(df_pm)
+    return df_pm
+
+
+def _filter_snapshot_features(
+    df_pm: Optional[pd.DataFrame],
+    gen_params: Dict[str, object],
+) -> Optional[pd.DataFrame]:
+    if df_pm is None or df_pm.empty:
+        return df_pm
+
+    selected_groups = gen_params.get("snapshot_groups") or []
+    if not selected_groups:
+        return df_pm
+
+    group_set = set(selected_groups)
+    keep_cols: List[str] = []
+    for base_col in ("portico", "ts_min", "timestamp"):
+        if base_col in df_pm.columns:
+            keep_cols.append(base_col)
+
+    if "speed_stats" in group_set:
+        keep_cols.extend([c for c in SNAPSHOT_SPEED_COLUMNS if c in df_pm.columns])
+    if "flow_base" in group_set:
+        keep_cols.extend([c for c in SNAPSHOT_FLOW_COLUMNS if c in df_pm.columns])
+    if "flow_cat" in group_set:
+        keep_cols.extend([c for c in df_pm.columns if c.startswith("flow_cat_")])
+    if "mix_cat" in group_set:
+        keep_cols.extend([c for c in df_pm.columns if c.startswith("mix_cat_")])
+    if "lane_stats" in group_set:
+        keep_cols.extend([c for c in SNAPSHOT_LANE_COLUMNS if c in df_pm.columns])
+    if "window_features" in group_set:
+        keep_cols.extend(
+            [c for c in df_pm.columns if c.endswith(SNAPSHOT_WINDOW_SUFFIXES)]
+        )
+    if "spatial_gradients" in group_set:
+        keep_cols.extend(
+            [c for c in df_pm.columns if c.endswith(SNAPSHOT_GRADIENT_SUFFIXES)]
+        )
+    if "temporal_encodings" in group_set:
+        keep_cols.extend([c for c in SNAPSHOT_TEMPORAL_COLUMNS if c in df_pm.columns])
+
+    keep_cols = list(dict.fromkeys(keep_cols))
+    if not keep_cols:
+        return df_pm
+    return df_pm.loc[:, keep_cols].copy()
+
+
 def _normalize_column_key(value: object) -> str:
     text = unicodedata.normalize("NFKD", str(value))
     text = text.encode("ascii", "ignore").decode("ascii")
@@ -474,9 +679,9 @@ def _find_match_column(
 
 
 def _find_column_by_keywords(
-    df: pd.DataFrame, keywords: Sequence[str]
+    df: object, keywords: Sequence[str]
 ) -> Optional[str]:
-    if df is None or df.empty:
+    if df is None or _is_empty_frame(df):
         return None
     normalized = {_normalize_column_key(col): col for col in df.columns}
     for key in keywords:
@@ -1610,12 +1815,252 @@ def _persist_feature_selection(
 
 
 def _get_feature_cols(df: pd.DataFrame) -> List[str]:
+    exclude = {
+        "target",
+        "synthetic",
+        "portico",
+        "ts_min",
+        "timestamp",
+        "interval_start",
+        "node_idx",
+        "next_ts_min",
+        "future_label",
+    }
     return [
         col
         for col in df.columns
-        if col not in {"target", "synthetic"}
+        if col not in exclude
         and pd.api.types.is_numeric_dtype(df[col])
     ]
+
+
+def _parse_neighbor_profile(
+    text_value: str,
+    *,
+    default: Optional[List[int]] = None,
+    min_value: int = 1,
+) -> List[int]:
+    if default is None:
+        default = [15, 10]
+    if not text_value:
+        return default
+    parts = re.split(r"[,\s]+", text_value.strip())
+    values = []
+    for part in parts:
+        if not part:
+            continue
+        try:
+            val = int(part)
+        except ValueError:
+            continue
+        if val < min_value:
+            continue
+        values.append(val)
+    return values or default
+
+
+def _edge_attr_dict_from_data(
+    data: HeteroData,
+) -> Dict[Tuple[str, str, str], Optional[torch.Tensor]]:
+    edge_attr_dict: Dict[Tuple[str, str, str], Optional[torch.Tensor]] = {}
+    for edge_type in data.edge_types:
+        store = data[edge_type]
+        edge_attr_dict[edge_type] = (
+            store.edge_attr if hasattr(store, "edge_attr") else None
+        )
+    return edge_attr_dict
+
+
+def _run_gnn_gradient_importance(
+    *,
+    graph_data: HeteroData,
+    feature_names: Sequence[str],
+    device: torch.device,
+    hidden_channels: int,
+    num_heads: int,
+    num_layers: int,
+    dropout: float,
+    lr: float,
+    weight_decay: float,
+    epochs: int,
+    batch_size: int,
+    neighbor_profile: Sequence[int],
+    target_class: int,
+    target_mode: str,
+    attribution_method: str,
+    ig_steps: int,
+    max_train_batches: int,
+    max_attr_batches: int,
+    seed: int,
+) -> pd.DataFrame:
+    from src.gat_model import HeteroGAT
+    from torch_geometric.loader import NeighborLoader
+
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+    data_cpu = graph_data.cpu()
+    if "pm" not in data_cpu.node_types:
+        raise ValueError("El grafo no contiene nodos 'pm'.")
+    if not hasattr(data_cpu["pm"], "y"):
+        raise ValueError("El grafo no contiene etiquetas 'y'.")
+    num_classes = int(torch.unique(data_cpu["pm"].y).numel())
+    if num_classes < 2:
+        raise ValueError(
+            "No hay dos clases en el target para calcular importancia GNN."
+        )
+
+    num_features = int(data_cpu["pm"].x.shape[1])
+    if len(feature_names) != num_features:
+        feature_names = [f"feat_{idx}" for idx in range(num_features)]
+
+    train_mask = (
+        data_cpu["pm"].train_mask
+        if hasattr(data_cpu["pm"], "train_mask")
+        else torch.ones(data_cpu["pm"].num_nodes, dtype=torch.bool)
+    )
+    if train_mask.sum() == 0:
+        raise ValueError("No hay nodos de entrenamiento disponibles.")
+
+    neighbor_profile = list(neighbor_profile)
+    if len(neighbor_profile) < num_layers:
+        neighbor_profile = neighbor_profile + [neighbor_profile[-1]] * (
+            num_layers - len(neighbor_profile)
+        )
+    num_neighbors_dict = {
+        edge_type: neighbor_profile for edge_type in data_cpu.edge_types
+    }
+
+    edge_feature_dim = _infer_edge_feature_dim(graph_data)
+    model = HeteroGAT(
+        in_channels=num_features,
+        hidden_channels=int(hidden_channels),
+        out_channels=num_classes,
+        num_heads=int(num_heads),
+        dropout=float(dropout),
+        edge_feature_dim=int(edge_feature_dim),
+        num_layers=int(num_layers),
+        aggr1="sum",
+        aggr2="sum",
+        use_checkpointing=False,
+    ).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(lr),
+        weight_decay=float(weight_decay),
+    )
+    criterion = torch.nn.CrossEntropyLoss()
+
+    train_loader = NeighborLoader(
+        data_cpu,
+        input_nodes=("pm", train_mask),
+        num_neighbors=num_neighbors_dict,
+        batch_size=int(batch_size),
+        shuffle=True,
+    )
+
+    model.train()
+    for epoch in range(int(epochs)):
+        batch_count = 0
+        for batch in train_loader:
+            batch_count += 1
+            if max_train_batches and batch_count > max_train_batches:
+                break
+            batch = batch.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            edge_attr_dict = _edge_attr_dict_from_data(batch)
+            out_dict, _, _ = model(
+                batch.x_dict, batch.edge_index_dict, edge_attr_dict
+            )
+            logits = out_dict["pm"]
+            batch_size_eff = int(
+                getattr(batch["pm"], "batch_size", logits.size(0))
+            )
+            logits = logits[:batch_size_eff]
+            y_true = batch["pm"].y[:batch_size_eff]
+            loss = criterion(logits, y_true)
+            loss.backward()
+            optimizer.step()
+
+    attr_loader = NeighborLoader(
+        data_cpu,
+        input_nodes=("pm", train_mask),
+        num_neighbors=num_neighbors_dict,
+        batch_size=int(batch_size),
+        shuffle=False,
+    )
+
+    model.eval()
+    importance_sum = torch.zeros(num_features, device=device)
+    total_nodes = 0
+
+    for batch_idx, batch in enumerate(attr_loader, start=1):
+        if max_attr_batches and batch_idx > max_attr_batches:
+            break
+        batch = batch.to(device)
+        edge_attr_dict = _edge_attr_dict_from_data(batch)
+        base_x = batch["pm"].x
+        batch_size_eff = int(
+            getattr(batch["pm"], "batch_size", base_x.size(0))
+        )
+        y_true = batch["pm"].y[:batch_size_eff]
+        if target_mode == "true":
+            target = y_true
+        else:
+            target = torch.full(
+                (batch_size_eff,),
+                int(target_class),
+                dtype=torch.long,
+                device=device,
+            )
+
+        if attribution_method == "ig":
+            baseline = torch.zeros_like(base_x)
+            total_grad = torch.zeros_like(base_x)
+            for step in range(1, int(ig_steps) + 1):
+                alpha = float(step) / float(ig_steps)
+                x_interp = baseline + alpha * (base_x - baseline)
+                x_interp = x_interp.detach().requires_grad_(True)
+                batch["pm"].x = x_interp
+                out_dict, _, _ = model(
+                    batch.x_dict, batch.edge_index_dict, edge_attr_dict
+                )
+                logits = out_dict["pm"][:batch_size_eff]
+                score = logits.gather(1, target.unsqueeze(1)).sum()
+                model.zero_grad(set_to_none=True)
+                if x_interp.grad is not None:
+                    x_interp.grad.zero_()
+                score.backward()
+                total_grad += x_interp.grad.detach()
+            avg_grad = total_grad / float(ig_steps)
+            attr = (base_x - baseline) * avg_grad
+        else:
+            x_req = base_x.detach().requires_grad_(True)
+            batch["pm"].x = x_req
+            out_dict, _, _ = model(
+                batch.x_dict, batch.edge_index_dict, edge_attr_dict
+            )
+            logits = out_dict["pm"][:batch_size_eff]
+            score = logits.gather(1, target.unsqueeze(1)).sum()
+            model.zero_grad(set_to_none=True)
+            if x_req.grad is not None:
+                x_req.grad.zero_()
+            score.backward()
+            attr = x_req.grad * x_req
+
+        attr = attr[:batch_size_eff]
+        importance_sum += attr.abs().sum(dim=0)
+        total_nodes += batch_size_eff
+
+    if total_nodes == 0:
+        raise ValueError("No se pudieron calcular atribuciones.")
+
+    importance = (importance_sum / float(total_nodes)).detach().cpu().numpy()
+    importance_df = pd.DataFrame(
+        {"variable": list(feature_names), "importance": importance}
+    ).sort_values("importance", ascending=False)
+    return importance_df.reset_index(drop=True)
 
 
 def _get_cluster_cols(df: pd.DataFrame) -> List[str]:
@@ -1641,6 +2086,210 @@ def _get_cluster_cols(df: pd.DataFrame) -> List[str]:
             valid_cols.append(col)
             continue
     return valid_cols
+
+
+def _is_snapshot_features(df: Optional[pd.DataFrame]) -> bool:
+    if df is None or df.empty:
+        return False
+    if "portico" not in df.columns or "ts_min" not in df.columns:
+        return False
+    columns = set(df.columns)
+    if any(col.startswith("speed_") for col in columns):
+        return True
+    if any(col.endswith(SNAPSHOT_WINDOW_SUFFIXES) for col in columns):
+        return True
+    if any(col.endswith(SNAPSHOT_GRADIENT_SUFFIXES) for col in columns):
+        return True
+    if any(col in columns for col in SNAPSHOT_FLOW_COLUMNS):
+        return True
+    if any(col in columns for col in SNAPSHOT_TEMPORAL_COLUMNS):
+        return True
+    return False
+
+
+def _is_empty_frame(obj: object) -> bool:
+    if obj is None:
+        return True
+    if isinstance(obj, pl.LazyFrame):
+        return obj.collect().is_empty()
+    if isinstance(obj, pl.DataFrame):
+        return obj.is_empty()
+    if isinstance(obj, pl.Series):
+        return obj.is_empty()
+    if isinstance(obj, (pd.DataFrame, pd.Series)):
+        return obj.empty
+    if hasattr(obj, "empty"):
+        return bool(getattr(obj, "empty"))
+    return False
+
+
+def _debug_cluster(enabled: bool, message: str) -> None:
+    if enabled:
+        st.caption(f"[cluster-debug] {message}")
+
+
+def _debug_labels(enabled: bool, message: str) -> None:
+    if enabled:
+        st.caption(f"[label-debug] {message}")
+
+
+def _frame_debug_info(obj: object, name: str) -> str:
+    if obj is None:
+        return f"{name}: None"
+    obj_type = type(obj).__name__
+    shape = None
+    cols = None
+    try:
+        if isinstance(obj, pl.LazyFrame):
+            shape = obj.collect().shape
+            cols = obj.columns
+        elif isinstance(obj, pl.DataFrame):
+            shape = obj.shape
+            cols = obj.columns
+        elif isinstance(obj, pl.Series):
+            shape = (len(obj),)
+        elif isinstance(obj, pd.DataFrame):
+            shape = obj.shape
+            cols = list(obj.columns)
+        elif isinstance(obj, pd.Series):
+            shape = obj.shape
+        else:
+            shape = getattr(obj, "shape", None)
+            cols = getattr(obj, "columns", None)
+    except Exception as exc:
+        return f"{name}: type={obj_type} (shape/cols error: {exc})"
+    cols_text = ""
+    if cols is not None:
+        cols_list = list(cols)
+        preview = ", ".join(str(c) for c in cols_list[:6])
+        suffix = f", ... (+{len(cols_list) - 6})" if len(cols_list) > 6 else ""
+        cols_text = f", cols=[{preview}{suffix}]"
+    return f"{name}: type={obj_type}, shape={shape}{cols_text}"
+
+
+def _merge_on_portico_ts(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    *,
+    debug: bool = False,
+    label: str = "merge",
+    dt_minutes: Optional[int] = None,
+) -> pd.DataFrame:
+    work_left = left.copy()
+    work_right = right.copy()
+    if dt_minutes is not None:
+        dt_minutes = int(dt_minutes)
+    if "ts_min" in work_left.columns:
+        work_left["ts_min"] = pd.to_numeric(
+            work_left["ts_min"], errors="coerce"
+        )
+        if dt_minutes:
+            work_left["ts_min"] = (
+                (work_left["ts_min"] // dt_minutes) * dt_minutes
+            )
+        work_left["ts_min"] = work_left["ts_min"].astype("Int64")
+    if "ts_min" in work_right.columns:
+        work_right["ts_min"] = pd.to_numeric(
+            work_right["ts_min"], errors="coerce"
+        )
+        if dt_minutes:
+            work_right["ts_min"] = (
+                (work_right["ts_min"] // dt_minutes) * dt_minutes
+            )
+        work_right["ts_min"] = work_right["ts_min"].astype("Int64")
+    if "portico" in work_left.columns:
+        work_left["portico"] = _normalize_portico_series(
+            work_left["portico"]
+        )
+    if "portico" in work_right.columns:
+        work_right["portico"] = _normalize_portico_series(
+            work_right["portico"]
+        )
+    work_left["portico_key"] = pd.to_numeric(
+        work_left["portico"], errors="coerce"
+    )
+    work_right["portico_key"] = pd.to_numeric(
+        work_right["portico"], errors="coerce"
+    )
+    use_numeric = (
+        work_left["portico_key"].notna().any()
+        and work_right["portico_key"].notna().any()
+    )
+    if debug:
+        left_range = (
+            (work_left["ts_min"].min(), work_left["ts_min"].max())
+            if "ts_min" in work_left.columns
+            else (None, None)
+        )
+        right_range = (
+            (work_right["ts_min"].min(), work_right["ts_min"].max())
+            if "ts_min" in work_right.columns
+            else (None, None)
+        )
+        _debug_cluster(
+            debug,
+            f"{label}: ts_min left={left_range} right={right_range}",
+        )
+        if use_numeric:
+            left_keys = (
+                work_left[["portico_key", "ts_min"]]
+                .dropna()
+                .drop_duplicates()
+            )
+            right_keys = (
+                work_right[["portico_key", "ts_min"]]
+                .dropna()
+                .drop_duplicates()
+            )
+            match = left_keys.merge(
+                right_keys, on=["portico_key", "ts_min"], how="inner"
+            )
+        else:
+            left_keys = (
+                work_left[["portico", "ts_min"]]
+                .dropna()
+                .drop_duplicates()
+            )
+            right_keys = (
+                work_right[["portico", "ts_min"]]
+                .dropna()
+                .drop_duplicates()
+            )
+            match = left_keys.merge(
+                right_keys, on=["portico", "ts_min"], how="inner"
+            )
+        _debug_cluster(
+            debug,
+            f"{label}: left={len(left_keys)} right={len(right_keys)} match={len(match)}",
+        )
+    right_value_cols = [
+        col
+        for col in work_right.columns
+        if col not in {"portico", "ts_min", "portico_key"}
+    ]
+    if use_numeric:
+        merged = work_left.merge(
+            work_right.drop(columns=["portico"], errors="ignore"),
+            left_on=["portico_key", "ts_min"],
+            right_on=["portico_key", "ts_min"],
+            how="left",
+        )
+    else:
+        merged = work_left.merge(
+            work_right,
+            on=["portico", "ts_min"],
+            how="left",
+        )
+    if right_value_cols and merged[right_value_cols].notna().any().any():
+        return merged.drop(columns=["portico_key"], errors="ignore")
+
+    if use_numeric:
+        merged = work_left.merge(
+            work_right,
+            on=["portico", "ts_min"],
+            how="left",
+        )
+    return merged.drop(columns=["portico_key"], errors="ignore")
 
 
 def _compute_puntos_negros_report(
@@ -1850,6 +2499,61 @@ def _prepare_cluster_features_df(
     return cluster_df
 
 
+def _filter_snapshot_chunk(
+    df: Optional[pd.DataFrame],
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    debug: bool = False,
+) -> Optional[pd.DataFrame]:
+    if df is None or _is_empty_frame(df):
+        return df
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], errors="coerce")
+        mask = (ts >= start_ts) & (ts < end_ts)
+        filtered = df.loc[mask].copy()
+        filtered = filtered.drop(columns=["timestamp"], errors="ignore")
+        _debug_cluster(
+            debug,
+            f"snapshot filter by timestamp: before={len(df)} after={len(filtered)} "
+            f"start={start_ts} end={end_ts}",
+        )
+        return filtered
+    start_min = int(pd.Timestamp(start_ts).value // 60_000_000_000)
+    end_min = int(pd.Timestamp(end_ts).value // 60_000_000_000)
+    if "ts_min" not in df.columns:
+        return df
+    filtered = df.loc[
+        (df["ts_min"] >= start_min) & (df["ts_min"] < end_min)
+    ].copy()
+    _debug_cluster(
+        debug,
+        f"snapshot filter by ts_min: before={len(df)} after={len(filtered)} "
+        f"start_min={start_min} end_min={end_min}",
+    )
+    return filtered
+
+
+def _filter_cluster_chunk(
+    df: Optional[pd.DataFrame],
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> Optional[pd.DataFrame]:
+    if df is None or _is_empty_frame(df):
+        return df
+    if "interval_start" in df.columns:
+        interval = pd.to_datetime(df["interval_start"], errors="coerce")
+        return df.loc[
+            (interval >= start_ts) & (interval < end_ts)
+        ].copy()
+    if "ts_min" in df.columns:
+        start_min = int(pd.Timestamp(start_ts).value // 60_000_000_000)
+        end_min = int(pd.Timestamp(end_ts).value // 60_000_000_000)
+        return df.loc[
+            (df["ts_min"] >= start_min) & (df["ts_min"] < end_min)
+        ].copy()
+    return df
+
+
 def _compute_cluster_features_from_flows(
     flows_df: pd.DataFrame,
     cluster_labels_df: pd.DataFrame,
@@ -1862,14 +2566,18 @@ def _compute_cluster_features_from_flows(
     include_density: bool = False,
     include_delta_speed: bool = False,
     include_delta_density: bool = False,
+    debug: bool = False,
 ) -> pd.DataFrame:
     from src.utils import compute_cluster_features, normalize_plate_series
 
     col_map = _infer_flow_columns(flows_df)
+    _debug_cluster(debug, _frame_debug_info(flows_df, "flows_df"))
+    _debug_cluster(debug, _frame_debug_info(cluster_labels_df, "cluster_labels_df"))
     if col_map is None:
         raise ValueError(
             "No se encontraron columnas de flujo requeridas (fecha/portico/matricula)."
         )
+    _debug_cluster(debug, f"col_map={col_map}")
     labels_df = cluster_labels_df
     if isinstance(flows_df, pl.LazyFrame):
         flows_df = flows_df.collect()
@@ -1889,24 +2597,33 @@ def _compute_cluster_features_from_flows(
                 .drop_nulls()
                 .unique()
             )
+            _debug_cluster(
+                debug,
+                f"plate_series (polars): count={len(plate_series)}",
+            )
             if plate_series.is_empty():
                 return pd.DataFrame()
             if "plate" in labels_df.columns:
                 labels_df = labels_df[
                     labels_df["plate"].isin(plate_series.to_list())
                 ]
-                if labels_df.empty:
+                if _is_empty_frame(labels_df):
                     return pd.DataFrame()
     else:
         plate_series = normalize_plate_series(flows_df[col_map["plate"]])
         plate_series = plate_series.dropna()
-        if plate_series.empty:
+        _debug_cluster(
+            debug,
+            f"plate_series (pandas): count={len(plate_series)}",
+        )
+        if _is_empty_frame(plate_series):
             return pd.DataFrame()
         plate_set = set(plate_series.unique())
         if "plate" in labels_df.columns:
             labels_df = labels_df[labels_df["plate"].isin(plate_set)]
-            if labels_df.empty:
+            if _is_empty_frame(labels_df):
                 return pd.DataFrame()
+    _debug_cluster(debug, _frame_debug_info(labels_df, "labels_df_filtered"))
     return compute_cluster_features(
         flows_df,
         labels_df,
@@ -2046,6 +2763,8 @@ def run_feature_generation_workflow(params):
     flow_source = gen_params.get("flow_source", "Archivo CSV")
     selected_raw_path = gen_params.get("flow_file_path")
     use_batches = gen_params.get("use_batches", False)
+    force_snapshot = bool(gen_params.get("force_snapshot"))
+    debug_cluster = bool(gen_params.get("debug_cluster"))
 
     cluster_features_df = None
     cluster_labels_df = None
@@ -2055,7 +2774,8 @@ def run_feature_generation_workflow(params):
     cluster_compute_failed = False
     cluster_file = gen_params.get("cluster_file")
     cluster_vars = gen_params.get("cluster_vars") or []
-    if gen_params.get("include_cluster") and not cluster_vars:
+    include_cluster = bool(gen_params.get("include_cluster"))
+    if include_cluster and not cluster_vars:
         cluster_vars = [
             "Proporciones por cluster",
             "Flow por tipo de cluster",
@@ -2072,7 +2792,41 @@ def run_feature_generation_workflow(params):
     include_density = "Density por tipo de cluster" in cluster_vars
     include_delta_speed = "Delta.Speed por tipo de cluster" in cluster_vars
     include_delta_density = "Delta.Density por tipo de cluster" in cluster_vars
-    if gen_params.get("include_cluster") and cluster_file:
+    include_delta_density = "Delta.Density por tipo de cluster" in cluster_vars
+
+    feature_mode = gen_params.get("feature_mode")
+    if not feature_mode:
+        feature_groups = gen_params.get("feature_groups") or []
+        if (
+            "Flow 5 min (Basic & Global)" in feature_groups
+            and "Snapshot Features (Window/Slopes)" not in feature_groups
+        ):
+            feature_mode = "Flow 5 min"
+        else:
+            feature_mode = "Snapshot"
+    use_snapshot = feature_mode == "Snapshot"
+    use_flow = feature_mode == "Flow 5 min"
+    force_snapshot = use_snapshot
+    include_cluster = include_cluster and use_flow
+
+    snapshot_groups = gen_params.get("snapshot_groups") or []
+    if use_snapshot and not snapshot_groups:
+        snapshot_groups = list(SNAPSHOT_GROUP_KEYS)
+        gen_params["snapshot_groups"] = snapshot_groups
+    snapshot_group_set = set(snapshot_groups) if use_snapshot else set()
+    include_window_features = "window_features" in snapshot_group_set
+    include_spatial_gradients = "spatial_gradients" in snapshot_group_set
+    include_temporal_encodings = "temporal_encodings" in snapshot_group_set
+    snapshot_window_cols = gen_params.get("snapshot_window_cols") or []
+    if include_window_features and not snapshot_window_cols:
+        snapshot_window_cols = list(SNAPSHOT_WINDOW_DEFAULT_COLS)
+        gen_params["snapshot_window_cols"] = snapshot_window_cols
+    snapshot_grad_cols = gen_params.get("snapshot_grad_cols") or []
+    if include_spatial_gradients and not snapshot_grad_cols:
+        snapshot_grad_cols = list(SNAPSHOT_GRADIENT_DEFAULT_COLS)
+        gen_params["snapshot_grad_cols"] = snapshot_grad_cols
+
+    if include_cluster and cluster_file:
         try:
             cluster_sample = pd.read_csv(cluster_file, nrows=50)
         except Exception as exc:
@@ -2167,6 +2921,12 @@ def run_feature_generation_workflow(params):
                         cluster_labels_df = cluster_labels_df.drop_duplicates(
                             subset=["plate"]
                         )
+                        _debug_cluster(
+                            bool(gen_params.get("debug_cluster")),
+                            _frame_debug_info(
+                                cluster_labels_df, "cluster_labels_df_loaded"
+                            ),
+                        )
                 else:
                     st.warning(
                         "⚠️ No se encontró columna de pórtico/tiempo ni etiquetas de cluster en "
@@ -2251,9 +3011,31 @@ def run_feature_generation_workflow(params):
                 ranges = _build_batch_ranges(start_t, end_t, gen_params.get("batch_mode", "month"))
                 acc_dfs = []
                 dt_m = gen_params.get("dt_minutes", int(DT_MINUTES))
+                snap_config = None
+                builder = None
+                df_p = None
+                overlap_minutes = 0
+                if force_snapshot:
+                    snap_config = SnapshotConfig()
+                    if gen_params:
+                        snap_config.dt_minutes = gen_params.get(
+                            "dt_minutes", snap_config.dt_minutes
+                        )
+                        snap_config.window_minutes = gen_params.get(
+                            "window_minutes", snap_config.window_minutes
+                        )
+                        snap_config.slow_speed_kmh = gen_params.get(
+                            "slow_speed_kmh", snap_config.slow_speed_kmh
+                        )
+                    builder = SnapshotFeatureBuilder(snap_config)
+                    overlap_steps = max(snap_config.window_steps, 2)
+                    overlap_minutes = int(overlap_steps * snap_config.dt_minutes)
+                    df_p = st.session_state.get("df_port")
+                    if df_p is None:
+                        df_p = load_porticos()
                 cluster_frames = []
                 cluster_failed = False
-                desired_cols = ["FECHA", "VELOCIDAD", "CATEGORIA", "PORTICO"]
+                desired_cols = ["FECHA", "VELOCIDAD", "CATEGORIA", "CARRIL", "PORTICO"]
                 if cluster_label_mode:
                     desired_cols.append("MATRICULA")
                 select_clause = "*"
@@ -2265,18 +3047,70 @@ def run_feature_generation_workflow(params):
                 for idx, (r_start, r_end, label) in enumerate(ranges):
                     status.text(f"Procesando lote {idx+1}/{len(ranges)}: {label}")
                     progress.progress(idx / len(ranges))
-                    
+
+                    query_start = r_start
+                    if force_snapshot and overlap_minutes > 0:
+                        query_start = r_start - pd.Timedelta(
+                            minutes=overlap_minutes
+                        )
+                        if query_start < start_t:
+                            query_start = start_t
                     q = (
                         f"SELECT {select_clause} FROM {table_name} "
-                        f"WHERE try_cast(FECHA as TIMESTAMP) >= '{r_start}' "
+                        f"WHERE try_cast(FECHA as TIMESTAMP) >= '{query_start}' "
                         f"AND try_cast(FECHA as TIMESTAMP) < '{r_end}'"
                     )
                     batch_df = con.execute(q).pl() # Polars Fetch
                     
                     if not batch_df.is_empty():
-                        feat_batch = compute_pm_features(batch_df, interactive=False, dt_minutes=dt_m)
-                        if feat_batch is not None and not feat_batch.empty:
-                            feat_batch["portico"] = _normalize_portico_series(feat_batch["portico"])
+                        flow_pd = None
+                        if force_snapshot:
+                            flow_pd = (
+                                batch_df.to_pandas()
+                                if hasattr(batch_df, "to_pandas")
+                                else batch_df
+                            )
+                            if not _is_empty_frame(flow_pd):
+                                snapshot_features, _ = builder.build(
+                                    flow_pd,
+                                    df_p,
+                                    tracked_columns=snapshot_window_cols,
+                                    gradient_columns=snapshot_grad_cols,
+                                    include_window_features=include_window_features,
+                                    include_spatial_gradients=include_spatial_gradients,
+                                    include_temporal_encodings=include_temporal_encodings,
+                                )
+                                feat_batch = flatten_snapshot_features(
+                                    snapshot_features,
+                                    include_timestamp=True,
+                                )
+                                feat_batch = _filter_snapshot_chunk(
+                                    feat_batch,
+                                    r_start,
+                                    r_end,
+                                    debug=debug_cluster,
+                                )
+                                _debug_cluster(
+                                    debug_cluster,
+                                    _frame_debug_info(
+                                        feat_batch, "feat_batch_filtered"
+                                    ),
+                                )
+                            else:
+                                feat_batch = None
+                        else:
+                            feat_batch = compute_pm_features(
+                                batch_df,
+                                interactive=False,
+                                dt_minutes=dt_m,
+                            )
+                        if (
+                            feat_batch is not None
+                            and not _is_empty_frame(feat_batch)
+                        ):
+                            feat_batch["portico"] = _normalize_portico_series(
+                                feat_batch["portico"]
+                            )
                             acc_dfs.append(feat_batch)
                         if (
                             cluster_label_mode
@@ -2284,24 +3118,40 @@ def run_feature_generation_workflow(params):
                             and not cluster_failed
                         ):
                             try:
-                                cluster_batch = _compute_cluster_features_from_flows(
-                                    batch_df,
-                                    cluster_labels_df,
-                                    dt_minutes=dt_m,
-                                    lanes=gen_params.get("lanes", 3),
-                                    include_counts=include_flow,
-                                    include_entropy=include_entropy,
-                                    include_speed=include_speed,
-                                    include_density=include_density,
-                                    include_delta_speed=include_delta_speed,
-                                    include_delta_density=include_delta_density,
+                                cluster_source = (
+                                    flow_pd if force_snapshot else batch_df
                                 )
-                                if cluster_batch is not None and not cluster_batch.empty:
+                                if _is_empty_frame(cluster_source):
+                                    cluster_batch = None
+                                else:
+                                    cluster_batch = _compute_cluster_features_from_flows(
+                                        cluster_source,
+                                        cluster_labels_df,
+                                        dt_minutes=dt_m,
+                                        lanes=gen_params.get("lanes", 3),
+                                        include_counts=include_flow,
+                                        include_entropy=include_entropy,
+                                        include_speed=include_speed,
+                                        include_density=include_density,
+                                        include_delta_speed=include_delta_speed,
+                                        include_delta_density=include_delta_density,
+                                        debug=debug_cluster,
+                                    )
+                                    if force_snapshot and cluster_batch is not None:
+                                        cluster_batch = _filter_cluster_chunk(
+                                            cluster_batch, r_start, r_end
+                                        )
+                                if (
+                                    cluster_batch is not None
+                                    and not _is_empty_frame(cluster_batch)
+                                ):
                                     cluster_frames.append(cluster_batch)
                             except Exception as exc:
                                 st.warning(
                                     f"No se pudieron calcular variables de cluster: {exc}"
                                 )
+                                if debug_cluster:
+                                    st.code(traceback.format_exc(), language="text")
                                 cluster_failed = True
                                 cluster_compute_failed = True
 
@@ -2309,6 +3159,15 @@ def run_feature_generation_workflow(params):
                 
                 if acc_dfs:
                     df_pm = pd.concat(acc_dfs, ignore_index=True)
+                    if (
+                        force_snapshot
+                        and "portico" in df_pm.columns
+                        and "ts_min" in df_pm.columns
+                    ):
+                        df_pm = df_pm.drop_duplicates(
+                            subset=["portico", "ts_min"],
+                            keep="last",
+                        )
                 else:
                     st.warning("No se generaron features en ningún lote.")
                     return None
@@ -2377,6 +3236,7 @@ def run_feature_generation_workflow(params):
                  return None
 
              flow_pd = df_flows.to_pandas() if hasattr(df_flows, "to_pandas") else df_flows
+             dt_m = gen_params.get("dt_minutes", int(DT_MINUTES))
              cluster_source = (
                  df_flows
                  if isinstance(df_flows, (pl.DataFrame, pl.LazyFrame))
@@ -2387,7 +3247,7 @@ def run_feature_generation_workflow(params):
                      cluster_features_df = _compute_cluster_features_from_flows(
                          cluster_source,
                          cluster_labels_df,
-                         dt_minutes=gen_params.get("dt_minutes", int(DT_MINUTES)),
+                         dt_minutes=dt_m,
                          lanes=gen_params.get("lanes", 3),
                          include_counts=include_flow,
                          include_entropy=include_entropy,
@@ -2395,6 +3255,7 @@ def run_feature_generation_workflow(params):
                          include_density=include_density,
                          include_delta_speed=include_delta_speed,
                          include_delta_density=include_delta_density,
+                         debug=debug_cluster,
                      )
                      cluster_portico_col = "portico"
                      cluster_time_col = "interval_start"
@@ -2402,37 +3263,56 @@ def run_feature_generation_workflow(params):
                      st.warning(
                          f"No se pudieron calcular variables de cluster: {exc}"
                      )
+                     if debug_cluster:
+                         st.code(traceback.format_exc(), language="text")
                      cluster_compute_failed = True
-                 if cluster_features_df is not None and cluster_features_df.empty:
+                 if cluster_features_df is not None and _is_empty_frame(cluster_features_df):
                      st.warning(
                          "No se encontraron coincidencias entre clusters y patentes en los flujos."
                      )
                      cluster_features_df = None
                      cluster_compute_failed = True
 
-             # Builder
-             snap_config = SnapshotConfig()
-             if gen_params:
-                snap_config.dt_minutes = gen_params.get("dt_minutes", snap_config.dt_minutes)
-                snap_config.window_minutes = gen_params.get("window_minutes", snap_config.window_minutes)
-                snap_config.slow_speed_kmh = gen_params.get("slow_speed_kmh", snap_config.slow_speed_kmh)
+             if force_snapshot:
+                 snap_config = SnapshotConfig()
+                 if gen_params:
+                    snap_config.dt_minutes = gen_params.get("dt_minutes", snap_config.dt_minutes)
+                    snap_config.window_minutes = gen_params.get("window_minutes", snap_config.window_minutes)
+                    snap_config.slow_speed_kmh = gen_params.get("slow_speed_kmh", snap_config.slow_speed_kmh)
 
-             builder = SnapshotFeatureBuilder(snap_config)
-             # df_port is needed for build? build uses df_port_use which is filtered.
-             # but SnapshotFeatureBuilder really just needs list of porticos for some indexing?
-             # actually build() logic: self.topology_builder.build_static(df_porticos) if no topology passed.
-             # We can pass FULL df_port here if available, or None?
-             df_p = st.session_state.get('df_port')
-             if df_p is None: df_p = load_porticos()
+                 builder = SnapshotFeatureBuilder(snap_config)
+                 df_p = st.session_state.get('df_port')
+                 if df_p is None:
+                     df_p = load_porticos()
 
-             snapshot_features, _ = builder.build(flow_pd, df_p) 
-             df_pm = flatten_snapshot_features(snapshot_features)
+                 snapshot_features, _ = builder.build(
+                     flow_pd,
+                     df_p,
+                     tracked_columns=snapshot_window_cols,
+                     gradient_columns=snapshot_grad_cols,
+                     include_window_features=include_window_features,
+                     include_spatial_gradients=include_spatial_gradients,
+                     include_temporal_encodings=include_temporal_encodings,
+                 )
+                 df_pm = flatten_snapshot_features(snapshot_features)
+             else:
+                 df_pm = compute_pm_features(
+                     df_flows,
+                     interactive=False,
+                     dt_minutes=dt_m,
+                 )
 
         elif source_choice == "Cargar existentes":
             csv_p = params.get("csv_path")
             if csv_p:
                  status.text(f"Cargando {os.path.basename(csv_p)}...")
                  df_pm = pd.read_csv(csv_p)
+                 if force_snapshot and not _is_snapshot_features(df_pm):
+                     st.error(
+                         "Las features cargadas no corresponden a snapshots. "
+                         "Genere nuevamente en modo snapshot."
+                     )
+                     return None
 
         # --- POST PROCESSING (Sorting & Filtering) ---
         if df_pm is not None:
@@ -2453,65 +3333,17 @@ def run_feature_generation_workflow(params):
                     return None
 
             # Filter Columns
-            if gen_params.get("metrics") and gen_params.get("categories"):
+            if force_snapshot and gen_params.get("snapshot_groups"):
+                status.text("Filtrando columnas snapshot seleccionadas...")
+                df_pm = _filter_snapshot_features(df_pm, gen_params)
+            if not force_snapshot and (
+                gen_params.get("metrics") or gen_params.get("global_metrics")
+            ):
                 status.text("Filtrando columnas seleccionadas...")
-                metric_map = {
-                    "Flow": "flujo", "Flow (veh/h)": "flujo_hph",
-                    "Speed (Mean)": "velocidad_media", "Speed (Std)": "velocidad_std",
-                    "Speed (Harmonic)": "velocidad_harmonica", "Speed (Median)": "velocidad_mediana",
-                    "Speed (Q25)": "velocidad_q25", "Speed (Q75)": "velocidad_q75",
-                    "Speed (IQR)": "velocidad_iqr", "Speed (MAD)": "velocidad_mad",
-                    "Speed (CV)": "velocidad_cv", "Speed (Skew)": "velocidad_skew",
-                    "Speed (Kurtosis)": "velocidad_kurt_exceso", "Speed (Entropy)": "velocidad_entropy",
-                    "Robust Flow (Median)": "flujo_mediana_subbins",
-                    "Robust Flow (Trimmed)": "flujo_media_recortada", "Robust Flow (Winsor)": "flujo_media_winsor",
-                    "Density": "densidad", "Gap Time-Space": "brecha_ts",
-                    "Flow Diff (dot_q)": "dot_q", "Smooth Speed": "smooth_v"
-                }
-                # Map UI category names to their numeric codes used by Polars pivot
-                cat_number_map = {"Light": 1, "Heavy": 2, "Motorcycles": 3}
-                keep_cols = ["portico", "ts_min"]
-                lanes = gen_params.get("lanes", 3)
-                
-                for cat_ui in gen_params["categories"]:
-                    cat_num = cat_number_map.get(cat_ui)
-                    if cat_num is None:
-                        continue
-                    for met_ui, met_db in metric_map.items():
-                        if met_ui in gen_params["metrics"]:
-                            # Polars pivot creates {metric}_{category_number} format
-                            col_name = f"{met_db}_{cat_num}"
-                            if col_name in df_pm.columns:
-                                if met_ui == "Flow" and lanes > 0:
-                                    df_pm[col_name] = df_pm[col_name] / lanes
-                                keep_cols.append(col_name)
-                
-                # Global Metrics
-                global_map = {
-                        "Total Flow": "flujo_total", "Total Density": "densidad_total",
-                        "Global Harmonic Speed": "v_armonica", "Heavy Prop.": "prop_pesados",
-                        "Congestion Index": "indice_congestion", "Mix Entropy": "entropia_mezcla",
-                        "Capacity (est)": "q_max_p95", "V/C Ratio": "vc_ratio",
-                        "FreeFlow Speed (Night)": "v_freeflow_p95_noche", "Relative FF Speed": "v_rel_ff",
-                        "Speed Drop": "v_drop", "Slow Share (30%)": "slowshare_0p30",
-                        "Slow Share (50%)": "slowshare_0p50", "Slow Share (70%)": "slowshare_0p70",
-                        "FD Envelope": "envolvente_FD", "Critical Density (k_crit)": "k_crit",
-                        "Density Ratio (k/k_crit)": "dens_ratio", "FD Residual": "resid_FD",
-                        "Capacity Slack": "slack_cap", "Outlier Rate": "outlier_rate",
-                        "Missing Rate": "missing_rate"
-                }
-                if gen_params.get("global_metrics"):
-                    for glob_ui, glob_db in global_map.items():
-                        if glob_ui in gen_params["global_metrics"]:
-                            if glob_db in df_pm.columns:
-                                keep_cols.append(glob_db)
-
-                available_cols = [c for c in keep_cols if c in df_pm.columns]
-                df_pm = df_pm[available_cols].copy()
-                df_pm = _rename_vehicle_type_suffixes(df_pm)
+                df_pm = _filter_flow_features(df_pm, gen_params)
 
             # Cluster Merging
-            if gen_params.get("include_cluster") and gen_params.get("cluster_file"):
+            if include_cluster and gen_params.get("cluster_file"):
                 status.text("Fusionando clusters...")
                 try:
                     dt_m = gen_params.get("dt_minutes", int(DT_MINUTES))
@@ -2617,11 +3449,12 @@ def run_feature_generation_workflow(params):
                                         "⚠️ No se encontraron variables de cluster para unir."
                                     )
                                 else:
-                                    df_pm = pd.merge(
+                                    df_pm = _merge_on_portico_ts(
                                         df_pm,
                                         cluster_ready,
-                                        on=["portico", "ts_min"],
-                                        how="left",
+                                        debug=debug_cluster,
+                                        label="cluster_merge",
+                                        dt_minutes=dt_m,
                                     )
                                     df_pm[cluster_vars] = df_pm[cluster_vars].fillna(0)
                 except Exception as e:
@@ -2867,6 +3700,9 @@ def _render_feature_engineering():
     selected_csv_features = None
     gen_params = {}
     porticos_filter = None
+    if "feat_mode" not in st.session_state:
+        st.session_state["feat_mode"] = "Snapshot"
+    feature_mode_state = st.session_state.get("feat_mode", "Snapshot")
 
     if source in ("Generar nuevas", "Cargar existentes"):
         st.markdown("#### Filtro por tramo")
@@ -3063,6 +3899,10 @@ def _render_feature_engineering():
                     horizontal=True,
                     key="feat_batch_mode",
                 )
+            if feature_mode_state == "Snapshot" and use_batches_effective:
+                st.caption(
+                    "Modo snapshot activo: el batch usa solapamiento para mantener la ventana."
+                )
             if auto_batch and auto_batch_trigger and not use_batches:
                 reason_text = (
                     ", ".join(auto_batch_reason)
@@ -3070,233 +3910,327 @@ def _render_feature_engineering():
                     else "umbral superado"
                 )
                 st.caption(f"Auto-batch activado: {reason_text}.")
-        with c_tog2:
-             include_cluster = st.checkbox("Incluir variables de cluster", value=False, key="feat_include_cluster")
-        cluster_vars = []
-
-        # 2. Basic Params (Col 1: Metrics/Cats, Col 2: Normalization/Clusters)
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Metric Options
-            metric_options = {
-                "Flow": "flujo",
-                "Flow (veh/h)": "flujo_hph",
-                "Speed (Mean)": "velocidad_media",
-                "Speed (Std)": "velocidad_std",
-                "Speed (Harmonic)": "velocidad_harmonica",
-                "Speed (Median)": "velocidad_mediana",
-                "Speed (Q25)": "velocidad_q25",
-                "Speed (Q75)": "velocidad_q75",
-                "Speed (IQR)": "velocidad_iqr",
-                "Speed (MAD)": "velocidad_mad",
-                "Speed (CV)": "velocidad_cv",
-                "Speed (Skew)": "velocidad_skew",
-                "Speed (Kurtosis)": "velocidad_kurt_exceso",
-                "Speed (Entropy)": "velocidad_entropy",
-                "Robust Flow (Median)": "flujo_mediana_subbins",
-                "Robust Flow (Trimmed)": "flujo_media_recortada",
-                "Robust Flow (Winsor)": "flujo_media_winsor",
-                "Density": "densidad",
-                "Gap Time-Space": "brecha_ts",
-                "Flow Diff (dot_q)": "dot_q",
-                "Smooth Speed": "smooth_v"
-            }
-            metrics_selected = st.multiselect(
-                "Variables por Categoría",
-                list(metric_options.keys()),
-                default=["Flow", "Speed (Mean)", "Density"],
-                key="feat_metrics_v2"
-            )
             
-            # Global / Congestion Options
-            global_options = {
-                "Total Flow": "flujo_total",
-                "Total Density": "densidad_total",
-                "Global Harmonic Speed": "v_armonica",
-                "Heavy Prop.": "prop_pesados",
-                "Congestion Index": "indice_congestion",
-                "Mix Entropy": "entropia_mezcla",
-                "Capacity (est)": "q_max_p95",
-                "V/C Ratio": "vc_ratio",
-                "FreeFlow Speed (Night)": "v_freeflow_p95_noche",
-                "Relative FF Speed": "v_rel_ff",
-                "Speed Drop": "v_drop",
-                "Slow Share (30%)": "slowshare_0p30",
-                "Slow Share (50%)": "slowshare_0p50",
-                "Slow Share (70%)": "slowshare_0p70",
-                "FD Envelope": "envolvente_FD",
-                "Critical Density (k_crit)": "k_crit",
-                "Density Ratio (k/k_crit)": "dens_ratio",
-                "FD Residual": "resid_FD",
-                "Capacity Slack": "slack_cap",
-                "Outlier Rate": "outlier_rate",
-                "Missing Rate": "missing_rate"
-            }
-            global_selected = st.multiselect(
-                "Indicadores Globales (Congestión)",
-                list(global_options.keys()),
-                default=["Congestion Index", "V/C Ratio", "Slow Share (50%)"],
-                key="feat_global_v2"
-            )
-            
-            # Categories
-            cat_options = ["Light", "Heavy", "Motorcycles"]
-            cats_selected = st.multiselect(
-                "Tipos de vehículo",
-                cat_options,
-                default=["Light", "Heavy"],
-                key="feat_cats"
-            )
+            # Common: Granularity
+            dt_min = st.number_input("Granularidad (min)", min_value=1, value=1, key="fp_dt", help="Intervalo de tiempo en minutos para agrupar los datos (e.g., cada 5 min). Aplica a ambos modos.")
 
-        with col2:
-            # Lanes
-            lanes = st.number_input("Carriles (para normalizar Flow)", min_value=1, value=3, step=1, key="feat_lanes")
-            
-            # Cluster File
-            cluster_file = None
-            if include_cluster:
-                # Broader search for cluster files, excluding metadata/summary files
-                all_cluster_csv = glob.glob(os.path.join(RESULTADOS_DIR, "cluster_*.csv"))
-                exclude_keywords = ["summary", "descriptive", "metrics", "quality", "k_optimo", "color_map"]
-                c_files = [
-                    f for f in all_cluster_csv 
-                    if not any(k in os.path.basename(f).lower() for k in exclude_keywords)
-                ]
-                c_files = sorted(c_files, key=os.path.getmtime, reverse=True)
-                
-                if c_files:
-                    cluster_file = st.selectbox("Archivo de etiquetas de cluster", c_files, format_func=os.path.basename, key="feat_cluster_file")
-                else:
-                    st.warning("No se encontraron archivos de cluster (cluster_*.csv)")
+        # --- TABS: SNAPSHOT vs FLOW ---
+        tab_snap, tab_flow = st.tabs(["Snapshot Features", "Flow 5 min"])
 
-                cluster_var_options = [
-                    "Proporciones por cluster",
-                    "Flow por tipo de cluster",
-                    "Entropia de cluster",
-                    "Speed por tipo de cluster",
-                    "Density por tipo de cluster",
-                    "Delta.Speed por tipo de cluster",
-                    "Delta.Density por tipo de cluster",
-                ]
-                default_vars = cluster_var_options
-                existing_vars = st.session_state.get("gnn_cluster_vars")
-                if isinstance(existing_vars, list):
-                    default_vars = [
-                        item for item in existing_vars if item in cluster_var_options
-                    ] or cluster_var_options
-                cluster_vars = st.multiselect(
-                    "Variables de cluster",
-                    options=cluster_var_options,
-                    default=default_vars,
-                    key="gnn_cluster_vars",
+        # --- TAB 1: SNAPSHOT ---
+        with tab_snap:
+            st.caption("Genera variables temporales (ventanas, pendientes, retardos) para GNN/LSTM.")
+            
+            # Snapshot Params
+            c3, c4, c5 = st.columns(3)
+            with c3:
+                seq_len = st.number_input("Largo Secuencia (steps)", min_value=1, value=10, key="fp_seq", help="Cantidad de pasos de tiempo (granularidad) hacia atrás que el modelo usará como input.")
+            with c4:
+                win_min = st.number_input("Ventana Agregación (min)", min_value=1, value=30, key="fp_win", help="Ventana de tiempo para agregar estadísticas (e.g. media móvil).")
+                guard_min = st.number_input("Guard Band (min)", min_value=0, value=0, key="fp_guard", help="Tiempo de separación entre el fin de los datos de input y el inicio del evento objetivo.")
+            with c5:
+                # dt_min is from common
+                slow_v = st.number_input("Velocidad Lenta (km/h)", min_value=0.0, value=30.0, key="fp_slow", help="Umbral de velocidad bajo el cual se considera congestión.")
+                hor_min = st.number_input("Horizonte (min)", min_value=1, value=5, key="fp_hor", help="Tiempo a futuro desde el input para predecir el evento (Target).")
+
+            st.markdown("#### Variables Snapshot")
+            snapshot_group_labels = list(SNAPSHOT_GROUP_OPTIONS.keys())
+            snapshot_default = snapshot_group_labels
+            snapshot_labels = st.multiselect(
+                "Selecciona grupos de features",
+                options=snapshot_group_labels,
+                default=snapshot_default,
+                key="snapshot_groups_select",
+            )
+            snapshot_groups = [
+                SNAPSHOT_GROUP_OPTIONS[label] for label in snapshot_labels
+            ]
+            if not snapshot_groups:
+                st.warning(
+                    "Selecciona al menos un grupo de features. "
+                    "Se usaran todos por defecto."
+                )
+                snapshot_groups = list(SNAPSHOT_GROUP_KEYS)
+
+            snapshot_window_cols: List[str] = []
+            if "window_features" in snapshot_groups:
+                snapshot_window_cols = st.multiselect(
+                    "Variables para ventanas/pendientes",
+                    options=SNAPSHOT_WINDOW_COL_OPTIONS,
+                    default=SNAPSHOT_WINDOW_DEFAULT_COLS,
+                    key="snapshot_window_cols",
+                )
+                if not snapshot_window_cols:
+                    snapshot_window_cols = list(SNAPSHOT_WINDOW_DEFAULT_COLS)
+
+            snapshot_grad_cols: List[str] = []
+            if "spatial_gradients" in snapshot_groups:
+                grad_options = ["speed_mean", "flow_total", "slow_pct"]
+                if "window_features" in snapshot_groups and snapshot_window_cols:
+                    grad_options.extend(
+                        [f"{col}_w_mean" for col in snapshot_window_cols]
+                    )
+                grad_options = list(dict.fromkeys(grad_options))
+                default_grad = [
+                    col for col in SNAPSHOT_GRADIENT_DEFAULT_COLS if col in grad_options
+                ] or grad_options
+                snapshot_grad_cols = st.multiselect(
+                    "Variables para gradientes espaciales",
+                    options=grad_options,
+                    default=default_grad,
+                    key="snapshot_grad_cols",
                 )
 
-        # 3. Time/Window Params (Graph Specific)
-        st.markdown("#### Parámetros Temporales (Snapshot)")
-        c3, c4, c5 = st.columns(3)
-        with c3:
-            dt_min = st.number_input("Granularidad (min)", min_value=1, value=1, key="fp_dt", help="Intervalo de tiempo en minutos para agrupar los datos (e.g., cada 5 min).")
-            seq_len = st.number_input("Largo Secuencia (steps)", min_value=1, value=10, key="fp_seq", help="Cantidad de pasos de tiempo (granularidad) hacia atrás que el modelo usará como input.")
-        with c4:
-            win_min = st.number_input("Ventana Agregación (min)", min_value=1, value=30, key="fp_win", help="Ventana de tiempo para agregar estadísticas (e.g. media móvil).")
-            guard_min = st.number_input("Guard Band (min)", min_value=0, value=0, key="fp_guard", help="Tiempo de separación entre el fin de los datos de input y el inicio del evento objetivo.")
-        with c5:
-            slow_v = st.number_input("Velocidad Lenta (km/h)", min_value=0.0, value=30.0, key="fp_slow", help="Umbral de velocidad bajo el cual se considera congestión.")
-            hor_min = st.number_input("Horizonte (min)", min_value=1, value=5, key="fp_hor", help="Tiempo a futuro desde el input para predecir el evento (Target).")
+            # Guide & Info
+            seq_minutes = int(dt_min) * int(seq_len)
+            label_start = int(guard_min) + int(dt_min)
+            label_end = int(guard_min) + int(dt_min) + int(hor_min)
+            example_input_end_minutes = 10 * 60
+            example_input_start_minutes = example_input_end_minutes - int(dt_min)
+            example_label_start_minutes = example_input_end_minutes + int(guard_min)
+            example_label_end_minutes = example_label_start_minutes + int(hor_min)
+            example_acc_minutes = example_label_start_minutes + min(2, int(hor_min))
 
-        seq_minutes = int(dt_min) * int(seq_len)
-        label_start = int(guard_min) + int(dt_min)
-        label_end = int(guard_min) + int(dt_min) + int(hor_min)
-        example_input_end_minutes = 10 * 60
-        example_input_start_minutes = example_input_end_minutes - int(dt_min)
-        example_label_start_minutes = (
-            example_input_end_minutes + int(guard_min)
-        )
-        example_label_end_minutes = (
-            example_label_start_minutes + int(hor_min)
-        )
-        example_acc_minutes = (
-            example_label_start_minutes + min(2, int(hor_min))
-        )
+            def _fmt_clock(total_minutes: int) -> str:
+                hour = (total_minutes // 60) % 24
+                minute = total_minutes % 60
+                return f"{hour:02d}:{minute:02d}"
 
-        def _fmt_clock(total_minutes: int) -> str:
-            hour = (total_minutes // 60) % 24
-            minute = total_minutes % 60
-            return f"{hour:02d}:{minute:02d}"
+            example_input_start_str = _fmt_clock(example_input_start_minutes)
+            example_input_end_str = _fmt_clock(example_input_end_minutes)
+            example_label_start_str = _fmt_clock(example_label_start_minutes)
+            example_label_end_str = _fmt_clock(example_label_end_minutes)
+            example_acc_str = _fmt_clock(example_acc_minutes)
+            
+            st.markdown(
+                f"""
+            <div style="background-color: #f0f2f6; padding: 15px; border-radius: 5px; font-size: 0.9em;">
+            <strong>Guía de Ajuste de Parámetros Temporales:</strong>
+            <ul style="margin-top: 5px; padding-left: 20px;">
+                <li><b>Granularidad (dt):</b> Define la resolución temporal. <i>Menor valor</i> (e.g. 1 min) captura cambios rápidos pero aumenta el ruido y el cómputo. <i>Mayor valor</i> (e.g. 15 min) suaviza la señal.</li>
+                <li><b>Largo Secuencia:</b> Cuánto "pasado" observa el modelo. Con <i>dt={int(dt_min)}</i> y <i>Largo={int(seq_len)}</i>, el modelo mira {seq_minutes} minutos hacia atrás.</li>
+                <li><b>Ventana Agregación:</b> Suaviza métricas antes de generar features. Con <i>{int(win_min)} min</i> se agrega sobre ese rango temporal.</li>
+                <li><b>Guard Band:</b> Tiempo "ciego" entre el fin de la ventana de input y el inicio de la etiqueta. Con <i>{int(guard_min)} min</i> se excluye ese margen.</li>
+                <li><b>Horizonte:</b> Rango temporal posterior al fin del input donde se busca el accidente. Con <i>{int(hor_min)} min</i> se etiqueta si ocurre un accidente en ese rango.</li>
+                <li><b>Velocidad Lenta:</b> Umbral para definir congestión. Con <i>{float(slow_v):g} km/h</i> se activan features de congestión.</li>
+            </ul>
+            <div style="margin-top: 8px;">
+                <strong>Etiquetado de accidentes:</strong> se etiqueta la ventana previa al accidente. Para cada fila en <i>ts_min</i> (inicio del intervalo),
+                se marca positivo si existe un evento entre <i>ts_min + {label_start} min</i> y <i>ts_min + {label_end} min</i>, donde
+                <i>{int(dt_min)} min</i> corresponde al fin del intervalo y se suma el guard band + horizonte.
+            </div>
+            <div style="margin-top: 6px;">
+                <strong>Ejemplo:</strong> si la fila es <i>{example_input_start_str} → {example_input_end_str}</i>, la ventana positiva es
+                <i>{example_label_start_str}</i> a <i>{example_label_end_str}</i>. Si ocurre un accidente a las <i>{example_acc_str}</i>,
+                entonces esa fila se etiqueta como positiva.
+            </div>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
 
-        example_input_start_str = _fmt_clock(example_input_start_minutes)
-        example_input_end_str = _fmt_clock(example_input_end_minutes)
-        example_label_start_str = _fmt_clock(example_label_start_minutes)
-        example_label_end_str = _fmt_clock(example_label_end_minutes)
-        example_acc_str = _fmt_clock(example_acc_minutes)
-        st.markdown(
-            f"""
-        <div style="background-color: #f0f2f6; padding: 15px; border-radius: 5px; font-size: 0.9em;">
-        <strong>Guía de Ajuste de Parámetros Temporales:</strong>
-        <ul style="margin-top: 5px; padding-left: 20px;">
-            <li><b>Granularidad (dt):</b> Define la resolución temporal. <i>Menor valor</i> (e.g. 1 min) captura cambios rápidos pero aumenta el ruido y el cómputo. <i>Mayor valor</i> (e.g. 15 min) suaviza la señal.</li>
-            <li><b>Largo Secuencia:</b> Cuánto "pasado" observa el modelo. Con <i>dt={int(dt_min)}</i> y <i>Largo={int(seq_len)}</i>, el modelo mira {seq_minutes} minutos hacia atrás.</li>
-            <li><b>Ventana Agregación:</b> Suaviza métricas antes de generar features. Con <i>{int(win_min)} min</i> se agrega sobre ese rango temporal.</li>
-            <li><b>Guard Band:</b> Tiempo "ciego" entre el fin de la ventana de input y el inicio de la etiqueta. Con <i>{int(guard_min)} min</i> se excluye ese margen.</li>
-            <li><b>Horizonte:</b> Rango temporal posterior al fin del input donde se busca el accidente. Con <i>{int(hor_min)} min</i> se etiqueta si ocurre un accidente en ese rango.</li>
-            <li><b>Velocidad Lenta:</b> Umbral para definir congestión. Con <i>{float(slow_v):g} km/h</i> se activan features de congestión.</li>
-        </ul>
-        <div style="margin-top: 8px;">
-            <strong>Etiquetado de accidentes:</strong> se etiqueta la ventana previa al accidente. Para cada fila en <i>ts_min</i> (inicio del intervalo),
-            se marca positivo si existe un evento entre <i>ts_min + {label_start} min</i> y <i>ts_min + {label_end} min</i>, donde
-            <i>{int(dt_min)} min</i> corresponde al fin del intervalo y se suma el guard band + horizonte.
-        </div>
-        <div style="margin-top: 6px;">
-            <strong>Ejemplo:</strong> si la fila es <i>{example_input_start_str} → {example_input_end_str}</i>, la ventana positiva es
-            <i>{example_label_start_str}</i> a <i>{example_label_end_str}</i>. Si ocurre un accidente a las <i>{example_acc_str}</i>,
-            entonces esa fila se etiqueta como positiva.
-        </div>
-        </div>
-        """,
-            unsafe_allow_html=True,
-        )
+            st.markdown("---")
+            if st.button("🚀 Generar Snapshot Features", type="primary", key="btn_run_snapshot"):
+                # Prepare Params for Snapshot
+                snap_params = {
+                    "use_batches": use_batches_effective,
+                    "batch_mode": batch_mode_sel,
+                    "dt_minutes": dt_min,
+                    "window_minutes": win_min,
+                    "slow_speed_kmh": slow_v,
+                    "seq_length": seq_len,
+                    "guard_band_minutes": guard_min,
+                    "horizon_minutes": hor_min,
+                    "flow_source": "Base de Datos (DuckDB)",
+                    "flow_file_path": None,
+                    "start_date": start_d,
+                    "end_date": end_d,
+                    "snapshot_groups": snapshot_groups,
+                    "snapshot_window_cols": snapshot_window_cols,
+                    "snapshot_grad_cols": snapshot_grad_cols,
+                    "feature_mode": "Snapshot",
+                    "force_snapshot": True,
+                    "debug_cluster": False,
+                }
+                if porticos_filter:
+                    snap_params["porticos_filter"] = porticos_filter
+                
+                st.session_state.feature_config = {
+                    "source": source,
+                    "csv_path": None,
+                    "params": snap_params,
+                }
+                result = run_feature_generation_workflow(st.session_state.feature_config)
+                if result is not None:
+                     st.success("Snapshot Features generadas correctamente.")
 
-        # Collect Params
-        gen_params = {
-            "use_batches": use_batches_effective,
-            "batch_mode": batch_mode_sel,
-            "metrics": metrics_selected,
-            "global_metrics": global_selected,
-            "categories": cats_selected,
-            "lanes": lanes,
-            "include_cluster": include_cluster,
-            "cluster_file": cluster_file,
-            "cluster_vars": cluster_vars,
-            "dt_minutes": dt_min,
-            "window_minutes": win_min,
-            "slow_speed_kmh": slow_v,
-            "seq_length": seq_len,
-            "guard_band_minutes": guard_min,
-            "horizon_minutes": hor_min,
-            "flow_source": "Base de Datos (DuckDB)",
-            "flow_file_path": None,
-            "start_date": start_d,
-            "end_date": end_d,
-            "porticos_filter": porticos_filter,
-        }
+        # --- TAB 2: FLOW 5 MIN ---
+        with tab_flow:
+            st.caption("Genera métricas descriptivas, de congestión y clusters.")
+            
+            # Flow Params
+            col1, col2 = st.columns(2)
+            with col1:
+                # Metric Options
+                metric_options = {
+                    "Flow": "flujo",
+                    "Flow (veh/h)": "flujo_hph",
+                    "Speed (Mean)": "velocidad_media",
+                    "Speed (Std)": "velocidad_std",
+                    "Speed (Harmonic)": "velocidad_harmonica",
+                    "Speed (Median)": "velocidad_mediana",
+                    "Speed (Q25)": "velocidad_q25",
+                    "Speed (Q75)": "velocidad_q75",
+                    "Speed (IQR)": "velocidad_iqr",
+                    "Speed (MAD)": "velocidad_mad",
+                    "Speed (CV)": "velocidad_cv",
+                    "Speed (Skew)": "velocidad_skew",
+                    "Speed (Kurtosis)": "velocidad_kurt_exceso",
+                    "Speed (Entropy)": "velocidad_entropy",
+                    "Robust Flow (Median)": "flujo_mediana_subbins",
+                    "Robust Flow (Trimmed)": "flujo_media_recortada",
+                    "Robust Flow (Winsor)": "flujo_media_winsor",
+                    "Density": "densidad",
+                    "Gap Time-Space": "brecha_ts",
+                    "Flow Diff (dot_q)": "dot_q",
+                    "Smooth Speed": "smooth_v"
+                }
+                metrics_selected = st.multiselect(
+                    "Variables por Categoría",
+                    list(metric_options.keys()),
+                    default=["Flow", "Speed (Mean)", "Density"],
+                    key="feat_metrics_v2",
+                )
+                
+                # Global / Congestion Options
+                global_options = {
+                    "Total Flow": "flujo_total",
+                    "Total Density": "densidad_total",
+                    "Global Harmonic Speed": "v_armonica",
+                    "Heavy Prop.": "prop_pesados",
+                    "Congestion Index": "indice_congestion",
+                    "Mix Entropy": "entropia_mezcla",
+                    "Capacity (est)": "q_max_p95",
+                    "V/C Ratio": "vc_ratio",
+                    "FreeFlow Speed (Night)": "v_freeflow_p95_noche",
+                    "Relative FF Speed": "v_rel_ff",
+                    "Speed Drop": "v_drop",
+                    "Slow Share (30%)": "slowshare_0p30",
+                    "Slow Share (50%)": "slowshare_0p50",
+                    "Slow Share (70%)": "slowshare_0p70",
+                    "FD Envelope": "envolvente_FD",
+                    "Critical Density (k_crit)": "k_crit",
+                    "Density Ratio (k/k_crit)": "dens_ratio",
+                    "FD Residual": "resid_FD",
+                    "Capacity Slack": "slack_cap",
+                    "Outlier Rate": "outlier_rate",
+                    "Missing Rate": "missing_rate"
+                }
+                global_selected = st.multiselect(
+                    "Indicadores Globales (Congestión)",
+                    list(global_options.keys()),
+                    default=["Congestion Index", "V/C Ratio", "Slow Share (50%)"],
+                    key="feat_global_v2",
+                )
+                
+                # Categories
+                cat_options = ["Light", "Heavy", "Motorcycles"]
+                cats_selected = st.multiselect(
+                    "Tipos de vehículo",
+                    cat_options,
+                    default=["Light", "Heavy"],
+                    key="feat_cats",
+                )
 
-    # Store Config
-    if porticos_filter:
-        gen_params["porticos_filter"] = porticos_filter
-    st.session_state.feature_config = {
-        "source": source,
-        "csv_path": selected_csv_features,
-        "params": gen_params,
-    }
-    
-    # 4. Action Button
-    st.markdown("---")
-    if source == "Generar nuevas":
-        if st.button("🚀 Generar Features", type="primary", width='stretch'):
-             result = run_feature_generation_workflow(st.session_state.feature_config)
-             if result is not None:
-                 st.success("Features generadas correctamente.")
+            with col2:
+                # Lanes
+                lanes = st.number_input("Carriles (para normalizar Flow)", min_value=1, value=3, step=1, key="feat_lanes")
+                
+                # Cluster Checkbox
+                include_cluster = st.checkbox(
+                     "Incluir variables de cluster",
+                     value=False,
+                     key="feat_include_cluster",
+                )
+                
+                # Cluster File
+                cluster_file = None
+                cluster_vars = []
+                if include_cluster:
+                    # Broader search for cluster files
+                    all_cluster_csv = glob.glob(os.path.join(RESULTADOS_DIR, "cluster_*.csv"))
+                    exclude_keywords = ["summary", "descriptive", "metrics", "quality", "k_optimo", "color_map"]
+                    c_files = [
+                        f for f in all_cluster_csv 
+                        if not any(k in os.path.basename(f).lower() for k in exclude_keywords)
+                    ]
+                    c_files = sorted(c_files, key=os.path.getmtime, reverse=True)
+                    
+                    if c_files:
+                        cluster_file = st.selectbox("Archivo de etiquetas de cluster", c_files, format_func=os.path.basename, key="feat_cluster_file")
+                    else:
+                        st.warning("No se encontraron archivos de cluster (cluster_*.csv)")
+
+                    cluster_var_options = [
+                        "Proporciones por cluster",
+                        "Flow por tipo de cluster",
+                        "Entropia de cluster",
+                        "Speed por tipo de cluster",
+                        "Density por tipo de cluster",
+                        "Delta.Speed por tipo de cluster",
+                        "Delta.Density por tipo de cluster",
+                    ]
+                    default_vars = cluster_var_options
+                    existing_vars = st.session_state.get("gnn_cluster_vars")
+                    if isinstance(existing_vars, list):
+                        default_vars = [
+                            item for item in existing_vars if item in cluster_var_options
+                        ] or cluster_var_options
+                    cluster_vars = st.multiselect(
+                        "Variables de cluster",
+                        options=cluster_var_options,
+                        default=default_vars,
+                        key="gnn_cluster_vars",
+                    )
+                    st.checkbox(
+                        "Debug cluster (mostrar trazas)",
+                        key="gnn_debug_cluster",
+                        help="Muestra información de debug cuando falla el cálculo de clusters.",
+                    )
+
+            st.markdown("---")
+            if st.button("🚀 Generar Flow Features", type="primary", key="btn_run_flow"):
+                 # Prepare Params for Flow
+                 flow_params = {
+                    "use_batches": use_batches_effective,
+                    "batch_mode": batch_mode_sel,
+                    "metrics": metrics_selected,
+                    "global_metrics": global_selected,
+                    "categories": cats_selected,
+                    "lanes": lanes,
+                    "include_cluster": include_cluster,
+                    "cluster_file": cluster_file,
+                    "cluster_vars": cluster_vars,
+                    "dt_minutes": dt_min,
+                    "flow_source": "Base de Datos (DuckDB)",
+                    "flow_file_path": None,
+                    "start_date": start_d,
+                    "end_date": end_d,
+                    "feature_mode": "Flow 5 min",
+                    "force_snapshot": False,
+                    "debug_cluster": st.session_state.get("gnn_debug_cluster", False),
+                 }
+                 if porticos_filter:
+                    flow_params["porticos_filter"] = porticos_filter
+                 
+                 st.session_state.feature_config = {
+                    "source": source,
+                    "csv_path": None,
+                    "params": flow_params,
+                 }
+                 result = run_feature_generation_workflow(st.session_state.feature_config)
+                 if result is not None:
+                      st.success("Flow Features generadas correctamente.")
 
     notice = st.session_state.get("feature_notice")
     if notice:
@@ -3359,11 +4293,114 @@ def _render_feature_selection_tab() -> None:
             accidents_work["ultimo_portico"]
         )
 
-    base_df = add_accident_target(
-        features_work,
-        accidents_work,
-        interval_minutes=dt_min,
-    )
+    params: Dict[str, object] = {}
+    feature_mode = None
+    if isinstance(st.session_state.get("feature_config"), dict):
+        params = st.session_state["feature_config"].get("params", {}) or {}
+        feature_mode = params.get("feature_mode")
+    if not feature_mode:
+        feature_mode = (
+            "Snapshot" if _is_snapshot_features(features_work) else "Flow 5 min"
+        )
+
+    label_debug_lines: List[str] = []
+    label_debug_lines.append(f"feature_mode={feature_mode} dt_min={dt_min}")
+
+    if feature_mode == "Snapshot":
+        accidents_work = accidents_work.copy()
+        if "accidente_time" not in accidents_work.columns:
+            st.warning("No se encontro columna de accidentes para etiquetar.")
+            return
+        accidents_work["ts_min"] = (
+            accidents_work["accidente_time"]
+            .dt.floor(f"{int(dt_min)}min")
+            .astype("int64")
+            // 60_000_000_000
+        )
+        df_acc_sel = accidents_work[["ultimo_portico", "ts_min"]].dropna()
+        df_acc_sel["ultimo_portico"] = _normalize_portico_series(
+            df_acc_sel["ultimo_portico"]
+        )
+        label_debug_lines.append(
+            f"accidents_rows={len(df_acc_sel)} acc_ts_range=({df_acc_sel['ts_min'].min()}, {df_acc_sel['ts_min'].max()})"
+        )
+
+        df_port = st.session_state.get("df_port")
+        if df_port is None:
+            df_port = load_porticos()
+        snapshot_topology = None
+        if isinstance(df_port, pd.DataFrame) and not df_port.empty:
+            try:
+                snapshot_topology = build_static_topology(
+                    df_port,
+                    SnapshotConfig(dt_minutes=int(dt_min)),
+                )
+            except Exception:
+                snapshot_topology = None
+
+        seq_l = params.get("seq_length", SEQ_LENGTH)
+        gb_min = params.get("guard_band_minutes", GUARD_BAND_MINUTES)
+        hor_min = params.get("horizon_minutes", HORIZON_MINUTES)
+        gb_effective = int(gb_min) + int(dt_min)
+        sequence_config = SequenceConfig(
+            sequence_length=int(seq_l),
+            guard_band_minutes=gb_effective,
+            horizon_minutes=int(hor_min),
+            include_downstream=bool(INCLUDE_DOWNSTREAM_IN_LABEL),
+        )
+        _, labels_df = build_sequence_index(
+            features_work,
+            df_acc_sel,
+            snapshot_topology,
+            sequence_config,
+            step_minutes=int(dt_min),
+        )
+        base_df = features_work.copy()
+        base_df["target"] = labels_df["label"].to_numpy(dtype=int)
+        label_debug_lines.append(
+            f"seq_len={sequence_config.sequence_length} guard={sequence_config.guard_band_minutes} horizon={sequence_config.horizon_minutes} downstream={sequence_config.include_downstream}"
+        )
+        label_debug_lines.append(
+            f"labels_pos={int(base_df['target'].sum())} total={len(base_df)}"
+        )
+    else:
+        base_df = features_work.copy()
+        base_df = base_df.drop(columns=["target"], errors="ignore")
+        if (
+            "accidente_time" in accidents_work.columns
+            and not accidents_work.empty
+            and "ts_min" in base_df.columns
+        ):
+            portico_col = buscar_columna(base_df, "portico") or "portico"
+            acc_labels = accidents_work[["ultimo_portico", "accidente_time"]].copy()
+            acc_labels["ts_min"] = (
+                acc_labels["accidente_time"]
+                .dt.floor(f"{int(dt_min)}min")
+                .astype("int64")
+                // 60_000_000_000
+            ) - int(dt_min)
+            acc_labels["ultimo_portico"] = _normalize_portico_series(
+                acc_labels["ultimo_portico"]
+            )
+            acc_pairs = acc_labels[["ultimo_portico", "ts_min"]].dropna()
+            acc_pairs = acc_pairs.drop_duplicates()
+            acc_pairs = acc_pairs.rename(columns={"ultimo_portico": portico_col})
+            base_df[portico_col] = _normalize_portico_series(base_df[portico_col])
+            base_df = base_df.merge(
+                acc_pairs.assign(target=1),
+                on=[portico_col, "ts_min"],
+                how="left",
+            )
+            label_debug_lines.append(
+                f"flow_pairs={len(acc_pairs)} acc_ts_shifted_range=({acc_pairs['ts_min'].min()}, {acc_pairs['ts_min'].max()})"
+            )
+        if "target" in base_df.columns:
+            base_df["target"] = base_df["target"].fillna(0).astype(int)
+        else:
+            base_df["target"] = 0
+        label_debug_lines.append(
+            f"labels_pos={int(base_df['target'].sum())} total={len(base_df)}"
+        )
     if base_df.empty:
         st.warning("No se pudo preparar el dataset base.")
         return
@@ -3397,16 +4434,25 @@ def _render_feature_selection_tab() -> None:
                 st.session_state["feature_selection_store"] = store
         if entry:
             if entry.get("importance_df") is not None:
-                st.session_state["feature_importances_df"] = entry.get(
-                    "importance_df"
+                method = (entry.get("params") or {}).get(
+                    "importance_method", "Importancia de Gini (RF)"
                 )
+                if method == "Gradientes (GNN)":
+                    st.session_state["feature_importances_gnn_df"] = entry.get(
+                        "importance_df"
+                    )
+                else:
+                    st.session_state["feature_importances_rf_df"] = entry.get(
+                        "importance_df"
+                    )
             if entry.get("selected_features") is not None:
                 st.session_state["selected_features"] = entry.get(
                     "selected_features"
                 )
         else:
             st.session_state["selected_features"] = None
-            st.session_state["feature_importances_df"] = None
+            st.session_state["feature_importances_rf_df"] = None
+            st.session_state["feature_importances_gnn_df"] = None
 
     if features_path:
         st.caption(f"Archivo de features: {features_path}")
@@ -3421,89 +4467,327 @@ def _render_feature_selection_tab() -> None:
     st.caption(
         f"Filas: {len(base_df):,} | Variables numericas: {len(feature_cols)}"
     )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        n_estimators = st.number_input(
-            "n_estimators",
-            min_value=50,
-            value=200,
-            step=50,
-            key="fs_n_estimators",
-        )
-    with col2:
-        max_depth = st.number_input(
-            "max_depth (0 = sin limite)",
-            min_value=0,
-            value=0,
-            step=1,
-            key="fs_max_depth",
-        )
-    random_state = st.number_input(
-        "random_state",
-        min_value=0,
-        value=42,
-        step=1,
-        key="fs_random_state",
+    debug_labels = st.checkbox(
+        "Debug etiquetas (mostrar resumen)",
+        value=False,
+        key="fs_debug_labels",
     )
+    if debug_labels:
+        st.code("\n".join(label_debug_lines), language="text")
 
-    if st.button("Calcular importancia"):
-        try:
-            from sklearn.ensemble import RandomForestClassifier
-        except ImportError:
-            st.error(
-                "scikit-learn no esta instalado. Ejecute `pip install scikit-learn`."
+    importance_method = st.radio(
+        "Metodo de importancia",
+        ["Importancia de Gini (RF)", "Gradientes (GNN)"],
+        horizontal=True,
+        key="fs_importance_method",
+    )
+    importance_key = (
+        "feature_importances_rf_df"
+        if importance_method == "Importancia de Gini (RF)"
+        else "feature_importances_gnn_df"
+    )
+    importance_df = st.session_state.get(importance_key)
+
+    fs_params: Dict[str, object] = {"importance_method": importance_method}
+
+    if importance_method == "Importancia de Gini (RF)":
+        col1, col2 = st.columns(2)
+        with col1:
+            n_estimators = st.number_input(
+                "n_estimators",
+                min_value=50,
+                value=200,
+                step=50,
+                key="fs_n_estimators",
             )
-            return
+        with col2:
+            max_depth = st.number_input(
+                "max_depth (0 = sin limite)",
+                min_value=0,
+                value=0,
+                step=1,
+                key="fs_max_depth",
+            )
+        random_state = st.number_input(
+            "random_state",
+            min_value=0,
+            value=42,
+            step=1,
+            key="fs_random_state",
+        )
 
-        progress = st.progress(0)
-        try:
-            X = base_df[feature_cols].fillna(0)
-            progress.progress(10)
-            y = base_df["target"].astype(int)
-            progress.progress(20)
-            if y.nunique() < 2:
-                st.warning(
-                    "No hay dos clases en el target para calcular importancia."
+        if st.button("Calcular importancia (RF)"):
+            try:
+                from sklearn.ensemble import RandomForestClassifier
+            except ImportError:
+                st.error(
+                    "scikit-learn no esta instalado. Ejecute `pip install scikit-learn`."
                 )
                 return
-            with st.spinner("Calculando importancia..."):
-                progress.progress(30)
-                model = RandomForestClassifier(
-                    n_estimators=int(n_estimators),
-                    max_depth=int(max_depth) if max_depth else None,
-                    criterion="gini",
-                    random_state=int(random_state),
-                    class_weight="balanced",
-                    n_jobs=-1,
-                )
-                model.fit(X, y)
-                progress.progress(80)
-            importance_df = pd.DataFrame(
-                {
-                    "variable": feature_cols,
-                    "importance": model.feature_importances_,
-                }
-            ).sort_values("importance", ascending=False)
-            importance_df = importance_df.reset_index(drop=True)
-            progress.progress(95)
-            st.session_state["feature_importances_df"] = importance_df
-            progress.progress(100)
-            st.success("Importancias calculadas.")
-        finally:
-            progress.empty()
 
-    importance_df = st.session_state.get("feature_importances_df")
+            progress = st.progress(0)
+            try:
+                X = base_df[feature_cols].fillna(0)
+                progress.progress(10)
+                y = base_df["target"].astype(int)
+                progress.progress(20)
+                if y.nunique() < 2:
+                    st.warning(
+                        "No hay dos clases en el target para calcular importancia."
+                    )
+                    return
+                with st.spinner("Calculando importancia..."):
+                    progress.progress(30)
+                    model = RandomForestClassifier(
+                        n_estimators=int(n_estimators),
+                        max_depth=int(max_depth) if max_depth else None,
+                        criterion="gini",
+                        random_state=int(random_state),
+                        class_weight="balanced",
+                        n_jobs=-1,
+                    )
+                    model.fit(X, y)
+                    progress.progress(80)
+                importance_df = pd.DataFrame(
+                    {
+                        "variable": feature_cols,
+                        "importance": model.feature_importances_,
+                    }
+                ).sort_values("importance", ascending=False)
+                importance_df = importance_df.reset_index(drop=True)
+                progress.progress(95)
+                st.session_state[importance_key] = importance_df
+                progress.progress(100)
+                st.success("Importancias calculadas.")
+            finally:
+                progress.empty()
+
+        fs_params.update(
+            {
+                "n_estimators": int(n_estimators),
+                "max_depth": int(max_depth) if max_depth else None,
+                "random_state": int(random_state),
+            }
+        )
+    else:
+        graph_obj = st.session_state.get("loaded_graph")
+        graph_data = graph_obj.get("data") if isinstance(graph_obj, dict) else None
+        if not isinstance(graph_data, HeteroData):
+            st.warning(
+                "Cargue un grafo en la pestaña Graph para calcular Gradientes (GNN)."
+            )
+        else:
+            num_graph_features = int(graph_data["pm"].x.shape[1])
+            if len(feature_cols) != num_graph_features:
+                st.warning(
+                    "Las features del grafo no coinciden con las actuales. "
+                    "Se usaran nombres genericos para el ranking."
+                )
+            gnn_has_classes = True
+            y_all = graph_data["pm"].y
+            y_check = y_all
+            if hasattr(graph_data["pm"], "train_mask"):
+                mask = graph_data["pm"].train_mask
+                if mask is not None and mask.numel() == y_all.numel():
+                    y_check = y_all[mask]
+            unique_vals, counts = torch.unique(
+                y_check.detach().cpu(), return_counts=True
+            )
+            if unique_vals.numel() < 2:
+                gnn_has_classes = False
+                st.warning(
+                    "No hay dos clases en el target del grafo. "
+                    f"Distribucion: {dict(zip(unique_vals.tolist(), counts.tolist()))}"
+                )
+            col1, col2 = st.columns(2)
+            with col1:
+                gnn_epochs = st.number_input(
+                    "epochs",
+                    min_value=1,
+                    value=5,
+                    step=1,
+                    key="fs_gnn_epochs",
+                )
+                gnn_hidden = st.number_input(
+                    "hidden_channels",
+                    min_value=4,
+                    value=16,
+                    step=4,
+                    key="fs_gnn_hidden",
+                )
+                gnn_heads = st.number_input(
+                    "num_heads",
+                    min_value=1,
+                    value=2,
+                    step=1,
+                    key="fs_gnn_heads",
+                )
+                gnn_layers = st.number_input(
+                    "num_layers",
+                    min_value=1,
+                    value=2,
+                    step=1,
+                    key="fs_gnn_layers",
+                )
+            with col2:
+                gnn_lr = st.number_input(
+                    "lr",
+                    min_value=1e-5,
+                    value=1e-3,
+                    step=1e-4,
+                    format="%.5f",
+                    key="fs_gnn_lr",
+                )
+                gnn_weight_decay = st.number_input(
+                    "weight_decay",
+                    min_value=0.0,
+                    value=1e-4,
+                    step=1e-5,
+                    format="%.5f",
+                    key="fs_gnn_wd",
+                )
+                gnn_dropout = st.slider(
+                    "dropout",
+                    min_value=0.0,
+                    max_value=0.8,
+                    value=0.2,
+                    step=0.05,
+                    key="fs_gnn_dropout",
+                )
+                gnn_batch_size = st.number_input(
+                    "batch_size",
+                    min_value=64,
+                    value=256,
+                    step=64,
+                    key="fs_gnn_batch",
+                )
+
+            neigh_text = st.text_input(
+                "Vecinos por capa (ej: 15,10)",
+                value="15,10",
+                key="fs_gnn_neighbors",
+            )
+            neighbor_profile = _parse_neighbor_profile(neigh_text)
+
+            attr_method = st.selectbox(
+                "Metodo de atribucion",
+                ["Gradient x Input", "Integrated Gradients"],
+                index=0,
+                key="fs_gnn_attr_method",
+            )
+            ig_steps = 20
+            if attr_method == "Integrated Gradients":
+                ig_steps = st.number_input(
+                    "IG steps",
+                    min_value=5,
+                    value=20,
+                    step=5,
+                    key="fs_gnn_ig_steps",
+                )
+            target_mode = st.selectbox(
+                "Objetivo para gradientes",
+                ["Clase positiva (1)", "Etiqueta real"],
+                index=0,
+                key="fs_gnn_target_mode",
+            )
+            max_train_batches = st.number_input(
+                "Max batches entrenamiento",
+                min_value=1,
+                value=50,
+                step=5,
+                key="fs_gnn_train_batches",
+            )
+            max_attr_batches = st.number_input(
+                "Max batches atribuciones",
+                min_value=1,
+                value=50,
+                step=5,
+                key="fs_gnn_attr_batches",
+            )
+            seed_val = st.number_input(
+                "seed",
+                min_value=0,
+                value=int(SEED),
+                step=1,
+                key="fs_gnn_seed",
+            )
+
+            if st.button("Calcular importancia (GNN)"):
+                if not gnn_has_classes:
+                    st.warning(
+                        "No hay dos clases en el target para calcular importancia GNN."
+                    )
+                    return
+                device = (
+                    torch.device("cuda")
+                    if torch.cuda.is_available()
+                    else torch.device("cpu")
+                )
+                method_code = (
+                    "ig" if attr_method == "Integrated Gradients" else "grad"
+                )
+                target_mode_code = (
+                    "true" if target_mode == "Etiqueta real" else "pos"
+                )
+                try:
+                    with st.spinner(
+                        "Entrenando GNN y calculando gradientes..."
+                    ):
+                        importance_df = _run_gnn_gradient_importance(
+                            graph_data=graph_data,
+                            feature_names=feature_cols,
+                            device=device,
+                            hidden_channels=int(gnn_hidden),
+                            num_heads=int(gnn_heads),
+                            num_layers=int(gnn_layers),
+                            dropout=float(gnn_dropout),
+                            lr=float(gnn_lr),
+                            weight_decay=float(gnn_weight_decay),
+                            epochs=int(gnn_epochs),
+                            batch_size=int(gnn_batch_size),
+                            neighbor_profile=neighbor_profile,
+                            target_class=1,
+                            target_mode=target_mode_code,
+                            attribution_method=method_code,
+                            ig_steps=int(ig_steps),
+                            max_train_batches=int(max_train_batches),
+                            max_attr_batches=int(max_attr_batches),
+                            seed=int(seed_val),
+                        )
+                    st.session_state[importance_key] = importance_df
+                    st.success("Importancias GNN calculadas.")
+                except ValueError as exc:
+                    st.warning(str(exc))
+
+            fs_params.update(
+                {
+                    "epochs": int(gnn_epochs),
+                    "hidden_channels": int(gnn_hidden),
+                    "num_heads": int(gnn_heads),
+                    "num_layers": int(gnn_layers),
+                    "lr": float(gnn_lr),
+                    "weight_decay": float(gnn_weight_decay),
+                    "dropout": float(gnn_dropout),
+                    "batch_size": int(gnn_batch_size),
+                    "neighbor_profile": list(neighbor_profile),
+                    "attribution_method": attr_method,
+                    "ig_steps": int(ig_steps),
+                    "target_mode": target_mode,
+                    "max_train_batches": int(max_train_batches),
+                    "max_attr_batches": int(max_attr_batches),
+                    "seed": int(seed_val),
+                }
+            )
     ordered_vars = feature_cols
     if isinstance(importance_df, pd.DataFrame) and not importance_df.empty:
         importance_df = importance_df[
             importance_df["variable"].isin(feature_cols)
         ].copy()
         if importance_df.empty:
-            st.session_state["feature_importances_df"] = None
+            st.session_state[importance_key] = None
             st.info("Calcule la importancia para ordenar las variables.")
         else:
-            st.session_state["feature_importances_df"] = importance_df
+            st.session_state[importance_key] = importance_df
             st.dataframe(importance_df, width="stretch")
             ordered_vars = importance_df["variable"].tolist()
     else:
@@ -3570,11 +4854,15 @@ def _render_feature_selection_tab() -> None:
     selected = []
     for idx, feature in enumerate(ordered_vars):
         key = re.sub(r"[^a-zA-Z0-9_]+", "_", feature)
-        checked = st.checkbox(
-            feature,
-            value=feature in selected_features,
-            key=f"feature_sel_{idx}_{key}",
-        )
+        checkbox_key = f"feature_sel_{idx}_{key}"
+        if checkbox_key in st.session_state:
+            checked = st.checkbox(feature, key=checkbox_key)
+        else:
+            checked = st.checkbox(
+                feature,
+                value=feature in selected_features,
+                key=checkbox_key,
+            )
         if checked:
             selected.append(feature)
     st.session_state["selected_features"] = selected
@@ -3585,11 +4873,6 @@ def _render_feature_selection_tab() -> None:
     else:
         st.info("No hay variables seleccionadas.")
 
-    fs_params = {
-        "n_estimators": int(n_estimators),
-        "max_depth": int(max_depth) if max_depth else None,
-        "random_state": int(random_state),
-    }
     _persist_feature_selection(
         feature_key=feature_key,
         feature_id=feature_id,
@@ -4797,6 +6080,17 @@ def _render_training_tab() -> None:
                 model = model_obj.get("model")
             else:
                 state_dict = model_obj.get("model_state") or model_obj.get("state_dict")
+                if state_dict is None:
+                    try:
+                        if model_obj and all(
+                            isinstance(k, str) for k in model_obj.keys()
+                        ) and all(
+                            isinstance(v, torch.Tensor)
+                            for v in model_obj.values()
+                        ):
+                            state_dict = model_obj
+                    except Exception:
+                        state_dict = None
         if model is None and state_dict is None:
             st.error("El modelo cargado no es compatible.")
             return
@@ -7176,7 +8470,11 @@ def _render_create_graph():
     with c2: build_spatial = st.checkbox("Espaciales", value=True)
     with c3: build_st_fwd = st.checkbox("Espacio-Temporal (Fwd)", value=False)
     with c4: build_spatial_back = st.checkbox("Espacial (Back)", value=False)
-
+    debug_labels = st.checkbox(
+        "Debug etiquetas (mostrar resumen)",
+        value=False,
+        key="gnn_debug_labels",
+    )
 
     # BUILD BUTTON
     if st.button("Construir Grafo", type="primary"):
@@ -7280,9 +8578,37 @@ def _render_create_graph():
             if df_pm is None or df_pm.empty:
                 st.error("No se pudieron obtener features. Verifique la configuración en 'Feature Engineering'.")
                 return
+            feature_mode = params.get("feature_mode")
+            if not feature_mode:
+                feature_mode = (
+                    "Snapshot"
+                    if _is_snapshot_features(df_pm)
+                    else "Flow 5 min"
+                )
+            use_snapshot_labels = feature_mode == "Snapshot"
+            if debug_labels:
+                _debug_labels(
+                    debug_labels,
+                    f"feature_mode={feature_mode} use_snapshot_labels={use_snapshot_labels}",
+                )
+            if (
+                FORCE_SNAPSHOT_FEATURES
+                and use_snapshot_labels
+                and not _is_snapshot_features(df_pm)
+            ):
+                st.error(
+                    "Las features en memoria no corresponden a snapshots. "
+                    "Genere nuevamente en modo snapshot."
+                )
+                return
 
             # Ensure we have correct sorting/reset index
             df_pm = df_pm.sort_values(["portico", "ts_min"]).reset_index(drop=True)
+            if debug_labels and "ts_min" in df_pm.columns:
+                _debug_labels(
+                    debug_labels,
+                    f"df_pm rows={len(df_pm)} ts_min_range=({df_pm['ts_min'].min()}, {df_pm['ts_min'].max()})",
+                )
             
             # --- 2.3 Filter by Porticos (Tramo) ---
             # Now we filter the Big Feature Set by the selected Porticos
@@ -7326,56 +8652,105 @@ def _render_create_graph():
             if not dt_feat_minutes or dt_feat_minutes <= 0:
                 dt_feat_minutes = _infer_dt_minutes(df_pm, portico_col)
             dt_feat_minutes = int(dt_feat_minutes)
-            
+            if debug_labels:
+                _debug_labels(
+                    debug_labels,
+                    f"dt_feat_minutes={dt_feat_minutes} portico_col={portico_col}",
+                )
+
             # Align Accidents
-            df_acc_use['ts_min'] = (
+            df_acc_use["ts_min"] = (
                 df_acc_use["accidente_time"]
                 .dt.floor(f"{int(dt_feat_minutes)}min")
-                .astype("int64") // 60_000_000_000
+                .astype("int64")
+                // 60_000_000_000
             )
+            if not use_snapshot_labels:
+                df_acc_use["ts_min"] = (
+                    df_acc_use["ts_min"] - int(dt_feat_minutes)
+                )
+            if debug_labels and "ts_min" in df_acc_use.columns:
+                _debug_labels(
+                    debug_labels,
+                    f"accidents_rows={len(df_acc_use)} acc_ts_range=({df_acc_use['ts_min'].min()}, {df_acc_use['ts_min'].max()}) shift_prev_window={not use_snapshot_labels}",
+                )
             # Cast types
             try:
                 if np.issubdtype(df_pm[portico_col].dtype, np.number):
-                     df_acc_use['ultimo_portico'] = pd.to_numeric(df_acc_use['ultimo_portico'], errors='coerce').astype('Int64')
-                     df_pm[portico_col] = pd.to_numeric(df_pm[portico_col], errors='coerce').astype('Int64')
+                    df_acc_use["ultimo_portico"] = pd.to_numeric(
+                        df_acc_use["ultimo_portico"], errors="coerce"
+                    ).astype("Int64")
+                    df_pm[portico_col] = pd.to_numeric(
+                        df_pm[portico_col], errors="coerce"
+                    ).astype("Int64")
                 else:
-                     df_acc_use['ultimo_portico'] = df_acc_use['ultimo_portico'].astype(str)
-                     df_pm[portico_col] = df_pm[portico_col].astype(str)
-            except: pass
+                    df_acc_use["ultimo_portico"] = df_acc_use[
+                        "ultimo_portico"
+                    ].astype(str)
+                    df_pm[portico_col] = df_pm[portico_col].astype(str)
+            except Exception:
+                pass
 
             affected_pms = pd.merge(
                 df_acc_use,
-                df_pm[[portico_col, 'ts_min', 'node_idx']],
-                left_on=['ultimo_portico', 'ts_min'],
-                right_on=[portico_col, 'ts_min'],
-                how='inner'
+                df_pm[[portico_col, "ts_min", "node_idx"]],
+                left_on=["ultimo_portico", "ts_min"],
+                right_on=[portico_col, "ts_min"],
+                how="inner",
             )
-            
-            # Sequence Index
-            seq_l = params.get("seq_length", SEQ_LENGTH)
-            gb_min = params.get("guard_band_minutes", GUARD_BAND_MINUTES)
-            hor_min = params.get("horizon_minutes", HORIZON_MINUTES)
-            gb_effective = int(gb_min) + int(dt_feat_minutes)
-            
-            sequence_config = SequenceConfig(
-                sequence_length=seq_l,
-                guard_band_minutes=gb_effective,
-                horizon_minutes=hor_min,
-                include_downstream=bool(INCLUDE_DOWNSTREAM_IN_LABEL),
-            )
-            seq_index, labels_df = build_sequence_index(
-                df_pm,
-                df_acc_use[['ultimo_portico', 'ts_min']].copy(),
-                snapshot_topology,
-                sequence_config,
-            )
-            labels_df = labels_df.sort_values('row_id')
-            df_pm['future_label'] = labels_df['label'].to_numpy(dtype=int)
-            
-            sequence_mask_np = np.zeros(len(df_pm), dtype=bool)
-            if seq_index.target_rows.size:
-                sequence_mask_np[seq_index.target_rows] = True
-            sequence_mask = torch.from_numpy(sequence_mask_np)
+            if debug_labels:
+                _debug_labels(
+                    debug_labels,
+                    f"affected_pms rows={len(affected_pms)} unique_nodes={affected_pms['node_idx'].nunique() if not affected_pms.empty else 0}",
+                )
+
+            seq_index = None
+            sequence_config = None
+            if use_snapshot_labels:
+                # Sequence Index (snapshot labeling)
+                seq_l = params.get("seq_length", SEQ_LENGTH)
+                gb_min = params.get("guard_band_minutes", GUARD_BAND_MINUTES)
+                hor_min = params.get("horizon_minutes", HORIZON_MINUTES)
+                gb_effective = int(gb_min) + int(dt_feat_minutes)
+
+                sequence_config = SequenceConfig(
+                    sequence_length=seq_l,
+                    guard_band_minutes=gb_effective,
+                    horizon_minutes=hor_min,
+                    include_downstream=bool(INCLUDE_DOWNSTREAM_IN_LABEL),
+                )
+                seq_index, labels_df = build_sequence_index(
+                    df_pm,
+                    df_acc_use[["ultimo_portico", "ts_min"]].copy(),
+                    snapshot_topology,
+                    sequence_config,
+                    step_minutes=dt_feat_minutes,
+                )
+                labels_df = labels_df.sort_values("row_id")
+                df_pm["future_label"] = labels_df["label"].to_numpy(dtype=int)
+
+                sequence_mask_np = np.zeros(len(df_pm), dtype=bool)
+                if seq_index.target_rows.size:
+                    sequence_mask_np[seq_index.target_rows] = True
+                sequence_mask = torch.from_numpy(sequence_mask_np)
+                if debug_labels:
+                    _debug_labels(
+                        debug_labels,
+                        f"snapshot_labels pos={int(df_pm['future_label'].sum())} seq_targets={int(seq_index.target_rows.size)}",
+                    )
+            else:
+                # Flow labeling (5 min previous interval)
+                df_pm["future_label"] = 0
+                if not affected_pms.empty:
+                    df_pm.loc[
+                        affected_pms["node_idx"].unique(), "future_label"
+                    ] = 1
+                sequence_mask = torch.ones(len(df_pm), dtype=torch.bool)
+                if debug_labels:
+                    _debug_labels(
+                        debug_labels,
+                        f"flow_labels pos={int(df_pm['future_label'].sum())} total={len(df_pm)}",
+                    )
 
             # Normalization
             status.text("Normalizando features...")
@@ -7404,10 +8779,19 @@ def _render_create_graph():
                     for feature in selected_features
                     if feature in feature_cols
                 ]
+                ignore_missing = {
+                    "portico",
+                    "ts_min",
+                    "node_idx",
+                    "future_label",
+                    "next_ts_min",
+                    "target",
+                }
                 missing = [
                     feature
                     for feature in selected_features
                     if feature not in feature_cols
+                    and feature not in ignore_missing
                 ]
                 if missing:
                     st.warning(
@@ -7579,6 +8963,15 @@ def _render_create_graph():
                             extras = np.zeros(
                                 (len(delta_s), EXTRA_SPATIAL)
                             )
+                            if EXTRA_SPATIAL > 0:
+                                dist_vals = (
+                                    s_edges["dist_km"].to_numpy(dtype=float)
+                                    if "dist_km" in s_edges.columns
+                                    else np.zeros(len(delta_s))
+                                )
+                                extras[:, 0] = np.nan_to_num(
+                                    dist_vals, nan=0.0
+                                )
                             spatial_attr = np.concatenate(
                                 [delta_s, extras], axis=1
                             )
@@ -7599,7 +8992,10 @@ def _render_create_graph():
                             if build_spatial_back:
                                 spatial_back_src = spatial_dst
                                 spatial_back_dst = spatial_src
-                                spatial_back_attr = -spatial_attr
+                                delta_back = -delta_s
+                                spatial_back_attr = np.concatenate(
+                                    [delta_back, extras], axis=1
+                                )
                                 data[
                                     ("pm", "spatial_back", "pm")
                                 ].edge_index = torch.tensor(
@@ -7647,12 +9043,22 @@ def _render_create_graph():
                                 feat_mat[stfwd_dst]
                                 - feat_mat[stfwd_src]
                             )
+                            extras = np.zeros(
+                                (len(delta_st), EXTRA_SPATIAL)
+                            )
+                            if EXTRA_SPATIAL > 0:
+                                dist_vals = (
+                                    st_edges["dist_km"].to_numpy(dtype=float)
+                                    if "dist_km" in st_edges.columns
+                                    else np.zeros(len(delta_st))
+                                )
+                                extras[:, 0] = np.nan_to_num(
+                                    dist_vals, nan=0.0
+                                )
                             stfwd_attr = np.concatenate(
                                 [
                                     delta_st,
-                                    np.zeros(
-                                        (len(delta_st), EXTRA_SPATIAL)
-                                    ),
+                                    extras,
                                 ],
                                 axis=1,
                             )

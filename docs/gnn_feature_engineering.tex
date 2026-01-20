@@ -1,0 +1,171 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\geometry{a4paper, margin=1in}
+
+\title{Documentación Técnica: Ingeniería de Características GNN}
+\author{Equipo de Desarrollo SUMO}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introducción}
+Este documento detalla el proceso de Ingeniería de Características (\textit{Feature Engineering}) utilizado para transformar los datos brutos de tráfico (registros de pórticos) en tensores de entrada estructurados para el entrenamiento de Redes Neuronales de Grafos (GNN). El objetivo es capturar la dinámica espacio-temporal del flujo vehicular.
+
+\section{Definiciones y Notación}
+Sea $G = (V, E)$ un grafo donde $V$ representa el conjunto de nodos y $E$ el conjunto de aristas.
+\begin{itemize}
+    \item Un \textbf{nodo} $u \in V$ representa un punto de medición (Pórtico) e un instante de tiempo específico. Denotamos un nodo como una tupla $(p, t)$, donde $p$ es el ID del pórtico y $t$ es el índice de la ventana temporal.
+    \item El vector de características del nodo se denota como $\mathbf{x}_u \in \mathbb{R}^F$, donde $F$ es el número de características.
+    \item Los datos crudos se agregan en ventanas de tiempo de duración $\Delta T$ (parámetro \texttt{DT\_MINUTES}, típicamente 5 minutos).
+\end{itemize}
+
+\section{Generación de Snapshots}
+El módulo de \textit{Snapshots} (\texttt{src/snapshot\_pipeline.py}) es el encargado de transformar el flujo continuo de datos en estados discretos enriquecidos con contexto temporal y espacial previo.
+
+\subsection{Agregación Temporal (Discretización)}
+El tiempo se divide en ventanas de tamaño $\Delta T$ (ej. 5 min). Para cada ventana $t$ y pórtico $p$, se calculan las métricas base descritas en la Sección \ref{sec:node_features}. Esto genera un "snapshot" base en el instante $t$.
+
+\subsection{Ventana Deslizante (Rolling Window)}
+Para capturar la tendencia temporal inmediata, se define una ventana de observación de longitud $W$ (parámetro \texttt{window\_minutes}, típicamente 30 min). Sea $S = W/\Delta T$ el número de pasos en la ventana.
+Para cada métrica base $m$ (ej. velocidad media, flujo), se calculan:
+\begin{itemize}
+    \item \textbf{Media Móvil}: $\mu_{m, t} = \frac{1}{S} \sum_{i=0}^{S-1} m_{t-i}$
+    \item \textbf{Desviación Estándar Móvil}: $\sigma_{m, t} = \text{std}(\{m_{t-i}\}_{i=0}^{S-1})$
+    \item \textbf{Lags}: Valores en instantes anteriores específicos, $m_{t-1}$ y $m_{t-2}$.
+    \item \textbf{Pendiente (Slope)}: La tasa de cambio de la métrica $m$ en la ventana, calculada mediante regresión lineal de mínimos cuadrados sobre los puntos $\{t-S+1, \dots, t\}$.
+\end{itemize}
+
+\subsection{Encodings Temporales}
+Para proveer al modelo información sobre la periodicidad del tráfico, se inyectan señales ciclo-estacionarias:
+\begin{itemize}
+    \item \textbf{Hora del día (Time of Day)}:
+    \[ \text{TOD}_{sin} = \sin\left(\frac{2\pi \cdot t_{min}}{1440}\right), \quad \text{TOD}_{cos} = \cos\left(\frac{2\pi \cdot t_{min}}{1440}\right) \]
+    \item \textbf{Día de la semana (Day of Week)}:
+    \[ \text{DOW}_{sin} = \sin\left(\frac{2\pi \cdot d}{7}\right), \quad \text{DOW}_{cos} = \cos\left(\frac{2\pi \cdot d}{7}\right) \]
+\end{itemize}
+
+\section{Características de Nodo Base (Node Features)}
+\label{sec:node_features}
+El cálculo de características base se realiza en \texttt{src/features.py} y se utiliza dentro de cada snapshot. Para cada ventana $t$ y pórtico $p$, se agregan los vehículos individuales $i = 1, \dots, N_{p,t}$ que pasaron por el pórtico.
+
+\subsection{Estadísticos de Velocidad}
+Dada una colección de velocidades $\{v_i\}$ registradas en la ventana:
+
+\begin{enumerate}
+    \item \textbf{Velocidad Media}:
+    \[ \bar{v} = \frac{1}{N} \sum_{i=1}^N v_i \]
+
+    \item \textbf{Desviación Estándar}:
+    \[ \sigma_v = \sqrt{\frac{1}{N-1} \sum_{i=1}^N (v_i - \bar{v})^2} \]
+
+    \item \textbf{Velocidad Armónica ($v_h$)}:
+    Fundamental para la teoría de tráfico, representa mejor la velocidad espacial media.
+    \[ v_h = \frac{N}{\sum_{i=1}^N \frac{1}{\max(v_i, \epsilon)}} \]
+    donde $\epsilon$ es una velocidad mínima (\texttt{HARMONIC\_V\_MIN}) para evitar división por cero.
+
+    \item \textbf{Mediana de Velocidad}:
+    \[ v_{med} = \text{median}(\{v_i\}) \]
+
+    \item \textbf{MAD (Median Absolute Deviation)}:
+    Estimador robusto de la variabilidad.
+    \[ \text{MAD} = \text{median}(|v_i - v_{med}|) \times 1.4826 \]
+    El factor $1.4826$ escala el MAD para ser consistente con la desviación estándar en distribuciones normales.
+
+    \item \textbf{Percentiles e IQR}:
+    \[ v_{25} = P_{25}(\{v_i\}), \quad v_{75} = P_{75}(\{v_i\}) \]
+    \[ \text{IQR} = v_{75} - v_{25} \]
+
+    \item \textbf{Coeficiente de Variación}:
+    \[ CV = \frac{\sigma_v}{\bar{v} + \epsilon} \]
+
+    \item \textbf{Momentos Superiores}:
+    \begin{itemize}
+        \item \textbf{Skewness} (Asimetría): Medida de la asimetría de la distribución de velocidades.
+        \item \textbf{Kurtosis} (Exceso): Medida de las colas de la distribución.
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Variables de Teoría de Tráfico}
+Estas variables relacionan Flujo ($q$), Velocidad ($v$) y Densidad ($k$). Se calculan globalmente y por categoría de vehículo $c \in \{1, 2, 3\}$.
+
+\begin{enumerate}
+    \item \textbf{Flujo ($q_c$)}: Conteo simple de vehículos de categoría $c$.
+    \[ q_{total} = \sum_{c} q_c \]
+
+    \item \textbf{Densidad Estimada ($k_c$)}:
+    Derivada de la ecuación fundamental $q = k \cdot v$.
+    \[ k_c = \frac{q_c}{\bar{v}_c} \]
+    \[ k_{total} = \sum_{c} k_c \]
+
+    \item \textbf{Velocidad Armónica Agregada}:
+    Recalculada a partir de los totales macroscópicos.
+    \[ v_{h, aggressive} = \frac{q_{total}}{k_{total}} \]
+
+    \item \textbf{Índice de Congestión}:
+    \[ IC = \frac{q_{total}}{\sum_c \bar{v}_c} \]
+    \textit{Nota: Esta es una métrica heurística específica del código base.}
+
+    \item \textbf{Ratio Volumen/Capacidad (VC Ratio)}:
+    La capacidad $C_{95}$ se estima dinámicamente como el percentil 95 histórico del flujo total en ese pórtico.
+    \[ \text{VC} = \frac{q_{total}}{C_{95}} \]
+
+    \item \textbf{Proporción de Pesados}:
+    Siendo la categoría 2 representativa de buses/camiones (dependiendo de la configuración):
+    \[ P_{pesados} = \frac{q_{cat=2}}{q_{total}} \]
+\end{enumerate}
+
+\section{Características de Arista (Edge Features)}
+Las aristas en el grafo heterogéneo capturan relaciones dinámicas. El cálculo se realiza en \texttt{src/graph.py}. Sea $u$ el nodo origen y $w$ el nodo destino. Definimos $\Delta \mathbf{x} = \mathbf{x}_w - \mathbf{x}_u$ como la diferencia de los vectores de características normalizados.
+
+\subsection{Aristas Temporales ($E_{temp}$)}
+Conectan el mismo pórtico en instantes consecutivos: $u=(p, t) \to w=(p, t+1)$.
+\begin{itemize}
+    \item \textbf{Features}: Vector de diferencia directa.
+    \[ \mathbf{e}_{uw} = [\mathbf{x}_w - \mathbf{x}_u, \mathbf{0}_{extra}] \]
+    Captura la evolución temporal pura (tendencia).
+\end{itemize}
+
+\subsection{Aristas Espaciales ($E_{spatial}$)}
+Conectan pórticos adyacentes en la autopista en el mismo instante: $u=(p_i, t) \to w=(p_{i+1}, t)$. Sea $d_{km}$ la distancia entre pórticos.
+
+Además de $\Delta \mathbf{x}$, se calculan variables físicas avanzadas basadas en la \textbf{Teoría de Ondas Cinemáticas (Lighthill-Whitham-Richards)}:
+
+\begin{enumerate}
+    \item \textbf{Gradientes Espaciales}:
+    Aproximación de derivadas parciales respecto al espacio.
+    \[ \nabla q = \frac{q_w - q_u}{d_{km}}, \quad \nabla k = \frac{k_w - k_u}{d_{km}}, \quad \nabla v = \frac{v_w - v_u}{d_{km}} \]
+
+    \item \textbf{Velocidad de Onda de Choque ($w_{shock}$)}:
+    Velocidad a la que se propaga una discontinuidad entre dos estados de tráfico.
+    \[ w_{shock} = \frac{\Delta q}{\Delta k} = \frac{q_w - q_u}{k_w - k_u} \]
+
+    \item \textbf{Indicador de Choque (Shock Indicator)}:
+    Identifica condiciones específicas donde la densidad aumenta downstream ($\Delta k > 0$) y el flujo disminuye ($\Delta q < 0$), indicativo de formación de congestión (bottleneck).
+    \[ I_{shock} = \max(0, \Delta k) \cdot \max(0, -\Delta q) \]
+\end{enumerate}
+
+El vector de características de la arista espacial es:
+\[ \mathbf{e}_{spatial} = [\mathbf{x}_w - \mathbf{x}_u, \nabla q, \nabla k, \nabla v, w_{shock}, I_{shock}, d_{km}] \]
+
+\section{Preprocesamiento y Normalización}
+Antes de ingresar al modelo, todas las características de nodo se normalizan usando \textbf{Z-Score Standardization}:
+
+\[ x'_{u,f} = \frac{x_{u,f} - \mu_f}{\sigma_f} \]
+
+\textbf{Importante}:
+\begin{itemize}
+    \item Los estadísticos $\mu_f$ y $\sigma_f$ se calculan utilizando \textbf{únicamente los datos del conjunto de entrenamiento} (definido por \texttt{train\_features\_path} o corte temporal).
+    \item Esto previene la fuga de información (\textit{data leakage}) desde el conjunto de validación o test.
+\end{itemize}
+
+\end{document}

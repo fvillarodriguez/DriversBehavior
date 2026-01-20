@@ -1,0 +1,97 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\geometry{a4paper, margin=1in}
+
+\title{Documentación Técnica: Variables de Flujo y Clustering}
+\author{Equipo de Desarrollo SUMO}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introducción}
+Este documento detalla dos conjuntos de características fundamentales utilizadas en la plataforma:
+\begin{enumerate}
+    \item \textbf{Variables de Flujo (5 min)}: Métricas macroscópicas agregadas por ventana de tiempo y pórtico.
+    \item \textbf{Variables de Clustering}: Métricas de comportamiento individual agregadas por usuario (matrícula) para la segmentación de conductores.
+\end{enumerate}
+
+\section{Variables de Flujo (Flow 5 min)}
+Calculadas en el módulo \texttt{src/features.py}. Estas variables representan el estado del tráfico en un pórtico específico durante una ventana de integración de $\Delta T = 5$ minutos.
+
+\subsection{Estadísticos de Velocidad (Speed Stats)}
+Sea $V = \{v_1, v_2, \dots, v_n\}$ el conjunto de velocidades registradas en la ventana.
+
+\begin{itemize}
+    \item \textbf{Velocidad Media}: $\mu_v = \frac{1}{n}\sum v_i$
+    \item \textbf{Desviación Estándar}: $\sigma_v = \sqrt{\frac{1}{n-1}\sum (v_i - \mu_v)^2}$
+    \item \textbf{Velocidad Mediana}: $v_{med} = \text{median}(V)$
+    \item \textbf{Velocidad Armónica}: $v_{harm} = \frac{n}{\sum \frac{1}{v_i}}$. (Más robusta para promedios espaciales).
+    \item \textbf{MAD (Median Absolute Deviation)}:
+    \[ \text{MAD} = 1.4826 \cdot \text{median}(|v_i - v_{med}|) \]
+    Estimador robusto de la dispersión, menos sensible a outliers que $\sigma_v$.
+    \item \textbf{Percentiles}: $P_{25}, P_{75}$ y Rango Intercuartil ($IQR = P_{75} - P_{25}$).
+    \item \textbf{Forma}:
+        \begin{itemize}
+            \item \textbf{Skewness}: Asimetría de la distribución.
+            \item \textbf{Kurtosis}: Exceso de curtosis (colas pesadas).
+        \end{itemize}
+\end{itemize}
+
+\subsection{Variables Agregadas de Tráfico}
+\begin{itemize}
+    \item \textbf{Flujo Total ($q$)}: Número total de vehículos en la ventana ($n$).
+    \item \textbf{Flujo por Categoría ($q_c$)}: Conteo desagregado por tipo de vehículo.
+    \item \textbf{Densidad Estimada ($k$)}: $k = \frac{q}{\bar{v}}$. (Vehículos por unidad de longitud).
+    \item \textbf{Índice de Congestión}:
+    \[ IC = \frac{q}{\sum \bar{v}_c + \epsilon} \]
+    Métrica heurística que crece con el flujo y decrece con la velocidad.
+    \item \textbf{Proporción de Pesados}: $\frac{q_{camiones}}{q_{total}}$.
+\end{itemize}
+
+\section{Variables de Clustering (Perfil de Conductor)}
+Calculadas en el módulo \texttt{src/clustering.py}. Estas variables caracterizan el comportamiento de conducción de un vehículo específico (identificado por su matrícula anonimizada) a lo largo de un periodo de observación.
+
+\subsection{Variables de Comportamiento}
+
+\subsubsection{1. Velocidad Relativa Promedio}
+Mide qué tan rápido conduce el usuario respecto al flujo general en ese momento.
+Para cada paso $j$ del usuario $u$ en el instante $t$:
+\[ v_{rel, j} = \frac{v_{u,j}}{\bar{v}_{portico, t}} \]
+\[ \text{Avg Relative Speed}_u = \frac{1}{N_u} \sum_{j=1}^{N_u} v_{rel, j} \]
+Si $> 1$, el usuario tiende a ir más rápido que el promedio.
+
+\subsubsection{2. Headway Promedio}
+Tiempo transcurrido desde el paso del vehículo anterior por el mismo carril.
+\[ h_j = t_{j} - t_{j-1} \]
+\[ \text{Avg Headway}_u = \text{mean}(\{h_j \mid h_j \le 60s\}) \]
+Se ignoran headways mayores a 60 segundos (flujo libre sin interacción).
+
+\subsubsection{3. Tasa de Conflicto (TTC Based)}
+Basada en el \textit{Time To Collision} (TTC) con el vehículo precedente.
+\[ TTC_j = \frac{h_j \cdot v_j}{v_j - v_{prev, j}} \quad (\text{si } v_j > v_{prev, j}) \]
+Se define un evento de conflicto si $TTC_j < \text{Umbral}_{portico}$ (donde el umbral varía entre 4.5s y 15s según geometría del pórtico).
+\[ \text{Conflict Rate}_u = \frac{\text{Conteo Conflictos}_u}{N_u} \]
+
+\subsubsection{4. Tasa de Cambio de Pista (Lane Change Rate)}
+Mide la frecuencia con la que el usuario cambia de carril. Se detecta un cambio si el carril en el pórtico $k$ es distinto al del pórtico $k-1$ en el mismo viaje.
+\[ \text{Lane Change Rate}_u = \frac{\text{Total Cambios}_u}{\text{Total Pasos}_u - 1} \]
+
+\subsubsection{5. Preferencia de Carril (Lane Usage)}
+Proporción de uso de cada carril $L \in \{1, 2, 3\}$.
+\[ \text{Lane Prop}_{L, u} = \frac{\text{Conteo Carril } L_u}{N_u} \]
+(Nota: Para K-Means usualmente se omite una categoría para evitar colinealidad perfecta).
+
+\subsection{Agregación Ponderada (Monthly Weighting)}
+Si se activa \texttt{monthly\_weighting}, las variables se calculan primero por mes y luego se promedian ponderando por el número de pasadas mensuales, dando más peso a los periodos de mayor actividad del conductor.
+
+\end{document}

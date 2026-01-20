@@ -302,7 +302,7 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
             st.dataframe(sample_df, width="stretch")
 
     with tabs[4]:
-        render_flow_stats_tab(data_dir=DATA_DIR, db_path=DB_PATH)
+        render_flow_stats_tab(db_path=DB_PATH)
 
 
 if __name__ == "__main__":

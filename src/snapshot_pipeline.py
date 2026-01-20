@@ -445,17 +445,35 @@ class SnapshotFeatureBuilder:
         flujos_df: pd.DataFrame,
         porticos_df: pd.DataFrame,
         tracked_columns: Optional[Iterable[str]] = None,
+        *,
+        gradient_columns: Optional[Sequence[str]] = None,
+        include_window_features: bool = True,
+        include_spatial_gradients: bool = True,
+        include_temporal_encodings: bool = True,
     ) -> Tuple[pd.DataFrame, GraphTopology]:
         """Generate snapshot features and static topology."""
         block_features = discretize_vehicle_flows(flujos_df, self.config)
-        enriched = add_window_features(
-            block_features,
-            self.config,
-            tracked_columns=tracked_columns,
-        )
+        if include_window_features:
+            enriched = add_window_features(
+                block_features,
+                self.config,
+                tracked_columns=tracked_columns,
+            )
+        else:
+            enriched = block_features
         topology = build_static_topology(porticos_df, self.config)
-        with_gradients = add_spatial_gradients(enriched, topology)
-        temporalized = add_temporal_encodings(with_gradients)
+        if include_spatial_gradients:
+            with_gradients = add_spatial_gradients(
+                enriched,
+                topology,
+                columns=gradient_columns,
+            )
+        else:
+            with_gradients = enriched
+        if include_temporal_encodings:
+            temporalized = add_temporal_encodings(with_gradients)
+        else:
+            temporalized = with_gradients
         return temporalized, topology
 
 

@@ -495,6 +495,7 @@ def build_graph() -> Optional[str]:
         df_acc[['ultimo_portico', 'ts_min']].copy(),
         snapshot_topology,
         sequence_config,
+        step_minutes=dt_feat_minutes,
     )
     labels_df = labels_df.sort_values('row_id')
     df_pm['future_label'] = labels_df['label'].to_numpy(dtype=int)

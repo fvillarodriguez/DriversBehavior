@@ -51,6 +51,8 @@ class HeteroGAT(torch.nn.Module):
             conv_dict = {
                 ('pm', 'spatial', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=True, edge_dim=edge_feature_dim),
                 ('pm', 'temporal', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=True, edge_dim=edge_feature_dim),
+                ('pm', 'spatial_back', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=True, edge_dim=edge_feature_dim),
+                ('pm', 'st_fwd', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=True, edge_dim=edge_feature_dim),
             }
             
             self.convs.append(HeteroConv(conv_dict, aggr=aggr1 if i == 0 else aggr2))

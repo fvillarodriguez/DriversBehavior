@@ -62,6 +62,20 @@ from src.anomaly import run_anomaly_pipeline
 sequence_index_global = None
 sequence_config_global = None
 
+
+def _json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    return obj
+
 # --- Helpers: model path discovery with variant tags ---
 def _has_imgagn(loaded_obj) -> bool:
     try:
@@ -1843,6 +1857,7 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
                     'smote_every_n_epochs_used': int(smote_every_override),
                     'num_neighbors_effective': loader_num_neighbors,
                 })
+                meta = _json_safe(meta)
                 # Para la copia única
                 meta_path_unique = os.path.splitext(best_model_path_unique)[0] + "_hparams.json"
                 import json as _json

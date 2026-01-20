@@ -1645,6 +1645,17 @@ def compute_cluster_features(
     """
     Calcula proporciones de clusters por portico e intervalo, y Flow/Speed/Density/Delta.
     """
+    def _is_empty_df(obj: object) -> bool:
+        if obj is None:
+            return True
+        if isinstance(obj, pl.LazyFrame):
+            return obj.collect().is_empty()
+        if isinstance(obj, pl.DataFrame):
+            return obj.is_empty()
+        if hasattr(obj, "empty"):
+            return bool(obj.empty)
+        return False
+
     if isinstance(flows_df, pl.LazyFrame):
         flows_df = flows_df.collect()
     if isinstance(cluster_labels_df, pl.LazyFrame):
@@ -1669,10 +1680,9 @@ def compute_cluster_features(
             cluster_col=cluster_col,
             speed_col=speed_col,
         )
-
-    if flows_df is None or flows_df.empty:
+    if _is_empty_df(flows_df):
         return pd.DataFrame()
-    if cluster_labels_df is None or cluster_labels_df.empty:
+    if _is_empty_df(cluster_labels_df):
         return pd.DataFrame()
     if cluster_col not in cluster_labels_df.columns:
         raise ValueError("El archivo de clusters no contiene 'cluster_label'.")

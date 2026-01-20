@@ -89,6 +89,7 @@ def build_sequence_index(
     config: SequenceConfig,
     portico_col: str = "portico",
     ts_col: str = "ts_min",
+    step_minutes: Optional[int] = None,
 ) -> Tuple[SequenceIndex, pd.DataFrame]:
     """
     Build temporal sequences (length L) and future-risk labels for each snapshot.
@@ -125,6 +126,26 @@ def build_sequence_index(
 
     labels = np.zeros(len(df_work), dtype=np.int8)
 
+    def _iter_contiguous_segments(
+        row_ids: np.ndarray,
+        ts_values: np.ndarray,
+        step: Optional[int],
+    ) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
+        if row_ids.size == 0:
+            return []
+        if step is None:
+            return [(row_ids, ts_values)]
+        diffs = np.diff(ts_values)
+        breaks = np.where(diffs != int(step))[0]
+        segments = []
+        start = 0
+        for brk in breaks:
+            end = brk + 1
+            segments.append((row_ids[start:end], ts_values[start:end]))
+            start = end
+        segments.append((row_ids[start:], ts_values[start:]))
+        return segments
+
     for portico, group in df_work.groupby(portico_col, sort=False):
         row_ids = group["row_id"].to_numpy()
         ts_values = group[ts_col].to_numpy()
@@ -144,13 +165,16 @@ def build_sequence_index(
         )
         labels[row_ids] = group_labels
 
-        if row_ids.size >= config.sequence_length:
-            for idx in range(config.sequence_length - 1, row_ids.size):
-                seq = row_ids[idx - config.sequence_length + 1 : idx + 1]
+        segments = _iter_contiguous_segments(row_ids, ts_values, step_minutes)
+        for seg_rows, seg_ts in segments:
+            if seg_rows.size < config.sequence_length:
+                continue
+            for idx in range(config.sequence_length - 1, seg_rows.size):
+                seq = seg_rows[idx - config.sequence_length + 1 : idx + 1]
                 sequence_rows.append(seq)
-                target_rows.append(row_ids[idx])
+                target_rows.append(seg_rows[idx])
                 porticos_list.append(portico)
-                target_ts_list.append(int(ts_values[idx]))
+                target_ts_list.append(int(seg_ts[idx]))
 
     if sequence_rows:
         sequence_array = np.vstack(sequence_rows).astype(np.int64)
