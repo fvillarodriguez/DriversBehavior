@@ -11,7 +11,8 @@ sumo-docs/
 Datos/
 Resultados/
 simulación/
-GRAPH_OLD/
+Graph_old/
+cache/
 Archivo.zip
 
 # MACOS
