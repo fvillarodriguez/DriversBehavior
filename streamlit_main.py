@@ -9,6 +9,9 @@ import sys
 from pathlib import Path
 from typing import Callable, Dict
 
+# Configurar fallback para MPS (Apple Silicon) antes de importar librerías de ML
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -40,11 +43,18 @@ def _render_home() -> None:
         - **DuckDB:** Admin flows database.
         - **Clustering:** Features, clustering and analysis.
         - **Crash prediction:** Train and evaluate accident prediction models.
+        - **Construcción de grafo:** Construye grafos para modelos GNN usando features de Crash prediction.
         - **Eventos:** Load and visualize accident events on an interactive map.
         - **Files:** Manage and browse data files.
         - **Test:** Testing playground.
         """
     )
+
+
+def _render_graph_builder() -> None:
+    import src.graph_builder_app as graph_builder_app
+
+    graph_builder_app.main(set_page_config=False, show_exit_button=False)
 
 
 def main() -> None:
@@ -64,6 +74,7 @@ def main() -> None:
         "Crash prediction": lambda: cluster_accident_app.main(
             set_page_config=False, show_exit_button=False
         ),
+        "GNN": _render_graph_builder,
         "Experiments Live": lambda: experiments_live_app.main(
             set_page_config=False
         ),
@@ -86,6 +97,14 @@ def main() -> None:
 
     selection = st.sidebar.radio("Secciones", list(pages.keys()))
     pages[selection]()
+
+    import psutil
+    process = psutil.Process(os.getpid())
+    mem_usage = process.memory_info().rss / 1e9  # GB
+    cpu_usage = process.cpu_percent(interval=None) # Non-blocking immediate check
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"**Proceso** | CPU: {cpu_usage:.1f}% | RAM: {mem_usage:.2f} GB")
 
     if st.sidebar.button("Cerrar"):
         os._exit(0)

@@ -103,7 +103,7 @@ def main() -> None:
     )
 
     st.subheader("Vista previa de datos")
-    st.dataframe(df.head(preview_rows), use_container_width=True)
+    st.dataframe(df.head(preview_rows), width='stretch')
 
     st.subheader("Estadisticas descriptivas (todas las variables)")
     try:
@@ -111,7 +111,7 @@ def main() -> None:
     except Exception as exc:  # pragma: no cover - defensive path
         st.error(f"No se pudieron calcular las estadisticas: {exc}")
     else:
-        st.dataframe(desc, use_container_width=True)
+        st.dataframe(desc, width='stretch')
 
     st.subheader("Graficos")
     numeric_cols = df_plot.select_dtypes(include="number").columns.tolist()
@@ -138,13 +138,13 @@ def main() -> None:
         y_col = st.selectbox("Scatter Y", numeric_cols, index=y_index)
 
     hist_fig = px.histogram(df_plot, x=hist_col, nbins=bins)
-    st.plotly_chart(hist_fig, use_container_width=True)
+    st.plotly_chart(hist_fig, width='stretch')
 
     box_fig = px.box(df_plot, y=box_col, points="outliers")
-    st.plotly_chart(box_fig, use_container_width=True)
+    st.plotly_chart(box_fig, width='stretch')
 
     scatter_fig = px.scatter(df_plot, x=x_col, y=y_col, opacity=0.6)
-    st.plotly_chart(scatter_fig, use_container_width=True)
+    st.plotly_chart(scatter_fig, width='stretch')
 
 
 if __name__ == "__main__":

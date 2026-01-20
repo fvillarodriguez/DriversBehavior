@@ -214,3 +214,24 @@ Generated artifacts are written under `Resultados/`, including:
 * Dataset splits are **temporal** to reduce leakage.
 * FAR-constrained threshold selection is performed on validation and then evaluated on test.
 * SMOTE is applied only to training data.
+
+---
+
+## Graph Neural Networks (GNN)
+
+The project now includes a comprehensive module for training and evaluating Graph Neural Networks, integrated into the `Graph Builder` application.
+
+### Key Features
+
+*   **Event Processing**: Load and map crash events to the road network graph.
+*   **Feature Selection**: Select relevant features using Random Forest importance scores.
+*   **Graph Construction**: Build spatiotemporal graphs with configurable edge types (forward, backward, spatial, temporal).
+*   **Network Configuration**: Fast interface to define GNN architectures (GAT, GCN, etc.), hyperparameters (learning rate, dropout), and training settings.
+*   **Hyperparameter Optimization (Optuna)**: Robust support for HPO to find optimal graph architectures and training parameters, with temporal cross-validation.
+*   **Graph Balancing**:
+    *   **GraphSMOTE**: Synthetic node generation to handle class imbalance in graph data.
+    *   **ImGAGN**: Generative adversarial network approach for imbalance.
+*   **Training & Evaluation**: Train models on balanced or original graphs, monitor metrics (F1, AUC, Precision, Recall), and visualize results.
+
+This workflow is fully managed via new tabs in the `Graph Builder` Streamlit app.
+

@@ -97,7 +97,7 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
     col1, col2 = st.columns([1, 4])
     
     with col1:
-        if st.button("🔄 Sync Now", type="primary", use_container_width=True):
+        if st.button("🔄 Sync Now", type="primary", width='stretch'):
             st.session_state["sync_logs"] = [] # Clear previous logs
             
             with col2:

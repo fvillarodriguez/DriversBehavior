@@ -58,6 +58,279 @@ def _init_state() -> None:
     st.session_state.setdefault("porticos_source", None)
     st.session_state.setdefault("highway_geo", None)
 
+    # Configuration Defaults
+    # Colors stored as hex strings, identifying with keys
+    st.session_state.setdefault("cfg_accidents_color", "#C81E00")  # Red-ish
+    st.session_state.setdefault("cfg_accidents_radius", 120)
+    st.session_state.setdefault("cfg_porticos_color", "#0064FF")  # Blue-ish
+    st.session_state.setdefault("cfg_porticos_radius", 80)
+    
+    # Tooltip defaults
+    # Tooltip defaults
+    default_acc_tooltips = ["tipo_evento", "evento_time_str", "Descripcion", "km", "eje", "calzada"]
+    default_port_tooltips = ["portico", "km", "eje", "calzada"]
+    
+    st.session_state.setdefault("cfg_acc_tooltip_cols", default_acc_tooltips)
+    st.session_state.setdefault("cfg_port_tooltip_cols", default_port_tooltips)
+
+
+def _hex_to_rgb(hex_color: str, alpha: int = 200) -> List[int]:
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) == 6:
+        return [int(hex_color[i : i + 2], 16) for i in (0, 2, 4)] + [alpha]
+    return [200, 30, 0, alpha]
+
+    return [200, 30, 0, alpha]
+
+
+def _calculate_tooltip_html(df: pd.DataFrame, columns: List[str]) -> pd.Series:
+    """Builds an HTML tooltip string strictly from the provided columns for each row."""
+    if df.empty or not columns:
+        return pd.Series([""] * len(df), index=df.index)
+    
+    # Start with empty string
+    html_series = pd.Series([""] * len(df), index=df.index)
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+            
+        # Get string values, fillna with empty
+        vals = df[col].astype(str).fillna("")
+        
+        # Build line: "<b>ColName:</b> Value<br>"
+        # We can capitalize the label for better look? Or just use col name.
+        # Let's clean the label slightly (replace _ with space)
+        label = col.replace("_", " ").title()
+        
+        # Vectorized string concat
+        line = "<b>" + label + ":</b> " + vals + "<br>"
+        html_series = html_series + line
+        
+    return html_series
+    layers = []
+    
+    # Calculate initial view state
+    initial_view_state = pdk.ViewState(
+        latitude=-33.45,
+        longitude=-70.66,
+        zoom=10,
+        pitch=0,
+    )
+
+    # 0. Satellite Layer (Bottom-most)
+    if show_satellite:
+        satellite_layer = pdk.Layer(
+            "TileLayer",
+            data="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            min_zoom=0,
+            max_zoom=19,
+            tileSize=256,
+            render_sub_layers=True,
+        )
+        layers.append(satellite_layer)
+
+    # 1. Highway Layer (Background)
+    if highway_geo is not None and not highway_geo.empty:
+        highway_layer = pdk.Layer(
+            "PathLayer",
+            data=highway_geo,
+            get_path="path",
+            get_color="color",
+            width_min_pixels=2,
+            width_scale=1,
+            pickable=True,
+            opacity=0.5,
+        )
+        layers.append(highway_layer)
+
+def _render_map(
+    mapped_events: Optional[pd.DataFrame],
+    heatmap_events: Optional[pd.DataFrame],
+    highway_geo: Optional[pd.DataFrame],
+    porticos_df: Optional[pd.DataFrame] = None,
+    *,
+    show_points: bool = True,
+    show_heatmap: bool = False,
+    show_satellite: bool = False,
+    show_porticos: bool = False,
+) -> None:
+    layers = []
+    
+    # Calculate initial view state
+    initial_view_state = pdk.ViewState(
+        latitude=-33.45,
+        longitude=-70.66,
+        zoom=10,
+        pitch=0,
+    )
+
+    # 0. Satellite Layer (Bottom-most)
+    if show_satellite:
+        satellite_layer = pdk.Layer(
+            "TileLayer",
+            data="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            min_zoom=0,
+            max_zoom=19,
+            tileSize=256,
+            render_sub_layers=True,
+        )
+        layers.append(satellite_layer)
+
+    # 1. Highway Layer (Background)
+    if highway_geo is not None and not highway_geo.empty:
+        # Highway tooltip? Maybe just name
+        if "name" in highway_geo.columns:
+            highway_geo["html_tooltip"] = "<b>Tramo:</b> " + highway_geo["name"].fillna("-")
+        else:
+            highway_geo["html_tooltip"] = ""
+            
+        highway_layer = pdk.Layer(
+            "PathLayer",
+            data=highway_geo,
+            get_path="path",
+            get_color="color",
+            width_min_pixels=2,
+            width_scale=1,
+            pickable=True,
+            opacity=0.5,
+        )
+        layers.append(highway_layer)
+
+    # Config values
+    acc_color_hex = st.session_state.get("cfg_accidents_color", "#C81E00")
+    acc_radius = st.session_state.get("cfg_accidents_radius", 120)
+    acc_cols = st.session_state.get("cfg_acc_tooltip_cols", [])
+    
+    port_color_hex = st.session_state.get("cfg_porticos_color", "#0064FF")
+    port_radius = st.session_state.get("cfg_porticos_radius", 80)
+    port_cols = st.session_state.get("cfg_port_tooltip_cols", [])
+
+    # 2. Porticos Layer (Infrastructure)
+    if show_porticos and porticos_df is not None and not porticos_df.empty:
+        # Ensure we have coordinates
+        if "lat" in porticos_df.columns and "lon" in porticos_df.columns:
+            p_data = porticos_df.dropna(subset=["lat", "lon"]).copy()
+            
+            # Filter by 'aux' column if present
+            if "aux" in p_data.columns:
+                 p_data["aux_numeric"] = (
+                     p_data["aux"]
+                     .astype(str)
+                     .str.replace(",", ".")
+                     .pipe(pd.to_numeric, errors="coerce")
+                     .fillna(0)
+                 )
+                 p_data = p_data[p_data["aux_numeric"] == 0]
+
+            if not p_data.empty:
+                # Build separated HTML tooltip
+                p_data["html_tooltip"] = _calculate_tooltip_html(p_data, port_cols)
+
+                # Assign dynamic color
+                p_rgb = _hex_to_rgb(port_color_hex, 200)
+                p_data["color"] = [p_rgb] * len(p_data)
+                
+                porticos_layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    data=p_data,
+                    get_position=["lon", "lat"],
+                    get_color="color",
+                    get_radius=port_radius,
+                    pickable=True,
+                    auto_highlight=True,
+                    opacity=0.8,
+                    radius_min_pixels=2,
+                    radius_max_pixels=10,
+                )
+                layers.append(porticos_layer)
+
+    # 3. Heatmap Layer (if enabled)
+    if (
+        show_heatmap
+        and heatmap_events is not None
+        and not heatmap_events.empty
+    ):
+        initial_view_state.latitude = heatmap_events["lat"].median()
+        initial_view_state.longitude = heatmap_events["lon"].median()
+        heat_layer = pdk.Layer(
+            "HeatmapLayer",
+            data=heatmap_events,
+            get_position=["lon", "lat"],
+            get_weight=1,
+            radiusPixels=40,
+            intensity=1.0,
+            threshold=0.05,
+        )
+        layers.append(heat_layer)
+
+    # 4. Events Layer (Top)
+    if show_points and mapped_events is not None and not mapped_events.empty:
+        # Check median of events for better centering if available
+        initial_view_state.latitude = mapped_events["lat"].median()
+        initial_view_state.longitude = mapped_events["lon"].median()
+
+        # Assign dynamic color
+        acc_rgb = _hex_to_rgb(acc_color_hex, 160)
+        mapped_events["color"] = [acc_rgb] * len(mapped_events)
+        
+        # Build HTML tooltip
+        mapped_events["html_tooltip"] = _calculate_tooltip_html(mapped_events, acc_cols)
+
+        events_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=mapped_events,
+            get_position=["lon", "lat"],
+            get_color="color",
+            get_radius=acc_radius,
+            pickable=True,
+            auto_highlight=True,
+            opacity=0.9,
+            radius_min_pixels=3,
+            radius_max_pixels=15,
+        )
+        layers.append(events_layer)
+
+    if not layers:
+        st.info("No hay capas para mostrar en el mapa.")
+        return
+
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="mapbox://styles/mapbox/light-v9" if not show_satellite else None,
+            initial_view_state=initial_view_state,
+            layers=layers,
+            tooltip={
+                "html": "{html_tooltip}",
+                "style": {"color": "white"},
+            },
+        )
+    )
+    if show_points and mapped_events is not None:
+         st.caption(f"Eventos mapeados: {len(mapped_events):,}")
+    if show_heatmap and heatmap_events is not None:
+         st.caption(f"Accidentes en mapa de calor: {len(heatmap_events):,}")
+
+
+def _render_events_table(events_df: pd.DataFrame) -> None:
+    detail_candidates = [
+        "evento_time",
+        "tipo_evento",
+        "ultimo_portico",
+        "portico_inicio",
+        "portico_fin",
+        "eje",
+        "calzada",
+        "km",
+        "Descripcion",
+        "SubTipo",
+    ]
+    detail_cols = _select_columns(events_df, detail_candidates)
+    detail_cols = [col for col in detail_cols if col in events_df.columns]
+    if not detail_cols:
+        st.info("No hay columnas para mostrar en detalle.")
+        return
+    st.dataframe(events_df[detail_cols].head(500), width="stretch")
 
 def _normalize_key(value: object) -> str:
     text = str(value).strip().lower()
@@ -798,177 +1071,7 @@ def _get_mapped_events_df(
     return mapped, None
 
 
-def _render_map(
-    mapped_events: Optional[pd.DataFrame],
-    heatmap_events: Optional[pd.DataFrame],
-    highway_geo: Optional[pd.DataFrame],
-    porticos_df: Optional[pd.DataFrame] = None,
-    *,
-    show_points: bool = True,
-    show_heatmap: bool = False,
-    show_satellite: bool = False,
-) -> None:
-    layers = []
-    
-    # Calculate initial view state
-    initial_view_state = pdk.ViewState(
-        latitude=-33.45,
-        longitude=-70.66,
-        zoom=10,
-        pitch=0,
-    )
 
-    # 0. Satellite Layer (Bottom-most)
-    if show_satellite:
-        satellite_layer = pdk.Layer(
-            "TileLayer",
-            data="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-            min_zoom=0,
-            max_zoom=19,
-            tileSize=256,
-            render_sub_layers=True,
-        )
-        layers.append(satellite_layer)
-
-    # 1. Highway Layer (Background)
-    if highway_geo is not None and not highway_geo.empty:
-        highway_layer = pdk.Layer(
-            "PathLayer",
-            data=highway_geo,
-            get_path="path",
-            get_color="color",
-            width_min_pixels=2,
-            width_scale=1,
-            pickable=True,
-            opacity=0.5,
-        )
-        layers.append(highway_layer)
-
-    # 2. Porticos Layer (Infrastructure - Blue)
-    if porticos_df is not None and not porticos_df.empty:
-        # Ensure we have coordinates
-        if "lat" in porticos_df.columns and "lon" in porticos_df.columns:
-            p_data = porticos_df.dropna(subset=["lat", "lon"]).copy()
-            
-            # Filter by 'aux' column if present
-            if "aux" in p_data.columns:
-                 # Convert to numeric to handle string/int mix safely
-                 p_data["aux_numeric"] = (
-                     p_data["aux"]
-                     .astype(str)
-                     .str.replace(",", ".")
-                     .pipe(pd.to_numeric, errors="coerce")
-                     .fillna(0)
-                 )
-                 p_data = p_data[p_data["aux_numeric"] == 0]
-
-            if not p_data.empty:
-                # Prepare tooltip columns to match the shared template
-                # Template: <b>Evento:</b> {tipo_evento}<br><b>Hora:</b> {evento_time_str}<br><b>Desc:</b> {Descripcion}
-                
-                p_data["tipo_evento"] = ( "Pórtico " + p_data["portico"].astype(str) )
-                p_data["evento_time_str"] = "Km " + p_data["km"].astype(str)
-                p_data["Descripcion"] = (
-                    " (" + p_data["eje"].astype(str) 
-                    + " " + p_data["calzada"].astype(str) + ")"
-                )
-
-                # Blue color: [0, 100, 255, 200]
-                p_data["color"] = pd.Series([[0, 100, 255, 200]] * len(p_data))
-                
-                porticos_layer = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=p_data,
-                    get_position=["lon", "lat"],
-                    get_color="color",
-                    get_radius=80, # Slightly smaller than events
-                    pickable=True,
-                    auto_highlight=True,
-                    opacity=0.8,
-                    radius_min_pixels=2,
-                    radius_max_pixels=10,
-                )
-                layers.append(porticos_layer)
-
-    # 3. Heatmap Layer (if enabled)
-    if (
-        show_heatmap
-        and heatmap_events is not None
-        and not heatmap_events.empty
-    ):
-        initial_view_state.latitude = heatmap_events["lat"].median()
-        initial_view_state.longitude = heatmap_events["lon"].median()
-        heat_layer = pdk.Layer(
-            "HeatmapLayer",
-            data=heatmap_events,
-            get_position=["lon", "lat"],
-            get_weight=1,
-            radiusPixels=40,
-            intensity=1.0,
-            threshold=0.05,
-        )
-        layers.append(heat_layer)
-
-    # 4. Events Layer (Red - Top)
-    if show_points and mapped_events is not None and not mapped_events.empty:
-        # Check median of events for better centering if available
-        initial_view_state.latitude = mapped_events["lat"].median()
-        initial_view_state.longitude = mapped_events["lon"].median()
-
-        events_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=mapped_events,
-            get_position=["lon", "lat"],
-            get_color="color",
-            get_radius=120,
-            pickable=True,
-            auto_highlight=True,
-            opacity=0.9,
-            radius_min_pixels=3,
-            radius_max_pixels=15,
-        )
-        layers.append(events_layer)
-
-    if not layers:
-        st.info("No hay capas para mostrar en el mapa.")
-        return
-
-    st.pydeck_chart(
-        pdk.Deck(
-            map_style="mapbox://styles/mapbox/light-v9" if not show_satellite else None,
-            initial_view_state=initial_view_state,
-            layers=layers,
-            tooltip={
-                "html": "<b>Evento:</b> {tipo_evento}<br><b>Hora:</b> {evento_time_str}<br><b>Desc:</b> {Descripcion}",
-                "style": {"color": "white"},
-            },
-        )
-    )
-    if show_points and mapped_events is not None:
-         st.caption(f"Eventos mapeados: {len(mapped_events):,}")
-    if show_heatmap and heatmap_events is not None:
-         st.caption(f"Accidentes en mapa de calor: {len(heatmap_events):,}")
-
-
-def _render_events_table(events_df: pd.DataFrame) -> None:
-    detail_candidates = [
-        "evento_time",
-        "tipo_evento",
-        "ultimo_portico",
-        "portico_inicio",
-        "portico_fin",
-        "eje",
-        "calzada",
-        "km",
-        "Descripcion",
-        "SubTipo",
-    ]
-    detail_cols = _select_columns(events_df, detail_candidates)
-    detail_cols = [col for col in detail_cols if col in events_df.columns]
-    if not detail_cols:
-        st.info("No hay columnas para mostrar en detalle.")
-        return
-    st.dataframe(events_df[detail_cols].head(500), width="stretch")
 
 def _normalize_portico_val(val):
     if pd.isna(val):
@@ -1328,71 +1431,151 @@ def _compute_event_coords(
     return coords_df
 
 
-def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None:
-    _init_state()
-    if set_page_config:
-        st.set_page_config(page_title="Events map", layout="wide")
-    st.title("Events")
+def _render_configuration_tab() -> None:
+    st.header("Configuración de Visualización")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Eventos (Accidentes)")
+        st.session_state["cfg_accidents_color"] = st.color_picker(
+            "Color de eventos", 
+            value=st.session_state.get("cfg_accidents_color", "#C81E00"),
+            key="cp_accidents"
+        )
+        st.session_state["cfg_accidents_radius"] = st.slider(
+            "Radio de eventos (metros aprox)",
+            min_value=50,
+            max_value=300,
+            value=st.session_state.get("cfg_accidents_radius", 120),
+            key="sl_accidents_radius"
+        )
 
-    if st.session_state.get("highway_geo") is None:
-        st.session_state["highway_geo"] = _load_highway_geo()
+    with col2:
+        st.subheader("Pórticos")
+        st.session_state["cfg_porticos_color"] = st.color_picker(
+            "Color de pórticos", 
+            value=st.session_state.get("cfg_porticos_color", "#0064FF"),
+            key="cp_porticos"
+        )
+        st.session_state["cfg_porticos_radius"] = st.slider(
+            "Radio de pórticos (metros aprox)",
+            min_value=20,
+            max_value=150,
+            value=st.session_state.get("cfg_porticos_radius", 80),
+            key="sl_porticos_radius"
+        )
+        
+    st.subheader("Tooltips")
+    
+    col_t1, col_t2 = st.columns(2)
+    
+    # 1. Accidents Tooltips
+    with col_t1:
+        st.markdown("**Accidentes (Eventos)**")
+        events_df = st.session_state.get("events_df")
+        available_cols_acc = [
+            "tipo_evento", "evento_time_str", "Descripcion", 
+            "SubTipo", "km", "eje", "calzada", "ultimo_portico", 
+            "portico_inicio", "portico_fin"
+        ]
+        if events_df is not None and not events_df.empty:
+            extra = [c for c in events_df.columns if c not in available_cols_acc and c not in ("lat", "lon", "color", "html_tooltip")]
+            available_cols_acc.extend(sorted(extra))
+            
+        current_acc_tooltips = st.session_state.get("cfg_acc_tooltip_cols", [])
+        # Fix missing options in default
+        valid_acc = [c for c in current_acc_tooltips if c in available_cols_acc]
 
-    if st.session_state.get("events_df") is None and _events_db_exists():
-        try:
-            events_from_db = _load_events_db()
-            if not events_from_db.empty:
-                st.session_state["events_df"] = events_from_db
-                st.session_state["event_files"] = ["Base eventos"]
-                st.session_state["porticos_source"] = "Datos/Porticos.csv"
-        except Exception as exc:
-            st.warning(f"No se pudo cargar la base de eventos: {exc}")
+        st.session_state["cfg_acc_tooltip_cols"] = st.multiselect(
+            "Campos para Accidentes",
+            options=available_cols_acc,
+            default=valid_acc or available_cols_acc[:3],
+            key="ms_tooltips_acc"
+        )
 
-    if show_exit_button and st.sidebar.button("Cerrar app"):
-        os._exit(0)
+    # 2. Porticos Tooltips
+    with col_t2:
+        st.markdown("**Pórticos**")
+        # Hardcoded relevant fields for Porticos since we don't always have the df loaded at this exact visual frame?
+        # Actually _render_configuration_tab is called in same cycle, but porticos_df might be cached/local.
+        # We'll use a standard list plus generic check.
+        available_cols_port = ["portico", "km", "eje", "calzada", "sentido", "lat", "lon"]
+        # Can we inspect the file? No need, let's stick to standard useful ones.
+        
+        current_port_tooltips = st.session_state.get("cfg_port_tooltip_cols", [])
+        valid_port = [c for c in current_port_tooltips if c in available_cols_port]
+        
+        st.session_state["cfg_port_tooltip_cols"] = st.multiselect(
+            "Campos para Pórticos",
+            options=available_cols_port,
+            default=valid_port or ["portico", "km"],
+            key="ms_tooltips_port"
+        )
 
-    st.subheader("Carga de eventos")
+
+def _render_management_tab() -> None:
+    st.header("Gestión de Eventos")
+    
+    # 1. Load / Status
+    events_df = st.session_state.get("events_df")
+    porticos_source = st.session_state.get("porticos_source")
+    
+    status_cols = st.columns(3)
+    status_cols[0].metric("Eventos Cargados", f"{len(events_df):,}" if events_df is not None else "0")
+    status_cols[1].metric("Fuente Pórticos", porticos_source or "-")
+    
+    st.divider()
+    
+    st.subheader("Eventos (accidentes)")
+    st.markdown(
+        "Selecciona uno o varios archivos de eventos desde la carpeta Datos."
+    )
     event_files = _list_event_files()
     selected_names: List[str] = []
+    
     if event_files:
+        options = [path.name for path in event_files]
+        defaults = st.session_state.get("event_files", [])
+        # Ensure defaults are in options
+        valid_defaults = [f for f in defaults if f in options]
+        
         selected_names = st.multiselect(
             "Archivos de eventos disponibles",
-            [path.name for path in event_files],
-            default=[path.name for path in event_files],
+            options,
+            default=valid_defaults if valid_defaults else options,
+            key="mgmt_file_selector"
         )
     else:
         st.info("No se encontraron archivos de eventos en la carpeta Datos.")
 
     allowed_types = None
     
-    # UI for Type Detection
-    col_scan, col_load = st.columns([1, 2])
-    with col_scan:
-        if st.button("Detectar tipos de eventos"):
+    with st.expander("Opciones avanzadas", expanded=False):
+        if st.button("Detectar tipos de eventos", key="btn_detect_types"):
             if not selected_names:
                 st.warning("Seleccione archivos para escanear.")
             else:
                 with st.spinner("Escaneando tipos de eventos..."):
                     types_found = _scan_event_types(selected_names)
                     st.session_state["detected_event_types"] = types_found
-                    # Reset previous selection if types change significantly? 
-                    # For now keep it simple.
                     st.success(f"Se encontraron {len(types_found)} tipos.")
 
-    # Show multiselect if types are detected
-    if "detected_event_types" in st.session_state and st.session_state["detected_event_types"]:
-        all_types = st.session_state["detected_event_types"]
-        # Default to all if not set, or maintain selection?
-        # Let's default to all to avoid filtering everything out by mistake
-        selected_types_filter = st.multiselect(
-            "Filtrar por tipo (antes de cargar)",
-            options=all_types,
-            default=all_types,
-            help="Seleccione los tipos de eventos que desea cargar. Si no selecciona ninguno, no se cargará nada."
-        )
-        allowed_types = selected_types_filter
+        if (
+            "detected_event_types" in st.session_state
+            and st.session_state["detected_event_types"]
+        ):
+            all_types = st.session_state["detected_event_types"]
+            selected_types_filter = st.multiselect(
+                "Filtrar por tipo (antes de cargar)",
+                options=all_types,
+                default=all_types,
+                key="mgmt_type_filter",
+                help="Seleccione los tipos de eventos que desea cargar."
+            )
+            allowed_types = selected_types_filter
 
-    with col_load:
-        load_clicked = st.button("Cargar eventos")
+    load_clicked = st.button("Procesar eventos", type="primary", key="btn_load_events")
 
     if load_clicked:
         if not selected_names:
@@ -1400,203 +1583,187 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
             return
             
         if allowed_types is not None and not allowed_types:
-             st.warning("Ha activado el filtro por tipo pero no seleccionó ninguno. Seleccione al menos uno.")
+             st.warning("Ha activado el filtro por tipo pero no seleccionó ninguno.")
              return
 
-        # Barra de progreso y status
-        progress_bar = st.progress(0, text="Iniciando carga de eventos...")
+        progress_bar = st.progress(0, text="Iniciando carga...")
         
         try:
-            # 1. Cargar Pórticos (10%)
-            progress_bar.progress(10, text="Cargando y procesando pórticos...")
+            # 1. Porticos
+            progress_bar.progress(10, text="Cargando pórticos...")
             try:
                 porticos_df = load_porticos()
-                # Try fallback augmentation
                 porticos_df = _ensure_porticos_coords(porticos_df)
                 porticos_source = "Datos/Porticos.csv"
             except Exception as exc:
-                st.error(f"No se pudieron cargar los porticos: {exc}")
-                progress_bar.empty()
+                st.error(f"Error cargando pórticos: {exc}")
                 return
 
-            # 2. Leer archivos de eventos (30%)
-            progress_bar.progress(30, text="Leyendo archivos de eventos...")
-            try:
-                raw_df = _read_event_files(selected_names, allowed_types=allowed_types)
-                if raw_df.empty:
-                    st.warning("No se encontraron eventos con los filtros seleccionados.")
-                    progress_bar.empty()
-                    return
-            except Exception as exc:
-                st.error(f"No se pudieron leer los eventos: {exc}")
+            # 2. Eventos
+            progress_bar.progress(30, text="Leyendo eventos...")
+            raw_df = _read_event_files(selected_names, allowed_types=allowed_types)
+            if raw_df.empty:
+                st.warning("No se encontraron eventos.")
                 progress_bar.empty()
                 return
 
             highway_geo = st.session_state.get("highway_geo")
             
-            # 3. Snap porticos (40%)
+            # 3. Snap Porticos
             if porticos_df is not None and highway_geo is not None:
-                 progress_bar.progress(40, text="Ajustando pórticos a la autopista...")
+                 progress_bar.progress(40, text="Ajustando pórticos...")
                  porticos_df = _snap_df_to_highway(porticos_df, highway_geo)
 
-            # 4. Preparar DataFrame de eventos (70%)
-            progress_bar.progress(50, text="Procesando datos y segmentos...")
+            # 4. Prepare
+            progress_bar.progress(50, text="Procesando datos...")
             events_df = _prepare_events_df(raw_df, porticos_df)
-            excluded_accidents = int(events_df.attrs.get("accidents_excluded", 0) or 0)
+            excluded = int(events_df.attrs.get("accidents_excluded", 0) or 0)
             
-            # 5. Calcular coordenadas (90%)
-            progress_bar.progress(80, text="Calculando coordenadas geográficas...")
+            # 5. Coords
+            progress_bar.progress(80, text="Calculando coordenadas...")
             events_df = _compute_event_coords(events_df, porticos_df, highway_geo)
             
-            # 6. Guardar en DB (95%)
-            progress_bar.progress(95, text="Actualizando base de datos local...")
+            # 6. Save
+            progress_bar.progress(95, text="Guardando...")
             events_db_df = _prepare_events_db_frame(events_df)
-            try:
-                inserted = _write_events_db(events_db_df)
-                st.success(
-                    f"Eventos cargados: {len(events_db_df):,} | Base actualizada: {inserted:,}"
-                )
-            except Exception as exc:
-                st.warning(f"No se pudo actualizar la base de eventos: {exc}")
-                st.success(f"Eventos cargados: {len(events_db_df):,}")
-            
-            if excluded_accidents:
-                st.warning(
-                    f"Accidentes sin pórtico (excluidos del cálculo): {excluded_accidents:,}"
-                )
+            _write_events_db(events_db_df)
             
             st.session_state["events_df"] = events_db_df
             st.session_state["event_files"] = selected_names
             st.session_state["porticos_source"] = porticos_source
             
-            # Finalizar
-            progress_bar.progress(100, text="¡Carga completa!")
-            # Retraso breve o limpieza opcional? Dejamos que se vea el 100%
+            st.success(f"Carga completa! {len(events_db_df):,} eventos.")
+            if excluded:
+                st.warning(f"{excluded:,} accidentes excluidos por falta de ubicación.")
+                
+            progress_bar.progress(100)
             
         except Exception as e:
-            st.error(f"Error inesperado durante la carga: {e}")
-        finally:
-             # Opcional: limpiar la barra de progreso después de un momento si se desea
-             # progress_bar.empty()
-             pass
+            st.error(f"Error: {e}")
 
+
+def _render_visualization_tab() -> None:
     events_df = st.session_state.get("events_df")
     highway_geo = st.session_state.get("highway_geo")
     
-    # Allow showing map if highway_geo is present, even if no events
     if (events_df is None or events_df.empty) and (highway_geo is None or highway_geo.empty):
-        st.info("Cargue eventos o nodos de autopista para visualizar.")
+        st.info("Cargue eventos o nodos de autopista en la pestaña Gestión para visualizar.")
         return
 
-    files_label = ", ".join(st.session_state.get("event_files", [])) or "-"
-    st.caption(
-        f"Archivos: {files_label} | "
-        f"Porticos: {st.session_state.get('porticos_source') or '-'} | "
-        f"Nodos Autopista: {'Cargados' if highway_geo is not None else 'No encontrados'} | "
-        "Via: expresa"
-    )
-
+    # Load porticos just for viz context if needed (cached hopefully)
     try:
         porticos_df = load_porticos()
         porticos_df = _ensure_porticos_coords(porticos_df)
         if highway_geo is not None:
              porticos_df = _snap_df_to_highway(porticos_df, highway_geo)
-    except Exception as exc:
-        st.warning(f"No se pudieron cargar los porticos: {exc}")
-        return
+    except Exception:
+        porticos_df = pd.DataFrame()
 
-    if events_df is not None and not events_df.empty:
-        events_df, fixed_count = _fill_missing_porticos(events_df, porticos_df)
-        if fixed_count:
-            events_df = _compute_event_coords(events_df, porticos_df, highway_geo)
-            events_db_df = _prepare_events_db_frame(events_df)
-            st.session_state["events_df"] = events_db_df
-            events_df = events_db_df
-            try:
-                _write_events_db(events_db_df)
-            except Exception as exc:
-                st.warning(f"No se pudo actualizar la base de eventos: {exc}")
-            st.info(
-                f"Se recalcularon pórticos para {fixed_count:,} eventos sin pórtico."
-            )
-        else:
-            st.session_state["events_df"] = events_df
+    st.header("Visualización de Eventos")
 
-        if "portico_inicio" in events_df.columns:
-            missing_mask = events_df["portico_inicio"].isna()
-            missing_df = events_df[missing_mask]
-            
-            # Check if any of the missing events are accidents
-            missing_accidents = missing_df[
-                missing_df["tipo_evento"].apply(_is_accident_type)
-            ]
-            
-            if not missing_accidents.empty:
-                st.warning(
-                    f"Quedan {len(missing_accidents):,} accidentes sin pórtico. "
-                    "Revise KM, Eje o Calzada en los datos."
-                )
-
+    # Filters
     filtered_df = pd.DataFrame()
     if events_df is not None and not events_df.empty:
-        st.subheader("Filtros")
-        filtered_df, _ = _render_filters(events_df, porticos_df)
-        
-        total_events = int(len(events_df))
-        filtered_events = int(len(filtered_df))
-        col1, col2 = st.columns(2)
-        col1.metric("Eventos totales", f"{total_events:,}")
-        col2.metric("Eventos filtrados", f"{filtered_events:,}")
-    else:
-        st.info("Visualizando solo estructura de autopista (sin eventos).")
+        # Collapsible filters box, hidden by default
+        with st.expander("Filtros", expanded=False):
+            filtered_df, _ = _render_filters(events_df, porticos_df)
+            
+            st.divider()
+            c1, c2 = st.columns(2)
+            c1.metric("Total", len(events_df))
+            c2.metric("Visible", len(filtered_df))
+    
+    # Map Layers
+    st.subheader("Mapa")
+    layer_options = [
+        "Accidentes (puntos)",
+        "Mapa de calor",
+        "Porticos",
+        "Satelite (Esri)",
+    ]
+    selected_layers = st.multiselect(
+        "Capas",
+        options=layer_options,
+        default=["Accidentes (puntos)", "Porticos", "Satelite (Esri)"],
+        key="viz_map_layers",
+        label_visibility="collapsed"
+    )
+    show_points = "Accidentes (puntos)" in selected_layers
+    show_heatmap = "Mapa de calor" in selected_layers
+    show_satellite = "Satelite (Esri)" in selected_layers
+    show_porticos = "Porticos" in selected_layers
 
-    st.subheader("Mapa de eventos")
     mapped_df = None
     heat_df = pd.DataFrame()
+    
     if not filtered_df.empty:
         mapped_df, map_error = _get_mapped_events_df(filtered_df, porticos_df, jitter=True)
         if map_error:
             st.warning(map_error)
             mapped_df = None
+            
         accidents_df = filtered_df
         if "tipo_evento" in filtered_df.columns:
             accidents_df = filtered_df[
                 filtered_df["tipo_evento"].apply(_is_accident_type)
             ]
         if not accidents_df.empty:
-            heat_df, heat_error = _get_mapped_events_df(
-                accidents_df, porticos_df, jitter=False
-            )
-            if heat_error:
-                st.warning(heat_error)
-    layer_options = [
-        "Accidentes (puntos)",
-        "Mapa de calor",
-        "Satelite (Esri)",
-    ]
-    selected_layers = st.multiselect(
-        "Capas del mapa",
-        options=layer_options,
-        default=["Accidentes (puntos)", "Satelite (Esri)"],
-        key="events_map_layers",
-    )
-    show_points = "Accidentes (puntos)" in selected_layers
-    show_heatmap = "Mapa de calor" in selected_layers
-    show_satellite = "Satelite (Esri)" in selected_layers
+            heat_df, _ = _get_mapped_events_df(accidents_df, porticos_df, jitter=False)
 
     _render_map(
         mapped_df,
         heat_df,
         highway_geo,
+        porticos_df,
         show_points=show_points,
         show_heatmap=show_heatmap,
         show_satellite=show_satellite,
+        show_porticos=show_porticos,
     )
-
+    
     if not filtered_df.empty:
-        st.subheader("Detalle de eventos filtrados")
+        st.subheader("Detalle")
         _render_events_table(filtered_df)
 
+
+def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None:
+    _init_state()
+    if set_page_config:
+        st.set_page_config(page_title="Mapa de Eventos", layout="wide")
+    
+    st.title("Mapa de Eventos")
+
+    # Autoload resources
+    if st.session_state.get("highway_geo") is None:
+        st.session_state["highway_geo"] = _load_highway_geo()
+        
+    if st.session_state.get("events_df") is None and _events_db_exists():
+        try:
+            events_from_db = _load_events_db()
+            if not events_from_db.empty:
+                st.session_state["events_df"] = events_from_db
+                st.session_state["event_files"] = ["Base eventos (DuckDB)"]
+                st.session_state["porticos_source"] = "Datos/Porticos.csv"
+        except Exception:
+            pass
+
+    if show_exit_button and st.sidebar.button("Cerrar App"):
+        os._exit(0)
+
+    tab_viz, tab_mgmt, tab_conf = st.tabs([
+        "Visualización", 
+        "Gestión eventos", 
+        "Configuración"
+    ])
+    
+    with tab_viz:
+        _render_visualization_tab()
+        
+    with tab_mgmt:
+        _render_management_tab()
+        
+    with tab_conf:
+        _render_configuration_tab()
 
 if __name__ == "__main__":
     main()

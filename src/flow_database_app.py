@@ -27,6 +27,7 @@ from utils import (  # noqa: E402
     get_flow_table_sample,
     import_flujos_to_duckdb,
 )
+from flow_stats_legacy import render_flow_stats_tab  # noqa: E402
 
 DATA_DIR = ROOT_DIR / "Datos"
 DB_PATH = DATA_DIR / "flujos.duckdb"
@@ -181,6 +182,7 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
             "Reemplazar",
             "Vaciar tabla",
             "Esquema y muestra",
+            "Estadisticas de flujos",
         ]
     )
 
@@ -298,6 +300,9 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
         else:
             st.subheader("Muestra")
             st.dataframe(sample_df, width="stretch")
+
+    with tabs[4]:
+        render_flow_stats_tab(data_dir=DATA_DIR, db_path=DB_PATH)
 
 
 if __name__ == "__main__":

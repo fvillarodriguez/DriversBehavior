@@ -1,12 +1,31 @@
-pyarrow
-pandas
-tqdm
-duckdb
-scikit-learn
-numpy
-streamlit
-plotly
-pytest
-imbalanced-learn
-xgboost
-optuna
+-f https://data.pyg.org/whl/torch-2.4.0+cpu.html
+pyarrow==22.0.0
+pandas==2.3.3
+polars==1.37.1
+tqdm==4.67.1
+duckdb==1.4.3
+scikit-learn==1.8.0
+numpy==2.4.0
+streamlit==1.52.2
+plotly==6.5.1
+pytest==9.0.2
+matplotlib==3.10.8
+networkx==3.2.1
+seaborn==0.13.2
+statsmodels==0.14.6
+imbalanced-learn==0.14.1
+xgboost==3.1.2
+optuna==4.6.0
+pydeck==0.9.1
+graphviz==0.21
+torchview==0.2.6
+torch==2.4.1; python_version < '3.13'
+torch-geometric==2.7.0
+pyg-lib==0.4.0; python_version < '3.13'
+torch-scatter==2.1.2; python_version < '3.13'
+torch-sparse==0.6.18; python_version < '3.13'
+torch-cluster==1.6.3; python_version < '3.13'
+torch-spline-conv==1.2.2; python_version < '3.13'
+GitPython==3.1.46
+SQLAlchemy==2.0.45
+scipy==1.16.3

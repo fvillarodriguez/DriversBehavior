@@ -17,6 +17,7 @@ import re
 
 import numpy as np
 import pandas as pd
+import polars as pl
 from tqdm import tqdm
 
 try:
@@ -1050,15 +1051,50 @@ def load_porticos_from_df(df: pd.DataFrame) -> pd.DataFrame:
     df[km_col] = pd.to_numeric(df[km_col], errors="coerce")
     df[orden_col] = pd.to_numeric(df[orden_col], errors="coerce")
 
-    return df[[cod_portico_col, km_col, calzada_col, orden_col, eje_col]].rename(
-        columns={
-            cod_portico_col: "portico",
-            km_col: "km",
-            calzada_col: "calzada",
-            orden_col: "orden",
-            eje_col: "eje",
-        }
-    )
+    optional_map = {
+        "aux": ["aux"],
+        "autopista": ["autopista"],
+        "edge_id_sumo": ["edge_id_sumo"],
+        "lane_id_sumo": ["lane_id_sumo"],
+        "pos_m": ["pos_m"],
+        "lat-lon": ["lat-lon", "lat_lon", "coordenadas"],
+        "lat": ["lat", "latitude", "latitud", "y"],
+        "lon": ["lon", "longitude", "longitud", "lng", "x"],
+    }
+    normalized = {_normalize_column_name(col): col for col in df.columns}
+    optional_cols: Dict[str, Optional[str]] = {}
+    for key, aliases in optional_map.items():
+        found = None
+        for alias in aliases:
+            candidate = normalized.get(_normalize_column_name(alias))
+            if candidate:
+                found = candidate
+                break
+        optional_cols[key] = found
+
+    keep_columns = [cod_portico_col, km_col, calzada_col, orden_col, eje_col]
+    for col in optional_cols.values():
+        if col:
+            keep_columns.append(col)
+
+    renamed = {
+        cod_portico_col: "portico",
+        km_col: "km",
+        calzada_col: "calzada",
+        orden_col: "orden",
+        eje_col: "eje",
+    }
+    for key, col in optional_cols.items():
+        if col:
+            renamed[col] = key
+
+    df_porticos = df[keep_columns].rename(columns=renamed)
+    if "pos_m" in df_porticos.columns:
+        df_porticos["pos_m"] = (
+            df_porticos["pos_m"].astype(str).str.replace(",", ".")
+        )
+        df_porticos["pos_m"] = pd.to_numeric(df_porticos["pos_m"], errors="coerce")
+    return df_porticos
 
 
 def load_porticos(path: Optional[str] = None) -> pd.DataFrame:
@@ -1308,6 +1344,64 @@ def load_accidentes_from_frames(
     return process_accidentes_df(df, porticos_df, allowed_via=allowed_via)
 
 
+def load_accidentes(
+    file_path: Optional[str] = None,
+    *,
+    allowed_via: Optional[Sequence[str]] = None,
+    return_excluded: bool = False,
+) -> Optional[Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]]:
+    """
+    Carga eventos de accidentes desde CSV y los procesa con los pórticos.
+    """
+    if file_path is None:
+        base_dir = Path("Datos")
+        if not base_dir.exists():
+            print("No se encontro la carpeta Datos.")
+            return None
+
+        patterns = ["eventos*.csv", "accidentes*.csv"]
+        candidates = []
+        for name in os.listdir(base_dir):
+            lower = name.lower()
+            if any(fnmatch.fnmatch(lower, pattern) for pattern in patterns):
+                candidates.append(base_dir / name)
+
+        if not candidates:
+            print("No se encontraron archivos de eventos en la carpeta Datos.")
+            return None
+
+        if len(candidates) == 1:
+            file_path = str(candidates[0])
+            print(f"Archivo de eventos detectado: {file_path}")
+        else:
+            file_path = choose_file_filtered(str(base_dir), patterns)
+            if file_path is None:
+                return None
+
+    try:
+        raw_df = read_csv_with_progress(file_path, sep=None)
+    except Exception as exc:
+        print(f"No se pudo leer el archivo de eventos: {exc}")
+        return None
+
+    try:
+        porticos_df = load_porticos()
+    except Exception as exc:
+        print(f"No se pudieron cargar los pórticos: {exc}")
+        return None
+
+    try:
+        return process_accidentes_df(
+            raw_df,
+            porticos_df,
+            allowed_via=allowed_via,
+            return_excluded=return_excluded,
+        )
+    except Exception as exc:
+        print(f"No se pudieron procesar los eventos: {exc}")
+        return None
+
+
 def normalize_plate_series(series: pd.Series) -> pd.Series:
     cleaned = series.astype(str).str.strip().str.upper()
     invalid_tokens = {"", "NAN", "NULL", "NONE"}
@@ -1333,70 +1427,157 @@ def compute_flow_features(
     """
     Calcula Flow/Speed/Speed_std/Density por portico, intervalo y tipo de vehiculo.
     """
-    def _tick(label: str) -> None:
-        if progress is None:
-            return
-        if hasattr(progress, "set_description"):
-            progress.set_description(label)
-        if hasattr(progress, "update"):
-            progress.update(1)
+    if flows_df is None:
+        return pd.DataFrame()
+    if isinstance(flows_df, pl.LazyFrame):
+        flows_df = flows_df.collect()
+    if isinstance(flows_df, pd.DataFrame):
+        flows_df = pl.from_pandas(flows_df)
+    if not isinstance(flows_df, pl.DataFrame):
+        raise ValueError("flows_df debe ser DataFrame (pandas o polars).")
+    if flows_df.is_empty():
+        return pd.DataFrame()
+    return _compute_flow_features_polars(
+        flows_df,
+        interval_minutes=interval_minutes,
+        lanes=lanes,
+        category_remap=category_remap,
+        category_labels=category_labels,
+        metrics=metrics,
+        categories=categories,
+        timestamp_col=timestamp_col,
+        speed_col=speed_col,
+        category_col=category_col,
+        portico_col=portico_col,
+    )
 
-    if flows_df is None or flows_df.empty:
+
+def _compute_flow_features_polars(
+    flows_df: pl.DataFrame,
+    *,
+    interval_minutes: int = DEFAULT_INTERVAL_MINUTES,
+    lanes: int = DEFAULT_LANES,
+    category_remap: Optional[Dict[int, int]] = None,
+    category_labels: Optional[Dict[int, str]] = None,
+    metrics: Optional[Sequence[str]] = None,
+    categories: Optional[Sequence[str]] = None,
+    timestamp_col: str = "FECHA",
+    speed_col: str = "VELOCIDAD",
+    category_col: str = "CATEGORIA",
+    portico_col: str = "PORTICO",
+) -> pd.DataFrame:
+    if flows_df is None or flows_df.is_empty():
+        return pd.DataFrame()
+    required = {timestamp_col, speed_col, category_col, portico_col}
+    missing = [col for col in required if col not in flows_df.columns]
+    if missing:
+        raise ValueError(
+            f"No se encontraron columnas requeridas: {sorted(missing)}"
+        )
+
+    def _time_expr() -> pl.Expr:
+        dtype = flows_df.schema.get(timestamp_col)
+        if dtype == pl.Utf8:
+            return pl.col(timestamp_col).str.to_datetime(
+                time_unit="ns", strict=False
+            )
+        return pl.col(timestamp_col).cast(pl.Datetime, strict=False)
+
+    work = (
+        flows_df.select([timestamp_col, speed_col, category_col, portico_col])
+        .with_columns(
+            [
+                _time_expr().alias(timestamp_col),
+                pl.col(speed_col).cast(pl.Float64, strict=False).alias(
+                    speed_col
+                ),
+                pl.col(category_col)
+                .cast(pl.Int64, strict=False)
+                .alias(category_col),
+                pl.col(portico_col)
+                .cast(pl.Utf8, strict=False)
+                .str.strip_chars()
+                .alias(portico_col),
+            ]
+        )
+        .drop_nulls([timestamp_col, speed_col, category_col, portico_col])
+    )
+    if work.is_empty():
         return pd.DataFrame()
 
-    df = flows_df[[timestamp_col, speed_col, category_col, portico_col]].copy()
-    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
-    df[speed_col] = pd.to_numeric(df[speed_col], errors="coerce")
-    df[category_col] = pd.to_numeric(df[category_col], errors="coerce")
-    df[portico_col] = df[portico_col].astype(str).str.strip()
-    df = df.dropna(subset=[timestamp_col, speed_col, category_col, portico_col])
-    if df.empty:
-        return pd.DataFrame()
-
-    _tick("Paso 1/3: Normalizando categorias")
     remap = category_remap or DEFAULT_CATEGORY_REMAP
     labels = category_labels or DEFAULT_CATEGORY_LABELS
-    df["category_id"] = df[category_col].map(remap)
-    df["category_label"] = df["category_id"].map(labels)
-    df = df[df["category_label"].notna()].copy()
+
+    work = work.with_columns(
+        pl.col(category_col)
+        .replace_strict(remap, default=None)
+        .alias("category_id")
+    ).with_columns(
+        pl.col("category_id")
+        .replace_strict(labels, default=None)
+        .alias("category_label")
+    )
+    work = work.filter(pl.col("category_label").is_not_null())
     if categories:
-        df = df[df["category_label"].isin(categories)]
-    if df.empty:
+        work = work.filter(pl.col("category_label").is_in(list(categories)))
+    if work.is_empty():
         return pd.DataFrame()
 
-    _tick("Paso 2/3: Agregando flujos")
-    df["interval_start"] = df[timestamp_col].dt.floor(f"{interval_minutes}min")
-    grouped = (
-        df.groupby([portico_col, "interval_start", "category_label"])
-        .agg(
-            flow_count=("category_label", "size"),
-            speed_mean=(speed_col, "mean"),
-            speed_std=(speed_col, "std"),
-        )
-        .reset_index()
+    work = work.with_columns(
+        pl.col(timestamp_col)
+        .dt.truncate(f"{int(interval_minutes)}m")
+        .alias("interval_start")
     )
-    if grouped.empty:
+
+    grouped = work.group_by(
+        [portico_col, "interval_start", "category_label"]
+    ).agg(
+        [
+            pl.len().alias("flow_count"),
+            pl.col(speed_col).mean().alias("speed_mean"),
+            pl.col(speed_col).std().alias("speed_std"),
+        ]
+    )
+    if grouped.is_empty():
         return pd.DataFrame()
 
     interval_factor = 60.0 / max(1, interval_minutes)
     lanes_value = max(1, lanes)
-    grouped["flow_per_hour"] = grouped["flow_count"] * interval_factor / lanes_value
-    grouped["density"] = grouped["flow_per_hour"] / grouped["speed_mean"]
-    grouped.loc[grouped["speed_mean"] <= 0, "density"] = 0
-    grouped["speed_std"] = grouped["speed_std"].fillna(0)
-    grouped = grouped.sort_values([portico_col, "category_label", "interval_start"])
-    grouped["delta_speed"] = (
-        grouped.groupby([portico_col, "category_label"])["speed_mean"]
-        .diff()
-        .fillna(0)
-    )
-    grouped["delta_density"] = (
-        grouped.groupby([portico_col, "category_label"])["density"]
-        .diff()
-        .fillna(0)
+
+    grouped = grouped.with_columns(
+        [
+            (
+                pl.col("flow_count") * interval_factor / lanes_value
+            ).alias("flow_per_hour"),
+            pl.when(pl.col("speed_mean") <= 0)
+            .then(0.0)
+            .otherwise(
+                (pl.col("flow_count") * interval_factor / lanes_value)
+                / pl.col("speed_mean")
+            )
+            .alias("density"),
+            pl.col("speed_std").fill_null(0.0).alias("speed_std"),
+        ]
+    ).with_columns(
+        pl.col("density").fill_null(0.0).alias("density")
     )
 
-    _tick("Paso 3/3: Pivot de variables")
+    grouped = grouped.sort([portico_col, "category_label", "interval_start"])
+    grouped = grouped.with_columns(
+        [
+            pl.col("speed_mean")
+            .diff()
+            .over([portico_col, "category_label"])
+            .fill_null(0.0)
+            .alias("delta_speed"),
+            pl.col("density")
+            .diff()
+            .over([portico_col, "category_label"])
+            .fill_null(0.0)
+            .alias("delta_density"),
+        ]
+    )
+
     metric_map = {
         "flow": "flow_per_hour",
         "speed": "speed_mean",
@@ -1407,26 +1588,39 @@ def compute_flow_features(
     }
     metrics = metrics or ["flow", "speed", "density"]
     frames = []
-    index_cols = [portico_col, "interval_start"]
     for metric in metrics:
         value_col = metric_map.get(metric)
         if value_col is None:
             continue
-        pivot = grouped.pivot_table(
-            index=index_cols,
-            columns="category_label",
-            values=value_col,
-            fill_value=0,
+        pivoted = (
+            grouped.pivot(
+                index=[portico_col, "interval_start"],
+                on="category_label",
+                values=value_col,
+                aggregate_function="first",
+            )
+            .fill_null(0.0)
         )
-        pivot.columns = [
-            f"{metric}_{_slugify(label)}" for label in pivot.columns
-        ]
-        frames.append(pivot)
+        rename_map = {}
+        for col in pivoted.columns:
+            if col in (portico_col, "interval_start"):
+                continue
+            rename_map[col] = f"{metric}_{_slugify(col)}"
+        if rename_map:
+            pivoted = pivoted.rename(rename_map)
+        frames.append(pivoted)
+
     if not frames:
         return pd.DataFrame()
 
-    result = pd.concat(frames, axis=1).reset_index()
-    return result.rename(columns={portico_col: "portico"})
+    result = frames[0]
+    for frame in frames[1:]:
+        result = result.join(
+            frame, on=[portico_col, "interval_start"], how="left"
+        )
+
+    result = result.rename({portico_col: "portico"})
+    return result.to_pandas()
 
 
 def compute_cluster_features(
@@ -1451,6 +1645,31 @@ def compute_cluster_features(
     """
     Calcula proporciones de clusters por portico e intervalo, y Flow/Speed/Density/Delta.
     """
+    if isinstance(flows_df, pl.LazyFrame):
+        flows_df = flows_df.collect()
+    if isinstance(cluster_labels_df, pl.LazyFrame):
+        cluster_labels_df = cluster_labels_df.collect()
+
+    if isinstance(flows_df, pl.DataFrame):
+        return _compute_cluster_features_polars(
+            flows_df,
+            cluster_labels_df,
+            interval_minutes=interval_minutes,
+            include_counts=include_counts,
+            include_entropy=include_entropy,
+            include_speed=include_speed,
+            include_density=include_density,
+            include_delta_speed=include_delta_speed,
+            include_delta_density=include_delta_density,
+            lanes=lanes,
+            timestamp_col=timestamp_col,
+            portico_col=portico_col,
+            plate_col_flow=plate_col_flow,
+            plate_col_cluster=plate_col_cluster,
+            cluster_col=cluster_col,
+            speed_col=speed_col,
+        )
+
     if flows_df is None or flows_df.empty:
         return pd.DataFrame()
     if cluster_labels_df is None or cluster_labels_df.empty:
@@ -1641,6 +1860,246 @@ def compute_cluster_features(
     return result.rename(columns={portico_col: "portico"})
 
 
+def _compute_cluster_features_polars(
+    flows_df: pl.DataFrame,
+    cluster_labels_df: Union[pd.DataFrame, pl.DataFrame],
+    *,
+    interval_minutes: int = DEFAULT_INTERVAL_MINUTES,
+    include_counts: bool = False,
+    include_entropy: bool = False,
+    include_speed: bool = False,
+    include_density: bool = False,
+    include_delta_speed: bool = False,
+    include_delta_density: bool = False,
+    lanes: int = DEFAULT_LANES,
+    timestamp_col: str = "FECHA",
+    portico_col: str = "PORTICO",
+    plate_col_flow: str = "MATRICULA",
+    plate_col_cluster: str = "plate",
+    cluster_col: str = "cluster_label",
+    speed_col: str = "VELOCIDAD",
+) -> pd.DataFrame:
+    if flows_df is None or flows_df.is_empty():
+        return pd.DataFrame()
+    if isinstance(cluster_labels_df, pd.DataFrame):
+        if cluster_labels_df.empty:
+            return pd.DataFrame()
+        labels = pl.from_pandas(cluster_labels_df)
+    else:
+        if cluster_labels_df.is_empty():
+            return pd.DataFrame()
+        labels = cluster_labels_df
+    if cluster_col not in labels.columns:
+        raise ValueError("El archivo de clusters no contiene 'cluster_label'.")
+    if plate_col_cluster not in labels.columns:
+        raise ValueError("El archivo de clusters no contiene la columna de placas.")
+
+    need_speed = (
+        include_speed
+        or include_density
+        or include_delta_speed
+        or include_delta_density
+    )
+    if need_speed and speed_col not in flows_df.columns:
+        raise ValueError(f"El archivo de flujos no contiene '{speed_col}'.")
+
+    if timestamp_col not in flows_df.columns:
+        raise ValueError(f"El archivo de flujos no contiene '{timestamp_col}'.")
+    if portico_col not in flows_df.columns:
+        raise ValueError(f"El archivo de flujos no contiene '{portico_col}'.")
+    if plate_col_flow not in flows_df.columns:
+        raise ValueError(f"El archivo de flujos no contiene '{plate_col_flow}'.")
+
+    def _normalize_plate_expr(col_name: str) -> pl.Expr:
+        cleaned = (
+            pl.col(col_name)
+            .cast(pl.Utf8, strict=False)
+            .str.strip_chars()
+            .str.to_uppercase()
+        )
+        invalid_tokens = ["", "NAN", "NULL", "NONE"]
+        return (
+            pl.when(cleaned.is_null() | cleaned.is_in(invalid_tokens))
+            .then(None)
+            .otherwise(cleaned)
+        )
+
+    time_dtype = flows_df.schema.get(timestamp_col)
+    if time_dtype == pl.Utf8:
+        time_expr = pl.col(timestamp_col).str.to_datetime(
+            time_unit="ns", strict=False
+        )
+    else:
+        time_expr = pl.col(timestamp_col).cast(pl.Datetime, strict=False)
+
+    flow_cols = [timestamp_col, portico_col, plate_col_flow]
+    if need_speed:
+        flow_cols.append(speed_col)
+
+        work = flows_df.select(flow_cols).with_columns(
+            [
+                time_expr.alias(timestamp_col),
+                pl.col(portico_col)
+                .cast(pl.Utf8, strict=False)
+                .str.strip_chars()
+                .alias(portico_col),
+                _normalize_plate_expr(plate_col_flow).alias("plate_clean"),
+            ]
+        )
+    if need_speed:
+        work = work.with_columns(
+            pl.col(speed_col).cast(pl.Float64, strict=False)
+        )
+
+    drop_cols = [timestamp_col, portico_col, "plate_clean"]
+    work = work.drop_nulls(drop_cols)
+    if work.is_empty():
+        return pd.DataFrame()
+
+    labels = labels.select([plate_col_cluster, cluster_col]).with_columns(
+        _normalize_plate_expr(plate_col_cluster).alias("plate_clean")
+    )
+    labels = labels.drop_nulls([plate_col_cluster, cluster_col, "plate_clean"])
+    labels = labels.unique(subset=["plate_clean"])
+    if labels.is_empty():
+        return pd.DataFrame()
+
+    merged = work.join(
+        labels.select(["plate_clean", cluster_col]),
+        on="plate_clean",
+        how="inner",
+    )
+    if merged.is_empty():
+        return pd.DataFrame()
+
+    merged = merged.with_columns(
+        pl.col(timestamp_col)
+        .dt.truncate(f"{int(interval_minutes)}m")
+        .alias("interval_start")
+    )
+
+    agg_exprs = [pl.len().alias("count")]
+    if need_speed:
+        agg_exprs.append(pl.col(speed_col).mean().alias("speed_mean"))
+    grouped = merged.group_by(
+        [portico_col, "interval_start", cluster_col]
+    ).agg(agg_exprs)
+    if grouped.is_empty():
+        return pd.DataFrame()
+
+    interval_factor = 60.0 / max(1, interval_minutes)
+    lanes_value = max(1, lanes)
+    total_expr = pl.col("count").sum().over([portico_col, "interval_start"])
+    grouped = grouped.with_columns(
+        [
+            total_expr.alias("total"),
+            pl.when(total_expr == 0)
+            .then(0.0)
+            .otherwise(pl.col("count") / total_expr)
+            .alias("share"),
+            (pl.col("count") * interval_factor / lanes_value).alias(
+                "flow_per_hour"
+            ),
+        ]
+    )
+
+    need_density = include_density or include_delta_density
+    if need_density:
+        grouped = grouped.with_columns(
+            pl.when(
+                pl.col("speed_mean").is_null() | (pl.col("speed_mean") <= 0)
+            )
+            .then(0.0)
+            .otherwise(pl.col("flow_per_hour") / pl.col("speed_mean"))
+            .alias("density")
+        )
+
+    if include_delta_speed or include_delta_density:
+        grouped = grouped.sort(
+            [portico_col, cluster_col, "interval_start"]
+        )
+        if include_delta_speed:
+            grouped = grouped.with_columns(
+                pl.col("speed_mean")
+                .diff()
+                .over([portico_col, cluster_col])
+                .fill_null(0.0)
+                .alias("delta_speed")
+            )
+        if include_delta_density:
+            grouped = grouped.with_columns(
+                pl.col("density")
+                .diff()
+                .over([portico_col, cluster_col])
+                .fill_null(0.0)
+                .alias("delta_density")
+            )
+
+    def _pivot_metric(value_col: str, prefix: str) -> pl.DataFrame:
+        pivoted = grouped.pivot(
+            index=[portico_col, "interval_start"],
+            on=cluster_col,
+            values=value_col,
+            aggregate_function="first",
+        ).fill_null(0.0)
+        rename_map = {}
+        for col in pivoted.columns:
+            if col in (portico_col, "interval_start"):
+                continue
+            rename_map[col] = f"{prefix}{_sanitize_cluster_label(col)}"
+        if rename_map:
+            pivoted = pivoted.rename(rename_map)
+        return pivoted
+
+    share_pivot = _pivot_metric("share", "cluster_share_")
+    frames = [share_pivot]
+
+    if include_counts:
+        frames.append(_pivot_metric("flow_per_hour", "cluster_flow_"))
+    if include_speed:
+        frames.append(_pivot_metric("speed_mean", "cluster_speed_"))
+    if include_density:
+        frames.append(_pivot_metric("density", "cluster_density_"))
+    if include_delta_speed:
+        frames.append(_pivot_metric("delta_speed", "cluster_delta_speed_"))
+    if include_delta_density:
+        frames.append(_pivot_metric("delta_density", "cluster_delta_density_"))
+
+    result = frames[0]
+    for frame in frames[1:]:
+        result = result.join(
+            frame, on=[portico_col, "interval_start"], how="left"
+        )
+
+    if include_entropy:
+        share_cols = [
+            col
+            for col in share_pivot.columns
+            if col not in (portico_col, "interval_start")
+        ]
+        if share_cols:
+            entropy_terms = [
+                pl.when(pl.col(col) > 0)
+                .then(pl.col(col) * pl.col(col).log())
+                .otherwise(0.0)
+                for col in share_cols
+            ]
+            result = result.with_columns(
+                (-pl.sum_horizontal(entropy_terms)).alias("cluster_entropy")
+            )
+
+    metric_cols = [
+        col for col in result.columns if col not in (portico_col, "interval_start")
+    ]
+    if metric_cols:
+        result = result.with_columns(
+            [pl.col(col).fill_null(0.0) for col in metric_cols]
+        )
+
+    result = result.rename({portico_col: "portico"})
+    return result.to_pandas()
+
+
 def add_accident_target(
     features_df: pd.DataFrame,
     accidents_df: pd.DataFrame,
@@ -1730,3 +2189,186 @@ def get_portico_segments(porticos_df: pd.DataFrame) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(segments)
+
+
+def limpiar_pantalla() -> None:
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def _eje_family(eje: str) -> str:
+    """Normaliza el nombre del eje para agrupar NORTE/SUR en la misma familia."""
+    eje = str(eje or "").strip()
+    eje = re.sub(r"\b(SUR|NORTE)\b", "", eje, flags=re.IGNORECASE)
+    eje = re.sub(r"\s+", " ", eje).strip()
+    return eje.upper()
+
+
+def normalize_portico_code(value: object) -> str:
+    """Normaliza el codigo de portico para comparaciones estables."""
+    try:
+        num = float(str(value).strip())
+        if abs(num - int(num)) < 1e-9:
+            return str(int(num))
+        return str(num)
+    except Exception:
+        return str(value).strip()
+
+
+def reconstruct_portico_sequence(
+    df_porticos: pd.DataFrame,
+    p1: object,
+    p2: object,
+    *,
+    max_anterior: int = 4,
+    max_posterior: int = 0,
+    prefer_family: bool = True,
+    deduplicate_slice: bool = True,
+) -> list:
+    """
+    Reconstruye la lista de porticos alrededor del par consecutivo (p1 -> p2).
+    """
+    required_cols = {"portico", "eje", "calzada", "orden"}
+    if not required_cols.issubset(df_porticos.columns):
+        raise ValueError(
+            f"df_porticos debe contener columnas {sorted(required_cols)}"
+        )
+
+    p1n = normalize_portico_code(p1)
+    p2n = normalize_portico_code(p2)
+
+    df_sorted = df_porticos.sort_values(by=["calzada", "eje", "orden"])
+
+    pair_ctx = None
+    for (calzada, eje), group in df_sorted.groupby(["calzada", "eje"]):
+        seq_raw = group["portico"].tolist()
+        seq_norm = [normalize_portico_code(x) for x in seq_raw]
+        for idx in range(len(seq_norm) - 1):
+            if seq_norm[idx] == p1n and seq_norm[idx + 1] == p2n:
+                pair_ctx = (calzada, eje, idx, seq_raw)
+                break
+        if pair_ctx is not None:
+            break
+
+    if pair_ctx is None:
+        for (calzada, eje), group in df_sorted.groupby(["calzada", "eje"]):
+            seq_raw = group["portico"].tolist()
+            seq_norm = [normalize_portico_code(x) for x in seq_raw]
+            if p1n in seq_norm:
+                pair_ctx = (calzada, eje, seq_norm.index(p1n), seq_raw)
+                break
+
+    if pair_ctx is None:
+        raise ValueError(
+            "No se encontro p1 en las secuencias de porticos cargadas"
+        )
+
+    sel_calzada, sel_eje, i_local, seq_local_raw = pair_ctx
+
+    if prefer_family:
+        df_tmp = df_porticos.copy()
+        df_tmp["eje_fam"] = df_tmp["eje"].apply(_eje_family)
+        fam_key = (sel_calzada, _eje_family(sel_eje))
+        fam_groups = df_tmp.sort_values(
+            ["calzada", "eje_fam", "orden"]
+        ).groupby(["calzada", "eje_fam"])
+        if fam_key in fam_groups.groups:
+            seq_fam_raw = fam_groups.get_group(fam_key)["portico"].tolist()
+            seq_fam_norm = [normalize_portico_code(x) for x in seq_fam_raw]
+            match_idx = None
+            for idx in range(len(seq_fam_norm) - 1):
+                if seq_fam_norm[idx] == p1n and seq_fam_norm[idx + 1] == p2n:
+                    match_idx = idx
+            if match_idx is not None:
+                start_idx = max(0, match_idx - max_anterior)
+                end_idx = min(
+                    len(seq_fam_raw), (match_idx + 1) + max_posterior + 1
+                )
+                slice_seq = seq_fam_raw[start_idx:end_idx]
+                if deduplicate_slice:
+                    seen = set()
+                    out = []
+                    for item in reversed(slice_seq):
+                        if item not in seen:
+                            out.append(item)
+                            seen.add(item)
+                    return list(reversed(out))
+                return slice_seq
+
+    start_idx = max(0, i_local - max_anterior)
+    end_idx = min(len(seq_local_raw), (i_local + 1) + max_posterior + 1)
+    return seq_local_raw[start_idx:end_idx]
+
+
+def seleccionar_tramo_y_porticos(
+    df_porticos: pd.DataFrame,
+    max_anterior: int = 4,
+    max_posterior: int = 0,
+) -> Optional[list]:
+    """
+    Permite seleccionar un tramo de forma interactiva y devuelve la lista
+    de porticos asociados. Usa input en consola.
+    """
+    if df_porticos is None or df_porticos.empty:
+        print("El DataFrame de porticos esta vacio.")
+        return None
+
+    df_sorted = df_porticos.sort_values(by=["calzada", "eje", "orden"])
+    tramos = []
+    secuencias = {}
+
+    for (calzada, eje), group in df_sorted.groupby(["calzada", "eje"]):
+        porticos = group["portico"].tolist()
+        kms = group["km"].tolist()
+        secuencias[(calzada, eje)] = porticos
+        for idx in range(len(porticos) - 1):
+            tramos.append(
+                {
+                    "calzada": calzada,
+                    "eje": eje,
+                    "tramo_str": (
+                        f"Calzada {calzada} - Eje {eje}: "
+                        f"{porticos[idx]} (km {kms[idx]}) -> "
+                        f"{porticos[idx + 1]} (km {kms[idx + 1]})"
+                    ),
+                    "p1_idx": idx,
+                }
+            )
+
+    if not tramos:
+        print("No se pudieron generar tramos a partir de los porticos.")
+        return None
+
+    print("Seleccione el tramo de interes:")
+    for idx, tramo in enumerate(tramos):
+        print(f"  [{idx}] {tramo['tramo_str']}")
+
+    choice_str = input(
+        "\nIngrese el numero del tramo (Enter para cancelar): "
+    ).strip()
+    if not choice_str:
+        print("Operacion cancelada.")
+        return None
+    try:
+        choice = int(choice_str)
+        if not (0 <= choice < len(tramos)):
+            raise ValueError
+    except ValueError:
+        print("Seleccion invalida.")
+        return None
+
+    tramo_sel = tramos[choice]
+    calzada = tramo_sel["calzada"]
+    eje = tramo_sel["eje"]
+    p1_idx = tramo_sel["p1_idx"]
+    p1 = secuencias[(calzada, eje)][p1_idx]
+    p2 = secuencias[(calzada, eje)][p1_idx + 1]
+
+    return reconstruct_portico_sequence(
+        df_porticos=df_porticos,
+        p1=p1,
+        p2=p2,
+        max_anterior=max_anterior,
+        max_posterior=max_posterior,
+        prefer_family=True,
+        deduplicate_slice=True,
+    )

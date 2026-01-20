@@ -1,4 +1,5 @@
 import pandas as pd
+import polars as pl
 import pytest
 import sys
 from pathlib import Path
@@ -93,3 +94,35 @@ def test_compute_cluster_features_consistency():
     for col in expected_cols:
         assert col in result.columns
 
+
+def test_compute_cluster_features_polars_input():
+    flow_data = {
+        "FECHA": pd.to_datetime(["2023-01-01 10:00:00", "2023-01-01 10:01:00"]),
+        "VELOCIDAD": [80, 85],
+        "MATRICULA": ["A1", "A2"],
+        "PORTICO": ["P1", "P1"],
+    }
+    flows_df = pl.from_pandas(pd.DataFrame(flow_data))
+    cluster_df = pd.DataFrame(
+        {"plate": ["A1", "A2"], "cluster_label": [0, 1]}
+    )
+
+    result = compute_cluster_features(
+        flows_df,
+        cluster_df,
+        interval_minutes=5,
+        include_counts=True,
+        include_speed=True,
+    )
+
+    assert not result.empty
+    expected_cols = [
+        "cluster_share_0",
+        "cluster_share_1",
+        "cluster_flow_0",
+        "cluster_flow_1",
+        "cluster_speed_0",
+        "cluster_speed_1",
+    ]
+    for col in expected_cols:
+        assert col in result.columns

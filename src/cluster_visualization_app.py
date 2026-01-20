@@ -131,7 +131,7 @@ def main() -> None:
         opacity=0.7,
     )
     scatter_fig.update_traces(marker={"size": 2})
-    st.plotly_chart(scatter_fig, use_container_width=True)
+    st.plotly_chart(scatter_fig, width='stretch')
 
     st.subheader("Distribucion de una variable")
     hist_col = st.selectbox("Variable", numeric_cols, index=0, key="hist_var")
@@ -139,7 +139,7 @@ def main() -> None:
     hist_fig = px.histogram(
         df_plot, x=hist_col, nbins=bins, color="cluster_label"
     )
-    st.plotly_chart(hist_fig, use_container_width=True)
+    st.plotly_chart(hist_fig, width='stretch')
 
     st.subheader("Caracterizacion de clusters")
     default_profile_vars = numeric_cols[: min(8, len(numeric_cols))]
@@ -179,12 +179,12 @@ def main() -> None:
                 yaxis_title="Cluster",
                 coloraxis_colorbar_title=norm_method,
             )
-            st.plotly_chart(heat_fig, use_container_width=True)
+            st.plotly_chart(heat_fig, width='stretch')
             show_table = st.checkbox(
                 "Mostrar tabla de promedios", value=False, key="profile_table"
             )
             if show_table:
-                st.dataframe(profile.round(3), use_container_width=True)
+                st.dataframe(profile.round(3), width='stretch')
 
     with tabs[1]:
         st.caption("Distribucion por cluster para una variable con violin o boxplot.")
@@ -212,7 +212,7 @@ def main() -> None:
                 points="outliers",
             )
         dist_fig.update_layout(xaxis_title="Cluster")
-        st.plotly_chart(dist_fig, use_container_width=True)
+        st.plotly_chart(dist_fig, width='stretch')
 
     with tabs[2]:
         st.caption(
@@ -246,7 +246,7 @@ def main() -> None:
                 color="cluster_label",
             )
             matrix_fig.update_traces(diagonal_visible=False)
-            st.plotly_chart(matrix_fig, use_container_width=True)
+            st.plotly_chart(matrix_fig, width='stretch')
 
     with tabs[3]:
         st.caption("Radar con perfiles normalizados para comparar clusters.")
@@ -295,7 +295,7 @@ def main() -> None:
                 ),
                 showlegend=True,
             )
-            st.plotly_chart(radar_fig, use_container_width=True)
+            st.plotly_chart(radar_fig, width='stretch')
 
     st.subheader("Tamanos de cluster")
     counts = (
@@ -310,8 +310,8 @@ def main() -> None:
     )
     bar_fig.update_traces(textposition="outside")
     bar_fig.update_layout(xaxis_title="Cluster", yaxis_title="Filas")
-    st.plotly_chart(bar_fig, use_container_width=True)
-    st.dataframe(counts, use_container_width=True)
+    st.plotly_chart(bar_fig, width='stretch')
+    st.dataframe(counts, width='stretch')
 
 
 if __name__ == "__main__":
