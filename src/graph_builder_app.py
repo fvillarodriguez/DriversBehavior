@@ -76,6 +76,7 @@ from src.config import (
     SEQ_LENGTH,
     TRAIN_RATIO,
     VAL_RATIO,
+    get_auto_device,
 )
 from src.features import compute_pm_features
 from src.graph_visualization import render_visual_graph_tab
@@ -5831,11 +5832,9 @@ def _render_balance_tab() -> None:
                 step=1,
                 key="gnn_smote_out",
             )
-            device = st.selectbox(
-                "Dispositivo",
-                ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"],
-                key="gnn_smote_device",
-            )
+            # Selección automática de dispositivo
+            device = get_auto_device()
+            st.info(f"Dispositivo: {device}")
 
         z2x_base_dir = st.text_input(
             "Directorio z2x decoders",
@@ -6042,14 +6041,9 @@ def _render_balance_tab() -> None:
             step=1,
             key="gnn_imgagn_minority",
         )
-        device_options = ["cpu"]
-        if torch.cuda.is_available():
-            device_options.append("cuda")
-        device = st.selectbox(
-            "Dispositivo",
-            device_options,
-            key="gnn_imgagn_device",
-        )
+        # Selección automática de dispositivo
+        device = get_auto_device()
+        st.info(f"Dispositivo: {device}")
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -6564,18 +6558,9 @@ def _render_training_tab() -> None:
     else:
         st.caption(f"Se reutilizaran los hiperparametros: {hp_choice}.")
 
-    device_opts = ["cpu"]
-    if torch.cuda.is_available():
-        device_opts.append("cuda")
-    if torch.backends.mps.is_available():
-        device_opts.append("mps")
-    eval_device = st.selectbox(
-        "Dispositivo para evaluacion",
-        device_opts,
-        index=0,
-        key="gnn_train_eval_device",
-    )
-    st.caption(f"Evaluacion se ejecutara en {eval_device}.")
+    # Selección automática de dispositivo
+    eval_device = get_auto_device()
+    st.info(f"Dispositivo para evaluacion: {eval_device}")
     st.markdown("#### Early stopping")
     max_epochs_train = st.number_input(
         "max_epochs",
@@ -6954,11 +6939,9 @@ def _render_evaluation_tab() -> None:
 
     # 4. Evaluación
     st.markdown("---")
-    eval_device = st.selectbox(
-        "Dispositivo para evaluación",
-        ["cpu", "cuda", "mps"] if torch.cuda.is_available() or torch.backends.mps.is_available() else ["cpu"],
-        key="gnn_eval_device"
-    )
+    # Selección automática de dispositivo
+    eval_device = get_auto_device()
+    st.info(f"Dispositivo para evaluación: {eval_device}")
     eval_threshold = st.slider(
         "Umbral de decisión (Override)",
         min_value=0.01,
@@ -7845,18 +7828,10 @@ def _render_optuna_tab() -> None:
             index=0,
             key="gnn_optuna_pruner",
         )
-    with col_device:
-        device_opts = ["cpu"]
-        if torch.cuda.is_available():
-            device_opts.append("cuda")
-        if torch.backends.mps.is_available():
-            device_opts.append("mps")
-        optuna_device = st.selectbox(
-            "Dispositivo",
-            device_opts,
-            index=0,
-            key="gnn_optuna_device",
-        )
+    
+    # Selección automática de dispositivo
+    optuna_device = get_auto_device()
+    st.info(f"Dispositivo para Optuna: {optuna_device}")
 
     multivariate = st.checkbox(
         "Sampler multivariate",

@@ -5,6 +5,16 @@ except Exception:
 import numpy as np # type: ignore
 import os
 
+def get_auto_device():
+    """Retorna el mejor dispositivo disponible: MPS > CUDA > CPU."""
+    if torch is not None:
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+    return "cpu"
+
 # --------------------------------------------------------------------------- #
 # CONFIGURACIÓN GLOBAL Y CONSTANTES
 # --------------------------------------------------------------------------- #

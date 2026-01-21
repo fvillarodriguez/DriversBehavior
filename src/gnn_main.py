@@ -417,12 +417,9 @@ def run_gnn_anomaly_pipeline(loaded_obj):
         use_graphsmote = False
 
     # Dispositivo
-    if torch.backends.mps.is_available():
-        device = torch.device("mps"); print("▶️ Usando dispositivo: Apple Metal (MPS)")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda"); print("▶️ Usando dispositivo: NVIDIA CUDA GPU")
-    else:
-        device = torch.device("cpu");  print("▶️ Usando dispositivo: CPU")
+    # Selection automática de dispositivo
+    device = get_auto_device()
+    print(f"▶️ Usando dispositivo: {device}")
 
     data = loaded_obj['data'].to(device)
 
@@ -1353,12 +1350,8 @@ def run_gat_training(
       - Integración de GraphSMOTE (offline, online, o ninguno).
     """
     # 0) Dispositivo
-    if torch.backends.mps.is_available():
-        device = torch.device("mps"); logger.info("Usando MPS")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda"); logger.info("Usando CUDA")
-    else:
-        device = torch.device("cpu");  logger.info("Usando CPU")
+    device = get_auto_device()
+    logger.info(f"Usando dispositivo: {device}")
 
     # 1) Cargar datos y estadísticas
     data = loaded_obj['data']
@@ -2314,12 +2307,9 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
                     logger.error(f"No se pudo cargar o procesar '{os.path.basename(latest_hpo_file)}': {e}. Iniciando nueva búsqueda.")
 
     # Dispositivo
-    if torch.backends.mps.is_available():
-        device = torch.device("mps"); logger.info("Usando MPS")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda"); logger.info("Usando CUDA")
-    else:
-        device = torch.device("cpu");  logger.info("Usando CPU")
+    # Selection automática de dispositivo
+    device = get_auto_device()
+    logger.info(f"Usando dispositivo: {device}")
 
     data = loaded_obj['data'].to(device)
     sequence_index_global = loaded_obj.get('sequence_index')
@@ -2385,12 +2375,9 @@ def run_imgagn_hpo(loaded_obj):
     Guarda CSV con el mejor trial y el estudio completo en 'Resultados/'.
     """
     # Dispositivo
-    if torch.backends.mps.is_available():
-        device = torch.device("mps"); logger.info("Usando MPS")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda"); logger.info("Usando CUDA")
-    else:
-        device = torch.device("cpu");  logger.info("Usando CPU")
+    # Selection automática de dispositivo
+    device = get_auto_device()
+    logger.info(f"Usando dispositivo: {device}")
 
     data = loaded_obj['data']
     node_type = 'pm'
@@ -2695,15 +2682,9 @@ def run_gat_testing(loaded_obj):
     use_graphsmote = use_graphsmote_input in ('s', 'si', 'y', 'yes')
 
     # 1. Determinar dispositivo y cargar datos
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("▶️ Usando dispositivo: Apple Metal (MPS)")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("▶️ Usando dispositivo: NVIDIA CUDA GPU")
-    else:
-        device = torch.device("cpu")
-        print("▶️ Usando dispositivo: CPU")
+    # Selection automática de dispositivo
+    device = get_auto_device()
+    print(f"▶️ Usando dispositivo: {device}")
     
     data = loaded_obj['data'].to(device)
 
@@ -3102,12 +3083,8 @@ def test_graphsmote(loaded_obj):
     
     # 1. Extraer datos y determinar dispositivo
     data = loaded_obj['data']
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    # Selection automática de dispositivo
+    device = get_auto_device()
     logger.info(f"Usando dispositivo: {device}")
 
     # 2. Crear un modelo base para generar embeddings
@@ -3210,12 +3187,7 @@ def test_imgagn(loaded_obj):
     logger.info("--- Iniciando Test de ImGAGN ---")
 
     # 1) Dispositivo
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    device = get_auto_device()
     logger.info(f"Usando dispositivo: {device}")
 
     data = loaded_obj['data']
@@ -3747,15 +3719,9 @@ def main():
                 print(f"✅ Grafo recién creado en: {new_graph_path}")
                 print("Cargando el nuevo grafo en memoria...")
                 try:
-                    if torch.backends.mps.is_available():
-                        device = torch.device("mps")
-                        print("Usando dispositivo: Apple Metal (MPS)")
-                    elif torch.cuda.is_available():
-                        device = torch.device("cuda")
-                        print("Usando dispositivo: NVIDIA CUDA GPU")
-                    else:
-                        device = torch.device("cpu")
-                        print("Usando dispositivo: CPU")
+                    # Selection automática de dispositivo
+                    device = get_auto_device()
+                    print(f"Usando dispositivo: {device}")
                     loaded_obj = torch.load(new_graph_path, map_location=device, weights_only=False)
                     loaded_obj['filename'] = os.path.basename(new_graph_path)
                     print("---------------------------------------")
