@@ -145,6 +145,7 @@ TIME_SLOTS_TO_FILTER = [
 # Parámetros de entrenamiento
 MAX_EPOCHS = 3000
 EARLY_STOPPING_PATIENCE = 5 # 30 Número de evaluaciones sin mejora
+EARLY_STOPPING_MIN_DELTA = 0.0
 
 # optimize
 TIMEOUT = 172800 #48HR

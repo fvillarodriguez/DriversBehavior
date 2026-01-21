@@ -494,8 +494,11 @@ def flatten_snapshot_features(
     flat = features.reset_index()
     flat = flat.rename(columns={"snapshot_time": "timestamp"})
 
-    ts_ns = flat["timestamp"].astype("int64")
-    flat["ts_min"] = (ts_ns // 60_000_000_000).astype(int)
+    ts = pd.to_datetime(flat["timestamp"], errors="coerce").astype("datetime64[ns]")
+    ts_ns = ts.astype("int64")
+    ts_min = pd.Series(ts_ns // 60_000_000_000, index=flat.index)
+    ts_min = ts_min.mask(ts.isna(), pd.NA).astype("Int64")
+    flat["ts_min"] = ts_min
 
     if not include_timestamp:
         flat = flat.drop(columns=["timestamp"])

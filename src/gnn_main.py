@@ -5,7 +5,7 @@ os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1' # --- FIX for MPS FallBck ---
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", # Asignador seguro de CUDA
   "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.8")
 
-from typing import Optional, Union, List, Dict, Tuple
+from typing import Callable, Optional, Union, List, Dict, Tuple
 
 import pandas as pd
 import re
@@ -47,7 +47,7 @@ from src.gat_model import HeteroGAT
 from src.temporal_head import TemporalAggregator
 from src.graphsmote import (RelEdgeGen,train_z2x_decoders,augment_graph_offline_once, refresh_synthetics_online)
 from src.imgagn import ImGAGNConfig, train_imgagn
-from src.config import (SEED,DT_MINUTES,MAX_EPOCHS,EARLY_STOPPING_PATIENCE,RESULTADOS_DIR,
+from src.config import (SEED,DT_MINUTES,MAX_EPOCHS,EARLY_STOPPING_PATIENCE,EARLY_STOPPING_MIN_DELTA,RESULTADOS_DIR,
                         BATCH_SIZE,NUM_NEIGHBORS,N_TRIALS,DEBUG,NUM_EPOCHS_OPTUNA,
                         GRAPHSMOTE_MODE, TARGET_POS_RATIO,
                         GRAPHSMOTE_K, PRETRAIN_EDGE_EPOCHS, SMOTE_EVERY_N_EPOCHS,
@@ -1323,7 +1323,18 @@ def _calculate_graph_hash(graph_filename):
         logger.error(f"Error al leer el archivo del grafo para hashear: {e}")
         return None
 
-def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, purpose: Optional[str] = None):
+def run_gat_training(
+    loaded_obj,
+    force_use_graphsmote: Optional[bool] = None,
+    purpose: Optional[str] = None,
+    *,
+    early_stop: Optional[bool] = None,
+    early_stop_patience: Optional[int] = None,
+    early_stop_min_delta: Optional[float] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
+    max_epochs: Optional[int] = None,
+    smote_num_neighbors: Optional[object] = None,
+):
     """
     Entrenamiento GAT completo con:
       - Selección o búsqueda de hiperparámetros.
@@ -1440,6 +1451,23 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
         logger.error("No se pudieron obtener los hiperparámetros. Abortando.")
         return
 
+    if smote_num_neighbors is None:
+        smote_num_neighbors = best_params.get("smote_num_neighbors")
+    if smote_num_neighbors is None:
+        smote_num_neighbors = best_params.get("num_neighbors")
+    if smote_num_neighbors is None:
+        smote_num_neighbors = EMB_NUM_NEIGHBORS
+    if isinstance(smote_num_neighbors, (int, float)):
+        layers = int(best_params.get("num_layers", 2))
+        smote_num_neighbors = [int(smote_num_neighbors)] * max(layers, 1)
+
+    if early_stop is not None:
+        best_params["early_stop"] = bool(early_stop)
+    if early_stop_patience is not None:
+        best_params["early_stop_patience"] = int(early_stop_patience)
+    if early_stop_min_delta is not None:
+        best_params["early_stop_min_delta"] = float(early_stop_min_delta)
+
     data.edge_attr_dict = { et: getattr(data[et], 'edge_attr', None) for et in data.edge_types }
 
     # 3) SummaryWriter + hparams
@@ -1495,12 +1523,35 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
     elif hasattr(model, 'temporal_head'):
         delattr(model, 'temporal_head')
 
+    # Rutas y directorios por modelo (usar mismo ID para z2x + modelo)
+    tag_suffix = _model_tag_suffix(use_graphsmote, loaded_obj)
+    ts_stamp_save = datetime.now().strftime('%Y%m%d_%H%M%S')
+    graph_hash = _calculate_graph_hash(loaded_obj.get('filename'))
+    hash_tag8 = f"_{graph_hash[:8]}" if graph_hash else ""
+    best_model_path = os.path.join(RESULTADOS_DIR, f"gat_model_BEST{tag_suffix}.pt")
+    best_model_path_unique = os.path.join(
+        RESULTADOS_DIR,
+        f"gat_model_BEST{tag_suffix}_{ts_stamp_save}{hash_tag8}.pt",
+    )
+    z2x_run_dir = os.path.join(
+        RESULTADOS_DIR,
+        "z2x_decoders",
+        os.path.splitext(os.path.basename(best_model_path_unique))[0],
+    )
+
     # --- Pre-entrenamiento de decodificadores si se usa GraphSMOTE ---
     z2x_decoders = None
     if use_graphsmote:
         logger.info("Entrenando decodificadores z->x para la aumentación...")
         model.use_checkpointing = False
-        z2x_decoders = train_z2x_decoders(model, data, device=device, epochs=DECODER_EPOCHS)
+        z2x_decoders = train_z2x_decoders(
+            model,
+            data,
+            device=device,
+            epochs=DECODER_EPOCHS,
+            num_neighbors=smote_num_neighbors,
+            save_dir=z2x_run_dir,
+        )
         model.use_checkpointing = True
 
     # Edge generator
@@ -1581,7 +1632,8 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
             k=GRAPHSMOTE_K,
             edge_gen=edge_gen,
             save_path=SAVE_AUG_GRAPH_PATH,
-            seed=GS_SEED
+            seed=GS_SEED,
+            num_neighbors=smote_num_neighbors,
         )
         model.use_checkpointing = True
         train_graph = aug_data.to(device)
@@ -1678,11 +1730,12 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
 
     train_loader = rebuild_train_loader(train_graph)
     
+    max_epochs = int(max_epochs) if max_epochs is not None else int(MAX_EPOCHS)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=float(best_params['lr']),
         steps_per_epoch=len(train_loader),
-        epochs=MAX_EPOCHS,
+        epochs=max_epochs,
         cycle_momentum=isinstance(optimizer, (torch.optim.AdamW, torch.optim.NAdam))
     )
 
@@ -1690,16 +1743,26 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
     best_val_f1 = 0.0
     best_epoch = 0
     patience_counter = 0
-    patience = EARLY_STOPPING_PATIENCE
-    # Sufijar el archivo del mejor modelo según la configuración
-    tag_suffix = _model_tag_suffix(use_graphsmote, loaded_obj)
-    # Alias estable (compatibilidad)
-    best_model_path = os.path.join(RESULTADOS_DIR, f"gat_model_BEST{tag_suffix}.pt")
-    # Ruta única con timestamp (+ hash de grafo si disponible) para no sobreescribir
-    ts_stamp_save = datetime.now().strftime('%Y%m%d_%H%M%S')
-    graph_hash = _calculate_graph_hash(loaded_obj.get('filename'))
-    hash_tag8 = f"_{graph_hash[:8]}" if graph_hash else ""
-    best_model_path_unique = os.path.join(RESULTADOS_DIR, f"gat_model_BEST{tag_suffix}_{ts_stamp_save}{hash_tag8}.pt")
+    early_stop_enabled = bool(best_params.get("early_stop", True))
+    patience = int(
+        best_params.get("early_stop_patience", EARLY_STOPPING_PATIENCE)
+    )
+    min_delta = float(
+        best_params.get("early_stop_min_delta", EARLY_STOPPING_MIN_DELTA)
+    )
+    if progress_callback is not None:
+        try:
+            progress_callback(
+                epoch=0,
+                total=max_epochs,
+                val_f1=None,
+                best_val_f1=best_val_f1,
+                patience=patience,
+                patience_counter=patience_counter,
+            )
+        except Exception:
+            pass
+    # best_model_path y best_model_path_unique ya definidos arriba
     
     # Automatic Mixed Precision (AMP)
     use_amp_param = best_params.get('use_amp', True)
@@ -1723,7 +1786,7 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
         logger.info("XAI=0 (desactivado): no se capturarán atenciones. Se omitirá la regularización L2 de atenciones (lambda_l2_att>0) y se silenciarán avisos por época.")
         suppress_missing_att_warning = True
 
-    for epoch in range(1, MAX_EPOCHS + 1):
+    for epoch in range(1, max_epochs + 1):
         if use_undersampling:
             strategy_now = undersampling_strategy
             if undersampling_strategy == 'hard' and epoch <= hard_sampling_warmup:
@@ -1739,7 +1802,8 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
                 k=GRAPHSMOTE_K,
                 z2x_decoders=z2x_decoders,
                 edge_gen=edge_gen,
-                seed=GS_SEED + epoch
+                seed=GS_SEED + epoch,
+                num_neighbors=smote_num_neighbors,
             )
             model.use_checkpointing = True
             train_graph = aug_data.to(device)
@@ -1765,10 +1829,10 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
             lam0 = float(best_params.get('initial_lambda_H', 0.0))
             lam1 = float(best_params.get('final_lambda_H', 0.0))
             if mode == 'cosine':
-                t = (epoch-1) / max(1, MAX_EPOCHS-1)
+                t = (epoch-1) / max(1, max_epochs-1)
                 current_lambda_H = lam0 + 0.5*(lam1-lam0)*(1 - math.cos(math.pi*t))
             else:  # linear
-                current_lambda_H = lam0 + (lam1 - lam0) * (epoch-1) / max(1, MAX_EPOCHS-1)
+                current_lambda_H = lam0 + (lam1 - lam0) * (epoch-1) / max(1, max_epochs-1)
         
         lambda_edge = float(best_params.get('lambda_edge', 1e-6))
         lambda_l2_att = float(best_params.get('lambda_l2_att', 0.0))
@@ -1822,7 +1886,7 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
                 except Exception:
                     pass
 
-        if val_f1 > best_val_f1:
+        if (val_f1 - best_val_f1) > min_delta:
             best_val_f1 = val_f1
             best_epoch = epoch
             patience_counter = 0
@@ -1883,8 +1947,26 @@ def run_gat_training(loaded_obj, force_use_graphsmote: Optional[bool] = None, pu
         else:
             patience_counter += 1
 
-        if patience_counter >= patience:
-            logger.info(f"Early stopping at epoch {epoch}.")
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    epoch=epoch,
+                    total=max_epochs,
+                    val_f1=val_f1,
+                    best_val_f1=best_val_f1,
+                    patience=patience,
+                    patience_counter=patience_counter,
+                )
+            except Exception:
+                pass
+
+        if early_stop_enabled and patience_counter >= patience:
+            logger.info(
+                "Early stopping at epoch %d (patience=%d, min_delta=%g).",
+                epoch,
+                patience,
+                min_delta,
+            )
             break
     
     writer.close()

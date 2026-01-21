@@ -144,6 +144,37 @@ class RelEdgeGen(torch.nn.Module):
 # ============================================================
 # 2) Extracción de embeddings
 # ============================================================
+def _normalize_num_neighbors(num_neighbors, data):
+    edge_types = getattr(data, "edge_types", None)
+
+    def _profile(val):
+        if isinstance(val, (int, float)):
+            return [int(val)]
+        if isinstance(val, (list, tuple)):
+            return [int(x) for x in val]
+        return None
+
+    if edge_types is None:
+        return _profile(num_neighbors) or [1]
+
+    if isinstance(num_neighbors, dict):
+        default_profile = None
+        for v in num_neighbors.values():
+            prof = _profile(v)
+            if prof:
+                default_profile = prof
+                break
+        if default_profile is None:
+            default_profile = [1]
+        return {
+            edge_type: _profile(num_neighbors.get(edge_type)) or default_profile
+            for edge_type in edge_types
+        }
+
+    profile = _profile(num_neighbors) or [1]
+    return {edge_type: profile for edge_type in edge_types}
+
+
 def compute_epoch_embeddings(model, data):
     model.eval()
     with torch.no_grad():
@@ -152,10 +183,11 @@ def compute_epoch_embeddings(model, data):
     return z_dict
 
 @torch.no_grad()
-def get_embeddings_minibatch(model, data):
+def get_embeddings_minibatch(model, data, *, num_neighbors=NUM_NEIGHBORS):
     model.eval()
     device = next(model.parameters()).device
     data_cpu = data.cpu()
+    num_neighbors = _normalize_num_neighbors(num_neighbors, data_cpu)
     z_dict = {node_type: [] for node_type in data.node_types}
 
     for node_type in data.node_types:
@@ -166,7 +198,7 @@ def get_embeddings_minibatch(model, data):
         loader = NeighborLoader(
             data_cpu,
             input_nodes=(node_type, torch.arange(data_cpu[node_type].num_nodes)),
-            num_neighbors=NUM_NEIGHBORS,
+            num_neighbors=num_neighbors,
             batch_size=BATCH_SIZE,
             shuffle=False,
         )
@@ -260,6 +292,7 @@ def train_z2x_decoders(
     val_split: float = 0.1,
     log_every: int = 1,
     show_progress: bool = True, #False para mostrar resultados de cada epoch de entrenamiento en la consola
+    num_neighbors=NUM_NEIGHBORS,
 ):
     """
     Entrena un decodificador z->x por tipo usando z extraído en modo eval.
@@ -270,7 +303,9 @@ def train_z2x_decoders(
     if device is None:
         device = next(model.parameters()).device
     
-    z_dict = get_embeddings_minibatch(model, data)
+    z_dict = get_embeddings_minibatch(
+        model, data, num_neighbors=num_neighbors
+    )
 
     # dims por tipo
     dims_per_type = {}
@@ -333,6 +368,8 @@ def train_z2x_decoders(
     if show_progress:
         epoch_iter = tqdm(epoch_iter, desc="Z2X training (epochs)", leave=False)
 
+    history = []
+
     for epoch in epoch_iter:
         dec.train()
         opt.zero_grad()
@@ -381,6 +418,13 @@ def train_z2x_decoders(
                 else:
                     epochs_no_improve += 1
 
+        # Append to history
+        history.append({
+            "epoch": epoch,
+            "train_loss": total_train_loss,
+            "val_loss": total_val_loss if total_val_loss is not None else None
+        })
+
         if (log_every is not None) and (log_every > 0) and (epoch % log_every == 0):
             if show_progress and hasattr(epoch_iter, 'set_postfix'):
                 if total_val_loss is not None:
@@ -413,6 +457,15 @@ def train_z2x_decoders(
     # Guardar por tipo
     for ntype in dims_per_type.keys():
         torch.save(dec.heads[ntype].state_dict(), os.path.join(save_dir, f"{ntype}.pt"))
+
+    # Guardar historial de entrenamiento
+    history_path = os.path.join(save_dir, "history.json")
+    try:
+        import json
+        with open(history_path, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        logger.error(f"Could not save z2x history: {e}")
 
     dec.eval()
     dec._loaded_types = set(dims_per_type.keys())
@@ -760,6 +813,7 @@ def _coalesce_and_align_all_edges(data: HeteroData):
 @torch.no_grad()
 def compute_train_embeddings(model, data: HeteroData, device, num_neighbors, batch_size, node_type='pm'):
     model.eval()
+    num_neighbors = _normalize_num_neighbors(num_neighbors, data)
     # Get embeddings only for the training nodes
     train_nodes = data[node_type].train_mask.nonzero(as_tuple=True)[0]
     loader = NeighborLoader(
@@ -1004,7 +1058,8 @@ def augment_graph_offline_once(
     k: int,
     edge_gen=None,
     save_path: str = None,
-    seed: int = 0
+    seed: int = 0,
+    num_neighbors=EMB_NUM_NEIGHBORS,
 ):
     rng = np.random.RandomState(seed)
     try:
@@ -1015,7 +1070,7 @@ def augment_graph_offline_once(
     # 1) Embeddings SOLO train
     z_dict = compute_train_embeddings(
         model, data, device,
-        num_neighbors=EMB_NUM_NEIGHBORS,
+        num_neighbors=num_neighbors,
         batch_size=EMB_BATCH_SIZE,
         node_type='pm'
     )
@@ -1089,7 +1144,8 @@ def refresh_synthetics_online(
     k: int,
     z2x_decoders,
     edge_gen=None,
-    seed: int = 0
+    seed: int = 0,
+    num_neighbors=EMB_NUM_NEIGHBORS,
 ):
     """
     Parte siempre del grafo BASE (solo reales) y vuelve a sintetizar,
@@ -1104,7 +1160,8 @@ def refresh_synthetics_online(
         z2x_decoders=z2x_decoders,
         edge_gen=edge_gen,
         save_path=None,
-        seed=seed
+        seed=seed,
+        num_neighbors=num_neighbors,
     )
     return augmented, registry
 def _first_hop_neighbors_of_accidents(

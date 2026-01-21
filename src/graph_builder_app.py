@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import contextlib
 import glob
 import hashlib
 import json
@@ -60,6 +61,8 @@ from src.snapshot_sequences import (
 from src.config import (
     BATCH_SIZE,
     DT_MINUTES,
+    EARLY_STOPPING_MIN_DELTA,
+    EARLY_STOPPING_PATIENCE,
     FLOAT,
     GRAPHSMOTE_K,
     DECODER_EPOCHS,
@@ -118,13 +121,81 @@ class StreamlitLogHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
+# Redirects stdout/stderr to a Streamlit container.
+class StreamlitStdout:
+    def __init__(self, container, max_lines: int = 200) -> None:
+        self.container = container
+        self.max_lines = max_lines
+        self.lines: List[str] = []
+        self.last_update = 0.0
+        self.update_interval = 0.5
+
+    def write(self, message: str) -> None:
+        if message is None:
+            return
+        text = str(message)
+        if not text:
+            return
+        for line in text.rstrip("\n").splitlines():
+            if not line.strip():
+                continue
+            self.lines.append(line)
+        if len(self.lines) > self.max_lines:
+            self.lines = self.lines[-self.max_lines:]
+        current_time = time.time()
+        if current_time - self.last_update > self.update_interval:
+            self.container.code("\n".join(self.lines), language="text")
+            self.last_update = current_time
+
+    def flush(self) -> None:
+        return
+
 # --- HELPERS ---
 def _normalize_portico_series(series: pd.Series) -> pd.Series:
     cleaned = series.astype(str).str.strip()
     lowered = cleaned.str.lower()
     invalid = lowered.isin({"", "nan", "none", "null"})
     cleaned = cleaned.mask(invalid, None)
-    return cleaned.str.replace(r"\.0$", "", regex=True)
+    cleaned = cleaned.str.replace(r"\.0$", "", regex=True)
+    numeric = pd.to_numeric(cleaned, errors="coerce")
+    if numeric.notna().any():
+        return numeric.astype("Int64")
+    return cleaned
+
+
+def _ts_min_from_datetime(
+    series: pd.Series,
+    *,
+    floor_minutes: Optional[int] = None,
+    shift: int = 0,
+) -> pd.Series:
+    ts = series.dt.floor("min")
+    if floor_minutes:
+        ts = series.dt.floor(f"{int(floor_minutes)}min")
+    ts_int = ts.astype("int64")
+    out = (ts_int // 60_000_000_000) + int(shift)
+    out = pd.Series(out, index=series.index, dtype="Int64")
+    return out.where(~ts.isna(), pd.NA)
+
+
+def _ts_min_range(series: pd.Series) -> Tuple[Optional[int], Optional[int]]:
+    values = pd.to_numeric(series, errors="coerce")
+    if values.empty:
+        return None, None
+    min_val = values.min()
+    max_val = values.max()
+    if pd.isna(min_val) or pd.isna(max_val):
+        return None, None
+    return int(min_val), int(max_val)
+
+
+def _ts_min_to_dt(ts_min: Optional[int]) -> Optional[pd.Timestamp]:
+    if ts_min is None:
+        return None
+    try:
+        return pd.to_datetime(int(ts_min), unit="m", origin="unix")
+    except Exception:
+        return None
 
 
 def _ensure_porticos_loaded() -> Optional[pd.DataFrame]:
@@ -664,6 +735,32 @@ def _normalize_match_key(value: object) -> str:
     text = unicodedata.normalize("NFKD", text)
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _sanitize_path_token(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value))
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")
+    return text or "model"
+
+
+def _resolve_z2x_dir(base_dir: str, model_path: Optional[str]) -> str:
+    base_dir = base_dir or os.path.join(RESULTADOS_DIR, "z2x_decoders")
+    if not model_path or model_path == "(ninguno)":
+        return base_dir
+    model_path_obj = Path(model_path)
+    stem = model_path_obj.stem
+    if not re.search(r"_\d{8}_\d{6}_[0-9a-fA-F]{8}$", stem):
+        pattern = f"{stem}_????????_??????_????????.pt"
+        candidates = sorted(
+            glob.glob(str(model_path_obj.with_name(pattern))),
+            key=os.path.getmtime,
+        )
+        if candidates:
+            model_path_obj = Path(candidates[-1])
+            stem = model_path_obj.stem
+    model_stem = _sanitize_path_token(stem)
+    return os.path.join(base_dir, model_stem)
 
 
 def _find_match_column(
@@ -2133,6 +2230,36 @@ def _debug_labels(enabled: bool, message: str) -> None:
         st.caption(f"[label-debug] {message}")
 
 
+def _debug_snapshot(enabled: bool, message: str) -> None:
+    if enabled:
+        st.caption(f"[snapshot-debug] {message}")
+
+
+def _auto_neighbor_count(graph_data: HeteroData, node_type: str = "pm") -> int:
+    if graph_data is None:
+        return 1
+    total_edges = 0
+    try:
+        for edge_type in graph_data.edge_types:
+            store = graph_data[edge_type]
+            if hasattr(store, "edge_index") and store.edge_index is not None:
+                total_edges += int(store.edge_index.shape[1])
+    except Exception:
+        total_edges = 0
+    try:
+        num_nodes = int(graph_data[node_type].num_nodes)
+    except Exception:
+        num_nodes = 1
+    avg_degree = total_edges / max(num_nodes, 1)
+    if avg_degree <= 2:
+        return 1
+    if avg_degree <= 4:
+        return 2
+    if avg_degree <= 8:
+        return 3
+    return 4
+
+
 def _frame_debug_info(obj: object, name: str) -> str:
     if obj is None:
         return f"{name}: None"
@@ -2765,6 +2892,7 @@ def run_feature_generation_workflow(params):
     use_batches = gen_params.get("use_batches", False)
     force_snapshot = bool(gen_params.get("force_snapshot"))
     debug_cluster = bool(gen_params.get("debug_cluster"))
+    debug_snapshot = bool(gen_params.get("debug_snapshot"))
 
     cluster_features_df = None
     cluster_labels_df = None
@@ -3071,6 +3199,27 @@ def run_feature_generation_workflow(params):
                                 else batch_df
                             )
                             if not _is_empty_frame(flow_pd):
+                                if debug_snapshot:
+                                    _debug_snapshot(
+                                        debug_snapshot,
+                                        _frame_debug_info(flow_pd, "flow_pd"),
+                                    )
+                                    fecha_col = _find_column_by_keywords(
+                                        flow_pd,
+                                        ["fecha", "timestamp", "datetime", "time"],
+                                    )
+                                    if fecha_col:
+                                        series = pd.to_datetime(
+                                            flow_pd[fecha_col], errors="coerce"
+                                        )
+                                        _debug_snapshot(
+                                            debug_snapshot,
+                                            f"flow_pd[{fecha_col}] dtype={flow_pd[fecha_col].dtype} min={series.min()} max={series.max()}",
+                                        )
+                                    _debug_snapshot(
+                                        debug_snapshot,
+                                        f"snapshot_params dt={snap_config.dt_minutes} window={snap_config.window_minutes}",
+                                    )
                                 snapshot_features, _ = builder.build(
                                     flow_pd,
                                     df_p,
@@ -3080,10 +3229,36 @@ def run_feature_generation_workflow(params):
                                     include_spatial_gradients=include_spatial_gradients,
                                     include_temporal_encodings=include_temporal_encodings,
                                 )
+                                if debug_snapshot and isinstance(
+                                    snapshot_features.index, pd.MultiIndex
+                                ):
+                                    if "snapshot_time" in snapshot_features.index.names:
+                                        snap_idx = snapshot_features.index.get_level_values(
+                                            "snapshot_time"
+                                        )
+                                    else:
+                                        snap_idx = snapshot_features.index.get_level_values(
+                                            1
+                                        )
+                                    snap_ts = pd.to_datetime(
+                                        snap_idx, errors="coerce"
+                                    )
+                                    _debug_snapshot(
+                                        debug_snapshot,
+                                        f"snapshot_index dtype={snap_idx.dtype} min={snap_ts.min()} max={snap_ts.max()}",
+                                    )
                                 feat_batch = flatten_snapshot_features(
                                     snapshot_features,
                                     include_timestamp=True,
                                 )
+                                if debug_snapshot and "ts_min" in feat_batch.columns:
+                                    min_ts, max_ts = _ts_min_range(
+                                        feat_batch["ts_min"]
+                                    )
+                                    _debug_snapshot(
+                                        debug_snapshot,
+                                        f"flat_snapshot ts_min_range=({min_ts}, {max_ts}) dt_range=({_ts_min_to_dt(min_ts)}, {_ts_min_to_dt(max_ts)})",
+                                    )
                                 feat_batch = _filter_snapshot_chunk(
                                     feat_batch,
                                     r_start,
@@ -3188,119 +3363,194 @@ def run_feature_generation_workflow(params):
                 return None
         
         # --- MEMORY MODE (or source=existing logic handled separately?) ---
-        elif source_choice == "Generar nuevas": # Memory Mode (No Batch)
-             status.text("Cargando flujos completos (Sin lotes)...")
-             df_flows = None
-             try:
-                 if flow_source == "Base de Datos (DuckDB)":
-                     if not os.path.exists(DEFAULT_DUCKDB_FILE):
-                         st.error(f"No existe la DB: {DEFAULT_DUCKDB_FILE}")
-                         return None
-                     con = duckdb.connect(str(DEFAULT_DUCKDB_FILE), read_only=True)
-                     
-                     # Construct Query with Filters
-                     cols = [c[0] for c in con.execute(f"DESCRIBE {FLOW_TABLE_NAME}").fetchall()]
-                     desired_cols = ["FECHA", "VELOCIDAD", "PORTICO", "CATEGORIA", "CARRIL"]
-                     if cluster_label_mode:
-                         desired_cols.append("MATRICULA")
-                     select_clause = "*"
-                     required_cols = {"FECHA", "VELOCIDAD", "PORTICO"}
-                     if required_cols.issubset(set(cols)):
-                         select_cols = [c for c in desired_cols if c in cols]
-                         if select_cols:
-                             select_clause = ", ".join(select_cols)
-                     query = f"SELECT {select_clause} FROM {FLOW_TABLE_NAME}"
-                     conditions = []
-                     
-                     if gen_params.get("start_date"):
-                         conditions.append(f"try_cast(FECHA as TIMESTAMP) >= '{gen_params['start_date']}'")
-                     if gen_params.get("end_date"):
-                         # Add 1 day to include end_date fully (as typical with date pickers)
-                         end_dt = pd.to_datetime(gen_params['end_date']) + pd.Timedelta(days=1)
-                         conditions.append(f"try_cast(FECHA as TIMESTAMP) < '{end_dt.strftime('%Y-%m-%d')}'")
-                         
-                     if conditions:
-                         query += " WHERE " + " AND ".join(conditions)
-                         status.text(f"Cargando DuckDB filtrado: {query}")
-                     
-                     df_flows = con.execute(query).pl()
-                     con.close()
-                 else:
-                     df_flows = pl.read_csv(selected_raw_path)
-             except Exception as e:
-                 st.error(f"Error cargando flujos completo: {e}")
-                 return None
+        elif source_choice == "Generar nuevas":  # Memory Mode (No Batch)
+            status.text("Cargando flujos completos (Sin lotes)...")
+            df_flows = None
+            try:
+                if flow_source == "Base de Datos (DuckDB)":
+                    if not os.path.exists(DEFAULT_DUCKDB_FILE):
+                        st.error(f"No existe la DB: {DEFAULT_DUCKDB_FILE}")
+                        return None
+                    con = duckdb.connect(str(DEFAULT_DUCKDB_FILE), read_only=True)
 
-             if df_flows is None or df_flows.is_empty():
-                 st.error("Flujos vacíos.")
-                 return None
+                    # Construct Query with Filters
+                    cols = [
+                        c[0]
+                        for c in con.execute(
+                            f"DESCRIBE {FLOW_TABLE_NAME}"
+                        ).fetchall()
+                    ]
+                    desired_cols = [
+                        "FECHA",
+                        "VELOCIDAD",
+                        "PORTICO",
+                        "CATEGORIA",
+                        "CARRIL",
+                    ]
+                    if cluster_label_mode:
+                        desired_cols.append("MATRICULA")
+                    select_clause = "*"
+                    required_cols = {"FECHA", "VELOCIDAD", "PORTICO"}
+                    if required_cols.issubset(set(cols)):
+                        select_cols = [
+                            c for c in desired_cols if c in cols
+                        ]
+                        if select_cols:
+                            select_clause = ", ".join(select_cols)
+                    query = (
+                        f"SELECT {select_clause} FROM {FLOW_TABLE_NAME}"
+                    )
+                    conditions = []
 
-             flow_pd = df_flows.to_pandas() if hasattr(df_flows, "to_pandas") else df_flows
-             dt_m = gen_params.get("dt_minutes", int(DT_MINUTES))
-             cluster_source = (
-                 df_flows
-                 if isinstance(df_flows, (pl.DataFrame, pl.LazyFrame))
-                 else flow_pd
-             )
-             if cluster_label_mode and cluster_labels_df is not None:
-                 try:
-                     cluster_features_df = _compute_cluster_features_from_flows(
-                         cluster_source,
-                         cluster_labels_df,
-                         dt_minutes=dt_m,
-                         lanes=gen_params.get("lanes", 3),
-                         include_counts=include_flow,
-                         include_entropy=include_entropy,
-                         include_speed=include_speed,
-                         include_density=include_density,
-                         include_delta_speed=include_delta_speed,
-                         include_delta_density=include_delta_density,
-                         debug=debug_cluster,
-                     )
-                     cluster_portico_col = "portico"
-                     cluster_time_col = "interval_start"
-                 except Exception as exc:
-                     st.warning(
-                         f"No se pudieron calcular variables de cluster: {exc}"
-                     )
-                     if debug_cluster:
-                         st.code(traceback.format_exc(), language="text")
-                     cluster_compute_failed = True
-                 if cluster_features_df is not None and _is_empty_frame(cluster_features_df):
-                     st.warning(
-                         "No se encontraron coincidencias entre clusters y patentes en los flujos."
-                     )
-                     cluster_features_df = None
-                     cluster_compute_failed = True
+                    if gen_params.get("start_date"):
+                        conditions.append(
+                            "try_cast(FECHA as TIMESTAMP) >= "
+                            f"'{gen_params['start_date']}'"
+                        )
+                    if gen_params.get("end_date"):
+                        # Add 1 day to include end_date fully (as typical with date pickers)
+                        end_dt = pd.to_datetime(
+                            gen_params["end_date"]
+                        ) + pd.Timedelta(days=1)
+                        conditions.append(
+                            "try_cast(FECHA as TIMESTAMP) < "
+                            f"'{end_dt.strftime('%Y-%m-%d')}'"
+                        )
 
-             if force_snapshot:
-                 snap_config = SnapshotConfig()
-                 if gen_params:
-                    snap_config.dt_minutes = gen_params.get("dt_minutes", snap_config.dt_minutes)
-                    snap_config.window_minutes = gen_params.get("window_minutes", snap_config.window_minutes)
-                    snap_config.slow_speed_kmh = gen_params.get("slow_speed_kmh", snap_config.slow_speed_kmh)
+                    if conditions:
+                        query += " WHERE " + " AND ".join(conditions)
+                        status.text(f"Cargando DuckDB filtrado: {query}")
 
-                 builder = SnapshotFeatureBuilder(snap_config)
-                 df_p = st.session_state.get('df_port')
-                 if df_p is None:
-                     df_p = load_porticos()
+                    df_flows = con.execute(query).pl()
+                    con.close()
+                else:
+                    df_flows = pl.read_csv(selected_raw_path)
+            except Exception as e:
+                st.error(f"Error cargando flujos completo: {e}")
+                return None
 
-                 snapshot_features, _ = builder.build(
-                     flow_pd,
-                     df_p,
-                     tracked_columns=snapshot_window_cols,
-                     gradient_columns=snapshot_grad_cols,
-                     include_window_features=include_window_features,
-                     include_spatial_gradients=include_spatial_gradients,
-                     include_temporal_encodings=include_temporal_encodings,
-                 )
-                 df_pm = flatten_snapshot_features(snapshot_features)
-             else:
-                 df_pm = compute_pm_features(
-                     df_flows,
-                     interactive=False,
-                     dt_minutes=dt_m,
-                 )
+            if df_flows is None or df_flows.is_empty():
+                st.error("Flujos vacíos.")
+                return None
+
+            flow_pd = (
+                df_flows.to_pandas()
+                if hasattr(df_flows, "to_pandas")
+                else df_flows
+            )
+            dt_m = gen_params.get("dt_minutes", int(DT_MINUTES))
+            cluster_source = (
+                df_flows
+                if isinstance(df_flows, (pl.DataFrame, pl.LazyFrame))
+                else flow_pd
+            )
+            if cluster_label_mode and cluster_labels_df is not None:
+                try:
+                    cluster_features_df = _compute_cluster_features_from_flows(
+                        cluster_source,
+                        cluster_labels_df,
+                        dt_minutes=dt_m,
+                        lanes=gen_params.get("lanes", 3),
+                        include_counts=include_flow,
+                        include_entropy=include_entropy,
+                        include_speed=include_speed,
+                        include_density=include_density,
+                        include_delta_speed=include_delta_speed,
+                        include_delta_density=include_delta_density,
+                        debug=debug_cluster,
+                    )
+                    cluster_portico_col = "portico"
+                    cluster_time_col = "interval_start"
+                except Exception as exc:
+                    st.warning(
+                        f"No se pudieron calcular variables de cluster: {exc}"
+                    )
+                    if debug_cluster:
+                        st.code(traceback.format_exc(), language="text")
+                    cluster_compute_failed = True
+                if cluster_features_df is not None and _is_empty_frame(
+                    cluster_features_df
+                ):
+                    st.warning(
+                        "No se encontraron coincidencias entre clusters y patentes en los flujos."
+                    )
+                    cluster_features_df = None
+                    cluster_compute_failed = True
+
+            if force_snapshot:
+                snap_config = SnapshotConfig()
+                if gen_params:
+                    snap_config.dt_minutes = gen_params.get(
+                        "dt_minutes", snap_config.dt_minutes
+                    )
+                    snap_config.window_minutes = gen_params.get(
+                        "window_minutes", snap_config.window_minutes
+                    )
+                    snap_config.slow_speed_kmh = gen_params.get(
+                        "slow_speed_kmh", snap_config.slow_speed_kmh
+                    )
+
+                builder = SnapshotFeatureBuilder(snap_config)
+                df_p = st.session_state.get("df_port")
+                if df_p is None:
+                    df_p = load_porticos()
+
+                if debug_snapshot:
+                    _debug_snapshot(
+                        debug_snapshot,
+                        _frame_debug_info(flow_pd, "flow_pd"),
+                    )
+                    fecha_col = _find_column_by_keywords(
+                        flow_pd, ["fecha", "timestamp", "datetime", "time"]
+                    )
+                    if fecha_col:
+                        series = pd.to_datetime(
+                            flow_pd[fecha_col], errors="coerce"
+                        )
+                        _debug_snapshot(
+                            debug_snapshot,
+                            f"flow_pd[{fecha_col}] dtype={flow_pd[fecha_col].dtype} min={series.min()} max={series.max()}",
+                        )
+                    _debug_snapshot(
+                        debug_snapshot,
+                        f"snapshot_params dt={snap_config.dt_minutes} window={snap_config.window_minutes}",
+                    )
+                snapshot_features, _ = builder.build(
+                    flow_pd,
+                    df_p,
+                    tracked_columns=snapshot_window_cols,
+                    gradient_columns=snapshot_grad_cols,
+                    include_window_features=include_window_features,
+                    include_spatial_gradients=include_spatial_gradients,
+                    include_temporal_encodings=include_temporal_encodings,
+                )
+                if debug_snapshot and isinstance(
+                    snapshot_features.index, pd.MultiIndex
+                ):
+                    if "snapshot_time" in snapshot_features.index.names:
+                        snap_idx = snapshot_features.index.get_level_values(
+                            "snapshot_time"
+                        )
+                    else:
+                        snap_idx = snapshot_features.index.get_level_values(1)
+                    snap_ts = pd.to_datetime(snap_idx, errors="coerce")
+                    _debug_snapshot(
+                        debug_snapshot,
+                        f"snapshot_index dtype={snap_idx.dtype} min={snap_ts.min()} max={snap_ts.max()}",
+                    )
+                df_pm = flatten_snapshot_features(snapshot_features)
+                if debug_snapshot and "ts_min" in df_pm.columns:
+                    min_ts, max_ts = _ts_min_range(df_pm["ts_min"])
+                    _debug_snapshot(
+                        debug_snapshot,
+                        f"flat_snapshot ts_min_range=({min_ts}, {max_ts}) dt_range=({_ts_min_to_dt(min_ts)}, {_ts_min_to_dt(max_ts)})",
+                    )
+            else:
+                df_pm = compute_pm_features(
+                    df_flows,
+                    interactive=False,
+                    dt_minutes=dt_m,
+                )
 
         elif source_choice == "Cargar existentes":
             csv_p = params.get("csv_path")
@@ -3980,6 +4230,11 @@ def _render_feature_engineering():
                     default=default_grad,
                     key="snapshot_grad_cols",
                 )
+            debug_snapshot = st.checkbox(
+                "Debug snapshot (mostrar trazas)",
+                value=False,
+                key="gnn_debug_snapshot",
+            )
 
             # Guide & Info
             seq_minutes = int(dt_min) * int(seq_len)
@@ -4050,6 +4305,7 @@ def _render_feature_engineering():
                     "snapshot_grad_cols": snapshot_grad_cols,
                     "feature_mode": "Snapshot",
                     "force_snapshot": True,
+                    "debug_snapshot": debug_snapshot,
                     "debug_cluster": False,
                 }
                 if porticos_filter:
@@ -4256,15 +4512,18 @@ def _render_feature_selection_tab() -> None:
     features_df = st.session_state.get("df_pm_cache")
     features_source = "GNN"
     features_path = None
+    features_origin = "df_pm_cache"
     if features_df is None or getattr(features_df, "empty", True):
         features_df = st.session_state.get("flow_features_df")
         features_path = st.session_state.get("flow_features_path")
         features_source = st.session_state.get("flow_features_source")
+        features_origin = "flow_features_df"
     else:
         feat_cfg = st.session_state.get("feature_config", {})
         if isinstance(feat_cfg, dict):
             features_path = feat_cfg.get("csv_path")
             features_source = feat_cfg.get("source") or "GNN"
+            features_origin = "feature_config"
 
     if accidents_df is None or accidents_df.empty:
         st.info("Cargue accidentes en la pestana Eventos.")
@@ -4292,6 +4551,10 @@ def _render_feature_selection_tab() -> None:
         accidents_work["ultimo_portico"] = _normalize_portico_series(
             accidents_work["ultimo_portico"]
         )
+    if "accidente_time" in accidents_work.columns:
+        accidents_work["accidente_time"] = pd.to_datetime(
+            accidents_work["accidente_time"], errors="coerce"
+        )
 
     params: Dict[str, object] = {}
     feature_mode = None
@@ -4305,25 +4568,78 @@ def _render_feature_selection_tab() -> None:
 
     label_debug_lines: List[str] = []
     label_debug_lines.append(f"feature_mode={feature_mode} dt_min={dt_min}")
+    label_debug_lines.append(
+        f"features_origin={features_origin} source={features_source} path={features_path}"
+    )
+    if "ts_min" in features_work.columns:
+        label_debug_lines.append(
+            f"features_ts_min_dtype={features_work['ts_min'].dtype}"
+        )
+    if "timestamp" in features_work.columns:
+        ts_range = (
+            pd.to_datetime(features_work["timestamp"], errors="coerce")
+            .agg(["min", "max"])
+            .to_dict()
+        )
+        label_debug_lines.append(
+            f"features_timestamp_range=({ts_range.get('min')}, {ts_range.get('max')})"
+        )
+    if "interval_start" in features_work.columns:
+        ts_range = (
+            pd.to_datetime(features_work["interval_start"], errors="coerce")
+            .agg(["min", "max"])
+            .to_dict()
+        )
+        label_debug_lines.append(
+            f"features_interval_start_range=({ts_range.get('min')}, {ts_range.get('max')})"
+        )
 
     if feature_mode == "Snapshot":
         accidents_work = accidents_work.copy()
         if "accidente_time" not in accidents_work.columns:
             st.warning("No se encontro columna de accidentes para etiquetar.")
             return
-        accidents_work["ts_min"] = (
+        accidents_work["ts_min"] = _ts_min_from_datetime(
             accidents_work["accidente_time"]
-            .dt.floor(f"{int(dt_min)}min")
-            .astype("int64")
-            // 60_000_000_000
         )
         df_acc_sel = accidents_work[["ultimo_portico", "ts_min"]].dropna()
         df_acc_sel["ultimo_portico"] = _normalize_portico_series(
             df_acc_sel["ultimo_portico"]
         )
+        portico_col = buscar_columna(features_work, "portico") or "portico"
+        if portico_col not in features_work.columns:
+            st.warning("No se encontro columna de pórtico para etiquetar.")
+            return
+        features_work[portico_col] = _normalize_portico_series(
+            features_work[portico_col]
+        )
+        label_debug_lines.append(
+            f"acc_time_range=({accidents_work['accidente_time'].min()}, {accidents_work['accidente_time'].max()})"
+        )
+        feat_min, feat_max = _ts_min_range(features_work["ts_min"])
+        acc_min, acc_max = _ts_min_range(df_acc_sel["ts_min"])
+        label_debug_lines.append(
+            f"feature_ts_min_range=({feat_min}, {feat_max}) feature_ts_dt_range=({_ts_min_to_dt(feat_min)}, {_ts_min_to_dt(feat_max)})"
+        )
+        label_debug_lines.append(
+            f"acc_ts_min_range=({acc_min}, {acc_max}) acc_ts_dt_range=({_ts_min_to_dt(acc_min)}, {_ts_min_to_dt(acc_max)})"
+        )
         label_debug_lines.append(
             f"accidents_rows={len(df_acc_sel)} acc_ts_range=({df_acc_sel['ts_min'].min()}, {df_acc_sel['ts_min'].max()})"
         )
+        if acc_min is not None and feat_max is not None:
+            gap = acc_min - feat_max
+            if abs(gap) > 1_000_000:
+                label_debug_lines.append(
+                    f"WARNING: ts_min mismatch acc_min-feature_max={gap}"
+                )
+        if portico_col in features_work.columns:
+            feat_ports = _normalize_portico_series(features_work[portico_col])
+            acc_ports = df_acc_sel["ultimo_portico"]
+            common_ports = pd.Index(feat_ports).intersection(acc_ports)
+            label_debug_lines.append(
+                f"ports features={feat_ports.nunique()} accidents={acc_ports.nunique()} common={len(common_ports)}"
+            )
 
         df_port = st.session_state.get("df_port")
         if df_port is None:
@@ -4363,6 +4679,24 @@ def _render_feature_selection_tab() -> None:
         label_debug_lines.append(
             f"labels_pos={int(base_df['target'].sum())} total={len(base_df)}"
         )
+        if "ts_min" in base_df.columns:
+            min_ts, max_ts = _ts_min_range(base_df["ts_min"])
+            if min_ts is None or max_ts is None:
+                min_ts = 0
+                max_ts = 0
+            window_start = min_ts + sequence_config.guard_band_minutes
+            window_end = max_ts + sequence_config.guard_band_minutes + sequence_config.horizon_minutes
+            label_debug_lines.append(
+                f"feature_ts_range=({min_ts}, {max_ts}) label_window=({window_start}, {window_end})"
+            )
+            if not df_acc_sel.empty:
+                acc_in_window = df_acc_sel[
+                    (df_acc_sel["ts_min"] >= window_start)
+                    & (df_acc_sel["ts_min"] <= window_end)
+                ]
+                label_debug_lines.append(
+                    f"acc_in_window={len(acc_in_window)}"
+                )
     else:
         base_df = features_work.copy()
         base_df = base_df.drop(columns=["target"], errors="ignore")
@@ -4373,12 +4707,11 @@ def _render_feature_selection_tab() -> None:
         ):
             portico_col = buscar_columna(base_df, "portico") or "portico"
             acc_labels = accidents_work[["ultimo_portico", "accidente_time"]].copy()
-            acc_labels["ts_min"] = (
-                acc_labels["accidente_time"]
-                .dt.floor(f"{int(dt_min)}min")
-                .astype("int64")
-                // 60_000_000_000
-            ) - int(dt_min)
+            acc_labels["ts_min"] = _ts_min_from_datetime(
+                acc_labels["accidente_time"],
+                floor_minutes=int(dt_min),
+                shift=-int(dt_min),
+            )
             acc_labels["ultimo_portico"] = _normalize_portico_series(
                 acc_labels["ultimo_portico"]
             )
@@ -4394,6 +4727,27 @@ def _render_feature_selection_tab() -> None:
             label_debug_lines.append(
                 f"flow_pairs={len(acc_pairs)} acc_ts_shifted_range=({acc_pairs['ts_min'].min()}, {acc_pairs['ts_min'].max()})"
             )
+            if portico_col in base_df.columns:
+                feat_ports = _normalize_portico_series(base_df[portico_col])
+                acc_ports = acc_pairs[portico_col]
+                common_ports = pd.Index(feat_ports).intersection(acc_ports)
+            label_debug_lines.append(
+                f"ports features={feat_ports.nunique()} accidents={acc_ports.nunique()} common={len(common_ports)}"
+            )
+            feat_min, feat_max = _ts_min_range(base_df["ts_min"])
+            acc_min, acc_max = _ts_min_range(acc_pairs["ts_min"])
+            label_debug_lines.append(
+                f"feature_ts_min_range=({feat_min}, {feat_max}) feature_ts_dt_range=({_ts_min_to_dt(feat_min)}, {_ts_min_to_dt(feat_max)})"
+            )
+            label_debug_lines.append(
+                f"acc_ts_min_range=({acc_min}, {acc_max}) acc_ts_dt_range=({_ts_min_to_dt(acc_min)}, {_ts_min_to_dt(acc_max)})"
+            )
+            if acc_min is not None and feat_max is not None:
+                gap = acc_min - feat_max
+                if abs(gap) > 1_000_000:
+                    label_debug_lines.append(
+                        f"WARNING: ts_min mismatch acc_min-feature_max={gap}"
+                    )
         if "target" in base_df.columns:
             base_df["target"] = base_df["target"].fillna(0).astype(int)
         else:
@@ -4401,6 +4755,10 @@ def _render_feature_selection_tab() -> None:
         label_debug_lines.append(
             f"labels_pos={int(base_df['target'].sum())} total={len(base_df)}"
         )
+        if "ts_min" in base_df.columns:
+            label_debug_lines.append(
+                f"feature_ts_range=({base_df['ts_min'].min()}, {base_df['ts_min'].max()})"
+            )
     if base_df.empty:
         st.warning("No se pudo preparar el dataset base.")
         return
@@ -5034,211 +5392,406 @@ def _render_balance_tab() -> None:
             key="gnn_smote_bidir",
         )
 
-        st.markdown("#### Modelo GNN entrenado")
-        st.write(
-            "GraphSMOTE necesita un GNN entrenado para generar embeddings y "
-            "decodificadores z->x. El entrenamiento guarda modelos "
-            "`gat_model_BEST*.pt` en Resultados y un _hparams.json asociado."
-        )
-        st.write(
-            "Para usarlo aqui: entrena el modelo con el grafo en memoria, "
-            "selecciona el archivo .pt y luego ejecuta GraphSMOTE."
-        )
-
-        model_files = sorted(
-            glob.glob(os.path.join(RESULTADOS_DIR, "*.pt"))
-        )
-        model_path = st.selectbox(
-            "Modelo GNN (.pt)",
-            options=["(ninguno)"] + model_files,
-            format_func=lambda x: "(ninguno)"
-            if x == "(ninguno)"
-            else os.path.basename(x),
-            key="gnn_smote_model_file",
-        )
-        model_path_override = st.text_input(
-            "Ruta manual del modelo (opcional)",
-            value="",
-            key="gnn_smote_model_path",
-        )
-        if model_path_override.strip():
-            model_path = model_path_override.strip()
-
-        train_use_smote = st.checkbox(
-            "Entrenar con GraphSMOTE (mismo grafo)",
-            value=False,
-            key="gnn_smote_train_with_smote",
-        )
-        train_reuse_hparams = st.checkbox(
-            "Reutilizar hiperparametros guardados si existen",
-            value=True,
-            key="gnn_smote_train_reuse_hparams",
-        )
-        col_train, col_delete = st.columns(2)
-        with col_train:
-            if st.button("Entrenar modelo GNN", key="gnn_smote_train_model"):
-                graph_obj = dict(balance_graph_obj)
-                graph_obj["data"] = graph_data
-                if not graph_obj.get("filename"):
-                    graph_path = st.session_state.get("graph_path")
-                    if graph_path:
-                        graph_obj["filename"] = os.path.basename(graph_path)
-
-                def _has_imgagn(obj: dict) -> bool:
-                    try:
-                        return bool(obj.get("imgagn_best_params")) or (
-                            "ImGAGN" in str(obj.get("filename", ""))
-                        )
-                    except Exception:
-                        return False
-
-                def _list_hpo_files(
-                    use_graphsmote: bool, obj: dict
-                ) -> list[str]:
-                    all_hp_files = sorted(
-                        glob.glob(
-                            os.path.join(
-                                RESULTADOS_DIR, "optuna_hyperparams_*.csv"
-                            )
-                        ),
-                        key=os.path.getmtime,
-                    )
-                    want_imgagn = _has_imgagn(obj)
-
-                    def _score_hp(path: str) -> tuple:
-                        name = os.path.basename(path)
-                        has_smote = "_GraphSMOTE" in name
-                        has_imgagn = "_ImGAGN" in name
-                        has_base = "_Base" in name
-                        ok_smote = (has_smote == use_graphsmote)
-                        ok_imgagn = (has_imgagn == want_imgagn)
-                        base_pref = (has_base and not use_graphsmote)
-                        return (
-                            int(ok_smote),
-                            int(ok_imgagn),
-                            int(base_pref),
-                            os.path.getmtime(path),
-                        )
-
-                    hp_files_sorted = sorted(all_hp_files, key=_score_hp)
-                    return [
-                        f
-                        for f in hp_files_sorted
-                        if ("_GraphSMOTE" in os.path.basename(f))
-                        == use_graphsmote
-                    ]
-
-                hp_files = _list_hpo_files(
-                    bool(train_use_smote), graph_obj
-                )
-                hp_choice = (
-                    len(hp_files)
-                    if train_reuse_hparams and hp_files
-                    else 0
-                )
-
-                try:
-                    from src import gnn_main as graph_main
-                except Exception as exc:
-                    st.error(f"No se pudo cargar el entrenador GNN: {exc}")
-                    return
-
-                original_input = builtins.input
-
-                def _auto_input(prompt: str = "") -> str:
-                    norm = (
-                        unicodedata.normalize("NFKD", prompt)
-                        .encode("ascii", "ignore")
-                        .decode("ascii")
-                        .lower()
-                    )
-                    if "seleccione el numero del archivo" in norm:
-                        return str(hp_choice)
-                    if "reutilizar estos" in norm:
-                        return "s" if train_reuse_hparams else "n"
-                    return "0"
-
-                builtins.input = _auto_input
-                with st.spinner("Entrenando modelo GNN..."):
-                    try:
-                        graph_main.run_gat_training(
-                            graph_obj,
-                            force_use_graphsmote=bool(train_use_smote),
-                        )
-                    except Exception as exc:
-                        st.error(f"Error al entrenar el modelo: {exc}")
-                        return
-                    finally:
-                        builtins.input = original_input
-
-                latest_model = None
-                latest_candidates = glob.glob(
-                    os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")
-                )
-                if latest_candidates:
-                    latest_model = max(
-                        latest_candidates, key=os.path.getmtime
-                    )
-                if latest_model:
-                    st.session_state["gnn_smote_model_file"] = latest_model
-                st.success(
-                    "Entrenamiento finalizado. Seleccione el modelo en la lista."
-                )
-                st.rerun()
-
-        with col_delete:
-            confirm_delete = st.checkbox(
-                "Confirmar borrado del modelo seleccionado",
-                value=False,
-                key="gnn_smote_confirm_delete",
+        #st.markdown("#### Modelo embeddings")
+        with st.expander("Modelo embeddings"):
+            st.write(
+                "GraphSMOTE necesita un GNN entrenado para generar embeddings y "
+                "decodificadores z->x. El entrenamiento guarda modelos "
+                "`gat_model_BEST*.pt` en Resultados y un _hparams.json asociado."
             )
-            if st.button(
-                "Borrar modelo seleccionado", key="gnn_smote_delete_model"
-            ):
-                if not model_path or model_path == "(ninguno)":
-                    st.error("Seleccione un modelo para borrar.")
-                elif not confirm_delete:
-                    st.warning("Confirme el borrado antes de continuar.")
-                else:
-                    try:
-                        model_path_obj = Path(model_path).resolve()
-                        resultados_dir = Path(RESULTADOS_DIR).resolve()
-                        if resultados_dir not in model_path_obj.parents:
-                            st.error(
-                                "Solo se pueden borrar modelos dentro de Resultados."
-                            )
-                        elif not model_path_obj.exists():
-                            st.error("El archivo seleccionado no existe.")
-                        else:
-                            hparams_path = model_path_obj.with_name(
-                                model_path_obj.stem + "_hparams.json"
-                            )
-                            model_path_obj.unlink()
-                            if hparams_path.exists():
-                                hparams_path.unlink()
-                            st.session_state["gnn_smote_model_file"] = (
-                                "(ninguno)"
-                            )
-                            st.success("Modelo borrado.")
-                            st.rerun()
-                    except Exception as exc:
-                        st.error(f"No se pudo borrar el modelo: {exc}")
+            st.write(
+                "Para usarlo aqui: entrena el modelo con el grafo en memoria, "
+                "selecciona el archivo .pt y luego ejecuta GraphSMOTE."
+            )
 
-        edge_feature_dim = 0
-        for edge_type in graph_data.edge_types:
-            store = graph_data[edge_type]
-            if hasattr(store, "edge_attr") and store.edge_attr is not None:
-                edge_attr = store.edge_attr
-                edge_feature_dim = (
-                    int(edge_attr.shape[1])
-                    if edge_attr.dim() > 1
-                    else 1
+            tab_train, tab_load = st.tabs(["Entrenar nuevo", "Cargar existente"])
+
+            with tab_train:
+                train_use_smote = st.checkbox(
+                    "Entrenar con GraphSMOTE (mismo grafo)",
+                    value=False,
+                    key="gnn_smote_train_with_smote",
+                    help=(
+                        "Si se activa, el entrenamiento del GNN usara GraphSMOTE para "
+                        "generar nodos sinteticos y entrenar sobre el grafo aumentado. "
+                        "Si se desactiva, entrena el GNN base sin aumentacion."
+                    ),
                 )
-                break
-        in_channels = int(graph_data[node_type].x.shape[1])
-        st.caption(
-            f"Dimensiones detectadas: in_channels={in_channels}, edge_feature_dim={edge_feature_dim}"
-        )
+                train_reuse_hparams = st.checkbox(
+                    "Reutilizar hiperparametros guardados si existen",
+                    value=True,
+                    key="gnn_smote_train_reuse_hparams",
+                    help=(
+                        "Si se activa, el entrenamiento reutiliza el ultimo archivo "
+                        "optuna_hyperparams_*.csv compatible. Si se desactiva, "
+                        "se fuerza una nueva busqueda de hiperparametros."
+                    ),
+                )
+                #st.markdown("#### Vecinos (GraphSMOTE)")
+                neighbor_mode = st.radio(
+                    "Selección de vecinos",
+                    ["Auto", "Manual"],
+                    horizontal=True,
+                    key="gnn_smote_neighbors_mode",
+                )
+                auto_neighbors = _auto_neighbor_count(graph_data)
+                if neighbor_mode == "Auto":
+                    st.caption(
+                        f"Auto seleccionado: {auto_neighbors} vecinos por capa."
+                    )
+                    smote_num_neighbors = auto_neighbors
+                else:
+                    smote_num_neighbors = st.number_input(
+                        "number of neighbors",
+                        min_value=1,
+                        max_value=4,
+                        value=int(auto_neighbors),
+                        step=1,
+                        key="gnn_smote_neighbors_manual",
+                    )
+                #st.markdown("#### Early stopping")
+                max_epochs_smote = st.number_input(
+                    "max_epochs",
+                    min_value=1,
+                    value=300,
+                    step=10,
+                    key="gnn_smote_max_epochs",
+                )
+                early_stop_smote = st.checkbox(
+                    "Early stopping",
+                    value=True,
+                    key="gnn_smote_early_stop",
+                )
+                early_patience_smote = st.number_input(
+                    "patience",
+                    min_value=1,
+                    value=int(EARLY_STOPPING_PATIENCE),
+                    step=1,
+                    key="gnn_smote_early_patience",
+                    disabled=not early_stop_smote,
+                )
+                early_min_delta_smote = st.number_input(
+                    "min_delta",
+                    min_value=0.0,
+                    value=float(EARLY_STOPPING_MIN_DELTA),
+                    step=0.0001,
+                    format="%.6f",
+                    key="gnn_smote_early_min_delta",
+                    disabled=not early_stop_smote,
+                )
+                
+                latest_model = None
+                if st.button("Entrenar nuevo modelo GNN", key="gnn_smote_train_model"):
+                    graph_obj = dict(balance_graph_obj)
+                    graph_obj["data"] = graph_data
+                    if not graph_obj.get("filename"):
+                        graph_path = st.session_state.get("graph_path")
+                        if graph_path:
+                            graph_obj["filename"] = os.path.basename(graph_path)
+
+                    def _has_imgagn(obj: dict) -> bool:
+                        try:
+                            return bool(obj.get("imgagn_best_params")) or (
+                                "ImGAGN" in str(obj.get("filename", ""))
+                            )
+                        except Exception:
+                            return False
+
+                    def _list_hpo_files(
+                        use_graphsmote: bool, obj: dict
+                    ) -> list[str]:
+                        all_hp_files = sorted(
+                            glob.glob(
+                                os.path.join(
+                                    RESULTADOS_DIR, "optuna_hyperparams_*.csv"
+                                )
+                            ),
+                            key=os.path.getmtime,
+                        )
+                        want_imgagn = _has_imgagn(obj)
+
+                        def _score_hp(path: str) -> tuple:
+                            name = os.path.basename(path)
+                            has_smote = "_GraphSMOTE" in name
+                            has_imgagn = "_ImGAGN" in name
+                            has_base = "_Base" in name
+                            ok_smote = (has_smote == use_graphsmote)
+                            ok_imgagn = (has_imgagn == want_imgagn)
+                            base_pref = (has_base and not use_graphsmote)
+                            return (
+                                int(ok_smote),
+                                int(ok_imgagn),
+                                int(base_pref),
+                                os.path.getmtime(path),
+                            )
+
+                        hp_files_sorted = sorted(all_hp_files, key=_score_hp)
+                        return [
+                            f
+                            for f in hp_files_sorted
+                            if ("_GraphSMOTE" in os.path.basename(f))
+                            == use_graphsmote
+                        ]
+
+                    hp_files = _list_hpo_files(
+                        bool(train_use_smote), graph_obj
+                    )
+                    hp_choice = (
+                        len(hp_files)
+                        if train_reuse_hparams and hp_files
+                        else 0
+                    )
+
+                    try:
+                        from src import gnn_main as graph_main
+                    except Exception as exc:
+                        st.error(f"No se pudo cargar el entrenador GNN: {exc}")
+                        return
+
+                    log_container = st.empty()
+                    progress_bar = st.progress(0)
+                    progress_text = st.empty()
+                    log_handler = StreamlitLogHandler(log_container)
+                    log_handler.setFormatter(
+                        logging.Formatter(
+                            "%(asctime)s - %(message)s",
+                            datefmt="%H:%M:%S",
+                        )
+                    )
+                    root_logger = logging.getLogger()
+                    root_logger.addHandler(log_handler)
+                    stdout_proxy = StreamlitStdout(log_container)
+
+                    def _progress_cb(
+                        *,
+                        epoch: int,
+                        total: int,
+                        val_f1: Optional[float],
+                        best_val_f1: float,
+                        patience: int,
+                        patience_counter: int,
+                    ) -> None:
+                        total_safe = max(int(total or 1), 1)
+                        progress_bar.progress(min(epoch / total_safe, 1.0))
+                        parts = [f"Epoch {epoch}/{total_safe}"]
+                        if val_f1 is not None:
+                            parts.append(f"val_f1={val_f1:.4f}")
+                        parts.append(f"best_f1={best_val_f1:.4f}")
+                        parts.append(
+                            f"patience={patience_counter}/{patience}"
+                        )
+                        progress_text.caption(" | ".join(parts))
+
+                    original_input = builtins.input
+
+                    def _auto_input(prompt: str = "") -> str:
+                        norm = (
+                            unicodedata.normalize("NFKD", prompt)
+                            .encode("ascii", "ignore")
+                            .decode("ascii")
+                            .lower()
+                        )
+                        if "seleccione el numero del archivo" in norm:
+                            return str(hp_choice)
+                        if "reutilizar estos" in norm:
+                            return "s" if train_reuse_hparams else "n"
+                        return "0"
+
+                    
+                    with st.spinner("Entrenando modelo GNN..."):
+                        try:
+                            with contextlib.redirect_stdout(stdout_proxy), contextlib.redirect_stderr(stdout_proxy):
+                                graph_main.run_gat_training(
+                                    graph_obj,
+                                    force_use_graphsmote=bool(train_use_smote),
+                                    early_stop=bool(early_stop_smote),
+                                    early_stop_patience=int(early_patience_smote),
+                                    early_stop_min_delta=float(early_min_delta_smote),
+                                    max_epochs=int(max_epochs_smote),
+                                    smote_num_neighbors=smote_num_neighbors,
+                                    progress_callback=_progress_cb,
+                                )
+                        except Exception as exc:
+                            st.error(f"Error al entrenar el modelo: {exc}")
+                            return
+                        finally:
+                            builtins.input = original_input
+                            root_logger.removeHandler(log_handler)
+                    
+                    builtins.input = _auto_input
+
+                    latest_model = None
+                    latest_candidates = glob.glob(
+                        os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")
+                    )
+                    if latest_candidates:
+                        latest_model = max(
+                            latest_candidates, key=os.path.getmtime
+                        )
+                    if latest_model:
+                        st.session_state[
+                            "gnn_smote_model_default"
+                        ] = latest_model
+                    st.success(
+                        "Entrenamiento finalizado. Seleccione el modelo en la lista."
+                    )
+                    st.rerun()
+
+            with tab_load:
+                model_files = sorted(
+                    glob.glob(
+                        os.path.join(
+                            RESULTADOS_DIR, "gat_model_BEST*.pt"
+                        )
+                    )
+                )
+                model_default = st.session_state.get("gnn_smote_model_default")
+                model_opts = ["(ninguno)"] + model_files
+                model_index = 0
+                if model_default in model_opts:
+                    model_index = model_opts.index(model_default)
+                model_path = st.selectbox(
+                    "Seleccione Modelo GNN para generar embbedings",
+                    options=model_opts,
+                    format_func=lambda x: "(ninguno)"
+                    if x == "(ninguno)"
+                    else os.path.basename(x),
+                    index=model_index,
+                    key="gnn_smote_model_file",
+                )
+
+                confirm_delete = st.checkbox(
+                    "Confirmar borrado del modelo seleccionado",
+                    value=False,
+                    key="gnn_smote_confirm_delete",
+                )
+                if st.button(
+                    "Borrar modelo seleccionado", key="gnn_smote_delete_model"
+                ):
+                    if not model_path or model_path == "(ninguno)":
+                        st.error("Seleccione un modelo para borrar.")
+                    elif not confirm_delete:
+                        st.warning("Confirme el borrado antes de continuar.")
+                    else:
+                        try:
+                            model_path_obj = Path(model_path).resolve()
+                            resultados_dir = Path(RESULTADOS_DIR).resolve()
+                            if resultados_dir not in model_path_obj.parents:
+                                st.error(
+                                    "Solo se pueden borrar modelos dentro de Resultados."
+                                )
+                            elif not model_path_obj.exists():
+                                st.error("El archivo seleccionado no existe.")
+                            else:
+                                hparams_path = model_path_obj.with_name(
+                                    model_path_obj.stem + "_hparams.json"
+                                )
+                                model_path_obj.unlink()
+                                if hparams_path.exists():
+                                    hparams_path.unlink()
+                                st.session_state["gnn_smote_model_file"] = (
+                                    "(ninguno)"
+                                )
+                                st.success("Modelo borrado.")
+                                st.rerun()
+                        except Exception as exc:
+                            st.error(f"No se pudo borrar el modelo: {exc}")
+                
+                if st.button("Validar modelo seleccionado", key="gnn_smote_validate_model_btn"):
+                    st.markdown("---")
+                    st.subheader("Calidad del Modelo (GraphSMOTE)")
+
+                    # 1. Panel Calidad z->x
+                    st.markdown("#### Calidad z→x (Decodificador)")
+                    z2x_base_dir = st.session_state.get(
+                        "gnn_smote_save_dir",
+                        os.path.join(RESULTADOS_DIR, "z2x_decoders"),
+                    )
+                    z2x_dir = _resolve_z2x_dir(z2x_base_dir, model_path)
+                    history_path = os.path.join(z2x_dir, "history.json")
+                    st.caption(f"Directorio z2x: {z2x_dir}")
+                    
+                    if os.path.exists(history_path):
+                        try:
+                            with open(history_path, "r") as f:
+                                hist_data = json.load(f)
+                            
+                            if isinstance(hist_data, list) and len(hist_data) > 0:
+                                df_hist = pd.DataFrame(hist_data)
+                                if "epoch" in df_hist.columns:
+                                    df_hist = df_hist.set_index("epoch")
+                                
+                                # Mostrar metrics
+                                best_val = df_hist["val_loss"].min() if "val_loss" in df_hist.columns else None
+                                if best_val is not None:
+                                    st.metric("Mejor Validation Loss (z→x)", f"{best_val:.6f}")
+                                
+                                st.line_chart(df_hist[["train_loss", "val_loss"]])
+                            else:
+                                st.warning("El historial de entrenamiento z→x está vacío o tiene formato incorrecto.")
+                        except Exception as e:
+                            st.error(f"Error cargando historial z→x: {e}")
+                    else:
+                        decoder_files = sorted(glob.glob(os.path.join(z2x_dir, "*.pt")))
+                        if decoder_files:
+                            st.info(
+                                "No se encontró historial z→x en el directorio actual. "
+                                "Se detectaron decodificadores entrenados, pero falta "
+                                "history.json para mostrar la curva."
+                            )
+                            st.caption(
+                                f"Decodificadores detectados: {len(decoder_files)}"
+                            )
+                        else:
+                            st.info(
+                                "No se encontró historial de entrenamiento z→x. "
+                                "Entrene GraphSMOTE para generarlo."
+                            )
+
+                    # 2. Resumen de Embedding
+                    st.markdown("#### Resumen de Embedding (Calidad GNN)")
+                    st.info("Si el embedding es pobre, el z→x difícilmente reconstruirá y GraphSMOTE generará malos sintéticos.")
+                    
+                    if model_path and model_path != "(ninguno)" and os.path.exists(model_path):
+                        try:
+                            hparams_path = Path(model_path).with_name(Path(model_path).stem + "_hparams.json")
+                            if hparams_path.exists():
+                                with open(hparams_path, "r") as f:
+                                    meta = json.load(f)
+                                
+                                col_f1, col_auprc, col_epoch = st.columns(3)
+                                with col_f1:
+                                    f1 = meta.get("best_val_f1")
+                                    st.metric("GNN Best Val F1", f"{f1:.4f}" if f1 is not None else "N/A")
+                                with col_auprc:
+                                    # A veces se guarda auc o auprc, verificar keys
+                                    auprc = meta.get("best_val_auprc") # Check if saved
+                                    if auprc is None: auprc = meta.get("auprc") 
+                                    st.metric("GNN Best Val AUPRC", f"{auprc:.4f}" if auprc is not None else "N/A")
+                                with col_epoch:
+                                    st.metric("Best Epoch", meta.get("best_epoch", "N/A"))
+                            else:
+                                st.warning("No se encontraron metadatos (_hparams.json) para este modelo.")
+                        except Exception as e:
+                            st.error(f"Error leyendo metadatos del modelo: {e}")
+                    else:
+                        st.warning("Seleccione un modelo válido para ver sus métricas.")
+
+            edge_feature_dim = 0
+            for edge_type in graph_data.edge_types:
+                store = graph_data[edge_type]
+                if hasattr(store, "edge_attr") and store.edge_attr is not None:
+                    edge_attr = store.edge_attr
+                    edge_feature_dim = (
+                        int(edge_attr.shape[1])
+                        if edge_attr.dim() > 1
+                        else 1
+                    )
+                    break
+            in_channels = int(graph_data[node_type].x.shape[1])
+            st.caption(
+                f"Dimensiones detectadas: in_channels={in_channels}, edge_feature_dim={edge_feature_dim}"
+            )
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -5285,11 +5838,13 @@ def _render_balance_tab() -> None:
                 key="gnn_smote_device",
             )
 
-        save_dir = st.text_input(
+        z2x_base_dir = st.text_input(
             "Directorio z2x decoders",
             value=os.path.join(RESULTADOS_DIR, "z2x_decoders"),
             key="gnn_smote_save_dir",
         )
+        z2x_dir = _resolve_z2x_dir(z2x_base_dir, model_path)
+        st.caption(f"Directorio z2x (modelo): {z2x_dir}")
         save_aug = st.checkbox(
             "Guardar grafo balanceado",
             value=False,
@@ -5395,7 +5950,7 @@ def _render_balance_tab() -> None:
                         int(k_smote),
                         int(k_neighbors_edges),
                         int(random_state),
-                        save_dir=save_dir,
+                        save_dir=z2x_dir,
                         add_to_train_mask=bool(add_to_train_mask),
                         disable_acc_smote_pm_generation=bool(
                             disable_acc_smote_pm_generation
@@ -5894,6 +6449,36 @@ def _render_training_tab() -> None:
         key="gnn_train_eval_device",
     )
     st.caption(f"Evaluacion se ejecutara en {eval_device}.")
+    st.markdown("#### Early stopping")
+    max_epochs_train = st.number_input(
+        "max_epochs",
+        min_value=1,
+        value=300,
+        step=10,
+        key="gnn_train_max_epochs",
+    )
+    early_stop_train = st.checkbox(
+        "Early stopping",
+        value=True,
+        key="gnn_train_early_stop",
+    )
+    early_patience_train = st.number_input(
+        "patience",
+        min_value=1,
+        value=int(EARLY_STOPPING_PATIENCE),
+        step=1,
+        key="gnn_train_early_patience",
+        disabled=not early_stop_train,
+    )
+    early_min_delta_train = st.number_input(
+        "min_delta",
+        min_value=0.0,
+        value=float(EARLY_STOPPING_MIN_DELTA),
+        step=0.0001,
+        format="%.6f",
+        key="gnn_train_early_min_delta",
+        disabled=not early_stop_train,
+    )
 
     if st.button("Entrenar modelo GNN", key="gnn_train_run"):
         try:
@@ -5901,6 +6486,38 @@ def _render_training_tab() -> None:
         except Exception as exc:
             st.error(f"No se pudo cargar el entrenador GNN: {exc}")
             return
+
+        log_container = st.empty()
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+        log_handler = StreamlitLogHandler(log_container)
+        log_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s - %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
+        root_logger = logging.getLogger()
+        root_logger.addHandler(log_handler)
+        stdout_proxy = StreamlitStdout(log_container)
+
+        def _progress_cb(
+            *,
+            epoch: int,
+            total: int,
+            val_f1: Optional[float],
+            best_val_f1: float,
+            patience: int,
+            patience_counter: int,
+        ) -> None:
+            total_safe = max(int(total or 1), 1)
+            progress_bar.progress(min(epoch / total_safe, 1.0))
+            parts = [f"Epoch {epoch}/{total_safe}"]
+            if val_f1 is not None:
+                parts.append(f"val_f1={val_f1:.4f}")
+            parts.append(f"best_f1={best_val_f1:.4f}")
+            parts.append(f"patience={patience_counter}/{patience}")
+            progress_text.caption(" | ".join(parts))
 
         pm_index_ref = st.session_state.get("loaded_graph", {}).get("pm_index")
         split_info = None
@@ -5993,15 +6610,22 @@ def _render_training_tab() -> None:
         builtins.input = _auto_input
         with st.spinner("Entrenando modelo GNN..."):
             try:
-                graph_main.run_gat_training(
-                    graph_obj,
-                    force_use_graphsmote=bool(use_graphsmote_train),
-                )
+                with contextlib.redirect_stdout(stdout_proxy), contextlib.redirect_stderr(stdout_proxy):
+                    graph_main.run_gat_training(
+                        graph_obj,
+                        force_use_graphsmote=bool(use_graphsmote_train),
+                        early_stop=bool(early_stop_train),
+                        early_stop_patience=int(early_patience_train),
+                        early_stop_min_delta=float(early_min_delta_train),
+                        max_epochs=int(max_epochs_train),
+                        progress_callback=_progress_cb,
+                    )
             except Exception as exc:
                 st.error(f"Error en entrenamiento: {exc}")
                 return
             finally:
                 builtins.input = original_input
+                root_logger.removeHandler(log_handler)
 
         model_path = _select_latest_gat_model(
             use_graphsmote=use_graphsmote_train, graph_obj=graph_obj
@@ -8538,12 +9162,20 @@ def _render_create_graph():
             ].copy()
 
             df_acc_use = st.session_state.df_acc.copy()
+            if "accidente_time" in df_acc_use.columns:
+                df_acc_use["accidente_time"] = pd.to_datetime(
+                    df_acc_use["accidente_time"], errors="coerce"
+                )
             df_acc_use["ultimo_portico"] = _normalize_portico_series(
                 df_acc_use["ultimo_portico"]
             )
             df_acc_use = df_acc_use[
                 df_acc_use["ultimo_portico"].isin(porticos_a_incluir)
             ].copy()
+            if "accidente_time" in df_acc_use.columns:
+                df_acc_use = df_acc_use.dropna(
+                    subset=["accidente_time", "ultimo_portico"]
+                )
 
             feature_config = st.session_state.get("feature_config", {})
             params = feature_config.get("params", {}) if isinstance(feature_config, dict) else {}
@@ -8605,9 +9237,12 @@ def _render_create_graph():
             # Ensure we have correct sorting/reset index
             df_pm = df_pm.sort_values(["portico", "ts_min"]).reset_index(drop=True)
             if debug_labels and "ts_min" in df_pm.columns:
+                pm_min_ts, pm_max_ts = _ts_min_range(df_pm["ts_min"])
+                pm_min_dt = _ts_min_to_dt(pm_min_ts)
+                pm_max_dt = _ts_min_to_dt(pm_max_ts)
                 _debug_labels(
                     debug_labels,
-                    f"df_pm rows={len(df_pm)} ts_min_range=({df_pm['ts_min'].min()}, {df_pm['ts_min'].max()})",
+                    f"df_pm rows={len(df_pm)} ts_min_range=({pm_min_ts}, {pm_max_ts}) ts_dt_range=({pm_min_dt}, {pm_max_dt})",
                 )
             
             # --- 2.3 Filter by Porticos (Tramo) ---
@@ -8615,6 +9250,9 @@ def _render_create_graph():
             portico_col = buscar_columna(df_pm, "portico")
             if portico_col:
                 initial_len = len(df_pm)
+                df_pm[portico_col] = _normalize_portico_series(
+                    df_pm[portico_col]
+                )
                 df_pm = df_pm[df_pm[portico_col].isin(porticos_a_incluir)].copy()
                 status.text(f"Filtrado por tramo: {initial_len} -> {len(df_pm)} registros.")
             else:
@@ -8623,6 +9261,14 @@ def _render_create_graph():
             if df_pm.empty:
                 st.error("Features vacías tras filtrar por tramo. Verifique nombres de pórticos.")
                 return
+            if debug_labels and portico_col and "ultimo_portico" in df_acc_use.columns:
+                feat_ports = _normalize_portico_series(df_pm[portico_col])
+                acc_ports = _normalize_portico_series(df_acc_use["ultimo_portico"])
+                common_ports = pd.Index(feat_ports).intersection(acc_ports)
+                _debug_labels(
+                    debug_labels,
+                    f"ports features={feat_ports.nunique()} accidents={acc_ports.nunique()} common={len(common_ports)}",
+                )
 
             # --- 2.4 Time Filtering (Applied here post-generation for full flexibility) ---
             # Although run_feature_generation didn't apply strict time filtering (06-10 etc), 
@@ -8659,24 +9305,40 @@ def _render_create_graph():
                 )
 
             # Align Accidents
-            df_acc_use["ts_min"] = (
-                df_acc_use["accidente_time"]
-                .dt.floor(f"{int(dt_feat_minutes)}min")
-                .astype("int64")
-                // 60_000_000_000
-            )
-            if not use_snapshot_labels:
-                df_acc_use["ts_min"] = (
-                    df_acc_use["ts_min"] - int(dt_feat_minutes)
-                )
-            if debug_labels and "ts_min" in df_acc_use.columns:
+            if debug_labels and "accidente_time" in df_acc_use.columns:
                 _debug_labels(
                     debug_labels,
-                    f"accidents_rows={len(df_acc_use)} acc_ts_range=({df_acc_use['ts_min'].min()}, {df_acc_use['ts_min'].max()}) shift_prev_window={not use_snapshot_labels}",
+                    f"acc_time_range=({df_acc_use['accidente_time'].min()}, {df_acc_use['accidente_time'].max()})",
                 )
+            if use_snapshot_labels:
+                df_acc_use["ts_min"] = _ts_min_from_datetime(
+                    df_acc_use["accidente_time"]
+                )
+            else:
+                df_acc_use["ts_min"] = _ts_min_from_datetime(
+                    df_acc_use["accidente_time"],
+                    floor_minutes=int(dt_feat_minutes),
+                    shift=-int(dt_feat_minutes),
+                )
+            df_acc_use = df_acc_use.dropna(subset=["ts_min"])
+            if debug_labels and "ts_min" in df_acc_use.columns:
+                acc_min_ts, acc_max_ts = _ts_min_range(df_acc_use["ts_min"])
+                acc_min_dt = _ts_min_to_dt(acc_min_ts)
+                acc_max_dt = _ts_min_to_dt(acc_max_ts)
+                _debug_labels(
+                    debug_labels,
+                    f"accidents_rows={len(df_acc_use)} acc_ts_range=({acc_min_ts}, {acc_max_ts}) acc_dt_range=({acc_min_dt}, {acc_max_dt}) shift_prev_window={not use_snapshot_labels}",
+                )
+                if pm_max_ts is not None and acc_min_ts is not None:
+                    gap = acc_min_ts - pm_max_ts
+                    if abs(gap) > 1_000_000:
+                        _debug_labels(
+                            debug_labels,
+                            f"WARNING: ts_min mismatch acc_min-feature_max={gap}",
+                        )
             # Cast types
             try:
-                if np.issubdtype(df_pm[portico_col].dtype, np.number):
+                if pd.api.types.is_numeric_dtype(df_pm[portico_col]):
                     df_acc_use["ultimo_portico"] = pd.to_numeric(
                         df_acc_use["ultimo_portico"], errors="coerce"
                     ).astype("Int64")
@@ -8719,6 +9381,23 @@ def _render_create_graph():
                     horizon_minutes=hor_min,
                     include_downstream=bool(INCLUDE_DOWNSTREAM_IN_LABEL),
                 )
+                if debug_labels and "ts_min" in df_pm.columns:
+                    min_ts = int(df_pm["ts_min"].min())
+                    max_ts = int(df_pm["ts_min"].max())
+                    window_start = min_ts + sequence_config.guard_band_minutes
+                    window_end = (
+                        max_ts
+                        + sequence_config.guard_band_minutes
+                        + sequence_config.horizon_minutes
+                    )
+                    acc_in_window = df_acc_use[
+                        (df_acc_use["ts_min"] >= window_start)
+                        & (df_acc_use["ts_min"] <= window_end)
+                    ]
+                    _debug_labels(
+                        debug_labels,
+                        f"label_window=({window_start}, {window_end}) acc_in_window={len(acc_in_window)}",
+                    )
                 seq_index, labels_df = build_sequence_index(
                     df_pm,
                     df_acc_use[["ultimo_portico", "ts_min"]].copy(),
