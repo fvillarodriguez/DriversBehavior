@@ -240,6 +240,7 @@ def train_imgagn(
     y_binary: Tensor,
     cfg: ImGAGNConfig = ImGAGNConfig(),
     target_ntype: Optional[str] = None,
+    progress_callback: Optional[callable] = None,
 ) -> Dict[str, Tensor]:
     """Train ImGAGN on a (homogeneous or heterogeneous) graph for binary minority detection.
     y_binary: 0=majority, 1=minority, defined on the target node set.
@@ -694,6 +695,15 @@ def train_imgagn(
             if last_recall is not None:
                 postfix['recall'] = f"{last_recall:.3f}"
             epoch_iter.set_postfix(postfix)
+
+        if progress_callback is not None:
+            progress_callback(
+                epoch=epoch,
+                total=cfg.epochs,
+                loss_d=(avg_loss_D / max(1, cnt_loss_D)),
+                loss_g=float(loss_G.detach().item()),
+                recall=last_recall
+            )
 
     if cfg.show_progress and hasattr(epoch_iter, 'close'):
         epoch_iter.close()

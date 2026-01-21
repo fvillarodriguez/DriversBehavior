@@ -1149,7 +1149,9 @@ def _run_optuna_search(
     search_space: Dict[str, object],
     optuna_settings: Dict[str, object],
     objective_settings: Dict[str, object],
-    log_container: Optional[object] = None, # New argument
+    log_container: Optional[object] = None,
+    progress_bar: Optional[object] = None,
+    status_text: Optional[object] = None,
 ) -> Dict[str, object]:
     
     # --- LOGGING SETUP ---
@@ -1714,11 +1716,26 @@ def _run_optuna_search(
         trial.set_user_attr("best_epoch", int(best_epoch))
         return float(best_score)
 
+    # Use provided UI elements or create new ones
+    if progress_bar is None:
+         progress_bar = st.progress(0)
+    if status_text is None:
+         status_text = st.empty()
+    
+    n_trials = int(optuna_settings["n_trials"])
+
+    def progress_callback(study, trial):
+        current_trial = trial.number + 1
+        progress = current_trial / n_trials
+        progress_bar.progress(min(progress, 1.0))
+        status_text.markdown(f"**Progreso Optuna: Ensayo {current_trial} de {n_trials}**")
+
     try:
         study.optimize(
             objective,
-            n_trials=int(optuna_settings["n_trials"]),
-            show_progress_bar=True,
+            n_trials=n_trials,
+            show_progress_bar=False,  # We use our own st.progress
+            callbacks=[progress_callback],
         )
     finally:
         # CLEANUP HANDLER
@@ -3770,6 +3787,7 @@ def render_graph_builder():
         tab_optuna,
         tab_balance,
         tab_training,
+        tab_evaluation,
     ) = st.tabs(
         [
             "Eventos",
@@ -3782,6 +3800,7 @@ def render_graph_builder():
             "Optuna",
             "Balance",
             "Training",
+            "Evaluación Modelo",
         ]
     )
 
@@ -3827,6 +3846,9 @@ def render_graph_builder():
     with tab_training:
         _render_training_tab()
 
+    with tab_evaluation:
+        _render_evaluation_tab()
+
 def _render_in_memory_graph():
     st.markdown("### Grafo en Memoria")
     loaded_graph = st.session_state.get("loaded_graph")
@@ -3858,77 +3880,6 @@ def _render_in_memory_graph():
                 st.markdown(f"**Índice PM:** {pm_count} nodos.")
 
         graph_data = loaded_graph.get("data")
-        if isinstance(graph_data, HeteroData) and graph_data.edge_types:
-            st.markdown("**Muestra de grafo (nodos y aristas)**")
-            edge_labels = []
-            edge_types = list(graph_data.edge_types)
-            for edge_type in edge_types:
-                src, rel, dst = edge_type
-                edge_labels.append(f"{src}-{rel}-{dst}")
-            edge_choice = st.selectbox(
-                "Tipo de arista",
-                edge_labels,
-                index=0,
-                key="gnn_mem_edge_type",
-            )
-            edge_type = edge_types[edge_labels.index(edge_choice)]
-            edge_store = graph_data[edge_type]
-            edge_index = edge_store.edge_index
-            if edge_index is None or edge_index.numel() == 0:
-                st.warning("No hay aristas para este tipo.")
-            else:
-                edge_idx = edge_index.detach().cpu().numpy()
-                edge_count = edge_idx.shape[1]
-                max_edges = min(50, edge_count)
-                edge_limit = st.slider(
-                    "Aristas a mostrar",
-                    min_value=1,
-                    max_value=max_edges,
-                    value=min(15, max_edges),
-                    step=1,
-                    key="gnn_mem_edge_limit",
-                )
-                take = min(edge_limit, edge_count)
-                sample_src = edge_idx[0][:take]
-                sample_dst = edge_idx[1][:take]
-
-                pm_rev = None
-                if "pm_index" in loaded_graph:
-                    pm_rev = getattr(loaded_graph["pm_index"], "_rev", None)
-
-                def _label_for_node(idx: int) -> str:
-                    if pm_rev and idx in pm_rev:
-                        portico, ts_min = pm_rev[idx]
-                        return f"p{portico}@{ts_min}"
-                    return f"n{idx}"
-
-                edge_rows = []
-                node_set = set()
-                for src_idx, dst_idx in zip(sample_src, sample_dst):
-                    node_set.add(int(src_idx))
-                    node_set.add(int(dst_idx))
-                    edge_rows.append(
-                        {
-                            "src": int(src_idx),
-                            "dst": int(dst_idx),
-                            "src_label": _label_for_node(int(src_idx)),
-                            "dst_label": _label_for_node(int(dst_idx)),
-                        }
-                    )
-                st.dataframe(pd.DataFrame(edge_rows), width="stretch")
-
-                max_nodes = min(len(node_set), 20)
-                nodes_ordered = sorted(node_set)[:max_nodes]
-                node_labels = {idx: _label_for_node(idx) for idx in nodes_ordered}
-                dot_lines = ["digraph G {", "  rankdir=LR;"]
-                for idx in nodes_ordered:
-                    label = node_labels[idx].replace('"', "'")
-                    dot_lines.append(f'  n{idx} [label="{label}"];')
-                for src_idx, dst_idx in zip(sample_src, sample_dst):
-                    if int(src_idx) in node_labels and int(dst_idx) in node_labels:
-                        dot_lines.append(f"  n{int(src_idx)} -> n{int(dst_idx)};")
-                dot_lines.append("}")
-                st.graphviz_chart("\n".join(dot_lines))
 
         if st.button("Limpiar Memoria"):
             st.session_state.loaded_graph = None
@@ -5294,10 +5245,11 @@ def _render_balance_tab() -> None:
                 "GraphSMOTE actualmente solo esta soportado para nodos 'pm'."
             )
             return
+        if "gnn_smote_minority" not in st.session_state:
+            st.session_state["gnn_smote_minority"] = 1
         minority_class = st.number_input(
             "Clase minoritaria",
             min_value=0,
-            value=1,
             step=1,
             key="gnn_smote_minority",
         )
@@ -5342,24 +5294,27 @@ def _render_balance_tab() -> None:
                         pass
                 st.success("Parametros Optuna aplicados.")
                 st.rerun()
+        if "gnn_smote_n_samples" not in st.session_state:
+            st.session_state["gnn_smote_n_samples"] = 500
         n_samples = st.number_input(
             "Nuevos nodos sinteticos",
             min_value=1,
-            value=500,
             step=50,
             key="gnn_smote_n_samples",
         )
+        if "gnn_smote_k" not in st.session_state:
+            st.session_state["gnn_smote_k"] = int(GRAPHSMOTE_K)
         k_smote = st.number_input(
             "k_smote",
             min_value=1,
-            value=int(GRAPHSMOTE_K),
             step=1,
             key="gnn_smote_k",
         )
+        if "gnn_smote_k_edges" not in st.session_state:
+            st.session_state["gnn_smote_k_edges"] = 5
         k_neighbors_edges = st.number_input(
             "k_neighbors_edges",
             min_value=1,
-            value=5,
             step=1,
             key="gnn_smote_k_edges",
         )
@@ -5374,11 +5329,7 @@ def _render_balance_tab() -> None:
             "Agregar sinteticos a train_mask",
             value=True,
             key="gnn_smote_add_train",
-        )
-        disable_acc_smote_pm_generation = st.checkbox(
-            "Desactivar generacion de accidentes sinteticos",
-            value=True,
-            key="gnn_smote_disable_acc",
+            help="Al activar esta opción, los nuevos nodos sintéticos se marcan como parte del conjunto de entrenamiento. Esto permite que los modelos posteriores 'vean' y aprendan de estos ejemplos balanceados.",
         )
         conect_mode = st.radio(
             "Conexion de sinteticos",
@@ -5407,16 +5358,9 @@ def _render_balance_tab() -> None:
             tab_train, tab_load = st.tabs(["Entrenar nuevo", "Cargar existente"])
 
             with tab_train:
-                train_use_smote = st.checkbox(
-                    "Entrenar con GraphSMOTE (mismo grafo)",
-                    value=False,
-                    key="gnn_smote_train_with_smote",
-                    help=(
-                        "Si se activa, el entrenamiento del GNN usara GraphSMOTE para "
-                        "generar nodos sinteticos y entrenar sobre el grafo aumentado. "
-                        "Si se desactiva, entrena el GNN base sin aumentacion."
-                    ),
-                )
+                # GraphSMOTE siempre activo para generar embeddings robustos y decodificadores
+                train_use_smote = True
+                #st.info("ℹ️ GraphSMOTE activo por defecto: Se entrenarán decodificadores z→x.")
                 train_reuse_hparams = st.checkbox(
                     "Reutilizar hiperparametros guardados si existen",
                     value=True,
@@ -5427,6 +5371,39 @@ def _render_balance_tab() -> None:
                         "se fuerza una nueva busqueda de hiperparametros."
                     ),
                 )
+
+                optimizer_overrides = {}
+                if not train_reuse_hparams:
+                    with st.expander("Configuración del Optimizador (Búsqueda)", expanded=True):
+                        st.info(
+                            "**Objetivo**: Maximizar **F0.5-score** (Prioridad Precisión sobre Recall).\n"
+                            "**Pruning**: AUPRC se usa para descartar entrenamientos malos.\n"
+                            "Los parámetros mostrados aquí fijan la búsqueda (anulando el rango Optuna)."
+                        )
+                        opt_name = st.selectbox("Optimizador", ["(Auto)", "Adam", "AdamW", "RAdam"], key="gnn_hpo_opt_name")
+                        if opt_name != "(Auto)":
+                            optimizer_overrides["optimizer"] = opt_name
+                        
+                        lr_val = st.text_input("Learning Rate (vacio=Auto)", value="", key="gnn_hpo_lr")
+                        if lr_val.strip():
+                            try:
+                                optimizer_overrides["lr"] = float(lr_val)
+                            except:
+                                st.warning("LR inválido, se usará Auto")
+                        
+                        wd_val = st.text_input("Weight Decay (vacio=Auto)", value="", key="gnn_hpo_wd")
+                        if wd_val.strip():
+                             try:
+                                optimizer_overrides["weight_decay"] = float(wd_val)
+                             except:
+                                st.warning("Weight Decay inválido, se usará Auto")
+                        
+                        clip_val = st.text_input("Gradient Clip (vacio=Auto)", value="", key="gnn_hpo_clip")
+                        if clip_val.strip():
+                             try:
+                                optimizer_overrides["grad_clip"] = float(clip_val)
+                             except:
+                                st.warning("Clip inválido, se usará Auto")
                 #st.markdown("#### Vecinos (GraphSMOTE)")
                 neighbor_mode = st.radio(
                     "Selección de vecinos",
@@ -5453,7 +5430,7 @@ def _render_balance_tab() -> None:
                 max_epochs_smote = st.number_input(
                     "max_epochs",
                     min_value=1,
-                    value=300,
+                    value=30,
                     step=10,
                     key="gnn_smote_max_epochs",
                 )
@@ -5465,7 +5442,7 @@ def _render_balance_tab() -> None:
                 early_patience_smote = st.number_input(
                     "patience",
                     min_value=1,
-                    value=int(EARLY_STOPPING_PATIENCE),
+                    value=20,
                     step=1,
                     key="gnn_smote_early_patience",
                     disabled=not early_stop_smote,
@@ -5473,7 +5450,7 @@ def _render_balance_tab() -> None:
                 early_min_delta_smote = st.number_input(
                     "min_delta",
                     min_value=0.0,
-                    value=float(EARLY_STOPPING_MIN_DELTA),
+                    value=0.00100,
                     step=0.0001,
                     format="%.6f",
                     key="gnn_smote_early_min_delta",
@@ -5481,7 +5458,7 @@ def _render_balance_tab() -> None:
                 )
                 
                 latest_model = None
-                if st.button("Entrenar nuevo modelo GNN", key="gnn_smote_train_model"):
+                if st.button("Entrenar nuevo modelo Embedding", key="gnn_smote_train_model"):
                     graph_obj = dict(balance_graph_obj)
                     graph_obj["data"] = graph_data
                     if not graph_obj.get("filename"):
@@ -5548,57 +5525,61 @@ def _render_balance_tab() -> None:
                         st.error(f"No se pudo cargar el entrenador GNN: {exc}")
                         return
 
-                    log_container = st.empty()
-                    progress_bar = st.progress(0)
-                    progress_text = st.empty()
-                    log_handler = StreamlitLogHandler(log_container)
-                    log_handler.setFormatter(
-                        logging.Formatter(
-                            "%(asctime)s - %(message)s",
-                            datefmt="%H:%M:%S",
-                        )
-                    )
-                    root_logger = logging.getLogger()
-                    root_logger.addHandler(log_handler)
-                    stdout_proxy = StreamlitStdout(log_container)
-
-                    def _progress_cb(
-                        *,
-                        epoch: int,
-                        total: int,
-                        val_f1: Optional[float],
-                        best_val_f1: float,
-                        patience: int,
-                        patience_counter: int,
-                    ) -> None:
-                        total_safe = max(int(total or 1), 1)
-                        progress_bar.progress(min(epoch / total_safe, 1.0))
-                        parts = [f"Epoch {epoch}/{total_safe}"]
-                        if val_f1 is not None:
-                            parts.append(f"val_f1={val_f1:.4f}")
-                        parts.append(f"best_f1={best_val_f1:.4f}")
-                        parts.append(
-                            f"patience={patience_counter}/{patience}"
-                        )
-                        progress_text.caption(" | ".join(parts))
-
-                    original_input = builtins.input
-
-                    def _auto_input(prompt: str = "") -> str:
-                        norm = (
-                            unicodedata.normalize("NFKD", prompt)
-                            .encode("ascii", "ignore")
-                            .decode("ascii")
-                            .lower()
-                        )
-                        if "seleccione el numero del archivo" in norm:
-                            return str(hp_choice)
-                        if "reutilizar estos" in norm:
-                            return "s" if train_reuse_hparams else "n"
-                        return "0"
-
-                    
                     with st.spinner("Entrenando modelo GNN..."):
+                        progress_text = st.empty()
+                        progress_bar = st.progress(0)
+                        
+                        with st.expander("Logs de Entrenamiento (En vivo)", expanded=True):
+                            log_container = st.empty()
+                        
+                        log_handler = StreamlitLogHandler(log_container)
+                        log_handler.setFormatter(
+                            logging.Formatter(
+                                "%(asctime)s - %(message)s",
+                                datefmt="%H:%M:%S",
+                            )
+                        )
+                        root_logger = logging.getLogger()
+                        root_logger.addHandler(log_handler)
+                        stdout_proxy = StreamlitStdout(log_container)
+
+                        def _progress_cb(
+                            *,
+                            epoch: int,
+                            total: int,
+                            val_f1: Optional[float],
+                            best_val_f1: float,
+                            patience: int,
+                            patience_counter: int,
+                        ) -> None:
+                            total_safe = max(int(total or 1), 1)
+                            progress_bar.progress(min(epoch / total_safe, 1.0))
+                            parts = [f"Epoch {epoch}/{total_safe}"]
+                            if val_f1 is not None:
+                                parts.append(f"val_f1={val_f1:.4f}")
+                            parts.append(f"best_f1={best_val_f1:.4f}")
+                            parts.append(
+                                f"patience={patience_counter}/{patience}"
+                            )
+                            progress_text.caption(" | ".join(parts))
+
+                        original_input = builtins.input
+                        
+                        def _auto_input(prompt: str = "") -> str:
+                            norm = (
+                                unicodedata.normalize("NFKD", prompt)
+                                .encode("ascii", "ignore")
+                                .decode("ascii")
+                                .lower()
+                            )
+                            if "seleccione el numero del archivo" in norm:
+                                return str(hp_choice)
+                            if "reutilizar estos" in norm:
+                                return "s" if train_reuse_hparams else "n"
+                            return "0"
+
+                        builtins.input = _auto_input
+                        
                         try:
                             with contextlib.redirect_stdout(stdout_proxy), contextlib.redirect_stderr(stdout_proxy):
                                 graph_main.run_gat_training(
@@ -5610,15 +5591,15 @@ def _render_balance_tab() -> None:
                                     max_epochs=int(max_epochs_smote),
                                     smote_num_neighbors=smote_num_neighbors,
                                     progress_callback=_progress_cb,
+                                    optimizer_overrides=optimizer_overrides,
                                 )
                         except Exception as exc:
                             st.error(f"Error al entrenar el modelo: {exc}")
+                            builtins.input = original_input # Restore input safely if error
                             return
                         finally:
                             builtins.input = original_input
                             root_logger.removeHandler(log_handler)
-                    
-                    builtins.input = _auto_input
 
                     latest_model = None
                     latest_candidates = glob.glob(
@@ -5699,83 +5680,90 @@ def _render_balance_tab() -> None:
                 
                 if st.button("Validar modelo seleccionado", key="gnn_smote_validate_model_btn"):
                     st.markdown("---")
-                    st.subheader("Calidad del Modelo (GraphSMOTE)")
+                    st.subheader("Calidad del Modelo")
 
-                    # 1. Panel Calidad z->x
-                    st.markdown("#### Calidad z→x (Decodificador)")
-                    z2x_base_dir = st.session_state.get(
-                        "gnn_smote_save_dir",
-                        os.path.join(RESULTADOS_DIR, "z2x_decoders"),
-                    )
-                    z2x_dir = _resolve_z2x_dir(z2x_base_dir, model_path)
-                    history_path = os.path.join(z2x_dir, "history.json")
-                    st.caption(f"Directorio z2x: {z2x_dir}")
-                    
-                    if os.path.exists(history_path):
-                        try:
-                            with open(history_path, "r") as f:
-                                hist_data = json.load(f)
-                            
-                            if isinstance(hist_data, list) and len(hist_data) > 0:
-                                df_hist = pd.DataFrame(hist_data)
-                                if "epoch" in df_hist.columns:
-                                    df_hist = df_hist.set_index("epoch")
-                                
-                                # Mostrar metrics
-                                best_val = df_hist["val_loss"].min() if "val_loss" in df_hist.columns else None
-                                if best_val is not None:
-                                    st.metric("Mejor Validation Loss (z→x)", f"{best_val:.6f}")
-                                
-                                st.line_chart(df_hist[["train_loss", "val_loss"]])
-                            else:
-                                st.warning("El historial de entrenamiento z→x está vacío o tiene formato incorrecto.")
-                        except Exception as e:
-                            st.error(f"Error cargando historial z→x: {e}")
-                    else:
-                        decoder_files = sorted(glob.glob(os.path.join(z2x_dir, "*.pt")))
-                        if decoder_files:
-                            st.info(
-                                "No se encontró historial z→x en el directorio actual. "
-                                "Se detectaron decodificadores entrenados, pero falta "
-                                "history.json para mostrar la curva."
-                            )
-                            st.caption(
-                                f"Decodificadores detectados: {len(decoder_files)}"
-                            )
-                        else:
-                            st.info(
-                                "No se encontró historial de entrenamiento z→x. "
-                                "Entrene GraphSMOTE para generarlo."
-                            )
-
-                    # 2. Resumen de Embedding
-                    st.markdown("#### Resumen de Embedding (Calidad GNN)")
-                    st.info("Si el embedding es pobre, el z→x difícilmente reconstruirá y GraphSMOTE generará malos sintéticos.")
-                    
+                    # Intentar cargar metadatos primero
+                    meta = {}
                     if model_path and model_path != "(ninguno)" and os.path.exists(model_path):
                         try:
                             hparams_path = Path(model_path).with_name(Path(model_path).stem + "_hparams.json")
                             if hparams_path.exists():
                                 with open(hparams_path, "r") as f:
                                     meta = json.load(f)
+                        except Exception:
+                            pass
+
+                    use_gs = meta.get("use_graphsmote", False)
+
+                    # 1. Panel Calidad z->x (Solo si usa GraphSMOTE)
+                    if use_gs:
+                        st.markdown("#### Calidad z→x (Decodificador)")
+                        z2x_base_dir = st.session_state.get(
+                            "gnn_smote_save_dir",
+                            os.path.join(RESULTADOS_DIR, "z2x_decoders"),
+                        )
+                        z2x_dir = _resolve_z2x_dir(z2x_base_dir, model_path)
+                        history_path = os.path.join(z2x_dir, "history.json")
+                        st.caption(f"Directorio z2x: {z2x_dir}")
+                        
+                        if os.path.exists(history_path):
+                            try:
+                                with open(history_path, "r") as f:
+                                    hist_data = json.load(f)
                                 
-                                col_f1, col_auprc, col_epoch = st.columns(3)
-                                with col_f1:
-                                    f1 = meta.get("best_val_f1")
-                                    st.metric("GNN Best Val F1", f"{f1:.4f}" if f1 is not None else "N/A")
-                                with col_auprc:
-                                    # A veces se guarda auc o auprc, verificar keys
-                                    auprc = meta.get("best_val_auprc") # Check if saved
-                                    if auprc is None: auprc = meta.get("auprc") 
-                                    st.metric("GNN Best Val AUPRC", f"{auprc:.4f}" if auprc is not None else "N/A")
-                                with col_epoch:
-                                    st.metric("Best Epoch", meta.get("best_epoch", "N/A"))
+                                if isinstance(hist_data, list) and len(hist_data) > 0:
+                                    df_hist = pd.DataFrame(hist_data)
+                                    if "epoch" in df_hist.columns:
+                                        df_hist = df_hist.set_index("epoch")
+                                    
+                                    # Mostrar metrics
+                                    best_val = df_hist["val_loss"].min() if "val_loss" in df_hist.columns else None
+                                    if best_val is not None:
+                                        st.metric("Mejor Validation Loss (z→x)", f"{best_val:.6f}")
+                                    
+                                    st.line_chart(df_hist[["train_loss", "val_loss"]])
+                                else:
+                                    st.warning("El historial de entrenamiento z→x está vacío o tiene formato incorrecto.")
+                            except Exception as e:
+                                st.error(f"Error cargando historial z→x: {e}")
+                        else:
+                            decoder_files = sorted(glob.glob(os.path.join(z2x_dir, "*.pt")))
+                            if decoder_files:
+                                st.info(
+                                    "No se encontró historial z→x en el directorio actual. "
+                                    "Se detectaron decodificadores entrenados, pero falta "
+                                    "history.json para mostrar la curva."
+                                )
+                                st.caption(
+                                    f"Decodificadores detectados: {len(decoder_files)}"
+                                )
                             else:
-                                st.warning("No se encontraron metadatos (_hparams.json) para este modelo.")
-                        except Exception as e:
-                            st.error(f"Error leyendo metadatos del modelo: {e}")
+                                st.warning(
+                                    "No se encontró historial de entrenamiento z→x. "
+                                    "Posiblemente el modelo se entrenó sin GraphSMOTE, o los archivos se movieron."
+                                )
                     else:
-                        st.warning("Seleccione un modelo válido para ver sus métricas.")
+                        st.info("Este modelo no fue entrenado con GraphSMOTE activos (z→x no disponible).")
+
+                    # 2. Resumen de Embedding
+                    st.markdown("#### Resumen de Embedding (Calidad GNN)")
+                   
+                    if meta:
+                        col_f1, col_auprc, col_epoch = st.columns(3)
+                        with col_f1:
+                            f1 = meta.get("best_val_f1")
+                            st.metric("GNN Best Val F1", f"{f1:.4f}" if f1 is not None else "N/A")
+                        with col_auprc:
+                            auprc = meta.get("best_val_auprc")
+                            if auprc is None: auprc = meta.get("auprc")
+                            st.metric("GNN Best Val AUPRC", f"{auprc:.4f}" if auprc is not None else "N/A")
+                        with col_epoch:
+                            st.metric("Best Epoch", meta.get("best_epoch", "N/A"))
+                    else:
+                        if model_path == "(ninguno)":
+                            st.warning("Seleccione un modelo válido.")
+                        else:
+                            st.warning("No se encontraron metadatos (_hparams.json) para este modelo.")
 
             edge_feature_dim = 0
             for edge_type in graph_data.edge_types:
@@ -5789,8 +5777,19 @@ def _render_balance_tab() -> None:
                     )
                     break
             in_channels = int(graph_data[node_type].x.shape[1])
+            
+            # Detectar modo (Snapshot vs Flow) usando metadatos originales
+            loaded_obj = st.session_state.get("loaded_graph", {})
+            if isinstance(loaded_obj, dict) and loaded_obj.get("sequence_config") is not None:
+                feature_mode = "Snapshot Features (Secuencias Temporales)"
+            else:
+                feature_mode = "Flow 5 min (Variables de Flujo y Cluster)"
+            st.caption("---------")
             st.caption(
-                f"Dimensiones detectadas: in_channels={in_channels}, edge_feature_dim={edge_feature_dim}"
+                f"**Configuración del Grafo en memoria:**\n\n"
+                f"* **Tipo:** {feature_mode}\n"
+                f"* **Features de Nodo (in_channels={in_channels}):** Dimensiones de entrada por nodo.\n"
+                f"* **Features de Arista (edge_feature_dim={edge_feature_dim}):** Atributos de conexión."
             )
 
         col_a, col_b = st.columns(2)
@@ -5828,7 +5827,7 @@ def _render_balance_tab() -> None:
             out_channels = st.number_input(
                 "out_channels",
                 min_value=1,
-                value=1,
+                value=2,
                 step=1,
                 key="gnn_smote_out",
             )
@@ -5845,19 +5844,12 @@ def _render_balance_tab() -> None:
         )
         z2x_dir = _resolve_z2x_dir(z2x_base_dir, model_path)
         st.caption(f"Directorio z2x (modelo): {z2x_dir}")
-        save_aug = st.checkbox(
-            "Guardar grafo balanceado",
-            value=False,
-            key="gnn_smote_save_graph",
+        default_name = f"graph_smote_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+        save_path = st.text_input(
+            "Ruta de guardado del grafo balanceado",
+            value=os.path.join(RESULTADOS_DIR, default_name),
+            key="gnn_smote_save_path",
         )
-        save_path = None
-        if save_aug:
-            default_name = f"graph_smote_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
-            save_path = st.text_input(
-                "Ruta de guardado",
-                value=os.path.join(RESULTADOS_DIR, default_name),
-                key="gnn_smote_save_path",
-            )
 
         if st.button("Balancear con GraphSMOTE", key="gnn_smote_run"):
             if not model_path or model_path == "(ninguno)":
@@ -5888,6 +5880,18 @@ def _render_balance_tab() -> None:
                 return
 
             try:
+                # 1. Intentar cargar metadatos para sincronizar arquitectura
+                meta_hparams = {}
+                hparams_path = Path(model_path).with_name(Path(model_path).stem + "_hparams.json")
+                if hparams_path.exists():
+                    try:
+                        with open(hparams_path, "r") as f:
+                            meta_hparams = json.load(f)
+                        st.info(f"Metadatos detectados. Sincronizando arquitectura desde {hparams_path.name}")
+                    except Exception as e:
+                        st.warning(f"No se pudo cargar {hparams_path.name}: {e}")
+
+                # 2. Cargar objeto del modelo
                 model_obj = torch.load(
                     model_path,
                     map_location=torch.device("cpu"),
@@ -5908,23 +5912,40 @@ def _render_balance_tab() -> None:
                     state_dict = (
                         model_obj.get("model_state")
                         or model_obj.get("state_dict")
+                        or model_obj # Fallback directo para state_dict
                     )
+            
             if model is None:
-                if state_dict is None:
-                    st.error("El modelo cargado no es compatible.")
-                    return
+                # 3. Instanciar el modelo con hiperparámetros (Prioridad Meta > UI)
+                h_channels = int(meta_hparams.get('hidden_channels', hidden_channels))
+                h_heads = int(meta_hparams.get('num_heads', num_heads))
+                h_layers = int(meta_hparams.get('num_layers', num_layers))
+                h_dropout = float(meta_hparams.get('dropout', dropout))
+                h_aggr1 = meta_hparams.get('aggr1', 'sum')
+                h_aggr2 = meta_hparams.get('aggr2', 'sum')
+                # out_channels suele ser num_classes. Intentamos detectarlo.
+                h_out = int(meta_hparams.get('out_channels', 0))
+                if h_out == 0:
+                    # Si no está en meta, intentar detectar del grafo actual
+                    try:
+                        h_out = len(torch.unique(graph_data[node_type].y))
+                    except:
+                        h_out = int(out_channels) # Fallback UI
+                
                 model = HeteroGAT(
                     in_channels=in_channels,
-                    hidden_channels=int(hidden_channels),
-                    out_channels=int(out_channels),
-                    num_heads=int(num_heads),
-                    dropout=float(dropout),
+                    hidden_channels=h_channels,
+                    out_channels=h_out,
+                    num_heads=h_heads,
+                    dropout=h_dropout,
                     edge_feature_dim=int(edge_feature_dim),
-                    num_layers=int(num_layers),
+                    num_layers=h_layers,
+                    aggr1=h_aggr1,
+                    aggr2=h_aggr2,
                     use_checkpointing=False,
                 )
                 missing, unexpected = model.load_state_dict(
-                    state_dict, strict=False
+                    state_dict, strict=True
                 )
                 if missing or unexpected:
                     st.warning(
@@ -5941,25 +5962,53 @@ def _render_balance_tab() -> None:
                     "n_samples": int(n_samples),
                 }
             ]
+            progress_bar_smote = st.progress(0)
+            progress_text_smote = st.empty()
+            
+            with st.expander("Logs de GraphSMOTE (En vivo)", expanded=False):
+                log_display_smote = st.empty()
+            
+            log_handler_smote = StreamlitLogHandler(log_display_smote)
+            log_handler_smote.setFormatter(logging.Formatter("%(asctime)s - %(message)s", "%H:%M:%S"))
+            root_logger = logging.getLogger()
+            root_logger.addHandler(log_handler_smote)
+            stdout_proxy_smote = StreamlitStdout(log_display_smote)
+
+            def _progress_cb_smote(epoch, total, train_loss, val_loss):
+                frac = min(epoch / max(1, total), 1.0)
+                progress_bar_smote.progress(frac)
+                parts = [f"Epoch {epoch}/{total}"]
+                parts.append(f"train_loss={train_loss:.6f}")
+                if val_loss is not None:
+                    parts.append(f"val_loss={val_loss:.6f}")
+                progress_text_smote.caption(" | ".join(parts))
+
             with st.spinner("Ejecutando GraphSMOTE..."):
                 try:
-                    augmented = graphsmote_mod.run_graphsmote(
-                        model,
-                        graph_data,
-                        nodes_to_smote,
-                        int(k_smote),
-                        int(k_neighbors_edges),
-                        int(random_state),
-                        save_dir=z2x_dir,
-                        add_to_train_mask=bool(add_to_train_mask),
-                        disable_acc_smote_pm_generation=bool(
-                            disable_acc_smote_pm_generation
-                        ),
-                        save_path=save_path,
-                    )
+                    import contextlib
+                    import builtins
+                    original_input = builtins.input
+                    builtins.input = lambda _: "0"
+                    
+                    with contextlib.redirect_stdout(stdout_proxy_smote), contextlib.redirect_stderr(stdout_proxy_smote):
+                        augmented = graphsmote_mod.run_graphsmote(
+                            model,
+                            graph_data,
+                            nodes_to_smote,
+                            int(k_smote),
+                            int(k_neighbors_edges),
+                            int(random_state),
+                            save_dir=z2x_dir,
+                            add_to_train_mask=bool(add_to_train_mask),
+                            save_path=save_path,
+                            progress_callback=_progress_cb_smote
+                        )
                 except Exception as exc:
                     st.error(f"Error en GraphSMOTE: {exc}")
                     return
+                finally:
+                    builtins.input = original_input
+                    root_logger.removeHandler(log_handler_smote)
 
             st.session_state["balanced_graph"] = {
                 "data": augmented,
@@ -6167,6 +6216,13 @@ def _render_balance_tab() -> None:
             key="gnn_imgagn_progress",
         )
 
+        default_name_imgagn = f"graph_imgagn_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+        save_path_imgagn = st.text_input(
+            "Ruta de guardado del grafo balanceado (ImGAGN)",
+            value=os.path.join(RESULTADOS_DIR, default_name_imgagn),
+            key="gnn_imgagn_save_path",
+        )
+
         if st.button("Balancear con ImGAGN", key="gnn_imgagn_run"):
             if not hasattr(graph_data[target_ntype], "train_mask"):
                 st.error("El grafo no tiene train_mask para balancear.")
@@ -6219,18 +6275,53 @@ def _render_balance_tab() -> None:
                 show_progress=bool(show_progress),
             )
 
-            with st.spinner("Ejecutando ImGAGN..."):
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+            log_container = st.empty()
+
+            with st.expander("Logs de ImGAGN (En vivo)", expanded=False):
+                log_display = st.empty()
+            
+            log_handler = StreamlitLogHandler(log_display)
+            log_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s", "%H:%M:%S"))
+            root_logger = logging.getLogger()
+            root_logger.addHandler(log_handler)
+            stdout_proxy = StreamlitStdout(log_display)
+
+            def _progress_cb(epoch, total, loss_d, loss_g, recall):
+                if not show_progress:
+                    return
+                frac = min(epoch / max(1, total), 1.0)
+                progress_bar.progress(frac)
+                parts = [f"Epoch {epoch}/{total}"]
+                parts.append(f"loss_D={loss_d:.4f}")
+                parts.append(f"loss_G={loss_g:.4f}")
+                if recall is not None:
+                    parts.append(f"recall={recall:.4f}")
+                progress_text.caption(" | ".join(parts))
+
+            with st.spinner("Ejecutando ImGAGN (Entrenamiento de Generador)..."):
                 try:
-                    result = imgagn_mod.train_imgagn(
-                        graph_data,
-                        graph_data[target_ntype].train_mask,
-                        y_binary,
-                        cfg=cfg,
-                        target_ntype=target_ntype,
-                    )
+                    import contextlib
+                    import builtins
+                    original_input = builtins.input
+                    builtins.input = lambda _: "0"
+                    
+                    with contextlib.redirect_stdout(stdout_proxy), contextlib.redirect_stderr(stdout_proxy):
+                        result = imgagn_mod.train_imgagn(
+                            graph_data,
+                            graph_data[target_ntype].train_mask,
+                            y_binary,
+                            cfg=cfg,
+                            target_ntype=target_ntype,
+                            progress_callback=_progress_cb
+                        )
                 except Exception as exc:
                     st.error(f"Error en ImGAGN: {exc}")
                     return
+                finally:
+                    builtins.input = original_input
+                    root_logger.removeHandler(log_handler)
 
             x_aug = result.get("x_aug")
             edge_index_aug = result.get("edge_index_aug")
@@ -6268,7 +6359,7 @@ def _render_balance_tab() -> None:
                 dim=0,
             )
 
-            data_aug = HeteroData()
+            data_aug = graph_data.clone()
             data_aug[target_ntype].x = x_aug
             data_aug[target_ntype].y = y_aug
             data_aug[target_ntype].train_mask = train_mask_aug
@@ -6281,13 +6372,23 @@ def _render_balance_tab() -> None:
                 ],
                 dim=0,
             )
+            data_aug[target_ntype].num_nodes = x_aug.size(0)
             data_aug[(target_ntype, "imgagn", target_ntype)].edge_index = edge_index_aug
 
             st.session_state["balanced_graph"] = {
                 "data": data_aug,
                 "source": "ImGAGN",
                 "params": {"target_ntype": target_ntype},
+                "imgagn_best_params": cfg.__dict__ if hasattr(cfg, "__dict__") else cfg,
             }
+
+            if save_path_imgagn:
+                try:
+                    torch.save(data_aug.cpu(), save_path_imgagn)
+                    st.info(f"Grafo balanceado guardado en: {save_path_imgagn}")
+                except Exception as e:
+                    st.error(f"Error al guardar grafo: {e}")
+
             st.success(
                 f"Balance ImGAGN completado. Nodos: {data_aug[target_ntype].num_nodes}"
             )
@@ -6316,12 +6417,56 @@ def _render_training_tab() -> None:
         else:
             st.caption("Se entrenara con el grafo original cargado en memoria.")
     else:
-        st.info("No hay grafo balanceado disponible. Se usara el grafo original.")
+        # Buscar grafos balanceados guardados
+        st.info("No hay grafo balanceado en memoria.")
+        balanced_files = sorted(
+            glob.glob(os.path.join(RESULTADOS_DIR, "graph_smote_*.pt"))
+            + glob.glob(os.path.join(RESULTADOS_DIR, "graph_aug.pt"))
+            + glob.glob(os.path.join(RESULTADOS_DIR, "graph_imgagn_*.pt")),
+            key=os.path.getmtime,
+            reverse=True
+        )
+        
+        if balanced_files:
+            #st.markdown("---")
+            #st.markdown("### 📥 Cargar Grafo Balanceado Guardado")
+            selected_file = st.selectbox(
+                "Seleccionar grafo balanceado guardado",
+                balanced_files,
+                format_func=lambda x: os.path.basename(x),
+                key="gnn_train_select_saved_balanced"
+            )
+            if st.button("Cargar grafo balanceado", key="gnn_train_load_saved_balanced"):
+                try:
+                    loaded_data = torch.load(selected_file, map_location="cpu", weights_only=False)
+                    source_tag = "GraphSMOTE" if "smote" in selected_file.lower() or "aug" in selected_file.lower() else "ImGAGN"
+                    st.session_state["balanced_graph"] = {
+                        "data": loaded_data,
+                        "source": f"{source_tag} (Cargado)",
+                        "params": {"file": os.path.basename(selected_file)},
+                    }
+                    st.success(f"Grafo cargado exitosamente desde {os.path.basename(selected_file)}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al cargar el grafo: {e}")
+        else:
+            st.info("No se encontraron grafos balanceados guardados en 'Resultados/'.")
+            st.caption("Se usara el grafo original.")
 
     graph_obj = dict(loaded_graph)
     graph_source_label = "Original"
     if use_balanced and balanced_graph is not None:
         graph_obj["data"] = balanced_graph.get("data")
+        if "ImGAGN" in str(balanced_graph.get("source", "")):
+            if balanced_graph.get("imgagn_best_params"):
+                graph_obj["imgagn_best_params"] = balanced_graph["imgagn_best_params"]
+            fn = graph_obj.get("filename", "graph")
+            if "_ImGAGN" not in fn:
+                graph_obj["filename"] = fn.replace(".pt", "_ImGAGN.pt") if fn.endswith(".pt") else f"{fn}_ImGAGN"
+        elif "GraphSMOTE" in str(balanced_graph.get("source", "")):
+            fn = graph_obj.get("filename", "graph")
+            if "_GraphSMOTE" not in fn:
+                graph_obj["filename"] = fn.replace(".pt", "_GraphSMOTE.pt") if fn.endswith(".pt") else f"{fn}_GraphSMOTE"
         graph_source_label = f"Balanceado ({balanced_graph.get('source', 'N/A')})"
     if not graph_obj.get("filename"):
         graph_path = st.session_state.get("graph_path")
@@ -6385,25 +6530,7 @@ def _render_training_tab() -> None:
     )
 
     network_cfg = st.session_state.get("gnn_network_config")
-    default_smote = bool(network_cfg.get("use_graphsmote", False)) if network_cfg else False
-    use_graphsmote_train = st.checkbox(
-        "Usar GraphSMOTE durante entrenamiento",
-        value=default_smote,
-        key="gnn_train_use_graphsmote",
-    )
-    if use_graphsmote_train and use_balanced:
-        st.caption(
-            "GraphSMOTE se aplicara sobre un grafo ya balanceado. "
-            "Considere desactivarlo si no necesita doble aumentacion."
-        )
-    elif use_graphsmote_train:
-        st.caption(
-            "GraphSMOTE generara nodos sinteticos adicionales durante el entrenamiento."
-        )
-    else:
-        st.caption(
-            "Entrenamiento directo sobre el grafo seleccionado (sin SMOTE en entrenamiento)."
-        )
+    use_graphsmote_train = False
 
     if network_cfg:
         st.caption("Configuracion de Network disponible para este entrenamiento.")
@@ -6487,9 +6614,16 @@ def _render_training_tab() -> None:
             st.error(f"No se pudo cargar el entrenador GNN: {exc}")
             return
 
-        log_container = st.empty()
         progress_bar = st.progress(0)
         progress_text = st.empty()
+        
+        # Placeholder for evaluation results (to be rendered ABOVE logs)
+        eval_results_placeholder = st.container()
+
+        # Log container at the bottom
+        with st.expander("Logs de Entrenamiento (En vivo)", expanded=True):
+            log_container = st.empty()
+        
         log_handler = StreamlitLogHandler(log_container)
         log_handler.setFormatter(
             logging.Formatter(
@@ -6633,235 +6767,216 @@ def _render_training_tab() -> None:
         if model_path:
             st.session_state["gnn_train_last_model"] = model_path
             st.success(f"Entrenamiento finalizado. Modelo: {os.path.basename(model_path)}")
+            
+            # EVALUACIÓN AUTOMÁTICA (Enviada al placeholder superior)
+            with eval_results_placeholder:
+                st.markdown("---")
+                st.subheader("Evaluación Automática")
+                _perform_model_evaluation(
+                    model_path=model_path,
+                    graph_data=graph_data,
+                    device=eval_device,
+                    threshold=None # Usará best_tau de hparams por defecto
+                )
         else:
             st.warning("Entrenamiento completado, pero no se encontro modelo guardado.")
 
-    model_files = sorted(
-        glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")),
-        key=os.path.getmtime,
-    )
-    model_choice = st.selectbox(
-        "Modelo para evaluar",
-        options=["(auto)"] + model_files,
-        format_func=lambda x: "(auto)" if x == "(auto)" else os.path.basename(x),
-        key="gnn_train_model_eval",
-    )
-    if model_choice == "(auto)":
-        model_choice = st.session_state.get("gnn_train_last_model")
-    if model_choice:
-        st.caption(f"Modelo seleccionado: {os.path.basename(model_choice)}")
-    else:
-        st.caption("No hay modelos disponibles para evaluar.")
+def _perform_model_evaluation(model_path, graph_data, device="cpu", threshold=None) -> None:
+    try:
+        from src import gnn_main as graph_main
+        from src.gat_model import HeteroGAT
+    except Exception as exc:
+        st.error(f"No se pudieron cargar módulos necesarios: {exc}")
+        return
 
-    if st.button("Evaluar modelo", key="gnn_train_eval"):
-        if not model_choice:
-            st.error("Seleccione un modelo valido para evaluar.")
-            return
+    node_type = "pm"
+    meta = _load_hparams_for_model(model_path)
+    
+    # Detalle de lo que se evalúa
+    st.info(f"Evaluando modelo: {os.path.basename(model_path)} en dispositivo: {device}")
 
-        try:
-            from src.gat_model import HeteroGAT
-            from src.temporal_head import TemporalAggregator
-            from src import gnn_main as graph_main
-        except Exception as exc:
-            st.error(f"No se pudo cargar dependencias de evaluacion: {exc}")
-            return
-
-        pm_index_ref = st.session_state.get("loaded_graph", {}).get("pm_index")
-        split_info = None
-        if pm_index_ref is not None:
-            split_info = _apply_temporal_split_to_graph(
-                graph_data,
-                pm_index_ref,
-                split_train_ratio,
-                split_val_ratio,
-            )
-        if split_info:
-            st.caption(
-                "Split aplicado: "
-                f"train={split_info['train_count']}, "
-                f"val={split_info['val_count']}, "
-                f"test={split_info['test_count']}"
-            )
-        else:
-            st.warning(
-                "No se pudo aplicar el split temporal; se usaran las mascaras actuales."
-            )
-
-        try:
-            model_obj = torch.load(
-                model_choice, map_location=torch.device("cpu"), weights_only=False
-            )
-        except Exception as exc:
-            st.error(f"No se pudo cargar el modelo: {exc}")
-            return
-
-        state_dict = None
-        model = None
-        if isinstance(model_obj, torch.nn.Module):
-            model = model_obj
-        elif isinstance(model_obj, dict):
-            if isinstance(model_obj.get("model"), torch.nn.Module):
-                model = model_obj.get("model")
-            else:
-                state_dict = model_obj.get("model_state") or model_obj.get("state_dict")
-                if state_dict is None:
-                    try:
-                        if model_obj and all(
-                            isinstance(k, str) for k in model_obj.keys()
-                        ) and all(
-                            isinstance(v, torch.Tensor)
-                            for v in model_obj.values()
-                        ):
-                            state_dict = model_obj
-                    except Exception:
-                        state_dict = None
-        if model is None and state_dict is None:
-            st.error("El modelo cargado no es compatible.")
-            return
-
-        hparams = _load_hparams_for_model(model_choice)
-        if state_dict is None and model is not None:
-            state_dict = model.state_dict()
-        if state_dict is None:
-            st.error("No se pudo cargar el state_dict del modelo.")
-            return
-
-        arch_defaults = _infer_arch_from_state_dict(state_dict)
-        in_channels = int(graph_data["pm"].x.shape[1])
-        edge_feature_dim = _infer_edge_feature_dim(graph_data)
-        num_classes = int(torch.unique(graph_data["pm"].y).numel())
-        hidden_channels = int(hparams.get("hidden_channels", arch_defaults["hidden_channels"]))
-        num_heads = int(hparams.get("num_heads", arch_defaults["num_heads"]))
-        num_layers = int(hparams.get("num_layers", arch_defaults["num_layers"]))
-        dropout = float(hparams.get("dropout", 0.2))
-        aggr1 = hparams.get("aggr1", "sum")
-        aggr2 = hparams.get("aggr2", "sum")
-        use_checkpointing = bool(hparams.get("use_checkpointing", False))
-
-        if model is None:
-            model = HeteroGAT(
-                in_channels=in_channels,
-                hidden_channels=hidden_channels,
-                out_channels=num_classes,
-                num_heads=num_heads,
-                dropout=dropout,
-                edge_feature_dim=edge_feature_dim,
-                num_layers=num_layers,
-                aggr1=aggr1,
-                aggr2=aggr2,
-                use_checkpointing=use_checkpointing,
-            )
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            if missing or unexpected:
-                st.warning(
-                    f"Estado cargado con diferencias. missing={len(missing)} unexpected={len(unexpected)}"
-                )
-
-        device = torch.device(eval_device)
-        model = model.to(device)
+    try:
+        # Cargar pesos
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+        if isinstance(state_dict, dict) and ("model_state" in state_dict or "state_dict" in state_dict):
+            state_dict = state_dict.get("model_state") or state_dict.get("state_dict")
+        elif isinstance(state_dict, torch.nn.Module):
+             state_dict = state_dict.state_dict()
+        
+        # Sincronizar Arquitectura
+        arch = _infer_arch_from_state_dict(state_dict)
+        h_channels = int(meta.get("hidden_channels", arch["hidden_channels"]))
+        h_heads = int(meta.get("num_heads", arch["num_heads"]))
+        h_layers = int(meta.get("num_layers", arch["num_layers"]))
+        h_dropout = float(meta.get("dropout", 0.0))
+        h_out = int(meta.get("out_channels", 0))
+        if h_out == 0:
+            try: h_out = len(torch.unique(graph_data[node_type].y))
+            except: h_out = 2
+        
+        # Instanciar
+        model = HeteroGAT(
+            in_channels=graph_data[node_type].x.shape[1],
+            hidden_channels=h_channels,
+            out_channels=h_out,
+            num_heads=h_heads,
+            dropout=h_dropout,
+            edge_feature_dim=_infer_edge_feature_dim(graph_data),
+            num_layers=h_layers,
+            aggr1=meta.get("aggr1", "sum"),
+            aggr2=meta.get("aggr2", "sum"),
+            use_checkpointing=False,
+        ).to(device)
+        
+        model.load_state_dict(state_dict, strict=True)
         model.eval()
 
-        sequence_index = graph_obj.get("sequence_index")
-        if sequence_index and getattr(sequence_index, "sequence_rows", None) is not None:
-            if getattr(sequence_index.sequence_rows, "size", 0):
-                seq_rows = torch.as_tensor(sequence_index.sequence_rows, dtype=torch.long)
-                target_rows = torch.as_tensor(sequence_index.target_rows, dtype=torch.long)
-                temporal_module = TemporalAggregator(
-                    sequence_rows=seq_rows,
-                    target_rows=target_rows,
-                    num_nodes=graph_data["pm"].num_nodes,
-                    embedding_dim=hidden_channels * num_heads,
-                    sequence_length=sequence_index.sequence_rows.shape[1],
-                    hidden_dim=hidden_channels * num_heads,
-                    num_classes=num_classes,
-                ).to(device)
-                temporal_module.reset_cache()
-                temporal_module.eval()
-                model.temporal_head = temporal_module
+        # Determinar umbral
+        eval_threshold = threshold
+        if eval_threshold is None:
+            eval_threshold = float(meta.get("best_tau", 0.5))
 
-        with st.spinner("Evaluando modelo..."):
-            try:
-                results_raw = graph_main.test(
-                    model,
-                    graph_data,
-                    batch_size=BATCH_SIZE,
-                    node_type="pm",
-                    threshold=None,
-                )
-            except Exception as exc:
-                st.error(f"Error al evaluar el modelo: {exc}")
-                return
+        # Test
+        results = graph_main.test(
+            model,
+            graph_data,
+            node_type=node_type,
+            threshold=eval_threshold
+        )
 
-        threshold = 0.5
-        if "val_mask" in results_raw:
-            y_val = results_raw["val_mask"]["true"].numpy()
-            y_prob = results_raw["val_mask"]["probs"][:, 1].numpy()
-            if np.unique(y_val).size > 1:
-                try:
-                    threshold, _ = graph_main.pick_tau_fbeta(
-                        y_val, y_prob, beta=1.0
-                    )
-                    st.caption(
-                        f"Umbral optimizado en validacion: {threshold:.4f}"
-                    )
-                except Exception:
-                    st.caption(
-                        "No se pudo optimizar umbral en validacion; se usa 0.5."
-                    )
-                    threshold = 0.5
-            else:
-                st.caption(
-                    "Validacion con una sola clase; se usa umbral 0.5."
-                )
-        else:
-            st.caption("No hay val_mask disponible; se usa umbral 0.5.")
-
-        try:
-            results = graph_main.test(
-                model,
-                graph_data,
-                batch_size=BATCH_SIZE,
-                node_type="pm",
-                threshold=float(threshold),
-            )
-        except Exception as exc:
-            st.error(f"Error al evaluar con umbral: {exc}")
+        if not results:
+            st.warning("No se obtuvieron resultados (¿faltan mascaras en el grafo?)")
             return
 
-        metrics_rows = []
-        confusion_tables = {}
-        for split_name, res in results.items():
-            cm = np.array(res["cm"])
-            metrics = _compute_binary_metrics_from_cm(cm)
-            metrics.update(
-                {
-                    "split": split_name.replace("_mask", ""),
-                    "auc": float(res.get("auc") or 0.0),
-                    "auprc": float(res.get("auprc") or 0.0),
-                    "mcc": float(res.get("mcc") or 0.0),
-                }
-            )
-            metrics_rows.append(metrics)
-            confusion_tables[split_name] = cm
+        # Mostrar Reportes
+        for mask_name, m_res in results.items():
+            with st.expander(f"Resultado Split: {mask_name}", expanded=True):
+                st.markdown("**Metricas principales**")
+                col1, col2, col3 = st.columns(3)
+                rep = m_res.get("report", {})
+                f1_1 = rep.get("Accidente (1)", {}).get("f1-score", 0.0)
+                f1_0 = rep.get("No Accidente (0)", {}).get("f1-score", 0.0)
+                acc = rep.get("accuracy", 0.0)
+                
+                col1.metric("F1 Accidente", f"{f1_1:.4f}")
+                col2.metric("F1 No Accidente", f"{f1_0:.4f}")
+                col3.metric("Accuracy", f"{acc:.4f}")
 
-        if metrics_rows:
-            st.markdown("**Metricas por split**")
-            metrics_df = pd.DataFrame(metrics_rows)
-            st.dataframe(metrics_df, width="stretch")
-        else:
-            st.warning("No se pudieron calcular metricas.")
+                if m_res.get("auc") is not None:
+                    st.write(f"- **AUC-ROC**: {m_res['auc']:.4f}")
+                if m_res.get("auprc") is not None:
+                    st.write(f"- **AUPRC**: {m_res['auprc']:.4f}")
+                if m_res.get("mcc") is not None:
+                    st.write(f"- **MCC**: {m_res['mcc']:.4f}")
 
-        if "test_mask" in confusion_tables:
-            cm = confusion_tables["test_mask"]
-            st.markdown("**Matriz de confusion (test)**")
-            cm_df = pd.DataFrame(
-                cm,
-                index=["Real 0", "Real 1"],
-                columns=["Pred 0", "Pred 1"],
-            )
-            st.dataframe(cm_df, width="stretch")
+                st.markdown("**Matriz de Confusión**")
+                cm = m_res.get("cm")
+                if cm is not None:
+                    df_cm = pd.DataFrame(
+                        cm, 
+                        index=["Real 0", "Real 1"], 
+                        columns=["Pred 0", "Pred 1"]
+                    )
+                    st.dataframe(df_cm)
+                
+                st.markdown("**Reporte Completo**")
+                st.dataframe(pd.DataFrame(rep).transpose())
+
+    except Exception as exc:
+        st.error(f"Error durante evaluación: {exc}")
+        st.exception(exc)
+
+def _render_evaluation_tab() -> None:
+    st.subheader("Evaluación Modelo (GNN)")
+    loaded_graph = st.session_state.get("loaded_graph")
+    if loaded_graph is None:
+        st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+        return
+
+    graph_data = loaded_graph.get("data")
+    node_type = "pm"
+    if node_type not in graph_data.node_types:
+        st.warning("El grafo no contiene nodos 'pm'.")
+        return
+
+    # 1. Selección de Modelo
+    model_files = sorted(
+        glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt"))
+    )
+    if not model_files:
+        st.warning("No se encontraron modelos guardados en Results/.")
+        return
+
+    model_opts = ["(seleccione)"] + model_files
+    selected_model_path = st.selectbox(
+        "Seleccione Modelo GNN para evaluar",
+        options=model_opts,
+        format_func=lambda x: "(seleccione)" if x == "(seleccione)" else os.path.basename(x),
+        key="gnn_eval_model_path",
+    )
+
+    if selected_model_path == "(seleccione)":
+        return
+
+    # 2. Cargar Metadatos
+    meta = _load_hparams_for_model(selected_model_path)
+    
+    col_arch, col_res = st.columns(2)
+    with col_arch:
+        st.markdown("#### Arquitectura del Modelo")
+        if meta:
+            st.json({
+                "hidden_channels": meta.get("hidden_channels", "N/A"),
+                "num_heads": meta.get("num_heads", "N/A"),
+                "num_layers": meta.get("num_layers", "N/A"),
+                "dropout": meta.get("dropout", "N/A"),
+                "out_channels": meta.get("out_channels", "N/A"),
+                "aggr1": meta.get("aggr1", "sum"),
+                "aggr2": meta.get("aggr2", "sum"),
+            })
         else:
-            st.info("No hay test_mask disponible para matriz de confusion.")
+            st.info("Sin archivo _hparams.json asociado.")
+
+    with col_res:
+        st.markdown("#### Resultado en Entrenamiento")
+        if meta:
+            st.metric("Best Val F1", f"{meta.get('best_val_f1') or 0.0:.4f}")
+            st.metric("Best Val AUPRC", f"{meta.get('best_val_auprc') or 0.0:.4f}")
+            st.caption(f"Umbral optimo detectado (tau): {meta.get('best_tau') or 0.5:.6f}")
+
+    # 3. Archivos involucrados
+    with st.expander("Archivos asociados", expanded=False):
+        stem = Path(selected_model_path).stem
+        pattern = os.path.join(RESULTADOS_DIR, f"{stem}*")
+        associated = glob.glob(pattern)
+        for f in associated:
+            st.write(f"- {os.path.basename(f)}")
+
+    # 4. Evaluación
+    st.markdown("---")
+    eval_device = st.selectbox(
+        "Dispositivo para evaluación",
+        ["cpu", "cuda", "mps"] if torch.cuda.is_available() or torch.backends.mps.is_available() else ["cpu"],
+        key="gnn_eval_device"
+    )
+    eval_threshold = st.slider(
+        "Umbral de decisión (Override)",
+        min_value=0.01,
+        max_value=0.99,
+        value=float(meta.get("best_tau", 0.5)),
+        step=0.01,
+        key="gnn_eval_threshold",
+    )
+
+    if st.button("Ejecutar Evaluación en Grafo Actual"):
+        with st.spinner("Cargando y evaluando modelo..."):
+            _perform_model_evaluation(
+                model_path=selected_model_path,
+                graph_data=graph_data,
+                device=eval_device,
+                threshold=eval_threshold
+            )
+
 
 
 def _render_network_tab() -> None:
@@ -7101,53 +7216,6 @@ def _render_network_tab() -> None:
                 key="gnn_net_lambda_final",
             )
 
-    st.markdown("**Balance durante entrenamiento**")
-    use_graphsmote = st.checkbox(
-        "Usar GraphSMOTE en entrenamiento",
-        value=bool(existing_cfg.get("use_graphsmote", False)),
-        key="gnn_net_use_smote",
-    )
-    smote_k = int(existing_cfg.get("smote_k", 5))
-    target_pos_ratio = float(existing_cfg.get("target_pos_ratio", 0.35))
-    smote_every_n_epochs = int(existing_cfg.get("smote_every_n_epochs", 2))
-    lambda_edge = float(existing_cfg.get("lambda_edge", 1e-6))
-    if use_graphsmote:
-        col_sm1, col_sm2, col_sm3, col_sm4 = st.columns(4)
-        with col_sm1:
-            smote_k = st.number_input(
-                "smote_k",
-                min_value=1,
-                value=int(smote_k),
-                step=1,
-                key="gnn_net_smote_k",
-            )
-        with col_sm2:
-            target_pos_ratio = st.number_input(
-                "target_pos_ratio",
-                min_value=0.1,
-                max_value=0.9,
-                value=float(target_pos_ratio),
-                step=0.05,
-                key="gnn_net_target_ratio",
-            )
-        with col_sm3:
-            smote_every_n_epochs = st.number_input(
-                "smote_every_n_epochs",
-                min_value=1,
-                value=int(smote_every_n_epochs),
-                step=1,
-                key="gnn_net_smote_every",
-            )
-        with col_sm4:
-            lambda_edge = st.number_input(
-                "lambda_edge",
-                min_value=1e-8,
-                max_value=1e-2,
-                value=float(lambda_edge),
-                format="%.8f",
-                key="gnn_net_lambda_edge",
-            )
-
     config_payload = {
         "hidden_channels": int(hidden_channels),
         "num_heads": int(num_heads),
@@ -7168,12 +7236,7 @@ def _render_network_tab() -> None:
         "lambda_H_fixed": float(lambda_H_fixed),
         "initial_lambda_H": float(initial_lambda_H),
         "final_lambda_H": float(final_lambda_H),
-        "batch_size": int(batch_size),
-        "use_graphsmote": bool(use_graphsmote),
-        "smote_k": int(smote_k),
-        "target_pos_ratio": float(target_pos_ratio),
-        "smote_every_n_epochs": int(smote_every_n_epochs),
-        "lambda_edge": float(lambda_edge),
+        "batch_size": int(batch_size)
     }
 
     st.session_state["gnn_network_config"] = config_payload
@@ -7445,6 +7508,10 @@ def _render_optuna_tab() -> None:
     graph_source_label = "Original"
     if use_balanced and balanced_graph is not None:
         graph_obj["data"] = balanced_graph.get("data")
+        if balanced_graph.get("source") == "ImGAGN":
+            fn = graph_obj.get("filename", "graph")
+            if "_ImGAGN" not in fn:
+                graph_obj["filename"] = fn.replace(".pt", "_ImGAGN.pt") if fn.endswith(".pt") else f"{fn}_ImGAGN"
         graph_source_label = f"Balanceado ({balanced_graph.get('source', 'N/A')})"
     if not graph_obj.get("filename"):
         graph_path = st.session_state.get("graph_path")
@@ -8191,21 +8258,21 @@ def _render_optuna_tab() -> None:
         batch_min = st.number_input(
             "batch_size min",
             min_value=1,
-            value=512,
+            value=256,
             step=1,
             key="gnn_optuna_batch_min",
         )
         batch_max = st.number_input(
             "batch_size max",
             min_value=1,
-            value=4096,
+            value=512,
             step=1,
             key="gnn_optuna_batch_max",
         )
         batch_step = st.number_input(
             "batch_size step",
             min_value=1,
-            value=512,
+            value=128,
             step=1,
             key="gnn_optuna_batch_step",
         )
@@ -8352,7 +8419,10 @@ def _render_optuna_tab() -> None:
 
         with st.spinner("Ejecutando Optuna..."):
             try:
-                # Create a container for logs
+                # Placeholders in desired order: Progress first, then Logs
+                status_text = st.empty()
+                progress_bar = st.progress(0)
+                
                 with st.expander("Logs de Optuna (En vivo)", expanded=True):
                     log_container = st.empty()
                 
@@ -8363,6 +8433,8 @@ def _render_optuna_tab() -> None:
                     optuna_settings=optuna_settings,
                     objective_settings=objective_settings,
                     log_container=log_container,
+                    progress_bar=progress_bar,
+                    status_text=status_text,
                 )
             except Exception as exc:
                 st.error(f"Error en Optuna: {exc}")

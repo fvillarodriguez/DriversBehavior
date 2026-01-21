@@ -79,13 +79,22 @@ def _json_safe(obj):
 # --- Helpers: model path discovery with variant tags ---
 def _has_imgagn(loaded_obj) -> bool:
     try:
-        return bool(loaded_obj.get('imgagn_best_params')) or ('ImGAGN' in str(loaded_obj.get('filename', '')))
+        if loaded_obj.get('imgagn_best_params'):
+            return True
+        fn = str(loaded_obj.get('filename', ''))
+        if 'ImGAGN' in fn or '_imgagn_' in fn.lower():
+            return True
+        return False
     except Exception:
         return False
 
 def _model_tag_suffix(use_graphsmote: bool, loaded_obj) -> str:
     tags = []
-    if use_graphsmote:
+    # If not explicitly forced by caller, check if the graph filename already implies GraphSMOTE
+    fn = str(loaded_obj.get('filename', '')).lower()
+    is_smote_graph = 'graphsmote' in fn or 'graph_aug' in fn
+    
+    if use_graphsmote or is_smote_graph:
         tags.append('GraphSMOTE')
     if _has_imgagn(loaded_obj):
         tags.append('ImGAGN')
@@ -1334,6 +1343,7 @@ def run_gat_training(
     progress_callback: Optional[Callable[..., None]] = None,
     max_epochs: Optional[int] = None,
     smote_num_neighbors: Optional[object] = None,
+    optimizer_overrides: Optional[dict] = None,
 ):
     """
     Entrenamiento GAT completo con:
@@ -1403,7 +1413,7 @@ def run_gat_training(
     best_params = None
     if not hp_files:
         logger.info("No se encontraron archivos de hiperparámetros compatibles. Iniciando nueva búsqueda...")
-        best_params = search_hyperparameters(loaded_obj, use_graphsmote_search=use_graphsmote)
+        best_params = search_hyperparameters(loaded_obj, use_graphsmote_search=use_graphsmote, optimizer_overrides=optimizer_overrides)
     else:
         print("--- Selección de Hiperparámetros ---")
         variant_lbl = "GraphSMOTE" if use_graphsmote else "Base"
@@ -1420,7 +1430,7 @@ def run_gat_training(
 
             if sel == 0:
                 logger.info("Iniciando nueva búsqueda de hiperparámetros...")
-                best_params = search_hyperparameters(loaded_obj, use_graphsmote_search=use_graphsmote)
+                best_params = search_hyperparameters(loaded_obj, use_graphsmote_search=use_graphsmote, optimizer_overrides=optimizer_overrides)
             elif 1 <= sel <= len(hp_files):
                 hp_path = hp_files[sel - 1]
                 logger.info(f"Cargando hiperparámetros desde: {os.path.basename(hp_path)}")
@@ -1741,6 +1751,7 @@ def run_gat_training(
 
         # 10) Loop de entrenamiento
     best_val_f1 = 0.0
+    best_val_auprc = 0.0
     best_epoch = 0
     patience_counter = 0
     early_stop_enabled = bool(best_params.get("early_stop", True))
@@ -1888,6 +1899,7 @@ def run_gat_training(
 
         if (val_f1 - best_val_f1) > min_delta:
             best_val_f1 = val_f1
+            best_val_auprc = val_res['val_mask'].get('auprc', 0.0) if val_res else 0.0
             best_epoch = epoch
             patience_counter = 0
             # Guardar modelo: copia única y alias estable
@@ -1911,6 +1923,7 @@ def run_gat_training(
                 meta = dict(best_params)
                 meta.update({
                     'best_val_f1': float(best_val_f1),
+                    'best_val_auprc': float(best_val_auprc),
                     'best_epoch': int(best_epoch),
                     'use_graphsmote': bool(use_graphsmote),
                     'graphsmote_mode': str(GRAPHSMOTE_MODE),
@@ -1920,6 +1933,7 @@ def run_gat_training(
                     'target_pos_ratio_used': float(target_pos_ratio_override),
                     'smote_every_n_epochs_used': int(smote_every_override),
                     'num_neighbors_effective': loader_num_neighbors,
+                    'out_channels': int(num_classes),
                 })
                 meta = _json_safe(meta)
                 # Para la copia única
@@ -2003,7 +2017,7 @@ def _apply_platt_model(y_prob: np.ndarray, model) -> np.ndarray:
         logger.debug(f"Error applying Platt scaler: {exc}")
         return y_prob
 
-def objective(trial, device, use_graphsmote_search=False):
+def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=None):
     global data
     """
     Objetivo Optuna: entrena por pocas épocas, evalúa métricas robustas
@@ -2036,9 +2050,35 @@ def objective(trial, device, use_graphsmote_search=False):
         neighbor_profile = neighbor_candidates[neighbor_choice]
 
         # Optimizador
-        lr = trial.suggest_float('lr', 5e-5, 1e-2, log=True)
-        optimizer_name = trial.suggest_categorical('optimizer', ['Adam', 'AdamW', 'RAdam'])
-        weight_decay = trial.suggest_float('weight_decay', 1e-6, 5e-3, log=True)
+        overrides = optimizer_overrides or {}
+        
+        lr_override = overrides.get('lr')
+        if lr_override is not None:
+             lr = trial.suggest_float('lr', float(lr_override), float(lr_override))
+        else:
+             lr = trial.suggest_float('lr', 5e-5, 1e-2, log=True)
+
+        opt_name_override = overrides.get('optimizer')
+        if opt_name_override:
+            optimizer_name = trial.suggest_categorical('optimizer', [str(opt_name_override)])
+        else:
+            optimizer_name = trial.suggest_categorical('optimizer', ['Adam', 'AdamW', 'RAdam'])
+
+        wd_override = overrides.get('weight_decay')
+        if wd_override is not None:
+            weight_decay = trial.suggest_float('weight_decay', float(wd_override), float(wd_override))
+        else:
+            weight_decay = trial.suggest_float('weight_decay', 1e-6, 5e-3, log=True)
+            
+        grad_clip_override = overrides.get('grad_clip') # If we want to add this to search space in future
+        # Currently grad_clip is not in default search space, but let's add it if requested?
+        # The prompt only mentioned incorporating parameters. I'll stick to what is already searched + make them fixable.
+        # Wait, usually grad_clip is NOT searched in objective? Let's check.
+        # It seems grad_clip is pulled from best_params in training loop but usually default 1.0. 
+        # I will leave grad_clip out of SEARCH unless valid demand, but user asked for "optimizer parameters".
+        # I will inject it as a fixed param if provided, but I need to ensure it's returned.
+        if grad_clip_override is not None:
+            trial.set_user_attr('grad_clip', float(grad_clip_override))
 
         # Regularización
         lambda_l2_att = trial.suggest_float('lambda_l2_att', 1e-4, 1e-1, log=True)
@@ -2163,7 +2203,7 @@ def objective(trial, device, use_graphsmote_search=False):
             model.train()
             current_lambda_H = initial_lambda_H + (final_lambda_H - initial_lambda_H) * (epoch - 1) / max(NUM_EPOCHS_OPTUNA - 1, 1)
             train_minibatch(
-                model, train_loader, optimizer, criterion, grad_clip_value=1.0, device=device,
+                model, train_loader, optimizer, criterion, grad_clip_value=float(overrides.get('grad_clip', 1.0)), device=device,
                 use_amp=False, scaler=None, scheduler=None, writer=None, epoch=epoch,
                 lambda_H=current_lambda_H, node_type='pm', edge_gen=edge_gen, lambda_edge=lambda_edge,
                 lambda_l2_att=lambda_l2_att
@@ -2216,7 +2256,7 @@ def objective(trial, device, use_graphsmote_search=False):
             torch.cuda.empty_cache()
         return 0.0
 
-def search_hyperparameters(loaded_obj, use_graphsmote_search=None):
+def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_overrides=None):
     global data, sequence_index_global, sequence_config_global
     graph_filename = loaded_obj.get('filename')
     # Si la elección no viene desde el menú de entrenamiento, preguntar al usuario.
@@ -2295,7 +2335,7 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None):
 
     try:
         # Pasar el nombre de argumento correcto según la firma de objective()
-        study.optimize(lambda tr: objective(tr, device, use_graphsmote_search=use_graphsmote_search), n_trials=N_TRIALS, show_progress_bar=True)
+        study.optimize(lambda tr: objective(tr, device, use_graphsmote_search=use_graphsmote_search, optimizer_overrides=optimizer_overrides), n_trials=N_TRIALS, show_progress_bar=True)
     finally:
         gc.collect()
         if torch.cuda.is_available():

@@ -293,6 +293,7 @@ def train_z2x_decoders(
     log_every: int = 1,
     show_progress: bool = True, #False para mostrar resultados de cada epoch de entrenamiento en la consola
     num_neighbors=NUM_NEIGHBORS,
+    progress_callback: Optional[callable] = None,
 ):
     """
     Entrena un decodificador z->x por tipo usando z extraído en modo eval.
@@ -434,12 +435,15 @@ def train_z2x_decoders(
                         'best': f"{best_val if best_val!=float('inf') else float('nan'):.4f}"
                     })
                 else:
-                    epoch_iter.set_postfix({'train': f"{total_train_loss:.4f}"})
-            else:
-                if total_val_loss is not None:
-                    logger.info(f"[Z2X] Epoch {epoch:03d}/{epochs} | train_loss={total_train_loss:.4f} | val_loss={total_val_loss:.4f} | best_val={best_val if best_val!=float('inf') else float('nan'):.4f}")
-                else:
                     logger.info(f"[Z2X] Epoch {epoch:03d}/{epochs} | train_loss={total_train_loss:.4f}")
+
+        if progress_callback is not None:
+            progress_callback(
+                epoch=epoch,
+                total=epochs,
+                train_loss=total_train_loss,
+                val_loss=total_val_loss
+            )
 
         if early_stop and has_any_val and patience > 0 and epochs_no_improve >= patience:
             if show_progress and hasattr(epoch_iter, 'set_description'):
@@ -567,9 +571,9 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
                    save_dir=os.path.join(RESULTADOS_DIR, "z2x_decoders"),
                    device=None,
                    add_to_train_mask=True,
-                   disable_acc_smote_pm_generation=True,
                    edge_gen=None,
-                   save_path=None):
+                   save_path=None,
+                   progress_callback: Optional[callable] = None):
     device = next(model.parameters()).device
     data = data.to(device)
 
@@ -579,7 +583,10 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
         expected_types = set(data.node_types)
         if z2x_decoders._loaded_types != expected_types:
             print("Entrenando z->x decoders ...")
-            z2x_decoders = train_z2x_decoders(model, data, device=device, save_dir=save_dir)
+            z2x_decoders = train_z2x_decoders(
+                model, data, device=device, save_dir=save_dir,
+                progress_callback=progress_callback
+            )
     z2x_decoders = z2x_decoders.to(device)
     z2x_decoders.eval()
 
