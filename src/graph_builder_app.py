@@ -83,6 +83,7 @@ from src.graph_visualization import render_visual_graph_tab
 from src.feature_explorer import render_feature_explorer
 
 FEATURE_SELECTION_DIR = Path(RESULTADOS_DIR)
+HISTORY_PATH = Path(RESULTADOS_DIR) / "gnn_history.jsonl"
 
 try:
     import duckdb
@@ -150,6 +151,229 @@ class StreamlitStdout:
 
     def flush(self) -> None:
         return
+
+# --- HISTORY HELPERS ---
+def _json_default(obj):
+    if isinstance(obj, (datetime, pd.Timestamp)):
+        return obj.isoformat()
+    if isinstance(obj, set):
+        return list(obj)
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
+def _append_gnn_history(entry: Dict[str, object]) -> None:
+    try:
+        if not HISTORY_PATH.parent.exists():
+            HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Add timestamp and run_id if missing
+        if "timestamp" not in entry:
+            entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if "run_id" not in entry:
+            entry["run_id"] = hashlib.md5(f"{entry['timestamp']}{str(entry)}".encode()).hexdigest()[:8]
+            
+        with HISTORY_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(entry, ensure_ascii=True, default=_json_default)
+                + "\n"
+            )
+        # Verify if we need to update session state cache
+        history = st.session_state.get("gnn_history_entries")
+        if history is not None:
+            history.append(entry)
+            st.session_state["gnn_history_entries"] = history
+    except Exception as e:
+        print(f"Error saving history: {e}")
+
+def _load_gnn_history_entries() -> List[Dict[str, object]]:
+    if not HISTORY_PATH.exists():
+        return []
+    entries: List[Dict[str, object]] = []
+    try:
+        with HISTORY_PATH.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if isinstance(entry, dict):
+                        entries.append(entry)
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return entries
+
+def _delete_gnn_history_entry(run_id: str) -> bool:
+    if not run_id or not HISTORY_PATH.exists():
+        return False
+    try:
+        lines = HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return False
+        
+    kept_lines = []
+    removed = False
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+            if entry.get("run_id") == run_id:
+                removed = True
+                continue
+        except Exception:
+            pass
+        kept_lines.append(line)
+        
+    if removed:
+        HISTORY_PATH.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+        # Update cache
+        if "gnn_history_entries" in st.session_state:
+             st.session_state["gnn_history_entries"] = [
+                 e for e in st.session_state["gnn_history_entries"] 
+                 if e.get("run_id") != run_id
+             ]
+        return True
+    return False
+
+def _collect_gnn_context() -> Dict[str, object]:
+    """Recopila el contexto actual de la aplicación para el historial."""
+    context = {}
+    
+    # 1. Dataset (Eventos)
+    dataset = {}
+    acc_files = st.session_state.get("accident_files", [])
+    # If accident_files is empty, try to get from loaded_acc_path
+    if not acc_files and st.session_state.get("loaded_acc_path"):
+        dataset["accidents_files"] = [os.path.basename(st.session_state["loaded_acc_path"])]
+    else:
+        dataset["accidents_files"] = acc_files
+    
+    context["dataset"] = dataset
+    
+    # 2. Features
+    features = {}
+    feat_cfg = st.session_state.get("feature_config")
+    if isinstance(feat_cfg, dict):
+        # Prefer csv_path if exists, else source type
+        src = feat_cfg.get("csv_path")
+        if not src:
+            src = feat_cfg.get("source", "Unknown")
+        features["source"] = src if isinstance(src, str) else str(src)
+        
+        # Try to get params info
+        params = feat_cfg.get("params", {})
+        if params:
+             features["mode"] = params.get("feature_mode", "Unknown")
+    else:
+        # Fallback if no config found (e.g. loaded graph only)
+        # But user specifically said NOT to use graph filename.
+        features["source"] = "Not Configured"
+
+    context["features"] = features
+
+    return context
+
+def _render_history_tab() -> None:
+    c_head, c_btn = st.columns([4, 1])
+    with c_head:
+        st.subheader("GNN Experiment History")
+    with c_btn:
+        if st.button("🔄 Actualizar", key="hist_refresh_btn"):
+            st.rerun()
+
+    entries = _load_gnn_history_entries()
+    if not entries:
+        st.info("No hay historial disponible.")
+        return
+        
+    # Sort by timestamp descending
+    entries_sorted = sorted(
+        entries, 
+        key=lambda item: str(item.get("timestamp", "")), 
+        reverse=True
+    )
+    
+    # --- FILTERS ---
+    col1, col2, col3 = st.columns(3)
+    
+    # Filter 1: Feature Type
+    def _get_feature_type(entry):
+        return entry.get("features", {}).get("mode", "Unknown")
+    
+    feat_types = sorted({_get_feature_type(e) for e in entries_sorted})
+    with col1:
+        f_type_sel = st.selectbox("Tipo de Features", ["Todos"] + list(feat_types), key="hist_filter_ftype")
+        
+    # Filter 2: Tramo
+    def _get_tramo_label(entry):
+        # Prefer graph_build details if available
+        gb = entry.get("graph_build", {})
+        porticos = gb.get("tramo_porticos")
+        if porticos and isinstance(porticos, list) and len(porticos) > 0:
+            if len(porticos) == 1:
+                return str(porticos[0])
+            return f"{porticos[0]}->{porticos[-1]}"
+            
+        # Fallback to dataset tramo label if old log or diff type
+        label = entry.get("dataset", {}).get("tramo", {}).get("label")
+        if label: return label
+        return "N/A"
+        
+    tramo_labels = sorted({_get_tramo_label(e) for e in entries_sorted})
+    with col2:
+        tramo_sel = st.selectbox("Tramo", ["Todos"] + list(tramo_labels), key="hist_filter_tramo")
+        
+    # Filter 3: Balance
+    def _get_balance_type(entry):
+        bal = entry.get("balance", {})
+        # If training, look for 'source' or 'use_balanced'
+        if entry.get("type") == "Training":
+            if bal.get("use_balanced"):
+                return str(bal.get("source", "Balanced"))
+            return "Original"
+        # If Optuna, look for 'strategy'
+        return bal.get("strategy", "Unknown")
+        
+    bal_types = sorted({_get_balance_type(e) for e in entries_sorted})
+    with col3:
+        bal_sel = st.selectbox("Tipo de Balance", ["Todos"] + bal_types, key="hist_filter_balance")
+        
+    # Apply Filters
+    filtered = entries_sorted
+    if f_type_sel != "Todos":
+        filtered = [e for e in filtered if _get_feature_type(e) == f_type_sel]
+    if tramo_sel != "Todos":
+        filtered = [e for e in filtered if _get_tramo_label(e) == tramo_sel]
+    if bal_sel != "Todos":
+        filtered = [e for e in filtered if _get_balance_type(e) == bal_sel]
+        
+    st.caption(f"Mostrando {len(filtered)} entradas.")
+    
+    for idx, entry in enumerate(filtered):
+        ts = entry.get("timestamp", "?")
+        etype = entry.get("type", "Unknown")
+        run_id = entry.get("run_id", "???")
+        
+        title = f"{ts} | {etype} | {run_id}"
+        
+        with st.expander(title):
+            c_del, c_info = st.columns([1, 5])
+            with c_del:
+                if st.button("🗑️ Eliminar", key=f"del_hist_{run_id}_{idx}"):
+                    if _delete_gnn_history_entry(run_id):
+                        st.success("Entrada eliminada.")
+                        st.rerun()
+            
+            st.markdown("#### Detalles del Experimento")
+            st.json(entry)
 
 # --- HELPERS ---
 def _normalize_portico_series(series: pd.Series) -> pd.Series:
@@ -1927,6 +2151,40 @@ def _persist_feature_selection(
             json.dump(payload, handle, ensure_ascii=True, indent=2)
     except Exception:
         return
+
+    # --- LOG HISTORY (Feature Selection) ---
+    # Only log if there were actual changes (ignore initial sync/save)
+    if selected_changed or importance_changed:
+        try:
+            from src.graph_builder_app import _collect_gnn_context, _append_gnn_history
+            entry = _collect_gnn_context()
+            
+            # Prepare importance dict if available
+            imp_dict = {}
+            if importance_df is not None and not importance_df.empty:
+                try:
+                    # Assuming columns "variable" and "importance" exist as per _render_feature_selection_tab
+                    if "variable" in importance_df.columns and "importance" in importance_df.columns:
+                         feat_imp = importance_df.set_index("variable")["importance"].to_dict()
+                         imp_dict = feat_imp
+                except Exception:
+                    pass
+            
+            entry.update({
+                "type": "Feature Selection",
+                "feature_selection": {
+                    "selected_count": len(selected_features),
+                    "total_features": int(len(features_df.columns)),
+                    "importance_method": params.get("importance_method", "Manual"),
+                    "params": dict(params),
+                    "selected_vars": list(selected_features),
+                    "importance_values": imp_dict
+                }
+            })
+            _append_gnn_history(entry)
+        except Exception as e:
+            print(f"Log error: {e}")
+    # ---------------------------------------
 
 
 def _get_feature_cols(df: pd.DataFrame) -> List[str]:
@@ -3735,7 +3993,9 @@ def run_feature_generation_workflow(params):
             try:
                 features_db_path = os.path.join(RESULTADOS_DIR, "features.duckdb")
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                table_name = f"features_GNN_{timestamp}"
+                # Updated per user request
+                mode_tag = "Snapshot" if force_snapshot else "Flow"
+                table_name = f"features_{mode_tag}_{timestamp}"
                 con_feat = duckdb.connect(str(features_db_path))
 
                 # Create versioned table
@@ -3746,6 +4006,36 @@ def run_feature_generation_workflow(params):
                     f"CREATE OR REPLACE VIEW features_latest AS SELECT * FROM {table_name}"
                 )
                 con_feat.close()
+
+                # UPDATE CONFIG so history sees the generated file/table name
+                # Preserve existing params but update source/path
+                current_cfg = st.session_state.get("feature_config", {}).copy()
+                current_cfg["source"] = "Generar nuevas (DuckDB)"
+                current_cfg["csv_path"] = table_name  # We use csv_path field to store table name for uniformity
+                if "params" not in current_cfg: current_cfg["params"] = {}
+                current_cfg["params"]["feature_mode"] = mode_tag
+                st.session_state.feature_config = current_cfg
+
+                # --- LOG HISTORY (Feature Generation) ---
+                try:
+                    from src.graph_builder_app import _collect_gnn_context, _append_gnn_history
+                    entry = _collect_gnn_context()
+                    # Determine mode for log
+                    f_mode = "Snapshot" if force_snapshot else "Flow"
+                    entry.update({
+                        "type": "Feature Engineering",
+                        "feature_engineering": {
+                            "mode": f_mode,
+                            "table_name": table_name,
+                            "rows": len(df_pm),
+                            "cols": len(df_pm.columns),
+                            "params": gen_params
+                        }
+                    })
+                    _append_gnn_history(entry)
+                except Exception as e:
+                    print(f"Log error: {e}")
+                # ----------------------------------------
 
             except Exception as e:
                 st.warning(
@@ -3789,6 +4079,7 @@ def render_graph_builder():
         tab_balance,
         tab_training,
         tab_evaluation,
+        tab_history,
     ) = st.tabs(
         [
             "Eventos",
@@ -3802,8 +4093,12 @@ def render_graph_builder():
             "Balance",
             "Training",
             "Evaluación Modelo",
+            "History",
         ]
     )
+
+    with tab_history:
+        _render_history_tab()
 
     with tab_events:
         _render_events_tab()
@@ -4008,6 +4303,20 @@ def _render_feature_engineering():
                             )
                         else:
                             st.session_state.df_pm_cache = df_tmp
+                            
+                            # Update config for History tracking
+                            inferred_mode = "Unknown"
+                            if "Snapshot" in str(source_path):
+                                inferred_mode = "Snapshot"
+                            elif "Flow" in str(source_path):
+                                inferred_mode = "Flow 5 min"
+                                
+                            st.session_state.feature_config = {
+                                "source": "Cargar existentes",
+                                "csv_path": source_path,
+                                "params": {"feature_mode": inferred_mode}
+                            }
+                            
                             st.success(
                                 "Features cargadas en memoria: "
                                 f"{len(df_tmp)} registros, {len(df_tmp.columns)} columnas."
@@ -5337,6 +5646,7 @@ def _render_balance_tab() -> None:
             ["Top-K TRAIN real", "Vecinos de accidentes (1-hop)"],
             horizontal=True,
             key="gnn_smote_conect_mode",
+            help="**Top-K TRAIN real**: Conecta c/u de los nodos sintéticos a los K nodos reales más similares (según embeddings).\n**Vecinos de accidentes (1-hop)**: Conecta c/u de los nodos sintéticos a los nodos padre (replica vecindarios).\n\n Siempre en train."
         )
         bidirectional = st.checkbox(
             "Aristas bidireccionales (real <-> sintetico)",
@@ -5348,12 +5658,11 @@ def _render_balance_tab() -> None:
         with st.expander("Modelo embeddings"):
             st.write(
                 "GraphSMOTE necesita un GNN entrenado para generar embeddings y "
-                "decodificadores z->x. El entrenamiento guarda modelos "
-                "`gat_model_BEST*.pt` en Resultados y un _hparams.json asociado."
+                "decodificadores z->x. El entrenamiento guarda el modelo y hparams.json asociado."
             )
             st.write(
-                "Para usarlo aqui: entrena el modelo con el grafo en memoria, "
-                "selecciona el archivo .pt y luego ejecuta GraphSMOTE."
+                "Para usarlo aqui: (1.-Entrenar nuevo) entrena el modelo con el grafo en memoria, "
+                "(2.-Cargar existente) selecciona el archivo .pt y (3.-Aplicar) ejecuta Balancear con GraphSMOTE."
             )
 
             tab_train, tab_load = st.tabs(["Entrenar nuevo", "Cargar existente"])
@@ -5604,7 +5913,7 @@ def _render_balance_tab() -> None:
 
                     latest_model = None
                     latest_candidates = glob.glob(
-                        os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")
+                        os.path.join(RESULTADOS_DIR, "GraphSMOTE_embeddings_model_*.pt")
                     )
                     if latest_candidates:
                         latest_model = max(
@@ -5623,7 +5932,7 @@ def _render_balance_tab() -> None:
                 model_files = sorted(
                     glob.glob(
                         os.path.join(
-                            RESULTADOS_DIR, "gat_model_BEST*.pt"
+                            RESULTADOS_DIR, "GraphSMOTE_embeddings_model_*.pt"
                         )
                     )
                 )
@@ -5834,13 +6143,10 @@ def _render_balance_tab() -> None:
             )
             # Selección automática de dispositivo
             device = get_auto_device()
-            st.info(f"Dispositivo: {device}")
+            st.caption(f"Dispositivo: {device}")
 
-        z2x_base_dir = st.text_input(
-            "Directorio z2x decoders",
-            value=os.path.join(RESULTADOS_DIR, "z2x_decoders"),
-            key="gnn_smote_save_dir",
-        )
+        # Fixed directory for decoders
+        z2x_base_dir = os.path.join(RESULTADOS_DIR, "z2x_decoders")
         z2x_dir = _resolve_z2x_dir(z2x_base_dir, model_path)
         st.caption(f"Directorio z2x (modelo): {z2x_dir}")
         default_name = f"graph_smote_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
@@ -6023,6 +6329,26 @@ def _render_balance_tab() -> None:
             st.success(
                 f"Balance GraphSMOTE completado. Nodos: {augmented[node_type].num_nodes}"
             )
+            
+            # --- LOG HISTORY ---
+            try:
+                 entry = _collect_gnn_context()
+                 entry.update({
+                     "type": "Balance",
+                     "balance": {
+                         "strategy": "GraphSMOTE",
+                         "params": {
+                             "k_smote": int(k_smote),
+                             "new_samples": int(n_samples),
+                             "k_neighbors_edges": int(k_neighbors_edges),
+                             "minority_class": int(minority_class),
+                         }
+                     }
+                 })
+                 _append_gnn_history(entry)
+            except Exception as e:
+                 print(f"Log error: {e}")
+            # -------------------
 
     else:
         node_types = list(graph_data.node_types)
@@ -6043,7 +6369,7 @@ def _render_balance_tab() -> None:
         )
         # Selección automática de dispositivo
         device = get_auto_device()
-        st.info(f"Dispositivo: {device}")
+        st.caption(f"Dispositivo: {device}")
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -6375,6 +6701,26 @@ def _render_balance_tab() -> None:
                 "params": {"target_ntype": target_ntype},
                 "imgagn_best_params": cfg.__dict__ if hasattr(cfg, "__dict__") else cfg,
             }
+
+            # --- LOG HISTORY ---
+            try:
+                 entry = _collect_gnn_context()
+                 entry.update({
+                     "type": "Balance",
+                     "balance": {
+                         "strategy": "ImGAGN",
+                         "params": {
+                             "dz": int(dz),
+                             "epochs": int(epochs),
+                             "max_new_nodes": int(max_new_nodes),
+                             "minority_class": int(minority_class),
+                         }
+                     }
+                 })
+                 _append_gnn_history(entry)
+            except Exception as e:
+                 print(f"Log error: {e}")
+            # -------------------
 
             if save_path_imgagn:
                 try:
@@ -6751,6 +7097,27 @@ def _render_training_tab() -> None:
         )
         if model_path:
             st.session_state["gnn_train_last_model"] = model_path
+            
+            # --- LOG HISTORY ---
+            try:
+                 entry = _collect_gnn_context()
+                 entry.update({
+                     "type": "Training",
+                     "training": {
+                         "model_path": str(model_path),
+                         "epochs": max_epochs_train, 
+                         "network_config": hp_choice,
+                     },
+                     "balance": {
+                         "use_balanced": use_balanced,
+                         "source": balanced_graph.get("source") if use_balanced else None
+                     }
+                 })
+                 _append_gnn_history(entry)
+            except Exception as e:
+                 print(f"Log error: {e}")
+            # -------------------
+
             st.success(f"Entrenamiento finalizado. Modelo: {os.path.basename(model_path)}")
             
             # EVALUACIÓN AUTOMÁTICA (Enviada al placeholder superior)
@@ -6778,7 +7145,7 @@ def _perform_model_evaluation(model_path, graph_data, device="cpu", threshold=No
     meta = _load_hparams_for_model(model_path)
     
     # Detalle de lo que se evalúa
-    st.info(f"Evaluando modelo: {os.path.basename(model_path)} en dispositivo: {device}")
+    st.caption(f"Evaluando modelo: {os.path.basename(model_path)} en dispositivo: {device}")
 
     try:
         # Cargar pesos
@@ -7831,7 +8198,7 @@ def _render_optuna_tab() -> None:
     
     # Selección automática de dispositivo
     optuna_device = get_auto_device()
-    st.info(f"Dispositivo para Optuna: {optuna_device}")
+    st.caption(f"Dispositivo para Optuna: {optuna_device}")
 
     multivariate = st.checkbox(
         "Sampler multivariate",
@@ -8417,6 +8784,25 @@ def _render_optuna_tab() -> None:
 
         best_params = result["best_params"]
         st.session_state["optuna_last_file"] = result["best_path"]
+        
+        # --- LOG HISTORY ---
+        try:
+             entry = _collect_gnn_context()
+             entry.update({
+                 "type": "Optuna",
+                 "optuna": {
+                     "best_params": result["best_params"],
+                     "best_value": result.get("best_value"),
+                     "trials": len(result.get("trials", [])),
+                     "path": str(result["best_path"])
+                 },
+                 "balance": {"strategy": balancing_strategy},
+             })
+             _append_gnn_history(entry)
+        except Exception as e:
+             print(f"Log error: {e}")
+        # -------------------
+
         st.success(
             f"Optuna finalizado. Archivo: {os.path.basename(result['best_path'])}"
         )
@@ -9843,6 +10229,41 @@ def _render_create_graph():
                 "filename": filename
             }
             st.session_state.graph_path = output_path
+            
+            # --- LOG HISTORY ---
+            try:
+                 entry = _collect_gnn_context()
+                 # Override dataset info since we just built it and context might be stale
+                 entry.update({
+                     "type": "Graph Build",
+                     "graph_build": {
+                         "filename": filename,
+                         "pm_index_count": len(pm_index) if pm_index else 0,
+                         "period_tag": period_tag,
+                         
+                         "date_min": str(_ts_min_to_dt(df_pm["ts_min"].min())),
+                         "date_max": str(_ts_min_to_dt(df_pm["ts_min"].max())),
+                         "label_1_count": int(data["pm"].y.sum().item()),
+                         
+                         "tramo_source": tramo_mode,
+                         "tramo_porticos_count": len(porticos_a_incluir),
+                         "tramo_porticos": list(porticos_a_incluir),
+                         
+                         "selected_vars": list(feature_cols),
+                         
+                         "temporal_filter": f"Key={time_sel_key}" + (" (06-10)" if time_sel_key=='2' else (" (18-22)" if time_sel_key=='3' else " (All)")),
+                         "edges": {
+                             "temporal": bool(build_temporal),
+                             "spatial_fwd": bool(build_spatial),
+                             "spatial_back": bool(build_spatial_back),
+                             "st_fwd": bool(build_st_fwd)
+                         }
+                     }
+                 })
+                 _append_gnn_history(entry)
+            except Exception as e:
+                 print(f"Log error: {e}")
+            # -------------------
             
         except Exception as e:
             status.error(f"Error construyendo grafo: {e}")

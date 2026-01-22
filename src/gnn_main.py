@@ -1531,11 +1531,28 @@ def run_gat_training(
     ts_stamp_save = datetime.now().strftime('%Y%m%d_%H%M%S')
     graph_hash = _calculate_graph_hash(loaded_obj.get('filename'))
     hash_tag8 = f"_{graph_hash[:8]}" if graph_hash else ""
-    best_model_path = os.path.join(RESULTADOS_DIR, f"gat_model_BEST{tag_suffix}.pt")
-    best_model_path_unique = os.path.join(
-        RESULTADOS_DIR,
-        f"gat_model_BEST{tag_suffix}_{ts_stamp_save}{hash_tag8}.pt",
-    )
+    
+    if use_graphsmote:
+        # User requested specific naming for GraphSMOTE models
+        # We might still want ImGAGN tags if present, but the primary prefix changes.
+        # Let's keep tag_suffix just in case it has other info, or strip _GraphSMOTE from it explicitly?
+        # tag_suffix string likely contains "_GraphSMOTE" already.
+        # User pattern: GraphSMOTE_embeddings_model_*.pt
+        # We will use that as base.
+        base_prefix = "GraphSMOTE_embeddings_model"
+        # Clean tag_suffix to avoid double "GraphSMOTE" if we want, or just append. 
+        # Simpler: just use the requested prefix + timestamp/hash.
+        best_model_path = os.path.join(RESULTADOS_DIR, f"{base_prefix}.pt")
+        best_model_path_unique = os.path.join(
+            RESULTADOS_DIR,
+            f"{base_prefix}_{ts_stamp_save}{hash_tag8}.pt",
+        )
+    else:
+        best_model_path = os.path.join(RESULTADOS_DIR, f"gat_model_BEST{tag_suffix}.pt")
+        best_model_path_unique = os.path.join(
+            RESULTADOS_DIR,
+            f"gat_model_BEST{tag_suffix}_{ts_stamp_save}{hash_tag8}.pt",
+        )
     z2x_run_dir = os.path.join(
         RESULTADOS_DIR,
         "z2x_decoders",
