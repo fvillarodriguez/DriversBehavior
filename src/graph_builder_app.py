@@ -3438,7 +3438,18 @@ def run_feature_generation_workflow(params):
                     df_p = st.session_state.get("df_port")
                     if df_p is None:
                         df_p = load_porticos()
-                cluster_frames = []
+                if df_p is None:
+                        df_p = load_porticos()
+                
+                # --- DB SETUP FOR INCREMENTAL SAVE ---
+                features_db_path = os.path.join(RESULTADOS_DIR, "features.duckdb")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                mode_tag = "Snapshot" if force_snapshot else "Flow"
+                table_name_out = f"features_{mode_tag}_{timestamp}"
+                con_feat = duckdb.connect(str(features_db_path))
+                table_created = False
+                total_rows_saved = 0
+
                 cluster_failed = False
                 desired_cols = ["FECHA", "VELOCIDAD", "CATEGORIA", "CARRIL", "PORTICO"]
                 if cluster_label_mode:
@@ -3556,19 +3567,9 @@ def run_feature_generation_workflow(params):
                                 interactive=False,
                                 dt_minutes=dt_m,
                             )
-                        if (
-                            feat_batch is not None
-                            and not _is_empty_frame(feat_batch)
-                        ):
-                            feat_batch["portico"] = _normalize_portico_series(
-                                feat_batch["portico"]
-                            )
-                            acc_dfs.append(feat_batch)
-                        if (
-                            cluster_label_mode
-                            and cluster_labels_df is not None
-                            and not cluster_failed
-                        ):
+                        
+                        cluster_batch = None
+                        if cluster_label_mode and cluster_labels_df is not None and not cluster_failed:
                             try:
                                 cluster_source = (
                                     flow_pd if force_snapshot else batch_df
@@ -3593,49 +3594,128 @@ def run_feature_generation_workflow(params):
                                         cluster_batch = _filter_cluster_chunk(
                                             cluster_batch, r_start, r_end
                                         )
-                                if (
-                                    cluster_batch is not None
-                                    and not _is_empty_frame(cluster_batch)
-                                ):
-                                    cluster_frames.append(cluster_batch)
                             except Exception as exc:
-                                st.warning(
-                                    f"No se pudieron calcular variables de cluster: {exc}"
-                                )
+                                st.warning(f"Error procesando clusters: {exc}")
                                 if debug_cluster:
                                     st.code(traceback.format_exc(), language="text")
                                 cluster_failed = True
-                                cluster_compute_failed = True
+                            except Exception as exc:
+                                st.warning(f"Error procesando clusters: {exc}")
+                                if debug_cluster:
+                                    st.code(traceback.format_exc(), language="text")
+                                cluster_failed = True
+                                
+                        # --- MERGE & SAVE (Incremental) ---
+                        # Prepare final batch dataframe
+                        df_save = feat_batch
+                        if df_save is not None and not _is_empty_frame(df_save):
+                             df_save["portico"] = _normalize_portico_series(df_save["portico"])
+                             # Filter Columns
+                             if force_snapshot and gen_params.get("snapshot_groups"):
+                                 df_save = _filter_snapshot_features(df_save, gen_params)
+                             if not force_snapshot and (gen_params.get("metrics") or gen_params.get("global_metrics")):
+                                 df_save = _filter_flow_features(df_save, gen_params)
+
+                             # Merge Cluster
+                             if (
+                                 cluster_label_mode
+                                 and cluster_labels_df is not None
+                                 and not cluster_failed
+                                 and cluster_batch is not None
+                                 and not _is_empty_frame(cluster_batch)
+                             ):
+                                 # Prepare merge
+                                 p_col = "portico"
+                                 t_col = "interval_start"
+                                 # (The cluster batch already has normalized portico from our logic if compatible)
+                                 cluster_ready = _prepare_cluster_features_df(
+                                     cluster_batch, p_col, t_col, dt_m
+                                 )
+                                 if not cluster_ready.empty:
+                                      # Filter cluster cols to save space
+                                      drop_cols = []
+                                      if not include_shares:
+                                          drop_cols.extend([c for c in cluster_ready.columns if c.startswith("cluster_share_")])
+                                      if not include_flow:
+                                          drop_cols.extend([c for c in cluster_ready.columns if c.startswith("cluster_flow_")])
+                                      if not include_entropy: drop_cols.append("cluster_entropy")
+                                      if not include_speed:
+                                          drop_cols.extend([c for c in cluster_ready.columns if c.startswith("cluster_speed_")])
+                                      if not include_density:
+                                          drop_cols.extend([c for c in cluster_ready.columns if c.startswith("cluster_density_")])
+                                      if not include_delta_speed:
+                                          drop_cols.extend([c for c in cluster_ready.columns if c.startswith("cluster_delta_speed_")])
+                                      if not include_delta_density:
+                                          drop_cols.extend([c for c in cluster_ready.columns if c.startswith("cluster_delta_density_")])
+                                      
+                                      if drop_cols:
+                                          cluster_ready = cluster_ready.drop(columns=drop_cols, errors="ignore")
+                                      
+                                      cluster_vars = [c for c in cluster_ready.columns if c not in ["portico", "ts_min"]]
+                                      if cluster_vars:
+                                          df_save = _merge_on_portico_ts(
+                                              df_save, cluster_ready, debug=debug_cluster, label="cluster_merge", dt_minutes=dt_m
+                                          )
+                                          df_save[cluster_vars] = df_save[cluster_vars].fillna(0)
+                             
+                             # Drop duplicate index if exists
+                             if "portico" in df_save.columns and "ts_min" in df_save.columns:
+                                  df_save = df_save.drop_duplicates(subset=["portico", "ts_min"], keep="last")
+
+                             if not df_save.empty:
+                                 if not table_created:
+                                     con_feat.execute(f"CREATE TABLE {table_name_out} AS SELECT * FROM df_save")
+                                     table_created = True
+                                 else:
+                                     con_feat.execute(f"INSERT INTO {table_name_out} SELECT * FROM df_save")
+                                 total_rows_saved += len(df_save)
+                                 
+                             # Clear memory
+                             del df_save
+                             del feat_batch
+                             if 'cluster_batch' in locals(): del cluster_batch
+
+
+
 
                 con.close()
                 
-                if acc_dfs:
-                    df_pm = pd.concat(acc_dfs, ignore_index=True)
-                    if (
-                        force_snapshot
-                        and "portico" in df_pm.columns
-                        and "ts_min" in df_pm.columns
-                    ):
-                        df_pm = df_pm.drop_duplicates(
-                            subset=["portico", "ts_min"],
-                            keep="last",
-                        )
+                # --- FINAL LOADING (Optional for UI) ---
+                if table_created:
+                    #status.text(f"Cargando resultados en memoria ({total_rows_saved} filas)...")
+                    # Load full dataset as requested
+                    df_pm = con_feat.execute(f"SELECT * FROM {table_name_out}").df()
+                    con_feat.close()
+                    st.session_state.df_pm_cache = df_pm.copy()
+                    st.session_state.feature_config = {
+                        "source": "Generar nuevas (DuckDB)",
+                        "csv_path": table_name_out,
+                        "params": gen_params
+                    }
+                    if force_snapshot: 
+                         st.session_state.feature_config["params"]["feature_mode"] = "Snapshot"
+                    else:
+                         st.session_state.feature_config["params"]["feature_mode"] = "Flow"
+
+                    st.success(
+                        f"Proceso finalizado. Features generadas y cargadas: {total_rows_saved:,} filas."
+                    )
+                    progress.empty()
                 else:
                     st.warning("No se generaron features en ningún lote.")
+                    con_feat.close()
+                    try:
+                         if os.path.exists(features_db_path):
+                             # Only unlink if we just created it and it's empty? 
+                             pass 
+                    except: pass
                     return None
-
-                if cluster_label_mode and cluster_labels_df is not None and cluster_frames:
-                    cluster_features_df = pd.concat(
-                        cluster_frames, ignore_index=True
-                    )
-                    cluster_portico_col = "portico"
-                    cluster_time_col = "interval_start"
-                elif cluster_label_mode and cluster_labels_df is not None:
-                    cluster_compute_failed = True
-
+            
             except Exception as e:
                 st.error(f"Error en Batch Mode: {e}")
                 try: con.close() 
+                except: pass
+                try: con_feat.close()
                 except: pass
                 return None
         
@@ -3842,7 +3922,7 @@ def run_feature_generation_workflow(params):
                      return None
 
         # --- POST PROCESSING (Sorting & Filtering) ---
-        if df_pm is not None:
+        if df_pm is not None and not (use_batches and source_choice == "Generar nuevas"):
             if "portico" in df_pm.columns:
                 df_pm["portico"] = _normalize_portico_series(df_pm["portico"])
             df_pm = df_pm.sort_values(["portico", "ts_min"]).reset_index(drop=True)
