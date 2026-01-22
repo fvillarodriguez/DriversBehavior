@@ -1,0 +1,9 @@
+{
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "sender_email": "fvilla.cl@gmail.com",
+    "sender_password": "dldj wmgn apue nlgn",
+    "recipients": [
+        "fvilla.cl@gmail.com"
+    ]
+}

@@ -27,6 +27,7 @@ import src.files_app as files_app
 import src.sumo_simulation_app as sumo_simulation_app
 import src.test_page as test_page
 import src.github_sync_app as github_sync_app
+import src.notification_system as notification_system
 
 
 def _render_home() -> None:
@@ -40,11 +41,11 @@ def _render_home() -> None:
         This application is a comprehensive pipeline for analyzing and predicting traffic accidents using flow and clustering data.
         
         **Modules Overview:**
-        - **DuckDB:** Admin flows database.
+        - **Flow database:** Admin flows database DuckDB.
         - **Clustering:** Features, clustering and analysis.
         - **Crash prediction:** Train and evaluate accident prediction models.
-        - **Construcción de grafo:** Construye grafos para modelos GNN usando features de Crash prediction.
-        - **Eventos:** Load and visualize accident events on an interactive map.
+        - **Graph Neural Network:** Construye grafos para modelos GNN usando features de Crash prediction.
+        - **Events:** Load and visualize accident events on an interactive map.
         - **Files:** Manage and browse data files.
         - **Test:** Testing playground.
         """
@@ -60,50 +61,71 @@ def _render_graph_builder() -> None:
 def main() -> None:
     st.set_page_config(page_title="Drivers Behavior", layout="wide", page_icon="🚗")
 
-    st.sidebar.title("Menu")
+    # --- PAGE DEFINITIONS ---
+    # Wrappers to provide unique function names for st.Page URL inference
     
+    def p_flow_database():
+        flow_database_app.main(set_page_config=False, show_exit_button=False)
+        
+    def p_files():
+        files_app.main(set_page_config=False, show_exit_button=False)
+        
+    def p_github():
+        github_sync_app.main(set_page_config=False, show_exit_button=False)
+        
+    def p_clustering():
+        clustering_tabs_app.main(set_page_config=False, show_exit_button=False)
+        
+    def p_crash():
+        cluster_accident_app.main(set_page_config=False, show_exit_button=False)
+        
+    def p_events():
+        events_map_app.main(set_page_config=False, show_exit_button=False)
+        
+    def p_experiments():
+        experiments_live_app.main(set_page_config=False)
+        
+    def p_sumo():
+        sumo_simulation_app.main(set_page_config=False, show_exit_button=False)
+        
+    def p_test():
+        test_page.main(set_page_config=False, show_exit_button=False)
 
-    pages: Dict[str, Callable[[], None]] = {
-        "Inicio": _render_home,
-        "Flow database": lambda: flow_database_app.main(
-            set_page_config=False, show_exit_button=False
-        ),
-        "Clustering": lambda: clustering_tabs_app.main(
-            set_page_config=False, show_exit_button=False
-        ),
-        "Crash prediction": lambda: cluster_accident_app.main(
-            set_page_config=False, show_exit_button=False
-        ),
-        "GNN": _render_graph_builder,
-        "Experiments Live": lambda: experiments_live_app.main(
-            set_page_config=False
-        ),
-        "Events": lambda: events_map_app.main(
-            set_page_config=False, show_exit_button=False
-        ),
-        "Simulacion SUMO": lambda: sumo_simulation_app.main(
-            set_page_config=False, show_exit_button=False
-        ),
-        "Files": lambda: files_app.main(
-            set_page_config=False, show_exit_button=False
-        ),
-        "Test": lambda: test_page.main(
-             set_page_config=False, show_exit_button=False
-        ),
-        "GitHub Sync": lambda: github_sync_app.main(
-             set_page_config=False, show_exit_button=False
-        ),
-    }
+    ps_databases = st.Page(p_flow_database, title="Flow database", icon=":material/database:")
+    ps_files = st.Page(p_files, title="Files", icon=":material/folder:")
+    ps_github = st.Page(p_github, title="GitHub Sync", icon=":material/sync:")
+    
+    ps_clustering = st.Page(p_clustering, title="Clustering", icon=":material/scatter_plot:")
+    ps_crash = st.Page(p_crash, title="Crash prediction", icon=":material/warning:")
+    ps_gnn = st.Page(_render_graph_builder, title="Graph Neural Network", icon=":material/hub:")
+    
+    ps_events = st.Page(p_events, title="Events", icon=":material/map:")
+    ps_exp = st.Page(p_experiments, title="Experiments Live", icon=":material/science:")
+    ps_sumo = st.Page(p_sumo, title="Simulacion SUMO", icon=":material/directions_car:")
+    
+    ps_notify = st.Page(notification_system.render_notification_config, title="Notification system", icon=":material/notifications:")
+    ps_test = st.Page(p_test, title="Test", icon=":material/bug_report:")
+    ps_home = st.Page(_render_home, title="Inicio", icon=":material/home:", default=True)
 
-    selection = st.sidebar.radio("Secciones", list(pages.keys()))
-    pages[selection]()
+    # --- NAVIGATION SETUP ---
+    pg = st.navigation(
+        {
+            "Navegación": [ps_home],
+            "Data & Gestión": [ps_databases, ps_files, ps_github],
+            "Análisis & Modelos": [ps_clustering, ps_crash, ps_gnn],
+            "Simulación & Vizualización": [ps_events, ps_exp, ps_sumo],
+            "Configuración": [ps_notify, ps_test],
+        }
+    )
+    
+    pg.run()
 
     import psutil
     process = psutil.Process(os.getpid())
     mem_usage = process.memory_info().rss / 1e9  # GB
     cpu_usage = process.cpu_percent(interval=None) # Non-blocking immediate check
 
-    st.sidebar.markdown("---")
+    #st.sidebar.markdown("---")
     st.sidebar.caption(f"**Proceso** | CPU: {cpu_usage:.1f}% | RAM: {mem_usage:.2f} GB")
 
     if st.sidebar.button("Cerrar"):

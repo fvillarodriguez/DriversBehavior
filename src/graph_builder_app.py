@@ -58,6 +58,7 @@ from src.snapshot_sequences import (
     SequenceConfig,
     build_sequence_index,
 )
+from src import notification_system
 from src.config import (
     BATCH_SIZE,
     DT_MINUTES,
@@ -4144,6 +4145,8 @@ def render_graph_builder():
 
     with tab_evaluation:
         _render_evaluation_tab()
+        
+
 
 def _render_in_memory_graph():
     st.markdown("### Grafo en Memoria")
@@ -4424,6 +4427,14 @@ def _render_feature_engineering():
             
             # Common: Granularity
             dt_min = st.number_input("Granularidad (min)", min_value=1, value=1, key="fp_dt", help="Intervalo de tiempo en minutos para agrupar los datos (e.g., cada 5 min). Aplica a ambos modos.")
+            
+            # Common: Notifications
+            notify_enabled = st.checkbox(
+                "eMail notificaciones",
+                value=False,
+                key="feat_notify_email",
+                help="Enviar email cuando finalice el script."
+            )
 
         # --- TABS: SNAPSHOT vs FLOW ---
         tab_snap, tab_flow = st.tabs(["Snapshot Features", "Flow 5 min"])
@@ -4580,6 +4591,15 @@ def _render_feature_engineering():
                 result = run_feature_generation_workflow(st.session_state.feature_config)
                 if result is not None:
                      st.success("Snapshot Features generadas correctamente.")
+                     if notify_enabled:
+                         entries = _load_gnn_history_entries()
+                         if entries:
+                             # Get the most recent entry
+                             last_entry = sorted(entries, key=lambda x: x.get("timestamp", ""), reverse=True)[0]
+                             if notification_system.send_notification_email("Feature Engineering (Snapshot)", last_entry):
+                                 st.toast("Email de notificación enviado.", icon="📧")
+                             else:
+                                 st.error("Error enviando email de notificación.")
 
         # --- TAB 2: FLOW 5 MIN ---
         with tab_flow:
@@ -4747,7 +4767,15 @@ def _render_feature_engineering():
                  }
                  result = run_feature_generation_workflow(st.session_state.feature_config)
                  if result is not None:
-                      st.success("Flow Features generadas correctamente.")
+                     st.success("Flow Features generadas correctamente.")
+                     if notify_enabled:
+                         entries = _load_gnn_history_entries()
+                         if entries:
+                             last_entry = sorted(entries, key=lambda x: x.get("timestamp", ""), reverse=True)[0]
+                             if notification_system.send_notification_email("Feature Engineering (Flow)", last_entry):
+                                 st.toast("Email de notificación enviado.", icon="📧")
+                             else:
+                                 st.error("Error enviando email de notificación.")
 
     notice = st.session_state.get("feature_notice")
     if notice:
@@ -6938,6 +6966,13 @@ def _render_training_tab() -> None:
         disabled=not early_stop_train,
     )
 
+    use_notify = st.checkbox(
+        "eMail notificaciones",
+        value=False,
+        key="gnn_train_notify",
+        help="Enviar email con el log al finalizar el entrenamiento."
+    )
+
     if st.button("Entrenar modelo GNN", key="gnn_train_run"):
         try:
             from src import gnn_main as graph_main
@@ -7117,6 +7152,12 @@ def _render_training_tab() -> None:
             except Exception as e:
                  print(f"Log error: {e}")
             # -------------------
+            
+            if use_notify:
+                 if notification_system.send_notification_email("Entrenamiento GNN Finalizado", entry):
+                     st.toast("Notificación enviada por email.", icon="📧")
+                 else:
+                     st.warning("No se pudo enviar la notificación por email.")
 
             st.success(f"Entrenamiento finalizado. Modelo: {os.path.basename(model_path)}")
             
