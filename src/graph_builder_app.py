@@ -124,6 +124,72 @@ class StreamlitLogHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
+def _get_file_date_range(source_type: str, source_path: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Retrieves min and max dates from a feature file for filter initialization."""
+    min_date, max_date = None, None
+    try:
+        if source_type == "duckdb" and duckdb:
+            con = duckdb.connect(str(source_path), read_only=True)
+            tables = [row[0] for row in con.execute("SELECT table_name FROM information_schema.tables").fetchall()]
+            target_table = None
+            for t in tables:
+                if t.startswith("features_"):
+                    target_table = t
+                    break
+            if not target_table and tables: target_table = tables[0]
+            
+            if target_table:
+                # Check column
+                cols = [c[0] for c in con.execute(f"DESCRIBE {target_table}").fetchall()]
+                ts_col = "ts_min" if "ts_min" in cols else "timestamp"
+                
+                if ts_col == "ts_min":
+                    res = con.execute(f"SELECT MIN(ts_min), MAX(ts_min) FROM {target_table}").fetchone()
+                    if res and res[0] is not None:
+                        min_date = pd.to_datetime(res[0], unit='m').to_pydatetime()
+                        max_date = pd.to_datetime(res[1], unit='m').to_pydatetime()
+                elif ts_col == "timestamp":
+                    res = con.execute(f"SELECT MIN(timestamp), MAX(timestamp) FROM {target_table}").fetchone()
+                    if res and res[0] is not None:
+                         min_date = pd.to_datetime(res[0]).to_pydatetime()
+                         max_date = pd.to_datetime(res[1]).to_pydatetime()
+            con.close()
+        elif source_type == "csv":
+            # For CSV, reading full file to get dates is slow. 
+            # We try to read just header and a sample, but dates are unsorted potentially.
+            # Best effort: read full but strictly only the timestamp column if possible?
+            # Actually pandas read_csv allows usecols.
+            # But let's just not block UI for too long. If file is huge, this is bad.
+            # Let's try reading with chunks if user really needs it, or just return None and let default apply?
+            # User request is explicit: "load with min/max".
+            # We can try reading just the summary if it exists or just usecols=['ts_min']
+            try:
+                 df_meta = pd.read_csv(source_path, nrows=5)
+                 col = 'ts_min' if 'ts_min' in df_meta.columns else 'timestamp'
+                 if col in df_meta.columns:
+                     # Efficient read? No good way without scanning.
+                     # We skip optimization for CSV for now or assume filename date?
+                     # Filename date is weak.
+                     # Let's scan using DuckDB which is faster reading CSV scan!
+                     if duckdb:
+                         q = f"SELECT MIN({col}), MAX({col}) FROM read_csv_auto('{source_path}')"
+                         con = duckdb.connect()
+                         res = con.execute(q).fetchone()
+                         if res and res[0]:
+                             if col == 'ts_min':
+                                 min_date = pd.to_datetime(res[0], unit='m').to_pydatetime()
+                                 max_date = pd.to_datetime(res[1], unit='m').to_pydatetime()
+                             else:
+                                 min_date = pd.to_datetime(res[0]).to_pydatetime()
+                                 max_date = pd.to_datetime(res[1]).to_pydatetime()
+                         con.close()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Error getting date range: {e}")
+        
+    return min_date, max_date
+
 # Redirects stdout/stderr to a Streamlit container.
 class StreamlitStdout:
     def __init__(self, container, max_lines: int = 200) -> None:
@@ -3664,6 +3730,19 @@ def run_feature_generation_workflow(params):
                                          con_feat_loop.execute(f"CREATE TABLE {table_name_out} AS SELECT * FROM df_save")
                                          table_created = True
                                      else:
+                                         # Robust consistency check
+                                         # Get existing columns in correct order
+                                         existing_cols = [c[0] for c in con_feat_loop.execute(f"DESCRIBE {table_name_out}").fetchall()]
+                                         
+                                         # Add missing cols to df_save with None
+                                         for c in existing_cols:
+                                             if c not in df_save.columns:
+                                                 df_save[c] = None
+                                         
+                                         # Ensure order matches
+                                         df_save = df_save[existing_cols]
+                                         
+                                         # Now safe to insert
                                          con_feat_loop.execute(f"INSERT INTO {table_name_out} SELECT * FROM df_save")
                                      total_rows_saved += len(df_save)
                                  finally:
@@ -4377,10 +4456,55 @@ def _render_feature_engineering():
                 key="feature_source_select"
             )
             
+            # Date Filter UI
+            use_date_filter_load = st.checkbox("Filtrar por Rango de Fechas", value=False, key="feat_load_use_date_filter")
+            start_d_load, end_d_load = None, None
+            
+            if use_date_filter_load:
+                # Detect defaults
+                st_type, st_path, _ = selected_opt
+                
+                # Cache metadata lookup to avoid re-reading on every interaction within the form
+                # We use a key based on filename
+                meta_key = f"meta_date_{os.path.basename(st_path)}"
+                if meta_key not in st.session_state:
+                     with st.spinner("Detectando rango de fechas del archivo..."):
+                         d_min, d_max = _get_file_date_range(st_type, st_path)
+                         st.session_state[meta_key] = (d_min, d_max)
+                
+                detected_min, detected_max = st.session_state.get(meta_key, (None, None))
+                
+                # Fallbacks
+                default_start = detected_min if detected_min else datetime(2023, 1, 1)
+                default_end = detected_max if detected_max else datetime(2023, 12, 31)
+                
+                # Ensure defaults are datetime.date
+                if isinstance(default_start, datetime): default_start = default_start.date()
+                if isinstance(default_end, datetime): default_end = default_end.date()
+                
+                cd1, cd2 = st.columns(2)
+                
+                start_d_load = cd1.date_input(
+                    "Fecha Inicio", 
+                    value=default_start, 
+                    min_value=default_start if detected_min else None,
+                    max_value=default_end if detected_max else None,
+                    key="feat_load_start_date"
+                )
+                end_d_load = cd2.date_input(
+                    "Fecha Fin", 
+                    value=default_end,
+                    min_value=default_start if detected_min else None,
+                    max_value=default_end if detected_max else None,
+                    key="feat_load_end_date"
+                )
+
             if st.button("Cargar en Memoria", type="primary"):
                 source_type, source_path, label = selected_opt
                 with st.spinner(f"Cargando {label}..."):
                     try:
+                        df_tmp = pd.DataFrame() # init
+                        
                         if source_type == "duckdb":
                             # source_path is now the full path to the .duckdb file
                             con_load = duckdb.connect(str(source_path), read_only=True)
@@ -4396,7 +4520,28 @@ def _render_feature_engineering():
                                     break
                             
                             if target_table:
-                                df_tmp = con_load.execute(f"SELECT * FROM {target_table}").df()
+                                query = f"SELECT * FROM {target_table}"
+                                filters = []
+                                
+                                # TIME FILTER FOR DUCKDB
+                                if use_date_filter_load and start_d_load and end_d_load:
+                                    # Check column existence for timestamp
+                                    cols = [c[0] for c in con_load.execute(f"DESCRIBE {target_table}").fetchall()]
+                                    ts_col = "ts_min" if "ts_min" in cols else "timestamp"
+                                    
+                                    if ts_col == "ts_min":
+                                         t_start = int(pd.Timestamp(start_d_load).timestamp() / 60)
+                                         t_end = int(pd.Timestamp(end_d_load).timestamp() / 60) + (24*60) # include end day
+                                         filters.append(f"{ts_col} >= {t_start}")
+                                         filters.append(f"{ts_col} <= {t_end}")
+                                    else:
+                                         filters.append(f"{ts_col} >= '{start_d_load}'")
+                                         filters.append(f"{ts_col} <= '{end_d_load}'")
+                                
+                                if filters:
+                                    query += " WHERE " + " AND ".join(filters)
+                                    
+                                df_tmp = con_load.execute(query).df()
                             else:
                                 st.error(f"No se encontró una tabla válida 'features_*' en {os.path.basename(source_path)}")
                                 df_tmp = pd.DataFrame() # fail gracefully
@@ -4404,6 +4549,16 @@ def _render_feature_engineering():
                             con_load.close()
                         else:
                             df_tmp = pd.read_csv(source_path)
+                            # Post-load filtering for CSV
+                             # Ensure timestamp column exists (from ts_min)
+                            if 'ts_min' in df_tmp.columns and 'timestamp' not in df_tmp.columns:
+                                df_tmp['timestamp'] = pd.to_datetime(df_tmp['ts_min'], unit='m')
+                            elif 'timestamp' in df_tmp.columns:
+                                df_tmp['timestamp'] = pd.to_datetime(df_tmp['timestamp'])
+                            
+                            if use_date_filter_load and start_d_load and end_d_load and 'timestamp' in df_tmp.columns:
+                                 mask = (df_tmp['timestamp'].dt.date >= start_d_load) & (df_tmp['timestamp'].dt.date <= end_d_load)
+                                 df_tmp = df_tmp[mask]
 
                         if porticos_filter:
                             df_tmp = _apply_tramo_filter(
@@ -9347,6 +9502,43 @@ def _render_create_graph():
         if events_label:
             st.markdown(f"Archivo de Eventos: `{events_label}`")
         # st.dataframe(st.session_state.df_port.head(), height=150) # Hidden by user request
+    
+    # --- SYNC FEATURE ENG TRAMO ---
+    # Check if we have a selection from feature engineering to carry over
+    feat_tramo = st.session_state.get("feature_tramo_porticos")
+    if feat_tramo and st.session_state.get("last_synced_feat_tramo") != str(feat_tramo):
+        # Proceed to sync
+        try:
+            p_start, p_end = feat_tramo[0], feat_tramo[-1]
+            # Find metadata for p_start to set selectors
+            row = st.session_state.df_port[st.session_state.df_port["portico"].astype(str) == str(p_start)]
+            if not row.empty:
+                autopista = row.iloc[0].get("autopista")
+                calzada = row.iloc[0].get("calzada")
+                eje = row.iloc[0].get("eje")
+                
+                # Update Session State
+                if autopista: st.session_state["gnn_autopista"] = autopista
+                if calzada: st.session_state["gnn_calzada"] = calzada
+                if eje: st.session_state["gnn_eje"] = eje
+                
+                # Check for tramo key consistency
+                # (We rely on logic inside selector to pick up these defaults)
+                
+                # Set Start/End
+                st.session_state["gnn_portico_start"] = p_start
+                st.session_state["gnn_portico_end"] = p_end
+                
+                # Set manual porticos directly
+                st.session_state["manual_porticos"] = feat_tramo
+                st.session_state["gnn_tramo_key"] = (autopista, calzada, eje)
+                
+                st.toast("Tramo sincronizado desde Feature Engineering")
+                
+            st.session_state["last_synced_feat_tramo"] = str(feat_tramo)
+        except Exception as e:
+            print(f"Error syncing tramo: {e}")
+    # -----------------------------
     
     # TRAMO SELECTION
     # st.markdown("#### Definición del Grafo (Tramo)")
