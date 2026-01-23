@@ -3479,37 +3479,40 @@ def run_feature_generation_workflow(params):
                     batch_df = con.execute(q).pl() # Polars Fetch
                     
                     if not batch_df.is_empty():
+                        # Define flow_pd for Cluster compatibility (downstream)
                         flow_pd = None
                         if force_snapshot:
-                            flow_pd = (
-                                batch_df.to_pandas()
-                                if hasattr(batch_df, "to_pandas")
-                                else batch_df
-                            )
-                            if not _is_empty_frame(flow_pd):
-                                if debug_snapshot:
-                                    _debug_snapshot(
-                                        debug_snapshot,
-                                        _frame_debug_info(flow_pd, "flow_pd"),
-                                    )
-                                    fecha_col = _find_column_by_keywords(
-                                        flow_pd,
-                                        ["fecha", "timestamp", "datetime", "time"],
-                                    )
-                                    if fecha_col:
-                                        series = pd.to_datetime(
-                                            flow_pd[fecha_col], errors="coerce"
-                                        )
+                            # Convert for legacy parts if needed, but Pipeline uses Polars 'batch_df'
+                            # We delay to_pandas until needed by cluster or debugging
+                            # But wait, 'cluster_source = flow_pd if force_snapshot else batch_df' later
+                            # So we SHOULD define flow_pd.
+                            flow_pd = batch_df.to_pandas()
+                            
+                            if debug_snapshot:
+                                _debug_snapshot(
+                                    debug_snapshot,
+                                    _frame_debug_info(batch_df, "batch_df (Polars)"),
+                                )
+                                # Log Date Range from Polars
+                                try:
+                                    # Peek at dates
+                                    # Assume generic 'FECHA' or 'timestamp'
+                                    cols = batch_df.columns
+                                    f_col = next((c for c in cols if "fecha" in c.lower() or "time" in c.lower()), None)
+                                    if f_col:
+                                        stats = batch_df.select([
+                                            pl.col(f_col).min().alias("min"), 
+                                            pl.col(f_col).max().alias("max")
+                                        ]).row(0)
                                         _debug_snapshot(
                                             debug_snapshot,
-                                            f"flow_pd[{fecha_col}] dtype={flow_pd[fecha_col].dtype} min={series.min()} max={series.max()}",
+                                            f"batch dates: min={stats[0]} max={stats[1]}"
                                         )
-                                    _debug_snapshot(
-                                        debug_snapshot,
-                                        f"snapshot_params dt={snap_config.dt_minutes} window={snap_config.window_minutes}",
-                                    )
-                                snapshot_features, _ = builder.build(
-                                    flow_pd,
+                                except Exception as exc:
+                                     _debug_snapshot(debug_snapshot, f"Debug Date Error: {exc}")
+
+                            snapshot_features, _ = builder.build(
+                                batch_df,
                                     df_p,
                                     tracked_columns=snapshot_window_cols,
                                     gradient_columns=snapshot_grad_cols,
@@ -3517,51 +3520,37 @@ def run_feature_generation_workflow(params):
                                     include_spatial_gradients=include_spatial_gradients,
                                     include_temporal_encodings=include_temporal_encodings,
                                 )
-                                if debug_snapshot and isinstance(
-                                    snapshot_features.index, pd.MultiIndex
-                                ):
-                                    if "snapshot_time" in snapshot_features.index.names:
-                                        snap_idx = snapshot_features.index.get_level_values(
-                                            "snapshot_time"
-                                        )
-                                    else:
-                                        snap_idx = snapshot_features.index.get_level_values(
-                                            1
-                                        )
-                                    snap_ts = pd.to_datetime(
-                                        snap_idx, errors="coerce"
-                                    )
-                                    _debug_snapshot(
-                                        debug_snapshot,
-                                        f"snapshot_index dtype={snap_idx.dtype} min={snap_ts.min()} max={snap_ts.max()}",
-                                    )
-                                feat_batch = flatten_snapshot_features(
-                                    snapshot_features,
-                                    include_timestamp=True,
+                                
+                            # Convert the Result to Pandas (Flattened)
+                            # The new flatten_snapshot_features takes Polars DF -> Returns Pandas
+                            feat_batch = flatten_snapshot_features(
+                                snapshot_features,
+                                include_timestamp=True,
+                            )
+                            
+                            # Compatibility: feat_batch is now Pandas
+                            if debug_snapshot and "ts_min" in feat_batch.columns:
+                                min_ts, max_ts = _ts_min_range(
+                                    feat_batch["ts_min"]
                                 )
-                                if debug_snapshot and "ts_min" in feat_batch.columns:
-                                    min_ts, max_ts = _ts_min_range(
-                                        feat_batch["ts_min"]
-                                    )
-                                    _debug_snapshot(
-                                        debug_snapshot,
-                                        f"flat_snapshot ts_min_range=({min_ts}, {max_ts}) dt_range=({_ts_min_to_dt(min_ts)}, {_ts_min_to_dt(max_ts)})",
-                                    )
-                                feat_batch = _filter_snapshot_chunk(
-                                    feat_batch,
-                                    r_start,
-                                    r_end,
-                                    debug=debug_cluster,
+                                _debug_snapshot(
+                                    debug_snapshot,
+                                    f"flat_snapshot ts_min_range=({min_ts}, {max_ts}) dt_range=({_ts_min_to_dt(min_ts)}, {_ts_min_to_dt(max_ts)})",
                                 )
-                                _debug_cluster(
-                                    debug_cluster,
-                                    _frame_debug_info(
-                                        feat_batch, "feat_batch_filtered"
-                                    ),
-                                )
-                            else:
-                                feat_batch = None
+                            feat_batch = _filter_snapshot_chunk(
+                                feat_batch,
+                                r_start,
+                                r_end,
+                                debug=debug_cluster,
+                            )
+                            _debug_cluster(
+                                debug_cluster,
+                                _frame_debug_info(
+                                    feat_batch, "feat_batch_filtered"
+                                ),
+                            )
                         else:
+                            # Flow Mode
                             feat_batch = compute_pm_features(
                                 batch_df,
                                 interactive=False,
@@ -3674,6 +3663,12 @@ def run_feature_generation_workflow(params):
                              del df_save
                              del feat_batch
                              if 'cluster_batch' in locals(): del cluster_batch
+                             if 'batch_df' in locals(): del batch_df
+                             if 'flow_pd' in locals(): del flow_pd
+                             if 'snapshot_features' in locals(): del snapshot_features
+                             
+                             import gc
+                             gc.collect()
 
 
 
