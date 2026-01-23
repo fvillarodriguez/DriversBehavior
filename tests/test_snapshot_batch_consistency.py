@@ -1,5 +1,6 @@
 import pytest
 import pandas as pd
+import polars as pl
 import numpy as np
 import sys
 import os
@@ -67,7 +68,7 @@ def test_snapshot_batch_consistency():
     
     # 2. Run Global (Memory Mode)
     print("\nRunning Global Mode...")
-    snap_global, _ = builder.build(full_df, df_porticos)
+    snap_global, _ = builder.build(pl.from_pandas(full_df), df_porticos)
     df_global = flatten_snapshot_features(snap_global, include_timestamp=True)
     # Apply same filter as batch (exclusive end) because full_df includes end_time inclusive
     df_global = _filter_snapshot_chunk(df_global, start_time, end_time)
@@ -89,7 +90,7 @@ def test_snapshot_batch_consistency():
         (full_df["FECHA"] < mid_time)
     ].copy()
     
-    snap_b1, _ = builder.build(df_b1_input, df_porticos)
+    snap_b1, _ = builder.build(pl.from_pandas(df_b1_input), df_porticos)
     df_b1 = flatten_snapshot_features(snap_b1, include_timestamp=True)
     
     # Filter Batch 1: Keep strict range [08:00, 10:00)
@@ -116,7 +117,7 @@ def test_snapshot_batch_consistency():
         (full_df["FECHA"] < end_time)
     ].copy()
     
-    snap_b2, _ = builder.build(df_b2_input, df_porticos)
+    snap_b2, _ = builder.build(pl.from_pandas(df_b2_input), df_porticos)
     df_b2 = flatten_snapshot_features(snap_b2, include_timestamp=True)
     
     # Filter Batch 2: Keep strict range [10:00, 12:00)

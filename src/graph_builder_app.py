@@ -3446,7 +3446,7 @@ def run_feature_generation_workflow(params):
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 mode_tag = "Snapshot" if force_snapshot else "Flow"
                 table_name_out = f"features_{mode_tag}_{timestamp}"
-                con_feat = duckdb.connect(str(features_db_path))
+                # con_feat removed
                 table_created = False
                 total_rows_saved = 0
 
@@ -3652,12 +3652,17 @@ def run_feature_generation_workflow(params):
                                   df_save = df_save.drop_duplicates(subset=["portico", "ts_min"], keep="last")
 
                              if not df_save.empty:
-                                 if not table_created:
-                                     con_feat.execute(f"CREATE TABLE {table_name_out} AS SELECT * FROM df_save")
-                                     table_created = True
-                                 else:
-                                     con_feat.execute(f"INSERT INTO {table_name_out} SELECT * FROM df_save")
-                                 total_rows_saved += len(df_save)
+                                 # Open connection just for writing
+                                 con_feat_loop = duckdb.connect(str(features_db_path))
+                                 try:
+                                     if not table_created:
+                                         con_feat_loop.execute(f"CREATE TABLE {table_name_out} AS SELECT * FROM df_save")
+                                         table_created = True
+                                     else:
+                                         con_feat_loop.execute(f"INSERT INTO {table_name_out} SELECT * FROM df_save")
+                                     total_rows_saved += len(df_save)
+                                 finally:
+                                     con_feat_loop.close()
                                  
                              # Clear memory
                              del df_save
@@ -3676,11 +3681,17 @@ def run_feature_generation_workflow(params):
                 con.close()
                 
                 # --- FINAL LOADING (Optional for UI) ---
+                # Delete line 3449 (handled by matching TargetContent correctly)
+
+                # Update Final Loading
                 if table_created:
-                    #status.text(f"Cargando resultados en memoria ({total_rows_saved} filas)...")
                     # Load full dataset as requested
-                    df_pm = con_feat.execute(f"SELECT * FROM {table_name_out}").df()
-                    con_feat.close()
+                    con_final = duckdb.connect(str(features_db_path), read_only=True)
+                    try:
+                        df_pm = con_final.execute(f"SELECT * FROM {table_name_out}").df()
+                    finally:
+                        con_final.close()
+                    
                     st.session_state.df_pm_cache = df_pm.copy()
                     st.session_state.feature_config = {
                         "source": "Generar nuevas (DuckDB)",
@@ -3698,7 +3709,7 @@ def run_feature_generation_workflow(params):
                     progress.empty()
                 else:
                     st.warning("No se generaron features en ningún lote.")
-                    con_feat.close()
+                    # con_feat.close() Removed
                     try:
                          if os.path.exists(features_db_path):
                              # Only unlink if we just created it and it's empty? 
@@ -3710,8 +3721,8 @@ def run_feature_generation_workflow(params):
                 st.error(f"Error en Batch Mode: {e}")
                 try: con.close() 
                 except: pass
-                try: con_feat.close()
-                except: pass
+                # con_feat handle removed
+                pass
                 return None
         
         # --- MEMORY MODE (or source=existing logic handled separately?) ---

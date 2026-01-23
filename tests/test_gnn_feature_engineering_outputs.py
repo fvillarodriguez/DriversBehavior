@@ -1,4 +1,5 @@
 import pandas as pd
+import polars as pl
 
 from src.features import compute_pm_features
 from src.snapshot_pipeline import (
@@ -80,7 +81,9 @@ def test_feature_engineering_outputs_have_positive_values() -> None:
 
     snap_config = SnapshotConfig(dt_minutes=5, window_minutes=10)
     snap_builder = SnapshotFeatureBuilder(snap_config)
-    snapshot_df, _ = snap_builder.build(flows, _make_porticos_df())
+    # Convert to Polars for the new pipeline
+    flows_pl = pl.from_pandas(flows)
+    snapshot_df, _ = snap_builder.build(flows_pl, _make_porticos_df())
     flat_snapshot = flatten_snapshot_features(snapshot_df)
     for col in ["speed_mean", "flow_total", "tod_sin", "tod_cos"]:
         assert col in flat_snapshot.columns
