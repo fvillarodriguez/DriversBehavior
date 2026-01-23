@@ -3442,10 +3442,15 @@ def run_feature_generation_workflow(params):
                         df_p = load_porticos()
                 
                 # --- DB SETUP FOR INCREMENTAL SAVE ---
-                features_db_path = os.path.join(RESULTADOS_DIR, "features.duckdb")
+                # --- DB SETUP FOR INCREMENTAL SAVE ---
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 mode_tag = "Snapshot" if force_snapshot else "Flow"
                 table_name_out = f"features_{mode_tag}_{timestamp}"
+                
+                # New: Use unique file per run
+                features_db_name = f"{table_name_out}.duckdb"
+                features_db_path = os.path.join(RESULTADOS_DIR, features_db_name)
+                
                 # con_feat removed
                 table_created = False
                 total_rows_saved = 0
@@ -4077,21 +4082,20 @@ def run_feature_generation_workflow(params):
             st.session_state.df_pm_cache = df_pm.copy()
 
             # Auto-save to DuckDB (with versioning)
+            # Auto-save to DuckDB (with versioning)
             try:
-                features_db_path = os.path.join(RESULTADOS_DIR, "features.duckdb")
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                # Updated per user request
-                mode_tag = "Snapshot" if force_snapshot else "Flow"
-                table_name = f"features_{mode_tag}_{timestamp}"
+                # Re-construct path (should be same vars as above if scope holds, 
+                # but 'timestamp' might have changed if we re-called datetime.now(). 
+                # Better to use the variables defined at start of function)
+                # valid variables from top scope: features_db_path, table_name_out
+                
+                # features_db_path is already set to unique file: features_....duckdb
+                # table_name_out is already set: features_...
+                
                 con_feat = duckdb.connect(str(features_db_path))
 
                 # Create versioned table
-                con_feat.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df_pm")
-
-                # Also update 'latest' view for convenience
-                con_feat.execute(
-                    f"CREATE OR REPLACE VIEW features_latest AS SELECT * FROM {table_name}"
-                )
+                con_feat.execute(f"CREATE TABLE {table_name_out} AS SELECT * FROM df_pm")
                 con_feat.close()
 
                 # UPDATE CONFIG so history sees the generated file/table name
@@ -4341,23 +4345,27 @@ def _render_feature_engineering():
         # List tables from DuckDB
         duckdb_tables = []
         if os.path.exists(features_db_path) and duckdb is not None:
-            try:
-                con_list = duckdb.connect(str(features_db_path), read_only=True)
-                tables_result = con_list.execute("SHOW TABLES").fetchall()
-                duckdb_tables = [t[0] for t in tables_result if t[0].startswith("features_") and not t[0].endswith("_latest")]
-                duckdb_tables = sorted(duckdb_tables, reverse=True)  # Newest first
-                con_list.close()
-            except Exception as e:
-                st.warning(f"Error leyendo tablas DuckDB: {e}")
+            # We keep features.duckdb check just in case, but main search is for individual files
+            pass
+
+        # Search for individual DuckDB files
+        # Pattern: features_*.duckdb in RESULTADOS_DIR
+        # We manually exclude 'features.duckdb' if we want only timestamped ones, or keep it.
+        # Let's list all features_*.duckdb
+        duckdb_files = sorted(glob.glob(os.path.join(RESULTADOS_DIR, "features_*.duckdb")), reverse=True)
+        
+        duckdb_options = []
+        for fpath in duckdb_files:
+            fname = os.path.basename(fpath)
+            # Label as DuckDB File
+            duckdb_options.append(("duckdb", fpath, f"📊 {fname} (DuckDB)"))
         
         # Also list CSV files as fallback
         csv_files = sorted(glob.glob(os.path.join(RESULTADOS_DIR, "features_*.csv")), reverse=True)
         csv_files = [f for f in csv_files if not os.path.basename(f).startswith("features_selected_names_")]
         
         # Build combined options
-        options = []
-        for t in duckdb_tables:
-            options.append(("duckdb", t, f"📊 {t} (DuckDB)"))
+        options = duckdb_options
         for f in csv_files:
             options.append(("csv", f, f"📄 {os.path.basename(f)} (CSV)"))
         
@@ -4374,8 +4382,25 @@ def _render_feature_engineering():
                 with st.spinner(f"Cargando {label}..."):
                     try:
                         if source_type == "duckdb":
-                            con_load = duckdb.connect(str(features_db_path), read_only=True)
-                            df_tmp = con_load.execute(f"SELECT * FROM {source_path}").df()
+                            # source_path is now the full path to the .duckdb file
+                            con_load = duckdb.connect(str(source_path), read_only=True)
+                            
+                            # We need to find the table name inside. 
+                            # Usually it matches the filename stem, but let's be robust and ask for tables.
+                            tables = con_load.execute("SHOW TABLES").fetchall()
+                            # Filter for features table
+                            target_table = None
+                            for t in tables:
+                                if t[0].startswith("features_"):
+                                    target_table = t[0]
+                                    break
+                            
+                            if target_table:
+                                df_tmp = con_load.execute(f"SELECT * FROM {target_table}").df()
+                            else:
+                                st.error(f"No se encontró una tabla válida 'features_*' en {os.path.basename(source_path)}")
+                                df_tmp = pd.DataFrame() # fail gracefully
+                            
                             con_load.close()
                         else:
                             df_tmp = pd.read_csv(source_path)
