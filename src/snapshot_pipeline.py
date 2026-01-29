@@ -57,12 +57,14 @@ def _resolve_column(
 
 
 def discretize_vehicle_flows(
-    flujos_df: Union[pl.DataFrame, pl.LazyFrame],
+    flujos_df: Union[pd.DataFrame, pl.DataFrame, pl.LazyFrame],
     config: SnapshotConfig,
 ) -> pl.DataFrame:
     """
     Aggregate raw per-vehicle data into Δ-minute blocks per pórtico using Polars.
     """
+    if isinstance(flujos_df, pd.DataFrame):
+        flujos_df = pl.from_pandas(flujos_df)
     if isinstance(flujos_df, pl.DataFrame):
         lf = flujos_df.lazy()
     else:
@@ -479,9 +481,11 @@ class SnapshotFeatureBuilder:
 
 # --- FULL IMPLEMENTATION OF DISCRETIZE TO MATCH ORIGINAL ---
 def discretize_vehicle_flows(
-        flujos_df: Union[pl.DataFrame, pl.LazyFrame],
+        flujos_df: Union[pd.DataFrame, pl.DataFrame, pl.LazyFrame],
         config: SnapshotConfig,
 ) -> pl.DataFrame:
+    if isinstance(flujos_df, pd.DataFrame):
+        flujos_df = pl.from_pandas(flujos_df)
     if isinstance(flujos_df, pl.DataFrame):
         lf = flujos_df.lazy()
     else:

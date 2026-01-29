@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Callable, Dict
+import psutil
 
 # Configurar fallback para MPS (Apple Silicon) antes de importar librerías de ML
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -28,25 +29,27 @@ import src.sumo_simulation_app as sumo_simulation_app
 import src.test_page as test_page
 import src.github_sync_app as github_sync_app
 import src.notification_system as notification_system
+import src.multi_agent_rl_app as multi_agent_rl_app
 
 
 def _render_home() -> None:
-    st.title("Drivers Behavior")
-    st.markdown(
-        "Modeling and simulation"
-    )
-    
+    st.title("Drivers Behavior Modeling and Simulation")
     st.markdown(
         """
         This application is a comprehensive pipeline for analyzing and predicting traffic accidents using flow and clustering data.
         
         **Modules Overview:**
         - **Flow database:** Admin flows database DuckDB.
+        - **Files:** Manage and browse data files.
+        - **GitHub Sync:** Sync local files with the remote repository.
         - **Clustering:** Features, clustering and analysis.
         - **Crash prediction:** Train and evaluate accident prediction models.
-        - **Graph Neural Network:** Construye grafos para modelos GNN usando features de Crash prediction.
+        - **Graph Neural Network:** Construct graphs for GNN models using crash prediction features.
+        - **Multi Agent RL:** Multi-Agent Reinforcement Learning modules.
         - **Events:** Load and visualize accident events on an interactive map.
-        - **Files:** Manage and browse data files.
+        - **Experiments Live:** Real-time experiment monitoring.
+        - **Simulacion SUMO:** SUMO traffic simulation integration.
+        - **Notification system:** Configure system notifications.
         - **Test:** Testing playground.
         """
     )
@@ -88,6 +91,9 @@ def main() -> None:
     def p_sumo():
         sumo_simulation_app.main(set_page_config=False, show_exit_button=False)
         
+    def p_marl():
+        multi_agent_rl_app.main(set_page_config=False, show_exit_button=False)
+
     def p_test():
         test_page.main(set_page_config=False, show_exit_button=False)
 
@@ -98,6 +104,7 @@ def main() -> None:
     ps_clustering = st.Page(p_clustering, title="Clustering", icon=":material/scatter_plot:")
     ps_crash = st.Page(p_crash, title="Crash prediction", icon=":material/warning:")
     ps_gnn = st.Page(_render_graph_builder, title="Graph Neural Network", icon=":material/hub:")
+    ps_marl = st.Page(p_marl, title="Multi Agent RL", icon=":material/groups:")
     
     ps_events = st.Page(p_events, title="Events", icon=":material/map:")
     ps_exp = st.Page(p_experiments, title="Experiments Live", icon=":material/science:")
@@ -112,7 +119,7 @@ def main() -> None:
         {
             "Navegación": [ps_home],
             "Data & Gestión": [ps_databases, ps_files, ps_github],
-            "Análisis & Modelos": [ps_clustering, ps_crash, ps_gnn],
+            "Análisis & Modelos": [ps_clustering, ps_crash, ps_gnn, ps_marl],
             "Simulación & Vizualización": [ps_events, ps_exp, ps_sumo],
             "Configuración": [ps_notify, ps_test],
         }
@@ -120,15 +127,51 @@ def main() -> None:
     
     pg.run()
 
-    import psutil
-    process = psutil.Process(os.getpid())
-    mem_usage = process.memory_info().rss / 1e9  # GB
-    cpu_usage = process.cpu_percent(interval=None) # Non-blocking immediate check
-
     #st.sidebar.markdown("---")
-    st.sidebar.caption(f"**Proceso** | CPU: {cpu_usage:.1f}% | RAM: {mem_usage:.2f} GB")
 
-    if st.sidebar.button("Cerrar"):
+    @st.fragment(run_every=2)
+    def _render_system_stats():
+        process = psutil.Process(os.getpid())
+        mem_usage = process.memory_info().rss / 1e9  # GB
+        cpu_usage = process.cpu_percent(interval=None) # Non-blocking immediate check
+        st.caption(f"**Proceso** | CPU: {cpu_usage:.1f}% | RAM: {mem_usage:.2f} GB")
+
+    with st.sidebar:
+        _render_system_stats()
+
+    def _clear_sidebar_memory():
+        keys_to_clear = [
+            "loaded_graph",
+            "graph_path",
+            "df_pm_cache",
+            "df_port",
+            "df_acc",
+        ]
+        for key in keys_to_clear:
+            if key in st.session_state:
+                st.session_state[key] = None
+        try:
+            import pandas as pd
+            import polars as pl
+            import numpy as np
+            import torch
+            for key, value in list(st.session_state.items()):
+                if isinstance(value, (pd.DataFrame, pl.DataFrame, pl.LazyFrame, np.ndarray, torch.Tensor)):
+                    st.session_state[key] = None
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if hasattr(torch, "mps") and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+
+    col_clear, col_exit = st.sidebar.columns(2)
+    if col_clear.button("",type='tertiary', icon="🧹"):
+        _clear_sidebar_memory()
+        col_clear.success("Memoria limpiada")
+    if col_exit.button("Cerrar"):
         os._exit(0)
         
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ import math
 from collections import defaultdict, deque
 from datetime import datetime
 from itertools import cycle
+import json
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import matplotlib
@@ -14,7 +16,9 @@ import streamlit as st
 import torch
 from torch_geometric.data import HeteroData
 
-from src.config import SEED
+from src.config import RESULTADOS_DIR, SEED
+
+HISTORY_PATH = Path(RESULTADOS_DIR) / "gnn_history.jsonl"
 
 
 def _to_cpu(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -105,6 +109,136 @@ def _build_summary_frames(loaded_obj: Dict[str, object]) -> Tuple[pd.DataFrame, 
         node_df.loc[node_df["node_type"] == "pm", "features"] = len(feature_cols)
 
     return node_df, edge_df, mask_df
+
+
+def _load_history_entries() -> List[Dict[str, object]]:
+    if not HISTORY_PATH.exists():
+        return []
+    entries: List[Dict[str, object]] = []
+    try:
+        with HISTORY_PATH.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+    except Exception:
+        return []
+    return entries
+
+
+def _find_graph_build_log(loaded_obj: Dict[str, object]) -> Tuple[Optional[Dict[str, object]], str]:
+    entries = _load_history_entries()
+    if not entries:
+        return None, "none"
+    filename = loaded_obj.get("filename")
+    match = None
+    if filename:
+        for entry in reversed(entries):
+            if entry.get("type") != "Graph Build":
+                continue
+            graph_meta = entry.get("graph_build", {})
+            if graph_meta.get("filename") == filename:
+                match = entry
+                break
+    if match:
+        return match, "filename"
+    for entry in reversed(entries):
+        if entry.get("type") == "Graph Build":
+            return entry, "latest"
+    return None, "none"
+
+
+def _summarize_pm_index(pm_index: object) -> Dict[str, object]:
+    summary: Dict[str, object] = {}
+    rev = getattr(pm_index, "_rev", None)
+    if rev is None:
+        return summary
+    values: Iterable[object]
+    if isinstance(rev, dict):
+        values = rev.values()
+    else:
+        values = rev
+    porticos: List[str] = []
+    ts_vals: List[float] = []
+    for item in values:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        portico = str(item[0])
+        try:
+            ts_min = float(item[1])
+        except Exception:
+            continue
+        porticos.append(portico)
+        ts_vals.append(ts_min)
+    if not porticos or not ts_vals:
+        return summary
+    unique_ports = sorted(set(porticos))
+    summary["portico_count"] = len(unique_ports)
+    summary["porticos_preview"] = unique_ports[:20]
+    summary["portico_min"] = unique_ports[0]
+    summary["portico_max"] = unique_ports[-1]
+    ts_min_val = min(ts_vals)
+    ts_max_val = max(ts_vals)
+    summary["ts_min"] = ts_min_val
+    summary["ts_max"] = ts_max_val
+    summary["date_min"] = datetime.fromtimestamp(ts_min_val * 60)
+    summary["date_max"] = datetime.fromtimestamp(ts_max_val * 60)
+    return summary
+
+
+def _feature_names_for(node_type: str, dim: int, feature_cols: List[str]) -> List[str]:
+    if node_type == "pm" and feature_cols and len(feature_cols) == dim:
+        return list(feature_cols)
+    return [f"f{i}" for i in range(dim)]
+
+
+def _tensor_feature_stats(
+    tensor: Optional[torch.Tensor],
+    feature_names: List[str],
+    *,
+    max_rows: int,
+    max_features: int,
+) -> pd.DataFrame:
+    if tensor is None:
+        return pd.DataFrame()
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(1)
+    if tensor.numel() == 0:
+        return pd.DataFrame()
+    rows = int(tensor.shape[0])
+    if rows > max_rows:
+        idx = torch.randint(0, rows, (max_rows,), device=tensor.device)
+        tensor = tensor.index_select(0, idx)
+    tensor = tensor.detach().float()
+    if tensor.device.type != "cpu":
+        tensor = tensor.cpu()
+    dim = int(tensor.shape[1])
+    if dim == 0:
+        return pd.DataFrame()
+    if max_features > 0 and dim > max_features:
+        sel = list(range(max_features))
+    else:
+        sel = list(range(dim))
+    names = [feature_names[i] if i < len(feature_names) else f"f{i}" for i in sel]
+    mean = tensor[:, sel].mean(0).tolist()
+    std = tensor[:, sel].std(0, unbiased=False).tolist()
+    minv = tensor[:, sel].min(0).values.tolist()
+    maxv = tensor[:, sel].max(0).values.tolist()
+    return pd.DataFrame(
+        {
+            "feature": names,
+            "mean": mean,
+            "std": std,
+            "min": minv,
+            "max": maxv,
+        }
+    )
 
 
 def _collect_pm_candidates(data: HeteroData) -> Dict[str, List[int]]:
@@ -408,6 +542,7 @@ def render_visual_graph_tab(loaded_obj: Optional[Dict[str, object]] = None) -> N
         return
 
     node_df, edge_df, mask_df = _build_summary_frames(loaded_obj)
+    feature_cols = loaded_obj.get("feature_cols", [])
 
     with st.expander("Graph overview", expanded=False):
         if not node_df.empty:
@@ -420,13 +555,158 @@ def render_visual_graph_tab(loaded_obj: Optional[Dict[str, object]] = None) -> N
             st.markdown("Masks")
             st.dataframe(mask_df, width="stretch")
 
-        feature_cols = loaded_obj.get("feature_cols", [])
         if feature_cols:
             st.markdown("Feature columns (pm)")
             preview = ", ".join(feature_cols[:50])
             if len(feature_cols) > 50:
                 preview += ", ..."
             st.caption(preview)
+
+    pm_index = loaded_obj.get("pm_index")
+    pm_summary = _summarize_pm_index(pm_index) if pm_index is not None else {}
+    log_entry, log_match = _find_graph_build_log(loaded_obj)
+
+    with st.expander("Metadata (fechas, porticos y logs)", expanded=True):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Desde el grafo**")
+            if pm_summary:
+                st.write(
+                    f"Rango fechas: {pm_summary['date_min']:%Y-%m-%d %H:%M} -> "
+                    f"{pm_summary['date_max']:%Y-%m-%d %H:%M}"
+                )
+                st.write(
+                    f"Porticos unicos: {pm_summary['portico_count']} "
+                    f"(min={pm_summary['portico_min']}, max={pm_summary['portico_max']})"
+                )
+                preview_ports = ", ".join(pm_summary.get("porticos_preview", []))
+                if preview_ports:
+                    st.caption(f"Ejemplo porticos: {preview_ports}")
+            else:
+                st.info("No hay informacion de porticos/fechas en pm_index.")
+        with col_b:
+            st.markdown("**Desde logs (History)**")
+            if log_entry:
+                graph_meta = log_entry.get("graph_build", {})
+                date_min = graph_meta.get("date_min")
+                date_max = graph_meta.get("date_max")
+                if date_min and date_max:
+                    st.write(f"Rango fechas (log): {date_min} -> {date_max}")
+                port_count = graph_meta.get("tramo_porticos_count")
+                if port_count is not None:
+                    st.write(f"Porticos en tramo (log): {port_count}")
+                temporal_filter = graph_meta.get("temporal_filter")
+                if temporal_filter:
+                    st.write(f"Filtro temporal: {temporal_filter}")
+                selected_vars = graph_meta.get("selected_vars", [])
+                if selected_vars:
+                    preview = ", ".join(selected_vars[:30])
+                    if len(selected_vars) > 30:
+                        preview += ", ..."
+                    st.caption(f"Features seleccionadas: {preview}")
+                edges_cfg = graph_meta.get("edges", {})
+                if edges_cfg:
+                    st.caption(
+                        "Edges: "
+                        + ", ".join([k for k, v in edges_cfg.items() if v and k != "physical_features"])
+                    )
+                    phys = edges_cfg.get("physical_features", [])
+                    if phys:
+                        st.caption(f"Features fisicas (edges): {', '.join(phys)}")
+                    delta_feats = edges_cfg.get("delta_features", [])
+                    if delta_feats:
+                        st.caption(f"Features delta (edges): {', '.join(delta_feats)}")
+                if log_match != "filename":
+                    st.caption("Log asociado por ultimo build (no se encontro filename exacto).")
+            else:
+                st.info("No hay logs de Graph Build en History.")
+
+    with st.expander("Detalle de features por tipo (nodos y aristas)", expanded=False):
+        tab_nodes, tab_edges = st.tabs(["Nodos", "Aristas"])
+        with tab_nodes:
+            node_types = list(data.node_types)
+            if not node_types:
+                st.info("No hay tipos de nodos.")
+            else:
+                ntype = st.selectbox("Tipo de nodo", node_types, key="viz_node_type")
+                store = data[ntype]
+                x = getattr(store, "x", None)
+                if x is None:
+                    st.info("Este tipo de nodo no tiene features.")
+                else:
+                    dim_x = int(x.shape[1]) if x.dim() > 1 else 1
+                    min_feats = 1 if dim_x < 5 else 5
+                    max_rows = st.number_input(
+                        "Muestras para estadistica",
+                        min_value=1000,
+                        max_value=200000,
+                        value=50000,
+                        step=5000,
+                        key="viz_node_stats_rows",
+                    )
+                    max_feats = st.number_input(
+                        "Maximo de features a mostrar",
+                        min_value=min_feats,
+                        max_value=max(1, min(200, dim_x)),
+                        value=min(40, dim_x),
+                        step=1,
+                        key="viz_node_stats_feats",
+                    )
+                    if st.button("Calcular stats (nodos)", key="viz_node_stats_btn"):
+                        names = _feature_names_for(ntype, dim_x, feature_cols)
+                        df_stats = _tensor_feature_stats(
+                            x,
+                            names,
+                            max_rows=int(max_rows),
+                            max_features=int(max_feats),
+                        )
+                        if df_stats.empty:
+                            st.info("Sin stats disponibles.")
+                        else:
+                            st.dataframe(df_stats, width="stretch")
+        with tab_edges:
+            edge_types = list(data.edge_types)
+            if not edge_types:
+                st.info("No hay tipos de aristas.")
+            else:
+                edge_labels = [f"{s}-{r}-{d}" for (s, r, d) in edge_types]
+                sel = st.selectbox("Tipo de arista", list(range(len(edge_types))), format_func=lambda i: edge_labels[i], key="viz_edge_type")
+                etype = edge_types[int(sel)]
+                store = data[etype]
+                edge_attr = getattr(store, "edge_attr", None)
+                if edge_attr is None:
+                    st.info("Este tipo de arista no tiene edge_attr.")
+                else:
+                    dim_e = int(edge_attr.shape[1]) if edge_attr.dim() > 1 else 1
+                    min_feats = 1 if dim_e < 5 else 5
+                    max_rows = st.number_input(
+                        "Muestras para estadistica (aristas)",
+                        min_value=1000,
+                        max_value=200000,
+                        value=50000,
+                        step=5000,
+                        key="viz_edge_stats_rows",
+                    )
+                    max_feats = st.number_input(
+                        "Maximo de features a mostrar (aristas)",
+                        min_value=min_feats,
+                        max_value=max(1, min(200, dim_e)),
+                        value=min(40, dim_e),
+                        step=1,
+                        key="viz_edge_stats_feats",
+                    )
+                    if st.button("Calcular stats (aristas)", key="viz_edge_stats_btn"):
+                        names = [f"edge_f{i}" for i in range(dim_e)]
+                        df_stats = _tensor_feature_stats(
+                            edge_attr,
+                            names,
+                            max_rows=int(max_rows),
+                            max_features=int(max_feats),
+                        )
+                        if df_stats.empty:
+                            st.info("Sin stats disponibles.")
+                        else:
+                            st.dataframe(df_stats, width="stretch")
 
     st.markdown("---")
     st.markdown("Subgraph visualization")
@@ -468,13 +748,29 @@ def render_visual_graph_tab(loaded_obj: Optional[Dict[str, object]] = None) -> N
         )
         selected_idx = pool[int(pos)]
 
-    pm_index = loaded_obj.get("pm_index")
     if pm_index is not None:
         info = _lookup_pm_index(pm_index, int(selected_idx))
         if info:
             portico, ts_min = info
             dt = datetime.fromtimestamp(ts_min * 60)
             st.caption(f"PM info: portico={portico}, ts={dt:%Y-%m-%d %H:%M}")
+
+    pm_store = data["pm"] if "pm" in data.node_types else None
+    if pm_store is not None and hasattr(pm_store, "x"):
+        if st.checkbox("Mostrar features del nodo seleccionado", value=False, key="viz_node_detail_toggle"):
+            x = pm_store.x
+            if x is not None and int(selected_idx) < x.shape[0]:
+                names = _feature_names_for("pm", int(x.shape[1]), feature_cols)
+                x_row = x[int(selected_idx)].detach().cpu()
+                df_node = pd.DataFrame(
+                    {
+                        "feature": names,
+                        "value": x_row.tolist(),
+                    }
+                )
+                st.dataframe(df_node, width="stretch")
+            else:
+                st.info("No hay features disponibles para este nodo.")
 
     prev_nodes = st.slider("Temporal hops", min_value=0, max_value=10, value=2, step=1)
     spring_iters = st.slider("Layout iterations", min_value=10, max_value=200, value=50, step=10)

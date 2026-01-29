@@ -128,7 +128,11 @@ def get_knn_cached(pos_emb: torch.Tensor,
     sig = _hash_tensor(pos_cpu, {"k": k_eff, "metric": metric, **extra_params})
     cache_file = Path(cache_dir) / f"knn_{sig}.pt"
     if cache_file.exists():
-        out = torch.load(cache_file, map_location="cpu")
+        # Prefer safe load (weights_only=True) when available to avoid pickle warnings.
+        try:
+            out = torch.load(cache_file, map_location="cpu", weights_only=True)
+        except TypeError:
+            out = torch.load(cache_file, map_location="cpu")
         return out["idx"], out["dist"]
 
     if prefer_sklearn:

@@ -1,5 +1,7 @@
 import logging
-from typing import Dict, Optional, Tuple
+import os
+import sys
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +20,39 @@ from torch_geometric.loader import NeighborLoader
 
 
 logger = logging.getLogger(__name__)
+
+
+def _mem_snapshot(tag: str) -> None:
+    try:
+        import psutil
+        rss = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
+    except Exception:
+        try:
+            import resource
+            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            rss = rss_kb / (1024 ** 2) if sys.platform == "darwin" else rss_kb / 1024.0
+        except Exception:
+            rss = None
+    parts = []
+    if rss is not None:
+        parts.append(f"RSS={rss:.1f}MB")
+    if torch.cuda.is_available():
+        try:
+            parts.append(f"CUDA_alloc={torch.cuda.memory_allocated() / (1024 ** 2):.1f}MB")
+            parts.append(f"CUDA_reserved={torch.cuda.memory_reserved() / (1024 ** 2):.1f}MB")
+        except Exception:
+            pass
+    if hasattr(torch, "mps") and torch.backends.mps.is_available():
+        try:
+            parts.append(f"MPS_alloc={torch.mps.current_allocated_memory() / (1024 ** 2):.1f}MB")
+        except Exception:
+            pass
+        try:
+            parts.append(f"MPS_driver={torch.mps.driver_allocated_memory() / (1024 ** 2):.1f}MB")
+        except Exception:
+            pass
+    if parts:
+        logger.info(f"[MEM][train_minibatch] {tag} | " + " | ".join(parts))
 
 # ================================
 # Entrenamiento por mini-batch
@@ -50,6 +85,8 @@ def train_minibatch(
     lambda_edge: float = 0.0, # <-- Peso para la loss de aristas
     lambda_l2_att: float = 0.0, # <-- Peso para la regularización L2 de la atención
     suppress_missing_att_warning: bool = False, # <-- Silencia aviso de atenciones ausentes
+    batch_callback: Optional[Callable[..., None]] = None, # <-- Callback para progreso por batch
+    batch_log_every: Optional[int] = None, # <-- Frecuencia de callback por batch
 ) -> Tuple[float, float, float, float]: # Agregado avg_edge_loss
     """
     Entrena una época completa sobre un loader (vecindad) y devuelve:
@@ -72,8 +109,22 @@ def train_minibatch(
         logger.info(f"[train_minibatch] Epoch {epoch}: Iniciando entrenamiento de minibatch.")
 
     progress_bar = tqdm(loader, desc=f"Epoch {epoch} (train)", leave=False)
+    total_batches = len(loader)
+    batch_log_step = None
+    if batch_callback is not None:
+        try:
+            if batch_log_every is None:
+                batch_log_step = max(1, int(total_batches // 50))
+            else:
+                batch_log_step = max(1, int(batch_log_every))
+        except Exception:
+            batch_log_step = 1
     # Acumulador de gradientes
     accumulation_steps = 2
+
+    mem_debug = os.environ.get("GNN_MEM_DEBUG", "").lower() in ("1", "true", "yes", "y")
+    mem_log_every = int(os.environ.get("GNN_MEM_DEBUG_EVERY", "200"))
+    neigh_debug = os.environ.get("GNN_NEIGHBOR_DEBUG", "").lower() in ("1", "true", "yes", "y")
     
     optimizer.zero_grad()
     if DEBUG:
@@ -82,6 +133,22 @@ def train_minibatch(
     for i, batch in enumerate(progress_bar):
         if DEBUG:
             logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Iniciando procesamiento de batch.")
+        if mem_debug and (i % mem_log_every == 0):
+            _mem_snapshot(f"epoch={epoch} batch={i}")
+        if neigh_debug and i == 0:
+            try:
+                pm_batch = batch[node_type].batch_size
+                pm_nodes = batch[node_type].num_nodes
+                edge_counts = {
+                    str(et): int(store.edge_index.size(1))
+                    for et, store in batch.edge_index_dict.items()
+                }
+                logger.info(
+                    f"[NEIGHBOR] epoch={epoch} pm_batch={pm_batch} pm_nodes={pm_nodes} "
+                    f"edge_counts={edge_counts}"
+                )
+            except Exception:
+                pass
         batch = batch.to(device) if device is not None else batch
 
         def compute_loss():
@@ -231,8 +298,32 @@ def train_minibatch(
             'L2_Att': f"{l2_att_loss.item():.4f}" if torch.isfinite(l2_att_loss) else "nan",
             'LR': f"{scheduler.get_last_lr()[0]:.2e}" if scheduler else 'N/A'
         })
+        if batch_callback is not None:
+            is_last = (i + 1) >= total_batches
+            if batch_log_step is None or (i % batch_log_step == 0) or is_last:
+                lr_value = None
+                try:
+                    if scheduler is not None:
+                        lr_value = float(scheduler.get_last_lr()[0])
+                    elif optimizer.param_groups:
+                        lr_value = float(optimizer.param_groups[0].get("lr"))
+                except Exception:
+                    lr_value = None
+                try:
+                    batch_callback(
+                        epoch=int(epoch),
+                        batch_idx=int(i + 1),
+                        batch_total=int(total_batches),
+                        train_loss=float(loss.item()) if torch.isfinite(loss) else None,
+                        train_cls_loss=float(cls_loss.item()) if torch.isfinite(cls_loss) else None,
+                        train_edge_loss=float(edge_loss.item()) if torch.isfinite(edge_loss) else None,
+                        train_l2_att_loss=float(l2_att_loss.item()) if torch.isfinite(l2_att_loss) else None,
+                        lr=lr_value,
+                    )
+                except Exception:
+                    pass
 
-    n_batches = max(1, len(loader))
+    n_batches = max(1, total_batches)
     avg_loss = total_loss / n_batches
     avg_cls_loss = total_cls_loss / n_batches
     avg_edge_loss = total_edge_loss / n_batches

@@ -1,0 +1,157 @@
+\documentclass[11pt, letterpaper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{float}
+
+\geometry{left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+
+\title{\textbf{Documentación Técnica: Proceso de Etiquetado de Accidentes en Modelos GNN}}
+\author{Equipo de Ingeniería de Datos (SUMO)}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Este documento detalla el procedimiento algorítmico y matemático utilizado para la asignación de etiquetas (labels) de accidentes en la generación de grafos para redes neuronales (GNN). Se describen las dos metodologías implementadas: \textit{Snapshot Features} (secuencias temporales con horizonte de predicción) y \textit{Flow Features} (predicción inmediata a 5 minutos), con énfasis en la normalización temporal, ventanas de búsqueda y propagación espacial de etiquetas.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introducción}
+El objetivo del módulo de etiquetado es transformar un registro discreto de eventos (accidentes) en una señal supervisada $y \in \{0, 1\}$ alineada con las características de tráfico (features) de la red vial. Dado que los accidentes son eventos puntuales en el espacio-tiempo $(p_a, t_a)$, y el tráfico se mide en intervalos discretos y ubicaciones fijas, es necesario un proceso de mapeo riguroso.
+
+\section{Definiciones y Normalización}
+
+\subsection{Dominio Temporal Discretizado}
+El tiempo se modela como una secuencia discreta de intervalos de longitud $\Delta t$ (típicamente $\Delta t = 5$ minutos).
+
+Sea $T_{raw}$ una marca de tiempo continua (timestamp). Definimos el tiempo normalizado $ts_{min}$ como el número entero de minutos desde una época de referencia (Unix Epoch).
+
+\begin{equation}
+    ts_{min}(T) = \lfloor \frac{T_{epoch}}{60} \rfloor
+\end{equation}
+
+Para alinear los eventos a la rejilla de los features, definimos una función de discretización $Disc(T, \Delta t)$:
+
+\begin{equation}
+    Disc(T, \Delta t) = \lfloor \frac{ts_{min}(T)}{\Delta t} \rfloor \times \Delta t
+\end{equation}
+
+Esta transformación asegura que tanto los features de flujo como los accidentes se encuentren en el mismo dominio de tiempo entero.
+
+\section{Metodología 1: Snapshot Features (Secuencias Temporales)}
+
+Esta metodología busca predecir la ocurrencia de un accidente en un horizonte futuro $[t_{start}, t_{end}]$, basándose en una secuencia de estados pasados del tráfico.
+
+\subsection{Parámetros de Configuración}
+\begin{itemize}
+    \item $L$: Longitud de la secuencia de entrada (Sequence Length).
+    \item $GB$: Banda de guarda (Guard Band) en minutos. Tiempo muerto entre la última observación y el inicio de la predicción.
+    \item $H$: Horizonte de predicción (Horizon) en minutos. Duración de la ventana de riesgo.
+\end{itemize}
+
+\subsection{Definición de Ventana de Etiquetado}
+Sea $x_i(t)$ el vector de características del nodo (pórtico) $i$ en el tiempo $t$. Queremos asignar una etiqueta $y_i(t)$.
+
+El intervalo de tiempo efectivo para la búsqueda de accidentes, denominado \textit{Ventana Objetivo} $W(t)$, se define como:
+
+\begin{equation}
+    W(t) = [t + GB, \quad t + GB + H]
+\end{equation}
+
+Donde $t$ representa el tiempo final de la secuencia de entrada (último feature observado).
+
+\subsection{Propagación Espacial (Lógica Downstream)}
+Para capturar la congestión que se propaga hacia atrás, la etiqueta del nodo $i$ depende no solo de los accidentes en $i$, sino también de los accidentes en su nodo vecino inmediato aguas abajo, denotado como $ds(i)$.
+
+Sea $A$ el conjunto de todos los accidentes, donde cada accidente $a \in A$ es un par $(p_a, t_a)$ de ubicación y tiempo.
+
+El conjunto de accidentes relevantes para el nodo $i$, denotado como $A_i$, es:
+
+\begin{equation}
+    A_i = \{ (p, t) \in A \mid p = i \lor p = ds(i) \}
+\end{equation}
+
+Es decir, consideramos accidentes en el propio nodo o en el siguiente tramo.
+
+\subsection{Función de Etiquetado}
+La etiqueta binaria $y_i(t)$ se define formalmente como:
+
+\begin{equation}
+    y_i(t) = 
+    \begin{cases} 
+    1 & \text{si } \exists (p, \tau) \in A_i \text{ tal que } \tau \in W(t) \\
+    0 & \text{en otro caso}
+    \end{cases}
+\end{equation}
+
+En términos algorítmicos, esto se implementa mediante búsqueda binaria (`searchsorted`) sobre los tiempos de accidentes ordenados para verificar la intersección con el intervalo $[t+GB, t+GB+H]$.
+
+\subsection{Ejemplo Numérico}
+Configuración: $t=10:00$, $\Delta t=5$, $GB=10$, $H=20$. \textit{(Suponiendo GB incluye el propio dt de predicción si se requiere)}.
+\begin{itemize}
+    \item Último feature observado: 10:00.
+    \item Inicio ventana: $10:00 + 10 = 10:10$.
+    \item Fin ventana: $10:10 + 20 = 10:30$.
+    \item Si ocurre un accidente en $i$ o $ds(i)$ a las 10:15, entonces $y_i(10:00) = 1$.
+\end{itemize}
+
+\section{Metodología 2: Flow Features (5 min / Next-Step)}
+
+Esta metodología es una simplificación diseñada para modelos tabulares o GNNs que predicen estrictamente el siguiente paso temporal ($\Delta t$).
+
+\subsection{Alineación por Desplazamiento (Shift)}
+En lugar de definir ventanas flexibles, se asume que los features en el tiempo $t$ deben predecir el accidente que ocurrirá en $t + \Delta t$.
+
+Para lograr esto mediante un \textit{Join} (cruce) exacto de bases de datos, se transforman los tiempos de los accidentes.
+
+Sea $t_a$ el tiempo real de un accidente.
+\begin{enumerate}
+    \item \textbf{Discretización (Floor):} $t'_{a} = \lfloor t_a / \Delta t \rfloor \times \Delta t$.
+    \item \textbf{Desplazamiento (Shift):} $t''_{a} = t'_{a} - \Delta t$.
+\end{enumerate}
+
+El tiempo $t''_{a}$ representa el "tiempo de los features previos" que deberían haber alertado sobre el accidente.
+
+\subsection{Criterio Espacial}
+En la metodología Flow, la asignación es estrictamente local por defecto (salvo que se pre-procesen features de vecindario).
+
+\begin{equation}
+    A^{Flow}_i = \{ (p, t) \in A \mid p = i \}
+\end{equation}
+
+\subsection{Función de Etiquetado}
+La etiqueta $y_i(t)$ se obtiene mediante la función indicadora:
+
+\begin{equation}
+    y_i(t) = \mathbb{I}\left( \exists (p, \tau) \in A^{Flow}_i \text{ tal que } \tau_{shifted} = t \right)
+\end{equation}
+
+Donde $\tau_{shifted}$ es el resultado de aplicar el paso 1 y 2 al tiempo del accidente.
+
+\section{Consideraciones de Auditoría}
+
+\subsection{Consistencia Topológica}
+Es crítico notar que la lógica \textit{downstream} de la metodología Snapshot depende de la integridad del grafo de pórticos cargado.
+\begin{itemize}
+    \item Si se selecciona un sub-grafo (ej. nodos 2, 3, 5, 7), el cálculo de etiquetas para el nodo borde (7) \textbf{consulta la topología global}.
+    \item Si existe un nodo 8 en la base de datos maestra de pórticos y ocurren accidentes en él, el nodo 7 será etiquetado positivamente, aunque el nodo 8 no tenga features cargados en el modelo.
+\end{itemize}
+
+\subsection{Multiplicidad de Etiquetas}
+Un único accidente real genera múltiples etiquetas positivas en el dataset de entrenamiento:
+\begin{enumerate}
+    \item \textbf{Multiplicidad Espacial:} Afecta al nodo del accidente y al nodo upstream ($2$ nodos afectados).
+    \item \textbf{Multiplicidad Temporal:} Afecta a todos los snapshots cuya ventana futura cubra el instante del accidente ($\approx H / \Delta t$ snapshots).
+\end{enumerate}
+Esta multiplicación es intencional y necesaria para balancear las clases y enseñar al modelo la evolución temporal del riesgo.
+
+\end{document}

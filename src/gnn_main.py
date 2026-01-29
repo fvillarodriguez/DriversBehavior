@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # tensorboard --logdir=Resultados/runs_attention
-import os, math, glob, gc, sys
+import os, math, glob, gc, sys, time, uuid
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1' # --- FIX for MPS FallBck ---
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", # Asignador seguro de CUDA
   "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.8")
@@ -53,7 +53,7 @@ from src.config import (SEED,DT_MINUTES,MAX_EPOCHS,EARLY_STOPPING_PATIENCE,EARLY
                         GRAPHSMOTE_K, PRETRAIN_EDGE_EPOCHS, SMOTE_EVERY_N_EPOCHS,
                         GS_SEED, SAVE_AUG_GRAPH_PATH, DECODER_EPOCHS, F_BETA_THRESHOLD, XAI,
                         EXPORT_LEGACY_GAT_CSV, SAVE_GAT_ALIASES, AUTO_IMGAGN_PRETRAIN,
-                        AUTOCALIBRATE_PROBS)
+                        AUTOCALIBRATE_PROBS, get_auto_device)
 from src.mlp_tabular import run_mlp_tabular_pipeline
 from src.transformer_ts import run_transformer_ts_pipeline
 from src.xgboost import run_xgboost_pipeline
@@ -75,6 +75,30 @@ def _json_safe(obj):
     if isinstance(obj, (np.integer, np.floating)):
         return obj.item()
     return obj
+
+def _json_clean(obj):
+    if isinstance(obj, dict):
+        return {k: _json_clean(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_clean(v) for v in obj]
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+    return obj
+
+def _emit_training_event(event: str, run_id: str, **payload) -> None:
+    try:
+        data = {
+            "scope": "gnn_training",
+            "event": event,
+            "run_id": run_id,
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }
+        data.update(payload)
+        data = _json_clean(_json_safe(data))
+        logger.info(json.dumps(data))
+    except Exception:
+        pass
 
 # --- Helpers: model path discovery with variant tags ---
 def _has_imgagn(loaded_obj) -> bool:
@@ -1134,7 +1158,18 @@ def pick_threshold_from_val(y_true_val, y_prob1_val, *, mode="fbeta", beta=0.5, 
     return tau, {"precision": float(prec_[i]), "recall": float(rec_[i]), "fbeta": float(fbeta[i])}
 
 @torch.no_grad()
-def test(model, data, batch_size=BATCH_SIZE, node_type='pm', threshold=None, calibration_model=None):
+def test(
+    model,
+    data,
+    batch_size=BATCH_SIZE,
+    node_type='pm',
+    threshold=None,
+    calibration_model=None,
+    masks: Optional[List[str]] = None,
+    node_indices: Optional[torch.Tensor] = None,
+    mask_name: str = "subset_mask",
+    num_neighbors=None,
+):
     """
     Evalúa el rendimiento de un modelo usando mini-batches para evitar OOM.
     Detecta dinámicamente las máscaras disponibles y calcula métricas adicionales.
@@ -1149,27 +1184,49 @@ def test(model, data, batch_size=BATCH_SIZE, node_type='pm', threshold=None, cal
     labels = [0, 1]
     target_names = ['No Accidente (0)', 'Accidente (1)']
 
-    # Mover datos a la CPU para NeighborLoader
-    data_cpu = data.cpu()
+    # Mover datos a la CPU para NeighborLoader (evita copia si ya está en CPU)
+    data_cpu = data
+    try:
+        sample_tensor = next(iter(data.x_dict.values()))
+        if sample_tensor.device.type != "cpu":
+            data_cpu = data.cpu()
+    except Exception:
+        data_cpu = data.cpu()
 
     temporal_module = getattr(model, 'temporal_head', None)
     if temporal_module is not None:
         temporal_module.eval()
         temporal_module.reset_cache()
 
-    # Detectar máscaras dinámicamente (ej. train_mask, val_mask, test_mask)
-    available_masks = [key for key in data_cpu[node_type].keys() if key.endswith('_mask')]
+    if node_indices is not None:
+        if not torch.is_tensor(node_indices):
+            node_indices = torch.as_tensor(node_indices, dtype=torch.long)
+        node_indices = node_indices.view(-1).cpu()
+        if node_indices.numel() == 0:
+            return results
+        eval_items = [(mask_name, node_indices)]
+    else:
+        # Detectar máscaras dinámicamente (ej. train_mask, val_mask, test_mask)
+        available_masks = [
+            key for key in data_cpu[node_type].keys() if key.endswith('_mask')
+        ]
+        if masks is not None:
+            mask_set = set(masks)
+            available_masks = [m for m in masks if m in mask_set and m in available_masks]
+        eval_items = []
+        for mname in available_masks:
+            mask = data_cpu[node_type][mname]
+            if mask.sum() == 0:
+                logger.info(f"Skipping '{mname}' as it is empty.")
+                continue
+            idx = mask.nonzero(as_tuple=False).view(-1)
+            eval_items.append((mname, idx))
 
-    for mask_name in available_masks:
-        mask = data_cpu[node_type][mask_name]
-        if mask.sum() == 0:
-            logger.info(f"Skipping '{mask_name}' as it is empty.")
-            continue
-
-        node_indices = mask.nonzero(as_tuple=False).view(-1)
-        
+    for mask_name, node_indices in eval_items:
         num_neighbors_cfg = _resolve_num_neighbors(
-            NUM_NEIGHBORS, NUM_NEIGHBORS, data_cpu.edge_types
+            num_neighbors if num_neighbors is not None else NUM_NEIGHBORS,
+            NUM_NEIGHBORS,
+            data_cpu.edge_types,
         )
         loader = NeighborLoader(
             data_cpu,
@@ -1308,20 +1365,38 @@ def print_evaluation_report(results, dataset_name):
     print(cm)    
     print("--------------------------------------------------")
 
-def _calculate_graph_hash(graph_filename):
+def _calculate_graph_hash(graph_filename=None, graph_path=None):
     """Calcula el hash SHA256 del contenido de un archivo de grafo."""
-    if not graph_filename:
-        logger.error("No se proporcionó un nombre de archivo de grafo para calcular el hash.")
+    if not graph_filename and not graph_path:
+        logger.info("No se proporcionó ruta/nombre de grafo para calcular el hash.")
         return None
 
-    graph_path = os.path.join(RESULTADOS_DIR, graph_filename)
-    if not os.path.exists(graph_path):
-        logger.warning(f"No se pudo encontrar el archivo del grafo en {graph_path} para calcular el hash.")
+    candidates = []
+    if graph_path:
+        candidates.append(graph_path)
+    if graph_filename:
+        candidates.append(graph_filename)
+        base_name = os.path.basename(graph_filename)
+        candidates.append(os.path.join(RESULTADOS_DIR, base_name))
+        if graph_filename != base_name:
+            candidates.append(os.path.join(RESULTADOS_DIR, graph_filename))
+
+    resolved_path = None
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            resolved_path = cand
+            break
+
+    if not resolved_path:
+        logger.info(
+            "No se encontró el archivo del grafo para calcular el hash "
+            f"(filename={graph_filename}). Se omite el hash."
+        )
         return None
     
     hasher = hashlib.sha256()
     try:
-        with open(graph_path, 'rb') as f:
+        with open(resolved_path, 'rb') as f:
             while chunk := f.read(8192):
                 hasher.update(chunk)
         return hasher.hexdigest()
@@ -1341,6 +1416,7 @@ def run_gat_training(
     max_epochs: Optional[int] = None,
     smote_num_neighbors: Optional[object] = None,
     optimizer_overrides: Optional[dict] = None,
+    train_decoders_only: bool = False,
 ):
     """
     Entrenamiento GAT completo con:
@@ -1373,10 +1449,22 @@ def run_gat_training(
         use_graphsmote = use_graphsmote_input in ('s', 'si', 'y', 'yes')
     else:
         use_graphsmote = bool(force_use_graphsmote)
+
+    # Detect if graph is already balanced (synthetic nodes present)
+    graph_has_synthetics = False
+    try:
+        if "pm" in data.node_types and hasattr(data["pm"], "is_synthetic"):
+            graph_has_synthetics = bool(data["pm"].is_synthetic.sum().item() > 0)
+    except Exception:
+        graph_has_synthetics = False
+    skip_graphsmote_augment = bool(use_graphsmote and graph_has_synthetics and not train_decoders_only)
+    enable_graphsmote_augment = bool(use_graphsmote and not skip_graphsmote_augment)
     
     # GRAPHSMOTE_MODE ahora se controla desde config.py, pero la activación general sigue aquí
     if use_graphsmote:
         logger.info(f"GraphSMOTE habilitado para este entrenamiento (Modo: {GRAPHSMOTE_MODE}).")
+        if skip_graphsmote_augment:
+            logger.info("Grafo ya balanceado (nodos sinteticos detectados). Se omite la aumentacion GraphSMOTE.")
     else:
         logger.info("GraphSMOTE deshabilitado para este entrenamiento.")
     if purpose:
@@ -1529,8 +1617,15 @@ def run_gat_training(
     # Rutas y directorios por modelo (usar mismo ID para z2x + modelo)
     tag_suffix = _model_tag_suffix(use_graphsmote, loaded_obj)
     ts_stamp_save = datetime.now().strftime('%Y%m%d_%H%M%S')
-    graph_hash = _calculate_graph_hash(loaded_obj.get('filename'))
+    graph_hash = _calculate_graph_hash(
+        loaded_obj.get('filename'),
+        loaded_obj.get('graph_path') or loaded_obj.get('path'),
+    )
     hash_tag8 = f"_{graph_hash[:8]}" if graph_hash else ""
+    run_id = f"gnn_{ts_stamp_save}"
+    if graph_hash:
+        run_id += f"_{graph_hash[:8]}"
+    run_id += f"_{uuid.uuid4().hex[:6]}"
     
     if use_graphsmote:
         # User requested specific naming for GraphSMOTE models
@@ -1561,7 +1656,7 @@ def run_gat_training(
 
     # --- Pre-entrenamiento de decodificadores si se usa GraphSMOTE ---
     z2x_decoders = None
-    if use_graphsmote:
+    if use_graphsmote and enable_graphsmote_augment:
         logger.info("Entrenando decodificadores z->x para la aumentación...")
         model.use_checkpointing = False
         z2x_decoders = train_z2x_decoders(
@@ -1571,8 +1666,55 @@ def run_gat_training(
             epochs=DECODER_EPOCHS,
             num_neighbors=smote_num_neighbors,
             save_dir=z2x_run_dir,
+            progress_callback=progress_callback,
         )
         model.use_checkpointing = True
+    elif use_graphsmote and not enable_graphsmote_augment:
+        z2x_decoders = None
+
+    if train_decoders_only:
+        if use_graphsmote:
+            logger.info("✅ Entrenamiento de decodificadores (z->x) finalizado correctamente.")
+            logger.info("El grafo aumentado ya está listo en memoria/disco para balanceo.")
+            try:
+                # Guardar modelo embeddings para reutilizar en GraphSMOTE (cargar existente)
+                torch.save(model.state_dict(), best_model_path_unique)
+                if SAVE_GAT_ALIASES:
+                    torch.save(model.state_dict(), best_model_path)
+                meta = dict(best_params)
+                meta.update(
+                    {
+                        "best_val_f1": None,
+                        "best_val_auprc": None,
+                        "best_epoch": 0,
+                        "use_graphsmote": True,
+                        "graph_hash": graph_hash,
+                        "git_commit": _get_repo_version(),
+                        "purpose": "GraphSMOTE embeddings (decoders only)",
+                        "train_decoders_only": True,
+                        "num_neighbors_effective": smote_num_neighbors,
+                        "out_channels": int(num_classes),
+                        "in_channels": int(in_channels),
+                        "edge_feature_dim": int(edge_feature_dim),
+                    }
+                )
+                meta = _json_safe(meta)
+                meta_path_unique = os.path.splitext(best_model_path_unique)[0] + "_hparams.json"
+                import json as _json
+                with open(meta_path_unique, 'w') as f:
+                    _json.dump(meta, f)
+                if SAVE_GAT_ALIASES:
+                    try:
+                        meta_path = os.path.splitext(best_model_path)[0] + "_hparams.json"
+                        with open(meta_path, 'w') as f:
+                            _json.dump(meta, f)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"No se pudo guardar modelo embeddings: {e}")
+        else:
+            logger.warning("⚠️ train_decoders_only=True pero GraphSMOTE no está habilitado.")
+        return
 
     # Edge generator
     z_dim_dict = {ntype: int(best_params['hidden_channels']) * int(best_params['num_heads']) for ntype in data.node_types}
@@ -1623,7 +1765,7 @@ def run_gat_training(
         criterion = torch.nn.CrossEntropyLoss(weight=weight.to(device) if weight is not None else None)
 
     # 7) Pre-entrenamiento del generador de aristas (si aplica)
-    if use_graphsmote and edge_gen is not None and PRETRAIN_EDGE_EPOCHS > 0:
+    if enable_graphsmote_augment and use_graphsmote and edge_gen is not None and PRETRAIN_EDGE_EPOCHS > 0:
         logger.info(f"Pre-entrenando el generador de aristas por {PRETRAIN_EDGE_EPOCHS} épocas...")
         pretrain_edge_generator(
             encoder=model,
@@ -1643,34 +1785,41 @@ def run_gat_training(
     smote_every_override = max(1, _safe_cast(best_params.get('smote_every_n_epochs'), int, SMOTE_EVERY_N_EPOCHS))
 
     if use_graphsmote and GRAPHSMOTE_MODE == 'offline':
-        logger.info("Modo Offline: Aumentando el grafo una sola vez.")
-        model.use_checkpointing = False
-        aug_data, _ = augment_graph_offline_once(
-            model, data, device,
-            z2x_decoders=z2x_decoders,
-            target_pos_ratio=target_pos_ratio_override,
-            k=GRAPHSMOTE_K,
-            edge_gen=edge_gen,
-            save_path=SAVE_AUG_GRAPH_PATH,
-            seed=GS_SEED,
-            num_neighbors=smote_num_neighbors,
-        )
-        model.use_checkpointing = True
-        train_graph = aug_data.to(device)
-        base_graph = data  # Para evaluación
-        if writer and hasattr(train_graph['pm'], 'is_synthetic'):
-            try:
-                synth_count = int(train_graph['pm'].is_synthetic.sum().item())
-                writer.add_scalar('GraphSMOTE/SyntheticNodes', synth_count, 0)
-            except Exception:
-                pass
+        if enable_graphsmote_augment:
+            logger.info("Modo Offline: Aumentando el grafo una sola vez.")
+            model.use_checkpointing = False
+            aug_data, _ = augment_graph_offline_once(
+                model, data, device,
+                z2x_decoders=z2x_decoders,
+                target_pos_ratio=target_pos_ratio_override,
+                k=GRAPHSMOTE_K,
+                edge_gen=edge_gen,
+                save_path=SAVE_AUG_GRAPH_PATH,
+                seed=GS_SEED,
+                num_neighbors=smote_num_neighbors,
+            )
+            model.use_checkpointing = True
+            train_graph = aug_data.to(device)
+            base_graph = data  # Para evaluación
+            if writer and hasattr(train_graph['pm'], 'is_synthetic'):
+                try:
+                    synth_count = int(train_graph['pm'].is_synthetic.sum().item())
+                    writer.add_scalar('GraphSMOTE/SyntheticNodes', synth_count, 0)
+                except Exception:
+                    pass
+        else:
+            logger.info("Modo Offline: Grafo ya balanceado, se usa directamente sin re-aumentar.")
+            train_graph = data
+            base_graph = data
     elif use_graphsmote and GRAPHSMOTE_MODE == 'online':
         logger.info("Modo Online: El grafo se refrescará periódicamente.")
         base_graph = data
         # La aumentación inicial se hace dentro del loop
         train_graph = base_graph 
     else:
-        train_graph = data.to(device)
+        # Mantener el grafo en CPU para minimizar uso de memoria en modo sin balanceo.
+        # NeighborLoader mueve los batches al device dentro de train_minibatch/test.
+        train_graph = data
         base_graph = data
 
     # 9) Loader y Scheduler
@@ -1751,6 +1900,21 @@ def run_gat_training(
     train_loader = rebuild_train_loader(train_graph)
     
     max_epochs = int(max_epochs) if max_epochs is not None else int(MAX_EPOCHS)
+    _emit_training_event(
+        "train_start",
+        run_id,
+        total=max_epochs,
+        device=str(device),
+        purpose=purpose or (loaded_obj.get("purpose") if isinstance(loaded_obj, dict) else None),
+        use_graphsmote=bool(use_graphsmote),
+        graphsmote_mode=str(GRAPHSMOTE_MODE),
+        train_decoders_only=bool(train_decoders_only),
+        graph_hash=graph_hash,
+        batch_size=int(batch_size_hp),
+        num_neighbors=loader_num_neighbors,
+        smote_every_n_epochs=int(smote_every_override),
+        target_pos_ratio=float(target_pos_ratio_override),
+    )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=float(best_params['lr']),
@@ -1783,6 +1947,16 @@ def run_gat_training(
             )
         except Exception:
             pass
+    batch_event_cb = None
+    if progress_callback is not None:
+        def _batch_event_cb(**payload):
+            _emit_training_event(
+                "train_batch",
+                run_id,
+                total=int(max_epochs),
+                **payload,
+            )
+        batch_event_cb = _batch_event_cb
     # best_model_path y best_model_path_unique ya definidos arriba
     
     # Automatic Mixed Precision (AMP)
@@ -1807,14 +1981,16 @@ def run_gat_training(
         logger.info("XAI=0 (desactivado): no se capturarán atenciones. Se omitirá la regularización L2 de atenciones (lambda_l2_att>0) y se silenciarán avisos por época.")
         suppress_missing_att_warning = True
 
+    stopped_early = False
     for epoch in range(1, max_epochs + 1):
+        epoch_start_time = time.time()
         if use_undersampling:
             strategy_now = undersampling_strategy
             if undersampling_strategy == 'hard' and epoch <= hard_sampling_warmup:
                 strategy_now = 'random'
             train_loader = rebuild_train_loader(train_graph, strategy_override=strategy_now)
         # Refresco para modo ONLINE
-        if use_graphsmote and GRAPHSMOTE_MODE == 'online' and epoch % smote_every_override == 0:
+        if enable_graphsmote_augment and use_graphsmote and GRAPHSMOTE_MODE == 'online' and epoch % smote_every_override == 0:
             logger.info(f"Epoch {epoch}: Refrescando nodos sintéticos (Online Mode)...")
             model.use_checkpointing = False
             aug_data, _ = refresh_synthetics_online(
@@ -1858,32 +2034,47 @@ def run_gat_training(
         lambda_edge = float(best_params.get('lambda_edge', 1e-6))
         lambda_l2_att = float(best_params.get('lambda_l2_att', 0.0))
         
-        loss, _, _, _ = train_minibatch(model, train_loader, optimizer, criterion,
+        loss, cls_loss, edge_loss, l2_att_loss = train_minibatch(model, train_loader, optimizer, criterion,
                                   grad_clip_value=float(best_params.get('grad_clip', 1.0)),
                                   device=device, use_amp=use_amp, scaler=scaler,
                                   scheduler=scheduler, writer=writer, epoch=epoch,
                                   lambda_H=current_lambda_H, node_type='pm',
                                   edge_gen=edge_gen, lambda_edge=lambda_edge,
                                   lambda_l2_att=lambda_l2_att,
-                                  suppress_missing_att_warning=suppress_missing_att_warning)
+                                  suppress_missing_att_warning=suppress_missing_att_warning,
+                                  batch_callback=batch_event_cb)
         writer.add_scalar("Loss/train", loss, epoch)
 
         # Validación (siempre sobre el grafo original)
         model.use_checkpointing = False
-        val_res = test(model, base_graph, node_type='pm', batch_size=batch_size_hp)
+        val_key = 'val_mask'
+        val_res = test(model, base_graph, node_type='pm', batch_size=batch_size_hp, masks=[val_key])
+        if not val_res:
+            val_key = 'train_mask'
+            val_res = test(model, base_graph, node_type='pm', batch_size=batch_size_hp, masks=[val_key])
         if temporal_module is not None:
             temporal_module.train()
         model.use_checkpointing = True
         
         val_f1 = 0.0
-        if val_res and 'val_mask' in val_res:
-            y_true_val = val_res['val_mask']['true'].numpy().ravel()
-            y_prob1_val = val_res['val_mask']['probs'][:, 1].numpy().ravel()
+        val_f1_pos = None
+        val_f1_macro = None
+        val_precision_pos = None
+        val_recall_pos = None
+        val_accuracy = None
+        val_auc = None
+        val_auprc = None
+        val_mcc = None
+        val_tau = None
+        if val_res and val_key in val_res:
+            y_true_val = val_res[val_key]['true'].numpy().ravel()
+            y_prob1_val = val_res[val_key]['probs'][:, 1].numpy().ravel()
             
             if len(np.unique(y_true_val)) > 1:
                 # Usar beta=1.0 para F1-score, consistente con la métrica de early stopping
                 tau, P, R, f1_score = pick_tau_fbeta(y_true_val, y_prob1_val, beta=1.0)
                 val_f1 = f1_score
+                val_tau = tau
                 if writer:
                     try:
                         writer.add_scalar('Calibration/Val_tau', tau, epoch)
@@ -1891,27 +2082,42 @@ def run_gat_training(
                         pass
             else:
                 # Fallback si solo hay una clase en el conjunto de validación
-                report = val_res['val_mask']['report']
+                report = val_res[val_key].get('report', {})
                 val_f1 = report.get('Accidente (1)', {}).get('f1-score', 0.0)
+
+            val_report = val_res[val_key].get('report', {})
+            val_f1_pos = val_report.get('Accidente (1)', {}).get('f1-score')
+            val_f1_macro = val_report.get('macro avg', {}).get('f1-score')
+            val_precision_pos = val_report.get('Accidente (1)', {}).get('precision')
+            val_recall_pos = val_report.get('Accidente (1)', {}).get('recall')
+            val_accuracy = val_report.get('accuracy')
+            val_auc = val_res[val_key].get('auc')
+            val_auprc = val_res[val_key].get('auprc')
+            val_mcc = val_res[val_key].get('mcc')
 
             if writer:
                 try:
-                    val_report = val_res['val_mask']['report']
                     writer.add_scalar('Metrics/Val_F1_candidate', val_f1, epoch)
-                    writer.add_scalar('Metrics/Val_F1_positive', val_report['Accidente (1)']['f1-score'], epoch)
-                    writer.add_scalar('Metrics/Val_F1_macro', val_report['macro avg']['f1-score'], epoch)
-                    writer.add_scalar('Metrics/Val_Precision_positive', val_report['Accidente (1)']['precision'], epoch)
-                    writer.add_scalar('Metrics/Val_Recall_positive', val_report['Accidente (1)']['recall'], epoch)
-                    writer.add_scalar('Metrics/Val_AUPRC', val_res['val_mask'].get('auprc') or 0.0, epoch)
-                    writer.add_scalar('Metrics/Val_AUC', val_res['val_mask'].get('auc') or 0.0, epoch)
+                    if val_f1_pos is not None:
+                        writer.add_scalar('Metrics/Val_F1_positive', val_f1_pos, epoch)
+                    if val_f1_macro is not None:
+                        writer.add_scalar('Metrics/Val_F1_macro', val_f1_macro, epoch)
+                    if val_precision_pos is not None:
+                        writer.add_scalar('Metrics/Val_Precision_positive', val_precision_pos, epoch)
+                    if val_recall_pos is not None:
+                        writer.add_scalar('Metrics/Val_Recall_positive', val_recall_pos, epoch)
+                    writer.add_scalar('Metrics/Val_AUPRC', val_auprc or 0.0, epoch)
+                    writer.add_scalar('Metrics/Val_AUC', val_auc or 0.0, epoch)
                 except Exception:
                     pass
 
+        is_best = False
         if (val_f1 - best_val_f1) > min_delta:
             best_val_f1 = val_f1
-            best_val_auprc = val_res['val_mask'].get('auprc', 0.0) if val_res else 0.0
+            best_val_auprc = val_res[val_key].get('auprc', 0.0) if val_res else 0.0
             best_epoch = epoch
             patience_counter = 0
+            is_best = True
             # Guardar modelo: copia única y alias estable
             try:
                 # Copia única (con timestamp/hash)
@@ -1944,6 +2150,8 @@ def run_gat_training(
                     'smote_every_n_epochs_used': int(smote_every_override),
                     'num_neighbors_effective': loader_num_neighbors,
                     'out_channels': int(num_classes),
+                    'in_channels': int(in_channels),
+                    'edge_feature_dim': int(edge_feature_dim),
                 })
                 meta = _json_safe(meta)
                 # Para la copia única
@@ -1984,6 +2192,58 @@ def run_gat_training(
             except Exception:
                 pass
 
+        current_lr = None
+        try:
+            if scheduler is not None:
+                current_lr = float(scheduler.get_last_lr()[0])
+            else:
+                current_lr = float(optimizer.param_groups[0].get("lr"))
+        except Exception:
+            current_lr = None
+
+        synth_count = None
+        try:
+            if hasattr(train_graph['pm'], 'is_synthetic'):
+                synth_count = int(train_graph['pm'].is_synthetic.sum().item())
+        except Exception:
+            synth_count = None
+
+        epoch_time_sec = time.time() - epoch_start_time
+        _emit_training_event(
+            "epoch",
+            run_id,
+            epoch=int(epoch),
+            total=int(max_epochs),
+            train_loss=loss,
+            train_cls_loss=cls_loss,
+            train_edge_loss=edge_loss,
+            train_l2_att_loss=l2_att_loss,
+            val_f1=val_f1,
+            val_f1_pos=val_f1_pos,
+            val_f1_macro=val_f1_macro,
+            val_precision_pos=val_precision_pos,
+            val_recall_pos=val_recall_pos,
+            val_accuracy=val_accuracy,
+            val_auc=val_auc,
+            val_auprc=val_auprc,
+            val_mcc=val_mcc,
+            val_tau=val_tau,
+            val_mask=val_key,
+            best_val_f1=best_val_f1,
+            best_val_auprc=best_val_auprc,
+            best_epoch=best_epoch,
+            is_best=is_best,
+            patience=patience,
+            patience_counter=patience_counter,
+            early_stop_enabled=early_stop_enabled,
+            lr=current_lr,
+            lambda_H=current_lambda_H,
+            lambda_edge=lambda_edge,
+            lambda_l2_att=lambda_l2_att,
+            smote_synth_count=synth_count,
+            epoch_time_sec=epoch_time_sec,
+        )
+
         if early_stop_enabled and patience_counter >= patience:
             logger.info(
                 "Early stopping at epoch %d (patience=%d, min_delta=%g).",
@@ -1991,9 +2251,30 @@ def run_gat_training(
                 patience,
                 min_delta,
             )
+            stopped_early = True
             break
+
+        # Limpieza de memoria por epoch (útil en grafos grandes)
+        try:
+            del val_res
+        except Exception:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     writer.close()
+    epochs_run = int(epoch) if "epoch" in locals() else 0
+    _emit_training_event(
+        "train_end",
+        run_id,
+        epochs_run=epochs_run,
+        total=int(max_epochs),
+        best_val_f1=best_val_f1,
+        best_val_auprc=best_val_auprc,
+        best_epoch=best_epoch,
+        stopped_early=stopped_early,
+    )
     logger.info(f"Training finished. Best F1: {best_val_f1:.4f} at epoch {best_epoch}.")
 
 def pick_tau_fbeta(y_true, y_prob, beta=0.5):

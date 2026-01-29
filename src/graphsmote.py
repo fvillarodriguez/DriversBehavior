@@ -63,6 +63,46 @@ def _safe_clean_edges(store, num_src, num_dst):
         )
         delattr(store, 'edge_attr')
 
+def _resolve_delta_feature_idx(data_or_store, device=None):
+    """Resolve delta feature indices for edge_attr deltas."""
+    idx = getattr(data_or_store, "delta_feature_idx", None)
+    if idx is None:
+        return None
+    if not torch.is_tensor(idx):
+        try:
+            idx = torch.tensor(idx, dtype=torch.long)
+        except Exception:
+            return None
+    if idx.numel() == 0:
+        return None
+    if device is not None:
+        try:
+            idx = idx.to(device)
+        except Exception:
+            pass
+    return idx
+
+def _delta_from_node_features(src_x: torch.Tensor, dst_x: torch.Tensor, delta_idx: Optional[torch.Tensor]):
+    """Compute dst_x - src_x using delta feature indices if provided."""
+    if src_x.dim() == 1:
+        src_x = src_x.view(-1, 1)
+    if dst_x.dim() == 1:
+        dst_x = dst_x.view(-1, 1)
+    if delta_idx is None:
+        return dst_x - src_x
+    try:
+        if delta_idx.device != src_x.device:
+            delta_idx = delta_idx.to(src_x.device)
+        if delta_idx.dim() == 0:
+            delta_idx = delta_idx.view(1)
+        max_dim = src_x.size(1)
+        delta_idx = delta_idx[(delta_idx >= 0) & (delta_idx < max_dim)]
+        if delta_idx.numel() == 0:
+            return dst_x - src_x
+        return dst_x.index_select(1, delta_idx) - src_x.index_select(1, delta_idx)
+    except Exception:
+        return dst_x - src_x
+
 # ============================================================
 # 1) Edge generator bilineal por relación
 # ============================================================
@@ -81,7 +121,16 @@ class RelEdgeGen(torch.nn.Module):
         S = self.S[key]
         return (z_src @ S @ z_dst.t())   # [N_src, N_dst]
 
-    def predict(self, z_src, z_dst, key, topk=None, tau=None, batch_size=BATCH_SIZE):
+    def predict(
+        self,
+        z_src,
+        z_dst,
+        key,
+        topk=None,
+        tau=None,
+        batch_size=BATCH_SIZE,
+        force_cpu: Optional[bool] = None,
+    ):
         if topk is None:
             # Original behavior for non-topk cases (might still cause OOM if z_src is large)
             logits = self.score(z_src, z_dst, key)
@@ -96,7 +145,10 @@ class RelEdgeGen(torch.nn.Module):
         device = z_src.device
         is_cuda = device.type == 'cuda'
         
-        compute_device = 'cpu' if 'mps' in str(device) else device
+        if force_cpu is None:
+            compute_device = 'cpu' if 'mps' in str(device) else device
+        else:
+            compute_device = torch.device('cpu') if force_cpu else device
         
         z_src_compute = z_src.to(compute_device)
         z_dst_compute = z_dst.to(compute_device)
@@ -183,7 +235,13 @@ def compute_epoch_embeddings(model, data):
     return z_dict
 
 @torch.no_grad()
-def get_embeddings_minibatch(model, data, *, num_neighbors=NUM_NEIGHBORS):
+def get_embeddings_minibatch(
+    model,
+    data,
+    *,
+    num_neighbors=NUM_NEIGHBORS,
+    store_on_cpu: bool = True,
+):
     model.eval()
     device = next(model.parameters()).device
     data_cpu = data.cpu()
@@ -215,7 +273,10 @@ def get_embeddings_minibatch(model, data, *, num_neighbors=NUM_NEIGHBORS):
             
             if node_type in batch_z_dict:
                 # We are only interested in the embeddings of the input nodes of the batch, not the neighbors
-                z_dict[node_type].append(batch_z_dict[node_type][:batch[node_type].batch_size].cpu())
+                z_batch = batch_z_dict[node_type][:batch[node_type].batch_size]
+                if store_on_cpu:
+                    z_batch = z_batch.cpu()
+                z_dict[node_type].append(z_batch)
                 if DEBUG:
                     logger.info(f"DEBUG: get_embeddings_minibatch - batch_z_dict[{node_type}].shape={batch_z_dict[node_type].shape}")
                 
@@ -227,7 +288,8 @@ def get_embeddings_minibatch(model, data, *, num_neighbors=NUM_NEIGHBORS):
         else:
             # If no embeddings were generated, create an empty tensor with the correct shape
             out_channels = model.out_channels if hasattr(model, 'out_channels') else (model.hidden_channels * model.num_heads)
-            z_dict[node_type] = torch.empty(0, out_channels, device='cpu')
+            empty_device = torch.device("cpu") if store_on_cpu else device
+            z_dict[node_type] = torch.empty(0, out_channels, device=empty_device)
             
     return z_dict
 
@@ -511,7 +573,117 @@ def load_z2x_decoders(model, data, node_types=None, device=None,
 # ============================================================
 # 4) SMOTE en espacio z (corregido: semillas NumPy + random)
 # ============================================================
-def smote_nodes(z, y, minority_class=1, k=5, n_samples=100, random_state=SEED):
+def _knn_torch_chunked_device(
+    X: torch.Tensor,
+    k: int,
+    *,
+    metric: str = "cosine",
+    q_block: int = 2048,
+    r_block: int = 2048,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Chunked kNN on the same device as X (GPU/MPS/CPU)."""
+    assert metric in {"cosine", "euclidean"}
+    Xd = X.detach().contiguous()
+    N, _ = Xd.shape
+    k1 = k + 1
+
+    top_val = torch.full((N, k1), float("-inf"), device=Xd.device)
+    top_idx = torch.full((N, k1), -1, dtype=torch.long, device=Xd.device)
+
+    if metric == "cosine":
+        Xn = torch.nn.functional.normalize(Xd, p=2.0, dim=1)
+        for q0 in range(0, N, q_block):
+            q1 = min(N, q0 + q_block)
+            Q = Xn[q0:q1]
+            cur_val = top_val[q0:q1]
+            cur_idx = top_idx[q0:q1]
+            for r0 in range(0, N, r_block):
+                r1 = min(N, r0 + r_block)
+                R = Xn[r0:r1]
+                sim = Q @ R.T
+                cand_val = torch.cat([cur_val, sim], dim=1)
+                cand_idx = torch.cat(
+                    [cur_idx, torch.arange(r0, r1, device=Xd.device).expand(q1 - q0, -1)],
+                    dim=1,
+                )
+                new_val, ord_idx = torch.topk(cand_val, k1, largest=True, dim=1)
+                cur_val = new_val
+                cur_idx = torch.gather(cand_idx, 1, ord_idx)
+                del sim, cand_val, cand_idx, new_val, ord_idx
+            top_val[q0:q1] = cur_val
+            top_idx[q0:q1] = cur_idx
+        row_ids = torch.arange(N, device=Xd.device).view(-1, 1).expand(-1, k1)
+        cur_val = top_val.clone()
+        cur_val[top_idx == row_ids] = float("-inf")
+        final_val, ord_idx = torch.topk(cur_val, k, largest=True, dim=1)
+        final_idx = torch.gather(top_idx, 1, ord_idx)
+        dist = 1.0 - final_val.clamp(-1, 1)
+        return final_idx.long(), dist.float()
+
+    X2 = (Xd * Xd).sum(dim=1, keepdim=True)
+    for q0 in range(0, N, q_block):
+        q1 = min(N, q0 + q_block)
+        Q = Xd[q0:q1]
+        Q2 = X2[q0:q1]
+        cur_val = top_val[q0:q1]
+        cur_idx = top_idx[q0:q1]
+        for r0 in range(0, N, r_block):
+            r1 = min(N, r0 + r_block)
+            R = Xd[r0:r1]
+            R2 = X2[r0:r1].T
+            d2 = Q2 + R2 - 2.0 * (Q @ R.T)
+            score = -d2
+            cand_val = torch.cat([cur_val, score], dim=1)
+            cand_idx = torch.cat(
+                [cur_idx, torch.arange(r0, r1, device=Xd.device).expand(q1 - q0, -1)],
+                dim=1,
+            )
+            new_val, ord_idx = torch.topk(cand_val, k1, largest=True, dim=1)
+            cur_val = new_val
+            cur_idx = torch.gather(cand_idx, 1, ord_idx)
+            del d2, score, cand_val, cand_idx, new_val, ord_idx
+        top_val[q0:q1] = cur_val
+        top_idx[q0:q1] = cur_idx
+    row_ids = torch.arange(N, device=Xd.device).view(-1, 1).expand(-1, k1)
+    cur_val = top_val.clone()
+    cur_val[top_idx == row_ids] = float("-inf")
+    final_val, ord_idx = torch.topk(cur_val, k, largest=True, dim=1)
+    final_idx = torch.gather(top_idx, 1, ord_idx)
+    dist2 = -final_val
+    dist = torch.sqrt(torch.clamp_min(dist2, 0.0))
+    return final_idx.long(), dist.float()
+
+
+def _simple_smote_from_knn_device(
+    pos_emb: torch.Tensor,
+    idx: torch.Tensor,
+    num_new: int,
+    *,
+    alpha: float = 0.5,
+) -> torch.Tensor:
+    N, d = pos_emb.shape
+    if num_new <= 0:
+        return torch.empty((0, d), dtype=pos_emb.dtype, device=pos_emb.device)
+    base = torch.randint(0, N, (num_new,), device=pos_emb.device)
+    nbrs = torch.randint(0, idx.size(1), (num_new,), device=pos_emb.device)
+    j = idx[base, nbrs]
+    X = pos_emb.detach()
+    synth = (1 - alpha) * X[base] + alpha * X[j]
+    return synth
+
+
+def smote_nodes(
+    z,
+    y,
+    minority_class=1,
+    k=5,
+    n_samples=100,
+    random_state=SEED,
+    *,
+    force_cpu: bool = True,
+    gpu_knn_max_n: int = 5000,
+    gpu_knn_block: int = 2048,
+):
     if random_state is not None:
         torch.manual_seed(random_state)
         np.random.seed(random_state)
@@ -524,26 +696,47 @@ def smote_nodes(z, y, minority_class=1, k=5, n_samples=100, random_state=SEED):
         logger.warning(f"Warning: # of minority samples ({pos_emb.shape[0]}) < k ({k}). Cannot apply SMOTE.")
         return torch.empty(0, pos_emb.shape[1], device=z.device), torch.empty(0, dtype=torch.long, device=y.device), None
 
-    # --- CPU/Chunking/Caching k-NN ---
+    # --- k-NN (CPU cache or device, depending on toggle) ---
     extra = {
-        "dataset": "unknown", # Debería ser reemplazado por un nombre de dataset real si está disponible
+        "dataset": "unknown",  # placeholder for caching signature
         "seed": int(random_state if random_state is not None else 0),
-        "version": "v1" 
+        "version": "v1",
     }
     cache_dir = os.path.join(".", "cache", "graphsmote")
-    
-    idx, dist = get_knn_cached(
-        pos_emb=pos_emb.to('cpu'), 
-        k=k, 
-        cache_dir=cache_dir, 
-        extra_params=extra, 
-        metric="cosine"
-    )
-    # --- Fin k-NN ---
 
-    # Generar sintéticos
-    synthetic_features = simple_smote_from_knn(pos_emb.to("cpu"), idx, num_new=n_samples, alpha=0.5)
-    synthetic_features = synthetic_features.to(device=z.device, dtype=z.dtype)
+    use_device_knn = (
+        (not force_cpu)
+        and pos_emb.device.type != "cpu"
+        and pos_emb.shape[0] <= int(gpu_knn_max_n)
+    )
+    idx = None
+    if use_device_knn:
+        try:
+            idx, _ = _knn_torch_chunked_device(
+                pos_emb, k, metric="cosine", q_block=int(gpu_knn_block), r_block=int(gpu_knn_block)
+            )
+            synthetic_features = _simple_smote_from_knn_device(
+                pos_emb, idx, num_new=n_samples, alpha=0.5
+            )
+            synthetic_features = synthetic_features.to(device=z.device, dtype=z.dtype)
+        except Exception as e:
+            logger.warning(f"[GraphSMOTE] GPU kNN failed ({e}); falling back to CPU.")
+            idx = None
+
+    if idx is None:
+        idx, _ = get_knn_cached(
+            pos_emb=pos_emb.to("cpu"),
+            k=k,
+            cache_dir=cache_dir,
+            extra_params=extra,
+            metric="cosine",
+        )
+        # Generar sintéticos en CPU y mover al device del modelo
+        synthetic_features = simple_smote_from_knn(
+            pos_emb.to("cpu"), idx, num_new=n_samples, alpha=0.5
+        )
+        synthetic_features = synthetic_features.to(device=z.device, dtype=z.dtype)
+    # --- Fin k-NN ---
     
     synthetic_labels = torch.full((n_samples,), minority_class, dtype=torch.long, device=y.device)
     
@@ -565,15 +758,22 @@ def save_augmented_graph(data, save_path):
         except Exception as e:
             logger.error(f"Error al guardar el grafo aumentado en {save_path}: {e}")
 
-def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
-                   random_state,
-                   z2x_decoders=None,
-                   save_dir=os.path.join(RESULTADOS_DIR, "z2x_decoders"),
-                   device=None,
-                   add_to_train_mask=True,
-                   edge_gen=None,
-                   save_path=None,
-                   progress_callback: Optional[callable] = None):
+def run_graphsmote(
+    model,
+    data,
+    nodes_to_smote,
+    k_smote,
+    k_neighbors_edges,
+    random_state,
+    z2x_decoders=None,
+    save_dir=os.path.join(RESULTADOS_DIR, "z2x_decoders"),
+    device=None,
+    add_to_train_mask=True,
+    edge_gen=None,
+    save_path=None,
+    progress_callback: Optional[callable] = None,
+    force_cpu: bool = True,
+):
     device = next(model.parameters()).device
     data = data.to(device)
 
@@ -591,7 +791,7 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
     z2x_decoders.eval()
 
     # Embeddings actuales normalizados
-    z_dict = get_embeddings_minibatch(model, data)
+    z_dict = get_embeddings_minibatch(model, data, store_on_cpu=bool(force_cpu))
 
     # Edge generator (si no se pasa, se crea uno)
     if edge_gen is None:
@@ -609,6 +809,11 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
     edge_gen.eval()
 
     augmented_data = data.clone()
+    if hasattr(data, "delta_feature_idx"):
+        try:
+            augmented_data.delta_feature_idx = data.delta_feature_idx
+        except Exception:
+            pass
 
     for smote_params in nodes_to_smote:
         node_type = smote_params['node_type']
@@ -616,14 +821,15 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
         n_samples = smote_params['n_samples']
 
         z_node = z_dict[node_type].to(device)
-        y_node = data[node_type].y
+        y_node = data[node_type].y.to(z_node.device)
 
         syn_z, syn_labels, minority_indices = smote_nodes(
             z_node, y_node,
             minority_class=minority_class,
             k=k_smote,
             n_samples=n_samples,
-            random_state=random_state
+            random_state=random_state,
+            force_cpu=bool(force_cpu),
         )
 
         if syn_z.numel() == 0:
@@ -640,9 +846,13 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
         N_old = augmented_data[node_type].num_nodes
         N_new = syn_x.size(0)
 
-        # features y labels
-        augmented_data[node_type].x = torch.cat([augmented_data[node_type].x, syn_x.to(device)], dim=0)
-        augmented_data[node_type].y = torch.cat([augmented_data[node_type].y, syn_labels.to(device)], dim=0)
+        # features y labels (alinear dispositivo con los tensores base)
+        base_x = augmented_data[node_type].x
+        base_y = augmented_data[node_type].y
+        syn_x = syn_x.to(base_x.device)
+        syn_labels = syn_labels.to(base_y.device)
+        augmented_data[node_type].x = torch.cat([base_x, syn_x], dim=0)
+        augmented_data[node_type].y = torch.cat([base_y, syn_labels], dim=0)
 
         # masks
         for m in ['train_mask', 'val_mask', 'test_mask', 'is_accident_pm']:
@@ -654,7 +864,7 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
             elif m == 'is_accident_pm':
                 # Si no existe, se crea para todos los nodos (antiguos y nuevos) como False.
                 total_nodes = N_old + N_new
-                new_mask = torch.zeros(total_nodes, dtype=torch.bool, device=device)
+                new_mask = torch.zeros(total_nodes, dtype=torch.bool, device=base_x.device)
                 setattr(augmented_data[node_type], m, new_mask)
         
         # sintéticos solo entrenan:
@@ -663,10 +873,13 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
 
         # flag diagnóstico
         if not hasattr(augmented_data[node_type], 'is_synthetic'):
-            augmented_data[node_type].is_synthetic = torch.zeros(N_old, dtype=torch.bool, device=device)
-        
-        new_synthetic_flag = torch.ones(N_new, dtype=torch.bool, device=device)
-        augmented_data[node_type].is_synthetic = torch.cat([augmented_data[node_type].is_synthetic, new_synthetic_flag], dim=0)
+            augmented_data[node_type].is_synthetic = torch.zeros(N_old, dtype=torch.bool, device=base_x.device)
+
+        old_syn = augmented_data[node_type].is_synthetic
+        if old_syn.device != base_x.device:
+            old_syn = old_syn.to(base_x.device)
+        new_synthetic_flag = torch.ones(N_new, dtype=torch.bool, device=base_x.device)
+        augmented_data[node_type].is_synthetic = torch.cat([old_syn, new_synthetic_flag], dim=0)
 
 
         # --- CONEXIÓN DE NODOS SINTÉTICOS ---
@@ -689,7 +902,8 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
                 logger.warning(f"No hay candidatos reales para conectar (modo GRAPHSMOTE_CONECT={GRAPHSMOTE_CONECT}).")
                 continue
 
-            z_real_train_pm = z_dict[node_type][candidate_real_indices].to(device)
+            candidate_real_indices = candidate_real_indices.to(z_node.device)
+            z_real_train_pm = z_node.index_select(0, candidate_real_indices)
             z_syn_pm = syn_z
             
             num_syn_nodes = syn_x.size(0)
@@ -704,7 +918,9 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
                 k_eff = min(k_neighbors_edges, z_real_train_pm.size(0))
                 if k_eff == 0:
                     continue
-                neighbor_indices_in_train = edge_gen.predict(z_syn_pm, z_real_train_pm, key, topk=k_eff)
+                neighbor_indices_in_train = edge_gen.predict(
+                    z_syn_pm, z_real_train_pm, key, topk=k_eff, force_cpu=bool(force_cpu)
+                )
                 
                 # Mapear de vuelta a índices globales
                 dst_nodes = candidate_real_indices[neighbor_indices_in_train.flatten()]
@@ -723,9 +939,16 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
 
                 # Build edge attributes from node features (dst_x - src_x)
                 try:
-                    src_x = augmented_data[rel_type[0]].x.index_select(0, new_edges[0].long())
-                    dst_x = augmented_data[rel_type[2]].x.index_select(0, new_edges[1].long())
-                    new_ea = dst_x - src_x
+                    src_x_store = augmented_data[rel_type[0]].x
+                    dst_x_store = augmented_data[rel_type[2]].x
+                    base_device = src_x_store.device
+                    if dst_x_store.device != base_device:
+                        dst_x_store = dst_x_store.to(base_device)
+                    new_edges = new_edges.to(base_device)
+                    src_x = src_x_store.index_select(0, new_edges[0].long())
+                    dst_x = dst_x_store.index_select(0, new_edges[1].long())
+                    delta_idx = _resolve_delta_feature_idx(augmented_data, base_device)
+                    new_ea = _delta_from_node_features(src_x, dst_x, delta_idx)
                     if hasattr(augmented_data[rel_type], 'edge_attr') and augmented_data[rel_type].edge_attr is not None:
                         edge_attr_dim = augmented_data[rel_type].edge_attr.shape[1] if augmented_data[rel_type].edge_attr.dim() > 1 else 1
                         if new_ea.dim() == 1:
@@ -735,16 +958,21 @@ def run_graphsmote(model, data, nodes_to_smote, k_smote, k_neighbors_edges,
                         elif new_ea.size(1) < edge_attr_dim:
                             pad = torch.zeros(new_ea.size(0), edge_attr_dim - new_ea.size(1), device=new_ea.device, dtype=new_ea.dtype)
                             new_ea = torch.cat([new_ea, pad], dim=1)
-                        new_ea = new_ea.to(dtype=augmented_data[rel_type].edge_attr.dtype, device=device)
+                        new_ea = new_ea.to(dtype=augmented_data[rel_type].edge_attr.dtype, device=base_device)
                     # Append edge_index and edge_attr
-                    augmented_data[rel_type].edge_index = torch.cat([augmented_data[rel_type].edge_index.to(device), new_edges], dim=1)
+                    edge_index_base = augmented_data[rel_type].edge_index.to(base_device)
+                    augmented_data[rel_type].edge_index = torch.cat([edge_index_base, new_edges], dim=1)
                     if hasattr(augmented_data[rel_type], 'edge_attr') and augmented_data[rel_type].edge_attr is not None:
-                        augmented_data[rel_type].edge_attr = torch.cat([augmented_data[rel_type].edge_attr, new_ea], dim=0)
+                        old_ea = augmented_data[rel_type].edge_attr
+                        if old_ea.device != new_ea.device:
+                            old_ea = old_ea.to(new_ea.device)
+                        augmented_data[rel_type].edge_attr = torch.cat([old_ea, new_ea], dim=0)
                     else:
                         augmented_data[rel_type].edge_attr = new_ea
                 except Exception:
                     # Fallback: append edges and rely on cleaning; edge_attr may be dropped if misaligned
-                    augmented_data[rel_type].edge_index = torch.cat([augmented_data[rel_type].edge_index.to(device), new_edges], dim=1)
+                    edge_index_base = augmented_data[rel_type].edge_index.to(new_edges.device)
+                    augmented_data[rel_type].edge_index = torch.cat([edge_index_base, new_edges], dim=1)
                 _safe_clean_edges(augmented_data[rel_type], augmented_data[node_type].num_nodes, augmented_data[node_type].num_nodes)
         
         # Cleanup intermediate tensors from the loop
@@ -947,7 +1175,15 @@ def _synthesize_minority_nodes_from_embeddings(
 
 # 2.4. Generación de aristas para sintéticos (usando tu edge generator)
 
-def _generate_edges_for_synthetics(model, aug_data: HeteroData, edge_gen, device, node_type='pm', topK=10):
+def _generate_edges_for_synthetics(
+    model,
+    aug_data: HeteroData,
+    edge_gen,
+    device,
+    node_type='pm',
+    topK=10,
+    force_cpu: bool = True,
+):
     """
     Para cada sintético, conecta con topK reales/vecinos probables por cada relación que involucre 'pm'.
     """
@@ -990,7 +1226,9 @@ def _generate_edges_for_synthetics(model, aug_data: HeteroData, edge_gen, device
             if k_actual == 0:
                 continue
             
-            topi = edge_gen.predict(z[syn_idx], z[train_idx], key, topk=k_actual)
+            topi = edge_gen.predict(
+                z[syn_idx], z[train_idx], key, topk=k_actual, force_cpu=bool(force_cpu)
+            )
             dst_sel = train_idx[topi]                                # indices reales de training
             src_sel = syn_idx.unsqueeze(1).expand_as(dst_sel)        # broadcast sintéticos
 
@@ -1018,9 +1256,16 @@ def _generate_edges_for_synthetics(model, aug_data: HeteroData, edge_gen, device
             # synthetic node features were decoded from embeddings.
             new_ea = None
             try:
-                src_x = aug_data[src].x.index_select(0, new_ei[0].long())
-                dst_x = aug_data[dst].x.index_select(0, new_ei[1].long())
-                ea = dst_x - src_x
+                src_x_store = aug_data[src].x
+                dst_x_store = aug_data[dst].x
+                base_device = src_x_store.device
+                if dst_x_store.device != base_device:
+                    dst_x_store = dst_x_store.to(base_device)
+                new_ei = new_ei.to(base_device)
+                src_x = src_x_store.index_select(0, new_ei[0].long())
+                dst_x = dst_x_store.index_select(0, new_ei[1].long())
+                delta_idx = _resolve_delta_feature_idx(aug_data, base_device)
+                ea = _delta_from_node_features(src_x, dst_x, delta_idx)
 
                 # Align dtype and dimensionality with existing edge_attr (if any)
                 if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
@@ -1032,19 +1277,25 @@ def _generate_edges_for_synthetics(model, aug_data: HeteroData, edge_gen, device
                     elif ea.size(1) < edge_attr_dim:
                         pad = torch.zeros(ea.size(0), edge_attr_dim - ea.size(1), device=ea.device, dtype=ea.dtype)
                         ea = torch.cat([ea, pad], dim=1)
-                    ea = ea.to(dtype=e_store.edge_attr.dtype, device=device)
+                    ea = ea.to(dtype=e_store.edge_attr.dtype, device=base_device)
                 new_ea = ea
             except Exception:
                 # Fallback: if something goes wrong, preserve previous behavior (zeros)
                 if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
                     edge_attr_dim = e_store.edge_attr.shape[1] if e_store.edge_attr.dim() > 1 else 1
-                    new_ea = torch.zeros((new_ei.shape[1], edge_attr_dim), dtype=e_store.edge_attr.dtype, device=device)
+                    new_ea = torch.zeros((new_ei.shape[1], edge_attr_dim), dtype=e_store.edge_attr.dtype, device=new_ei.device)
             
             if hasattr(e_store, 'edge_index') and e_store.edge_index.numel() > 0:
-                e_store.edge_index = torch.cat([e_store.edge_index, new_ei], dim=1)
+                edge_index_base = e_store.edge_index
+                if edge_index_base.device != new_ei.device:
+                    edge_index_base = edge_index_base.to(new_ei.device)
+                e_store.edge_index = torch.cat([edge_index_base, new_ei], dim=1)
                 if new_ea is not None:
                     if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
-                        e_store.edge_attr = torch.cat([e_store.edge_attr, new_ea], dim=0)
+                        edge_attr_base = e_store.edge_attr
+                        if edge_attr_base.device != new_ea.device:
+                            edge_attr_base = edge_attr_base.to(new_ea.device)
+                        e_store.edge_attr = torch.cat([edge_attr_base, new_ea], dim=0)
                     else:
                         e_store.edge_attr = new_ea
             else:
@@ -1094,6 +1345,11 @@ def augment_graph_offline_once(
 
     # 3) Construye grafo aumentado
     aug = data.clone()
+    if hasattr(data, "delta_feature_idx"):
+        try:
+            aug.delta_feature_idx = data.delta_feature_idx
+        except Exception:
+            pass
 
     N = aug['pm'].num_nodes
     x_new = torch.cat([aug['pm'].x.cpu(), syn['x_syn']], dim=0)

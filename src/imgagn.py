@@ -58,9 +58,14 @@ def to_homogeneous_if_needed(data, target_ntype: Optional[str] = None):
     # Prefer an existing homogeneous edge set between target nodes
     # Search any edge type where src==dst==target_ntype
     eidx = None
+    eattr = None
     for (src, _, dst), store in data.edge_items():
         if src == target_ntype and dst == target_ntype and 'edge_index' in store:
             eidx = store['edge_index']
+            try:
+                eattr = store['edge_attr'] if 'edge_attr' in store else None
+            except Exception:
+                eattr = None
             break
 
     if eidx is None:
@@ -75,13 +80,25 @@ def to_homogeneous_if_needed(data, target_ntype: Optional[str] = None):
             topk = sims.topk(k=k, dim=1).indices
             rows = torch.arange(x.size(0), device=x.device).view(-1, 1).repeat(1, k)
             eidx = torch.stack([rows.reshape(-1), topk.reshape(-1)], dim=0)
-            eidx = to_undirected(eidx, num_nodes=x.size(0))
         else:
             eidx = torch.empty(2, 0, dtype=torch.long, device=x.device)
+        eidx = to_undirected(eidx, num_nodes=x.size(0))
 
     hom = type('Dummy', (), {})()  # simple struct-like
     from torch_geometric.data import Data
     hom = Data(x=x, edge_index=eidx, y=y)
+    if eattr is not None:
+        try:
+            if eattr.size(0) == eidx.size(1):
+                hom.edge_attr = eattr
+        except Exception:
+            pass
+    # Preserve optional delta feature indices if provided in the original data
+    try:
+        if hasattr(data, "delta_feature_idx"):
+            hom.delta_feature_idx = data.delta_feature_idx
+    except Exception:
+        pass
     return hom, {'target_ntype': target_ntype}
 
 # --------- Generator (GraphGenerator) ---------
@@ -193,7 +210,15 @@ class ImGAGNConfig:
     # UI
     show_progress: bool = True
 
-def _build_augmented_graph(x: Tensor, edge_index: Tensor, xg: Tensor, links: Tensor, minority_index_map: Tensor):
+def _build_augmented_graph(
+    x: Tensor,
+    edge_index: Tensor,
+    xg: Tensor,
+    links: Tensor,
+    minority_index_map: Tensor,
+    edge_attr: Optional[Tensor] = None,
+    delta_feature_idx: Optional[Tensor] = None,
+):
     """Append generated nodes and connect them to real TRAIN minority nodes.
     minority_index_map maps link column indices -> original node indices in x.
     Returns augmented (x_aug, edge_index_aug) and index slices.
@@ -219,8 +244,68 @@ def _build_augmented_graph(x: Tensor, edge_index: Tensor, xg: Tensor, links: Ten
 
     from torch_geometric.utils import coalesce
     e_aug = torch.cat([edge_index, e_add], dim=1)
-    e_aug = coalesce(e_aug, num_nodes=N + ng)
-    return x_aug, e_aug, (slice(N, N+ng),)
+    edge_attr_aug = None
+    if edge_attr is not None:
+        try:
+            if edge_attr.dim() == 1:
+                edge_attr = edge_attr.view(-1, 1)
+            if edge_attr.size(0) != edge_index.size(1):
+                edge_attr = None
+        except Exception:
+            edge_attr = None
+    if edge_attr is not None:
+        edge_dim = int(edge_attr.size(1))
+        delta_idx = None
+        try:
+            if delta_feature_idx is not None:
+                if torch.is_tensor(delta_feature_idx):
+                    delta_idx = delta_feature_idx.to(device=x_aug.device)
+                else:
+                    delta_idx = torch.tensor(
+                        delta_feature_idx, dtype=torch.long, device=x_aug.device
+                    )
+                if delta_idx.numel() > 0:
+                    delta_idx = delta_idx[
+                        (delta_idx >= 0) & (delta_idx < x_aug.size(1))
+                    ]
+                if delta_idx.numel() == 0:
+                    delta_idx = None
+        except Exception:
+            delta_idx = None
+        # Build edge_attr for new edges as delta of node features + zeros for physical extras
+        if e_add.size(1) > 0:
+            src_new = e_add[0]
+            dst_new = e_add[1]
+            if delta_idx is not None:
+                delta_new = (
+                    x_aug[dst_new][:, delta_idx]
+                    - x_aug[src_new][:, delta_idx]
+                )
+            else:
+                delta_new = x_aug[dst_new] - x_aug[src_new]
+            if edge_dim > delta_new.size(1):
+                extras = torch.zeros(
+                    (delta_new.size(0), edge_dim - delta_new.size(1)),
+                    dtype=delta_new.dtype,
+                    device=delta_new.device,
+                )
+                edge_attr_new = torch.cat([delta_new, extras], dim=1)
+            elif edge_dim < delta_new.size(1):
+                edge_attr_new = delta_new[:, :edge_dim]
+            else:
+                edge_attr_new = delta_new
+        else:
+            edge_attr_new = edge_attr.new_zeros((0, edge_dim))
+        edge_attr_aug = torch.cat([edge_attr, edge_attr_new], dim=0)
+        e_aug, edge_attr_aug = coalesce(
+            e_aug,
+            edge_attr_aug,
+            num_nodes=N + ng,
+            reduce="mean",
+        )
+    else:
+        e_aug = coalesce(e_aug, num_nodes=N + ng)
+    return x_aug, e_aug, edge_attr_aug, (slice(N, N+ng),)
 
 def _mm_separation(h: Tensor, y_minor: Tensor, margin: float = 1.0) -> Tensor:
     """Push minority and majority embeddings apart: simple pairwise hinge.
@@ -240,6 +325,7 @@ def train_imgagn(
     y_binary: Tensor,
     cfg: ImGAGNConfig = ImGAGNConfig(),
     target_ntype: Optional[str] = None,
+    delta_feature_idx: Optional[Tensor] = None,
     progress_callback: Optional[callable] = None,
 ) -> Dict[str, Tensor]:
     """Train ImGAGN on a (homogeneous or heterogeneous) graph for binary minority detection.
@@ -267,6 +353,13 @@ def train_imgagn(
     hom, meta = to_homogeneous_if_needed(data, target_ntype)
     x: Tensor = hom.x.to(device)
     edge_index: Tensor = hom.edge_index.to(device)
+    edge_attr: Optional[Tensor] = getattr(hom, "edge_attr", None)
+    if edge_attr is not None:
+        edge_attr = edge_attr.to(device)
+    if delta_feature_idx is None:
+        delta_feature_idx = getattr(hom, "delta_feature_idx", None)
+        if delta_feature_idx is None:
+            delta_feature_idx = getattr(data, "delta_feature_idx", None)
     y: Tensor = y_binary.to(device)
     train_mask = train_mask.to(device)
 
@@ -493,7 +586,15 @@ def train_imgagn(
             xg, links = _build_synth_nograd(z, topk=cfg.topk_links)
 
         # Augmented graph
-        x_aug, e_aug, (gen_slice,) = _build_augmented_graph(x, edge_index, xg, links, idx_train_min)
+        x_aug, e_aug, edge_attr_aug, (gen_slice,) = _build_augmented_graph(
+            x,
+            edge_index,
+            xg,
+            links,
+            idx_train_min,
+            edge_attr=edge_attr,
+            delta_feature_idx=delta_feature_idx,
+        )
         N_tot = x_aug.size(0)
         y_real_all = torch.cat([torch.zeros(x.size(0), device=device), torch.ones(ng, device=device)], dim=0)  # 0=real,1=fake
         y_minor_all = torch.cat([y, torch.ones(ng, device=device)], dim=0)  # generated are minority
@@ -580,7 +681,15 @@ def train_imgagn(
 
         # 2) Build xg (requires grad), centroid (requires grad) and links (no grad) in chunks
         xg_g, centroid_full, links_g = _build_xg_centroid_with_links(z, h_min, topk=cfg.topk_links)
-        x_aug_g, e_aug_g, (gen_slice_g,) = _build_augmented_graph(x, edge_index, xg_g, links_g, idx_train_min)
+        x_aug_g, e_aug_g, edge_attr_aug_g, (gen_slice_g,) = _build_augmented_graph(
+            x,
+            edge_index,
+            xg_g,
+            links_g,
+            idx_train_min,
+            edge_attr=edge_attr,
+            delta_feature_idx=delta_feature_idx,
+        )
 
         sum_rf = torch.tensor(0.0, device=device)
         sum_mi = torch.tensor(0.0, device=device)
@@ -712,13 +821,22 @@ def train_imgagn(
     with torch.no_grad():
         z = torch.randn(ng, cfg.dz, device=device)
         xg, links = _build_synth_nograd(z, topk=cfg.topk_links)
-        x_aug, e_aug, (gen_slice,) = _build_augmented_graph(x, edge_index, xg, links, idx_train_min)
+        x_aug, e_aug, edge_attr_aug, (gen_slice,) = _build_augmented_graph(
+            x,
+            edge_index,
+            xg,
+            links,
+            idx_train_min,
+            edge_attr=edge_attr,
+            delta_feature_idx=delta_feature_idx,
+        )
 
     return {
         'G_state': G.state_dict(),
         'D_state': D.state_dict(),
         'x_aug': x_aug.detach().cpu(),
         'edge_index_aug': e_aug.detach().cpu(),
+        'edge_attr_aug': edge_attr_aug.detach().cpu() if edge_attr_aug is not None else None,
         'gen_slice': gen_slice,
         'best_train_recall': torch.tensor(best.get('recall', -1.0)),
         'epochs': torch.tensor(cfg.epochs),

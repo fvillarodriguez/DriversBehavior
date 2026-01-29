@@ -314,6 +314,101 @@ def _render_features_sampler_view(df: pd.DataFrame) -> None:
         st.dataframe(df, width="stretch")
 
 
+def _render_gnn_optuna_objectives_view(
+    df: pd.DataFrame, best_row: Optional[Dict[str, object]]
+) -> None:
+    st.caption("Experimento detectado: GNN Optuna Objectives")
+    plot_df = df.copy()
+    metric_cols = [
+        "test_f1",
+        "test_precision",
+        "test_recall",
+        "test_accuracy",
+        "test_far",
+        "test_auprc",
+        "test_mcc",
+    ]
+    for col in metric_cols:
+        if col in plot_df.columns:
+            plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+
+    if best_row is None and "test_f1" in plot_df.columns:
+        valid = plot_df[
+            pd.to_numeric(plot_df["test_f1"], errors="coerce").notna()
+        ]
+        if not valid.empty:
+            best_row = valid.loc[valid["test_f1"].idxmax()].to_dict()
+
+    if best_row:
+        st.markdown("**Resultado optimo (test_f1)**")
+        metrics_payload = {
+            "objective": best_row.get("objective_label"),
+            "test_f1": best_row.get("test_f1"),
+            "test_precision": best_row.get("test_precision"),
+            "test_recall": best_row.get("test_recall"),
+            "test_accuracy": best_row.get("test_accuracy"),
+            "test_far": best_row.get("test_far"),
+            "test_auprc": best_row.get("test_auprc"),
+            "test_mcc": best_row.get("test_mcc"),
+        }
+        st.json(metrics_payload)
+        model_path = best_row.get("model_path")
+        if model_path:
+            st.caption(f"Modelo: {model_path}")
+
+    tab_viz, tab_data = st.tabs(["Grafico", "Datos"])
+    with tab_viz:
+        if {"objective_label", "test_f1"}.issubset(plot_df.columns):
+            plot_df = plot_df[plot_df["test_f1"].notna()].copy()
+            if plot_df.empty:
+                st.info("No hay datos numericos para graficar.")
+                st.dataframe(df, width="stretch")
+            else:
+                if float(plot_df["test_f1"].max() or 0.0) == 0.0:
+                    st.info("Todos los valores de test_f1 son 0.0 en esta corrida.")
+                try:
+                    import altair as alt
+                    color_enc = (
+                        alt.Color("balance_strategy:N", title="Balanceo")
+                        if "balance_strategy" in plot_df.columns
+                        else alt.value("#1f77b4")
+                    )
+                    base = alt.Chart(plot_df).encode(
+                        x=alt.X(
+                            "objective_label:N",
+                            axis=alt.Axis(title="Objetivo"),
+                        ),
+                        y=alt.Y(
+                            "test_f1:Q",
+                            axis=alt.Axis(title="Test F1"),
+                            scale=alt.Scale(domain=[0, 1]),
+                        ),
+                        color=color_enc,
+                        tooltip=[
+                            "objective_label",
+                            "balance_strategy",
+                            "test_f1",
+                            "test_precision",
+                            "test_recall",
+                            "test_far",
+                        ],
+                    )
+                    bars = base.mark_bar(opacity=0.8)
+                    points = base.mark_circle(size=60)
+                    labels = base.mark_text(
+                        dy=-8, size=10, color="#444"
+                    ).encode(text=alt.Text("test_f1:Q", format=".3f"))
+                    chart = (bars + points + labels).interactive()
+                    st.altair_chart(chart, width="stretch")
+                except ImportError:
+                    st.warning("Altair no instalado.")
+        else:
+            st.info("No hay columnas suficientes para graficar.")
+
+    with tab_data:
+        st.dataframe(df, width="stretch")
+
+
 def _render_best_highway_section_view(
     df: pd.DataFrame, best_row: Optional[Dict[str, object]]
 ) -> None:
@@ -494,9 +589,19 @@ def main(*, set_page_config: bool = True) -> None:
             .str.contains("best highway section", case=False, na=False)
             .any()
         )
+        is_gnn_optuna = (
+            "gnn optuna" in experiment_name
+            or df.get("experiment", pd.Series())
+            .astype(str)
+            .str.contains("gnn optuna", case=False, na=False)
+            .any()
+            or {"objective_label", "test_f1"}.issubset(df.columns)
+        )
 
         if is_best_section:
             _render_best_highway_section_view(df, best_row)
+        elif is_gnn_optuna:
+            _render_gnn_optuna_objectives_view(df, best_row)
         elif is_find_samples:
             _render_find_samples_view(df, best_row)
         else:

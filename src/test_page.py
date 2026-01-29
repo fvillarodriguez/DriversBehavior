@@ -58,14 +58,18 @@ def run_tests():
             output_buffer = StringIO()
             with contextlib.redirect_stdout(output_buffer):
                 # Run pytest on the specific file
-                # Use -q for quiet output, just the summary mostly
-                retcode = pytest.main(["-v", f"tests/{test_file}"])
+                # Use -s to preserve print output for display
+                retcode = pytest.main(["-v", "-s", f"tests/{test_file}"])
             
             test_output = output_buffer.getvalue()
             
             # Update the expander with final status
             if retcode == 0:
                 test_result_expander.success(f"✅ PASS: {test_file}")
+                if test_output.strip():
+                    test_result_expander.code(test_output, language="text")
+                else:
+                    test_result_expander.caption("Sin salida adicional.")
                 passed += 1
             else:
                 test_result_expander.error(f"❌ FAIL: {test_file}")

@@ -1,9 +1,13 @@
+import sys as _sys
 import torch
 import torch.nn.functional as F
 from torch.nn import LayerNorm, Linear, ModuleList
 from torch_geometric.nn import GATConv, HeteroConv
 from torch.utils.checkpoint import checkpoint
 from src.config import DEBUG, XAI
+
+# Ensure module is available under the expected name for PyG inspector
+_sys.modules.setdefault("src.gat_model", _sys.modules[__name__])
 
 class GATConvSaveAlpha(GATConv):
     """
@@ -71,6 +75,9 @@ class HeteroGAT(torch.nn.Module):
         # Permitir omitir edge_attr_dict: rellenar si es necesario
         if edge_attr_dict is None:
             edge_attr_dict = {}
+
+        if not hasattr(self, "_edge_attr_mismatch_warned"):
+            self._edge_attr_mismatch_warned = set()
         
         if DEBUG:
             print("\n--- HeteroGAT Forward Pass ---")
@@ -100,7 +107,28 @@ class HeteroGAT(torch.nn.Module):
                     active_ead = {}
                     for k in active_edge_types:
                         if k in edge_attr_dict_cap and edge_attr_dict_cap[k] is not None:
-                            active_ead[k] = edge_attr_dict_cap[k]
+                            ea = edge_attr_dict_cap[k]
+                            if k in active_eid:
+                                num_e = active_eid[k].shape[1]
+                                if ea.size(0) != num_e:
+                                    if self.edge_feature_dim and self.edge_feature_dim > 0:
+                                        ref = next(iter(x_dict_cap.values()))
+                                        ea = torch.zeros(
+                                            (num_e, self.edge_feature_dim),
+                                            dtype=ref.dtype,
+                                            device=ref.device,
+                                        )
+                                        if k not in self._edge_attr_mismatch_warned:
+                                            print(
+                                                f"[WARN] edge_attr mismatch for {k}: "
+                                                f"edge_index={num_e}, edge_attr={edge_attr_dict_cap[k].size(0)}. "
+                                                "Using zeros for this batch."
+                                            )
+                                            self._edge_attr_mismatch_warned.add(k)
+                                    else:
+                                        ea = None
+                            if ea is not None:
+                                active_ead[k] = ea
                         else:
                             if self.edge_feature_dim and self.edge_feature_dim > 0 and k in active_eid:
                                 num_e = active_eid[k].shape[1]
@@ -125,7 +153,28 @@ class HeteroGAT(torch.nn.Module):
                     active_ead = {}
                     for k in active_edge_types:
                         if k in ead and ead[k] is not None:
-                            active_ead[k] = ead[k]
+                            ea = ead[k]
+                            if k in active_eid:
+                                num_e = active_eid[k].shape[1]
+                                if ea.size(0) != num_e:
+                                    if self.edge_feature_dim and self.edge_feature_dim > 0:
+                                        ref = next(iter(xd.values()))
+                                        ea = torch.zeros(
+                                            (num_e, self.edge_feature_dim),
+                                            dtype=ref.dtype,
+                                            device=ref.device,
+                                        )
+                                        if k not in self._edge_attr_mismatch_warned:
+                                            print(
+                                                f"[WARN] edge_attr mismatch for {k}: "
+                                                f"edge_index={num_e}, edge_attr={ead[k].size(0)}. "
+                                                "Using zeros for this batch."
+                                            )
+                                            self._edge_attr_mismatch_warned.add(k)
+                                    else:
+                                        ea = None
+                            if ea is not None:
+                                active_ead[k] = ea
                         else:
                             if self.edge_feature_dim and self.edge_feature_dim > 0 and k in active_eid:
                                 num_e = active_eid[k].shape[1]

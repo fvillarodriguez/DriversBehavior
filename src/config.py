@@ -159,8 +159,8 @@ EARLY_STOPPING_MIN_DELTA = 0.0
 
 # optimize
 TIMEOUT = 172800 #48HR
-N_TRIALS = 2  #100
-NUM_EPOCHS_OPTUNA = 2 #50 epoch por cada prueba
+N_TRIALS = 30  #100
+NUM_EPOCHS_OPTUNA = 10 #50 epoch por cada prueba
 #EARLY_STOPPING_EPOCH_OPTUNA = 10
 
 # NeighborLoader
@@ -170,8 +170,8 @@ NUM_NEIGHBORS = {
     ('pm', 'temporal', 'pm'): [10, 5, 5],
 } #2 niveles (Recordar desvanecimiento de la información con la profundidad.)
 
-TRAIN_RATIO = 80
-VAL_RATIO = 10
+TRAIN_RATIO = 70
+VAL_RATIO = 15
 
 # Selección de umbral (PR)
 F_BETA_THRESHOLD = 0.5  # Beta para F_beta al elegir el umbral de decisión
