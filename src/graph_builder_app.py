@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import builtins
+import copy
 import contextlib
 import gc
 import glob
 import hashlib
+import shutil
 import io
 import json
 import math
@@ -17,7 +19,7 @@ import unicodedata
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -66,6 +68,7 @@ from src.snapshot_sequences import (
 from src import notification_system
 from src.config import (
     BATCH_SIZE,
+    ACCUMULATION_STEPS,
     DT_MINUTES,
     EARLY_STOPPING_MIN_DELTA,
     EARLY_STOPPING_PATIENCE,
@@ -88,6 +91,7 @@ from src.config import (
 from src.features import compute_pm_features
 from src.graph_visualization import render_visual_graph_tab
 from src.feature_explorer import render_feature_explorer
+from src.optimizers import get_optimizer_cls
 
 FEATURE_SELECTION_DIR = Path(RESULTADOS_DIR)
 HISTORY_PATH = Path(RESULTADOS_DIR) / "gnn_history.jsonl"
@@ -133,6 +137,55 @@ class StreamlitLogHandler(logging.Handler):
                 self.last_update = current_time
         except Exception:
             self.handleError(record)
+
+class _TuneTrialAdapter:
+    """Adapter para reutilizar el objetivo de Optuna con Ray Tune."""
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        *,
+        number: int = 0,
+        report_cb: Optional[Callable[[float, int], None]] = None,
+    ) -> None:
+        self._config = dict(config)
+        self.number = int(number)
+        self.user_attrs: Dict[str, Any] = {}
+        self._report_cb = report_cb
+
+    def _get(self, name: str) -> Any:
+        if name not in self._config:
+            raise KeyError(f"Ray Tune config missing '{name}'")
+        return self._config[name]
+
+    def suggest_int(self, name: str, low: int, high: int, *, step: int = 1, log: bool = False) -> int:
+        return int(self._get(name))
+
+    def suggest_float(
+        self,
+        name: str,
+        low: float,
+        high: float,
+        *,
+        step: Optional[float] = None,
+        log: bool = False,
+    ) -> float:
+        return float(self._get(name))
+
+    def suggest_categorical(self, name: str, choices: Sequence[Any]) -> Any:
+        return self._get(name)
+
+    def set_user_attr(self, key: str, value: Any) -> None:
+        self.user_attrs[key] = value
+
+    def report(self, value: float, step: int) -> None:
+        if self._report_cb is not None:
+            try:
+                self._report_cb(float(value), int(step))
+            except Exception:
+                pass
+
+    def should_prune(self) -> bool:
+        return False
 
 class StreamlitJSONLogHandler(logging.Handler):
     """Parse JSON log payloads and forward structured events to a callback."""
@@ -1888,6 +1941,279 @@ def _render_optuna_range_analysis(analysis: Dict[str, object]) -> None:
             st.markdown(f"- {text}")
 
 
+def _trial_value_column(trials_df: pd.DataFrame) -> Optional[str]:
+    col = _optuna_value_column(trials_df)
+    if col:
+        return col
+    if "score" in trials_df.columns:
+        return "score"
+    return None
+
+
+def _param_col_name(trials_df: pd.DataFrame, name: str) -> Optional[str]:
+    candidate_cols = [f"params_{name}", name, f"config/{name}"]
+    for col in candidate_cols:
+        if col in trials_df.columns:
+            return col
+    return None
+
+
+def _smart_adjust_search_space(
+    search_space: Dict[str, object],
+    trials_df: Optional[pd.DataFrame],
+    *,
+    top_frac: float = 0.20,
+    pct_low: float = 0.10,
+    pct_high: float = 0.90,
+    near_ratio: float = 0.10,
+    edge_frac: float = 0.40,
+    linear_expand: float = 0.25,
+    log_expand: float = 2.0,
+    importances: Optional[Dict[str, float]] = None,
+) -> Tuple[Dict[str, object], List[Dict[str, object]], Dict[str, float]]:
+    """Recenter ranges by percentiles, expand if edge-concentration, and shrink by importance."""
+    updated_space: Dict[str, object] = copy.deepcopy(search_space)
+    adjustments: List[Dict[str, object]] = []
+    used_importances: Dict[str, float] = {}
+
+    if trials_df is None or trials_df.empty:
+        return updated_space, adjustments, used_importances
+
+    value_col = _trial_value_column(trials_df)
+    df_valid = trials_df
+    if value_col and value_col in trials_df.columns:
+        df_valid = trials_df[pd.to_numeric(trials_df[value_col], errors="coerce").notna()].copy()
+        df_valid = df_valid.sort_values(value_col, ascending=False)
+    if df_valid.empty:
+        return updated_space, adjustments, used_importances
+
+    top_n = max(1, int(len(df_valid) * float(top_frac)))
+    df_top = df_valid.head(top_n).copy()
+
+    log_params = {
+        "lr",
+        "weight_decay",
+        "lambda_l2_att",
+        "lambda_edge",
+        "lambda_H_fixed",
+        "initial_lambda_H",
+        "final_lambda_H",
+        "imgagn_lr_g",
+        "imgagn_lr_d",
+        "imgagn_alpha_reg",
+        "imgagn_beta_reg",
+    }
+
+    def _is_int_like(val: object) -> bool:
+        if isinstance(val, (int, np.integer)):
+            return True
+        if isinstance(val, (float, np.floating)):
+            return float(val).is_integer()
+        return False
+
+    for name, spec in (search_space or {}).items():
+        if not isinstance(spec, dict) or "min" not in spec or "max" not in spec:
+            continue
+        try:
+            lo = float(spec["min"])
+            hi = float(spec["max"])
+        except Exception:
+            continue
+        if hi <= lo:
+            continue
+
+        col = _param_col_name(df_top, name)
+        if not col:
+            continue
+        series = pd.to_numeric(df_top[col], errors="coerce").dropna()
+        if series.empty:
+            continue
+
+        p_low = float(series.quantile(pct_low))
+        p_high = float(series.quantile(pct_high))
+        if p_high <= p_low:
+            p_low, p_high = lo, hi
+
+        # Edge concentration check
+        if name in log_params and lo > 0 and hi > 0:
+            pos_vals = (np.log10(series) - math.log10(lo)) / (math.log10(hi) - math.log10(lo))
+        else:
+            pos_vals = (series - lo) / (hi - lo)
+        near_min = float((pos_vals <= near_ratio).mean())
+        near_max = float((pos_vals >= (1.0 - near_ratio)).mean())
+        expand_needed = max(near_min, near_max) >= edge_frac
+
+        new_lo, new_hi = p_low, p_high
+        if expand_needed:
+            if name in log_params:
+                if near_min >= edge_frac:
+                    new_lo = max(p_low / max(log_expand, 1.01), 1e-12)
+                if near_max >= edge_frac:
+                    new_hi = p_high * max(log_expand, 1.01)
+            else:
+                span = max(hi - lo, 1e-6)
+                expand = max(linear_expand, 0.0) * span
+                if near_min >= edge_frac:
+                    new_lo = p_low - expand
+                if near_max >= edge_frac:
+                    new_hi = p_high + expand
+
+        # Importance-based shrink/fix
+        if importances and name in importances:
+            imp = float(importances[name])
+            used_importances[name] = imp
+            if imp < 0.02:
+                median = float(series.median())
+                new_lo = new_hi = median
+            elif imp < 0.05:
+                new_lo = float(series.quantile(0.25))
+                new_hi = float(series.quantile(0.75))
+
+        is_int = _is_int_like(spec.get("min")) and _is_int_like(spec.get("max"))
+        if is_int:
+            new_lo = int(math.floor(new_lo))
+            new_hi = int(math.ceil(new_hi))
+            step = spec.get("step")
+            try:
+                step = int(step) if step is not None else 1
+            except Exception:
+                step = 1
+            if new_hi <= new_lo:
+                new_hi = new_lo + max(step, 1)
+
+        if new_hi <= new_lo:
+            continue
+
+        updated_space[name]["min"] = new_lo
+        updated_space[name]["max"] = new_hi
+        adjustments.append(
+            {
+                "param": name,
+                "old_min": lo,
+                "old_max": hi,
+                "new_min": new_lo,
+                "new_max": new_hi,
+                "near_min_pct": round(near_min * 100.0, 1),
+                "near_max_pct": round(near_max * 100.0, 1),
+                "importance": used_importances.get(name),
+            }
+        )
+
+    return updated_space, adjustments, used_importances
+
+
+def _expand_search_space_from_alerts(
+    search_space: Dict[str, object],
+    analysis: Dict[str, object],
+    *,
+    linear_expand: float = 0.25,
+    log_expand: float = 2.0,
+) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    """Apply RED alert recommendations by expanding min/max bounds."""
+    if not analysis or analysis.get("alert_level") != "red":
+        return search_space, []
+
+    updated_space: Dict[str, object] = copy.deepcopy(search_space)
+    rows = analysis.get("rows", []) or []
+    adjustments: List[Dict[str, object]] = []
+    log_params = {
+        "lr",
+        "weight_decay",
+        "lambda_l2_att",
+        "lambda_edge",
+        "lambda_H_fixed",
+        "initial_lambda_H",
+        "final_lambda_H",
+        "imgagn_lr_g",
+        "imgagn_lr_d",
+        "imgagn_alpha_reg",
+        "imgagn_beta_reg",
+    }
+
+    def _is_int_like(val: object) -> bool:
+        if isinstance(val, (int, np.integer)):
+            return True
+        if isinstance(val, (float, np.floating)):
+            return float(val).is_integer()
+        return False
+
+    for row in rows:
+        if row.get("status") != "RED":
+            continue
+        name = row.get("param")
+        bound = row.get("near_bound")
+        if not name or bound not in ("min", "max"):
+            continue
+        spec = updated_space.get(name)
+        if not isinstance(spec, dict) or "min" not in spec or "max" not in spec:
+            continue
+        try:
+            lo = float(spec["min"])
+            hi = float(spec["max"])
+        except Exception:
+            continue
+
+        if hi <= lo:
+            continue
+
+        is_int = _is_int_like(spec.get("min")) and _is_int_like(spec.get("max"))
+        delta = hi - lo
+        lower_cap = 1.0 if is_int and lo >= 1.0 else 0.0
+        upper_cap = 0.99 if hi <= 1.0 and name not in log_params else None
+
+        if name in log_params:
+            if bound == "min":
+                new_lo = max(lo / max(log_expand, 1.01), 1e-12)
+                new_hi = hi
+            else:
+                new_lo = lo
+                new_hi = hi * max(log_expand, 1.01)
+        else:
+            expand = max(linear_expand, 0.0) * max(delta, 1e-6)
+            if bound == "min":
+                new_lo = lo - expand
+                new_hi = hi
+            else:
+                new_lo = lo
+                new_hi = hi + expand
+
+        if upper_cap is not None:
+            new_hi = min(new_hi, upper_cap)
+        new_lo = max(new_lo, lower_cap)
+
+        if new_hi <= new_lo:
+            if is_int:
+                new_hi = new_lo + 1.0
+            else:
+                new_hi = new_lo + max(delta * 0.1, 1e-6)
+
+        if is_int:
+            new_lo = int(math.floor(new_lo))
+            new_hi = int(math.ceil(new_hi))
+            step = spec.get("step")
+            try:
+                step = int(step) if step is not None else 1
+            except Exception:
+                step = 1
+            if new_hi <= new_lo:
+                new_hi = new_lo + max(step, 1)
+
+        spec["min"] = new_lo
+        spec["max"] = new_hi
+        adjustments.append(
+            {
+                "param": name,
+                "bound": bound,
+                "old_min": lo,
+                "old_max": hi,
+                "new_min": new_lo,
+                "new_max": new_hi,
+            }
+        )
+
+    return updated_space, adjustments
+
+
 def _cleanup_experiment_memory() -> None:
     try:
         gc.collect()
@@ -2567,6 +2893,9 @@ def _run_optuna_search(
     log_container: Optional[object] = None,
     progress_bar: Optional[object] = None,
     status_text: Optional[object] = None,
+    stop_flag_key: Optional[str] = None,
+    return_objective: bool = False,
+    storage_path: Optional[str] = None,
 ) -> Dict[str, object]:
     
     # --- LOGGING SETUP ---
@@ -2628,6 +2957,7 @@ def _run_optuna_search(
                 return None
 
     debug_flag = bool(optuna_settings.get("debug"))
+    accumulation_steps = int(objective_settings.get("accumulation_steps", ACCUMULATION_STEPS))
 
     def _mem_snapshot(tag: str, extra: Optional[str] = None) -> None:
         if not debug_flag:
@@ -2787,14 +3117,75 @@ def _run_optuna_search(
     else:
         pruner = optuna.pruners.NopPruner()
 
-    study = optuna.create_study(
-        direction="maximize", sampler=sampler, pruner=pruner
-    )
-
-    num_epochs = int(optuna_settings["epochs"])
-    eval_every = int(optuna_settings["eval_every"])
     objective_metric = str(objective_settings["metric"])
     threshold_beta = float(objective_settings["threshold_beta"])
+    num_epochs = int(optuna_settings["epochs"])
+    eval_every = int(optuna_settings["eval_every"])
+
+    graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
+    variant_tag = graph_main._variant_tags(use_graphsmote, graph_obj)
+    if use_imgagn:
+        if "_Base" in variant_tag:
+            variant_tag = variant_tag.replace("_Base", "")
+        if variant_tag:
+            parts = [part for part in variant_tag.split("_") if part]
+            variant_tag = "_" + "_".join(parts) if parts else ""
+        if "_ImGAGN" not in variant_tag:
+            variant_tag = f"{variant_tag}_ImGAGN" if variant_tag else "_ImGAGN"
+    space_signature = _search_space_signature(search_space)
+    study_base = f"gnn_optuna_{objective_metric}{variant_tag}_{space_signature}"
+    if graph_hash:
+        study_base = f"{study_base}_{graph_hash[:16]}"
+    study_name = re.sub(r"[^A-Za-z0-9_\\-]", "_", study_base)
+    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    
+    if storage_path:
+        storage_url = f"sqlite:///{storage_path}"
+    else:
+        # Fallback to default shared storage if no specific path provided
+        default_storage_path = os.path.join(RESULTADOS_DIR, "optuna_studies.db")
+        storage_url = f"sqlite:///{default_storage_path}"
+            
+    try:
+        storage = optuna.storages.RDBStorage(
+            url=storage_url,
+            heartbeat_interval=60,
+            grace_period=120,
+        )
+    except Exception:
+        storage = storage_url
+
+    study = None
+    try:
+        try:
+            study = optuna.load_study(
+                study_name=study_name,
+                storage=storage,
+                sampler=sampler,
+                pruner=pruner,
+            )
+        except TypeError:
+            study = optuna.load_study(
+                study_name=study_name,
+                storage=storage,
+            )
+            try:
+                study.sampler = sampler
+                study.pruner = pruner
+            except Exception:
+                pass
+    except Exception as exc:
+        if exc.__class__.__name__ in ("StudyNotFound", "KeyError"):
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=sampler,
+                pruner=pruner,
+                storage=storage,
+                study_name=study_name,
+                load_if_exists=False,
+            )
+        else:
+            raise
 
     # use_graphsmote/use_imgagn ya definidos arriba
 
@@ -3231,7 +3622,8 @@ def _run_optuna_search(
             else None
         )
 
-        optimizer = getattr(torch.optim, optimizer_name)(
+        optimizer_cls = get_optimizer_cls(optimizer_name)
+        optimizer = optimizer_cls(
             list(model.parameters())
             + (list(edge_gen.parameters()) if edge_gen else []),
             lr=lr,
@@ -3379,6 +3771,7 @@ def _run_optuna_search(
                     edge_gen=edge_gen,
                     lambda_edge=float(lambda_edge),
                     lambda_l2_att=float(lambda_l2_att),
+                    accumulation_steps=accumulation_steps,
                 )
 
                 if epoch % eval_every != 0:
@@ -3524,6 +3917,22 @@ def _run_optuna_search(
         trial.set_user_attr("best_epoch", int(best_epoch))
         return float(best_score)
 
+    if return_objective:
+        payload = {
+            "objective": objective,
+            "study_name": study_name,
+            "objective_metric": objective_metric,
+            "graph_hash": graph_hash,
+            "variant_tag": variant_tag,
+            "use_graphsmote": use_graphsmote,
+            "use_imgagn": use_imgagn,
+        }
+        if handler:
+            for name in loggers_to_attach:
+                logger = logging.getLogger(name)
+                logger.removeHandler(handler)
+        return payload
+
     # Use provided UI elements or create new ones
     if progress_bar is None:
          progress_bar = st.progress(0)
@@ -3540,20 +3949,61 @@ def _run_optuna_search(
         if timeout_seconds is not None and timeout_seconds <= 0:
             timeout_seconds = None
 
+    try:
+        done_states = {
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.PRUNED,
+            optuna.trial.TrialState.FAIL,
+        }
+    except Exception:
+        done_states = set()
+
+    def _count_done_trials(study_obj) -> int:
+        if not done_states:
+            return len(study_obj.trials)
+        return sum(1 for t in study_obj.trials if t.state in done_states)
+
+    done_trials = _count_done_trials(study)
+    remaining_trials = max(0, n_trials - done_trials)
+
     def progress_callback(study, trial):
-        current_trial = trial.number + 1
-        progress = current_trial / n_trials
+        completed = _count_done_trials(study)
+        progress = completed / max(float(n_trials), 1.0)
         progress_bar.progress(min(progress, 1.0))
-        status_text.markdown(f"**Progreso Optuna: Ensayo {current_trial} de {n_trials}**")
+        status_text.markdown(
+            f"**Progreso Optuna: Ensayo {completed} de {n_trials}**"
+        )
+        if stop_flag_key and st.session_state.get(stop_flag_key):
+            try:
+                status_text.markdown(
+                    f"**Progreso Optuna: Ensayo {completed} de {n_trials}** · "
+                    "Detencion solicitada. Cerrando iteracion..."
+                )
+                study.stop()
+            except Exception:
+                pass
+        try:
+            live_path = os.path.join(
+                RESULTADOS_DIR, f"optuna_full_study_live_{study.study_name}.csv"
+            )
+            study.trials_dataframe().to_csv(live_path, index=False)
+        except Exception:
+            pass
 
     try:
-        study.optimize(
-            objective,
-            n_trials=n_trials,
-            timeout=timeout_seconds,
-            show_progress_bar=False,  # We use our own st.progress
-            callbacks=[progress_callback],
-        )
+        if remaining_trials <= 0:
+            progress_bar.progress(1.0)
+            status_text.markdown(
+                f"**Optuna reanudado: {done_trials} ensayos ya completados (objetivo {n_trials}).**"
+            )
+        else:
+            study.optimize(
+                objective,
+                n_trials=remaining_trials,
+                timeout=timeout_seconds,
+                show_progress_bar=False,  # We use our own st.progress
+                callbacks=[progress_callback],
+            )
     finally:
         # CLEANUP HANDLER
         if handler:
@@ -3587,8 +4037,14 @@ def _run_optuna_search(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
     variant_tag = graph_main._variant_tags(use_graphsmote, graph_obj)
-    if use_imgagn and "_ImGAGN" not in variant_tag:
-        variant_tag = f"{variant_tag}_ImGAGN"
+    if use_imgagn:
+        if "_Base" in variant_tag:
+            variant_tag = variant_tag.replace("_Base", "")
+        if variant_tag:
+            parts = [part for part in variant_tag.split("_") if part]
+            variant_tag = "_" + "_".join(parts) if parts else ""
+        if "_ImGAGN" not in variant_tag:
+            variant_tag = f"{variant_tag}_ImGAGN" if variant_tag else "_ImGAGN"
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
     os.makedirs(RESULTADOS_DIR, exist_ok=True)
 
@@ -3620,8 +4076,394 @@ def _run_optuna_search(
         "best_path": best_params_path,
         "full_path": full_study_path,
         "study": study,
+        "trials_df": trials_df,
         "range_analysis": range_analysis,
     }
+
+def _run_ray_tune_search(
+    *,
+    graph_obj: Dict[str, object],
+    balancing_strategy: str,
+    search_space: Dict[str, object],
+    optuna_settings: Dict[str, object],
+    objective_settings: Dict[str, object],
+    log_container: Optional[object] = None,
+    progress_bar: Optional[object] = None,
+    status_text: Optional[object] = None,
+) -> Dict[str, object]:
+    handler = None
+    loggers_to_attach = ["optuna", "src.gnn_main", "src.train_pretrain", "src.graph_builder_app"]
+    if log_container is not None:
+        handler = StreamlitLogHandler(log_container)
+        formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+        handler.setFormatter(formatter)
+        for name in loggers_to_attach:
+            logger = logging.getLogger(name)
+            logger.setLevel(logging.INFO)
+            logger.addHandler(handler)
+
+    try:
+        try:
+            import ray
+            from ray import tune
+            try:
+                from ray.air import session
+            except Exception:
+                session = None
+        except Exception as exc:
+            raise RuntimeError(f"Ray Tune no esta disponible: {exc}") from exc
+
+        objective_bundle = _run_optuna_search(
+            graph_obj=graph_obj,
+            balancing_strategy=balancing_strategy,
+            search_space=search_space,
+            optuna_settings=optuna_settings,
+            objective_settings=objective_settings,
+            log_container=None,
+            progress_bar=None,
+            status_text=None,
+            return_objective=True,
+        )
+        objective = objective_bundle["objective"]
+        study_name = str(objective_bundle.get("study_name", "ray_tune"))
+        objective_metric = str(objective_bundle.get("objective_metric", "score"))
+        graph_hash = objective_bundle.get("graph_hash")
+        variant_tag = str(objective_bundle.get("variant_tag", ""))
+        use_graphsmote = bool(objective_bundle.get("use_graphsmote", False))
+        use_imgagn = bool(objective_bundle.get("use_imgagn", False))
+
+        def _int_choices(min_v: int, max_v: int, step: int) -> List[int]:
+            try:
+                step = max(1, int(step))
+                min_v = int(min_v)
+                max_v = int(max_v)
+                if max_v < min_v:
+                    min_v, max_v = max_v, min_v
+                return list(range(min_v, max_v + 1, step)) or [min_v]
+            except Exception:
+                return [int(min_v)]
+
+        def _float_choices(min_v: float, max_v: float, step: float) -> List[float]:
+            try:
+                min_v = float(min_v)
+                max_v = float(max_v)
+                step = float(step)
+                if step <= 0:
+                    return [min_v]
+                if max_v < min_v:
+                    min_v, max_v = max_v, min_v
+                values = []
+                current = min_v
+                while current <= max_v + 1e-12:
+                    values.append(round(current, 10))
+                    current += step
+                return values or [min_v]
+            except Exception:
+                return [float(min_v)]
+
+        def _choice(values: Sequence[Any]) -> object:
+            vals = list(values)
+            if not vals:
+                raise ValueError("Ray Tune: espacio de busqueda vacio.")
+            return tune.choice(vals)
+
+        def _loguniform_or_choice(min_v: float, max_v: float) -> object:
+            try:
+                min_v = float(min_v)
+                max_v = float(max_v)
+                if min_v <= 0 or max_v <= 0 or min_v == max_v:
+                    return tune.choice([float(min_v)])
+                if max_v < min_v:
+                    min_v, max_v = max_v, min_v
+                return tune.loguniform(min_v, max_v)
+            except Exception:
+                return tune.choice([float(min_v)])
+
+        hidden_cfg = search_space["hidden_channels"]
+        num_heads_cfg = search_space["num_heads"]
+        num_layers_cfg = search_space["num_layers"]
+        dropout_cfg = search_space["dropout"]
+        batch_cfg = search_space["batch_size"]
+
+        lr_cfg = search_space["lr"]
+        wd_cfg = search_space["weight_decay"]
+        lambda_l2_cfg = search_space["lambda_l2_att"]
+
+        focal_gamma_cfg = search_space["focal_gamma"]
+        focal_alpha_cfg = search_space["focal_alpha"]
+
+        ray_space: Dict[str, object] = {
+            "hidden_channels": _choice(_int_choices(hidden_cfg["min"], hidden_cfg["max"], hidden_cfg["step"])),
+            "num_heads": _choice(_int_choices(num_heads_cfg["min"], num_heads_cfg["max"], num_heads_cfg["step"])),
+            "num_layers": _choice(_int_choices(num_layers_cfg["min"], num_layers_cfg["max"], num_layers_cfg["step"])),
+            "dropout": _choice(_float_choices(dropout_cfg["min"], dropout_cfg["max"], dropout_cfg["step"])),
+            "aggr1": _choice(search_space["aggr1"]),
+            "aggr2": _choice(search_space["aggr2"]),
+            "use_checkpointing": _choice(search_space["use_checkpointing"]),
+            "num_neighbors_choice": _choice(search_space["neighbor_choices"]),
+            "lr": _loguniform_or_choice(lr_cfg["min"], lr_cfg["max"]),
+            "optimizer": _choice(search_space["optimizers"]),
+            "weight_decay": _loguniform_or_choice(wd_cfg["min"], wd_cfg["max"]),
+            "lambda_l2_att": _loguniform_or_choice(lambda_l2_cfg["min"], lambda_l2_cfg["max"]),
+            "lambda_H_mode": _choice(search_space["lambda_H_mode"]),
+            "lambda_H_fixed": _loguniform_or_choice(
+                search_space["lambda_H_fixed"]["min"],
+                search_space["lambda_H_fixed"]["max"],
+            ),
+            "initial_lambda_H": _loguniform_or_choice(
+                search_space["initial_lambda_H"]["min"],
+                search_space["initial_lambda_H"]["max"],
+            ),
+            "final_lambda_H": _loguniform_or_choice(
+                search_space["final_lambda_H"]["min"],
+                search_space["final_lambda_H"]["max"],
+            ),
+            "loss_type": _choice(search_space["loss_type"]),
+            "focal_gamma": _choice(_float_choices(
+                focal_gamma_cfg["min"],
+                focal_gamma_cfg["max"],
+                focal_gamma_cfg["step"],
+            )),
+            "batch_size": _choice(_int_choices(batch_cfg["min"], batch_cfg["max"], batch_cfg["step"])),
+        }
+
+        if not use_graphsmote:
+            ray_space["focal_alpha"] = _choice(_float_choices(
+                focal_alpha_cfg["min"],
+                focal_alpha_cfg["max"],
+                focal_alpha_cfg["step"],
+            ))
+
+        if use_graphsmote:
+            smote_k_cfg = search_space["smote_k"]
+            ray_space["smote_k"] = _choice(_int_choices(
+                smote_k_cfg["min"], smote_k_cfg["max"], smote_k_cfg["step"]
+            ))
+            ray_space["target_pos_ratio"] = _choice(search_space["target_pos_ratio"])
+            ray_space["smote_every_n_epochs"] = _choice(search_space["smote_every_n_epochs"])
+            lambda_edge_cfg = search_space["lambda_edge"]
+            ray_space["lambda_edge"] = _loguniform_or_choice(
+                lambda_edge_cfg["min"], lambda_edge_cfg["max"]
+            )
+
+        if use_imgagn:
+            ray_space["imgagn_dz"] = _choice(_int_choices(
+                search_space["imgagn_dz"]["min"],
+                search_space["imgagn_dz"]["max"],
+                search_space["imgagn_dz"]["step"],
+            ))
+            ray_space["imgagn_hidden_g"] = _choice(_int_choices(
+                search_space["imgagn_hidden_g"]["min"],
+                search_space["imgagn_hidden_g"]["max"],
+                search_space["imgagn_hidden_g"]["step"],
+            ))
+            ray_space["imgagn_topk"] = _choice(_int_choices(
+                search_space["imgagn_topk"]["min"],
+                search_space["imgagn_topk"]["max"],
+                search_space["imgagn_topk"]["step"],
+            ))
+            ray_space["imgagn_lambda1"] = _choice(_float_choices(
+                search_space["imgagn_lambda1"]["min"],
+                search_space["imgagn_lambda1"]["max"],
+                search_space["imgagn_lambda1"]["step"],
+            ))
+            ray_space["imgagn_epochs"] = _choice(_int_choices(
+                search_space["imgagn_epochs"]["min"],
+                search_space["imgagn_epochs"]["max"],
+                search_space["imgagn_epochs"]["step"],
+            ))
+            ray_space["imgagn_lr_g"] = _loguniform_or_choice(
+                search_space["imgagn_lr_g"]["min"],
+                search_space["imgagn_lr_g"]["max"],
+            )
+            ray_space["imgagn_lr_d"] = _loguniform_or_choice(
+                search_space["imgagn_lr_d"]["min"],
+                search_space["imgagn_lr_d"]["max"],
+            )
+            ray_space["imgagn_alpha_reg"] = _loguniform_or_choice(
+                search_space["imgagn_alpha_reg"]["min"],
+                search_space["imgagn_alpha_reg"]["max"],
+            )
+            ray_space["imgagn_beta_reg"] = _loguniform_or_choice(
+                search_space["imgagn_beta_reg"]["min"],
+                search_space["imgagn_beta_reg"]["max"],
+            )
+
+        if progress_bar is None:
+            progress_bar = st.progress(0)
+        if status_text is None:
+            status_text = st.empty()
+        status_text.markdown("**Ray Tune en ejecucion...**")
+
+        if not ray.is_initialized():
+            ray.init(ignore_reinit_error=True, include_dashboard=False)
+
+        n_trials = int(optuna_settings.get("n_trials", 1))
+        storage_dir = Path(RESULTADOS_DIR).resolve() / "ray_tune"
+        storage_path = f"file://{storage_dir.as_posix()}"
+
+        def _report(metrics: Dict[str, Any]) -> None:
+            if session is not None:
+                try:
+                    session.report(metrics)
+                    return
+                except Exception:
+                    pass
+            tune.report(**metrics)
+
+        def _trial_number() -> int:
+            trial_id = None
+            if session is not None:
+                try:
+                    trial_id = session.get_trial_id()
+                except Exception:
+                    trial_id = None
+            if trial_id is None:
+                try:
+                    trial_id = tune.get_trial_id()
+                except Exception:
+                    trial_id = None
+            if not trial_id:
+                return 0
+            try:
+                return int(trial_id.split("_")[-1])
+            except Exception:
+                try:
+                    import hashlib
+                    return int(hashlib.sha1(trial_id.encode("utf-8")).hexdigest()[:8], 16)
+                except Exception:
+                    return 0
+
+        def trainable(config: Dict[str, Any]) -> None:
+            trial_number = _trial_number()
+            adapter = _TuneTrialAdapter(
+                config,
+                number=trial_number,
+                report_cb=lambda v, s: _report({"score": v, "epoch": s}),
+            )
+            score = objective(adapter)
+            payload: Dict[str, Any] = {"score": float(score)}
+            for key in ("num_neighbors", "use_checkpointing", "best_tau", "best_epoch", "best_metric"):
+                if key in adapter.user_attrs:
+                    payload[key] = adapter.user_attrs[key]
+            _report(payload)
+
+        device_label = str(objective_settings.get("device", "")).lower()
+        resources_per_trial = {"cpu": 1}
+        if "cuda" in device_label:
+            resources_per_trial["gpu"] = 1
+
+        analysis = tune.run(
+            trainable,
+            config=ray_space,
+            num_samples=n_trials,
+            metric="score",
+            mode="max",
+            name=f"raytune_{study_name}",
+            storage_path=storage_path,
+            resume="AUTO",
+            resources_per_trial=resources_per_trial,
+        )
+
+        progress_bar.progress(1.0)
+        status_text.markdown("**Ray Tune finalizado.**")
+
+        best_config: Dict[str, Any] = {}
+        best_metrics: Dict[str, Any] = {}
+        best_score = None
+        try:
+            best_result = analysis.get_best_result(metric="score", mode="max")
+            best_config = dict(best_result.config or {})
+            best_metrics = dict(best_result.metrics or {})
+            best_score = best_metrics.get("score")
+        except Exception:
+            try:
+                best_trial = analysis.get_best_trial(metric="score", mode="max")
+                if best_trial is not None:
+                    best_config = dict(best_trial.config or {})
+                    best_metrics = dict(best_trial.last_result or {})
+                    best_score = best_metrics.get("score")
+            except Exception:
+                pass
+        if not best_config:
+            try:
+                best_config = dict(
+                    analysis.get_best_config(metric="score", mode="max") or {}
+                )
+            except Exception:
+                pass
+
+        best_params = dict(best_config)
+        if best_score is not None:
+            best_params["value"] = best_score
+        best_params["objective_metric"] = objective_metric
+        for key in ("num_neighbors", "use_checkpointing", "best_tau", "best_epoch", "best_metric"):
+            if key in best_metrics:
+                best_params[key] = best_metrics[key]
+        best_params["use_graphsmote"] = use_graphsmote
+        try:
+            from src import gnn_main as graph_main
+            best_params["use_imgagn_aug"] = bool(use_imgagn) or bool(
+                graph_main._has_imgagn(graph_obj)
+            )
+        except Exception:
+            best_params["use_imgagn_aug"] = bool(use_imgagn)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
+        os.makedirs(RESULTADOS_DIR, exist_ok=True)
+
+        best_params_path = os.path.join(
+            RESULTADOS_DIR,
+            f"optuna_hyperparams_raytune_{timestamp}{hash_tag}{variant_tag}.csv",
+        )
+        pd.DataFrame([best_params]).to_csv(best_params_path, index=False)
+
+        trials_df = None
+        try:
+            trials_df = analysis.results_df
+        except Exception:
+            try:
+                trials_df = analysis.get_dataframe()
+            except Exception:
+                try:
+                    trials_df = analysis.dataframe()
+                except Exception:
+                    trials_df = None
+
+        full_study_path = None
+        range_analysis: Dict[str, object] = {}
+        if trials_df is not None:
+            trials_df["use_graphsmote"] = use_graphsmote
+            trials_df["graph_hash"] = graph_hash
+            full_study_path = os.path.join(
+                RESULTADOS_DIR,
+                f"optuna_full_study_raytune_{timestamp}{hash_tag}{variant_tag}.csv",
+            )
+            trials_df.to_csv(full_study_path, index=False)
+            try:
+                range_analysis = _optuna_analyze_ranges(
+                    trials_df,
+                    best_config,
+                    search_space,
+                    near_ratio=0.10,
+                    top_frac=0.20,
+                )
+            except Exception:
+                range_analysis = {}
+
+        return {
+            "best_params": best_params,
+            "best_path": best_params_path,
+            "full_path": full_study_path,
+            "trials_df": trials_df,
+            "range_analysis": range_analysis,
+        }
+    finally:
+        if handler:
+            for name in loggers_to_attach:
+                logger = logging.getLogger(name)
+                logger.removeHandler(handler)
 
 
 def _feature_selection_key(
@@ -5773,8 +6615,292 @@ def run_feature_generation_workflow(params):
 
     return None
 
+def _render_optimization_tab() -> None:
+    st.subheader("Optimization")
+    optimizer_choice = st.selectbox(
+        "Optimizador",
+        ["Optuna", "Ray"],
+        index=0,
+        key="gnn_optimization_choice",
+    )
+    st.markdown("### Configuracion")
+    _render_optuna_tab(show_run_controls=False)
+    if optimizer_choice == "Ray":
+        st.caption(
+            "Ray Tune usara la configuracion anterior (Optuna) para definir el espacio de busqueda."
+        )
+
+    def _get_graph_context() -> Tuple[Optional[Dict[str, object]], Optional[HeteroData]]:
+        loaded_graph = st.session_state.get("loaded_graph")
+        balanced_graph = st.session_state.get("balanced_graph")
+        if loaded_graph is None:
+            st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+            return None, None
+
+        use_balanced = bool(st.session_state.get("gnn_optuna_use_balanced", False))
+        graph_obj = dict(loaded_graph)
+        if use_balanced and balanced_graph is not None:
+            graph_obj["data"] = balanced_graph.get("data")
+            if balanced_graph.get("source") == "ImGAGN":
+                fn = graph_obj.get("filename", "graph")
+                if "_ImGAGN" not in fn:
+                    graph_obj["filename"] = (
+                        fn.replace(".pt", "_ImGAGN.pt")
+                        if fn.endswith(".pt")
+                        else f"{fn}_ImGAGN"
+                    )
+        if not graph_obj.get("filename"):
+            graph_path = st.session_state.get("graph_path")
+            if graph_path:
+                graph_obj["filename"] = os.path.basename(graph_path)
+
+        graph_data = graph_obj.get("data")
+        if not isinstance(graph_data, HeteroData):
+            st.warning("El grafo seleccionado no es HeteroData.")
+            return None, None
+        if "pm" not in graph_data.node_types:
+            st.warning("El grafo no contiene nodos 'pm'.")
+            return None, None
+        if not hasattr(graph_data["pm"], "train_mask"):
+            st.warning("El grafo no contiene train_mask.")
+            return None, None
+        if not hasattr(graph_data["pm"], "y"):
+            st.warning("El grafo no contiene etiquetas 'y'.")
+            return None, None
+        return graph_obj, graph_data
+
+    graph_obj, graph_data = _get_graph_context()
+    if graph_obj is None or graph_data is None:
+        return
+
+    pending = False
+    pending_details = ""
+    objective_metric = str(st.session_state.get("gnn_optuna_metric", "F1"))
+    n_trials = int(st.session_state.get("gnn_optuna_trials", N_TRIALS))
+    balancing_strategy = str(
+        st.session_state.get("gnn_balancing_strategy", "Sin balancear")
+    )
+    space_signature = _search_space_signature_from_state()
+    if optimizer_choice == "Optuna":
+        study_name, storage_url = _compute_optuna_study_name(
+            graph_obj=graph_obj,
+            balancing_strategy=balancing_strategy,
+            objective_metric=objective_metric,
+            space_signature=space_signature,
+        )
+        pending, done_trials = _optuna_study_pending(
+            study_name=study_name,
+            storage_url=storage_url,
+            target_trials=n_trials,
+        )
+        if pending:
+            pending_details = f"Optuna pendiente: {done_trials}/{n_trials} trials completados."
+    else:
+        study_name, _ = _compute_optuna_study_name(
+            graph_obj=graph_obj,
+            balancing_strategy=balancing_strategy,
+            objective_metric=objective_metric,
+            space_signature=space_signature,
+        )
+        storage_dir = Path(RESULTADOS_DIR).resolve() / "ray_tune" / f"raytune_{study_name}"
+        pending, done_trials, last_update, status_counts = _ray_tune_pending(
+            storage_dir=storage_dir,
+            target_trials=n_trials,
+        )
+        if pending:
+            pending_details = f"Ray Tune pendiente: {done_trials}/{n_trials} trials completados."
+            if last_update:
+                last_update_str = datetime.fromtimestamp(last_update).strftime("%Y-%m-%d %H:%M:%S")
+                pending_details += f" | Última actualización: {last_update_str}"
+            if status_counts:
+                status_text = ", ".join(f"{k}:{v}" for k, v in sorted(status_counts.items()))
+                pending_details += f" | Estados: {status_text}"
+
+    if pending_details:
+        st.info(pending_details)
+
+    col_run, col_reset = st.columns([1, 1])
+    with col_run:
+        run_label = "Continuar" if pending else "Ejecutar"
+        run_button = st.button(f"{run_label} {optimizer_choice}", key="gnn_optimize_run")
+    with col_reset:
+        reset_button = False
+        if pending:
+            reset_button = st.button(
+                "Reiniciar estudio",
+                key="gnn_optimize_reset",
+            )
+
+    if reset_button:
+        if optimizer_choice == "Optuna":
+            try:
+                import optuna
+                study_name, storage_url = _compute_optuna_study_name(
+                    graph_obj=graph_obj,
+                    balancing_strategy=balancing_strategy,
+                    objective_metric=objective_metric,
+                    space_signature=_search_space_signature_from_state(),
+                )
+                optuna.delete_study(study_name=study_name, storage=storage_url)
+                live_path = os.path.join(
+                    RESULTADOS_DIR, f"optuna_full_study_live_{study_name}.csv"
+                )
+                if os.path.exists(live_path):
+                    try:
+                        os.remove(live_path)
+                    except Exception:
+                        pass
+                st.success(f"Estudio reiniciado: {study_name}")
+            except KeyError:
+                st.warning("No se encontro un estudio para reiniciar.")
+            except Exception as exc:
+                st.error(f"No se pudo reiniciar el estudio: {exc}")
+        else:
+            study_name, _ = _compute_optuna_study_name(
+                graph_obj=graph_obj,
+                balancing_strategy=balancing_strategy,
+                objective_metric=objective_metric,
+                space_signature=_search_space_signature_from_state(),
+            )
+            storage_dir = Path(RESULTADOS_DIR).resolve() / "ray_tune" / f"raytune_{study_name}"
+            try:
+                if storage_dir.exists():
+                    shutil.rmtree(storage_dir)
+                st.success(f"Estudio reiniciado: {storage_dir.name}")
+            except Exception as exc:
+                st.error(f"No se pudo reiniciar Ray Tune: {exc}")
+
+    if not run_button:
+        return
+
+    settings, errors = _collect_optuna_ray_settings(
+        graph_obj=graph_obj,
+        graph_data=graph_data,
+    )
+    if errors:
+        for err in errors:
+            st.error(err)
+        return
+
+    search_space = settings["search_space"]
+    optuna_settings = settings["optuna_settings"]
+    objective_settings = settings["objective_settings"]
+    balancing_strategy = settings["balancing_strategy"]
+
+    if optimizer_choice == "Optuna":
+        with st.spinner("Ejecutando Optuna..."):
+            try:
+                status_text = st.empty()
+                progress_bar = st.progress(0)
+                with st.expander("Logs de Optuna (En vivo)", expanded=True):
+                    log_container = st.empty()
+                result = _run_optuna_search(
+                    graph_obj=graph_obj,
+                    balancing_strategy=balancing_strategy,
+                    search_space=search_space,
+                    optuna_settings=optuna_settings,
+                    objective_settings=objective_settings,
+                    log_container=log_container,
+                    progress_bar=progress_bar,
+                    status_text=status_text,
+                )
+            except Exception as exc:
+                st.error(f"Error en Optuna: {exc}")
+                if st.session_state.get("gnn_optuna_notify", False):
+                    notification_system.send_error_notification_email(
+                        "Optuna (Optimization)",
+                        exc,
+                        context={
+                            "graph": graph_obj.get("filename"),
+                            "objective": objective_settings.get("metric"),
+                            "balance": balancing_strategy,
+                            "n_trials": optuna_settings.get("n_trials"),
+                        },
+                    )
+                return
+
+        best_params = result["best_params"]
+        st.session_state["optuna_last_file"] = result["best_path"]
+        range_analysis = result.get("range_analysis") or {}
+        _render_optuna_range_analysis(range_analysis)
+
+        try:
+            entry = _collect_gnn_context()
+            entry.update(
+                {
+                    "type": "Optuna",
+                    "optuna": {
+                        "best_params": result["best_params"],
+                        "best_value": result.get("best_value"),
+                        "trials": len(result.get("trials", [])),
+                        "path": str(result["best_path"]),
+                        "full_path": str(result.get("full_path") or ""),
+                        "range_analysis": range_analysis,
+                    },
+                    "balance": {"strategy": balancing_strategy},
+                }
+            )
+            _append_gnn_history(entry)
+        except Exception:
+            pass
+
+        st.success(
+            f"Optuna finalizado. Archivo: {os.path.basename(result['best_path'])}"
+        )
+        st.markdown("**Mejores hiperparametros**")
+        st.dataframe(pd.DataFrame([best_params]), width="stretch")
+        st.caption(
+            "Estos resultados se guardaron en Resultados y pueden usarse en Training y Balance."
+        )
+    else:
+        with st.spinner("Ejecutando Ray Tune..."):
+            try:
+                status_text = st.empty()
+                progress_bar = st.progress(0)
+                with st.expander("Logs de Ray Tune (En vivo)", expanded=True):
+                    log_container = st.empty()
+                result = _run_ray_tune_search(
+                    graph_obj=graph_obj,
+                    balancing_strategy=balancing_strategy,
+                    search_space=search_space,
+                    optuna_settings=optuna_settings,
+                    objective_settings=objective_settings,
+                    log_container=log_container,
+                    progress_bar=progress_bar,
+                    status_text=status_text,
+                )
+            except Exception as exc:
+                st.error(f"Error en Ray Tune: {exc}")
+                if st.session_state.get("gnn_optuna_notify", False):
+                    notification_system.send_error_notification_email(
+                        "Ray Tune (Optimization)",
+                        exc,
+                        context={
+                            "graph": graph_obj.get("filename"),
+                            "objective": objective_settings.get("metric"),
+                            "balance": balancing_strategy,
+                            "n_trials": optuna_settings.get("n_trials"),
+                        },
+                    )
+                return
+
+        best_params = result["best_params"]
+        st.session_state["ray_last_file"] = result["best_path"]
+        range_analysis = result.get("range_analysis") or {}
+        _render_optuna_range_analysis(range_analysis)
+
+        st.success(
+            f"Ray Tune finalizado. Archivo: {os.path.basename(result['best_path'])}"
+        )
+        st.markdown("**Mejores hiperparametros**")
+        st.dataframe(pd.DataFrame([best_params]), width="stretch")
+        st.caption(
+            "Estos resultados se guardaron en Resultados y pueden usarse en Training y Balance."
+        )
+
+
 def render_graph_builder():
-    # --- Tabs for Eventos, Feature Engineering, Feature Selection, Graph, Network, Optuna, Balance, Training ---
+    # --- Tabs for Eventos, Feature Engineering, Feature Selection, Graph, Network, Optimization, Balance, Training ---
     (
         tab_events,
         tab_features,
@@ -5783,7 +6909,7 @@ def render_graph_builder():
         tab_graph,
         tab_visual,
         tab_network,
-        tab_optuna,
+        tab_optimization,
         tab_balance,
         tab_training,
         tab_evaluation,
@@ -5798,7 +6924,7 @@ def render_graph_builder():
             "Graph",
             "Visual Graph",
             "Network",
-            "Optuna",
+            "Optimization",
             "Balance",
             "Training",
             "Evaluación Modelo",
@@ -5843,8 +6969,8 @@ def render_graph_builder():
     with tab_network:
         _render_network_tab()
 
-    with tab_optuna:
-        _render_optuna_tab()
+    with tab_optimization:
+        _render_optimization_tab()
 
     with tab_balance:
         _render_balance_tab()
@@ -6409,6 +7535,15 @@ def _render_feature_engineering():
                                  st.toast("Email de notificación enviado.", icon="📧")
                              else:
                                  st.error("Error enviando email de notificación.")
+                else:
+                     if notify_enabled:
+                         err_notice = st.session_state.get("feature_notice", {})
+                         err_text = err_notice.get("text") or "Error desconocido en Snapshot Features."
+                         notification_system.send_error_notification_email(
+                             "Feature Engineering (Snapshot)",
+                             err_text,
+                             context={"params": snap_params},
+                         )
 
         # --- TAB 2: FLOW 5 MIN ---
         with tab_flow:
@@ -6585,6 +7720,15 @@ def _render_feature_engineering():
                                  st.toast("Email de notificación enviado.", icon="📧")
                              else:
                                  st.error("Error enviando email de notificación.")
+                 else:
+                     if notify_enabled:
+                         err_notice = st.session_state.get("feature_notice", {})
+                         err_text = err_notice.get("text") or "Error desconocido en Flow Features."
+                         notification_system.send_error_notification_email(
+                             "Feature Engineering (Flow)",
+                             err_text,
+                             context={"params": flow_params},
+                         )
 
     notice = st.session_state.get("feature_notice")
     if notice:
@@ -7538,7 +8682,11 @@ def _render_balance_tab() -> None:
                             "**Pruning**: AUPRC se usa para descartar entrenamientos malos.\n"
                             "Los parámetros mostrados aquí fijan la búsqueda (anulando el rango Optuna)."
                         )
-                        opt_name = st.selectbox("Optimizador", ["(Auto)", "Adam", "AdamW", "RAdam"], key="gnn_hpo_opt_name")
+                        opt_name = st.selectbox(
+                            "Optimizador",
+                            ["(Auto)", "Adam", "AdamW", "RAdam", "Lion"],
+                            key="gnn_hpo_opt_name",
+                        )
                         if opt_name != "(Auto)":
                             optimizer_overrides["optimizer"] = opt_name
                         
@@ -8677,11 +9825,27 @@ def _render_balance_tab() -> None:
             data_aug[target_ntype].num_nodes = x_aug.size(0)
             data_aug[(target_ntype, "imgagn", target_ntype)].edge_index = edge_index_aug
 
+            best_recall = None
+            try:
+                if "best_train_recall" in result:
+                    if torch.is_tensor(result["best_train_recall"]):
+                        best_recall = float(result["best_train_recall"].item())
+                    else:
+                        best_recall = float(result["best_train_recall"])
+            except Exception:
+                best_recall = None
+
+            imgagn_meta = {
+                "config": cfg.__dict__ if hasattr(cfg, "__dict__") else cfg,
+                "seed": int(result.get("seed", SEED)) if isinstance(result, dict) else int(SEED),
+                "best_train_recall": best_recall,
+            }
+
             st.session_state["balanced_graph"] = {
                 "data": data_aug,
                 "source": "ImGAGN",
                 "params": {"target_ntype": target_ntype},
-                "imgagn_best_params": cfg.__dict__ if hasattr(cfg, "__dict__") else cfg,
+                "imgagn_best_params": imgagn_meta,
             }
 
             # --- LOG HISTORY ---
@@ -8696,6 +9860,8 @@ def _render_balance_tab() -> None:
                              "epochs": int(epochs),
                              "max_new_nodes": int(max_new_nodes),
                              "minority_class": int(minority_class),
+                             "best_train_recall": best_recall,
+                             "seed": imgagn_meta.get("seed"),
                          }
                      }
                  })
@@ -8926,6 +10092,15 @@ def _render_training_tab() -> None:
         key="gnn_train_early_min_delta",
         disabled=not early_stop_train,
     )
+    st.markdown("#### Gradient accumulation")
+    accumulation_steps_train = st.number_input(
+        "accumulation_steps",
+        min_value=1,
+        value=int(ACCUMULATION_STEPS),
+        step=1,
+        key="gnn_train_accumulation_steps",
+        help="Acumula gradientes por N batches antes de actualizar (reduce memoria efectiva). Ej.: batch_size=128 y accumulation_steps=4 → actualiza cada 4 batches, batch efectivo 512.",
+    )
 
     st.markdown("#### Evaluación automática")
     auto_eval = st.checkbox(
@@ -8997,9 +10172,103 @@ def _render_training_tab() -> None:
         help="Enviar email con el log al finalizar el entrenamiento."
     )
 
-    if st.button("Entrenar modelo GNN", key="gnn_train_run"):
+    training_checkpoint_path = None
+    training_pending = False
+    training_details = ""
+    training_status = {}
+    try:
+        from src import gnn_main as graph_main
+        graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
+        variant_tag = "GraphSMOTE" if use_graphsmote_effective else "Base"
+        hp_label = hp_choice
+        if hp_choice == "Auto (mas reciente)":
+            hp_label = "auto"
+        elif hp_choice == "Nueva busqueda":
+            hp_label = "search"
+        elif network_option and hp_choice == network_option:
+            hp_label = "network"
+        config_sig = f"{variant_tag}|{graph_hash}|{hp_label}|{max_epochs_train}|{SEED}"
+        config_hash = hashlib.sha1(config_sig.encode("utf-8")).hexdigest()[:10]
+        ckpt_dir = Path(RESULTADOS_DIR) / "gnn_train_checkpoints" / f"{variant_tag}_{config_hash}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        training_checkpoint_path = ckpt_dir / "checkpoint.pt"
+        if training_checkpoint_path.exists():
+            try:
+                ckpt = torch.load(training_checkpoint_path, map_location="cpu", weights_only=False)
+            except Exception:
+                ckpt = None
+            if isinstance(ckpt, dict):
+                epoch_done = int(ckpt.get("epoch", 0))
+                max_epochs_ckpt = int(ckpt.get("max_epochs", max_epochs_train))
+                best_val = ckpt.get("best_val_f1")
+                run_id = ckpt.get("run_id")
+                last_val_f1 = ckpt.get("last_val_f1")
+                last_val_auc = ckpt.get("last_val_auc")
+                last_val_auprc = ckpt.get("last_val_auprc")
+                last_val_mcc = ckpt.get("last_val_mcc")
+                last_val_tau = ckpt.get("last_val_tau")
+                training_pending = epoch_done < max_epochs_ckpt
+                training_status = {
+                    "epoch": epoch_done,
+                    "max_epochs": max_epochs_ckpt,
+                    "best_val_f1": best_val,
+                    "run_id": run_id,
+                }
+                last_update = datetime.fromtimestamp(
+                    training_checkpoint_path.stat().st_mtime
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                training_details = (
+                    f"Checkpoint detectado: {epoch_done}/{max_epochs_ckpt} epochs "
+                    f"| Última actualización: {last_update}"
+                )
+                if best_val is not None:
+                    training_details += f" | best_val_f1={float(best_val):.4f}"
+                metrics_parts = []
+                if last_val_f1 is not None:
+                    metrics_parts.append(f"val_f1={float(last_val_f1):.4f}")
+                if last_val_auc is not None:
+                    metrics_parts.append(f"val_auc={float(last_val_auc):.4f}")
+                if last_val_auprc is not None:
+                    metrics_parts.append(f"val_auprc={float(last_val_auprc):.4f}")
+                if last_val_mcc is not None:
+                    metrics_parts.append(f"val_mcc={float(last_val_mcc):.4f}")
+                if last_val_tau is not None:
+                    metrics_parts.append(f"val_tau={float(last_val_tau):.4f}")
+                if metrics_parts:
+                    training_details += " | Últimas métricas: " + ", ".join(metrics_parts)
+                if run_id:
+                    training_details += f" | run_id={run_id}"
+                if max_epochs_train < max_epochs_ckpt:
+                    st.warning(
+                        "El max_epochs actual es menor que el del checkpoint. "
+                        "Considera igualarlo para continuar correctamente."
+                    )
+    except Exception:
+        training_checkpoint_path = None
+
+    if training_details:
+        st.info(training_details)
+
+    col_run_train, col_reset_train = st.columns([1, 1])
+    with col_run_train:
+        train_label = "Continuar entrenamiento" if training_pending else "Entrenar modelo GNN"
+        run_training = st.button(train_label, key="gnn_train_run")
+    with col_reset_train:
+        reset_training = False
+        if training_pending and training_checkpoint_path is not None:
+            reset_training = st.button("Reiniciar entrenamiento", key="gnn_train_reset")
+
+    if reset_training and training_checkpoint_path is not None:
         try:
-            from src import gnn_main as graph_main
+            training_checkpoint_path.unlink(missing_ok=True)
+            st.success("Checkpoint eliminado. El entrenamiento iniciará desde cero.")
+            training_pending = False
+        except Exception as exc:
+            st.error(f"No se pudo eliminar el checkpoint: {exc}")
+
+    if run_training:
+        try:
+            import optuna
         except Exception as exc:
             st.error(f"No se pudo cargar el entrenador GNN: {exc}")
             return
@@ -9437,9 +10706,23 @@ def _render_training_tab() -> None:
                         early_stop_min_delta=float(early_min_delta_train),
                         max_epochs=int(max_epochs_train),
                         progress_callback=_progress_cb,
+                        accumulation_steps=int(accumulation_steps_train),
+                        resume_state_path=str(training_checkpoint_path) if training_pending and training_checkpoint_path else None,
+                        save_state_path=str(training_checkpoint_path) if training_checkpoint_path else None,
                     )
             except Exception as exc:
                 st.error(f"Error en entrenamiento: {exc}")
+                if use_notify:
+                    notification_system.send_error_notification_email(
+                        "Entrenamiento GNN",
+                        exc,
+                        context={
+                            "graph": graph_obj.get("filename"),
+                            "use_graphsmote": bool(use_graphsmote_effective),
+                            "max_epochs": int(max_epochs_train),
+                            "hp_choice": hp_choice,
+                        },
+                    )
                 return
             finally:
                 builtins.input = original_input
@@ -10158,12 +11441,55 @@ def _render_gnn_experiments_tab() -> None:
             f"- Aristas: {int(sum(graph_data[edge_type].edge_index.shape[1] for edge_type in graph_data.edge_types))}"
         )
 
-        experiments = ["Optuna objectives (GNN)"]
+        experiments = ["Optuna objectives (GNN)", "Opt.Recursiva"]
         experiment_choice = st.selectbox(
             "Experimento",
             experiments,
             key="gnn_exp_choice",
         )
+
+        is_recursive_exp = experiment_choice == "Opt.Recursiva"
+        if is_recursive_exp:
+            st.markdown("### Opt.Recursiva (Optuna vs Ray)")
+            col_rec_a, col_rec_b, col_rec_c = st.columns(3)
+            with col_rec_a:
+                rec_max_iters = st.number_input(
+                    "Max iteraciones",
+                    min_value=1,
+                    value=3,
+                    step=1,
+                    key="gnn_exp_rec_max_iters",
+                    help="Corta el ciclo para evitar bucles infinitos.",
+                )
+            with col_rec_b:
+                rec_linear_expand = st.number_input(
+                    "Expandir rango lineal (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=25.0,
+                    step=5.0,
+                    key="gnn_exp_rec_linear_expand",
+                    help="Cuanto expandir min/max en parametros lineales cuando hay alerta roja.",
+                )
+            with col_rec_c:
+                rec_log_expand = st.number_input(
+                    "Expandir rango log (factor)",
+                    min_value=1.01,
+                    value=2.0,
+                    step=0.25,
+                    key="gnn_exp_rec_log_expand",
+                    help="Factor multiplicativo para parametros log cuando hay alerta roja.",
+                )
+            rec_order = st.selectbox(
+                "Orden de optimizadores",
+                ["Optuna -> Ray", "Ray -> Optuna"],
+                index=0,
+                key="gnn_exp_rec_order",
+            )
+            st.caption(
+                "Si hay alertas rojas, se ajusta el rango sugerido y se re-optimiza "
+                "hasta no tener alertas rojas o alcanzar el maximo de iteraciones."
+            )
 
         st.markdown("### Muestreo de Datos (Graph Sampling)")
         prev_fixed_train = bool(st.session_state.get("gnn_exp_fixed_train", False))
@@ -10173,10 +11499,22 @@ def _render_gnn_experiments_tab() -> None:
         sampling_mode_options = [
             "Resamplear seeds por epoch",
             "Fijar subset de entrenamiento por trial (reduce varianza)",
+            "Cargar todo el grafo en memoria (sin muestreo)",
         ]
-        default_sampling_idx = 1 if prev_fixed_train else 0
-        if prev_sample_each and not prev_fixed_train:
-            default_sampling_idx = 0
+        prev_full_graph = bool(st.session_state.get("gnn_exp_full_graph", False))
+        if not prev_full_graph:
+            try:
+                prev_train_nodes = int(st.session_state.get("gnn_exp_sample_train", 0))
+                prev_val_nodes = int(st.session_state.get("gnn_exp_sample_val", 0))
+                prev_full_graph = prev_train_nodes <= 0 and prev_val_nodes <= 0
+            except Exception:
+                prev_full_graph = False
+        if prev_full_graph:
+            default_sampling_idx = 2
+        else:
+            default_sampling_idx = 1 if prev_fixed_train else 0
+            if prev_sample_each and not prev_fixed_train:
+                default_sampling_idx = 0
         sampling_mode = st.radio(
             "Modo de muestreo",
             sampling_mode_options,
@@ -10184,48 +11522,74 @@ def _render_gnn_experiments_tab() -> None:
             key="gnn_exp_sampling_mode",
             help="Elige una sola opcion para evitar mezclar estrategias.",
         )
+        full_graph_mode = sampling_mode == sampling_mode_options[2]
         sample_each_epoch = sampling_mode == sampling_mode_options[0]
         fixed_train_subset = sampling_mode == sampling_mode_options[1]
+        if full_graph_mode:
+            sample_each_epoch = False
+            fixed_train_subset = False
         st.session_state["gnn_exp_sample_each_epoch"] = sample_each_epoch
         st.session_state["gnn_exp_fixed_train"] = fixed_train_subset
+        st.session_state["gnn_exp_full_graph"] = full_graph_mode
         st.caption(
             "Resamplear por epoch aumenta variabilidad; subset fijo reduce varianza y "
             "hace mas comparables los trials."
         )
+        if full_graph_mode:
+            st.caption(
+                "Modo sin muestreo: usa todos los nodos train/val (mayor uso de memoria)."
+            )
+            st.session_state["gnn_exp_sample_train"] = 0
+            st.session_state["gnn_exp_sample_val"] = 0
+            st.session_state["gnn_exp_fixed_val"] = False
         fixed_val_subset = st.checkbox(
             "Fijar subset de validacion por trial (reduce varianza)",
             value=False,
             key="gnn_exp_fixed_val",
+            disabled=full_graph_mode,
             help="Usa el mismo subset de validacion durante todo el trial.",
         )
         col_s1, col_s2 = st.columns(2)
         with col_s1:
             sample_train_nodes = st.number_input(
                 "Max seeds train por trial",
-                min_value=1000,
-                value=1000,
+                min_value=0,
+                value=0 if full_graph_mode else 1000,
                 step=1000,
                 key="gnn_exp_sample_train",
+                disabled=full_graph_mode,
             )
         with col_s2:
             sample_val_nodes = st.number_input(
                 "Max seeds val para evaluacion",
-                min_value=500,
-                value=1000,
+                min_value=0,
+                value=0 if full_graph_mode else 1000,
                 step=500,
                 key="gnn_exp_sample_val",
+                disabled=full_graph_mode,
             )
+        if full_graph_mode:
+            sample_train_nodes = 0
+            sample_val_nodes = 0
 
         st.markdown("### Estrategias de Balanceo")
-        balancing_strategies = [
-            "Sin balancear",
-            "Opt. balance con GraphSMOTE",
-            "Opt. balance con ImGAGN",
-        ]
-        st.info(
-            "El experimento se ejecuta sobre las 3 estrategias de balanceo: "
-            "Sin balancear, GraphSMOTE e ImGAGN."
+        balancing_strategies = st.multiselect(
+            "Seleccionar estrategias",
+            [
+                "Sin balancear",
+                "Opt. balance con GraphSMOTE",
+                "Opt. balance con ImGAGN",
+            ],
+            default=[
+                "Sin balancear",
+                "Opt. balance con GraphSMOTE",
+                "Opt. balance con ImGAGN",
+            ],
+            key="gnn_exp_balancing_strategies",
         )
+        if not balancing_strategies:
+            st.warning("Seleccione al menos una estrategia de balanceo.")
+            return
 
         smote_k_min = smote_k_max = smote_k_step = 0
         target_pos_ratio = []
@@ -10889,8 +12253,8 @@ def _render_gnn_experiments_tab() -> None:
                 )
             optimizer_choices = st.multiselect(
                 "Optimizadores",
-                ["Adam", "AdamW", "RAdam"],
-                default=["Adam", "AdamW", "RAdam"],
+                ["Adam", "AdamW", "RAdam", "Lion"],
+                default=["AdamW", "Lion"],
                 key="gnn_exp_optimizers",
             )
 
@@ -11086,7 +12450,28 @@ def _render_gnn_experiments_tab() -> None:
             disabled=not early_stop_train,
         )
 
-        if st.button("Ejecutar Experimento", key="gnn_exp_run"):
+        st.markdown("---")
+        # Experiment Control Logic
+        # Experiment Control Logic
+        exp_state = st.session_state.get("gnn_exp_state", {})
+        has_active_run = bool(exp_state.get("run_id"))
+        
+        use_existing_run = st.checkbox(
+            "Continuar con experimento en memoria",
+            value=has_active_run,
+            disabled=not has_active_run,
+            help="Si está marcado, continúa el experimento previo. Si no, inicia uno nuevo.",
+            key="gnn_exp_continue_checkbox"
+        )
+        
+        run_btn_label = "Continuar Experimento" if use_existing_run else "Ejecutar Experimento (Nuevo)"
+        
+        if st.button(run_btn_label, key="gnn_exp_run", type="primary"):
+            if not use_existing_run:
+                # User chose to start new, so clear previous state
+                st.session_state["gnn_exp_state"] = {}
+                exp_state = {}
+                has_active_run = False
             if not objective_metrics:
                 st.error("Seleccione al menos un objetivo de Optuna.")
                 return
@@ -11257,25 +12642,57 @@ def _render_gnn_experiments_tab() -> None:
                 "fixed_train_subset": bool(fixed_train_subset),
             }
 
-            results = []
-            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Initialize or Resume State
+            if has_active_run:
+                run_id = exp_state.get("run_id")
+                results = exp_state.get("results", [])
+                exp_db_path = exp_state.get("exp_db_path")
+                st.info(f"Continuing experiment: {run_id}. Loaded {len(results)} completed trials.")
+            else:
+                results = []
+                run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
             device = get_auto_device()
-            experiment_name = "GNN Optuna Objectives"
-            exp_meta = {
-                "run_id": run_id,
-                "graph": graph_obj.get("filename"),
-                "balance_strategies": list(balancing_strategies),
-                "train_ratio": int(train_ratio),
-                "val_ratio": int(val_ratio),
-                "test_ratio": int(test_ratio),
-                "far_target": float(far_target),
-            }
-            exp_db_path = _init_gnn_experiment_db(experiment_name, exp_meta)
+            experiment_name = (
+                "GNN Opt.Recursiva" if is_recursive_exp else "GNN Optuna Objectives"
+            )
+            
+            if not has_active_run:
+                exp_meta = {
+                    "run_id": run_id,
+                    "graph": graph_obj.get("filename"),
+                    "balance_strategies": list(balancing_strategies),
+                    "train_ratio": int(train_ratio),
+                    "val_ratio": int(val_ratio),
+                    "test_ratio": int(test_ratio),
+                    "far_target": float(far_target),
+                }
+                if is_recursive_exp:
+                    exp_meta.update(
+                        {
+                            "optimizer_order": rec_order,
+                            "max_iterations": int(rec_max_iters),
+                            "linear_expand": float(rec_linear_expand),
+                            "log_expand": float(rec_log_expand),
+                        }
+                    )
+                exp_db_path = _init_gnn_experiment_db(experiment_name, exp_meta)
+                
+                # Save initial state
+                st.session_state["gnn_exp_state"] = {
+                    "run_id": run_id,
+                    "results": results,
+                    "exp_db_path": exp_db_path,
+                    "timestamp": datetime.now().isoformat()
+                }
+
             if exp_db_path:
                 st.caption(f"DB live: {exp_db_path}")
 
             progress_global = st.progress(0)
             total_runs = len(objective_metrics) * len(balancing_strategies)
+            if is_recursive_exp:
+                total_runs *= int(rec_max_iters) * 2
             run_counter = 0
 
             for balance_idx, balancing_strategy in enumerate(balancing_strategies, start=1):
@@ -11287,175 +12704,508 @@ def _render_gnn_experiments_tab() -> None:
                 )
                 st.markdown(f"### Estrategia: {balancing_strategy}")
                 for idx, objective_metric in enumerate(objective_metrics, start=1):
-                    with st.expander(
-                        f"{balancing_strategy} · Objetivo {idx}/{len(objective_metrics)}: {objective_metric}",
-                        expanded=True,
-                    ):
-                        status_text = st.empty()
-                        progress_bar = st.progress(0)
-                        with st.expander("Logs de Optuna (En vivo)", expanded=False):
-                            log_container = st.empty()
-
-                        objective_settings = {
-                            "metric": objective_metric,
-                            "threshold_beta": threshold_beta,
-                            "device": device,
-                        }
-
-                        try:
-                            result = _run_optuna_search(
-                                graph_obj=graph_obj,
-                                balancing_strategy=balancing_strategy,
-                                search_space=search_space,
-                                optuna_settings=optuna_settings,
-                                objective_settings=objective_settings,
-                                log_container=log_container,
-                                progress_bar=progress_bar,
-                                status_text=status_text,
+                    if is_recursive_exp:
+                        optimizer_order = (
+                            ["Optuna", "Ray"]
+                            if rec_order == "Optuna -> Ray"
+                            else ["Ray", "Optuna"]
+                        )
+                        search_space_iter = copy.deepcopy(search_space)
+                        stop_due_to_no_red = False
+                        for iteration in range(1, int(rec_max_iters) + 1):
+                            st.markdown(
+                                f"#### Objetivo {idx}/{len(objective_metrics)}: {objective_metric} · Iteracion {iteration}"
                             )
-                        except Exception as exc:
-                            st.error(f"Error en Optuna ({objective_metric}): {exc}")
-                            payload = {
-                                "experiment": experiment_name,
-                                "run_id": run_id,
-                                "objective_label": objective_metric,
-                                "balance_strategy": balancing_strategy,
-                                "error": str(exc),
-                                "status": "optuna_error",
-                            }
-                            _append_gnn_experiment_result(exp_db_path, payload)
-                            results.append(payload)
-                            _cleanup_experiment_memory()
-                            run_counter += 1
-                            progress_global.progress(
-                                min(run_counter / max(total_runs, 1), 1.0)
+                            red_found = False
+                            for optimizer_name in optimizer_order:
+                                    with st.expander(
+                                        f"{balancing_strategy} · {objective_metric} · Iter {iteration} · {optimizer_name}",
+                                        expanded=True,
+                                    ):
+                                        # Check if already done
+                                        already_done = False
+                                        for res in results:
+                                            if (res.get("balance_strategy") == balancing_strategy and
+                                                res.get("objective_metric") == objective_metric and
+                                                res.get("iteration") == iteration and
+                                                res.get("optimizer") == optimizer_name):
+                                                already_done = True
+                                                break
+                                        
+                                        if already_done:
+                                            st.info(f"Skipping completed trial: {balancing_strategy} - {objective_metric} - Iter {iteration} - {optimizer_name}")
+                                            run_counter += 1
+                                            progress_global.progress(min(run_counter / max(total_runs, 1), 1.0))
+                                            
+                                            # Update search space with result for next iteration continuity (simplified: assumption is state is mainly about results for analysis, 
+                                            # but ideally we should replay parameter range updates if we want perfect state restoration. 
+                                            # For now, skipping execution is the user request.)
+                                            continue
+
+                                        status_text = st.empty()
+                                        progress_bar = st.progress(0)
+                                        stop_key = f"gnn_exp_optuna_stop_{run_id}_{balance_idx}_{idx}_{iteration}_{optimizer_name}"
+                                        if optimizer_name == "Optuna":
+                                            stop_col_a, stop_col_b = st.columns([0.8, 0.2])
+                                            with stop_col_b:
+                                                if st.button("Detener iteración", key=stop_key):
+                                                    st.session_state[stop_key] = True
+                                        log_label = (
+                                            "Logs de Optuna (En vivo)"
+                                            if optimizer_name == "Optuna"
+                                            else "Logs de Ray Tune (En vivo)"
+                                        )
+                                        with st.expander(log_label, expanded=False):
+                                            log_container = st.empty()
+    
+                                        objective_settings = {
+                                            "metric": objective_metric,
+                                            "threshold_beta": threshold_beta,
+                                            "device": device,
+                                        }
+    
+                                        try:
+                                            if optimizer_name == "Optuna":
+                                                result = _run_optuna_search(
+                                                    graph_obj=graph_obj,
+                                                    balancing_strategy=balancing_strategy,
+                                                    search_space=search_space_iter,
+                                                    optuna_settings=optuna_settings,
+                                                    objective_settings=objective_settings,
+                                                    log_container=log_container,
+                                                    progress_bar=progress_bar,
+                                                    status_text=status_text,
+                                                    stop_flag_key=stop_key,
+                                                    storage_path=str(exp_db_path) if exp_db_path else None,
+                                                )
+                                            else:
+                                                result = _run_ray_tune_search(
+                                                    graph_obj=graph_obj,
+                                                    balancing_strategy=balancing_strategy,
+                                                    search_space=search_space_iter,
+                                                    optuna_settings=optuna_settings,
+                                                    objective_settings=objective_settings,
+                                                    log_container=log_container,
+                                                    progress_bar=progress_bar,
+                                                    status_text=status_text,
+                                                )
+                                        except Exception as exc:
+                                            st.error(
+                                                f"Error en {optimizer_name} ({objective_metric}): {exc}"
+                                            )
+                                            if st.session_state.get("gnn_optuna_notify", False):
+                                                notification_system.send_error_notification_email(
+                                                    f"{optimizer_name} (Experiments)",
+                                                    exc,
+                                                    context={
+                                                        "experiment": experiment_name,
+                                                        "objective": objective_metric,
+                                                        "balance": balancing_strategy,
+                                                        "iteration": iteration,
+                                                    },
+                                                )
+                                            payload = {
+                                                "experiment": experiment_name,
+                                                "run_id": run_id,
+                                                "objective_label": objective_metric,
+                                                "objective_metric": objective_metric,
+                                                "balance_strategy": balancing_strategy,
+                                                "optimizer": optimizer_name,
+                                                "iteration": iteration,
+                                                "error": str(exc),
+                                                "status": "optimizer_error",
+                                            }
+                                            _append_gnn_experiment_result(exp_db_path, payload)
+                                            results.append(payload)
+                                            _cleanup_experiment_memory()
+                                            run_counter += 1
+                                            progress_global.progress(
+                                                min(run_counter / max(total_runs, 1), 1.0)
+                                            )
+                                            continue
+    
+                                        best_params = result.get("best_params", {})
+                                        trials_df = result.get("trials_df")
+                                        range_analysis = result.get("range_analysis") or {}
+                                        _render_optuna_range_analysis(range_analysis)
+    
+                                        adjustments = []
+                                        importances_used = {}
+                                        if range_analysis.get("alert_level") == "red":
+                                            red_found = True
+                                            optuna_importances = None
+                                            study_ref = result.get("study")
+                                            if study_ref is not None:
+                                                try:
+                                                    import optuna
+                                                    optuna_importances = optuna.importance.get_param_importances(
+                                                        study_ref
+                                                    )
+                                                except Exception:
+                                                    optuna_importances = None
+    
+                                            search_space_iter, adjustments, importances_used = _smart_adjust_search_space(
+                                                search_space_iter,
+                                                trials_df,
+                                                top_frac=0.20,
+                                                pct_low=0.10,
+                                                pct_high=0.90,
+                                                near_ratio=0.10,
+                                                edge_frac=0.40,
+                                                linear_expand=float(rec_linear_expand) / 100.0,
+                                                log_expand=float(rec_log_expand),
+                                                importances=optuna_importances,
+                                            )
+                                            if not adjustments:
+                                                search_space_iter, adjustments = _expand_search_space_from_alerts(
+                                                    search_space_iter,
+                                                    range_analysis,
+                                                    linear_expand=float(rec_linear_expand) / 100.0,
+                                                    log_expand=float(rec_log_expand),
+                                                )
+                                            if adjustments:
+                                                st.markdown("### Ajustes aplicados")
+                                                st.dataframe(
+                                                    pd.DataFrame(adjustments),
+                                                    width="stretch",
+                                                )
+                                            if importances_used:
+                                                st.markdown("### Importancia de parametros (Optuna)")
+                                                st.dataframe(
+                                                    pd.DataFrame(
+                                                        [
+                                                            {"param": k, "importance": v}
+                                                            for k, v in importances_used.items()
+                                                        ]
+                                                    ).sort_values("importance", ascending=False),
+                                                    width="stretch",
+                                                )
+    
+                                        # Preparar grafo para entrenamiento
+                                        graph_train_obj = dict(graph_obj)
+                                        graph_train_data = graph_data
+                                        if use_imgagn_search:
+                                            try:
+                                                graph_train_data = _apply_imgagn_to_graph(
+                                                    graph_data, best_params, device
+                                                )
+                                                graph_train_obj["data"] = graph_train_data
+                                                graph_train_obj["imgagn_best_params"] = best_params
+                                            except Exception as exc:
+                                                st.error(f"ImGAGN fallo: {exc}")
+    
+                                        model_path = None
+                                        train_error = None
+                                        try:
+                                            model_path = _train_gnn_with_best_params(
+                                                graph_train_obj,
+                                                result.get("best_path"),
+                                                use_graphsmote=use_graphsmote_search,
+                                                max_epochs=int(max_epochs_train),
+                                                early_stop=bool(early_stop_train),
+                                                early_stop_patience=int(early_patience_train),
+                                                early_stop_min_delta=float(early_min_delta_train),
+                                            )
+                                        except Exception as exc:
+                                            train_error = str(exc)
+                                            st.error(f"Error entrenando modelo: {exc}")
+    
+                                        eval_payload: Dict[str, object] = {}
+                                        eval_error = None
+                                        if model_path:
+                                            try:
+                                                eval_batch_size = int(
+                                                    best_params.get("batch_size", BATCH_SIZE)
+                                                )
+                                                eval_num_neighbors = best_params.get("num_neighbors")
+                                                eval_payload = _evaluate_gnn_model_far_target(
+                                                    model_path=model_path,
+                                                    graph_data=graph_train_data,
+                                                    device=device,
+                                                    far_target=float(far_target),
+                                                    batch_size=eval_batch_size,
+                                                    num_neighbors=eval_num_neighbors,
+                                                )
+                                            except Exception as exc:
+                                                eval_error = str(exc)
+                                                st.error(f"Error evaluando modelo: {exc}")
+    
+                                        report = eval_payload.get("report", {})
+                                        metrics = eval_payload.get("metrics", {})
+                                        test_f1 = (
+                                            report.get("Accidente (1)", {}).get("f1-score")
+                                            if report
+                                            else None
+                                        )
+                                        test_precision = (
+                                            report.get("Accidente (1)", {}).get("precision")
+                                            if report
+                                            else None
+                                        )
+                                        test_recall = (
+                                            report.get("Accidente (1)", {}).get("recall")
+                                            if report
+                                            else None
+                                        )
+                                        test_accuracy = report.get("accuracy") if report else None
+    
+                                        status = "ok"
+                                        if model_path is None:
+                                            status = "train_error"
+                                        elif eval_error:
+                                            status = "eval_error"
+    
+                                        payload = {
+                                            "experiment": experiment_name,
+                                            "run_id": run_id,
+                                            "objective_label": objective_metric,
+                                            "objective_metric": objective_metric,
+                                            "optimizer": optimizer_name,
+                                            "iteration": iteration,
+                                            "alert_level": range_analysis.get("alert_level"),
+                                            "red_params": range_analysis.get("red_params"),
+                                            "yellow_params": range_analysis.get("yellow_params"),
+                                            "range_adjustments": adjustments,
+                                            "range_policy": "smart_v1",
+                                            "param_importance": importances_used,
+                                            "best_value": best_params.get("value"),
+                                            "best_epoch": best_params.get("best_epoch"),
+                                            "best_tau": best_params.get("best_tau"),
+                                            "best_path": result.get("best_path"),
+                                            "full_path": result.get("full_path"),
+                                            "range_analysis": range_analysis,
+                                            "balance_strategy": balancing_strategy,
+                                            "graph": graph_obj.get("filename"),
+                                            "batch_size_eval": best_params.get("batch_size"),
+                                            "num_neighbors_eval": best_params.get("num_neighbors"),
+                                            "far_target": float(far_target),
+                                            "model_path": model_path,
+                                            "eval_threshold": eval_payload.get("threshold"),
+                                            "val_far": (
+                                                eval_payload.get("calibration", {}) or {}
+                                            ).get("far"),
+                                            "val_sens": (
+                                                eval_payload.get("calibration", {}) or {}
+                                            ).get("sens"),
+                                            "test_f1": test_f1,
+                                            "test_precision": test_precision,
+                                            "test_recall": test_recall,
+                                            "test_accuracy": test_accuracy,
+                                            "test_far": metrics.get("far"),
+                                            "test_specificity": metrics.get("specificity"),
+                                            "test_auprc": eval_payload.get("auprc"),
+                                            "test_auc": eval_payload.get("auc"),
+                                            "test_mcc": eval_payload.get("mcc"),
+                                            "confusion_matrix": eval_payload.get("confusion_matrix"),
+                                            "train_error": train_error,
+                                            "eval_error": eval_error,
+                                            "status": status,
+                                        }
+    
+                                        _append_gnn_experiment_result(exp_db_path, payload)
+                                        results.append(payload)
+                                        _cleanup_experiment_memory()
+                                        run_counter += 1
+                                        progress_global.progress(
+                                            min(run_counter / max(total_runs, 1), 1.0)
+                                        )
+                            if not red_found:
+                                stop_due_to_no_red = True
+                                break
+                        if stop_due_to_no_red:
+                            st.success(
+                                f"{objective_metric}: sin alertas rojas. Deteniendo iteraciones."
                             )
-                            continue
-
-                        best_params = result.get("best_params", {})
-                        range_analysis = result.get("range_analysis") or {}
-                        _render_optuna_range_analysis(range_analysis)
-
-                        # Preparar grafo para entrenamiento
-                        graph_train_obj = dict(graph_obj)
-                        graph_train_data = graph_data
-                        if use_imgagn_search:
-                            try:
-                                graph_train_data = _apply_imgagn_to_graph(
-                                    graph_data, best_params, device
+                    else:
+                        with st.expander(
+                            f"{balancing_strategy} · Objetivo {idx}/{len(objective_metrics)}: {objective_metric}",
+                            expanded=True,
+                        ):
+                            status_text = st.empty()
+                            progress_bar = st.progress(0)
+                            stop_key = f"gnn_exp_optuna_stop_{run_id}_{balance_idx}_{idx}"
+                            stop_col_a, stop_col_b = st.columns([0.8, 0.2])
+                            with stop_col_b:
+                                if st.button("Detener iteración", key=stop_key):
+                                    st.session_state[stop_key] = True
+                            with st.expander("Logs de Optuna (En vivo)", expanded=False):
+                                log_container = st.empty()
+    
+                                objective_settings = {
+                                    "metric": objective_metric,
+                                    "threshold_beta": threshold_beta,
+                                    "device": device,
+                                }
+    
+                                try:
+                                    result = _run_optuna_search(
+                                        graph_obj=graph_obj,
+                                        balancing_strategy=balancing_strategy,
+                                        search_space=search_space,
+                                        optuna_settings=optuna_settings,
+                                        objective_settings=objective_settings,
+                                        log_container=log_container,
+                                        progress_bar=progress_bar,
+                                        status_text=status_text,
+                                        stop_flag_key=stop_key,
+                                        storage_path=str(exp_db_path) if exp_db_path else None,
+                                    )
+                                except Exception as exc:
+                                    st.error(f"Error en Optuna ({objective_metric}): {exc}")
+                                    if st.session_state.get("gnn_optuna_notify", False):
+                                        notification_system.send_error_notification_email(
+                                            "Optuna (Experiments)",
+                                            exc,
+                                            context={
+                                                "experiment": experiment_name,
+                                                "objective": objective_metric,
+                                                "balance": balancing_strategy,
+                                            },
+                                        )
+                                    payload = {
+                                        "experiment": experiment_name,
+                                        "run_id": run_id,
+                                        "objective_label": objective_metric,
+                                        "balance_strategy": balancing_strategy,
+                                        "error": str(exc),
+                                        "status": "optuna_error",
+                                    }
+                                    _append_gnn_experiment_result(exp_db_path, payload)
+                                    results.append(payload)
+                                    # Update persistently
+                                    st.session_state["gnn_exp_state"]["results"] = results
+                                    
+                                    _cleanup_experiment_memory()
+                                    run_counter += 1
+                                    progress_global.progress(
+                                        min(run_counter / max(total_runs, 1), 1.0)
+                                    )
+                                    continue
+    
+                                best_params = result.get("best_params", {})
+                                range_analysis = result.get("range_analysis") or {}
+                                _render_optuna_range_analysis(range_analysis)
+    
+                                # Preparar grafo para entrenamiento
+                                graph_train_obj = dict(graph_obj)
+                                graph_train_data = graph_data
+                                if use_imgagn_search:
+                                    try:
+                                        graph_train_data = _apply_imgagn_to_graph(
+                                            graph_data, best_params, device
+                                        )
+                                        graph_train_obj["data"] = graph_train_data
+                                        graph_train_obj["imgagn_best_params"] = best_params
+                                    except Exception as exc:
+                                        st.error(f"ImGAGN fallo: {exc}")
+    
+                                model_path = None
+                                train_error = None
+                                try:
+                                    model_path = _train_gnn_with_best_params(
+                                        graph_train_obj,
+                                        result.get("best_path"),
+                                        use_graphsmote=use_graphsmote_search,
+                                        max_epochs=int(max_epochs_train),
+                                        early_stop=bool(early_stop_train),
+                                        early_stop_patience=int(early_patience_train),
+                                        early_stop_min_delta=float(early_min_delta_train),
+                                    )
+                                except Exception as exc:
+                                    train_error = str(exc)
+                                    st.error(f"Error entrenando modelo: {exc}")
+    
+                                eval_payload: Dict[str, object] = {}
+                                eval_error = None
+                                if model_path:
+                                    try:
+                                        eval_batch_size = int(
+                                            best_params.get("batch_size", BATCH_SIZE)
+                                        )
+                                        eval_num_neighbors = best_params.get("num_neighbors")
+                                        eval_payload = _evaluate_gnn_model_far_target(
+                                            model_path=model_path,
+                                            graph_data=graph_train_data,
+                                            device=device,
+                                            far_target=float(far_target),
+                                            batch_size=eval_batch_size,
+                                            num_neighbors=eval_num_neighbors,
+                                        )
+                                    except Exception as exc:
+                                        eval_error = str(exc)
+                                        st.error(f"Error evaluando modelo: {exc}")
+    
+                                report = eval_payload.get("report", {})
+                                metrics = eval_payload.get("metrics", {})
+                                test_f1 = (
+                                    report.get("Accidente (1)", {}).get("f1-score")
+                                    if report
+                                    else None
                                 )
-                                graph_train_obj["data"] = graph_train_data
-                                graph_train_obj["imgagn_best_params"] = best_params
-                            except Exception as exc:
-                                st.error(f"ImGAGN fallo: {exc}")
-
-                        model_path = None
-                        train_error = None
-                        try:
-                            model_path = _train_gnn_with_best_params(
-                                graph_train_obj,
-                                result.get("best_path"),
-                                use_graphsmote=use_graphsmote_search,
-                                max_epochs=int(max_epochs_train),
-                                early_stop=bool(early_stop_train),
-                                early_stop_patience=int(early_patience_train),
-                                early_stop_min_delta=float(early_min_delta_train),
-                            )
-                        except Exception as exc:
-                            train_error = str(exc)
-                            st.error(f"Error entrenando modelo: {exc}")
-
-                        eval_payload: Dict[str, object] = {}
-                        eval_error = None
-                        if model_path:
-                            try:
-                                eval_batch_size = int(
-                                    best_params.get("batch_size", BATCH_SIZE)
+                                test_precision = (
+                                    report.get("Accidente (1)", {}).get("precision")
+                                    if report
+                                    else None
                                 )
-                                eval_num_neighbors = best_params.get("num_neighbors")
-                                eval_payload = _evaluate_gnn_model_far_target(
-                                    model_path=model_path,
-                                    graph_data=graph_train_data,
-                                    device=device,
-                                    far_target=float(far_target),
-                                    batch_size=eval_batch_size,
-                                    num_neighbors=eval_num_neighbors,
+                                test_recall = (
+                                    report.get("Accidente (1)", {}).get("recall")
+                                    if report
+                                    else None
                                 )
-                            except Exception as exc:
-                                eval_error = str(exc)
-                                st.error(f"Error evaluando modelo: {exc}")
-
-                        report = eval_payload.get("report", {})
-                        metrics = eval_payload.get("metrics", {})
-                        test_f1 = (
-                            report.get("Accidente (1)", {}).get("f1-score")
-                            if report
-                            else None
-                        )
-                        test_precision = (
-                            report.get("Accidente (1)", {}).get("precision")
-                            if report
-                            else None
-                        )
-                        test_recall = (
-                            report.get("Accidente (1)", {}).get("recall")
-                            if report
-                            else None
-                        )
-                        test_accuracy = report.get("accuracy") if report else None
-
-                        status = "ok"
-                        if model_path is None:
-                            status = "train_error"
-                        elif eval_error:
-                            status = "eval_error"
-
-                        payload = {
-                            "experiment": experiment_name,
-                            "run_id": run_id,
-                            "objective_label": objective_metric,
-                            "objective_metric": objective_metric,
-                            "optuna_best_value": best_params.get("value"),
-                            "optuna_best_epoch": best_params.get("best_epoch"),
-                            "optuna_best_tau": best_params.get("best_tau"),
-                            "optuna_best_path": result.get("best_path"),
-                            "optuna_full_path": result.get("full_path"),
-                            "optuna_range_analysis": range_analysis,
-                            "balance_strategy": balancing_strategy,
-                            "graph": graph_obj.get("filename"),
-                            "batch_size_eval": best_params.get("batch_size"),
-                            "num_neighbors_eval": best_params.get("num_neighbors"),
-                            "far_target": float(far_target),
-                            "model_path": model_path,
-                            "eval_threshold": eval_payload.get("threshold"),
-                            "val_far": (
-                                eval_payload.get("calibration", {}) or {}
-                            ).get("far"),
-                            "val_sens": (
-                                eval_payload.get("calibration", {}) or {}
-                            ).get("sens"),
-                            "test_f1": test_f1,
-                            "test_precision": test_precision,
-                            "test_recall": test_recall,
-                            "test_accuracy": test_accuracy,
-                            "test_far": metrics.get("far"),
-                            "test_specificity": metrics.get("specificity"),
-                            "test_auprc": eval_payload.get("auprc"),
-                            "test_auc": eval_payload.get("auc"),
-                            "test_mcc": eval_payload.get("mcc"),
-                            "confusion_matrix": eval_payload.get("confusion_matrix"),
-                            "train_error": train_error,
-                            "eval_error": eval_error,
-                            "status": status,
-                        }
-
-                        _append_gnn_experiment_result(exp_db_path, payload)
-                        results.append(payload)
-                        _cleanup_experiment_memory()
-                        run_counter += 1
-                        progress_global.progress(
-                            min(run_counter / max(total_runs, 1), 1.0)
-                        )
+                                test_accuracy = report.get("accuracy") if report else None
+    
+                                status = "ok"
+                                if model_path is None:
+                                    status = "train_error"
+                                elif eval_error:
+                                    status = "eval_error"
+    
+                                payload = {
+                                    "experiment": experiment_name,
+                                    "run_id": run_id,
+                                    "objective_label": objective_metric,
+                                    "objective_metric": objective_metric,
+                                    "optuna_best_value": best_params.get("value"),
+                                    "optuna_best_epoch": best_params.get("best_epoch"),
+                                    "optuna_best_tau": best_params.get("best_tau"),
+                                    "optuna_best_path": result.get("best_path"),
+                                    "optuna_full_path": result.get("full_path"),
+                                    "optuna_range_analysis": range_analysis,
+                                    "balance_strategy": balancing_strategy,
+                                    "graph": graph_obj.get("filename"),
+                                    "batch_size_eval": best_params.get("batch_size"),
+                                    "num_neighbors_eval": best_params.get("num_neighbors"),
+                                    "far_target": float(far_target),
+                                    "model_path": model_path,
+                                    "eval_threshold": eval_payload.get("threshold"),
+                                    "val_far": (
+                                        eval_payload.get("calibration", {}) or {}
+                                    ).get("far"),
+                                    "val_sens": (
+                                        eval_payload.get("calibration", {}) or {}
+                                    ).get("sens"),
+                                    "test_f1": test_f1,
+                                    "test_precision": test_precision,
+                                    "test_recall": test_recall,
+                                    "test_accuracy": test_accuracy,
+                                    "test_far": metrics.get("far"),
+                                    "test_specificity": metrics.get("specificity"),
+                                    "test_auprc": eval_payload.get("auprc"),
+                                    "test_auc": eval_payload.get("auc"),
+                                    "test_mcc": eval_payload.get("mcc"),
+                                    "confusion_matrix": eval_payload.get("confusion_matrix"),
+                                    "train_error": train_error,
+                                    "eval_error": eval_error,
+                                    "status": status,
+                                }
+    
+                                _append_gnn_experiment_result(exp_db_path, payload)
+                                results.append(payload)
+                                _cleanup_experiment_memory()
+                                run_counter += 1
+                                progress_global.progress(
+                                    min(run_counter / max(total_runs, 1), 1.0)
+                                )
 
             if results:
                 results_df = pd.DataFrame(results)
@@ -11625,8 +13375,8 @@ def _render_network_tab() -> None:
     with col_opt1:
         optimizer_name = st.selectbox(
             "optimizer",
-            ["Adam", "AdamW", "RAdam"],
-            index=["Adam", "AdamW", "RAdam"].index(
+            ["Adam", "AdamW", "RAdam", "Lion"],
+            index=["Adam", "AdamW", "RAdam", "Lion"].index(
                 str(existing_cfg.get("optimizer", "Adam"))
             ),
             key="gnn_net_optimizer",
@@ -11993,8 +13743,386 @@ def _render_network_tab() -> None:
         )
 
 
-def _render_optuna_tab() -> None:
-    st.subheader("Optuna (Balance + Training)")
+def _compute_optuna_study_name(
+    *,
+    graph_obj: Dict[str, object],
+    balancing_strategy: str,
+    objective_metric: str,
+    space_signature: Optional[str] = None,
+) -> Tuple[str, str]:
+    from src import gnn_main as graph_main
+
+    use_graphsmote_search = (balancing_strategy == "Opt. balance con GraphSMOTE")
+    use_imgagn_search = (balancing_strategy == "Opt. balance con ImGAGN")
+    graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
+    variant_tag = graph_main._variant_tags(use_graphsmote_search, graph_obj)
+    if use_imgagn_search:
+        if "_Base" in variant_tag:
+            variant_tag = variant_tag.replace("_Base", "")
+        if variant_tag:
+            parts = [part for part in variant_tag.split("_") if part]
+            variant_tag = "_" + "_".join(parts) if parts else ""
+        if "_ImGAGN" not in variant_tag:
+            variant_tag = f"{variant_tag}_ImGAGN" if variant_tag else "_ImGAGN"
+    study_base = f"gnn_optuna_{objective_metric}{variant_tag}"
+    if space_signature:
+        study_base = f"{study_base}_{space_signature}"
+    if graph_hash:
+        study_base = f"{study_base}_{graph_hash[:16]}"
+    study_name = re.sub(r"[^A-Za-z0-9_\\-]", "_", study_base)
+    storage_path = os.path.join(RESULTADOS_DIR, "optuna_studies.db")
+    storage_url = f"sqlite:///{storage_path}"
+    return study_name, storage_url
+
+
+def _optuna_study_pending(
+    *,
+    study_name: str,
+    storage_url: str,
+    target_trials: int,
+) -> Tuple[bool, int]:
+    try:
+        import optuna
+    except Exception:
+        return False, 0
+    try:
+        study = optuna.load_study(study_name=study_name, storage=storage_url)
+    except Exception:
+        return False, 0
+    try:
+        done_states = {
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.PRUNED,
+            optuna.trial.TrialState.FAIL,
+        }
+    except Exception:
+        done_states = set()
+    if not done_states:
+        done_trials = len(study.trials)
+    else:
+        done_trials = sum(1 for t in study.trials if t.state in done_states)
+    return done_trials < int(target_trials), int(done_trials)
+
+
+def _ray_tune_pending(
+    *,
+    storage_dir: Path,
+    target_trials: int,
+) -> Tuple[bool, int, Optional[float], Dict[str, int]]:
+    if not storage_dir.exists():
+        return False, 0, None, {}
+    state_path = storage_dir / "experiment_state.json"
+    if not state_path.exists():
+        return False, 0, None, {}
+    try:
+        with state_path.open("r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except Exception:
+        return False, 0, None, {}
+
+    trials = []
+    if isinstance(state, dict):
+        if isinstance(state.get("trials"), list):
+            trials = state.get("trials") or []
+        elif isinstance(state.get("trial_data"), dict):
+            trials = list(state.get("trial_data", {}).values())
+
+    done_statuses = {"TERMINATED", "ERROR"}
+    pending_statuses = {"PENDING", "RUNNING", "PAUSED"}
+    done_trials = 0
+    pending_trials = 0
+    status_counts: Dict[str, int] = {}
+    for trial in trials:
+        status = str(trial.get("status") or "").upper()
+        if status:
+            status_counts[status] = status_counts.get(status, 0) + 1
+        if status in pending_statuses:
+            pending_trials += 1
+        elif status in done_statuses:
+            done_trials += 1
+
+    last_update = None
+    try:
+        last_update = state_path.stat().st_mtime
+    except Exception:
+        last_update = None
+
+    if pending_trials > 0:
+        return True, done_trials, last_update, status_counts
+    if trials and done_trials < int(target_trials):
+        return True, done_trials, last_update, status_counts
+    return False, done_trials, last_update, status_counts
+
+
+def _search_space_signature(search_space: Dict[str, object]) -> str:
+    if not search_space:
+        return "nospace"
+    signature_payload: Dict[str, object] = {}
+    for key, value in sorted(search_space.items()):
+        if isinstance(value, list):
+            try:
+                signature_payload[key] = sorted(value, key=lambda v: str(v))
+            except Exception:
+                signature_payload[key] = [str(v) for v in value]
+    raw = json.dumps(signature_payload, ensure_ascii=True, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+
+
+def _search_space_signature_from_state() -> str:
+    def _get_state(key: str, default: object) -> object:
+        return st.session_state.get(key, default)
+
+    signature_payload = {
+        "aggr1": list(_get_state("gnn_optuna_aggr1", ["sum", "mean"])),
+        "aggr2": list(_get_state("gnn_optuna_aggr2", ["sum", "mean"])),
+        "use_checkpointing": list(_get_state("gnn_optuna_checkpoint", [False, True])),
+        "neighbor_choices": list(_get_state("gnn_optuna_neighbor_choices", ["compact", "focused", "broad", "wide"])),
+        "lambda_H_mode": list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"])),
+        "loss_type": list(_get_state("gnn_optuna_loss_type", ["CrossEntropy", "FocalLoss"])),
+        "optimizers": list(_get_state("gnn_optuna_optimizers", ["AdamW", "Lion"])),
+        "target_pos_ratio": [
+            v.strip()
+            for v in str(_get_state("gnn_optuna_target_ratio", "0.25,0.35,0.5")).split(",")
+            if v.strip()
+        ],
+        "smote_every_n_epochs": [
+            v.strip()
+            for v in str(_get_state("gnn_optuna_smote_every", "2,4,6")).split(",")
+            if v.strip()
+        ],
+    }
+    raw = json.dumps(signature_payload, ensure_ascii=True, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+
+
+def _collect_optuna_ray_settings(
+    *,
+    graph_obj: Dict[str, object],
+    graph_data: HeteroData,
+) -> Tuple[Optional[Dict[str, object]], List[str]]:
+    def _get_state(key: str, default: object) -> object:
+        return st.session_state.get(key, default)
+
+    def _parse_int_list(text: str, fallback: List[int]) -> List[int]:
+        try:
+            items = [int(v.strip()) for v in text.split(",") if v.strip()]
+            return items or fallback
+        except Exception:
+            return fallback
+
+    def _parse_float_list(text: str, fallback: List[float]) -> List[float]:
+        try:
+            items = [float(v.strip()) for v in text.split(",") if v.strip()]
+            return items or fallback
+        except Exception:
+            return fallback
+
+    errors: List[str] = []
+
+    balancing_strategy = str(_get_state("gnn_balancing_strategy", "Sin balancear"))
+    use_graphsmote_search = (balancing_strategy == "Opt. balance con GraphSMOTE")
+    use_imgagn_search = (balancing_strategy == "Opt. balance con ImGAGN")
+
+    train_ratio = int(_get_state("gnn_optuna_split_train", TRAIN_RATIO))
+    val_ratio = int(_get_state("gnn_optuna_split_val", VAL_RATIO))
+    pm_index_ref = graph_obj.get("pm_index")
+    split_info = None
+    if pm_index_ref is not None:
+        split_info = _apply_temporal_split_to_graph(
+            graph_data,
+            pm_index_ref,
+            int(train_ratio),
+            int(val_ratio),
+        )
+    if split_info:
+        st.caption(
+            "Split aplicado: "
+            f"train={split_info['train_count']}, "
+            f"val={split_info['val_count']}, "
+            f"test={split_info['test_count']}"
+        )
+    else:
+        st.warning(
+            "No se pudo aplicar el split temporal; se usaran las mascaras actuales."
+        )
+
+    neighbor_profiles = {
+        "compact": _parse_int_list(str(_get_state("gnn_optuna_neighbor_compact", "15,10")), [15, 10]),
+        "focused": _parse_int_list(str(_get_state("gnn_optuna_neighbor_focused", "10,5")), [10, 5]),
+        "broad": _parse_int_list(str(_get_state("gnn_optuna_neighbor_broad", "25,15,10")), [25, 15, 10]),
+        "wide": _parse_int_list(str(_get_state("gnn_optuna_neighbor_wide", "30,20")), [30, 20]),
+    }
+    neighbor_choices = list(_get_state("gnn_optuna_neighbor_choices", list(neighbor_profiles.keys())))
+    aggr1 = list(_get_state("gnn_optuna_aggr1", ["sum", "mean"]))
+    aggr2 = list(_get_state("gnn_optuna_aggr2", ["sum", "mean"]))
+    loss_types = list(_get_state("gnn_optuna_loss_type", ["CrossEntropy", "FocalLoss"]))
+    optimizer_choices = list(_get_state("gnn_optuna_optimizers", ["AdamW", "Lion"]))
+    checkpoint_choices = list(_get_state("gnn_optuna_checkpoint", [False, True]))
+    lambda_H_modes = list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"]))
+
+    if not neighbor_choices:
+        errors.append("Seleccione al menos un perfil de vecinos.")
+    if not aggr1 or not aggr2:
+        errors.append("Seleccione opciones de agregacion para aggr1 y aggr2.")
+    if not loss_types:
+        errors.append("Seleccione al menos un loss_type.")
+    if not optimizer_choices:
+        errors.append("Seleccione al menos un optimizador.")
+    if not checkpoint_choices:
+        errors.append("Seleccione al menos un valor para use_checkpointing.")
+    if not lambda_H_modes:
+        errors.append("Seleccione al menos un lambda_H_mode.")
+
+    hidden_min = int(_get_state("gnn_optuna_hidden_min", 32))
+    hidden_max = int(_get_state("gnn_optuna_hidden_max", 128))
+    hidden_step = int(_get_state("gnn_optuna_hidden_step", 32))
+    heads_min = int(_get_state("gnn_optuna_heads_min", 2))
+    heads_max = int(_get_state("gnn_optuna_heads_max", 8))
+    heads_step = int(_get_state("gnn_optuna_heads_step", 2))
+    layers_min = int(_get_state("gnn_optuna_layers_min", 2))
+    layers_max = int(_get_state("gnn_optuna_layers_max", 5))
+    layers_step = int(_get_state("gnn_optuna_layers_step", 1))
+    dropout_min = float(_get_state("gnn_optuna_dropout_min", 0.05))
+    dropout_max = float(_get_state("gnn_optuna_dropout_max", 0.6))
+    dropout_step = float(_get_state("gnn_optuna_dropout_step", 0.05))
+    lr_min = float(_get_state("gnn_optuna_lr_min", 5e-5))
+    lr_max = float(_get_state("gnn_optuna_lr_max", 1e-2))
+    wd_min = float(_get_state("gnn_optuna_wd_min", 1e-6))
+    wd_max = float(_get_state("gnn_optuna_wd_max", 5e-3))
+    lambda_l2_min = float(_get_state("gnn_optuna_l2_min", 1e-4))
+    lambda_l2_max = float(_get_state("gnn_optuna_l2_max", 1e-1))
+    lambda_H_min = float(_get_state("gnn_optuna_lambda_fixed_min", 1e-4))
+    lambda_H_max = float(_get_state("gnn_optuna_lambda_fixed_max", 5e-2))
+    lambda_init_min = float(_get_state("gnn_optuna_lambda_init_min", 1e-4))
+    lambda_init_max = float(_get_state("gnn_optuna_lambda_init_max", 1e-2))
+    lambda_final_min = float(_get_state("gnn_optuna_lambda_final_min", 1e-2))
+    lambda_final_max = float(_get_state("gnn_optuna_lambda_final_max", 5e-2))
+    focal_gamma_min = float(_get_state("gnn_optuna_fg_min", 1.0))
+    focal_gamma_max = float(_get_state("gnn_optuna_fg_max", 3.0))
+    focal_gamma_step = float(_get_state("gnn_optuna_fg_step", 0.1))
+    focal_alpha_min = float(_get_state("gnn_optuna_fa_min", 0.5))
+    focal_alpha_max = float(_get_state("gnn_optuna_fa_max", 0.95))
+    focal_alpha_step = float(_get_state("gnn_optuna_fa_step", 0.05))
+    batch_min = int(_get_state("gnn_optuna_batch_min", 128))
+    batch_max = int(_get_state("gnn_optuna_batch_max", 128))
+    batch_step = int(_get_state("gnn_optuna_batch_step", 128))
+
+    smote_k_min = int(_get_state("gnn_optuna_smote_k_min", 3)) if use_graphsmote_search else 0
+    smote_k_max = int(_get_state("gnn_optuna_smote_k_max", 7)) if use_graphsmote_search else 0
+    smote_k_step = int(_get_state("gnn_optuna_smote_k_step", 2)) if use_graphsmote_search else 0
+    target_ratio_txt = str(_get_state("gnn_optuna_target_ratio", "0.25,0.35,0.5"))
+    smote_every_txt = str(_get_state("gnn_optuna_smote_every", "2,4,6"))
+    target_pos_ratio = _parse_float_list(target_ratio_txt, [0.25, 0.35, 0.5]) if use_graphsmote_search else []
+    smote_every_n_epochs = (
+        [int(v.strip()) for v in smote_every_txt.split(",") if v.strip()] or [2, 4, 6]
+    ) if use_graphsmote_search else []
+    lambda_edge_min = float(_get_state("gnn_optuna_lambda_edge_min", 1e-7)) if use_graphsmote_search else 0.0
+    lambda_edge_max = float(_get_state("gnn_optuna_lambda_edge_max", 1e-4)) if use_graphsmote_search else 0.0
+
+    imgagn_dz_min = int(_get_state("imgagn_dz_min", 64)) if use_imgagn_search else 0
+    imgagn_dz_max = int(_get_state("imgagn_dz_max", 128)) if use_imgagn_search else 0
+    imgagn_dz_step = int(_get_state("imgagn_dz_step", 32)) if use_imgagn_search else 0
+    imgagn_hidden_g_min = int(_get_state("imgagn_hg_min", 128)) if use_imgagn_search else 0
+    imgagn_hidden_g_max = int(_get_state("imgagn_hg_max", 256)) if use_imgagn_search else 0
+    imgagn_hidden_g_step = int(_get_state("imgagn_hg_step", 64)) if use_imgagn_search else 0
+    imgagn_topk_min = int(_get_state("imgagn_topk_min", 3)) if use_imgagn_search else 0
+    imgagn_topk_max = int(_get_state("imgagn_topk_max", 7)) if use_imgagn_search else 0
+    imgagn_topk_step = int(_get_state("imgagn_topk_step", 2)) if use_imgagn_search else 0
+    imgagn_lambda1_min = float(_get_state("imgagn_l1_min", 0.8)) if use_imgagn_search else 0.0
+    imgagn_lambda1_max = float(_get_state("imgagn_l1_max", 1.2)) if use_imgagn_search else 0.0
+    imgagn_lambda1_step = float(_get_state("imgagn_l1_step", 0.2)) if use_imgagn_search else 0.0
+    imgagn_epochs_min = int(_get_state("imgagn_ep_min", 50)) if use_imgagn_search else 0
+    imgagn_epochs_max = int(_get_state("imgagn_ep_max", 150)) if use_imgagn_search else 0
+    imgagn_epochs_step = int(_get_state("imgagn_ep_step", 50)) if use_imgagn_search else 0
+    imgagn_lr_g_min = float(_get_state("imgagn_lrg_min", 1e-4)) if use_imgagn_search else 0.0
+    imgagn_lr_g_max = float(_get_state("imgagn_lrg_max", 1e-2)) if use_imgagn_search else 0.0
+    imgagn_lr_d_min = float(_get_state("imgagn_lrd_min", 1e-4)) if use_imgagn_search else 0.0
+    imgagn_lr_d_max = float(_get_state("imgagn_lrd_max", 1e-2)) if use_imgagn_search else 0.0
+    imgagn_alpha_min = float(_get_state("imgagn_areg_min", 1e-6)) if use_imgagn_search else 0.0
+    imgagn_alpha_max = float(_get_state("imgagn_areg_max", 1e-3)) if use_imgagn_search else 0.0
+    imgagn_beta_min = float(_get_state("imgagn_breg_min", 1e-6)) if use_imgagn_search else 0.0
+    imgagn_beta_max = float(_get_state("imgagn_breg_max", 1e-3)) if use_imgagn_search else 0.0
+
+    search_space = {
+        "hidden_channels": {"min": hidden_min, "max": hidden_max, "step": hidden_step},
+        "num_heads": {"min": heads_min, "max": heads_max, "step": heads_step},
+        "num_layers": {"min": layers_min, "max": layers_max, "step": layers_step},
+        "dropout": {"min": dropout_min, "max": dropout_max, "step": dropout_step},
+        "aggr1": aggr1,
+        "aggr2": aggr2,
+        "use_checkpointing": checkpoint_choices,
+        "neighbor_profiles": neighbor_profiles,
+        "neighbor_choices": neighbor_choices,
+        "lr": {"min": lr_min, "max": lr_max},
+        "weight_decay": {"min": wd_min, "max": wd_max},
+        "lambda_l2_att": {"min": lambda_l2_min, "max": lambda_l2_max},
+        "lambda_H_mode": lambda_H_modes,
+        "lambda_H_fixed": {"min": lambda_H_min, "max": lambda_H_max},
+        "initial_lambda_H": {"min": lambda_init_min, "max": lambda_init_max},
+        "final_lambda_H": {"min": lambda_final_min, "max": lambda_final_max},
+        "loss_type": loss_types,
+        "focal_gamma": {"min": focal_gamma_min, "max": focal_gamma_max, "step": focal_gamma_step},
+        "focal_alpha": {"min": focal_alpha_min, "max": focal_alpha_max, "step": focal_alpha_step},
+        "batch_size": {"min": batch_min, "max": batch_max, "step": batch_step},
+        "optimizers": optimizer_choices,
+        "smote_k": {"min": smote_k_min, "max": smote_k_max, "step": smote_k_step},
+        "target_pos_ratio": target_pos_ratio,
+        "smote_every_n_epochs": smote_every_n_epochs,
+        "lambda_edge": {"min": lambda_edge_min, "max": lambda_edge_max},
+        "imgagn_dz": {"min": imgagn_dz_min, "max": imgagn_dz_max, "step": imgagn_dz_step},
+        "imgagn_hidden_g": {"min": imgagn_hidden_g_min, "max": imgagn_hidden_g_max, "step": imgagn_hidden_g_step},
+        "imgagn_topk": {"min": imgagn_topk_min, "max": imgagn_topk_max, "step": imgagn_topk_step},
+        "imgagn_lambda1": {"min": imgagn_lambda1_min, "max": imgagn_lambda1_max, "step": imgagn_lambda1_step},
+        "imgagn_epochs": {"min": imgagn_epochs_min, "max": imgagn_epochs_max, "step": imgagn_epochs_step},
+        "imgagn_lr_g": {"min": imgagn_lr_g_min, "max": imgagn_lr_g_max},
+        "imgagn_lr_d": {"min": imgagn_lr_d_min, "max": imgagn_lr_d_max},
+        "imgagn_alpha_reg": {"min": imgagn_alpha_min, "max": imgagn_alpha_max},
+        "imgagn_beta_reg": {"min": imgagn_beta_min, "max": imgagn_beta_max},
+    }
+
+    n_trials = int(_get_state("gnn_optuna_trials", N_TRIALS))
+    num_epochs = int(_get_state("gnn_optuna_epochs", NUM_EPOCHS_OPTUNA))
+    eval_every = int(_get_state("gnn_optuna_eval_every", 2))
+    optuna_seed = int(_get_state("gnn_optuna_seed", SEED))
+    optuna_settings = {
+        "n_trials": n_trials,
+        "epochs": num_epochs,
+        "eval_every": eval_every,
+        "seed": optuna_seed,
+        "timeout": int(_get_state("gnn_optuna_timeout", TIMEOUT)),
+        "pruner": _get_state("gnn_optuna_pruner", "Hyperband"),
+        "min_resource": _get_state("gnn_optuna_min_resource", 3),
+        "max_resource": _get_state("gnn_optuna_max_resource", num_epochs),
+        "reduction_factor": _get_state("gnn_optuna_reduction", 3),
+        "n_warmup_steps": _get_state("gnn_optuna_warmup", 0),
+        "multivariate": bool(_get_state("gnn_optuna_multivariate", True)),
+        "group": bool(_get_state("gnn_optuna_group", True)),
+        "sample_train_nodes": int(_get_state("gnn_optuna_sample_train", 0)),
+        "sample_each_epoch": bool(_get_state("gnn_optuna_sample_each_epoch", True)),
+        "debug": bool(_get_state("gnn_optuna_debug", False)),
+        "sample_val_nodes": int(_get_state("gnn_optuna_sample_val", 0)),
+        "fixed_val_subset": bool(_get_state("gnn_optuna_fixed_val", False)),
+        "fixed_train_subset": bool(_get_state("gnn_optuna_fixed_train", False)),
+    }
+    objective_settings = {
+        "metric": _get_state("gnn_optuna_metric", "F1"),
+        "threshold_beta": float(_get_state("gnn_optuna_beta", 1.0)),
+        "device": get_auto_device(),
+    }
+
+    payload = {
+        "search_space": search_space,
+        "optuna_settings": optuna_settings,
+        "objective_settings": objective_settings,
+        "balancing_strategy": balancing_strategy,
+        "use_graphsmote_search": use_graphsmote_search,
+        "use_imgagn_search": use_imgagn_search,
+    }
+    return payload, errors
+
+
+def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
+    #st.subheader("Optuna (Balance + Training)")
 
     loaded_graph = st.session_state.get("loaded_graph")
     balanced_graph = st.session_state.get("balanced_graph")
@@ -12064,14 +14192,26 @@ def _render_optuna_tab() -> None:
     sampling_mode_options = [
         "Resamplear seeds por epoch",
         "Fijar subset de entrenamiento por trial (reduce varianza)",
+        "Cargar todo el grafo en memoria (sin muestreo)",
     ]
     prev_fixed_train = bool(st.session_state.get("gnn_optuna_fixed_train", False))
     prev_sample_each = bool(
         st.session_state.get("gnn_optuna_sample_each_epoch", True)
     )
-    default_sampling_idx = 1 if prev_fixed_train else 0
-    if not prev_fixed_train and not prev_sample_each:
-        default_sampling_idx = 0
+    prev_full_graph = bool(st.session_state.get("gnn_optuna_full_graph", False))
+    if not prev_full_graph:
+        try:
+            prev_train_nodes = int(st.session_state.get("gnn_optuna_sample_train", 0))
+            prev_val_nodes = int(st.session_state.get("gnn_optuna_sample_val", 0))
+            prev_full_graph = prev_train_nodes <= 0 and prev_val_nodes <= 0
+        except Exception:
+            prev_full_graph = False
+    if prev_full_graph:
+        default_sampling_idx = 2
+    else:
+        default_sampling_idx = 1 if prev_fixed_train else 0
+        if not prev_fixed_train and not prev_sample_each:
+            default_sampling_idx = 0
     sampling_mode = st.selectbox(
         "Estrategia de subset de entrenamiento",
         sampling_mode_options,
@@ -12079,18 +14219,31 @@ def _render_optuna_tab() -> None:
         key="gnn_optuna_sampling_mode",
         help="Elige una sola opcion para evitar mezclar estrategias.",
     )
+    full_graph_mode = sampling_mode == sampling_mode_options[2]
     sample_each_epoch = sampling_mode == sampling_mode_options[0]
     fixed_train_subset = sampling_mode == sampling_mode_options[1]
+    if full_graph_mode:
+        sample_each_epoch = False
+        fixed_train_subset = False
     st.session_state["gnn_optuna_sample_each_epoch"] = sample_each_epoch
     st.session_state["gnn_optuna_fixed_train"] = fixed_train_subset
+    st.session_state["gnn_optuna_full_graph"] = full_graph_mode
     st.caption(
         "Resamplear por epoch aumenta variabilidad; subset fijo reduce varianza y "
         "hace mas comparables los trials."
     )
+    if full_graph_mode:
+        st.caption(
+            "Modo sin muestreo: usa todos los nodos train/val (mayor uso de memoria)."
+        )
+        st.session_state["gnn_optuna_sample_train"] = 0
+        st.session_state["gnn_optuna_sample_val"] = 0
+        st.session_state["gnn_optuna_fixed_val"] = False
     fixed_val_subset = st.checkbox(
         "Fijar subset de validacion por trial (reduce varianza)",
         value=False,
         key="gnn_optuna_fixed_val",
+        disabled=full_graph_mode,
         help="Si se activa, se usa el mismo subset de validacion en cada evaluacion del trial. "
              "Reduce varianza en el score y mejora comparabilidad. Se registra en el CSV de Optuna.",
     )
@@ -12102,19 +14255,24 @@ def _render_optuna_tab() -> None:
     with col_s1:
         sample_train_nodes = st.number_input(
             "Max seeds train por trial",
-            min_value=1000,
-            value=1000,
+            min_value=0,
+            value=0 if full_graph_mode else 1000,
             step=1000,
             key="gnn_optuna_sample_train",
+            disabled=full_graph_mode,
         )
     with col_s2:
         sample_val_nodes = st.number_input(
             "Max seeds val para evaluacion",
-            min_value=500,
-            value=1000,
+            min_value=0,
+            value=0 if full_graph_mode else 1000,
             step=500,
             key="gnn_optuna_sample_val",
+            disabled=full_graph_mode,
         )
+    if full_graph_mode:
+        sample_train_nodes = 0
+        sample_val_nodes = 0
 
     st.markdown("### Estrategia de Balanceo")
     balancing_strategy = st.radio(
@@ -12702,8 +14860,8 @@ def _render_optuna_tab() -> None:
             )
         optimizer_choices = st.multiselect(
             "Optimizadores",
-            ["Adam", "AdamW", "RAdam"],
-            default=["Adam", "AdamW", "RAdam"],
+            ["Adam", "AdamW", "RAdam", "Lion"],
+            default=["AdamW", "Lion"],
             key="gnn_optuna_optimizers",
         )
 
@@ -12869,220 +15027,352 @@ def _render_optuna_tab() -> None:
         value=False,
         key="gnn_optuna_debug",
     )
+    st.checkbox(
+        "eMail notificaciones (Optuna/Ray)",
+        value=False,
+        key="gnn_optuna_notify",
+        help="Enviar email si el optimizador termina o falla.",
+    )
     if optuna_debug:
         os.environ["GNN_NEIGHBOR_DEBUG"] = "1"
         os.environ["GNN_MEM_DEBUG"] = "1"
     else:
         os.environ.pop("GNN_NEIGHBOR_DEBUG", None)
         os.environ.pop("GNN_MEM_DEBUG", None)
-    if st.button("Ejecutar Optuna", key="gnn_optuna_run"):
-        if not neighbor_choices:
-            st.error("Seleccione al menos un perfil de vecinos.")
-            return
-        if not aggr1 or not aggr2:
-            st.error("Seleccione opciones de agregacion para aggr1 y aggr2.")
-            return
-        if not loss_types:
-            st.error("Seleccione al menos un loss_type.")
-            return
-        if not optimizer_choices:
-            st.error("Seleccione al menos un optimizador.")
-            return
-        if not checkpoint_choices:
-            st.error("Seleccione al menos un valor para use_checkpointing.")
-            return
-        if not lambda_H_modes:
-            st.error("Seleccione al menos un lambda_H_mode.")
-            return
+    if not show_run_controls:
+        return
 
-        split_info = None
-        if pm_index_ref is not None:
-            split_info = _apply_temporal_split_to_graph(
-                graph_data,
-                pm_index_ref,
-                int(train_ratio),
-                int(val_ratio),
-            )
-        if split_info:
+def _render_ray_tune_tab() -> None:
+    st.subheader("Ray Tune (Balance + Training)")
+
+    loaded_graph = st.session_state.get("loaded_graph")
+    balanced_graph = st.session_state.get("balanced_graph")
+    if loaded_graph is None:
+        st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+        return
+
+    use_balanced = bool(st.session_state.get("gnn_optuna_use_balanced", False))
+    graph_source_label = "Original"
+    if balanced_graph is not None:
+        if use_balanced:
             st.caption(
-                "Split aplicado: "
-                f"train={split_info['train_count']}, "
-                f"val={split_info['val_count']}, "
-                f"test={split_info['test_count']}"
+                f"Se optimiza con grafo balanceado ({balanced_graph.get('source', 'N/A')})."
             )
         else:
-            st.warning(
-                "No se pudo aplicar el split temporal; se usaran las mascaras actuales."
-            )
+            st.caption("Se optimiza con el grafo original.")
+    else:
+        st.info("No hay grafo balanceado disponible; se usara el grafo original.")
 
-        search_space = {
-            "hidden_channels": {
-                "min": hidden_min,
-                "max": hidden_max,
-                "step": hidden_step,
-            },
-            "num_heads": {
-                "min": heads_min,
-                "max": heads_max,
-                "step": heads_step,
-            },
-            "num_layers": {
-                "min": layers_min,
-                "max": layers_max,
-                "step": layers_step,
-            },
-            "dropout": {
-                "min": dropout_min,
-                "max": dropout_max,
-                "step": dropout_step,
-            },
-            "aggr1": aggr1,
-            "aggr2": aggr2,
-            "use_checkpointing": checkpoint_choices,
-            "neighbor_profiles": neighbor_profiles,
-            "neighbor_choices": neighbor_choices,
-            "lr": {"min": lr_min, "max": lr_max},
-            "weight_decay": {"min": wd_min, "max": wd_max},
-            "lambda_l2_att": {"min": lambda_l2_min, "max": lambda_l2_max},
-            "lambda_H_mode": lambda_H_modes,
-            "lambda_H_fixed": {
-                "min": lambda_H_min,
-                "max": lambda_H_max,
-            },
-            "initial_lambda_H": {
-                "min": lambda_init_min,
-                "max": lambda_init_max,
-            },
-            "final_lambda_H": {
-                "min": lambda_final_min,
-                "max": lambda_final_max,
-            },
-            "loss_type": loss_types,
-            "focal_gamma": {
-                "min": focal_gamma_min,
-                "max": focal_gamma_max,
-                "step": focal_gamma_step,
-            },
-            "focal_alpha": {
-                "min": focal_alpha_min,
-                "max": focal_alpha_max,
-                "step": focal_alpha_step,
-            },
-            "batch_size": {
-                "min": batch_min,
-                "max": batch_max,
-                "step": batch_step,
-            },
-            "optimizers": optimizer_choices,
-            "smote_k": {
-                "min": smote_k_min,
-                "max": smote_k_max,
-                "step": smote_k_step,
-            },
-            "target_pos_ratio": target_pos_ratio,
-            "smote_every_n_epochs": smote_every_n_epochs,
-            "lambda_edge": {
-                "min": lambda_edge_min,
-                "max": lambda_edge_max,
-            },
-            # ImGAGN parameters
-            "imgagn_dz": {"min": imgagn_dz_min, "max": imgagn_dz_max, "step": imgagn_dz_step},
-            "imgagn_hidden_g": {"min": imgagn_hidden_g_min, "max": imgagn_hidden_g_max, "step": imgagn_hidden_g_step},
-            "imgagn_topk": {"min": imgagn_topk_min, "max": imgagn_topk_max, "step": imgagn_topk_step},
-            "imgagn_lambda1": {"min": imgagn_lambda1_min, "max": imgagn_lambda1_max, "step": imgagn_lambda1_step},
-            "imgagn_epochs": {"min": imgagn_epochs_min, "max": imgagn_epochs_max, "step": imgagn_epochs_step},
-            "imgagn_lr_g": {"min": imgagn_lr_g_min, "max": imgagn_lr_g_max},
-            "imgagn_lr_d": {"min": imgagn_lr_d_min, "max": imgagn_lr_d_max},
-            "imgagn_alpha_reg": {"min": imgagn_alpha_min, "max": imgagn_alpha_max},
-            "imgagn_beta_reg": {"min": imgagn_beta_min, "max": imgagn_beta_max},
-        }
-        optuna_settings = {
-            "n_trials": n_trials,
-            "epochs": num_epochs,
-            "eval_every": eval_every,
-            "seed": optuna_seed,
-            "timeout": int(optuna_timeout),
-            "pruner": pruner_type,
-            "min_resource": min_resource,
-            "max_resource": max_resource,
-            "reduction_factor": reduction_factor,
-            "n_warmup_steps": n_warmup_steps,
-            "multivariate": multivariate,
-            "group": group,
-            "sample_train_nodes": int(sample_train_nodes),
-            "sample_each_epoch": bool(sample_each_epoch),
-            "debug": bool(optuna_debug),
-            "sample_val_nodes": int(sample_val_nodes),
-            "fixed_val_subset": bool(fixed_val_subset),
-            "fixed_train_subset": bool(fixed_train_subset),
-        }
-        objective_settings = {
-            "metric": objective_metric,
-            "threshold_beta": threshold_beta,
-            "device": optuna_device,
-        }
+    graph_obj = dict(loaded_graph)
+    if use_balanced and balanced_graph is not None:
+        graph_obj["data"] = balanced_graph.get("data")
+        if balanced_graph.get("source") == "ImGAGN":
+            fn = graph_obj.get("filename", "graph")
+            if "_ImGAGN" not in fn:
+                graph_obj["filename"] = fn.replace(".pt", "_ImGAGN.pt") if fn.endswith(".pt") else f"{fn}_ImGAGN"
+        graph_source_label = f"Balanceado ({balanced_graph.get('source', 'N/A')})"
+    if not graph_obj.get("filename"):
+        graph_path = st.session_state.get("graph_path")
+        if graph_path:
+            graph_obj["filename"] = os.path.basename(graph_path)
 
-        with st.spinner("Ejecutando Optuna..."):
-            try:
-                # Placeholders in desired order: Progress first, then Logs
-                status_text = st.empty()
-                progress_bar = st.progress(0)
-                
-                with st.expander("Logs de Optuna (En vivo)", expanded=True):
-                    log_container = st.empty()
-                
-                result = _run_optuna_search(
-                    graph_obj=graph_obj,
-                    balancing_strategy=balancing_strategy,
-                    search_space=search_space,
-                    optuna_settings=optuna_settings,
-                    objective_settings=objective_settings,
-                    log_container=log_container,
-                    progress_bar=progress_bar,
-                    status_text=status_text,
-                )
-            except Exception as exc:
-                st.error(f"Error en Optuna: {exc}")
-                return
+    graph_data = graph_obj.get("data")
+    if not isinstance(graph_data, HeteroData):
+        st.warning("El grafo seleccionado no es HeteroData.")
+        return
+    if "pm" not in graph_data.node_types:
+        st.warning("El grafo no contiene nodos 'pm'.")
+        return
+    if not hasattr(graph_data["pm"], "train_mask"):
+        st.warning("El grafo no contiene train_mask.")
+        return
+    if not hasattr(graph_data["pm"], "y"):
+        st.warning("El grafo no contiene etiquetas 'y'.")
+        return
 
-        best_params = result["best_params"]
-        st.session_state["optuna_last_file"] = result["best_path"]
-        range_analysis = result.get("range_analysis") or {}
+    st.markdown(
+        f"**Grafo seleccionado:** {graph_source_label}  \n"
+        f"- Nodos PM: {int(graph_data['pm'].num_nodes)}  \n"
+        f"- Aristas: {int(sum(graph_data[edge_type].edge_index.shape[1] for edge_type in graph_data.edge_types))}"
+    )
+    st.caption(
+        "Ray Tune usa la misma configuracion que Optuna. "
+        "Ajusta parametros en Optimization > Optuna y ejecuta Ray Tune aqui."
+    )
 
-        # Mostrar analisis de rangos al finalizar Optuna
-        _render_optuna_range_analysis(range_analysis)
-        
-        # --- LOG HISTORY ---
+    n_trials = int(st.session_state.get("gnn_optuna_trials", N_TRIALS))
+    num_epochs = int(st.session_state.get("gnn_optuna_epochs", NUM_EPOCHS_OPTUNA))
+    eval_every = int(st.session_state.get("gnn_optuna_eval_every", 2))
+    optuna_seed = int(st.session_state.get("gnn_optuna_seed", SEED))
+    optuna_device = get_auto_device()
+    st.caption(
+        f"Trials: {n_trials} | Epochs/trial: {num_epochs} | "
+        f"Eval cada: {eval_every} | Seed: {optuna_seed} | Dispositivo: {optuna_device}"
+    )
+
+    run_ray = st.button("Ejecutar Ray Tune", key="gnn_ray_tune_run")
+
+    if not run_ray:
+        return
+
+    def _get_state(key: str, default: object) -> object:
+        return st.session_state.get(key, default)
+
+    def _parse_int_list(text: str, fallback: List[int]) -> List[int]:
         try:
-             entry = _collect_gnn_context()
-             entry.update({
-                 "type": "Optuna",
-                 "optuna": {
-                     "best_params": result["best_params"],
-                     "best_value": result.get("best_value"),
-                     "trials": len(result.get("trials", [])),
-                     "path": str(result["best_path"]),
-                     "full_path": str(result.get("full_path") or ""),
-                     "range_analysis": range_analysis,
-                 },
-                 "balance": {"strategy": balancing_strategy},
-             })
-             _append_gnn_history(entry)
-        except Exception as e:
-             print(f"Log error: {e}")
-        # -------------------
+            items = [int(v.strip()) for v in text.split(",") if v.strip()]
+            return items or fallback
+        except Exception:
+            return fallback
 
-        st.success(
-            f"Optuna finalizado. Archivo: {os.path.basename(result['best_path'])}"
+    def _parse_float_list(text: str, fallback: List[float]) -> List[float]:
+        try:
+            items = [float(v.strip()) for v in text.split(",") if v.strip()]
+            return items or fallback
+        except Exception:
+            return fallback
+
+    neighbor_profiles = {
+        "compact": _parse_int_list(str(_get_state("gnn_optuna_neighbor_compact", "15,10")), [15, 10]),
+        "focused": _parse_int_list(str(_get_state("gnn_optuna_neighbor_focused", "10,5")), [10, 5]),
+        "broad": _parse_int_list(str(_get_state("gnn_optuna_neighbor_broad", "25,15,10")), [25, 15, 10]),
+        "wide": _parse_int_list(str(_get_state("gnn_optuna_neighbor_wide", "30,20")), [30, 20]),
+    }
+    neighbor_choices = list(_get_state("gnn_optuna_neighbor_choices", list(neighbor_profiles.keys())))
+
+    aggr1 = list(_get_state("gnn_optuna_aggr1", ["sum", "mean"]))
+    aggr2 = list(_get_state("gnn_optuna_aggr2", ["sum", "mean"]))
+    loss_types = list(_get_state("gnn_optuna_loss_type", ["CrossEntropy", "FocalLoss"]))
+    optimizer_choices = list(_get_state("gnn_optuna_optimizers", ["AdamW", "Lion"]))
+    checkpoint_choices = list(_get_state("gnn_optuna_checkpoint", [False, True]))
+    lambda_H_modes = list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"]))
+
+    if not neighbor_choices:
+        st.error("Seleccione al menos un perfil de vecinos (Optuna).")
+        return
+    if not aggr1 or not aggr2:
+        st.error("Seleccione opciones de agregacion para aggr1 y aggr2 (Optuna).")
+        return
+    if not loss_types:
+        st.error("Seleccione al menos un loss_type (Optuna).")
+        return
+    if not optimizer_choices:
+        st.error("Seleccione al menos un optimizador (Optuna).")
+        return
+    if not checkpoint_choices:
+        st.error("Seleccione al menos un valor para use_checkpointing (Optuna).")
+        return
+    if not lambda_H_modes:
+        st.error("Seleccione al menos un lambda_H_mode (Optuna).")
+        return
+
+    balancing_strategy = str(_get_state("gnn_balancing_strategy", "Sin balancear"))
+    use_graphsmote_search = (balancing_strategy == "Opt. balance con GraphSMOTE")
+    use_imgagn_search = (balancing_strategy == "Opt. balance con ImGAGN")
+
+    # Split temporal (usar config de Optuna)
+    train_ratio = int(_get_state("gnn_optuna_split_train", TRAIN_RATIO))
+    val_ratio = int(_get_state("gnn_optuna_split_val", VAL_RATIO))
+    pm_index_ref = graph_obj.get("pm_index")
+    split_info = None
+    if pm_index_ref is not None:
+        split_info = _apply_temporal_split_to_graph(
+            graph_data,
+            pm_index_ref,
+            int(train_ratio),
+            int(val_ratio),
         )
-        st.markdown("**Mejores hiperparametros**")
-        st.dataframe(
-            pd.DataFrame([best_params]),
-            width="stretch",
-        )
+    if split_info:
         st.caption(
-            "Estos resultados se guardaron en Resultados y pueden usarse en Training y Balance."
+            "Split aplicado: "
+            f"train={split_info['train_count']}, "
+            f"val={split_info['val_count']}, "
+            f"test={split_info['test_count']}"
         )
+    else:
+        st.warning(
+            "No se pudo aplicar el split temporal; se usaran las mascaras actuales."
+        )
+
+    # --- Construir search_space desde Optuna ---
+    hidden_min = int(_get_state("gnn_optuna_hidden_min", 32))
+    hidden_max = int(_get_state("gnn_optuna_hidden_max", 128))
+    hidden_step = int(_get_state("gnn_optuna_hidden_step", 32))
+
+    heads_min = int(_get_state("gnn_optuna_heads_min", 2))
+    heads_max = int(_get_state("gnn_optuna_heads_max", 8))
+    heads_step = int(_get_state("gnn_optuna_heads_step", 2))
+
+    layers_min = int(_get_state("gnn_optuna_layers_min", 2))
+    layers_max = int(_get_state("gnn_optuna_layers_max", 5))
+    layers_step = int(_get_state("gnn_optuna_layers_step", 1))
+
+    dropout_min = float(_get_state("gnn_optuna_dropout_min", 0.05))
+    dropout_max = float(_get_state("gnn_optuna_dropout_max", 0.6))
+    dropout_step = float(_get_state("gnn_optuna_dropout_step", 0.05))
+
+    lr_min = float(_get_state("gnn_optuna_lr_min", 5e-5))
+    lr_max = float(_get_state("gnn_optuna_lr_max", 1e-2))
+
+    wd_min = float(_get_state("gnn_optuna_wd_min", 1e-6))
+    wd_max = float(_get_state("gnn_optuna_wd_max", 5e-3))
+
+    lambda_l2_min = float(_get_state("gnn_optuna_l2_min", 1e-4))
+    lambda_l2_max = float(_get_state("gnn_optuna_l2_max", 1e-1))
+
+    lambda_H_min = float(_get_state("gnn_optuna_lambda_fixed_min", 1e-4))
+    lambda_H_max = float(_get_state("gnn_optuna_lambda_fixed_max", 5e-2))
+    lambda_init_min = float(_get_state("gnn_optuna_lambda_init_min", 1e-4))
+    lambda_init_max = float(_get_state("gnn_optuna_lambda_init_max", 1e-2))
+    lambda_final_min = float(_get_state("gnn_optuna_lambda_final_min", 1e-2))
+    lambda_final_max = float(_get_state("gnn_optuna_lambda_final_max", 5e-2))
+
+    focal_gamma_min = float(_get_state("gnn_optuna_fg_min", 1.0))
+    focal_gamma_max = float(_get_state("gnn_optuna_fg_max", 3.0))
+    focal_gamma_step = float(_get_state("gnn_optuna_fg_step", 0.1))
+    focal_alpha_min = float(_get_state("gnn_optuna_fa_min", 0.5))
+    focal_alpha_max = float(_get_state("gnn_optuna_fa_max", 0.95))
+    focal_alpha_step = float(_get_state("gnn_optuna_fa_step", 0.05))
+
+    batch_min = int(_get_state("gnn_optuna_batch_min", 128))
+    batch_max = int(_get_state("gnn_optuna_batch_max", 128))
+    batch_step = int(_get_state("gnn_optuna_batch_step", 128))
+
+    smote_k_min = int(_get_state("gnn_optuna_smote_k_min", 3)) if use_graphsmote_search else 0
+    smote_k_max = int(_get_state("gnn_optuna_smote_k_max", 7)) if use_graphsmote_search else 0
+    smote_k_step = int(_get_state("gnn_optuna_smote_k_step", 2)) if use_graphsmote_search else 0
+    target_ratio_txt = str(_get_state("gnn_optuna_target_ratio", "0.25,0.35,0.5"))
+    smote_every_txt = str(_get_state("gnn_optuna_smote_every", "2,4,6"))
+    target_pos_ratio = _parse_float_list(target_ratio_txt, [0.25, 0.35, 0.5]) if use_graphsmote_search else []
+    smote_every_n_epochs = (
+        [int(v.strip()) for v in smote_every_txt.split(",") if v.strip()] or [2, 4, 6]
+    ) if use_graphsmote_search else []
+    lambda_edge_min = float(_get_state("gnn_optuna_lambda_edge_min", 1e-7)) if use_graphsmote_search else 0.0
+    lambda_edge_max = float(_get_state("gnn_optuna_lambda_edge_max", 1e-4)) if use_graphsmote_search else 0.0
+
+    imgagn_dz_min = int(_get_state("imgagn_dz_min", 64)) if use_imgagn_search else 0
+    imgagn_dz_max = int(_get_state("imgagn_dz_max", 128)) if use_imgagn_search else 0
+    imgagn_dz_step = int(_get_state("imgagn_dz_step", 32)) if use_imgagn_search else 0
+    imgagn_hidden_g_min = int(_get_state("imgagn_hg_min", 128)) if use_imgagn_search else 0
+    imgagn_hidden_g_max = int(_get_state("imgagn_hg_max", 256)) if use_imgagn_search else 0
+    imgagn_hidden_g_step = int(_get_state("imgagn_hg_step", 64)) if use_imgagn_search else 0
+    imgagn_topk_min = int(_get_state("imgagn_topk_min", 3)) if use_imgagn_search else 0
+    imgagn_topk_max = int(_get_state("imgagn_topk_max", 7)) if use_imgagn_search else 0
+    imgagn_topk_step = int(_get_state("imgagn_topk_step", 2)) if use_imgagn_search else 0
+    imgagn_lambda1_min = float(_get_state("imgagn_l1_min", 0.8)) if use_imgagn_search else 0.0
+    imgagn_lambda1_max = float(_get_state("imgagn_l1_max", 1.2)) if use_imgagn_search else 0.0
+    imgagn_lambda1_step = float(_get_state("imgagn_l1_step", 0.2)) if use_imgagn_search else 0.0
+    imgagn_epochs_min = int(_get_state("imgagn_ep_min", 50)) if use_imgagn_search else 0
+    imgagn_epochs_max = int(_get_state("imgagn_ep_max", 150)) if use_imgagn_search else 0
+    imgagn_epochs_step = int(_get_state("imgagn_ep_step", 50)) if use_imgagn_search else 0
+    imgagn_lr_g_min = float(_get_state("imgagn_lrg_min", 1e-4)) if use_imgagn_search else 0.0
+    imgagn_lr_g_max = float(_get_state("imgagn_lrg_max", 1e-2)) if use_imgagn_search else 0.0
+    imgagn_lr_d_min = float(_get_state("imgagn_lrd_min", 1e-4)) if use_imgagn_search else 0.0
+    imgagn_lr_d_max = float(_get_state("imgagn_lrd_max", 1e-2)) if use_imgagn_search else 0.0
+    imgagn_alpha_min = float(_get_state("imgagn_areg_min", 1e-6)) if use_imgagn_search else 0.0
+    imgagn_alpha_max = float(_get_state("imgagn_areg_max", 1e-3)) if use_imgagn_search else 0.0
+    imgagn_beta_min = float(_get_state("imgagn_breg_min", 1e-6)) if use_imgagn_search else 0.0
+    imgagn_beta_max = float(_get_state("imgagn_breg_max", 1e-3)) if use_imgagn_search else 0.0
+
+    search_space = {
+        "hidden_channels": {"min": hidden_min, "max": hidden_max, "step": hidden_step},
+        "num_heads": {"min": heads_min, "max": heads_max, "step": heads_step},
+        "num_layers": {"min": layers_min, "max": layers_max, "step": layers_step},
+        "dropout": {"min": dropout_min, "max": dropout_max, "step": dropout_step},
+        "aggr1": aggr1,
+        "aggr2": aggr2,
+        "use_checkpointing": checkpoint_choices,
+        "neighbor_profiles": neighbor_profiles,
+        "neighbor_choices": neighbor_choices,
+        "lr": {"min": lr_min, "max": lr_max},
+        "weight_decay": {"min": wd_min, "max": wd_max},
+        "lambda_l2_att": {"min": lambda_l2_min, "max": lambda_l2_max},
+        "lambda_H_mode": lambda_H_modes,
+        "lambda_H_fixed": {"min": lambda_H_min, "max": lambda_H_max},
+        "initial_lambda_H": {"min": lambda_init_min, "max": lambda_init_max},
+        "final_lambda_H": {"min": lambda_final_min, "max": lambda_final_max},
+        "loss_type": loss_types,
+        "focal_gamma": {"min": focal_gamma_min, "max": focal_gamma_max, "step": focal_gamma_step},
+        "focal_alpha": {"min": focal_alpha_min, "max": focal_alpha_max, "step": focal_alpha_step},
+        "batch_size": {"min": batch_min, "max": batch_max, "step": batch_step},
+        "optimizers": optimizer_choices,
+        "smote_k": {"min": smote_k_min, "max": smote_k_max, "step": smote_k_step},
+        "target_pos_ratio": target_pos_ratio,
+        "smote_every_n_epochs": smote_every_n_epochs,
+        "lambda_edge": {"min": lambda_edge_min, "max": lambda_edge_max},
+        "imgagn_dz": {"min": imgagn_dz_min, "max": imgagn_dz_max, "step": imgagn_dz_step},
+        "imgagn_hidden_g": {"min": imgagn_hidden_g_min, "max": imgagn_hidden_g_max, "step": imgagn_hidden_g_step},
+        "imgagn_topk": {"min": imgagn_topk_min, "max": imgagn_topk_max, "step": imgagn_topk_step},
+        "imgagn_lambda1": {"min": imgagn_lambda1_min, "max": imgagn_lambda1_max, "step": imgagn_lambda1_step},
+        "imgagn_epochs": {"min": imgagn_epochs_min, "max": imgagn_epochs_max, "step": imgagn_epochs_step},
+        "imgagn_lr_g": {"min": imgagn_lr_g_min, "max": imgagn_lr_g_max},
+        "imgagn_lr_d": {"min": imgagn_lr_d_min, "max": imgagn_lr_d_max},
+        "imgagn_alpha_reg": {"min": imgagn_alpha_min, "max": imgagn_alpha_max},
+        "imgagn_beta_reg": {"min": imgagn_beta_min, "max": imgagn_beta_max},
+    }
+
+    optuna_settings = {
+        "n_trials": n_trials,
+        "epochs": num_epochs,
+        "eval_every": eval_every,
+        "seed": optuna_seed,
+        "timeout": int(_get_state("gnn_optuna_timeout", TIMEOUT)),
+        "pruner": _get_state("gnn_optuna_pruner", "Hyperband"),
+        "min_resource": _get_state("gnn_optuna_min_resource", 3),
+        "max_resource": _get_state("gnn_optuna_max_resource", num_epochs),
+        "reduction_factor": _get_state("gnn_optuna_reduction", 3),
+        "n_warmup_steps": _get_state("gnn_optuna_warmup", 0),
+        "multivariate": bool(_get_state("gnn_optuna_multivariate", True)),
+        "group": bool(_get_state("gnn_optuna_group", True)),
+        "sample_train_nodes": int(_get_state("gnn_optuna_sample_train", 0)),
+        "sample_each_epoch": bool(_get_state("gnn_optuna_sample_each_epoch", True)),
+        "debug": bool(_get_state("gnn_optuna_debug", False)),
+        "sample_val_nodes": int(_get_state("gnn_optuna_sample_val", 0)),
+        "fixed_val_subset": bool(_get_state("gnn_optuna_fixed_val", False)),
+        "fixed_train_subset": bool(_get_state("gnn_optuna_fixed_train", False)),
+    }
+    objective_settings = {
+        "metric": _get_state("gnn_optuna_metric", "F1"),
+        "threshold_beta": float(_get_state("gnn_optuna_beta", 1.0)),
+        "device": optuna_device,
+    }
+
+    with st.spinner("Ejecutando Ray Tune..."):
+        try:
+            status_text = st.empty()
+            progress_bar = st.progress(0)
+            with st.expander("Logs de Ray Tune (En vivo)", expanded=True):
+                log_container = st.empty()
+            result = _run_ray_tune_search(
+                graph_obj=graph_obj,
+                balancing_strategy=balancing_strategy,
+                search_space=search_space,
+                optuna_settings=optuna_settings,
+                objective_settings=objective_settings,
+                log_container=log_container,
+                progress_bar=progress_bar,
+                status_text=status_text,
+            )
+        except Exception as exc:
+            st.error(f"Error en Ray Tune: {exc}")
+            return
+
+    best_params = result["best_params"]
+    st.session_state["ray_last_file"] = result["best_path"]
+    range_analysis = result.get("range_analysis") or {}
+    _render_optuna_range_analysis(range_analysis)
+
+    st.success(
+        f"Ray Tune finalizado. Archivo: {os.path.basename(result['best_path'])}"
+    )
+    st.markdown("**Mejores hiperparametros**")
+    st.dataframe(
+        pd.DataFrame([best_params]),
+        width="stretch",
+    )
+    st.caption(
+        "Estos resultados se guardaron en Resultados y pueden usarse en Training y Balance."
+    )
 
 
 def _render_events_tab() -> None:

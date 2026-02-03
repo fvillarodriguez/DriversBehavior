@@ -5,10 +5,11 @@ Streamlit app to manage the flow database (DuckDB).
 from __future__ import annotations
 
 import fnmatch
+import importlib
 import inspect
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -20,6 +21,7 @@ SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+import utils as utils_mod  # noqa: E402
 from utils import (  # noqa: E402
     clear_flow_table,
     get_flow_db_summary,
@@ -32,6 +34,17 @@ from flow_stats_legacy import render_flow_stats_tab  # noqa: E402
 DATA_DIR = ROOT_DIR / "Datos"
 DB_PATH = DATA_DIR / "flujos.duckdb"
 FLOW_PATTERNS = ("flujo*.csv",)
+
+
+def _get_delete_flow_rows_fn():
+    fn = getattr(utils_mod, "delete_flow_rows_by_date_range", None)
+    if fn is None:
+        try:
+            importlib.reload(utils_mod)
+        except Exception:
+            return None
+        fn = getattr(utils_mod, "delete_flow_rows_by_date_range", None)
+    return fn
 
 
 def _supports_progress() -> bool:
@@ -267,6 +280,121 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
             st.success(f"Se eliminaron {removed:,} filas.")
             with summary_container.container():
                 _render_summary()
+
+        st.divider()
+        st.subheader("Eliminar por rango de fechas")
+        try:
+            summary = get_flow_db_summary(db_path=DB_PATH)
+        except ImportError as exc:
+            st.error(str(exc))
+            st.stop()
+
+        if summary.row_count <= 0:
+            st.info("La tabla está vacía. No hay registros para eliminar.")
+        else:
+            range_label = "-"
+            if summary.min_timestamp or summary.max_timestamp:
+                start_label = (
+                    summary.min_timestamp.strftime("%Y-%m-%d %H:%M")
+                    if summary.min_timestamp
+                    else "-"
+                )
+                end_label = (
+                    summary.max_timestamp.strftime("%Y-%m-%d %H:%M")
+                    if summary.max_timestamp
+                    else "-"
+                )
+                range_label = f"{start_label} → {end_label}"
+            st.caption(f"Rango disponible en la base: {range_label}")
+
+            default_start_date = (
+                summary.min_timestamp.date()
+                if summary.min_timestamp
+                else datetime.today().date()
+            )
+            default_end_date = (
+                summary.max_timestamp.date()
+                if summary.max_timestamp
+                else datetime.today().date()
+            )
+            default_start_time = (
+                summary.min_timestamp.time().replace(second=0, microsecond=0)
+                if summary.min_timestamp
+                else dt_time(0, 0)
+            )
+            default_end_time = (
+                summary.max_timestamp.time().replace(second=0, microsecond=0)
+                if summary.max_timestamp
+                else dt_time(23, 59)
+            )
+
+            cols = st.columns(2)
+            with cols[0]:
+                start_date = st.date_input(
+                    "Fecha inicio",
+                    value=default_start_date,
+                    key="delete_range_start_date",
+                )
+            with cols[1]:
+                end_date = st.date_input(
+                    "Fecha fin",
+                    value=default_end_date,
+                    key="delete_range_end_date",
+                )
+
+            cols = st.columns(2)
+            with cols[0]:
+                start_time = st.time_input(
+                    "Hora inicio",
+                    value=default_start_time,
+                    key="delete_range_start_time",
+                )
+            with cols[1]:
+                end_time = st.time_input(
+                    "Hora fin",
+                    value=default_end_time,
+                    key="delete_range_end_time",
+                )
+
+            start_ts = pd.Timestamp(datetime.combine(start_date, start_time))
+            end_ts = pd.Timestamp(datetime.combine(end_date, end_time))
+            if end_ts < start_ts:
+                st.error("La fecha/hora final debe ser posterior a la inicial.")
+                can_delete_range = False
+            else:
+                st.caption(
+                    f"Se eliminarán registros entre {start_ts} y {end_ts} (inclusive)."
+                )
+                can_delete_range = True
+
+            confirm_range = st.text_input(
+                "Escriba RANGE para confirmar",
+                key="delete_range_confirm",
+            )
+            can_delete_range = (
+                can_delete_range and confirm_range.strip().upper() == "RANGE"
+            )
+            if st.button(
+                "Eliminar rango",
+                key="delete_range_button",
+                disabled=not can_delete_range,
+            ):
+                delete_fn = _get_delete_flow_rows_fn()
+                if delete_fn is None:
+                    st.error(
+                        "No se pudo cargar la función de borrado por rango. "
+                        "Reinicie la app."
+                    )
+                    st.stop()
+                with st.spinner("Eliminando registros en rango..."):
+                    removed = delete_fn(
+                        date_start=start_ts,
+                        date_end=end_ts,
+                        db_path=DB_PATH,
+                    )
+                st.success(f"Se eliminaron {removed:,} filas en el rango.")
+                with summary_container.container():
+                    _render_summary()
 
     with tabs[3]:
         st.write("Explora el esquema y una muestra de la tabla.")

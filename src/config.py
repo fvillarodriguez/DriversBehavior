@@ -156,6 +156,8 @@ TIME_SLOTS_TO_FILTER = [
 MAX_EPOCHS = 3000
 EARLY_STOPPING_PATIENCE = 5 # 30 Número de evaluaciones sin mejora
 EARLY_STOPPING_MIN_DELTA = 0.0
+# Gradiente acumulado (para reducir memoria efectiva de batch)
+ACCUMULATION_STEPS = 2
 
 # optimize
 TIMEOUT = 172800 #48HR

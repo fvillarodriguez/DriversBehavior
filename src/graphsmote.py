@@ -823,8 +823,25 @@ def run_graphsmote(
         z_node = z_dict[node_type].to(device)
         y_node = data[node_type].y.to(z_node.device)
 
+        # Restringir SMOTE al subset de entrenamiento si existe train_mask
+        z_smote = z_node
+        y_smote = y_node
+        try:
+            if hasattr(data[node_type], "train_mask"):
+                train_mask = data[node_type].train_mask.to(z_node.device)
+                if train_mask.dtype != torch.bool:
+                    train_mask = train_mask.bool()
+                train_idx = torch.nonzero(train_mask, as_tuple=False).view(-1)
+                if train_idx.numel() > 0:
+                    z_smote = z_node.index_select(0, train_idx)
+                    y_smote = y_node.index_select(0, train_idx)
+        except Exception:
+            # Si falla, se usa el conjunto completo por compatibilidad
+            z_smote = z_node
+            y_smote = y_node
+
         syn_z, syn_labels, minority_indices = smote_nodes(
-            z_node, y_node,
+            z_smote, y_smote,
             minority_class=minority_class,
             k=k_smote,
             n_samples=n_samples,

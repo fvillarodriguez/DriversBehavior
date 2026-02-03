@@ -47,8 +47,9 @@ from src.gat_model import HeteroGAT
 from src.temporal_head import TemporalAggregator
 from src.graphsmote import (RelEdgeGen,train_z2x_decoders,augment_graph_offline_once, refresh_synthetics_online)
 from src.imgagn import ImGAGNConfig, train_imgagn
+from src.optimizers import get_optimizer_cls
 from src.config import (SEED,DT_MINUTES,MAX_EPOCHS,EARLY_STOPPING_PATIENCE,EARLY_STOPPING_MIN_DELTA,RESULTADOS_DIR,
-                        BATCH_SIZE,NUM_NEIGHBORS,N_TRIALS,DEBUG,NUM_EPOCHS_OPTUNA,
+                        BATCH_SIZE,NUM_NEIGHBORS,N_TRIALS,DEBUG,NUM_EPOCHS_OPTUNA,ACCUMULATION_STEPS,
                         GRAPHSMOTE_MODE, TARGET_POS_RATIO,
                         GRAPHSMOTE_K, PRETRAIN_EDGE_EPOCHS, SMOTE_EVERY_N_EPOCHS,
                         GS_SEED, SAVE_AUG_GRAPH_PATH, DECODER_EPOCHS, F_BETA_THRESHOLD, XAI,
@@ -125,15 +126,20 @@ def _model_tag_suffix(use_graphsmote: bool, loaded_obj) -> str:
     return ("_" + "_".join(tags)) if tags else ""
 
 def _variant_tags(use_graphsmote: bool, loaded_obj) -> str:
-    """Return a variant tag for filenames: _GraphSMOTE or _Base, plus optional _ImGAGN."""
+    """Return a variant tag for filenames: _GraphSMOTE/_ImGAGN, else _Base."""
     parts = []
-    parts.append('GraphSMOTE' if use_graphsmote else 'Base')
+    if use_graphsmote:
+        parts.append("GraphSMOTE")
+    has_imgagn = False
     try:
-        if _has_imgagn(loaded_obj):
-            parts.append('ImGAGN')
+        has_imgagn = _has_imgagn(loaded_obj)
     except Exception:
-        pass
-    return "_" + "_".join(parts) if parts else ""
+        has_imgagn = False
+    if has_imgagn:
+        parts.append("ImGAGN")
+    if not parts:
+        parts.append("Base")
+    return "_" + "_".join(parts)
 
 def _find_best_model_path(use_graphsmote: bool, loaded_obj, best_params: Optional[dict] = None) -> Optional[str]:
     # Try exact tag match first
@@ -1417,6 +1423,9 @@ def run_gat_training(
     smote_num_neighbors: Optional[object] = None,
     optimizer_overrides: Optional[dict] = None,
     train_decoders_only: bool = False,
+    accumulation_steps: Optional[int] = None,
+    resume_state_path: Optional[str] = None,
+    save_state_path: Optional[str] = None,
 ):
     """
     Entrenamiento GAT completo con:
@@ -1541,6 +1550,17 @@ def run_gat_training(
     if not best_params:
         logger.error("No se pudieron obtener los hiperparámetros. Abortando.")
         return
+
+    # Gradient accumulation (configurable)
+    if accumulation_steps is None:
+        accumulation_steps = best_params.get("accumulation_steps")
+    if accumulation_steps is None:
+        accumulation_steps = ACCUMULATION_STEPS
+    try:
+        accumulation_steps = max(1, int(accumulation_steps))
+    except Exception:
+        accumulation_steps = int(ACCUMULATION_STEPS)
+    best_params["accumulation_steps"] = accumulation_steps
 
     if smote_num_neighbors is None:
         smote_num_neighbors = best_params.get("smote_num_neighbors")
@@ -1721,7 +1741,7 @@ def run_gat_training(
     edge_gen = RelEdgeGen(z_dim_dict, data.edge_types).to(device) if use_graphsmote else None
 
     optimizer_name = str(best_params.get('optimizer', 'Adam'))
-    optimizer_cls = getattr(torch.optim, optimizer_name, torch.optim.Adam)
+    optimizer_cls = get_optimizer_cls(optimizer_name)
     optimizer = optimizer_cls(
         model.parameters() if edge_gen is None else list(model.parameters()) + list(edge_gen.parameters()),
         lr=best_params['lr'],
@@ -1914,6 +1934,7 @@ def run_gat_training(
         num_neighbors=loader_num_neighbors,
         smote_every_n_epochs=int(smote_every_override),
         target_pos_ratio=float(target_pos_ratio_override),
+        accumulation_steps=int(accumulation_steps),
     )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -1923,11 +1944,41 @@ def run_gat_training(
         cycle_momentum=isinstance(optimizer, (torch.optim.AdamW, torch.optim.NAdam))
     )
 
-        # 10) Loop de entrenamiento
-    best_val_f1 = 0.0
-    best_val_auprc = 0.0
-    best_epoch = 0
-    patience_counter = 0
+    if save_state_path is None and resume_state_path:
+        save_state_path = resume_state_path
+
+    start_epoch = 1
+    resume_best_val_f1 = 0.0
+    resume_best_val_auprc = 0.0
+    resume_best_epoch = 0
+    resume_patience_counter = 0
+    if resume_state_path:
+        try:
+            if os.path.exists(resume_state_path):
+                ckpt = torch.load(resume_state_path, map_location=device, weights_only=False)
+                if isinstance(ckpt, dict) and "model_state" in ckpt:
+                    model.load_state_dict(ckpt["model_state"], strict=False)
+                    if ckpt.get("optimizer_state"):
+                        optimizer.load_state_dict(ckpt["optimizer_state"])
+                    if ckpt.get("scheduler_state"):
+                        scheduler.load_state_dict(ckpt["scheduler_state"])
+                    start_epoch = int(ckpt.get("epoch", 0)) + 1
+                    resume_best_val_f1 = float(ckpt.get("best_val_f1", 0.0))
+                    resume_best_val_auprc = float(ckpt.get("best_val_auprc", 0.0))
+                    resume_best_epoch = int(ckpt.get("best_epoch", 0))
+                    resume_patience_counter = int(ckpt.get("patience_counter", 0))
+                    logger.info(
+                        f"Reanudando entrenamiento desde epoch {start_epoch} "
+                        f"(checkpoint: {os.path.basename(resume_state_path)})"
+                    )
+        except Exception as exc:
+            logger.warning(f"No se pudo reanudar desde checkpoint: {exc}")
+
+    # 10) Loop de entrenamiento
+    best_val_f1 = float(resume_best_val_f1)
+    best_val_auprc = float(resume_best_val_auprc)
+    best_epoch = int(resume_best_epoch)
+    patience_counter = int(resume_patience_counter)
     early_stop_enabled = bool(best_params.get("early_stop", True))
     patience = int(
         best_params.get("early_stop_patience", EARLY_STOPPING_PATIENCE)
@@ -1982,7 +2033,7 @@ def run_gat_training(
         suppress_missing_att_warning = True
 
     stopped_early = False
-    for epoch in range(1, max_epochs + 1):
+    for epoch in range(start_epoch, max_epochs + 1):
         epoch_start_time = time.time()
         if use_undersampling:
             strategy_now = undersampling_strategy
@@ -2042,7 +2093,8 @@ def run_gat_training(
                                   edge_gen=edge_gen, lambda_edge=lambda_edge,
                                   lambda_l2_att=lambda_l2_att,
                                   suppress_missing_att_warning=suppress_missing_att_warning,
-                                  batch_callback=batch_event_cb)
+                                  batch_callback=batch_event_cb,
+                                  accumulation_steps=accumulation_steps)
         writer.add_scalar("Loss/train", loss, epoch)
 
         # Validación (siempre sobre el grafo original)
@@ -2244,6 +2296,32 @@ def run_gat_training(
             epoch_time_sec=epoch_time_sec,
         )
 
+        if save_state_path:
+            try:
+                ckpt_payload = {
+                    "epoch": int(epoch),
+                    "max_epochs": int(max_epochs),
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "best_val_f1": float(best_val_f1),
+                    "best_val_auprc": float(best_val_auprc),
+                    "best_epoch": int(best_epoch),
+                    "patience_counter": int(patience_counter),
+                    "run_id": run_id,
+                    "graph_hash": graph_hash,
+                    "use_graphsmote": bool(use_graphsmote),
+                    "last_val_f1": float(val_f1) if val_f1 is not None else None,
+                    "last_val_auc": float(val_auc) if val_auc is not None else None,
+                    "last_val_auprc": float(val_auprc) if val_auprc is not None else None,
+                    "last_val_mcc": float(val_mcc) if val_mcc is not None else None,
+                    "last_val_tau": float(val_tau) if val_tau is not None else None,
+                    "epoch_time_sec": float(epoch_time_sec),
+                }
+                torch.save(ckpt_payload, save_state_path)
+            except Exception as exc:
+                logger.warning(f"No se pudo guardar checkpoint: {exc}")
+
         if early_stop_enabled and patience_counter >= patience:
             logger.info(
                 "Early stopping at epoch %d (patience=%d, min_delta=%g).",
@@ -2342,6 +2420,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
 
         # Optimizador
         overrides = optimizer_overrides or {}
+        accumulation_steps = int(overrides.get("accumulation_steps", ACCUMULATION_STEPS))
         
         lr_override = overrides.get('lr')
         if lr_override is not None:
@@ -2353,7 +2432,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
         if opt_name_override:
             optimizer_name = trial.suggest_categorical('optimizer', [str(opt_name_override)])
         else:
-            optimizer_name = trial.suggest_categorical('optimizer', ['Adam', 'AdamW', 'RAdam'])
+            optimizer_name = trial.suggest_categorical('optimizer', ['Adam', 'AdamW', 'RAdam', 'Lion'])
 
         wd_override = overrides.get('weight_decay')
         if wd_override is not None:
@@ -2432,7 +2511,8 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
 
         edge_gen = RelEdgeGen({ntype: hidden_channels * num_heads for ntype in data.node_types}, data.edge_types).to(device) if use_graphsmote_search else None
         
-        optimizer = getattr(torch.optim, optimizer_name)(
+        optimizer_cls = get_optimizer_cls(optimizer_name)
+        optimizer = optimizer_cls(
             list(model.parameters()) + (list(edge_gen.parameters()) if edge_gen else []),
             lr=lr, weight_decay=weight_decay
         )
@@ -2497,7 +2577,8 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
                 model, train_loader, optimizer, criterion, grad_clip_value=float(overrides.get('grad_clip', 1.0)), device=device,
                 use_amp=False, scaler=None, scheduler=None, writer=None, epoch=epoch,
                 lambda_H=current_lambda_H, node_type='pm', edge_gen=edge_gen, lambda_edge=lambda_edge,
-                lambda_l2_att=lambda_l2_att
+                lambda_l2_att=lambda_l2_att,
+                accumulation_steps=accumulation_steps
             )
 
             # Validación periódica
@@ -2617,13 +2698,76 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
     sampler = optuna.samplers.TPESampler(seed=SEED, multivariate=True, group=True)
     pruner  = optuna.pruners.HyperbandPruner(min_resource=3, max_resource=NUM_EPOCHS_OPTUNA, reduction_factor=3)
 
-    # Crear estudio nuevo
-    study = optuna.create_study(direction='maximize', sampler=sampler, pruner=pruner)
-    logger.info(f"Optuna study creado: {study.study_name}")
+    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    study_base = "gnn_optuna_main"
+    if graph_hash:
+        study_base = f"{study_base}_{graph_hash[:16]}"
+    variant_tag = _variant_tags(use_graphsmote_search, loaded_obj)
+    study_base = f"{study_base}{variant_tag}"
+    study_name = re.sub(r"[^A-Za-z0-9_\\-]", "_", study_base)
+    storage_path = os.path.join(RESULTADOS_DIR, "optuna_studies.db")
+    storage_url = f"sqlite:///{storage_path}"
+    try:
+        storage = optuna.storages.RDBStorage(
+            url=storage_url,
+            heartbeat_interval=60,
+            grace_period=120,
+        )
+    except Exception:
+        storage = storage_url
+
+    # Crear o recuperar estudio
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=sampler,
+        pruner=pruner,
+        storage=storage,
+        study_name=study_name,
+        load_if_exists=True,
+    )
+    logger.info(f"Optuna study activo: {study.study_name}")
 
     try:
-        # Pasar el nombre de argumento correcto según la firma de objective()
-        study.optimize(lambda tr: objective(tr, device, use_graphsmote_search=use_graphsmote_search, optimizer_overrides=optimizer_overrides), n_trials=N_TRIALS, show_progress_bar=True)
+        try:
+            done_states = {
+                optuna.trial.TrialState.COMPLETE,
+                optuna.trial.TrialState.PRUNED,
+                optuna.trial.TrialState.FAIL,
+            }
+        except Exception:
+            done_states = set()
+        if done_states:
+            done_trials = sum(1 for t in study.trials if t.state in done_states)
+        else:
+            done_trials = len(study.trials)
+        remaining_trials = max(0, int(N_TRIALS) - int(done_trials))
+        def _save_live(study_obj, _trial):
+            try:
+                live_path = os.path.join(
+                    RESULTADOS_DIR, f"optuna_full_study_live_{study_obj.study_name}.csv"
+                )
+                study_obj.trials_dataframe().to_csv(live_path, index=False)
+            except Exception:
+                pass
+
+        if remaining_trials <= 0:
+            logger.info(
+                f"Optuna reanudado: {done_trials} ensayos ya completados (objetivo {N_TRIALS})."
+            )
+            _save_live(study, None)
+        else:
+            # Pasar el nombre de argumento correcto según la firma de objective()
+            study.optimize(
+                lambda tr: objective(
+                    tr,
+                    device,
+                    use_graphsmote_search=use_graphsmote_search,
+                    optimizer_overrides=optimizer_overrides,
+                ),
+                n_trials=remaining_trials,
+                show_progress_bar=True,
+                callbacks=[_save_live],
+            )
     finally:
         gc.collect()
         if torch.cuda.is_available():
@@ -2703,8 +2847,30 @@ def run_imgagn_hpo(loaded_obj):
     # Optuna: sampler y pruner razonables
     sampler = optuna.samplers.TPESampler(seed=SEED, multivariate=True, group=True)
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=2)
-    study = optuna.create_study(direction='maximize', sampler=sampler, pruner=pruner)
-    logger.info(f"Optuna study (ImGAGN) creado: {study.study_name}")
+    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    study_base = "imgagn_optuna"
+    if graph_hash:
+        study_base = f"{study_base}_{graph_hash[:16]}"
+    study_name = re.sub(r"[^A-Za-z0-9_\\-]", "_", study_base)
+    storage_path = os.path.join(RESULTADOS_DIR, "optuna_studies.db")
+    storage_url = f"sqlite:///{storage_path}"
+    try:
+        storage = optuna.storages.RDBStorage(
+            url=storage_url,
+            heartbeat_interval=60,
+            grace_period=120,
+        )
+    except Exception:
+        storage = storage_url
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=sampler,
+        pruner=pruner,
+        storage=storage,
+        study_name=study_name,
+        load_if_exists=True,
+    )
+    logger.info(f"Optuna study (ImGAGN) activo: {study.study_name}")
 
     def objective(trial: optuna.Trial):
         try:
@@ -2769,7 +2935,40 @@ def run_imgagn_hpo(loaded_obj):
             return 0.0
 
     try:
-        study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=True)
+        try:
+            done_states = {
+                optuna.trial.TrialState.COMPLETE,
+                optuna.trial.TrialState.PRUNED,
+                optuna.trial.TrialState.FAIL,
+            }
+        except Exception:
+            done_states = set()
+        if done_states:
+            done_trials = sum(1 for t in study.trials if t.state in done_states)
+        else:
+            done_trials = len(study.trials)
+        remaining_trials = max(0, int(N_TRIALS) - int(done_trials))
+        def _save_live(study_obj, _trial):
+            try:
+                live_path = os.path.join(
+                    RESULTADOS_DIR, f"imgagn_full_study_live_{study_obj.study_name}.csv"
+                )
+                study_obj.trials_dataframe().to_csv(live_path, index=False)
+            except Exception:
+                pass
+
+        if remaining_trials <= 0:
+            logger.info(
+                f"Optuna ImGAGN reanudado: {done_trials} ensayos ya completados (objetivo {N_TRIALS})."
+            )
+            _save_live(study, None)
+        else:
+            study.optimize(
+                objective,
+                n_trials=remaining_trials,
+                show_progress_bar=True,
+                callbacks=[_save_live],
+            )
     finally:
         gc.collect()
         if torch.cuda.is_available():
@@ -2890,6 +3089,23 @@ def run_imgagn_pipeline(loaded_obj, retrain_gat: bool = True):
         run_gat_training(loaded_obj)
         return
 
+    # Trazabilidad: registrar recall, seed y config usados en ImGAGN
+    best_recall = None
+    try:
+        if isinstance(res, dict) and "best_train_recall" in res:
+            if torch.is_tensor(res["best_train_recall"]):
+                best_recall = float(res["best_train_recall"].item())
+            else:
+                best_recall = float(res["best_train_recall"])
+    except Exception:
+        best_recall = None
+    imgagn_meta = dict(best_params) if isinstance(best_params, dict) else {}
+    imgagn_meta.update({
+        "best_train_recall": best_recall,
+        "seed": int(res.get("seed", SEED)) if isinstance(res, dict) else int(SEED),
+        "config": res.get("config", cfg.__dict__ if hasattr(cfg, "__dict__") else cfg),
+    })
+
     # 4) Volcar el grafo aumentado a HeteroData
     try:
         from torch_geometric.data import HeteroData
@@ -2956,7 +3172,7 @@ def run_imgagn_pipeline(loaded_obj, retrain_gat: bool = True):
         save_obj = dict(loaded_obj)
         save_obj['data'] = data_aug
         save_obj['filename'] = filename
-        save_obj['imgagn_best_params'] = best_params
+        save_obj['imgagn_best_params'] = imgagn_meta
         torch.save(save_obj, out_path)
         logger.info(f"✅ Grafo ImGAGN aumentado guardado en -> {filename}")
 

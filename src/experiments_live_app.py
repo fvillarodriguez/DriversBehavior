@@ -409,6 +409,251 @@ def _render_gnn_optuna_objectives_view(
         st.dataframe(df, width="stretch")
 
 
+def _render_gnn_recursive_view(
+    df: pd.DataFrame, best_row: Optional[Dict[str, object]]
+) -> None:
+    st.caption("Experimento detectado: Opt.Recursiva (Optuna vs Ray)")
+    plot_df = df.copy()
+
+    include_errors = st.checkbox(
+        "Incluir registros con error",
+        value=False,
+        key="live_gnn_recursive_include_errors",
+    )
+    if not include_errors and "status" in plot_df.columns:
+        plot_df = plot_df[plot_df["status"] == "ok"]
+
+    if plot_df.empty:
+        st.info("No hay datos suficientes para graficar.")
+        st.dataframe(df, width="stretch")
+        return
+
+    objective_options = (
+        sorted(plot_df["objective_label"].dropna().astype(str).unique())
+        if "objective_label" in plot_df.columns
+        else []
+    )
+    balance_options = (
+        sorted(plot_df["balance_strategy"].dropna().astype(str).unique())
+        if "balance_strategy" in plot_df.columns
+        else []
+    )
+    optimizer_options = (
+        sorted(plot_df["optimizer"].dropna().astype(str).unique())
+        if "optimizer" in plot_df.columns
+        else []
+    )
+
+    col_filters_1, col_filters_2, col_filters_3 = st.columns(3)
+    with col_filters_1:
+        selected_objective = st.selectbox(
+            "Objetivo",
+            options=objective_options or ["(sin objetivo)"],
+            key="live_gnn_recursive_objective",
+        )
+    with col_filters_2:
+        selected_balance = st.selectbox(
+            "Balanceo",
+            options=balance_options or ["(sin balanceo)"],
+            key="live_gnn_recursive_balance",
+        )
+    with col_filters_3:
+        selected_optimizer = st.multiselect(
+            "Optimizadores",
+            options=optimizer_options or ["Optuna", "Ray"],
+            default=optimizer_options or ["Optuna", "Ray"],
+            key="live_gnn_recursive_optimizer",
+        )
+
+    if "objective_label" in plot_df.columns and objective_options:
+        plot_df = plot_df[
+            plot_df["objective_label"].astype(str) == str(selected_objective)
+        ]
+    if "balance_strategy" in plot_df.columns and balance_options:
+        plot_df = plot_df[
+            plot_df["balance_strategy"].astype(str) == str(selected_balance)
+        ]
+    if "optimizer" in plot_df.columns and selected_optimizer:
+        plot_df = plot_df[
+            plot_df["optimizer"].astype(str).isin(selected_optimizer)
+        ]
+
+    if "iteration" in plot_df.columns:
+        plot_df["iteration"] = pd.to_numeric(
+            plot_df["iteration"], errors="coerce"
+        )
+    else:
+        plot_df["iteration"] = pd.to_numeric(
+            plot_df.get("_row_id", pd.Series(range(len(plot_df)))),
+            errors="coerce",
+        )
+
+    metric_candidates = [
+        "test_f1",
+        "test_precision",
+        "test_recall",
+        "test_accuracy",
+        "test_far",
+        "test_auprc",
+        "test_mcc",
+    ]
+    available_metrics = [
+        m for m in metric_candidates if m in plot_df.columns
+    ]
+    if not available_metrics:
+        st.info("No hay metricas disponibles para graficar.")
+        st.dataframe(df, width="stretch")
+        return
+
+    selected_metric = st.selectbox(
+        "Metrica principal",
+        available_metrics,
+        index=0,
+        key="live_gnn_recursive_metric",
+    )
+
+    for col in available_metrics:
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+
+    if best_row is None and selected_metric in plot_df.columns:
+        valid = plot_df[plot_df[selected_metric].notna()]
+        if not valid.empty:
+            best_row = valid.loc[valid[selected_metric].idxmax()].to_dict()
+
+    if best_row:
+        st.markdown("**Resultado optimo (metrica seleccionada)**")
+        metrics_payload = {
+            "objective": best_row.get("objective_label"),
+            "optimizer": best_row.get("optimizer"),
+            "iteration": best_row.get("iteration"),
+            "test_f1": best_row.get("test_f1"),
+            "test_precision": best_row.get("test_precision"),
+            "test_recall": best_row.get("test_recall"),
+            "test_accuracy": best_row.get("test_accuracy"),
+            "test_far": best_row.get("test_far"),
+            "test_auprc": best_row.get("test_auprc"),
+            "test_mcc": best_row.get("test_mcc"),
+        }
+        st.json(metrics_payload)
+        model_path = best_row.get("model_path")
+        if model_path:
+            st.caption(f"Modelo: {model_path}")
+
+    tab_viz, tab_data = st.tabs(["Grafico", "Datos"])
+    with tab_viz:
+        try:
+            import altair as alt
+
+            base = plot_df.dropna(subset=["iteration"]).copy()
+            if base.empty:
+                st.info("No hay datos suficientes para graficar.")
+            else:
+                chart = (
+                    alt.Chart(base)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X(
+                            "iteration:Q",
+                            axis=alt.Axis(title="Iteracion"),
+                        ),
+                        y=alt.Y(
+                            f"{selected_metric}:Q",
+                            axis=alt.Axis(title=selected_metric),
+                        ),
+                        color=alt.Color(
+                            "optimizer:N",
+                            title="Optimizador",
+                        ),
+                        tooltip=[
+                            "iteration",
+                            "optimizer",
+                            "balance_strategy",
+                            "objective_label",
+                            selected_metric,
+                        ],
+                    )
+                    .interactive()
+                )
+                st.altair_chart(chart, width="stretch")
+
+            long_rows = []
+            for metric in available_metrics:
+                metric_df = plot_df[
+                    ["iteration", "optimizer", metric]
+                ].copy()
+                metric_df["metric"] = metric
+                metric_df = metric_df.rename(columns={metric: "value"})
+                long_rows.append(metric_df)
+            long_df = pd.concat(long_rows, ignore_index=True)
+            long_df = long_df.dropna(subset=["value", "iteration"])
+
+            if not long_df.empty:
+                multi = (
+                    alt.Chart(long_df)
+                    .mark_line(point=True, opacity=0.8)
+                    .encode(
+                        x=alt.X(
+                            "iteration:Q",
+                            axis=alt.Axis(title="Iteracion"),
+                        ),
+                        y=alt.Y(
+                            "value:Q",
+                            axis=alt.Axis(title="Valor"),
+                        ),
+                        color=alt.Color("optimizer:N", title="Optimizador"),
+                        column=alt.Column(
+                            "metric:N",
+                            title="Metricas",
+                            header=alt.Header(labelAngle=0),
+                        ),
+                        tooltip=["iteration", "optimizer", "metric", "value"],
+                    )
+                    .properties(height=220)
+                    .interactive()
+                )
+                st.altair_chart(multi, width="stretch")
+
+            if "alert_level" in plot_df.columns:
+                alert_map = {"none": 0, "yellow": 1, "red": 2}
+                alert_df = plot_df[
+                    ["iteration", "optimizer", "alert_level"]
+                ].copy()
+                alert_df["alert_value"] = (
+                    alert_df["alert_level"].astype(str).str.lower().map(alert_map)
+                )
+                alert_df = alert_df.dropna(subset=["alert_value", "iteration"])
+                if not alert_df.empty:
+                    alert_chart = (
+                        alt.Chart(alert_df)
+                        .mark_line(point=True)
+                        .encode(
+                            x=alt.X(
+                                "iteration:Q",
+                                axis=alt.Axis(title="Iteracion"),
+                            ),
+                            y=alt.Y(
+                                "alert_value:Q",
+                                axis=alt.Axis(
+                                    title="Alerta (0=none, 1=yellow, 2=red)"
+                                ),
+                            ),
+                            color=alt.Color("optimizer:N", title="Optimizador"),
+                            tooltip=[
+                                "iteration",
+                                "optimizer",
+                                "alert_level",
+                            ],
+                        )
+                        .interactive()
+                    )
+                    st.altair_chart(alert_chart, width="stretch")
+        except ImportError:
+            st.warning("Altair no instalado.")
+
+    with tab_data:
+        st.dataframe(plot_df, width="stretch")
+
+
 def _render_best_highway_section_view(
     df: pd.DataFrame, best_row: Optional[Dict[str, object]]
 ) -> None:
@@ -589,6 +834,15 @@ def main(*, set_page_config: bool = True) -> None:
             .str.contains("best highway section", case=False, na=False)
             .any()
         )
+        is_gnn_recursive = (
+            "opt.recursiva" in experiment_name
+            or "opt recursiva" in experiment_name
+            or df.get("experiment", pd.Series())
+            .astype(str)
+            .str.contains("opt\\.recursiva|opt recursiva", case=False, na=False)
+            .any()
+            or {"optimizer", "iteration"}.issubset(df.columns)
+        )
         is_gnn_optuna = (
             "gnn optuna" in experiment_name
             or df.get("experiment", pd.Series())
@@ -600,6 +854,8 @@ def main(*, set_page_config: bool = True) -> None:
 
         if is_best_section:
             _render_best_highway_section_view(df, best_row)
+        elif is_gnn_recursive:
+            _render_gnn_recursive_view(df, best_row)
         elif is_gnn_optuna:
             _render_gnn_optuna_objectives_view(df, best_row)
         elif is_find_samples:

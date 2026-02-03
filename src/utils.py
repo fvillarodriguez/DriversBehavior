@@ -498,6 +498,44 @@ def clear_flow_table(db_path: Optional[Path] = None) -> int:
         conn.close()
 
 
+def delete_flow_rows_by_date_range(
+    *,
+    date_start: pd.Timestamp,
+    date_end: pd.Timestamp,
+    db_path: Optional[Path] = None,
+) -> int:
+    """
+    Elimina registros de flujos entre dos fechas (inclusive).
+    """
+
+    if date_start is None or date_end is None:
+        return 0
+
+    conn = _connect_duckdb(read_only=False, db_path=db_path)
+    try:
+        _create_flow_table(conn)
+        params = [date_start, date_end]
+        existing = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {FLOW_TABLE_NAME}
+            WHERE FECHA >= ? AND FECHA <= ?
+            """,
+            params,
+        ).fetchone()[0]
+        if existing:
+            conn.execute(
+                f"""
+                DELETE FROM {FLOW_TABLE_NAME}
+                WHERE FECHA >= ? AND FECHA <= ?
+                """,
+                params,
+            )
+        return int(existing or 0)
+    finally:
+        conn.close()
+
+
 def _fetch_summary_row(conn) -> Tuple[int, Optional[pd.Timestamp], Optional[pd.Timestamp]]:
     row = conn.execute(
         f"""

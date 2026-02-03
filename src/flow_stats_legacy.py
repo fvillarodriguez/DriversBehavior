@@ -456,7 +456,7 @@ def render_flow_stats_tab(*, db_path: Path) -> None:
     min_speed = col1.number_input("Min Speed (km/h)", 1.0, 150.0, 1.0)
     # Removing options strictly not needed or implied by "Batching"
     
-    temp_db = RESULTADOS_DIR / "temp_agg.duckdb"
+    temp_db = Path(RESULTADOS_DIR) / "temp_agg.duckdb"
     
     if st.button("Procesar Mensual (Memoria Optimizada)"):
         df_res = process_monthly_and_store(db_path, min_speed, False, temp_db)

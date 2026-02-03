@@ -87,6 +87,7 @@ def train_minibatch(
     suppress_missing_att_warning: bool = False, # <-- Silencia aviso de atenciones ausentes
     batch_callback: Optional[Callable[..., None]] = None, # <-- Callback para progreso por batch
     batch_log_every: Optional[int] = None, # <-- Frecuencia de callback por batch
+    accumulation_steps: int = 2, # <-- Acumulación de gradientes
 ) -> Tuple[float, float, float, float]: # Agregado avg_edge_loss
     """
     Entrena una época completa sobre un loader (vecindad) y devuelve:
@@ -119,14 +120,17 @@ def train_minibatch(
                 batch_log_step = max(1, int(batch_log_every))
         except Exception:
             batch_log_step = 1
-    # Acumulador de gradientes
-    accumulation_steps = 2
+    # Acumulador de gradientes (evitar valores inválidos)
+    try:
+        accumulation_steps = max(1, int(accumulation_steps))
+    except Exception:
+        accumulation_steps = 1
 
     mem_debug = os.environ.get("GNN_MEM_DEBUG", "").lower() in ("1", "true", "yes", "y")
     mem_log_every = int(os.environ.get("GNN_MEM_DEBUG_EVERY", "200"))
     neigh_debug = os.environ.get("GNN_NEIGHBOR_DEBUG", "").lower() in ("1", "true", "yes", "y")
     
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     if DEBUG:
         logger.info(f"[train_minibatch] Epoch {epoch}: Gradientes iniciales puestos a cero.")
 
@@ -278,12 +282,11 @@ def train_minibatch(
                 if edge_gen: torch.nn.utils.clip_grad_norm_(edge_gen.parameters(), grad_clip_value)
                 optimizer.step()
 
-            if scheduler is not None:
-                scheduler.step()
-            
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             if DEBUG:
                 logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Gradientes puestos a cero después del paso.")
+            if scheduler is not None:
+                scheduler.step()
 
         if torch.isfinite(loss):
             total_loss += float(loss.item())

@@ -1,6 +1,7 @@
 import json
 import os
 import smtplib
+import traceback
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -94,6 +95,28 @@ def send_notification_email(subject: str, history_entry: Dict) -> bool:
     except Exception as e:
         print(f"Error enviando email: {e}")
         return False
+
+
+def send_error_notification_email(
+    subject: str,
+    error: object,
+    *,
+    context: Optional[Dict] = None,
+) -> bool:
+    error_text = ""
+    if isinstance(error, BaseException):
+        error_text = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+    else:
+        error_text = str(error)
+
+    payload = {
+        "status": "Error",
+        "error": error_text,
+        "context": context or {},
+    }
+    return send_notification_email(f"ERROR: {subject}", payload)
 
 def render_notification_config():
     st.subheader("Configuración de Notificaciones por Email")

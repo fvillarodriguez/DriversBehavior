@@ -1,6 +1,6 @@
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Tuple, Optional, Dict, List
 
 import torch
@@ -840,4 +840,6 @@ def train_imgagn(
         'gen_slice': gen_slice,
         'best_train_recall': torch.tensor(best.get('recall', -1.0)),
         'epochs': torch.tensor(cfg.epochs),
+        'seed': int(SEED),
+        'config': asdict(cfg),
     }
