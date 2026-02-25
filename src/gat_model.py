@@ -2,7 +2,7 @@ import sys as _sys
 import torch
 import torch.nn.functional as F
 from torch.nn import LayerNorm, Linear, ModuleList
-from torch_geometric.nn import GATConv, HeteroConv
+from torch_geometric.nn import GATConv, HeteroConv, TransformerConv
 from torch.utils.checkpoint import checkpoint
 from src.config import DEBUG, XAI
 
@@ -29,6 +29,49 @@ class GATConvSaveAlpha(GATConv):
         # Fallback: if upstream signature changes
         self._alpha = None
         return out
+
+
+class TransformerConvSaveAlpha(TransformerConv):
+    """
+    Wrapper over PyG's TransformerConv that stores the last attention coefficients
+    in `self._alpha`, mirroring GATConvSaveAlpha.
+    """
+    def forward(self, x, edge_index, edge_attr=None, size=None, return_attention_weights=False):
+        out = super().forward(x, edge_index, edge_attr=edge_attr, return_attention_weights=True)
+        if isinstance(out, tuple):
+            x_out, (eff_eidx, alpha) = out
+            self._alpha = alpha
+            if return_attention_weights:
+                return x_out, (eff_eidx, alpha)
+            return x_out
+        self._alpha = None
+        return out
+
+
+def _edge_type_module_key(edge_type):
+    if isinstance(edge_type, tuple) and len(edge_type) == 3:
+        return f"{edge_type[0]}__{edge_type[1]}__{edge_type[2]}"
+    return str(edge_type)
+
+
+class EdgeAttrEncoder(torch.nn.Module):
+    """Small MLP to learn a task-adapted representation of raw edge attributes."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            Linear(in_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        if edge_attr is None:
+            return edge_attr
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.view(-1, 1)
+        return self.net(edge_attr)
 
 
 class HeteroGAT(torch.nn.Module):
@@ -194,7 +237,7 @@ class HeteroGAT(torch.nn.Module):
 
             if XAI:
                 for edge_type, conv_layer in conv.convs.items():
-                    if isinstance(conv_layer, GATConv) and hasattr(conv_layer, '_alpha') and conv_layer._alpha is not None:
+                    if hasattr(conv_layer, '_alpha') and conv_layer._alpha is not None:
                         key = f'conv{i+1}_{edge_type[0]}_{edge_type[1]}_{edge_type[2]}'
                         attentions[key] = conv_layer._alpha
                         conv_layer._alpha = None
@@ -218,3 +261,119 @@ class HeteroGAT(torch.nn.Module):
             print("--- End HeteroGAT Forward Pass ---")
 
         return x_dict, z_dict, attentions
+
+
+class HeteroGATWithEdgeEncoder(HeteroGAT):
+    """
+    HeteroGAT variant that first maps raw edge attributes through an MLP encoder.
+    The encoded edge attributes are then consumed by GAT attention.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        hidden_channels,
+        out_channels,
+        num_heads,
+        dropout,
+        edge_feature_dim,
+        num_layers,
+        use_checkpointing=False,
+        aggr1='sum',
+        aggr2='sum',
+        edge_encoder_hidden_dim=None,
+        edge_encoded_dim=None,
+        edge_encoder_dropout=0.0,
+    ):
+        raw_edge_dim = int(edge_feature_dim or 0)
+        encoded_edge_dim = int(edge_encoded_dim if edge_encoded_dim is not None else raw_edge_dim)
+        super().__init__(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            out_channels=out_channels,
+            num_heads=num_heads,
+            dropout=dropout,
+            edge_feature_dim=encoded_edge_dim,
+            num_layers=num_layers,
+            use_checkpointing=use_checkpointing,
+            aggr1=aggr1,
+            aggr2=aggr2,
+        )
+        self.raw_edge_feature_dim = raw_edge_dim
+        self.encoded_edge_feature_dim = encoded_edge_dim
+        self.edge_encoder_hidden_dim = int(
+            edge_encoder_hidden_dim
+            if edge_encoder_hidden_dim is not None
+            else max(raw_edge_dim, encoded_edge_dim, 8)
+        )
+        self.edge_attr_encoders = torch.nn.ModuleDict()
+        if raw_edge_dim > 0 and encoded_edge_dim > 0:
+            try:
+                edge_types = list(self.convs[0].convs.keys())
+            except Exception:
+                edge_types = []
+            for edge_type in edge_types:
+                self.edge_attr_encoders[_edge_type_module_key(edge_type)] = EdgeAttrEncoder(
+                    in_dim=raw_edge_dim,
+                    hidden_dim=self.edge_encoder_hidden_dim,
+                    out_dim=encoded_edge_dim,
+                    dropout=float(edge_encoder_dropout),
+                )
+
+    def _encode_edge_attr_dict(self, edge_attr_dict):
+        if not isinstance(edge_attr_dict, dict) or not self.edge_attr_encoders:
+            return edge_attr_dict
+        encoded = {}
+        for edge_type, edge_attr in edge_attr_dict.items():
+            if edge_attr is None:
+                continue
+            enc_key = _edge_type_module_key(edge_type)
+            if enc_key not in self.edge_attr_encoders:
+                encoded[edge_type] = edge_attr
+                continue
+            encoded[edge_type] = self.edge_attr_encoders[enc_key](edge_attr)
+        return encoded
+
+    def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
+        edge_attr_encoded = self._encode_edge_attr_dict(edge_attr_dict)
+        return super().forward(x_dict, edge_index_dict, edge_attr_encoded)
+
+
+class HeteroEdgeAware(torch.nn.Module):
+    """
+    Alternative hetero GNN that swaps GATConv for TransformerConv while keeping
+    the same output contract as HeteroGAT.
+    """
+
+    def __init__(self, in_channels, hidden_channels, out_channels, num_heads, dropout, edge_feature_dim, num_layers, use_checkpointing=False,
+                 aggr1='sum', aggr2='sum'):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.use_checkpointing = use_checkpointing
+        self.num_layers = num_layers
+        self.edge_feature_dim = edge_feature_dim
+
+        self.convs = ModuleList()
+        self.norms = ModuleList()
+
+        for i in range(num_layers):
+            conv_in_channels = in_channels if i == 0 else hidden_channels * num_heads
+            conv_dict = {
+                ('pm', 'spatial', 'pm'): TransformerConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, dropout=dropout, edge_dim=edge_feature_dim),
+                ('pm', 'temporal', 'pm'): TransformerConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, dropout=dropout, edge_dim=edge_feature_dim),
+                ('pm', 'spatial_back', 'pm'): TransformerConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, dropout=dropout, edge_dim=edge_feature_dim),
+                ('pm', 'st_fwd', 'pm'): TransformerConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, dropout=dropout, edge_dim=edge_feature_dim),
+            }
+            self.convs.append(HeteroConv(conv_dict, aggr=aggr1 if i == 0 else aggr2))
+
+            norm_dict = torch.nn.ModuleDict()
+            norm_dict['pm'] = LayerNorm(hidden_channels * num_heads)
+            self.norms.append(norm_dict)
+
+        self.pm_lin = Linear(hidden_channels * num_heads, out_channels)
+
+    def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
+        # Reuse the proven forward path from HeteroGAT by delegating to an adapter instance method.
+        return HeteroGAT.forward(self, x_dict, edge_index_dict, edge_attr_dict=edge_attr_dict)

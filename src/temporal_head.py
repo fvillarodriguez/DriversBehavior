@@ -24,6 +24,7 @@ class TemporalAggregator(nn.Module):
         sequence_length: int,
         hidden_dim: Optional[int] = None,
         num_classes: int = 2,
+        cache_strategy: str = "incremental",
     ):
         super().__init__()
         if sequence_rows.ndim != 2:
@@ -31,6 +32,7 @@ class TemporalAggregator(nn.Module):
         self.embedding_dim = int(embedding_dim)
         self.hidden_dim = int(hidden_dim) if hidden_dim else self.embedding_dim
         self.sequence_length = int(sequence_length)
+        self.cache_strategy = str(cache_strategy or "incremental").strip().lower()
         if self.sequence_length != sequence_rows.shape[1]:
             raise ValueError("sequence_length inconsistent with sequence_rows second dimension.")
 
@@ -63,6 +65,44 @@ class TemporalAggregator(nn.Module):
         """Reset cached embeddings (useful before evaluation passes)."""
         self.embedding_cache.zero_()
 
+    @torch.no_grad()
+    def update_cache(
+        self,
+        embeddings: torch.Tensor,
+        global_node_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        """
+        Update cached embeddings.
+
+        Args:
+            embeddings:
+                Either a full global embedding matrix ``[N, D]`` (when
+                ``global_node_ids`` is None) or a partial batch of embeddings
+                aligned with ``global_node_ids``.
+            global_node_ids:
+                Optional global indices for partial cache updates.
+        """
+        if embeddings is None or embeddings.numel() == 0:
+            return
+        if embeddings.ndim != 2:
+            raise ValueError("embeddings must have shape [N, D].")
+
+        cache_device = self.embedding_cache.device
+        emb_to_cache = embeddings.detach().to(cache_device, dtype=self.embedding_cache.dtype)
+
+        if global_node_ids is None:
+            self._ensure_cache_capacity(int(emb_to_cache.size(0)))
+            self.embedding_cache[: emb_to_cache.size(0)] = emb_to_cache
+            return
+
+        if global_node_ids.numel() != embeddings.size(0):
+            raise ValueError("global_node_ids and embeddings must align on the first dimension.")
+        max_gid = int(global_node_ids.max().item()) if global_node_ids.numel() else -1
+        if max_gid >= 0:
+            self._ensure_cache_capacity(max_gid + 1)
+            gids = global_node_ids.to(cache_device, dtype=torch.long)
+            self.embedding_cache[gids] = emb_to_cache
+
     def _ensure_cache_capacity(self, required_size: int) -> None:
         current = int(self.embedding_cache.size(0))
         if required_size <= current:
@@ -82,22 +122,20 @@ class TemporalAggregator(nn.Module):
             dim=0,
         )
 
-    def forward(
+    def _build_sequence_batch(
         self,
         embeddings: torch.Tensor,
         global_node_ids: torch.Tensor,
         batch_size: int,
     ) -> torch.Tensor:
-        """
-        Args:
-            embeddings: Tensor [num_nodes_in_subgraph, embedding_dim] from GAT.
-            global_node_ids: Tensor of global node indices aligned with embeddings.
-            batch_size: Number of target nodes (first entries) in the loader batch.
-        Returns:
-            Logits tensor of shape [batch_size, num_classes].
-        """
         if batch_size == 0:
-            return torch.zeros(0, self.classifier.out_features, device=embeddings.device, dtype=embeddings.dtype)
+            return torch.zeros(
+                0,
+                self.sequence_length,
+                self.embedding_dim,
+                device=embeddings.device,
+                dtype=embeddings.dtype,
+            )
 
         device = embeddings.device
         global_ids_cpu = global_node_ids.detach().cpu().tolist()
@@ -105,8 +143,7 @@ class TemporalAggregator(nn.Module):
         self._ensure_cache_capacity(max_gid + 1)
 
         # Update cache with current embeddings (detach to avoid leaking gradients)
-        global_ids_device = global_node_ids.to(self.embedding_cache.device)
-        self.embedding_cache[global_ids_device] = embeddings.detach().to(self.embedding_cache.device)
+        self.update_cache(embeddings, global_node_ids=global_node_ids)
 
         # Mapping global id -> local index within current batch
         local_index_map = {gid: idx for idx, gid in enumerate(global_ids_cpu)}
@@ -132,13 +169,32 @@ class TemporalAggregator(nn.Module):
                 if local is not None:
                     seq_embs.append(embeddings[local])
                 else:
-                    seq_embs.append(self.embedding_cache[sg].to(device))
+                    seq_embs.append(
+                        self.embedding_cache[sg].to(device=device, dtype=embeddings.dtype)
+                    )
             seq_tensor = torch.stack(seq_embs, dim=0)
             sequence_tensors.append(seq_tensor)
 
-        sequence_batch = torch.stack(sequence_tensors, dim=0)
+        return torch.stack(sequence_tensors, dim=0)
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        global_node_ids: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """
+        Args:
+            embeddings: Tensor [num_nodes_in_subgraph, embedding_dim] from GAT.
+            global_node_ids: Tensor of global node indices aligned with embeddings.
+            batch_size: Number of target nodes (first entries) in the loader batch.
+        Returns:
+            Logits tensor of shape [batch_size, num_classes].
+        """
+        if batch_size == 0:
+            return torch.zeros(0, self.classifier.out_features, device=embeddings.device, dtype=embeddings.dtype)
+        sequence_batch = self._build_sequence_batch(embeddings, global_node_ids, batch_size)
         output, _ = self.temporal(sequence_batch)
         last_hidden = output[:, -1, :]
         logits = self.classifier(last_hidden)
         return logits
-

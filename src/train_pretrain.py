@@ -105,6 +105,7 @@ def train_minibatch(
     total_cls_loss = 0.0
     total_edge_loss = 0.0
     total_l2_att_loss = 0.0
+    total_h_loss = 0.0
 
     if DEBUG:
         logger.info(f"[train_minibatch] Epoch {epoch}: Iniciando entrenamiento de minibatch.")
@@ -234,15 +235,30 @@ def train_minibatch(
             elif lambda_l2_att > 0 and not attentions and i == 0 and not suppress_missing_att_warning:
                 logger.warning("lambda_l2_att > 0, pero no se recibieron atenciones del modelo. Verifica que XAI esté activo y que el modelo guarde alpha.")
 
-            total_loss = cls_loss + lambda_edge * edge_loss + lambda_l2_att * l2_att_loss
+            # Entropy regularization over class probabilities (H).
+            h_loss = torch.tensor(0.0, device=pm_embeddings.device)
+            if lambda_H > 0:
+                probs_m = F.softmax(logits_m, dim=1)
+                entropy_per_node = -torch.sum(
+                    probs_m * torch.log(torch.clamp(probs_m, min=1e-12)),
+                    dim=1,
+                )
+                h_loss = torch.mean(entropy_per_node)
+
+            total_loss = (
+                cls_loss
+                + lambda_H * h_loss
+                + lambda_edge * edge_loss
+                + lambda_l2_att * l2_att_loss
+            )
             if DEBUG:
                 grad_fn_info = total_loss.grad_fn.__class__.__name__ if total_loss.grad_fn else 'None'
                 logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Loss calculada. grad_fn: {grad_fn_info}")
-            return total_loss, cls_loss.detach(), edge_loss.detach(), l2_att_loss.detach()
+            return total_loss, cls_loss.detach(), edge_loss.detach(), l2_att_loss.detach(), h_loss.detach()
 
         if use_amp and scaler is not None:
             with torch.amp.autocast("cuda"):
-                loss, cls_loss, edge_loss, l2_att_loss = compute_loss()
+                loss, cls_loss, edge_loss, l2_att_loss, h_loss = compute_loss()
                 loss = loss / accumulation_steps # Normalizar la loss
             
             if torch.isfinite(loss):
@@ -256,7 +272,7 @@ def train_minibatch(
                 logger.warning("Loss is NaN, skipping backward pass.")
 
         else:
-            loss, cls_loss, edge_loss, l2_att_loss = compute_loss()
+            loss, cls_loss, edge_loss, l2_att_loss, h_loss = compute_loss()
             loss = loss / accumulation_steps # Normalizar la loss
             if torch.isfinite(loss):
                 if DEBUG:
@@ -293,10 +309,12 @@ def train_minibatch(
             total_cls_loss += float(cls_loss.item())
             total_edge_loss += float(edge_loss.item())
             total_l2_att_loss += float(l2_att_loss.item())
+            total_h_loss += float(h_loss.item())
 
         progress_bar.set_postfix({
             'Loss': f"{loss.item():.4f}" if torch.isfinite(loss) else "nan",
             'CLS': f"{cls_loss.item():.4f}" if torch.isfinite(cls_loss) else "nan",
+            'H': f"{h_loss.item():.4f}" if torch.isfinite(h_loss) else "nan",
             'Edge': f"{edge_loss.item():.4f}" if torch.isfinite(edge_loss) else "nan",
             'L2_Att': f"{l2_att_loss.item():.4f}" if torch.isfinite(l2_att_loss) else "nan",
             'LR': f"{scheduler.get_last_lr()[0]:.2e}" if scheduler else 'N/A'
@@ -331,10 +349,12 @@ def train_minibatch(
     avg_cls_loss = total_cls_loss / n_batches
     avg_edge_loss = total_edge_loss / n_batches
     avg_l2_att_loss = total_l2_att_loss / n_batches
+    avg_h_loss = total_h_loss / n_batches
 
     if writer is not None:
         writer.add_scalar('Loss/Train_Total', avg_loss, epoch)
         writer.add_scalar('Loss/Train_CLS', avg_cls_loss, epoch)
+        writer.add_scalar('Loss/Train_H', avg_h_loss, epoch)
         writer.add_scalar('Loss/Train_Edge', avg_edge_loss, epoch)
         writer.add_scalar('Loss/Train_L2_Att', avg_l2_att_loss, epoch)
         if scheduler is not None:

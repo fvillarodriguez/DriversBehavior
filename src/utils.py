@@ -36,6 +36,7 @@ FLOW_TABLE_SCHEMA = """
     PORTICO VARCHAR,
     CARRIL VARCHAR
 """
+DEFAULT_INTERVAL_MINUTES = 5
 
 
 @dataclass(frozen=True)
@@ -658,6 +659,482 @@ def get_flow_table_sample(
         return conn.execute(query, [int(limit)]).df()
     finally:
         conn.close()
+
+
+def get_flow_counts_by_category(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Retorna el total de observaciones por categoría vehicular.
+    """
+
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            SELECT
+                CATEGORIA AS categoria,
+                COUNT(*) AS total
+            FROM {FLOW_TABLE_NAME}
+            WHERE CATEGORIA IS NOT NULL
+            GROUP BY CATEGORIA
+            ORDER BY total DESC, categoria
+        """
+        return conn.execute(query).df()
+    finally:
+        conn.close()
+
+
+def get_flow_counts_by_year(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Retorna el total de observaciones por año.
+    """
+
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            SELECT
+                CAST(EXTRACT(year FROM FECHA) AS INTEGER) AS anio,
+                COUNT(*) AS total
+            FROM {FLOW_TABLE_NAME}
+            WHERE FECHA IS NOT NULL
+            GROUP BY anio
+            ORDER BY anio
+        """
+        return conn.execute(query).df()
+    finally:
+        conn.close()
+
+
+def get_flow_counts_by_month(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Retorna el total de observaciones por mes.
+    """
+
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            SELECT
+                CAST(EXTRACT(year FROM FECHA) AS INTEGER) AS anio,
+                CAST(EXTRACT(month FROM FECHA) AS INTEGER) AS mes,
+                COUNT(*) AS total
+            FROM {FLOW_TABLE_NAME}
+            WHERE FECHA IS NOT NULL
+            GROUP BY anio, mes
+            ORDER BY anio, mes
+        """
+        return conn.execute(query).df()
+    finally:
+        conn.close()
+
+
+def get_flow_days_by_year(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Retorna el total de días con observaciones por año.
+    """
+
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            SELECT
+                CAST(EXTRACT(year FROM FECHA) AS INTEGER) AS anio,
+                COUNT(DISTINCT CAST(FECHA AS DATE)) AS dias
+            FROM {FLOW_TABLE_NAME}
+            WHERE FECHA IS NOT NULL
+            GROUP BY anio
+            ORDER BY anio
+        """
+        return conn.execute(query).df()
+    finally:
+        conn.close()
+
+
+def _flow_time_bin_expr(interval_minutes: int) -> str:
+    interval = max(1, int(interval_minutes))
+    return (
+        "DATE_TRUNC('minute', FECHA) - "
+        f"(EXTRACT(minute FROM FECHA) % {interval}) * INTERVAL '1 minute'"
+    )
+
+
+def get_flow_basic_stats(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Retorna métricas básicas de cobertura y escala de la tabla de flujos.
+    """
+
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            SELECT
+                COUNT(*) AS total,
+                MIN(FECHA) AS min_ts,
+                MAX(FECHA) AS max_ts,
+                COUNT(DISTINCT NULLIF(TRIM(PORTICO), '')) AS porticos,
+                COUNT(DISTINCT NULLIF(TRIM(CARRIL), '')) AS carriles,
+                COUNT(DISTINCT CATEGORIA) AS categorias,
+                COUNT(DISTINCT NULLIF(UPPER(TRIM(MATRICULA)), '')) AS patentes,
+                COUNT(DISTINCT CAST(FECHA AS DATE)) AS dias,
+                COUNT(DISTINCT DATE_TRUNC('hour', FECHA)) AS horas
+            FROM {FLOW_TABLE_NAME}
+        """
+        row = conn.execute(query).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return {}
+
+    min_ts = pd.to_datetime(row[1]) if row[1] is not None else None
+    max_ts = pd.to_datetime(row[2]) if row[2] is not None else None
+    return {
+        "total": int(row[0] or 0),
+        "min_ts": min_ts,
+        "max_ts": max_ts,
+        "porticos": int(row[3] or 0),
+        "carriles": int(row[4] or 0),
+        "categorias": int(row[5] or 0),
+        "patentes": int(row[6] or 0),
+        "dias": int(row[7] or 0),
+        "horas": int(row[8] or 0),
+    }
+
+
+def get_flow_missingness_stats(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Retorna el conteo y porcentaje de missingness en columnas clave.
+    """
+
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN CARRIL IS NULL OR TRIM(CARRIL) = '' THEN 1 ELSE 0 END) AS miss_carril,
+                SUM(CASE WHEN VELOCIDAD IS NULL THEN 1 ELSE 0 END) AS miss_velocidad,
+                SUM(CASE WHEN CATEGORIA IS NULL THEN 1 ELSE 0 END) AS miss_categoria,
+                SUM(CASE WHEN PORTICO IS NULL OR TRIM(PORTICO) = '' THEN 1 ELSE 0 END) AS miss_portico,
+                SUM(CASE WHEN MATRICULA IS NULL OR TRIM(MATRICULA) = '' THEN 1 ELSE 0 END) AS miss_matricula
+            FROM {FLOW_TABLE_NAME}
+        """
+        row = conn.execute(query).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return pd.DataFrame()
+
+    total = int(row[0] or 0)
+    if total <= 0:
+        return pd.DataFrame()
+
+    def _pct(value: int) -> float:
+        return round(value * 100.0 / total, 3)
+
+    data = [
+        {"Campo": "CARRIL", "Missing": int(row[1] or 0), "%": _pct(int(row[1] or 0))},
+        {"Campo": "VELOCIDAD", "Missing": int(row[2] or 0), "%": _pct(int(row[2] or 0))},
+        {"Campo": "CATEGORIA", "Missing": int(row[3] or 0), "%": _pct(int(row[3] or 0))},
+        {"Campo": "PORTICO", "Missing": int(row[4] or 0), "%": _pct(int(row[4] or 0))},
+        {"Campo": "MATRICULA", "Missing": int(row[5] or 0), "%": _pct(int(row[5] or 0))},
+    ]
+    return pd.DataFrame(data)
+
+
+def get_flow_speed_stats(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Estadísticos de velocidad instantánea (global).
+    """
+
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            SELECT
+                AVG(VELOCIDAD) AS mean,
+                STDDEV_SAMP(VELOCIDAD) AS sd,
+                QUANTILE_CONT(VELOCIDAD, 0.05) AS p5,
+                QUANTILE_CONT(VELOCIDAD, 0.25) AS p25,
+                QUANTILE_CONT(VELOCIDAD, 0.50) AS p50,
+                QUANTILE_CONT(VELOCIDAD, 0.95) AS p95
+            FROM {FLOW_TABLE_NAME}
+            WHERE VELOCIDAD IS NOT NULL
+        """
+        row = conn.execute(query).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        [
+            {
+                "Variable": "Velocidad (km/h)",
+                "Mean": row[0],
+                "SD": row[1],
+                "P5": row[2],
+                "P25": row[3],
+                "P50": row[4],
+                "P95": row[5],
+            }
+        ]
+    )
+
+
+def get_flow_speed_stats_by_category(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Estadísticos de velocidad instantánea por categoría.
+    """
+
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            SELECT
+                CASE WHEN CATEGORIA = 4 THEN 2 ELSE CATEGORIA END AS categoria,
+                AVG(VELOCIDAD) AS mean,
+                STDDEV_SAMP(VELOCIDAD) AS sd,
+                QUANTILE_CONT(VELOCIDAD, 0.05) AS p5,
+                QUANTILE_CONT(VELOCIDAD, 0.25) AS p25,
+                QUANTILE_CONT(VELOCIDAD, 0.50) AS p50,
+                QUANTILE_CONT(VELOCIDAD, 0.95) AS p95
+            FROM {FLOW_TABLE_NAME}
+            WHERE VELOCIDAD IS NOT NULL AND CATEGORIA IS NOT NULL
+            GROUP BY 1
+            ORDER BY 1
+        """
+        return conn.execute(query).df()
+    finally:
+        conn.close()
+
+
+def get_flow_plate_concentration(
+    db_path: Optional[Path] = None, top_percent: float = 0.01
+) -> Dict[str, Any]:
+    """
+    Retorna métricas de concentración de patentes (top % de patentes).
+    """
+
+    pct = max(0.0, float(top_percent))
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            WITH plate_counts AS (
+                SELECT
+                    NULLIF(UPPER(TRIM(MATRICULA)), '') AS plate,
+                    COUNT(*) AS cnt
+                FROM {FLOW_TABLE_NAME}
+                WHERE MATRICULA IS NOT NULL
+                GROUP BY plate
+            ),
+            ordered AS (
+                SELECT
+                    cnt,
+                    ROW_NUMBER() OVER (ORDER BY cnt DESC) AS rn,
+                    COUNT(*) OVER () AS total_plates,
+                    SUM(cnt) OVER () AS total_detections
+                FROM plate_counts
+                WHERE plate IS NOT NULL
+            )
+            SELECT
+                SUM(cnt) FILTER (WHERE rn <= CEIL(total_plates * {pct})) AS top_detections,
+                MAX(total_detections) AS total_detections,
+                MAX(total_plates) AS total_plates
+            FROM ordered
+        """
+        row = conn.execute(query).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return {}
+
+    top_detections = int(row[0] or 0)
+    total_detections = int(row[1] or 0)
+    total_plates = int(row[2] or 0)
+    share = (top_detections / total_detections * 100.0) if total_detections else 0.0
+    return {
+        "top_percent": pct,
+        "top_detections": top_detections,
+        "total_detections": total_detections,
+        "total_plates": total_plates,
+        "top_share": share,
+    }
+
+
+def get_flow_window_stats(
+    db_path: Optional[Path] = None, interval_minutes: int = DEFAULT_INTERVAL_MINUTES
+) -> pd.DataFrame:
+    """
+    Estadísticos de variables a nivel pórtico-ventana.
+    """
+
+    interval = max(1, int(interval_minutes))
+    flow_bin = _flow_time_bin_expr(interval)
+    scale = 60.0 / interval
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        query = f"""
+            WITH lanes AS (
+                SELECT
+                    PORTICO,
+                    COUNT(DISTINCT NULLIF(TRIM(CARRIL), '')) AS lanes
+                FROM {FLOW_TABLE_NAME}
+                WHERE PORTICO IS NOT NULL
+                GROUP BY PORTICO
+            ),
+            windows AS (
+                SELECT
+                    PORTICO,
+                    {flow_bin} AS ts_bin,
+                    COUNT(*) AS n,
+                    AVG(VELOCIDAD) AS vbar
+                FROM {FLOW_TABLE_NAME}
+                WHERE FECHA IS NOT NULL AND PORTICO IS NOT NULL
+                GROUP BY PORTICO, ts_bin
+            ),
+            features AS (
+                SELECT
+                    n,
+                    vbar,
+                    CASE WHEN lanes > 0 THEN n * {scale} / lanes ELSE NULL END AS q,
+                    CASE WHEN vbar > 0 AND lanes > 0 THEN (n * {scale} / lanes) / vbar ELSE NULL END AS k
+                FROM windows
+                LEFT JOIN lanes USING (PORTICO)
+            )
+            SELECT
+                AVG(n) AS n_mean,
+                STDDEV_SAMP(n) AS n_sd,
+                QUANTILE_CONT(n, 0.05) AS n_p5,
+                QUANTILE_CONT(n, 0.25) AS n_p25,
+                QUANTILE_CONT(n, 0.50) AS n_p50,
+                QUANTILE_CONT(n, 0.95) AS n_p95,
+                AVG(vbar) AS v_mean,
+                STDDEV_SAMP(vbar) AS v_sd,
+                QUANTILE_CONT(vbar, 0.05) AS v_p5,
+                QUANTILE_CONT(vbar, 0.25) AS v_p25,
+                QUANTILE_CONT(vbar, 0.50) AS v_p50,
+                QUANTILE_CONT(vbar, 0.95) AS v_p95,
+                AVG(q) AS q_mean,
+                STDDEV_SAMP(q) AS q_sd,
+                QUANTILE_CONT(q, 0.05) AS q_p5,
+                QUANTILE_CONT(q, 0.25) AS q_p25,
+                QUANTILE_CONT(q, 0.50) AS q_p50,
+                QUANTILE_CONT(q, 0.95) AS q_p95,
+                AVG(k) AS k_mean,
+                STDDEV_SAMP(k) AS k_sd,
+                QUANTILE_CONT(k, 0.05) AS k_p5,
+                QUANTILE_CONT(k, 0.25) AS k_p25,
+                QUANTILE_CONT(k, 0.50) AS k_p50,
+                QUANTILE_CONT(k, 0.95) AS k_p95
+            FROM features
+        """
+        row = conn.execute(query).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return pd.DataFrame()
+
+    rows = [
+        {
+            "Variable": "n (veh/ventana)",
+            "Mean": row[0],
+            "SD": row[1],
+            "P5": row[2],
+            "P25": row[3],
+            "P50": row[4],
+            "P95": row[5],
+        },
+        {
+            "Variable": "v̄ (km/h)",
+            "Mean": row[6],
+            "SD": row[7],
+            "P5": row[8],
+            "P25": row[9],
+            "P50": row[10],
+            "P95": row[11],
+        },
+        {
+            "Variable": "q (veh/h/carril)",
+            "Mean": row[12],
+            "SD": row[13],
+            "P5": row[14],
+            "P25": row[15],
+            "P50": row[16],
+            "P95": row[17],
+        },
+        {
+            "Variable": "k (veh/km/carril)",
+            "Mean": row[18],
+            "SD": row[19],
+            "P5": row[20],
+            "P25": row[21],
+            "P50": row[22],
+            "P95": row[23],
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def get_flow_window_prevalence_stats(
+    acc_windows: pd.DataFrame,
+    *,
+    interval_minutes: int = DEFAULT_INTERVAL_MINUTES,
+    db_path: Optional[Path] = None,
+) -> Dict[str, int]:
+    """
+    Calcula el total de ventanas y las positivas en el set de flujos.
+    """
+
+    interval = max(1, int(interval_minutes))
+    flow_bin = _flow_time_bin_expr(interval)
+    conn = _connect_duckdb(read_only=True, db_path=db_path)
+    try:
+        acc_df = acc_windows.copy()
+        if not acc_df.empty:
+            acc_df = acc_df[["PORTICO", "ts_bin"]].dropna().drop_duplicates()
+        if acc_df.empty:
+            query_total = f"""
+                SELECT COUNT(*) FROM (
+                    SELECT PORTICO, {flow_bin} AS ts_bin
+                    FROM {FLOW_TABLE_NAME}
+                    WHERE FECHA IS NOT NULL AND PORTICO IS NOT NULL
+                    GROUP BY PORTICO, ts_bin
+                ) t
+            """
+            total = int(conn.execute(query_total).fetchone()[0] or 0)
+            return {"total_windows": total, "positive_windows": 0}
+
+        conn.register("acc_windows", acc_df)
+        query = f"""
+            WITH flow_windows AS (
+                SELECT
+                    PORTICO,
+                    {flow_bin} AS ts_bin
+                FROM {FLOW_TABLE_NAME}
+                WHERE FECHA IS NOT NULL AND PORTICO IS NOT NULL
+                GROUP BY PORTICO, ts_bin
+            ),
+            acc AS (
+                SELECT DISTINCT PORTICO, ts_bin FROM acc_windows
+            )
+            SELECT
+                (SELECT COUNT(*) FROM flow_windows) AS total_windows,
+                (SELECT COUNT(*) FROM (
+                    SELECT acc.PORTICO, acc.ts_bin
+                    FROM acc
+                    INNER JOIN flow_windows
+                        ON acc.PORTICO = flow_windows.PORTICO
+                       AND acc.ts_bin = flow_windows.ts_bin
+                    GROUP BY acc.PORTICO, acc.ts_bin
+                ) t) AS positive_windows
+        """
+        row = conn.execute(query).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return {"total_windows": 0, "positive_windows": 0}
+    return {
+        "total_windows": int(row[0] or 0),
+        "positive_windows": int(row[1] or 0),
+    }
 
 
 def buscar_columna(df: pd.DataFrame, nombre_esperado: str) -> str:

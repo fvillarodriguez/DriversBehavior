@@ -214,6 +214,17 @@ GUARD_BAND_MINUTES = 10    # γ: separación entre features y target en minutos
 HORIZON_MINUTES = 20       # H: ventana futura a evaluar (minutos)
 INCLUDE_DOWNSTREAM_IN_LABEL = 1  # 1=considerar accidente en primer downstream como positivo
 
+# --- Variantes GNN temporales ---
+# Ejemplos:
+#   "gat_snapshot", "gat_gru", "gat_transformer", "gat_attnpool",
+#   "gat_edge_mlp", "gat_edge_mlp_gru", "gnn_edge_aware", "gnn_edge_aware_gru"
+GNN_VARIANT = "gat_gru"
+
+# Estrategia de caché para heads temporales:
+# - "global_epoch": priming por época con embeddings globales (recomendado para comparabilidad)
+# - "incremental": caché incremental por batch (más liviano)
+GNN_TEMPORAL_CACHE_STRATEGY = "global_epoch"
+
 """
 Nodos
 -----

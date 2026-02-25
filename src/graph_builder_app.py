@@ -78,6 +78,8 @@ from src.config import (
     GUARD_BAND_MINUTES,
     HORIZON_MINUTES,
     INCLUDE_DOWNSTREAM_IN_LABEL,
+    GNN_VARIANT,
+    GNN_TEMPORAL_CACHE_STRATEGY,
     N_TRIALS,
     NUM_EPOCHS_OPTUNA,
     TIMEOUT,
@@ -2382,15 +2384,53 @@ def _train_gnn_with_best_params(
     early_stop: bool,
     early_stop_patience: int,
     early_stop_min_delta: float,
+    train_sampler_mode: Optional[str] = None,
+    deterministic_sampling: Optional[bool] = None,
+    sampling_seed: Optional[int] = None,
+    disable_hard_undersampling: Optional[bool] = None,
+    cluster_gcn_num_parts: Optional[int] = None,
+    cluster_gcn_parts_per_epoch: Optional[int] = None,
+    graphsaint_mode: Optional[str] = None,
+    graphsaint_batch_size: Optional[int] = None,
+    graphsaint_num_steps: Optional[int] = None,
+    graphsaint_walk_length: Optional[int] = None,
+    eval_neighbors_mode: Optional[str] = None,
+    eval_num_neighbors: Optional[object] = None,
 ) -> Optional[str]:
     try:
         from src import gnn_main as graph_main
     except Exception:
         return None
 
-    hp_files = _list_hpo_files_for_training(
-        use_graphsmote=use_graphsmote, graph_obj=graph_obj
+    all_hp_files = sorted(
+        glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv")),
+        key=os.path.getmtime,
     )
+    want_imgagn = bool(graph_obj.get("imgagn_best_params")) or (
+        "ImGAGN" in str(graph_obj.get("filename", ""))
+    )
+
+    def _score_hp(path: str) -> Tuple[int, int, int, float]:
+        name = os.path.basename(path)
+        has_smote = "_GraphSMOTE" in name
+        has_imgagn = "_ImGAGN" in name
+        has_base = "_Base" in name
+        ok_smote = has_smote == bool(use_graphsmote)
+        ok_imgagn = has_imgagn == want_imgagn
+        base_pref = has_base and (not bool(use_graphsmote))
+        return (
+            int(ok_smote),
+            int(ok_imgagn),
+            int(base_pref),
+            os.path.getmtime(path),
+        )
+
+    hp_files_sorted = sorted(all_hp_files, key=_score_hp)
+    hp_files = [
+        path
+        for path in hp_files_sorted
+        if ("_GraphSMOTE" in os.path.basename(path)) == bool(use_graphsmote)
+    ]
     choice_index = 0
     if best_params_path and best_params_path in hp_files:
         choice_index = hp_files.index(best_params_path) + 1
@@ -2421,6 +2461,18 @@ def _train_gnn_with_best_params(
             early_stop_patience=int(early_stop_patience),
             early_stop_min_delta=float(early_stop_min_delta),
             max_epochs=int(max_epochs),
+            train_sampler_mode=train_sampler_mode,
+            deterministic_sampling=deterministic_sampling,
+            sampling_seed=sampling_seed,
+            disable_hard_undersampling=disable_hard_undersampling,
+            cluster_gcn_num_parts=cluster_gcn_num_parts,
+            cluster_gcn_parts_per_epoch=cluster_gcn_parts_per_epoch,
+            graphsaint_mode=graphsaint_mode,
+            graphsaint_batch_size=graphsaint_batch_size,
+            graphsaint_num_steps=graphsaint_num_steps,
+            graphsaint_walk_length=graphsaint_walk_length,
+            eval_neighbors_mode=eval_neighbors_mode,
+            eval_num_neighbors=eval_num_neighbors,
         )
     finally:
         builtins.input = original_input
@@ -2435,6 +2487,7 @@ def _evaluate_gnn_model_far_target(
     *,
     model_path: str,
     graph_data: HeteroData,
+    sequence_index: Optional[object] = None,
     device: torch.device,
     far_target: float,
     batch_size: int,
@@ -2442,7 +2495,6 @@ def _evaluate_gnn_model_far_target(
     seed: int = SEED,
 ) -> Dict[str, object]:
     from src import gnn_main as graph_main
-    from src.gat_model import HeteroGAT
 
     node_type = "pm"
     meta = _load_hparams_for_model(model_path)
@@ -2469,18 +2521,23 @@ def _evaluate_gnn_model_far_target(
         except Exception:
             h_out = 2
 
-    model = HeteroGAT(
-        in_channels=graph_data[node_type].x.shape[1],
-        hidden_channels=h_channels,
-        out_channels=h_out,
-        num_heads=h_heads,
-        dropout=h_dropout,
-        edge_feature_dim=_infer_edge_feature_dim(graph_data),
-        num_layers=h_layers,
-        aggr1=meta.get("aggr1", "sum"),
-        aggr2=meta.get("aggr2", "sum"),
+    gnn_variant = _normalize_ui_gnn_variant(meta.get("gnn_variant", GNN_VARIANT))
+    model = graph_main._build_gnn_model(
+        in_channels=int(graph_data[node_type].x.shape[1]),
+        hidden_channels=int(h_channels),
+        out_channels=int(h_out),
+        num_heads=int(h_heads),
+        dropout=float(h_dropout),
+        edge_feature_dim=int(_infer_edge_feature_dim(graph_data)),
+        num_layers=int(h_layers),
+        aggr1=str(meta.get("aggr1", "sum")),
+        aggr2=str(meta.get("aggr2", "sum")),
         use_checkpointing=False,
-    ).to(device)
+        gnn_variant=gnn_variant,
+        sequence_index=sequence_index,
+        num_nodes=int(getattr(graph_data[node_type], "num_nodes", graph_data[node_type].x.shape[0])),
+        device=device,
+    )
 
     model.load_state_dict(state_dict, strict=True)
     model.eval()
@@ -2489,43 +2546,58 @@ def _evaluate_gnn_model_far_target(
     calib_mask = _pick_calibration_mask(
         graph_data,
         node_type=node_type,
-        preferred=("val_mask", "train_mask"),
-        fallback=_list_available_masks(graph_data, node_type=node_type),
+        preferred=("val_mask",),
+        fallback=(),
+        allow_train_mask=False,
     )
+    if not calib_mask:
+        raise ValueError(
+            "No se encontro val_mask no vacio para calibrar el umbral FAR."
+        )
     tau = float(meta.get("best_tau", 0.5))
     calib_info: Dict[str, object] = {}
-    if calib_mask:
-        calib_results = graph_main.test(
-            model,
-            graph_data,
-            node_type=node_type,
-            threshold=None,
-            masks=[calib_mask],
-            batch_size=int(batch_size),
-            num_neighbors=num_neighbors,
+    calib_results = graph_main.test(
+        model,
+        graph_data,
+        node_type=node_type,
+        threshold=None,
+        masks=[calib_mask],
+        batch_size=int(batch_size),
+        num_neighbors=num_neighbors,
+    )
+    calib_key = (
+        calib_mask if calib_results and calib_mask in calib_results else None
+    )
+    if not calib_key:
+        raise ValueError(
+            "No se pudo obtener resultados en val_mask para calibrar FAR."
         )
-        calib_key = (
-            calib_mask if calib_results and calib_mask in calib_results else None
-        )
-        if calib_key:
-            y_true_val = calib_results[calib_key]["true"].numpy().ravel()
-            y_prob1_val = calib_results[calib_key]["probs"][:, 1].numpy().ravel()
-            tau, info = _select_threshold_for_far_target(
-                y_true_val,
-                y_prob1_val,
-                far_target=float(far_target),
-                mode="max_sens_under_far",
-            )
-            calib_info = {
-                "mask": calib_key,
-                "far": float(info.get("far", float("nan"))),
-                "sens": float(info.get("sens", float("nan"))),
-                "note": info.get("note"),
-            }
+    y_true_val = calib_results[calib_key]["true"].numpy().ravel()
+    y_prob1_val = calib_results[calib_key]["probs"][:, 1].numpy().ravel()
+    tau, info = _select_threshold_for_far_target(
+        y_true_val,
+        y_prob1_val,
+        far_target=float(far_target),
+        mode="max_sens_under_far",
+    )
+    calib_info = {
+        "mask": calib_key,
+        "far": float(info.get("far", float("nan"))),
+        "sens": float(info.get("sens", float("nan"))),
+        "note": info.get("note"),
+    }
 
-    test_mask = "test_mask" if hasattr(graph_data["pm"], "test_mask") else None
-    if test_mask is None and hasattr(graph_data["pm"], "val_mask"):
-        test_mask = "val_mask"
+    test_mask = _pick_calibration_mask(
+        graph_data,
+        node_type=node_type,
+        preferred=("test_mask",),
+        fallback=(),
+        allow_train_mask=False,
+    )
+    if not test_mask:
+        raise ValueError(
+            "No se encontro test_mask no vacio para la evaluacion final."
+        )
     eval_masks = [test_mask] if test_mask else None
     test_results = graph_main.test(
         model,
@@ -2537,8 +2609,6 @@ def _evaluate_gnn_model_far_target(
         num_neighbors=num_neighbors,
     )
     mask_key = test_mask
-    if mask_key is None and test_results:
-        mask_key = next(iter(test_results))
 
     payload: Dict[str, object] = {
         "threshold": float(tau),
@@ -2582,6 +2652,7 @@ def _pick_calibration_mask(
     node_type: str = "pm",
     preferred: Optional[Sequence[str]] = None,
     fallback: Optional[Sequence[str]] = None,
+    allow_train_mask: bool = True,
 ) -> Optional[str]:
     masks = _list_available_masks(graph_data, node_type=node_type)
     if not masks:
@@ -2599,6 +2670,8 @@ def _pick_calibration_mask(
         if name in seen:
             continue
         seen.add(name)
+        if not allow_train_mask and name == "train_mask":
+            continue
         if name in masks and _is_non_empty(name):
             return name
     return None
@@ -2722,6 +2795,7 @@ def _network_config_to_hparams(
     cfg: Dict[str, object], *, use_graphsmote: bool
 ) -> Dict[str, object]:
     params: Dict[str, object] = {
+        "gnn_variant": _normalize_ui_gnn_variant(cfg.get("gnn_variant", GNN_VARIANT)),
         "hidden_channels": int(cfg.get("hidden_channels", 64)),
         "num_heads": int(cfg.get("num_heads", 4)),
         "num_layers": int(cfg.get("num_layers", 2)),
@@ -3067,6 +3141,9 @@ def _run_optuna_search(
 
     use_graphsmote = (balancing_strategy == "Opt. balance con GraphSMOTE")
     use_imgagn = (balancing_strategy == "Opt. balance con ImGAGN")
+    gnn_variant_fixed = _normalize_ui_gnn_variant(
+        (objective_settings or {}).get("gnn_variant", GNN_VARIANT)
+    )
 
     # En Optuna sin balanceo, fuerza el grafo a CPU para evitar duplicados MPS/CUDA.
     if not (use_graphsmote or use_imgagn):
@@ -3123,7 +3200,11 @@ def _run_optuna_search(
     eval_every = int(optuna_settings["eval_every"])
 
     graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
-    variant_tag = graph_main._variant_tags(use_graphsmote, graph_obj)
+    variant_tag = graph_main._variant_tags(
+        use_graphsmote,
+        graph_obj,
+        gnn_variant=gnn_variant_fixed,
+    )
     if use_imgagn:
         if "_Base" in variant_tag:
             variant_tag = variant_tag.replace("_Base", "")
@@ -3223,6 +3304,7 @@ def _run_optuna_search(
         trial_seed = int(SEED) + trial.number
         torch.manual_seed(trial_seed)
         np.random.seed(trial_seed)
+        trial.set_user_attr("gnn_variant", gnn_variant_fixed)
         
         # Clone data for this trial to avoid contamination (solo si se usa balanceo)
         if use_graphsmote or use_imgagn:
@@ -3578,40 +3660,23 @@ def _run_optuna_search(
         edge_feature_dim = _infer_edge_feature_dim(data)
         in_channels = data["pm"].x.shape[1]
 
-        model = HeteroGAT(
-            in_channels=in_channels,
-            hidden_channels=hidden_channels,
-            out_channels=num_classes,
-            num_heads=num_heads,
-            dropout=dropout,
-            edge_feature_dim=edge_feature_dim,
-            num_layers=num_layers,
-            aggr1=aggr1,
-            aggr2=aggr2,
-            use_checkpointing=use_checkpointing_flag,
-        ).to(device)
-
-        temporal_module = None
-        if sequence_index and getattr(sequence_index, "sequence_rows", None) is not None:
-            if sequence_index.sequence_rows.size:
-                seq_rows_tensor = torch.as_tensor(
-                    sequence_index.sequence_rows, dtype=torch.long
-                )
-                target_rows_tensor = torch.as_tensor(
-                    sequence_index.target_rows, dtype=torch.long
-                )
-                temporal_module = TemporalAggregator(
-                    sequence_rows=seq_rows_tensor,
-                    target_rows=target_rows_tensor,
-                    num_nodes=data["pm"].num_nodes,
-                    embedding_dim=hidden_channels * num_heads,
-                    sequence_length=sequence_index.sequence_rows.shape[1],
-                    hidden_dim=hidden_channels * num_heads,
-                    num_classes=num_classes,
-                ).to(device)
-                temporal_module.reset_cache()
-                temporal_module.train()
-                model.temporal_head = temporal_module
+        model = graph_main._build_gnn_model(
+            in_channels=int(in_channels),
+            hidden_channels=int(hidden_channels),
+            out_channels=int(num_classes),
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            edge_feature_dim=int(edge_feature_dim),
+            num_layers=int(num_layers),
+            aggr1=str(aggr1),
+            aggr2=str(aggr2),
+            use_checkpointing=bool(use_checkpointing_flag),
+            gnn_variant=gnn_variant_fixed,
+            sequence_index=sequence_index,
+            num_nodes=int(getattr(data["pm"], "num_nodes", data["pm"].x.shape[0])),
+            device=device,
+        )
+        temporal_module = getattr(model, "temporal_head", None)
 
         edge_gen = (
             RelEdgeGen(
@@ -3754,6 +3819,16 @@ def _run_optuna_search(
                         / max(num_epochs - 1, 1)
                     )
 
+                try:
+                    graph_main._prime_temporal_cache_if_needed(
+                        model,
+                        train_graph,
+                        node_type="pm",
+                        context=f"optuna_trial_{trial.number}_epoch_{epoch}",
+                    )
+                except Exception:
+                    pass
+
                 train_minibatch(
                     model,
                     train_loader,
@@ -3778,8 +3853,13 @@ def _run_optuna_search(
                     continue
 
                 val_mask_name = "val_mask"
-                if not hasattr(base_graph["pm"], "val_mask"):
-                    val_mask_name = "train_mask"
+                if (
+                    not hasattr(base_graph["pm"], "val_mask")
+                    or int(base_graph["pm"].val_mask.sum().item()) == 0
+                ):
+                    raise RuntimeError(
+                        "No se encontro val_mask valido para evaluacion en Optuna."
+                    )
                 if fixed_val_subset:
                     if val_mask_fixed != val_mask_name:
                         val_idx_fixed = None
@@ -3853,10 +3933,12 @@ def _run_optuna_search(
                     )
                 if temporal_module is not None:
                     temporal_module.train()
-                if not val_results or ("val_mask" not in val_results and "train_mask" not in val_results):
-                    continue
+                if not val_results or ("val_mask" not in val_results):
+                    raise RuntimeError(
+                        "No se pudieron obtener resultados sobre val_mask durante Optuna."
+                    )
 
-                val_key = "val_mask" if "val_mask" in val_results else "train_mask"
+                val_key = "val_mask"
 
                 y_true_val = val_results[val_key]["true"].numpy().ravel()
                 y_prob1_val = (
@@ -3924,6 +4006,7 @@ def _run_optuna_search(
             "objective_metric": objective_metric,
             "graph_hash": graph_hash,
             "variant_tag": variant_tag,
+            "gnn_variant": gnn_variant_fixed,
             "use_graphsmote": use_graphsmote,
             "use_imgagn": use_imgagn,
         }
@@ -4036,7 +4119,11 @@ def _run_optuna_search(
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
-    variant_tag = graph_main._variant_tags(use_graphsmote, graph_obj)
+    variant_tag = graph_main._variant_tags(
+        use_graphsmote,
+        graph_obj,
+        gnn_variant=gnn_variant_fixed,
+    )
     if use_imgagn:
         if "_Base" in variant_tag:
             variant_tag = variant_tag.replace("_Base", "")
@@ -4057,6 +4144,7 @@ def _run_optuna_search(
     trials_df = study.trials_dataframe()
     trials_df["use_graphsmote"] = use_graphsmote
     trials_df["graph_hash"] = graph_hash
+    trials_df["gnn_variant"] = gnn_variant_fixed
     full_study_path = os.path.join(
         RESULTADOS_DIR,
         f"optuna_full_study_{timestamp}{hash_tag}{variant_tag}.csv",
@@ -4129,6 +4217,9 @@ def _run_ray_tune_search(
         objective_metric = str(objective_bundle.get("objective_metric", "score"))
         graph_hash = objective_bundle.get("graph_hash")
         variant_tag = str(objective_bundle.get("variant_tag", ""))
+        gnn_variant_fixed = _normalize_ui_gnn_variant(
+            objective_bundle.get("gnn_variant", (objective_settings or {}).get("gnn_variant", GNN_VARIANT))
+        )
         use_graphsmote = bool(objective_bundle.get("use_graphsmote", False))
         use_imgagn = bool(objective_bundle.get("use_imgagn", False))
 
@@ -4397,6 +4488,7 @@ def _run_ray_tune_search(
         if best_score is not None:
             best_params["value"] = best_score
         best_params["objective_metric"] = objective_metric
+        best_params["gnn_variant"] = gnn_variant_fixed
         for key in ("num_neighbors", "use_checkpointing", "best_tau", "best_epoch", "best_metric"):
             if key in best_metrics:
                 best_params[key] = best_metrics[key]
@@ -4436,6 +4528,7 @@ def _run_ray_tune_search(
         if trials_df is not None:
             trials_df["use_graphsmote"] = use_graphsmote
             trials_df["graph_hash"] = graph_hash
+            trials_df["gnn_variant"] = gnn_variant_fixed
             full_study_path = os.path.join(
                 RESULTADOS_DIR,
                 f"optuna_full_study_raytune_{timestamp}{hash_tag}{variant_tag}.csv",
@@ -9882,6 +9975,298 @@ def _render_balance_tab() -> None:
             )
 
 
+def _gnn_strategy_catalog_rows() -> List[Dict[str, str]]:
+    return [
+        {
+            "variant": "gat_snapshot",
+            "spatial_encoder": "HeteroGAT (GATConv)",
+            "temporal_head": "No",
+            "edge_processing": "edge_attr directo",
+            "notes": "Baseline espacial (snapshot actual).",
+        },
+        {
+            "variant": "gat_gru",
+            "spatial_encoder": "HeteroGAT (GATConv)",
+            "temporal_head": "GRU",
+            "edge_processing": "edge_attr directo",
+            "notes": "Referencia temporal recurrente.",
+        },
+        {
+            "variant": "gat_transformer",
+            "spatial_encoder": "HeteroGAT (GATConv)",
+            "temporal_head": "Transformer",
+            "edge_processing": "edge_attr directo",
+            "notes": "Self-attention temporal con posición aprendible.",
+        },
+        {
+            "variant": "gat_attnpool",
+            "spatial_encoder": "HeteroGAT (GATConv)",
+            "temporal_head": "AttnPool",
+            "edge_processing": "edge_attr directo",
+            "notes": "Ablation ligera de bajo costo.",
+        },
+        {
+            "variant": "gat_edge_mlp / gat_edge_mlp_gru / gat_edge_mlp_transformer",
+            "spatial_encoder": "HeteroGAT + Edge MLP",
+            "temporal_head": "No / GRU / Transformer",
+            "edge_processing": "MLP por tipo de arista",
+            "notes": "Aprende representación de deltas antes de atención.",
+        },
+        {
+            "variant": "gnn_edge_aware / *_gru / *_transformer",
+            "spatial_encoder": "HeteroEdgeAware (TransformerConv)",
+            "temporal_head": "No / GRU / Transformer",
+            "edge_processing": "edge_attr en TransformerConv",
+            "notes": "Alternativa edge-aware para comparar con GAT.",
+        },
+    ]
+
+
+def _supported_gnn_variants() -> List[str]:
+    return [
+        "gat_snapshot",
+        "gat_gru",
+        "gat_transformer",
+        "gat_attnpool",
+        "gat_edge_mlp",
+        "gat_edge_mlp_gru",
+        "gat_edge_mlp_transformer",
+        "gnn_edge_aware",
+        "gnn_edge_aware_gru",
+        "gnn_edge_aware_transformer",
+    ]
+
+
+def _normalize_ui_gnn_variant(value: Optional[object]) -> str:
+    options = set(_supported_gnn_variants())
+    fallback = "gat_snapshot"
+    default_variant = str(GNN_VARIANT or fallback)
+
+    def _canon(raw_value: Optional[object]) -> Optional[str]:
+        if raw_value is None:
+            return None
+        raw = str(raw_value).strip().lower()
+        if not raw:
+            return None
+        raw = raw.replace("+", "_").replace("-", "_").replace(" ", "_")
+        aliases = {
+            "gat": "gat_snapshot",
+            "snapshot": "gat_snapshot",
+            "baseline": "gat_snapshot",
+            "gru": "gat_gru",
+            "lstm": "gat_gru",
+            "transformer": "gat_transformer",
+            "attnpool": "gat_attnpool",
+            "attn_pool": "gat_attnpool",
+            "edge_mlp": "gat_edge_mlp",
+            "edge_aware": "gnn_edge_aware",
+            "transformerconv": "gnn_edge_aware",
+        }
+        raw = aliases.get(raw, raw)
+        return raw if raw in options else None
+
+    return _canon(value) or _canon(default_variant) or fallback
+
+
+def _get_ui_selected_gnn_variant() -> str:
+    if "gnn_ui_variant" in st.session_state:
+        return _normalize_ui_gnn_variant(st.session_state.get("gnn_ui_variant"))
+    cfg = st.session_state.get("gnn_network_config", {})
+    if isinstance(cfg, dict) and cfg.get("gnn_variant"):
+        return _normalize_ui_gnn_variant(cfg.get("gnn_variant"))
+    return _normalize_ui_gnn_variant(GNN_VARIANT)
+
+
+def _gnn_variant_ui_labels() -> Dict[str, str]:
+    return {
+        "gat_snapshot": "gat_snapshot (baseline espacial)",
+        "gat_gru": "gat_gru (GAT + GRU temporal)",
+        "gat_transformer": "gat_transformer (GAT + Transformer temporal)",
+        "gat_attnpool": "gat_attnpool (GAT + Attention Pooling temporal)",
+        "gat_edge_mlp": "gat_edge_mlp (GAT + MLP de aristas)",
+        "gat_edge_mlp_gru": "gat_edge_mlp_gru (GAT + MLP aristas + GRU)",
+        "gat_edge_mlp_transformer": "gat_edge_mlp_transformer (GAT + MLP aristas + Transformer)",
+        "gnn_edge_aware": "gnn_edge_aware (TransformerConv snapshot)",
+        "gnn_edge_aware_gru": "gnn_edge_aware_gru (TransformerConv + GRU)",
+        "gnn_edge_aware_transformer": "gnn_edge_aware_transformer (TransformerConv + Transformer)",
+    }
+
+
+def _describe_gnn_variant(variant: Optional[object]) -> Dict[str, str]:
+    name = _normalize_ui_gnn_variant(variant)
+    is_edge_aware = name.startswith("gnn_edge_aware")
+    uses_edge_mlp = name.startswith("gat_edge_mlp")
+
+    temporal_kind = "snapshot"
+    temporal_label = "No"
+    if name.endswith("_gru") or name == "gat_gru":
+        temporal_kind = "gru"
+        temporal_label = "GRU"
+    elif name.endswith("_transformer") or name == "gat_transformer":
+        temporal_kind = "transformer"
+        temporal_label = "Transformer"
+    elif name == "gat_attnpool":
+        temporal_kind = "attnpool"
+        temporal_label = "Attention Pooling"
+
+    spatial_encoder = "HeteroEdgeAware" if is_edge_aware else "HeteroGAT"
+    if uses_edge_mlp:
+        spatial_encoder = "HeteroGATWithEdgeEncoder"
+
+    return {
+        "name": name,
+        "spatial_encoder": spatial_encoder,
+        "conv_type": "TransformerConv" if is_edge_aware else "GATConv",
+        "edge_processing": "MLP (EdgeAttrEncoder)" if uses_edge_mlp else "edge_attr directo",
+        "temporal_kind": temporal_kind,
+        "temporal_label": temporal_label,
+        "uses_edge_mlp": "yes" if uses_edge_mlp else "no",
+        "is_edge_aware": "yes" if is_edge_aware else "no",
+    }
+
+
+def _render_gnn_variant_selector(
+    *,
+    key: str,
+    default_variant: Optional[object] = None,
+    context_label: str = "Network",
+) -> str:
+    options = _supported_gnn_variants()
+    labels = _gnn_variant_ui_labels()
+    current = _normalize_ui_gnn_variant(default_variant or _get_ui_selected_gnn_variant())
+    idx = options.index(current) if current in options else 0
+    selected = st.selectbox(
+        f"GNN_VARIANT ({context_label})",
+        options,
+        index=idx,
+        key=key,
+        format_func=lambda v: labels.get(str(v), str(v)),
+        help=(
+            "Selecciona la variante del experimento. La elección se guarda en la sesión y "
+            "se exporta con la configuración de Network."
+        ),
+    )
+    selected_norm = _normalize_ui_gnn_variant(selected)
+    st.session_state["gnn_ui_variant"] = selected_norm
+    return selected_norm
+
+
+def _render_gnn_strategy_reference_panel(
+    *,
+    context_label: str,
+    graph_obj: Optional[Dict[str, object]] = None,
+    model_meta: Optional[Dict[str, object]] = None,
+    active_variant_override: Optional[str] = None,
+    expanded: bool = False,
+) -> None:
+    sequence_index = None
+    if isinstance(graph_obj, dict):
+        sequence_index = graph_obj.get("sequence_index")
+
+    seq_len = None
+    seq_count = None
+    if sequence_index is not None and getattr(sequence_index, "sequence_rows", None) is not None:
+        try:
+            seq_len = int(sequence_index.sequence_rows.shape[1])
+            seq_count = int(sequence_index.sequence_rows.shape[0])
+        except Exception:
+            seq_len = None
+            seq_count = None
+
+    active_variant = _normalize_ui_gnn_variant(
+        (model_meta or {}).get("gnn_variant")
+        or active_variant_override
+        or _get_ui_selected_gnn_variant()
+    )
+    config_variant = _normalize_ui_gnn_variant(GNN_VARIANT)
+    active_variant_tag = (model_meta or {}).get("variant_tag")
+    cache_strategy = str(GNN_TEMPORAL_CACHE_STRATEGY)
+
+    with st.expander(f"Guía de estrategias GNN ({context_label})", expanded=expanded):
+        st.markdown(
+            "Esta guía resume las variantes GNN implementadas para experimentos comparables "
+            "en secuencias temporales. La comparación científica debe mantener fijo el grafo, "
+            "los splits temporales, el `SequenceIndex` y la semilla."
+        )
+
+        st.markdown("#### Configuración temporal activa (UI / config.py)")
+        if active_variant != config_variant:
+            st.caption(
+                "La variante activa mostrada (modelo cargado o selección de UI) difiere de "
+                "`config.py`. Al exportar desde Network, la selección de la UI se guarda como "
+                "`gnn_variant`."
+            )
+        st.markdown(
+            f"- `GNN_VARIANT` (activo): **{active_variant}**  \n"
+            f"- `GNN_VARIANT` (`config.py`): `{config_variant}`  \n"
+            f"- `GNN_TEMPORAL_CACHE_STRATEGY`: **{cache_strategy}**  \n"
+            f"- `SEQ_LENGTH`: **{int(SEQ_LENGTH)}** snapshots  \n"
+            f"- `GUARD_BAND_MINUTES`: **{int(GUARD_BAND_MINUTES)}** min  \n"
+            f"- `HORIZON_MINUTES`: **{int(HORIZON_MINUTES)}** min"
+        )
+        st.caption(
+            "Interpretación del etiquetado: positivo si existe accidente en el intervalo "
+            "(t + guard_band, t + guard_band + horizon]. Para '5 minutos antes' estricto, "
+            "use guard_band=5 y horizon=5."
+        )
+
+        if seq_len is not None and seq_count is not None:
+            st.caption(
+                f"SequenceIndex detectado en el grafo: {seq_count} secuencias, longitud L={seq_len}."
+            )
+        else:
+            st.caption(
+                "No se detectó `SequenceIndex` en el grafo actual. Las variantes con head temporal "
+                "caerán a comportamiento snapshot o no podrán explotar secuencias."
+            )
+
+        if model_meta:
+            st.markdown("#### Metadatos del modelo cargado")
+            meta_payload = {
+                "gnn_variant": model_meta.get("gnn_variant", "N/A"),
+                "variant_tag": active_variant_tag or "N/A",
+                "best_val_f1": model_meta.get("best_val_f1", "N/A"),
+                "best_val_auprc": model_meta.get("best_val_auprc", "N/A"),
+            }
+            st.json(meta_payload)
+
+        st.markdown("#### Variantes implementadas")
+        st.dataframe(pd.DataFrame(_gnn_strategy_catalog_rows()), width="stretch")
+
+        st.markdown("#### Estrategias temporales (idea → detalle)")
+        st.markdown(
+            "- `snapshot`: usa solo el embedding del snapshot actual (baseline espacial).  \n"
+            "- `GRU`: resume la ventana temporal en el hidden final (estable y barato).  \n"
+            "- `Transformer`: modela interacciones entre tiempos con self-attention y posición aprendible.  \n"
+            "- `AttnPool`: calcula pesos temporales suaves sin Transformer completo (ablation ligera)."
+        )
+
+        st.markdown("#### Estrategia de caché temporal")
+        st.markdown(
+            "- `global_epoch` (recomendado para paper): realiza un forward global del encoder por época y "
+            "puebla el caché de embeddings, mejorando consistencia de secuencias.  \n"
+            "- `incremental`: actualiza el caché batch a batch; es más liviano, pero depende del muestreo."
+        )
+
+        st.markdown("#### Protocolo de comparación recomendado")
+        st.markdown(
+            "1. `gat_snapshot` (baseline)  \n"
+            "2. `gat_gru`  \n"
+            "3. `gat_transformer`  \n"
+            "4. `gat_edge_mlp_gru`  \n"
+            "5. `gnn_edge_aware_gru` o `gnn_edge_aware_transformer`"
+        )
+        st.caption(
+            "Métricas sugeridas: AUPRC/PR-AUC (principal), ROC-AUC, Recall@FAR objetivo y MCC."
+        )
+
+        st.code(
+            "GNN_VARIANT = \"gat_gru\"\n"
+            "GNN_TEMPORAL_CACHE_STRATEGY = \"global_epoch\"",
+            language="python",
+        )
+
+
 def _render_training_tab() -> None:
     st.subheader("Training (GNN)")
     loaded_graph = st.session_state.get("loaded_graph")
@@ -10016,6 +10401,11 @@ def _render_training_tab() -> None:
         f"Split configurado: train={split_train_ratio}%, "
         f"val={split_val_ratio}%, test={split_test_ratio}%."
     )
+    _render_gnn_strategy_reference_panel(
+        context_label="Training",
+        graph_obj=graph_obj,
+        expanded=False,
+    )
 
     network_cfg = st.session_state.get("gnn_network_config")
     detected_smote = False
@@ -10102,6 +10492,232 @@ def _render_training_tab() -> None:
         help="Acumula gradientes por N batches antes de actualizar (reduce memoria efectiva). Ej.: batch_size=128 y accumulation_steps=4 → actualiza cada 4 batches, batch efectivo 512.",
     )
 
+    st.markdown("#### Sampling y Fidelity (comparación con full-batch)")
+    fidelity_targets = [
+        "NeighborLoader",
+        "Cluster-GCN (seed partitions)",
+        "GraphSAINT (seed sampling)",
+    ]
+    fidelity_target_sampler = st.selectbox(
+        "Preset fidelity para sampler",
+        fidelity_targets,
+        key="gnn_train_fidelity_target_sampler",
+        help=(
+            "Elige sobre qué sampler quieres aplicar el preset de alta fidelidad. "
+            "El preset fuerza evaluación interna exhaustive, determinismo y desactiva hard-undersampling."
+        ),
+    )
+    apply_fidelity_preset = st.button(
+        "Aplicar preset Full-batch fidelity",
+        key="gnn_train_apply_fidelity_preset",
+        help=(
+            "Configura automáticamente una receta para aproximar resultados full-batch "
+            "sobre el sampler seleccionado."
+        ),
+    )
+    if apply_fidelity_preset:
+        st.session_state["gnn_train_sampler_mode"] = fidelity_target_sampler
+        st.session_state["gnn_train_det_sampling"] = True
+        st.session_state["gnn_train_sampling_seed"] = int(SEED)
+        st.session_state["gnn_train_disable_hard"] = True
+        if fidelity_target_sampler == "Cluster-GCN (seed partitions)":
+            st.session_state["gnn_train_cluster_parts"] = 64
+            st.session_state["gnn_train_cluster_parts_epoch"] = 0
+            st.session_state["gnn_train_graphsaint_mode"] = "Node"
+            st.session_state["gnn_train_graphsaint_batch"] = 2048
+            st.session_state["gnn_train_graphsaint_steps"] = 8
+            st.session_state["gnn_train_graphsaint_walk"] = 2
+        elif fidelity_target_sampler == "GraphSAINT (seed sampling)":
+            st.session_state["gnn_train_graphsaint_mode"] = "Random Walk"
+            st.session_state["gnn_train_graphsaint_batch"] = 4096
+            st.session_state["gnn_train_graphsaint_steps"] = 16
+            st.session_state["gnn_train_graphsaint_walk"] = 3
+            st.session_state["gnn_train_cluster_parts"] = 64
+            st.session_state["gnn_train_cluster_parts_epoch"] = 0
+        else:
+            st.session_state["gnn_train_cluster_parts"] = 64
+            st.session_state["gnn_train_cluster_parts_epoch"] = 0
+            st.session_state["gnn_train_graphsaint_mode"] = "Node"
+            st.session_state["gnn_train_graphsaint_batch"] = 2048
+            st.session_state["gnn_train_graphsaint_steps"] = 8
+            st.session_state["gnn_train_graphsaint_walk"] = 2
+        st.session_state["gnn_train_eval_neighbors_mode"] = "Exhaustive (-1 por capa, más fiel)"
+        st.session_state["gnn_train_eval_neighbors_custom"] = "15,10"
+        st.rerun()
+
+    sampler_options = {
+        "NeighborLoader": "neighbor",
+        "Cluster-GCN (seed partitions)": "cluster_gcn",
+        "GraphSAINT (seed sampling)": "graphsaint",
+    }
+    sampler_label = st.selectbox(
+        "Sampler de entrenamiento",
+        list(sampler_options.keys()),
+        key="gnn_train_sampler_mode",
+        help=(
+            "Define cómo se eligen semillas PM por época. "
+            "NeighborLoader: baseline rápido. "
+            "Cluster-GCN: recorre particiones de nodos para reducir varianza espacial/temporal. "
+            "GraphSAINT: samplea subconjuntos estocásticos de nodos/aristas/caminatas."
+        ),
+    )
+    train_sampler_mode = sampler_options[sampler_label]
+
+    deterministic_sampling_train = st.checkbox(
+        "Sampling determinístico",
+        value=bool(st.session_state.get("gnn_train_det_sampling", True)),
+        key="gnn_train_det_sampling",
+        help=(
+            "Fija la aleatoriedad del sampler para repetir resultados entre corridas. "
+            "Útil cuando comparas contra full-batch o cuando haces debugging."
+        ),
+    )
+    sampling_seed_train = int(
+        st.number_input(
+            "Sampling seed",
+            min_value=0,
+            value=int(st.session_state.get("gnn_train_sampling_seed", int(SEED))),
+            step=1,
+            key="gnn_train_sampling_seed",
+            disabled=not deterministic_sampling_train,
+            help="Semilla usada por el sampler por época (si determinístico está activo).",
+        )
+    )
+
+    disable_hard_undersampling_train = st.checkbox(
+        "Desactivar hard-undersampling automático",
+        value=bool(st.session_state.get("gnn_train_disable_hard", True)),
+        key="gnn_train_disable_hard",
+        help=(
+            "Evita que el entrenamiento fuerce negativos 'hard' cuando detecta fuerte desbalance. "
+            "Útil para comparar de forma más limpia el efecto puro del sampler."
+        ),
+    )
+
+    cluster_gcn_num_parts_train = 64
+    cluster_gcn_parts_per_epoch_train = 0
+    if train_sampler_mode == "cluster_gcn":
+        col_cluster_a, col_cluster_b = st.columns(2)
+        with col_cluster_a:
+            cluster_gcn_num_parts_train = int(
+                st.number_input(
+                    "Cluster-GCN num_parts",
+                    min_value=2,
+                    value=int(st.session_state.get("gnn_train_cluster_parts", 64)),
+                    step=2,
+                    key="gnn_train_cluster_parts",
+                    help=(
+                        "Cantidad de particiones del grafo PM para ordenar semillas por bloques. "
+                        "Más partes = batches más locales."
+                    ),
+                )
+            )
+        with col_cluster_b:
+            cluster_gcn_parts_per_epoch_train = int(
+                st.number_input(
+                    "Cluster-GCN parts por época (0=todas)",
+                    min_value=0,
+                    value=int(st.session_state.get("gnn_train_cluster_parts_epoch", 0)),
+                    step=1,
+                    key="gnn_train_cluster_parts_epoch",
+                    help=(
+                        "Cuántas particiones recorrer en cada época. "
+                        "0 usa todas; valores menores reducen costo por época."
+                    ),
+                )
+            )
+
+    graphsaint_mode_train = "node"
+    graphsaint_batch_size_train = 2048
+    graphsaint_num_steps_train = 8
+    graphsaint_walk_length_train = 2
+    if train_sampler_mode == "graphsaint":
+        saint_mode_map = {"Node": "node", "Edge": "edge", "Random Walk": "random_walk"}
+        graphsaint_mode_label = st.selectbox(
+            "GraphSAINT modo",
+            list(saint_mode_map.keys()),
+            key="gnn_train_graphsaint_mode",
+            help=(
+                "Node: samplea nodos. Edge: samplea aristas. "
+                "Random Walk: samplea subgrafos por caminatas aleatorias."
+            ),
+        )
+        graphsaint_mode_train = saint_mode_map[graphsaint_mode_label]
+
+        col_saint_a, col_saint_b = st.columns(2)
+        with col_saint_a:
+            graphsaint_batch_size_train = int(
+                st.number_input(
+                    "GraphSAINT batch_size",
+                    min_value=64,
+                    value=int(st.session_state.get("gnn_train_graphsaint_batch", 2048)),
+                    step=64,
+                    key="gnn_train_graphsaint_batch",
+                    help="Tamaño de muestra por paso de GraphSAINT (nodos/aristas según el modo).",
+                )
+            )
+            graphsaint_num_steps_train = int(
+                st.number_input(
+                    "GraphSAINT num_steps",
+                    min_value=1,
+                    value=int(st.session_state.get("gnn_train_graphsaint_steps", 8)),
+                    step=1,
+                    key="gnn_train_graphsaint_steps",
+                    help="Número de submuestras GraphSAINT por época para construir seeds.",
+                )
+            )
+        with col_saint_b:
+            graphsaint_walk_length_train = int(
+                st.number_input(
+                    "GraphSAINT walk_length",
+                    min_value=1,
+                    value=int(st.session_state.get("gnn_train_graphsaint_walk", 2)),
+                    step=1,
+                    key="gnn_train_graphsaint_walk",
+                    disabled=graphsaint_mode_train != "random_walk",
+                    help="Longitud de caminata aleatoria cuando el modo es Random Walk.",
+                )
+            )
+
+    eval_mode_labels = {
+        "Mismo que train (rápido)": "same",
+        "Exhaustive (-1 por capa, más fiel)": "exhaustive",
+        "Custom": "custom",
+    }
+    eval_neighbors_mode_label = st.selectbox(
+        "Vecinos para validación interna",
+        list(eval_mode_labels.keys()),
+        key="gnn_train_eval_neighbors_mode",
+        help=(
+            "Controla la fidelidad de métricas de validación durante entrenamiento. "
+            "Exhaustive se parece más a full-batch, pero usa más memoria/tiempo."
+        ),
+    )
+    eval_neighbors_mode_train = eval_mode_labels[eval_neighbors_mode_label]
+
+    eval_num_neighbors_train = None
+    if eval_neighbors_mode_train == "custom":
+        eval_num_neighbors_raw = st.text_input(
+            "eval num_neighbors custom (ej: 15,10 o 20-15-10)",
+            value=str(st.session_state.get("gnn_train_eval_neighbors_custom", "15,10")),
+            key="gnn_train_eval_neighbors_custom",
+            help=(
+                "Perfil de vecinos por capa SOLO para validación interna. "
+                "Formato: CSV (15,10) o guiones (15-10)."
+            ),
+        )
+        try:
+            raw = (eval_num_neighbors_raw or "").strip()
+            if "-" in raw and "," not in raw:
+                eval_num_neighbors_train = [int(tok.strip()) for tok in raw.split("-") if tok.strip()]
+            else:
+                eval_num_neighbors_train = [int(tok.strip()) for tok in raw.split(",") if tok.strip()]
+            if not eval_num_neighbors_train:
+                eval_num_neighbors_train = None
+        except Exception:
+            st.error("Formato inválido en eval num_neighbors custom. Se usará configuración por defecto.")
+            eval_num_neighbors_train = None
+
     st.markdown("#### Evaluación automática")
     auto_eval = st.checkbox(
         "Evaluar automáticamente al terminar",
@@ -10172,6 +10788,7 @@ def _render_training_tab() -> None:
         help="Enviar email con el log al finalizar el entrenamiento."
     )
 
+    use_graphsmote_effective = bool(use_graphsmote_train)
     training_checkpoint_path = None
     training_pending = False
     training_details = ""
@@ -10187,7 +10804,11 @@ def _render_training_tab() -> None:
             hp_label = "search"
         elif network_option and hp_choice == network_option:
             hp_label = "network"
-        config_sig = f"{variant_tag}|{graph_hash}|{hp_label}|{max_epochs_train}|{SEED}"
+        config_sig = (
+            f"{variant_tag}|{graph_hash}|{hp_label}|{max_epochs_train}|{SEED}|"
+            f"{train_sampler_mode}|{deterministic_sampling_train}|{sampling_seed_train}|"
+            f"{disable_hard_undersampling_train}|{eval_neighbors_mode_train}|{eval_num_neighbors_train}"
+        )
         config_hash = hashlib.sha1(config_sig.encode("utf-8")).hexdigest()[:10]
         ckpt_dir = Path(RESULTADOS_DIR) / "gnn_train_checkpoints" / f"{variant_tag}_{config_hash}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -10206,6 +10827,8 @@ def _render_training_tab() -> None:
                 last_val_auc = ckpt.get("last_val_auc")
                 last_val_auprc = ckpt.get("last_val_auprc")
                 last_val_mcc = ckpt.get("last_val_mcc")
+                last_val_far = ckpt.get("last_val_far")
+                last_val_objective = ckpt.get("last_val_objective_score")
                 last_val_tau = ckpt.get("last_val_tau")
                 training_pending = epoch_done < max_epochs_ckpt
                 training_status = {
@@ -10232,6 +10855,10 @@ def _render_training_tab() -> None:
                     metrics_parts.append(f"val_auprc={float(last_val_auprc):.4f}")
                 if last_val_mcc is not None:
                     metrics_parts.append(f"val_mcc={float(last_val_mcc):.4f}")
+                if last_val_far is not None:
+                    metrics_parts.append(f"val_far={float(last_val_far):.4f}")
+                if last_val_objective is not None:
+                    metrics_parts.append(f"val_obj={float(last_val_objective):.4f}")
                 if last_val_tau is not None:
                     metrics_parts.append(f"val_tau={float(last_val_tau):.4f}")
                 if metrics_parts:
@@ -10373,6 +11000,7 @@ def _render_training_tab() -> None:
             metric_cols = [
                 c for c in (
                     "val_f1",
+                    "val_f05",
                     "val_f1_pos",
                     "val_f1_macro",
                     "val_precision_pos",
@@ -10389,6 +11017,8 @@ def _render_training_tab() -> None:
                     "val_auc",
                     "val_auprc",
                     "val_mcc",
+                    "val_far",
+                    "val_objective_score",
                     "val_tau",
                 )
                 if c in df.columns and df[c].notna().any()
@@ -10535,6 +11165,10 @@ def _render_training_tab() -> None:
                     "val_auc": payload.get("val_auc"),
                     "val_auprc": payload.get("val_auprc"),
                     "val_mcc": payload.get("val_mcc"),
+                    "val_far": payload.get("val_far"),
+                    "val_f05": payload.get("val_f05"),
+                    "val_objective_score": payload.get("val_objective_score"),
+                    "best_val_objective_score": payload.get("best_val_objective_score"),
                     "val_tau": payload.get("val_tau"),
                     "lr": payload.get("lr"),
                     "smote_synth_count": payload.get("smote_synth_count"),
@@ -10563,6 +11197,7 @@ def _render_training_tab() -> None:
             best_val_f1: float,
             patience: int,
             patience_counter: int,
+            **kwargs,
         ) -> None:
             if live_state.get("has_json"):
                 return
@@ -10709,6 +11344,18 @@ def _render_training_tab() -> None:
                         accumulation_steps=int(accumulation_steps_train),
                         resume_state_path=str(training_checkpoint_path) if training_pending and training_checkpoint_path else None,
                         save_state_path=str(training_checkpoint_path) if training_checkpoint_path else None,
+                        train_sampler_mode=str(train_sampler_mode),
+                        deterministic_sampling=bool(deterministic_sampling_train),
+                        sampling_seed=int(sampling_seed_train),
+                        disable_hard_undersampling=bool(disable_hard_undersampling_train),
+                        cluster_gcn_num_parts=int(cluster_gcn_num_parts_train),
+                        cluster_gcn_parts_per_epoch=int(cluster_gcn_parts_per_epoch_train),
+                        graphsaint_mode=str(graphsaint_mode_train),
+                        graphsaint_batch_size=int(graphsaint_batch_size_train),
+                        graphsaint_num_steps=int(graphsaint_num_steps_train),
+                        graphsaint_walk_length=int(graphsaint_walk_length_train),
+                        eval_neighbors_mode=str(eval_neighbors_mode_train),
+                        eval_num_neighbors=eval_num_neighbors_train,
                     )
             except Exception as exc:
                 st.error(f"Error en entrenamiento: {exc}")
@@ -10750,6 +11397,12 @@ def _render_training_tab() -> None:
                          "model_path": str(model_path),
                          "epochs": max_epochs_train, 
                          "network_config": hp_choice,
+                         "sampler_mode": train_sampler_mode,
+                         "deterministic_sampling": bool(deterministic_sampling_train),
+                         "sampling_seed": int(sampling_seed_train),
+                         "disable_hard_undersampling": bool(disable_hard_undersampling_train),
+                         "eval_neighbors_mode": eval_neighbors_mode_train,
+                         "eval_num_neighbors": eval_num_neighbors_train,
                      },
                      "balance": {
                          "use_balanced": use_balanced,
@@ -10792,6 +11445,11 @@ def _render_training_tab() -> None:
                                 graph_data=eval_graph_data,
                                 device=eval_device,
                                 threshold=None,
+                                num_neighbors=(
+                                    ([-1] * int((network_cfg or {}).get("num_layers", 2)))
+                                    if eval_neighbors_mode_train == "exhaustive"
+                                    else eval_num_neighbors_train
+                                ),
                                 threshold_strategy="far",
                                 far_target=float(st.session_state.get("gnn_eval_far_target", 0.20)),
                             )
@@ -10891,80 +11549,79 @@ def _perform_model_evaluation(
             calib_mask = _pick_calibration_mask(
                 graph_data,
                 node_type=node_type,
-                preferred=("val_mask", "train_mask"),
-                fallback=eval_masks,
+                preferred=("val_mask",),
+                fallback=(),
+                allow_train_mask=False,
             )
-            if calib_mask:
-                sampled_idx = None
-                if max_nodes_per_mask > 0:
-                    sampled_idx = _sample_mask_indices(
-                        graph_data,
-                        calib_mask,
-                        max_nodes=int(max_nodes_per_mask),
-                        seed=int(seed),
-                        ensure_both_classes=True,
-                        node_type=node_type,
-                    )
-                if sampled_idx is not None and sampled_idx.numel() == 0:
-                    sampled_idx = None
-                if sampled_idx is not None:
-                    calib_results = graph_main.test(
-                        model,
-                        graph_data,
-                        node_type=node_type,
-                        threshold=None,
-                        node_indices=sampled_idx,
-                        mask_name=calib_mask,
-                        batch_size=eval_batch_size,
-                        num_neighbors=num_neighbors,
-                    )
-                else:
-                    calib_results = graph_main.test(
-                        model,
-                        graph_data,
-                        node_type=node_type,
-                        threshold=None,
-                        masks=[calib_mask],
-                        batch_size=eval_batch_size,
-                        num_neighbors=num_neighbors,
-                    )
-                calib_key = calib_mask if calib_results and calib_mask in calib_results else None
-                if calib_key is None and calib_results:
-                    calib_key = next(iter(calib_results))
-                if calib_key:
-                    y_true_val = calib_results[calib_key]["true"].numpy().ravel()
-                    y_prob1_val = calib_results[calib_key]["probs"][:, 1].numpy().ravel()
-                    target_far = 0.0 if strategy == "min_far" else float(far_target)
-                    tau, info = _select_threshold_for_far_target(
-                        y_true_val,
-                        y_prob1_val,
-                        far_target=target_far,
-                        mode="max_sens_under_far",
-                    )
-                    eval_threshold = float(tau)
-                    note = str(info.get("note") or "").strip()
-                    note_txt = " (closest FAR)" if note == "closest_far" else ""
-                    st.caption(
-                        f"Umbral auto (FAR <= {target_far:.2f}) usando {calib_key}: "
-                        f"tau={eval_threshold:.6f} | FAR={info.get('far', float('nan')):.4f} "
-                        f"| Sens={info.get('sens', float('nan')):.4f}{note_txt}"
-                    )
-                else:
-                    st.warning(
-                        "No se pudo calibrar FAR (sin resultados en la máscara). "
-                        "Se usará el umbral del modelo."
-                    )
-                # Liberar tensores grandes si no se necesitan.
-                if calib_results:
-                    for m_res in calib_results.values():
-                        m_res.pop("preds", None)
-                        m_res.pop("probs", None)
-                        m_res.pop("true", None)
-            else:
-                st.warning(
-                    "No se encontró máscara de validación para calibrar FAR. "
-                    "Se usará el umbral del modelo."
+            if not calib_mask:
+                st.error(
+                    "No se encontró val_mask no vacía para calibrar FAR. "
+                    "Genera un split temporal válido antes de esta evaluación."
                 )
+                return
+            sampled_idx = None
+            if max_nodes_per_mask > 0:
+                sampled_idx = _sample_mask_indices(
+                    graph_data,
+                    calib_mask,
+                    max_nodes=int(max_nodes_per_mask),
+                    seed=int(seed),
+                    ensure_both_classes=True,
+                    node_type=node_type,
+                )
+            if sampled_idx is not None and sampled_idx.numel() == 0:
+                sampled_idx = None
+            if sampled_idx is not None:
+                calib_results = graph_main.test(
+                    model,
+                    graph_data,
+                    node_type=node_type,
+                    threshold=None,
+                    node_indices=sampled_idx,
+                    mask_name=calib_mask,
+                    batch_size=eval_batch_size,
+                    num_neighbors=num_neighbors,
+                )
+            else:
+                calib_results = graph_main.test(
+                    model,
+                    graph_data,
+                    node_type=node_type,
+                    threshold=None,
+                    masks=[calib_mask],
+                    batch_size=eval_batch_size,
+                    num_neighbors=num_neighbors,
+                )
+            calib_key = calib_mask if calib_results and calib_mask in calib_results else None
+            if not calib_key:
+                st.error(
+                    "No se pudo obtener resultados en val_mask para calibrar FAR. "
+                    "Revisa la máscara y vuelve a ejecutar."
+                )
+                return
+            y_true_val = calib_results[calib_key]["true"].numpy().ravel()
+            y_prob1_val = calib_results[calib_key]["probs"][:, 1].numpy().ravel()
+            target_far = 0.0 if strategy == "min_far" else float(far_target)
+            tau, info = _select_threshold_for_far_target(
+                y_true_val,
+                y_prob1_val,
+                far_target=target_far,
+                mode="max_sens_under_far",
+            )
+            eval_threshold = float(tau)
+            note = str(info.get("note") or "").strip()
+            note_txt = " (closest FAR)" if note == "closest_far" else ""
+            st.caption(
+                f"Umbral auto (FAR <= {target_far:.2f}) usando {calib_key}: "
+                f"tau={eval_threshold:.6f} | FAR={info.get('far', float('nan')):.4f} "
+                f"| Sens={info.get('sens', float('nan')):.4f}{note_txt}"
+            )
+            # Liberar tensores grandes si no se necesitan.
+            if calib_results:
+                for m_res in calib_results.values():
+                    m_res.pop("preds", None)
+                    m_res.pop("probs", None)
+                    m_res.pop("true", None)
 
         if eval_threshold is None:
             try:
@@ -11111,6 +11768,8 @@ def _render_evaluation_tab() -> None:
         st.markdown("#### Arquitectura del Modelo")
         if meta:
             st.json({
+                "gnn_variant": meta.get("gnn_variant", "N/A"),
+                "variant_tag": meta.get("variant_tag", "N/A"),
                 "hidden_channels": meta.get("hidden_channels", "N/A"),
                 "num_heads": meta.get("num_heads", "N/A"),
                 "num_layers": meta.get("num_layers", "N/A"),
@@ -11140,6 +11799,13 @@ def _render_evaluation_tab() -> None:
         associated = glob.glob(pattern)
         for f in associated:
             st.write(f"- {os.path.basename(f)}")
+
+    _render_gnn_strategy_reference_panel(
+        context_label="Evaluación",
+        graph_obj=loaded_graph,
+        model_meta=meta if isinstance(meta, dict) else None,
+        expanded=False,
+    )
 
     # 4. Evaluación
     st.markdown("---")
@@ -11296,6 +11962,1654 @@ def _render_evaluation_tab() -> None:
             )
 
 
+def _coerce_neighbor_profile(
+    value: object,
+    fallback: Sequence[int],
+    *,
+    allow_negative_one: bool = True,
+) -> List[int]:
+    profile: List[int] = []
+    raw = value
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if not txt:
+            return [int(v) for v in fallback]
+        parsed = None
+        try:
+            parsed = json.loads(txt)
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            raw = parsed
+        else:
+            sep = "-" if ("-" in txt and "," not in txt and "[" not in txt) else ","
+            tokens = [tok.strip() for tok in txt.split(sep) if tok.strip()]
+            raw = tokens
+    if isinstance(raw, (int, float, np.integer, np.floating)):
+        raw = [int(raw)]
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            try:
+                num = int(item)
+            except Exception:
+                continue
+            if num == 0:
+                continue
+            if num < 0 and not (allow_negative_one and num == -1):
+                continue
+            profile.append(num)
+    if not profile:
+        profile = [int(v) for v in fallback]
+    return profile
+
+
+def _parse_int_options(
+    text: str,
+    fallback: Sequence[int],
+    *,
+    min_value: int = 1,
+) -> List[int]:
+    items: List[int] = []
+    for token in re.split(r"[,\s;]+", str(text or "").strip()):
+        if not token:
+            continue
+        try:
+            val = int(token)
+        except Exception:
+            continue
+        if val < int(min_value):
+            continue
+        items.append(val)
+    if not items:
+        items = [int(v) for v in fallback]
+    unique: List[int] = []
+    seen = set()
+    for val in items:
+        if val in seen:
+            continue
+        seen.add(val)
+        unique.append(val)
+    return unique
+
+
+def _parse_neighbor_profiles_input(
+    text: str,
+    fallback: Sequence[Sequence[int]],
+) -> List[List[int]]:
+    groups = [
+        grp.strip()
+        for grp in re.split(r"[;\n]+", str(text or ""))
+        if grp and grp.strip()
+    ]
+    profiles: List[List[int]] = []
+    for grp in groups:
+        prof = _coerce_neighbor_profile(grp, fallback=[15, 10])
+        if prof:
+            profiles.append(prof)
+    if not profiles:
+        profiles = [
+            _coerce_neighbor_profile(list(base), fallback=[15, 10])
+            for base in fallback
+        ]
+    unique: List[List[int]] = []
+    seen = set()
+    for prof in profiles:
+        key = tuple(int(v) for v in prof)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append([int(v) for v in prof])
+    return unique
+
+
+def _sampler_config_label(config: Dict[str, object]) -> str:
+    mode = str(config.get("train_sampler_mode", "neighbor"))
+    profile = config.get("num_neighbors", [])
+    prof_txt = ",".join(str(int(v)) for v in profile) if isinstance(profile, (list, tuple)) else str(profile)
+    repeat = int(config.get("repeat", 1))
+    if mode == "neighbor":
+        label = f"neighbor|nn={prof_txt}"
+    elif mode == "cluster_gcn":
+        label = (
+            f"cluster_gcn|nn={prof_txt}|parts={int(config.get('cluster_gcn_num_parts', 0))}"
+            f"|parts_epoch={int(config.get('cluster_gcn_parts_per_epoch', 0))}"
+        )
+    else:
+        label = (
+            f"graphsaint|nn={prof_txt}|mode={config.get('graphsaint_mode', 'node')}"
+            f"|batch={int(config.get('graphsaint_batch_size', 0))}"
+            f"|steps={int(config.get('graphsaint_num_steps', 0))}"
+            f"|walk={int(config.get('graphsaint_walk_length', 0))}"
+        )
+    if repeat > 1:
+        label = f"{label}|rep={repeat}"
+    return label
+
+
+def _build_sampler_fidelity_grid(
+    *,
+    sampler_modes: Sequence[str],
+    neighbor_profiles: Sequence[Sequence[int]],
+    cluster_num_parts: Sequence[int],
+    cluster_parts_per_epoch: Sequence[int],
+    graphsaint_modes: Sequence[str],
+    graphsaint_batch_sizes: Sequence[int],
+    graphsaint_num_steps: Sequence[int],
+    graphsaint_walk_lengths: Sequence[int],
+    deterministic_sampling: bool,
+    sampling_seed: int,
+    disable_hard_undersampling: bool,
+    eval_neighbors_mode: str,
+    eval_num_neighbors: Optional[Sequence[int]],
+    repeats: int = 1,
+) -> List[Dict[str, object]]:
+    alias = {
+        "neighbor": "neighbor",
+        "neighborloader": "neighbor",
+        "cluster_gcn": "cluster_gcn",
+        "clustergcn": "cluster_gcn",
+        "graphsaint": "graphsaint",
+    }
+    valid_modes: List[str] = []
+    for mode in sampler_modes or []:
+        key = alias.get(str(mode).strip().lower().replace("-", "_"))
+        if key and key not in valid_modes:
+            valid_modes.append(key)
+    if not valid_modes:
+        return []
+
+    mode_eval = str(eval_neighbors_mode or "same").strip().lower()
+    if mode_eval not in {"same", "exhaustive", "custom"}:
+        mode_eval = "same"
+    eval_custom = (
+        [int(v) for v in eval_num_neighbors]
+        if mode_eval == "custom" and isinstance(eval_num_neighbors, (list, tuple))
+        else None
+    )
+
+    base_profiles: List[List[int]] = []
+    for prof in neighbor_profiles or []:
+        base_profiles.append(
+            _coerce_neighbor_profile(prof, fallback=[15, 10])
+        )
+    if not base_profiles:
+        base_profiles = [[15, 10]]
+
+    base_configs: List[Dict[str, object]] = []
+    for prof in base_profiles:
+        for mode in valid_modes:
+            if mode == "neighbor":
+                base_configs.append(
+                    {
+                        "train_sampler_mode": "neighbor",
+                        "num_neighbors": [int(v) for v in prof],
+                        "cluster_gcn_num_parts": 0,
+                        "cluster_gcn_parts_per_epoch": 0,
+                        "graphsaint_mode": "node",
+                        "graphsaint_batch_size": 0,
+                        "graphsaint_num_steps": 0,
+                        "graphsaint_walk_length": 0,
+                    }
+                )
+                continue
+
+            if mode == "cluster_gcn":
+                for num_parts in cluster_num_parts or [64]:
+                    for parts_epoch in cluster_parts_per_epoch or [0]:
+                        base_configs.append(
+                            {
+                                "train_sampler_mode": "cluster_gcn",
+                                "num_neighbors": [int(v) for v in prof],
+                                "cluster_gcn_num_parts": int(num_parts),
+                                "cluster_gcn_parts_per_epoch": int(parts_epoch),
+                                "graphsaint_mode": "node",
+                                "graphsaint_batch_size": 0,
+                                "graphsaint_num_steps": 0,
+                                "graphsaint_walk_length": 0,
+                            }
+                        )
+                continue
+
+            saint_modes = [
+                str(m).strip().lower() for m in (graphsaint_modes or ["node"])
+            ]
+            saint_modes = [m for m in saint_modes if m in {"node", "edge", "random_walk"}] or ["node"]
+            for saint_mode in saint_modes:
+                for saint_bs in graphsaint_batch_sizes or [2048]:
+                    for saint_steps in graphsaint_num_steps or [8]:
+                        walk_candidates = (
+                            graphsaint_walk_lengths
+                            if saint_mode == "random_walk"
+                            else [1]
+                        )
+                        for saint_walk in walk_candidates:
+                            base_configs.append(
+                                {
+                                    "train_sampler_mode": "graphsaint",
+                                    "num_neighbors": [int(v) for v in prof],
+                                    "cluster_gcn_num_parts": 0,
+                                    "cluster_gcn_parts_per_epoch": 0,
+                                    "graphsaint_mode": saint_mode,
+                                    "graphsaint_batch_size": int(saint_bs),
+                                    "graphsaint_num_steps": int(saint_steps),
+                                    "graphsaint_walk_length": int(saint_walk),
+                                }
+                            )
+
+    unique_configs: List[Dict[str, object]] = []
+    seen = set()
+    for cfg in base_configs:
+        key = json.dumps(cfg, sort_keys=True, ensure_ascii=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_configs.append(cfg)
+
+    expanded: List[Dict[str, object]] = []
+    repeat_count = max(1, int(repeats))
+    for rep in range(1, repeat_count + 1):
+        rep_seed = int(sampling_seed) + (rep - 1 if bool(deterministic_sampling) else 0)
+        for base_cfg in unique_configs:
+            cfg = dict(base_cfg)
+            cfg["repeat"] = int(rep)
+            cfg["deterministic_sampling"] = bool(deterministic_sampling)
+            cfg["sampling_seed"] = int(rep_seed)
+            cfg["disable_hard_undersampling"] = bool(disable_hard_undersampling)
+            cfg["eval_neighbors_mode"] = mode_eval
+            cfg["eval_num_neighbors"] = (
+                [int(v) for v in eval_custom]
+                if isinstance(eval_custom, list)
+                else None
+            )
+            cfg["config_name"] = _sampler_config_label(cfg)
+            expanded.append(cfg)
+
+    for idx, cfg in enumerate(expanded, start=1):
+        cfg["config_idx"] = int(idx)
+    return expanded
+
+
+def _resolve_sampler_eval_neighbors(
+    config: Dict[str, object],
+    *,
+    fallback_layers: int,
+) -> Optional[List[int]]:
+    def _clean_profile(raw_values: object) -> Optional[List[int]]:
+        if not isinstance(raw_values, (list, tuple)):
+            return None
+        vals: List[int] = []
+        for val in raw_values:
+            try:
+                num = int(val)
+            except Exception:
+                continue
+            if num == 0:
+                continue
+            vals.append(num)
+        return vals or None
+
+    mode = str(config.get("eval_neighbors_mode", "same")).strip().lower()
+    if mode == "exhaustive":
+        layers = max(1, int(config.get("num_layers", fallback_layers)))
+        return [-1 for _ in range(layers)]
+    if mode == "custom":
+        return _clean_profile(config.get("eval_num_neighbors"))
+    return _clean_profile(config.get("num_neighbors"))
+
+
+def _extract_sampler_metrics_from_eval(
+    eval_payload: Dict[str, object],
+) -> Dict[str, object]:
+    report = eval_payload.get("report") or {}
+    metrics = eval_payload.get("metrics") or {}
+    calib = eval_payload.get("calibration") or {}
+    return {
+        "eval_threshold": eval_payload.get("threshold"),
+        "val_far": calib.get("far"),
+        "val_sens": calib.get("sens"),
+        "test_f1": report.get("Accidente (1)", {}).get("f1-score"),
+        "test_precision": report.get("Accidente (1)", {}).get("precision"),
+        "test_recall": report.get("Accidente (1)", {}).get("recall"),
+        "test_accuracy": report.get("accuracy"),
+        "test_far": metrics.get("far"),
+        "test_specificity": metrics.get("specificity"),
+        "test_auprc": eval_payload.get("auprc"),
+        "test_auc": eval_payload.get("auc"),
+        "test_mcc": eval_payload.get("mcc"),
+        "confusion_matrix": eval_payload.get("confusion_matrix"),
+    }
+
+
+def _metric_float(value: object) -> Optional[float]:
+    try:
+        val = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(val):
+        return None
+    return val
+
+
+def _compute_sampler_fidelity_score(
+    candidate_metrics: Dict[str, object],
+    reference_metrics: Dict[str, object],
+    metric_weights: Optional[Dict[str, float]] = None,
+) -> Tuple[float, Dict[str, float]]:
+    weights = metric_weights or {
+        "test_f1": 3.0,
+        "test_recall": 2.0,
+        "test_far": 2.0,
+        "test_precision": 1.0,
+        "test_auprc": 1.0,
+        "test_auc": 1.0,
+        "test_mcc": 1.0,
+        "test_accuracy": 0.5,
+    }
+    score_num = 0.0
+    score_den = 0.0
+    deltas: Dict[str, float] = {}
+    for metric, weight in weights.items():
+        w = float(weight)
+        if w <= 0.0:
+            continue
+        ref_val = _metric_float(reference_metrics.get(metric))
+        cand_val = _metric_float(candidate_metrics.get(metric))
+        if ref_val is None or cand_val is None:
+            continue
+        delta = abs(cand_val - ref_val)
+        deltas[metric] = float(delta)
+        score_num += w * float(delta)
+        score_den += w
+    if score_den <= 0.0:
+        return float("inf"), deltas
+    return float(score_num / score_den), deltas
+
+
+def _rank_sampler_fidelity_results(
+    rows: Sequence[Dict[str, object]],
+    *,
+    reference_metrics: Dict[str, object],
+    metric_weights: Optional[Dict[str, float]] = None,
+) -> Tuple[List[Dict[str, object]], Optional[Dict[str, object]]]:
+    ranked: List[Dict[str, object]] = []
+    for row in rows:
+        item = dict(row)
+        status = str(item.get("status", "ok")).strip().lower()
+        if status != "ok":
+            item["fidelity_score"] = float("inf")
+            ranked.append(item)
+            continue
+        score, deltas = _compute_sampler_fidelity_score(
+            item, reference_metrics, metric_weights
+        )
+        item["fidelity_score"] = float(score)
+        for metric, delta in deltas.items():
+            item[f"delta_{metric}"] = float(delta)
+        ranked.append(item)
+
+    def _sort_key(row: Dict[str, object]) -> Tuple[int, float, float, float, str]:
+        score = _metric_float(row.get("fidelity_score"))
+        finite_score = score if score is not None else float("inf")
+        f1 = _metric_float(row.get("test_f1"))
+        far = _metric_float(row.get("test_far"))
+        return (
+            0 if math.isfinite(finite_score) else 1,
+            float(finite_score),
+            -float(f1 if f1 is not None else -1.0),
+            float(far if far is not None else 1.0),
+            str(row.get("config_name", "")),
+        )
+
+    ranked.sort(key=_sort_key)
+    best = None
+    for row in ranked:
+        score = _metric_float(row.get("fidelity_score"))
+        if score is not None and math.isfinite(score):
+            best = row
+            break
+    return ranked, best
+
+
+def _materialize_sampler_hparams_variant(
+    *,
+    base_params_path: str,
+    graph_obj: Dict[str, object],
+    use_graphsmote: bool,
+    run_id: str,
+    sampler_config: Dict[str, object],
+) -> Optional[str]:
+    params = _load_optuna_params_from_csv(base_params_path)
+    if not params:
+        return None
+    cfg = dict(sampler_config or {})
+    params["num_neighbors"] = json.dumps(
+        cfg.get("num_neighbors", [15, 10]), ensure_ascii=True
+    )
+    params["train_sampler_mode"] = cfg.get("train_sampler_mode", "neighbor")
+    params["deterministic_sampling"] = bool(cfg.get("deterministic_sampling", False))
+    params["sampling_seed"] = int(cfg.get("sampling_seed", SEED))
+    params["disable_hard_undersampling"] = bool(
+        cfg.get("disable_hard_undersampling", False)
+    )
+    params["cluster_gcn_num_parts"] = int(cfg.get("cluster_gcn_num_parts", 0))
+    params["cluster_gcn_parts_per_epoch"] = int(
+        cfg.get("cluster_gcn_parts_per_epoch", 0)
+    )
+    params["graphsaint_mode"] = cfg.get("graphsaint_mode", "node")
+    params["graphsaint_batch_size"] = int(cfg.get("graphsaint_batch_size", 0))
+    params["graphsaint_num_steps"] = int(cfg.get("graphsaint_num_steps", 0))
+    params["graphsaint_walk_length"] = int(cfg.get("graphsaint_walk_length", 0))
+    params["eval_neighbors_mode"] = cfg.get("eval_neighbors_mode", "same")
+    eval_raw = cfg.get("eval_num_neighbors")
+    params["eval_num_neighbors"] = (
+        json.dumps(eval_raw, ensure_ascii=True)
+        if isinstance(eval_raw, (list, tuple))
+        else eval_raw
+    )
+
+    graph_hash = None
+    variant_tag = "_GraphSMOTE" if use_graphsmote else "_Base"
+    try:
+        from src import gnn_main as graph_main
+
+        graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
+        variant_tag = graph_main._variant_tags(bool(use_graphsmote), graph_obj)
+    except Exception:
+        graph_hash = None
+
+    hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
+    cfg_slug = _slugify(
+        f"{run_id}_{sampler_config.get('config_idx', 0)}_{sampler_config.get('config_name', 'sampler')}"
+    ) or "sampler"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out_path = Path(RESULTADOS_DIR) / (
+        f"optuna_hyperparams_{timestamp}_{cfg_slug}{hash_tag}{variant_tag}.csv"
+    )
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([params]).to_csv(out_path, index=False)
+    except Exception:
+        return None
+    return str(out_path)
+
+
+def _render_sampler_fidelity_experiment(
+    *,
+    graph_obj: Dict[str, object],
+    graph_data: HeteroData,
+    graph_source_label: str,
+) -> None:
+    st.markdown("### Sampler Fidelity vs Full-batch")
+    st.caption(
+        "Este experimento entrena una referencia y luego compara configuraciones de sampler "
+        "para encontrar la opción más cercana a full-batch."
+    )
+    with st.expander("¿Qué ajustas y qué efecto tiene?", expanded=False):
+        st.markdown(
+            "- `num_neighbors`: define cuántos vecinos toma por capa; valores más altos acercan a full-batch pero consumen más memoria.\n"
+            "- `train_sampler_mode`: `neighbor`, `cluster_gcn`, `graphsaint`; cambia cómo se muestrea el subgrafo de entrenamiento.\n"
+            "- `deterministic_sampling` + `sampling_seed`: estabiliza reproducibilidad del experimento.\n"
+            "- `disable_hard_undersampling`: evita sesgo por hard-mining cuando buscas fidelidad al baseline.\n"
+            "- `eval_neighbors_mode`: `exhaustive` evalúa con vecindario completo para comparar en condiciones cercanas a full-batch."
+        )
+
+    use_graphsmote = st.checkbox(
+        "Entrenar con GraphSMOTE",
+        value=False,
+        key="gnn_exp_sampler_fidelity_use_graphsmote",
+        help="Activa la misma variante de balanceo para referencia y candidatos.",
+    )
+
+    hp_files = _list_hpo_files_for_training(
+        use_graphsmote=bool(use_graphsmote),
+        graph_obj=graph_obj,
+    )
+    if not hp_files:
+        st.warning(
+            "No se encontraron archivos `optuna_hyperparams_*.csv` compatibles para este grafo/variante."
+        )
+        return
+
+    hp_labels = [os.path.basename(path) for path in hp_files]
+    selected_label = st.selectbox(
+        "Hiperparámetros base",
+        hp_labels,
+        index=len(hp_labels) - 1,
+        key="gnn_exp_sampler_fidelity_base_hparams",
+        help="Archivo base desde el que se generan variantes por sampler.",
+    )
+    selected_hparams_path = next(
+        (path for path in hp_files if os.path.basename(path) == selected_label),
+        hp_files[-1],
+    )
+    base_params = _load_optuna_params_from_csv(selected_hparams_path)
+    if not base_params:
+        st.error("No se pudieron leer los hiperparámetros base.")
+        return
+
+    base_neighbors = _coerce_neighbor_profile(
+        base_params.get("num_neighbors"),
+        fallback=[15, 10],
+    )
+    base_layers = max(
+        1,
+        int(
+            _metric_float(base_params.get("num_layers"))
+            or len(base_neighbors)
+            or 2
+        ),
+    )
+    if len(base_neighbors) < base_layers:
+        base_neighbors = base_neighbors + [base_neighbors[-1]] * (
+            base_layers - len(base_neighbors)
+        )
+
+    st.caption(
+        f"Base detectada: layers={base_layers}, batch_size={int(_metric_float(base_params.get('batch_size')) or BATCH_SIZE)}, "
+        f"num_neighbors={base_neighbors}"
+    )
+
+    st.markdown("**Referencia Full-batch**")
+    col_ref_a, col_ref_b = st.columns(2)
+    with col_ref_a:
+        ref_neighbors_text = st.text_input(
+            "num_neighbors referencia",
+            value=",".join(str(v) for v in base_neighbors),
+            key="gnn_exp_sampler_ref_neighbors",
+            help="Perfil de vecinos de la corrida de referencia.",
+        )
+    with col_ref_b:
+        ref_eval_mode = st.selectbox(
+            "Eval referencia",
+            ["exhaustive", "same", "custom"],
+            index=0,
+            key="gnn_exp_sampler_ref_eval_mode",
+            help="`exhaustive` se recomienda para aproximar comparación full-batch.",
+        )
+    ref_eval_custom = None
+    if ref_eval_mode == "custom":
+        ref_eval_custom = st.text_input(
+            "eval num_neighbors referencia (custom)",
+            value=",".join(str(v) for v in base_neighbors),
+            key="gnn_exp_sampler_ref_eval_custom",
+            help="Solo aplica cuando eval referencia está en `custom`.",
+        )
+
+    st.markdown("**Grid de Samplers**")
+    sampler_labels = {
+        "NeighborLoader": "neighbor",
+        "Cluster-GCN": "cluster_gcn",
+        "GraphSAINT": "graphsaint",
+    }
+    selected_sampler_labels = st.multiselect(
+        "Samplers a evaluar",
+        list(sampler_labels.keys()),
+        default=list(sampler_labels.keys()),
+        key="gnn_exp_sampler_modes",
+        help="Se evaluarán todas las combinaciones configuradas para estos samplers.",
+    )
+    if not selected_sampler_labels:
+        st.warning("Selecciona al menos un sampler.")
+        return
+
+    neighbor_profiles_text = st.text_area(
+        "Perfiles num_neighbors (separar por ';')",
+        value=";".join(
+            [
+                ",".join(str(v) for v in base_neighbors),
+                "25,15,10",
+                "10,5",
+            ]
+        ),
+        key="gnn_exp_sampler_neighbor_profiles",
+        help="Ejemplo: `15,10;25,15,10;10,5`.",
+    )
+
+    col_sampling_a, col_sampling_b, col_sampling_c = st.columns(3)
+    with col_sampling_a:
+        deterministic_sampling = st.checkbox(
+            "Deterministic sampling",
+            value=True,
+            key="gnn_exp_sampler_deterministic",
+            help="Usa un generador fijo para reducir variabilidad entre corridas.",
+        )
+    with col_sampling_b:
+        sampling_seed = st.number_input(
+            "Sampling seed",
+            min_value=0,
+            value=int(SEED),
+            step=1,
+            key="gnn_exp_sampler_seed",
+            help="Semilla base para sampler y variación entre repeticiones.",
+        )
+    with col_sampling_c:
+        disable_hard_undersampling = st.checkbox(
+            "Disable hard undersampling",
+            value=True,
+            key="gnn_exp_sampler_disable_hard",
+            help="Desactiva hard-mining para acercar el entrenamiento al baseline full-batch.",
+        )
+
+    col_cluster_a, col_cluster_b = st.columns(2)
+    with col_cluster_a:
+        cluster_parts_txt = st.text_input(
+            "Cluster-GCN num_parts",
+            value="64,128",
+            key="gnn_exp_sampler_cluster_parts",
+            help="Cantidad de particiones del grafo para Cluster-GCN.",
+        )
+    with col_cluster_b:
+        cluster_parts_epoch_txt = st.text_input(
+            "Cluster-GCN parts/epoch",
+            value="0,4,8",
+            key="gnn_exp_sampler_cluster_parts_epoch",
+            help="Cuántas particiones usar por epoch (0 = todas).",
+        )
+
+    col_saint_a, col_saint_b, col_saint_c, col_saint_d = st.columns(4)
+    with col_saint_a:
+        graphsaint_modes = st.multiselect(
+            "GraphSAINT mode",
+            ["node", "edge", "random_walk"],
+            default=["node", "edge", "random_walk"],
+            key="gnn_exp_sampler_graphsaint_modes",
+            help="Modo de muestreo interno de GraphSAINT.",
+        )
+    with col_saint_b:
+        graphsaint_batch_txt = st.text_input(
+            "GraphSAINT batch_size",
+            value="1024,2048",
+            key="gnn_exp_sampler_graphsaint_batch",
+            help="Cantidad de nodos/semillas por mini-lote GraphSAINT.",
+        )
+    with col_saint_c:
+        graphsaint_steps_txt = st.text_input(
+            "GraphSAINT num_steps",
+            value="4,8",
+            key="gnn_exp_sampler_graphsaint_steps",
+            help="Número de subgrafos por epoch aproximado.",
+        )
+    with col_saint_d:
+        graphsaint_walk_txt = st.text_input(
+            "GraphSAINT walk_length",
+            value="2,4",
+            key="gnn_exp_sampler_graphsaint_walk",
+            help="Longitud de caminata para `random_walk`.",
+        )
+
+    col_eval_a, col_eval_b = st.columns(2)
+    with col_eval_a:
+        eval_mode = st.selectbox(
+            "Eval candidatos",
+            ["same", "exhaustive", "custom"],
+            index=1,
+            key="gnn_exp_sampler_eval_mode",
+            help="`exhaustive` compara candidatos en condiciones más cercanas a full-batch.",
+        )
+    with col_eval_b:
+        eval_custom_txt = st.text_input(
+            "Eval num_neighbors custom",
+            value=",".join(str(v) for v in base_neighbors),
+            key="gnn_exp_sampler_eval_custom",
+            help="Solo aplica si Eval candidatos = `custom`.",
+            disabled=eval_mode != "custom",
+        )
+
+    col_rep_a, col_rep_b = st.columns(2)
+    with col_rep_a:
+        repeats = st.number_input(
+            "Repeticiones por configuración",
+            min_value=1,
+            max_value=10,
+            value=1,
+            step=1,
+            key="gnn_exp_sampler_repeats",
+            help="Permite medir estabilidad de cada configuración.",
+        )
+    with col_rep_b:
+        far_target = st.slider(
+            "FAR target para evaluación",
+            min_value=0.0,
+            max_value=0.5,
+            value=0.2,
+            step=0.01,
+            key="gnn_exp_sampler_far_target",
+            help="Se usa para calibrar umbral antes de medir desempeño final.",
+        )
+
+    st.markdown("**Entrenamiento**")
+    col_train_a, col_train_b, col_train_c = st.columns(3)
+    with col_train_a:
+        max_epochs_train = st.number_input(
+            "max_epochs",
+            min_value=1,
+            value=200,
+            step=10,
+            key="gnn_exp_sampler_max_epochs",
+            help="Límite de epochs para cada corrida del experimento.",
+        )
+    with col_train_b:
+        early_stop_train = st.checkbox(
+            "Early stopping",
+            value=True,
+            key="gnn_exp_sampler_early_stop",
+            help="Detiene entrenamiento si no mejora el objetivo.",
+        )
+    with col_train_c:
+        early_patience_train = st.number_input(
+            "patience",
+            min_value=1,
+            value=int(EARLY_STOPPING_PATIENCE),
+            step=1,
+            key="gnn_exp_sampler_patience",
+            disabled=not early_stop_train,
+            help="Epochs sin mejora antes de detener.",
+        )
+    early_min_delta_train = st.number_input(
+        "min_delta",
+        min_value=0.0,
+        value=float(EARLY_STOPPING_MIN_DELTA),
+        step=0.0001,
+        format="%.6f",
+        key="gnn_exp_sampler_min_delta",
+        disabled=not early_stop_train,
+        help="Mejora mínima para resetear paciencia.",
+    )
+
+    st.markdown("**Pesos del score de fidelidad**")
+    col_w_a, col_w_b, col_w_c = st.columns(3)
+    with col_w_a:
+        w_f1 = st.number_input(
+            "Peso F1",
+            min_value=0.0,
+            value=3.0,
+            step=0.5,
+            key="gnn_exp_sampler_w_f1",
+            help="Penaliza diferencias en F1 vs referencia.",
+        )
+    with col_w_b:
+        w_recall = st.number_input(
+            "Peso Recall",
+            min_value=0.0,
+            value=2.0,
+            step=0.5,
+            key="gnn_exp_sampler_w_recall",
+            help="Penaliza diferencias en Recall vs referencia.",
+        )
+    with col_w_c:
+        w_far = st.number_input(
+            "Peso FAR",
+            min_value=0.0,
+            value=2.0,
+            step=0.5,
+            key="gnn_exp_sampler_w_far",
+            help="Penaliza diferencias en FAR vs referencia.",
+        )
+    metric_weights = {
+        "test_f1": float(w_f1),
+        "test_recall": float(w_recall),
+        "test_far": float(w_far),
+        "test_precision": 1.0,
+        "test_auprc": 1.0,
+        "test_auc": 1.0,
+        "test_mcc": 1.0,
+        "test_accuracy": 0.5,
+    }
+
+    neighbor_profiles = _parse_neighbor_profiles_input(
+        neighbor_profiles_text,
+        fallback=[base_neighbors],
+    )
+    cluster_num_parts = _parse_int_options(
+        cluster_parts_txt, fallback=[64], min_value=1
+    )
+    cluster_parts_per_epoch = _parse_int_options(
+        cluster_parts_epoch_txt, fallback=[0], min_value=0
+    )
+    saint_batches = _parse_int_options(
+        graphsaint_batch_txt, fallback=[2048], min_value=1
+    )
+    saint_steps = _parse_int_options(
+        graphsaint_steps_txt, fallback=[8], min_value=1
+    )
+    saint_walks = _parse_int_options(
+        graphsaint_walk_txt, fallback=[2], min_value=1
+    )
+
+    eval_custom_neighbors = None
+    if eval_mode == "custom":
+        eval_custom_neighbors = _coerce_neighbor_profile(
+            eval_custom_txt, fallback=base_neighbors
+        )
+    reference_neighbors = _coerce_neighbor_profile(
+        ref_neighbors_text, fallback=base_neighbors
+    )
+    ref_eval_custom_neighbors = None
+    if ref_eval_mode == "custom":
+        ref_eval_custom_neighbors = _coerce_neighbor_profile(
+            ref_eval_custom or "", fallback=reference_neighbors
+        )
+
+    sampler_modes = [
+        sampler_labels[label]
+        for label in selected_sampler_labels
+        if label in sampler_labels
+    ]
+    candidate_configs = _build_sampler_fidelity_grid(
+        sampler_modes=sampler_modes,
+        neighbor_profiles=neighbor_profiles,
+        cluster_num_parts=cluster_num_parts,
+        cluster_parts_per_epoch=cluster_parts_per_epoch,
+        graphsaint_modes=graphsaint_modes,
+        graphsaint_batch_sizes=saint_batches,
+        graphsaint_num_steps=saint_steps,
+        graphsaint_walk_lengths=saint_walks,
+        deterministic_sampling=bool(deterministic_sampling),
+        sampling_seed=int(sampling_seed),
+        disable_hard_undersampling=bool(disable_hard_undersampling),
+        eval_neighbors_mode=str(eval_mode),
+        eval_num_neighbors=eval_custom_neighbors,
+        repeats=int(repeats),
+    )
+    for cfg in candidate_configs:
+        cfg["num_layers"] = int(base_layers)
+
+    st.caption(
+        f"Configuraciones candidatas generadas: {len(candidate_configs)} "
+        f"(perfiles={len(neighbor_profiles)} | repeats={int(repeats)})"
+    )
+    if candidate_configs:
+        preview_cols = [
+            "config_idx",
+            "config_name",
+            "train_sampler_mode",
+            "num_neighbors",
+            "cluster_gcn_num_parts",
+            "cluster_gcn_parts_per_epoch",
+            "graphsaint_mode",
+            "graphsaint_batch_size",
+            "graphsaint_num_steps",
+            "graphsaint_walk_length",
+            "repeat",
+            "sampling_seed",
+            "eval_neighbors_mode",
+        ]
+        st.dataframe(
+            pd.DataFrame(candidate_configs)[preview_cols],
+            width="stretch",
+        )
+
+    if st.button(
+        "Ejecutar Sampler Fidelity",
+        key="gnn_exp_sampler_fidelity_run",
+        type="primary",
+    ):
+        if not candidate_configs:
+            st.error("No hay configuraciones para ejecutar.")
+            return
+
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        experiment_name = "GNN Sampler Fidelity"
+        device = get_auto_device()
+        eval_batch_size = int(_metric_float(base_params.get("batch_size")) or BATCH_SIZE)
+        graph_hash = None
+        try:
+            from src import gnn_main as graph_main
+
+            graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
+        except Exception:
+            graph_hash = None
+
+        exp_meta = {
+            "run_id": run_id,
+            "graph": graph_obj.get("filename"),
+            "graph_source": graph_source_label,
+            "graph_hash": graph_hash,
+            "base_hparams_path": selected_hparams_path,
+            "use_graphsmote": bool(use_graphsmote),
+            "far_target": float(far_target),
+            "max_epochs": int(max_epochs_train),
+            "candidate_count": len(candidate_configs),
+            "reference_eval_mode": ref_eval_mode,
+            "candidate_eval_mode": eval_mode,
+            "metric_weights": metric_weights,
+        }
+        exp_db_path = _init_gnn_experiment_db(experiment_name, exp_meta)
+        if exp_db_path:
+            st.caption(f"DB live: {exp_db_path}")
+
+        progress = st.progress(0.0)
+        status_box = st.empty()
+        total_steps = len(candidate_configs) + 1
+        step_idx = 0
+        all_rows: List[Dict[str, object]] = []
+
+        reference_cfg: Dict[str, object] = {
+            "config_idx": 0,
+            "config_name": "reference_fullbatch",
+            "repeat": 1,
+            "train_sampler_mode": "neighbor",
+            "num_neighbors": [int(v) for v in reference_neighbors],
+            "num_layers": int(base_layers),
+            "deterministic_sampling": bool(deterministic_sampling),
+            "sampling_seed": int(sampling_seed),
+            "disable_hard_undersampling": bool(disable_hard_undersampling),
+            "cluster_gcn_num_parts": 0,
+            "cluster_gcn_parts_per_epoch": 0,
+            "graphsaint_mode": "node",
+            "graphsaint_batch_size": 0,
+            "graphsaint_num_steps": 0,
+            "graphsaint_walk_length": 0,
+            "eval_neighbors_mode": str(ref_eval_mode),
+            "eval_num_neighbors": ref_eval_custom_neighbors,
+        }
+
+        status_box.markdown("Entrenando referencia full-batch...")
+        step_idx += 1
+        progress.progress(min(step_idx / max(total_steps, 1), 1.0))
+        ref_hp_path = _materialize_sampler_hparams_variant(
+            base_params_path=selected_hparams_path,
+            graph_obj=graph_obj,
+            use_graphsmote=bool(use_graphsmote),
+            run_id=run_id,
+            sampler_config=reference_cfg,
+        )
+        ref_model_path = None
+        ref_train_error = None
+        ref_eval_error = None
+        ref_eval_payload: Dict[str, object] = {}
+        ref_eval_neighbors = _resolve_sampler_eval_neighbors(
+            reference_cfg, fallback_layers=base_layers
+        )
+        if not ref_hp_path:
+            ref_train_error = "No se pudo generar archivo de hiperparámetros para referencia."
+        else:
+            try:
+                ref_model_path = _train_gnn_with_best_params(
+                    graph_obj,
+                    ref_hp_path,
+                    use_graphsmote=bool(use_graphsmote),
+                    max_epochs=int(max_epochs_train),
+                    early_stop=bool(early_stop_train),
+                    early_stop_patience=int(early_patience_train),
+                    early_stop_min_delta=float(early_min_delta_train),
+                    train_sampler_mode="neighbor",
+                    deterministic_sampling=bool(
+                        reference_cfg.get("deterministic_sampling", False)
+                    ),
+                    sampling_seed=int(reference_cfg.get("sampling_seed", SEED)),
+                    disable_hard_undersampling=bool(
+                        reference_cfg.get("disable_hard_undersampling", False)
+                    ),
+                    cluster_gcn_num_parts=0,
+                    cluster_gcn_parts_per_epoch=0,
+                    graphsaint_mode="node",
+                    graphsaint_batch_size=0,
+                    graphsaint_num_steps=0,
+                    graphsaint_walk_length=0,
+                    eval_neighbors_mode=str(reference_cfg.get("eval_neighbors_mode", "same")),
+                    eval_num_neighbors=reference_cfg.get("eval_num_neighbors"),
+                )
+            except Exception as exc:
+                ref_train_error = str(exc)
+        if ref_model_path:
+            try:
+                ref_eval_payload = _evaluate_gnn_model_far_target(
+                    model_path=ref_model_path,
+                    graph_data=graph_data,
+                    sequence_index=graph_obj.get("sequence_index"),
+                    device=device,
+                    far_target=float(far_target),
+                    batch_size=int(eval_batch_size),
+                    num_neighbors=ref_eval_neighbors,
+                )
+            except Exception as exc:
+                ref_eval_error = str(exc)
+
+        ref_status = "ok"
+        if ref_model_path is None:
+            ref_status = "train_error"
+        elif ref_eval_error:
+            ref_status = "eval_error"
+        reference_row = {
+            "experiment": experiment_name,
+            "run_id": run_id,
+            "role": "reference",
+            "graph": graph_obj.get("filename"),
+            "graph_source": graph_source_label,
+            "graph_hash": graph_hash,
+            "base_hparams_path": selected_hparams_path,
+            "generated_hparams_path": ref_hp_path,
+            "use_graphsmote": bool(use_graphsmote),
+            "far_target": float(far_target),
+            "batch_size_eval": int(eval_batch_size),
+            "model_path": ref_model_path,
+            "status": ref_status,
+            "train_error": ref_train_error,
+            "eval_error": ref_eval_error,
+            "sampler_config": reference_cfg,
+            "train_sampler_mode": "neighbor",
+            "num_neighbors_train": reference_cfg.get("num_neighbors"),
+            "deterministic_sampling": reference_cfg.get("deterministic_sampling"),
+            "sampling_seed": reference_cfg.get("sampling_seed"),
+            "disable_hard_undersampling": reference_cfg.get(
+                "disable_hard_undersampling"
+            ),
+            "cluster_gcn_num_parts": 0,
+            "cluster_gcn_parts_per_epoch": 0,
+            "graphsaint_mode": "node",
+            "graphsaint_batch_size": 0,
+            "graphsaint_num_steps": 0,
+            "graphsaint_walk_length": 0,
+            "eval_neighbors_mode": reference_cfg.get("eval_neighbors_mode"),
+            "eval_num_neighbors": reference_cfg.get("eval_num_neighbors"),
+            "eval_num_neighbors_resolved": ref_eval_neighbors,
+        }
+        reference_row.update(_extract_sampler_metrics_from_eval(ref_eval_payload))
+        reference_row["fidelity_score"] = 0.0 if ref_status == "ok" else float("inf")
+        _append_gnn_experiment_result(exp_db_path, reference_row)
+        all_rows.append(reference_row)
+        _cleanup_experiment_memory()
+
+        if ref_status != "ok":
+            st.error(
+                "La referencia falló. Revisa `train_error`/`eval_error` en resultados."
+            )
+            results_df = pd.DataFrame(all_rows)
+            st.dataframe(results_df, width="stretch")
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_csv = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+            results_df.to_csv(out_csv, index=False)
+            st.warning(f"Resultados parciales guardados en {out_csv}")
+            return
+
+        reference_metrics = {
+            key: reference_row.get(key)
+            for key in (
+                "test_f1",
+                "test_precision",
+                "test_recall",
+                "test_accuracy",
+                "test_far",
+                "test_auprc",
+                "test_auc",
+                "test_mcc",
+            )
+        }
+
+        candidate_rows: List[Dict[str, object]] = []
+        for cfg in candidate_configs:
+            status_box.markdown(
+                f"Ejecutando {int(cfg.get('config_idx', 0))}/{len(candidate_configs)}: {cfg.get('config_name')}"
+            )
+            step_idx += 1
+            progress.progress(min(step_idx / max(total_steps, 1), 1.0))
+
+            cfg = dict(cfg)
+            cfg["num_layers"] = int(base_layers)
+            hp_variant_path = _materialize_sampler_hparams_variant(
+                base_params_path=selected_hparams_path,
+                graph_obj=graph_obj,
+                use_graphsmote=bool(use_graphsmote),
+                run_id=run_id,
+                sampler_config=cfg,
+            )
+            model_path = None
+            train_error = None
+            eval_error = None
+            eval_payload: Dict[str, object] = {}
+            eval_neighbors = _resolve_sampler_eval_neighbors(
+                cfg, fallback_layers=base_layers
+            )
+
+            if not hp_variant_path:
+                train_error = "No se pudo generar archivo de hiperparámetros."
+            else:
+                try:
+                    model_path = _train_gnn_with_best_params(
+                        graph_obj,
+                        hp_variant_path,
+                        use_graphsmote=bool(use_graphsmote),
+                        max_epochs=int(max_epochs_train),
+                        early_stop=bool(early_stop_train),
+                        early_stop_patience=int(early_patience_train),
+                        early_stop_min_delta=float(early_min_delta_train),
+                        train_sampler_mode=str(cfg.get("train_sampler_mode", "neighbor")),
+                        deterministic_sampling=bool(
+                            cfg.get("deterministic_sampling", False)
+                        ),
+                        sampling_seed=int(cfg.get("sampling_seed", SEED)),
+                        disable_hard_undersampling=bool(
+                            cfg.get("disable_hard_undersampling", False)
+                        ),
+                        cluster_gcn_num_parts=int(
+                            cfg.get("cluster_gcn_num_parts", 0)
+                        ),
+                        cluster_gcn_parts_per_epoch=int(
+                            cfg.get("cluster_gcn_parts_per_epoch", 0)
+                        ),
+                        graphsaint_mode=str(cfg.get("graphsaint_mode", "node")),
+                        graphsaint_batch_size=int(
+                            cfg.get("graphsaint_batch_size", 0)
+                        ),
+                        graphsaint_num_steps=int(cfg.get("graphsaint_num_steps", 0)),
+                        graphsaint_walk_length=int(
+                            cfg.get("graphsaint_walk_length", 0)
+                        ),
+                        eval_neighbors_mode=str(cfg.get("eval_neighbors_mode", "same")),
+                        eval_num_neighbors=cfg.get("eval_num_neighbors"),
+                    )
+                except Exception as exc:
+                    train_error = str(exc)
+
+            if model_path:
+                try:
+                    eval_payload = _evaluate_gnn_model_far_target(
+                        model_path=model_path,
+                        graph_data=graph_data,
+                        sequence_index=graph_obj.get("sequence_index"),
+                        device=device,
+                        far_target=float(far_target),
+                        batch_size=int(eval_batch_size),
+                        num_neighbors=eval_neighbors,
+                    )
+                except Exception as exc:
+                    eval_error = str(exc)
+
+            status = "ok"
+            if model_path is None:
+                status = "train_error"
+            elif eval_error:
+                status = "eval_error"
+
+            payload = {
+                "experiment": experiment_name,
+                "run_id": run_id,
+                "role": "candidate",
+                "graph": graph_obj.get("filename"),
+                "graph_source": graph_source_label,
+                "graph_hash": graph_hash,
+                "base_hparams_path": selected_hparams_path,
+                "generated_hparams_path": hp_variant_path,
+                "use_graphsmote": bool(use_graphsmote),
+                "far_target": float(far_target),
+                "batch_size_eval": int(eval_batch_size),
+                "model_path": model_path,
+                "status": status,
+                "train_error": train_error,
+                "eval_error": eval_error,
+                "sampler_config": cfg,
+                "config_idx": cfg.get("config_idx"),
+                "config_name": cfg.get("config_name"),
+                "repeat": cfg.get("repeat"),
+                "train_sampler_mode": cfg.get("train_sampler_mode"),
+                "num_neighbors_train": cfg.get("num_neighbors"),
+                "deterministic_sampling": cfg.get("deterministic_sampling"),
+                "sampling_seed": cfg.get("sampling_seed"),
+                "disable_hard_undersampling": cfg.get("disable_hard_undersampling"),
+                "cluster_gcn_num_parts": cfg.get("cluster_gcn_num_parts"),
+                "cluster_gcn_parts_per_epoch": cfg.get(
+                    "cluster_gcn_parts_per_epoch"
+                ),
+                "graphsaint_mode": cfg.get("graphsaint_mode"),
+                "graphsaint_batch_size": cfg.get("graphsaint_batch_size"),
+                "graphsaint_num_steps": cfg.get("graphsaint_num_steps"),
+                "graphsaint_walk_length": cfg.get("graphsaint_walk_length"),
+                "eval_neighbors_mode": cfg.get("eval_neighbors_mode"),
+                "eval_num_neighbors": cfg.get("eval_num_neighbors"),
+                "eval_num_neighbors_resolved": eval_neighbors,
+                "reference_config_name": reference_row.get("config_name"),
+                "reference_model_path": reference_row.get("model_path"),
+            }
+            payload.update(_extract_sampler_metrics_from_eval(eval_payload))
+            if status == "ok":
+                fidelity_score, deltas = _compute_sampler_fidelity_score(
+                    payload, reference_metrics, metric_weights
+                )
+                payload["fidelity_score"] = float(fidelity_score)
+                for metric, delta in deltas.items():
+                    payload[f"delta_{metric}"] = float(delta)
+            else:
+                payload["fidelity_score"] = float("inf")
+
+            _append_gnn_experiment_result(exp_db_path, payload)
+            candidate_rows.append(payload)
+            all_rows.append(payload)
+            _cleanup_experiment_memory()
+
+        ranked_candidates, best_row = _rank_sampler_fidelity_results(
+            candidate_rows,
+            reference_metrics=reference_metrics,
+            metric_weights=metric_weights,
+        )
+        final_rows = [reference_row] + ranked_candidates
+        results_df = pd.DataFrame(final_rows)
+        st.dataframe(results_df, width="stretch")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_csv = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+        results_df.to_csv(out_csv, index=False)
+        st.success(f"Resultados guardados en {out_csv}")
+
+        if best_row:
+            _append_gnn_experiment_best(exp_db_path, best_row)
+            st.success(
+                f"Mejor configuración: {best_row.get('config_name')} | "
+                f"fidelity_score={float(best_row.get('fidelity_score', float('nan'))):.6f}"
+            )
+            st.json(
+                {
+                    "config_name": best_row.get("config_name"),
+                    "train_sampler_mode": best_row.get("train_sampler_mode"),
+                    "num_neighbors_train": best_row.get("num_neighbors_train"),
+                    "fidelity_score": best_row.get("fidelity_score"),
+                    "test_f1": best_row.get("test_f1"),
+                    "test_recall": best_row.get("test_recall"),
+                    "test_far": best_row.get("test_far"),
+                }
+            )
+
+        try:
+            entry = _collect_gnn_context()
+            entry.update(
+                {
+                    "type": "GNN Experiment",
+                    "experiment": {
+                        "name": experiment_name,
+                        "run_id": run_id,
+                        "results_path": str(out_csv),
+                        "db_path": str(exp_db_path) if exp_db_path else None,
+                        "base_hparams_path": selected_hparams_path,
+                        "reference_config": reference_cfg,
+                        "candidates": len(candidate_configs),
+                        "best_config_name": best_row.get("config_name") if best_row else None,
+                    },
+                }
+            )
+            _append_gnn_history(entry)
+        except Exception as exc:
+            st.warning(f"No se pudo guardar en historial: {exc}")
+
+
+def _run_gnn_best_variant_experiment(
+    *,
+    graph_obj: Dict[str, object],
+    graph_data: HeteroData,
+    pm_index_ref: object,
+    train_ratio: int,
+    val_ratio: int,
+    test_ratio: int,
+    balancing_strategies: List[str],
+    objective_metrics: List[str],
+    selected_variants: List[str],
+    search_space: Dict[str, object],
+    optuna_settings: Dict[str, object],
+    threshold_beta: float,
+    far_target: float,
+    max_epochs_train: int,
+    early_stop_train: bool,
+    early_patience_train: int,
+    early_min_delta_train: float,
+    exp_state: Dict[str, object],
+    has_active_run: bool,
+) -> None:
+    if not selected_variants:
+        st.error("Seleccione al menos una variante GNN.")
+        return
+
+    if pm_index_ref is not None:
+        split_info = _apply_temporal_split_to_graph(
+            graph_data,
+            pm_index_ref,
+            int(train_ratio),
+            int(val_ratio),
+        )
+        if split_info:
+            st.caption(
+                "Split aplicado: "
+                f"train={split_info['train_count']}, "
+                f"val={split_info['val_count']}, "
+                f"test={split_info['test_count']}"
+            )
+
+    if has_active_run:
+        run_id = exp_state.get("run_id")
+        results = list(exp_state.get("results", []) or [])
+        exp_db_path = exp_state.get("exp_db_path")
+        st.info(
+            f"Continuing experiment: {run_id}. Loaded {len(results)} completed trials."
+        )
+    else:
+        results = []
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        exp_meta = {
+            "run_id": run_id,
+            "graph": graph_obj.get("filename"),
+            "balance_strategies": list(balancing_strategies),
+            "objectives": list(objective_metrics),
+            "gnn_variants": list(selected_variants),
+            "train_ratio": int(train_ratio),
+            "val_ratio": int(val_ratio),
+            "test_ratio": int(test_ratio),
+            "far_target": float(far_target),
+        }
+        exp_db_path = _init_gnn_experiment_db("GNN Best Variant Search", exp_meta)
+        st.session_state["gnn_exp_state"] = {
+            "run_id": run_id,
+            "results": results,
+            "exp_db_path": exp_db_path,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    if exp_db_path:
+        st.caption(f"DB live: {exp_db_path}")
+
+    device = get_auto_device()
+    experiment_name = "GNN Best Variant Search"
+    progress_global = st.progress(0)
+    total_runs = max(
+        1,
+        len(selected_variants) * len(balancing_strategies) * len(objective_metrics),
+    )
+    run_counter = 0
+
+    def _persist_results_state() -> None:
+        try:
+            if "gnn_exp_state" in st.session_state and isinstance(
+                st.session_state["gnn_exp_state"], dict
+            ):
+                st.session_state["gnn_exp_state"]["results"] = results
+        except Exception:
+            pass
+
+    for variant_idx, variant_name in enumerate(selected_variants, start=1):
+        variant_norm = _normalize_ui_gnn_variant(variant_name)
+        st.markdown(
+            f"## Variante GNN {variant_idx}/{len(selected_variants)}: `{variant_norm}`"
+        )
+        _render_gnn_strategy_reference_panel(
+            context_label=f"Experiments · {variant_norm}",
+            graph_obj=graph_obj,
+            active_variant_override=variant_norm,
+            expanded=False,
+        )
+
+        for balance_idx, balancing_strategy in enumerate(balancing_strategies, start=1):
+            use_graphsmote_search = (
+                balancing_strategy == "Opt. balance con GraphSMOTE"
+            )
+            use_imgagn_search = (
+                balancing_strategy == "Opt. balance con ImGAGN"
+            )
+            st.markdown(f"### Estrategia: {balancing_strategy}")
+
+            for obj_idx, objective_metric in enumerate(objective_metrics, start=1):
+                with st.expander(
+                    (
+                        f"{variant_norm} · {balancing_strategy} · "
+                        f"Objetivo {obj_idx}/{len(objective_metrics)}: {objective_metric}"
+                    ),
+                    expanded=True,
+                ):
+                    status_text = st.empty()
+                    progress_bar = st.progress(0)
+                    stop_key = (
+                        f"gnn_exp_variant_stop_{run_id}_{variant_idx}_{balance_idx}_{obj_idx}"
+                    )
+                    stop_col_a, stop_col_b = st.columns([0.8, 0.2])
+                    with stop_col_b:
+                        if st.button("Detener iteración", key=stop_key):
+                            st.session_state[stop_key] = True
+
+                    with st.expander("Logs de Optuna (En vivo)", expanded=False):
+                        log_container = st.empty()
+
+                        objective_settings = {
+                            "metric": objective_metric,
+                            "threshold_beta": threshold_beta,
+                            "device": device,
+                            "gnn_variant": variant_norm,
+                        }
+
+                        try:
+                            result = _run_optuna_search(
+                                graph_obj=graph_obj,
+                                balancing_strategy=balancing_strategy,
+                                search_space=search_space,
+                                optuna_settings=optuna_settings,
+                                objective_settings=objective_settings,
+                                log_container=log_container,
+                                progress_bar=progress_bar,
+                                status_text=status_text,
+                                stop_flag_key=stop_key,
+                                storage_path=str(exp_db_path) if exp_db_path else None,
+                            )
+                        except Exception as exc:
+                            st.error(
+                                f"Error en Optuna ({objective_metric}, {variant_norm}): {exc}"
+                            )
+                            if st.session_state.get("gnn_optuna_notify", False):
+                                notification_system.send_error_notification_email(
+                                    "Optuna (Experiments Variant Search)",
+                                    exc,
+                                    context={
+                                        "experiment": experiment_name,
+                                        "objective": objective_metric,
+                                        "balance": balancing_strategy,
+                                        "gnn_variant": variant_norm,
+                                    },
+                                )
+                            payload = {
+                                "experiment": experiment_name,
+                                "run_id": run_id,
+                                "objective_label": objective_metric,
+                                "objective_metric": objective_metric,
+                                "balance_strategy": balancing_strategy,
+                                "gnn_variant": variant_norm,
+                                "error": str(exc),
+                                "status": "optuna_error",
+                            }
+                            _append_gnn_experiment_result(exp_db_path, payload)
+                            results.append(payload)
+                            _persist_results_state()
+                            _cleanup_experiment_memory()
+                            run_counter += 1
+                            progress_global.progress(min(run_counter / total_runs, 1.0))
+                            continue
+
+                    best_params = result.get("best_params", {}) or {}
+                    range_analysis = result.get("range_analysis") or {}
+                    _render_optuna_range_analysis(range_analysis)
+
+                    graph_train_obj = dict(graph_obj)
+                    graph_train_data = graph_data
+                    if use_imgagn_search:
+                        try:
+                            graph_train_data = _apply_imgagn_to_graph(
+                                graph_data, best_params, device
+                            )
+                            graph_train_obj["data"] = graph_train_data
+                            graph_train_obj["imgagn_best_params"] = best_params
+                        except Exception as exc:
+                            st.error(f"ImGAGN fallo: {exc}")
+
+                    model_path = None
+                    train_error = None
+                    try:
+                        model_path = _train_gnn_with_best_params(
+                            graph_train_obj,
+                            result.get("best_path"),
+                            use_graphsmote=use_graphsmote_search,
+                            max_epochs=int(max_epochs_train),
+                            early_stop=bool(early_stop_train),
+                            early_stop_patience=int(early_patience_train),
+                            early_stop_min_delta=float(early_min_delta_train),
+                        )
+                    except Exception as exc:
+                        train_error = str(exc)
+                        st.error(f"Error entrenando modelo: {exc}")
+
+                    eval_payload: Dict[str, object] = {}
+                    eval_error = None
+                    if model_path:
+                        try:
+                            eval_batch_size = int(
+                                best_params.get("batch_size", BATCH_SIZE)
+                            )
+                            eval_num_neighbors = best_params.get("num_neighbors")
+                            eval_payload = _evaluate_gnn_model_far_target(
+                                model_path=model_path,
+                                graph_data=graph_train_data,
+                                sequence_index=graph_train_obj.get("sequence_index"),
+                                device=device,
+                                far_target=float(far_target),
+                                batch_size=eval_batch_size,
+                                num_neighbors=eval_num_neighbors,
+                            )
+                        except Exception as exc:
+                            eval_error = str(exc)
+                            st.error(f"Error evaluando modelo: {exc}")
+
+                    report = eval_payload.get("report", {}) or {}
+                    metrics = eval_payload.get("metrics", {}) or {}
+                    test_f1 = (
+                        report.get("Accidente (1)", {}).get("f1-score")
+                        if report
+                        else None
+                    )
+                    test_precision = (
+                        report.get("Accidente (1)", {}).get("precision")
+                        if report
+                        else None
+                    )
+                    test_recall = (
+                        report.get("Accidente (1)", {}).get("recall")
+                        if report
+                        else None
+                    )
+                    test_accuracy = report.get("accuracy") if report else None
+
+                    status = "ok"
+                    if model_path is None:
+                        status = "train_error"
+                    elif eval_error:
+                        status = "eval_error"
+
+                    payload = {
+                        "experiment": experiment_name,
+                        "run_id": run_id,
+                        "gnn_variant": best_params.get("gnn_variant", variant_norm),
+                        "objective_label": objective_metric,
+                        "objective_metric": objective_metric,
+                        "optuna_best_value": best_params.get("value"),
+                        "optuna_best_epoch": best_params.get("best_epoch"),
+                        "optuna_best_tau": best_params.get("best_tau"),
+                        "optuna_best_path": result.get("best_path"),
+                        "optuna_full_path": result.get("full_path"),
+                        "optuna_range_analysis": range_analysis,
+                        "balance_strategy": balancing_strategy,
+                        "graph": graph_obj.get("filename"),
+                        "batch_size_eval": best_params.get("batch_size"),
+                        "num_neighbors_eval": best_params.get("num_neighbors"),
+                        "far_target": float(far_target),
+                        "model_path": model_path,
+                        "eval_threshold": eval_payload.get("threshold"),
+                        "val_far": (eval_payload.get("calibration", {}) or {}).get("far"),
+                        "val_sens": (eval_payload.get("calibration", {}) or {}).get("sens"),
+                        "test_f1": test_f1,
+                        "test_precision": test_precision,
+                        "test_recall": test_recall,
+                        "test_accuracy": test_accuracy,
+                        "test_far": metrics.get("far"),
+                        "test_specificity": metrics.get("specificity"),
+                        "test_auprc": eval_payload.get("auprc"),
+                        "test_auc": eval_payload.get("auc"),
+                        "test_mcc": eval_payload.get("mcc"),
+                        "confusion_matrix": eval_payload.get("confusion_matrix"),
+                        "train_error": train_error,
+                        "eval_error": eval_error,
+                        "status": status,
+                    }
+                    _append_gnn_experiment_result(exp_db_path, payload)
+                    results.append(payload)
+                    _persist_results_state()
+                    _cleanup_experiment_memory()
+                    run_counter += 1
+                    progress_global.progress(min(run_counter / total_runs, 1.0))
+
+    if not results:
+        st.warning("No se generaron resultados.")
+        return
+
+    results_df = pd.DataFrame(results)
+    st.dataframe(results_df, width="stretch")
+
+    if "gnn_variant" in results_df.columns:
+        df_ok = results_df.copy()
+        if "status" in df_ok.columns:
+            df_ok = df_ok[df_ok["status"] == "ok"]
+        metric_for_rank = "test_auprc" if "test_auprc" in df_ok.columns else "test_f1"
+        for col in ("test_f1", "test_auprc", "test_auc", "test_mcc"):
+            if col in df_ok.columns:
+                df_ok[col] = pd.to_numeric(df_ok[col], errors="coerce")
+        if metric_for_rank in df_ok.columns and not df_ok.empty:
+            idx_best_variant = df_ok.groupby("gnn_variant")[metric_for_rank].idxmax()
+            summary = df_ok.loc[idx_best_variant].copy()
+            keep_cols = [
+                "gnn_variant",
+                "balance_strategy",
+                "objective_label",
+                "test_f1",
+                "test_auprc",
+                "test_auc",
+                "test_mcc",
+                "model_path",
+            ]
+            keep_cols = [c for c in keep_cols if c in summary.columns]
+            summary = summary[keep_cols].sort_values(metric_for_rank, ascending=False)
+            st.markdown("### Ranking de variantes (mejor corrida por variante)")
+            st.dataframe(summary, width="stretch")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    res_path = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+    results_df.to_csv(res_path, index=False)
+    st.success(f"Resultados guardados en {res_path}")
+
+    best_row = None
+    if "test_f1" in results_df.columns:
+        df_ok = results_df[pd.to_numeric(results_df["test_f1"], errors="coerce").notna()].copy()
+        if "test_auprc" in df_ok.columns:
+            df_ok["test_auprc"] = pd.to_numeric(df_ok["test_auprc"], errors="coerce")
+            auprc_ok = df_ok[df_ok["test_auprc"].notna()]
+            if not auprc_ok.empty:
+                best_row = auprc_ok.loc[auprc_ok["test_auprc"].idxmax()].to_dict()
+        if best_row is None and not df_ok.empty:
+            df_ok["test_f1"] = pd.to_numeric(df_ok["test_f1"], errors="coerce")
+            best_row = df_ok.loc[df_ok["test_f1"].idxmax()].to_dict()
+    if best_row:
+        _append_gnn_experiment_best(exp_db_path, best_row)
+
+    try:
+        entry = _collect_gnn_context()
+        entry.update(
+            {
+                "type": "GNN Experiment",
+                "experiment": {
+                    "name": experiment_name,
+                    "run_id": run_id,
+                    "results_path": str(res_path),
+                    "db_path": str(exp_db_path) if exp_db_path else None,
+                    "objectives": list(objective_metrics),
+                    "gnn_variants": list(selected_variants),
+                    "count": len(results),
+                },
+            }
+        )
+        _append_gnn_history(entry)
+    except Exception as exc:
+        st.warning(f"No se pudo guardar en historial: {exc}")
+
+
 def _render_gnn_experiments_tab() -> None:
     #st.header("Experiments (GNN)")
 
@@ -11441,14 +13755,29 @@ def _render_gnn_experiments_tab() -> None:
             f"- Aristas: {int(sum(graph_data[edge_type].edge_index.shape[1] for edge_type in graph_data.edge_types))}"
         )
 
-        experiments = ["Optuna objectives (GNN)", "Opt.Recursiva"]
+        experiments = [
+            "Optuna objectives (GNN)",
+            "Opt.Recursiva",
+            "Best GNN Variant (Optuna+Train+Test)",
+            "Sampler fidelity (Full-batch)",
+        ]
         experiment_choice = st.selectbox(
             "Experimento",
             experiments,
             key="gnn_exp_choice",
         )
 
+        if experiment_choice == "Sampler fidelity (Full-batch)":
+            _render_sampler_fidelity_experiment(
+                graph_obj=graph_obj,
+                graph_data=graph_data,
+                graph_source_label=graph_source_label,
+            )
+            return
+
         is_recursive_exp = experiment_choice == "Opt.Recursiva"
+        is_variant_search_exp = experiment_choice == "Best GNN Variant (Optuna+Train+Test)"
+        selected_variants = [_normalize_ui_gnn_variant(GNN_VARIANT)]
         if is_recursive_exp:
             st.markdown("### Opt.Recursiva (Optuna vs Ray)")
             col_rec_a, col_rec_b, col_rec_c = st.columns(3)
@@ -11489,6 +13818,40 @@ def _render_gnn_experiments_tab() -> None:
             st.caption(
                 "Si hay alertas rojas, se ajusta el rango sugerido y se re-optimiza "
                 "hasta no tener alertas rojas o alcanzar el maximo de iteraciones."
+            )
+        elif is_variant_search_exp:
+            st.markdown("### Búsqueda de Mejor Variante GNN")
+            st.caption(
+                "Ejecuta Optuna + entrenamiento + test para cada variante seleccionada "
+                "sobre el mismo grafo y con las mismas opciones de balanceo/objetivo/sampling."
+            )
+            labels = _gnn_variant_ui_labels()
+            all_variants = _supported_gnn_variants()
+            recommended_variants = [
+                "gat_snapshot",
+                "gat_gru",
+                "gat_transformer",
+                "gat_edge_mlp_gru",
+                "gnn_edge_aware_gru",
+            ]
+            default_variants = [v for v in recommended_variants if v in all_variants] or all_variants[:5]
+            selected_variants = st.multiselect(
+                "Variantes GNN a comparar",
+                all_variants,
+                default=default_variants,
+                format_func=lambda v: labels.get(str(v), str(v)),
+                key="gnn_exp_variant_candidates",
+                help=(
+                    "Cada variante corre su propia optimización de hiperparámetros y luego "
+                    "entrenamiento/evaluación final."
+                ),
+            )
+            if not selected_variants:
+                st.warning("Seleccione al menos una variante GNN.")
+                return
+            st.caption(
+                "Se recomienda comparar con mismo split temporal, misma semilla y mismos "
+                "objetivos de Optuna para atribuir diferencias a la arquitectura."
             )
 
         st.markdown("### Muestreo de Datos (Graph Sampling)")
@@ -12642,6 +15005,30 @@ def _render_gnn_experiments_tab() -> None:
                 "fixed_train_subset": bool(fixed_train_subset),
             }
 
+            if is_variant_search_exp:
+                _run_gnn_best_variant_experiment(
+                    graph_obj=graph_obj,
+                    graph_data=graph_data,
+                    pm_index_ref=pm_index_ref,
+                    train_ratio=int(train_ratio),
+                    val_ratio=int(val_ratio),
+                    test_ratio=int(test_ratio),
+                    balancing_strategies=list(balancing_strategies),
+                    objective_metrics=list(objective_metrics),
+                    selected_variants=[_normalize_ui_gnn_variant(v) for v in selected_variants],
+                    search_space=search_space,
+                    optuna_settings=optuna_settings,
+                    threshold_beta=float(threshold_beta),
+                    far_target=float(far_target),
+                    max_epochs_train=int(max_epochs_train),
+                    early_stop_train=bool(early_stop_train),
+                    early_patience_train=int(early_patience_train),
+                    early_min_delta_train=float(early_min_delta_train),
+                    exp_state=exp_state,
+                    has_active_run=bool(has_active_run and use_existing_run),
+                )
+                return
+
             # Initialize or Resume State
             if has_active_run:
                 run_id = exp_state.get("run_id")
@@ -12921,6 +15308,7 @@ def _render_gnn_experiments_tab() -> None:
                                                 eval_payload = _evaluate_gnn_model_far_target(
                                                     model_path=model_path,
                                                     graph_data=graph_train_data,
+                                                    sequence_index=graph_train_obj.get("sequence_index"),
                                                     device=device,
                                                     far_target=float(far_target),
                                                     batch_size=eval_batch_size,
@@ -13126,6 +15514,7 @@ def _render_gnn_experiments_tab() -> None:
                                         eval_payload = _evaluate_gnn_model_far_target(
                                             model_path=model_path,
                                             graph_data=graph_train_data,
+                                            sequence_index=graph_train_obj.get("sequence_index"),
                                             device=device,
                                             far_target=float(far_target),
                                             batch_size=eval_batch_size,
@@ -13281,8 +15670,24 @@ def _render_network_tab() -> None:
     st.caption(
         f"edge_attr_dim={edge_feature_dim} | clases={num_classes} | tipos de aristas={len(graph_data.edge_types)}"
     )
-
     existing_cfg = st.session_state.get("gnn_network_config", {})
+    st.markdown("**Variante GNN del experimento**")
+    selected_variant = _render_gnn_variant_selector(
+        key="gnn_variant_selector_network",
+        default_variant=(existing_cfg or {}).get("gnn_variant", GNN_VARIANT),
+        context_label="Network",
+    )
+    variant_spec = _describe_gnn_variant(selected_variant)
+    var_col1, var_col2, var_col3 = st.columns(3)
+    var_col1.metric("Encoder espacial", variant_spec["spatial_encoder"])
+    var_col2.metric("Head temporal", variant_spec["temporal_label"])
+    var_col3.metric("Aristas", variant_spec["edge_processing"])
+    _render_gnn_strategy_reference_panel(
+        context_label="Network",
+        graph_obj=loaded_graph,
+        active_variant_override=selected_variant,
+        expanded=False,
+    )
 
     st.markdown("**Parametros de red**")
     col_a, col_b, col_c = st.columns(3)
@@ -13480,7 +15885,15 @@ def _render_network_tab() -> None:
                 key="gnn_net_lambda_final",
             )
 
+    graph_filename = str(loaded_graph.get("filename", "") or "")
+    balanced_graph_ref = st.session_state.get("balanced_graph") or {}
+    use_graphsmote = (
+        "_GraphSMOTE" in graph_filename
+        or "GraphSMOTE" in str(balanced_graph_ref.get("source", ""))
+    )
+
     config_payload = {
+        "gnn_variant": str(selected_variant),
         "hidden_channels": int(hidden_channels),
         "num_heads": int(num_heads),
         "num_layers": int(num_layers),
@@ -13535,17 +15948,48 @@ def _render_network_tab() -> None:
     st.markdown("**Visualizacion de capas**")
     layer_rows = []
     emb_dim = hidden_channels * num_heads
+    if variant_spec["uses_edge_mlp"] == "yes":
+        layer_rows.append(
+            {
+                "layer": "edge_attr",
+                "type": "EdgeAttrEncoder (MLP)",
+                "heads": "-",
+                "hidden": int(edge_feature_dim),
+                "emb_dim": int(edge_feature_dim),
+            }
+        )
     for idx in range(1, int(num_layers) + 1):
         layer_rows.append(
             {
                 "layer": idx,
-                "type": "GAT",
+                "type": variant_spec["conv_type"],
                 "heads": int(num_heads),
                 "hidden": int(hidden_channels),
                 "emb_dim": int(emb_dim),
             }
         )
+    if variant_spec["temporal_kind"] != "snapshot":
+        layer_rows.append(
+            {
+                "layer": "temporal",
+                "type": variant_spec["temporal_label"],
+                "heads": "-",
+                "hidden": int(emb_dim),
+                "emb_dim": int(emb_dim),
+            }
+        )
     st.dataframe(pd.DataFrame(layer_rows), width="stretch")
+
+    sequence_index = loaded_graph.get("sequence_index")
+    has_sequence_index = (
+        sequence_index is not None
+        and getattr(sequence_index, "sequence_rows", None) is not None
+    )
+    if variant_spec["temporal_kind"] != "snapshot" and not has_sequence_index:
+        st.caption(
+            "Aviso: la variante temporal requiere `SequenceIndex`; sin secuencias, el modelo "
+            "no podrá explotar la ventana temporal."
+        )
 
     dot_lines = [
         "digraph G {",
@@ -13553,18 +15997,41 @@ def _render_network_tab() -> None:
         "node [shape=box style=\"rounded,filled\" fillcolor=\"#E8F1FF\" color=\"#2C3E50\" fontname=\"Helvetica\"];",
         f"input [label=\"Input\\nF={in_channels}\"];",
     ]
+    if variant_spec["uses_edge_mlp"] == "yes":
+        dot_lines.append(
+            f"edgeattr [label=\"edge_attr\\nD={edge_feature_dim}\" fillcolor=\"#FFF4E5\"];"
+        )
+        dot_lines.append(
+            "edge_mlp [label=\"EdgeAttrEncoder\\nMLP\" fillcolor=\"#FFF4E5\"];"
+        )
     for idx in range(1, int(num_layers) + 1):
         dot_lines.append(
-            f"layer{idx} [label=\"GAT {idx}\\nheads={num_heads}\\nhidden={hidden_channels}\\nemb={emb_dim}\"];"
+            f"layer{idx} [label=\"{variant_spec['conv_type']} {idx}\\nheads={num_heads}\\nhidden={hidden_channels}\\nemb={emb_dim}\"];"
+        )
+    if variant_spec["temporal_kind"] != "snapshot":
+        dot_lines.append(
+            "temporal [label=\"Temporal head\\n"
+            f"{variant_spec['temporal_label']}\\nL={int(SEQ_LENGTH)}\" fillcolor=\"#E9FFF1\"];"
         )
     dot_lines.append(f"output [label=\"Output\\nclasses={num_classes}\"];")
     dot_lines.append("input -> layer1;")
+    if variant_spec["uses_edge_mlp"] == "yes":
+        dot_lines.append("edgeattr -> edge_mlp;")
+        dot_lines.append("edge_mlp -> layer1 [style=dashed color=\"#B9770E\"];")
     if int(num_layers) > 1:
         for idx in range(1, int(num_layers)):
             dot_lines.append(f"layer{idx} -> layer{idx+1};")
-        dot_lines.append(f"layer{num_layers} -> output;")
+        if variant_spec["temporal_kind"] != "snapshot":
+            dot_lines.append(f"layer{num_layers} -> temporal;")
+            dot_lines.append("temporal -> output;")
+        else:
+            dot_lines.append(f"layer{num_layers} -> output;")
     else:
-        dot_lines.append("layer1 -> output;")
+        if variant_spec["temporal_kind"] != "snapshot":
+            dot_lines.append("layer1 -> temporal;")
+            dot_lines.append("temporal -> output;")
+        else:
+            dot_lines.append("layer1 -> output;")
     dot_lines.append("}")
     st.graphviz_chart("\n".join(dot_lines))
 
@@ -13572,6 +16039,18 @@ def _render_network_tab() -> None:
     st.code("tensorboard --logdir Resultados/runs_attention", language="bash")
 
     st.markdown("**Vista torchview**")
+    if variant_spec["is_edge_aware"] == "yes":
+        st.info(
+            "La vista torchview detallada de este tab está implementada para variantes "
+            "basadas en `HeteroGAT`. Para `gnn_edge_aware*`, use el diagrama esquemático "
+            "de capas mostrado arriba."
+        )
+        return
+    if variant_spec["uses_edge_mlp"] == "yes" or variant_spec["temporal_kind"] != "snapshot":
+        st.caption(
+            "La vista torchview muestra el backbone espacial. El diagrama Graphviz anterior "
+            "incorpora el Edge MLP y/o el head temporal de la variante seleccionada."
+        )
     view_options = [
         "Completo (GAT + salida)",
         "Backbone (todas las capas)",
@@ -14182,6 +16661,11 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
     st.caption(
         "Optuna busca hiperparametros para entrenamiento y, si se activa, "
         "incluye parametros de GraphSMOTE para balancear durante el entrenamiento."
+    )
+    _render_gnn_strategy_reference_panel(
+        context_label="Optimization/Optuna",
+        graph_obj=graph_obj,
+        expanded=False,
     )
 
     st.markdown("### Muestreo de Seeds (train/val)")

@@ -1,5 +1,5 @@
 # Fdb version 4
-["pdflatex"] 1770079219.23236 "/Users/felipe/Desktop/SUMO/docs/main_es.tex" "_latex_build/main_es.pdf" "main_es" 1770079219.5701 2
+["pdflatex"] 1771944778.58099 "/Users/felipe/Desktop/SUMO/docs/main_es.tex" "_latex_build/main_es.pdf" "main_es" 1771944778.90231 2
   "/Users/felipe/Desktop/SUMO/docs/main_es.tex" 1770075274.26226 551 484b7c95fdb540604ed6b025aecee1b0 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/cm-super/cm-super-t1.enc" 1136849721 2971 def0b6c1f0b107b3b936def894055589 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/map/fontname/texfonts.map" 1577235249 3524 cb3e574dea2d1052e39280babc910dc8 ""
@@ -91,9 +91,9 @@
   "/usr/local/texlive/2025/texmf-var/fonts/map/pdftex/updmap/pdftex.map" 1770079005 5467155 19efa205003f9ecad95fbbaa6ff24da1 ""
   "/usr/local/texlive/2025/texmf-var/web2c/pdftex/pdflatex.fmt" 1741450574 3345740 46b66fdb0378f7bf5921b5eabf1762b8 ""
   "/usr/local/texlive/2025/texmf.cnf" 1741450484 577 418a7058ec8e006d8704f60ecd22c938 ""
-  "_latex_build/main_es.aux" 1770079219.54873 5836 a63aa68a008ec235c012b04ab5326d52 "pdflatex"
-  "_latex_build/main_es.out" 1770079219.54876 6278 6ed376dc514c8aa25e500d31038f2623 "pdflatex"
-  "_latex_build/main_es.toc" 1770079219.44342 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
+  "_latex_build/main_es.aux" 1771944778.88209 5836 a63aa68a008ec235c012b04ab5326d52 "pdflatex"
+  "_latex_build/main_es.out" 1771944778.88212 6278 6ed376dc514c8aa25e500d31038f2623 "pdflatex"
+  "_latex_build/main_es.toc" 1771944778.78045 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
   "clustering_features_detail_es.tex" 1768591610.44689 10350 b6920a25967ff36e913c9a688b882969 ""
   "main_es.tex" 1770075274.26226 551 484b7c95fdb540604ed6b025aecee1b0 ""
   "sections/accident_prediction_es.tex" 1768147915.44873 7589 8a77ce767c3cd0fd0427e11bd56a3ce3 ""

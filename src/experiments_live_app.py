@@ -332,6 +332,43 @@ def _render_gnn_optuna_objectives_view(
         if col in plot_df.columns:
             plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
 
+    if "gnn_variant" in plot_df.columns:
+        variant_options = sorted(
+            plot_df["gnn_variant"].dropna().astype(str).unique().tolist()
+        )
+        if variant_options:
+            selected_variants = st.multiselect(
+                "Variantes GNN",
+                options=variant_options,
+                default=variant_options,
+                key="live_gnn_optuna_variants",
+            )
+            if selected_variants:
+                plot_df = plot_df[
+                    plot_df["gnn_variant"].astype(str).isin(selected_variants)
+                ].copy()
+
+    if "balance_strategy" in plot_df.columns:
+        balance_options = sorted(
+            plot_df["balance_strategy"].dropna().astype(str).unique().tolist()
+        )
+        if balance_options:
+            selected_balance = st.multiselect(
+                "Balanceo",
+                options=balance_options,
+                default=balance_options,
+                key="live_gnn_optuna_balance_filter",
+            )
+            if selected_balance:
+                plot_df = plot_df[
+                    plot_df["balance_strategy"].astype(str).isin(selected_balance)
+                ].copy()
+
+    if plot_df.empty:
+        st.info("No hay datos para los filtros seleccionados.")
+        st.dataframe(df, width="stretch")
+        return
+
     if best_row is None and "test_f1" in plot_df.columns:
         valid = plot_df[
             pd.to_numeric(plot_df["test_f1"], errors="coerce").notna()
@@ -342,6 +379,8 @@ def _render_gnn_optuna_objectives_view(
     if best_row:
         st.markdown("**Resultado optimo (test_f1)**")
         metrics_payload = {
+            "gnn_variant": best_row.get("gnn_variant"),
+            "balance_strategy": best_row.get("balance_strategy"),
             "objective": best_row.get("objective_label"),
             "test_f1": best_row.get("test_f1"),
             "test_precision": best_row.get("test_precision"),
@@ -358,6 +397,31 @@ def _render_gnn_optuna_objectives_view(
 
     tab_viz, tab_data = st.tabs(["Grafico", "Datos"])
     with tab_viz:
+        if "gnn_variant" in plot_df.columns:
+            summary_metric = "test_auprc" if "test_auprc" in plot_df.columns else "test_f1"
+            if summary_metric in plot_df.columns:
+                tmp = plot_df.copy()
+                tmp[summary_metric] = pd.to_numeric(tmp[summary_metric], errors="coerce")
+                tmp = tmp[tmp[summary_metric].notna()]
+                if not tmp.empty:
+                    idx = tmp.groupby("gnn_variant")[summary_metric].idxmax()
+                    summary = tmp.loc[idx].copy()
+                    keep_cols = [
+                        "gnn_variant",
+                        "balance_strategy",
+                        "objective_label",
+                        "test_f1",
+                        "test_auprc",
+                        "test_auc",
+                        "test_mcc",
+                    ]
+                    keep_cols = [c for c in keep_cols if c in summary.columns]
+                    st.markdown("**Mejor corrida por variante**")
+                    st.dataframe(
+                        summary[keep_cols].sort_values(summary_metric, ascending=False),
+                        width="stretch",
+                    )
+
         if {"objective_label", "test_f1"}.issubset(plot_df.columns):
             plot_df = plot_df[plot_df["test_f1"].notna()].copy()
             if plot_df.empty:
@@ -368,12 +432,24 @@ def _render_gnn_optuna_objectives_view(
                     st.info("Todos los valores de test_f1 son 0.0 en esta corrida.")
                 try:
                     import altair as alt
+                    tooltip_fields = [
+                        "objective_label",
+                        "balance_strategy",
+                    ]
+                    if "gnn_variant" in plot_df.columns:
+                        tooltip_fields.append("gnn_variant")
+                    tooltip_fields += [
+                        "test_f1",
+                        "test_precision",
+                        "test_recall",
+                        "test_far",
+                    ]
                     color_enc = (
                         alt.Color("balance_strategy:N", title="Balanceo")
                         if "balance_strategy" in plot_df.columns
                         else alt.value("#1f77b4")
                     )
-                    base = alt.Chart(plot_df).encode(
+                    enc_kwargs = dict(
                         x=alt.X(
                             "objective_label:N",
                             axis=alt.Axis(title="Objetivo"),
@@ -384,15 +460,17 @@ def _render_gnn_optuna_objectives_view(
                             scale=alt.Scale(domain=[0, 1]),
                         ),
                         color=color_enc,
-                        tooltip=[
-                            "objective_label",
-                            "balance_strategy",
-                            "test_f1",
-                            "test_precision",
-                            "test_recall",
-                            "test_far",
-                        ],
+                        tooltip=tooltip_fields,
                     )
+                    if "gnn_variant" in plot_df.columns:
+                        n_variants = int(plot_df["gnn_variant"].astype(str).nunique())
+                        if n_variants > 1:
+                            enc_kwargs["column"] = alt.Column(
+                                "gnn_variant:N",
+                                title="Variante GNN",
+                                header=alt.Header(labelAngle=0),
+                            )
+                    base = alt.Chart(plot_df).encode(**enc_kwargs)
                     bars = base.mark_bar(opacity=0.8)
                     points = base.mark_circle(size=60)
                     labels = base.mark_text(
@@ -443,6 +521,11 @@ def _render_gnn_recursive_view(
         if "optimizer" in plot_df.columns
         else []
     )
+    variant_options = (
+        sorted(plot_df["gnn_variant"].dropna().astype(str).unique())
+        if "gnn_variant" in plot_df.columns
+        else []
+    )
 
     col_filters_1, col_filters_2, col_filters_3 = st.columns(3)
     with col_filters_1:
@@ -464,6 +547,15 @@ def _render_gnn_recursive_view(
             default=optimizer_options or ["Optuna", "Ray"],
             key="live_gnn_recursive_optimizer",
         )
+    if variant_options:
+        selected_variants = st.multiselect(
+            "Variantes GNN",
+            options=variant_options,
+            default=variant_options,
+            key="live_gnn_recursive_variants",
+        )
+    else:
+        selected_variants = []
 
     if "objective_label" in plot_df.columns and objective_options:
         plot_df = plot_df[
@@ -476,6 +568,10 @@ def _render_gnn_recursive_view(
     if "optimizer" in plot_df.columns and selected_optimizer:
         plot_df = plot_df[
             plot_df["optimizer"].astype(str).isin(selected_optimizer)
+        ]
+    if "gnn_variant" in plot_df.columns and selected_variants:
+        plot_df = plot_df[
+            plot_df["gnn_variant"].astype(str).isin(selected_variants)
         ]
 
     if "iteration" in plot_df.columns:
@@ -523,6 +619,7 @@ def _render_gnn_recursive_view(
     if best_row:
         st.markdown("**Resultado optimo (metrica seleccionada)**")
         metrics_payload = {
+            "gnn_variant": best_row.get("gnn_variant"),
             "objective": best_row.get("objective_label"),
             "optimizer": best_row.get("optimizer"),
             "iteration": best_row.get("iteration"),
@@ -548,6 +645,15 @@ def _render_gnn_recursive_view(
             if base.empty:
                 st.info("No hay datos suficientes para graficar.")
             else:
+                line_tooltip = [
+                    "iteration",
+                    "optimizer",
+                    "balance_strategy",
+                    "objective_label",
+                    selected_metric,
+                ]
+                if "gnn_variant" in base.columns:
+                    line_tooltip.insert(2, "gnn_variant")
                 chart = (
                     alt.Chart(base)
                     .mark_line(point=True)
@@ -564,13 +670,7 @@ def _render_gnn_recursive_view(
                             "optimizer:N",
                             title="Optimizador",
                         ),
-                        tooltip=[
-                            "iteration",
-                            "optimizer",
-                            "balance_strategy",
-                            "objective_label",
-                            selected_metric,
-                        ],
+                        tooltip=line_tooltip,
                     )
                     .interactive()
                 )
@@ -578,9 +678,10 @@ def _render_gnn_recursive_view(
 
             long_rows = []
             for metric in available_metrics:
-                metric_df = plot_df[
-                    ["iteration", "optimizer", metric]
-                ].copy()
+                metric_cols_base = ["iteration", "optimizer", metric]
+                if "gnn_variant" in plot_df.columns:
+                    metric_cols_base.append("gnn_variant")
+                metric_df = plot_df[metric_cols_base].copy()
                 metric_df["metric"] = metric
                 metric_df = metric_df.rename(columns={metric: "value"})
                 long_rows.append(metric_df)
@@ -588,6 +689,9 @@ def _render_gnn_recursive_view(
             long_df = long_df.dropna(subset=["value", "iteration"])
 
             if not long_df.empty:
+                multi_tooltip = ["iteration", "optimizer", "metric", "value"]
+                if "gnn_variant" in long_df.columns:
+                    multi_tooltip.insert(2, "gnn_variant")
                 multi = (
                     alt.Chart(long_df)
                     .mark_line(point=True, opacity=0.8)
@@ -606,7 +710,7 @@ def _render_gnn_recursive_view(
                             title="Metricas",
                             header=alt.Header(labelAngle=0),
                         ),
-                        tooltip=["iteration", "optimizer", "metric", "value"],
+                        tooltip=multi_tooltip,
                     )
                     .properties(height=220)
                     .interactive()
@@ -615,14 +719,18 @@ def _render_gnn_recursive_view(
 
             if "alert_level" in plot_df.columns:
                 alert_map = {"none": 0, "yellow": 1, "red": 2}
-                alert_df = plot_df[
-                    ["iteration", "optimizer", "alert_level"]
-                ].copy()
+                alert_cols = ["iteration", "optimizer", "alert_level"]
+                if "gnn_variant" in plot_df.columns:
+                    alert_cols.append("gnn_variant")
+                alert_df = plot_df[alert_cols].copy()
                 alert_df["alert_value"] = (
                     alert_df["alert_level"].astype(str).str.lower().map(alert_map)
                 )
                 alert_df = alert_df.dropna(subset=["alert_value", "iteration"])
                 if not alert_df.empty:
+                    alert_tooltip = ["iteration", "optimizer", "alert_level"]
+                    if "gnn_variant" in alert_df.columns:
+                        alert_tooltip.insert(2, "gnn_variant")
                     alert_chart = (
                         alt.Chart(alert_df)
                         .mark_line(point=True)
@@ -638,11 +746,7 @@ def _render_gnn_recursive_view(
                                 ),
                             ),
                             color=alt.Color("optimizer:N", title="Optimizador"),
-                            tooltip=[
-                                "iteration",
-                                "optimizer",
-                                "alert_level",
-                            ],
+                            tooltip=alert_tooltip,
                         )
                         .interactive()
                     )

@@ -52,21 +52,21 @@ from typing import Optional, List, Tuple
 
 
 def _compute_time_cutoffs(
-    accident_ts: List[int],
+    timeline_ts: List[int],
     train_ratio: int,
     val_ratio: int,
 ) -> Tuple[float, float]:
     """
-    Derive train/validation cutoffs (inclusive) using sorted accident timestamps.
+    Derive train/validation cutoffs (inclusive) using sorted timeline timestamps.
 
     Returns:
         (train_ts_cutoff, val_ts_cutoff) in minutes since epoch. `float('inf')`
-        indicates that the split is not applied (e.g., insufficient incidents).
+        indicates that the split is not applied (e.g., insufficient timestamps).
     """
-    if not accident_ts:
+    if not timeline_ts:
         return float("inf"), float("inf")
 
-    sorted_ts = sorted(set(accident_ts))
+    sorted_ts = sorted(set(timeline_ts))
     n_ts = len(sorted_ts)
     if n_ts < 3:
         return float("inf"), float("inf")
@@ -475,14 +475,14 @@ def build_graph() -> Optional[str]:
         right_on=[portico_col, 'ts_min'],
         how='inner'
     )
-    accident_ts_unique = affected_pms['ts_min'].unique().tolist() if not affected_pms.empty else []
+    timeline_ts_unique = df_pm['ts_min'].unique().tolist()
     train_ts_cutoff, val_ts_cutoff = _compute_time_cutoffs(
-        accident_ts_unique,
+        timeline_ts_unique,
         TRAIN_RATIO,
         VAL_RATIO,
     )
     if not np.isfinite(train_ts_cutoff):
-        print("ℹ️ División temporal: todos los nodos se asignarán a entrenamiento (insuficientes incidentes).")
+        print("ℹ️ División temporal: todos los nodos se asignarán a entrenamiento (insuficientes timestamps).")
 
     sequence_config = SequenceConfig(
         sequence_length=SEQ_LENGTH,
@@ -794,7 +794,7 @@ def build_graph() -> Optional[str]:
     pm_rev_map = {v: k for k, v in pm_map.items()}
     pm_index = PMIndex(pm_map, pm_rev_map)
 
-    # --- 8) Crear y guardar máscaras de datos (División temporal basada en PM is_accident_pm) ---
+    # --- 8) Crear y guardar máscaras de datos (división temporal por timeline) ---
     print("▶️ Creando máscaras de entrenamiento/validación/prueba (división temporal fija)...")
     num_pm_nodes = data['pm'].num_nodes
     if num_pm_nodes > 0:

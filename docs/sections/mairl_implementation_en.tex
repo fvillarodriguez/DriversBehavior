@@ -1,0 +1,95 @@
+\section{MA-AIRL Implementation}
+
+\subsection{Objective and scope}
+A functional version of the Multi-Agent Adversarial Inverse Reinforcement Learning (MA-AIRL) algorithm was implemented following the framework described in \texttt{src/MAIRL.pdf}. The objective is to learn, for each driver cluster, a stochastic policy and a reward function that explain the observed demonstrations in aggregated cluster data, and then export \textit{vType} parameters for SUMO.
+
+\subsection{Overall architecture}
+The implementation is split into two layers:
+\begin{itemize}
+\item \textbf{MA-AIRL core} in \texttt{src/marl\_core.py}: expert data, normalization, networks (policy, reward, and potential), training, and parameter export.
+\item \textbf{Interface} in \texttt{src/multi\_agent\_rl\_app.py}: data loading, \textit{feature} selection, hyperparameter controls, training execution, and metrics visualization.
+\end{itemize}
+
+\subsection{Expert data and state construction}
+Input data are cluster CSV files with the \texttt{cluster\_label} column. Each row is interpreted as an expert sample, with a state $s$ composed of selected numeric columns (by default: \texttt{avg\_speed\_kmh}, \texttt{avg\_headway\_s}, \texttt{lane\_change\_rate}). The implementation includes:
+\begin{itemize}
+\item \textbf{Feature selection} from the UI to define the state vector.
+\item \textbf{Standardization} with a dedicated \texttt{StandardScaler} (column-wise mean and standard deviation).
+\item \textbf{Per-agent split} by grouping rows with \texttt{cluster\_label}.
+\end{itemize}
+
+\subsection{Expert actions (SUMO proxy)}
+MA-AIRL requires $(s, a)$ pairs. Since the CSV data do not contain real actions, an \textbf{action proxy} is built for each sample:
+\begin{itemize}
+\item Metrics are mapped to car-following parameters: \texttt{maxSpeed}, \texttt{accel}, \texttt{decel}, \texttt{minGap}, \texttt{sigma}, \texttt{impatience}.
+\item Heuristic transforms are applied and clipped to \texttt{PARAM\_BOUNDS} limits.
+\item Actions are normalized to $[-1,1]$ for stable training.
+\end{itemize}
+This enables MA-AIRL training even without explicit action trajectories.
+
+\subsection{MA-AIRL models}
+For each agent (cluster), three networks are instantiated:
+\begin{itemize}
+\item \textbf{Gaussian policy} $q_\theta(a \mid s)$: MLP producing $\mu$ and $\log\sigma$.
+\item \textbf{Reward estimator} $g_\omega(s,a)$: MLP over state-action pairs.
+\item \textbf{Potential} $h_\phi(s)$: MLP over the state.
+\end{itemize}
+The structured form is implemented as:
+\[
+f_{\omega,\phi}(s,a,s') = g_\omega(s,a) + \gamma h_\phi(s') - h_\phi(s)
+\]
+
+\subsection{Discriminator function and objective}
+Following Equation (11) in the paper, the discriminator is defined as:
+\[
+D_{\omega}(s,a)=\frac{\exp(f_{\omega}(s,a))}{\exp(f_{\omega}(s,a)) + q_\theta(a \mid s)}
+\]
+Training uses:
+\begin{itemize}
+\item \textbf{Discriminator step}: maximize $\mathbb{E}_{X_E}[\log D] + \mathbb{E}_{X_\pi}[\log(1-D)]$.
+\item \textbf{Generator (policy) step}: maximize $\mathbb{E}_{X_\pi}[f_\omega(s,a) - \log q_\theta(a \mid s)]$ (Equation 12).
+\end{itemize}
+
+\subsection{Temporal proxy}
+The data do not include explicit temporal transitions $(s,s')$. To keep the MA-AIRL structure, a \textbf{one-step proxy} is used:
+\[
+s' = s
+\]
+This preserves the potential-based form without requiring full sequences. The approximation is explicitly documented in code.
+
+\subsection{Training metrics}
+During training, the following metrics are reported:
+\begin{itemize}
+\item \textbf{disc\_loss}: discriminator loss.
+\item \textbf{policy\_loss}: policy loss.
+\item \textbf{reward\_mean}: average of $f_\omega$ on expert samples.
+\end{itemize}
+Metrics are kept in memory for plotting and post-run analysis.
+
+\subsection{Export of parameters to SUMO}
+At the end, per-agent parameters are obtained by evaluating the policy on the mean state and de-normalizing to SUMO ranges. The process exports:
+\begin{itemize}
+\item \texttt{mairl\_vtypes.add.xml} with one \texttt{vType} per cluster.
+\end{itemize}
+This enables injecting learned parameters into real SUMO simulations.
+
+\subsection{UI integration}
+An algorithm selector was added:
+\begin{itemize}
+\item \textbf{MA-AIRL (paper)}: adversarial training with expert data.
+\item \textbf{CEM (legacy)}: previous cross-entropy method with SUMO.
+\end{itemize}
+Hyperparameter controls were also added (batch size, $\gamma$, \textit{learning rates}, network size, and device).
+
+\subsection{Modified files}
+\begin{itemize}
+\item \texttt{src/marl\_core.py}: MA-AIRL core (data, networks, training, export).
+\item \texttt{src/multi\_agent\_rl\_app.py}: UI and MA-AIRL training flow.
+\end{itemize}
+
+\subsection{Current limitations and next steps}
+\begin{itemize}
+\item The implementation uses $s'=s$ due to missing explicit temporal sequences.
+\item Expert actions are heuristic proxies derived from aggregated metrics.
+\item Recommended next step: build real trajectories from SUMO or time-based data to estimate $s'$ and real actions.
+\end{itemize}

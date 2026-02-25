@@ -167,6 +167,108 @@ se usan \emph{extras} en cero para alinear dimensiones.
 \textbf{Clase}: \texttt{src/temporal\_head.py::TemporalAggregator}.\\
 \textbf{Idea}: GRU sobre secuencias de embeddings recientes; mantiene cache de embeddings para nodos no presentes en el batch, evitando fuga de gradientes.
 
+\subsection{Registro de variantes GNN (encoder + temporal + aristas)}
+\label{sec:gnn_variantes}
+El pipeline ahora incorpora un \textbf{registro de variantes} controlado por
+\texttt{src/config.py} (\texttt{GNN\_VARIANT}, \texttt{GNN\_TEMPORAL\_CACHE\_STRATEGY})
+y materializado en \texttt{src/gnn\_main.py} mediante las funciones
+\texttt{\_build\_gnn\_model}, \texttt{\_build\_temporal\_head\_for\_variant} y
+\texttt{\_prime\_temporal\_cache\_if\_needed}. Adem\'as, la UI en
+\texttt{src/graph\_builder\_app.py} expone una gu\'ia resumida en los tabs
+\emph{Network}, \emph{Training}, \emph{Optuna} y \emph{Evaluaci\'on}. La idea de dise\~no es separar:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Encoder espacial}: GAT heterog\'eneo base, GAT con codificador de aristas, o variante edge-aware.
+  \item \textbf{Head temporal}: snapshot (sin secuencia), GRU, Transformer temporal o attention pooling.
+  \item \textbf{Protocolo de cache}: \texttt{incremental} por batch o \texttt{global\_epoch} (forward global por \'epoca para secuencias consistentes).
+\end{itemize}
+
+\subsubsection{Idea general de comparabilidad}
+Todas las variantes comparten el mismo \texttt{SequenceIndex} (construido en
+\texttt{src/snapshot\_sequences.py} a partir de \texttt{sequence\_rows}/\texttt{target\_rows}),
+el mismo grafo y los mismos splits temporales. Esto permite comparar arquitecturas sin cambiar
+la definici\'on de etiqueta ni el horizonte de predicci\'on.
+
+\paragraph{Etiquetado ``5 minutos antes''}
+La l\'ogica de etiquetado usa:
+\[
+\text{intervalo positivo} = (t+\gamma,\; t+\gamma+H]
+\]
+donde \(\gamma\) es \texttt{GUARD\_BAND\_MINUTES} y \(H\) es \texttt{HORIZON\_MINUTES}.
+Para una configuraci\'on estricta de ``5 minutos antes'', se recomienda:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{GUARD\_BAND\_MINUTES = 5}
+  \item \texttt{HORIZON\_MINUTES = 5} (o 10--20 para riesgo en ventana)
+\end{itemize}
+en \texttt{src/config.py}.
+
+\subsubsection{Variantes implementadas}
+\textbf{Implementaci\'on}: \texttt{src/gat\_model.py}, \texttt{src/temporal\_head.py},
+\texttt{src/temporal\_heads.py}, \texttt{src/gnn\_main.py}.\\
+\textbf{Selecci\'on}: mediante el string \texttt{GNN\_VARIANT} (normalizado en
+\texttt{src/gnn\_main.py::\_normalize\_gnn\_variant}).
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{\texttt{gat\_snapshot}} (baseline): \texttt{HeteroGAT} sin head temporal. Clasifica con el embedding del snapshot actual.
+  \item \textbf{\texttt{gat\_gru}}: \texttt{HeteroGAT} + \texttt{TemporalGRUHead} (\texttt{src/temporal\_heads.py}).
+  \item \textbf{\texttt{gat\_transformer}}: \texttt{HeteroGAT} + \texttt{TemporalTransformerHead} (self-attention con positional embedding aprendible).
+  \item \textbf{\texttt{gat\_attnpool}}: \texttt{HeteroGAT} + \texttt{TemporalAttnPoolHead} (ablation ligera y barata computacionalmente).
+  \item \textbf{\texttt{gat\_edge\_mlp}}: \texttt{HeteroGATWithEdgeEncoder} (MLP por tipo de arista sobre \texttt{edge\_attr}) sin head temporal.
+  \item \textbf{\texttt{gat\_edge\_mlp\_gru}} y \textbf{\texttt{gat\_edge\_mlp\_transformer}}: combinan codificador de aristas + head temporal.
+  \item \textbf{\texttt{gnn\_edge\_aware}}: \texttt{HeteroEdgeAware} (usa \texttt{TransformerConv}) sin head temporal.
+  \item \textbf{\texttt{gnn\_edge\_aware\_gru}} y \textbf{\texttt{gnn\_edge\_aware\_transformer}}: variante edge-aware con modelado temporal.
+\end{enumerate}
+
+\subsubsection{Codificaci\'on de aristas (\texttt{edge\_attr})}
+La variante \texttt{HeteroGATWithEdgeEncoder} agrega un MLP de aristas
+(\texttt{EdgeAttrEncoder}) antes de la atenci\'on. Motivaci\'on:
+\begin{itemize}[leftmargin=*]
+  \item los deltas \(\Delta x\) pueden tener escalas heterog\'eneas;
+  \item un mapeo aprendido puede inducir una geometr\'ia m\'as estable para la atenci\'on;
+  \item permite estudiar de forma separada el efecto de ``mejor \texttt{edge\_attr}'' vs. ``mejor head temporal''.
+\end{itemize}
+
+\subsubsection{Heads temporales y ensamblado de secuencias}
+Los heads temporales reutilizan la infraestructura de \texttt{TemporalAggregator}:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{update\_cache(...)} para cache global o parcial de embeddings.
+  \item \texttt{\_build\_sequence\_batch(...)} para reconstruir tensores \([B, L, D]\) usando \texttt{sequence\_rows}.
+\end{itemize}
+Esto permite cambiar el operador temporal (GRU/Transformer/Attention Pooling) sin cambiar el
+contrato del entrenamiento en \texttt{src/train\_pretrain.py} ni la firma de \texttt{forward}.
+
+\subsubsection{Estrategias de cache temporal (punto cr\'itico)}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\texttt{incremental}}: cache por batch (hist\'orico, menor costo, m\'as dependiente del sampler).
+  \item \textbf{\texttt{global\_epoch}}: priming por \'epoca con forward global (\texttt{compute\_epoch\_embeddings}), luego training/eval usan cache consistente.
+\end{itemize}
+\textbf{Recomendaci\'on para art\'iculo/ciencia}: usar \texttt{global\_epoch} para que las secuencias
+temporales tengan la misma referencia de embeddings dentro de una \'epoca.
+
+\subsubsection{Matriz experimental recomendada}
+\begin{enumerate}[leftmargin=*]
+  \item \texttt{gat\_snapshot} (baseline espacial)
+  \item \texttt{gat\_gru}
+  \item \texttt{gat\_transformer}
+  \item \texttt{gat\_edge\_mlp\_gru}
+  \item \texttt{gnn\_edge\_aware\_gru} (o \texttt{gnn\_edge\_aware\_transformer})
+\end{enumerate}
+Mantener semilla, split temporal, \texttt{SequenceIndex} y protocolo de evaluaci\'on constantes.
+
+\subsubsection{M\'etricas para eventos raros}
+Para comparaci\'on cient\'ifica y operativa, priorizar:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{PR-AUC / AUPRC}: m\'etrica principal en desbalance severo.
+  \item \textbf{ROC-AUC}: referencia secundaria.
+  \item \textbf{Recall@FAR/FPR objetivo}: util para restricciones operacionales.
+  \item \textbf{MCC}: robusta cuando hay fuerte asimetr\'ia de clases.
+\end{itemize}
+
+\subsubsection{Trazabilidad de variantes}
+El entrenamiento y HPO guardan \texttt{gnn\_variant} y \texttt{variant\_tag}
+en sidecars de hiperpar\'ametros, checkpoints y logs estructurados
+(\texttt{Resultados/gat\_model\_BEST*.pt}, \texttt{\_hparams.json}, Optuna CSVs).
+Esto evita mezclar checkpoints de arquitecturas incompatibles.
+
 \section{Entrenamiento y optimizaci\'on}
 \textbf{Punto de entrada}: \texttt{src/gnn\_main.py::run\_gat\_training}.
 
@@ -177,7 +279,7 @@ se usan \emph{extras} en cero para alinear dimensiones.
   \item \textbf{ImGAGN autom\'atico} (si \texttt{AUTO\_IMGAGN\_PRETRAIN=1}).
   \item \textbf{GraphSMOTE}: elecci\'on por usuario/flag y detecci\'on de sint\'eticos existentes.
   \item \textbf{HPO}: selecci\'on de \texttt{optuna\_hyperparams\_*.csv} o b\'usqueda nueva.
-  \item \textbf{Modelo}: instancia de \texttt{HeteroGAT}; si hay \texttt{SequenceIndex}, se agrega \texttt{TemporalAggregator}.
+  \item \textbf{Modelo}: f\'abrica \texttt{\_build\_gnn\_model} selecciona encoder/temporal head seg\'un \texttt{gnn\_variant} y adjunta el head temporal cuando aplica.
   \item \textbf{Decodificadores z\textrightarrow x}: entrenados si GraphSMOTE activo (\texttt{train\_z2x\_decoders}).
   \item \textbf{Edge generator}: \texttt{RelEdgeGen} para reconstrucci\'on y aristas sint\'eticas.
   \item \textbf{P\'erdida}: \texttt{CrossEntropy} o \texttt{FocalLoss} (con/ sin pesos).

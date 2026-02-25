@@ -12,7 +12,14 @@ import re
 from datetime import datetime
 import numpy as np
 import torch 
-from torch_geometric.loader import NeighborLoader 
+from torch_geometric.data import Data
+from torch_geometric.loader import (
+    NeighborLoader,
+    ClusterData,
+    GraphSAINTNodeSampler,
+    GraphSAINTEdgeSampler,
+    GraphSAINTRandomWalkSampler,
+)
 import torch.nn.functional as F 
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_curve, average_precision_score, matthews_corrcoef
 import optuna 
@@ -43,9 +50,10 @@ except Exception:
 from src.graph import build_graph
 from src.features import compute_pm_features, compute_pm_features_streaming
 from src.train_pretrain import train_minibatch, pretrain_edge_generator
-from src.gat_model import HeteroGAT
+from src.gat_model import HeteroGAT, HeteroGATWithEdgeEncoder, HeteroEdgeAware
 from src.temporal_head import TemporalAggregator
-from src.graphsmote import (RelEdgeGen,train_z2x_decoders,augment_graph_offline_once, refresh_synthetics_online)
+from src.temporal_heads import TemporalGRUHead, TemporalTransformerHead, TemporalAttnPoolHead
+from src.graphsmote import (RelEdgeGen,train_z2x_decoders,augment_graph_offline_once, refresh_synthetics_online, compute_epoch_embeddings)
 from src.imgagn import ImGAGNConfig, train_imgagn
 from src.optimizers import get_optimizer_cls
 from src.config import (SEED,DT_MINUTES,MAX_EPOCHS,EARLY_STOPPING_PATIENCE,EARLY_STOPPING_MIN_DELTA,RESULTADOS_DIR,
@@ -54,7 +62,7 @@ from src.config import (SEED,DT_MINUTES,MAX_EPOCHS,EARLY_STOPPING_PATIENCE,EARLY
                         GRAPHSMOTE_K, PRETRAIN_EDGE_EPOCHS, SMOTE_EVERY_N_EPOCHS,
                         GS_SEED, SAVE_AUG_GRAPH_PATH, DECODER_EPOCHS, F_BETA_THRESHOLD, XAI,
                         EXPORT_LEGACY_GAT_CSV, SAVE_GAT_ALIASES, AUTO_IMGAGN_PRETRAIN,
-                        AUTOCALIBRATE_PROBS, get_auto_device)
+                        AUTOCALIBRATE_PROBS, GNN_VARIANT, GNN_TEMPORAL_CACHE_STRATEGY, get_auto_device)
 from src.mlp_tabular import run_mlp_tabular_pipeline
 from src.transformer_ts import run_transformer_ts_pipeline
 from src.xgboost import run_xgboost_pipeline
@@ -113,7 +121,65 @@ def _has_imgagn(loaded_obj) -> bool:
     except Exception:
         return False
 
-def _model_tag_suffix(use_graphsmote: bool, loaded_obj) -> str:
+def _normalize_gnn_variant(value: Optional[str] = None) -> str:
+    raw = value
+    if raw is None:
+        raw = os.environ.get("SUMO_GNN_VARIANT") or os.environ.get("GNN_VARIANT") or GNN_VARIANT
+    raw = str(raw or "gat_gru").strip().lower()
+    raw = raw.replace("+", "_").replace("-", "_")
+    raw = re.sub(r"[^a-z0-9_]+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    aliases = {
+        "gat": "gat_snapshot",
+        "baseline": "gat_snapshot",
+        "snapshot": "gat_snapshot",
+        "gat_temporal": "gat_gru",
+        "temporal_gru": "gat_gru",
+        "gru": "gat_gru",
+        "temporal_lstm": "gat_gru",
+        "lstm": "gat_gru",
+        "transformer": "gat_transformer",
+        "attnpool": "gat_attnpool",
+        "attn_pool": "gat_attnpool",
+        "gat_edge_mlp_temporal": "gat_edge_mlp_gru",
+        "gat_edge_mlp_transformer_temporal": "gat_edge_mlp_transformer",
+        "edge_aware": "gnn_edge_aware",
+    }
+    return aliases.get(raw, raw or "gat_gru")
+
+
+def _parse_gnn_variant(value: Optional[str] = None) -> dict:
+    name = _normalize_gnn_variant(value)
+    encoder_kind = "gat"
+    if name.startswith("gnn_edge_aware"):
+        encoder_kind = "edge_aware"
+    temporal_kind = "snapshot"
+    for kind in ("attnpool", "transformer", "gru", "snapshot"):
+        if name.endswith(f"_{kind}") or name == f"gat_{kind}":
+            temporal_kind = kind
+            break
+    if name in {"gat_gru", "gat_transformer", "gat_attnpool"}:
+        temporal_kind = name.split("_", 1)[1]
+    if name in {"gat_edge_mlp", "gnn_edge_aware"}:
+        temporal_kind = "snapshot"
+    use_edge_mlp = "edge_mlp" in name
+    return {
+        "name": name,
+        "encoder_kind": encoder_kind,
+        "temporal_kind": temporal_kind,
+        "use_edge_mlp": use_edge_mlp,
+    }
+
+
+def _gnn_variant_tag_component(gnn_variant: Optional[str] = None) -> str:
+    return f"GNN_{_normalize_gnn_variant(gnn_variant)}"
+
+
+def _variant_has_temporal_head(gnn_variant: Optional[str] = None) -> bool:
+    return _parse_gnn_variant(gnn_variant)["temporal_kind"] != "snapshot"
+
+
+def _model_tag_suffix(use_graphsmote: bool, loaded_obj, gnn_variant: Optional[str] = None) -> str:
     tags = []
     # If not explicitly forced by caller, check if the graph filename already implies GraphSMOTE
     fn = str(loaded_obj.get('filename', '')).lower()
@@ -123,9 +189,10 @@ def _model_tag_suffix(use_graphsmote: bool, loaded_obj) -> str:
         tags.append('GraphSMOTE')
     if _has_imgagn(loaded_obj):
         tags.append('ImGAGN')
+    tags.append(_gnn_variant_tag_component(gnn_variant))
     return ("_" + "_".join(tags)) if tags else ""
 
-def _variant_tags(use_graphsmote: bool, loaded_obj) -> str:
+def _variant_tags(use_graphsmote: bool, loaded_obj, gnn_variant: Optional[str] = None) -> str:
     """Return a variant tag for filenames: _GraphSMOTE/_ImGAGN, else _Base."""
     parts = []
     if use_graphsmote:
@@ -139,11 +206,197 @@ def _variant_tags(use_graphsmote: bool, loaded_obj) -> str:
         parts.append("ImGAGN")
     if not parts:
         parts.append("Base")
+    parts.append(_gnn_variant_tag_component(gnn_variant))
     return "_" + "_".join(parts)
 
-def _find_best_model_path(use_graphsmote: bool, loaded_obj, best_params: Optional[dict] = None) -> Optional[str]:
+def _build_temporal_head_for_variant(
+    *,
+    gnn_variant: Optional[str],
+    sequence_index,
+    num_nodes: int,
+    embedding_dim: int,
+    num_classes: int,
+    dropout: float = 0.0,
+    cache_strategy: Optional[str] = None,
+):
+    variant_cfg = _parse_gnn_variant(gnn_variant)
+    if variant_cfg["temporal_kind"] == "snapshot":
+        return None
+    if not sequence_index or getattr(sequence_index, "sequence_rows", None) is None:
+        return None
+    try:
+        if int(np.size(sequence_index.sequence_rows)) == 0:
+            return None
+    except Exception:
+        return None
+
+    seq_rows_tensor = torch.as_tensor(sequence_index.sequence_rows, dtype=torch.long)
+    target_rows_tensor = torch.as_tensor(sequence_index.target_rows, dtype=torch.long)
+    seq_len = int(sequence_index.sequence_rows.shape[1])
+    temporal_hidden_dim = embedding_dim
+    cache_mode = str(cache_strategy or GNN_TEMPORAL_CACHE_STRATEGY or "incremental").strip().lower()
+
+    temporal_kind = variant_cfg["temporal_kind"]
+    if temporal_kind == "gru":
+        head_cls = TemporalGRUHead
+        extra_kwargs = {}
+    elif temporal_kind == "transformer":
+        head_cls = TemporalTransformerHead
+        extra_kwargs = {
+            "num_heads": 4,
+            "num_layers": 2,
+            "dropout": float(dropout),
+        }
+    elif temporal_kind == "attnpool":
+        head_cls = TemporalAttnPoolHead
+        extra_kwargs = {"dropout": float(dropout)}
+    else:
+        # Fallback conservador al head existente.
+        head_cls = TemporalAggregator
+        extra_kwargs = {}
+
+    return head_cls(
+        sequence_rows=seq_rows_tensor,
+        target_rows=target_rows_tensor,
+        num_nodes=int(num_nodes),
+        embedding_dim=int(embedding_dim),
+        sequence_length=seq_len,
+        hidden_dim=int(temporal_hidden_dim),
+        num_classes=int(num_classes),
+        cache_strategy=cache_mode,
+        **extra_kwargs,
+    )
+
+
+def _build_gnn_model(
+    *,
+    in_channels: int,
+    hidden_channels: int,
+    out_channels: int,
+    num_heads: int,
+    dropout: float,
+    edge_feature_dim: int,
+    num_layers: int,
+    use_checkpointing: bool = False,
+    aggr1: str = "sum",
+    aggr2: str = "sum",
+    gnn_variant: Optional[str] = None,
+    sequence_index=None,
+    num_nodes: Optional[int] = None,
+    device=None,
+):
+    variant_cfg = _parse_gnn_variant(gnn_variant)
+    model_kwargs = dict(
+        in_channels=in_channels,
+        hidden_channels=int(hidden_channels),
+        out_channels=int(out_channels),
+        num_heads=int(num_heads),
+        dropout=float(dropout),
+        edge_feature_dim=int(edge_feature_dim),
+        num_layers=int(num_layers),
+        use_checkpointing=bool(use_checkpointing),
+        aggr1=aggr1,
+        aggr2=aggr2,
+    )
+
+    if variant_cfg["encoder_kind"] == "edge_aware":
+        model = HeteroEdgeAware(**model_kwargs)
+    elif variant_cfg["use_edge_mlp"]:
+        raw_edge_dim = int(edge_feature_dim or 0)
+        edge_hidden = max(8, raw_edge_dim * 2) if raw_edge_dim > 0 else 8
+        model = HeteroGATWithEdgeEncoder(
+            **model_kwargs,
+            edge_encoder_hidden_dim=edge_hidden,
+            edge_encoded_dim=raw_edge_dim,
+            edge_encoder_dropout=float(dropout) * 0.5,
+        )
+    else:
+        model = HeteroGAT(**model_kwargs)
+
+    model.gnn_variant = variant_cfg["name"]
+
+    if _variant_has_temporal_head(variant_cfg["name"]):
+        temporal_head = _build_temporal_head_for_variant(
+            gnn_variant=variant_cfg["name"],
+            sequence_index=sequence_index,
+            num_nodes=int(num_nodes or 0),
+            embedding_dim=int(hidden_channels) * int(num_heads),
+            num_classes=int(out_channels),
+            dropout=float(dropout),
+        )
+        if temporal_head is not None:
+            model.temporal_head = temporal_head
+            model.temporal_head.reset_cache()
+            model.temporal_head.train()
+    elif hasattr(model, 'temporal_head'):
+        delattr(model, 'temporal_head')
+
+    if device is not None:
+        model = model.to(device)
+    return model
+
+
+@torch.no_grad()
+def _prime_temporal_cache_if_needed(model, graph, node_type: str = "pm", context: str = "") -> bool:
+    temporal_module = getattr(model, "temporal_head", None)
+    if temporal_module is None:
+        return False
+    cache_strategy = str(getattr(temporal_module, "cache_strategy", "incremental")).strip().lower()
+    if cache_strategy != "global_epoch":
+        return False
+
+    was_training = bool(model.training)
+    prev_checkpointing = getattr(model, "use_checkpointing", None)
+    try:
+        temporal_module.reset_cache()
+        if not hasattr(graph, "edge_attr_dict"):
+            graph.edge_attr_dict = {
+                et: getattr(graph[et], "edge_attr", None)
+                for et in getattr(graph, "edge_types", [])
+            }
+        model.eval()
+        if prev_checkpointing is not None:
+            model.use_checkpointing = False
+        z_dict = compute_epoch_embeddings(model, graph)
+        z_pm = z_dict.get(node_type)
+        if z_pm is None:
+            return False
+        temporal_module.update_cache(z_pm)
+        return True
+    except Exception as exc:
+        try:
+            logger.warning(
+                f"No se pudo primar el caché temporal global"
+                f"{' (' + context + ')' if context else ''}: {exc}. Se usará caché incremental."
+            )
+        except Exception:
+            pass
+        return False
+    finally:
+        if prev_checkpointing is not None:
+            try:
+                model.use_checkpointing = prev_checkpointing
+            except Exception:
+                pass
+        model.train(was_training)
+        try:
+            if temporal_module is not None:
+                temporal_module.train(was_training)
+        except Exception:
+            pass
+
+
+def _find_best_model_path(
+    use_graphsmote: bool,
+    loaded_obj,
+    best_params: Optional[dict] = None,
+    gnn_variant: Optional[str] = None,
+) -> Optional[str]:
     # Try exact tag match first
-    tag = _model_tag_suffix(use_graphsmote, loaded_obj)
+    want_variant = gnn_variant
+    if want_variant is None and isinstance(best_params, dict):
+        want_variant = best_params.get("gnn_variant")
+    tag = _model_tag_suffix(use_graphsmote, loaded_obj, gnn_variant=want_variant)
     exact = os.path.join(RESULTADOS_DIR, f"gat_model_BEST{tag}.pt")
     if os.path.exists(exact):
         return exact
@@ -153,6 +406,7 @@ def _find_best_model_path(use_graphsmote: bool, loaded_obj, best_params: Optiona
         base = os.path.join(RESULTADOS_DIR, "gat_model_BEST.pt")
         return base if os.path.exists(base) else None
     preferred = []
+    want_variant_component = _gnn_variant_tag_component(want_variant)
     for f in files:
         name = os.path.basename(f)
         if use_graphsmote and "_GraphSMOTE" not in name:
@@ -160,6 +414,8 @@ def _find_best_model_path(use_graphsmote: bool, loaded_obj, best_params: Optiona
         if (not use_graphsmote) and "_GraphSMOTE" in name:
             continue
         if _has_imgagn(loaded_obj) and "_ImGAGN" not in name:
+            continue
+        if "_GNN_" in name and want_variant_component not in name:
             continue
         preferred.append(f)
     if preferred:
@@ -281,6 +537,13 @@ def _gather_gat_models_listing() -> list[dict]:
                 variant.insert(0, 'Base')
         if "_ImGAGN" in name:
             variant.append('ImGAGN')
+        gnn_variant_meta = None
+        try:
+            gnn_variant_meta = meta.get('gnn_variant')
+        except Exception:
+            gnn_variant_meta = None
+        if gnn_variant_meta:
+            variant.append(str(gnn_variant_meta))
         # Arch from meta or infer from state dict
         arch = {}
         if all(k in meta for k in ('hidden_channels','num_heads','num_layers')):
@@ -389,6 +652,162 @@ def _safe_cast(value, cast_type, default):
     except Exception:
         return default
 
+def _make_exhaustive_num_neighbors(edge_types, num_layers: int) -> dict:
+    layers = max(int(num_layers), 1)
+    profile = [-1] * layers
+    return {edge_type: profile for edge_type in edge_types}
+
+def _build_pm_homogeneous_view(graph, node_type: str = "pm") -> Optional[Data]:
+    try:
+        if node_type not in graph.node_types:
+            return None
+        num_nodes = int(graph[node_type].num_nodes)
+        if num_nodes <= 0:
+            return None
+        edge_chunks = []
+        for edge_type in graph.edge_types:
+            src, _, dst = edge_type
+            if src != node_type or dst != node_type:
+                continue
+            edge_index = getattr(graph[edge_type], "edge_index", None)
+            if edge_index is None or edge_index.numel() == 0:
+                continue
+            edge_chunks.append(edge_index.cpu())
+        if not edge_chunks:
+            return None
+        edge_index = torch.cat(edge_chunks, dim=1)
+        view = Data(num_nodes=num_nodes, edge_index=edge_index)
+        view.orig_nid = torch.arange(num_nodes, dtype=torch.long)
+        return view
+    except Exception:
+        return None
+
+def _cluster_gcn_seed_order(
+    pm_view: Data,
+    base_seeds: torch.Tensor,
+    *,
+    num_parts: int,
+    clusters_per_epoch: int,
+    deterministic: bool,
+    seed: int,
+    epoch: int,
+) -> torch.Tensor:
+    if base_seeds.numel() == 0:
+        return base_seeds
+    try:
+        cluster_data = ClusterData(
+            pm_view,
+            num_parts=max(int(num_parts), 2),
+            recursive=False,
+            log=False,
+        )
+        partptr = cluster_data.partition.partptr.cpu()
+        node_perm = cluster_data.partition.node_perm.cpu()
+        n_parts = int(partptr.numel() - 1)
+        if n_parts <= 0:
+            return base_seeds
+
+        part_ids = torch.arange(n_parts)
+        if deterministic:
+            gen = torch.Generator()
+            gen.manual_seed(int(seed) + int(epoch))
+            part_ids = part_ids[torch.randperm(n_parts, generator=gen)]
+        else:
+            part_ids = part_ids[torch.randperm(n_parts)]
+
+        keep_parts = int(clusters_per_epoch) if int(clusters_per_epoch) > 0 else n_parts
+        part_ids = part_ids[: min(keep_parts, n_parts)]
+
+        seed_mask = torch.zeros(pm_view.num_nodes, dtype=torch.bool)
+        seed_mask[base_seeds.cpu()] = True
+        selected = []
+        for part_id in part_ids.tolist():
+            lo = int(partptr[part_id].item())
+            hi = int(partptr[part_id + 1].item())
+            nodes = node_perm[lo:hi]
+            nodes = nodes[seed_mask[nodes]]
+            if nodes.numel() > 0:
+                selected.append(nodes)
+
+        if not selected:
+            return base_seeds
+        return torch.cat(selected, dim=0).to(base_seeds.device)
+    except Exception as exc:
+        logger.warning(f"No se pudo aplicar sampler Cluster-GCN: {exc}. Se usará NeighborLoader.")
+        return base_seeds
+
+def _graphsaint_seed_sample(
+    pm_view: Data,
+    base_seeds: torch.Tensor,
+    *,
+    mode: str,
+    batch_size: int,
+    num_steps: int,
+    walk_length: int,
+    deterministic: bool,
+    seed: int,
+    epoch: int,
+) -> torch.Tensor:
+    if base_seeds.numel() == 0:
+        return base_seeds
+    try:
+        sample_mode = str(mode or "node").strip().lower()
+        saint_data = pm_view.clone()
+        saint_data.train_seed_mask = torch.zeros(saint_data.num_nodes, dtype=torch.bool)
+        saint_data.train_seed_mask[base_seeds.cpu()] = True
+
+        prev_cpu_state = torch.random.get_rng_state()
+        if deterministic:
+            torch.manual_seed(int(seed) + int(epoch))
+        try:
+            if sample_mode == "edge":
+                saint_loader = GraphSAINTEdgeSampler(
+                    saint_data,
+                    batch_size=max(int(batch_size), 1),
+                    num_steps=max(int(num_steps), 1),
+                    log=False,
+                )
+            elif sample_mode in {"random_walk", "randomwalk", "rw"}:
+                saint_loader = GraphSAINTRandomWalkSampler(
+                    saint_data,
+                    batch_size=max(int(batch_size), 1),
+                    walk_length=max(int(walk_length), 1),
+                    num_steps=max(int(num_steps), 1),
+                    log=False,
+                )
+            else:
+                saint_loader = GraphSAINTNodeSampler(
+                    saint_data,
+                    batch_size=max(int(batch_size), 1),
+                    num_steps=max(int(num_steps), 1),
+                    log=False,
+                )
+
+            seen = torch.zeros(saint_data.num_nodes, dtype=torch.bool)
+            ordered = []
+            for sampled in saint_loader:
+                orig_nid = getattr(sampled, "orig_nid", None)
+                mask = getattr(sampled, "train_seed_mask", None)
+                if orig_nid is None or mask is None:
+                    continue
+                cand = orig_nid[mask.bool()].cpu()
+                if cand.numel() == 0:
+                    continue
+                cand = cand[~seen[cand]]
+                if cand.numel() == 0:
+                    continue
+                seen[cand] = True
+                ordered.append(cand)
+
+            if not ordered:
+                return base_seeds
+            return torch.cat(ordered, dim=0).to(base_seeds.device)
+        finally:
+            torch.random.set_rng_state(prev_cpu_state)
+    except Exception as exc:
+        logger.warning(f"No se pudo aplicar sampler GraphSAINT: {exc}. Se usará NeighborLoader.")
+        return base_seeds
+
 def _get_repo_version() -> Optional[str]:
     """Devuelve el commit corto de git si disponible, si no None."""
     try:
@@ -483,7 +902,8 @@ def run_gnn_anomaly_pipeline(loaded_obj):
     in_channels = data['pm'].x.shape[1]
     arch = chosen['arch']
     meta = chosen['meta']
-    model = HeteroGAT(
+    chosen_gnn_variant = meta.get('gnn_variant', GNN_VARIANT)
+    model = _build_gnn_model(
         in_channels=in_channels,
         hidden_channels=int(arch.get('hidden_channels') or meta.get('hidden_channels', 32)),
         out_channels=num_classes,
@@ -493,8 +913,12 @@ def run_gnn_anomaly_pipeline(loaded_obj):
         num_layers=int(arch.get('num_layers') or meta.get('num_layers', len(NUM_NEIGHBORS))),
         use_checkpointing=False,
         aggr1=meta.get('aggr1', 'sum'),
-        aggr2=meta.get('aggr2', 'sum')
-    ).to(device)
+        aggr2=meta.get('aggr2', 'sum'),
+        gnn_variant=chosen_gnn_variant,
+        sequence_index=loaded_obj.get('sequence_index') if isinstance(loaded_obj, dict) else None,
+        num_nodes=data['pm'].num_nodes,
+        device=device,
+    )
 
     # Cargar pesos (elige el modelo correspondiente a la variante seleccionada)
     best_model_path = chosen['path']
@@ -1001,7 +1425,7 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 
 def make_epoch_seeds(g, node_type='pm', pos_to_neg_ratio=3.0, strategy='random',
-                     model=None, device=None, topk_hard=None):
+                     model=None, device=None, topk_hard=None, generator: Optional[torch.Generator] = None):
     """
     Devuelve índices (semillas) para entrenar esta época: todos los positivos + un subconjunto de negativos.
     - strategy = 'random'   → negativos al azar
@@ -1049,11 +1473,17 @@ def make_epoch_seeds(g, node_type='pm', pos_to_neg_ratio=3.0, strategy='random',
         order = torch.argsort(scores, descending=True)
         neg_keep = neg_idx[order[:n_neg_keep]]
     else:
-        perm = torch.randperm(neg_idx.numel())
+        if generator is not None:
+            perm = torch.randperm(neg_idx.numel(), generator=generator)
+        else:
+            perm = torch.randperm(neg_idx.numel())
         neg_keep = neg_idx[perm[:n_neg_keep]]
 
     seeds = torch.cat([pos_idx, neg_keep], dim=0)
-    seeds = seeds[torch.randperm(seeds.numel())]
+    if generator is not None:
+        seeds = seeds[torch.randperm(seeds.numel(), generator=generator)]
+    else:
+        seeds = seeds[torch.randperm(seeds.numel())]
     return seeds
 
 # --------------------------------------------------------------------------- #
@@ -1115,6 +1545,9 @@ class FocalLoss(torch.nn.Module):
 def prior_shift_adjust(p_train, p_real, p_hat):
     # p_train: prevalencia en entrenamiento; p_real: prevalencia real
     # p_hat: prob entrenada
+    eps = 1e-6
+    p_train = float(np.clip(p_train, eps, 1.0 - eps))
+    p_real = float(np.clip(p_real, eps, 1.0 - eps))
     odds = p_hat / np.clip(1 - p_hat, 1e-9, None)
     adj = odds * (p_real/(1-p_real)) / (p_train/(1-p_train))
     return adj / (1 + adj)
@@ -1246,6 +1679,7 @@ def test(
 
         if temporal_module is not None:
             temporal_module.reset_cache()
+            _prime_temporal_cache_if_needed(model, data, node_type=node_type, context=f"test:{mask_name}")
 
         for batch in loader:
             batch = batch.to(device)
@@ -1410,6 +1844,59 @@ def _calculate_graph_hash(graph_filename=None, graph_path=None):
         logger.error(f"Error al leer el archivo del grafo para hashear: {e}")
         return None
 
+def _normalize_objective_metric(metric: object) -> str:
+    raw = str(metric or "F1").strip()
+    key = raw.lower().replace("_", "-")
+    aliases = {
+        "f1": "F1",
+        "recall": "Recall",
+        "far": "FAR",
+        "recall-far": "Recall-FAR",
+        "f0.5": "F0.5",
+        "f05": "F0.5",
+        "auprc": "AUPRC",
+        "mcc": "MCC",
+        "accuracy": "Accuracy",
+    }
+    return aliases.get(key, "F1")
+
+def _score_from_objective_metrics(
+    objective_metric: str,
+    *,
+    f1: Optional[float],
+    recall: Optional[float],
+    far: Optional[float],
+    fbeta: Optional[float],
+    auprc: Optional[float],
+    mcc: Optional[float],
+    accuracy: Optional[float],
+) -> float:
+    def _safe(v: Optional[float], default: float = 0.0) -> float:
+        try:
+            fv = float(v)
+            return fv if math.isfinite(fv) else float(default)
+        except Exception:
+            return float(default)
+
+    metric = _normalize_objective_metric(objective_metric)
+    if metric == "F1":
+        return _safe(f1)
+    if metric == "Recall":
+        return _safe(recall)
+    if metric == "FAR":
+        return 1.0 - _safe(far)
+    if metric == "Recall-FAR":
+        return _safe(recall) - _safe(far)
+    if metric == "F0.5":
+        return _safe(fbeta)
+    if metric == "AUPRC":
+        return _safe(auprc)
+    if metric == "MCC":
+        return _safe(mcc)
+    if metric == "Accuracy":
+        return _safe(accuracy)
+    return _safe(f1)
+
 def run_gat_training(
     loaded_obj,
     force_use_graphsmote: Optional[bool] = None,
@@ -1426,6 +1913,18 @@ def run_gat_training(
     accumulation_steps: Optional[int] = None,
     resume_state_path: Optional[str] = None,
     save_state_path: Optional[str] = None,
+    train_sampler_mode: Optional[str] = None,
+    deterministic_sampling: Optional[bool] = None,
+    sampling_seed: Optional[int] = None,
+    disable_hard_undersampling: Optional[bool] = None,
+    cluster_gcn_num_parts: Optional[int] = None,
+    cluster_gcn_parts_per_epoch: Optional[int] = None,
+    graphsaint_mode: Optional[str] = None,
+    graphsaint_batch_size: Optional[int] = None,
+    graphsaint_num_steps: Optional[int] = None,
+    graphsaint_walk_length: Optional[int] = None,
+    eval_neighbors_mode: Optional[str] = None,
+    eval_num_neighbors: Optional[object] = None,
 ):
     """
     Entrenamiento GAT completo con:
@@ -1579,6 +2078,120 @@ def run_gat_training(
     if early_stop_min_delta is not None:
         best_params["early_stop_min_delta"] = float(early_stop_min_delta)
 
+    sampler_raw = train_sampler_mode if train_sampler_mode is not None else best_params.get("train_sampler_mode", best_params.get("sampler_mode", "neighbor"))
+    sampler_key = str(sampler_raw or "neighbor").strip().lower().replace("-", "_")
+    sampler_aliases = {
+        "neighbor": "neighbor",
+        "neighborloader": "neighbor",
+        "cluster_gcn": "cluster_gcn",
+        "clustergcn": "cluster_gcn",
+        "graphsaint": "graphsaint",
+    }
+    train_sampler_mode_resolved = sampler_aliases.get(sampler_key, "neighbor")
+
+    deterministic_sampling_resolved = bool(
+        deterministic_sampling if deterministic_sampling is not None else best_params.get("deterministic_sampling", False)
+    )
+    sampling_seed_resolved = int(
+        _safe_cast(
+            sampling_seed if sampling_seed is not None else best_params.get("sampling_seed"),
+            int,
+            SEED,
+        )
+    )
+    disable_hard_undersampling_resolved = bool(
+        disable_hard_undersampling
+        if disable_hard_undersampling is not None
+        else best_params.get("disable_hard_undersampling", False)
+    )
+
+    cluster_gcn_num_parts_resolved = int(
+        _safe_cast(
+            cluster_gcn_num_parts if cluster_gcn_num_parts is not None else best_params.get("cluster_gcn_num_parts"),
+            int,
+            64,
+        )
+    )
+    cluster_gcn_parts_per_epoch_resolved = int(
+        _safe_cast(
+            cluster_gcn_parts_per_epoch if cluster_gcn_parts_per_epoch is not None else best_params.get("cluster_gcn_parts_per_epoch"),
+            int,
+            0,
+        )
+    )
+    graphsaint_mode_resolved = str(
+        graphsaint_mode if graphsaint_mode is not None else best_params.get("graphsaint_mode", "node")
+    ).strip().lower()
+    if graphsaint_mode_resolved not in {"node", "edge", "random_walk"}:
+        graphsaint_mode_resolved = "node"
+    graphsaint_batch_size_resolved = int(
+        _safe_cast(
+            graphsaint_batch_size if graphsaint_batch_size is not None else best_params.get("graphsaint_batch_size"),
+            int,
+            2048,
+        )
+    )
+    graphsaint_num_steps_resolved = int(
+        _safe_cast(
+            graphsaint_num_steps if graphsaint_num_steps is not None else best_params.get("graphsaint_num_steps"),
+            int,
+            8,
+        )
+    )
+    graphsaint_walk_length_resolved = int(
+        _safe_cast(
+            graphsaint_walk_length if graphsaint_walk_length is not None else best_params.get("graphsaint_walk_length"),
+            int,
+            2,
+        )
+    )
+
+    eval_mode_raw = eval_neighbors_mode if eval_neighbors_mode is not None else best_params.get("eval_neighbors_mode", "same")
+    eval_mode_key = str(eval_mode_raw or "same").strip().lower().replace("-", "_")
+    eval_mode_aliases = {
+        "same": "same",
+        "train": "same",
+        "same_as_train": "same",
+        "exhaustive": "exhaustive",
+        "full": "exhaustive",
+        "custom": "custom",
+    }
+    eval_neighbors_mode_resolved = eval_mode_aliases.get(eval_mode_key, "same")
+    eval_num_neighbors_resolved = eval_num_neighbors if eval_num_neighbors is not None else best_params.get("eval_num_neighbors")
+    if eval_neighbors_mode_resolved == "custom" and eval_num_neighbors_resolved is None:
+        eval_num_neighbors_resolved = best_params.get("num_neighbors")
+
+    best_params["train_sampler_mode"] = train_sampler_mode_resolved
+    best_params["deterministic_sampling"] = bool(deterministic_sampling_resolved)
+    best_params["sampling_seed"] = int(sampling_seed_resolved)
+    best_params["disable_hard_undersampling"] = bool(disable_hard_undersampling_resolved)
+    best_params["cluster_gcn_num_parts"] = int(cluster_gcn_num_parts_resolved)
+    best_params["cluster_gcn_parts_per_epoch"] = int(cluster_gcn_parts_per_epoch_resolved)
+    best_params["graphsaint_mode"] = str(graphsaint_mode_resolved)
+    best_params["graphsaint_batch_size"] = int(graphsaint_batch_size_resolved)
+    best_params["graphsaint_num_steps"] = int(graphsaint_num_steps_resolved)
+    best_params["graphsaint_walk_length"] = int(graphsaint_walk_length_resolved)
+    best_params["eval_neighbors_mode"] = str(eval_neighbors_mode_resolved)
+    best_params["eval_num_neighbors"] = eval_num_neighbors_resolved
+
+    logger.info(
+        "Sampling config | mode=%s | deterministic=%s | seed=%d | disable_hard=%s | "
+        "cluster_parts=%d | cluster_parts_epoch=%d | saint_mode=%s | saint_batch=%d | saint_steps=%d | saint_walk=%d | "
+        "eval_neighbors_mode=%s | eval_num_neighbors=%s",
+        train_sampler_mode_resolved,
+        deterministic_sampling_resolved,
+        sampling_seed_resolved,
+        disable_hard_undersampling_resolved,
+        cluster_gcn_num_parts_resolved,
+        cluster_gcn_parts_per_epoch_resolved,
+        graphsaint_mode_resolved,
+        graphsaint_batch_size_resolved,
+        graphsaint_num_steps_resolved,
+        graphsaint_walk_length_resolved,
+        eval_neighbors_mode_resolved,
+        eval_num_neighbors_resolved,
+    )
+
     data.edge_attr_dict = { et: getattr(data[et], 'edge_attr', None) for et in data.edge_types }
 
     # 3) SummaryWriter + hparams
@@ -1600,7 +2213,8 @@ def run_gat_training(
     edge_feature_dim = _detect_edge_feature_dim(data, node_type='pm')
 
     in_channels = data['pm'].x.shape[1]
-    model = HeteroGAT(
+    gnn_variant = best_params.get('gnn_variant', GNN_VARIANT)
+    model = _build_gnn_model(
         in_channels=in_channels,
         hidden_channels=int(best_params['hidden_channels']),
         out_channels=num_classes,
@@ -1610,32 +2224,16 @@ def run_gat_training(
         num_layers=int(best_params.get('num_layers', 2)),
         aggr1=best_params.get('aggr1', 'sum'),
         aggr2=best_params.get('aggr2', 'sum'),
-        use_checkpointing=bool(best_params.get('use_checkpointing', False)), 
-    ).to(device)
-
-    sequence_index = loaded_obj.get('sequence_index')
-    temporal_module = None
-    if sequence_index and getattr(sequence_index, "sequence_rows", None) is not None:
-        if sequence_index.sequence_rows.size:
-            seq_rows_tensor = torch.as_tensor(sequence_index.sequence_rows, dtype=torch.long)
-            target_rows_tensor = torch.as_tensor(sequence_index.target_rows, dtype=torch.long)
-            temporal_module = TemporalAggregator(
-                sequence_rows=seq_rows_tensor,
-                target_rows=target_rows_tensor,
-                num_nodes=data['pm'].num_nodes,
-                embedding_dim=int(best_params['hidden_channels']) * int(best_params['num_heads']),
-                sequence_length=sequence_index.sequence_rows.shape[1],
-                hidden_dim=int(best_params['hidden_channels']) * int(best_params['num_heads']),
-                num_classes=num_classes,
-            ).to(device)
-            temporal_module.reset_cache()
-            temporal_module.train()
-            model.temporal_head = temporal_module
-    elif hasattr(model, 'temporal_head'):
-        delattr(model, 'temporal_head')
+        use_checkpointing=bool(best_params.get('use_checkpointing', False)),
+        gnn_variant=gnn_variant,
+        sequence_index=loaded_obj.get('sequence_index'),
+        num_nodes=data['pm'].num_nodes,
+        device=device,
+    )
+    temporal_module = getattr(model, 'temporal_head', None)
 
     # Rutas y directorios por modelo (usar mismo ID para z2x + modelo)
-    tag_suffix = _model_tag_suffix(use_graphsmote, loaded_obj)
+    tag_suffix = _model_tag_suffix(use_graphsmote, loaded_obj, gnn_variant=gnn_variant)
     ts_stamp_save = datetime.now().strftime('%Y%m%d_%H%M%S')
     graph_hash = _calculate_graph_hash(
         loaded_obj.get('filename'),
@@ -1843,34 +2441,144 @@ def run_gat_training(
         base_graph = data
 
     # 9) Loader y Scheduler
-    def create_loader(graph_to_load, use_undersampling=False, pos_to_neg_ratio=3.0,
-                      strategy='random', model=None, device=None, topk_hard=None):
-        """
-        Si use_undersampling=True → usa semillas por época (positivos + subset de negativos).
-        Si False → usa todos los train como semillas (comportamiento actual).
-        """
-        if use_undersampling:
-            seeds = make_epoch_seeds(
-                graph_to_load, node_type='pm',
-                pos_to_neg_ratio=pos_to_neg_ratio,
-                strategy=strategy, model=model, device=device, topk_hard=topk_hard
+    pm_view_cache = {"key": None, "view": None}
+
+    def _pm_view_for_graph(graph_to_load):
+        try:
+            key = (
+                int(graph_to_load["pm"].num_nodes),
+                tuple(
+                    int(graph_to_load[edge_type].edge_index.size(1))
+                    for edge_type in graph_to_load.edge_types
+                    if edge_type[0] == "pm" and edge_type[2] == "pm"
+                ),
             )
-            input_nodes = ('pm', seeds)
-        else:
-            train_idx = graph_to_load['pm'].train_mask.nonzero(as_tuple=False).view(-1)
-            input_nodes = ('pm', train_idx)
+        except Exception:
+            key = None
+        if key is not None and pm_view_cache.get("key") == key:
+            return pm_view_cache.get("view")
+        view = _build_pm_homogeneous_view(graph_to_load, node_type="pm")
+        pm_view_cache["key"] = key
+        pm_view_cache["view"] = view
+        return view
+
+    def _epoch_seed_generator(epoch_idx: int, offset: int = 0) -> Optional[torch.Generator]:
+        if not deterministic_sampling_resolved:
+            return None
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(sampling_seed_resolved) + int(epoch_idx) * 9973 + int(offset))
+        return gen
+
+    def _resolve_base_seeds(
+        graph_cpu,
+        *,
+        use_undersampling: bool,
+        strategy: str,
+        model,
+        device,
+        topk_hard,
+        epoch_idx: int,
+        pos_to_neg_ratio: float,
+    ) -> torch.Tensor:
+        if use_undersampling:
+            strategy_effective = str(strategy)
+            if disable_hard_undersampling_resolved and strategy_effective == "hard":
+                strategy_effective = "random"
+            return make_epoch_seeds(
+                graph_cpu,
+                node_type="pm",
+                pos_to_neg_ratio=pos_to_neg_ratio,
+                strategy=strategy_effective,
+                model=model if strategy_effective == "hard" else None,
+                device=device if strategy_effective == "hard" else None,
+                topk_hard=topk_hard,
+                generator=_epoch_seed_generator(epoch_idx, offset=11),
+            )
+        return graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1)
+
+    def _apply_sampler_mode(graph_cpu, base_seeds: torch.Tensor, epoch_idx: int) -> torch.Tensor:
+        if base_seeds.numel() == 0:
+            return base_seeds
+        if train_sampler_mode_resolved == "neighbor":
+            return base_seeds
+        pm_view = _pm_view_for_graph(graph_cpu)
+        if pm_view is None:
+            logger.warning("No hay vista homogénea PM para sampler alternativo. Se usará NeighborLoader.")
+            return base_seeds
+        if train_sampler_mode_resolved == "cluster_gcn":
+            return _cluster_gcn_seed_order(
+                pm_view,
+                base_seeds,
+                num_parts=cluster_gcn_num_parts_resolved,
+                clusters_per_epoch=cluster_gcn_parts_per_epoch_resolved,
+                deterministic=deterministic_sampling_resolved,
+                seed=sampling_seed_resolved,
+                epoch=epoch_idx,
+            )
+        if train_sampler_mode_resolved == "graphsaint":
+            return _graphsaint_seed_sample(
+                pm_view,
+                base_seeds,
+                mode=graphsaint_mode_resolved,
+                batch_size=graphsaint_batch_size_resolved,
+                num_steps=graphsaint_num_steps_resolved,
+                walk_length=graphsaint_walk_length_resolved,
+                deterministic=deterministic_sampling_resolved,
+                seed=sampling_seed_resolved,
+                epoch=epoch_idx,
+            )
+        return base_seeds
+
+    def create_loader(
+        graph_to_load,
+        use_undersampling=False,
+        pos_to_neg_ratio=3.0,
+        strategy='random',
+        model=None,
+        device=None,
+        topk_hard=None,
+        epoch_idx: int = 1,
+    ):
+        """
+        Construye loader por época con soporte de:
+        - undersampling de semillas (random/hard)
+        - sampler alternativo (neighbor/cluster_gcn/graphsaint) sobre semillas PM
+        - determinismo opcional (seed controlado por época)
+        """
+        graph_cpu = graph_to_load.cpu()
+        base_seeds = _resolve_base_seeds(
+            graph_cpu,
+            use_undersampling=bool(use_undersampling),
+            strategy=str(strategy),
+            model=model,
+            device=device,
+            topk_hard=topk_hard,
+            epoch_idx=int(epoch_idx),
+            pos_to_neg_ratio=float(pos_to_neg_ratio),
+        )
+        seeds = _apply_sampler_mode(graph_cpu, base_seeds, int(epoch_idx))
+        if seeds.numel() == 0:
+            seeds = base_seeds
+        input_nodes = ('pm', seeds)
 
         try:
             num_neighbors_cfg = loader_num_neighbors
         except Exception:
             num_neighbors_cfg = NUM_NEIGHBORS
 
+        loader_gen = _epoch_seed_generator(int(epoch_idx), offset=101)
+        shuffle_batches = True
+        if train_sampler_mode_resolved == "cluster_gcn":
+            # Preserva vecindad por partición para acercar comportamiento Cluster-GCN.
+            shuffle_batches = False
+
         return NeighborLoader(
-            graph_to_load.cpu(),
+            graph_cpu,
             input_nodes=input_nodes,
             num_neighbors=num_neighbors_cfg,
             batch_size=batch_size_hp,
-            shuffle=True
+            shuffle=shuffle_batches,
+            generator=loader_gen,
         )
 
     raw_undersample = best_params.get('undersample', None)
@@ -1878,13 +2586,15 @@ def run_gat_training(
     use_undersampling = bool(raw_undersample) if not auto_enable_hard else False
     pos_to_neg_ratio = float(_safe_cast(best_params.get('pos_to_neg_ratio'), float, 3.0))
     undersampling_strategy = str(best_params.get('undersampling_strategy', 'random'))
+    if disable_hard_undersampling_resolved and undersampling_strategy == 'hard':
+        undersampling_strategy = 'random'
     topk_hard = best_params.get('topk_hard', None)
     if topk_hard is not None:
         topk_hard = int(topk_hard)
 
     hard_sampling_warmup = max(0, int(_safe_cast(best_params.get('hard_sampling_warmup'), int, 1)))
 
-    if auto_enable_hard:
+    if auto_enable_hard and not disable_hard_undersampling_resolved:
         try:
             train_mask = data['pm'].train_mask
             if train_mask.sum() > 0:
@@ -1905,7 +2615,7 @@ def run_gat_training(
                 except Exception:
                     topk_hard = 512
 
-    def rebuild_train_loader(graph, strategy_override=None):
+    def rebuild_train_loader(graph, strategy_override=None, epoch_idx: int = 1):
         effective_strategy = strategy_override or undersampling_strategy
         return create_loader(
             graph,
@@ -1914,17 +2624,40 @@ def run_gat_training(
             strategy=effective_strategy,
             model=model if effective_strategy == 'hard' else None,
             device=device if effective_strategy == 'hard' else None,
-            topk_hard=topk_hard
+            topk_hard=topk_hard,
+            epoch_idx=int(epoch_idx),
         )
 
-    train_loader = rebuild_train_loader(train_graph)
+    train_loader = rebuild_train_loader(train_graph, epoch_idx=1)
     
     max_epochs = int(max_epochs) if max_epochs is not None else int(MAX_EPOCHS)
+    objective_metric = _normalize_objective_metric(best_params.get("objective_metric", "F1"))
+    objective_beta_default = 0.5 if objective_metric == "F0.5" else 1.0
+    objective_threshold_beta = float(
+        _safe_cast(
+            best_params.get("threshold_beta", best_params.get("f_beta_threshold")),
+            float,
+            objective_beta_default,
+        )
+    )
+    best_params["objective_metric"] = objective_metric
+    best_params["threshold_beta"] = float(objective_threshold_beta)
+
+    has_val_mask = hasattr(base_graph["pm"], "val_mask")
+    val_mask_count = int(base_graph["pm"].val_mask.sum().item()) if has_val_mask else 0
+    if val_mask_count == 0:
+        raise RuntimeError(
+            "No se encontro un split de validacion valido (val_mask vacio o ausente). "
+            "Aborta entrenamiento para evitar usar train_mask como validacion."
+        )
+
     _emit_training_event(
         "train_start",
         run_id,
         total=max_epochs,
         device=str(device),
+        gnn_variant=_normalize_gnn_variant(gnn_variant),
+        variant_tag=_variant_tags(use_graphsmote, loaded_obj, gnn_variant=gnn_variant),
         purpose=purpose or (loaded_obj.get("purpose") if isinstance(loaded_obj, dict) else None),
         use_graphsmote=bool(use_graphsmote),
         graphsmote_mode=str(GRAPHSMOTE_MODE),
@@ -1935,6 +2668,20 @@ def run_gat_training(
         smote_every_n_epochs=int(smote_every_override),
         target_pos_ratio=float(target_pos_ratio_override),
         accumulation_steps=int(accumulation_steps),
+        train_sampler_mode=str(train_sampler_mode_resolved),
+        deterministic_sampling=bool(deterministic_sampling_resolved),
+        sampling_seed=int(sampling_seed_resolved),
+        disable_hard_undersampling=bool(disable_hard_undersampling_resolved),
+        cluster_gcn_num_parts=int(cluster_gcn_num_parts_resolved),
+        cluster_gcn_parts_per_epoch=int(cluster_gcn_parts_per_epoch_resolved),
+        graphsaint_mode=str(graphsaint_mode_resolved),
+        graphsaint_batch_size=int(graphsaint_batch_size_resolved),
+        graphsaint_num_steps=int(graphsaint_num_steps_resolved),
+        graphsaint_walk_length=int(graphsaint_walk_length_resolved),
+        eval_neighbors_mode=str(eval_neighbors_mode_resolved),
+        eval_num_neighbors=eval_num_neighbors_resolved,
+        objective_metric=str(objective_metric),
+        objective_threshold_beta=float(objective_threshold_beta),
     )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -1950,6 +2697,7 @@ def run_gat_training(
     start_epoch = 1
     resume_best_val_f1 = 0.0
     resume_best_val_auprc = 0.0
+    resume_best_val_objective = float("-inf")
     resume_best_epoch = 0
     resume_patience_counter = 0
     if resume_state_path:
@@ -1965,6 +2713,12 @@ def run_gat_training(
                     start_epoch = int(ckpt.get("epoch", 0)) + 1
                     resume_best_val_f1 = float(ckpt.get("best_val_f1", 0.0))
                     resume_best_val_auprc = float(ckpt.get("best_val_auprc", 0.0))
+                    try:
+                        resume_best_val_objective = float(
+                            ckpt.get("best_val_objective_score", ckpt.get("best_val_f1", float("-inf")))
+                        )
+                    except Exception:
+                        resume_best_val_objective = float("-inf")
                     resume_best_epoch = int(ckpt.get("best_epoch", 0))
                     resume_patience_counter = int(ckpt.get("patience_counter", 0))
                     logger.info(
@@ -1977,6 +2731,9 @@ def run_gat_training(
     # 10) Loop de entrenamiento
     best_val_f1 = float(resume_best_val_f1)
     best_val_auprc = float(resume_best_val_auprc)
+    best_val_objective_score = float(resume_best_val_objective)
+    if not math.isfinite(best_val_objective_score):
+        best_val_objective_score = float("-inf")
     best_epoch = int(resume_best_epoch)
     patience_counter = int(resume_patience_counter)
     early_stop_enabled = bool(best_params.get("early_stop", True))
@@ -1993,6 +2750,8 @@ def run_gat_training(
                 total=max_epochs,
                 val_f1=None,
                 best_val_f1=best_val_f1,
+                best_val_objective_score=best_val_objective_score,
+                objective_metric=objective_metric,
                 patience=patience,
                 patience_counter=patience_counter,
             )
@@ -2032,14 +2791,28 @@ def run_gat_training(
         logger.info("XAI=0 (desactivado): no se capturarán atenciones. Se omitirá la regularización L2 de atenciones (lambda_l2_att>0) y se silenciarán avisos por época.")
         suppress_missing_att_warning = True
 
+    def _resolve_eval_neighbors_cfg(graph_for_eval):
+        if eval_neighbors_mode_resolved == "same":
+            return loader_num_neighbors
+        if eval_neighbors_mode_resolved == "exhaustive":
+            return _make_exhaustive_num_neighbors(
+                graph_for_eval.edge_types,
+                int(best_params.get("num_layers", 2)),
+            )
+        return _resolve_num_neighbors(
+            eval_num_neighbors_resolved,
+            loader_num_neighbors,
+            graph_for_eval.edge_types,
+        )
+
     stopped_early = False
     for epoch in range(start_epoch, max_epochs + 1):
         epoch_start_time = time.time()
-        if use_undersampling:
+        if use_undersampling or train_sampler_mode_resolved != "neighbor":
             strategy_now = undersampling_strategy
             if undersampling_strategy == 'hard' and epoch <= hard_sampling_warmup:
                 strategy_now = 'random'
-            train_loader = rebuild_train_loader(train_graph, strategy_override=strategy_now)
+            train_loader = rebuild_train_loader(train_graph, strategy_override=strategy_now, epoch_idx=epoch)
         # Refresco para modo ONLINE
         if enable_graphsmote_augment and use_graphsmote and GRAPHSMOTE_MODE == 'online' and epoch % smote_every_override == 0:
             logger.info(f"Epoch {epoch}: Refrescando nodos sintéticos (Online Mode)...")
@@ -2064,7 +2837,7 @@ def run_gat_training(
             strategy_now = undersampling_strategy
             if undersampling_strategy == 'hard' and epoch <= hard_sampling_warmup:
                 strategy_now = 'random'
-            train_loader = rebuild_train_loader(train_graph, strategy_override=strategy_now)  # Recargar el loader con configuración original
+            train_loader = rebuild_train_loader(train_graph, strategy_override=strategy_now, epoch_idx=epoch)  # Recargar el loader con configuración original
 
         # Rutina de entrenamiento
         model.train()
@@ -2084,6 +2857,8 @@ def run_gat_training(
         
         lambda_edge = float(best_params.get('lambda_edge', 1e-6))
         lambda_l2_att = float(best_params.get('lambda_l2_att', 0.0))
+
+        _prime_temporal_cache_if_needed(model, train_graph, node_type='pm', context=f"train_epoch_{epoch}")
         
         loss, cls_loss, edge_loss, l2_att_loss = train_minibatch(model, train_loader, optimizer, criterion,
                                   grad_clip_value=float(best_params.get('grad_clip', 1.0)),
@@ -2099,11 +2874,20 @@ def run_gat_training(
 
         # Validación (siempre sobre el grafo original)
         model.use_checkpointing = False
+        eval_neighbors_cfg = _resolve_eval_neighbors_cfg(base_graph)
         val_key = 'val_mask'
-        val_res = test(model, base_graph, node_type='pm', batch_size=batch_size_hp, masks=[val_key])
-        if not val_res:
-            val_key = 'train_mask'
-            val_res = test(model, base_graph, node_type='pm', batch_size=batch_size_hp, masks=[val_key])
+        val_res = test(
+            model,
+            base_graph,
+            node_type='pm',
+            batch_size=batch_size_hp,
+            masks=[val_key],
+            num_neighbors=eval_neighbors_cfg,
+        )
+        if not val_res or val_key not in val_res:
+            raise RuntimeError(
+                "No se pudieron obtener resultados sobre val_mask durante entrenamiento."
+            )
         if temporal_module is not None:
             temporal_module.train()
         model.use_checkpointing = True
@@ -2118,15 +2902,45 @@ def run_gat_training(
         val_auprc = None
         val_mcc = None
         val_tau = None
+        val_far = None
+        val_f05 = None
+        val_objective_score = None
         if val_res and val_key in val_res:
             y_true_val = val_res[val_key]['true'].numpy().ravel()
             y_prob1_val = val_res[val_key]['probs'][:, 1].numpy().ravel()
-            
+
+            score_f1 = None
+            score_recall = None
+            score_far = None
+            score_accuracy = None
+            score_f05 = None
+
             if len(np.unique(y_true_val)) > 1:
-                # Usar beta=1.0 para F1-score, consistente con la métrica de early stopping
+                # Métricas de referencia (F1 clásico con beta=1.0).
                 tau, P, R, f1_score = pick_tau_fbeta(y_true_val, y_prob1_val, beta=1.0)
                 val_f1 = f1_score
                 val_tau = tau
+
+                # Métricas alineadas al objetivo de HPO/final training.
+                tau_obj, p_obj, r_obj, fbeta_obj = pick_tau_fbeta(
+                    y_true_val, y_prob1_val, beta=float(objective_threshold_beta)
+                )
+                preds_obj = (y_prob1_val >= tau_obj).astype(int)
+                cm_obj = confusion_matrix(y_true_val, preds_obj, labels=[0, 1])
+                tn_obj, fp_obj, fn_obj, tp_obj = cm_obj.ravel()
+                total_obj = tn_obj + fp_obj + fn_obj + tp_obj
+
+                score_recall = float(tp_obj / (tp_obj + fn_obj)) if (tp_obj + fn_obj) else 0.0
+                score_far = float(fp_obj / (fp_obj + tn_obj)) if (fp_obj + tn_obj) else 0.0
+                score_accuracy = float((tp_obj + tn_obj) / total_obj) if total_obj else 0.0
+                score_f1 = float(
+                    2.0 * p_obj * r_obj / (p_obj + r_obj)
+                ) if (p_obj + r_obj) else 0.0
+
+                _, _, _, score_f05 = pick_tau_fbeta(y_true_val, y_prob1_val, beta=0.5)
+                val_far = float(score_far)
+                val_f05 = float(score_f05)
+
                 if writer:
                     try:
                         writer.add_scalar('Calibration/Val_tau', tau, epoch)
@@ -2147,6 +2961,42 @@ def run_gat_training(
             val_auprc = val_res[val_key].get('auprc')
             val_mcc = val_res[val_key].get('mcc')
 
+            if score_f1 is None:
+                score_f1 = float(val_f1 or 0.0)
+            if score_recall is None:
+                score_recall = float(val_recall_pos or 0.0)
+            if score_accuracy is None:
+                score_accuracy = float(val_accuracy or 0.0)
+            if score_f05 is None:
+                p_pos = float(val_precision_pos or 0.0)
+                r_pos = float(val_recall_pos or 0.0)
+                beta2 = 0.5 ** 2
+                score_f05 = (
+                    float((1 + beta2) * p_pos * r_pos / (beta2 * p_pos + r_pos))
+                    if (beta2 * p_pos + r_pos) > 0
+                    else 0.0
+                )
+                val_f05 = float(score_f05)
+            if score_far is None:
+                cm_fallback = val_res[val_key].get('cm')
+                if cm_fallback is not None and np.asarray(cm_fallback).shape == (2, 2):
+                    tn_c, fp_c, _, _ = np.asarray(cm_fallback).ravel()
+                    score_far = float(fp_c / (fp_c + tn_c)) if (fp_c + tn_c) else 0.0
+                else:
+                    score_far = 0.0
+                val_far = float(score_far)
+
+            val_objective_score = _score_from_objective_metrics(
+                objective_metric,
+                f1=score_f1,
+                recall=score_recall,
+                far=score_far,
+                fbeta=score_f05,
+                auprc=val_auprc,
+                mcc=val_mcc,
+                accuracy=score_accuracy,
+            )
+
             if writer:
                 try:
                     writer.add_scalar('Metrics/Val_F1_candidate', val_f1, epoch)
@@ -2160,13 +3010,24 @@ def run_gat_training(
                         writer.add_scalar('Metrics/Val_Recall_positive', val_recall_pos, epoch)
                     writer.add_scalar('Metrics/Val_AUPRC', val_auprc or 0.0, epoch)
                     writer.add_scalar('Metrics/Val_AUC', val_auc or 0.0, epoch)
+                    if val_far is not None:
+                        writer.add_scalar('Metrics/Val_FAR', val_far, epoch)
+                    if val_f05 is not None:
+                        writer.add_scalar('Metrics/Val_F0.5', val_f05, epoch)
+                    if val_objective_score is not None:
+                        writer.add_scalar('Metrics/Val_Objective', val_objective_score, epoch)
                 except Exception:
                     pass
 
         is_best = False
-        if (val_f1 - best_val_f1) > min_delta:
-            best_val_f1 = val_f1
-            best_val_auprc = val_res[val_key].get('auprc', 0.0) if val_res else 0.0
+        if (
+            val_objective_score is not None
+            and math.isfinite(float(val_objective_score))
+            and (float(val_objective_score) - float(best_val_objective_score)) > min_delta
+        ):
+            best_val_objective_score = float(val_objective_score)
+            best_val_f1 = float(val_f1)
+            best_val_auprc = float(val_auprc) if val_auprc is not None else 0.0
             best_epoch = epoch
             patience_counter = 0
             is_best = True
@@ -2183,16 +3044,21 @@ def run_gat_training(
             except Exception as e:
                 logger.error(f"No se pudo guardar el modelo en disco: {e}")
             logger.info(
-                f"Epoch {epoch:03d}: New best F1 Accidente (1) on validation: {val_f1:.4f}.\n"
+                f"Epoch {epoch:03d}: New best {objective_metric} on validation: {best_val_objective_score:.4f} (F1 ref={val_f1:.4f}).\n"
                 f"  → Guardado: {os.path.basename(best_model_path_unique)} (alias variante: {os.path.basename(best_model_path)}, alias global: gat_model_BEST.pt)"
             )
             # Guardar sidecar con hiperparámetros y metadatos del entrenamiento (para ambas rutas)
             try:
                 meta = dict(best_params)
                 meta.update({
+                    'gnn_variant': _normalize_gnn_variant(gnn_variant),
+                    'variant_tag': _variant_tags(use_graphsmote, loaded_obj, gnn_variant=gnn_variant),
                     'best_val_f1': float(best_val_f1),
+                    'best_val_objective_score': float(best_val_objective_score),
                     'best_val_auprc': float(best_val_auprc),
                     'best_epoch': int(best_epoch),
+                    'objective_metric': str(objective_metric),
+                    'objective_threshold_beta': float(objective_threshold_beta),
                     'use_graphsmote': bool(use_graphsmote),
                     'graphsmote_mode': str(GRAPHSMOTE_MODE),
                     'graph_hash': graph_hash,
@@ -2238,6 +3104,9 @@ def run_gat_training(
                     total=max_epochs,
                     val_f1=val_f1,
                     best_val_f1=best_val_f1,
+                    val_objective_score=val_objective_score,
+                    best_val_objective_score=best_val_objective_score,
+                    objective_metric=objective_metric,
                     patience=patience,
                     patience_counter=patience_counter,
                 )
@@ -2266,6 +3135,8 @@ def run_gat_training(
             run_id,
             epoch=int(epoch),
             total=int(max_epochs),
+            gnn_variant=_normalize_gnn_variant(gnn_variant),
+            variant_tag=_variant_tags(use_graphsmote, loaded_obj, gnn_variant=gnn_variant),
             train_loss=loss,
             train_cls_loss=cls_loss,
             train_edge_loss=edge_loss,
@@ -2279,11 +3150,17 @@ def run_gat_training(
             val_auc=val_auc,
             val_auprc=val_auprc,
             val_mcc=val_mcc,
+            val_far=val_far,
+            val_f05=val_f05,
             val_tau=val_tau,
             val_mask=val_key,
             best_val_f1=best_val_f1,
+            best_val_objective_score=best_val_objective_score,
             best_val_auprc=best_val_auprc,
             best_epoch=best_epoch,
+            objective_metric=objective_metric,
+            objective_threshold_beta=objective_threshold_beta,
+            val_objective_score=val_objective_score,
             is_best=is_best,
             patience=patience,
             patience_counter=patience_counter,
@@ -2292,6 +3169,8 @@ def run_gat_training(
             lambda_H=current_lambda_H,
             lambda_edge=lambda_edge,
             lambda_l2_att=lambda_l2_att,
+            train_sampler_mode=str(train_sampler_mode_resolved),
+            eval_neighbors_mode=str(eval_neighbors_mode_resolved),
             smote_synth_count=synth_count,
             epoch_time_sec=epoch_time_sec,
         )
@@ -2305,16 +3184,28 @@ def run_gat_training(
                     "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(),
                     "best_val_f1": float(best_val_f1),
+                    "best_val_objective_score": float(best_val_objective_score),
                     "best_val_auprc": float(best_val_auprc),
                     "best_epoch": int(best_epoch),
                     "patience_counter": int(patience_counter),
                     "run_id": run_id,
                     "graph_hash": graph_hash,
+                    "gnn_variant": _normalize_gnn_variant(gnn_variant),
+                    "variant_tag": _variant_tags(use_graphsmote, loaded_obj, gnn_variant=gnn_variant),
                     "use_graphsmote": bool(use_graphsmote),
+                    "objective_metric": str(objective_metric),
+                    "objective_threshold_beta": float(objective_threshold_beta),
+                    "train_sampler_mode": str(train_sampler_mode_resolved),
+                    "deterministic_sampling": bool(deterministic_sampling_resolved),
+                    "sampling_seed": int(sampling_seed_resolved),
+                    "eval_neighbors_mode": str(eval_neighbors_mode_resolved),
+                    "eval_num_neighbors": eval_num_neighbors_resolved,
                     "last_val_f1": float(val_f1) if val_f1 is not None else None,
+                    "last_val_objective_score": float(val_objective_score) if val_objective_score is not None else None,
                     "last_val_auc": float(val_auc) if val_auc is not None else None,
                     "last_val_auprc": float(val_auprc) if val_auprc is not None else None,
                     "last_val_mcc": float(val_mcc) if val_mcc is not None else None,
+                    "last_val_far": float(val_far) if val_far is not None else None,
                     "last_val_tau": float(val_tau) if val_tau is not None else None,
                     "epoch_time_sec": float(epoch_time_sec),
                 }
@@ -2349,11 +3240,17 @@ def run_gat_training(
         epochs_run=epochs_run,
         total=int(max_epochs),
         best_val_f1=best_val_f1,
+        best_val_objective_score=best_val_objective_score,
         best_val_auprc=best_val_auprc,
         best_epoch=best_epoch,
+        objective_metric=objective_metric,
+        objective_threshold_beta=objective_threshold_beta,
         stopped_early=stopped_early,
     )
-    logger.info(f"Training finished. Best F1: {best_val_f1:.4f} at epoch {best_epoch}.")
+    logger.info(
+        f"Training finished. Best {objective_metric}: {best_val_objective_score:.4f} "
+        f"(F1 ref={best_val_f1:.4f}) at epoch {best_epoch}."
+    )
 
 def pick_tau_fbeta(y_true, y_prob, beta=0.5):
     prec, rec, thr = precision_recall_curve(y_true, y_prob)
@@ -2420,6 +3317,8 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
 
         # Optimizador
         overrides = optimizer_overrides or {}
+        gnn_variant = overrides.get('gnn_variant', GNN_VARIANT)
+        trial.set_user_attr('gnn_variant', _normalize_gnn_variant(gnn_variant))
         accumulation_steps = int(overrides.get("accumulation_steps", ACCUMULATION_STEPS))
         
         lr_override = overrides.get('lr')
@@ -2483,31 +3382,23 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
         edge_feature_dim = _detect_edge_feature_dim(data, node_type='pm')
         in_channels = data['pm'].x.shape[1]
 
-        model = HeteroGAT(
-            in_channels=in_channels, hidden_channels=hidden_channels, out_channels=num_classes,
-            num_heads=num_heads, dropout=dropout, edge_feature_dim=edge_feature_dim,
-            num_layers=num_layers, aggr1=aggr1, aggr2=aggr2, use_checkpointing=use_checkpointing_flag
-        ).to(device)
-
-        temporal_module = None
-        if sequence_index_global and getattr(sequence_index_global, "sequence_rows", None) is not None:
-            if sequence_index_global.sequence_rows.size:
-                seq_rows_tensor = torch.as_tensor(sequence_index_global.sequence_rows, dtype=torch.long)
-                target_rows_tensor = torch.as_tensor(sequence_index_global.target_rows, dtype=torch.long)
-                temporal_module = TemporalAggregator(
-                    sequence_rows=seq_rows_tensor,
-                    target_rows=target_rows_tensor,
-                    num_nodes=data['pm'].num_nodes,
-                    embedding_dim=hidden_channels * num_heads,
-                    sequence_length=sequence_index_global.sequence_rows.shape[1],
-                    hidden_dim=hidden_channels * num_heads,
-                    num_classes=num_classes,
-                ).to(device)
-                temporal_module.reset_cache()
-                temporal_module.train()
-                model.temporal_head = temporal_module
-        elif hasattr(model, 'temporal_head'):
-            delattr(model, 'temporal_head')
+        model = _build_gnn_model(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            out_channels=num_classes,
+            num_heads=num_heads,
+            dropout=dropout,
+            edge_feature_dim=edge_feature_dim,
+            num_layers=num_layers,
+            aggr1=aggr1,
+            aggr2=aggr2,
+            use_checkpointing=use_checkpointing_flag,
+            gnn_variant=gnn_variant,
+            sequence_index=sequence_index_global,
+            num_nodes=data['pm'].num_nodes,
+            device=device,
+        )
+        temporal_module = getattr(model, 'temporal_head', None)
 
         edge_gen = RelEdgeGen({ntype: hidden_channels * num_heads for ntype in data.node_types}, data.edge_types).to(device) if use_graphsmote_search else None
         
@@ -2573,6 +3464,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             # Entrenamiento
             model.train()
             current_lambda_H = initial_lambda_H + (final_lambda_H - initial_lambda_H) * (epoch - 1) / max(NUM_EPOCHS_OPTUNA - 1, 1)
+            _prime_temporal_cache_if_needed(model, train_graph, node_type='pm', context=f"hpo_epoch_{epoch}")
             train_minibatch(
                 model, train_loader, optimizer, criterion, grad_clip_value=float(overrides.get('grad_clip', 1.0)), device=device,
                 use_amp=False, scaler=None, scheduler=None, writer=None, epoch=epoch,
@@ -2583,11 +3475,17 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
 
             # Validación periódica
             if epoch % 2 == 0:
-                val_results = test(model, base_graph, node_type='pm', batch_size=batch_size_candidate)
+                val_results = test(
+                    model,
+                    base_graph,
+                    node_type='pm',
+                    batch_size=batch_size_candidate,
+                    masks=['val_mask'],
+                )
                 if temporal_module is not None:
                     temporal_module.train()
                 if not val_results or 'val_mask' not in val_results:
-                    continue
+                    raise RuntimeError("No se pudo evaluar val_mask durante HPO.")
 
                 y_true_val = val_results['val_mask']['true'].numpy().ravel()
                 y_prob1_val = val_results['val_mask']['probs'][:, 1].numpy().ravel()
@@ -2598,7 +3496,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
                 auprc = average_precision_score(y_true_val, y_prob1_val)
                 tau, P, R, f05 = pick_tau_fbeta(y_true_val, y_prob1_val, beta=0.5)
                 
-                trial.report(auprc, epoch)
+                trial.report(f05, epoch)
                 if trial.should_prune():
                     raise optuna.TrialPruned()
 
@@ -2652,6 +3550,7 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
             # Filtrar por SMOTE y por ImGAGN si aplica; preferir coincidencias exactas de variante
             want_smote = bool(use_graphsmote_search)
             want_imgagn = _has_imgagn(loaded_obj)
+            want_gnn_component = _gnn_variant_tag_component(GNN_VARIANT)
             preferred = []
             fallback = []
             for p in candidates:
@@ -2659,6 +3558,8 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
                 has_smote = ("_GraphSMOTE" in name)
                 has_imgagn = ("_ImGAGN" in name)
                 has_base = ("_Base" in name)
+                if "_GNN_" in name and want_gnn_component not in name:
+                    continue
                 # Coincidencia exacta de ambos flags a la lista preferida
                 if (has_smote == want_smote) and (has_imgagn == want_imgagn):
                     preferred.append(p)
@@ -2694,6 +3595,14 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
     sequence_index_global = loaded_obj.get('sequence_index')
     sequence_config_global = loaded_obj.get('sequence_config')
 
+    has_val_mask = hasattr(data["pm"], "val_mask")
+    val_mask_count = int(data["pm"].val_mask.sum().item()) if has_val_mask else 0
+    if val_mask_count == 0:
+        raise RuntimeError(
+            "No se puede ejecutar HPO sin val_mask valido. "
+            "Cree un split temporal con validacion antes de lanzar Optuna."
+        )
+
     # Sampler y Pruner
     sampler = optuna.samplers.TPESampler(seed=SEED, multivariate=True, group=True)
     pruner  = optuna.pruners.HyperbandPruner(min_resource=3, max_resource=NUM_EPOCHS_OPTUNA, reduction_factor=3)
@@ -2702,7 +3611,7 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
     study_base = "gnn_optuna_main"
     if graph_hash:
         study_base = f"{study_base}_{graph_hash[:16]}"
-    variant_tag = _variant_tags(use_graphsmote_search, loaded_obj)
+    variant_tag = _variant_tags(use_graphsmote_search, loaded_obj, gnn_variant=GNN_VARIANT)
     study_base = f"{study_base}{variant_tag}"
     study_name = re.sub(r"[^A-Za-z0-9_\\-]", "_", study_base)
     storage_path = os.path.join(RESULTADOS_DIR, "optuna_studies.db")
@@ -2785,6 +3694,8 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
     for key, value in best.user_attrs.items():
         best_params[key] = value
     best_params['use_graphsmote'] = use_graphsmote_search
+    best_params['gnn_variant'] = _normalize_gnn_variant(best_params.get('gnn_variant', GNN_VARIANT))
+    best_params['variant_tag'] = _variant_tags(use_graphsmote_search, loaded_obj, gnn_variant=best_params['gnn_variant'])
     best_params.setdefault('undersample', 'auto')
     try:
         best_params['use_imgagn_aug'] = bool(_has_imgagn(loaded_obj))
@@ -2793,7 +3704,7 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # Etiquetas de variante
-    variant_tag = _variant_tags(use_graphsmote_search, loaded_obj)
+    variant_tag = _variant_tags(use_graphsmote_search, loaded_obj, gnn_variant=best_params.get('gnn_variant', GNN_VARIANT))
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
     os.makedirs(RESULTADOS_DIR, exist_ok=True)
 
@@ -2804,6 +3715,8 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
     trials_df = study.trials_dataframe()
     trials_df['use_graphsmote'] = use_graphsmote_search
     trials_df['graph_hash'] = graph_hash
+    trials_df['gnn_variant'] = _normalize_gnn_variant(best_params.get('gnn_variant', GNN_VARIANT))
+    trials_df['variant_tag'] = variant_tag
     full_study_path = os.path.join(RESULTADOS_DIR, f"optuna_full_study_{timestamp}{hash_tag}{variant_tag}.csv")
     trials_df.to_csv(full_study_path, index=False)
     logger.info(f"Estudio completo guardado en -> {os.path.basename(full_study_path)}")
@@ -3285,7 +4198,8 @@ def run_gat_testing(loaded_obj):
     edge_feature_dim = _detect_edge_feature_dim(data, node_type='pm')
 
     in_channels = data['pm'].x.shape[1]
-    model = HeteroGAT(
+    gnn_variant = best_params.get('gnn_variant', GNN_VARIANT)
+    model = _build_gnn_model(
         in_channels=in_channels,
         hidden_channels=best_params['hidden_channels'],
         out_channels=num_classes,
@@ -3295,11 +4209,20 @@ def run_gat_testing(loaded_obj):
         num_layers=int(best_params.get('num_layers', len(NUM_NEIGHBORS))),
         use_checkpointing=True,
         aggr1=best_params.get('aggr1', 'sum'),
-        aggr2=best_params.get('aggr2', 'sum')
-    ).to(device)
+        aggr2=best_params.get('aggr2', 'sum'),
+        gnn_variant=gnn_variant,
+        sequence_index=loaded_obj.get('sequence_index'),
+        num_nodes=data['pm'].num_nodes,
+        device=device,
+    )
 
     # 4. Cargar el estado del modelo entrenado
-    best_model_path = _find_best_model_path(use_graphsmote, loaded_obj)
+    best_model_path = _find_best_model_path(
+        use_graphsmote,
+        loaded_obj,
+        best_params=best_params,
+        gnn_variant=gnn_variant,
+    )
     if not best_model_path or not os.path.exists(best_model_path):
         print("❌ No se encontró un modelo GAT compatible. Por favor, entrene un modelo primero (opción g).")
         return
@@ -3326,14 +4249,13 @@ def run_gat_testing(loaded_obj):
     if tau is None:
         print("▶️ No se encontró `best_tau` en los hiperparámetros. Calculando umbral óptimo desde la validación...")
         # 1) Pase inicial para recolectar probabilidades en validación
-        initial_results = test(model, data, node_type='pm', threshold=None)
+        initial_results = test(model, data, node_type='pm', threshold=None, masks=['val_mask', 'train_mask'])
 
     if tau is None:
         if 'val_mask' not in initial_results:
-            print("⚠️ No hay val_mask; usaré train_mask para determinar umbral (menos ideal).")
-            mask_key = 'train_mask'
-        else:
-            mask_key = 'val_mask'
+            print("❌ No hay val_mask disponible para calibrar umbral. Abortando para evitar usar train_mask.")
+            return
+        mask_key = 'val_mask'
 
         if mask_key not in initial_results:
             print(f"Error: La máscara '{mask_key}' no se encontró en los resultados iniciales. Abortando.")
@@ -3368,7 +4290,7 @@ def run_gat_testing(loaded_obj):
             print(f"🔧 Umbral seleccionado en validación: tau={tau:.6f}  -> P={info.get('precision', float('nan')):.3f}, R={info.get('recall', float('nan')):.3f}")
 
     # 3) Pase final con ese umbral aplicado en TODOS los splits
-        final_results = test(model, data, node_type='pm', threshold=tau, calibration_model=platt_model)
+    final_results = test(model, data, node_type='pm', threshold=tau, calibration_model=platt_model)
     
     if not final_results:
         print("El test no produjo resultados. Verifique las máscaras de datos en el grafo.")

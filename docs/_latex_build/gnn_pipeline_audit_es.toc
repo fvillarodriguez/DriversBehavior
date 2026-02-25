@@ -1,46 +1,56 @@
 \babel@toc {spanish}{}\relax 
 \contentsline {section}{\numberline {1}Alcance y metodolog\'ia}{2}{section.1}%
-\contentsline {section}{\numberline {2}Mapa general del pipeline}{2}{section.2}%
+\contentsline {section}{\numberline {2}Mapa general del pipeline}{3}{section.2}%
 \contentsline {section}{\numberline {3}Pipeline \emph {tab a tab} (Streamlit Graph Builder)}{3}{section.3}%
 \contentsline {subsection}{\numberline {3.1}Eventos}{3}{subsection.3.1}%
 \contentsline {subsection}{\numberline {3.2}Feature Engineering}{3}{subsection.3.2}%
-\contentsline {subsection}{\numberline {3.3}Feature Explorer}{3}{subsection.3.3}%
-\contentsline {subsection}{\numberline {3.4}Feature Selection}{3}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.3}Feature Explorer}{4}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}Feature Selection}{4}{subsection.3.4}%
 \contentsline {subsection}{\numberline {3.5}Graph}{4}{subsection.3.5}%
 \contentsline {subsection}{\numberline {3.6}Visual Graph}{4}{subsection.3.6}%
 \contentsline {subsection}{\numberline {3.7}Network}{4}{subsection.3.7}%
 \contentsline {subsection}{\numberline {3.8}Optuna}{4}{subsection.3.8}%
 \contentsline {subsection}{\numberline {3.9}Balance}{4}{subsection.3.9}%
-\contentsline {subsection}{\numberline {3.10}Training}{4}{subsection.3.10}%
+\contentsline {subsection}{\numberline {3.10}Training}{5}{subsection.3.10}%
 \contentsline {subsection}{\numberline {3.11}Evaluaci\'on}{5}{subsection.3.11}%
 \contentsline {subsection}{\numberline {3.12}History}{5}{subsection.3.12}%
 \contentsline {subsection}{\numberline {3.13}Experiments}{5}{subsection.3.13}%
 \contentsline {section}{\numberline {4}Modelo de datos del grafo}{5}{section.4}%
 \contentsline {subsection}{\numberline {4.1}Aristas y atributos}{5}{subsection.4.1}%
 \contentsline {subsection}{\numberline {4.2}Etiquetado temporal}{5}{subsection.4.2}%
-\contentsline {section}{\numberline {5}Arquitectura del modelo GNN}{5}{section.5}%
+\contentsline {section}{\numberline {5}Arquitectura del modelo GNN}{6}{section.5}%
 \contentsline {subsection}{\numberline {5.1}Temporal head (opcional)}{6}{subsection.5.1}%
-\contentsline {section}{\numberline {6}Entrenamiento y optimizaci\'on}{6}{section.6}%
-\contentsline {subsection}{\numberline {6.1}Flujo del entrenamiento}{6}{subsection.6.1}%
-\contentsline {subsection}{\numberline {6.2}Train-minibatch y regularizaci\'on}{6}{subsection.6.2}%
-\contentsline {section}{\numberline {7}GraphSMOTE: s\'intesis de nodos y aristas}{7}{section.7}%
-\contentsline {subsection}{\numberline {7.1}Paso 1: embeddings}{7}{subsection.7.1}%
-\contentsline {subsection}{\numberline {7.2}Paso 2: SMOTE en embeddings}{7}{subsection.7.2}%
-\contentsline {subsection}{\numberline {7.3}Paso 3: decodificadores z\textrightarrow x}{7}{subsection.7.3}%
-\contentsline {subsection}{\numberline {7.4}Paso 4: inserci\'on de nodos}{7}{subsection.7.4}%
-\contentsline {subsection}{\numberline {7.5}Paso 5: generaci\'on de aristas sint\'eticas}{7}{subsection.7.5}%
-\contentsline {subsection}{\numberline {7.6}Modos de operaci\'on}{8}{subsection.7.6}%
-\contentsline {section}{\numberline {8}ImGAGN: generaci\'on adversarial}{8}{section.8}%
-\contentsline {subsection}{\numberline {8.1}Paso 1: homogenizaci\'on}{8}{subsection.8.1}%
-\contentsline {subsection}{\numberline {8.2}Paso 2: definir cantidad de sint\'eticos}{8}{subsection.8.2}%
-\contentsline {subsection}{\numberline {8.3}Paso 3: generador}{8}{subsection.8.3}%
-\contentsline {subsection}{\numberline {8.4}Paso 4: discriminador}{8}{subsection.8.4}%
-\contentsline {subsection}{\numberline {8.5}Paso 5: entrenamiento adversarial}{9}{subsection.8.5}%
-\contentsline {subsection}{\numberline {8.6}Paso 6: grafo final}{9}{subsection.8.6}%
-\contentsline {section}{\numberline {9}Optuna (b\'usqueda de hiperpar\'ametros)}{9}{section.9}%
-\contentsline {section}{\numberline {10}Evaluaci\'on, calibraci\'on y artefactos}{9}{section.10}%
-\contentsline {section}{\numberline {11}Auditor\'ia t\'ecnica y mejores pr\'acticas}{10}{section.11}%
-\contentsline {subsection}{\numberline {11.1}Fortalezas observadas}{10}{subsection.11.1}%
-\contentsline {subsection}{\numberline {11.2}Riesgos o puntos cr\'iticos (actualizado)}{10}{subsection.11.2}%
-\contentsline {subsection}{\numberline {11.3}Recomendaciones priorizadas (estado actual)}{10}{subsection.11.3}%
-\contentsline {section}{\numberline {12}Anexo: referencias a funciones y archivos}{10}{section.12}%
+\contentsline {subsection}{\numberline {5.2}Registro de variantes GNN (encoder + temporal + aristas)}{6}{subsection.5.2}%
+\contentsline {subsubsection}{\numberline {5.2.1}Idea general de comparabilidad}{6}{subsubsection.5.2.1}%
+\contentsline {paragraph}{Etiquetado ``5 minutos antes''}{6}{section*.2}%
+\contentsline {subsubsection}{\numberline {5.2.2}Variantes implementadas}{7}{subsubsection.5.2.2}%
+\contentsline {subsubsection}{\numberline {5.2.3}Codificaci\'on de aristas (\texttt {edge\_attr})}{7}{subsubsection.5.2.3}%
+\contentsline {subsubsection}{\numberline {5.2.4}Heads temporales y ensamblado de secuencias}{7}{subsubsection.5.2.4}%
+\contentsline {subsubsection}{\numberline {5.2.5}Estrategias de cache temporal (punto cr\'itico)}{7}{subsubsection.5.2.5}%
+\contentsline {subsubsection}{\numberline {5.2.6}Matriz experimental recomendada}{8}{subsubsection.5.2.6}%
+\contentsline {subsubsection}{\numberline {5.2.7}M\'etricas para eventos raros}{8}{subsubsection.5.2.7}%
+\contentsline {subsubsection}{\numberline {5.2.8}Trazabilidad de variantes}{8}{subsubsection.5.2.8}%
+\contentsline {section}{\numberline {6}Entrenamiento y optimizaci\'on}{8}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Flujo del entrenamiento}{8}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Train-minibatch y regularizaci\'on}{9}{subsection.6.2}%
+\contentsline {section}{\numberline {7}GraphSMOTE: s\'intesis de nodos y aristas}{9}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Paso 1: embeddings}{9}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Paso 2: SMOTE en embeddings}{9}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Paso 3: decodificadores z\textrightarrow x}{9}{subsection.7.3}%
+\contentsline {subsection}{\numberline {7.4}Paso 4: inserci\'on de nodos}{10}{subsection.7.4}%
+\contentsline {subsection}{\numberline {7.5}Paso 5: generaci\'on de aristas sint\'eticas}{10}{subsection.7.5}%
+\contentsline {subsection}{\numberline {7.6}Modos de operaci\'on}{10}{subsection.7.6}%
+\contentsline {section}{\numberline {8}ImGAGN: generaci\'on adversarial}{10}{section.8}%
+\contentsline {subsection}{\numberline {8.1}Paso 1: homogenizaci\'on}{10}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Paso 2: definir cantidad de sint\'eticos}{10}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}Paso 3: generador}{11}{subsection.8.3}%
+\contentsline {subsection}{\numberline {8.4}Paso 4: discriminador}{11}{subsection.8.4}%
+\contentsline {subsection}{\numberline {8.5}Paso 5: entrenamiento adversarial}{11}{subsection.8.5}%
+\contentsline {subsection}{\numberline {8.6}Paso 6: grafo final}{11}{subsection.8.6}%
+\contentsline {section}{\numberline {9}Optuna (b\'usqueda de hiperpar\'ametros)}{11}{section.9}%
+\contentsline {section}{\numberline {10}Evaluaci\'on, calibraci\'on y artefactos}{12}{section.10}%
+\contentsline {section}{\numberline {11}Auditor\'ia t\'ecnica y mejores pr\'acticas}{12}{section.11}%
+\contentsline {subsection}{\numberline {11.1}Fortalezas observadas}{12}{subsection.11.1}%
+\contentsline {subsection}{\numberline {11.2}Riesgos o puntos cr\'iticos (actualizado)}{12}{subsection.11.2}%
+\contentsline {subsection}{\numberline {11.3}Recomendaciones priorizadas (estado actual)}{13}{subsection.11.3}%
+\contentsline {section}{\numberline {12}Anexo: referencias a funciones y archivos}{13}{section.12}%
