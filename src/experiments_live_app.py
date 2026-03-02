@@ -758,6 +758,374 @@ def _render_gnn_recursive_view(
         st.dataframe(plot_df, width="stretch")
 
 
+def _render_gnn_sampler_memory_budget_view(
+    df: pd.DataFrame, best_row: Optional[Dict[str, object]]
+) -> None:
+    st.caption("Experimento detectado: GNN Sampler Memory Budget")
+    plot_df = df.copy()
+
+    numeric_cols = [
+        "batch_size",
+        "memory_peak_bytes",
+        "memory_peak_gb",
+        "memory_peak_fraction_total",
+        "memory_peak_fraction_budget",
+        "budget_bytes",
+        "budget_gb",
+        "probe_batches",
+        "adaptive_jump",
+    ]
+    for col in numeric_cols:
+        if col in plot_df.columns:
+            plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+    if "memory_peak_gb" not in plot_df.columns and "memory_peak_bytes" in plot_df.columns:
+        plot_df["memory_peak_gb"] = plot_df["memory_peak_bytes"] / (1024 ** 3)
+
+    role_options = (
+        sorted(plot_df["role"].dropna().astype(str).unique().tolist())
+        if "role" in plot_df.columns
+        else []
+    )
+    if role_options:
+        default_roles = (
+            ["best_per_config"] if "best_per_config" in role_options else role_options
+        )
+        selected_roles = st.multiselect(
+            "Roles",
+            options=role_options,
+            default=default_roles,
+            key="live_gnn_mem_roles",
+        )
+        if selected_roles:
+            plot_df = plot_df[plot_df["role"].astype(str).isin(selected_roles)].copy()
+
+    include_errors = st.checkbox(
+        "Incluir errores/OOM",
+        value=False,
+        key="live_gnn_mem_include_errors",
+    )
+    if "status" in plot_df.columns and not include_errors:
+        plot_df = plot_df[plot_df["status"] == "ok"].copy()
+
+    if "train_sampler_mode" in plot_df.columns:
+        sampler_options = sorted(
+            plot_df["train_sampler_mode"].dropna().astype(str).unique().tolist()
+        )
+        if sampler_options:
+            selected_samplers = st.multiselect(
+                "Sampler mode",
+                options=sampler_options,
+                default=sampler_options,
+                key="live_gnn_mem_sampler_filter",
+            )
+            if selected_samplers:
+                plot_df = plot_df[
+                    plot_df["train_sampler_mode"].astype(str).isin(selected_samplers)
+                ].copy()
+
+    if "status" not in plot_df.columns:
+        plot_df["status"] = "unknown"
+    plot_df["status_norm"] = plot_df["status"].astype(str).str.lower()
+    if "memory_peak_fraction_budget" in plot_df.columns:
+        plot_df["usage_pct"] = 100.0 * plot_df["memory_peak_fraction_budget"]
+    else:
+        plot_df["usage_pct"] = pd.NA
+
+    def _budget_bucket(row: pd.Series) -> str:
+        status = str(row.get("status_norm", "unknown"))
+        if status != "ok":
+            if "oom" in status:
+                return "OOM"
+            if "error" in status:
+                return "Error"
+            return "No-OK"
+        val = pd.to_numeric(row.get("usage_pct"), errors="coerce")
+        if pd.isna(val):
+            return "Sin medición"
+        if val < 60:
+            return "Muy bajo (<60%)"
+        if val < 85:
+            return "Bajo (60-85%)"
+        if val <= 100:
+            return "Objetivo (85-100%)"
+        if val <= 110:
+            return "Sobre presupuesto (100-110%)"
+        return "Muy sobrepresupuesto (>110%)"
+
+    plot_df["budget_state"] = plot_df.apply(_budget_bucket, axis=1)
+
+    if plot_df.empty:
+        st.info("No hay datos para los filtros seleccionados.")
+        st.dataframe(df, width="stretch")
+        return
+
+    if best_row is None:
+        valid = plot_df.copy()
+        if {"status", "memory_peak_fraction_budget"}.issubset(valid.columns):
+            valid = valid[
+                (valid["status"] == "ok")
+                & valid["memory_peak_fraction_budget"].notna()
+            ]
+            under = valid[valid["memory_peak_fraction_budget"] <= 1.0]
+            if not under.empty:
+                best_row = under.loc[
+                    under["memory_peak_fraction_budget"].idxmax()
+                ].to_dict()
+            elif not valid.empty:
+                over = valid[valid["memory_peak_fraction_budget"] > 1.0]
+                if not over.empty:
+                    over = over.assign(
+                        _delta=(over["memory_peak_fraction_budget"] - 1.0).abs()
+                    )
+                    best_row = over.loc[over["_delta"].idxmin()].to_dict()
+
+    ok_df = plot_df[
+        (plot_df["status_norm"] == "ok")
+        & pd.to_numeric(plot_df["usage_pct"], errors="coerce").notna()
+    ].copy()
+    under_df = ok_df[ok_df["usage_pct"] <= 100.0].copy()
+    over_df = ok_df[ok_df["usage_pct"] > 100.0].copy()
+
+    total_eval = int(len(plot_df))
+    total_ok = int(len(ok_df))
+    total_under = int(len(under_df))
+    under_ratio = (100.0 * total_under / total_ok) if total_ok > 0 else 0.0
+    best_under_pct = (
+        float(under_df["usage_pct"].max())
+        if not under_df.empty
+        else None
+    )
+    min_over_pct = (
+        float(over_df["usage_pct"].min())
+        if not over_df.empty
+        else None
+    )
+
+    kpi_a, kpi_b, kpi_c, kpi_d = st.columns(4)
+    kpi_a.metric("Evaluaciones", f"{total_eval}")
+    kpi_b.metric("Corridas OK", f"{total_ok}")
+    kpi_c.metric(
+        "Bajo presupuesto",
+        f"{total_under}",
+        f"{under_ratio:.1f}% de OK",
+    )
+    if best_under_pct is not None:
+        kpi_d.metric(
+            "Mejor uso bajo presupuesto",
+            f"{best_under_pct:.1f}%",
+            f"gap {100.0 - best_under_pct:.1f}%",
+        )
+    elif min_over_pct is not None:
+        kpi_d.metric(
+            "Exceso mínimo",
+            f"{min_over_pct:.1f}%",
+            f"+{min_over_pct - 100.0:.1f}%",
+        )
+    else:
+        kpi_d.metric("Mejor uso bajo presupuesto", "N/A")
+
+    st.caption(
+        "Lectura rápida: `85-100%` es zona objetivo, `>100%` excede presupuesto, "
+        "`<85%` está subutilizando memoria."
+    )
+
+    if best_row:
+        st.markdown("**Configuración recomendada**")
+        payload = {
+            "config_name": best_row.get("config_name"),
+            "train_sampler_mode": best_row.get("train_sampler_mode"),
+            "num_neighbors": best_row.get("num_neighbors"),
+            "batch_size": best_row.get("batch_size"),
+            "memory_peak_gb": best_row.get("memory_peak_gb"),
+            "memory_peak_fraction_budget": best_row.get("memory_peak_fraction_budget"),
+            "budget_gb": best_row.get("budget_gb"),
+            "status": best_row.get("status"),
+        }
+        st.json(payload)
+
+    tab_viz, tab_data = st.tabs(["Grafico", "Datos"])
+    with tab_viz:
+        if {"batch_size", "usage_pct"}.issubset(plot_df.columns):
+            chart_df = plot_df.dropna(
+                subset=["batch_size", "usage_pct"]
+            ).copy()
+            if chart_df.empty:
+                st.info("No hay datos numéricos suficientes para graficar.")
+            else:
+                try:
+                    import altair as alt
+
+                    max_usage = float(chart_df["usage_pct"].max())
+                    y_max = max(120.0, max_usage + 5.0)
+                    color_domain = [
+                        "Objetivo (85-100%)",
+                        "Bajo (60-85%)",
+                        "Muy bajo (<60%)",
+                        "Sobre presupuesto (100-110%)",
+                        "Muy sobrepresupuesto (>110%)",
+                        "OOM",
+                        "Error",
+                        "No-OK",
+                        "Sin medición",
+                    ]
+                    color_range = [
+                        "#2ca02c",
+                        "#1f77b4",
+                        "#9ecae1",
+                        "#ff7f0e",
+                        "#d62728",
+                        "#9467bd",
+                        "#8c564b",
+                        "#7f7f7f",
+                        "#c7c7c7",
+                    ]
+                    color_enc = alt.Color(
+                        "budget_state:N",
+                        title="Estado",
+                        scale=alt.Scale(domain=color_domain, range=color_range),
+                    )
+                    tooltip = [
+                        "config_name",
+                        "train_sampler_mode",
+                        "batch_size",
+                        "usage_pct",
+                        "memory_peak_gb",
+                        "status",
+                        "adaptive_jump",
+                        "role",
+                    ]
+                    base = (
+                        alt.Chart()
+                        .mark_circle(size=95, opacity=0.9)
+                        .encode(
+                            x=alt.X("batch_size:Q", axis=alt.Axis(title="Batch size")),
+                            y=alt.Y(
+                                "usage_pct:Q",
+                                axis=alt.Axis(title="Uso del presupuesto (%)"),
+                                scale=alt.Scale(domain=[0, y_max]),
+                            ),
+                            color=color_enc,
+                            shape=alt.Shape("status_norm:N", title="Status"),
+                            tooltip=tooltip,
+                        )
+                    )
+                    line_85 = (
+                        alt.Chart()
+                        .mark_rule(color="#1f77b4", strokeDash=[6, 4], opacity=0.8)
+                        .encode(y=alt.datum(85.0))
+                    )
+                    line_95 = (
+                        alt.Chart()
+                        .mark_rule(color="#2ca02c", strokeDash=[6, 4], opacity=0.8)
+                        .encode(y=alt.datum(95.0))
+                    )
+                    line_100 = (
+                        alt.Chart()
+                        .mark_rule(color="#d62728", strokeDash=[6, 4], opacity=0.9)
+                        .encode(y=alt.datum(100.0))
+                    )
+                    layered = alt.layer(
+                        base,
+                        line_85,
+                        line_95,
+                        line_100,
+                        data=chart_df,
+                    ).interactive()
+
+                    if (
+                        "train_sampler_mode" in chart_df.columns
+                        and chart_df["train_sampler_mode"].nunique() > 1
+                    ):
+                        composed = layered.facet(
+                            column=alt.Column(
+                                "train_sampler_mode:N",
+                                title="Sampler mode",
+                                header=alt.Header(labelAngle=0),
+                            )
+                        )
+                        st.altair_chart(composed, width="stretch")
+                    else:
+                        st.altair_chart(layered, width="stretch")
+
+                    st.markdown("**Top configuraciones bajo presupuesto**")
+                    rank_df = chart_df[
+                        (chart_df["status_norm"] == "ok")
+                        & (chart_df["usage_pct"] <= 100.0)
+                    ].copy()
+                    if rank_df.empty:
+                        st.info("No hay configuraciones bajo presupuesto en los datos actuales.")
+                    else:
+                        rank_df["rank_label"] = (
+                            rank_df["train_sampler_mode"].astype(str)
+                            + " | bs="
+                            + rank_df["batch_size"].astype(int).astype(str)
+                        )
+                        rank_df = rank_df.sort_values("usage_pct", ascending=False).head(15)
+                        bar = (
+                            alt.Chart(rank_df)
+                            .mark_bar()
+                            .encode(
+                                x=alt.X("usage_pct:Q", axis=alt.Axis(title="Uso del presupuesto (%)")),
+                                y=alt.Y(
+                                    "rank_label:N",
+                                    sort="-x",
+                                    axis=alt.Axis(title="Configuración"),
+                                ),
+                                color=alt.Color(
+                                    "train_sampler_mode:N",
+                                    title="Sampler",
+                                ),
+                                tooltip=[
+                                    "config_name",
+                                    "train_sampler_mode",
+                                    "batch_size",
+                                    "usage_pct",
+                                    "memory_peak_gb",
+                                ],
+                            )
+                        )
+                        ref_95 = (
+                            alt.Chart(pd.DataFrame({"x": [95.0]}))
+                            .mark_rule(color="#2ca02c", strokeDash=[6, 4], opacity=0.9)
+                            .encode(x="x:Q")
+                        )
+                        ref_100 = (
+                            alt.Chart(pd.DataFrame({"x": [100.0]}))
+                            .mark_rule(color="#d62728", strokeDash=[6, 4], opacity=0.9)
+                            .encode(x="x:Q")
+                        )
+                        st.altair_chart((bar + ref_95 + ref_100).interactive(), width="stretch")
+                except ImportError:
+                    st.warning("Altair no instalado.")
+        else:
+            st.info("No hay columnas suficientes para graficar.")
+
+    with tab_data:
+        view_df = plot_df.copy()
+        preferred_cols = [
+            "config_name",
+            "train_sampler_mode",
+            "role",
+            "status",
+            "probe_mode",
+            "sampler_impl",
+            "batch_size",
+            "usage_pct",
+            "memory_peak_gb",
+            "budget_gb",
+            "budget_state",
+            "adaptive_jump",
+            "probe_batches",
+            "error",
+        ]
+        cols = [c for c in preferred_cols if c in view_df.columns]
+        if cols:
+            view_df = view_df[cols]
+        if "usage_pct" in view_df.columns:
+            view_df = view_df.sort_values("usage_pct", ascending=False, na_position="last")
+        st.dataframe(view_df, width="stretch")
+
+
 def _render_best_highway_section_view(
     df: pd.DataFrame, best_row: Optional[Dict[str, object]]
 ) -> None:
@@ -955,8 +1323,21 @@ def main(*, set_page_config: bool = True) -> None:
             .any()
             or {"objective_label", "test_f1"}.issubset(df.columns)
         )
+        is_gnn_sampler_memory = (
+            "sampler memory budget" in experiment_name
+            or df.get("experiment", pd.Series())
+            .astype(str)
+            .str.contains("sampler memory budget", case=False, na=False)
+            .any()
+            or {
+                "memory_peak_fraction_budget",
+                "batch_size",
+            }.issubset(df.columns)
+        )
 
-        if is_best_section:
+        if is_gnn_sampler_memory:
+            _render_gnn_sampler_memory_budget_view(df, best_row)
+        elif is_best_section:
             _render_best_highway_section_view(df, best_row)
         elif is_gnn_recursive:
             _render_gnn_recursive_view(df, best_row)

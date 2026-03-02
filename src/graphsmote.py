@@ -562,7 +562,9 @@ def load_z2x_decoders(model, data, node_types=None, device=None,
         p = os.path.join(save_dir, f"{ntype}.pt")
         if os.path.exists(p):
             try:
-                dec.heads[ntype].load_state_dict(torch.load(p, map_location=device))
+                dec.heads[ntype].load_state_dict(
+                    torch.load(p, map_location=device, weights_only=True)
+                )
                 loaded.add(ntype)
             except RuntimeError as e:
                 print(f"Warning: could not load state_dict for ntype '{ntype}'. It might be retrained if necessary. Error: {e}")

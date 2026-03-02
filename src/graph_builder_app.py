@@ -16,6 +16,8 @@ import sqlite3
 import sys
 import traceback
 import unicodedata
+import subprocess
+import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -69,11 +71,14 @@ from src import notification_system
 from src.config import (
     BATCH_SIZE,
     ACCUMULATION_STEPS,
+    NUM_NEIGHBORS,
     DT_MINUTES,
     EARLY_STOPPING_MIN_DELTA,
     EARLY_STOPPING_PATIENCE,
     FLOAT,
+    GRAPHSMOTE_MODE,
     GRAPHSMOTE_K,
+    SAVE_AUG_GRAPH_PATH,
     DECODER_EPOCHS,
     GUARD_BAND_MINUTES,
     HORIZON_MINUTES,
@@ -1644,50 +1649,116 @@ def _select_latest_gat_model(
 def _list_hpo_files_for_training(
     *,
     use_graphsmote: Optional[bool],
+    use_imgagn: Optional[bool] = None,
     graph_obj: Dict[str, object],
 ) -> List[str]:
+    def _resolve_graph_hash_for_loaded_graph(obj: Dict[str, object]) -> Optional[str]:
+        if not isinstance(obj, dict):
+            return None
+        direct = obj.get("graph_hash")
+        if isinstance(direct, str):
+            text = direct.strip().lower()
+            if len(text) >= 16:
+                return text
+        for meta_key in ("metadata", "meta"):
+            meta = obj.get(meta_key)
+            if isinstance(meta, dict):
+                raw = meta.get("graph_hash")
+                if isinstance(raw, str):
+                    text = raw.strip().lower()
+                    if len(text) >= 16:
+                        return text
+        graph_path = obj.get("graph_path")
+        graph_filename = obj.get("filename")
+        try:
+            from src import gnn_main as graph_main
+            resolved = graph_main._calculate_graph_hash(
+                graph_filename=graph_filename,
+                graph_path=graph_path,
+            )
+            if isinstance(resolved, str) and len(resolved) >= 16:
+                return resolved.strip().lower()
+        except Exception:
+            return None
+        return None
+
     all_hp_files = sorted(
         glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv")),
         key=os.path.getmtime,
     )
     if not all_hp_files:
         return []
-    graph_hash = None
-    try:
-        from src import gnn_main as graph_main
-        graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
-    except Exception:
-        graph_hash = None
-    if graph_hash:
-        hash_tag = f"_{graph_hash[:16]}"
-        all_hp_files = [
-            f for f in all_hp_files
-            if hash_tag in os.path.basename(f)
-        ]
+    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj or {})
+    if not graph_hash:
+        return []
+    hash_tag = f"_{graph_hash[:16]}"
+    matched_by_name = [
+        f for f in all_hp_files
+        if hash_tag in os.path.basename(f)
+    ]
+    if matched_by_name:
+        all_hp_files = matched_by_name
+    else:
+        matched_by_column: List[str] = []
+        for path in all_hp_files:
+            try:
+                df = pd.read_csv(path, nrows=1)
+            except Exception:
+                continue
+            if df.empty or "graph_hash" not in df.columns:
+                continue
+            raw = df.iloc[0].get("graph_hash")
+            if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                continue
+            value = str(raw).strip().lower()
+            if not value:
+                continue
+            if value.startswith(graph_hash[:16]) or graph_hash.startswith(value[:16]):
+                matched_by_column.append(path)
+        all_hp_files = matched_by_column
     if not all_hp_files:
         return []
-    if use_graphsmote is None:
+    if use_graphsmote is None and use_imgagn is None:
         return all_hp_files
-    want_imgagn = bool(graph_obj.get("imgagn_best_params")) or (
+
+    inferred_imgagn = bool(graph_obj.get("imgagn_best_params")) or (
         "ImGAGN" in str(graph_obj.get("filename", ""))
     )
+    want_imgagn = inferred_imgagn if use_imgagn is None else bool(use_imgagn)
 
     def _score_hp(path: str) -> Tuple[int, int, int, float]:
         name = os.path.basename(path)
         has_smote = "_GraphSMOTE" in name
         has_imgagn = "_ImGAGN" in name
         has_base = "_Base" in name
-        ok_smote = (has_smote == use_graphsmote)
+        ok_smote = (
+            True if use_graphsmote is None else (has_smote == bool(use_graphsmote))
+        )
         ok_imgagn = (has_imgagn == want_imgagn)
-        base_pref = has_base and not use_graphsmote
+        base_pref = has_base and not has_smote and not has_imgagn
         return (int(ok_smote), int(ok_imgagn), int(base_pref), os.path.getmtime(path))
 
     hp_files_sorted = sorted(all_hp_files, key=_score_hp)
-    return [
-        f
-        for f in hp_files_sorted
-        if ("_GraphSMOTE" in os.path.basename(f)) == use_graphsmote
-    ]
+    if use_imgagn is None:
+        if use_graphsmote is None:
+            return hp_files_sorted
+        return [
+            f
+            for f in hp_files_sorted
+            if ("_GraphSMOTE" in os.path.basename(f)) == bool(use_graphsmote)
+        ]
+
+    filtered: List[str] = []
+    for path in hp_files_sorted:
+        name = os.path.basename(path)
+        has_smote = "_GraphSMOTE" in name
+        has_imgagn = "_ImGAGN" in name
+        if use_graphsmote is not None and has_smote != bool(use_graphsmote):
+            continue
+        if has_imgagn != bool(use_imgagn):
+            continue
+        filtered.append(path)
+    return filtered
 
 
 def _compute_binary_metrics_from_cm(cm: np.ndarray) -> Dict[str, float]:
@@ -3382,6 +3453,74 @@ def _run_optuna_search(
         if debug_flag:
             logger.info(f"[NEIGHBOR] trial={trial.number} profile={neighbor_choice} num_neighbors={neighbor_profile}")
 
+        sampler_modes = list(search_space.get("sampler_modes", ["neighbor"]))
+        if not sampler_modes:
+            sampler_modes = ["neighbor"]
+        train_sampler_mode = str(
+            trial.suggest_categorical("train_sampler_mode", sampler_modes)
+        )
+        cluster_gcn_num_parts = 0
+        cluster_gcn_parts_per_epoch = 0
+        graphsaint_mode = "node"
+        graphsaint_batch_size = 0
+        graphsaint_num_steps = 0
+        graphsaint_walk_length = 0
+        if train_sampler_mode == "cluster_gcn":
+            cluster_gcn_num_parts = int(
+                trial.suggest_categorical(
+                    "cluster_gcn_num_parts",
+                    list(search_space.get("cluster_gcn_num_parts", [64])),
+                )
+            )
+            cluster_gcn_parts_per_epoch = int(
+                trial.suggest_categorical(
+                    "cluster_gcn_parts_per_epoch",
+                    list(search_space.get("cluster_gcn_parts_per_epoch", [0])),
+                )
+            )
+        elif train_sampler_mode == "graphsaint":
+            graphsaint_mode = _parse_graphsaint_mode(
+                trial.suggest_categorical(
+                    "graphsaint_mode",
+                    list(search_space.get("graphsaint_modes", ["node"])),
+                ),
+                fallback="node",
+            )
+            graphsaint_batch_size = int(
+                trial.suggest_categorical(
+                    "graphsaint_batch_size",
+                    list(search_space.get("graphsaint_batch_sizes", [2048])),
+                )
+            )
+            graphsaint_num_steps = int(
+                trial.suggest_categorical(
+                    "graphsaint_num_steps",
+                    list(search_space.get("graphsaint_num_steps", [8])),
+                )
+            )
+            if graphsaint_mode == "random_walk":
+                graphsaint_walk_length = int(
+                    trial.suggest_categorical(
+                        "graphsaint_walk_length",
+                        list(search_space.get("graphsaint_walk_lengths", [2])),
+                    )
+                )
+            else:
+                graphsaint_walk_length = 1
+        if debug_flag:
+            logger.info(
+                "[SAMPLER] trial=%s mode=%s cluster=(parts=%s,parts_epoch=%s) "
+                "graphsaint=(mode=%s,batch=%s,steps=%s,walk=%s)",
+                trial.number,
+                train_sampler_mode,
+                cluster_gcn_num_parts,
+                cluster_gcn_parts_per_epoch,
+                graphsaint_mode,
+                graphsaint_batch_size,
+                graphsaint_num_steps,
+                graphsaint_walk_length,
+            )
+
         lr_cfg = search_space["lr"]
         wd_cfg = search_space["weight_decay"]
         lambda_l2_cfg = search_space["lambda_l2_att"]
@@ -3654,6 +3793,19 @@ def _run_optuna_search(
             step=int(batch_cfg["step"]),
         )
         trial.set_user_attr("num_neighbors", neighbor_profile)
+        trial.set_user_attr("train_sampler_mode", str(train_sampler_mode))
+        trial.set_user_attr("cluster_gcn_num_parts", int(cluster_gcn_num_parts))
+        trial.set_user_attr(
+            "cluster_gcn_parts_per_epoch",
+            int(cluster_gcn_parts_per_epoch),
+        )
+        trial.set_user_attr("graphsaint_mode", str(graphsaint_mode))
+        trial.set_user_attr("graphsaint_batch_size", int(graphsaint_batch_size))
+        trial.set_user_attr("graphsaint_num_steps", int(graphsaint_num_steps))
+        trial.set_user_attr(
+            "graphsaint_walk_length",
+            int(graphsaint_walk_length),
+        )
         trial.set_user_attr("use_checkpointing", use_checkpointing_flag)
 
         num_classes = 2
@@ -3721,9 +3873,6 @@ def _run_optuna_search(
             else None
         )
 
-        num_neighbors_dict = {
-            edge_type: neighbor_profile for edge_type in train_graph.edge_types
-        }
         _mem_snapshot(f"trial_{trial.number}_before_loader")
         train_graph_cpu = _to_cpu_if_needed(train_graph)
         seed_idx = None
@@ -3746,18 +3895,117 @@ def _run_optuna_search(
             )
         else:
             trial.set_user_attr("train_subset_mode", "full")
-        train_loader = NeighborLoader(
+
+        def _effective_seed_pool(
+            graph_cpu_local: HeteroData,
+            *,
+            base_seed_idx: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+            train_idx = (
+                graph_cpu_local["pm"].train_mask
+                .nonzero(as_tuple=False)
+                .view(-1)
+                .cpu()
+            )
+            if base_seed_idx is None:
+                return train_idx
+            seeds = base_seed_idx.view(-1).cpu()
+            if seeds.numel() == 0:
+                return train_idx
+            return seeds
+
+        def _resolve_sampler_seed_idx(
+            graph_cpu_local: HeteroData,
+            *,
+            base_seed_idx: Optional[torch.Tensor],
+            epoch_seed: int,
+            epoch_num: int,
+        ) -> Optional[torch.Tensor]:
+            seed_pool = _effective_seed_pool(
+                graph_cpu_local,
+                base_seed_idx=base_seed_idx,
+            )
+            if seed_pool.numel() == 0:
+                return None
+            if train_sampler_mode == "neighbor":
+                return seed_pool
+
+            pm_view = graph_main._build_pm_homogeneous_view(
+                graph_cpu_local, node_type="pm"
+            )
+            if pm_view is None:
+                return seed_pool
+
+            if train_sampler_mode == "cluster_gcn":
+                return graph_main._cluster_gcn_seed_order(
+                    pm_view,
+                    seed_pool,
+                    num_parts=int(cluster_gcn_num_parts),
+                    clusters_per_epoch=int(cluster_gcn_parts_per_epoch),
+                    deterministic=True,
+                    seed=int(epoch_seed),
+                    epoch=int(epoch_num),
+                ).cpu()
+
+            if train_sampler_mode == "graphsaint":
+                return graph_main._graphsaint_seed_sample(
+                    pm_view,
+                    seed_pool,
+                    mode=str(graphsaint_mode),
+                    batch_size=max(1, int(graphsaint_batch_size)),
+                    num_steps=max(1, int(graphsaint_num_steps)),
+                    walk_length=max(1, int(graphsaint_walk_length)),
+                    deterministic=True,
+                    seed=int(epoch_seed),
+                    epoch=int(epoch_num),
+                ).cpu()
+
+            return seed_pool
+
+        def _build_train_loader_from_sampler(
+            graph_cpu_local: HeteroData,
+            *,
+            base_seed_idx: Optional[torch.Tensor],
+            epoch_seed: int,
+            epoch_num: int,
+        ) -> Tuple[object, Optional[torch.Tensor]]:
+            sampler_seed_idx = _resolve_sampler_seed_idx(
+                graph_cpu_local,
+                base_seed_idx=base_seed_idx,
+                epoch_seed=epoch_seed,
+                epoch_num=epoch_num,
+            )
+            input_nodes_obj: object
+            if sampler_seed_idx is not None and sampler_seed_idx.numel() > 0:
+                input_nodes_obj = ("pm", sampler_seed_idx)
+            else:
+                input_nodes_obj = ("pm", graph_cpu_local["pm"].train_mask)
+
+            num_neighbors_cfg = {
+                edge_type: neighbor_profile
+                for edge_type in graph_cpu_local.edge_types
+            }
+            shuffle_flag = False if train_sampler_mode == "cluster_gcn" else True
+            loader_obj = NeighborLoader(
+                graph_cpu_local,
+                input_nodes=input_nodes_obj,
+                num_neighbors=num_neighbors_cfg,
+                batch_size=batch_size_candidate,
+                shuffle=bool(shuffle_flag),
+            )
+            return loader_obj, sampler_seed_idx
+
+        train_loader, active_seed_idx = _build_train_loader_from_sampler(
             train_graph_cpu,
-            input_nodes=("pm", seed_idx if seed_idx is not None else train_graph_cpu["pm"].train_mask),
-            num_neighbors=num_neighbors_dict,
-            batch_size=batch_size_candidate,
-            shuffle=True,
+            base_seed_idx=seed_idx,
+            epoch_seed=trial_seed,
+            epoch_num=1,
         )
         _mem_snapshot(
             f"trial_{trial.number}_loader_ready",
             extra=(
                 f"batch={batch_size_candidate}, steps={len(train_loader)}, "
-                f"seed_count={int(seed_idx.numel()) if seed_idx is not None else 'all'}"
+                f"seed_count={int(active_seed_idx.numel()) if active_seed_idx is not None else 'all'}"
             ),
         )
 
@@ -3787,26 +4035,21 @@ def _run_optuna_search(
                             seed_idx = _sample_train_seeds(
                                 train_graph_cpu, max_train_nodes=max_train_nodes, seed=trial_seed + epoch
                             )
-                        train_loader = NeighborLoader(
+                        train_loader, active_seed_idx = _build_train_loader_from_sampler(
                             train_graph_cpu,
-                            input_nodes=("pm", seed_idx if seed_idx is not None else train_graph_cpu["pm"].train_mask),
-                            num_neighbors={
-                                edge_type: neighbor_profile
-                                for edge_type in train_graph.edge_types
-                            },
-                            batch_size=batch_size_candidate,
-                            shuffle=True,
+                            base_seed_idx=seed_idx,
+                            epoch_seed=trial_seed,
+                            epoch_num=epoch,
                         )
                 elif (not fixed_train_subset) and sample_each_epoch and max_train_nodes > 0:
                     seed_idx = _sample_train_seeds(
                         train_graph_cpu, max_train_nodes=max_train_nodes, seed=trial_seed + epoch
                     )
-                    train_loader = NeighborLoader(
+                    train_loader, active_seed_idx = _build_train_loader_from_sampler(
                         train_graph_cpu,
-                        input_nodes=("pm", seed_idx if seed_idx is not None else train_graph_cpu["pm"].train_mask),
-                        num_neighbors=num_neighbors_dict,
-                        batch_size=batch_size_candidate,
-                        shuffle=True,
+                        base_seed_idx=seed_idx,
+                        epoch_seed=trial_seed,
+                        epoch_num=epoch,
                     )
 
                 if lambda_H_mode == "fixed":
@@ -4292,6 +4535,13 @@ def _run_ray_tune_search(
             "aggr2": _choice(search_space["aggr2"]),
             "use_checkpointing": _choice(search_space["use_checkpointing"]),
             "num_neighbors_choice": _choice(search_space["neighbor_choices"]),
+            "train_sampler_mode": _choice(search_space["sampler_modes"]),
+            "cluster_gcn_num_parts": _choice(search_space["cluster_gcn_num_parts"]),
+            "cluster_gcn_parts_per_epoch": _choice(search_space["cluster_gcn_parts_per_epoch"]),
+            "graphsaint_mode": _choice(search_space["graphsaint_modes"]),
+            "graphsaint_batch_size": _choice(search_space["graphsaint_batch_sizes"]),
+            "graphsaint_num_steps": _choice(search_space["graphsaint_num_steps"]),
+            "graphsaint_walk_length": _choice(search_space["graphsaint_walk_lengths"]),
             "lr": _loguniform_or_choice(lr_cfg["min"], lr_cfg["max"]),
             "optimizer": _choice(search_space["optimizers"]),
             "weight_decay": _loguniform_or_choice(wd_cfg["min"], wd_cfg["max"]),
@@ -4434,7 +4684,20 @@ def _run_ray_tune_search(
             )
             score = objective(adapter)
             payload: Dict[str, Any] = {"score": float(score)}
-            for key in ("num_neighbors", "use_checkpointing", "best_tau", "best_epoch", "best_metric"):
+            for key in (
+                "num_neighbors",
+                "train_sampler_mode",
+                "cluster_gcn_num_parts",
+                "cluster_gcn_parts_per_epoch",
+                "graphsaint_mode",
+                "graphsaint_batch_size",
+                "graphsaint_num_steps",
+                "graphsaint_walk_length",
+                "use_checkpointing",
+                "best_tau",
+                "best_epoch",
+                "best_metric",
+            ):
                 if key in adapter.user_attrs:
                     payload[key] = adapter.user_attrs[key]
             _report(payload)
@@ -4489,7 +4752,20 @@ def _run_ray_tune_search(
             best_params["value"] = best_score
         best_params["objective_metric"] = objective_metric
         best_params["gnn_variant"] = gnn_variant_fixed
-        for key in ("num_neighbors", "use_checkpointing", "best_tau", "best_epoch", "best_metric"):
+        for key in (
+            "num_neighbors",
+            "train_sampler_mode",
+            "cluster_gcn_num_parts",
+            "cluster_gcn_parts_per_epoch",
+            "graphsaint_mode",
+            "graphsaint_batch_size",
+            "graphsaint_num_steps",
+            "graphsaint_walk_length",
+            "use_checkpointing",
+            "best_tau",
+            "best_epoch",
+            "best_metric",
+        ):
             if key in best_metrics:
                 best_params[key] = best_metrics[key]
         best_params["use_graphsmote"] = use_graphsmote
@@ -10494,16 +10770,31 @@ def _render_training_tab() -> None:
 
     st.markdown("#### Sampling y Fidelity (comparación con full-batch)")
     fidelity_targets = [
-        "NeighborLoader",
-        "Cluster-GCN (seed partitions)",
-        "GraphSAINT (seed sampling)",
+        "NeighborLoader (nativo)",
+        "Cluster-GCN (nativo)",
+        "GraphSAINT (nativo)",
     ]
+    legacy_sampler_labels = {
+        "NeighborLoader": "NeighborLoader (nativo)",
+        "Cluster-GCN (seed partitions)": "Cluster-GCN (nativo)",
+        "GraphSAINT (seed sampling)": "GraphSAINT (nativo)",
+    }
+    legacy_fidelity = st.session_state.get("gnn_train_fidelity_target_sampler")
+    if isinstance(legacy_fidelity, str) and legacy_fidelity in legacy_sampler_labels:
+        st.session_state["gnn_train_fidelity_target_sampler"] = legacy_sampler_labels[
+            legacy_fidelity
+        ]
+    legacy_train_sampler = st.session_state.get("gnn_train_sampler_mode")
+    if isinstance(legacy_train_sampler, str) and legacy_train_sampler in legacy_sampler_labels:
+        st.session_state["gnn_train_sampler_mode"] = legacy_sampler_labels[
+            legacy_train_sampler
+        ]
     fidelity_target_sampler = st.selectbox(
         "Preset fidelity para sampler",
         fidelity_targets,
         key="gnn_train_fidelity_target_sampler",
         help=(
-            "Elige sobre qué sampler quieres aplicar el preset de alta fidelidad. "
+            "Elige sobre qué sampler nativo quieres aplicar el preset de alta fidelidad. "
             "El preset fuerza evaluación interna exhaustive, determinismo y desactiva hard-undersampling."
         ),
     )
@@ -10520,14 +10811,14 @@ def _render_training_tab() -> None:
         st.session_state["gnn_train_det_sampling"] = True
         st.session_state["gnn_train_sampling_seed"] = int(SEED)
         st.session_state["gnn_train_disable_hard"] = True
-        if fidelity_target_sampler == "Cluster-GCN (seed partitions)":
+        if fidelity_target_sampler == "Cluster-GCN (nativo)":
             st.session_state["gnn_train_cluster_parts"] = 64
             st.session_state["gnn_train_cluster_parts_epoch"] = 0
             st.session_state["gnn_train_graphsaint_mode"] = "Node"
             st.session_state["gnn_train_graphsaint_batch"] = 2048
             st.session_state["gnn_train_graphsaint_steps"] = 8
             st.session_state["gnn_train_graphsaint_walk"] = 2
-        elif fidelity_target_sampler == "GraphSAINT (seed sampling)":
+        elif fidelity_target_sampler == "GraphSAINT (nativo)":
             st.session_state["gnn_train_graphsaint_mode"] = "Random Walk"
             st.session_state["gnn_train_graphsaint_batch"] = 4096
             st.session_state["gnn_train_graphsaint_steps"] = 16
@@ -10546,19 +10837,19 @@ def _render_training_tab() -> None:
         st.rerun()
 
     sampler_options = {
-        "NeighborLoader": "neighbor",
-        "Cluster-GCN (seed partitions)": "cluster_gcn",
-        "GraphSAINT (seed sampling)": "graphsaint",
+        "NeighborLoader (nativo)": "neighbor",
+        "Cluster-GCN (nativo)": "cluster_gcn",
+        "GraphSAINT (nativo)": "graphsaint",
     }
     sampler_label = st.selectbox(
         "Sampler de entrenamiento",
         list(sampler_options.keys()),
         key="gnn_train_sampler_mode",
         help=(
-            "Define cómo se eligen semillas PM por época. "
+            "Define cómo se eligen semillas PM por época, usando samplers nativos de PyG. "
             "NeighborLoader: baseline rápido. "
-            "Cluster-GCN: recorre particiones de nodos para reducir varianza espacial/temporal. "
-            "GraphSAINT: samplea subconjuntos estocásticos de nodos/aristas/caminatas."
+            "Cluster-GCN: usa `ClusterData/ClusterLoader` para particionar y muestrear por clústeres. "
+            "GraphSAINT: usa `GraphSAINT*Sampler` para muestreo estocástico de nodos/aristas/caminatas."
         ),
     )
     train_sampler_mode = sampler_options[sampler_label]
@@ -12062,6 +12353,254 @@ def _parse_neighbor_profiles_input(
     return unique
 
 
+SAMPLER_NEIGHBOR_PROFILE_PRESETS: Tuple[Tuple[str, Tuple[int, ...]], ...] = (
+    ("compact", (15, 10)),
+    ("focused", (10, 5)),
+    ("broad", (25, 15, 10)),
+    ("wide", (30, 20)),
+)
+SAMPLER_CLUSTER_GCN_PROFILE_PRESETS: Tuple[Tuple[str, Tuple[int, int]], ...] = (
+    ("compact", (64, 0)),
+    ("focused", (64, 4)),
+    ("broad", (128, 0)),
+    ("wide", (128, 4)),
+)
+SAMPLER_GRAPHSAINT_PROFILE_PRESETS: Tuple[
+    Tuple[str, Tuple[str, int, int, int]],
+    ...,
+] = (
+    ("compact", ("node", 1024, 4, 2)),
+    ("focused", ("edge", 1024, 4, 2)),
+    ("broad", ("node", 2048, 8, 4)),
+    ("wide", ("random_walk", 2048, 8, 4)),
+)
+
+
+def _render_sampler_neighbor_profiles_controls(
+    *,
+    key_prefix: str,
+) -> List[List[int]]:
+    profile_map: Dict[str, List[int]] = {}
+    default_enabled: List[str] = []
+    with st.expander("Perfiles de vecinos", expanded=True):
+        st.caption(
+            "Define perfiles para NeighborLoader. Cada perfil es una lista por capa."
+        )
+        for name, default_profile in SAMPLER_NEIGHBOR_PROFILE_PRESETS:
+            default_txt = ",".join(str(int(v)) for v in default_profile)
+            profile_txt = st.text_input(
+                name,
+                value=default_txt,
+                key=f"{key_prefix}_neighbor_profile_{name}",
+            )
+            profile_map[name] = _coerce_neighbor_profile(
+                profile_txt,
+                fallback=list(default_profile),
+            )
+            default_enabled.append(name)
+        enabled_profiles = st.multiselect(
+            "Perfiles habilitados",
+            options=default_enabled,
+            default=default_enabled,
+            key=f"{key_prefix}_neighbor_profiles_enabled",
+            help="Selecciona qué perfiles entran al grid del experimento.",
+        )
+    ordered_profiles = [
+        profile_map[name]
+        for name in enabled_profiles
+        if name in profile_map
+    ]
+    unique_profiles: List[List[int]] = []
+    seen = set()
+    for profile in ordered_profiles:
+        key = tuple(int(v) for v in profile)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_profiles.append([int(v) for v in profile])
+    return unique_profiles
+
+
+def _parse_cluster_gcn_profile_line(
+    text: str,
+    *,
+    fallback_num_parts: int,
+    fallback_parts_per_epoch: int,
+) -> Tuple[int, int]:
+    tokens = [tok for tok in re.split(r"[,\s;]+", str(text or "").strip()) if tok]
+    values: List[int] = []
+    for token in tokens:
+        try:
+            values.append(int(token))
+        except Exception:
+            continue
+    num_parts = int(fallback_num_parts)
+    parts_per_epoch = int(fallback_parts_per_epoch)
+    if values:
+        num_parts = int(max(1, values[0]))
+    if len(values) > 1:
+        parts_per_epoch = int(max(0, values[1]))
+    return num_parts, parts_per_epoch
+
+
+def _render_sampler_cluster_gcn_profiles_controls(
+    *,
+    key_prefix: str,
+) -> Tuple[List[int], List[int]]:
+    profile_map: Dict[str, Tuple[int, int]] = {}
+    default_enabled: List[str] = []
+    with st.expander("Perfiles Cluster-GCN", expanded=True):
+        st.caption(
+            "Define perfiles como `num_parts,parts_per_epoch`."
+        )
+        for name, (default_parts, default_epoch) in SAMPLER_CLUSTER_GCN_PROFILE_PRESETS:
+            line_txt = st.text_input(
+                name,
+                value=f"{int(default_parts)},{int(default_epoch)}",
+                key=f"{key_prefix}_cluster_profile_{name}",
+            )
+            profile_map[name] = _parse_cluster_gcn_profile_line(
+                line_txt,
+                fallback_num_parts=int(default_parts),
+                fallback_parts_per_epoch=int(default_epoch),
+            )
+            default_enabled.append(name)
+        enabled_profiles = st.multiselect(
+            "Perfiles habilitados",
+            options=default_enabled,
+            default=default_enabled,
+            key=f"{key_prefix}_cluster_profiles_enabled",
+            help="Selecciona qué perfiles entran al grid del experimento.",
+        )
+    num_parts: List[int] = []
+    parts_per_epoch: List[int] = []
+    seen_parts = set()
+    seen_epoch = set()
+    for name in enabled_profiles:
+        pair = profile_map.get(name)
+        if pair is None:
+            continue
+        p_num, p_epoch = int(pair[0]), int(pair[1])
+        if p_num not in seen_parts:
+            seen_parts.add(p_num)
+            num_parts.append(p_num)
+        if p_epoch not in seen_epoch:
+            seen_epoch.add(p_epoch)
+            parts_per_epoch.append(p_epoch)
+    return num_parts, parts_per_epoch
+
+
+def _parse_graphsaint_mode(value: object, fallback: str) -> str:
+    mode = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "node": "node",
+        "edge": "edge",
+        "random_walk": "random_walk",
+        "randomwalk": "random_walk",
+        "walk": "random_walk",
+    }
+    parsed = aliases.get(mode)
+    if parsed in {"node", "edge", "random_walk"}:
+        return parsed
+    return str(fallback or "node")
+
+
+def _parse_graphsaint_profile_line(
+    text: str,
+    *,
+    fallback_mode: str,
+    fallback_batch_size: int,
+    fallback_num_steps: int,
+    fallback_walk_length: int,
+) -> Tuple[str, int, int, int]:
+    tokens = [tok for tok in re.split(r"[,\s;]+", str(text or "").strip()) if tok]
+    mode = _parse_graphsaint_mode(
+        tokens[0] if tokens else fallback_mode,
+        fallback=fallback_mode,
+    )
+    nums: List[int] = []
+    for token in tokens[1:]:
+        try:
+            nums.append(int(token))
+        except Exception:
+            continue
+    batch_size = int(fallback_batch_size)
+    num_steps = int(fallback_num_steps)
+    walk_length = int(fallback_walk_length)
+    if nums:
+        batch_size = int(max(1, nums[0]))
+    if len(nums) > 1:
+        num_steps = int(max(1, nums[1]))
+    if len(nums) > 2:
+        walk_length = int(max(1, nums[2]))
+    return mode, batch_size, num_steps, walk_length
+
+
+def _render_sampler_graphsaint_profiles_controls(
+    *,
+    key_prefix: str,
+) -> Tuple[List[str], List[int], List[int], List[int]]:
+    profile_map: Dict[str, Tuple[str, int, int, int]] = {}
+    default_enabled: List[str] = []
+    with st.expander("Perfiles GraphSAINT", expanded=True):
+        st.caption(
+            "Define perfiles como `mode,batch_size,num_steps,walk_length`."
+        )
+        for (
+            name,
+            (default_mode, default_batch, default_steps, default_walk),
+        ) in SAMPLER_GRAPHSAINT_PROFILE_PRESETS:
+            line_txt = st.text_input(
+                name,
+                value=(
+                    f"{default_mode},{int(default_batch)},"
+                    f"{int(default_steps)},{int(default_walk)}"
+                ),
+                key=f"{key_prefix}_graphsaint_profile_{name}",
+            )
+            profile_map[name] = _parse_graphsaint_profile_line(
+                line_txt,
+                fallback_mode=str(default_mode),
+                fallback_batch_size=int(default_batch),
+                fallback_num_steps=int(default_steps),
+                fallback_walk_length=int(default_walk),
+            )
+            default_enabled.append(name)
+        enabled_profiles = st.multiselect(
+            "Perfiles habilitados",
+            options=default_enabled,
+            default=default_enabled,
+            key=f"{key_prefix}_graphsaint_profiles_enabled",
+            help="Selecciona qué perfiles entran al grid del experimento.",
+        )
+    modes: List[str] = []
+    batches: List[int] = []
+    steps: List[int] = []
+    walks: List[int] = []
+    seen_modes = set()
+    seen_batches = set()
+    seen_steps = set()
+    seen_walks = set()
+    for name in enabled_profiles:
+        profile = profile_map.get(name)
+        if profile is None:
+            continue
+        mode, batch, step, walk = profile
+        if mode not in seen_modes:
+            seen_modes.add(mode)
+            modes.append(str(mode))
+        if int(batch) not in seen_batches:
+            seen_batches.add(int(batch))
+            batches.append(int(batch))
+        if int(step) not in seen_steps:
+            seen_steps.add(int(step))
+            steps.append(int(step))
+        if int(walk) not in seen_walks:
+            seen_walks.add(int(walk))
+            walks.append(int(walk))
+    return modes, batches, steps, walks
+
+
 def _sampler_config_label(config: Dict[str, object]) -> str:
     mode = str(config.get("train_sampler_mode", "neighbor"))
     profile = config.get("num_neighbors", [])
@@ -12290,6 +12829,27 @@ def _metric_float(value: object) -> Optional[float]:
     return val
 
 
+def _metric_bool(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return bool(int(value) != 0)
+    if isinstance(value, (float, np.floating)):
+        if not math.isfinite(float(value)):
+            return bool(default)
+        return bool(int(float(value)) != 0)
+    text = str(value).strip().lower()
+    if not text:
+        return bool(default)
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 def _compute_sampler_fidelity_score(
     candidate_metrics: Dict[str, object],
     reference_metrics: Dict[str, object],
@@ -12368,6 +12928,1543 @@ def _rank_sampler_fidelity_results(
             best = row
             break
     return ranked, best
+
+
+def _is_oom_runtime_error(exc: Exception) -> bool:
+    msg = str(exc or "").strip().lower()
+    if not msg:
+        return False
+    oom_tokens = (
+        "out of memory",
+        "cuda out of memory",
+        "mps backend out of memory",
+        "not enough memory",
+        "failed to allocate memory",
+    )
+    return any(token in msg for token in oom_tokens)
+
+
+def _memory_budget_bytes(total_vram_gb: float, target_fraction: float) -> int:
+    total_gb = max(float(total_vram_gb or 0.0), 0.1)
+    frac = min(max(float(target_fraction or 0.0), 0.05), 0.995)
+    return int(total_gb * (1024 ** 3) * frac)
+
+
+def _bytes_to_gb(value: object) -> Optional[float]:
+    val = _metric_float(value)
+    if val is None:
+        return None
+    return float(val / (1024 ** 3))
+
+
+def _resolve_device_total_memory_bytes(
+    device: torch.device,
+    *,
+    fallback_total_bytes: int,
+) -> int:
+    fallback = max(int(fallback_total_bytes or 0), 1)
+    try:
+        if device.type == "cuda" and torch.cuda.is_available():
+            return int(torch.cuda.get_device_properties(device).total_memory)
+    except Exception:
+        pass
+    try:
+        if (
+            device.type == "mps"
+            and hasattr(torch, "mps")
+            and torch.backends.mps.is_available()
+            and hasattr(torch.mps, "recommended_max_memory")
+        ):
+            rec = int(torch.mps.recommended_max_memory())
+            if rec > 0:
+                return rec
+    except Exception:
+        pass
+    return fallback
+
+
+def _reset_device_memory_trackers(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+        except Exception:
+            pass
+        return
+    if (
+        device.type == "mps"
+        and hasattr(torch, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
+def _device_current_memory_bytes(device: torch.device) -> int:
+    if device.type == "cuda" and torch.cuda.is_available():
+        try:
+            return int(torch.cuda.memory_reserved(device))
+        except Exception:
+            try:
+                return int(torch.cuda.memory_allocated(device))
+            except Exception:
+                return 0
+    if (
+        device.type == "mps"
+        and hasattr(torch, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        try:
+            driver_bytes = int(torch.mps.driver_allocated_memory())
+            if driver_bytes > 0:
+                return driver_bytes
+        except Exception:
+            pass
+        try:
+            return int(torch.mps.current_allocated_memory())
+        except Exception:
+            return 0
+    return 0
+
+
+def _device_peak_memory_bytes(device: torch.device) -> int:
+    if device.type == "cuda" and torch.cuda.is_available():
+        try:
+            peak_reserved = int(torch.cuda.max_memory_reserved(device))
+            if peak_reserved > 0:
+                return peak_reserved
+        except Exception:
+            pass
+        try:
+            return int(torch.cuda.max_memory_allocated(device))
+        except Exception:
+            return 0
+    return _device_current_memory_bytes(device)
+
+
+def _parse_batch_candidates(
+    batch_min: int,
+    batch_max: int,
+    batch_step: int,
+) -> List[int]:
+    lo = max(1, int(batch_min))
+    hi = max(lo, int(batch_max))
+    step = max(1, int(batch_step))
+    values = list(range(lo, hi + 1, step))
+    if values[-1] != hi:
+        values.append(hi)
+    return sorted(set(int(v) for v in values if int(v) > 0))
+
+
+def _resolve_probe_loader_limit(
+    *,
+    base_len: int,
+    probe_steps: int,
+    fidelity_full_epoch: bool,
+) -> int:
+    max_batches = max(1, int(probe_steps))
+    safe_len = max(0, int(base_len))
+    if bool(fidelity_full_epoch):
+        return int(safe_len) if safe_len > 0 else int(max_batches)
+    if safe_len <= 0:
+        return int(max_batches)
+    return int(max(1, min(int(max_batches), int(safe_len))))
+
+
+def _infer_batch_step_size(values: Sequence[int]) -> int:
+    diffs: List[int] = []
+    clean = sorted(set(int(v) for v in values if int(v) > 0))
+    for idx in range(1, len(clean)):
+        delta = int(clean[idx]) - int(clean[idx - 1])
+        if delta > 0:
+            diffs.append(int(delta))
+    if not diffs:
+        return 1
+    return int(min(diffs))
+
+
+def _advance_batch_index_by_jump(
+    values: Sequence[int],
+    *,
+    current_idx: int,
+    jump_units: int,
+    batch_step_size: int,
+    upper_bound_idx: Optional[int] = None,
+) -> int:
+    if not values:
+        return 0
+    last_idx = len(values) - 1
+    lo = int(max(0, min(current_idx, last_idx)))
+    hi = int(last_idx if upper_bound_idx is None else max(0, min(int(upper_bound_idx), last_idx)))
+    if hi <= lo:
+        return lo
+
+    step_size = max(1, int(batch_step_size))
+    jump = max(1, int(jump_units))
+    current_batch = int(values[lo])
+    target_batch = int(current_batch + jump * step_size)
+
+    probe_idx = lo + 1
+    while probe_idx <= hi:
+        if int(values[probe_idx]) >= target_batch:
+            return int(probe_idx)
+        probe_idx += 1
+    return int(hi)
+
+
+def _normalize_adaptive_jump_options(
+    jump_options: Optional[Sequence[int]],
+) -> List[int]:
+    values: List[int] = []
+    if isinstance(jump_options, (list, tuple, set)):
+        for raw in jump_options:
+            try:
+                val = int(raw)
+            except Exception:
+                continue
+            if val > 0:
+                values.append(val)
+    if not values:
+        values = list(range(1, 11))
+    return sorted(set(values))
+
+
+def _adaptive_probe_jump(
+    memory_fraction_budget: Optional[float],
+    jump_options: Optional[Sequence[int]] = None,
+) -> int:
+    options = _normalize_adaptive_jump_options(jump_options)
+    frac = _metric_float(memory_fraction_budget)
+    if frac is None:
+        return int(options[-1])
+    frac = float(max(frac, 0.0))
+    default_jump = 10
+    if frac >= 0.98:
+        default_jump = 1
+    elif frac >= 0.93:
+        default_jump = 2
+    elif frac >= 0.88:
+        default_jump = 3
+    elif frac >= 0.83:
+        default_jump = 4
+    elif frac >= 0.78:
+        default_jump = 5
+    elif frac >= 0.72:
+        default_jump = 6
+    elif frac >= 0.64:
+        default_jump = 7
+    elif frac >= 0.54:
+        default_jump = 8
+    elif frac >= 0.42:
+        default_jump = 9
+    if len(options) == 1:
+        return int(options[0])
+    position = (float(default_jump) - 1.0) / 9.0
+    idx = int(round(position * float(len(options) - 1)))
+    idx = max(0, min(idx, len(options) - 1))
+    return int(options[idx])
+
+
+def _shutdown_torch_loader_iterator(iterator: object) -> None:
+    if iterator is None:
+        return
+    try:
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+    except Exception:
+        pass
+
+
+def _prepare_graph_for_sampler_memory_probe(
+    *,
+    graph_data: HeteroData,
+    sequence_index: Optional[object],
+    base_params: Dict[str, object],
+    device: torch.device,
+    sampling_seed: int,
+    use_graphsmote: bool = False,
+    use_imgagn: bool = False,
+) -> Tuple[HeteroData, List[str]]:
+    notes: List[str] = []
+    if "pm" not in graph_data.node_types:
+        notes.append("No se detectó nodo 'pm'; se usa grafo original para el probe.")
+        return graph_data, notes
+
+    want_graphsmote = bool(use_graphsmote) or _metric_bool(
+        base_params.get("use_graphsmote"),
+        default=False,
+    )
+    want_imgagn = bool(use_imgagn) or _metric_bool(
+        base_params.get("use_imgagn_aug"),
+        default=False,
+    ) or _metric_bool(
+        base_params.get("use_imgagn"),
+        default=False,
+    )
+    if not (want_graphsmote or want_imgagn):
+        return graph_data, notes
+
+    variant = "GraphSMOTE"
+    if bool(use_imgagn) and (not bool(use_graphsmote)):
+        variant = "ImGAGN"
+    elif bool(use_graphsmote) and (not bool(use_imgagn)):
+        variant = "GraphSMOTE"
+    elif want_imgagn and not want_graphsmote:
+        variant = "ImGAGN"
+    elif want_imgagn and want_graphsmote:
+        variant = "ImGAGN"
+        notes.append(
+            "Se detectó GraphSMOTE e ImGAGN simultáneamente; el probe priorizará ImGAGN."
+        )
+
+    has_synthetic = False
+    try:
+        has_synthetic = (
+            hasattr(graph_data["pm"], "is_synthetic")
+            and bool(graph_data["pm"].is_synthetic.sum().item() > 0)
+        )
+    except Exception:
+        has_synthetic = False
+    if has_synthetic:
+        notes.append(
+            f"{variant} detectado: el grafo ya contiene nodos sintéticos."
+        )
+        return graph_data, notes
+
+    if variant == "GraphSMOTE":
+        mode = str(GRAPHSMOTE_MODE or "offline").strip().lower()
+        if mode not in {"offline", "online"}:
+            notes.append(
+                f"GraphSMOTE activo con GRAPHSMOTE_MODE='{mode}'. "
+                "Se mantiene grafo original para el probe."
+            )
+            return graph_data, notes
+
+    def _extract_heterodata(obj: object) -> Optional[HeteroData]:
+        if isinstance(obj, HeteroData):
+            return obj
+        if isinstance(obj, dict):
+            data_obj = obj.get("data")
+            if isinstance(data_obj, HeteroData):
+                return data_obj
+        return None
+
+    def _is_compatible_augmented_graph(
+        candidate: HeteroData,
+        *,
+        loaded_obj: Optional[object] = None,
+        source_path: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        if "pm" not in candidate.node_types:
+            return False, "sin nodos pm"
+        if not hasattr(candidate["pm"], "is_synthetic"):
+            return False, "sin flag is_synthetic"
+        try:
+            synth_count = int(candidate["pm"].is_synthetic.sum().item())
+        except Exception:
+            synth_count = 0
+        if synth_count <= 0:
+            return False, "sin nodos sintéticos"
+        try:
+            base_feats = int(graph_data["pm"].x.shape[1])
+            cand_feats = int(candidate["pm"].x.shape[1])
+            if base_feats != cand_feats:
+                return False, f"dimensión de features distinta ({cand_feats} != {base_feats})"
+        except Exception:
+            pass
+        try:
+            base_nodes = int(graph_data["pm"].num_nodes)
+            real_nodes = int((~candidate["pm"].is_synthetic.bool()).sum().item())
+            if real_nodes != base_nodes:
+                return False, f"nodos reales distintos ({real_nodes} != {base_nodes})"
+        except Exception:
+            pass
+        if variant == "ImGAGN":
+            has_imgagn_marker = False
+            if isinstance(loaded_obj, dict):
+                has_imgagn_marker = bool(loaded_obj.get("imgagn_best_params"))
+            if (
+                not has_imgagn_marker
+                and isinstance(source_path, str)
+                and "imgagn" in source_path.lower()
+            ):
+                has_imgagn_marker = True
+            if (
+                not has_imgagn_marker
+                and ("pm", "imgagn", "pm") in getattr(candidate, "edge_types", [])
+            ):
+                has_imgagn_marker = True
+            if not has_imgagn_marker:
+                return False, "sin marcadores de ImGAGN"
+        return True, "ok"
+
+    candidate_paths: List[str] = []
+    if variant == "GraphSMOTE":
+        for raw in (
+            base_params.get("graph_aug_path"),
+            SAVE_AUG_GRAPH_PATH,
+            os.path.join(RESULTADOS_DIR, "graph_aug.pt"),
+        ):
+            if raw:
+                candidate_paths.append(str(raw))
+        pattern_paths: List[str] = []
+        for pattern in ("graph_aug*.pt", "graph_smote_*.pt", "*GraphSMOTE*.pt"):
+            pattern_paths.extend(glob.glob(os.path.join(RESULTADOS_DIR, pattern)))
+        pattern_paths = sorted(pattern_paths, key=os.path.getmtime, reverse=True)
+        candidate_paths.extend(pattern_paths)
+    else:
+        for raw in (
+            base_params.get("graph_imgagn_path"),
+            base_params.get("imgagn_graph_path"),
+        ):
+            if raw:
+                candidate_paths.append(str(raw))
+        pattern_paths = []
+        for pattern in (
+            "graph_imgagn_*.pt",
+            "*ImGAGN*.pt",
+            "highway_graph_ImGAGN_AUG_*.pt",
+        ):
+            pattern_paths.extend(glob.glob(os.path.join(RESULTADOS_DIR, pattern)))
+        pattern_paths = sorted(pattern_paths, key=os.path.getmtime, reverse=True)
+        candidate_paths.extend(pattern_paths)
+
+    seen_paths = set()
+    for raw_path in candidate_paths:
+        path = os.path.abspath(str(raw_path))
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        if not os.path.exists(path):
+            continue
+        try:
+            loaded_obj = torch.load(path, map_location="cpu", weights_only=False)
+            loaded_data = _extract_heterodata(loaded_obj)
+            if loaded_data is None:
+                notes.append(
+                    f"Se ignoró {os.path.basename(path)}: no contiene HeteroData compatible."
+                )
+                continue
+            ok, reason = _is_compatible_augmented_graph(
+                loaded_data,
+                loaded_obj=loaded_obj,
+                source_path=path,
+            )
+            if not ok:
+                notes.append(
+                    f"Se ignoró {os.path.basename(path)}: {reason}."
+                )
+                continue
+            try:
+                synth_count = int(loaded_data["pm"].is_synthetic.sum().item())
+            except Exception:
+                synth_count = 0
+            notes.append(
+                f"{variant} para probe cargado desde "
+                f"{os.path.basename(path)} (sintéticos={synth_count})."
+            )
+            return loaded_data, notes
+        except Exception as exc:
+            notes.append(
+                f"No se pudo cargar {os.path.basename(path)} para {variant}: {exc}"
+            )
+
+    if variant == "GraphSMOTE":
+        notes.append(
+            "[ALERTA] GraphSMOTE activo, pero no se encontró un grafo aumentado "
+            "compatible (`graph_aug.pt` / `graph_smote_*.pt`). "
+            "Se omite aumentación en vivo por estabilidad (evita segfault en MPS)."
+        )
+    else:
+        notes.append(
+            "[ALERTA] ImGAGN activo, pero no se encontró un grafo aumentado "
+            "compatible (`graph_imgagn_*.pt` / `*ImGAGN*.pt`). "
+            "Se usará el grafo original y la memoria puede quedar subestimada."
+        )
+    return graph_data, notes
+
+
+def _build_sampler_memory_loader(
+    *,
+    graph_cpu: HeteroData,
+    sampler_config: Dict[str, object],
+    batch_size: int,
+    sampling_seed: int,
+) -> Tuple[Optional[object], Optional[str]]:
+    from torch_geometric.loader import (
+        ClusterData,
+        ClusterLoader,
+        GraphSAINTEdgeSampler,
+        GraphSAINTNodeSampler,
+        GraphSAINTRandomWalkSampler,
+        NeighborLoader,
+    )
+    from src import gnn_main as graph_main
+
+    if "pm" not in graph_cpu.node_types:
+        return None, "No se encontró tipo de nodo 'pm'."
+    if not hasattr(graph_cpu["pm"], "train_mask"):
+        return None, "No se encontró train_mask para 'pm'."
+
+    base_seeds = graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1).cpu()
+    if base_seeds.numel() == 0:
+        return None, "No hay semillas de train disponibles."
+
+    def _pm_induced_hetero_batch(pm_nodes_raw: torch.Tensor) -> Tuple[Optional[HeteroData], Optional[str]]:
+        if not torch.is_tensor(pm_nodes_raw):
+            pm_nodes = torch.as_tensor(pm_nodes_raw, dtype=torch.long)
+        else:
+            pm_nodes = pm_nodes_raw.long()
+        pm_nodes = pm_nodes.view(-1).cpu()
+        if pm_nodes.numel() == 0:
+            return None, "Subgrafo nativo sin nodos PM."
+
+        total_pm = int(getattr(graph_cpu["pm"], "num_nodes", graph_cpu["pm"].x.size(0)))
+        filtered: List[int] = []
+        seen_nodes = set()
+        for raw in pm_nodes.tolist():
+            idx = int(raw)
+            if idx < 0 or idx >= total_pm:
+                continue
+            if idx in seen_nodes:
+                continue
+            seen_nodes.add(idx)
+            filtered.append(idx)
+        if not filtered:
+            return None, "Subgrafo nativo no contiene nodos PM válidos."
+        pm_nodes = torch.as_tensor(filtered, dtype=torch.long)
+
+        out = HeteroData()
+        out["pm"].x = graph_cpu["pm"].x[pm_nodes].cpu()
+        if hasattr(graph_cpu["pm"], "y") and graph_cpu["pm"].y is not None:
+            out["pm"].y = graph_cpu["pm"].y[pm_nodes].cpu()
+        for mask_name in ("train_mask", "val_mask", "test_mask", "is_synthetic", "sequence_mask"):
+            try:
+                mask_val = getattr(graph_cpu["pm"], mask_name)
+            except Exception:
+                mask_val = None
+            if torch.is_tensor(mask_val) and mask_val.size(0) >= total_pm:
+                out["pm"][mask_name] = mask_val[pm_nodes].cpu()
+        out["pm"].num_nodes = int(pm_nodes.numel())
+        out["pm"].n_id = pm_nodes.clone()
+        out["pm"].batch_size = int(pm_nodes.numel())
+
+        g2l = torch.full((total_pm,), -1, dtype=torch.long)
+        g2l[pm_nodes] = torch.arange(pm_nodes.numel(), dtype=torch.long)
+
+        pm_edge_types = [
+            edge_type
+            for edge_type in graph_cpu.edge_types
+            if edge_type[0] == "pm" and edge_type[2] == "pm"
+        ]
+        for edge_type in pm_edge_types:
+            edge_index = getattr(graph_cpu[edge_type], "edge_index", None)
+            if edge_index is None:
+                continue
+            edge_index_cpu = edge_index.long().cpu()
+            if edge_index_cpu.numel() == 0:
+                out[edge_type].edge_index = torch.zeros((2, 0), dtype=torch.long)
+                continue
+            src_local = g2l[edge_index_cpu[0]]
+            dst_local = g2l[edge_index_cpu[1]]
+            keep = (src_local >= 0) & (dst_local >= 0)
+            edge_local = torch.stack([src_local[keep], dst_local[keep]], dim=0)
+            out[edge_type].edge_index = edge_local
+
+            edge_attr = getattr(graph_cpu[edge_type], "edge_attr", None)
+            if edge_attr is None:
+                continue
+            edge_attr_cpu = edge_attr.cpu()
+            if edge_attr_cpu.size(0) == edge_index_cpu.size(1):
+                out[edge_type].edge_attr = edge_attr_cpu[keep]
+            elif edge_attr_cpu.dim() >= 2:
+                out[edge_type].edge_attr = torch.zeros(
+                    (int(edge_local.size(1)), int(edge_attr_cpu.size(1))),
+                    dtype=edge_attr_cpu.dtype,
+                )
+
+        # Asegura relaciones esperadas por HeteroGAT aun cuando no haya aristas.
+        for req_edge_type in (
+            ("pm", "spatial", "pm"),
+            ("pm", "temporal", "pm"),
+            ("pm", "spatial_back", "pm"),
+            ("pm", "st_fwd", "pm"),
+        ):
+            if req_edge_type not in out.edge_types:
+                out[req_edge_type].edge_index = torch.zeros((2, 0), dtype=torch.long)
+
+        return out, None
+
+    class _NativeSamplerAsHeteroLoader:
+        def __init__(
+            self,
+            *,
+            base_loader: object,
+            max_batches: Optional[int],
+            deterministic_sampling: bool,
+            sampling_seed_value: int,
+        ) -> None:
+            self.base_loader = base_loader
+            self.max_batches = (
+                int(max_batches)
+                if max_batches is not None and int(max_batches) > 0
+                else None
+            )
+            self.deterministic_sampling = bool(deterministic_sampling)
+            self.sampling_seed_value = int(sampling_seed_value)
+            self.seen = 0
+
+        def __len__(self) -> int:
+            base_len = 0
+            try:
+                base_len = int(len(self.base_loader))
+            except Exception:
+                base_len = 0
+            if self.max_batches is None:
+                return max(1, int(base_len)) if base_len > 0 else 1
+            if base_len <= 0:
+                return max(1, int(self.max_batches))
+            return max(1, min(int(base_len), int(self.max_batches)))
+
+        def __iter__(self):
+            self.seen = 0
+            prev_cpu_state = torch.random.get_rng_state()
+            if self.deterministic_sampling:
+                torch.manual_seed(int(self.sampling_seed_value))
+            base_it = iter(self.base_loader)
+            try:
+                for sampled in base_it:
+                    if self.max_batches is not None and self.seen >= int(self.max_batches):
+                        break
+                    pm_nodes = getattr(sampled, "orig_nid", None)
+                    if pm_nodes is None:
+                        pm_nodes = getattr(sampled, "n_id", None)
+                    if pm_nodes is None:
+                        continue
+                    hetero_batch, _ = _pm_induced_hetero_batch(pm_nodes)
+                    if hetero_batch is None:
+                        continue
+                    self.seen += 1
+                    yield hetero_batch
+            finally:
+                _shutdown_torch_loader_iterator(base_it)
+                if self.deterministic_sampling:
+                    try:
+                        torch.random.set_rng_state(prev_cpu_state)
+                    except Exception:
+                        pass
+
+    cfg = dict(sampler_config or {})
+    mode_raw = str(cfg.get("train_sampler_mode", "neighbor")).strip().lower()
+    mode = {
+        "neighborloader": "neighbor",
+        "neighbor": "neighbor",
+        "cluster_gcn": "cluster_gcn",
+        "clustergcn": "cluster_gcn",
+        "graphsaint": "graphsaint",
+    }.get(mode_raw.replace("-", "_"), "neighbor")
+    deterministic = _metric_bool(cfg.get("deterministic_sampling"), default=True)
+    seed = int(_metric_float(cfg.get("sampling_seed")) or int(sampling_seed))
+    seeds = base_seeds
+
+    try:
+        num_neighbors_cfg = graph_main._resolve_num_neighbors(
+            cfg.get("num_neighbors"),
+            NUM_NEIGHBORS,
+            graph_cpu.edge_types,
+        )
+    except Exception:
+        num_neighbors_cfg = NUM_NEIGHBORS
+
+    if mode in {"cluster_gcn", "graphsaint"}:
+        try:
+            pm_view = graph_main._build_pm_homogeneous_view(graph_cpu, node_type="pm")
+        except Exception:
+            pm_view = None
+        if pm_view is None:
+            return None, "No se pudo construir vista homogénea PM para sampler nativo."
+
+        if mode == "cluster_gcn":
+            try:
+                num_parts = max(2, int(cfg.get("cluster_gcn_num_parts", 64)))
+                parts_per_epoch = int(cfg.get("cluster_gcn_parts_per_epoch", 0))
+                cluster_data = ClusterData(
+                    pm_view,
+                    num_parts=int(num_parts),
+                    recursive=False,
+                    log=False,
+                )
+                avg_nodes_per_part = max(
+                    1,
+                    int(math.ceil(float(int(pm_view.num_nodes)) / float(int(num_parts)))),
+                )
+                target_nodes = max(1, int(batch_size))
+                parts_per_batch = max(
+                    1,
+                    int(round(float(target_nodes) / float(avg_nodes_per_part))),
+                )
+                parts_per_batch = max(1, min(int(parts_per_batch), int(num_parts)))
+                cluster_loader = ClusterLoader(
+                    cluster_data,
+                    batch_size=int(parts_per_batch),
+                    shuffle=not bool(deterministic),
+                )
+                max_cluster_batches = None
+                if int(parts_per_epoch) > 0:
+                    max_cluster_batches = max(
+                        1,
+                        int(math.ceil(float(int(parts_per_epoch)) / float(int(parts_per_batch)))),
+                    )
+                native_loader = _NativeSamplerAsHeteroLoader(
+                    base_loader=cluster_loader,
+                    max_batches=max_cluster_batches,
+                    deterministic_sampling=bool(deterministic),
+                    sampling_seed_value=int(seed),
+                )
+                setattr(native_loader, "sampler_impl", "cluster_gcn_native")
+                setattr(native_loader, "native_parts_per_batch", int(parts_per_batch))
+                return native_loader, None
+            except Exception as exc:
+                return None, f"Cluster-GCN nativo falló: {exc}"
+
+        try:
+            saint_mode = str(cfg.get("graphsaint_mode", "node")).strip().lower().replace("-", "_")
+            profile_batch_size = int(cfg.get("graphsaint_batch_size", 0))
+            if profile_batch_size > 0:
+                scale = float(max(1, int(batch_size))) / float(max(1, int(BATCH_SIZE)))
+                effective_saint_batch = max(1, int(round(float(profile_batch_size) * scale)))
+            else:
+                effective_saint_batch = max(1, int(batch_size))
+            effective_saint_batch = min(
+                int(max(1, int(pm_view.num_nodes))),
+                int(effective_saint_batch),
+            )
+            saint_steps = max(1, int(cfg.get("graphsaint_num_steps", 8)))
+            saint_walk = max(1, int(cfg.get("graphsaint_walk_length", 2)))
+
+            if saint_mode == "edge":
+                saint_loader = GraphSAINTEdgeSampler(
+                    pm_view,
+                    batch_size=int(effective_saint_batch),
+                    num_steps=int(saint_steps),
+                    log=False,
+                )
+            elif saint_mode in {"random_walk", "randomwalk", "rw"}:
+                saint_loader = GraphSAINTRandomWalkSampler(
+                    pm_view,
+                    batch_size=int(effective_saint_batch),
+                    walk_length=int(saint_walk),
+                    num_steps=int(saint_steps),
+                    log=False,
+                )
+            else:
+                saint_loader = GraphSAINTNodeSampler(
+                    pm_view,
+                    batch_size=int(effective_saint_batch),
+                    num_steps=int(saint_steps),
+                    log=False,
+                )
+            native_loader = _NativeSamplerAsHeteroLoader(
+                base_loader=saint_loader,
+                max_batches=None,
+                deterministic_sampling=bool(deterministic),
+                sampling_seed_value=int(seed),
+            )
+            setattr(native_loader, "sampler_impl", f"graphsaint_native_{saint_mode}")
+            setattr(native_loader, "native_graphsaint_batch_size", int(effective_saint_batch))
+            return native_loader, None
+        except Exception as exc:
+            return None, f"GraphSAINT nativo falló: {exc}"
+
+    if not torch.is_tensor(seeds):
+        seeds = torch.as_tensor(seeds, dtype=torch.long)
+    seeds = seeds.view(-1).cpu()
+    if seeds.numel() == 0:
+        seeds = base_seeds
+
+    try:
+        loader_gen = None
+        if deterministic:
+            loader_gen = torch.Generator(device="cpu")
+            loader_gen.manual_seed(int(seed))
+        shuffle_flag = False if mode == "cluster_gcn" else True
+        loader = NeighborLoader(
+            graph_cpu,
+            input_nodes=("pm", seeds),
+            num_neighbors=num_neighbors_cfg,
+            batch_size=max(1, int(batch_size)),
+            shuffle=bool(shuffle_flag),
+            generator=loader_gen,
+            num_workers=0,
+            persistent_workers=False,
+        )
+        try:
+            setattr(loader, "sampler_impl", "neighbor_native")
+        except Exception:
+            pass
+    except Exception as exc:
+        return None, str(exc)
+    return loader, None
+
+
+def _probe_sampler_memory_usage_subprocess(
+    *,
+    graph_data: HeteroData,
+    sequence_index: Optional[object],
+    base_params: Dict[str, object],
+    sampler_config: Dict[str, object],
+    batch_size: int,
+    probe_steps: int,
+    device: torch.device,
+    sampling_seed: int,
+    total_memory_bytes: int,
+    fidelity_full_epoch: bool = False,
+    timeout_seconds: int = 900,
+) -> Dict[str, object]:
+    result: Dict[str, object] = {
+        "status": "error",
+        "error": None,
+        "probe_batches": 0,
+        "eval_status": "not_run",
+        "memory_peak_bytes": 0,
+        "memory_peak_gb": None,
+        "memory_peak_fraction_total": None,
+        "isolation_mode": "subprocess_mps",
+        "probe_mode": (
+            "fidelity_full_epoch"
+            if bool(fidelity_full_epoch)
+            else "fast_limited_batches"
+        ),
+    }
+    try:
+        graph_cpu, _ = _ensure_cpu_graph(graph_data)
+        payload = {
+            "graph_data": graph_cpu,
+            "sequence_index": sequence_index,
+            "base_params": dict(base_params or {}),
+            "sampler_config": dict(sampler_config or {}),
+            "batch_size": int(batch_size),
+            "probe_steps": int(probe_steps),
+            "device": str(device),
+            "sampling_seed": int(sampling_seed),
+            "total_memory_bytes": int(total_memory_bytes),
+            "fidelity_full_epoch": bool(fidelity_full_epoch),
+        }
+        with tempfile.TemporaryDirectory(prefix="sampler_probe_mps_") as tmpdir:
+            payload_path = os.path.join(tmpdir, "payload.pt")
+            output_path = os.path.join(tmpdir, "result.json")
+            torch.save(payload, payload_path)
+            cmd = [
+                sys.executable,
+                "-m",
+                "src.sampler_memory_probe_worker",
+                "--payload",
+                payload_path,
+                "--output",
+                output_path,
+            ]
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(60, int(timeout_seconds)),
+                cwd=str(ROOT_DIR),
+            )
+            if proc.returncode != 0:
+                stderr = (proc.stderr or "").strip()
+                stdout = (proc.stdout or "").strip()
+                detail = stderr or stdout or f"return_code={proc.returncode}"
+                result["status"] = "crash"
+                result["error"] = (
+                    "Probe en subproceso terminó con error/segfault "
+                    f"(code={proc.returncode}): {detail}"
+                )
+                return result
+            if not os.path.exists(output_path):
+                result["status"] = "error"
+                result["error"] = "Probe en subproceso no generó salida."
+                return result
+            with open(output_path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                result.update(loaded)
+                result["isolation_mode"] = "subprocess_mps"
+                return result
+            result["status"] = "error"
+            result["error"] = "Salida inválida del subproceso."
+            return result
+    except subprocess.TimeoutExpired:
+        result["status"] = "timeout"
+        result["error"] = "Probe en subproceso excedió el tiempo límite."
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+    return result
+
+
+def _probe_sampler_memory_usage(
+    *,
+    graph_data: HeteroData,
+    sequence_index: Optional[object],
+    base_params: Dict[str, object],
+    sampler_config: Dict[str, object],
+    batch_size: int,
+    probe_steps: int,
+    device: torch.device,
+    sampling_seed: int,
+    total_memory_bytes: int,
+    fidelity_full_epoch: bool = False,
+    use_subprocess_isolation: bool = True,
+) -> Dict[str, object]:
+    from src import gnn_main as graph_main
+    from src.train_pretrain import train_minibatch
+
+    if bool(use_subprocess_isolation) and device.type == "mps":
+        return _probe_sampler_memory_usage_subprocess(
+            graph_data=graph_data,
+            sequence_index=sequence_index,
+            base_params=base_params,
+            sampler_config=sampler_config,
+            batch_size=int(batch_size),
+            probe_steps=int(probe_steps),
+            device=device,
+            sampling_seed=int(sampling_seed),
+            total_memory_bytes=int(total_memory_bytes),
+            fidelity_full_epoch=bool(fidelity_full_epoch),
+        )
+
+    result: Dict[str, object] = {
+        "status": "ok",
+        "error": None,
+        "probe_batches": 0,
+        "eval_status": "not_run",
+        "sampler_impl": None,
+        "memory_peak_bytes": 0,
+        "memory_peak_gb": None,
+        "memory_peak_fraction_total": None,
+        "probe_mode": (
+            "fidelity_full_epoch"
+            if bool(fidelity_full_epoch)
+            else "fast_limited_batches"
+        ),
+    }
+
+    graph_cpu, _ = _ensure_cpu_graph(graph_data)
+    loader, loader_error = _build_sampler_memory_loader(
+        graph_cpu=graph_cpu,
+        sampler_config=sampler_config,
+        batch_size=int(batch_size),
+        sampling_seed=int(sampling_seed),
+    )
+    if loader is None:
+        result["status"] = "loader_error"
+        result["error"] = loader_error
+        return result
+    try:
+        result["sampler_impl"] = str(getattr(loader, "sampler_impl", "neighbor_native"))
+    except Exception:
+        result["sampler_impl"] = "neighbor_native"
+
+    hidden_channels = int(_metric_float(base_params.get("hidden_channels")) or 64)
+    num_heads = int(_metric_float(base_params.get("num_heads")) or 4)
+    num_layers = int(_metric_float(base_params.get("num_layers")) or 2)
+    dropout = float(_metric_float(base_params.get("dropout")) or 0.2)
+    aggr1 = str(base_params.get("aggr1", "sum"))
+    aggr2 = str(base_params.get("aggr2", "sum"))
+    gnn_variant = _normalize_ui_gnn_variant(base_params.get("gnn_variant", GNN_VARIANT))
+    use_checkpointing = _metric_bool(base_params.get("use_checkpointing"), default=False)
+    try:
+        num_classes = int(torch.unique(graph_data["pm"].y).numel())
+    except Exception:
+        num_classes = 2
+    num_classes = max(int(num_classes), 2)
+
+    model = None
+    edge_gen = None
+    criterion = None
+    scaler = None
+    optimizer = None
+    scheduler = None
+    peak_bytes = 0
+    try:
+        _cleanup_experiment_memory()
+        _reset_device_memory_trackers(device)
+        torch.manual_seed(int(sampling_seed))
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.manual_seed_all(int(sampling_seed))
+            except Exception:
+                pass
+
+        model = graph_main._build_gnn_model(
+            in_channels=int(graph_data["pm"].x.shape[1]),
+            hidden_channels=int(hidden_channels),
+            out_channels=int(num_classes),
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            edge_feature_dim=int(_infer_edge_feature_dim(graph_data)),
+            num_layers=int(num_layers),
+            aggr1=str(aggr1),
+            aggr2=str(aggr2),
+            use_checkpointing=bool(use_checkpointing),
+            gnn_variant=gnn_variant,
+            sequence_index=sequence_index,
+            num_nodes=int(getattr(graph_data["pm"], "num_nodes", graph_data["pm"].x.shape[0])),
+            device=device,
+        )
+        model.train()
+
+        temporal_module = getattr(model, "temporal_head", None)
+        if temporal_module is not None:
+            try:
+                temporal_module.reset_cache()
+            except Exception:
+                pass
+
+        use_graphsmote = bool(
+            _metric_bool(sampler_config.get("use_graphsmote"), default=False)
+            or _metric_bool(base_params.get("use_graphsmote"), default=False)
+        )
+        if use_graphsmote:
+            try:
+                from src.graphsmote import RelEdgeGen
+
+                z_dim = int(hidden_channels) * int(num_heads)
+                z_dim_dict = {ntype: z_dim for ntype in graph_data.node_types}
+                edge_gen = RelEdgeGen(z_dim_dict, graph_data.edge_types).to(device)
+            except Exception:
+                edge_gen = None
+
+        optimizer_name = str(base_params.get("optimizer", "Adam"))
+        optimizer_cls = get_optimizer_cls(optimizer_name)
+        lr = float(_metric_float(base_params.get("lr")) or 1e-3)
+        weight_decay = float(_metric_float(base_params.get("weight_decay")) or 1e-6)
+        optim_params = list(model.parameters()) + (
+            list(edge_gen.parameters()) if edge_gen is not None else []
+        )
+        optimizer = optimizer_cls(
+            optim_params,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+
+        loss_type = str(base_params.get("loss_type", "CrossEntropy"))
+        if loss_type == "FocalLoss":
+            focal_gamma = float(_metric_float(base_params.get("focal_gamma")) or 2.0)
+            focal_alpha = float(_metric_float(base_params.get("focal_alpha")) or 0.25)
+            alpha_val = None if use_graphsmote else [1.0 - focal_alpha, focal_alpha]
+            criterion = graph_main.FocalLoss(gamma=focal_gamma, alpha=alpha_val)
+        else:
+            weight = None
+            im_gagn_augmented = False
+            try:
+                im_gagn_augmented = (
+                    hasattr(graph_data["pm"], "is_synthetic")
+                    and bool(graph_data["pm"].is_synthetic.sum().item() > 0)
+                )
+            except Exception:
+                im_gagn_augmented = False
+            if not use_graphsmote and not im_gagn_augmented:
+                y_train = graph_data["pm"].y[graph_data["pm"].train_mask]
+                counts = torch.bincount(y_train)
+                if counts.numel() > 1:
+                    weight = (1.0 / counts.float()).to(device)
+            criterion = torch.nn.CrossEntropyLoss(weight=weight)
+
+        base_len = 0
+        try:
+            base_len = int(len(loader))
+        except Exception:
+            base_len = 0
+        limited_len = _resolve_probe_loader_limit(
+            base_len=int(base_len),
+            probe_steps=int(probe_steps),
+            fidelity_full_epoch=bool(fidelity_full_epoch),
+        )
+
+        class _LimitedLoader:
+            def __init__(self, base_loader, limit: int):
+                self.base_loader = base_loader
+                self.limit = max(1, int(limit))
+                self.seen = 0
+
+            def __len__(self):
+                try:
+                    return max(1, min(int(len(self.base_loader)), self.limit))
+                except Exception:
+                    return self.limit
+
+            def __iter__(self):
+                base_it = iter(self.base_loader)
+                produced = 0
+                try:
+                    while produced < self.limit:
+                        try:
+                            item = next(base_it)
+                        except StopIteration:
+                            break
+                        produced += 1
+                        self.seen = produced
+                        yield item
+                finally:
+                    _shutdown_torch_loader_iterator(base_it)
+
+        limited_loader = _LimitedLoader(loader, limit=limited_len)
+
+        use_amp_param = _metric_bool(base_params.get("use_amp"), default=True)
+        use_amp = bool(use_amp_param and device.type == "cuda")
+        if use_amp:
+            try:
+                scaler = torch.amp.GradScaler()
+            except Exception:
+                scaler = None
+                use_amp = False
+
+        try:
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=float(lr),
+                steps_per_epoch=max(1, int(len(limited_loader))),
+                epochs=1,
+                cycle_momentum=isinstance(
+                    optimizer,
+                    (torch.optim.AdamW, torch.optim.NAdam),
+                ),
+            )
+        except Exception:
+            scheduler = None
+
+        mode = str(base_params.get("lambda_H_mode", "fixed")).strip().lower()
+        if mode == "fixed":
+            lambda_H = float(_metric_float(base_params.get("lambda_H_fixed")) or 0.0)
+        else:
+            lambda_H = float(_metric_float(base_params.get("initial_lambda_H")) or 0.0)
+        lambda_edge = float(_metric_float(base_params.get("lambda_edge")) or 1e-6)
+        if not use_graphsmote:
+            lambda_edge = 0.0
+        lambda_l2_att = float(_metric_float(base_params.get("lambda_l2_att")) or 0.0)
+        grad_clip = float(_metric_float(base_params.get("grad_clip")) or 1.0)
+        accumulation_steps = int(
+            _metric_float(base_params.get("accumulation_steps")) or ACCUMULATION_STEPS
+        )
+        accumulation_steps = max(1, int(accumulation_steps))
+
+        try:
+            graph_main._prime_temporal_cache_if_needed(
+                model,
+                graph_data,
+                node_type="pm",
+                context="memory_probe",
+            )
+        except Exception:
+            pass
+
+        peak_bytes = max(peak_bytes, _device_current_memory_bytes(device))
+        def _batch_memory_cb(**_payload):
+            nonlocal peak_bytes
+            peak_bytes = max(peak_bytes, _device_current_memory_bytes(device))
+
+        train_minibatch(
+            model,
+            limited_loader,
+            optimizer,
+            criterion,
+            grad_clip_value=float(grad_clip),
+            device=device,
+            use_amp=bool(use_amp),
+            scaler=scaler,
+            scheduler=scheduler,
+            writer=None,
+            epoch=1,
+            lambda_H=float(lambda_H),
+            node_type="pm",
+            edge_gen=edge_gen,
+            lambda_edge=float(lambda_edge),
+            lambda_l2_att=float(lambda_l2_att),
+            batch_callback=_batch_memory_cb,
+            batch_log_every=1,
+            accumulation_steps=int(accumulation_steps),
+        )
+        result["probe_batches"] = int(getattr(limited_loader, "seen", 0))
+
+        if device.type == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                pass
+        peak_bytes = max(peak_bytes, _device_peak_memory_bytes(device))
+
+        has_val_mask = False
+        try:
+            has_val_mask = (
+                hasattr(graph_data["pm"], "val_mask")
+                and bool(graph_data["pm"].val_mask.sum().item() > 0)
+            )
+        except Exception:
+            has_val_mask = False
+
+        if has_val_mask and int(result["probe_batches"]) > 0:
+            eval_mode_raw = str(
+                base_params.get("eval_neighbors_mode", "same")
+            ).strip().lower().replace("-", "_")
+            if eval_mode_raw in {"same", "train", "same_as_train"}:
+                eval_mode = "same"
+            elif eval_mode_raw in {"exhaustive", "full"}:
+                eval_mode = "exhaustive"
+            else:
+                eval_mode = "custom"
+
+            try:
+                train_neighbors_cfg = graph_main._resolve_num_neighbors(
+                    sampler_config.get("num_neighbors"),
+                    base_params.get("num_neighbors", NUM_NEIGHBORS),
+                    graph_data.edge_types,
+                )
+            except Exception:
+                train_neighbors_cfg = NUM_NEIGHBORS
+
+            if eval_mode == "same":
+                eval_neighbors_cfg = train_neighbors_cfg
+            elif eval_mode == "exhaustive":
+                try:
+                    eval_neighbors_cfg = graph_main._make_exhaustive_num_neighbors(
+                        graph_data.edge_types,
+                        int(num_layers),
+                    )
+                except Exception:
+                    eval_neighbors_cfg = {
+                        edge_type: [-1 for _ in range(max(1, int(num_layers)))]
+                        for edge_type in graph_data.edge_types
+                    }
+            else:
+                try:
+                    eval_neighbors_cfg = graph_main._resolve_num_neighbors(
+                        base_params.get("eval_num_neighbors"),
+                        train_neighbors_cfg,
+                        graph_data.edge_types,
+                    )
+                except Exception:
+                    eval_neighbors_cfg = train_neighbors_cfg
+
+            graph_main.test(
+                model,
+                graph_data,
+                node_type="pm",
+                batch_size=max(1, int(batch_size)),
+                masks=["val_mask"],
+                num_neighbors=eval_neighbors_cfg,
+            )
+            result["eval_status"] = "ok"
+            peak_bytes = max(peak_bytes, _device_peak_memory_bytes(device))
+            peak_bytes = max(peak_bytes, _device_current_memory_bytes(device))
+            if temporal_module is not None:
+                try:
+                    temporal_module.train()
+                except Exception:
+                    pass
+        elif not has_val_mask:
+            result["eval_status"] = "no_val_mask"
+        else:
+            result["eval_status"] = "no_batches"
+
+        if int(result["probe_batches"]) == 0:
+            result["status"] = "no_batches"
+            result["error"] = "No se pudo procesar batches para medir memoria."
+    except RuntimeError as exc:
+        if _is_oom_runtime_error(exc):
+            result["status"] = "oom"
+            result["error"] = str(exc)
+        else:
+            result["status"] = "error"
+            result["error"] = str(exc)
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+    finally:
+        try:
+            del loader
+        except Exception:
+            pass
+        peak_bytes = max(int(peak_bytes), int(_device_peak_memory_bytes(device)))
+        result["memory_peak_bytes"] = int(max(peak_bytes, 0))
+        peak_gb = _bytes_to_gb(result["memory_peak_bytes"])
+        result["memory_peak_gb"] = float(peak_gb) if peak_gb is not None else None
+        if int(total_memory_bytes) > 0:
+            result["memory_peak_fraction_total"] = float(
+                int(result["memory_peak_bytes"]) / int(total_memory_bytes)
+            )
+        if model is not None:
+            del model
+        if edge_gen is not None:
+            del edge_gen
+        if optimizer is not None:
+            del optimizer
+        if scheduler is not None:
+            del scheduler
+        if scaler is not None:
+            del scaler
+        if criterion is not None:
+            del criterion
+        _cleanup_experiment_memory()
+
+    return result
+
+
+def _search_sampler_batch_for_budget(
+    *,
+    graph_data: HeteroData,
+    sequence_index: Optional[object],
+    base_params: Dict[str, object],
+    sampler_config: Dict[str, object],
+    batch_candidates: Sequence[int],
+    probe_steps: int,
+    device: torch.device,
+    sampling_seed: int,
+    budget_bytes: int,
+    total_memory_bytes: int,
+    batch_step_size: Optional[int] = None,
+    jump_options: Optional[Sequence[int]] = None,
+    fidelity_full_epoch: bool = False,
+) -> Tuple[Optional[Dict[str, object]], List[Dict[str, object]]]:
+    values = sorted(set(int(v) for v in batch_candidates if int(v) > 0))
+    if not values:
+        return None, []
+    adaptive_jump_options = _normalize_adaptive_jump_options(jump_options)
+    resolved_batch_step_size = int(
+        max(
+            1,
+            int(batch_step_size)
+            if batch_step_size is not None
+            else int(_infer_batch_step_size(values)),
+        )
+    )
+
+    probes: List[Dict[str, object]] = []
+    row_by_idx: Dict[int, Dict[str, object]] = {}
+    best_row: Optional[Dict[str, object]] = None
+
+    def _probe_idx(
+        idx: int,
+        *,
+        phase: str,
+        jump: Optional[int] = None,
+    ) -> Dict[str, object]:
+        nonlocal probes, row_by_idx
+        idx = int(max(0, min(idx, len(values) - 1)))
+        if idx in row_by_idx:
+            cached = row_by_idx[idx]
+            if cached.get("adaptive_phase") is None:
+                cached["adaptive_phase"] = str(phase)
+            if jump is not None and cached.get("adaptive_jump") is None:
+                cached["adaptive_jump"] = int(jump)
+            return cached
+
+        batch_size = int(values[idx])
+        probe = _probe_sampler_memory_usage(
+            graph_data=graph_data,
+            sequence_index=sequence_index,
+            base_params=base_params,
+            sampler_config=sampler_config,
+            batch_size=batch_size,
+            probe_steps=int(probe_steps),
+            device=device,
+            sampling_seed=int(sampling_seed),
+            total_memory_bytes=int(total_memory_bytes),
+            fidelity_full_epoch=bool(fidelity_full_epoch),
+        )
+        row = dict(sampler_config)
+        row.update(
+            {
+                "batch_index": int(idx),
+                "batch_size": int(batch_size),
+                "status": probe.get("status"),
+                "error": probe.get("error"),
+                "probe_batches": int(probe.get("probe_batches", 0)),
+                "eval_status": probe.get("eval_status"),
+                "probe_mode": probe.get("probe_mode"),
+                "sampler_impl": probe.get("sampler_impl"),
+                "memory_peak_bytes": int(probe.get("memory_peak_bytes", 0)),
+                "memory_peak_gb": probe.get("memory_peak_gb"),
+                "memory_peak_fraction_total": probe.get("memory_peak_fraction_total"),
+                "budget_bytes": int(budget_bytes),
+                "budget_gb": _bytes_to_gb(budget_bytes),
+                "adaptive_phase": str(phase),
+                "adaptive_jump": int(jump) if jump is not None else None,
+                "adaptive_jump_options": ";".join(
+                    str(int(v)) for v in adaptive_jump_options
+                ),
+                "adaptive_jump_batch_delta": (
+                    int(max(1, int(jump)) * resolved_batch_step_size)
+                    if jump is not None
+                    else None
+                ),
+                "adaptive_batch_step_size": int(resolved_batch_step_size),
+            }
+        )
+        peak_bytes = int(row.get("memory_peak_bytes", 0))
+        if int(budget_bytes) > 0:
+            row["memory_peak_fraction_budget"] = float(
+                peak_bytes / int(budget_bytes)
+            )
+        else:
+            row["memory_peak_fraction_budget"] = None
+        probes.append(row)
+        row_by_idx[idx] = row
+        return row
+
+    def _fits_budget(row: Optional[Dict[str, object]]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        return (
+            str(row.get("status", "")).strip().lower() == "ok"
+            and int(row.get("memory_peak_bytes", 0)) > 0
+            and int(row.get("memory_peak_bytes", 0)) <= int(budget_bytes)
+        )
+
+    def _accept_best(row: Dict[str, object]) -> None:
+        nonlocal best_row
+        if not _fits_budget(row):
+            return
+        if best_row is None:
+            best_row = row
+            return
+        curr_peak = int(row.get("memory_peak_bytes", 0))
+        best_peak = int(best_row.get("memory_peak_bytes", 0))
+        if curr_peak > best_peak:
+            best_row = row
+        elif curr_peak == best_peak and int(row.get("batch_size", 0)) > int(
+            best_row.get("batch_size", 0)
+        ):
+            best_row = row
+
+    # Exploración adaptativa: saltos grandes cuando el uso es bajo y refinamiento
+    # progresivo cuando nos acercamos al presupuesto.
+    current_idx = 0
+    current_row = _probe_idx(
+        current_idx,
+        phase="explore",
+        jump=int(adaptive_jump_options[-1]),
+    )
+    best_under_idx = current_idx if _fits_budget(current_row) else None
+    _accept_best(current_row)
+
+    safety = 0
+    max_safety = max(50, len(values) * 3)
+    while current_idx < (len(values) - 1) and safety < max_safety:
+        safety += 1
+        current_frac = _metric_float(current_row.get("memory_peak_fraction_budget"))
+        jump = _adaptive_probe_jump(current_frac, adaptive_jump_options)
+        next_idx = _advance_batch_index_by_jump(
+            values,
+            current_idx=int(current_idx),
+            jump_units=int(jump),
+            batch_step_size=int(resolved_batch_step_size),
+            upper_bound_idx=len(values) - 1,
+        )
+        if next_idx <= current_idx:
+            if current_idx + 1 < len(values):
+                next_idx = current_idx + 1
+            else:
+                break
+
+        next_row = _probe_idx(next_idx, phase="explore", jump=jump)
+        if _fits_budget(next_row):
+            best_under_idx = int(next_idx)
+            _accept_best(next_row)
+            current_idx = int(next_idx)
+            current_row = next_row
+            continue
+
+        # Si excede o falla, refinamos entre el último punto válido y el fallido
+        # usando saltos menores (pasos más cortos cerca de altos porcentajes).
+        low_idx = (
+            int(best_under_idx)
+            if best_under_idx is not None
+            else int(max(0, current_idx))
+        )
+        high_idx = int(next_idx)
+        if low_idx >= high_idx:
+            break
+
+        refine_cursor = int(low_idx)
+        while refine_cursor + 1 < high_idx:
+            high_row = row_by_idx.get(high_idx)
+            high_frac = _metric_float(
+                (high_row or {}).get("memory_peak_fraction_budget")
+            )
+            refine_jump = _adaptive_probe_jump(high_frac, adaptive_jump_options)
+            probe_idx = _advance_batch_index_by_jump(
+                values,
+                current_idx=int(refine_cursor),
+                jump_units=int(refine_jump),
+                batch_step_size=int(resolved_batch_step_size),
+                upper_bound_idx=high_idx - 1,
+            )
+            if probe_idx <= refine_cursor:
+                probe_idx = refine_cursor + 1
+            probe_row = _probe_idx(
+                probe_idx,
+                phase="refine",
+                jump=refine_jump,
+            )
+            if _fits_budget(probe_row):
+                best_under_idx = int(probe_idx)
+                _accept_best(probe_row)
+                refine_cursor = int(probe_idx)
+            else:
+                high_idx = int(probe_idx)
+        break
+
+    probes.sort(key=lambda item: int(item.get("batch_size", 0)))
+    return best_row, probes
+
+
+def _select_best_sampler_memory_row(
+    rows: Sequence[Dict[str, object]],
+    *,
+    budget_bytes: int,
+) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
+    valid_rows = [
+        dict(row)
+        for row in rows
+        if str(row.get("status", "")).strip().lower() == "ok"
+        and int(row.get("memory_peak_bytes", 0)) > 0
+    ]
+    if not valid_rows:
+        return None, None
+
+    under_budget = [
+        row for row in valid_rows if int(row.get("memory_peak_bytes", 0)) <= int(budget_bytes)
+    ]
+    over_budget = [
+        row for row in valid_rows if int(row.get("memory_peak_bytes", 0)) > int(budget_bytes)
+    ]
+
+    best_under = None
+    if under_budget:
+        under_budget.sort(
+            key=lambda row: (
+                int(row.get("memory_peak_bytes", 0)),
+                int(row.get("batch_size", 0)),
+            ),
+            reverse=True,
+        )
+        best_under = under_budget[0]
+
+    closest_over = None
+    if over_budget:
+        over_budget.sort(
+            key=lambda row: (
+                int(row.get("memory_peak_bytes", 0)) - int(budget_bytes),
+                int(row.get("batch_size", 0)),
+            )
+        )
+        closest_over = over_budget[0]
+
+    return best_under, closest_over
 
 
 def _materialize_sampler_hparams_variant(
@@ -12453,20 +14550,35 @@ def _render_sampler_fidelity_experiment(
             "- `eval_neighbors_mode`: `exhaustive` evalúa con vecindario completo para comparar en condiciones cercanas a full-batch."
         )
 
-    use_graphsmote = st.checkbox(
-        "Entrenar con GraphSMOTE",
-        value=False,
-        key="gnn_exp_sampler_fidelity_use_graphsmote",
-        help="Activa la misma variante de balanceo para referencia y candidatos.",
+    variant_label_to_flags = {
+        "Base": {"use_graphsmote": False, "use_imgagn": False},
+        "GraphSMOTE": {"use_graphsmote": True, "use_imgagn": False},
+        "ImGAGN": {"use_graphsmote": False, "use_imgagn": True},
+    }
+    base_variant = st.radio(
+        "Variante base",
+        options=list(variant_label_to_flags.keys()),
+        index=0,
+        horizontal=True,
+        key="gnn_exp_sampler_fidelity_base_variant",
+        help="Selecciona la variante base para referencia y candidatos.",
     )
+    variant_flags = variant_label_to_flags.get(
+        str(base_variant),
+        {"use_graphsmote": False, "use_imgagn": False},
+    )
+    use_graphsmote = bool(variant_flags.get("use_graphsmote", False))
+    use_imgagn = bool(variant_flags.get("use_imgagn", False))
 
     hp_files = _list_hpo_files_for_training(
         use_graphsmote=bool(use_graphsmote),
+        use_imgagn=bool(use_imgagn),
         graph_obj=graph_obj,
     )
     if not hp_files:
         st.warning(
-            "No se encontraron archivos `optuna_hyperparams_*.csv` compatibles para este grafo/variante."
+            "No se encontraron archivos `optuna_hyperparams_*.csv` "
+            f"compatibles para la variante `{base_variant}`."
         )
         return
 
@@ -12505,7 +14617,8 @@ def _render_sampler_fidelity_experiment(
         )
 
     st.caption(
-        f"Base detectada: layers={base_layers}, batch_size={int(_metric_float(base_params.get('batch_size')) or BATCH_SIZE)}, "
+        f"Base detectada ({base_variant}): "
+        f"layers={base_layers}, batch_size={int(_metric_float(base_params.get('batch_size')) or BATCH_SIZE)}, "
         f"num_neighbors={base_neighbors}"
     )
 
@@ -12552,18 +14665,12 @@ def _render_sampler_fidelity_experiment(
         st.warning("Selecciona al menos un sampler.")
         return
 
-    neighbor_profiles_text = st.text_area(
-        "Perfiles num_neighbors (separar por ';')",
-        value=";".join(
-            [
-                ",".join(str(v) for v in base_neighbors),
-                "25,15,10",
-                "10,5",
-            ]
-        ),
-        key="gnn_exp_sampler_neighbor_profiles",
-        help="Ejemplo: `15,10;25,15,10;10,5`.",
+    neighbor_profiles = _render_sampler_neighbor_profiles_controls(
+        key_prefix="gnn_exp_sampler",
     )
+    if not neighbor_profiles:
+        st.warning("Selecciona al menos un perfil habilitado.")
+        return
 
     col_sampling_a, col_sampling_b, col_sampling_c = st.columns(3)
     with col_sampling_a:
@@ -12590,52 +14697,16 @@ def _render_sampler_fidelity_experiment(
             help="Desactiva hard-mining para acercar el entrenamiento al baseline full-batch.",
         )
 
-    col_cluster_a, col_cluster_b = st.columns(2)
-    with col_cluster_a:
-        cluster_parts_txt = st.text_input(
-            "Cluster-GCN num_parts",
-            value="64,128",
-            key="gnn_exp_sampler_cluster_parts",
-            help="Cantidad de particiones del grafo para Cluster-GCN.",
+    cluster_num_parts, cluster_parts_per_epoch = (
+        _render_sampler_cluster_gcn_profiles_controls(
+            key_prefix="gnn_exp_sampler",
         )
-    with col_cluster_b:
-        cluster_parts_epoch_txt = st.text_input(
-            "Cluster-GCN parts/epoch",
-            value="0,4,8",
-            key="gnn_exp_sampler_cluster_parts_epoch",
-            help="Cuántas particiones usar por epoch (0 = todas).",
+    )
+    graphsaint_modes, saint_batches, saint_steps, saint_walks = (
+        _render_sampler_graphsaint_profiles_controls(
+            key_prefix="gnn_exp_sampler",
         )
-
-    col_saint_a, col_saint_b, col_saint_c, col_saint_d = st.columns(4)
-    with col_saint_a:
-        graphsaint_modes = st.multiselect(
-            "GraphSAINT mode",
-            ["node", "edge", "random_walk"],
-            default=["node", "edge", "random_walk"],
-            key="gnn_exp_sampler_graphsaint_modes",
-            help="Modo de muestreo interno de GraphSAINT.",
-        )
-    with col_saint_b:
-        graphsaint_batch_txt = st.text_input(
-            "GraphSAINT batch_size",
-            value="1024,2048",
-            key="gnn_exp_sampler_graphsaint_batch",
-            help="Cantidad de nodos/semillas por mini-lote GraphSAINT.",
-        )
-    with col_saint_c:
-        graphsaint_steps_txt = st.text_input(
-            "GraphSAINT num_steps",
-            value="4,8",
-            key="gnn_exp_sampler_graphsaint_steps",
-            help="Número de subgrafos por epoch aproximado.",
-        )
-    with col_saint_d:
-        graphsaint_walk_txt = st.text_input(
-            "GraphSAINT walk_length",
-            value="2,4",
-            key="gnn_exp_sampler_graphsaint_walk",
-            help="Longitud de caminata para `random_walk`.",
-        )
+    )
 
     col_eval_a, col_eval_b = st.columns(2)
     with col_eval_a:
@@ -12756,25 +14827,16 @@ def _render_sampler_fidelity_experiment(
         "test_accuracy": 0.5,
     }
 
-    neighbor_profiles = _parse_neighbor_profiles_input(
-        neighbor_profiles_text,
-        fallback=[base_neighbors],
-    )
-    cluster_num_parts = _parse_int_options(
-        cluster_parts_txt, fallback=[64], min_value=1
-    )
-    cluster_parts_per_epoch = _parse_int_options(
-        cluster_parts_epoch_txt, fallback=[0], min_value=0
-    )
-    saint_batches = _parse_int_options(
-        graphsaint_batch_txt, fallback=[2048], min_value=1
-    )
-    saint_steps = _parse_int_options(
-        graphsaint_steps_txt, fallback=[8], min_value=1
-    )
-    saint_walks = _parse_int_options(
-        graphsaint_walk_txt, fallback=[2], min_value=1
-    )
+    if "Cluster-GCN" in selected_sampler_labels and (
+        not cluster_num_parts or not cluster_parts_per_epoch
+    ):
+        st.warning("Selecciona al menos un perfil habilitado en Cluster-GCN.")
+        return
+    if "GraphSAINT" in selected_sampler_labels and (
+        not graphsaint_modes or not saint_batches or not saint_steps or not saint_walks
+    ):
+        st.warning("Selecciona al menos un perfil habilitado en GraphSAINT.")
+        return
 
     eval_custom_neighbors = None
     if eval_mode == "custom":
@@ -12866,7 +14928,9 @@ def _render_sampler_fidelity_experiment(
             "graph_source": graph_source_label,
             "graph_hash": graph_hash,
             "base_hparams_path": selected_hparams_path,
+            "base_variant": str(base_variant),
             "use_graphsmote": bool(use_graphsmote),
+            "use_imgagn": bool(use_imgagn),
             "far_target": float(far_target),
             "max_epochs": int(max_epochs_train),
             "candidate_count": len(candidate_configs),
@@ -12980,7 +15044,9 @@ def _render_sampler_fidelity_experiment(
             "graph_hash": graph_hash,
             "base_hparams_path": selected_hparams_path,
             "generated_hparams_path": ref_hp_path,
+            "base_variant": str(base_variant),
             "use_graphsmote": bool(use_graphsmote),
+            "use_imgagn": bool(use_imgagn),
             "far_target": float(far_target),
             "batch_size_eval": int(eval_batch_size),
             "model_path": ref_model_path,
@@ -13131,7 +15197,9 @@ def _render_sampler_fidelity_experiment(
                 "graph_hash": graph_hash,
                 "base_hparams_path": selected_hparams_path,
                 "generated_hparams_path": hp_variant_path,
+                "base_variant": str(base_variant),
                 "use_graphsmote": bool(use_graphsmote),
+                "use_imgagn": bool(use_imgagn),
                 "far_target": float(far_target),
                 "batch_size_eval": int(eval_batch_size),
                 "model_path": model_path,
@@ -13206,6 +15274,7 @@ def _render_sampler_fidelity_experiment(
                     "test_f1": best_row.get("test_f1"),
                     "test_recall": best_row.get("test_recall"),
                     "test_far": best_row.get("test_far"),
+                    "base_variant": str(base_variant),
                 }
             )
 
@@ -13220,9 +15289,638 @@ def _render_sampler_fidelity_experiment(
                         "results_path": str(out_csv),
                         "db_path": str(exp_db_path) if exp_db_path else None,
                         "base_hparams_path": selected_hparams_path,
+                        "base_variant": str(base_variant),
                         "reference_config": reference_cfg,
                         "candidates": len(candidate_configs),
                         "best_config_name": best_row.get("config_name") if best_row else None,
+                    },
+                }
+            )
+            _append_gnn_history(entry)
+        except Exception as exc:
+            st.warning(f"No se pudo guardar en historial: {exc}")
+
+
+def _render_sampler_memory_budget_experiment(
+    *,
+    graph_obj: Dict[str, object],
+    graph_data: HeteroData,
+    graph_source_label: str,
+) -> None:
+    st.markdown("### Sampler Memory Budget (95% VRAM)")
+    st.caption(
+        "Busca automáticamente la configuración de muestreo que maximiza uso de memoria "
+        "sin sobrepasar el presupuesto objetivo."
+    )
+    with st.expander("¿Qué controla este experimento y por qué sirve para CUDA/Apple?", expanded=False):
+        st.markdown(
+            "- `batch_size`: principal palanca de consumo de VRAM/Unified Memory por iteración.\n"
+            "- `num_neighbors`: define expansión del subgrafo por capa; impacta memoria y latencia.\n"
+            "- `train_sampler_mode`: `neighbor`, `cluster_gcn`, `graphsaint`; cambia patrón de seeds/subgrafos.\n"
+            "- `backend`: permite perfilar explícitamente en `CUDA` o `MPS` (stack Apple/MLX vía PyTorch)."
+        )
+
+    variant_label_to_flags = {
+        "Base": {"use_graphsmote": False, "use_imgagn": False},
+        "GraphSMOTE": {"use_graphsmote": True, "use_imgagn": False},
+        "ImGAGN": {"use_graphsmote": False, "use_imgagn": True},
+    }
+    base_variant = st.radio(
+        "Variante base",
+        options=list(variant_label_to_flags.keys()),
+        index=0,
+        horizontal=True,
+        key="gnn_exp_sampler_mem_base_variant",
+        help="Selecciona la variante de hiperparámetros base a evaluar.",
+    )
+    variant_flags = variant_label_to_flags.get(
+        str(base_variant),
+        {"use_graphsmote": False, "use_imgagn": False},
+    )
+    use_graphsmote = bool(variant_flags.get("use_graphsmote", False))
+    use_imgagn = bool(variant_flags.get("use_imgagn", False))
+    hp_files = _list_hpo_files_for_training(
+        use_graphsmote=bool(use_graphsmote),
+        use_imgagn=bool(use_imgagn),
+        graph_obj=graph_obj,
+    )
+    if not hp_files:
+        st.warning(
+            "No se encontraron archivos `optuna_hyperparams_*.csv` "
+            f"compatibles para la variante `{base_variant}`."
+        )
+        return
+
+    hp_labels = [os.path.basename(path) for path in hp_files]
+    selected_label = st.selectbox(
+        "Hiperparámetros base",
+        hp_labels,
+        index=len(hp_labels) - 1,
+        key="gnn_exp_sampler_mem_base_hparams",
+        help="Se usa para construir el modelo del probe de memoria.",
+    )
+    selected_hparams_path = next(
+        (path for path in hp_files if os.path.basename(path) == selected_label),
+        hp_files[-1],
+    )
+    base_params = _load_optuna_params_from_csv(selected_hparams_path)
+    if not base_params:
+        st.error("No se pudieron leer los hiperparámetros base.")
+        return
+
+    base_neighbors = _coerce_neighbor_profile(
+        base_params.get("num_neighbors"),
+        fallback=[15, 10],
+    )
+    base_layers = max(
+        1,
+        int(_metric_float(base_params.get("num_layers")) or len(base_neighbors) or 2),
+    )
+    if len(base_neighbors) < base_layers:
+        base_neighbors = base_neighbors + [base_neighbors[-1]] * (
+            base_layers - len(base_neighbors)
+        )
+    base_batch = int(_metric_float(base_params.get("batch_size")) or BATCH_SIZE)
+    st.caption(
+        f"Base detectada ({base_variant}): layers={base_layers}, "
+        f"batch_size={base_batch}, num_neighbors={base_neighbors}"
+    )
+
+    st.markdown("**Hardware y presupuesto de memoria**")
+    col_hw_a, col_hw_b, col_hw_c, col_hw_d = st.columns(4)
+    with col_hw_a:
+        backend_choice = st.selectbox(
+            "Backend",
+            ["Auto", "CUDA", "MPS", "CPU"],
+            index=0,
+            key="gnn_exp_sampler_mem_backend",
+            help="Selecciona el backend a perfilar. `MPS` corresponde al stack PyTorch sobre Apple Silicon.",
+        )
+    with col_hw_b:
+        vram_total_gb = st.number_input(
+            "VRAM total (GB)",
+            min_value=1.0,
+            max_value=256.0,
+            value=24.0,
+            step=1.0,
+            key="gnn_exp_sampler_mem_total_gb",
+            help="Capacidad total a respetar para el presupuesto. Ejemplo: 24 GB.",
+        )
+    with col_hw_c:
+        vram_target_fraction = st.slider(
+            "Uso objetivo",
+            min_value=0.50,
+            max_value=0.99,
+            value=0.95,
+            step=0.01,
+            key="gnn_exp_sampler_mem_target",
+            help="Fracción máxima de memoria permitida. 0.95 equivale a 95%.",
+        )
+    with col_hw_d:
+        probe_steps = st.number_input(
+            "Batches por probe",
+            min_value=1,
+            max_value=20,
+            value=3,
+            step=1,
+            key="gnn_exp_sampler_mem_steps",
+            help="Cantidad de mini-batches para medir pico de memoria por configuración.",
+        )
+    fidelity_full_epoch = st.checkbox(
+        "Modo fidelity (epoch completo)",
+        value=False,
+        key="gnn_exp_sampler_mem_fidelity_mode",
+        help=(
+            "Replica mejor el pipeline de training: cada medición usa todos los "
+            "mini-batches de train del sampler y luego validación. Incrementa costo."
+        ),
+    )
+    if bool(fidelity_full_epoch):
+        st.caption(
+            "Fidelity activo: `Batches por probe` se usa solo como fallback "
+            "si no se puede estimar `len(loader)`."
+        )
+
+    st.markdown("**Grid de muestreo**")
+    st.caption(
+        "Implementación del probe: Neighbor=`NeighborLoader`, "
+        "Cluster-GCN=`ClusterLoader` nativo, GraphSAINT=`GraphSAINT*Sampler` nativo."
+    )
+    sampler_labels = {
+        "NeighborLoader": "neighbor",
+        "Cluster-GCN": "cluster_gcn",
+        "GraphSAINT": "graphsaint",
+    }
+    selected_sampler_labels = st.multiselect(
+        "Samplers a evaluar",
+        list(sampler_labels.keys()),
+        default=list(sampler_labels.keys()),
+        key="gnn_exp_sampler_mem_modes",
+        help="Se evalúan las combinaciones de los samplers seleccionados.",
+    )
+    if not selected_sampler_labels:
+        st.warning("Selecciona al menos un sampler.")
+        return
+
+    neighbor_profiles = _render_sampler_neighbor_profiles_controls(
+        key_prefix="gnn_exp_sampler_mem",
+    )
+    if not neighbor_profiles:
+        st.warning("Selecciona al menos un perfil habilitado.")
+        return
+    col_sampling_a, col_sampling_b, col_sampling_c = st.columns(3)
+    with col_sampling_a:
+        deterministic_sampling = st.checkbox(
+            "Deterministic sampling",
+            value=True,
+            key="gnn_exp_sampler_mem_deterministic",
+            help="Usa semillas fijas para estabilizar resultados entre probes.",
+        )
+    with col_sampling_b:
+        sampling_seed = st.number_input(
+            "Sampling seed",
+            min_value=0,
+            value=int(SEED),
+            step=1,
+            key="gnn_exp_sampler_mem_seed",
+            help="Semilla base para construcción de batches/seeds.",
+        )
+    with col_sampling_c:
+        evaluate_all_configs = st.checkbox(
+            "Evaluar todas las combinaciones",
+            value=True,
+            key="gnn_exp_sampler_mem_all_cfg",
+            help="Si está activo, no se truncará el grid de configuraciones.",
+        )
+    max_configs = st.number_input(
+        "Máximo configuraciones (si no evalúas todas)",
+        min_value=1,
+        max_value=1000,
+        value=24,
+        step=1,
+        key="gnn_exp_sampler_mem_max_cfg",
+        disabled=bool(evaluate_all_configs),
+        help="Solo aplica cuando `Evaluar todas las combinaciones` está desactivado.",
+    )
+    adaptive_jump_sizes_txt = st.text_input(
+        "Saltos adaptativos (separados por ';')",
+        value="1;2;3;4;5;6;7;8;9;10",
+        key="gnn_exp_sampler_mem_adaptive_jumps",
+        help=(
+            "Cada valor es un múltiplo del `batch_size step` del rango a optimizar. "
+            "Ejemplo: con step=128, salto 3 => +384 batch_size."
+        ),
+    )
+
+    cluster_num_parts, cluster_parts_per_epoch = (
+        _render_sampler_cluster_gcn_profiles_controls(
+            key_prefix="gnn_exp_sampler_mem",
+        )
+    )
+    graphsaint_modes, saint_batches, saint_steps, saint_walks = (
+        _render_sampler_graphsaint_profiles_controls(
+            key_prefix="gnn_exp_sampler_mem",
+        )
+    )
+
+    st.markdown("**Rango de batch_size a optimizar**")
+    col_batch_a, col_batch_b, col_batch_c = st.columns(3)
+    with col_batch_a:
+        batch_min = st.number_input(
+            "batch_size min",
+            min_value=1,
+            value=max(32, int(base_batch // 2)),
+            step=1,
+            key="gnn_exp_sampler_mem_batch_min",
+            help="Límite inferior de búsqueda para batch_size.",
+        )
+    with col_batch_b:
+        batch_max = st.number_input(
+            "batch_size max",
+            min_value=1,
+            value=max(int(base_batch), 4096),
+            step=1,
+            key="gnn_exp_sampler_mem_batch_max",
+            help="Límite superior de búsqueda para batch_size.",
+        )
+    with col_batch_c:
+        batch_step = st.number_input(
+            "batch_size step",
+            min_value=1,
+            value=128,
+            step=1,
+            key="gnn_exp_sampler_mem_batch_step",
+            help="Granularidad de búsqueda; menor step aumenta precisión y costo.",
+        )
+
+    if "Cluster-GCN" in selected_sampler_labels and (
+        not cluster_num_parts or not cluster_parts_per_epoch
+    ):
+        st.warning("Selecciona al menos un perfil habilitado en Cluster-GCN.")
+        return
+    if "GraphSAINT" in selected_sampler_labels and (
+        not graphsaint_modes or not saint_batches or not saint_steps or not saint_walks
+    ):
+        st.warning("Selecciona al menos un perfil habilitado en GraphSAINT.")
+        return
+    adaptive_jump_options = sorted(
+        _parse_int_options(
+            adaptive_jump_sizes_txt,
+            fallback=list(range(1, 11)),
+            min_value=1,
+        )
+    )
+    adaptive_jump_deltas = [
+        int(max(1, int(opt)) * max(1, int(batch_step)))
+        for opt in adaptive_jump_options
+    ]
+    sampler_modes = [
+        sampler_labels[label]
+        for label in selected_sampler_labels
+        if label in sampler_labels
+    ]
+    candidate_configs = _build_sampler_fidelity_grid(
+        sampler_modes=sampler_modes,
+        neighbor_profiles=neighbor_profiles,
+        cluster_num_parts=cluster_num_parts,
+        cluster_parts_per_epoch=cluster_parts_per_epoch,
+        graphsaint_modes=graphsaint_modes,
+        graphsaint_batch_sizes=saint_batches,
+        graphsaint_num_steps=saint_steps,
+        graphsaint_walk_lengths=saint_walks,
+        deterministic_sampling=bool(deterministic_sampling),
+        sampling_seed=int(sampling_seed),
+        disable_hard_undersampling=True,
+        eval_neighbors_mode="same",
+        eval_num_neighbors=None,
+        repeats=1,
+    )
+    for cfg in candidate_configs:
+        cfg["num_layers"] = int(base_layers)
+
+    total_configs = len(candidate_configs)
+    if (not bool(evaluate_all_configs)) and len(candidate_configs) > int(max_configs):
+        st.warning(
+            f"Se truncará de {len(candidate_configs)} a {int(max_configs)} configuraciones para limitar costo."
+        )
+        candidate_configs = candidate_configs[: int(max_configs)]
+    elif bool(evaluate_all_configs):
+        st.caption(
+            f"Se evaluarán todas las combinaciones del grid: {total_configs}."
+        )
+
+    st.caption(f"Configuraciones candidatas: {len(candidate_configs)}")
+    st.caption(
+        "Búsqueda adaptativa en batch_size activa: "
+        f"saltos={adaptive_jump_options} x step({int(batch_step)}) "
+        f"=> deltas={adaptive_jump_deltas}. "
+        "Uso bajo => saltos grandes; uso alto => saltos cortos."
+    )
+    if candidate_configs:
+        batch_range_label = (
+            f"{int(batch_min)}..{int(batch_max)} (step={int(batch_step)})"
+        )
+        preview_df = pd.DataFrame(candidate_configs).copy()
+        preview_df["batch_size_range"] = batch_range_label
+        preview_cols = [
+            "config_idx",
+            "config_name",
+            "train_sampler_mode",
+            "batch_size_range",
+            "num_neighbors",
+            "cluster_gcn_num_parts",
+            "cluster_gcn_parts_per_epoch",
+            "graphsaint_mode",
+            "graphsaint_batch_size",
+            "graphsaint_num_steps",
+            "graphsaint_walk_length",
+        ]
+        st.dataframe(
+            preview_df[preview_cols],
+            width="stretch",
+        )
+
+    if st.button(
+        "Ejecutar Sampler Memory Budget",
+        key="gnn_exp_sampler_mem_run",
+        type="primary",
+    ):
+        if not candidate_configs:
+            st.error("No hay configuraciones candidatas para ejecutar.")
+            return
+
+        if backend_choice == "CUDA" and not torch.cuda.is_available():
+            st.error("CUDA no está disponible en este entorno.")
+            return
+        if (
+            backend_choice == "MPS"
+            and (
+                not hasattr(torch, "mps")
+                or not torch.backends.mps.is_available()
+            )
+        ):
+            st.error("MPS no está disponible en este entorno.")
+            return
+        device = _resolve_eval_device(backend_choice)
+        if isinstance(device, str):
+            device = torch.device(str(device))
+        if device.type == "mps":
+            st.caption(
+                "Modo estabilidad MPS activo: cada probe corre en subproceso aislado. "
+                "Si PyTorch/PyG falla, se marca la combinación como `crash` sin cerrar la app."
+            )
+
+        user_total_bytes = int(max(float(vram_total_gb), 0.1) * (1024 ** 3))
+        detected_total_bytes = _resolve_device_total_memory_bytes(
+            device,
+            fallback_total_bytes=user_total_bytes,
+        )
+        effective_total_bytes = min(int(user_total_bytes), int(detected_total_bytes))
+        budget_bytes = int(effective_total_bytes * float(vram_target_fraction))
+        if budget_bytes <= 0:
+            st.error("El presupuesto calculado es inválido.")
+            return
+
+        batch_candidates = _parse_batch_candidates(
+            int(batch_min),
+            int(batch_max),
+            int(batch_step),
+        )
+        if not batch_candidates:
+            st.error("No se pudo construir un rango válido de batch_size.")
+            return
+
+        experiment_name = "GNN Sampler Memory Budget"
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        exp_meta = {
+            "run_id": run_id,
+            "graph": graph_obj.get("filename"),
+            "graph_source": graph_source_label,
+            "base_hparams_path": selected_hparams_path,
+            "base_variant": str(base_variant),
+            "use_graphsmote": bool(use_graphsmote),
+            "use_imgagn": bool(use_imgagn),
+            "device": str(device),
+            "total_vram_gb_input": float(vram_total_gb),
+            "detected_total_memory_gb": _bytes_to_gb(detected_total_bytes),
+            "effective_total_memory_gb": _bytes_to_gb(effective_total_bytes),
+            "target_fraction": float(vram_target_fraction),
+            "budget_gb": _bytes_to_gb(budget_bytes),
+            "probe_steps": int(probe_steps),
+            "batch_candidates": batch_candidates,
+            "batch_step_size": int(batch_step),
+            "candidate_count": len(candidate_configs),
+            "adaptive_jump_options": adaptive_jump_options,
+            "adaptive_jump_batch_deltas": adaptive_jump_deltas,
+            "probe_mode": (
+                "fidelity_full_epoch"
+                if bool(fidelity_full_epoch)
+                else "fast_limited_batches"
+            ),
+        }
+        exp_db_path = _init_gnn_experiment_db(experiment_name, exp_meta)
+        if exp_db_path:
+            st.caption(f"DB live: {exp_db_path}")
+        st.info(
+            "Presupuesto efectivo: "
+            f"{(_bytes_to_gb(budget_bytes) or 0.0):.2f} GB "
+            f"({float(vram_target_fraction) * 100:.1f}% de {(_bytes_to_gb(effective_total_bytes) or 0.0):.2f} GB)."
+        )
+
+        prep_status = st.empty()
+        prep_status.markdown(
+            "Preparando pipeline de memoria (train + validación) según hiperparámetros base..."
+        )
+        with st.spinner("Preparando grafo efectivo para el probe de memoria..."):
+            probe_graph_data, prep_notes = _prepare_graph_for_sampler_memory_probe(
+                graph_data=graph_data,
+                sequence_index=graph_obj.get("sequence_index"),
+                base_params=base_params,
+                device=device,
+                sampling_seed=int(sampling_seed),
+                use_graphsmote=bool(use_graphsmote),
+                use_imgagn=bool(use_imgagn),
+            )
+        prep_status.empty()
+        for note in prep_notes:
+            text = str(note)
+            if text.startswith("[ALERTA]"):
+                st.warning(text.replace("[ALERTA]", "", 1).strip())
+            else:
+                st.caption(text)
+
+        progress = st.progress(0.0)
+        status_box = st.empty()
+        all_probe_rows: List[Dict[str, object]] = []
+        best_per_config: List[Dict[str, object]] = []
+        total = max(1, len(candidate_configs))
+
+        for idx, cfg in enumerate(candidate_configs, start=1):
+            status_box.markdown(
+                f"Evaluando config {idx}/{len(candidate_configs)}: `{cfg.get('config_name')}`"
+            )
+            best_row, probe_rows = _search_sampler_batch_for_budget(
+                graph_data=probe_graph_data,
+                sequence_index=graph_obj.get("sequence_index"),
+                base_params=base_params,
+                sampler_config=cfg,
+                batch_candidates=batch_candidates,
+                probe_steps=int(probe_steps),
+                device=device,
+                sampling_seed=int(sampling_seed),
+                budget_bytes=int(budget_bytes),
+                total_memory_bytes=int(effective_total_bytes),
+                batch_step_size=int(batch_step),
+                jump_options=adaptive_jump_options,
+                fidelity_full_epoch=bool(fidelity_full_epoch),
+            )
+            for probe in probe_rows:
+                payload = {
+                    "experiment": experiment_name,
+                    "run_id": run_id,
+                    "role": "probe",
+                    "graph": graph_obj.get("filename"),
+                    "graph_source": graph_source_label,
+                    "base_variant": str(base_variant),
+                    "use_graphsmote": bool(use_graphsmote),
+                    "use_imgagn": bool(use_imgagn),
+                    "device": str(device),
+                    "target_fraction": float(vram_target_fraction),
+                    "budget_bytes": int(budget_bytes),
+                    "budget_gb": _bytes_to_gb(budget_bytes),
+                    "base_hparams_path": selected_hparams_path,
+                }
+                payload.update(probe)
+                all_probe_rows.append(payload)
+                _append_gnn_experiment_result(exp_db_path, payload)
+
+            summary_row = None
+            if best_row is not None:
+                summary_row = dict(best_row)
+                summary_row["selection_status"] = "under_budget"
+            else:
+                _, closest_over = _select_best_sampler_memory_row(
+                    probe_rows,
+                    budget_bytes=int(budget_bytes),
+                )
+                if closest_over is not None:
+                    summary_row = dict(closest_over)
+                    summary_row["selection_status"] = "closest_over_budget"
+
+            if summary_row is not None:
+                summary_payload = {
+                    "experiment": experiment_name,
+                    "run_id": run_id,
+                    "role": "best_per_config",
+                    "graph": graph_obj.get("filename"),
+                    "graph_source": graph_source_label,
+                    "base_variant": str(base_variant),
+                    "use_graphsmote": bool(use_graphsmote),
+                    "use_imgagn": bool(use_imgagn),
+                    "device": str(device),
+                    "target_fraction": float(vram_target_fraction),
+                    "budget_bytes": int(budget_bytes),
+                    "budget_gb": _bytes_to_gb(budget_bytes),
+                    "base_hparams_path": selected_hparams_path,
+                }
+                summary_payload.update(summary_row)
+                best_per_config.append(summary_payload)
+                _append_gnn_experiment_result(exp_db_path, summary_payload)
+
+            progress.progress(min(idx / total, 1.0))
+            _cleanup_experiment_memory()
+
+        if not all_probe_rows:
+            st.warning("No se pudieron generar mediciones de memoria.")
+            return
+
+        summary_source = best_per_config if best_per_config else all_probe_rows
+        best_under, closest_over = _select_best_sampler_memory_row(
+            summary_source,
+            budget_bytes=int(budget_bytes),
+        )
+
+        summary_df = pd.DataFrame(summary_source)
+        if not summary_df.empty and "memory_peak_fraction_budget" in summary_df.columns:
+            summary_df = summary_df.sort_values(
+                by=["memory_peak_fraction_budget", "memory_peak_bytes"],
+                ascending=[False, False],
+            )
+        st.markdown("### Ranking de configuraciones")
+        st.dataframe(summary_df, width="stretch")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_csv = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+        pd.DataFrame(all_probe_rows).to_csv(out_csv, index=False)
+        st.success(f"Resultados guardados en {out_csv}")
+
+        selected_row = best_under or closest_over
+        if selected_row is not None:
+            _append_gnn_experiment_best(exp_db_path, selected_row)
+            is_under = selected_row is best_under
+            if is_under:
+                st.success(
+                    "Mejor configuración bajo presupuesto encontrada "
+                    f"(uso={float(selected_row.get('memory_peak_fraction_budget', 0.0)) * 100:.2f}%)."
+                )
+            else:
+                st.warning(
+                    "No hubo configuración bajo presupuesto; se muestra la más cercana por encima del límite."
+                )
+            sampling_params = {
+                "train_sampler_mode": selected_row.get("train_sampler_mode"),
+                "num_neighbors": selected_row.get("num_neighbors"),
+                "batch_size": selected_row.get("batch_size"),
+                "cluster_gcn_num_parts": selected_row.get("cluster_gcn_num_parts"),
+                "cluster_gcn_parts_per_epoch": selected_row.get(
+                    "cluster_gcn_parts_per_epoch"
+                ),
+                "graphsaint_mode": selected_row.get("graphsaint_mode"),
+                "graphsaint_batch_size": selected_row.get("graphsaint_batch_size"),
+                "graphsaint_num_steps": selected_row.get("graphsaint_num_steps"),
+                "graphsaint_walk_length": selected_row.get("graphsaint_walk_length"),
+                "deterministic_sampling": selected_row.get("deterministic_sampling"),
+                "sampling_seed": selected_row.get("sampling_seed"),
+            }
+            st.markdown("### Parámetros recomendados de muestreo")
+            st.json(
+                {
+                    "sampling_params": sampling_params,
+                    "memory_peak_gb": selected_row.get("memory_peak_gb"),
+                    "memory_peak_fraction_budget": selected_row.get(
+                        "memory_peak_fraction_budget"
+                    ),
+                    "budget_gb": _bytes_to_gb(budget_bytes),
+                    "device": str(device),
+                    "selection_status": selected_row.get("selection_status", "under_budget"),
+                    "adaptive_jump_options": adaptive_jump_options,
+                    "base_variant": str(base_variant),
+                    "probe_mode": (
+                        "fidelity_full_epoch"
+                        if bool(fidelity_full_epoch)
+                        else "fast_limited_batches"
+                    ),
+                }
+            )
+        else:
+            st.warning("No se pudo seleccionar una configuración final válida.")
+
+        try:
+            entry = _collect_gnn_context()
+            entry.update(
+                {
+                    "type": "GNN Experiment",
+                    "experiment": {
+                        "name": experiment_name,
+                        "run_id": run_id,
+                        "results_path": str(out_csv),
+                        "db_path": str(exp_db_path) if exp_db_path else None,
+                        "base_hparams_path": selected_hparams_path,
+                        "base_variant": str(base_variant),
+                        "candidate_count": len(candidate_configs),
+                        "budget_gb": _bytes_to_gb(budget_bytes),
+                        "target_fraction": float(vram_target_fraction),
+                        "device": str(device),
                     },
                 }
             )
@@ -13760,6 +16458,7 @@ def _render_gnn_experiments_tab() -> None:
             "Opt.Recursiva",
             "Best GNN Variant (Optuna+Train+Test)",
             "Sampler fidelity (Full-batch)",
+            "Sampler memory budget (95% VRAM)",
         ]
         experiment_choice = st.selectbox(
             "Experimento",
@@ -13769,6 +16468,13 @@ def _render_gnn_experiments_tab() -> None:
 
         if experiment_choice == "Sampler fidelity (Full-batch)":
             _render_sampler_fidelity_experiment(
+                graph_obj=graph_obj,
+                graph_data=graph_data,
+                graph_source_label=graph_source_label,
+            )
+            return
+        if experiment_choice == "Sampler memory budget (95% VRAM)":
+            _render_sampler_memory_budget_experiment(
                 graph_obj=graph_obj,
                 graph_data=graph_data,
                 graph_source_label=graph_source_label,
@@ -15978,7 +18684,12 @@ def _render_network_tab() -> None:
                 "emb_dim": int(emb_dim),
             }
         )
-    st.dataframe(pd.DataFrame(layer_rows), width="stretch")
+    layers_df = pd.DataFrame(layer_rows)
+    # Evita conflictos Arrow por mezcla de int/str en columnas como `layer` o `heads`.
+    for col in ("layer", "heads"):
+        if col in layers_df.columns:
+            layers_df[col] = layers_df[col].astype(str)
+    st.dataframe(layers_df, width="stretch")
 
     sequence_index = loaded_graph.get("sequence_index")
     has_sequence_index = (
@@ -16369,6 +19080,33 @@ def _search_space_signature_from_state() -> str:
             for v in str(_get_state("gnn_optuna_smote_every", "2,4,6")).split(",")
             if v.strip()
         ],
+        "sampler_modes": list(_get_state("gnn_optuna_sampler_modes", ["neighbor"])),
+        "cluster_gcn_num_parts": [
+            v.strip()
+            for v in str(_get_state("gnn_optuna_cluster_num_parts", "64,128")).split(",")
+            if v.strip()
+        ],
+        "cluster_gcn_parts_per_epoch": [
+            v.strip()
+            for v in str(_get_state("gnn_optuna_cluster_parts_per_epoch", "0,4")).split(",")
+            if v.strip()
+        ],
+        "graphsaint_modes": list(_get_state("gnn_optuna_graphsaint_modes", ["node", "edge", "random_walk"])),
+        "graphsaint_batch_sizes": [
+            v.strip()
+            for v in str(_get_state("gnn_optuna_graphsaint_batch_sizes", "1024,2048")).split(",")
+            if v.strip()
+        ],
+        "graphsaint_num_steps": [
+            v.strip()
+            for v in str(_get_state("gnn_optuna_graphsaint_num_steps", "4,8")).split(",")
+            if v.strip()
+        ],
+        "graphsaint_walk_lengths": [
+            v.strip()
+            for v in str(_get_state("gnn_optuna_graphsaint_walk_lengths", "2,4")).split(",")
+            if v.strip()
+        ],
     }
     raw = json.dumps(signature_payload, ensure_ascii=True, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
@@ -16438,7 +19176,57 @@ def _collect_optuna_ray_settings(
     optimizer_choices = list(_get_state("gnn_optuna_optimizers", ["AdamW", "Lion"]))
     checkpoint_choices = list(_get_state("gnn_optuna_checkpoint", [False, True]))
     lambda_H_modes = list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"]))
-
+    sampler_alias = {
+        "neighborloader": "neighbor",
+        "neighbor": "neighbor",
+        "cluster_gcn": "cluster_gcn",
+        "clustergcn": "cluster_gcn",
+        "graphsaint": "graphsaint",
+    }
+    raw_sampler_modes = _get_state("gnn_optuna_sampler_modes", ["neighbor"])
+    if not isinstance(raw_sampler_modes, (list, tuple)):
+        raw_sampler_modes = [raw_sampler_modes]
+    sampler_modes: List[str] = []
+    for raw_mode in raw_sampler_modes:
+        key = sampler_alias.get(str(raw_mode).strip().lower().replace("-", "_"))
+        if key and key not in sampler_modes:
+            sampler_modes.append(key)
+    cluster_num_parts = _parse_int_options(
+        str(_get_state("gnn_optuna_cluster_num_parts", "64,128")),
+        [64, 128],
+        min_value=2,
+    )
+    cluster_parts_per_epoch = _parse_int_options(
+        str(_get_state("gnn_optuna_cluster_parts_per_epoch", "0,4")),
+        [0, 4],
+        min_value=0,
+    )
+    raw_graphsaint_modes = _get_state(
+        "gnn_optuna_graphsaint_modes",
+        ["node", "edge", "random_walk"],
+    )
+    if not isinstance(raw_graphsaint_modes, (list, tuple)):
+        raw_graphsaint_modes = [raw_graphsaint_modes]
+    graphsaint_modes: List[str] = []
+    for raw_mode in raw_graphsaint_modes:
+        parsed_mode = _parse_graphsaint_mode(raw_mode, fallback="node")
+        if parsed_mode not in graphsaint_modes:
+            graphsaint_modes.append(parsed_mode)
+    graphsaint_batch_sizes = _parse_int_options(
+        str(_get_state("gnn_optuna_graphsaint_batch_sizes", "1024,2048")),
+        [1024, 2048],
+        min_value=1,
+    )
+    graphsaint_num_steps = _parse_int_options(
+        str(_get_state("gnn_optuna_graphsaint_num_steps", "4,8")),
+        [4, 8],
+        min_value=1,
+    )
+    graphsaint_walk_lengths = _parse_int_options(
+        str(_get_state("gnn_optuna_graphsaint_walk_lengths", "2,4")),
+        [2, 4],
+        min_value=1,
+    )
     if not neighbor_choices:
         errors.append("Seleccione al menos un perfil de vecinos.")
     if not aggr1 or not aggr2:
@@ -16451,6 +19239,20 @@ def _collect_optuna_ray_settings(
         errors.append("Seleccione al menos un valor para use_checkpointing.")
     if not lambda_H_modes:
         errors.append("Seleccione al menos un lambda_H_mode.")
+    if not sampler_modes:
+        errors.append("Seleccione al menos un sampler de entrenamiento (NeighborLoader / Cluster-GCN / GraphSAINT).")
+    if "cluster_gcn" in sampler_modes and not cluster_num_parts:
+        errors.append("Configure al menos un valor para Cluster-GCN num_parts.")
+    if "cluster_gcn" in sampler_modes and not cluster_parts_per_epoch:
+        errors.append("Configure al menos un valor para Cluster-GCN parts_per_epoch.")
+    if "graphsaint" in sampler_modes and not graphsaint_modes:
+        errors.append("Seleccione al menos un modo de GraphSAINT.")
+    if "graphsaint" in sampler_modes and not graphsaint_batch_sizes:
+        errors.append("Configure al menos un valor para GraphSAINT batch_size.")
+    if "graphsaint" in sampler_modes and not graphsaint_num_steps:
+        errors.append("Configure al menos un valor para GraphSAINT num_steps.")
+    if "graphsaint" in sampler_modes and "random_walk" in graphsaint_modes and not graphsaint_walk_lengths:
+        errors.append("Configure al menos un walk_length para GraphSAINT Random Walk.")
 
     hidden_min = int(_get_state("gnn_optuna_hidden_min", 32))
     hidden_max = int(_get_state("gnn_optuna_hidden_max", 128))
@@ -16532,6 +19334,13 @@ def _collect_optuna_ray_settings(
         "use_checkpointing": checkpoint_choices,
         "neighbor_profiles": neighbor_profiles,
         "neighbor_choices": neighbor_choices,
+        "sampler_modes": sampler_modes,
+        "cluster_gcn_num_parts": cluster_num_parts,
+        "cluster_gcn_parts_per_epoch": cluster_parts_per_epoch,
+        "graphsaint_modes": graphsaint_modes,
+        "graphsaint_batch_sizes": graphsaint_batch_sizes,
+        "graphsaint_num_steps": graphsaint_num_steps,
+        "graphsaint_walk_lengths": graphsaint_walk_lengths,
         "lr": {"min": lr_min, "max": lr_max},
         "weight_decay": {"min": wd_min, "max": wd_max},
         "lambda_l2_att": {"min": lambda_l2_min, "max": lambda_l2_max},
@@ -17259,52 +20068,229 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             key="gnn_optuna_aggr2",
         )
 
-    with st.expander("Perfiles de vecinos"):
+    # Compatibilidad: migra claves legacy de perfiles hacia la UI nueva
+    # sin perder la integración con el payload existente de Optuna/Ray.
+    neighbor_profile_names = [
+        name for name, _ in SAMPLER_NEIGHBOR_PROFILE_PRESETS
+    ]
+    for name, default_profile in SAMPLER_NEIGHBOR_PROFILE_PRESETS:
+        ui_key = f"gnn_optuna_neighbor_profile_{name}"
+        legacy_key = f"gnn_optuna_neighbor_{name}"
+        if ui_key not in st.session_state:
+            default_txt = ",".join(str(int(v)) for v in default_profile)
+            st.session_state[ui_key] = str(
+                st.session_state.get(legacy_key, default_txt)
+            )
+    if "gnn_optuna_neighbor_profiles_enabled" not in st.session_state:
+        legacy_enabled = st.session_state.get(
+            "gnn_optuna_neighbor_choices",
+            neighbor_profile_names,
+        )
+        if not isinstance(legacy_enabled, (list, tuple)):
+            legacy_enabled = [legacy_enabled]
+        enabled_clean = [
+            str(name)
+            for name in legacy_enabled
+            if str(name) in neighbor_profile_names
+        ]
+        st.session_state["gnn_optuna_neighbor_profiles_enabled"] = (
+            enabled_clean if enabled_clean else list(neighbor_profile_names)
+        )
+
+    neighbor_profiles_selected = _render_sampler_neighbor_profiles_controls(
+        key_prefix="gnn_optuna",
+    )
+    enabled_neighbor_profiles = st.session_state.get(
+        "gnn_optuna_neighbor_profiles_enabled",
+        neighbor_profile_names,
+    )
+    if not isinstance(enabled_neighbor_profiles, (list, tuple)):
+        enabled_neighbor_profiles = [enabled_neighbor_profiles]
+    enabled_neighbor_profiles = [
+        str(name)
+        for name in enabled_neighbor_profiles
+        if str(name) in neighbor_profile_names
+    ]
+    st.session_state["gnn_optuna_neighbor_choices"] = enabled_neighbor_profiles
+    for name, default_profile in SAMPLER_NEIGHBOR_PROFILE_PRESETS:
+        raw_txt = st.session_state.get(
+            f"gnn_optuna_neighbor_profile_{name}",
+            ",".join(str(int(v)) for v in default_profile),
+        )
+        parsed_profile = _coerce_neighbor_profile(raw_txt, fallback=list(default_profile))
+        st.session_state[f"gnn_optuna_neighbor_{name}"] = ",".join(
+            str(int(v)) for v in parsed_profile
+        )
+    if not neighbor_profiles_selected:
+        st.warning("Debe seleccionar al menos un perfil de vecinos.")
+
+    with st.expander("Samplers de entrenamiento", expanded=True):
         st.caption(
-            "Define perfiles para NeighborLoader. Cada perfil es una lista por capa."
+            "Implementaciones nativas: Neighbor=`NeighborLoader`, "
+            "Cluster-GCN=`ClusterLoader`, GraphSAINT=`GraphSAINT*Sampler`."
         )
-
-        def _parse_int_list(text: str, fallback: List[int]) -> List[int]:
-            try:
-                items = [int(v.strip()) for v in text.split(",") if v.strip()]
-                return items or fallback
-            except Exception:
-                return fallback
-
-        profile_compact = st.text_input(
-            "compact",
-            value="15,10",
-            key="gnn_optuna_neighbor_compact",
-        )
-        profile_focused = st.text_input(
-            "focused",
-            value="10,5",
-            key="gnn_optuna_neighbor_focused",
-        )
-        profile_broad = st.text_input(
-            "broad",
-            value="25,15,10",
-            key="gnn_optuna_neighbor_broad",
-        )
-        profile_wide = st.text_input(
-            "wide",
-            value="30,20",
-            key="gnn_optuna_neighbor_wide",
-        )
-        neighbor_profiles = {
-            "compact": _parse_int_list(profile_compact, [15, 10]),
-            "focused": _parse_int_list(profile_focused, [10, 5]),
-            "broad": _parse_int_list(profile_broad, [25, 15, 10]),
-            "wide": _parse_int_list(profile_wide, [30, 20]),
+        sampler_label_to_mode = {
+            "NeighborLoader (nativo)": "neighbor",
+            "Cluster-GCN (nativo)": "cluster_gcn",
+            "GraphSAINT (nativo)": "graphsaint",
         }
-        neighbor_choices = st.multiselect(
-            "Perfiles habilitados",
-            list(neighbor_profiles.keys()),
-            default=list(neighbor_profiles.keys()),
-            key="gnn_optuna_neighbor_choices",
+        default_modes = st.session_state.get("gnn_optuna_sampler_modes", ["neighbor"])
+        if not isinstance(default_modes, (list, tuple)):
+            default_modes = [default_modes]
+        default_labels = [
+            label
+            for label, mode in sampler_label_to_mode.items()
+            if mode in default_modes
+        ] or ["NeighborLoader (nativo)"]
+        selected_sampler_labels = st.multiselect(
+            "Samplers incluidos en la optimizacion",
+            options=list(sampler_label_to_mode.keys()),
+            default=default_labels,
+            key="gnn_optuna_sampler_modes_ui",
+            help="Selecciona qué estrategias de muestreo nativas evaluará Optuna/Ray en los trials.",
         )
-        if not neighbor_choices:
-            st.warning("Debe seleccionar al menos un perfil de vecinos.")
+        selected_sampler_modes = [
+            sampler_label_to_mode[label]
+            for label in selected_sampler_labels
+            if label in sampler_label_to_mode
+        ]
+        st.session_state["gnn_optuna_sampler_modes"] = selected_sampler_modes
+        if not selected_sampler_modes:
+            st.warning("Debe seleccionar al menos un sampler de entrenamiento.")
+
+    # Bootstrap de perfiles Cluster-GCN desde claves legacy de lista.
+    if "cluster_gcn" in selected_sampler_modes:
+        if "gnn_optuna_cluster_profiles_enabled" not in st.session_state:
+            st.session_state["gnn_optuna_cluster_profiles_enabled"] = [
+                name for name, _ in SAMPLER_CLUSTER_GCN_PROFILE_PRESETS
+            ]
+        if not any(
+            f"gnn_optuna_cluster_profile_{name}" in st.session_state
+            for name, _ in SAMPLER_CLUSTER_GCN_PROFILE_PRESETS
+        ):
+            legacy_parts = _parse_int_options(
+                str(st.session_state.get("gnn_optuna_cluster_num_parts", "64,128")),
+                [64, 128],
+                min_value=2,
+            )
+            legacy_parts_epoch = _parse_int_options(
+                str(st.session_state.get("gnn_optuna_cluster_parts_per_epoch", "0,4")),
+                [0, 4],
+                min_value=0,
+            )
+            legacy_pairs: List[Tuple[int, int]] = []
+            for part in legacy_parts:
+                for part_epoch in legacy_parts_epoch:
+                    legacy_pairs.append((int(part), int(part_epoch)))
+            for idx, (name, fallback_pair) in enumerate(
+                SAMPLER_CLUSTER_GCN_PROFILE_PRESETS
+            ):
+                selected_pair = (
+                    legacy_pairs[idx]
+                    if idx < len(legacy_pairs)
+                    else (int(fallback_pair[0]), int(fallback_pair[1]))
+                )
+                st.session_state[f"gnn_optuna_cluster_profile_{name}"] = (
+                    f"{int(selected_pair[0])},{int(selected_pair[1])}"
+                )
+
+        cluster_num_parts, cluster_parts_per_epoch = (
+            _render_sampler_cluster_gcn_profiles_controls(key_prefix="gnn_optuna")
+        )
+        st.session_state["gnn_optuna_cluster_num_parts"] = ",".join(
+            str(int(v)) for v in cluster_num_parts
+        )
+        st.session_state["gnn_optuna_cluster_parts_per_epoch"] = ",".join(
+            str(int(v)) for v in cluster_parts_per_epoch
+        )
+        if not cluster_num_parts or not cluster_parts_per_epoch:
+            st.warning("Debe configurar al menos un perfil válido para Cluster-GCN.")
+
+    # Bootstrap de perfiles GraphSAINT desde claves legacy.
+    if "graphsaint" in selected_sampler_modes:
+        if "gnn_optuna_graphsaint_profiles_enabled" not in st.session_state:
+            st.session_state["gnn_optuna_graphsaint_profiles_enabled"] = [
+                name for name, _ in SAMPLER_GRAPHSAINT_PROFILE_PRESETS
+            ]
+        if not any(
+            f"gnn_optuna_graphsaint_profile_{name}" in st.session_state
+            for name, _ in SAMPLER_GRAPHSAINT_PROFILE_PRESETS
+        ):
+            raw_legacy_modes = st.session_state.get(
+                "gnn_optuna_graphsaint_modes",
+                ["node", "edge", "random_walk"],
+            )
+            if not isinstance(raw_legacy_modes, (list, tuple)):
+                raw_legacy_modes = [raw_legacy_modes]
+            legacy_modes: List[str] = []
+            for raw_mode in raw_legacy_modes:
+                parsed_mode = _parse_graphsaint_mode(raw_mode, fallback="node")
+                if parsed_mode not in legacy_modes:
+                    legacy_modes.append(parsed_mode)
+            legacy_batches = _parse_int_options(
+                str(st.session_state.get("gnn_optuna_graphsaint_batch_sizes", "1024,2048")),
+                [1024, 2048],
+                min_value=1,
+            )
+            legacy_steps = _parse_int_options(
+                str(st.session_state.get("gnn_optuna_graphsaint_num_steps", "4,8")),
+                [4, 8],
+                min_value=1,
+            )
+            legacy_walks = _parse_int_options(
+                str(st.session_state.get("gnn_optuna_graphsaint_walk_lengths", "2,4")),
+                [2, 4],
+                min_value=1,
+            )
+            legacy_profiles: List[Tuple[str, int, int, int]] = []
+            for mode in legacy_modes or ["node"]:
+                for batch in legacy_batches or [1024]:
+                    for num_steps in legacy_steps or [4]:
+                        walk_candidates = legacy_walks if mode == "random_walk" else [2]
+                        for walk in walk_candidates:
+                            legacy_profiles.append(
+                                (str(mode), int(batch), int(num_steps), int(walk))
+                            )
+            for idx, (name, fallback_profile) in enumerate(
+                SAMPLER_GRAPHSAINT_PROFILE_PRESETS
+            ):
+                selected_profile = (
+                    legacy_profiles[idx]
+                    if idx < len(legacy_profiles)
+                    else (
+                        str(fallback_profile[0]),
+                        int(fallback_profile[1]),
+                        int(fallback_profile[2]),
+                        int(fallback_profile[3]),
+                    )
+                )
+                st.session_state[f"gnn_optuna_graphsaint_profile_{name}"] = (
+                    f"{selected_profile[0]},{int(selected_profile[1])},"
+                    f"{int(selected_profile[2])},{int(selected_profile[3])}"
+                )
+
+        graphsaint_modes, graphsaint_batch_sizes, graphsaint_num_steps, graphsaint_walk_lengths = (
+            _render_sampler_graphsaint_profiles_controls(key_prefix="gnn_optuna")
+        )
+        st.session_state["gnn_optuna_graphsaint_modes"] = [
+            str(mode) for mode in graphsaint_modes
+        ]
+        st.session_state["gnn_optuna_graphsaint_batch_sizes"] = ",".join(
+            str(int(v)) for v in graphsaint_batch_sizes
+        )
+        st.session_state["gnn_optuna_graphsaint_num_steps"] = ",".join(
+            str(int(v)) for v in graphsaint_num_steps
+        )
+        st.session_state["gnn_optuna_graphsaint_walk_lengths"] = ",".join(
+            str(int(v)) for v in graphsaint_walk_lengths
+        )
+        if (
+            not graphsaint_modes
+            or not graphsaint_batch_sizes
+            or not graphsaint_num_steps
+            or not graphsaint_walk_lengths
+        ):
+            st.warning("Debe configurar al menos un perfil válido para GraphSAINT.")
 
     with st.expander("Optimizador"):
         col_lr, col_wd = st.columns(2)
@@ -17630,6 +20616,57 @@ def _render_ray_tune_tab() -> None:
     optimizer_choices = list(_get_state("gnn_optuna_optimizers", ["AdamW", "Lion"]))
     checkpoint_choices = list(_get_state("gnn_optuna_checkpoint", [False, True]))
     lambda_H_modes = list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"]))
+    sampler_alias = {
+        "neighborloader": "neighbor",
+        "neighbor": "neighbor",
+        "cluster_gcn": "cluster_gcn",
+        "clustergcn": "cluster_gcn",
+        "graphsaint": "graphsaint",
+    }
+    raw_sampler_modes = _get_state("gnn_optuna_sampler_modes", ["neighbor"])
+    if not isinstance(raw_sampler_modes, (list, tuple)):
+        raw_sampler_modes = [raw_sampler_modes]
+    sampler_modes: List[str] = []
+    for raw_mode in raw_sampler_modes:
+        key = sampler_alias.get(str(raw_mode).strip().lower().replace("-", "_"))
+        if key and key not in sampler_modes:
+            sampler_modes.append(key)
+    cluster_num_parts = _parse_int_options(
+        str(_get_state("gnn_optuna_cluster_num_parts", "64,128")),
+        [64, 128],
+        min_value=2,
+    )
+    cluster_parts_per_epoch = _parse_int_options(
+        str(_get_state("gnn_optuna_cluster_parts_per_epoch", "0,4")),
+        [0, 4],
+        min_value=0,
+    )
+    raw_graphsaint_modes = _get_state(
+        "gnn_optuna_graphsaint_modes",
+        ["node", "edge", "random_walk"],
+    )
+    if not isinstance(raw_graphsaint_modes, (list, tuple)):
+        raw_graphsaint_modes = [raw_graphsaint_modes]
+    graphsaint_modes: List[str] = []
+    for raw_mode in raw_graphsaint_modes:
+        parsed_mode = _parse_graphsaint_mode(raw_mode, fallback="node")
+        if parsed_mode not in graphsaint_modes:
+            graphsaint_modes.append(parsed_mode)
+    graphsaint_batch_sizes = _parse_int_options(
+        str(_get_state("gnn_optuna_graphsaint_batch_sizes", "1024,2048")),
+        [1024, 2048],
+        min_value=1,
+    )
+    graphsaint_num_steps = _parse_int_options(
+        str(_get_state("gnn_optuna_graphsaint_num_steps", "4,8")),
+        [4, 8],
+        min_value=1,
+    )
+    graphsaint_walk_lengths = _parse_int_options(
+        str(_get_state("gnn_optuna_graphsaint_walk_lengths", "2,4")),
+        [2, 4],
+        min_value=1,
+    )
 
     if not neighbor_choices:
         st.error("Seleccione al menos un perfil de vecinos (Optuna).")
@@ -17648,6 +20685,27 @@ def _render_ray_tune_tab() -> None:
         return
     if not lambda_H_modes:
         st.error("Seleccione al menos un lambda_H_mode (Optuna).")
+        return
+    if not sampler_modes:
+        st.error("Seleccione al menos un sampler de entrenamiento (Optuna).")
+        return
+    if "cluster_gcn" in sampler_modes and not cluster_num_parts:
+        st.error("Configure al menos un valor para Cluster-GCN num_parts (Optuna).")
+        return
+    if "cluster_gcn" in sampler_modes and not cluster_parts_per_epoch:
+        st.error("Configure al menos un valor para Cluster-GCN parts_per_epoch (Optuna).")
+        return
+    if "graphsaint" in sampler_modes and not graphsaint_modes:
+        st.error("Seleccione al menos un modo de GraphSAINT (Optuna).")
+        return
+    if "graphsaint" in sampler_modes and not graphsaint_batch_sizes:
+        st.error("Configure al menos un GraphSAINT batch_size (Optuna).")
+        return
+    if "graphsaint" in sampler_modes and not graphsaint_num_steps:
+        st.error("Configure al menos un GraphSAINT num_steps (Optuna).")
+        return
+    if "graphsaint" in sampler_modes and "random_walk" in graphsaint_modes and not graphsaint_walk_lengths:
+        st.error("Configure GraphSAINT walk_length para modo Random Walk (Optuna).")
         return
 
     balancing_strategy = str(_get_state("gnn_balancing_strategy", "Sin balancear"))
@@ -17768,6 +20826,13 @@ def _render_ray_tune_tab() -> None:
         "use_checkpointing": checkpoint_choices,
         "neighbor_profiles": neighbor_profiles,
         "neighbor_choices": neighbor_choices,
+        "sampler_modes": sampler_modes,
+        "cluster_gcn_num_parts": cluster_num_parts,
+        "cluster_gcn_parts_per_epoch": cluster_parts_per_epoch,
+        "graphsaint_modes": graphsaint_modes,
+        "graphsaint_batch_sizes": graphsaint_batch_sizes,
+        "graphsaint_num_steps": graphsaint_num_steps,
+        "graphsaint_walk_lengths": graphsaint_walk_lengths,
         "lr": {"min": lr_min, "max": lr_max},
         "weight_decay": {"min": wd_min, "max": wd_max},
         "lambda_l2_att": {"min": lambda_l2_min, "max": lambda_l2_max},
