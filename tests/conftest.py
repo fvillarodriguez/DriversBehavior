@@ -1,7 +1,14 @@
+import os
+import sys
 
 import pytest
 import pandas as pd
 import numpy as np
+
+# Ensure repository root is importable so `from src...` works from any pytest cwd.
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 @pytest.fixture
 def sample_flow_data():
@@ -28,12 +35,11 @@ def sample_flow_data():
     
     return pd.DataFrame(data)
 
-import torch
-from torch_geometric.data import HeteroData
-
 @pytest.fixture
 def dummy_graph_data():
     """Creates a basic HeteroData object for testing."""
+    torch = pytest.importorskip("torch")
+    HeteroData = pytest.importorskip("torch_geometric.data").HeteroData
     data = HeteroData()
     
     # Nodes: 'pm' (Portico-Maestro)

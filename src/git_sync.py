@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 from typing import List, Tuple, Optional, Generator
 
+GITHUB_FILE_LIMIT_BYTES = 100 * 1024 * 1024
+
 # Códigos de escape ANSI para colores
 class Colors:
     HEADER = '\033[95m'
@@ -203,35 +205,197 @@ def configure_git_user(name: str, email: str) -> Tuple[bool, str]:
         return False, f"Error configurando git: {e}"
 
 
+def get_current_branch() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        branch = result.stdout.strip()
+        return branch if branch else "main"
+    except subprocess.CalledProcessError:
+        return "main"
+
+
+def remote_branch_exists(branch: str) -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/remotes/origin/{branch}"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def get_branch_divergence(branch: str) -> Tuple[int, int]:
+    if not remote_branch_exists(branch):
+        return 0, 0
+
+    result = subprocess.run(
+        ["git", "rev-list", "--left-right", "--count", f"{branch}...origin/{branch}"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return 0, 0
+
+    counts = result.stdout.strip().split()
+    if len(counts) != 2:
+        return 0, 0
+
+    ahead, behind = counts
+    return int(ahead), int(behind)
+
+
+def backup_remote_branch_stream(branch: str) -> Generator[str, None, bool]:
+    backup_suffix = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_branch = f"backup/{branch.replace('/', '-')}-{backup_suffix}"
+    yield f"Respaldando origin/{branch} en origin/{backup_branch}..."
+
+    success = yield from run_command_stream(
+        [
+            "git",
+            "push",
+            "origin",
+            f"refs/remotes/origin/{branch}:refs/heads/{backup_branch}",
+        ],
+        "Creando respaldo remoto",
+    )
+    if not success:
+        yield "No se pudo crear el respaldo remoto."
+        return False
+
+    yield f"Respaldo remoto creado en origin/{backup_branch}."
+    return True
+
+
+def get_tracked_files_over_limit(limit_bytes: int = GITHUB_FILE_LIMIT_BYTES) -> List[Tuple[str, int]]:
+    result = subprocess.run(
+        ["git", "ls-tree", "-r", "-l", "HEAD"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return []
+
+    oversized_files: List[Tuple[str, int]] = []
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) != 5:
+            continue
+
+        size_text = parts[3]
+        path = parts[4]
+        if not size_text.isdigit():
+            continue
+
+        size = int(size_text)
+        if size > limit_bytes:
+            oversized_files.append((path, size))
+
+    return oversized_files
+
+
 def sync_with_github_stream() -> Generator[str, None, bool]:
     yield "Iniciando Sincronización con GitHub..."
-    
-    # 1. Pull
-    success = yield from run_command_stream(["git", "pull", "origin", "main"], "Trayendo cambios remotos")
+    current_branch = get_current_branch()
+    has_remote_branch = False
+
+    success = yield from run_command_stream(["git", "fetch", "origin"], "Trayendo cambios remotos")
     if not success:
-        yield "Error al hacer pull. Conflictos posibles."
+        yield "Error al hacer fetch del remoto."
         return False
 
-    if not check_git_status():
-        yield "✨ No hay cambios locales *nuevos* para crear commit."
-        # No retornamos aquí, seguimos para hacer push de commits previos si los hay.
-    else:
-        # 2. Add
+    has_remote_branch = remote_branch_exists(current_branch)
+
+    if check_git_status():
         success = yield from run_command_stream(["git", "add", "."], "Agregando archivos")
-        if not success: return False
-    
-        # 3. Commit
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        success = yield from run_command_stream(["git", "commit", "-m", f"Auto-sync: {ts}"], "Haciendo commit")
-        if not success: return False
+        if not success:
+            return False
 
-    # 4. Push
-    success = yield from run_command_stream(["git", "push", "-u", "origin", "main"], "Enviando cambios (push)")
-    if not success:
-        yield "Error al hacer push."
+        if check_git_status():
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            success = yield from run_command_stream(
+                ["git", "commit", "-m", f"Auto-sync: {ts}"],
+                "Haciendo commit",
+            )
+            if not success:
+                return False
+        else:
+            yield "ℹ️ No hubo cambios indexables después de aplicar .gitignore."
+    else:
+        yield "✨ No hay cambios locales nuevos para crear commit."
+
+    ahead, behind = get_branch_divergence(current_branch)
+    yield f"Estado de la rama '{current_branch}': ahead {ahead}, behind {behind}."
+
+    oversized_files = get_tracked_files_over_limit()
+    if oversized_files:
+        yield "❌ GitHub rechazará el push porque hay archivos rastreados mayores a 100 MB."
+        for path, size in oversized_files:
+            size_mb = size / (1024 * 1024)
+            yield f" - {path} ({size_mb:.2f} MB)"
+        yield "Quite esos archivos del historial de Git o muévalos a Git LFS antes de reintentar."
         return False
 
-    yield "🎉 Sincronización completada exitosamente."
+    if not has_remote_branch:
+        success = yield from run_command_stream(
+            ["git", "push", "-u", "origin", f"{current_branch}:{current_branch}"],
+            "Publicando rama local por primera vez",
+        )
+        if not success:
+            yield "Error al publicar la rama en el remoto."
+            return False
+
+        yield "🎉 Sincronización completada exitosamente."
+        return True
+
+    if behind > 0 and ahead == 0:
+        success = yield from run_command_stream(
+            ["git", "merge", "--ff-only", f"origin/{current_branch}"],
+            "Aplicando fast-forward desde remoto",
+        )
+        if not success:
+            yield "No fue posible adelantar la rama local con fast-forward."
+            return False
+
+        yield "🎉 Sincronización completada exitosamente."
+        return True
+
+    if behind > 0:
+        success = yield from backup_remote_branch_stream(current_branch)
+        if not success:
+            yield "Se abortó la sincronización para no sobrescribir el remoto sin respaldo."
+            return False
+
+        success = yield from run_command_stream(
+            ["git", "push", "--force-with-lease", "-u", "origin", f"{current_branch}:{current_branch}"],
+            "Enviando cambios locales y reemplazando el remoto",
+        )
+        if not success:
+            yield "Error al hacer push forzado."
+            return False
+
+        yield "🎉 Sincronización completada exitosamente. La rama local prevaleció sobre el remoto."
+        return True
+
+    if ahead > 0:
+        success = yield from run_command_stream(
+            ["git", "push", "-u", "origin", f"{current_branch}:{current_branch}"],
+            "Enviando cambios (push)",
+        )
+        if not success:
+            yield "Error al hacer push."
+            return False
+
+        yield "🎉 Sincronización completada exitosamente."
+        return True
+
+    yield "✅ Repositorio ya sincronizado. No hubo nada que enviar."
     return True
 
 # Wrapper para compatibilidad

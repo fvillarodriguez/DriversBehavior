@@ -2,8 +2,11 @@
 Shared model training and evaluation logic for the Crash Prediction App.
 """
 from typing import Dict, List, Optional, Tuple, Any
+import importlib
 import numpy as np
 import pandas as pd
+from pathlib import Path
+import sys
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -13,6 +16,42 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
+
+
+def _import_external_xgboost():
+    src_dir = str(Path(__file__).resolve().parent)
+    original_sys_path = list(sys.path)
+    existing_module = sys.modules.get("xgboost")
+    removed_local_module = None
+    try:
+        if existing_module is not None:
+            module_file = Path(str(getattr(existing_module, "__file__", "") or "")).resolve()
+            if module_file == (Path(src_dir) / "xgboost.py").resolve():
+                removed_local_module = sys.modules.pop("xgboost")
+        sys.path = [
+            entry
+            for entry in original_sys_path
+            if str(Path(entry or ".").resolve()) != src_dir
+        ]
+        xgb = importlib.import_module("xgboost")  # type: ignore
+    finally:
+        sys.path = original_sys_path
+        if removed_local_module is not None:
+            sys.modules["xgboost"] = removed_local_module
+
+    module_path = Path(str(getattr(xgb, "__file__", "") or "")).resolve()
+    if module_path == (Path(src_dir) / "xgboost.py").resolve():
+        raise ImportError(
+            "Se importo el modulo local `src/xgboost.py` en lugar del paquete externo `xgboost`. "
+            "Revise el entorno o renombre el modulo local para evitar sombreado."
+        )
+    if not hasattr(xgb, "XGBClassifier"):
+        raise ImportError(
+            "El paquete `xgboost` importado no expone `XGBClassifier`. "
+            f"Modulo cargado: {module_path}"
+        )
+    return xgb
+
 
 def build_model(model_name: str, params: Dict[str, object], random_state: int):
     if model_name == "Random Forest":
@@ -27,10 +66,11 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
 
     if model_name == "XGBoost":
         try:
-            import xgboost as xgb  # type: ignore
+            xgb = _import_external_xgboost()
         except ImportError as exc:
             raise ImportError(
-                "xgboost no esta instalado. Ejecute `pip install xgboost`."
+                "No se pudo cargar el paquete externo `xgboost`. "
+                "Instale `xgboost` o corrija el sombreado del modulo local."
             ) from exc
 
         return xgb.XGBClassifier(

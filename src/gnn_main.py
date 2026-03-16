@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # tensorboard --logdir=Resultados/runs_attention
 import os, math, glob, gc, sys, time, uuid
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1' # --- FIX for MPS FallBck ---
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1' # --- FIX for MPS Fallback ---
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", # Asignador seguro de CUDA
   "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.8")
 

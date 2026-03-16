@@ -1,10 +1,9 @@
 import unittest
 from unittest.mock import patch, MagicMock
-import json
 import os
 import sys
 
-# Add src to path
+# Add repository root to path so `from src ...` is importable.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src import notification_system
@@ -21,7 +20,7 @@ class TestNotificationSystem(unittest.TestCase):
         
     def tearDown(self):
         # Restore config
-        if self.original_config:
+        if self.original_config is not None:
             with open(self.config_path, 'w') as f:
                 f.write(self.original_config)
         elif self.config_path.exists():
@@ -82,6 +81,38 @@ class TestNotificationSystem(unittest.TestCase):
         self.assertEqual(call_args[0][1], ["recipient@test.com"])
         msg_str = call_args[0][2]
         self.assertIn("Subject: Script finalizado: Subject Test", msg_str)
+
+    @patch("smtplib.SMTP")
+    def test_send_notification_email_missing_required_config_returns_false(self, mock_smtp):
+        config = {
+            "smtp_server": "smtp.test.com",
+            "smtp_port": 587,
+            "sender_email": "sender@test.com",
+            "sender_password": "password123",
+            "recipients": [],
+        }
+        notification_system.save_email_config(config)
+
+        res = notification_system.send_notification_email("Subject Test", {"status": "ok"})
+
+        self.assertFalse(res)
+        mock_smtp.assert_not_called()
+
+    @patch("smtplib.SMTP", side_effect=Exception("smtp down"))
+    def test_send_notification_email_smtp_exception_returns_false(self, mock_smtp):
+        config = {
+            "smtp_server": "smtp.test.com",
+            "smtp_port": 587,
+            "sender_email": "sender@test.com",
+            "sender_password": "password123",
+            "recipients": ["recipient@test.com"],
+        }
+        notification_system.save_email_config(config)
+
+        res = notification_system.send_notification_email("Subject Test", {"status": "ok"})
+
+        self.assertFalse(res)
+        mock_smtp.assert_called_once_with("smtp.test.com", 587)
 
 if __name__ == '__main__':
     unittest.main()

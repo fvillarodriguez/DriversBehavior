@@ -27,10 +27,12 @@ import src.experiments_live_app as experiments_live_app
 import src.files_app as files_app
 import src.sumo_simulation_app as sumo_simulation_app
 import src.test_page as test_page
+import src.drift_detection_app as drift_detection_app
 import src.github_sync_app as github_sync_app
 import src.notification_system as notification_system
 import src.multi_agent_rl_app as multi_agent_rl_app
 import src.latex_viewer_app as latex_viewer_app
+import src.nlp_severity_app as nlp_severity_app
 
 
 def _render_home() -> None:
@@ -45,6 +47,8 @@ def _render_home() -> None:
         - **GitHub Sync:** Sync local files with the remote repository.
         - **Clustering:** Features, clustering and analysis.
         - **Crash prediction:** Train and evaluate accident prediction models.
+        - **NLP in Severity:** Build granular flow + text datasets to model accident severity.
+        - **Drift detection:** Recalibration and drift detection replication module.
         - **Graph Neural Network:** Construct graphs for GNN models using crash prediction features.
         - **Multi Agent RL:** Multi-Agent Reinforcement Learning modules.
         - **Events:** Load and visualize accident events on an interactive map.
@@ -82,6 +86,12 @@ def main() -> None:
         
     def p_crash():
         cluster_accident_app.main(set_page_config=False, show_exit_button=False)
+
+    def p_nlp_severity():
+        nlp_severity_app.main(set_page_config=False, show_exit_button=False)
+
+    def p_drift():
+        drift_detection_app.main(set_page_config=False, show_exit_button=False)
         
     def p_events():
         events_map_app.main(set_page_config=False, show_exit_button=False)
@@ -107,6 +117,8 @@ def main() -> None:
     
     ps_clustering = st.Page(p_clustering, title="Clustering", icon=":material/scatter_plot:")
     ps_crash = st.Page(p_crash, title="Crash prediction", icon=":material/warning:")
+    ps_nlp_sev = st.Page(p_nlp_severity, title="NLP in Severity", icon=":material/text_fields:")
+    ps_drift = st.Page(p_drift, title="Drift detection", icon=":material/timeline:")
     ps_gnn = st.Page(_render_graph_builder, title="Graph Neural Network", icon=":material/hub:")
     ps_marl = st.Page(p_marl, title="Multi Agent RL", icon=":material/groups:")
     
@@ -124,7 +136,7 @@ def main() -> None:
         {
             "Navegación": [ps_home],
             "Data & Gestión": [ps_databases, ps_files, ps_github],
-            "Análisis & Modelos": [ps_clustering, ps_crash, ps_gnn, ps_marl],
+            "Análisis & Modelos": [ps_clustering, ps_crash, ps_nlp_sev, ps_drift, ps_gnn, ps_marl],
             "Simulación & Vizualización": [ps_events, ps_exp, ps_sumo],
             "Configuración": [ps_notify, ps_test, ps_latex],
         }
