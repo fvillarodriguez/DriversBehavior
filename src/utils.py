@@ -317,15 +317,11 @@ def _get_duckdb_path(db_path: Optional[Path] = None) -> Path:
 def _connect_duckdb(read_only: bool = False, db_path: Optional[Path] = None):
     _ensure_duckdb_available()
     path = _get_duckdb_path(db_path)
-    ro_flag = read_only and path.exists()
-    try:
-        return duckdb.connect(str(path), read_only=ro_flag)
-    except duckdb.ConnectionException as exc:
-        # DuckDB does not allow a read-only connection if another connection
-        # already exists with a different configuration (e.g., read-write).
-        if ro_flag and "different configuration" in str(exc):
-            return duckdb.connect(str(path), read_only=False)
-        raise
+    # DuckDB refuses to open the same file with mixed read_only settings inside
+    # the same process. The Streamlit app interleaves reads and writes against
+    # this database on reruns, so we keep a single writable configuration and
+    # treat `read_only=True` as caller intent rather than a driver flag.
+    return duckdb.connect(str(path), read_only=False)
 
 
 def _create_flow_table(conn) -> None:

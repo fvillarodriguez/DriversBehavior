@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -33,14 +36,18 @@ except Exception:
     duckdb = None
 
 try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None
+
+try:
     import xgboost as xgb  # type: ignore
 except Exception:
     xgb = None
 
 from src.utils import (
-    add_accident_target,
-    compute_flow_features,
     find_candidate_porticos,
+    get_portico_segments,
     load_porticos,
     process_accidentes_df,
 )
@@ -51,6 +58,18 @@ RESULTS_DIR = ROOT_DIR / "Resultados"
 DATA_DIR = ROOT_DIR / "Datos"
 FLOW_DB_PATH = DATA_DIR / "flujos.duckdb"
 FLOW_TABLE_NAME = "flujos_duckdb"
+DRIFT_FOCUS_PORTICOS = ["11", "12", "14", "15"]
+DRIFT_ARTICLE_PORTICO_ORDER = ["15", "14", "12", "11"]
+DRIFT_FOCUS_TRAMO = ("__DRIFT_FIXED_PORTICOS__", "", "", "")
+DRIFT_ARTICLE_CATEGORY_MAP = {1: "Light", 2: "Heavy", 3: "Heavy", 4: "Motorcycle"}
+DRIFT_ARTICLE_CATEGORIES = ["Light", "Heavy", "Motorcycle"]
+DRIFT_ARTICLE_CATEGORY_SLUGS = {
+    "Light": "light",
+    "Heavy": "heavy",
+    "Motorcycle": "motorcycle",
+}
+DRIFT_ARTICLE_MIN_REFERENCE_SPEED_KMH = 20.0
+DRIFT_ARTICLE_MIN_MATCH_WINDOW_MINUTES = 30.0
 
 PAPER_TITLE = (
     "Evaluating recalibration strategies for real-time crash prediction: "
@@ -157,6 +176,58 @@ REPLICATION_ANALYSES: List[Dict[str, str]] = [
     },
 ]
 
+PYTHON_MIGRATION_REVIEW_PLAN: List[Dict[str, str]] = [
+    {
+        "step": "1. Auditar paridad articulo vs. R",
+        "objective": "Reemplazar bugs estructurales de main.R por una sola ruta Python verificable.",
+        "python_artifacts": "build_python_migration_review_plan + run_recalibration_experiments",
+        "addresses": "df_pred_vs_real inexistente, loops duplicados, NNet faltante",
+        "review_check": "Verificar que cada estrategia/modelo corre desde una unica funcion y que NNet aparece en la corrida.",
+    },
+    {
+        "step": "2. Congelar pipeline de datos",
+        "objective": "Asegurar que la base usada por los experimentos sea determinista y trazable.",
+        "python_artifacts": "run_configurable_preparation_pipeline + run_manifest",
+        "addresses": "preparacion secuencial y reproducible",
+        "review_check": "Confirmar filas iniciales/finales, features activas y configuracion guardada en el manifiesto.",
+    },
+    {
+        "step": "3. Fijar seleccion final de variables",
+        "objective": "Aplicar correlacion + ranking RF + top-N efectivo antes de entrenar.",
+        "python_artifacts": "drop_highly_correlated_features + rank_features_random_forest",
+        "addresses": "alineacion con las 15 variables mas relevantes del articulo",
+        "review_check": "Comprobar que la pestaña de experimentos usa exactamente el top-N seleccionado.",
+    },
+    {
+        "step": "4. Ejecutar yearly strategies por semilla",
+        "objective": "Correr static, period-aligned y cumulative secuencialmente con umbral Youden por entrenamiento.",
+        "python_artifacts": "run_yearly_strategy + train_model_with_internal_validation",
+        "addresses": "umbral hardcodeado 0.0023 y ambiguedad de resultados",
+        "review_check": "Revisar threshold, best_params y metricas por ano/modelo/semilla.",
+    },
+    {
+        "step": "5. Ejecutar ADWIN secuencial",
+        "objective": "Procesar el stream punto a punto, registrar drift y reentrenar solo con W1.",
+        "python_artifacts": "run_adaptive_strategy + SimpleADWIN",
+        "addresses": "recalibracion adaptativa reproducible",
+        "review_check": "Validar drift_date, W/W0/W1 y cada reentreno en el log.",
+    },
+    {
+        "step": "6. Agregar resultados y evidencias",
+        "objective": "Separar resultados crudos por corrida de los promedios reportables.",
+        "python_artifacts": "summarize_results + format_appendix_tables_mean + build_average_roc_curves",
+        "addresses": "resultados finales del articulo como promedio sobre semillas",
+        "review_check": "Comparar tablas raw vs. mean y revisar Figure 7/Appendix A.6-A.9.",
+    },
+    {
+        "step": "7. Revisar auditoria de ejecucion",
+        "objective": "Tener trazabilidad completa de cada paso para reproducir o depurar.",
+        "python_artifacts": "execution_log + run_manifest",
+        "addresses": "falta de log estructurado",
+        "review_check": "Inspeccionar eventos ok/skipped/error antes de aceptar los resultados.",
+    },
+]
+
 
 def build_related_work_table() -> pd.DataFrame:
     """Returns a compact replica of paper Table 1."""
@@ -176,30 +247,137 @@ def build_related_work_table() -> pd.DataFrame:
 
 
 def feature_catalog_table() -> pd.DataFrame:
-    """Returns Table 4 feature catalog."""
+    """Tabla tipo Table 4, corregida y traducida al español."""
     rows = [
-        ("Vel_x^Y", "Average speed by category x at gate Y"),
-        ("Vel_x^{Y,Z}", "Average speed between consecutive gates Y and Z"),
-        ("Sd_x^Y", "Speed standard deviation by category x at gate Y"),
-        ("Sd_x^{Y,Z}", "Speed standard deviation between gates Y and Z"),
-        ("Flow_x^Y", "Vehicle count by category x at gate Y"),
-        ("Flow_x^{Y,Z}", "Traffic volume between gates Y and Z"),
-        ("Den_x^Y", "Density by category x at gate Y"),
-        ("Den_x^{Y,Z}", "Density between gates Y and Z"),
-        ("DeltaFlow_x^Y", "Flow change between consecutive intervals"),
-        ("DeltaFlow_x^{Y,Z}", "Inter-gate flow change between intervals"),
-        ("DeltaVel_x^Y", "Speed change between consecutive intervals"),
-        ("DeltaDen_x^Y", "Density change between consecutive intervals"),
-        ("DeltaSd_x^Y", "Speed standard deviation change"),
-        ("Ft_Motorcycle^Y", "Motorcycle fraction at gate Y"),
-        ("Ft_Heavy^Y", "Heavy vehicle fraction at gate Y"),
-        ("CL_x^{Y,Z}", "Lane-change ratio between gates Y and Z"),
-        ("Vel^{Y,Z}", "Overall speed across all categories"),
-        ("Flow^{Y,Z}", "Overall flow across all categories"),
-        ("Sd^{Y,Z}", "Overall speed dispersion"),
-        ("Acc(t)", "Binary target: 1 if at least one accident in interval t+1"),
+        {
+            "bloque": "Velocidad promedio por pórtico y tipo de vehículo",
+            "equivalente_articulo": "Vel_x^Y",
+            "que_mide": "La velocidad media observada en un pórtico para una categoría de vehículo en un intervalo de 5 minutos.",
+            "como_se_calcula": "Se agrupan los registros AVI por intervalo, pórtico y tipo de vehículo, y se promedia la velocidad registrada.",
+        },
+        {
+            "bloque": "Desviación estándar de velocidad por pórtico y tipo de vehículo",
+            "equivalente_articulo": "Sd_x^Y",
+            "que_mide": "La dispersión de velocidades dentro del mismo pórtico, intervalo y tipo de vehículo.",
+            "como_se_calcula": "Se usa la desviación estándar muestral de las velocidades de los vehículos observados en ese grupo.",
+        },
+        {
+            "bloque": "Flujo por pórtico y tipo de vehículo",
+            "equivalente_articulo": "Flow_x^Y",
+            "que_mide": "La cantidad de vehículos de una categoría que pasan por un pórtico en un intervalo.",
+            "como_se_calcula": "Se cuenta el número de registros AVI del grupo.",
+        },
+        {
+            "bloque": "Densidad por pórtico y tipo de vehículo",
+            "equivalente_articulo": "Den_x^Y",
+            "que_mide": "Una aproximación de la ocupación del tráfico en el pórtico para una categoría.",
+            "como_se_calcula": "Se divide el flujo del grupo por su velocidad promedio. Si no hay velocidad válida, la densidad queda vacía.",
+        },
+        {
+            "bloque": "Cambios temporales por pórtico y tipo de vehículo",
+            "equivalente_articulo": "DeltaFlow_x^Y, DeltaVel_x^Y, DeltaDen_x^Y, DeltaSd_x^Y",
+            "que_mide": "Cómo cambia el flujo, la velocidad, la densidad o la dispersión de velocidad entre intervalos consecutivos.",
+            "como_se_calcula": "Para cada variable base del pórtico, se resta el valor del intervalo anterior dentro del mismo pórtico y tipo de vehículo.",
+        },
+        {
+            "bloque": "Fracciones de motos y pesados por pórtico",
+            "equivalente_articulo": "Ft_Motorcycle^Y, Ft_Heavy^Y",
+            "que_mide": "Qué proporción del flujo total del pórtico corresponde a motos o a vehículos pesados.",
+            "como_se_calcula": "Se divide el flujo de la categoría por el flujo total del pórtico en el mismo intervalo.",
+        },
+        {
+            "bloque": "Variables por segmento y tipo de vehículo",
+            "equivalente_articulo": "Vel_x^{Y,Z}, Sd_x^{Y,Z}, Flow_x^{Y,Z}, Den_x^{Y,Z}, DeltaFlow_x^{Y,Z}, DeltaVel_x^{Y,Z}, DeltaDen_x^{Y,Z}",
+            "que_mide": "El estado y la evolución del tráfico entre dos pórticos consecutivos para cada tipo de vehículo.",
+            "como_se_calcula": "Se emparejan patentes entre pórticos consecutivos dentro de una ventana de tiempo razonable. A partir del tiempo de viaje y la distancia entre pórticos se calcula la velocidad espacial; luego se agregan flujo, dispersión, densidad y sus deltas por intervalo y categoría.",
+        },
+        {
+            "bloque": "Cambio de pista por segmento y tipo de vehículo",
+            "equivalente_articulo": "CL_x^{Y,Z}",
+            "que_mide": "La proporción de vehículos emparejados que cambian de carril entre el pórtico de origen y el de destino.",
+            "como_se_calcula": "Dentro de los vehículos emparejados del segmento, se compara el carril de entrada y salida y se calcula la fracción con cambio.",
+        },
+        {
+            "bloque": "Variables globales por segmento",
+            "equivalente_articulo": "Vel^{Y,Z}, Sd^{Y,Z}, Flow^{Y,Z}, Den^{Y,Z}, DeltaFlow^{Y,Z}, DeltaVel^{Y,Z}, DeltaDen^{Y,Z}",
+            "que_mide": "La condición agregada del tráfico del segmento sin separar por tipo de vehículo.",
+            "como_se_calcula": "Se repite el mismo cálculo del segmento, pero agrupando todos los vehículos juntos.",
+        },
+        {
+            "bloque": "Variables por carril en el segmento",
+            "equivalente_articulo": "Vel_lane_l^{Y,Z}, Sd_lane_l^{Y,Z}, Flow_lane_l^{Y,Z}, Den_lane_l^{Y,Z}, DeltaFlow_lane_l^{Y,Z}, DeltaVel_lane_l^{Y,Z}, DeltaDen_lane_l^{Y,Z}",
+            "que_mide": "La condición del segmento vista desde el carril de origen del vehículo. Permite detectar diferencias entre carriles y coincide con lo observado en la Figure 6.",
+            "como_se_calcula": "Sobre los vehículos emparejados del segmento, se filtra por carril de origen en Y y se agregan velocidad, flujo, densidad, dispersión y deltas para cada lane.",
+        },
+        {
+            "bloque": "Target de accidente",
+            "equivalente_articulo": "Acc(t)",
+            "que_mide": "Si en el siguiente intervalo ocurre al menos un accidente en el corredor analizado.",
+            "como_se_calcula": "Los accidentes se alinean a la grilla de 5 minutos y luego se desplazan un intervalo hacia atrás, de modo que las features de t predicen accidentes en t+1.",
+        },
     ]
-    return pd.DataFrame(rows, columns=["variable", "description"])
+    return pd.DataFrame(rows)
+
+
+def feature_engineering_reference_table() -> pd.DataFrame:
+    """Referencia detallada en español para la UI de Drift detection."""
+    rows = [
+        {
+            "bloque": "Estado del tráfico en cada pórtico por tipo de vehículo",
+            "columnas_generadas": "vel_*, sd_*, flow_*, den_*, delta_flow_*, delta_vel_*, delta_den_*, delta_sd_*",
+            "nivel": "Pórtico",
+            "desagregacion": "Light / Heavy / Motorcycle",
+            "que_mide": "Describe cómo se comporta el tráfico en un pórtico específico para cada tipo de vehículo.",
+            "como_se_calcula": "Se agrupan los registros AVI por intervalo de 5 minutos, pórtico y categoría. El flujo es un conteo, la velocidad es un promedio, la desviación estándar mide dispersión, la densidad es flujo dividido por velocidad y los deltas son diferencias contra el intervalo anterior.",
+            "ejemplos": "vel_light_15, flow_heavy_12, delta_sd_motorcycle_14",
+        },
+        {
+            "bloque": "Composición del flujo en cada pórtico",
+            "columnas_generadas": "ft_motorcycle_*, ft_heavy_*",
+            "nivel": "Pórtico",
+            "desagregacion": "Total del pórtico",
+            "que_mide": "Indica qué porcentaje del flujo corresponde a motos o a vehículos pesados.",
+            "como_se_calcula": "Se divide el flujo de la categoría por el flujo total del pórtico en el mismo intervalo.",
+            "ejemplos": "ft_motorcycle_15, ft_heavy_12",
+        },
+        {
+            "bloque": "Estado del tráfico en cada segmento por tipo de vehículo",
+            "columnas_generadas": "vel_*_15_14, sd_*_15_14, flow_*_15_14, den_*_15_14, delta_flow_*_15_14, delta_vel_*_15_14, delta_den_*_15_14, cl_*_15_14",
+            "nivel": "Segmento entre pórticos consecutivos",
+            "desagregacion": "Light / Heavy / Motorcycle",
+            "que_mide": "Captura cómo se mueve cada tipo de vehículo entre dos pórticos consecutivos del corredor.",
+            "como_se_calcula": "Se emparejan patentes entre pórticos consecutivos dentro de una ventana razonable. Con la distancia del segmento y el tiempo de viaje se calcula la velocidad espacial. Luego se agregan flujo, velocidad, dispersión, densidad, deltas y cambio de pista por intervalo y categoría.",
+            "ejemplos": "flow_heavy_15_14, delta_vel_light_14_12, cl_motorcycle_12_11",
+        },
+        {
+            "bloque": "Estado global del segmento",
+            "columnas_generadas": "vel_15_14, sd_15_14, flow_15_14, den_15_14, delta_flow_15_14, delta_vel_15_14, delta_den_15_14",
+            "nivel": "Segmento entre pórticos consecutivos",
+            "desagregacion": "Todos los vehículos juntos",
+            "que_mide": "Resume la condición general del segmento sin separar por tipo de vehículo.",
+            "como_se_calcula": "Se usa el mismo matching entre pórticos, pero agregando todos los vehículos en un solo grupo.",
+            "ejemplos": "vel_15_14, den_14_12, delta_den_12_11",
+        },
+        {
+            "bloque": "Estado del segmento por carril",
+            "columnas_generadas": "vel_lane1_15_14, sd_lane2_14_12, flow_lane3_12_11, den_lane*_*, delta_flow_lane*_*, delta_vel_lane*_*, delta_den_lane*_*",
+            "nivel": "Segmento entre pórticos consecutivos",
+            "desagregacion": "Lane 1 / Lane 2 / Lane 3",
+            "que_mide": "Permite ver si el segmento se comporta distinto según el carril de origen del vehículo.",
+            "como_se_calcula": "Se toma el matching del segmento y se vuelve a agregar, pero separando por el carril en el que el vehículo fue observado en el pórtico de origen. Este bloque se incluyó porque la Figure 6 destaca variables por lane entre las más relevantes.",
+            "ejemplos": "vel_lane2_15_14, flow_lane1_14_12, delta_den_lane3_12_11",
+        },
+        {
+            "bloque": "Target de accidente",
+            "columnas_generadas": "target",
+            "nivel": "Intervalo",
+            "desagregacion": "Corredor completo",
+            "que_mide": "Indica si en el siguiente intervalo ocurre al menos un accidente dentro del corredor analizado.",
+            "como_se_calcula": "Los accidentes se alinean a la grilla temporal de 5 minutos y se desplazan un intervalo hacia atrás. Así, las variables del intervalo t intentan anticipar accidentes en t+1.",
+            "ejemplos": "target",
+        },
+    ]
+    return pd.DataFrame(rows)
 
 
 def hyperparameter_reference_table() -> pd.DataFrame:
@@ -313,6 +491,11 @@ def article_replication_blueprint() -> Dict[str, pd.DataFrame]:
         "figures": figures_df,
         "tables": tables_df,
     }
+
+
+def build_python_migration_review_plan() -> pd.DataFrame:
+    """Ordered checklist to review the R -> Python migration work."""
+    return pd.DataFrame(PYTHON_MIGRATION_REVIEW_PLAN)
 
 
 def sample_avi_records(flows_df: pd.DataFrame, n_rows: int = 6) -> pd.DataFrame:
@@ -458,6 +641,18 @@ def compute_accident_hour_distribution_from_target(
     return out
 
 
+def _count_positive_target_rows(
+    df: Optional[pd.DataFrame],
+    *,
+    target_col: str = "target",
+) -> int:
+    """Counts rows labeled as accidents in the final dataset."""
+    if not isinstance(df, pd.DataFrame) or df.empty or target_col not in df.columns:
+        return 0
+    target = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int)
+    return int(target.eq(1).sum())
+
+
 @dataclass
 class DataPreparationSummary:
     initial_rows: int
@@ -470,11 +665,933 @@ class DataPreparationSummary:
     zero_run_windows_detected: int
 
 
+def _infer_interval_minutes_from_feature_df(
+    df: Optional[pd.DataFrame],
+    *,
+    time_col: str = "interval_start",
+    default_minutes: int = 5,
+) -> int:
+    if not isinstance(df, pd.DataFrame) or df.empty or time_col not in df.columns:
+        return int(default_minutes)
+    timestamps = pd.to_datetime(df[time_col], errors="coerce").dropna().drop_duplicates().sort_values()
+    if len(timestamps) < 2:
+        return int(default_minutes)
+    deltas = timestamps.diff().dropna()
+    deltas = deltas[deltas > pd.Timedelta(0)]
+    if deltas.empty:
+        return int(default_minutes)
+    try:
+        mode_delta = deltas.mode().iloc[0]
+        minutes = int(round(pd.Timedelta(mode_delta).total_seconds() / 60.0))
+        return max(1, minutes)
+    except Exception:
+        return int(default_minutes)
+
+
+def _rebuild_preparation_artifacts_from_payload(
+    raw_df: pd.DataFrame,
+    clean_df: pd.DataFrame,
+    *,
+    missing_threshold: float = 0.01,
+    target_col: str = "target",
+    time_col: str = "interval_start",
+    min_zero_days: int = 7,
+) -> Tuple[DataPreparationSummary, Dict[str, Any], pd.DataFrame]:
+    """Reconstructs Stage 1/2 counts from raw_features + clean_features."""
+    if raw_df is None or raw_df.empty:
+        empty_summary = DataPreparationSummary(0, 0, 0, 0, 0, 0, int(len(clean_df)) if isinstance(clean_df, pd.DataFrame) else 0, 0)
+        return empty_summary, {"removed_cols": [], "remaining_features": [], "rows_after_drop": 0}, pd.DataFrame()
+
+    raw_features = _feature_columns_for_modeling(raw_df, target_col=target_col)
+    missing_ratio = raw_df[raw_features].isna().mean() if raw_features else pd.Series(dtype=float)
+    removed_cols = missing_ratio[missing_ratio > float(missing_threshold)].index.tolist()
+    remaining_features = [col for col in raw_features if col not in set(removed_cols)]
+
+    stage1_df = raw_df.copy()
+    if remaining_features:
+        stage1_df = stage1_df.dropna(subset=remaining_features).copy()
+    if time_col in stage1_df.columns:
+        stage1_df[time_col] = pd.to_datetime(stage1_df[time_col], errors="coerce")
+
+    interval_minutes = _infer_interval_minutes_from_feature_df(stage1_df, time_col=time_col, default_minutes=5)
+    removed_zero_run_rows = max(0, int(len(stage1_df) - len(clean_df)))
+    zero_runs = pd.DataFrame(columns=["start", "end", "length_intervals", "length_days"])
+    if removed_zero_run_rows > 0:
+        zero_runs = identify_long_zero_accident_runs(
+            stage1_df,
+            target_col=target_col,
+            time_col=time_col,
+            min_days=min_zero_days,
+            interval_minutes=interval_minutes,
+        )
+
+    summary = DataPreparationSummary(
+        initial_rows=int(len(raw_df)),
+        initial_features=int(len(raw_features)),
+        removed_high_missing_features=int(len(removed_cols)),
+        remaining_features_after_stage1=int(len(remaining_features)),
+        rows_after_missing_drop=int(len(stage1_df)),
+        removed_zero_run_rows=removed_zero_run_rows,
+        final_rows=int(len(clean_df)),
+        zero_run_windows_detected=int(len(zero_runs)) if removed_zero_run_rows > 0 else 0,
+    )
+    stage1_info = {
+        "removed_cols": removed_cols,
+        "remaining_features": remaining_features,
+        "rows_after_drop": int(len(stage1_df)),
+        "missing_ratio": missing_ratio.sort_values(ascending=False),
+    }
+    return summary, stage1_info, zero_runs
+
+
 @dataclass
 class FlowSampleSelection:
     date_start: Optional[pd.Timestamp] = None
     date_end: Optional[pd.Timestamp] = None
     row_limit: Optional[int] = None
+
+
+def _format_bytes(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    size = float(value)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            return f"{size:,.2f} {unit}"
+        size /= 1024.0
+    return f"{size:,.2f} TB"
+
+
+def _get_feature_engineering_ram_text() -> str:
+    process_bytes: Optional[float] = None
+    system_used_bytes: Optional[float] = None
+    system_total_bytes: Optional[float] = None
+    system_percent: Optional[float] = None
+
+    if psutil is not None:
+        try:
+            proc = psutil.Process(os.getpid())
+            process_bytes = float(proc.memory_info().rss)
+        except Exception:
+            process_bytes = None
+        try:
+            vm = psutil.virtual_memory()
+            system_used_bytes = float(vm.used)
+            system_total_bytes = float(vm.total)
+            system_percent = float(vm.percent)
+        except Exception:
+            system_used_bytes = None
+            system_total_bytes = None
+            system_percent = None
+    else:
+        try:
+            import resource
+
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            if sys.platform == "darwin":
+                process_bytes = float(rss)
+            else:
+                process_bytes = float(rss) * 1024.0
+        except Exception:
+            process_bytes = None
+        if hasattr(os, "sysconf"):
+            try:
+                page_size = float(os.sysconf("SC_PAGE_SIZE"))
+                phys_pages = float(os.sysconf("SC_PHYS_PAGES"))
+                system_total_bytes = page_size * phys_pages
+            except Exception:
+                system_total_bytes = None
+
+    parts: List[str] = []
+    if process_bytes is not None:
+        parts.append(f"RSS proceso: {_format_bytes(process_bytes)}")
+    if system_used_bytes is not None and system_total_bytes is not None and system_percent is not None:
+        parts.append(
+            f"RAM sistema: {_format_bytes(system_used_bytes)} / {_format_bytes(system_total_bytes)} ({system_percent:.1f}%)"
+        )
+    elif system_total_bytes is not None and process_bytes is not None:
+        percent = process_bytes / system_total_bytes * 100.0 if system_total_bytes > 0 else 0.0
+        parts.append(f"RAM total: {_format_bytes(system_total_bytes)} | RSS {percent:.1f}%")
+    return " | ".join(parts) if parts else "RAM -"
+
+
+class _FeatureEngineeringProgress:
+    def __init__(self) -> None:
+        self._bar = st.progress(0.0)
+        self._status = st.empty()
+        self._ram = st.empty()
+        self.set_progress(0.0, "Preparando pipeline...")
+
+    def set_progress(self, ratio: float, label: str, *, detail: Optional[str] = None) -> None:
+        bounded = max(0.0, min(float(ratio), 1.0))
+        self._bar.progress(bounded)
+        pct = int(round(bounded * 100.0))
+        self._status.caption(f"{pct}% | {label}")
+        ram_text = _get_feature_engineering_ram_text()
+        if detail:
+            self._ram.caption(f"{detail} | {ram_text}")
+        else:
+            self._ram.caption(ram_text)
+
+    def clear(self) -> None:
+        self._bar.empty()
+        self._status.empty()
+        self._ram.empty()
+
+
+def _update_feature_progress(
+    progress_bar: Optional[Any],
+    ratio: float,
+    label: str,
+    *,
+    detail: Optional[str] = None,
+) -> None:
+    if progress_bar is None:
+        return
+    setter = getattr(progress_bar, "set_progress", None)
+    if callable(setter):
+        setter(ratio, label, detail=detail)
+        return
+    progress_fn = getattr(progress_bar, "progress", None)
+    if callable(progress_fn):
+        progress_fn(max(0.0, min(float(ratio), 1.0)))
+
+
+def _canonical_drift_category_name(value: object) -> Optional[str]:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    text = str(value).strip().lower()
+    aliases = {
+        "light": "Light",
+        "lights": "Light",
+        "heavy": "Heavy",
+        "heavies": "Heavy",
+        "motorcycle": "Motorcycle",
+        "motorcycles": "Motorcycle",
+        "moto": "Motorcycle",
+        "motos": "Motorcycle",
+        "bike": "Motorcycle",
+        "bikes": "Motorcycle",
+    }
+    return aliases.get(text)
+
+
+def _resolve_drift_article_categories(
+    categories: Optional[Sequence[str]] = None,
+) -> List[str]:
+    if not categories:
+        return list(DRIFT_ARTICLE_CATEGORIES)
+    normalized = [
+        _canonical_drift_category_name(item)
+        for item in categories
+    ]
+    normalized = [item for item in normalized if item is not None]
+    if not normalized:
+        return list(DRIFT_ARTICLE_CATEGORIES)
+    return [item for item in DRIFT_ARTICLE_CATEGORIES if item in normalized]
+
+
+def _unique_preserve_order(values: Iterable[object]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _resolve_drift_article_portico_order(
+    allowed_porticos: Optional[Sequence[str]] = None,
+) -> List[str]:
+    base = allowed_porticos if allowed_porticos is not None else DRIFT_FOCUS_PORTICOS
+    normalized = [
+        _normalize_portico_code(item)
+        for item in base
+    ]
+    normalized = [item for item in normalized if item is not None]
+    ordered = _unique_preserve_order(normalized)
+    article_first = [item for item in DRIFT_ARTICLE_PORTICO_ORDER if item in ordered]
+    remainder = [item for item in ordered if item not in article_first]
+    return article_first + remainder if article_first else ordered
+
+
+def _resolve_drift_article_segments(
+    portico_order: Sequence[str],
+) -> List[Tuple[str, str]]:
+    normalized = _resolve_drift_article_portico_order(portico_order)
+    return [
+        (normalized[idx], normalized[idx + 1])
+        for idx in range(len(normalized) - 1)
+    ]
+
+
+def _parse_lat_lon_pair(value: object) -> Optional[Tuple[float, float]]:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    parts = [part.strip() for part in str(value).split(",")]
+    if len(parts) != 2:
+        return None
+    try:
+        return float(parts[0]), float(parts[1])
+    except Exception:
+        return None
+
+
+def _haversine_km(
+    coord_a: Tuple[float, float],
+    coord_b: Tuple[float, float],
+) -> float:
+    lat1, lon1 = coord_a
+    lat2, lon2 = coord_b
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2.0) ** 2
+    )
+    return 2.0 * 6371.0 * math.atan2(math.sqrt(a), math.sqrt(max(1e-12, 1.0 - a)))
+
+
+def _lookup_article_segment_distance_km(
+    start_portico: str,
+    end_portico: str,
+    *,
+    porticos_df: Optional[pd.DataFrame] = None,
+) -> Optional[float]:
+    try:
+        meta = load_porticos() if porticos_df is None else porticos_df.copy()
+    except Exception:
+        return None
+    if meta is None or meta.empty or "portico" not in meta.columns:
+        return None
+
+    meta = meta.copy()
+    meta["portico_norm"] = _normalize_portico_series(meta["portico"])
+    candidates: List[float] = []
+
+    try:
+        segments_df = get_portico_segments(meta)
+    except Exception:
+        segments_df = pd.DataFrame()
+    if not segments_df.empty:
+        segments_df = segments_df.copy()
+        segments_df["portico_last"] = _normalize_portico_series(segments_df["portico_last"])
+        segments_df["portico_next"] = _normalize_portico_series(segments_df["portico_next"])
+        exact = segments_df[
+            (segments_df["portico_last"] == str(start_portico))
+            & (segments_df["portico_next"] == str(end_portico))
+        ]
+        if not exact.empty:
+            dist = pd.to_numeric(exact["km_next"], errors="coerce") - pd.to_numeric(
+                exact["km_last"], errors="coerce"
+            )
+            dist = dist.abs().replace(0, np.nan).dropna()
+            if not dist.empty:
+                candidates.append(float(dist.max()))
+
+    start_rows = meta.loc[meta["portico_norm"] == str(start_portico)].copy()
+    end_rows = meta.loc[meta["portico_norm"] == str(end_portico)].copy()
+    if start_rows.empty or end_rows.empty:
+        return max(candidates) if candidates else None
+
+    start_km = pd.to_numeric(start_rows.get("km"), errors="coerce").dropna().tolist()
+    end_km = pd.to_numeric(end_rows.get("km"), errors="coerce").dropna().tolist()
+    for km_start in start_km:
+        for km_end in end_km:
+            dist = abs(float(km_end) - float(km_start))
+            if dist > 0:
+                candidates.append(dist)
+
+    if "lat-lon" in start_rows.columns and "lat-lon" in end_rows.columns:
+        start_coords = [
+            coord
+            for coord in start_rows["lat-lon"].map(_parse_lat_lon_pair).tolist()
+            if coord is not None
+        ]
+        end_coords = [
+            coord
+            for coord in end_rows["lat-lon"].map(_parse_lat_lon_pair).tolist()
+            if coord is not None
+        ]
+        for coord_start in start_coords:
+            for coord_end in end_coords:
+                dist = _haversine_km(coord_start, coord_end)
+                if dist > 0:
+                    candidates.append(dist)
+
+    if not candidates:
+        return None
+    return float(max(candidates))
+
+
+def _article_match_tolerance_minutes(distance_km: Optional[float]) -> float:
+    if distance_km is None or distance_km <= 0:
+        return float(DRIFT_ARTICLE_MIN_MATCH_WINDOW_MINUTES)
+    derived = distance_km / max(DRIFT_ARTICLE_MIN_REFERENCE_SPEED_KMH, 1e-9) * 60.0
+    return float(max(DRIFT_ARTICLE_MIN_MATCH_WINDOW_MINUTES, derived))
+
+
+def _rename_gate_article_columns(
+    columns: Iterable[Tuple[str, str]],
+    prefix: str,
+) -> List[str]:
+    return [
+        f"{prefix}_{DRIFT_ARTICLE_CATEGORY_SLUGS.get(category, str(category).lower())}_{portico}"
+        for portico, category in columns
+    ]
+
+
+def _compute_article_segment_matches(
+    work: pd.DataFrame,
+    *,
+    start_portico: str,
+    end_portico: str,
+    distance_km: Optional[float],
+    tolerance_minutes: Optional[float] = None,
+) -> pd.DataFrame:
+    needed = {
+        "plate_clean",
+        "portico_norm",
+        "FECHA",
+        "interval_start",
+        "category_name",
+        "lane_clean",
+    }
+    if work is None or work.empty or not needed.issubset(set(work.columns)):
+        return pd.DataFrame(
+            columns=["interval_start", "category_name", "segment_speed", "lane_change", "lane_origin"]
+        )
+
+    subset = work.loc[
+        work["plate_clean"].notna()
+        & work["portico_norm"].isin([str(start_portico), str(end_portico)])
+    ].copy()
+    if subset.empty:
+        return pd.DataFrame(
+            columns=["interval_start", "category_name", "segment_speed", "lane_change", "lane_origin"]
+        )
+
+    start_df = subset.loc[
+        subset["portico_norm"] == str(start_portico),
+        ["plate_clean", "FECHA", "interval_start", "category_name", "lane_clean"],
+    ].rename(
+        columns={
+            "FECHA": "time_start",
+            "category_name": "category_start",
+            "lane_clean": "lane_start",
+        }
+    )
+    end_df = subset.loc[
+        subset["portico_norm"] == str(end_portico),
+        ["plate_clean", "FECHA", "category_name", "lane_clean"],
+    ].rename(
+        columns={
+            "FECHA": "time_end",
+            "category_name": "category_end",
+            "lane_clean": "lane_end",
+        }
+    )
+    if start_df.empty or end_df.empty:
+        return pd.DataFrame(
+            columns=["interval_start", "category_name", "segment_speed", "lane_change", "lane_origin"]
+        )
+
+    tolerance = pd.Timedelta(
+        minutes=float(
+            tolerance_minutes
+            if tolerance_minutes is not None
+            else _article_match_tolerance_minutes(distance_km)
+        )
+    )
+
+    start_df = start_df.sort_values(["time_start", "plate_clean"])
+    end_df = end_df.sort_values(["time_end", "plate_clean"])
+
+    matches = pd.merge_asof(
+        end_df,
+        start_df,
+        by="plate_clean",
+        left_on="time_end",
+        right_on="time_start",
+        direction="backward",
+        tolerance=tolerance,
+    )
+    matches = matches.dropna(subset=["time_start", "interval_start"])
+    if matches.empty:
+        return pd.DataFrame(
+            columns=["interval_start", "category_name", "segment_speed", "lane_change", "lane_origin"]
+        )
+
+    matches = matches.loc[
+        matches["category_start"].eq(matches["category_end"])
+        | matches["category_end"].isna()
+    ].copy()
+    if matches.empty:
+        return pd.DataFrame(
+            columns=["interval_start", "category_name", "segment_speed", "lane_change", "lane_origin"]
+        )
+
+    matches = matches.sort_values(["plate_clean", "time_end"])
+    matches = matches.drop_duplicates(subset=["plate_clean", "time_start"], keep="first")
+    travel_minutes = (matches["time_end"] - matches["time_start"]).dt.total_seconds() / 60.0
+    positive_mask = travel_minutes > 0
+    matches = matches.loc[positive_mask].copy()
+    if matches.empty:
+        return pd.DataFrame(
+            columns=["interval_start", "category_name", "segment_speed", "lane_change", "lane_origin"]
+        )
+
+    travel_hours = travel_minutes.loc[matches.index] / 60.0
+    if distance_km is None or distance_km <= 0:
+        matches["segment_speed"] = np.nan
+    else:
+        matches["segment_speed"] = float(distance_km) / travel_hours
+
+    lane_valid = matches["lane_start"].notna() & matches["lane_end"].notna()
+    matches["lane_change"] = np.where(
+        lane_valid,
+        matches["lane_start"].astype(str) != matches["lane_end"].astype(str),
+        np.nan,
+    )
+    matches["category_name"] = matches["category_start"].fillna(matches["category_end"])
+    matches["lane_origin"] = (
+        matches["lane_start"]
+        .astype("string")
+        .str.extract(r"(\d+)", expand=False)
+    )
+    return matches[["interval_start", "category_name", "segment_speed", "lane_change", "lane_origin"]]
+
+
+def _compute_drift_article_features(
+    flows_df: pd.DataFrame,
+    *,
+    interval_minutes: int = 5,
+    categories: Optional[Sequence[str]] = None,
+    allowed_porticos: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    required = {"FECHA", "VELOCIDAD", "CATEGORIA", "MATRICULA", "PORTICO", "CARRIL"}
+    if flows_df is None or flows_df.empty or not required.issubset(set(flows_df.columns)):
+        return pd.DataFrame()
+
+    portico_order = _resolve_drift_article_portico_order(allowed_porticos)
+    if not portico_order:
+        return pd.DataFrame()
+    category_order = _resolve_drift_article_categories(categories)
+    segment_order = _resolve_drift_article_segments(portico_order)
+
+    work = flows_df[list(required)].copy()
+    work["FECHA"] = pd.to_datetime(work["FECHA"], errors="coerce")
+    work["VELOCIDAD"] = pd.to_numeric(work["VELOCIDAD"], errors="coerce")
+    work["CATEGORIA"] = pd.to_numeric(work["CATEGORIA"], errors="coerce")
+    work["portico_norm"] = _normalize_portico_series(work["PORTICO"])
+    work["category_raw"] = pd.to_numeric(work["CATEGORIA"], errors="coerce").astype("Int64")
+    work["category_name"] = work["category_raw"].map(DRIFT_ARTICLE_CATEGORY_MAP)
+    work["plate_clean"] = (
+        work["MATRICULA"]
+        .astype("string")
+        .str.strip()
+        .str.upper()
+        .replace({"": pd.NA, "NAN": pd.NA, "NULL": pd.NA, "NONE": pd.NA})
+    )
+    work["lane_clean"] = (
+        work["CARRIL"]
+        .astype("string")
+        .str.strip()
+        .replace({"": pd.NA, "NAN": pd.NA, "NULL": pd.NA, "NONE": pd.NA})
+    )
+    work = work.dropna(subset=["FECHA", "portico_norm", "category_name"])
+    work = work.loc[
+        work["portico_norm"].isin(portico_order)
+        & work["category_name"].isin(category_order)
+    ].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    work["interval_start"] = work["FECHA"].dt.floor(f"{int(interval_minutes)}min")
+    intervals = (
+        pd.Index(work["interval_start"].dropna().sort_values().unique(), name="interval_start")
+        .sort_values()
+    )
+    if len(intervals) == 0:
+        return pd.DataFrame()
+
+    interval_frame = pd.DataFrame({"interval_start": intervals})
+    gate_columns = pd.MultiIndex.from_product(
+        [portico_order, category_order],
+        names=["portico", "category_name"],
+    )
+
+    gate_stats = (
+        work.groupby(["interval_start", "portico_norm", "category_name"], dropna=False)
+        .agg(
+            flow=("category_name", "size"),
+            vel=("VELOCIDAD", "mean"),
+            sd=("VELOCIDAD", "std"),
+        )
+        .reset_index()
+    )
+    gate_stats["den"] = np.where(
+        gate_stats["vel"] > 0,
+        gate_stats["flow"] / gate_stats["vel"],
+        np.nan,
+    )
+
+    def _gate_pivot(value_col: str, prefix: str, *, fill_zero: bool) -> pd.DataFrame:
+        wide = gate_stats.pivot(
+            index="interval_start",
+            columns=["portico_norm", "category_name"],
+            values=value_col,
+        )
+        wide = wide.reindex(index=intervals, columns=gate_columns)
+        if fill_zero:
+            wide = wide.fillna(0.0)
+        wide = wide.astype(float)
+        wide.columns = _rename_gate_article_columns(list(wide.columns), prefix)
+        return wide
+
+    gate_flow = _gate_pivot("flow", "flow", fill_zero=True)
+    gate_vel = _gate_pivot("vel", "vel", fill_zero=False)
+    gate_sd = _gate_pivot("sd", "sd", fill_zero=False)
+    gate_den = _gate_pivot("den", "den", fill_zero=False)
+
+    def _delta_frame(frame: pd.DataFrame, *, prefix_from: str, prefix_to: str) -> pd.DataFrame:
+        delta = frame.diff()
+        if not delta.empty:
+            first_valid = frame.iloc[0].notna()
+            delta.iloc[0, first_valid.to_numpy()] = 0.0
+        delta.columns = [
+            col.replace(f"{prefix_from}_", f"{prefix_to}_", 1)
+            for col in frame.columns
+        ]
+        return delta
+
+    gate_delta_flow = _delta_frame(gate_flow, prefix_from="flow", prefix_to="delta_flow")
+    gate_delta_vel = _delta_frame(gate_vel, prefix_from="vel", prefix_to="delta_vel")
+    gate_delta_den = _delta_frame(gate_den, prefix_from="den", prefix_to="delta_den")
+    gate_delta_sd = _delta_frame(gate_sd, prefix_from="sd", prefix_to="delta_sd")
+
+    result = interval_frame.set_index("interval_start")
+    for frame in [
+        gate_flow,
+        gate_vel,
+        gate_sd,
+        gate_den,
+        gate_delta_flow,
+        gate_delta_vel,
+        gate_delta_den,
+        gate_delta_sd,
+    ]:
+        result = result.join(frame, how="left")
+
+    for portico in portico_order:
+        total = (
+            result.get(f"flow_light_{portico}", pd.Series(0.0, index=result.index)).fillna(0.0)
+            + result.get(f"flow_heavy_{portico}", pd.Series(0.0, index=result.index)).fillna(0.0)
+            + result.get(f"flow_motorcycle_{portico}", pd.Series(0.0, index=result.index)).fillna(0.0)
+        )
+        motorcycle_flow = result.get(
+            f"flow_motorcycle_{portico}",
+            pd.Series(0.0, index=result.index),
+        ).fillna(0.0)
+        heavy_flow = result.get(
+            f"flow_heavy_{portico}",
+            pd.Series(0.0, index=result.index),
+        ).fillna(0.0)
+        result[f"ft_motorcycle_{portico}"] = np.where(total > 0, motorcycle_flow / total, np.nan)
+        result[f"ft_heavy_{portico}"] = np.where(total > 0, heavy_flow / total, np.nan)
+
+    porticos_meta: Optional[pd.DataFrame]
+    try:
+        porticos_meta = load_porticos()
+    except Exception:
+        porticos_meta = None
+
+    for start_portico, end_portico in segment_order:
+        distance_km = _lookup_article_segment_distance_km(
+            start_portico,
+            end_portico,
+            porticos_df=porticos_meta,
+        )
+        matches = _compute_article_segment_matches(
+            work,
+            start_portico=start_portico,
+            end_portico=end_portico,
+            distance_km=distance_km,
+        )
+        lane_order = ["1", "2", "3"]
+        if matches.empty:
+            segment_stats = pd.DataFrame(
+                columns=["interval_start", "category_name", "flow", "vel", "sd", "cl", "den"]
+            )
+            overall_stats = pd.DataFrame(columns=["interval_start", "flow", "vel", "sd", "den"])
+            lane_stats = pd.DataFrame(columns=["interval_start", "lane_origin", "flow", "vel", "sd", "den"])
+        else:
+            segment_stats = (
+                matches.groupby(["interval_start", "category_name"], dropna=False)
+                .agg(
+                    flow=("category_name", "size"),
+                    vel=("segment_speed", "mean"),
+                    sd=("segment_speed", "std"),
+                    cl=("lane_change", "mean"),
+                )
+                .reset_index()
+            )
+            segment_stats["den"] = np.where(
+                segment_stats["vel"] > 0,
+                segment_stats["flow"] / segment_stats["vel"],
+                np.nan,
+            )
+            overall_stats = (
+                matches.groupby("interval_start", dropna=False)
+                .agg(
+                    flow=("category_name", "size"),
+                    vel=("segment_speed", "mean"),
+                    sd=("segment_speed", "std"),
+                )
+                .reset_index()
+            )
+            overall_stats["den"] = np.where(
+                overall_stats["vel"] > 0,
+                overall_stats["flow"] / overall_stats["vel"],
+                np.nan,
+            )
+            lane_stats = (
+                matches.dropna(subset=["lane_origin"])
+                .groupby(["interval_start", "lane_origin"], dropna=False)
+                .agg(
+                    flow=("lane_origin", "size"),
+                    vel=("segment_speed", "mean"),
+                    sd=("segment_speed", "std"),
+                )
+                .reset_index()
+            )
+            lane_stats["den"] = np.where(
+                lane_stats["vel"] > 0,
+                lane_stats["flow"] / lane_stats["vel"],
+                np.nan,
+            )
+
+        def _segment_pivot(value_col: str, prefix: str, *, fill_zero: bool) -> pd.DataFrame:
+            wide = segment_stats.pivot(
+                index="interval_start",
+                columns="category_name",
+                values=value_col,
+            )
+            wide = wide.reindex(index=intervals, columns=category_order)
+            if fill_zero:
+                wide = wide.fillna(0.0)
+            wide = wide.astype(float)
+            wide.columns = [
+                f"{prefix}_{DRIFT_ARTICLE_CATEGORY_SLUGS.get(category, str(category).lower())}_{start_portico}_{end_portico}"
+                for category in wide.columns
+            ]
+            return wide
+
+        def _lane_pivot(value_col: str, prefix: str, *, fill_zero: bool) -> pd.DataFrame:
+            wide = lane_stats.pivot(
+                index="interval_start",
+                columns="lane_origin",
+                values=value_col,
+            )
+            wide = wide.reindex(index=intervals, columns=lane_order)
+            if fill_zero:
+                wide = wide.fillna(0.0)
+            wide = wide.astype(float)
+            wide.columns = [
+                f"{prefix}_lane{lane}_{start_portico}_{end_portico}"
+                for lane in wide.columns
+            ]
+            return wide
+
+        seg_flow = _segment_pivot("flow", "flow", fill_zero=True)
+        seg_vel = _segment_pivot("vel", "vel", fill_zero=False)
+        seg_sd = _segment_pivot("sd", "sd", fill_zero=False)
+        seg_den = _segment_pivot("den", "den", fill_zero=False)
+        seg_cl = _segment_pivot("cl", "cl", fill_zero=False)
+        seg_delta_flow = _delta_frame(seg_flow, prefix_from="flow", prefix_to="delta_flow")
+        seg_delta_vel = _delta_frame(seg_vel, prefix_from="vel", prefix_to="delta_vel")
+        seg_delta_den = _delta_frame(seg_den, prefix_from="den", prefix_to="delta_den")
+
+        lane_flow = _lane_pivot("flow", "flow", fill_zero=True)
+        lane_vel = _lane_pivot("vel", "vel", fill_zero=False)
+        lane_sd = _lane_pivot("sd", "sd", fill_zero=False)
+        lane_den = _lane_pivot("den", "den", fill_zero=False)
+        lane_delta_flow = _delta_frame(lane_flow, prefix_from="flow", prefix_to="delta_flow")
+        lane_delta_vel = _delta_frame(lane_vel, prefix_from="vel", prefix_to="delta_vel")
+        lane_delta_den = _delta_frame(lane_den, prefix_from="den", prefix_to="delta_den")
+
+        overall_stats = overall_stats.set_index("interval_start").reindex(intervals)
+        overall_flow = pd.DataFrame(
+            {
+                f"flow_{start_portico}_{end_portico}": pd.to_numeric(
+                    overall_stats["flow"],
+                    errors="coerce",
+                )
+                .fillna(0.0)
+                .astype(float)
+            },
+            index=overall_stats.index,
+        )
+        overall_vel = pd.DataFrame(
+            {
+                f"vel_{start_portico}_{end_portico}": pd.to_numeric(
+                    overall_stats["vel"],
+                    errors="coerce",
+                ).astype(float)
+            },
+            index=overall_stats.index,
+        )
+        overall_sd = pd.DataFrame(
+            {
+                f"sd_{start_portico}_{end_portico}": pd.to_numeric(
+                    overall_stats["sd"],
+                    errors="coerce",
+                ).astype(float)
+            },
+            index=overall_stats.index,
+        )
+        overall_den = pd.DataFrame(
+            {
+                f"den_{start_portico}_{end_portico}": pd.to_numeric(
+                    overall_stats["den"],
+                    errors="coerce",
+                ).astype(float)
+            },
+            index=overall_stats.index,
+        )
+        overall_delta_flow = _delta_frame(overall_flow, prefix_from="flow", prefix_to="delta_flow")
+        overall_delta_vel = _delta_frame(overall_vel, prefix_from="vel", prefix_to="delta_vel")
+        overall_delta_den = _delta_frame(overall_den, prefix_from="den", prefix_to="delta_den")
+
+        for frame in [
+            seg_flow,
+            seg_vel,
+            seg_sd,
+            seg_den,
+            seg_cl,
+            seg_delta_flow,
+            seg_delta_vel,
+            seg_delta_den,
+            overall_flow,
+            overall_vel,
+            overall_sd,
+            overall_den,
+            overall_delta_flow,
+            overall_delta_vel,
+            overall_delta_den,
+            lane_flow,
+            lane_vel,
+            lane_sd,
+            lane_den,
+            lane_delta_flow,
+            lane_delta_vel,
+            lane_delta_den,
+        ]:
+            result = result.join(frame, how="left")
+
+    out = result.reset_index().sort_values("interval_start").reset_index(drop=True)
+    value_cols = [col for col in out.columns if col != "interval_start"]
+    for col in value_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype(float)
+    return out
+
+
+def _filter_accidents_for_allowed_porticos(
+    accidents_df: pd.DataFrame,
+    allowed_porticos: Optional[Sequence[str]],
+) -> pd.DataFrame:
+    if accidents_df is None or accidents_df.empty:
+        return pd.DataFrame()
+    if not allowed_porticos:
+        return accidents_df.copy()
+
+    allowed = {
+        item
+        for item in (
+            _normalize_portico_code(portico)
+            for portico in allowed_porticos
+        )
+        if item is not None
+    }
+    if not allowed:
+        return accidents_df.copy()
+
+    work = accidents_df.copy()
+    if "ultimo_portico" in work.columns and "proximo_portico" in work.columns:
+        allowed_segments = {
+            (str(start), str(end))
+            for start, end in _resolve_drift_article_segments(list(allowed))
+        }
+        if allowed_segments:
+            ultimo = _normalize_portico_series(work["ultimo_portico"])
+            proximo = _normalize_portico_series(work["proximo_portico"])
+            mask = pd.Series(False, index=work.index)
+            for start_portico, end_portico in allowed_segments:
+                mask |= ultimo.eq(start_portico) & proximo.eq(end_portico)
+            return work.loc[mask].copy()
+
+    masks: List[pd.Series] = []
+    if "ultimo_portico" in work.columns:
+        ultimo = _normalize_portico_series(work["ultimo_portico"])
+        masks.append(ultimo.isin(allowed))
+    if "proximo_portico" in work.columns:
+        proximo = _normalize_portico_series(work["proximo_portico"])
+        masks.append(proximo.isin(allowed))
+    if not masks:
+        return work
+
+    mask = masks[0].copy()
+    for extra in masks[1:]:
+        mask |= extra
+    return work.loc[mask].copy()
+
+
+def _add_interval_accident_target(
+    features_df: pd.DataFrame,
+    accidents_df: pd.DataFrame,
+    *,
+    interval_minutes: int = 5,
+    interval_col: str = "interval_start",
+    accident_time_col: str = "accidente_time",
+) -> pd.DataFrame:
+    if features_df is None or features_df.empty:
+        return pd.DataFrame()
+
+    df = features_df.copy()
+    if interval_col not in df.columns:
+        return pd.DataFrame()
+    df[interval_col] = pd.to_datetime(df[interval_col], errors="coerce")
+    df = df.dropna(subset=[interval_col])
+    if df.empty:
+        return pd.DataFrame()
+
+    if accidents_df is None or accidents_df.empty or accident_time_col not in accidents_df.columns:
+        df["target"] = 0
+        return df
+
+    acc = accidents_df[[accident_time_col]].copy()
+    acc[accident_time_col] = pd.to_datetime(acc[accident_time_col], errors="coerce")
+    acc = acc.dropna(subset=[accident_time_col])
+    if acc.empty:
+        df["target"] = 0
+        return df
+
+    acc[interval_col] = acc[accident_time_col].dt.floor(f"{int(interval_minutes)}min") - pd.Timedelta(
+        minutes=int(interval_minutes)
+    )
+    acc_pairs = acc[[interval_col]].drop_duplicates().copy()
+    acc_pairs["target"] = 1
+    merged = df.merge(acc_pairs, how="left", on=interval_col)
+    merged["target"] = merged["target"].fillna(0).astype(int)
+    return merged
 
 
 def _infer_feature_columns(
@@ -755,6 +1872,47 @@ def run_configurable_preparation_pipeline(
     return final_df, summary, stage1_info, zero_runs, steps
 
 
+def _build_preparation_detail_table(
+    summary: DataPreparationSummary,
+    *,
+    prep_config: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    prep_config = prep_config or {}
+    missing_threshold = prep_config.get("missing_threshold")
+    min_zero_days = prep_config.get("min_zero_days")
+    stage1_interval_drops = max(0, int(summary.initial_rows - summary.rows_after_missing_drop))
+
+    if isinstance(missing_threshold, (int, float)):
+        stage1_rule = f"Variables removidas por Stage 1 (> {float(missing_threshold) * 100:.2f}% missing)"
+    else:
+        stage1_rule = "Variables removidas por Stage 1 (missing sobre el umbral configurado)"
+
+    if isinstance(min_zero_days, (int, float)):
+        stage2_rule = (
+            "Filas eliminadas por Stage 2 "
+            f"(ventanas de >={int(min_zero_days)} dias consecutivos sin accidentes)"
+        )
+        stage2_windows_rule = (
+            "Ventanas detectadas por Stage 2 "
+            f"(>={int(min_zero_days)} dias consecutivos sin accidentes)"
+        )
+    else:
+        stage2_rule = "Filas eliminadas por Stage 2 (ventanas largas sin accidentes)"
+        stage2_windows_rule = "Ventanas detectadas por Stage 2 (ventanas largas sin accidentes)"
+
+    rows = [
+        {"stage": "Stage 1", "detalle": stage1_rule, "cantidad": int(summary.removed_high_missing_features)},
+        {
+            "stage": "Stage 1",
+            "detalle": "Intervalos eliminados por Stage 1 (any missing value en predictors restantes)",
+            "cantidad": stage1_interval_drops,
+        },
+        {"stage": "Stage 2", "detalle": stage2_rule, "cantidad": int(summary.removed_zero_run_rows)},
+        {"stage": "Stage 2", "detalle": stage2_windows_rule, "cantidad": int(summary.zero_run_windows_detected)},
+    ]
+    return pd.DataFrame(rows)
+
+
 def compute_abs_correlations(
     df: pd.DataFrame,
     feature_cols: Sequence[str],
@@ -902,6 +2060,7 @@ def compute_classification_metrics(
 
 
 MODEL_NAMES = ["XGBoost", "AdaBoost", "Random Forest", "NNet"]
+DEFAULT_REPETITION_SEEDS: Tuple[int, ...] = (42, 52, 62)
 
 FULL_HYPERPARAM_GRIDS: Dict[str, Dict[str, Sequence[Any]]] = {
     "Random Forest": {
@@ -956,6 +2115,104 @@ FAST_HYPERPARAM_GRIDS: Dict[str, Dict[str, Sequence[Any]]] = {
         "maxit": [200],
     },
 }
+
+
+def parse_repetition_seeds(raw_value: str) -> List[int]:
+    """
+    Parses the repetition seed input used in the Streamlit UI.
+    Empty input falls back to the article-aligned default seed list.
+    """
+    if raw_value is None or not str(raw_value).strip():
+        return list(DEFAULT_REPETITION_SEEDS)
+
+    seeds: List[int] = []
+    seen = set()
+    tokens = [tok for tok in re.split(r"[\s,;]+", str(raw_value).strip()) if tok]
+    for token in tokens:
+        seed = int(token)
+        if seed < 0:
+            raise ValueError("Seeds must be non-negative integers.")
+        if seed not in seen:
+            seeds.append(seed)
+            seen.add(seed)
+
+    if not seeds:
+        return list(DEFAULT_REPETITION_SEEDS)
+    return seeds
+
+
+def _normalize_log_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return json.dumps(np.asarray(value).tolist(), ensure_ascii=True)
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, default=str, ensure_ascii=True)
+    if isinstance(value, (list, tuple, set)):
+        return json.dumps(list(value), default=str, ensure_ascii=True)
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
+def _append_execution_log(
+    log_rows: Optional[List[Dict[str, Any]]],
+    *,
+    phase: str,
+    status: str,
+    message: str,
+    **context: Any,
+) -> None:
+    if log_rows is None:
+        return
+
+    entry: Dict[str, Any] = {
+        "order": len(log_rows) + 1,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "phase": str(phase),
+        "status": str(status),
+        "message": str(message),
+    }
+    for key, value in context.items():
+        entry[str(key)] = _normalize_log_value(value)
+    log_rows.append(entry)
+
+
+def _group_seed_metadata(df: pd.DataFrame, group_cols: Sequence[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=list(group_cols) + ["n_repetitions", "seed_list", "run_orders"])
+
+    grouped = df.groupby(list(group_cols), dropna=False)
+    return grouped.apply(
+        lambda grp: pd.Series(
+            {
+                "n_repetitions": int(
+                    grp["run_seed"].dropna().astype(int).nunique()
+                    if "run_seed" in grp.columns and grp["run_seed"].notna().any()
+                    else 1
+                ),
+                "seed_list": ",".join(
+                    str(int(seed))
+                    for seed in sorted(grp["run_seed"].dropna().astype(int).unique())
+                )
+                if "run_seed" in grp.columns and grp["run_seed"].notna().any()
+                else "",
+                "run_orders": ",".join(
+                    str(int(order))
+                    for order in sorted(grp["run_order"].dropna().astype(int).unique())
+                )
+                if "run_order" in grp.columns and grp["run_order"].notna().any()
+                else "",
+            }
+        ),
+        include_groups=False,
+    ).reset_index()
 
 
 def _parameter_combinations(
@@ -1267,6 +2524,9 @@ def run_yearly_strategy(
     fast_mode: bool = True,
     grid_limit: Optional[int] = None,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
+    run_seed: Optional[int] = None,
+    run_order: int = 1,
+    execution_log: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """
     Runs static / period-aligned / cumulative yearly experiments.
@@ -1286,6 +2546,7 @@ def run_yearly_strategy(
 
     pred_years = [y for y in years if y > int(base_year)]
 
+    effective_seed = int(random_state if run_seed is None else run_seed)
     rows: List[Dict[str, Any]] = []
     roc_payload: List[Dict[str, Any]] = []
 
@@ -1308,12 +2569,68 @@ def run_yearly_strategy(
             test_df = work.loc[test_mask].copy()
 
             if train_df.empty or test_df.empty:
+                _append_execution_log(
+                    execution_log,
+                    phase="yearly_split_skip",
+                    status="skipped",
+                    message="Training or test split is empty.",
+                    strategy=strategy,
+                    model=model_name,
+                    prediction_year=int(pred_year),
+                    training_year=train_label,
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    n_train=int(len(train_df)),
+                    n_test=int(len(test_df)),
+                )
                 continue
             if pd.to_numeric(train_df[target_col], errors="coerce").fillna(0).astype(int).nunique() < 2:
+                _append_execution_log(
+                    execution_log,
+                    phase="yearly_split_skip",
+                    status="skipped",
+                    message="Training split contains a single target class.",
+                    strategy=strategy,
+                    model=model_name,
+                    prediction_year=int(pred_year),
+                    training_year=train_label,
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    n_train=int(len(train_df)),
+                    n_test=int(len(test_df)),
+                )
                 continue
             if pd.to_numeric(test_df[target_col], errors="coerce").fillna(0).astype(int).nunique() < 2:
+                _append_execution_log(
+                    execution_log,
+                    phase="yearly_split_skip",
+                    status="skipped",
+                    message="Test split contains a single target class.",
+                    strategy=strategy,
+                    model=model_name,
+                    prediction_year=int(pred_year),
+                    training_year=train_label,
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    n_train=int(len(train_df)),
+                    n_test=int(len(test_df)),
+                )
                 continue
 
+            _append_execution_log(
+                execution_log,
+                phase="yearly_train_start",
+                status="started",
+                message="Training model for yearly strategy split.",
+                strategy=strategy,
+                model=model_name,
+                prediction_year=int(pred_year),
+                training_year=train_label,
+                run_seed=effective_seed,
+                run_order=run_order,
+                n_train=int(len(train_df)),
+                n_test=int(len(test_df)),
+            )
             t0 = time.perf_counter()
             try:
                 bundle = train_model_with_internal_validation(
@@ -1323,12 +2640,27 @@ def run_yearly_strategy(
                     model_name=model_name,
                     validation_size=validation_size,
                     folds=folds,
-                    random_state=random_state,
+                    random_state=effective_seed,
                     fast_mode=fast_mode,
                     grid_limit=grid_limit,
                     custom_grid=(custom_grids or {}).get(model_name),
                 )
-            except Exception:
+            except Exception as exc:
+                _append_execution_log(
+                    execution_log,
+                    phase="yearly_train_error",
+                    status="error",
+                    message="Model training failed for yearly strategy split.",
+                    strategy=strategy,
+                    model=model_name,
+                    prediction_year=int(pred_year),
+                    training_year=train_label,
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    n_train=int(len(train_df)),
+                    n_test=int(len(test_df)),
+                    error=str(exc),
+                )
                 continue
             train_time = time.perf_counter() - t0
 
@@ -1356,8 +2688,32 @@ def run_yearly_strategy(
                 "n_train": int(len(train_df)),
                 "n_test": int(len(test_df)),
                 "best_params": json.dumps(bundle["best_params"], sort_keys=True),
+                "run_seed": effective_seed,
+                "run_order": int(run_order),
             }
             rows.append(row)
+
+            _append_execution_log(
+                execution_log,
+                phase="yearly_eval_complete",
+                status="ok",
+                message="Finished yearly strategy training and evaluation.",
+                strategy=strategy,
+                model=model_name,
+                prediction_year=int(pred_year),
+                training_year=train_label,
+                run_seed=effective_seed,
+                run_order=run_order,
+                threshold=float(bundle["threshold"]),
+                auc=float(metrics["auc"]),
+                sensitivity=float(metrics["sensitivity"]),
+                specificity=float(metrics["specificity"]),
+                error_rate=float(metrics["error_rate"]),
+                best_params=bundle["best_params"],
+                n_train=int(len(train_df)),
+                n_test=int(len(test_df)),
+                training_time_sec=float(train_time),
+            )
 
             roc_payload.append(
                 {
@@ -1366,6 +2722,8 @@ def run_yearly_strategy(
                     "segment": str(pred_year),
                     "y_true": eval_payload["y_true"],
                     "scores": eval_payload["scores"],
+                    "run_seed": effective_seed,
+                    "run_order": int(run_order),
                 }
             )
 
@@ -1463,6 +2821,9 @@ def run_adaptive_strategy(
     adwin_delta: float = 0.002,
     min_window: int = 45_000,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
+    run_seed: Optional[int] = None,
+    run_order: int = 1,
+    execution_log: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """
     Runs Section 4.7 adaptive retraining with ADWIN drift detection.
@@ -1486,11 +2847,25 @@ def run_adaptive_strategy(
     if base_train.empty or stream.empty:
         return pd.DataFrame(), []
 
+    effective_seed = int(random_state if run_seed is None else run_seed)
     rows: List[Dict[str, Any]] = []
     roc_payload: List[Dict[str, Any]] = []
 
     for model_name in model_names:
         if pd.to_numeric(base_train[target_col], errors="coerce").fillna(0).astype(int).nunique() < 2:
+            _append_execution_log(
+                execution_log,
+                phase="adaptive_base_skip",
+                status="skipped",
+                message="Base training split contains a single target class.",
+                strategy="adaptive_adwin",
+                model=model_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+            )
             continue
 
         try:
@@ -1502,13 +2877,43 @@ def run_adaptive_strategy(
                 model_name=model_name,
                 validation_size=validation_size,
                 folds=folds,
-                random_state=random_state,
+                random_state=effective_seed,
                 fast_mode=fast_mode,
                 grid_limit=grid_limit,
                 custom_grid=(custom_grids or {}).get(model_name),
             )
             fit_time = time.perf_counter() - t0
-        except Exception:
+            _append_execution_log(
+                execution_log,
+                phase="adaptive_base_train_complete",
+                status="ok",
+                message="Finished base training for adaptive strategy.",
+                strategy="adaptive_adwin",
+                model=model_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                threshold=float(bundle["threshold"]),
+                best_params=bundle["best_params"],
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+                training_time_sec=float(fit_time),
+            )
+        except Exception as exc:
+            _append_execution_log(
+                execution_log,
+                phase="adaptive_base_train_error",
+                status="error",
+                message="Base training failed for adaptive strategy.",
+                strategy="adaptive_adwin",
+                model=model_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+                error=str(exc),
+            )
             continue
 
         model = bundle["model"]
@@ -1563,7 +2968,32 @@ def run_adaptive_strategy(
                     "specificity": float(seg_metrics["specificity"]),
                     "error_rate": float(seg_metrics["error_rate"]),
                     "training_time_sec": float(fit_time),
+                    "threshold": float(threshold),
+                    "run_seed": effective_seed,
+                    "run_order": int(run_order),
                 }
+            )
+
+            _append_execution_log(
+                execution_log,
+                phase="adaptive_drift_detected",
+                status="ok",
+                message="ADWIN detected drift and closed a prediction segment.",
+                strategy="adaptive_adwin",
+                model=model_name,
+                drift=int(drift_idx),
+                drift_date=pd.Timestamp(ts_i),
+                run_seed=effective_seed,
+                run_order=run_order,
+                threshold=float(threshold),
+                W=int(info["n"]),
+                W0=int(info["n0"]),
+                W1=int(info["n1"]),
+                remaining_periods=remaining,
+                auc=float(seg_metrics["auc"]),
+                sensitivity=float(seg_metrics["sensitivity"]),
+                specificity=float(seg_metrics["specificity"]),
+                error_rate=float(seg_metrics["error_rate"]),
             )
 
             roc_payload.append(
@@ -1573,6 +3003,8 @@ def run_adaptive_strategy(
                     "segment": f"drift_{drift_idx}",
                     "y_true": np.asarray(segment_y),
                     "scores": np.asarray(segment_s),
+                    "run_seed": effective_seed,
+                    "run_order": int(run_order),
                 }
             )
 
@@ -1594,7 +3026,7 @@ def run_adaptive_strategy(
                         model_name=model_name,
                         validation_size=validation_size,
                         folds=folds,
-                        random_state=random_state,
+                        random_state=effective_seed,
                         fast_mode=fast_mode,
                         grid_limit=grid_limit,
                         custom_grid=(custom_grids or {}).get(model_name),
@@ -1602,8 +3034,35 @@ def run_adaptive_strategy(
                     fit_time = time.perf_counter() - t_fit
                     model = bundle["model"]
                     threshold = float(bundle["threshold"])
-                except Exception:
-                    pass
+                    _append_execution_log(
+                        execution_log,
+                        phase="adaptive_retrain_complete",
+                        status="ok",
+                        message="Adaptive retraining completed using ADWIN window W1.",
+                        strategy="adaptive_adwin",
+                        model=model_name,
+                        drift=int(drift_idx),
+                        run_seed=effective_seed,
+                        run_order=run_order,
+                        threshold=float(threshold),
+                        best_params=bundle["best_params"],
+                        retrain_rows=int(len(retrain_df)),
+                        training_time_sec=float(fit_time),
+                    )
+                except Exception as exc:
+                    _append_execution_log(
+                        execution_log,
+                        phase="adaptive_retrain_error",
+                        status="error",
+                        message="Adaptive retraining failed after drift detection.",
+                        strategy="adaptive_adwin",
+                        model=model_name,
+                        drift=int(drift_idx),
+                        run_seed=effective_seed,
+                        run_order=run_order,
+                        retrain_rows=int(len(retrain_df)),
+                        error=str(exc),
+                    )
 
             segment_y = []
             segment_s = []
@@ -1631,7 +3090,28 @@ def run_adaptive_strategy(
                     "specificity": float(seg_metrics["specificity"]),
                     "error_rate": float(seg_metrics["error_rate"]),
                     "training_time_sec": float(fit_time),
+                    "threshold": float(threshold),
+                    "run_seed": effective_seed,
+                    "run_order": int(run_order),
                 }
+            )
+            _append_execution_log(
+                execution_log,
+                phase="adaptive_final_segment",
+                status="ok",
+                message="Stored final adaptive segment after finishing the stream.",
+                strategy="adaptive_adwin",
+                model=model_name,
+                drift=int(drift_idx),
+                drift_date=pd.Timestamp(ts_stream.iloc[-1]),
+                run_seed=effective_seed,
+                run_order=run_order,
+                threshold=float(threshold),
+                remaining_periods=0,
+                auc=float(seg_metrics["auc"]),
+                sensitivity=float(seg_metrics["sensitivity"]),
+                specificity=float(seg_metrics["specificity"]),
+                error_rate=float(seg_metrics["error_rate"]),
             )
             roc_payload.append(
                 {
@@ -1640,6 +3120,8 @@ def run_adaptive_strategy(
                     "segment": "final",
                     "y_true": np.asarray(segment_y),
                     "scores": np.asarray(segment_s),
+                    "run_seed": effective_seed,
+                    "run_order": int(run_order),
                 }
             )
 
@@ -1666,6 +3148,7 @@ def run_recalibration_experiments(
     adwin_delta: float = 0.002,
     min_window: int = 45_000,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
+    repetition_seeds: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     """
     Main orchestrator for all four paper strategies.
@@ -1674,63 +3157,120 @@ def run_recalibration_experiments(
         model_names = MODEL_NAMES
     if strategies is None:
         strategies = ["static", "period_aligned", "cumulative", "adaptive_adwin"]
+    if repetition_seeds is None:
+        repetition_seeds = DEFAULT_REPETITION_SEEDS
 
     all_rows: List[pd.DataFrame] = []
     all_roc: List[Dict[str, Any]] = []
-    adaptive_rows = pd.DataFrame()
+    adaptive_frames: List[pd.DataFrame] = []
+    execution_log: List[Dict[str, Any]] = []
 
-    for strategy in strategies:
-        if strategy in {"static", "period_aligned", "cumulative"}:
-            rows_df, roc_data = run_yearly_strategy(
-                df,
-                strategy=strategy,
-                feature_cols=feature_cols,
-                target_col=target_col,
-                time_col=time_col,
-                model_names=model_names,
-                base_year=base_year,
-                validation_size=validation_size,
-                folds=folds,
-                random_state=random_state,
-                fast_mode=fast_mode,
-                grid_limit=grid_limit,
-                custom_grids=custom_grids,
-            )
-            if not rows_df.empty:
-                all_rows.append(rows_df)
-            all_roc.extend(roc_data)
+    run_manifest = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "models": list(model_names),
+        "strategies": list(strategies),
+        "repetition_seeds": [int(seed) for seed in repetition_seeds],
+        "base_year": int(base_year) if base_year is not None else None,
+        "validation_size": float(validation_size),
+        "folds": int(folds),
+        "random_state_fallback": int(random_state),
+        "fast_mode": bool(fast_mode),
+        "grid_limit": int(grid_limit) if grid_limit is not None else None,
+        "adwin_delta": float(adwin_delta),
+        "min_window": int(min_window),
+        "feature_count": int(len(feature_cols)),
+        "feature_cols": list(feature_cols),
+        "target_col": str(target_col),
+        "time_col": str(time_col),
+        "input_rows": int(len(df)),
+    }
 
-        elif strategy == "adaptive_adwin":
-            adaptive_rows, roc_data = run_adaptive_strategy(
-                df,
-                feature_cols=feature_cols,
-                target_col=target_col,
-                time_col=time_col,
-                model_names=model_names,
-                base_year=base_year,
-                random_state=random_state,
-                validation_size=validation_size,
-                folds=folds,
-                fast_mode=fast_mode,
-                grid_limit=grid_limit,
-                adwin_delta=adwin_delta,
-                min_window=min_window,
-                custom_grids=custom_grids,
-            )
-            all_roc.extend(roc_data)
+    for run_order, seed in enumerate(repetition_seeds, start=1):
+        _append_execution_log(
+            execution_log,
+            phase="run_start",
+            status="started",
+            message="Starting sequential experiment repetition.",
+            run_seed=int(seed),
+            run_order=int(run_order),
+            strategies=list(strategies),
+            models=list(model_names),
+        )
+
+        for strategy in strategies:
+            if strategy in {"static", "period_aligned", "cumulative"}:
+                rows_df, roc_data = run_yearly_strategy(
+                    df,
+                    strategy=strategy,
+                    feature_cols=feature_cols,
+                    target_col=target_col,
+                    time_col=time_col,
+                    model_names=model_names,
+                    base_year=base_year,
+                    validation_size=validation_size,
+                    folds=folds,
+                    random_state=random_state,
+                    fast_mode=fast_mode,
+                    grid_limit=grid_limit,
+                    custom_grids=custom_grids,
+                    run_seed=int(seed),
+                    run_order=int(run_order),
+                    execution_log=execution_log,
+                )
+                if not rows_df.empty:
+                    all_rows.append(rows_df)
+                all_roc.extend(roc_data)
+
+            elif strategy == "adaptive_adwin":
+                adaptive_rows, roc_data = run_adaptive_strategy(
+                    df,
+                    feature_cols=feature_cols,
+                    target_col=target_col,
+                    time_col=time_col,
+                    model_names=model_names,
+                    base_year=base_year,
+                    random_state=random_state,
+                    validation_size=validation_size,
+                    folds=folds,
+                    fast_mode=fast_mode,
+                    grid_limit=grid_limit,
+                    adwin_delta=adwin_delta,
+                    min_window=min_window,
+                    custom_grids=custom_grids,
+                    run_seed=int(seed),
+                    run_order=int(run_order),
+                    execution_log=execution_log,
+                )
+                if not adaptive_rows.empty:
+                    adaptive_frames.append(adaptive_rows)
+                all_roc.extend(roc_data)
+
+        _append_execution_log(
+            execution_log,
+            phase="run_complete",
+            status="ok",
+            message="Completed sequential experiment repetition.",
+            run_seed=int(seed),
+            run_order=int(run_order),
+        )
 
     yearly_results = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+    adaptive_results = pd.concat(adaptive_frames, ignore_index=True) if adaptive_frames else pd.DataFrame()
     roc_curves = build_average_roc_curves(all_roc)
-    summary = summarize_results(yearly_results, adaptive_rows)
-    appendix = format_appendix_tables(yearly_results, adaptive_rows)
+    summary = summarize_results(yearly_results, adaptive_results)
+    appendix = format_appendix_tables(yearly_results, adaptive_results)
+    appendix_mean = format_appendix_tables_mean(yearly_results, adaptive_results)
 
     return {
         "yearly_results": yearly_results,
-        "adaptive_results": adaptive_rows,
+        "adaptive_results": adaptive_results,
         "roc_payload": all_roc,
         "average_roc": roc_curves,
         "summary": summary,
         "appendix_tables": appendix,
+        "appendix_tables_mean": appendix_mean,
+        "execution_log": pd.DataFrame(execution_log),
+        "run_manifest": run_manifest,
     }
 
 
@@ -1794,8 +3334,18 @@ def summarize_results(
     if yearly_results is not None and not yearly_results.empty:
         y = (
             yearly_results.groupby(["strategy", "model"], dropna=False)
-            [["auc", "sensitivity", "specificity", "error_rate", "training_time_sec"]]
-            .mean()
+            .agg(
+                auc=("auc", "mean"),
+                sensitivity=("sensitivity", "mean"),
+                specificity=("specificity", "mean"),
+                error_rate=("error_rate", "mean"),
+                training_time_sec=("training_time_sec", "mean"),
+                n_segments=("model", "size"),
+                n_repetitions=(
+                    "run_seed",
+                    lambda s: int(s.dropna().astype(int).nunique()) if s.notna().any() else 1,
+                ),
+            )
             .reset_index()
         )
         rows.append(y)
@@ -1803,8 +3353,18 @@ def summarize_results(
     if adaptive_results is not None and not adaptive_results.empty:
         a = (
             adaptive_results.groupby(["strategy", "model"], dropna=False)
-            [["auc", "sensitivity", "specificity", "error_rate", "training_time_sec"]]
-            .mean()
+            .agg(
+                auc=("auc", "mean"),
+                sensitivity=("sensitivity", "mean"),
+                specificity=("specificity", "mean"),
+                error_rate=("error_rate", "mean"),
+                training_time_sec=("training_time_sec", "mean"),
+                n_segments=("model", "size"),
+                n_repetitions=(
+                    "run_seed",
+                    lambda s: int(s.dropna().astype(int).nunique()) if s.notna().any() else 1,
+                ),
+            )
             .reset_index()
         )
         rows.append(a)
@@ -1840,6 +3400,10 @@ def format_appendix_tables(
             "error_rate",
             "training_time_sec",
             "threshold",
+            "n_train",
+            "n_test",
+            "run_seed",
+            "run_order",
         ]
         static = yearly_results.loc[yearly_results["strategy"] == "static", common_cols]
         period = yearly_results.loc[yearly_results["strategy"] == "period_aligned", common_cols]
@@ -1863,8 +3427,120 @@ def format_appendix_tables(
             "specificity",
             "error_rate",
             "training_time_sec",
+            "threshold",
+            "run_seed",
+            "run_order",
         ]
         tables["A.9"] = adaptive_results[cols].reset_index(drop=True)
+
+    return tables
+
+
+def format_appendix_tables_mean(
+    yearly_results: pd.DataFrame,
+    adaptive_results: pd.DataFrame,
+) -> Dict[str, pd.DataFrame]:
+    """Formats mean appendix tables across sequential seed repetitions."""
+    tables: Dict[str, pd.DataFrame] = {
+        "A.6": pd.DataFrame(),
+        "A.7": pd.DataFrame(),
+        "A.8": pd.DataFrame(),
+        "A.9": pd.DataFrame(),
+    }
+
+    if yearly_results is not None and not yearly_results.empty:
+        group_cols = ["strategy", "iteration", "training_year", "prediction_year", "model"]
+        metric_cols = [
+            "auc",
+            "sensitivity",
+            "specificity",
+            "error_rate",
+            "training_time_sec",
+            "threshold",
+            "n_train",
+            "n_test",
+        ]
+        agg_yearly = (
+            yearly_results.groupby(group_cols, dropna=False)[metric_cols]
+            .mean()
+            .reset_index()
+        )
+        agg_yearly = agg_yearly.merge(_group_seed_metadata(yearly_results, group_cols), on=group_cols, how="left")
+
+        common_cols = [
+            "iteration",
+            "training_year",
+            "prediction_year",
+            "model",
+            "auc",
+            "sensitivity",
+            "specificity",
+            "error_rate",
+            "training_time_sec",
+            "threshold",
+            "n_train",
+            "n_test",
+            "n_repetitions",
+            "seed_list",
+            "run_orders",
+        ]
+        tables["A.6"] = agg_yearly.loc[agg_yearly["strategy"] == "static", common_cols].reset_index(drop=True)
+        tables["A.7"] = agg_yearly.loc[agg_yearly["strategy"] == "period_aligned", common_cols].reset_index(drop=True)
+        tables["A.8"] = agg_yearly.loc[agg_yearly["strategy"] == "cumulative", common_cols].reset_index(drop=True)
+
+    if adaptive_results is not None and not adaptive_results.empty:
+        group_cols = ["strategy", "drift", "model"]
+        metric_cols = [
+            "W",
+            "W0",
+            "W1",
+            "remaining_periods",
+            "auc",
+            "sensitivity",
+            "specificity",
+            "error_rate",
+            "training_time_sec",
+            "threshold",
+        ]
+        agg_adaptive = (
+            adaptive_results.groupby(group_cols, dropna=False)[metric_cols]
+            .mean()
+            .reset_index()
+        )
+        drift_dates = (
+            adaptive_results.groupby(group_cols, dropna=False)
+            .agg(
+                drift_date_min=("drift_date", "min"),
+                drift_date_max=("drift_date", "max"),
+            )
+            .reset_index()
+        )
+        agg_adaptive = agg_adaptive.merge(drift_dates, on=group_cols, how="left")
+        agg_adaptive = agg_adaptive.merge(
+            _group_seed_metadata(adaptive_results, group_cols),
+            on=group_cols,
+            how="left",
+        )
+        cols = [
+            "drift",
+            "drift_date_min",
+            "drift_date_max",
+            "W",
+            "W0",
+            "W1",
+            "remaining_periods",
+            "model",
+            "auc",
+            "sensitivity",
+            "specificity",
+            "error_rate",
+            "training_time_sec",
+            "threshold",
+            "n_repetitions",
+            "seed_list",
+            "run_orders",
+        ]
+        tables["A.9"] = agg_adaptive[cols].reset_index(drop=True)
 
     return tables
 
@@ -2165,19 +3841,22 @@ def build_dataset_from_flujos_and_eventos(
     flows_df = flows_df.dropna(subset=["CATEGORIA"])
     flows_df["CATEGORIA"] = flows_df["CATEGORIA"].astype(int)
 
-    features_df = compute_flow_features(
+    features_df = _compute_drift_article_features(
         flows_df,
         interval_minutes=int(interval_minutes),
-        metrics=["flow", "speed", "density", "delta_speed", "delta_density"],
+        allowed_porticos=DRIFT_FOCUS_PORTICOS,
     )
     if features_df.empty:
         raise ValueError("Feature engineering produced an empty dataset.")
 
-    base_df = add_accident_target(
-        features_df,
+    corridor_accidents = _filter_accidents_for_allowed_porticos(
         accidents_df,
+        DRIFT_FOCUS_PORTICOS,
+    )
+    base_df = _add_interval_accident_target(
+        features_df,
+        corridor_accidents,
         interval_minutes=int(interval_minutes),
-        portico_col="portico",
         interval_col="interval_start",
     )
     if base_df.empty:
@@ -2188,8 +3867,8 @@ def build_dataset_from_flujos_and_eventos(
             "Load and concatenate selected event files from Datos/.",
             "Process events with Porticos.csv using Crash prediction event logic (process_accidentes_df).",
             "Query raw flow records from flujos.duckdb (table flujos_duckdb).",
-            "Aggregate flow data into interval features (flow/speed/density + deltas).",
-            "Align accidents to intervals and build binary target with add_accident_target.",
+            "Compute article-aligned interval features for the selected corridor and consecutive segments.",
+            "Filter accidents to the selected corridor and build interval-level target for t+1.",
         ],
         "flow_db_path": str(flow_db_path),
         "flow_table_name": str(flow_table_name),
@@ -2200,6 +3879,7 @@ def build_dataset_from_flujos_and_eventos(
         "counts": {
             "raw_event_rows": int(len(raw_events)),
             "processed_accidents": int(len(accidents_df)),
+            "total_accidents": int(len(corridor_accidents)),
             "excluded_events_without_portico": int(len(excluded_df)),
             "flow_rows_queried": int(len(flows_df)),
             "interval_rows_features": int(len(features_df)),
@@ -2351,6 +4031,282 @@ def _query_flujos_duckdb_filtered(
         con.close()
 
 
+def _build_crash_prediction_batch_ranges(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    mode: str,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp, str]]:
+    mode_normalized = str(mode).strip().lower()
+    if mode_normalized not in {"month", "week"}:
+        raise ValueError("mode must be 'month' or 'week'")
+    if end_ts < start_ts:
+        return []
+
+    if mode_normalized == "month":
+        range_start = pd.Timestamp(start_ts).to_period("M").start_time.normalize()
+        range_end = (pd.Timestamp(end_ts) + pd.offsets.MonthBegin(1)).normalize()
+        boundaries = pd.date_range(start=range_start, end=range_end, freq="MS")
+        return [
+            (boundaries[i], boundaries[i + 1], boundaries[i].strftime("%Y-%m"))
+            for i in range(len(boundaries) - 1)
+        ]
+
+    range_start = pd.Timestamp(start_ts).normalize() - pd.Timedelta(days=pd.Timestamp(start_ts).weekday())
+    range_end = pd.Timestamp(end_ts).normalize() + pd.Timedelta(days=7)
+    boundaries = pd.date_range(start=range_start, end=range_end, freq="7D")
+    ranges: List[Tuple[pd.Timestamp, pd.Timestamp, str]] = []
+    for i in range(len(boundaries) - 1):
+        current = boundaries[i]
+        nxt = boundaries[i + 1]
+        label = f"{current:%Y-%m-%d}_to_{(nxt - pd.Timedelta(days=1)):%Y-%m-%d}"
+        ranges.append((current, nxt, label))
+    return ranges
+
+
+def _compute_batched_flow_features_to_duckdb(
+    *,
+    flow_db_path: str,
+    flow_table_name: str,
+    out_path: Path,
+    batch_mode: str,
+    interval_minutes: int,
+    lanes: int,
+    metrics: Sequence[str],
+    categories: Sequence[str],
+    date_start: Optional[pd.Timestamp] = None,
+    date_end: Optional[pd.Timestamp] = None,
+    allowed_porticos: Optional[Sequence[str]] = None,
+    row_limit: Optional[int] = None,
+    progress_bar: Optional[Any] = None,
+) -> Dict[str, Any]:
+    if duckdb is None:
+        raise ImportError("duckdb is not installed.")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _update_feature_progress(progress_bar, 0.02, "Creando base temporal DuckDB...")
+
+    temp_db_path = out_path.with_name(f"{out_path.stem}__work_{time.time_ns()}.duckdb")
+    if out_path.exists():
+        out_path.unlink()
+    if temp_db_path.exists():
+        temp_db_path.unlink()
+
+    con_temp = None
+    con_feat = None
+    ranges: List[Tuple[pd.Timestamp, pd.Timestamp, str]] = []
+    input_rows = 0
+    feature_rows = 0
+    table_created = False
+
+    try:
+        con_temp = duckdb.connect(str(temp_db_path))
+        flow_db_ref = str(flow_db_path).replace("'", "''")
+        con_temp.execute(f"ATTACH '{flow_db_ref}' AS flow_db (READ_ONLY)")
+
+        query = f"""
+            CREATE TABLE work_flujos AS
+            SELECT FECHA, VELOCIDAD, CATEGORIA, MATRICULA, PORTICO, CARRIL
+            FROM flow_db.{flow_table_name}
+            WHERE 1=1
+        """
+        params: List[Any] = []
+        if date_start is not None:
+            query += " AND FECHA >= ?"
+            params.append(pd.Timestamp(date_start))
+        if date_end is not None:
+            query += " AND FECHA <= ?"
+            params.append(pd.Timestamp(date_end))
+        porticos_filter = [str(p) for p in allowed_porticos or [] if p is not None]
+        if porticos_filter:
+            placeholders = ",".join(["?"] * len(porticos_filter))
+            query += f" AND CAST(PORTICO AS VARCHAR) IN ({placeholders})"
+            params.extend(porticos_filter)
+        query += " ORDER BY FECHA"
+        if row_limit is not None and int(row_limit) > 0:
+            query += " LIMIT ?"
+            params.append(int(row_limit))
+        con_temp.execute(query, params)
+        _update_feature_progress(
+            progress_bar,
+            0.12,
+            "Base temporal lista.",
+            detail="Se materializo work_flujos para procesar por lotes.",
+        )
+
+        row_count = int(con_temp.execute("SELECT COUNT(*) FROM work_flujos").fetchone()[0])
+        if row_count <= 0:
+            return {
+                "batch_ranges": [],
+                "input_rows": 0,
+                "feature_rows": 0,
+                "output_path": str(out_path),
+            }
+
+        min_ts, max_ts = con_temp.execute("SELECT MIN(FECHA), MAX(FECHA) FROM work_flujos").fetchone()
+        if min_ts is None or max_ts is None:
+            return {
+                "batch_ranges": [],
+                "input_rows": 0,
+                "feature_rows": 0,
+                "output_path": str(out_path),
+            }
+
+        ranges = _build_crash_prediction_batch_ranges(
+            pd.Timestamp(min_ts),
+            pd.Timestamp(max_ts),
+            batch_mode,
+        )
+        if not ranges:
+            return {
+                "batch_ranges": [],
+                "input_rows": 0,
+                "feature_rows": 0,
+                "output_path": str(out_path),
+            }
+        _update_feature_progress(
+            progress_bar,
+            0.18,
+            "Lotes construidos.",
+            detail=f"Modo {batch_mode} | {len(ranges)} lotes.",
+        )
+
+        con_feat = duckdb.connect(str(out_path))
+        for idx, (start_ts, end_exclusive, batch_label) in enumerate(ranges, start=1):
+            batch_start_ratio = 0.18 + ((idx - 1) / max(len(ranges), 1)) * 0.62
+            batch_end_ratio = 0.18 + (idx / max(len(ranges), 1)) * 0.62
+            _update_feature_progress(
+                progress_bar,
+                batch_start_ratio,
+                f"Lote {idx}/{len(ranges)}: cargando flujos...",
+                detail=batch_label,
+            )
+            df_batch = con_temp.execute(
+                """
+                SELECT FECHA, VELOCIDAD, CATEGORIA, MATRICULA, PORTICO, CARRIL
+                FROM work_flujos
+                WHERE FECHA >= ? AND FECHA < ?
+                ORDER BY FECHA
+                """,
+                [start_ts, end_exclusive],
+            ).df()
+            input_rows += int(len(df_batch))
+            if df_batch.empty:
+                _update_feature_progress(
+                    progress_bar,
+                    batch_end_ratio,
+                    f"Lote {idx}/{len(ranges)} vacio.",
+                    detail=batch_label,
+                )
+                continue
+
+            _update_feature_progress(
+                progress_bar,
+                batch_start_ratio + (batch_end_ratio - batch_start_ratio) * 0.35,
+                f"Lote {idx}/{len(ranges)}: limpiando y agregando features...",
+                detail=f"{batch_label} | filas crudas: {len(df_batch):,}",
+            )
+            df_batch["FECHA"] = pd.to_datetime(df_batch["FECHA"], errors="coerce")
+            df_batch["VELOCIDAD"] = pd.to_numeric(df_batch["VELOCIDAD"], errors="coerce")
+            df_batch["CATEGORIA"] = pd.to_numeric(df_batch["CATEGORIA"], errors="coerce")
+            df_batch = df_batch.dropna(subset=["FECHA", "CATEGORIA"])
+            df_batch["CATEGORIA"] = df_batch["CATEGORIA"].astype(int)
+            if df_batch.empty:
+                _update_feature_progress(
+                    progress_bar,
+                    batch_end_ratio,
+                    f"Lote {idx}/{len(ranges)} sin filas validas.",
+                    detail=batch_label,
+                )
+                continue
+
+            feat_batch = _compute_drift_article_features(
+                df_batch,
+                interval_minutes=int(interval_minutes),
+                categories=list(categories),
+                allowed_porticos=allowed_porticos,
+            )
+            if feat_batch.empty:
+                _update_feature_progress(
+                    progress_bar,
+                    batch_end_ratio,
+                    f"Lote {idx}/{len(ranges)} sin features.",
+                    detail=batch_label,
+                )
+                continue
+
+            _update_feature_progress(
+                progress_bar,
+                batch_start_ratio + (batch_end_ratio - batch_start_ratio) * 0.75,
+                f"Lote {idx}/{len(ranges)}: escribiendo en DuckDB...",
+                detail=f"{batch_label} | filas features: {len(feat_batch):,}",
+            )
+            feat_batch["interval_start"] = pd.to_datetime(feat_batch["interval_start"], errors="coerce")
+            feat_batch = feat_batch.dropna(subset=["interval_start"])
+            feat_batch = feat_batch.drop_duplicates(subset=["interval_start"]).sort_values("interval_start")
+            if feat_batch.empty:
+                _update_feature_progress(
+                    progress_bar,
+                    batch_end_ratio,
+                    f"Lote {idx}/{len(ranges)} sin features validas.",
+                    detail=batch_label,
+                )
+                continue
+
+            con_feat.register("batch_view", feat_batch)
+            if not table_created:
+                con_feat.execute("CREATE TABLE flow_features AS SELECT * FROM batch_view")
+                table_created = True
+            else:
+                con_feat.execute("INSERT INTO flow_features SELECT * FROM batch_view")
+            feature_rows += int(len(feat_batch))
+            _update_feature_progress(
+                progress_bar,
+                batch_end_ratio,
+                f"Lote {idx}/{len(ranges)} completado.",
+                detail=f"{batch_label} | acumulado features: {feature_rows:,}",
+            )
+
+        if not table_created and out_path.exists():
+            out_path.unlink()
+
+        _update_feature_progress(
+            progress_bar,
+            0.84,
+            "Lectura por lotes completada.",
+            detail=f"Flujos procesados: {input_rows:,} | features: {feature_rows:,}",
+        )
+        return {
+            "batch_ranges": ranges,
+            "input_rows": int(input_rows),
+            "feature_rows": int(feature_rows),
+            "output_path": str(out_path),
+        }
+    except Exception:
+        if con_feat is not None:
+            try:
+                con_feat.close()
+            except Exception:
+                pass
+            con_feat = None
+        if con_temp is not None:
+            try:
+                con_temp.close()
+            except Exception:
+                pass
+            con_temp = None
+        if out_path.exists():
+            out_path.unlink()
+        raise
+    finally:
+        if con_feat is not None:
+            con_feat.close()
+        if con_temp is not None:
+            con_temp.close()
+        if temp_db_path.exists():
+            temp_db_path.unlink()
+
+
 def _build_batch_ranges(
     start_ts: pd.Timestamp,
     end_ts: pd.Timestamp,
@@ -2374,18 +4330,17 @@ def _build_batch_ranges(
     return ranges
 
 
-def _save_feature_duckdb(
+def _write_feature_payload_to_duckdb(
+    path: Path,
+    *,
     raw_df: pd.DataFrame,
     clean_df: pd.DataFrame,
-    *,
-    prefix: str = "drift_flow_features",
-) -> Path:
+) -> None:
     if duckdb is None:
         raise ImportError("duckdb is not installed.")
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = RESULTS_DIR / f"{prefix}_{stamp}.duckdb"
-    con = duckdb.connect(str(out_path))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(path))
     try:
         con.register("raw_view", raw_df)
         con.execute("CREATE OR REPLACE TABLE raw_features AS SELECT * FROM raw_view")
@@ -2393,6 +4348,24 @@ def _save_feature_duckdb(
         con.execute("CREATE OR REPLACE TABLE clean_features AS SELECT * FROM clean_view")
     finally:
         con.close()
+
+
+def _save_feature_duckdb(
+    raw_df: pd.DataFrame,
+    clean_df: pd.DataFrame,
+    *,
+    prefix: str = "drift_flow_features",
+    path: Optional[Path] = None,
+) -> Path:
+    if duckdb is None:
+        raise ImportError("duckdb is not installed.")
+    if path is None:
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = RESULTS_DIR / f"{prefix}_{stamp}.duckdb"
+    else:
+        out_path = Path(path)
+    _write_feature_payload_to_duckdb(out_path, raw_df=raw_df, clean_df=clean_df)
     return out_path
 
 
@@ -2415,6 +4388,7 @@ def _build_tramo_selector_for_feature_tab() -> Optional[Tuple[str, str, str, str
         return None
 
     options: List[Tuple[str, Optional[Tuple[str, str, str, str]]]] = [
+        ("Porticos fijos: 11, 12, 14 y 15", DRIFT_FOCUS_TRAMO),
         ("Toda la autopista", None)
     ]
 
@@ -2436,6 +4410,8 @@ def _build_tramo_selector_for_feature_tab() -> Optional[Tuple[str, str, str, str
 def _porticos_in_tramo(tramo: Optional[Tuple[str, str, str, str]]) -> Optional[List[str]]:
     if tramo is None:
         return None
+    if tramo == DRIFT_FOCUS_TRAMO:
+        return list(DRIFT_FOCUS_PORTICOS)
     eje, calzada, p_start, p_end = tramo
     try:
         porticos_df = load_porticos()
@@ -2462,6 +4438,15 @@ def _porticos_in_tramo(tramo: Optional[Tuple[str, str, str, str]]) -> Optional[L
     i1 = codes.index(p_end)
     lo, hi = sorted([i0, i1])
     return codes[lo : hi + 1]
+
+
+def _describe_tramo_selection(tramo: Optional[Tuple[str, str, str, str]]) -> str:
+    if tramo == DRIFT_FOCUS_TRAMO:
+        return f"Porticos fijos: {', '.join(DRIFT_FOCUS_PORTICOS)}"
+    if tramo is None:
+        return "Toda la autopista"
+    eje, calzada, p_start, p_end = tramo
+    return f"{eje} | {calzada} | {p_start} -> {p_end}"
 
 
 def generate_synthetic_article_dataset(
@@ -2533,9 +4518,12 @@ def _init_state() -> None:
     st.session_state.setdefault("drift_zero_runs", None)
     st.session_state.setdefault("drift_prep_summary", None)
     st.session_state.setdefault("drift_feature_cols", None)
+    st.session_state.setdefault("drift_candidate_feature_cols", None)
     st.session_state.setdefault("drift_importance_df", None)
     st.session_state.setdefault("drift_corr_pairs", None)
     st.session_state.setdefault("drift_results", None)
+    st.session_state.setdefault("drift_execution_log", None)
+    st.session_state.setdefault("drift_run_manifest", None)
     st.session_state.setdefault("drift_events_df", None)
     st.session_state.setdefault("drift_events_excluded_df", None)
     st.session_state.setdefault("drift_pipeline_meta", None)
@@ -2561,6 +4549,9 @@ def _render_blueprint_tab() -> None:
 
     st.markdown("**Related work (Table 1 replica)**")
     st.dataframe(build_related_work_table(), width="stretch")
+
+    st.markdown("**Migration and review plan**")
+    st.dataframe(build_python_migration_review_plan(), width="stretch")
 
 
 def _render_events_tab() -> None:
@@ -2709,6 +4700,7 @@ def _render_feature_engineering_output() -> None:
     clean_df = st.session_state.get("drift_clean_df")
     summary = st.session_state.get("drift_prep_summary")
     pipeline_meta = st.session_state.get("drift_pipeline_meta")
+    prep_config = pipeline_meta.get("prep_config") if isinstance(pipeline_meta, dict) else {}
 
     if isinstance(pipeline_meta, dict):
         steps = pipeline_meta.get("steps") or []
@@ -2719,14 +4711,20 @@ def _render_feature_engineering_output() -> None:
 
         counts = pipeline_meta.get("counts") or {}
         if counts:
-            c1, c2, c3, c4 = st.columns(4)
+            final_accidents = int(
+                counts.get("final_positive_rows", _count_positive_target_rows(clean_df))
+            )
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Eventos procesados", f"{int(counts.get('processed_accidents', 0)):,}")
-            c2.metric("Filas flujo consultadas", f"{int(counts.get('flow_rows_queried', 0)):,}")
-            c3.metric("Filas base (target)", f"{int(counts.get('base_rows_with_target', 0)):,}")
-            c4.metric("Filas finales", f"{int(counts.get('final_rows', 0)):,}")
+            c2.metric("Accidentes finales", f"{final_accidents:,}")
+            c3.metric("Filas flujo consultadas", f"{int(counts.get('flow_rows_queried', 0)):,}")
+            c4.metric("Filas base (target)", f"{int(counts.get('base_rows_with_target', 0)):,}")
+            c5.metric("Filas finales", f"{int(counts.get('final_rows', 0)):,}")
 
     if isinstance(summary, DataPreparationSummary):
         st.markdown("**Resumen Stage 1 / Stage 2**")
+        if isinstance(prep_config, dict) and prep_config.get("reconstructed_from_payload"):
+            st.caption("Resumen reconstruido desde `raw_features` y `clean_features` del archivo cargado.")
         stage_df = pd.DataFrame(
             [
                 {
@@ -2747,6 +4745,11 @@ def _render_feature_engineering_output() -> None:
             ]
         )
         st.dataframe(stage_df, width="stretch")
+        st.markdown("**Detalle de remociones por etapa**")
+        st.dataframe(
+            _build_preparation_detail_table(summary, prep_config=prep_config),
+            width="stretch",
+        )
 
     if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
         st.markdown("**Preview base (raw_features)**")
@@ -2767,7 +4770,7 @@ def _render_feature_engineering_tab() -> None:
         "**Flujo de esta pestaña:**\n"
         "1. Cargar eventos procesados (tab Eventos).\n"
         "2. Consultar `Datos/flujos.duckdb` con muestreo y filtro de tramo.\n"
-        "3. Generar variables de flujo por intervalo (por lote o en una pasada).\n"
+        "3. Generar variables por intervalo para pórticos, segmentos y lanes (por lote o en una pasada).\n"
         "4. Construir `target` con accidentes.\n"
         "5. Aplicar Stage 1 y Stage 2 con selectores.\n"
         "6. Exportar resultado en DuckDB (`raw_features` + `clean_features`)."
@@ -2837,29 +4840,35 @@ def _render_feature_engineering_tab() -> None:
                     df["target"] = pd.to_numeric(df["target"], errors="coerce").fillna(0).astype(int)
 
             feature_cols = _feature_columns_for_modeling(clean_df, target_col="target")
+            prep_summary, stage1_info, zero_runs = _rebuild_preparation_artifacts_from_payload(
+                raw_df,
+                clean_df,
+                missing_threshold=0.01,
+                target_col="target",
+                time_col="interval_start",
+                min_zero_days=7,
+            )
             st.session_state["drift_raw_df"] = raw_df
             st.session_state["drift_clean_df"] = clean_df
+            st.session_state["drift_candidate_feature_cols"] = feature_cols
             st.session_state["drift_feature_cols"] = feature_cols
-            st.session_state["drift_stage1_info"] = {"remaining_features": feature_cols, "removed_cols": []}
-            st.session_state["drift_zero_runs"] = pd.DataFrame()
-            st.session_state["drift_prep_summary"] = DataPreparationSummary(
-                initial_rows=int(len(raw_df)),
-                initial_features=int(len(feature_cols)),
-                removed_high_missing_features=0,
-                remaining_features_after_stage1=int(len(feature_cols)),
-                rows_after_missing_drop=int(len(clean_df)),
-                removed_zero_run_rows=0,
-                final_rows=int(len(clean_df)),
-                zero_run_windows_detected=0,
-            )
+            st.session_state["drift_stage1_info"] = stage1_info
+            st.session_state["drift_zero_runs"] = zero_runs
+            st.session_state["drift_prep_summary"] = prep_summary
             st.session_state["drift_pipeline_meta"] = {
                 "steps": [f"Archivo existente cargado: {selected}"],
+                "prep_config": {
+                    "missing_threshold": 0.01,
+                    "min_zero_days": 7,
+                    "reconstructed_from_payload": True,
+                },
                 "counts": {
                     "processed_accidents": int(
                         len(st.session_state.get("drift_events_df"))
                     )
                     if isinstance(st.session_state.get("drift_events_df"), pd.DataFrame)
                     else 0,
+                    "final_positive_rows": _count_positive_target_rows(clean_df),
                     "flow_rows_queried": int(len(raw_df)),
                     "base_rows_with_target": int(len(raw_df)),
                     "final_rows": int(len(clean_df)),
@@ -2907,38 +4916,33 @@ def _render_feature_engineering_tab() -> None:
         use_batches = False
     batch_mode = st.selectbox(
         "Modo de lote",
-        ["Diario", "Semanal", "Mensual"],
-        index=2,
+        ["Mensual", "Semanal"],
+        index=0,
         disabled=not use_batches,
         key="drift_batch_mode",
     )
 
     tramo_tuple = _build_tramo_selector_for_feature_tab()
     allowed_porticos = _porticos_in_tramo(tramo_tuple)
-
-    metric_options = {
-        "Flow": "flow",
-        "Speed": "speed",
-        "Speed_std": "speed_std",
-        "Density": "density",
-        "Delta.Speed": "delta_speed",
-        "Delta.Density": "delta_density",
-    }
-    metrics_selected = st.multiselect(
-        "Variables a generar",
-        list(metric_options.keys()),
-        default=list(metric_options.keys()),
-        key="drift_metrics_selected",
+    article_categories = list(DRIFT_ARTICLE_CATEGORIES)
+    st.caption(
+        "Variables article-aligned calculadas automaticamente: "
+        "Vel, Sd, Flow, Den y deltas por portico/categoria; "
+        "Ft_Motorcycle/Ft_Heavy; "
+        "Vel, Sd, Flow, Den, DeltaFlow, DeltaVel, DeltaDen y CL por segmentos consecutivos; "
+        "ademas de bloques globales y por lane para segmentos."
     )
-    metrics = [metric_options[item] for item in metrics_selected]
-
-    categories = st.multiselect(
-        "Tipos de vehiculo",
-        ["Light", "Heavy", "Motorcycles"],
-        default=["Light", "Heavy", "Motorcycles"],
-        key="drift_categories_selected",
+    st.caption(
+        f"Categorias fijas del articulo: {', '.join(article_categories)} | "
+        f"Porticos del corredor: {', '.join(DRIFT_FOCUS_PORTICOS)} | "
+        f"Orden operacional de segmentos: {' -> '.join(_resolve_drift_article_portico_order(allowed_porticos))}"
     )
-    lanes = st.number_input("Carriles para normalizar Flow", min_value=1, max_value=8, value=3, step=1)
+    with st.expander("Variables y formulas del feature engineering", expanded=False):
+        st.caption(
+            "Nota metodologica: la Table 4 resume las familias principales, pero el propio articulo y la Figure 6 "
+            "muestran que parte del set predictivo se calcula tambien a nivel de lane."
+        )
+        st.dataframe(feature_engineering_reference_table(), width="stretch")
     interval_minutes = st.number_input("Intervalo (minutos)", min_value=1, max_value=60, value=5, step=1)
 
     stage1_mode = st.selectbox(
@@ -2963,13 +4967,6 @@ def _render_feature_engineering_tab() -> None:
     )
 
     if st.button("Calcular nuevas variables", key="drift_run_feature_engineering", disabled=not range_valid):
-        if not metrics:
-            st.warning("Selecciona al menos una variable a generar.")
-            return
-        if not categories:
-            st.warning("Selecciona al menos un tipo de vehiculo.")
-            return
-
         flow_date_start = sample.date_start
         flow_date_end = sample.date_end
         if flow_date_start is None and isinstance(summary.get("min_ts"), pd.Timestamp):
@@ -2980,87 +4977,143 @@ def _render_feature_engineering_tab() -> None:
             st.error("No se pudo inferir el rango de fechas para consultar flujos.")
             return
 
-        batch_ranges: List[Tuple[pd.Timestamp, pd.Timestamp]]
+        flow_row_limit = int(sample.row_limit) if sample.row_limit is not None else None
+        queried_rows = 0
+        progress = _FeatureEngineeringProgress()
+        out_path: Optional[Path] = None
+        batch_ranges: List[Any] = []
+
         if use_batches:
-            batch_end_exclusive = pd.Timestamp(flow_date_end) + pd.Timedelta(nanoseconds=1)
-            batch_ranges = _build_batch_ranges(pd.Timestamp(flow_date_start), batch_end_exclusive, str(batch_mode))
-            if not batch_ranges:
-                st.error("No se pudieron construir lotes con el rango seleccionado.")
+            batch_mode_code = "month" if str(batch_mode) == "Mensual" else "week"
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = RESULTS_DIR / f"drift_flow_features_{stamp}.duckdb"
+            try:
+                batch_meta = _compute_batched_flow_features_to_duckdb(
+                    flow_db_path=str(FLOW_DB_PATH),
+                    flow_table_name=FLOW_TABLE_NAME,
+                    out_path=out_path,
+                    batch_mode=batch_mode_code,
+                    interval_minutes=int(interval_minutes),
+                    lanes=1,
+                    metrics=[],
+                    categories=article_categories,
+                    date_start=pd.Timestamp(flow_date_start),
+                    date_end=pd.Timestamp(flow_date_end),
+                    allowed_porticos=allowed_porticos,
+                    row_limit=flow_row_limit,
+                    progress_bar=progress,
+                )
+            except Exception as exc:
+                progress.set_progress(1.0, "Error en procesamiento por lotes.", detail=str(exc))
+                st.error(f"No se pudo ejecutar el procesamiento por lotes en DuckDB: {exc}")
+                return
+
+            batch_ranges = list(batch_meta.get("batch_ranges") or [])
+            queried_rows = int(batch_meta.get("input_rows", 0) or 0)
+            if not out_path.exists():
+                progress.set_progress(1.0, "No se generaron features en lotes.")
+                st.warning("No se generaron variables con la configuracion actual.")
+                return
+            try:
+                progress.set_progress(
+                    0.88,
+                    "Cargando features batcheadas desde DuckDB...",
+                    detail=f"{len(batch_ranges)} lotes procesados.",
+                )
+                features_df = _load_feature_df_from_duckdb(out_path)
+            except Exception as exc:
+                progress.set_progress(1.0, "Error cargando salida batcheada.", detail=str(exc))
+                st.error(f"No se pudo cargar el resultado por lotes desde DuckDB: {exc}")
                 return
         else:
-            batch_ranges = [(pd.Timestamp(flow_date_start), pd.Timestamp(flow_date_end) + pd.Timedelta(nanoseconds=1))]
-
-        flow_row_limit = int(sample.row_limit) if sample.row_limit is not None else None
-        frames: List[pd.DataFrame] = []
-        queried_rows = 0
-        progress = st.progress(0)
-
-        for idx, (start_ts, end_exclusive) in enumerate(batch_ranges, start=1):
-            end_inclusive = pd.Timestamp(end_exclusive) - pd.Timedelta(nanoseconds=1)
-            per_batch_limit = flow_row_limit if len(batch_ranges) == 1 else None
-            df_batch = _query_flujos_duckdb_filtered(
+            batch_ranges = [
+                (
+                    pd.Timestamp(flow_date_start),
+                    pd.Timestamp(flow_date_end) + pd.Timedelta(nanoseconds=1),
+                )
+            ]
+            progress.set_progress(
+                0.10,
+                "Consultando flujos...",
+                detail=f"Rango {pd.Timestamp(flow_date_start)} a {pd.Timestamp(flow_date_end)}",
+            )
+            df_full = _query_flujos_duckdb_filtered(
                 str(FLOW_DB_PATH),
                 table_name=FLOW_TABLE_NAME,
-                row_limit=per_batch_limit,
-                date_start=start_ts,
-                date_end=end_inclusive,
+                row_limit=flow_row_limit,
+                date_start=pd.Timestamp(flow_date_start),
+                date_end=pd.Timestamp(flow_date_end),
                 allowed_porticos=allowed_porticos,
             )
-            queried_rows += int(len(df_batch))
-            if df_batch.empty:
-                progress.progress(idx / len(batch_ranges))
-                continue
+            queried_rows = int(len(df_full))
+            if df_full.empty:
+                progress.set_progress(1.0, "Consulta completada sin filas.")
+                st.warning("No se generaron variables con la configuracion actual.")
+                return
 
-            df_batch["FECHA"] = pd.to_datetime(df_batch["FECHA"], errors="coerce")
-            df_batch["VELOCIDAD"] = pd.to_numeric(df_batch["VELOCIDAD"], errors="coerce")
-            df_batch["CATEGORIA"] = pd.to_numeric(df_batch["CATEGORIA"], errors="coerce")
-            df_batch = df_batch.dropna(subset=["FECHA", "CATEGORIA"])
-            df_batch["CATEGORIA"] = df_batch["CATEGORIA"].astype(int)
-            if df_batch.empty:
-                progress.progress(idx / len(batch_ranges))
-                continue
-
-            feat_batch = compute_flow_features(
-                df_batch,
-                interval_minutes=int(interval_minutes),
-                lanes=int(lanes),
-                metrics=metrics,
-                categories=categories,
+            progress.set_progress(
+                0.30,
+                "Limpiando registros crudos...",
+                detail=f"Filas consultadas: {queried_rows:,}",
             )
-            if not feat_batch.empty:
-                feat_batch["portico"] = _normalize_portico_series(feat_batch["portico"])
-                frames.append(feat_batch)
+            df_full["FECHA"] = pd.to_datetime(df_full["FECHA"], errors="coerce")
+            df_full["VELOCIDAD"] = pd.to_numeric(df_full["VELOCIDAD"], errors="coerce")
+            df_full["CATEGORIA"] = pd.to_numeric(df_full["CATEGORIA"], errors="coerce")
+            df_full = df_full.dropna(subset=["FECHA", "CATEGORIA"])
+            df_full["CATEGORIA"] = df_full["CATEGORIA"].astype(int)
+            if df_full.empty:
+                progress.set_progress(1.0, "Limpieza completada sin filas validas.")
+                st.warning("No se generaron variables con la configuracion actual.")
+                return
 
-            progress.progress(idx / len(batch_ranges))
-        progress.empty()
+            progress.set_progress(
+                0.55,
+                "Calculando features article-aligned...",
+                detail=f"Filas validas: {len(df_full):,}",
+            )
+            features_df = _compute_drift_article_features(
+                df_full,
+                interval_minutes=int(interval_minutes),
+                categories=article_categories,
+                allowed_porticos=allowed_porticos,
+            )
 
-        if not frames:
+        if features_df.empty:
+            progress.set_progress(1.0, "No se generaron variables con la configuracion actual.")
             st.warning("No se generaron variables con la configuracion actual.")
             return
 
-        features_df = pd.concat(frames, ignore_index=True)
-        features_df = features_df.drop_duplicates(subset=["portico", "interval_start"]).sort_values(
-            ["interval_start", "portico"]
+        progress.set_progress(
+            0.90,
+            "Normalizando features y construyendo target...",
+            detail=f"Filas features: {len(features_df):,}",
         )
         features_df["interval_start"] = pd.to_datetime(features_df["interval_start"], errors="coerce")
-        features_df = features_df.dropna(subset=["interval_start", "portico"]).reset_index(drop=True)
+        features_df = features_df.dropna(subset=["interval_start"]).drop_duplicates(
+            subset=["interval_start"]
+        ).sort_values("interval_start").reset_index(drop=True)
 
-        base_df = add_accident_target(
+        corridor_accidents = _filter_accidents_for_allowed_porticos(accidents_df, allowed_porticos)
+        base_df = _add_interval_accident_target(
             features_df,
-            accidents_df,
+            corridor_accidents,
             interval_minutes=int(interval_minutes),
-            portico_col="portico",
             interval_col="interval_start",
             accident_time_col="accidente_time",
-            accident_portico_col="ultimo_portico",
         )
         if base_df.empty:
+            progress.set_progress(1.0, "No se pudo construir base con target.")
             st.warning("No se pudo generar base con target.")
             return
 
         base_df["target"] = pd.to_numeric(base_df["target"], errors="coerce").fillna(0).astype(int)
         feature_cols = _feature_columns_for_modeling(base_df, target_col="target")
 
+        progress.set_progress(
+            0.94,
+            "Ejecutando Stage 1 / Stage 2...",
+            detail=f"Base con target: {len(base_df):,} filas",
+        )
         clean_df, prep_summary, stage1_info, zero_runs, prep_steps = run_configurable_preparation_pipeline(
             base_df,
             feature_cols=feature_cols,
@@ -3074,12 +5127,24 @@ def _render_feature_engineering_tab() -> None:
         )
 
         if clean_df.empty:
+            progress.set_progress(1.0, "Preparacion completada sin dataset util.")
             st.warning("Las etapas de preparacion dejaron el dataset vacio.")
             return
 
+        progress.set_progress(
+            0.98,
+            "Exportando resultado a DuckDB...",
+            detail=f"Filas limpias: {len(clean_df):,}",
+        )
         try:
-            out_path = _save_feature_duckdb(base_df, clean_df, prefix="drift_flow_features")
+            out_path = _save_feature_duckdb(
+                base_df,
+                clean_df,
+                prefix="drift_flow_features",
+                path=out_path,
+            )
         except Exception as exc:
+            progress.set_progress(1.0, "Error exportando DuckDB.", detail=str(exc))
             st.error(f"No se pudo exportar el resultado a DuckDB: {exc}")
             return
 
@@ -3095,14 +5160,17 @@ def _render_feature_engineering_tab() -> None:
             "Eventos procesados desde la pestaña Eventos (Crash prediction replica).",
             f"Consulta base de flujos fija: {FLOW_DB_PATH} / {FLOW_TABLE_NAME}.",
             f"Muestreo aplicado: {sample_mode}.",
-            f"Variables generadas: {', '.join(metrics)}.",
-            f"Tipos de vehiculo: {', '.join(categories)}.",
+            "Variables generadas segun Section 4.1 + Table 4 + Figure 6, incluyendo bloques por lane en segmentos.",
+            f"Categorias fijas del articulo: {', '.join(article_categories)}.",
+            f"Porticos del corredor: {', '.join(DRIFT_FOCUS_PORTICOS)}.",
+            f"Orden operacional de segmentos: {' -> '.join(_resolve_drift_article_portico_order(allowed_porticos))}.",
         ]
         if tramo_tuple:
-            eje, calzada, p_start, p_end = tramo_tuple
-            steps.append(f"Filtro tramo: {eje} | {calzada} | {p_start} -> {p_end}.")
+            steps.append(f"Filtro tramo: {_describe_tramo_selection(tramo_tuple)}.")
         if use_batches:
-            steps.append(f"Procesamiento por lote: {batch_mode} ({len(batch_ranges)} lotes).")
+            steps.append(
+                f"Procesamiento por lote DuckDB estilo Crash prediction: {batch_mode} ({len(batch_ranges)} lotes)."
+            )
         else:
             steps.append("Procesamiento sin lotes (consulta unica).")
         steps.extend(prep_steps)
@@ -3113,12 +5181,21 @@ def _render_feature_engineering_tab() -> None:
         st.session_state["drift_stage1_info"] = stage1_info
         st.session_state["drift_zero_runs"] = zero_runs
         st.session_state["drift_prep_summary"] = prep_summary
+        st.session_state["drift_candidate_feature_cols"] = stage1_info.get("remaining_features", feature_cols)
         st.session_state["drift_feature_cols"] = stage1_info.get("remaining_features", feature_cols)
         st.session_state["drift_feature_export_path"] = str(out_path)
         st.session_state["drift_pipeline_meta"] = {
             "steps": steps,
+            "prep_config": {
+                "stage1_applied": bool(stage1_mode == "Aplicar"),
+                "missing_threshold": float(missing_threshold),
+                "stage2_applied": bool(stage2_mode == "Aplicar"),
+                "min_zero_days": int(min_zero_days),
+                "interval_minutes": int(interval_minutes),
+            },
             "counts": {
                 "processed_accidents": int(len(accidents_df)),
+                "final_positive_rows": _count_positive_target_rows(clean_df),
                 "flow_rows_available_in_filter": int(flow_count),
                 "flow_rows_queried": int(queried_rows),
                 "base_rows_with_target": int(len(base_df)),
@@ -3126,6 +5203,11 @@ def _render_feature_engineering_tab() -> None:
                 "final_rows": int(len(clean_df)),
             },
         }
+        progress.set_progress(
+            1.0,
+            "Feature engineering completado.",
+            detail=f"Base: {len(base_df):,} | Limpio: {len(clean_df):,} | DuckDB: {out_path.name}",
+        )
         st.success(
             f"Pipeline completado. Base={len(base_df):,} filas | "
             f"Limpio={len(clean_df):,} filas | Exportado={out_path.name}"
@@ -3165,14 +5247,18 @@ def _render_feature_selection_tab() -> None:
             target_col=target_col,
             top_n=int(top_n),
         )
+        selected_for_experiments = (
+            importance_df["feature"].astype(str).tolist() if not importance_df.empty else list(kept)
+        )
 
-        st.session_state["drift_feature_cols"] = kept
+        st.session_state["drift_candidate_feature_cols"] = kept
+        st.session_state["drift_feature_cols"] = selected_for_experiments
         st.session_state["drift_corr_pairs"] = corr_pairs
         st.session_state["drift_importance_df"] = importance_df
 
         st.success(
             f"Dropped {len(dropped)} highly correlated features. "
-            f"Kept {len(kept)} features."
+            f"Using top {len(selected_for_experiments)} features for experiments."
         )
 
     corr_pairs = st.session_state.get("drift_corr_pairs")
@@ -3189,6 +5275,9 @@ def _render_feature_selection_tab() -> None:
         st.markdown("**Figure 6 replica: top feature importances**")
         st.bar_chart(importance_df.set_index("feature")["importance"], width="stretch")
         st.dataframe(importance_df, width="stretch")
+        st.caption(
+            "Experiments use the ordered top-N features shown above, after the correlation filter."
+        )
 
 
 def _render_experiments_tab() -> None:
@@ -3203,6 +5292,10 @@ def _render_experiments_tab() -> None:
     if not feature_cols:
         st.info("Run feature selection first.")
         return
+
+    st.caption(
+        f"Feature set locked for experiments: {len(feature_cols)} variables after correlation filtering + RF ranking."
+    )
 
     target_col_default = "target" if "target" in clean_df.columns else clean_df.columns[-1]
     time_col_default = "interval_start" if "interval_start" in clean_df.columns else clean_df.columns[0]
@@ -3227,7 +5320,18 @@ def _render_experiments_tab() -> None:
         adwin_delta = st.number_input("ADWIN delta", min_value=0.0001, max_value=0.1, value=0.002, step=0.0005, format="%.4f")
         min_window = st.number_input("ADWIN min window", min_value=100, max_value=200000, value=45000, step=100)
 
+    seed_text = st.text_input(
+        "Sequential repetition seeds",
+        value=", ".join(str(seed) for seed in DEFAULT_REPETITION_SEEDS),
+        help="The article reports mean metrics across repeated runs. Seeds are executed sequentially and logged.",
+    )
+
     if st.button("Run full paper experiment set", key="drift_run_experiments"):
+        try:
+            repetition_seeds = parse_repetition_seeds(seed_text)
+        except ValueError as exc:
+            st.error(f"Invalid seed list: {exc}")
+            return
         with st.spinner("Running experiments. This can take time on large datasets..."):
             results = run_recalibration_experiments(
                 clean_df,
@@ -3242,8 +5346,11 @@ def _render_experiments_tab() -> None:
                 grid_limit=int(grid_limit),
                 adwin_delta=float(adwin_delta),
                 min_window=int(min_window),
+                repetition_seeds=repetition_seeds,
             )
         st.session_state["drift_results"] = results
+        st.session_state["drift_execution_log"] = results.get("execution_log")
+        st.session_state["drift_run_manifest"] = results.get("run_manifest")
 
     results = st.session_state.get("drift_results")
     if not isinstance(results, dict):
@@ -3254,6 +5361,13 @@ def _render_experiments_tab() -> None:
     adaptive = results.get("adaptive_results")
     avg_roc = results.get("average_roc")
     appendix = results.get("appendix_tables")
+    appendix_mean = results.get("appendix_tables_mean")
+    execution_log = results.get("execution_log")
+    run_manifest = results.get("run_manifest")
+
+    if isinstance(run_manifest, dict):
+        st.markdown("**Run manifest**")
+        st.json(run_manifest, expanded=False)
 
     st.markdown("**Strategy summary**")
     if isinstance(summary, pd.DataFrame) and not summary.empty:
@@ -3269,6 +5383,16 @@ def _render_experiments_tab() -> None:
             else:
                 st.info(f"Table {key} has no rows for current run.")
 
+    if isinstance(appendix_mean, dict):
+        st.markdown("**Appendix mean tables across sequential seeds**")
+        for key in ["A.6", "A.7", "A.8", "A.9"]:
+            df_tab = appendix_mean.get(key)
+            st.caption(f"Mean Table {key}")
+            if isinstance(df_tab, pd.DataFrame) and not df_tab.empty:
+                st.dataframe(df_tab, width="stretch")
+            else:
+                st.info(f"Mean Table {key} has no rows for current run.")
+
     st.markdown("**Figure 7 replica: average ROC curves**")
     if isinstance(avg_roc, pd.DataFrame) and not avg_roc.empty:
         pivot = avg_roc.pivot_table(index="fpr", columns="label", values="tpr", aggfunc="mean")
@@ -3283,6 +5407,10 @@ def _render_experiments_tab() -> None:
     if isinstance(adaptive, pd.DataFrame) and not adaptive.empty:
         st.markdown("**Adaptive ADWIN drift events**")
         st.dataframe(adaptive, width="stretch")
+
+    if isinstance(execution_log, pd.DataFrame) and not execution_log.empty:
+        st.markdown("**Execution log**")
+        st.dataframe(execution_log, width="stretch")
 
 
 def _render_coverage_tab() -> None:

@@ -3663,13 +3663,9 @@ def _get_duckdb_path(db_path: Optional[Path] = None) -> Path:
 def _connect_duckdb(read_only: bool = False, db_path: Optional[Path] = None):
     _ensure_duckdb_available()
     path = _get_duckdb_path(db_path)
-    ro_flag = read_only and path.exists()
-    try:
-        return duckdb.connect(str(path), read_only=ro_flag)
-    except duckdb.ConnectionException as exc:
-        if ro_flag and "different configuration" in str(exc):
-            return duckdb.connect(str(path), read_only=False)
-        raise
+    # Keep one writable connection mode per process to avoid DuckDB crashes when
+    # Streamlit mixes read and write actions over the same file.
+    return duckdb.connect(str(path), read_only=False)
 
 def _create_flow_table(conn) -> None:
     conn.execute(f"CREATE TABLE IF NOT EXISTS {FLOW_TABLE_NAME} ({FLOW_TABLE_SCHEMA})")

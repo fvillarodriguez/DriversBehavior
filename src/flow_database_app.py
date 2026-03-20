@@ -73,6 +73,20 @@ FLOW_PATTERNS = ("flujo*.csv",)
 EVENT_PATTERNS = ("eventos*.csv", "accidentes*.csv")
 CATEGORY_LABELS = {1: "Light", 2: "Heavy", 3: "Motorcycles"}
 CACHE_PATH = ROOT_DIR / "Resultados" / "flow_data_description_cache.json"
+MONTH_LABELS = {
+    1: "Ene",
+    2: "Feb",
+    3: "Mar",
+    4: "Abr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Ago",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dic",
+}
 
 
 def _get_delete_flow_rows_fn():
@@ -114,6 +128,22 @@ def _run_import(
             kwargs.pop("progress_callback", None)
             return import_flujos_to_duckdb(**kwargs)
         raise
+
+
+def _format_import_error(exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    message_lower = message.lower()
+    if "column" in message_lower and (
+        "not found" in message_lower
+        or "referenced column" in message_lower
+        or "does not exist" in message_lower
+    ):
+        return (
+            "No se pudo importar el CSV porque no tiene la estructura esperada. "
+            "Columnas requeridas: FECHA, VELOCIDAD, CATEGORIA, MATRICULA, "
+            "PORTICO y CARRIL."
+        )
+    return f"No se pudo importar el CSV: {message}"
 
 
 def _format_ts(value) -> str:
@@ -196,7 +226,7 @@ class _ProgressTracker:
 def _pl_read_flow(columns: list[str]) -> pl.DataFrame:
     if duckdb is None:
         raise ImportError("duckdb no está instalado.")
-    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    conn = utils_mod._connect_duckdb(read_only=False, db_path=DB_PATH)
     try:
         cols_sql = ", ".join(columns)
         query = f"SELECT {cols_sql} FROM {FLOW_TABLE_NAME}"
@@ -906,6 +936,181 @@ def _compute_missing_months(
     return missing_by_year
 
 
+def _month_label(month: object) -> str:
+    try:
+        month_int = int(month)
+    except Exception:
+        return str(month)
+    return MONTH_LABELS.get(month_int, f"{month_int:02d}")
+
+
+def _normalize_flow_month_counts(counts_month: pd.DataFrame) -> pd.DataFrame:
+    if counts_month is None or counts_month.empty:
+        return pd.DataFrame(columns=["anio", "mes", "total"])
+    month_df = counts_month.copy()
+    month_df["anio"] = pd.to_numeric(month_df["anio"], errors="coerce")
+    month_df["mes"] = pd.to_numeric(month_df["mes"], errors="coerce")
+    month_df["total"] = pd.to_numeric(month_df["total"], errors="coerce").fillna(0)
+    month_df = month_df.dropna(subset=["anio", "mes"]).copy()
+    if month_df.empty:
+        return pd.DataFrame(columns=["anio", "mes", "total"])
+    month_df["anio"] = month_df["anio"].astype(int)
+    month_df["mes"] = month_df["mes"].astype(int)
+    month_df["total"] = month_df["total"].astype(int)
+    month_df = (
+        month_df.groupby(["anio", "mes"], as_index=False)["total"]
+        .sum()
+        .sort_values(["anio", "mes"])
+        .reset_index(drop=True)
+    )
+    return month_df
+
+
+def _expected_months_by_year(
+    min_ts: Optional[pd.Timestamp], max_ts: Optional[pd.Timestamp]
+) -> Dict[int, list[int]]:
+    if min_ts is None or max_ts is None:
+        return {}
+    expected: Dict[int, list[int]] = {}
+    all_months = pd.period_range(min_ts.to_period("M"), max_ts.to_period("M"), freq="M")
+    for period in all_months:
+        expected.setdefault(period.year, []).append(period.month)
+    return expected
+
+
+def _build_flow_coverage_year_table(
+    counts_year: pd.DataFrame,
+    counts_month: pd.DataFrame,
+    min_ts: Optional[pd.Timestamp],
+    max_ts: Optional[pd.Timestamp],
+) -> pd.DataFrame:
+    if counts_year is None or counts_year.empty:
+        return pd.DataFrame()
+
+    year_df = counts_year.copy()
+    year_df["anio"] = pd.to_numeric(year_df["anio"], errors="coerce")
+    year_df["total"] = pd.to_numeric(year_df["total"], errors="coerce").fillna(0)
+    year_df = year_df.dropna(subset=["anio"]).copy()
+    if year_df.empty:
+        return pd.DataFrame()
+
+    year_df["anio"] = year_df["anio"].astype(int)
+    year_df["total"] = year_df["total"].astype(int)
+
+    month_df = _normalize_flow_month_counts(counts_month)
+    if month_df.empty:
+        month_span = pd.DataFrame(
+            columns=["anio", "meses_activos", "primer_mes", "ultimo_mes"]
+        )
+    else:
+        month_span = (
+            month_df.groupby("anio", as_index=False)
+            .agg(
+                meses_activos=("mes", "nunique"),
+                primer_mes=("mes", "min"),
+                ultimo_mes=("mes", "max"),
+            )
+            .sort_values("anio")
+        )
+
+    expected_by_year = _expected_months_by_year(min_ts, max_ts)
+    expected_df = pd.DataFrame(
+        [
+            {"anio": year, "meses_esperados": len(months)}
+            for year, months in sorted(expected_by_year.items())
+        ]
+    )
+    missing_by_year = _compute_missing_months(month_df, min_ts, max_ts)
+
+    coverage = year_df.merge(month_span, on="anio", how="left")
+    if not expected_df.empty:
+        coverage = coverage.merge(expected_df, on="anio", how="left")
+    else:
+        coverage["meses_esperados"] = np.nan
+
+    coverage["meses_activos"] = coverage["meses_activos"].fillna(0).astype(int)
+    coverage["meses_esperados"] = (
+        coverage["meses_esperados"].fillna(coverage["meses_activos"]).astype(int)
+    )
+    coverage["primer_mes"] = coverage["primer_mes"].apply(
+        lambda value: _month_label(value) if pd.notna(value) else "-"
+    )
+    coverage["ultimo_mes"] = coverage["ultimo_mes"].apply(
+        lambda value: _month_label(value) if pd.notna(value) else "-"
+    )
+    coverage["cobertura_pct"] = np.where(
+        coverage["meses_esperados"] > 0,
+        np.round(coverage["meses_activos"] * 100.0 / coverage["meses_esperados"], 1),
+        np.nan,
+    )
+    coverage["meses_faltantes"] = coverage["anio"].map(
+        lambda year: ", ".join(_month_label(month) for month in missing_by_year.get(int(year), []))
+        if missing_by_year.get(int(year))
+        else "-"
+    )
+
+    coverage = coverage.rename(
+        columns={
+            "anio": "Anio",
+            "total": "Detecciones",
+            "meses_activos": "Meses activos",
+            "meses_esperados": "Meses esperados",
+            "cobertura_pct": "Cobertura %",
+            "primer_mes": "Primer mes con datos",
+            "ultimo_mes": "Ultimo mes con datos",
+            "meses_faltantes": "Meses faltantes",
+        }
+    ).sort_values("Anio")
+    return coverage.reset_index(drop=True)
+
+
+def _build_flow_coverage_month_matrix(
+    counts_month: pd.DataFrame,
+    min_ts: Optional[pd.Timestamp],
+    max_ts: Optional[pd.Timestamp],
+) -> pd.DataFrame:
+    month_df = _normalize_flow_month_counts(counts_month)
+    if month_df.empty:
+        return pd.DataFrame()
+
+    expected_by_year = _expected_months_by_year(min_ts, max_ts)
+    years = sorted(set(month_df["anio"].tolist()) | set(expected_by_year.keys()))
+    totals = {
+        (int(row["anio"]), int(row["mes"])): int(row["total"])
+        for _, row in month_df.iterrows()
+    }
+
+    rows: list[Dict[str, object]] = []
+    for year in years:
+        expected_months = set(expected_by_year.get(year, []))
+        row: Dict[str, object] = {"Anio": str(year)}
+        for month in range(1, 13):
+            total = totals.get((year, month))
+            label = MONTH_LABELS[month]
+            if total is not None and total > 0:
+                row[label] = f"{total:,}"
+            elif not expected_by_year:
+                row[label] = ""
+            elif month in expected_months:
+                row[label] = "0"
+            else:
+                row[label] = ""
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _build_flow_coverage_month_detail(counts_month: pd.DataFrame) -> pd.DataFrame:
+    month_df = _normalize_flow_month_counts(counts_month)
+    if month_df.empty:
+        return pd.DataFrame()
+    detail = month_df.rename(
+        columns={"anio": "Anio", "mes": "Mes num", "total": "Detecciones"}
+    ).copy()
+    detail["Mes"] = detail["Mes num"].map(lambda value: f"{int(value):02d} - {_month_label(value)}")
+    detail = detail[["Anio", "Mes", "Detecciones"]].sort_values(["Anio", "Mes"])
+    return detail.reset_index(drop=True)
+
+
 def _build_accident_stats(
     file_path: Path,
     cache_entry: Optional[Dict[str, object]] = None,
@@ -1296,6 +1501,7 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
             "Reemplazar",
             "Vaciar tabla",
             "Esquema y muestra",
+            "Cobertura",
             "Estadistica de flujos",
         ]
     )
@@ -1315,19 +1521,27 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
                 progress_bar.progress(ratio)
                 progress_status.caption(message)
 
-            with st.spinner("Importando datos..."):
-                inserted = _run_import(
-                    csv_path=csv_path,
-                    replace=False,
-                    progress_callback=_update_progress,
-                )
+            try:
+                with st.spinner("Importando datos..."):
+                    inserted = _run_import(
+                        csv_path=csv_path,
+                        replace=False,
+                        progress_callback=_update_progress,
+                    )
+            except Exception as exc:
+                progress_status.caption("Importación fallida.")
+                st.error(_format_import_error(exc))
+                inserted = None
             progress_bar.progress(1.0)
-            if inserted:
+            if inserted is None:
+                pass
+            elif inserted:
                 st.success(f"Se agregaron {inserted:,} filas.")
             else:
                 st.warning("No se agregaron filas.")
-            with summary_container.container():
-                _render_summary()
+            if inserted is not None:
+                with summary_container.container():
+                    _render_summary()
 
     with tabs[1]:
         st.write("Reemplaza la tabla completa con un CSV.")
@@ -1353,16 +1567,22 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
                 progress_bar.progress(ratio)
                 progress_status.caption(message)
 
-            with st.spinner("Reemplazando datos..."):
-                inserted = _run_import(
-                    csv_path=csv_path,
-                    replace=True,
-                    progress_callback=_update_progress,
-                )
+            try:
+                with st.spinner("Reemplazando datos..."):
+                    inserted = _run_import(
+                        csv_path=csv_path,
+                        replace=True,
+                        progress_callback=_update_progress,
+                    )
+            except Exception as exc:
+                progress_status.caption("Reemplazo fallido.")
+                st.error(_format_import_error(exc))
+                inserted = None
             progress_bar.progress(1.0)
-            st.success(f"Se cargaron {inserted:,} filas nuevas.")
-            with summary_container.container():
-                _render_summary()
+            if inserted is not None:
+                st.success(f"Se cargaron {inserted:,} filas nuevas.")
+                with summary_container.container():
+                    _render_summary()
 
     with tabs[2]:
         st.write("Elimina todos los registros de la tabla.")
@@ -1569,6 +1789,69 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
                 st.dataframe(year_df, width="stretch")
 
     with tabs[4]:
+        st.write("Analiza que años y que meses tienen datos de flujo en la base.")
+        try:
+            summary = get_flow_db_summary(db_path=DB_PATH)
+            counts_year = get_flow_counts_by_year(db_path=DB_PATH)
+            counts_month = get_flow_counts_by_month(db_path=DB_PATH)
+        except ImportError as exc:
+            st.error(str(exc))
+            st.stop()
+
+        if summary.row_count <= 0 or counts_year.empty:
+            st.info("La tabla de flujos esta vacia. Importe datos para analizar cobertura.")
+        else:
+            year_coverage = _build_flow_coverage_year_table(
+                counts_year,
+                counts_month,
+                summary.min_timestamp,
+                summary.max_timestamp,
+            )
+            month_matrix = _build_flow_coverage_month_matrix(
+                counts_month,
+                summary.min_timestamp,
+                summary.max_timestamp,
+            )
+            month_detail = _build_flow_coverage_month_detail(counts_month)
+            missing_total = int(
+                sum(
+                    len(months)
+                    for months in _compute_missing_months(
+                        counts_month, summary.min_timestamp, summary.max_timestamp
+                    ).values()
+                )
+            )
+            active_months = int(month_detail.shape[0])
+            expected_months = active_months + missing_total
+            coverage_pct = round(active_months * 100.0 / expected_months, 1) if expected_months else 100.0
+
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Años con datos", f"{len(year_coverage):,}")
+            metric_cols[1].metric("Meses activos", f"{active_months:,}")
+            metric_cols[2].metric("Meses sin datos", f"{missing_total:,}")
+            metric_cols[3].metric("Cobertura mensual", f"{coverage_pct:.1f}%")
+
+            st.caption(
+                "La cobertura mensual se calcula dentro del rango observado entre la "
+                "fecha minima y maxima de la base. En la matriz, `0` indica un mes "
+                "dentro de ese rango pero sin registros."
+            )
+
+            chart_df = year_coverage[["Anio", "Detecciones"]].copy()
+            chart_df["Anio"] = chart_df["Anio"].astype(str)
+            st.subheader("Detecciones por año")
+            st.bar_chart(chart_df.set_index("Anio"))
+
+            st.subheader("Resumen anual")
+            st.dataframe(year_coverage, width="stretch", hide_index=True)
+
+            st.subheader("Matriz año-mes")
+            st.dataframe(month_matrix, width="stretch", hide_index=True)
+
+            with st.expander("Detalle mensual"):
+                st.dataframe(month_detail, width="stretch", hide_index=True)
+
+    with tabs[5]:
         st.write("Descripcion y estadistica de flujos/accidentes (dataset operativo).")
         params_cols = st.columns(3)
         engine_label = params_cols[0].selectbox(
