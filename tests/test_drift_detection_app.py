@@ -12,6 +12,7 @@ from src.drift_detection_app import (
     _compute_drift_article_features,
     _describe_tramo_selection,
     _filter_accidents_for_allowed_porticos,
+    _import_external_xgboost,
     _load_feature_payload_from_duckdb,
     _load_feature_df_from_duckdb,
     _normalize_portico_series,
@@ -46,6 +47,13 @@ def test_count_positive_target_rows_uses_final_target_column():
 
     assert _count_positive_target_rows(clean_df) == 3
     assert _count_positive_target_rows(pd.DataFrame({"x": [1, 2, 3]})) == 0
+
+
+def test_import_external_xgboost_exposes_classifier():
+    xgb = _import_external_xgboost()
+
+    assert hasattr(xgb, "XGBClassifier")
+    assert "site-packages/xgboost" in str(getattr(xgb, "__file__", ""))
 
 
 def test_article_coverage_is_100_percent():
@@ -282,6 +290,41 @@ def test_end_to_end_recalibration_and_average_roc():
     roc2 = build_average_roc_curves(payload)
     assert not roc2.empty
     assert set(["strategy", "model", "fpr", "tpr", "label"]).issubset(set(roc2.columns))
+
+
+def test_recalibration_experiments_emit_progress_updates():
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=160, random_state=31)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    progress_events = []
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        progress_callback=progress_events.append,
+    )
+
+    assert not outputs["summary"].empty
+    assert len(progress_events) >= 3
+    assert progress_events[0]["completed_units"] == 0
+    assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 1
 
 
 def test_parse_repetition_seeds_and_multi_seed_logging():

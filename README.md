@@ -1,237 +1,275 @@
-# Drivers Behavior — Traffic Accident Prediction & Driver Clustering
+# SUMO - Drivers Behavior Modeling and Simulation
 
-A Streamlit-based toolkit to **analyze highway traffic detections**, **cluster driver behavior** (by license plate), and **predict near-future accidents** at gantries (“pórticos”) using aggregated flow features and optional cluster-derived features.
+Aplicación multipágina en Streamlit y utilidades CLI para analizar flujos vehiculares, agrupar comportamiento de conductores, predecir accidentes, construir grafos para GNN, ejecutar módulos especializados de NLP y drift, y correr un pipeline de simulación con SUMO.
 
-This repository bundles:
+El repositorio usa como ejes principales:
 
-* A modular **Streamlit UI** (multi-page app)
-* A **DuckDB-backed** workflow for flow data
-* Driver-behavior **clustering** (plate-level features → KMeans/GMM/HDBSCAN)
-* Accident prediction models with **temporal splits**, **imbalance handling**, and **threshold calibration** to meet a target **False Alarm Rate (FAR)**
-* Experiment tooling and a **live dashboard** reading results from SQLite
+- `Datos/` para insumos persistentes.
+- `Resultados/` para artefactos, modelos y salidas intermedias.
+- `simulación/` para archivos propios del flujo SUMO.
+- `src/` para la lógica de negocio y las apps de Streamlit.
 
----
+## Módulos Activos
 
-## Key Ideas
+El menú principal se define en `streamlit_main.py` y hoy expone estos módulos:
 
-### 1) What is predicted?
+### Data & Gestión
 
-Each row in the modeling dataset represents a pair:
+- `Flow database` (`src/flow_database_app.py`): importa, consulta y administra la base DuckDB de flujos.
+- `Files` (`src/files_app.py`): navega y administra artefactos en `Resultados/` y carpetas similares.
+- `GitHub Sync` (`src/github_sync_app.py`): sincroniza el repo local con el remoto.
 
-**(gantry p, time interval τ)**
+### Análisis & Modelos
 
-The binary target is defined so that:
+- `Clustering` (`src/clustering_tabs_app.py`): genera variables por patente y ejecuta K-Means, GMM y HDBSCAN.
+- `Crash prediction` (`src/cluster_accident_app.py`): entrena y evalúa modelos de predicción de accidentes usando variables de flujo y, opcionalmente, variables agregadas por cluster.
+- `NLP in Severity` (`src/nlp_severity_app.py`): construye datasets granulares con texto para modelar severidad.
+- `Drift detection` (`src/drift_detection_app.py`): replica estrategias de recalibración y detección de drift para predicción de crash en tiempo real.
+- `Graph Neural Network` (`src/graph_builder_app.py`, `src/gnn_main.py`): construye grafos espaciotemporales, ejecuta entrenamiento GNN y soporta balanceo con GraphSMOTE e ImGAGN.
+- `Multi Agent RL` (`src/multi_agent_rl_app.py`): módulo experimental de aprendizaje por refuerzo multiagente sobre el flujo SUMO.
 
-> `target = 1` means: “an accident will occur in the *next* interval at this gantry”.
+### Simulación & Visualización
 
-Concretely, an accident at time `t_a` mapped to gantry `p_a` is labeled at the **previous** discrete interval:
+- `Events` (`src/events_map_app.py`): visualiza eventos en mapa usando `Datos/eventos.duckdb`.
+- `Experiments Live` (`src/experiments_live_app.py`): monitorea en vivo bases SQLite `Resultados/experiment_live_*.sqlite`.
+- `Simulación SUMO` (`src/sumo_simulation_app.py`): ejecuta el pipeline SUMO, genera `sumo_trips.rou.xml`, corre `duarouter` y luego `sumo`.
 
-* `τ(t) = floor(t / Δ) * Δ`
-* `τ_a = τ(t_a) − Δ`
+### Configuración
 
----
+- `Notification system` (`src/notification_system.py`): configura notificaciones por correo usando `email_config.json`.
+- `LaTeX` (`src/latex_viewer_app.py`): abre y, si `latexmk` está instalado, compila documentación `.tex`.
+- `Test` (`src/test_page.py`): página de pruebas.
 
-## Main Modules
-
-### Flow database (DuckDB)
-
-Flow detections are stored in **DuckDB** and queried by time range. Each detection typically includes:
-
-* timestamp `t`
-* gantry `p`
-* lane `ℓ`
-* vehicle category `c`
-* speed `v`
-* license plate `plate`
-
-### Clustering (driver behavior)
-
-Builds **plate-level feature vectors** from detections (counts, mean speed, lane usage, relative speed, headway, TTC/conflict proxies, lane-change rate, etc.) and clusters drivers using:
-
-* **K-Means**
-* **Gaussian Mixture Models (GMM)** with AIC/BIC support
-* **HDBSCAN** (noise label = -1)
-
-Optionally supports a **frequent vs. rare** driver flow:
-
-* Train clustering on frequent plates
-* Assign rare plates with confidence thresholds (distance/probability), otherwise label as unknown (-1)
-
-Outputs include:
-
-* `Resultados/cluster_features*.duckdb`
-* `Resultados/cluster_kmeans_kK.csv`, `Resultados/cluster_gmm_kK.csv`, `Resultados/cluster_hdbscan.csv`
-* summaries/descriptives CSVs
-
-### Accident prediction
-
-Builds a dataset at **(gantry, interval)** resolution using:
-
-**Macro flow features** (by gantry, interval, category), e.g.:
-
-* counts, mean speeds
-* flow per hour, density
-* optional temporal deltas (first differences)
-
-**Optional cluster-aggregated features** (by gantry, interval, cluster label):
-
-* cluster shares, cluster-level flow/speed/density, temporal deltas
-* mixture entropy: `H = −Σ share * log(share)`
-
-Models supported:
-
-* Random Forest (with class weights)
-* XGBoost (binary logistic)
-* SVM (scaled, probability output)
-
-Imbalance handling:
-
-* class weighting
-* optional **SMOTE applied only on the training set**
-
-Threshold calibration for operational control:
-
-* Choose a threshold `θ` on validation such that **FAR ≤ α**, maximizing sensitivity under that constraint.
-
-### Experiments (Optuna + live monitoring)
-
-Includes an optimization loop that can tune:
-
-* SMOTE parameters
-* model hyperparameters
-* optionally the threshold (or use FAR-calibrated threshold strategy)
-
-Artifacts typically written to `Resultados/`, e.g.:
-
-* feature CSV/DuckDB outputs
-* balanced datasets
-* Optuna JSON + trials CSV
-* iterative experiments CSV
-* live experiment SQLite DB files: `Resultados/experiment_live_*.sqlite`
-
-A dedicated Streamlit page (“Experiments Live”) monitors those SQLite files and updates automatically.
-
----
-
-## Streamlit App
-
-The main menu provides pages such as:
-
-* Flow database
-* Clustering
-* Crash prediction
-* Experiments Live
-* Events map visualization
-* Files browser
-* Test page
-
----
-
-## Project Structure (typical)
+## Estructura Del Proyecto
 
 ```text
 .
 ├── streamlit_main.py
+├── main.py
+├── start_app.command
+├── start_app_windows.bat
+├── venv_start.py
 ├── src/
-│   ├── flow_database_app.py
-│   ├── clustering_tabs_app.py
-│   ├── cluster_accident_app.py
-│   ├── experiments_live_app.py
-│   ├── events_map_app.py
-│   └── ...
-├── tests/
 ├── Datos/
-│   └── Porticos.csv
-└── Resultados/
+├── Resultados/
+├── simulación/
+├── docs/
+├── DRIFT/
+├── NLP/
+└── tests/
 ```
 
-> Note: `Datos/Porticos.csv` is used to map accident locations (e.g., km/eje/calzada) to nearby gantries.
+## Requisitos
 
----
+### Requisitos base
 
-## Installation
+- Python `3.10` a `3.12`.
+- Recomendado: Python `3.12`.
+- No usar Python `3.13+` si se va a trabajar con PyTorch Geometric y NeighborLoader.
+- `pip`, `venv` y dependencias de `requirements.txt`.
 
-### Requirements
+### Dependencias opcionales según módulo
 
-* Python (recommended: 3.10+)
-* DuckDB
-* Streamlit
-* Common ML stack (pandas, numpy, scikit-learn)
-* Optional depending on features:
+- SUMO (`sumo`, `duarouter`) disponible por `PATH` o vía `SUMO_HOME`.
+- `latexmk` para compilar `.tex` desde el visor LaTeX.
+- Git configurado si se va a usar `GitHub Sync`.
 
-  * imbalanced-learn (SMOTE)
-  * xgboost
-  * optuna
-  * altair and/or plotly (visualizations)
-  * hdbscan
+## Instalación Recomendada
 
-### Setup (example)
+La forma más segura de preparar el entorno es usar el bootstrap del repo, porque valida la versión de Python e instala primero el stack de PyTorch Geometric.
 
 ```bash
-python -m venv .venv
+python venv_start.py --python python3.12
 source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
 ```
 
----
-
-## Quickstart
-
-Run the Streamlit UI:
+Si `python3.12` ya es tu `python` por defecto:
 
 ```bash
+python venv_start.py
+source .venv/bin/activate
+```
+
+En Windows:
+
+```bat
+py -3.12 venv_start.py
+.venv\Scripts\activate
+```
+
+## Arranque De La Aplicación
+
+### Opción recomendada
+
+macOS:
+
+```bash
+./start_app.command
+```
+
+Windows:
+
+```bat
+start_app_windows.bat
+```
+
+### Opción manual
+
+```bash
+source .venv/bin/activate
 streamlit run streamlit_main.py
 ```
 
----
+## Entrypoints Disponibles
 
-## Data Inputs
+- `streamlit_main.py`: launcher principal de toda la suite.
+- `main.py`: CLI alterna para tres bloques concretos: Flow database, SUMO y Clustering.
 
-This project expects (at least):
+CLI:
 
-1. **Flow detections** accessible via DuckDB tables (queried by time range).
-2. **Accident events files** filtered to “Accidente” (and optionally by road type, e.g., “vía expresa”).
-3. Gantry metadata (e.g., `Datos/Porticos.csv`) for location-to-gantry mapping.
+```bash
+source .venv/bin/activate
+python main.py
+```
 
----
+## Insumos Esperados
 
-## Outputs
+### 1. Flujos vehiculares
 
-Generated artifacts are written under `Resultados/`, including:
+El flujo de trabajo estándar persiste los datos en:
 
-* flow features and cluster features datasets
-* labels per plate (clustering)
-* balanced training data (if SMOTE used)
-* Optuna optimization logs
-* iterative experiment result tables
-* live monitoring SQLite databases for the dashboard
+- `Datos/flujos.duckdb`
+- tabla `flujos_duckdb`
 
----
+Columnas estándar esperadas por las utilidades base:
 
-## Reproducibility Notes
+- `FECHA`
+- `VELOCIDAD`
+- `CATEGORIA`
+- `MATRICULA`
+- `PORTICO`
+- `CARRIL`
 
-* Dataset splits are **temporal** to reduce leakage.
-* FAR-constrained threshold selection is performed on validation and then evaluated on test.
-* SMOTE is applied only to training data.
+Si todavía no existe `Datos/flujos.duckdb`, el módulo `Flow database` permite importar un CSV de flujos y dejarlo listo para el resto del pipeline.
 
----
+### 2. Pórticos
 
-## Graph Neural Networks (GNN)
+Archivo esperado:
 
-The project now includes a comprehensive module for training and evaluating Graph Neural Networks, integrated into the `Graph Builder` application.
+- `Datos/Porticos.csv`
 
-### Key Features
+El loader asume separador `;` y necesita, al menos:
 
-*   **Event Processing**: Load and map crash events to the road network graph.
-*   **Feature Selection**: Select relevant features using Random Forest importance scores.
-*   **Graph Construction**: Build spatiotemporal graphs with configurable edge types (forward, backward, spatial, temporal).
-*   **Network Configuration**: Fast interface to define GNN architectures (GAT, GCN, etc.), hyperparameters (learning rate, dropout), and training settings.
-*   **Hyperparameter Optimization (Optuna)**: Robust support for HPO to find optimal graph architectures and training parameters, with temporal cross-validation.
-*   **Graph Balancing**:
-    *   **GraphSMOTE**: Synthetic node generation to handle class imbalance in graph data.
-    *   **ImGAGN**: Generative adversarial network approach for imbalance.
-*   **Training & Evaluation**: Train models on balanced or original graphs, monitor metrics (F1, AUC, Precision, Recall), and visualize results.
+- `cod_portico`
+- `Km`
+- `Calzada`
+- `Orden`
+- `Eje`
 
-This workflow is fully managed via new tabs in the `Graph Builder` Streamlit app.
+Columnas opcionales útiles para SUMO y visualización:
 
+- `edge_id_sumo`
+- `lane_id_sumo`
+- `pos_m`
+- `lat`
+- `lon`
+- `lat-lon`
+
+### 3. Eventos y accidentes
+
+Según el módulo, el repo utiliza archivos como:
+
+- `Datos/Eventos-2018-2021.csv`
+- `Datos/Eventos-2022-2024.csv`
+- `Datos/eventos.duckdb`
+
+Estos insumos alimentan principalmente `Events`, `Crash prediction`, `NLP in Severity` y `Graph Neural Network`.
+
+### 4. Archivos SUMO
+
+Para ejecutar la parte de simulación se usan, por defecto, estos archivos:
+
+- `simulación/highway.net.xml`
+- `simulación/sample.sumocfg`
+
+Y se generan:
+
+- `simulación/sumo_trips.rou.xml`
+- `simulación/routes.rou.xml`
+- `simulación/tripinfo.xml`
+- `simulación/sumo_depart_summary.xml`
+
+## Orden Recomendado De Ejecución Del Pipeline
+
+### Pipeline general
+
+1. Crear y activar el entorno virtual.
+2. Iniciar la app con `streamlit run streamlit_main.py` o con `./start_app.command`.
+3. Entrar a `Flow database` e importar o validar `Datos/flujos.duckdb`.
+4. Verificar `Datos/Porticos.csv` antes de usar módulos que dependen de georreferencia, segmentación o SUMO.
+5. Ejecutar `Clustering` si se requieren features por patente o agregados por cluster.
+6. Ejecutar `Crash prediction` para construir features por pórtico-intervalo, entrenar modelos y evaluar resultados.
+7. Ejecutar `Graph Neural Network` si se desea construir grafos y entrenar variantes GNN sobre el problema de accidentes.
+8. Usar `Experiments Live` para monitorear optimizaciones y experimentos que escriben SQLite en `Resultados/`.
+9. Usar `Events`, `NLP in Severity`, `Drift detection` o `Multi Agent RL` según el caso de estudio.
+
+### Pipeline SUMO
+
+1. Confirmar que `SUMO_HOME` esté configurado o que `sumo` y `duarouter` estén en el `PATH`.
+2. Asegurar que `Datos/flujos.duckdb` y `Datos/Porticos.csv` estén disponibles.
+3. Abrir `Simulación SUMO`.
+4. Ejecutar el pipeline para reconstruir trayectorias y generar `simulación/sumo_trips.rou.xml`.
+5. Ejecutar la pestaña de `duarouter` para generar `routes.rou.xml`.
+6. Ejecutar la pestaña de `sumo` para producir `tripinfo.xml`.
+
+También se puede hacer por CLI:
+
+```bash
+source .venv/bin/activate
+python main.py
+```
+
+Luego seleccionar:
+
+- `1` para Flow database
+- `2` para SUMO
+- `3` para Clustering
+
+## Artefactos Generados
+
+Dependiendo del módulo, el pipeline genera artefactos como:
+
+- `Datos/flujos.duckdb`
+- `Resultados/cluster_features*.duckdb`
+- `Resultados/cluster_kmeans_k*.csv`
+- `Resultados/cluster_gmm_k*.csv`
+- `Resultados/cluster_hdbscan.csv`
+- `Resultados/cluster_summary*.csv`
+- `Resultados/experiment_live_*.sqlite`
+- modelos, embeddings, grafos y reportes GNN en `Resultados/`
+- artefactos SUMO en `simulación/`
+
+## Validación Rápida
+
+Antes de correr experimentos largos, conviene verificar:
+
+- que `Flow database` detecte correctamente la cobertura temporal de `Datos/flujos.duckdb`
+- que `Datos/Porticos.csv` cargue sin errores
+- que `Resultados/` tenga permisos de escritura
+- que `sumo` y `duarouter` respondan si se usará la simulación
+- que `latexmk` esté instalado si se quiere compilar documentación desde la app
+
+## Troubleshooting
+
+- Si falla la instalación de PyG, usa Python `3.12` y vuelve a crear `.venv`.
+- Si `duarouter` o `sumo` no aparecen, exporta `SUMO_HOME` o agrega `SUMO_HOME/bin` al `PATH`.
+- Si el visor LaTeX abre PDFs pero no compila `.tex`, falta `latexmk`.
+- Si no existe `Datos/flujos.duckdb`, importa primero el CSV desde `Flow database`.
+- Si el pipeline SUMO no genera rutas, revisa que `Porticos.csv` incluya `edge_id_sumo`, `lane_id_sumo` y `pos_m`.
+
+## Testing
+
+```bash
+source .venv/bin/activate
+pytest
+```

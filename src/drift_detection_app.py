@@ -9,6 +9,7 @@ full "Drift detection" section in a single source file.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import math
 import os
@@ -19,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,11 +40,6 @@ try:
     import psutil  # type: ignore
 except Exception:
     psutil = None
-
-try:
-    import xgboost as xgb  # type: ignore
-except Exception:
-    xgb = None
 
 from src.utils import (
     find_candidate_porticos,
@@ -76,6 +72,40 @@ PAPER_TITLE = (
     "adaptive drift detection vs. cumulative retraining"
 )
 PAPER_TIME_SPAN = "2018-01-01 to 2024-09-30"
+
+
+def _import_external_xgboost():
+    src_dir = Path(__file__).resolve().parent
+    original_sys_path = list(sys.path)
+    existing_module = sys.modules.get("xgboost")
+    removed_local_module = None
+    try:
+        if existing_module is not None:
+            module_file = Path(str(getattr(existing_module, "__file__", "") or "")).resolve()
+            if module_file == (src_dir / "xgboost.py").resolve():
+                removed_local_module = sys.modules.pop("xgboost")
+        sys.path = [
+            entry
+            for entry in original_sys_path
+            if str(Path(entry or ".").resolve()) != str(src_dir)
+        ]
+        xgb = importlib.import_module("xgboost")  # type: ignore
+    finally:
+        sys.path = original_sys_path
+        if removed_local_module is not None:
+            sys.modules["xgboost"] = removed_local_module
+
+    module_path = Path(str(getattr(xgb, "__file__", "") or "")).resolve()
+    if module_path == (src_dir / "xgboost.py").resolve():
+        raise ImportError(
+            "Se importo el modulo local `src/xgboost.py` en lugar del paquete externo `xgboost`."
+        )
+    if not hasattr(xgb, "XGBClassifier"):
+        raise ImportError(
+            "El paquete `xgboost` importado no expone `XGBClassifier`. "
+            f"Modulo cargado: {module_path}"
+        )
+    return xgb
 
 ARTICLE_SECTIONS: List[Tuple[str, str]] = [
     ("1", "Introduction"),
@@ -838,6 +868,35 @@ class _FeatureEngineeringProgress:
         self._bar.empty()
         self._status.empty()
         self._ram.empty()
+
+
+class _ExperimentProgress:
+    def __init__(self) -> None:
+        self._bar = st.progress(0.0)
+        self._status = st.empty()
+        self._detail = st.empty()
+        self.update(
+            {
+                "completed_units": 0,
+                "total_units": 1,
+                "label": "Preparando experimentos...",
+                "detail": "",
+            }
+        )
+
+    def update(self, payload: Dict[str, Any]) -> None:
+        total_units = max(1, int(payload.get("total_units", 1)))
+        completed_units = float(payload.get("completed_units", 0))
+        ratio = max(0.0, min(completed_units / float(total_units), 1.0))
+        self._bar.progress(ratio)
+        pct = int(round(ratio * 100.0))
+        label = str(payload.get("label", "Ejecutando experimentos..."))
+        detail = str(payload.get("detail", "") or "")
+        self._status.caption(f"{pct}% | {label}")
+        if detail:
+            self._detail.caption(detail)
+        else:
+            self._detail.caption(f"{int(round(completed_units))} / {total_units} bloques completados")
 
 
 def _update_feature_progress(
@@ -2279,8 +2338,13 @@ def _build_model(
         )
 
     if model_name == "XGBoost":
-        if xgb is None:
-            raise ImportError("xgboost is not installed in this environment.")
+        try:
+            xgb = _import_external_xgboost()
+        except ImportError as exc:
+            raise ImportError(
+                "No se pudo cargar el paquete externo `xgboost`. "
+                "Revise el entorno o el sombreado con `src/xgboost.py`."
+            ) from exc
         return xgb.XGBClassifier(
             n_estimators=int(params.get("nrounds", 100)),
             max_depth=int(params.get("max_depth", 6)),
@@ -3149,6 +3213,7 @@ def run_recalibration_experiments(
     min_window: int = 45_000,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
     repetition_seeds: Optional[Sequence[int]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
     Main orchestrator for all four paper strategies.
@@ -3159,6 +3224,30 @@ def run_recalibration_experiments(
         strategies = ["static", "period_aligned", "cumulative", "adaptive_adwin"]
     if repetition_seeds is None:
         repetition_seeds = DEFAULT_REPETITION_SEEDS
+
+    progress_models = list(model_names)
+    progress_strategies = list(strategies)
+    progress_seeds = [int(seed) for seed in repetition_seeds]
+    total_units = max(1, len(progress_models) * len(progress_strategies) * len(progress_seeds))
+    completed_units = 0
+
+    def emit_progress(
+        *,
+        label: str,
+        detail: str = "",
+        completed_override: Optional[int] = None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        completed_value = completed_units if completed_override is None else int(completed_override)
+        progress_callback(
+            {
+                "completed_units": int(completed_value),
+                "total_units": int(total_units),
+                "label": str(label),
+                "detail": str(detail),
+            }
+        )
 
     all_rows: List[pd.DataFrame] = []
     all_roc: List[Dict[str, Any]] = []
@@ -3183,7 +3272,14 @@ def run_recalibration_experiments(
         "target_col": str(target_col),
         "time_col": str(time_col),
         "input_rows": int(len(df)),
+        "total_progress_units": int(total_units),
     }
+
+    emit_progress(
+        label="Iniciando experimentos de recalibracion...",
+        detail=f"0 / {total_units} bloques completados",
+        completed_override=0,
+    )
 
     for run_order, seed in enumerate(repetition_seeds, start=1):
         _append_execution_log(
@@ -3198,52 +3294,70 @@ def run_recalibration_experiments(
         )
 
         for strategy in strategies:
-            if strategy in {"static", "period_aligned", "cumulative"}:
-                rows_df, roc_data = run_yearly_strategy(
-                    df,
-                    strategy=strategy,
-                    feature_cols=feature_cols,
-                    target_col=target_col,
-                    time_col=time_col,
-                    model_names=model_names,
-                    base_year=base_year,
-                    validation_size=validation_size,
-                    folds=folds,
-                    random_state=random_state,
-                    fast_mode=fast_mode,
-                    grid_limit=grid_limit,
-                    custom_grids=custom_grids,
-                    run_seed=int(seed),
-                    run_order=int(run_order),
-                    execution_log=execution_log,
+            for model_name in model_names:
+                emit_progress(
+                    label="Ejecutando bloque de experimentos...",
+                    detail=(
+                        f"Seed {int(seed)} | Strategy {strategy} | Model {model_name} | "
+                        f"{completed_units} / {total_units} bloques completados"
+                    ),
                 )
-                if not rows_df.empty:
-                    all_rows.append(rows_df)
-                all_roc.extend(roc_data)
 
-            elif strategy == "adaptive_adwin":
-                adaptive_rows, roc_data = run_adaptive_strategy(
-                    df,
-                    feature_cols=feature_cols,
-                    target_col=target_col,
-                    time_col=time_col,
-                    model_names=model_names,
-                    base_year=base_year,
-                    random_state=random_state,
-                    validation_size=validation_size,
-                    folds=folds,
-                    fast_mode=fast_mode,
-                    grid_limit=grid_limit,
-                    adwin_delta=adwin_delta,
-                    min_window=min_window,
-                    custom_grids=custom_grids,
-                    run_seed=int(seed),
-                    run_order=int(run_order),
-                    execution_log=execution_log,
+                if strategy in {"static", "period_aligned", "cumulative"}:
+                    rows_df, roc_data = run_yearly_strategy(
+                        df,
+                        strategy=strategy,
+                        feature_cols=feature_cols,
+                        target_col=target_col,
+                        time_col=time_col,
+                        model_names=[model_name],
+                        base_year=base_year,
+                        validation_size=validation_size,
+                        folds=folds,
+                        random_state=random_state,
+                        fast_mode=fast_mode,
+                        grid_limit=grid_limit,
+                        custom_grids=custom_grids,
+                        run_seed=int(seed),
+                        run_order=int(run_order),
+                        execution_log=execution_log,
+                    )
+                    if not rows_df.empty:
+                        all_rows.append(rows_df)
+                    all_roc.extend(roc_data)
+
+                elif strategy == "adaptive_adwin":
+                    adaptive_rows, roc_data = run_adaptive_strategy(
+                        df,
+                        feature_cols=feature_cols,
+                        target_col=target_col,
+                        time_col=time_col,
+                        model_names=[model_name],
+                        base_year=base_year,
+                        random_state=random_state,
+                        validation_size=validation_size,
+                        folds=folds,
+                        fast_mode=fast_mode,
+                        grid_limit=grid_limit,
+                        adwin_delta=adwin_delta,
+                        min_window=min_window,
+                        custom_grids=custom_grids,
+                        run_seed=int(seed),
+                        run_order=int(run_order),
+                        execution_log=execution_log,
+                    )
+                    if not adaptive_rows.empty:
+                        adaptive_frames.append(adaptive_rows)
+                    all_roc.extend(roc_data)
+
+                completed_units += 1
+                emit_progress(
+                    label="Bloque completado.",
+                    detail=(
+                        f"Seed {int(seed)} | Strategy {strategy} | Model {model_name} | "
+                        f"{completed_units} / {total_units} bloques completados"
+                    ),
                 )
-                if not adaptive_rows.empty:
-                    adaptive_frames.append(adaptive_rows)
-                all_roc.extend(roc_data)
 
         _append_execution_log(
             execution_log,
@@ -3260,6 +3374,12 @@ def run_recalibration_experiments(
     summary = summarize_results(yearly_results, adaptive_results)
     appendix = format_appendix_tables(yearly_results, adaptive_results)
     appendix_mean = format_appendix_tables_mean(yearly_results, adaptive_results)
+
+    emit_progress(
+        label="Experimentos de recalibracion completados.",
+        detail=f"{completed_units} / {total_units} bloques completados",
+        completed_override=total_units,
+    )
 
     return {
         "yearly_results": yearly_results,
@@ -5332,7 +5452,8 @@ def _render_experiments_tab() -> None:
         except ValueError as exc:
             st.error(f"Invalid seed list: {exc}")
             return
-        with st.spinner("Running experiments. This can take time on large datasets..."):
+        progress = _ExperimentProgress()
+        try:
             results = run_recalibration_experiments(
                 clean_df,
                 feature_cols=feature_cols,
@@ -5347,7 +5468,19 @@ def _render_experiments_tab() -> None:
                 adwin_delta=float(adwin_delta),
                 min_window=int(min_window),
                 repetition_seeds=repetition_seeds,
+                progress_callback=progress.update,
             )
+        except Exception as exc:
+            progress.update(
+                {
+                    "completed_units": 0,
+                    "total_units": 1,
+                    "label": "Error ejecutando experimentos.",
+                    "detail": str(exc),
+                }
+            )
+            st.error(f"No se pudieron ejecutar los experimentos: {exc}")
+            return
         st.session_state["drift_results"] = results
         st.session_state["drift_execution_log"] = results.get("execution_log")
         st.session_state["drift_run_manifest"] = results.get("run_manifest")
