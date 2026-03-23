@@ -1,3 +1,4 @@
+import os
 import json
 import warnings
 from pathlib import Path
@@ -358,6 +359,7 @@ def test_run_kswin_strategy_variants():
         folds=2,
         random_state=11,
         fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
         grid_limit=1,
         kswin_top_k_features=3,
         kswin_vote_threshold=1,
@@ -407,6 +409,20 @@ def test_build_model_bounds_random_forest_n_jobs(monkeypatch):
     assert int(overridden_model.n_jobs) == 1
 
 
+def test_build_model_full_memory_mode_uses_all_visible_cpus(monkeypatch):
+    monkeypatch.delenv("SUMO_RF_N_JOBS", raising=False)
+
+    model = drift_app._build_model(
+        "Random Forest",
+        {"splitrule": "gini", "mtry": 2, "min_node_size": 1},
+        random_state=13,
+        n_features=5,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_FULL_MEMORY,
+    )
+
+    assert int(model.n_jobs) == max(1, int(os.cpu_count() or 1))
+
+
 def test_recalibration_run_id_is_deterministic():
     df = pd.DataFrame(
         {
@@ -440,6 +456,7 @@ def test_recalibration_run_id_is_deterministic():
         folds=2,
         random_state=11,
         fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
         grid_limit=1,
         adwin_delta=0.01,
         min_window=40,
@@ -467,6 +484,7 @@ def test_recalibration_run_id_is_deterministic():
         folds=2,
         random_state=11,
         fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
         grid_limit=1,
         adwin_delta=0.01,
         min_window=40,
@@ -494,6 +512,7 @@ def test_recalibration_run_id_is_deterministic():
         folds=3,
         random_state=11,
         fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
         grid_limit=1,
         adwin_delta=0.01,
         min_window=40,
@@ -616,6 +635,96 @@ def test_preview_recalibration_checkpoint_detects_resumable_manifest(tmp_path):
     assert resumed["completed_blocks"] == 1
     assert resumed["smote_artifacts"] == 1
     assert resumed["manifest_path"].endswith("manifest.json")
+
+
+def test_preview_recalibration_checkpoint_separates_resource_modes(tmp_path):
+    df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                [
+                    "2018-01-01 00:00:00",
+                    "2018-01-01 00:05:00",
+                    "2019-01-01 00:00:00",
+                    "2019-01-01 00:05:00",
+                ]
+            ),
+            "x": [0.1, 0.2, 0.3, 0.4],
+            "target": [0, 1, 0, 1],
+        }
+    )
+    feature_selection_context = {"selected_features": ["x"], "feature_count": 1}
+
+    restricted = drift_app._preview_recalibration_checkpoint(
+        df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        grid_limit=1,
+        adwin_delta=0.01,
+        min_window=40,
+        min_retrain_size=20,
+        arf_variants=["ARFmoderate"],
+        kswin_variants=["KSWINpaper"],
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=80,
+        repetition_seeds=[11],
+        balance_modes=[BALANCE_MODE_NONE],
+        feature_selection_context=feature_selection_context,
+        checkpoint_root=tmp_path / "runs",
+    )
+
+    run_dir = Path(restricted["run_dir"])
+    paths = drift_app._recalibration_run_paths(run_dir)
+    drift_app._ensure_recalibration_run_dirs(paths)
+    manifest = drift_app._initial_recalibration_manifest(
+        run_id=restricted["run_id"],
+        run_manifest={"total_progress_units": 1, "resource_mode": drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED},
+        feature_selection_context=feature_selection_context,
+        experiment_blocks=[{"strategy": "static", "model": "Random Forest", "balance_mode": BALANCE_MODE_NONE}],
+        tuning_tasks=[{"model_name": "Random Forest", "balance_mode": BALANCE_MODE_NONE}],
+        preflight={},
+    )
+    drift_app._persist_manifest(paths["manifest"], manifest)
+
+    full_memory = drift_app._preview_recalibration_checkpoint(
+        df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_FULL_MEMORY,
+        grid_limit=1,
+        adwin_delta=0.01,
+        min_window=40,
+        min_retrain_size=20,
+        arf_variants=["ARFmoderate"],
+        kswin_variants=["KSWINpaper"],
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=80,
+        repetition_seeds=[11],
+        balance_modes=[BALANCE_MODE_NONE],
+        feature_selection_context=feature_selection_context,
+        checkpoint_root=tmp_path / "runs",
+    )
+
+    assert restricted["run_id"] != full_memory["run_id"]
+    assert full_memory["checkpoint_available"] is False
 
 
 def test_cv_auc_parallel_uses_sklearn_parallel_without_warning():
@@ -1054,6 +1163,7 @@ def test_nnet_policy_version_changes_run_and_tuning_keys(monkeypatch):
         folds=3,
         random_state=42,
         fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
         grid_limit=30,
         adwin_delta=0.002,
         min_window=45_000,
@@ -1076,6 +1186,7 @@ def test_nnet_policy_version_changes_run_and_tuning_keys(monkeypatch):
         folds=3,
         random_state=42,
         fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
         grid_limit=30,
         custom_grid=None,
     )
@@ -1098,6 +1209,7 @@ def test_nnet_policy_version_changes_run_and_tuning_keys(monkeypatch):
         folds=3,
         random_state=42,
         fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
         grid_limit=30,
         adwin_delta=0.002,
         min_window=45_000,
@@ -1120,12 +1232,121 @@ def test_nnet_policy_version_changes_run_and_tuning_keys(monkeypatch):
         folds=3,
         random_state=42,
         fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
         grid_limit=30,
         custom_grid=None,
     )
 
     assert run_id_before != run_id_after
     assert tuning_key_before != tuning_key_after
+
+
+def test_resource_mode_changes_run_and_tuning_keys():
+    df = generate_synthetic_article_dataset(years=(2018, 2019), rows_per_year=40, random_state=211)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+    feature_selection_context = {"selected_features": features}
+    canonical_train_df = df.loc[pd.to_datetime(df["interval_start"], errors="coerce").dt.year.eq(2018)].copy()
+
+    restricted_run_id = drift_app._build_recalibration_run_id(
+        df=df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        arf_variants=[],
+        kswin_variants=[],
+        balance_modes=[BALANCE_MODE_NONE],
+        repetition_seeds=[42],
+        base_year=2018,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        grid_limit=30,
+        adwin_delta=0.002,
+        min_window=45_000,
+        min_retrain_size=None,
+        kswin_top_k_features=10,
+        kswin_vote_threshold=2,
+        kswin_retrain_days=90,
+        kswin_min_retrain_rows=100,
+        custom_grids=None,
+        feature_selection_context=feature_selection_context,
+    )
+    full_run_id = drift_app._build_recalibration_run_id(
+        df=df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        arf_variants=[],
+        kswin_variants=[],
+        balance_modes=[BALANCE_MODE_NONE],
+        repetition_seeds=[42],
+        base_year=2018,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_FULL_MEMORY,
+        grid_limit=30,
+        adwin_delta=0.002,
+        min_window=45_000,
+        min_retrain_size=None,
+        kswin_top_k_features=10,
+        kswin_vote_threshold=2,
+        kswin_retrain_days=90,
+        kswin_min_retrain_rows=100,
+        custom_grids=None,
+        feature_selection_context=feature_selection_context,
+    )
+
+    restricted_tuning_key = drift_app._build_global_tuning_key(
+        model_name="Random Forest",
+        balance_mode=BALANCE_MODE_NONE,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        canonical_train_df=canonical_train_df,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        grid_limit=30,
+        custom_grid=None,
+    )
+    full_tuning_key = drift_app._build_global_tuning_key(
+        model_name="Random Forest",
+        balance_mode=BALANCE_MODE_NONE,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        canonical_train_df=canonical_train_df,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_FULL_MEMORY,
+        grid_limit=30,
+        custom_grid=None,
+    )
+
+    assert restricted_run_id != full_run_id
+    assert restricted_tuning_key != full_tuning_key
 
 
 def test_load_or_create_smote_artifact_reuses_exact_signature(tmp_path, monkeypatch):
@@ -1391,6 +1612,7 @@ def test_end_to_end_recalibration_and_average_roc():
     assert not roc_df.empty
     assert outputs["summary"]["n_repetitions"].eq(1).all()
     assert outputs["run_manifest"]["repetition_seeds"] == [11]
+    assert outputs["run_manifest"]["resource_mode"] == drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE
     assert not outputs["execution_log"].empty
     assert "run_seed" in outputs["yearly_results"].columns
 

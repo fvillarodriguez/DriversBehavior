@@ -1,0 +1,246 @@
+\documentclass[11pt,a4paper]{article}
+
+% --- Paquetes ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{siunitx}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{enumitem}
+
+\geometry{margin=2.5cm}
+
+\definecolor{best}{HTML}{D4EDDA}
+\definecolor{worst}{HTML}{F8D7DA}
+\definecolor{accent}{HTML}{2C3E50}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=accent,
+    citecolor=accent,
+    urlcolor=accent
+}
+
+\begin{document}
+
+% =============================================================================
+\section{Diseño Experimental}
+% =============================================================================
+
+Se comparan cuatro estrategias de recalibración para modelos de predicción de crashes, evaluadas sobre el período 2019--2024.
+
+\begin{table}[H]
+\centering
+\caption{Estrategias de recalibración evaluadas.}
+\label{tab:estrategias}
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Estrategia} & \textbf{Datos de entrenamiento} & \textbf{Tamaño} \\
+\midrule
+Static          & Fijo: año 2018                        & $\sim$94\,679 obs \\
+Period-aligned  & Año inmediatamente anterior ($N{-}1$) & 50\,238--94\,099 obs \\
+Cumulative      & Todo el histórico ($\leq N{-}1$)      & 94\,679--471\,050 obs \\
+Adaptive ADWIN  & Ventana deslizante post-drift          & 45\,000 obs (fija) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Cada estrategia se ejecuta con cuatro modelos base (XGBoost, AdaBoost, Random Forest, NNet) y dos modos de balance de clases (sin balanceo y SMOTE). Adicionalmente, se evaluó Adaptive Random Forest (ARF) como estrategia de streaming puro.
+
+% =============================================================================
+\section{Ranking de Estrategias}
+% =============================================================================
+
+La Tabla~\ref{tab:ranking} presenta las mejores configuraciones por estrategia, ordenadas por AUC promedio (sin SMOTE).
+
+\begin{table}[H]
+\centering
+\caption{Ranking de estrategias por AUC promedio (balance = none).}
+\label{tab:ranking}
+\begin{tabular}{@{}clcS[table-format=1.3]S[table-format=1.3]S[table-format=1.3]@{}}
+\toprule
+\textbf{\#} & \textbf{Estrategia} & \textbf{Modelo} & {\textbf{AUC}} & {\textbf{Sensitivity}} & {\textbf{Specificity}} \\
+\midrule
+\rowcolor{best}
+1 & Cumulative     & Random Forest & 0.796 & 0.678 & 0.779 \\
+\rowcolor{best}
+2 & Cumulative     & XGBoost       & 0.790 & 0.718 & 0.739 \\
+3 & Static         & Random Forest & 0.787 & 0.703 & 0.750 \\
+4 & Static         & XGBoost       & 0.778 & 0.706 & 0.729 \\
+5 & Period-aligned & Random Forest & 0.776 & 0.664 & 0.766 \\
+6 & Period-aligned & XGBoost       & 0.771 & 0.716 & 0.706 \\
+7 & ADWIN          & Random Forest & 0.759 & 0.612 & 0.748 \\
+\rowcolor{worst}
+8 & ADWIN          & AdaBoost      & 0.736 & 0.713 & 0.677 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Hallazgo principal:}
+\[
+    \text{Cumulative} > \text{Static} > \text{Period-aligned} \gg \text{Adaptive ADWIN}
+\]
+
+% =============================================================================
+\section{Degradación Temporal del Modelo Estático}
+% =============================================================================
+
+La Tabla~\ref{tab:degradacion} muestra cómo evoluciona el AUC del modelo estático (entrenado en 2018) al predecir años sucesivos.
+
+\begin{table}[H]
+\centering
+\caption{AUC por año de predicción --- estrategia static, balance = none.}
+\label{tab:degradacion}
+\begin{tabular}{@{}cS[table-format=1.3]S[table-format=1.3]l@{}}
+\toprule
+\textbf{Año Pred.} & {\textbf{RF (AUC)}} & {\textbf{XGBoost (AUC)}} & \textbf{Tendencia} \\
+\midrule
+2019 & 0.772 & 0.769 & Baseline \\
+2020 & 0.761 & 0.741 & Leve caída \\
+2021 & 0.791 & 0.781 & Recuperación \\
+2022 & 0.772 & 0.772 & Estable \\
+\rowcolor{best}
+2023 & 0.845 & 0.847 & \textbf{Pico} \\
+2024 & 0.779 & 0.757 & Vuelta a normal \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Dos observaciones relevantes:
+\begin{itemize}[nosep]
+    \item 2023 es consistentemente el año más fácil de predecir en \textbf{todas} las estrategias.
+    \item El modelo estático \textbf{no muestra degradación monotónica}, lo que sugiere que el concept drift en los patrones de crashes no es severo.
+\end{itemize}
+
+% =============================================================================
+\section{Ventaja de Cumulative vs.\ Static}
+% =============================================================================
+
+\begin{table}[H]
+\centering
+\caption{Comparación de AUC entre estrategias static y cumulative (balance = none).}
+\label{tab:cumul_vs_static}
+\begin{tabular}{@{}lS[table-format=1.3]S[table-format=1.3]S[table-format=+1.3, table-space-text-post=***]@{}}
+\toprule
+\textbf{Modelo} & {\textbf{AUC Static}} & {\textbf{AUC Cumulative}} & {\textbf{$\Delta$}} \\
+\midrule
+Random Forest & 0.787 & 0.796 & +0.009 \\
+XGBoost       & 0.778 & 0.790 & +0.012 \\
+AdaBoost      & 0.763 & 0.774 & +0.011 \\
+NNet          & 0.748 & 0.747 & -0.001 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La ganancia del reentrenamiento acumulativo es modesta pero consistente ($\sim$1 punto de AUC). NNet es el único modelo que no se beneficia de esta estrategia.
+
+% =============================================================================
+\section{Diagnóstico del Adaptive ADWIN}
+% =============================================================================
+
+ADWIN presenta el peor desempeño entre todas las estrategias. El análisis detallado de los logs de drift revela las siguientes causas:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Exceso de drifts detectados:} entre 18 y 27 reentrenamientos por modelo en 5 años, versus 6 reentrenamientos en las estrategias yearly.
+    \item \textbf{Ventanas de evaluación muy pequeñas:} muchos segmentos post-drift contienen $<$100 observaciones, produciendo métricas altamente ruidosas (AUC individual oscila entre 0.17 y 0.97).
+    \item \textbf{Inestabilidad de thresholds:} el umbral de clasificación cambia drásticamente entre reentrenamientos (e.g., NNet oscila entre 0.0004 y 0.41).
+    \item \textbf{NNet es especialmente inestable con ADWIN:} AUC promedio de 0.734 (none) y 0.648 (smote).
+    \item \textbf{ARF es inutilizable:} AUC $= 0.471$, peor que clasificación aleatoria.
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\caption{Número de reentrenamientos (drifts detectados) por modelo en ADWIN.}
+\label{tab:adwin_drifts}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Modelo} & \textbf{Drifts (none)} & \textbf{Drifts (smote)} \\
+\midrule
+AdaBoost      & 24 & 27 \\
+Random Forest & 26 & 26 \\
+XGBoost       & 20 & 23 \\
+NNet          & 18 & 21 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =============================================================================
+\section{Efecto de SMOTE}
+% =============================================================================
+
+\begin{table}[H]
+\centering
+\caption{Impacto de SMOTE en el AUC promedio por estrategia (todos los modelos).}
+\label{tab:smote}
+\begin{tabular}{@{}lS[table-format=1.3]S[table-format=1.3]S[table-format=+1.3]@{}}
+\toprule
+\textbf{Estrategia} & {\textbf{AUC sin SMOTE}} & {\textbf{AUC con SMOTE}} & {\textbf{$\Delta$}} \\
+\midrule
+Cumulative     & 0.787 & 0.770 & -0.017 \\
+Static         & 0.769 & 0.746 & -0.023 \\
+Period-aligned & 0.761 & 0.738 & -0.023 \\
+ADWIN          & 0.737 & 0.695 & -0.042 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+SMOTE \textbf{perjudica consistentemente} el AUC en todas las estrategias. La caída es más pronunciada en ADWIN, donde las ventanas de entrenamiento pequeñas amplifican el ruido introducido por el oversampling sintético.
+
+% =============================================================================
+\section{Ranking de Modelos}
+% =============================================================================
+
+\begin{table}[H]
+\centering
+\caption{Rendimiento promedio por modelo (across strategies, balance = none).}
+\label{tab:modelos}
+\begin{tabular}{@{}lS[table-format=1.3]S[table-format=1.3]S[table-format=1.3]S[table-format=3.1]@{}}
+\toprule
+\textbf{Modelo} & {\textbf{AUC}} & {\textbf{Sensitivity}} & {\textbf{Specificity}} & {\textbf{Tiempo (s)}} \\
+\midrule
+\rowcolor{best}
+Random Forest & 0.779 & 0.664 & 0.761 & 67.0 \\
+\rowcolor{best}
+XGBoost       & 0.770 & 0.673 & 0.733 & 0.7 \\
+AdaBoost      & 0.757 & 0.696 & 0.720 & 28.0 \\
+\rowcolor{worst}
+NNet          & 0.741 & 0.658 & 0.687 & 8.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+XGBoost ofrece el mejor trade-off rendimiento/costo computacional: es $\sim$100$\times$ más rápido que Random Forest con solo 0.009 menos de AUC.
+
+% =============================================================================
+\section{Conclusiones y Recomendaciones}
+% =============================================================================
+
+\begin{enumerate}
+    \item \textbf{Mejor configuración absoluta:} Cumulative + Random Forest (sin SMOTE), AUC $= 0.796$.
+
+    \item \textbf{Mejor trade-off práctico:} Cumulative + XGBoost (sin SMOTE), AUC $= 0.790$, con un tiempo de entrenamiento $\sim$70$\times$ menor.
+
+    \item \textbf{Static es competitivo:} Solo $\sim$1 punto de AUC por debajo de cumulative. Si el costo operacional de reentrenamiento es alto, el modelo estático es una alternativa viable.
+
+    \item \textbf{ADWIN no funciona bien en este contexto:} El exceso de falsos drifts, las ventanas pequeñas y las métricas ruidosas degradan significativamente el rendimiento. Posibles mejoras incluyen:
+    \begin{itemize}[nosep]
+        \item Aumentar el parámetro $\delta$ para reducir sensibilidad.
+        \item Imponer ventanas mínimas de evaluación más grandes.
+        \item Implementar un mecanismo de ``cooling period'' entre reentrenamientos.
+    \end{itemize}
+
+    \item \textbf{SMOTE no ayuda:} El desbalance de clases no parece ser el bottleneck del rendimiento en este problema.
+
+    \item \textbf{El drift temporal no es severo:} El modelo entrenado en 2018 mantiene buen rendimiento hasta 2024, sugiriendo que los patrones espaciotemporales de crashes son relativamente estables en el horizonte evaluado.
+\end{enumerate}
+
+\end{document}
