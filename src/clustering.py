@@ -799,6 +799,12 @@ def _scale_cluster_features(
     return scaler.transform(X_all), scaler
 
 
+def _distance_to_confidence_score(distances: np.ndarray) -> np.ndarray:
+    """Map centroid distances to a bounded confidence score where higher is better."""
+    clipped = np.clip(np.asarray(distances, dtype=float), a_min=0.0, a_max=None)
+    return 1.0 / (1.0 + clipped)
+
+
 def assign_clusters_kmeans(
     frequent_df: pd.DataFrame,
     rare_df: pd.DataFrame,
@@ -809,6 +815,8 @@ def assign_clusters_kmeans(
 ) -> Tuple[pd.DataFrame, object, float]:
     """
     Entrena KMeans en frequent_df. Asigna clusters a rare_df con umbral de distancia.
+    `confidence_score` queda normalizado a [0, 1] donde mayor es mejor.
+    `distance_to_centroid` preserva la distancia cruda usada para el umbral.
     Retorna (df_consolidado, model, threshold_used).
     """
     try:
@@ -839,6 +847,7 @@ def assign_clusters_kmeans(
         
         rare_dists_all = kmeans.transform(X_rare_scaled)
         rare_min_dists = rare_dists_all.min(axis=1)
+        rare_conf_scores = _distance_to_confidence_score(rare_min_dists)
         rare_labels = kmeans.predict(X_rare_scaled)
         
         # Apply threshold
@@ -849,7 +858,8 @@ def assign_clusters_kmeans(
         # Build Rare result
         rare_result = rare_df.copy()
         rare_result["cluster_label"] = rare_labels
-        rare_result["confidence_score"] = rare_min_dists
+        rare_result["distance_to_centroid"] = rare_min_dists
+        rare_result["confidence_score"] = rare_conf_scores
         rare_result["is_rare"] = True
     else:
         rare_result = pd.DataFrame()
@@ -858,7 +868,8 @@ def assign_clusters_kmeans(
     freq_labels = kmeans.labels_
     freq_result = frequent_df.copy()
     freq_result["cluster_label"] = freq_labels
-    freq_result["confidence_score"] = freq_min_dists
+    freq_result["distance_to_centroid"] = freq_min_dists
+    freq_result["confidence_score"] = _distance_to_confidence_score(freq_min_dists)
     freq_result["is_rare"] = False
     
     # Consolidate
@@ -2494,7 +2505,7 @@ def handle_clusterization(session) -> None:
 
         if X_scaled is None:
             try:
-                X_scaled = _scale_cluster_features(cluster_df, feature_cols)
+                X_scaled, _ = _scale_cluster_features(cluster_df, feature_cols)
             except ImportError as exc:
                 print(f"❌ {exc}")
                 return
@@ -2619,7 +2630,7 @@ def handle_clusterization(session) -> None:
 
         if X_scaled is None:
             try:
-                X_scaled = _scale_cluster_features(cluster_df, feature_cols)
+                X_scaled, _ = _scale_cluster_features(cluster_df, feature_cols)
             except ImportError as exc:
                 print(f"❌ {exc}")
                 return
@@ -2678,7 +2689,7 @@ def handle_clusterization(session) -> None:
         _maybe_export_cluster_inputs(features_df, None)
 
         try:
-            X_scaled = _scale_cluster_features(cluster_df, feature_cols)
+            X_scaled, _ = _scale_cluster_features(cluster_df, feature_cols)
         except ImportError as exc:
             print(f"❌ {exc}")
             return

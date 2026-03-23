@@ -5,9 +5,13 @@
 \usepackage[spanish]{babel}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
+\usepackage{enumitem}
 \usepackage{hyperref}
 \usepackage{geometry}
 \geometry{margin=2.5cm}
+\makeatletter
+\def\input@path{{}{docs/}}
+\makeatother
 
 \title{Documentación Técnica}
 \author{}
@@ -19,8 +23,9 @@
 
 \input{sections/clustering_es.tex}
 \input{sections/accident_prediction_es.tex}
-\input{clustering_features_detail_es.tex}
-\input{gnn_pipeline_audit_es.tex}
+\input{sections/drift_detection_es.tex}
+\input{sections/clustering_features_detail_es.tex}
+\input{sections/gnn_pipeline_audit_es.tex}
 \input{sections/mairl_implementation_es.tex}
 
 \end{document}

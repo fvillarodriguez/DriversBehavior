@@ -8,13 +8,14 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
+DRIFT_RUNS_DIR = RESULTS_DIR / "drift_recalibration_runs"
 
 
 def _list_live_db_files() -> list[Path]:
@@ -25,6 +26,788 @@ def _list_live_db_files() -> list[Path]:
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
+
+
+def _load_json_file(path: Path, default: Any = None) -> Any:
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return default
+
+
+def _read_jsonl_records(path: Path) -> list[Dict[str, object]]:
+    if not path.exists():
+        return []
+    rows: list[Dict[str, object]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(payload)
+    except Exception:
+        return []
+    return rows
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return int(default)
+    return int(numeric)
+
+
+def _list_drift_manifest_files() -> list[Path]:
+    if not DRIFT_RUNS_DIR.exists():
+        return []
+    return sorted(
+        DRIFT_RUNS_DIR.glob("*/manifest.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _build_live_sources() -> list[Dict[str, object]]:
+    entries: list[Dict[str, object]] = []
+    for path in _list_drift_manifest_files():
+        manifest = _load_json_file(path, default={})
+        run_id = str((manifest or {}).get("run_id") or path.parent.name)
+        status = str((manifest or {}).get("status") or "unknown")
+        updated_at = str((manifest or {}).get("updated_at") or (manifest or {}).get("started_at") or "-")
+        entries.append(
+            {
+                "type": "drift_recalibration",
+                "path": path,
+                "sort_key": float(path.stat().st_mtime),
+                "label": f"Drift recalibration | {run_id} | {status} | {updated_at}",
+            }
+        )
+    for path in _list_live_db_files():
+        entries.append(
+            {
+                "type": "sqlite",
+                "path": path,
+                "sort_key": float(path.stat().st_mtime),
+                "label": f"SQLite | {path.name}",
+            }
+        )
+    entries.sort(key=lambda item: float(item.get("sort_key", 0.0)), reverse=True)
+    return entries
+
+
+def _drift_strategy_priority(name: object) -> int:
+    priority = {
+        "static": 0,
+        "period_aligned": 1,
+        "cumulative": 2,
+        "adaptive_adwin": 3,
+        "adaptive_arf": 4,
+        "adaptive_kswin": 5,
+    }
+    return int(priority.get(str(name), 99))
+
+
+def _drift_model_priority(name: object) -> int:
+    priority = {
+        "NNet": 0,
+        "AdaBoost": 1,
+        "Random Forest": 2,
+        "XGBoost": 3,
+    }
+    return int(priority.get(str(name), 99))
+
+
+def _drift_block_sort_key(row: Dict[str, object]) -> tuple[int, int, int, int, int, str, str]:
+    balance = str(row.get("balance_mode") or "not_applicable")
+    balance_priority = {"none": 0, "not_applicable": 0, "smote": 1}
+    return (
+        _safe_int(row.get("run_order")),
+        _safe_int(row.get("run_seed")),
+        _drift_strategy_priority(row.get("strategy")),
+        int(balance_priority.get(balance, 9)),
+        _drift_model_priority(row.get("model")),
+        str(row.get("model") or ""),
+        str(row.get("detector_variant") or ""),
+    )
+
+
+def _build_drift_tuning_trials_frame(artifacts: list[Dict[str, object]]) -> pd.DataFrame:
+    rows: list[Dict[str, object]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        study_id = str(artifact.get("study_id") or "")
+        model = str(artifact.get("model_name") or artifact.get("model") or "")
+        balance_mode = str(artifact.get("balance_mode") or "not_applicable")
+        stage = str(artifact.get("stage") or "tuning")
+        for trial in artifact.get("trials") or []:
+            if not isinstance(trial, dict):
+                continue
+            rows.append(
+                {
+                    "study_id": study_id,
+                    "model": model,
+                    "balance_mode": balance_mode,
+                    "stage": stage,
+                    "trial_number": _safe_int(trial.get("trial_number"), default=len(rows)),
+                    "cv_auc": pd.to_numeric(trial.get("cv_auc"), errors="coerce"),
+                    "state": str(trial.get("state") or ""),
+                }
+            )
+    if not rows:
+        return pd.DataFrame(
+            columns=["study_id", "model", "balance_mode", "stage", "trial_number", "cv_auc", "state"]
+        )
+    return pd.DataFrame(rows).sort_values(
+        ["model", "balance_mode", "stage", "trial_number"]
+    ).reset_index(drop=True)
+
+
+def _build_drift_execution_memory_trace(execution_log: pd.DataFrame) -> pd.DataFrame:
+    if execution_log is None or execution_log.empty:
+        return pd.DataFrame(columns=["order", "metric", "value", "phase", "status"])
+    work = execution_log.copy()
+    for col in ["order", "rss_before_mb", "rss_after_mb", "training_time_sec"]:
+        if col not in work.columns:
+            work[col] = pd.NA
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    rows: list[Dict[str, object]] = []
+    for metric in ["rss_before_mb", "rss_after_mb", "training_time_sec"]:
+        metric_rows = work.loc[work[metric].notna(), ["order", "phase", "status", metric]].copy()
+        if metric_rows.empty:
+            continue
+        metric_rows = metric_rows.rename(columns={metric: "value"})
+        metric_rows["metric"] = metric
+        rows.extend(metric_rows.to_dict(orient="records"))
+    if not rows:
+        return pd.DataFrame(columns=["order", "metric", "value", "phase", "status"])
+    return pd.DataFrame(rows).sort_values(["metric", "order"]).reset_index(drop=True)
+
+
+def _build_drift_average_roc_curves(
+    roc_payload: list[Dict[str, object]],
+    *,
+    n_points: int = 101,
+) -> pd.DataFrame:
+    if not roc_payload:
+        return pd.DataFrame(columns=["strategy", "model", "balance_mode", "fpr", "tpr", "label"])
+
+    fpr_grid = pd.Series([idx / float(max(1, n_points - 1)) for idx in range(int(n_points))], dtype=float)
+    rows: list[Dict[str, object]] = []
+    keys = sorted(
+        {
+            (
+                str(item.get("strategy") or ""),
+                str(item.get("model") or ""),
+                str(item.get("balance_mode") or "not_applicable"),
+            )
+            for item in roc_payload
+            if isinstance(item, dict)
+        }
+    )
+    for strategy, model, balance_mode in keys:
+        curves: list[pd.Series] = []
+        for item in roc_payload:
+            if not isinstance(item, dict):
+                continue
+            if (
+                str(item.get("strategy") or "") != strategy
+                or str(item.get("model") or "") != model
+                or str(item.get("balance_mode") or "not_applicable") != balance_mode
+            ):
+                continue
+            y_true = pd.Series(item.get("y_true") or [], dtype="float64").dropna().astype(int)
+            scores = pd.Series(item.get("scores") or [], dtype="float64").dropna().astype(float)
+            if y_true.empty or scores.empty or len(y_true) != len(scores) or y_true.nunique() < 2:
+                continue
+            roc_df = pd.DataFrame({"y_true": y_true.to_numpy(), "scores": scores.to_numpy()}).sort_values(
+                "scores",
+                ascending=False,
+                kind="stable",
+            )
+            positives = float((roc_df["y_true"] == 1).sum())
+            negatives = float((roc_df["y_true"] == 0).sum())
+            if positives <= 0 or negatives <= 0:
+                continue
+            roc_df["tp"] = (roc_df["y_true"] == 1).cumsum()
+            roc_df["fp"] = (roc_df["y_true"] == 0).cumsum()
+            roc_df["tpr"] = roc_df["tp"] / positives
+            roc_df["fpr"] = roc_df["fp"] / negatives
+            curve_df = pd.concat(
+                [
+                    pd.DataFrame({"fpr": [0.0], "tpr": [0.0]}),
+                    roc_df[["fpr", "tpr"]],
+                    pd.DataFrame({"fpr": [1.0], "tpr": [1.0]}),
+                ],
+                ignore_index=True,
+            ).drop_duplicates(subset=["fpr"], keep="last")
+            interpolated = (
+                curve_df.set_index("fpr")["tpr"]
+                .reindex(sorted(set(curve_df["fpr"]).union(set(fpr_grid.tolist()))))
+                .interpolate(method="index")
+                .reindex(fpr_grid.tolist())
+            )
+            if interpolated.empty:
+                continue
+            curves.append(interpolated.reset_index(drop=True))
+        if not curves:
+            continue
+        mean_tpr = pd.concat(curves, axis=1).mean(axis=1)
+        label = f"{strategy} | {model} | {balance_mode}"
+        for fpr_value, tpr_value in zip(fpr_grid.tolist(), mean_tpr.tolist()):
+            rows.append(
+                {
+                    "strategy": strategy,
+                    "model": model,
+                    "balance_mode": balance_mode,
+                    "fpr": float(fpr_value),
+                    "tpr": float(tpr_value),
+                    "label": label,
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=["strategy", "model", "balance_mode", "fpr", "tpr", "label"])
+    return pd.DataFrame(rows)
+
+
+def _summarize_drift_rows(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "source",
+                "strategy",
+                "model",
+                "balance_mode",
+                "auc",
+                "sensitivity",
+                "specificity",
+                "error_rate",
+                "training_time_sec",
+                "n_rows",
+                "n_seeds",
+            ]
+        )
+    work = df.copy()
+    if "balance_mode" not in work.columns:
+        work["balance_mode"] = "not_applicable"
+    for col in ["auc", "sensitivity", "specificity", "error_rate", "training_time_sec", "run_seed"]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+    agg_map: Dict[str, tuple[str, object]] = {"n_rows": ("strategy", "size")}
+    for metric in ["auc", "sensitivity", "specificity", "error_rate", "training_time_sec"]:
+        if metric in work.columns:
+            agg_map[metric] = (metric, "mean")
+    if "run_seed" in work.columns:
+        agg_map["n_seeds"] = (
+            "run_seed",
+            lambda s: int(pd.Series(s).dropna().astype(int).nunique()) if pd.Series(s).notna().any() else 0,
+        )
+    grouped = (
+        work.groupby(["strategy", "model", "balance_mode"], dropna=False)
+        .agg(**agg_map)
+        .reset_index()
+    )
+    grouped.insert(0, "source", source)
+    if "n_seeds" not in grouped.columns:
+        grouped["n_seeds"] = 0
+    ordered_cols = [
+        "source",
+        "strategy",
+        "model",
+        "balance_mode",
+        "auc",
+        "sensitivity",
+        "specificity",
+        "error_rate",
+        "training_time_sec",
+        "n_rows",
+        "n_seeds",
+    ]
+    for col in ordered_cols:
+        if col not in grouped.columns:
+            grouped[col] = pd.NA
+    return grouped[ordered_cols].sort_values(
+        ["source", "strategy", "balance_mode", "model"]
+    ).reset_index(drop=True)
+
+
+def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFrame) -> pd.DataFrame:
+    frames = [
+        _summarize_drift_rows(yearly_df, source="yearly"),
+        _summarize_drift_rows(adaptive_df, source="adaptive"),
+    ]
+    non_empty = [frame for frame in frames if frame is not None and not frame.empty]
+    if not non_empty:
+        return pd.DataFrame(
+            columns=[
+                "source",
+                "strategy",
+                "model",
+                "balance_mode",
+                "auc",
+                "sensitivity",
+                "specificity",
+                "error_rate",
+                "training_time_sec",
+                "n_rows",
+                "n_seeds",
+            ]
+        )
+    return pd.concat(non_empty, ignore_index=True)
+
+
+def _display_cell(value: object, *, pending: bool = False) -> object:
+    if pending:
+        return "Pendiente"
+    if value is None:
+        return "-"
+    if isinstance(value, str):
+        return value if value.strip() else "-"
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return "-"
+        return value.isoformat(sep=" ", timespec="seconds")
+    if pd.isna(value):
+        return "-"
+    if isinstance(value, float):
+        if abs(value - round(value)) < 1e-9:
+            return int(round(value))
+        return round(value, 4)
+    return value
+
+
+def _yearly_training_label(strategy: str, *, base_year: Optional[int], prediction_year: int) -> str:
+    if base_year is None:
+        return "-"
+    if strategy == "static":
+        return f"{int(base_year)}"
+    if strategy == "period_aligned":
+        return f"{int(prediction_year) - 1}"
+    if strategy == "cumulative":
+        return f"[<= {int(prediction_year) - 1}]"
+    return "-"
+
+
+def _expected_yearly_table(
+    manifest: Dict[str, object],
+    yearly_df: pd.DataFrame,
+    *,
+    strategy: str,
+) -> pd.DataFrame:
+    run_manifest = dict(manifest.get("run_manifest") or {})
+    selected_strategies = [str(item) for item in run_manifest.get("strategies") or []]
+    if strategy not in selected_strategies and (
+        yearly_df is None
+        or yearly_df.empty
+        or not yearly_df["strategy"].astype(str).eq(strategy).any()
+    ):
+        return pd.DataFrame()
+
+    base_year_raw = run_manifest.get("base_year")
+    base_year = None if pd.isna(pd.to_numeric(base_year_raw, errors="coerce")) else _safe_int(base_year_raw)
+    prediction_years = [
+        _safe_int(year)
+        for year in (run_manifest.get("prediction_years") or [])
+        if not pd.isna(pd.to_numeric(year, errors="coerce"))
+    ]
+    models = [str(item) for item in run_manifest.get("models") or []]
+    balance_modes = [str(item) for item in run_manifest.get("balance_modes") or []]
+    repetition_seeds = [_safe_int(item) for item in (run_manifest.get("repetition_seeds") or [])]
+
+    if not prediction_years and isinstance(yearly_df, pd.DataFrame) and not yearly_df.empty and "prediction_year" in yearly_df.columns:
+        prediction_years = sorted(
+            yearly_df["prediction_year"].dropna().astype(int).unique().tolist()
+        )
+    if not models and isinstance(yearly_df, pd.DataFrame) and not yearly_df.empty:
+        models = sorted(yearly_df["model"].dropna().astype(str).unique().tolist())
+    if not balance_modes and isinstance(yearly_df, pd.DataFrame) and not yearly_df.empty:
+        balance_modes = sorted(yearly_df["balance_mode"].dropna().astype(str).unique().tolist())
+    if not repetition_seeds and isinstance(yearly_df, pd.DataFrame) and not yearly_df.empty and "run_seed" in yearly_df.columns:
+        repetition_seeds = sorted(yearly_df["run_seed"].dropna().astype(int).unique().tolist())
+
+    display_cols = [
+        "status",
+        "iteration",
+        "training_year",
+        "prediction_year",
+        "model",
+        "balance_mode",
+        "auc",
+        "sensitivity",
+        "specificity",
+        "error_rate",
+        "training_time_sec",
+        "threshold",
+        "n_train",
+        "n_test",
+        "run_seed",
+        "run_order",
+    ]
+    if not models or not prediction_years or not repetition_seeds:
+        return pd.DataFrame(columns=display_cols)
+
+    work = pd.DataFrame() if yearly_df is None else yearly_df.copy()
+    if not work.empty:
+        for col in ["prediction_year", "run_seed", "run_order"]:
+            if col in work.columns:
+                work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    rows: list[Dict[str, object]] = []
+    for run_order, seed in enumerate(repetition_seeds, start=1):
+        for prediction_year in prediction_years:
+            for model in models:
+                for balance_mode in balance_modes:
+                    match = pd.DataFrame()
+                    if not work.empty:
+                        mask = (
+                            work["strategy"].astype(str).eq(strategy)
+                            & work["model"].astype(str).eq(model)
+                            & work["balance_mode"].astype(str).eq(balance_mode)
+                            & pd.to_numeric(work["prediction_year"], errors="coerce").eq(int(prediction_year))
+                            & pd.to_numeric(work["run_seed"], errors="coerce").eq(int(seed))
+                            & pd.to_numeric(work["run_order"], errors="coerce").eq(int(run_order))
+                        )
+                        match = work.loc[mask].head(1)
+                    if not match.empty:
+                        source_row = match.iloc[0].to_dict()
+                        row = {
+                            "status": "Completado",
+                            "iteration": _display_cell(source_row.get("iteration")),
+                            "training_year": _display_cell(source_row.get("training_year")),
+                            "prediction_year": _display_cell(source_row.get("prediction_year")),
+                            "model": _display_cell(source_row.get("model")),
+                            "balance_mode": _display_cell(source_row.get("balance_mode")),
+                            "auc": _display_cell(source_row.get("auc")),
+                            "sensitivity": _display_cell(source_row.get("sensitivity")),
+                            "specificity": _display_cell(source_row.get("specificity")),
+                            "error_rate": _display_cell(source_row.get("error_rate")),
+                            "training_time_sec": _display_cell(source_row.get("training_time_sec")),
+                            "threshold": _display_cell(source_row.get("threshold")),
+                            "n_train": _display_cell(source_row.get("n_train")),
+                            "n_test": _display_cell(source_row.get("n_test")),
+                            "run_seed": _display_cell(source_row.get("run_seed")),
+                            "run_order": _display_cell(source_row.get("run_order")),
+                        }
+                    else:
+                        row = {
+                            "status": "Pendiente",
+                            "iteration": _display_cell(
+                                None if base_year is None else int(prediction_year) - int(base_year)
+                            ),
+                            "training_year": _yearly_training_label(
+                                strategy,
+                                base_year=base_year,
+                                prediction_year=int(prediction_year),
+                            ),
+                            "prediction_year": int(prediction_year),
+                            "model": model,
+                            "balance_mode": balance_mode,
+                            "auc": "Pendiente",
+                            "sensitivity": "Pendiente",
+                            "specificity": "Pendiente",
+                            "error_rate": "Pendiente",
+                            "training_time_sec": "Pendiente",
+                            "threshold": "Pendiente",
+                            "n_train": "Pendiente",
+                            "n_test": "Pendiente",
+                            "run_seed": int(seed),
+                            "run_order": int(run_order),
+                        }
+                    rows.append(row)
+
+    return pd.DataFrame(rows, columns=display_cols)
+
+
+def _expected_adaptive_table(
+    manifest: Dict[str, object],
+    block_df: pd.DataFrame,
+    adaptive_df: pd.DataFrame,
+) -> pd.DataFrame:
+    run_manifest = dict(manifest.get("run_manifest") or {})
+    selected_strategies = [str(item) for item in run_manifest.get("strategies") or []]
+    adaptive_strategies = [
+        strategy
+        for strategy in ["adaptive_adwin", "adaptive_arf", "adaptive_kswin"]
+        if strategy in selected_strategies
+    ]
+
+    display_cols = [
+        "status",
+        "strategy",
+        "drift",
+        "drift_date",
+        "prediction_year",
+        "balance_mode",
+        "segment_rows",
+        "n_internal_drifts",
+        "n_internal_warnings",
+        "vote_count",
+        "vote_threshold",
+        "monitor_feature_count",
+        "retrain_rows",
+        "retrain_positive_rows",
+        "base_model",
+        "detector_variant",
+        "detected_features",
+        "monitored_features",
+        "W",
+        "W0",
+        "W1",
+        "remaining_periods",
+        "model",
+        "auc",
+        "sensitivity",
+        "specificity",
+        "error_rate",
+        "training_time_sec",
+        "threshold",
+        "run_seed",
+        "run_order",
+    ]
+
+    rows: list[Dict[str, object]] = []
+    adaptive_work = pd.DataFrame() if adaptive_df is None else adaptive_df.copy()
+    if not adaptive_work.empty:
+        available_cols = [col for col in display_cols if col in adaptive_work.columns]
+        actual_df = adaptive_work[available_cols].copy()
+        actual_df.insert(0, "status", "Completado")
+        for col in display_cols:
+            if col not in actual_df.columns:
+                actual_df[col] = "-"
+        actual_df = actual_df[display_cols]
+        for record in actual_df.to_dict(orient="records"):
+            rows.append({key: _display_cell(value) for key, value in record.items()})
+
+    if isinstance(block_df, pd.DataFrame) and not block_df.empty:
+        pending_blocks = block_df.loc[
+            block_df["strategy"].astype(str).isin(adaptive_strategies)
+            & ~block_df["status"].astype(str).str.lower().eq("completed")
+        ].copy()
+        for block in pending_blocks.to_dict(orient="records"):
+            rows.append(
+                {
+                    "status": "Pendiente",
+                    "strategy": str(block.get("strategy") or "-"),
+                    "drift": "Pendiente",
+                    "drift_date": "Pendiente",
+                    "prediction_year": "Pendiente",
+                    "balance_mode": str(block.get("balance_mode") or "not_applicable"),
+                    "segment_rows": "Pendiente",
+                    "n_internal_drifts": "Pendiente",
+                    "n_internal_warnings": "Pendiente",
+                    "vote_count": "Pendiente",
+                    "vote_threshold": "Pendiente",
+                    "monitor_feature_count": "Pendiente",
+                    "retrain_rows": "Pendiente",
+                    "retrain_positive_rows": "Pendiente",
+                    "base_model": "Pendiente",
+                    "detector_variant": _display_cell(block.get("detector_variant")),
+                    "detected_features": "Pendiente",
+                    "monitored_features": "Pendiente",
+                    "W": "Pendiente",
+                    "W0": "Pendiente",
+                    "W1": "Pendiente",
+                    "remaining_periods": "Pendiente",
+                    "model": str(block.get("model") or "-"),
+                    "auc": "Pendiente",
+                    "sensitivity": "Pendiente",
+                    "specificity": "Pendiente",
+                    "error_rate": "Pendiente",
+                    "training_time_sec": "Pendiente",
+                    "threshold": "Pendiente",
+                    "run_seed": _display_cell(block.get("run_seed")),
+                    "run_order": _display_cell(block.get("run_order")),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=display_cols)
+
+    out = pd.DataFrame(rows, columns=display_cols)
+    sort_cols = [col for col in ["status", "strategy", "model", "balance_mode", "run_seed", "run_order"] if col in out.columns]
+    return out.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+
+
+def _build_drift_live_result_tables(
+    manifest: Dict[str, object],
+    block_df: pd.DataFrame,
+    yearly_df: pd.DataFrame,
+    adaptive_df: pd.DataFrame,
+) -> Dict[str, pd.DataFrame]:
+    return {
+        "A.6": _expected_yearly_table(manifest, yearly_df, strategy="static"),
+        "A.7": _expected_yearly_table(manifest, yearly_df, strategy="period_aligned"),
+        "A.8": _expected_yearly_table(manifest, yearly_df, strategy="cumulative"),
+        "A.9": _expected_adaptive_table(manifest, block_df, adaptive_df),
+    }
+
+
+def _read_drift_run(manifest_path: Path) -> Dict[str, object]:
+    manifest = _load_json_file(manifest_path, default={}) or {}
+    run_dir = manifest_path.parent
+    blocks_dir = run_dir / "blocks"
+    tuning_dir = run_dir / "tuning"
+    live_status_path = run_dir / "live_status.json"
+    live_events_path = run_dir / "live_events.jsonl"
+
+    payloads_by_block: Dict[str, Dict[str, object]] = {}
+    block_payloads: list[Dict[str, object]] = []
+    if blocks_dir.exists():
+        for block_path in sorted(blocks_dir.glob("*.json")):
+            payload = _load_json_file(block_path, default=None)
+            if not isinstance(payload, dict):
+                continue
+            block_id = str(payload.get("block_id") or block_path.stem)
+            payloads_by_block[block_id] = payload
+            block_payloads.append(payload)
+    block_payloads.sort(
+        key=lambda payload: _drift_block_sort_key(
+            {
+                "run_order": payload.get("run_order"),
+                "run_seed": payload.get("run_seed"),
+                **dict(payload.get("block") or {}),
+            }
+        )
+    )
+
+    block_rows: list[Dict[str, object]] = []
+    block_index = dict(manifest.get("block_index") or {})
+    all_block_ids = sorted(
+        set(str(key) for key in block_index.keys()).union(payloads_by_block.keys()),
+        key=lambda block_id: _drift_block_sort_key(
+            {
+                "run_order": (block_index.get(block_id) or {}).get("run_order") or (payloads_by_block.get(block_id) or {}).get("run_order"),
+                "run_seed": (block_index.get(block_id) or {}).get("run_seed") or (payloads_by_block.get(block_id) or {}).get("run_seed"),
+                **dict((block_index.get(block_id) or {}).copy()),
+                **dict((payloads_by_block.get(block_id) or {}).get("block") or {}),
+            }
+        ),
+    )
+    for block_id in all_block_ids:
+        info = dict(block_index.get(block_id) or {})
+        payload = dict(payloads_by_block.get(block_id) or {})
+        block_config = dict(payload.get("block") or {})
+        row = {
+            "block_id": block_id,
+            "status": str(info.get("status") or "completed" if payload else "pending"),
+            "strategy": str(info.get("strategy") or block_config.get("strategy") or ""),
+            "model": str(info.get("model") or block_config.get("model") or ""),
+            "detector_variant": str(info.get("detector_variant") or block_config.get("detector_variant") or ""),
+            "balance_mode": str(info.get("balance_mode") or block_config.get("balance_mode") or "not_applicable"),
+            "run_seed": _safe_int(info.get("run_seed") or payload.get("run_seed")),
+            "run_order": _safe_int(info.get("run_order") or payload.get("run_order")),
+            "saved_at": payload.get("saved_at"),
+            "yearly_rows": int(len(payload.get("yearly_rows") or [])),
+            "adaptive_rows": int(len(payload.get("adaptive_rows") or [])),
+            "execution_log_rows": int(len(payload.get("execution_log") or [])),
+        }
+        detector_variant = str(row["detector_variant"] or "")
+        balance_mode = str(row["balance_mode"] or "not_applicable")
+        parts = [str(row["strategy"]), str(row["model"])]
+        if detector_variant:
+            parts.append(detector_variant)
+        if balance_mode and balance_mode != "not_applicable":
+            parts.append(balance_mode)
+        row["block_label"] = " | ".join(part for part in parts if part)
+        row["seed_label"] = f"seed {int(row['run_seed'])}"
+        block_rows.append(row)
+    block_df = pd.DataFrame(block_rows)
+    if not block_df.empty:
+        block_df = block_df.sort_values(
+            ["run_order", "run_seed", "strategy", "balance_mode", "model", "detector_variant"]
+        ).reset_index(drop=True)
+
+    yearly_frames: list[pd.DataFrame] = []
+    adaptive_frames: list[pd.DataFrame] = []
+    roc_payload_rows: list[Dict[str, object]] = []
+    execution_log_rows = list(manifest.get("global_execution_log") or [])
+    for payload in block_payloads:
+        yearly_rows = payload.get("yearly_rows") or []
+        adaptive_rows = payload.get("adaptive_rows") or []
+        roc_payload_rows.extend(
+            item
+            for item in (payload.get("roc_payload") or [])
+            if isinstance(item, dict)
+        )
+        if yearly_rows:
+            yearly_frames.append(pd.DataFrame(yearly_rows))
+        if adaptive_rows:
+            adaptive_frames.append(pd.DataFrame(adaptive_rows))
+        execution_log_rows.extend(list(payload.get("execution_log") or []))
+    yearly_df = pd.concat(yearly_frames, ignore_index=True) if yearly_frames else pd.DataFrame()
+    adaptive_df = pd.concat(adaptive_frames, ignore_index=True) if adaptive_frames else pd.DataFrame()
+    for idx, row in enumerate(execution_log_rows, start=1):
+        row["order"] = idx
+    execution_log_df = pd.DataFrame(execution_log_rows)
+
+    tuning_artifacts: list[Dict[str, object]] = []
+    if tuning_dir.exists():
+        for tuning_path in sorted(tuning_dir.glob("*.json")):
+            artifact = _load_json_file(tuning_path, default=None)
+            if isinstance(artifact, dict):
+                tuning_artifacts.append(artifact)
+    tuning_trials_df = _build_drift_tuning_trials_frame(tuning_artifacts)
+    summary_df = _build_drift_partial_summary(yearly_df, adaptive_df)
+    memory_trace_df = _build_drift_execution_memory_trace(execution_log_df)
+    average_roc_df = _build_drift_average_roc_curves(roc_payload_rows)
+
+    live_status = _load_json_file(live_status_path, default={}) or {}
+    live_event_rows = _read_jsonl_records(live_events_path)
+    if not live_event_rows and isinstance(live_status, dict) and live_status:
+        live_event_rows = [live_status]
+    if not live_event_rows and isinstance(manifest, dict) and manifest:
+        progress = dict(manifest.get("progress") or {})
+        live_event_rows = [
+            {
+                "timestamp": manifest.get("updated_at") or manifest.get("started_at"),
+                "completed_units": progress.get("completed_units", 0.0),
+                "total_units": progress.get("total_units", 0),
+                "progress_ratio": (
+                    float(progress.get("completed_units", 0.0)) / float(max(1, int(progress.get("total_units", 0) or 1)))
+                ),
+                "label": "Checkpoint state",
+                "detail": "",
+                "context": {},
+            }
+        ]
+    live_events_df = pd.DataFrame(live_event_rows)
+    if not live_events_df.empty:
+        if "progress_ratio" not in live_events_df.columns:
+            live_events_df["progress_ratio"] = (
+                pd.to_numeric(live_events_df.get("completed_units"), errors="coerce")
+                / pd.to_numeric(live_events_df.get("total_units"), errors="coerce").clip(lower=1)
+            )
+        live_events_df["progress_pct"] = 100.0 * pd.to_numeric(live_events_df["progress_ratio"], errors="coerce")
+        live_events_df["event_index"] = range(1, len(live_events_df) + 1)
+
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "run_dir": run_dir,
+        "block_df": block_df,
+        "yearly_df": yearly_df,
+        "adaptive_df": adaptive_df,
+        "summary_df": summary_df,
+        "execution_log_df": execution_log_df,
+        "memory_trace_df": memory_trace_df,
+        "roc_payload": roc_payload_rows,
+        "average_roc_df": average_roc_df,
+        "tuning_trials_df": tuning_trials_df,
+        "tuning_artifacts": tuning_artifacts,
+        "live_status": live_status,
+        "live_events_df": live_events_df,
+        "live_status_path": live_status_path,
+        "live_events_path": live_events_path,
+    }
 
 
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
@@ -1248,20 +2031,436 @@ def _render_best_highway_section_view(
     st.dataframe(plot_df, width="stretch")
 
 
+def _render_drift_block_matrix(block_df: pd.DataFrame) -> None:
+    if block_df is None or block_df.empty:
+        st.info("No hay bloques registrados en el checkpoint.")
+        return
+    chart_df = block_df.copy()
+    chart_df["status"] = chart_df["status"].astype(str).str.lower()
+    status_short = {
+        "pending": "P",
+        "running": "R",
+        "completed": "OK",
+        "failed": "ERR",
+    }
+    chart_df["status_short"] = chart_df["status"].map(status_short).fillna(
+        chart_df["status"].str[:3].str.upper()
+    )
+    block_order = chart_df["block_label"].drop_duplicates().tolist()
+    seed_order = (
+        chart_df.sort_values(["run_order", "run_seed"])["seed_label"]
+        .drop_duplicates()
+        .tolist()
+    )
+
+    try:
+        import altair as alt
+    except ImportError:
+        table_df = chart_df[
+            ["seed_label", "block_label", "status", "strategy", "model", "balance_mode"]
+        ].copy()
+        st.dataframe(table_df, width="stretch")
+        return
+
+    color_domain = ["pending", "running", "completed", "failed"]
+    color_range = ["#c7c7c7", "#1f77b4", "#2ca02c", "#d62728"]
+    tooltip = [
+        "seed_label",
+        "block_label",
+        "status",
+        "strategy",
+        "model",
+        "detector_variant",
+        "balance_mode",
+        "saved_at",
+    ]
+    base = (
+        alt.Chart(chart_df)
+        .mark_rect(cornerRadius=3)
+        .encode(
+            x=alt.X(
+                "block_label:N",
+                title="Bloques",
+                sort=block_order,
+                axis=alt.Axis(labelAngle=-35),
+            ),
+            y=alt.Y("seed_label:N", title="Seeds", sort=seed_order),
+            color=alt.Color(
+                "status:N",
+                title="Estado",
+                scale=alt.Scale(domain=color_domain, range=color_range),
+            ),
+            tooltip=tooltip,
+        )
+        .properties(height=max(140, 40 * len(seed_order)))
+    )
+    text = (
+        alt.Chart(chart_df)
+        .mark_text(color="white", fontSize=10)
+        .encode(
+            x=alt.X("block_label:N", sort=block_order),
+            y=alt.Y("seed_label:N", sort=seed_order),
+            text="status_short:N",
+        )
+    )
+    st.altair_chart((base + text).interactive(), width="stretch")
+
+
+def _render_drift_roc_curves(
+    average_roc_df: pd.DataFrame,
+    *,
+    key_prefix: str = "live_drift_roc",
+) -> None:
+    if average_roc_df is None or average_roc_df.empty:
+        st.info("No hay curvas ROC-AUC disponibles todavia.")
+        return
+
+    plot_df = average_roc_df.copy()
+    strategies = plot_df["strategy"].astype(str).drop_duplicates().tolist()
+    selected_strategies = st.multiselect(
+        "Estrategias ROC",
+        options=strategies,
+        default=strategies,
+        key=f"{key_prefix}_strategies",
+    )
+    if selected_strategies:
+        plot_df = plot_df.loc[
+            plot_df["strategy"].astype(str).isin([str(item) for item in selected_strategies])
+        ].copy()
+
+    if plot_df.empty:
+        st.info("No hay curvas ROC-AUC para las estrategias seleccionadas.")
+        return
+
+    st.caption("Curvas promedio agregadas desde los bloques completados.")
+
+    try:
+        import plotly.express as px
+    except ImportError:
+        roc_pivot = plot_df.pivot_table(
+            index="fpr",
+            columns="label",
+            values="tpr",
+            aggfunc="last",
+        ).sort_index()
+        st.line_chart(roc_pivot, width="stretch")
+    else:
+        fig = px.line(
+            plot_df,
+            x="fpr",
+            y="tpr",
+            color="label",
+            facet_col="strategy",
+            facet_col_wrap=2,
+            line_group="label",
+            hover_data=["strategy", "model", "balance_mode"],
+        )
+        fig.update_layout(
+            xaxis_title="False Positive Rate",
+            yaxis_title="True Positive Rate",
+            legend_title_text="Serie",
+        )
+        fig.update_xaxes(range=[0.0, 1.0])
+        fig.update_yaxes(range=[0.0, 1.0])
+        st.plotly_chart(fig, width="stretch")
+
+    st.dataframe(plot_df, width="stretch")
+
+
+def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
+    manifest = dict(data.get("manifest") or {})
+    live_status = dict(data.get("live_status") or {})
+    live_events_df = data.get("live_events_df")
+    block_df = data.get("block_df")
+    summary_df = data.get("summary_df")
+    tuning_trials_df = data.get("tuning_trials_df")
+    memory_trace_df = data.get("memory_trace_df")
+    average_roc_df = data.get("average_roc_df")
+    yearly_df = data.get("yearly_df")
+    adaptive_df = data.get("adaptive_df")
+    execution_log_df = data.get("execution_log_df")
+    live_result_tables = _build_drift_live_result_tables(
+        manifest,
+        block_df if isinstance(block_df, pd.DataFrame) else pd.DataFrame(),
+        yearly_df if isinstance(yearly_df, pd.DataFrame) else pd.DataFrame(),
+        adaptive_df if isinstance(adaptive_df, pd.DataFrame) else pd.DataFrame(),
+    )
+
+    st.caption("Experimento detectado: Drift recalibration")
+    st.caption(f"Checkpoint: {data.get('manifest_path')}")
+    st.caption(f"Run dir: {data.get('run_dir')}")
+
+    progress = dict(manifest.get("progress") or {})
+    total_units = _safe_int(
+        live_status.get("total_units", progress.get("total_units", 0)),
+        default=1,
+    )
+    completed_units = pd.to_numeric(
+        live_status.get("completed_units", progress.get("completed_units", 0.0)),
+        errors="coerce",
+    )
+    if pd.isna(completed_units):
+        completed_units = 0.0
+    progress_ratio = pd.to_numeric(
+        live_status.get("progress_ratio"), errors="coerce"
+    )
+    if pd.isna(progress_ratio):
+        progress_ratio = float(completed_units) / float(max(1, total_units))
+    progress_ratio = max(0.0, min(float(progress_ratio), 1.0))
+    status = str(
+        live_status.get("status")
+        or manifest.get("status")
+        or "unknown"
+    )
+    updated_at = str(
+        live_status.get("timestamp")
+        or manifest.get("updated_at")
+        or manifest.get("started_at")
+        or "-"
+    )
+    context = dict(live_status.get("context") or {})
+    current_label = str(live_status.get("label") or "Sin actividad registrada")
+    current_detail = str(live_status.get("detail") or "")
+
+    if status == "failed":
+        last_error = dict(manifest.get("last_error") or {})
+        st.error(
+            f"Checkpoint fallido en fase `{last_error.get('phase', 'desconocida')}`: {last_error.get('error', 'sin detalle')}"
+        )
+    elif status == "completed":
+        st.success("Corrida completada. Se muestran resultados finales y trazas de ejecución.")
+    else:
+        st.info("Corrida en progreso o reanudable. La vista se actualiza con el checkpoint persistido.")
+
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6 = st.columns(6)
+    kpi_1.metric("Estado", status)
+    kpi_2.metric("Progreso", f"{100.0 * progress_ratio:.1f}%")
+    kpi_3.metric(
+        "Tunings",
+        f"{_safe_int(progress.get('completed_tuning_tasks'))}/{_safe_int(progress.get('total_tuning_tasks'))}",
+    )
+    kpi_4.metric(
+        "Bloques",
+        f"{_safe_int(progress.get('completed_blocks'))}/{_safe_int(progress.get('total_blocks'))}",
+    )
+    kpi_5.metric("Ultima actualizacion", updated_at)
+    kpi_6.metric("SMOTE cache", f"{len(manifest.get('smote_index') or {})}")
+
+    st.progress(progress_ratio)
+    st.caption(current_label)
+    if current_detail:
+        st.caption(current_detail)
+
+    active_col_1, active_col_2, active_col_3, active_col_4 = st.columns(4)
+    active_col_1.metric("Fase activa", str(context.get("phase") or "-"))
+    active_col_2.metric("Estrategia", str(context.get("strategy") or "-"))
+    active_col_3.metric("Modelo", str(context.get("model") or "-"))
+    active_col_4.metric("Seed", str(context.get("run_seed") or "-"))
+
+    live_tab, partial_tab, data_tab = st.tabs(
+        ["Live calculations", "Partial results", "Raw data"]
+    )
+
+    with live_tab:
+        st.markdown("**Progress over time**")
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            history_df = live_events_df.copy()
+            if "event_index" not in history_df.columns:
+                history_df["event_index"] = range(1, len(history_df) + 1)
+            if "progress_pct" not in history_df.columns:
+                history_df["progress_pct"] = 100.0 * pd.to_numeric(
+                    history_df.get("progress_ratio"), errors="coerce"
+                )
+            plot_df = history_df[["event_index", "progress_pct"]].copy()
+            plot_df = plot_df.dropna(subset=["progress_pct"])
+            if not plot_df.empty:
+                st.line_chart(plot_df.set_index("event_index")["progress_pct"], width="stretch")
+            st.dataframe(
+                history_df[["event_index", "timestamp", "label", "detail", "progress_pct"]],
+                width="stretch",
+            )
+        else:
+            st.info("No hay eventos live persistidos todavía.")
+
+        st.markdown("**Block execution matrix**")
+        _render_drift_block_matrix(
+            block_df if isinstance(block_df, pd.DataFrame) else pd.DataFrame()
+        )
+
+        st.markdown("**Progress breakdown**")
+        block_status_df = (
+            pd.DataFrame(columns=["status", "count"])
+            if not isinstance(block_df, pd.DataFrame) or block_df.empty
+            else block_df["status"].astype(str).value_counts().rename_axis("status").reset_index(name="count")
+        )
+        if not block_status_df.empty:
+            st.bar_chart(
+                block_status_df.set_index("status")["count"],
+                width="stretch",
+            )
+            st.dataframe(block_status_df, width="stretch")
+        else:
+            st.info("No hay estados de bloques para resumir.")
+
+        st.markdown("**Tuning evolution**")
+        if isinstance(tuning_trials_df, pd.DataFrame) and not tuning_trials_df.empty:
+            tuning_plot = tuning_trials_df.copy()
+            tuning_plot["series_label"] = (
+                tuning_plot["model"].astype(str)
+                + " | "
+                + tuning_plot["balance_mode"].astype(str)
+                + " | "
+                + tuning_plot["stage"].astype(str)
+            )
+            tuning_plot["best_so_far"] = tuning_plot.groupby("series_label")["cv_auc"].cummax()
+            tuning_pivot = tuning_plot.pivot_table(
+                index="trial_number",
+                columns="series_label",
+                values="best_so_far",
+                aggfunc="max",
+            ).sort_index()
+            st.line_chart(tuning_pivot, width="stretch")
+            st.dataframe(tuning_plot, width="stretch")
+        else:
+            st.info("No hay tuning trials persistidos todavía.")
+
+        st.markdown("**Execution resource trace**")
+        if isinstance(memory_trace_df, pd.DataFrame) and not memory_trace_df.empty:
+            trace_metric = st.selectbox(
+                "Trace metric",
+                options=sorted(memory_trace_df["metric"].astype(str).unique().tolist()),
+                index=0,
+                key="live_drift_trace_metric",
+            )
+            trace_plot = memory_trace_df.loc[
+                memory_trace_df["metric"].astype(str) == str(trace_metric)
+            ].copy()
+            if not trace_plot.empty:
+                trace_plot["series_label"] = (
+                    trace_plot["phase"].astype(str) + " | " + trace_plot["status"].astype(str)
+                )
+                trace_pivot = trace_plot.pivot_table(
+                    index="order",
+                    columns="series_label",
+                    values="value",
+                    aggfunc="last",
+                ).sort_index()
+                st.line_chart(trace_pivot, width="stretch")
+            st.dataframe(trace_plot, width="stretch")
+        else:
+            st.info("No hay trazas de recursos disponibles.")
+
+    with partial_tab:
+        st.markdown("**Experiment result tables**")
+        has_live_tables = any(
+            isinstance(table_df, pd.DataFrame) and not table_df.empty
+            for table_df in live_result_tables.values()
+        )
+        if has_live_tables:
+            for table_key in ["A.6", "A.7", "A.8", "A.9"]:
+                table_df = live_result_tables.get(table_key)
+                st.caption(f"Table {table_key}")
+                if isinstance(table_df, pd.DataFrame) and not table_df.empty:
+                    st.dataframe(table_df, width="stretch")
+                else:
+                    st.info(f"Table {table_key} no aplica a la configuracion actual.")
+        else:
+            st.info("No fue posible reconstruir tablas live para la corrida actual.")
+
+        st.markdown("**ROC-AUC curves by strategy**")
+        _render_drift_roc_curves(
+            average_roc_df if isinstance(average_roc_df, pd.DataFrame) else pd.DataFrame(),
+            key_prefix="partial_drift_roc",
+        )
+
+        st.markdown("**Partial strategy summary**")
+        if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
+            if "auc" in summary_df.columns and summary_df["auc"].notna().any():
+                chart_df = summary_df.copy()
+                chart_df["series_label"] = (
+                    chart_df["source"].astype(str)
+                    + " | "
+                    + chart_df["strategy"].astype(str)
+                    + " | "
+                    + chart_df["model"].astype(str)
+                    + " | "
+                    + chart_df["balance_mode"].astype(str)
+                )
+                st.bar_chart(
+                    chart_df.set_index("series_label")["auc"],
+                    width="stretch",
+                )
+            st.dataframe(summary_df, width="stretch")
+        else:
+            st.info("Aún no hay resultados parciales agregables.")
+
+        st.markdown("**Completed blocks**")
+        if isinstance(block_df, pd.DataFrame) and not block_df.empty:
+            completed_blocks = block_df.loc[
+                block_df["status"].astype(str).str.lower() == "completed"
+            ].copy()
+            if not completed_blocks.empty:
+                st.dataframe(completed_blocks, width="stretch")
+            else:
+                st.info("Todavía no hay bloques completados.")
+        else:
+            st.info("No hay bloque index persistido.")
+
+        st.markdown("**Accumulated rows**")
+        acc_col_1, acc_col_2, acc_col_3 = st.columns(3)
+        acc_col_1.metric(
+            "Yearly rows",
+            str(len(yearly_df)) if isinstance(yearly_df, pd.DataFrame) else "0",
+        )
+        acc_col_2.metric(
+            "Adaptive rows",
+            str(len(adaptive_df)) if isinstance(adaptive_df, pd.DataFrame) else "0",
+        )
+        acc_col_3.metric(
+            "Execution log rows",
+            str(len(execution_log_df))
+            if isinstance(execution_log_df, pd.DataFrame)
+            else "0",
+        )
+        if isinstance(yearly_df, pd.DataFrame) and not yearly_df.empty:
+            st.markdown("**Yearly preview**")
+            st.dataframe(yearly_df, width="stretch")
+        if isinstance(adaptive_df, pd.DataFrame) and not adaptive_df.empty:
+            st.markdown("**Adaptive preview**")
+            st.dataframe(adaptive_df, width="stretch")
+
+    with data_tab:
+        st.markdown("**Manifest**")
+        st.json(manifest, expanded=False)
+        if live_status:
+            st.markdown("**Live status**")
+            st.json(live_status, expanded=False)
+        if isinstance(block_df, pd.DataFrame) and not block_df.empty:
+            st.markdown("**Block index**")
+            st.dataframe(block_df, width="stretch")
+        if isinstance(tuning_trials_df, pd.DataFrame) and not tuning_trials_df.empty:
+            st.markdown("**Tuning trials**")
+            st.dataframe(tuning_trials_df, width="stretch")
+        if isinstance(execution_log_df, pd.DataFrame) and not execution_log_df.empty:
+            st.markdown("**Execution log**")
+            st.dataframe(execution_log_df, width="stretch")
+
+
 def main(*, set_page_config: bool = True) -> None:
     if set_page_config:
         st.set_page_config(page_title="Experiments Live", layout="wide")
     st.title("Experimentos en vivo")
 
-    db_files = _list_live_db_files()
-    db_names = [p.name for p in db_files]
-    if not db_names:
-        st.info("No hay bases de datos de experimentos.")
+    sources = _build_live_sources()
+    if not sources:
+        st.info("No hay fuentes live disponibles.")
         return
-    selected = st.selectbox(
-        "Base de datos",
-        options=db_names,
+
+    selected_idx = st.selectbox(
+        "Fuente en vivo",
+        options=list(range(len(sources))),
         index=0,
+        format_func=lambda idx: str(sources[idx]["label"]),
     )
 
     auto_refresh = st.sidebar.checkbox(
@@ -1276,77 +2475,79 @@ def main(*, set_page_config: bool = True) -> None:
     if st.sidebar.button("Actualizar ahora"):
         st.rerun()
 
-    path = next((p for p in db_files if p.name == selected), None)
-    if path is None:
-        st.warning("Seleccione una base valida.")
-        return
-
-    meta, df, best_row = _read_live_db(path)
-    st.caption(f"Archivo: {path}")
-    if meta:
-        with st.expander("Meta", expanded=False):
-            st.json(meta)
-
-    if df.empty:
-        st.warning("No hay resultados en la base de datos.")
+    source = sources[int(selected_idx)]
+    source_type = str(source.get("type") or "")
+    path = Path(str(source.get("path")))
+    if source_type == "drift_recalibration":
+        run_data = _read_drift_run(path)
+        _render_drift_recalibration_view(run_data)
     else:
-        experiment_name = str(meta.get("experiment", "")).lower()
-        is_find_samples = (
-            "find samples" in experiment_name
-            or df.get("experiment", pd.Series())
-            .astype(str)
-            .str.contains("find samples", case=False, na=False)
-            .any()
-            or "candidate_rank" in df.columns
-        )
-        is_best_section = (
-            "best highway section" in experiment_name
-            or df.get("experiment", pd.Series())
-            .astype(str)
-            .str.contains("best highway section", case=False, na=False)
-            .any()
-        )
-        is_gnn_recursive = (
-            "opt.recursiva" in experiment_name
-            or "opt recursiva" in experiment_name
-            or df.get("experiment", pd.Series())
-            .astype(str)
-            .str.contains("opt\\.recursiva|opt recursiva", case=False, na=False)
-            .any()
-            or {"optimizer", "iteration"}.issubset(df.columns)
-        )
-        is_gnn_optuna = (
-            "gnn optuna" in experiment_name
-            or df.get("experiment", pd.Series())
-            .astype(str)
-            .str.contains("gnn optuna", case=False, na=False)
-            .any()
-            or {"objective_label", "test_f1"}.issubset(df.columns)
-        )
-        is_gnn_sampler_memory = (
-            "sampler memory budget" in experiment_name
-            or df.get("experiment", pd.Series())
-            .astype(str)
-            .str.contains("sampler memory budget", case=False, na=False)
-            .any()
-            or {
-                "memory_peak_fraction_budget",
-                "batch_size",
-            }.issubset(df.columns)
-        )
+        meta, df, best_row = _read_live_db(path)
+        st.caption(f"Archivo: {path}")
+        if meta:
+            with st.expander("Meta", expanded=False):
+                st.json(meta)
 
-        if is_gnn_sampler_memory:
-            _render_gnn_sampler_memory_budget_view(df, best_row)
-        elif is_best_section:
-            _render_best_highway_section_view(df, best_row)
-        elif is_gnn_recursive:
-            _render_gnn_recursive_view(df, best_row)
-        elif is_gnn_optuna:
-            _render_gnn_optuna_objectives_view(df, best_row)
-        elif is_find_samples:
-            _render_find_samples_view(df, best_row)
+        if df.empty:
+            st.warning("No hay resultados en la base de datos.")
         else:
-            _render_features_sampler_view(df)
+            experiment_name = str(meta.get("experiment", "")).lower()
+            is_find_samples = (
+                "find samples" in experiment_name
+                or df.get("experiment", pd.Series())
+                .astype(str)
+                .str.contains("find samples", case=False, na=False)
+                .any()
+                or "candidate_rank" in df.columns
+            )
+            is_best_section = (
+                "best highway section" in experiment_name
+                or df.get("experiment", pd.Series())
+                .astype(str)
+                .str.contains("best highway section", case=False, na=False)
+                .any()
+            )
+            is_gnn_recursive = (
+                "opt.recursiva" in experiment_name
+                or "opt recursiva" in experiment_name
+                or df.get("experiment", pd.Series())
+                .astype(str)
+                .str.contains("opt\\.recursiva|opt recursiva", case=False, na=False)
+                .any()
+                or {"optimizer", "iteration"}.issubset(df.columns)
+            )
+            is_gnn_optuna = (
+                "gnn optuna" in experiment_name
+                or df.get("experiment", pd.Series())
+                .astype(str)
+                .str.contains("gnn optuna", case=False, na=False)
+                .any()
+                or {"objective_label", "test_f1"}.issubset(df.columns)
+            )
+            is_gnn_sampler_memory = (
+                "sampler memory budget" in experiment_name
+                or df.get("experiment", pd.Series())
+                .astype(str)
+                .str.contains("sampler memory budget", case=False, na=False)
+                .any()
+                or {
+                    "memory_peak_fraction_budget",
+                    "batch_size",
+                }.issubset(df.columns)
+            )
+
+            if is_gnn_sampler_memory:
+                _render_gnn_sampler_memory_budget_view(df, best_row)
+            elif is_best_section:
+                _render_best_highway_section_view(df, best_row)
+            elif is_gnn_recursive:
+                _render_gnn_recursive_view(df, best_row)
+            elif is_gnn_optuna:
+                _render_gnn_optuna_objectives_view(df, best_row)
+            elif is_find_samples:
+                _render_find_samples_view(df, best_row)
+            else:
+                _render_features_sampler_view(df)
 
     if auto_refresh:
         time.sleep(float(refresh_seconds))

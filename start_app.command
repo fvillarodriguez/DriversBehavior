@@ -52,6 +52,17 @@ load_env_file() {
 load_env_file ".env"
 load_env_file ".env.local"
 
+setup_python_warning_filters() {
+  local sklearn_parallel_filter="ignore::UserWarning:sklearn.utils.parallel"
+  if [ -n "${PYTHONWARNINGS:-}" ]; then
+    export PYTHONWARNINGS="${sklearn_parallel_filter},${PYTHONWARNINGS}"
+  else
+    export PYTHONWARNINGS="${sklearn_parallel_filter}"
+  fi
+}
+
+setup_python_warning_filters
+
 setup_crash_reporter_suppression() {
   if [ "$(uname -s)" != "Darwin" ]; then
     return

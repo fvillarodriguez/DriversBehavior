@@ -1,0 +1,476 @@
+\section{Drift detection}
+\label{sec:drift-detection}
+
+\subsection{Objetivo, alcance y relaci\'on con el paper}
+El m\'odulo \texttt{src/drift\_detection\_app.py} implementa un espacio de trabajo de replicaci\'on para el paper \textit{Evaluating recalibration strategies for real-time crash prediction: adaptive drift detection vs. cumulative retraining}. El propio archivo declara que concentra la secci\'on completa de \textit{Drift detection} en una sola fuente Python, y organiza la reproducci\'on de la metodolog\'ia, la construcci\'on de features, la selecci\'on de variables, la ejecuci\'on experimental y la verificaci\'on de cobertura.
+
+El alcance real del m\'odulo va m\'as all\'a de un detector puntual de drift. Incluye:
+\begin{itemize}[leftmargin=*]
+  \item preparaci\'on determinista del dataset de crash prediction para el corredor analizado;
+  \item estrategias batch de recalibraci\'on anual;
+  \item estrategias adaptativas con ADWIN, ARF y KSWIN;
+  \item persistencia de checkpoints, cach\'es de tuning y artefactos SMOTE;
+  \item salidas resumidas alineadas con Appendix A.6--A.9 y Figure 7 del paper.
+\end{itemize}
+
+La configuraci\'on de referencia del paper se fija con \texttt{PAPER\_TIME\_SPAN = 2018-01-01 to 2024-09-30}. Adem\'as, el corredor de foco se restringe al conjunto fijo de p\'orticos \texttt{11, 12, 14, 15} (\texttt{DRIFT\_FOCUS\_PORTICOS}), mientras que el orden de segmentos usado para la ingenier\'ia de variables del art\'iculo es \texttt{15\textrightarrow14}, \texttt{14\textrightarrow12} y \texttt{12\textrightarrow11}.
+
+\subsection{Dependencias y fuentes de datos}
+El m\'odulo asume como fuente principal de flujos la base \texttt{Datos/flujos.duckdb} y la tabla \texttt{flujos\_duckdb}. Para eventos utiliza archivos CSV bajo \texttt{Datos/} procesados con \texttt{process\_accidentes\_df}, y para georreferencia y relaci\'on entre p\'orticos utiliza \texttt{Datos/Porticos.csv} a trav\'es de \texttt{load\_porticos}, \texttt{find\_candidate\_porticos} y \texttt{get\_portico\_segments}.
+
+La app tambi\'en depende de librer\'ias opcionales seg\'un la etapa:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{duckdb} para consulta y persistencia de features;
+  \item \texttt{optuna} para tuning de hiperpar\'ametros;
+  \item \texttt{imblearn} para \texttt{SMOTE};
+  \item \texttt{river} para \texttt{ADWIN}, \texttt{KSWIN} y \texttt{AdaptiveRandomForestClassifier}.
+\end{itemize}
+
+\subsection{Mapa de la interfaz tab a tab}
+La funci\'on \texttt{main()} crea seis tabs con etiquetas reales \texttt{Blueprint}, \texttt{Eventos}, \texttt{Feature engineering}, \texttt{Feature Selection}, \texttt{Experiments} y \texttt{Coverage}. Cada una corresponde a un bloque funcional expl\'icito:
+
+\paragraph{Blueprint}
+\texttt{\_render\_blueprint\_tab()} presenta la matriz de replicaci\'on del paper, la tabla de trabajo relacionado (\texttt{build\_related\_work\_table()}), las secciones/figuras/tablas cubiertas y el plan de migraci\'on desde R a Python (\texttt{build\_python\_migration\_review\_plan()}).
+
+\paragraph{Eventos}
+\texttt{\_render\_events\_tab()} carga uno o m\'ultiples archivos de accidentes desde \texttt{Datos/}, procesa la asignaci\'on a p\'orticos con \texttt{process\_accidentes\_df()}, conserva los eventos excluidos por falta de mapeo y construye un resumen por tramo para comparar con \textit{Crash prediction}.
+
+\paragraph{Feature engineering}
+\texttt{\_render\_feature\_engineering\_tab()} ofrece tres fuentes: cargar DuckDB existente, recalcular features o reutilizar el dataset en memoria. En modo de c\'alculo, consulta \texttt{flujos.duckdb}, genera variables para p\'orticos, segmentos y carriles, construye \texttt{target}, aplica Stage 1 y Stage 2 y exporta un DuckDB con tablas \texttt{raw\_features} y \texttt{clean\_features}.
+
+\paragraph{Feature Selection}
+\texttt{\_render\_feature\_selection\_tab()} ejecuta filtrado por correlaci\'on, ranking con Random Forest y persistencia del resultado de selecci\'on dentro del mismo archivo DuckDB de features.
+
+\paragraph{Experiments}
+\texttt{\_render\_experiments\_tab()} bloquea el conjunto final de variables, permite seleccionar modelos batch, estrategias, variantes ARF/KSWIN, modos de balanceo y semillas secuenciales, y luego invoca \texttt{run\_recalibration\_experiments()} con soporte de \textit{preview}, \textit{resume} y arranque limpio ignorando checkpoints existentes.
+
+\paragraph{Coverage}
+\texttt{\_render\_coverage\_tab()} valida que todas las secciones, figuras y tablas declaradas en \texttt{ARTICLE\_SECTIONS}, \texttt{ARTICLE\_FIGURES} y \texttt{ARTICLE\_TABLES} queden mapeadas a artefactos concretos en Python. Esta verificaci\'on se resume con \texttt{article\_coverage\_percentage()}.
+
+\subsection{Feature engineering y construcci\'on del target}
+La ingenier\'ia de variables est\'a concentrada en \texttt{\_compute\_drift\_article\_features()}, con apoyo de \texttt{feature\_catalog\_table()} y \texttt{feature\_engineering\_reference\_table()}. El objetivo es replicar la Table 4 del paper y producir un dataset listo para predicci\'on en grilla de 5 minutos, manteniendo exactamente la sem\'antica operativa del c\'odigo.
+
+\paragraph{Notaci\'on operativa}
+Sea \(\Delta = 5\) minutos el ancho del intervalo temporal, y sea
+\[
+b(\tau) = \left\lfloor \frac{\tau}{\Delta} \right\rfloor \Delta
+\]
+la funci\'on que asigna un timestamp \(\tau\) al inicio del intervalo correspondiente. Bajo la configuraci\'on art\'iculo por defecto, el corredor usa el orden de p\'orticos
+\[
+P = (15, 14, 12, 11),
+\]
+las categor\'ias
+\[
+C = \{\mathrm{Light}, \mathrm{Heavy}, \mathrm{Motorcycle}\},
+\]
+y los segmentos consecutivos
+\[
+S = \{(15,14), (14,12), (12,11)\}.
+\]
+Cada registro AVI crudo aporta timestamp \(\tau_r\), velocidad puntual \(v_r\), categor\'ia \(c_r\), patente \(\pi_r\), p\'ortico \(p_r\) y carril \(\ell_r\). La app mapea \texttt{CATEGORIA} a \texttt{Light/Heavy/Motorcycle} con \texttt{DRIFT\_ARTICLE\_CATEGORY\_MAP}, es decir, \(\{1\mapsto \mathrm{Light}, 2\mapsto \mathrm{Heavy}, 3\mapsto \mathrm{Heavy}, 4\mapsto \mathrm{Motorcycle}\}\).
+
+\paragraph{Espacio de variables generado}
+Con el corredor fijo de cuatro p\'orticos, tres segmentos, tres categor\'ias y tres carriles, la configuraci\'on completa genera 260 predictores num\'ericos antes de agregar \texttt{target}:
+\begin{itemize}[leftmargin=*]
+  \item 96 variables por p\'ortico y tipo de veh\'iculo: \(4\) m\'etricas base + \(4\) deltas, para \(4\) p\'orticos y \(3\) categor\'ias;
+  \item 8 variables composicionales por p\'ortico: \texttt{ft\_motorcycle\_*} y \texttt{ft\_heavy\_*};
+  \item 72 variables por segmento y categor\'ia: \(5\) m\'etricas base + \(3\) deltas, para \(3\) segmentos y \(3\) categor\'ias;
+  \item 21 variables globales por segmento: \(4\) m\'etricas base + \(3\) deltas, para \(3\) segmentos;
+  \item 63 variables por carril de origen: \(4\) m\'etricas base + \(3\) deltas, para \(3\) segmentos y \(3\) carriles.
+\end{itemize}
+Si el usuario restringe p\'orticos o categor\'ias desde la UI, este espacio se reduce, pero las definiciones matem\'aticas se mantienen invariantes.
+
+\paragraph{Variables por p\'ortico y tipo de veh\'iculo}
+Para cada intervalo \(t\), p\'ortico \(p \in P\) y categor\'ia \(c \in C\), se define el conjunto de observaciones
+\[
+G_{t,p,c} = \{r : b(\tau_r)=t,\ p_r=p,\ c_r=c\}.
+\]
+Sobre ese conjunto se calculan las variables con prefijos \texttt{flow\_}, \texttt{vel\_}, \texttt{sd\_}, \texttt{den\_}:
+\[
+\mathrm{Flow}_{t,p,c} = |G_{t,p,c}|,
+\]
+\[
+\mathrm{Vel}_{t,p,c} = \frac{1}{|G_{t,p,c}|}\sum_{r \in G_{t,p,c}} v_r,
+\]
+\[
+\mathrm{Sd}_{t,p,c} = \sqrt{\frac{1}{|G_{t,p,c}|-1}\sum_{r \in G_{t,p,c}}(v_r-\mathrm{Vel}_{t,p,c})^2},
+\]
+\[
+\mathrm{Den}_{t,p,c} =
+\begin{cases}
+\dfrac{\mathrm{Flow}_{t,p,c}}{\mathrm{Vel}_{t,p,c}}, & \text{si } \mathrm{Vel}_{t,p,c} > 0, \\
+\mathrm{NA}, & \text{en otro caso.}
+\end{cases}
+\]
+En la implementaci\'on real, \(\mathrm{Flow}\) se rellena con \(0\) cuando no hay observaciones, mientras que \(\mathrm{Vel}\), \(\mathrm{Sd}\) y \(\mathrm{Den}\) permanecen vac\'ias cuando el grupo no existe o no tiene suficiente soporte. Adem\'as, \(\mathrm{Sd}\) usa la desviaci\'on est\'andar muestral de \texttt{pandas}; por tanto, si s\'olo hay un veh\'iculo en el grupo, la columna queda en \texttt{NaN}.
+
+Los cambios temporales se construyen con primera diferencia dentro de cada serie temporal:
+\[
+\Delta X_{t,p,c} = X_{t,p,c} - X_{t-\Delta,p,c},
+\qquad
+X \in \{\mathrm{Flow}, \mathrm{Vel}, \mathrm{Den}, \mathrm{Sd}\}.
+\]
+Esto produce las columnas \texttt{delta\_flow\_*}, \texttt{delta\_vel\_*}, \texttt{delta\_den\_*} y \texttt{delta\_sd\_*}. Para el primer intervalo donde la variable base est\'a definida, el c\'odigo fija el delta en \(0\); si la variable base ya nace vac\'ia, el delta tambi\'en queda vac\'io.
+
+\paragraph{Fracciones composicionales por p\'ortico}
+Sobre el mismo intervalo y p\'ortico, la app calcula el flujo total
+\[
+\mathrm{Flow}^{\mathrm{tot}}_{t,p}
+= \mathrm{Flow}_{t,p,\mathrm{Light}}
++ \mathrm{Flow}_{t,p,\mathrm{Heavy}}
++ \mathrm{Flow}_{t,p,\mathrm{Motorcycle}}.
+\]
+Con ello deriva las fracciones
+\[
+\mathrm{FtMotorcycle}_{t,p} =
+\frac{\mathrm{Flow}_{t,p,\mathrm{Motorcycle}}}{\mathrm{Flow}^{\mathrm{tot}}_{t,p}},
+\qquad
+\mathrm{FtHeavy}_{t,p} =
+\frac{\mathrm{Flow}_{t,p,\mathrm{Heavy}}}{\mathrm{Flow}^{\mathrm{tot}}_{t,p}}.
+\]
+Estas son las columnas \texttt{ft\_motorcycle\_*} y \texttt{ft\_heavy\_*}. Si el flujo total del p\'ortico es cero, ambas fracciones quedan en \texttt{NaN} en vez de forzarse a cero, porque el denominador no representa una mezcla observada.
+
+\paragraph{Matching por segmento entre p\'orticos consecutivos}
+Las variables segmentales no se calculan a partir de velocidades locales del p\'ortico, sino de viajes emparejados entre dos p\'orticos consecutivos. Para cada segmento \(s=(p^{-},p^{+}) \in S\), la distancia \(d_s\) se obtiene con \texttt{\_lookup\_article\_segment\_distance\_km()}, priorizando metadatos viales y usando fallback geom\'etrico si hace falta.
+
+La ventana m\'axima de matching depende de la distancia:
+\[
+\tau_s = \max\left(30,\ \frac{60\,d_s}{20}\right)\ \text{minutos},
+\]
+porque \texttt{DRIFT\_ARTICLE\_MIN\_MATCH\_WINDOW\_MINUTES = 30} y la velocidad de referencia m\'inima es \(20\ \mathrm{km/h}\). Un par upstream-downstream se acepta si:
+\begin{itemize}[leftmargin=*]
+  \item comparte la misma patente \(\pi\);
+  \item el paso downstream ocurre despu\'es del upstream y antes de \(\tau_s\);
+  \item la categor\'ia coincide entre ambos extremos;
+  \item el tiempo de viaje es estrictamente positivo.
+\end{itemize}
+La implementaci\'on usa \texttt{merge\_asof(..., direction="backward")} desde el p\'ortico downstream hacia el upstream y luego elimina duplicados por \texttt{plate\_clean} y \texttt{time\_start}, conservando el primer downstream compatible de cada observaci\'on upstream. El intervalo del match se ancla al timestamp upstream, es decir, a \(b(\tau_{\mathrm{start}})\).
+
+Para cada match \(m\) del segmento \(s\), se define el tiempo de viaje
+\[
+\mathrm{TT}_m = \tau^{\mathrm{end}}_m - \tau^{\mathrm{start}}_m,
+\]
+y la velocidad espacial
+\[
+\mathrm{SegVel}_m =
+\begin{cases}
+\dfrac{d_s}{\mathrm{TT}_m/1\ \mathrm{hora}}, & \text{si } d_s > 0, \\
+\mathrm{NA}, & \text{si no hay distancia v\'alida.}
+\end{cases}
+\]
+En paralelo, se calcula el indicador de cambio de carril
+\[
+\mathrm{LC}_m =
+\mathbf{1}\{\ell^{\mathrm{start}}_m \neq \ell^{\mathrm{end}}_m\},
+\]
+si ambos carriles existen; en caso contrario, el match aporta \texttt{NaN} a esa componente.
+
+\paragraph{Variables por segmento y tipo de veh\'iculo}
+Sea \(M_{t,s,c}\) el conjunto de matches del intervalo \(t\), segmento \(s\) y categor\'ia \(c\). A partir de ellos se generan columnas como \texttt{flow\_light\_15\_14}, \texttt{vel\_heavy\_14\_12} o \texttt{cl\_motorcycle\_12\_11}:
+\[
+\mathrm{Flow}_{t,s,c} = |M_{t,s,c}|,
+\]
+\[
+\mathrm{Vel}_{t,s,c} = \frac{1}{|M_{t,s,c}|}\sum_{m \in M_{t,s,c}} \mathrm{SegVel}_m,
+\]
+\[
+\mathrm{Sd}_{t,s,c} = \sqrt{\frac{1}{|M_{t,s,c}|-1}\sum_{m \in M_{t,s,c}}(\mathrm{SegVel}_m-\mathrm{Vel}_{t,s,c})^2},
+\]
+\[
+\mathrm{CL}_{t,s,c} = \frac{1}{|M^{LC}_{t,s,c}|}\sum_{m \in M^{LC}_{t,s,c}} \mathrm{LC}_m,
+\]
+\[
+\mathrm{Den}_{t,s,c} =
+\begin{cases}
+\dfrac{\mathrm{Flow}_{t,s,c}}{\mathrm{Vel}_{t,s,c}}, & \text{si } \mathrm{Vel}_{t,s,c} > 0, \\
+\mathrm{NA}, & \text{en otro caso.}
+\end{cases}
+\]
+Aqu\'i \(M^{LC}_{t,s,c}\) denota el subconjunto con carriles observados en ambos extremos. Los deltas \(\Delta \mathrm{Flow}\), \(\Delta \mathrm{Vel}\) y \(\Delta \mathrm{Den}\) repiten la misma definici\'on de primera diferencia temporal usada a nivel de p\'ortico. No existe \(\Delta \mathrm{CL}\) en el c\'odigo actual.
+
+\paragraph{Variables globales por segmento y por carril de origen}
+El bloque global del segmento agrega todos los matches del intervalo sin separar por categor\'ia:
+\[
+M_{t,s} = \bigcup_{c \in C} M_{t,s,c}.
+\]
+Sobre \(M_{t,s}\) se generan \texttt{flow\_15\_14}, \texttt{vel\_15\_14}, \texttt{sd\_15\_14}, \texttt{den\_15\_14} y sus deltas temporales. Matem\'aticamente, las f\'ormulas son id\'enticas a las del bloque segmental por categor\'ia, pero reemplazando \(M_{t,s,c}\) por \(M_{t,s}\).
+
+Para capturar heterogeneidad por carril, el mismo matching se reagrupa por carril de origen:
+\[
+M_{t,s,\ell} = \{m \in M_{t,s} : \ell^{\mathrm{start}}_m = \ell\},
+\qquad \ell \in \{1,2,3\}.
+\]
+Sobre ese subconjunto se calculan \(\mathrm{Flow}_{t,s,\ell}\), \(\mathrm{Vel}_{t,s,\ell}\), \(\mathrm{Sd}_{t,s,\ell}\), \(\mathrm{Den}_{t,s,\ell}\) y sus deltas, produciendo columnas como \texttt{vel\_lane2\_15\_14} o \texttt{delta\_den\_lane3\_12\_11}. Este bloque es importante porque el propio c\'odigo justifica su inclusi\'on por la relevancia emp\'irica de variables por carril en la r\'eplica de Figure 6.
+
+\paragraph{Reglas de borde y consistencia num\'erica}
+La implementaci\'on distingue entre ausencia de tr\'afico y ausencia de medida:
+\begin{itemize}[leftmargin=*]
+  \item los flujos se rellenan con \(0\) cuando el grupo no tiene observaciones;
+  \item velocidades, desviaciones, densidades y \textit{lane change fractions} permanecen en \texttt{NaN} si no existe informaci\'on suficiente;
+  \item los deltas se calculan sobre la versi\'on ya pivotada de cada bloque, por lo que respetan el mismo patr\'on de faltantes;
+  \item cuando el c\'alculo se hace por lotes en DuckDB, las features est\'aticas coinciden con el c\'alculo monol\'itico, y los deltas se reinicializan en los bordes de lote con \(0\) o \texttt{NaN}; esto est\'a cubierto por \texttt{test\_drift\_batched\_flow\_features\_duckdb\_consistency}.
+\end{itemize}
+
+\paragraph{Construcci\'on del target}
+El target se agrega con \texttt{\_add\_interval\_accident\_target()} despu\'es de filtrar accidentes del corredor con \texttt{\_filter\_accidents\_for\_allowed\_porticos()}. Si \(t_a\) es el timestamp de un accidente, su marca binaria se asigna al intervalo
+\[
+t^{\star} = b(t_a) - \Delta.
+\]
+Por tanto,
+\[
+y_t = 1 \iff \exists a \text{ tal que } b(t_a) = t + \Delta.
+\]
+Esta definici\'on implementa un \textit{lead time} de un bin: las features de \(t\) intentan anticipar accidentes que ocurren en el siguiente intervalo de 5 minutos. La prueba \texttt{test\_drift\_article\_features\_cover\_table4\_and\_target\_shift} valida expl\'icitamente este corrimiento; por ejemplo, un accidente a las \(00{:}06\) activa \texttt{target = 1} en la fila de las \(00{:}00\), no en la de las \(00{:}05\).
+
+\subsection{Preparaci\'on de datos: Stage 1 y Stage 2}
+La Secci\'on 4.2 del paper se operacionaliza con \texttt{apply\_missing\_data\_policy()}, \texttt{identify\_long\_zero\_accident\_runs()}, \texttt{filter\_long\_zero\_accident\_runs()} y \texttt{run\_configurable\_preparation\_pipeline()}.
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Stage 1}: elimina variables con m\'as de \(1\%\) de valores faltantes y luego elimina intervalos con cualquier predictor faltante en las variables restantes.
+  \item \textbf{Stage 2}: elimina ventanas largas sin accidentes, por defecto de al menos 7 d\'ias consecutivos con \texttt{target = 0}.
+\end{itemize}
+
+La salida incluye un \texttt{DataPreparationSummary} con conteo de filas iniciales/finales, variables removidas, ventanas detectadas y filas descartadas. La prueba \texttt{test\_configurable\_preparation\_pipeline\_respects\_stage\_switches} valida que ambos stages respondan correctamente a sus selectores.
+
+\subsection{Selecci\'on de variables}
+La etapa de selecci\'on usa \texttt{compute\_abs\_correlations()}, \texttt{drop\_highly\_correlated\_features()} y \texttt{rank\_features\_random\_forest()}. Operativamente se ejecuta en dos pasos:
+\begin{enumerate}[leftmargin=*]
+  \item remover variables altamente correlacionadas con un umbral configurable;
+  \item entrenar un Random Forest para ordenar las variables restantes y quedarse con el top-$N$ efectivo para los experimentos.
+\end{enumerate}
+
+La misma pesta\~na genera la r\'eplica de Figure 5 (densidad de $|\rho|$) y Figure 6 (importancias top), y persiste el payload de selecci\'on en el DuckDB de features. La prueba \texttt{test\_feature\_selection\_payload\_persists\_with\_feature\_duckdb} cubre esta persistencia.
+
+\subsection{Dise\~no experimental y estrategias}
+Las estrategias disponibles est\'an definidas por \texttt{EXPERIMENT\_STRATEGIES}:
+\texttt{static}, \texttt{period\_aligned}, \texttt{cumulative}, \texttt{adaptive\_adwin}, \texttt{adaptive\_arf} y \texttt{adaptive\_kswin}. Los modelos batch soportados por \texttt{MODEL\_NAMES} son \texttt{XGBoost}, \texttt{AdaBoost}, \texttt{Random Forest} y \texttt{NNet}; las variantes online son \texttt{ARFmoderate}, \texttt{ARFmaj}, \texttt{ARFfast}, \texttt{KSWINpaper} y \texttt{KSWINseasonal}.
+
+\paragraph{Configuraci\'on experimental formal}
+Sea \(Y_0 < Y_1 < \cdots < Y_J\) la secuencia de a\~nos observados en el dataset ordenado por \texttt{interval\_start}. La app toma como a\~no base \(Y_0\) por defecto, salvo que el usuario fije otro. Para cada intervalo \(t\), el par \((x_t, y_t)\) est\'a formado por las features seleccionadas y el target binario de accidente a un paso. El experimento siempre opera sobre el dataset limpio de Stage 1 y Stage 2.
+
+La orquestaci\'on principal en \texttt{run\_recalibration\_experiments()} construye bloques experimentales sobre el producto cartesiano de:
+\begin{itemize}[leftmargin=*]
+  \item estrategias;
+  \item modelos batch o variantes online;
+  \item modos de balanceo \texttt{none}/\texttt{smote} cuando aplica;
+  \item semillas de repetici\'on secuenciales.
+\end{itemize}
+Esto significa que el resultado final no es una sola corrida, sino un conjunto de bloques persistidos y reensamblados al final. Formalmente, si \(B\) es el conjunto de bloques y \(R\) el conjunto de semillas, la cantidad base de ejecuciones es \(|B|\times|R|\), a la que se agregan las tareas globales de tuning can\'onico.
+
+\paragraph{Entrenamiento batch interno y calibraci\'on de threshold}
+Las estrategias batch, \texttt{adaptive\_adwin} y \texttt{adaptive\_kswin} reutilizan \texttt{train\_model\_with\_internal\_validation()}. Dado un split de entrenamiento \(T\), el flujo real del c\'odigo es:
+\begin{enumerate}[leftmargin=*]
+  \item dividir \(T\) en un split estratificado interno \((T^{\mathrm{fit}}, T^{\mathrm{val}})\) con proporci\'on de validaci\'on \(\rho = 0.2\) por defecto;
+  \item sintonizar hiperpar\'ametros sobre \(T^{\mathrm{fit}}\) con AUC media de validaci\'on cruzada estratificada;
+  \item calibrar el umbral operativo sobre todo \(T\) usando scores \textit{out-of-fold};
+  \item reentrenar el modelo final con todos los datos de \(T\), y aplicar SMOTE si el bloque lo requiere.
+\end{enumerate}
+
+Sea \(\Theta_{m,b}\) el espacio de b\'usqueda del modelo \(m\) y del modo de balanceo \(b\). La selecci\'on de hiperpar\'ametros resuelve:
+\[
+\hat{\theta}
+=
+\arg\max_{\theta \in \Theta_{m,b}}
+\frac{1}{K}
+\sum_{k=1}^{K}
+\mathrm{AUC}_k(\theta),
+\]
+donde \(K\) es el n\'umero efectivo de folds estratificados. Si \texttt{balance\_mode = smote}, el propio espacio de b\'usqueda incorpora \texttt{sampling\_strategy} y \texttt{k\_neighbors}; si \texttt{balance\_mode = none}, s\'olo se buscan hiperpar\'ametros del modelo.
+
+Una vez elegido \(\hat{\theta}\), el c\'odigo genera scores cruzados \(s_i^{\mathrm{cv}}\) para cada fila \(i \in T\) y selecciona el umbral con el criterio de Youden:
+\[
+\hat{\tau}
+=
+\arg\max_{\tau}
+\left[
+\mathrm{TPR}(\tau) - \mathrm{FPR}(\tau)
+\right]
+=
+\arg\max_{\tau}
+\left[
+\mathrm{Sensitivity}(\tau) + \mathrm{Specificity}(\tau) - 1
+\right].
+\]
+Las predicciones duras se definen como
+\[
+\hat{y}_i = \mathbf{1}\{s_i \ge \hat{\tau}\}.
+\]
+Si la calibraci\'on \textit{out-of-fold} falla por falta de variabilidad, el c\'odigo cae a un esquema de respaldo usando el holdout interno \(T^{\mathrm{val}}\).
+
+\paragraph{Balanceo con SMOTE}
+El modo \texttt{smote} nunca se aplica sobre test o stream, s\'olo sobre folds de entrenamiento y sobre el refit final. Si la clase minoritaria tiene menos de dos ejemplos, o si la raz\'on minoritaria/mayoritaria ya est\'a por encima del objetivo, el balanceo no se ejecuta. En caso contrario, SMOTE construye un conjunto balanceado \((X^{\mathrm{bal}}, y^{\mathrm{bal}})\) con:
+\[
+\frac{N_{\mathrm{minor}}^{\mathrm{new}}}{N_{\mathrm{major}}}
+ \approx
+\texttt{sampling\_strategy},
+\]
+y el vecindario efectivo satisface
+\[
+k_{\mathrm{eff}} = \min(k_{\mathrm{neighbors}}, N_{\mathrm{minor}} - 1).
+\]
+Los artefactos SMOTE pueden persistirse y reutilizarse por bloque mediante \texttt{\_load\_or\_create\_smote\_artifact()}.
+
+\paragraph{Estrategias batch anuales}
+\texttt{run\_yearly\_strategy()} implementa tres reglas de entrenamiento para cada a\~no objetivo \(Y_j\), \(j \ge 1\):
+\[
+\mathcal{T}^{\mathrm{static}}_j = \{t : \mathrm{year}(t)=Y_0\},
+\]
+\[
+\mathcal{T}^{\mathrm{period}}_j = \{t : \mathrm{year}(t)=Y_j - 1\},
+\]
+\[
+\mathcal{T}^{\mathrm{cum}}_j = \{t : \mathrm{year}(t)\le Y_j - 1\},
+\]
+y el conjunto de evaluaci\'on es siempre
+\[
+\mathcal{E}_j = \{t : \mathrm{year}(t)=Y_j\}.
+\]
+Cada fila de salida contiene \texttt{training\_year}, \texttt{prediction\_year}, \texttt{model}, \texttt{balance\_mode}, m\'etricas, umbral, tiempo de entrenamiento y tama\~nos \texttt{n\_train}/\texttt{n\_test}. En la estrategia \texttt{static}, como \(\mathcal{T}^{\mathrm{static}}_j\) es id\'entico para todo \(j\), el c\'odigo cachea y reutiliza el bundle entrenado para evitar tuning y refit redundantes; esto est\'a cubierto por \texttt{test\_run\_yearly\_strategy\_reuses\_static\_training\_bundle}.
+
+El resultado esperado de este bloque es:
+\begin{itemize}[leftmargin=*]
+  \item una fila en \texttt{yearly\_results} por combinaci\'on \((\text{estrategia}, \text{modelo}, \text{balance}, Y_j, \text{seed})\);
+  \item una curva ROC segmentada por a\~no objetivo en \texttt{roc\_payload};
+  \item tablas Appendix A.6, A.7 y A.8 para \texttt{static}, \texttt{period\_aligned} y \texttt{cumulative}, respectivamente.
+\end{itemize}
+
+\paragraph{Recalibraci\'on adaptativa con ADWIN}
+\texttt{run\_adaptive\_strategy()} entrena primero un modelo batch sobre el a\~no base \(Y_0\) y luego procesa cronol\'ogicamente todo el stream posterior. Para cada fila del stream se calcula un score \(s_t\), una predicci\'on dura \(\hat{y}_t = \mathbf{1}\{s_t \ge \hat{\tau}\}\) y una se\~nal de error binario
+\[
+e_t = \mathbf{1}\{\hat{y}_t \neq y_t\}.
+\]
+La clase \texttt{SimpleADWIN} mantiene una ventana \(W\) de errores. Para cada corte candidato \(W = W_0 \cup W_1\), con tama\~nos \(n_0\) y \(n_1\), define:
+\[
+\mu_0 = \frac{1}{n_0}\sum_{e \in W_0} e,
+\qquad
+\mu_1 = \frac{1}{n_1}\sum_{e \in W_1} e,
+\]
+\[
+m = \left(\frac{1}{n_0} + \frac{1}{n_1}\right)^{-1},
+\qquad
+\epsilon = \sqrt{\frac{1}{2m}\log\left(\max\left(1.0000001,\frac{4\log n}{\delta}\right)\right)},
+\]
+donde \(n = |W|\) y \(\delta = \texttt{adwin\_delta}\). Se declara drift si
+\[
+|\mu_0 - \mu_1| > \epsilon.
+\]
+Cuando eso ocurre, el c\'odigo:
+\begin{itemize}[leftmargin=*]
+  \item cierra el segmento de predicci\'on acumulado hasta \(t\);
+  \item registra \texttt{drift\_date}, \texttt{W}, \texttt{W0}, \texttt{W1} y \texttt{remaining\_periods};
+  \item intenta recalibrar el modelo usando las \'ultimas \(|W_1|\) observaciones del stream.
+\end{itemize}
+El reentrenamiento s\'olo ocurre si la ventana \(W_1\) tiene al menos \(\max(20, \lfloor \texttt{min\_window}/10 \rfloor)\) filas, o el \texttt{min\_retrain\_size} que fije el usuario, y contiene ambas clases. Si no se cumple esa condici\'on, el detector igual corta el segmento, pero el modelo vigente contin\'ua. El resultado esperado es una tabla \texttt{adaptive\_results} con una fila por drift detectado m\'as un segmento final con \texttt{remaining\_periods = 0}; estas filas alimentan la parte ADWIN de Appendix A.9.
+
+\paragraph{Adaptive Random Forest}
+\texttt{run\_arf\_strategy()} implementa una estrategia genuinamente online. Sobre el a\~no base \(Y_0\), la funci\'on \texttt{train\_arf\_with\_internal\_validation()} separa un bloque final de validaci\'on cronol\'ogica y usa el bloque inicial para \textit{warm-up} del ensamble ARF. Luego predice secuencialmente sobre el bloque de validaci\'on, aprende inmediatamente cada etiqueta y fija \(\hat{\tau}\) con el mismo criterio de Youden.
+
+Durante el stream posterior, el modelo se actualiza observaci\'on a observaci\'on:
+\[
+s_t = f_{t-1}(x_t),
+\qquad
+f_t = \mathcal{U}(f_{t-1}, x_t, y_t),
+\]
+donde \(\mathcal{U}\) representa el paso online \texttt{learn\_one}. A diferencia de ADWIN y KSWIN, no hay un reentrenamiento batch externo tras un drift: la adaptaci\'on est\'a internalizada en el bosque. Por eso el c\'odigo no duplica esta estrategia por \texttt{balance\_mode}; siempre usa \texttt{not\_applicable}.
+
+Los resultados se segmentan por a\~no de predicci\'on, no por drift externo. Cada fila esperada contiene:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{prediction\_year};
+  \item \texttt{segment\_rows};
+  \item \texttt{n\_internal\_drifts};
+  \item \texttt{n\_internal\_warnings};
+  \item m\'etricas y umbral operativo.
+\end{itemize}
+En consecuencia, Appendix A.9 muestra a ARF como segmentos anuales online, no como ventanas \(W/W_0/W_1\). Las pruebas \texttt{test\_run\_arf\_strategy\_variants} y \texttt{test\_recalibration\_experiments\_support\_adaptive\_arf} verifican esa salida.
+
+\paragraph{Recalibraci\'on adaptativa con KSWIN}
+\texttt{run\_kswin\_strategy()} separa claramente el problema de detecci\'on de drift covariable del problema de predicci\'on. Primero entrena un modelo batch sobre \(Y_0\). Luego selecciona las variables monitorizadas con \texttt{\_select\_kswin\_monitor\_columns()}, que en la implementaci\'on actual toma las primeras \texttt{top-k} columnas num\'ericas del orden de \texttt{feature\_cols}. No es un ranking online: es una selecci\'on determinista de las features ya aprobadas por Feature Selection.
+
+Para cada feature monitorizada \(f\), KSWIN puede operar en dos espacios:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{KSWINpaper}: usa el valor crudo \(x_{t,f}\);
+  \item \texttt{KSWINseasonal}: usa un z-score estacional
+  \[
+  z_{t,f} = \frac{x_{t,f} - \mu_{d(t),h(t),f}}{\sigma_{d(t),h(t),f}},
+  \]
+  con fallback a perfiles por hora y luego a perfiles globales del a\~no base.
+\end{itemize}
+Cada detector usa \(\alpha = 10^{-4}\), \(\texttt{window\_size}=300\) y \(\texttt{stat\_size}=30\), por lo que Appendix A.9 reporta
+\[
+W = 300,\qquad W_0 = 270,\qquad W_1 = 30
+\]
+como tama\~nos fijos del detector, no como ventanas aprendidas din\'amicamente.
+
+Sea \(F_t\) el conjunto de features cuyo detector dispara drift en el instante \(t\). La condici\'on de drift del bloque es:
+\[
+|F_t| \ge \texttt{vote\_threshold}.
+\]
+Cuando eso ocurre, se cierra el segmento de predicci\'on, se registran \texttt{vote\_count}, \texttt{detected\_features}, \texttt{monitored\_features}, y se selecciona una ventana de recalibraci\'on temporal:
+\[
+\mathcal{R}_t = \{i : t_i \ge t - D\},
+\]
+donde \(D = \texttt{kswin\_retrain\_days}\). Si \(|\mathcal{R}_t| < \texttt{kswin\_min\_retrain\_rows}\), el c\'odigo usa las \'ultimas \texttt{min\_rows} observaciones; si esa ventana tiene una sola clase, se expande a todo lo observado hasta \(t\). Tras el refit batch, los detectores KSWIN se reconstruyen y se recalientan con la ventana de reentrenamiento.
+
+El resultado esperado de KSWIN es una fila por drift votado m\'as un segmento final, con columnas adicionales como \texttt{vote\_threshold}, \texttt{monitor\_feature\_count}, \texttt{retrain\_rows} y \texttt{retrain\_positive\_rows}. Las pruebas \texttt{test\_run\_kswin\_strategy\_variants}, \texttt{test\_recalibration\_experiments\_support\_adaptive\_kswin} y \texttt{test\_kswin\_optuna\_studies\_capture\_base\_and\_retrains\_with\_balance\_mode} validan precisamente ese comportamiento.
+
+\paragraph{Semillas, tuning global, persistencia y reanudaci\'on}
+\texttt{run\_recalibration\_experiments()} no vuelve a tunear desde cero cada bloque batch. Antes de lanzar los bloques, construye tareas de tuning can\'onico sobre el split base del a\~no \(Y_0\) para cada combinaci\'on \((\text{modelo}, \text{balance})\) que vaya a ser usada por estrategias batch, ADWIN o KSWIN. Ese tuning global se persiste en \texttt{tuning\_dir} y luego se inyecta como \texttt{fixed\_params}/\texttt{fixed\_tuning\_artifact} en los bloques posteriores. En t\'erminos metodol\'ogicos, esto impone comparabilidad entre estrategias que comparten familia de modelo, porque todas parten del mismo \(\hat{\theta}\) can\'onico por seed y modo de balanceo.
+
+Cada bloque persiste:
+\begin{itemize}[leftmargin=*]
+  \item filas anuales o adaptativas;
+  \item ROC payload segmentado;
+  \item su propio \texttt{execution\_log};
+  \item referencias a tuning y a artefactos SMOTE.
+\end{itemize}
+El \texttt{manifest.json} central mantiene progreso, bloques completados, cach\'es disponibles y errores. Si una corrida falla a mitad de camino, la siguiente ejecuci\'on puede reanudar desde el checkpoint y reutilizar tuning/SMOTE ya calculados; esto est\'a cubierto por \texttt{test\_preview\_recalibration\_checkpoint\_detects\_resumable\_manifest} y \texttt{test\_recalibration\_experiments\_resume\_from\_failed\_checkpoint}.
+
+\paragraph{Resultados esperados}
+Metodol\'ogicamente, la salida completa del experimento debe contener siete productos coherentes entre s\'i:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{yearly\_results}: una fila por split anual batch, con \texttt{strategy}, \texttt{prediction\_year}, \texttt{model}, \texttt{balance\_mode}, m\'etricas, umbral y tama\~nos muestrales;
+  \item \texttt{adaptive\_results}: una fila por segmento adaptativo, ya sea delimitado por drift ADWIN/KSWIN o por a\~no en ARF;
+  \item \texttt{summary}: medias por \((\texttt{strategy}, \texttt{model}, \texttt{balance\_mode})\), incluyendo \texttt{n\_segments} y \texttt{n\_repetitions};
+  \item \texttt{appendix\_tables}: A.6 para \texttt{static}, A.7 para \texttt{period\_aligned}, A.8 para \texttt{cumulative} y A.9 para resultados adaptativos;
+  \item \texttt{appendix\_tables\_mean}: las mismas tablas, pero promediadas por semillas secuenciales y enriquecidas con \texttt{seed\_list} y \texttt{run\_orders};
+  \item \texttt{average\_roc}: curvas ROC medias tipo Figure 7, construidas interpolando cada curva individual sobre una grilla uniforme de \(101\) puntos en FPR y promediando la TPR:
+  \[
+  \overline{\mathrm{TPR}}_g(u) = \frac{1}{J_g}\sum_{j=1}^{J_g}\widetilde{\mathrm{TPR}}_{g,j}(u);
+  \]
+  \item \texttt{run\_manifest} y \texttt{execution\_log}: trazabilidad reproducible del experimento, incluyendo configuraci\'on, seeds, thresholds, tuning, checkpoints, errores y consumo de recursos.
+\end{itemize}
+Las pruebas \texttt{test\_end\_to\_end\_recalibration\_and\_average\_roc}, \texttt{test\_recalibration\_experiments\_compare\_balance\_modes\_end\_to\_end} y \texttt{test\_recalibration\_experiments\_persist\_optuna\_json} verifican precisamente que ese paquete de resultados exista, sea consistente y pueda persistirse como JSON final.
+
+\subsection{M\'etricas, tablas y artefactos finales}
+La evaluaci\'on usa cuatro m\'etricas base calculadas por \texttt{compute\_classification\_metrics()}: \texttt{auc}, \texttt{sensitivity}, \texttt{specificity} y \texttt{error\_rate}, adem\'as del \texttt{threshold} operativo. Sobre esas tablas, el m\'odulo construye:
+\begin{itemize}[leftmargin=*]
+  \item resumen consolidado con \texttt{summarize\_results()};
+  \item tablas Appendix A.6--A.9 con \texttt{format\_appendix\_tables()};
+  \item tablas promedio por semillas con \texttt{format\_appendix\_tables\_mean()};
+  \item curva ROC promedio tipo Figure 7 con \texttt{build\_average\_roc\_curves()}.
+\end{itemize}
+
+La persistencia principal se divide en tres niveles:
+\begin{itemize}[leftmargin=*]
+  \item features exportadas en DuckDB bajo \texttt{Resultados/};
+  \item checkpoints por corrida en \texttt{Resultados/drift\_recalibration\_runs/}, con \texttt{manifest.json}, bloques persistidos, tuning cache y artefactos SMOTE;
+  \item JSON final de resultados con \texttt{\_persist\_drift\_recalibration\_json()}, guardado como \texttt{drift\_recalibration\_optuna\_*.json}.
+\end{itemize}
+
+El \texttt{run\_manifest} registra configuraci\'on, semillas, estrategias, tama\~nos de grilla, features activas y rutas de checkpoint. El \texttt{execution\_log} almacena trazabilidad de tuning, entrenamiento, errores, reentrenos adaptativos y consumo de recursos.
+
+\subsection{Validaci\'on mediante pruebas}
+El archivo \texttt{tests/test\_drift\_detection\_app.py} entrega cobertura funcional amplia del pipeline. Entre los casos m\'as relevantes:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{test\_article\_coverage\_is\_100\_percent};
+  \item \texttt{test\_drift\_article\_features\_cover\_table4\_and\_target\_shift};
+  \item \texttt{test\_drift\_batched\_flow\_features\_duckdb\_consistency};
+  \item \texttt{test\_end\_to\_end\_recalibration\_and\_average\_roc};
+  \item \texttt{test\_recalibration\_experiments\_compare\_balance\_modes\_end\_to\_end};
+  \item \texttt{test\_recalibration\_experiments\_persist\_optuna\_json};
+  \item \texttt{test\_recalibration\_experiments\_resume\_from\_failed\_checkpoint};
+  \item \texttt{test\_recalibration\_experiments\_support\_adaptive\_arf};
+  \item \texttt{test\_recalibration\_experiments\_support\_adaptive\_kswin}.
+\end{itemize}
+
+En conjunto, estas pruebas confirman que la documentaci\'on de \textit{Drift detection} no describe un dise\~no aspiracional, sino el comportamiento realmente implementado en el repositorio.

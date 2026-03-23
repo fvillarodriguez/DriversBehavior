@@ -18,6 +18,7 @@ xgboost==3.1.2
 optuna==4.6.0
 pydeck==0.9.1
 graphviz==0.21
+river==0.23.0
 torchview==0.2.6
 torch==2.4.1; python_version < '3.13'
 torch-geometric==2.7.0

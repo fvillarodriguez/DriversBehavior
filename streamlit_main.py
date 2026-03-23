@@ -6,12 +6,68 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Callable, Dict
 import psutil
 
 # Configurar fallback para MPS (Apple Silicon) antes de importar librerías de ML
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+warnings.filterwarnings(
+    "ignore",
+    message=r"`sklearn\.utils\.parallel\.delayed` should be used with `sklearn\.utils\.parallel\.Parallel`.*",
+    category=UserWarning,
+)
+
+
+def _patch_sklearn_parallel_warning_noise() -> None:
+    try:
+        from sklearn.utils import parallel as sklearn_parallel  # type: ignore
+    except Exception:
+        return
+
+    func_wrapper = getattr(sklearn_parallel, "_FuncWrapper", None)
+    config_context = getattr(sklearn_parallel, "config_context", None)
+    if func_wrapper is None or config_context is None:
+        return
+
+    current_call = getattr(func_wrapper, "__call__", None)
+    if current_call is None or getattr(current_call, "__name__", "") == "_sumo_quiet_sklearn_funcwrapper_call":
+        return
+
+    warning_filter_keys = ["action", "message", "category", "module", "lineno"]
+
+    def _sumo_quiet_sklearn_funcwrapper_call(self, *args, **kwargs):
+        config = getattr(self, "config", {})
+        warning_filters = getattr(self, "warning_filters", [])
+
+        with config_context(**config), warnings.catch_warnings():
+            if warning_filters:
+                warnings.resetwarnings()
+                for filter_args in warning_filters:
+                    this_warning_filter_dict = {
+                        key: value
+                        for key, value in zip(warning_filter_keys, filter_args)
+                        if value is not None
+                    }
+                    if (
+                        "message" not in this_warning_filter_dict
+                        and "module" not in this_warning_filter_dict
+                    ):
+                        warnings.simplefilter(**this_warning_filter_dict, append=True)
+                    else:
+                        for special_key in ["message", "module"]:
+                            this_value = this_warning_filter_dict.get(special_key)
+                            if this_value is not None and not isinstance(this_value, str):
+                                this_warning_filter_dict[special_key] = this_value.pattern
+                        warnings.filterwarnings(**this_warning_filter_dict, append=True)
+            return self.function(*args, **kwargs)
+
+    _sumo_quiet_sklearn_funcwrapper_call.__name__ = "_sumo_quiet_sklearn_funcwrapper_call"
+    func_wrapper.__call__ = _sumo_quiet_sklearn_funcwrapper_call
+
+
+_patch_sklearn_parallel_warning_noise()
 
 import streamlit as st
 

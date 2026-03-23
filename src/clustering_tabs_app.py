@@ -1380,7 +1380,7 @@ def _render_hdbscan(
             return
 
         try:
-            x_scaled = _scale_cluster_features(cluster_df, feature_cols)
+            x_scaled, _ = _scale_cluster_features(cluster_df, feature_cols)
         except ImportError as exc:
             st.error(str(exc))
             return

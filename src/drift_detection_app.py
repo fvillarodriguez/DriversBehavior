@@ -9,13 +9,18 @@ full "Drift detection" section in a single source file.
 """
 from __future__ import annotations
 
+import gc
+import hashlib
 import importlib
 import json
 import math
 import os
 import re
 import sys
+import tempfile
 import time
+import traceback
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -25,11 +30,21 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
+from joblib import Parallel as JoblibParallel
+from joblib import delayed as joblib_delayed
+from sklearn.ensemble import AdaBoostClassifier, ExtraTreesClassifier, RandomForestClassifier
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
 from sklearn.model_selection import ParameterGrid, StratifiedKFold, train_test_split
 from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
+try:
+    from sklearn.utils.parallel import Parallel as SklearnParallel
+    from sklearn.utils.parallel import delayed as sklearn_delayed
+except Exception:
+    SklearnParallel = JoblibParallel
+    sklearn_delayed = joblib_delayed
 
 try:
     import duckdb  # type: ignore
@@ -40,6 +55,27 @@ try:
     import psutil  # type: ignore
 except Exception:
     psutil = None
+
+try:
+    import optuna  # type: ignore
+    from optuna.samplers import TPESampler  # type: ignore
+except Exception:
+    optuna = None
+    TPESampler = None
+
+try:
+    from imblearn.over_sampling import SMOTE  # type: ignore
+except Exception:
+    SMOTE = None
+
+try:
+    from river import drift as river_drift  # type: ignore
+    from river import forest as river_forest  # type: ignore
+    from river import metrics as river_metrics  # type: ignore
+except Exception:
+    river_drift = None
+    river_forest = None
+    river_metrics = None
 
 from src.utils import (
     find_candidate_porticos,
@@ -72,6 +108,14 @@ PAPER_TITLE = (
     "adaptive drift detection vs. cumulative retraining"
 )
 PAPER_TIME_SPAN = "2018-01-01 to 2024-09-30"
+NNET_TRAINING_POLICY_VERSION = "scaled_early_stopping_v1"
+NNET_MAX_ITER_RETRY_CAP = 1000
+
+
+class ModelTrainingSkipped(RuntimeError):
+    def __init__(self, message: str, *, metadata: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.metadata = dict(metadata or {})
 
 
 def _import_external_xgboost():
@@ -896,7 +940,10 @@ class _ExperimentProgress:
         if detail:
             self._detail.caption(detail)
         else:
-            self._detail.caption(f"{int(round(completed_units))} / {total_units} bloques completados")
+            if abs(completed_units - round(completed_units)) < 1e-9:
+                self._detail.caption(f"{int(round(completed_units))} / {total_units} bloques completados")
+            else:
+                self._detail.caption(f"{completed_units:.2f} / {total_units} bloques completados")
 
 
 def _update_feature_progress(
@@ -915,6 +962,24 @@ def _update_feature_progress(
     progress_fn = getattr(progress_bar, "progress", None)
     if callable(progress_fn):
         progress_fn(max(0.0, min(float(ratio), 1.0)))
+
+
+def _emit_experiment_progress(
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+    *,
+    ratio: float,
+    label: str,
+    detail: str = "",
+) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(
+        {
+            "ratio": max(0.0, min(float(ratio), 1.0)),
+            "label": str(label),
+            "detail": str(detail),
+        }
+    )
 
 
 def _canonical_drift_category_name(value: object) -> Optional[str]:
@@ -2119,7 +2184,172 @@ def compute_classification_metrics(
 
 
 MODEL_NAMES = ["XGBoost", "AdaBoost", "Random Forest", "NNet"]
+YEARLY_STRATEGIES = ["static", "period_aligned", "cumulative"]
+ADAPTIVE_ADWIN_STRATEGY = "adaptive_adwin"
+ADAPTIVE_ARF_STRATEGY = "adaptive_arf"
+ADAPTIVE_KSWIN_STRATEGY = "adaptive_kswin"
+EXPERIMENT_STRATEGIES = YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_ARF_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]
+ARF_VARIANT_NAMES = ["ARFmoderate", "ARFmaj", "ARFfast"]
+ARF_DEFAULT_VARIANTS: Tuple[str, ...] = ("ARFmoderate", "ARFmaj")
+KSWIN_VARIANT_NAMES = ["KSWINpaper", "KSWINseasonal"]
+KSWIN_DEFAULT_VARIANTS: Tuple[str, ...] = ("KSWINpaper",)
 DEFAULT_REPETITION_SEEDS: Tuple[int, ...] = (42, 52, 62)
+BALANCE_MODE_NONE = "none"
+BALANCE_MODE_SMOTE = "smote"
+BALANCE_MODE_NOT_APPLICABLE = "not_applicable"
+DEFAULT_BATCH_BALANCE_MODES: Tuple[str, ...] = (BALANCE_MODE_NONE, BALANCE_MODE_SMOTE)
+DEFAULT_EXPERIMENT_PRESET = "Full Base"
+EXPERIMENT_PRESET_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "Full Base": {
+        "description": (
+            "Replica la configuracion del ultimo experimento completo: cuatro modelos, "
+            "todas las estrategias, `none` + `smote`, seed 42 y KSWINpaper."
+        ),
+        "models": list(MODEL_NAMES),
+        "strategies": list(EXPERIMENT_STRATEGIES),
+        "fast_mode": True,
+        "optuna_trials": 30,
+        "folds": 3,
+        "validation_size": 0.2,
+        "adwin_delta": 0.002,
+        "min_window": 45000,
+        "min_retrain_size": 4500,
+        "arf_variants": ["ARFmoderate"],
+        "kswin_variants": ["KSWINpaper"],
+        "kswin_top_k_features": 10,
+        "kswin_vote_threshold": 2,
+        "kswin_retrain_days": 90,
+        "kswin_min_retrain_rows": 100,
+        "balance_modes": [BALANCE_MODE_NONE, BALANCE_MODE_SMOTE],
+        "repetition_seeds": [42],
+    },
+    "KSWIN": {
+        "description": (
+            "Preset acotado para relanzar `adaptive_kswin` sin irse a dias: "
+            "solo AdaBoost + Random Forest, balance `none`, seed 42, top-k=5, folds=2 y 8 trials."
+        ),
+        "models": ["AdaBoost", "Random Forest"],
+        "strategies": [ADAPTIVE_KSWIN_STRATEGY],
+        "fast_mode": True,
+        "optuna_trials": 8,
+        "folds": 2,
+        "validation_size": 0.2,
+        "adwin_delta": 0.002,
+        "min_window": 45000,
+        "min_retrain_size": 4500,
+        "arf_variants": ["ARFmoderate"],
+        "kswin_variants": ["KSWINpaper"],
+        "kswin_top_k_features": 5,
+        "kswin_vote_threshold": 2,
+        "kswin_retrain_days": 90,
+        "kswin_min_retrain_rows": 100,
+        "balance_modes": [BALANCE_MODE_NONE],
+        "repetition_seeds": [42],
+    },
+}
+
+FAST_SMOTE_SEARCH_SPACE: Dict[str, Sequence[Any]] = {
+    "sampling_strategy": [0.5, 1.0],
+    "k_neighbors": [3, 5],
+}
+
+FULL_SMOTE_SEARCH_SPACE: Dict[str, Sequence[Any]] = {
+    "sampling_strategy": [0.3, 0.5, 0.75, 1.0],
+    "k_neighbors": [3, 5, 7],
+}
+
+
+def _apply_experiment_preset(preset_name: str, *, feature_count: int) -> None:
+    preset = EXPERIMENT_PRESET_CONFIGS.get(preset_name) or EXPERIMENT_PRESET_CONFIGS[DEFAULT_EXPERIMENT_PRESET]
+    bounded_feature_count = max(1, int(feature_count))
+    bounded_vote_max = max(1, min(10, bounded_feature_count))
+
+    st.session_state["drift_exp_models"] = list(preset["models"])
+    st.session_state["drift_exp_strategies"] = list(preset["strategies"])
+    st.session_state["drift_exp_fast_mode"] = bool(preset["fast_mode"])
+    st.session_state["drift_exp_optuna_trials"] = int(preset["optuna_trials"])
+    st.session_state["drift_exp_folds"] = int(preset["folds"])
+    st.session_state["drift_exp_validation_size"] = float(preset["validation_size"])
+    st.session_state["drift_exp_adwin_delta"] = float(preset["adwin_delta"])
+    st.session_state["drift_exp_min_window"] = int(preset["min_window"])
+    st.session_state["drift_exp_min_retrain_size"] = int(preset["min_retrain_size"])
+    st.session_state["drift_exp_arf_variants"] = list(preset["arf_variants"])
+    st.session_state["drift_exp_kswin_variants"] = list(preset["kswin_variants"])
+    st.session_state["drift_exp_kswin_top_k_features"] = min(
+        int(preset["kswin_top_k_features"]),
+        bounded_feature_count,
+    )
+    st.session_state["drift_exp_kswin_vote_threshold"] = min(
+        int(preset["kswin_vote_threshold"]),
+        bounded_vote_max,
+    )
+    st.session_state["drift_exp_kswin_retrain_days"] = int(preset["kswin_retrain_days"])
+    st.session_state["drift_exp_kswin_min_retrain_rows"] = int(preset["kswin_min_retrain_rows"])
+    st.session_state["drift_exp_balance_modes"] = list(preset["balance_modes"])
+    st.session_state["drift_exp_seed_text"] = ", ".join(
+        str(seed) for seed in preset["repetition_seeds"]
+    )
+
+
+def _sync_experiment_control_bounds(feature_count: int) -> None:
+    bounded_feature_count = max(1, int(feature_count))
+    bounded_vote_max = max(1, min(10, bounded_feature_count))
+
+    if "drift_exp_kswin_top_k_features" in st.session_state:
+        st.session_state["drift_exp_kswin_top_k_features"] = min(
+            max(1, int(st.session_state["drift_exp_kswin_top_k_features"])),
+            bounded_feature_count,
+        )
+    if "drift_exp_kswin_vote_threshold" in st.session_state:
+        st.session_state["drift_exp_kswin_vote_threshold"] = min(
+            max(1, int(st.session_state["drift_exp_kswin_vote_threshold"])),
+            bounded_vote_max,
+        )
+
+
+def _on_experiment_preset_change() -> None:
+    preset_name = str(st.session_state.get("drift_experiment_preset", DEFAULT_EXPERIMENT_PRESET))
+    feature_count = int(st.session_state.get("drift_experiment_feature_count", 1))
+    _apply_experiment_preset(preset_name, feature_count=feature_count)
+    st.session_state["drift_experiment_preset_applied"] = preset_name
+
+ARF_VARIANT_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "ARFmoderate": {
+        "warning_delta": 1e-4,
+        "drift_delta": 1e-5,
+        "disable_weighted_vote": False,
+        "description": "Configuracion base del paper con ADWIN conservador y weighted vote.",
+    },
+    "ARFmaj": {
+        "warning_delta": 1e-4,
+        "drift_delta": 1e-5,
+        "disable_weighted_vote": True,
+        "description": "Misma configuracion moderate, pero con majority vote para reducir sesgo por accuracy.",
+    },
+    "ARFfast": {
+        "warning_delta": 1e-2,
+        "drift_delta": 1e-3,
+        "disable_weighted_vote": False,
+        "description": "Version mas reactiva con ADWIN agresivo para drift abrupto.",
+    },
+}
+
+KSWIN_VARIANT_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "KSWINpaper": {
+        "alpha": 0.0001,
+        "window_size": 300,
+        "stat_size": 30,
+        "transform": "raw",
+        "description": "Configuracion del paper: KSWIN sobre variables crudas con n=300, r=30 y alpha=0.0001.",
+    },
+    "KSWINseasonal": {
+        "alpha": 0.0001,
+        "window_size": 300,
+        "stat_size": 30,
+        "transform": "seasonal_zscore",
+        "description": "KSWIN sobre z-scores por estacionalidad base (hora y dia), para reducir falsos positivos de trafico.",
+    },
+}
 
 FULL_HYPERPARAM_GRIDS: Dict[str, Dict[str, Sequence[Any]]] = {
     "Random Forest": {
@@ -2144,7 +2374,7 @@ FULL_HYPERPARAM_GRIDS: Dict[str, Dict[str, Sequence[Any]]] = {
     "NNet": {
         "size": [6, 7, 10, 12, 13, 14, 15, 16],
         "decay": [0.095, 0.1, 0.15, 0.2],
-        "maxit": [190, 200, 300, 500],
+        "maxit": [300, 500, 800],
     },
 }
 
@@ -2171,7 +2401,7 @@ FAST_HYPERPARAM_GRIDS: Dict[str, Dict[str, Sequence[Any]]] = {
     "NNet": {
         "size": [10, 14],
         "decay": [0.1, 0.2],
-        "maxit": [200],
+        "maxit": [300, 500],
     },
 }
 
@@ -2218,6 +2448,751 @@ def _normalize_log_value(value: Any) -> Any:
     if isinstance(value, float) and math.isnan(value):
         return None
     return value
+
+
+def _json_default(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, pd.DataFrame):
+        return value.to_dict(orient="records")
+    if isinstance(value, pd.Series):
+        return value.tolist()
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return str(value)
+
+
+def _to_json_safe(value: Any) -> Any:
+    return json.loads(json.dumps(value, default=_json_default, ensure_ascii=True))
+
+
+def _slugify_token(value: Any, *, max_len: int = 160) -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "_", str(value)).strip("_").lower()
+    if not text:
+        text = "item"
+    return text[:max_len]
+
+
+def _current_rss_mb() -> Optional[float]:
+    if psutil is None:
+        return None
+    try:
+        proc = psutil.Process(os.getpid())
+        return float(proc.memory_info().rss / (1024.0 ** 2))
+    except Exception:
+        return None
+
+
+def _cleanup_recalibration_memory() -> Optional[float]:
+    gc.collect()
+    return _current_rss_mb()
+
+
+def _update_memory_summary(
+    manifest: Optional[Dict[str, Any]],
+    *,
+    phase: str,
+    rss_before_mb: Optional[float] = None,
+    rss_after_mb: Optional[float] = None,
+) -> None:
+    if manifest is None:
+        return
+    summary = dict(manifest.get("memory_summary") or {})
+    if rss_before_mb is not None:
+        summary["rss_before_mb"] = float(rss_before_mb)
+        peak = summary.get("rss_peak_mb")
+        if peak is None or float(rss_before_mb) > float(peak):
+            summary["rss_peak_mb"] = float(rss_before_mb)
+    if rss_after_mb is not None:
+        summary["rss_after_mb"] = float(rss_after_mb)
+        peak = summary.get("rss_peak_mb")
+        if peak is None or float(rss_after_mb) > float(peak):
+            summary["rss_peak_mb"] = float(rss_after_mb)
+    summary["last_phase"] = str(phase)
+    summary["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest["memory_summary"] = summary
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(_to_json_safe(payload), handle, ensure_ascii=True, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
+def _load_json_file(path: Path, *, default: Any = None) -> Any:
+    file_path = Path(path)
+    if not file_path.exists():
+        return default
+    with file_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _hash_series_signature(series: pd.Series) -> bytes:
+    hashed = pd.util.hash_pandas_object(series, index=False).to_numpy(dtype=np.uint64, copy=False)
+    return hashed.tobytes()
+
+
+def _frame_signature(
+    df: pd.DataFrame,
+    *,
+    columns: Sequence[str],
+    include_index: bool = True,
+) -> str:
+    if df is None or df.empty:
+        return "empty"
+    sha = hashlib.sha256()
+    work = df.copy()
+    if include_index:
+        sha.update(np.asarray(work.index.to_numpy(), dtype=np.int64).tobytes())
+    for col in columns:
+        if col not in work.columns:
+            sha.update(f"missing::{col}".encode("utf-8"))
+            continue
+        series = work[col]
+        if isinstance(series.dtype, pd.DatetimeTZDtype) or pd.api.types.is_datetime64_any_dtype(series):
+            normalized = pd.to_datetime(series, errors="coerce").astype("string").fillna("<NA>")
+        else:
+            normalized = series.astype("string").fillna("<NA>")
+        sha.update(str(col).encode("utf-8"))
+        sha.update(_hash_series_signature(normalized))
+    sha.update(str(len(work)).encode("utf-8"))
+    return sha.hexdigest()
+
+
+def _model_execution_priority(model_name: str) -> int:
+    priority = {
+        "NNet": 0,
+        "AdaBoost": 1,
+        "Random Forest": 2,
+        "XGBoost": 3,
+    }
+    return int(priority.get(str(model_name), 99))
+
+
+def _feature_export_signature(feature_selection_context: Dict[str, Any]) -> str:
+    export_path = feature_selection_context.get("feature_export_path")
+    if export_path:
+        return str(export_path)
+    return ",".join(str(col) for col in feature_selection_context.get("selected_features", []))
+
+
+def _build_recalibration_run_id(
+    *,
+    df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    target_col: str,
+    time_col: str,
+    model_names: Sequence[str],
+    strategies: Sequence[str],
+    arf_variants: Sequence[str],
+    kswin_variants: Sequence[str],
+    balance_modes: Sequence[str],
+    repetition_seeds: Sequence[int],
+    base_year: Optional[int],
+    validation_size: float,
+    folds: int,
+    random_state: int,
+    fast_mode: bool,
+    grid_limit: Optional[int],
+    adwin_delta: float,
+    min_window: int,
+    min_retrain_size: Optional[int],
+    kswin_top_k_features: int,
+    kswin_vote_threshold: int,
+    kswin_retrain_days: int,
+    kswin_min_retrain_rows: int,
+    custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]],
+    feature_selection_context: Dict[str, Any],
+) -> str:
+    signature_cols = [col for col in [time_col, target_col] + list(feature_cols) if col in df.columns]
+    dataset_signature = _frame_signature(df, columns=signature_cols, include_index=True)
+    payload = {
+        "dataset_signature": dataset_signature,
+        "feature_export_signature": _feature_export_signature(feature_selection_context),
+        "feature_cols": list(feature_cols),
+        "target_col": str(target_col),
+        "time_col": str(time_col),
+        "models": list(model_names),
+        "strategies": list(strategies),
+        "arf_variants": list(arf_variants),
+        "kswin_variants": list(kswin_variants),
+        "balance_modes": list(balance_modes),
+        "repetition_seeds": [int(seed) for seed in repetition_seeds],
+        "base_year": None if base_year is None else int(base_year),
+        "validation_size": float(validation_size),
+        "folds": int(folds),
+        "random_state": int(random_state),
+        "fast_mode": bool(fast_mode),
+        "grid_limit": None if grid_limit is None else int(grid_limit),
+        "adwin_delta": float(adwin_delta),
+        "min_window": int(min_window),
+        "min_retrain_size": None if min_retrain_size is None else int(min_retrain_size),
+        "kswin_top_k_features": int(kswin_top_k_features),
+        "kswin_vote_threshold": int(kswin_vote_threshold),
+        "kswin_retrain_days": int(kswin_retrain_days),
+        "kswin_min_retrain_rows": int(kswin_min_retrain_rows),
+        "custom_grids": _to_json_safe(custom_grids or {}),
+    }
+    if "NNet" in [str(name) for name in model_names]:
+        payload["nnet_training_policy_version"] = NNET_TRAINING_POLICY_VERSION
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+    return f"run_{digest[:16]}"
+
+
+def _build_recalibration_block_id(block: Dict[str, Any], *, run_seed: int, run_order: int) -> str:
+    payload = {
+        "run_seed": int(run_seed),
+        "run_order": int(run_order),
+        "strategy": str(block.get("strategy", "")),
+        "model": str(block.get("model", "")),
+        "detector_variant": str(block.get("detector_variant", "")),
+        "balance_mode": str(block.get("balance_mode", BALANCE_MODE_NOT_APPLICABLE)),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+    return f"block_{digest[:16]}"
+
+
+def _build_global_tuning_key(
+    *,
+    model_name: str,
+    balance_mode: str,
+    feature_cols: Sequence[str],
+    target_col: str,
+    time_col: str,
+    canonical_train_df: pd.DataFrame,
+    validation_size: float,
+    folds: int,
+    random_state: int,
+    fast_mode: bool,
+    grid_limit: Optional[int],
+    custom_grid: Optional[Dict[str, Sequence[Any]]],
+) -> str:
+    signature_cols = [col for col in [time_col, target_col] + list(feature_cols) if col in canonical_train_df.columns]
+    payload = {
+        "model_name": str(model_name),
+        "balance_mode": str(balance_mode),
+        "feature_cols": list(feature_cols),
+        "target_col": str(target_col),
+        "time_col": str(time_col),
+        "train_signature": _frame_signature(canonical_train_df, columns=signature_cols, include_index=True),
+        "validation_size": float(validation_size),
+        "folds": int(folds),
+        "random_state": int(random_state),
+        "fast_mode": bool(fast_mode),
+        "grid_limit": None if grid_limit is None else int(grid_limit),
+        "custom_grid": _to_json_safe(custom_grid or {}),
+    }
+    policy_version = _model_policy_version(model_name)
+    if policy_version is not None:
+        payload["model_policy_version"] = str(policy_version)
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+    return f"tuning_{digest[:16]}"
+
+
+def _build_smote_key(
+    *,
+    run_id: str,
+    train_df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    target_col: str,
+    time_col: Optional[str],
+    sampling_strategy: float,
+    k_neighbors: int,
+) -> str:
+    signature_cols = [str(target_col)] + list(feature_cols)
+    if time_col and time_col in train_df.columns:
+        signature_cols = [str(time_col)] + signature_cols
+    payload = {
+        "run_id": str(run_id),
+        "train_signature": _frame_signature(train_df, columns=signature_cols, include_index=True),
+        "feature_cols": list(feature_cols),
+        "target_col": str(target_col),
+        "time_col": None if time_col is None else str(time_col),
+        "sampling_strategy": float(sampling_strategy),
+        "k_neighbors": int(k_neighbors),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+    return f"smote_{digest[:16]}"
+
+
+def _recalibration_run_dir(run_id: str, *, checkpoint_root: Optional[Path] = None) -> Path:
+    root = Path(checkpoint_root) if checkpoint_root is not None else RESULTS_DIR / "drift_recalibration_runs"
+    return root / str(run_id)
+
+
+def _recalibration_run_paths(run_dir: Path) -> Dict[str, Path]:
+    return {
+        "run_dir": run_dir,
+        "manifest": run_dir / "manifest.json",
+        "blocks_dir": run_dir / "blocks",
+        "tuning_dir": run_dir / "tuning",
+        "smote_dir": run_dir / "smote",
+        "live_status": run_dir / "live_status.json",
+        "live_events": run_dir / "live_events.jsonl",
+    }
+
+
+def _ensure_recalibration_run_dirs(paths: Dict[str, Path]) -> None:
+    for key in ["run_dir", "blocks_dir", "tuning_dir", "smote_dir"]:
+        Path(paths[key]).mkdir(parents=True, exist_ok=True)
+
+
+def _persist_manifest(path: Path, manifest: Dict[str, Any]) -> None:
+    manifest["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _atomic_write_json(path, manifest)
+
+
+def _persist_recalibration_live_status(path: Path, payload: Dict[str, Any]) -> None:
+    _atomic_write_json(path, payload)
+
+
+def _append_recalibration_live_event(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_to_json_safe(payload), ensure_ascii=True))
+        handle.write("\n")
+
+
+def _reset_recalibration_live_artifacts(paths: Dict[str, Path]) -> None:
+    for key in ["live_status", "live_events"]:
+        live_path = Path(paths[key])
+        if not live_path.exists():
+            continue
+        try:
+            live_path.unlink()
+        except Exception:
+            pass
+
+
+def _load_manifest(path: Path) -> Optional[Dict[str, Any]]:
+    payload = _load_json_file(path, default=None)
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _preview_recalibration_checkpoint(
+    df: pd.DataFrame,
+    *,
+    feature_cols: Sequence[str],
+    target_col: str = "target",
+    time_col: str = "interval_start",
+    model_names: Optional[Sequence[str]] = None,
+    strategies: Optional[Sequence[str]] = None,
+    base_year: Optional[int] = None,
+    validation_size: float = 0.2,
+    folds: int = 3,
+    random_state: int = 42,
+    fast_mode: bool = True,
+    grid_limit: Optional[int] = 30,
+    adwin_delta: float = 0.002,
+    min_window: int = 45_000,
+    min_retrain_size: Optional[int] = None,
+    arf_variants: Optional[Sequence[str]] = None,
+    kswin_variants: Optional[Sequence[str]] = None,
+    kswin_top_k_features: int = 10,
+    kswin_vote_threshold: int = 2,
+    kswin_retrain_days: int = 90,
+    kswin_min_retrain_rows: int = 100,
+    custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
+    repetition_seeds: Optional[Sequence[int]] = None,
+    balance_modes: Optional[Sequence[str]] = None,
+    feature_selection_context: Optional[Dict[str, Any]] = None,
+    checkpoint_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    if model_names is None:
+        model_names = MODEL_NAMES
+    if strategies is None:
+        strategies = EXPERIMENT_STRATEGIES
+    if arf_variants is None:
+        arf_variants = ARF_DEFAULT_VARIANTS
+    if kswin_variants is None:
+        kswin_variants = KSWIN_DEFAULT_VARIANTS
+    if repetition_seeds is None:
+        repetition_seeds = DEFAULT_REPETITION_SEEDS
+    if balance_modes is None:
+        balance_modes = DEFAULT_BATCH_BALANCE_MODES
+
+    normalized_feature_selection_context = _normalize_feature_selection_context(
+        feature_selection_context,
+        feature_cols=feature_cols,
+    )
+    effective_base_year = _canonical_base_year(df, time_col=time_col, base_year=base_year)
+    run_id = _build_recalibration_run_id(
+        df=df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        time_col=time_col,
+        model_names=list(model_names),
+        strategies=list(strategies),
+        arf_variants=list(arf_variants),
+        kswin_variants=list(kswin_variants),
+        balance_modes=list(balance_modes),
+        repetition_seeds=list(repetition_seeds),
+        base_year=effective_base_year,
+        validation_size=float(validation_size),
+        folds=int(folds),
+        random_state=int(random_state),
+        fast_mode=bool(fast_mode),
+        grid_limit=grid_limit,
+        adwin_delta=float(adwin_delta),
+        min_window=int(min_window),
+        min_retrain_size=min_retrain_size,
+        kswin_top_k_features=int(kswin_top_k_features),
+        kswin_vote_threshold=int(kswin_vote_threshold),
+        kswin_retrain_days=int(kswin_retrain_days),
+        kswin_min_retrain_rows=int(kswin_min_retrain_rows),
+        custom_grids=custom_grids,
+        feature_selection_context=normalized_feature_selection_context,
+    )
+    run_dir = _recalibration_run_dir(run_id, checkpoint_root=checkpoint_root)
+    paths = _recalibration_run_paths(run_dir)
+    manifest = _load_manifest(paths["manifest"])
+    if manifest is not None:
+        manifest = _reconcile_recalibration_manifest(manifest, paths=paths)
+    progress = dict((manifest or {}).get("progress") or {})
+    status = str((manifest or {}).get("status", "missing"))
+    checkpoint_available = manifest is not None
+    return {
+        "run_id": str(run_id),
+        "run_dir": str(run_dir),
+        "manifest_path": str(paths["manifest"]),
+        "status": status,
+        "checkpoint_available": bool(checkpoint_available),
+        "can_resume": bool(checkpoint_available and status != "completed"),
+        "can_load_completed": bool(checkpoint_available and status == "completed"),
+        "updated_at": None if manifest is None else manifest.get("updated_at"),
+        "completed_tuning_tasks": int(progress.get("completed_tuning_tasks", 0)),
+        "total_tuning_tasks": int(progress.get("total_tuning_tasks", 0)),
+        "completed_blocks": int(progress.get("completed_blocks", 0)),
+        "total_blocks": int(progress.get("total_blocks", 0)),
+        "smote_artifacts": len((manifest or {}).get("smote_index") or {}),
+        "manifest": manifest,
+        "feature_selection_context": normalized_feature_selection_context,
+        "effective_base_year": effective_base_year,
+    }
+
+
+def _persist_recalibration_block(path: Path, payload: Dict[str, Any]) -> None:
+    _atomic_write_json(path, payload)
+
+
+def _load_recalibration_block(path: Path) -> Optional[Dict[str, Any]]:
+    payload = _load_json_file(path, default=None)
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _persist_tuning_artifact(path: Path, payload: Dict[str, Any]) -> None:
+    _atomic_write_json(path, payload)
+
+
+def _load_tuning_artifact(path: Path) -> Optional[Dict[str, Any]]:
+    payload = _load_json_file(path, default=None)
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _write_smote_payload_to_duckdb(
+    path: Path,
+    *,
+    augmented_df: pd.DataFrame,
+    metadata: Dict[str, Any],
+) -> None:
+    if duckdb is None:
+        raise ImportError("duckdb is not installed.")
+    target_path = Path(path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f".{target_path.stem}_{time.time_ns()}.tmp")
+    con = duckdb.connect(str(temp_path))
+    try:
+        con.register("augmented_view", augmented_df)
+        con.execute("CREATE OR REPLACE TABLE augmented_train AS SELECT * FROM augmented_view")
+        meta_df = pd.DataFrame(
+            {
+                "metadata_json": [
+                    json.dumps(_to_json_safe(metadata), ensure_ascii=True, sort_keys=True)
+                ]
+            }
+        )
+        con.register("metadata_view", meta_df)
+        con.execute("CREATE OR REPLACE TABLE metadata AS SELECT * FROM metadata_view")
+    finally:
+        con.close()
+    os.replace(temp_path, target_path)
+
+
+def _load_smote_payload_from_duckdb(path: Path) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if duckdb is None:
+        raise ImportError("duckdb is not installed.")
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        augmented_df = con.execute("SELECT * FROM augmented_train").df()
+        metadata_json = con.execute("SELECT metadata_json FROM metadata LIMIT 1").fetchone()
+    finally:
+        con.close()
+    metadata = {}
+    if metadata_json and metadata_json[0]:
+        try:
+            metadata = json.loads(str(metadata_json[0]))
+        except Exception:
+            metadata = {"raw_metadata": str(metadata_json[0])}
+    return augmented_df, metadata
+
+
+def _tuning_search_df_from_artifact(
+    artifact: Optional[Dict[str, Any]],
+    *,
+    model_name: str,
+    balance_mode: str,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    trials = list((artifact or {}).get("trials") or [])
+    for row in trials:
+        rows.append(
+            {
+                "trial_number": int(row.get("trial_number", len(rows))),
+                "model": str(model_name),
+                "cv_auc": row.get("cv_auc"),
+                "params": json.dumps(row.get("params") or {}, sort_keys=True, ensure_ascii=True),
+                "state": str(row.get("state", "")),
+                "balance_mode": str(balance_mode),
+                "converged": bool(row.get("converged", True)),
+                "n_non_converged_folds": int(row.get("n_non_converged_folds", 0)),
+                "n_valid_folds": int(row.get("n_valid_folds", 0)),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=["trial_number", "model", "cv_auc", "params", "state", "balance_mode", "converged", "n_non_converged_folds", "n_valid_folds"])
+    return pd.DataFrame(rows).sort_values(["converged", "cv_auc"], ascending=[False, False], na_position="last").reset_index(drop=True)
+
+
+def _serialize_block_payload(
+    *,
+    block_id: str,
+    block: Dict[str, Any],
+    run_seed: int,
+    run_order: int,
+    yearly_rows: pd.DataFrame,
+    adaptive_rows: pd.DataFrame,
+    roc_payload: Sequence[Dict[str, Any]],
+    execution_log: Sequence[Dict[str, Any]],
+    tuning_refs: Sequence[str],
+    smote_refs: Sequence[str],
+) -> Dict[str, Any]:
+    return {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "block_id": str(block_id),
+        "block": _to_json_safe(block),
+        "run_seed": int(run_seed),
+        "run_order": int(run_order),
+        "yearly_rows": [] if yearly_rows is None or yearly_rows.empty else yearly_rows.to_dict(orient="records"),
+        "adaptive_rows": [] if adaptive_rows is None or adaptive_rows.empty else adaptive_rows.to_dict(orient="records"),
+        "roc_payload": _to_json_safe(list(roc_payload)),
+        "execution_log": _to_json_safe(list(execution_log)),
+        "tuning_refs": [str(ref) for ref in tuning_refs],
+        "smote_refs": [str(ref) for ref in smote_refs],
+    }
+
+
+def _load_completed_block_payloads(manifest: Dict[str, Any], *, blocks_dir: Path) -> List[Dict[str, Any]]:
+    payloads: List[Dict[str, Any]] = []
+    for block_id in manifest.get("completed_block_ids", []):
+        block_info = (manifest.get("block_index") or {}).get(str(block_id), {})
+        block_path = blocks_dir / str(block_info.get("filename") or f"{block_id}.json")
+        payload = _load_recalibration_block(block_path)
+        if payload:
+            payloads.append(payload)
+    strategy_priority = {
+        "static": 0,
+        "period_aligned": 1,
+        "cumulative": 2,
+        ADAPTIVE_ADWIN_STRATEGY: 3,
+        ADAPTIVE_ARF_STRATEGY: 4,
+        ADAPTIVE_KSWIN_STRATEGY: 5,
+    }
+    payloads.sort(
+        key=lambda payload: (
+            int(payload.get("run_order", 1)),
+            int(payload.get("run_seed", 0)),
+            int(strategy_priority.get(str((payload.get("block") or {}).get("strategy", "")), 99)),
+            0 if str((payload.get("block") or {}).get("balance_mode", BALANCE_MODE_NOT_APPLICABLE)) != BALANCE_MODE_SMOTE else 1,
+            _model_execution_priority(str((payload.get("block") or {}).get("model", ""))),
+            str((payload.get("block") or {}).get("model", "")),
+            str((payload.get("block") or {}).get("detector_variant", "")),
+        )
+    )
+    return payloads
+
+
+def _reconcile_recalibration_manifest(manifest: Dict[str, Any], *, paths: Dict[str, Path]) -> Dict[str, Any]:
+    completed_ids = {str(item) for item in manifest.get("completed_block_ids", [])}
+    block_index = dict(manifest.get("block_index") or {})
+    for block_path in sorted(paths["blocks_dir"].glob("*.json")):
+        payload = _load_recalibration_block(block_path)
+        if not payload:
+            continue
+        block_id = str(payload.get("block_id") or block_path.stem)
+        block_index[block_id] = {
+            **dict(block_index.get(block_id) or {}),
+            "filename": block_path.name,
+            "status": "completed",
+        }
+        completed_ids.add(block_id)
+    tuning_index = dict(manifest.get("tuning_index") or {})
+    for tuning_path in sorted(paths["tuning_dir"].glob("*.json")):
+        payload = _load_tuning_artifact(tuning_path)
+        if not payload:
+            continue
+        tuning_key = str(payload.get("tuning_key") or tuning_path.stem)
+        tuning_index[tuning_key] = {
+            **dict(tuning_index.get(tuning_key) or {}),
+            "filename": tuning_path.name,
+            "status": "completed",
+            "study_id": payload.get("study_id"),
+        }
+    smote_index = dict(manifest.get("smote_index") or {})
+    for smote_path in sorted(paths["smote_dir"].glob("*.duckdb")):
+        if smote_path.name in {".DS_Store"}:
+            continue
+        smote_key = smote_path.stem
+        smote_index[smote_key] = {
+            **dict(smote_index.get(smote_key) or {}),
+            "filename": smote_path.name,
+            "status": "available",
+        }
+    manifest["block_index"] = block_index
+    manifest["tuning_index"] = tuning_index
+    manifest["smote_index"] = smote_index
+    manifest["completed_block_ids"] = sorted(completed_ids)
+    return manifest
+
+
+def _assemble_recalibration_outputs_from_checkpoints(
+    manifest: Dict[str, Any],
+    *,
+    paths: Dict[str, Path],
+    feature_selection_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    block_payloads = _load_completed_block_payloads(manifest, blocks_dir=paths["blocks_dir"])
+    yearly_frames: List[pd.DataFrame] = []
+    adaptive_frames: List[pd.DataFrame] = []
+    roc_payload: List[Dict[str, Any]] = []
+    execution_log_rows: List[Dict[str, Any]] = list(manifest.get("global_execution_log") or [])
+    for payload in block_payloads:
+        yearly_rows = payload.get("yearly_rows") or []
+        adaptive_rows = payload.get("adaptive_rows") or []
+        if yearly_rows:
+            yearly_frames.append(pd.DataFrame(yearly_rows))
+        if adaptive_rows:
+            adaptive_frames.append(pd.DataFrame(adaptive_rows))
+        roc_payload.extend(list(payload.get("roc_payload") or []))
+        execution_log_rows.extend(list(payload.get("execution_log") or []))
+
+    yearly_results = pd.concat(yearly_frames, ignore_index=True) if yearly_frames else pd.DataFrame()
+    adaptive_results = pd.concat(adaptive_frames, ignore_index=True) if adaptive_frames else pd.DataFrame()
+    roc_curves = build_average_roc_curves(roc_payload)
+    summary = summarize_results(yearly_results, adaptive_results)
+    appendix = format_appendix_tables(yearly_results, adaptive_results)
+    appendix_mean = format_appendix_tables_mean(yearly_results, adaptive_results)
+
+    studies: List[Dict[str, Any]] = []
+    for tuning_info in (manifest.get("tuning_index") or {}).values():
+        tuning_path = paths["tuning_dir"] / str(tuning_info.get("filename", ""))
+        payload = _load_tuning_artifact(tuning_path)
+        if payload:
+            studies.append(payload)
+
+    for idx, row in enumerate(execution_log_rows, start=1):
+        row["order"] = idx
+    execution_log_df = pd.DataFrame(execution_log_rows)
+
+    return {
+        "yearly_results": yearly_results,
+        "adaptive_results": adaptive_results,
+        "roc_payload": roc_payload,
+        "average_roc": roc_curves,
+        "summary": summary,
+        "appendix_tables": appendix,
+        "appendix_tables_mean": appendix_mean,
+        "execution_log": execution_log_df,
+        "run_manifest": dict(manifest.get("run_manifest") or {}),
+        "checkpoint_manifest": manifest,
+        "studies": studies,
+        "feature_selection_context": feature_selection_context,
+    }
+
+
+def _estimate_recalibration_workload(
+    *,
+    df: pd.DataFrame,
+    time_col: str,
+    model_names: Sequence[str],
+    strategies: Sequence[str],
+    arf_variants: Sequence[str],
+    kswin_variants: Sequence[str],
+    balance_modes: Sequence[str],
+    repetition_seeds: Sequence[int],
+    grid_limit: Optional[int],
+    folds: int,
+) -> Dict[str, Any]:
+    years = _available_prediction_years(df, time_col)
+    pred_years = max(0, len(years) - 1)
+    batch_strategies = [s for s in strategies if s in YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]]
+    tuning_tasks = []
+    if batch_strategies:
+        for model_name in model_names:
+            for balance_mode in balance_modes:
+                if str(balance_mode) in DEFAULT_BATCH_BALANCE_MODES:
+                    tuning_tasks.append((str(model_name), str(balance_mode)))
+    experiment_blocks = _build_experiment_blocks(
+        model_names=list(model_names),
+        strategies=list(strategies),
+        arf_variants=list(arf_variants),
+        kswin_variants=list(kswin_variants),
+        balance_modes=list(balance_modes),
+    )
+    lower_bound_fits = 0
+    for block in experiment_blocks:
+        strategy = str(block.get("strategy", ""))
+        if strategy in YEARLY_STRATEGIES:
+            lower_bound_fits += pred_years
+        elif strategy in {ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY}:
+            lower_bound_fits += 1
+    lower_bound_fits *= max(1, len(repetition_seeds))
+    high_risk = (
+        "Random Forest" in model_names
+        and BALANCE_MODE_SMOTE in balance_modes
+        and int(folds) >= 5
+        and (grid_limit is None or int(grid_limit) >= 20)
+    )
+    return {
+        "n_tuning_tasks": int(len(tuning_tasks)),
+        "n_blocks": int(len(experiment_blocks) * max(1, len(repetition_seeds))),
+        "estimated_batch_fits": int(lower_bound_fits),
+        "high_risk_memory": bool(high_risk),
+    }
 
 
 def _append_execution_log(
@@ -2274,26 +3249,525 @@ def _group_seed_metadata(df: pd.DataFrame, group_cols: Sequence[str]) -> pd.Data
     ).reset_index()
 
 
-def _parameter_combinations(
+def _ensure_optuna_available() -> None:
+    if optuna is None or TPESampler is None:
+        raise ImportError(
+            "La busqueda de hiperparametros requiere `optuna`. "
+            "Revise el entorno activo antes de ejecutar Drift detection."
+        )
+
+
+def _ensure_smote_available() -> None:
+    if SMOTE is None:
+        raise ImportError(
+            "El balanceo con SMOTE requiere `imbalanced-learn`. "
+            "Revise el entorno activo antes de ejecutar Drift detection con SMOTE."
+        )
+
+
+def _normalize_param_choice(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _prepare_xy_raw(
+    df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    target_col: str,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    cols = [c for c in feature_cols if c in df.columns]
+    X = df[cols].copy()
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+    y = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int)
+    return X, y
+
+
+def _fit_fill_values(X: pd.DataFrame) -> Dict[str, float]:
+    if X is None or X.empty:
+        return {}
+    medians = X.median(numeric_only=True)
+    out: Dict[str, float] = {}
+    for col in X.columns:
+        value = medians.get(col, 0.0)
+        value = 0.0 if pd.isna(value) else float(value)
+        out[str(col)] = value
+    return out
+
+
+def _apply_fill_values(X: pd.DataFrame, fill_values: Optional[Dict[str, float]]) -> pd.DataFrame:
+    work = X.copy()
+    values = dict(fill_values or {})
+    for col in work.columns:
+        fill_value = float(values.get(str(col), 0.0))
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(fill_value).astype(float)
+    return work
+
+
+def _default_search_params(search_space: Dict[str, Sequence[Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for name, values in search_space.items():
+        options = list(values)
+        if not options:
+            continue
+        out[str(name)] = _normalize_param_choice(options[0])
+    return out
+
+
+def _search_space_size(search_space: Dict[str, Sequence[Any]]) -> int:
+    size = 1
+    for values in search_space.values():
+        options = list(values)
+        if not options:
+            continue
+        size *= len(options)
+    return max(1, int(size))
+
+
+def _parallel_cv_jobs(model_name: str, effective_folds: int) -> int:
+    if model_name != "AdaBoost":
+        return 1
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(int(effective_folds), int(cpu_count)))
+
+
+def _bounded_estimator_n_jobs(model_name: str) -> int:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    env_var = ""
+    default_cap = 1
+
+    if model_name == "Random Forest":
+        env_var = "SUMO_RF_N_JOBS"
+        default_cap = 2
+    elif model_name == "XGBoost":
+        env_var = "SUMO_XGB_N_JOBS"
+        default_cap = 4
+    else:
+        return 1
+
+    raw_value = os.getenv(env_var, "").strip()
+    if raw_value:
+        try:
+            requested = int(raw_value)
+        except ValueError:
+            requested = default_cap
+        return max(1, min(requested, cpu_count))
+    return max(1, min(default_cap, cpu_count))
+
+
+def _build_model_search_space(
     model_name: str,
     *,
     fast_mode: bool,
-    grid_limit: Optional[int],
     custom_grid: Optional[Dict[str, Sequence[Any]]] = None,
-) -> List[Dict[str, Any]]:
+    balance_mode: str = BALANCE_MODE_NONE,
+) -> Dict[str, Sequence[Any]]:
     if custom_grid is not None:
-        grid = custom_grid
+        search_space = {str(key): list(values) for key, values in custom_grid.items()}
     else:
-        grid = FAST_HYPERPARAM_GRIDS[model_name] if fast_mode else FULL_HYPERPARAM_GRIDS[model_name]
+        base = FAST_HYPERPARAM_GRIDS[model_name] if fast_mode else FULL_HYPERPARAM_GRIDS[model_name]
+        search_space = {str(key): list(values) for key, values in base.items()}
 
-    combos = list(ParameterGrid(grid))
-    if grid_limit is None or grid_limit <= 0 or len(combos) <= int(grid_limit):
-        return combos
+    if balance_mode == BALANCE_MODE_SMOTE:
+        smote_space = FAST_SMOTE_SEARCH_SPACE if fast_mode else FULL_SMOTE_SEARCH_SPACE
+        for key, values in smote_space.items():
+            search_space[str(key)] = list(values)
+    return search_space
 
-    # Deterministic down-sampling to keep runtime bounded.
-    idx = np.linspace(0, len(combos) - 1, int(grid_limit)).round().astype(int)
-    dedup = sorted(set(idx.tolist()))
-    return [combos[i] for i in dedup]
+
+def _split_model_and_smote_params(
+    params: Dict[str, Any],
+    *,
+    balance_mode: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    smote_keys = {"sampling_strategy", "k_neighbors"}
+    clean = {str(key): _normalize_param_choice(value) for key, value in dict(params).items()}
+    model_params = {key: value for key, value in clean.items() if key not in smote_keys}
+    smote_params = {}
+    if balance_mode == BALANCE_MODE_SMOTE:
+        smote_params = {
+            key: clean[key]
+            for key in smote_keys
+            if key in clean
+        }
+    return model_params, smote_params
+
+
+def _model_policy_version(model_name: str) -> Optional[str]:
+    if str(model_name) == "NNet":
+        return NNET_TRAINING_POLICY_VERSION
+    return None
+
+
+def _requires_feature_transform(model_name: str) -> bool:
+    return str(model_name) == "NNet"
+
+
+def _fit_feature_transform(
+    X: pd.DataFrame,
+    *,
+    model_name: str,
+) -> Optional[Dict[str, Any]]:
+    if not _requires_feature_transform(model_name):
+        return None
+    scaler = StandardScaler()
+    scaler.fit(X)
+    scale = np.asarray(getattr(scaler, "scale_", np.ones(X.shape[1], dtype=float)), dtype=float)
+    scale[~np.isfinite(scale)] = 1.0
+    scale[np.isclose(scale, 0.0)] = 1.0
+    mean = np.asarray(getattr(scaler, "mean_", np.zeros(X.shape[1], dtype=float)), dtype=float)
+    mean[~np.isfinite(mean)] = 0.0
+    return {
+        "kind": "standard_scaler",
+        "policy_version": NNET_TRAINING_POLICY_VERSION,
+        "columns": list(X.columns),
+        "mean": mean.tolist(),
+        "scale": scale.tolist(),
+    }
+
+
+def _apply_feature_transform(
+    X: pd.DataFrame,
+    feature_transform: Optional[Dict[str, Any]],
+) -> pd.DataFrame:
+    if not feature_transform:
+        return X.copy()
+    if str(feature_transform.get("kind", "")) != "standard_scaler":
+        return X.copy()
+    columns = [str(col) for col in feature_transform.get("columns", list(X.columns))]
+    work = X.copy()
+    for col in columns:
+        if col not in work.columns:
+            work[col] = 0.0
+    work = work[columns].copy()
+    mean = np.asarray(feature_transform.get("mean", [0.0] * len(columns)), dtype=float)
+    scale = np.asarray(feature_transform.get("scale", [1.0] * len(columns)), dtype=float)
+    scale[~np.isfinite(scale)] = 1.0
+    scale[np.isclose(scale, 0.0)] = 1.0
+    values = work.to_numpy(dtype=float, copy=True)
+    transformed = (values - mean) / scale
+    return pd.DataFrame(transformed, columns=columns, index=work.index)
+
+
+def _fit_nnet_warning_safe(model, X: pd.DataFrame, y: Sequence[int]) -> Dict[str, Any]:
+    warnings_list: List[warnings.WarningMessage] = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model.fit(X, y)
+        warnings_list = list(caught)
+    convergence_items = [
+        item for item in warnings_list
+        if issubclass(item.category, ConvergenceWarning)
+    ]
+    for item in warnings_list:
+        if issubclass(item.category, ConvergenceWarning):
+            continue
+        warnings.warn(item.message, item.category, stacklevel=2)
+    n_iter_value = getattr(model, "n_iter_", None)
+    if isinstance(n_iter_value, np.generic):
+        n_iter_value = n_iter_value.item()
+    return {
+        "converged": len(convergence_items) == 0,
+        "fit_warning_count": int(len(convergence_items)),
+        "n_iter_final": None if n_iter_value is None else int(n_iter_value),
+        "warning_messages": [str(item.message) for item in convergence_items],
+    }
+
+
+def _fit_model_with_diagnostics(
+    model_name: str,
+    model_params: Dict[str, Any],
+    *,
+    random_state: int,
+    n_features: int,
+    X_fit: pd.DataFrame,
+    y_fit: Sequence[int],
+    allow_retry: bool = False,
+) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
+    params_used = {str(key): _normalize_param_choice(value) for key, value in dict(model_params).items()}
+    model = _build_model(
+        model_name,
+        params_used,
+        random_state=random_state,
+        n_features=n_features,
+    )
+    diagnostics: Dict[str, Any]
+    if str(model_name) == "NNet":
+        diagnostics = _fit_nnet_warning_safe(model, X_fit, y_fit)
+        diagnostics["fit_retry_applied"] = False
+        diagnostics["retry_initial_converged"] = bool(diagnostics.get("converged", True))
+        if allow_retry and not bool(diagnostics.get("converged", True)):
+            retry_params = dict(params_used)
+            current_maxit = int(retry_params.get("maxit", 200))
+            retry_params["maxit"] = int(min(max(current_maxit * 2, current_maxit + 1), NNET_MAX_ITER_RETRY_CAP))
+            if int(retry_params["maxit"]) != int(current_maxit):
+                retry_model = _build_model(
+                    model_name,
+                    retry_params,
+                    random_state=random_state,
+                    n_features=n_features,
+                )
+                retry_diagnostics = _fit_nnet_warning_safe(retry_model, X_fit, y_fit)
+                retry_diagnostics["fit_retry_applied"] = True
+                retry_diagnostics["retry_initial_converged"] = bool(diagnostics.get("converged", True))
+                model = retry_model
+                params_used = retry_params
+                diagnostics = retry_diagnostics
+    else:
+        model.fit(X_fit, y_fit)
+        diagnostics = {
+            "converged": True,
+            "fit_warning_count": 0,
+            "n_iter_final": None,
+            "fit_retry_applied": False,
+            "retry_initial_converged": True,
+            "warning_messages": [],
+        }
+    diagnostics["model_name"] = str(model_name)
+    diagnostics["params_used"] = dict(params_used)
+    return model, diagnostics, params_used
+
+
+def _apply_smote_balance(
+    X: pd.DataFrame,
+    y: Sequence[int],
+    *,
+    sampling_strategy: float,
+    k_neighbors: int,
+    random_state: int,
+) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
+    _ensure_smote_available()
+    y_np = np.asarray(y).astype(int)
+    train_rows = int(len(X))
+    if X.empty or np.unique(y_np).size < 2:
+        return X.copy(), y_np, {
+            "applied": False,
+            "train_rows": train_rows,
+            "original_rows": train_rows,
+            "balanced_rows": train_rows,
+            "sampling_strategy": float(sampling_strategy),
+            "k_neighbors": int(k_neighbors),
+        }
+
+    class_counts = np.bincount(y_np)
+    positive_count = int(class_counts.min()) if class_counts.size else 0
+    majority_count = int(class_counts.max()) if class_counts.size else 0
+    if positive_count < 2:
+        return X.copy(), y_np, {
+            "applied": False,
+            "train_rows": train_rows,
+            "original_rows": train_rows,
+            "balanced_rows": train_rows,
+            "sampling_strategy": float(sampling_strategy),
+            "k_neighbors": int(k_neighbors),
+        }
+    current_ratio = float(positive_count / majority_count) if majority_count > 0 else 1.0
+    if current_ratio >= float(sampling_strategy):
+        return X.copy(), y_np, {
+            "applied": False,
+            "train_rows": train_rows,
+            "original_rows": train_rows,
+            "balanced_rows": train_rows,
+            "sampling_strategy": float(sampling_strategy),
+            "k_neighbors": int(k_neighbors),
+            "reason": "already_at_or_above_target_ratio",
+        }
+
+    effective_k = max(1, min(int(k_neighbors), positive_count - 1))
+    sampler = SMOTE(
+        sampling_strategy=float(sampling_strategy),
+        k_neighbors=int(effective_k),
+        random_state=int(random_state),
+    )
+    X_res, y_res = sampler.fit_resample(X, y_np)
+    X_bal = pd.DataFrame(X_res, columns=list(X.columns))
+    y_bal = np.asarray(y_res).astype(int)
+    return X_bal, y_bal, {
+        "applied": True,
+        "train_rows": train_rows,
+        "sampling_strategy": float(sampling_strategy),
+        "k_neighbors": int(effective_k),
+        "original_rows": train_rows,
+        "balanced_rows": int(len(X_bal)),
+    }
+
+
+def _load_or_create_smote_artifact(
+    *,
+    run_id: str,
+    train_df: pd.DataFrame,
+    X: pd.DataFrame,
+    y: Sequence[int],
+    feature_cols: Sequence[str],
+    target_col: str,
+    time_col: Optional[str],
+    sampling_strategy: float,
+    k_neighbors: int,
+    random_state: int,
+    smote_cache_dir: Optional[Path],
+    smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
+    if smote_cache_dir is None:
+        return _apply_smote_balance(
+            X,
+            y,
+            sampling_strategy=float(sampling_strategy),
+            k_neighbors=int(k_neighbors),
+            random_state=int(random_state),
+        )
+
+    smote_cache_dir = Path(smote_cache_dir)
+    smote_cache_dir.mkdir(parents=True, exist_ok=True)
+    smote_key = _build_smote_key(
+        run_id=run_id,
+        train_df=train_df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        time_col=time_col,
+        sampling_strategy=float(sampling_strategy),
+        k_neighbors=int(k_neighbors),
+    )
+    artifact_path = smote_cache_dir / f"{smote_key}.duckdb"
+    if artifact_path.exists():
+        augmented_df, metadata = _load_smote_payload_from_duckdb(artifact_path)
+        y_bal = pd.to_numeric(augmented_df[target_col], errors="coerce").fillna(0).astype(int).to_numpy()
+        X_bal = augmented_df[[col for col in feature_cols if col in augmented_df.columns]].copy()
+        fit_info = dict(metadata.get("fit_info") or {})
+        fit_info.update(
+            {
+                "artifact_key": smote_key,
+                "artifact_path": str(artifact_path),
+                "artifact_reused": True,
+            }
+        )
+        if smote_cache_registry is not None:
+            smote_cache_registry[smote_key] = {
+                "smote_key": smote_key,
+                "path": str(artifact_path),
+                "metadata": metadata,
+                "status": "available",
+                "reused": True,
+            }
+        return X_bal, y_bal, fit_info
+
+    X_bal, y_bal, fit_info = _apply_smote_balance(
+        X,
+        y,
+        sampling_strategy=float(sampling_strategy),
+        k_neighbors=int(k_neighbors),
+        random_state=int(random_state),
+    )
+    augmented_df = X_bal.copy()
+    augmented_df[target_col] = np.asarray(y_bal).astype(int)
+    metadata = {
+        "smote_key": smote_key,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "feature_cols": list(feature_cols),
+        "target_col": str(target_col),
+        "time_col": None if time_col is None else str(time_col),
+        "sampling_strategy": float(sampling_strategy),
+        "k_neighbors": int(k_neighbors),
+        "fit_info": {
+            **dict(fit_info),
+            "artifact_key": smote_key,
+            "artifact_path": str(artifact_path),
+            "artifact_reused": False,
+        },
+    }
+    _write_smote_payload_to_duckdb(
+        artifact_path,
+        augmented_df=augmented_df,
+        metadata=metadata,
+    )
+    if smote_cache_registry is not None:
+        smote_cache_registry[smote_key] = {
+            "smote_key": smote_key,
+            "path": str(artifact_path),
+            "metadata": metadata,
+            "status": "available",
+            "reused": False,
+        }
+    fit_info = dict(metadata["fit_info"])
+    return X_bal, y_bal, fit_info
+
+
+def _normalized_optuna_trials(
+    study: Any,
+    *,
+    balance_mode: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for trial in study.trials:
+        state_name = str(getattr(trial.state, "name", trial.state))
+        trial_value = None
+        if trial.value is not None and float(trial.value) >= 0:
+            trial_value = float(trial.value)
+        model_params, smote_params = _split_model_and_smote_params(
+            dict(trial.params),
+            balance_mode=balance_mode,
+        )
+        cv_diagnostics = dict(getattr(trial, "user_attrs", {}).get("cv_diagnostics") or {})
+        rows.append(
+            {
+                "trial_number": int(trial.number),
+                "state": state_name,
+                "cv_auc": trial_value,
+                "params": {key: _normalize_param_choice(value) for key, value in trial.params.items()},
+                "model_params": model_params,
+                "smote_params": smote_params,
+                "converged": bool(cv_diagnostics.get("converged", True)),
+                "n_non_converged_folds": int(cv_diagnostics.get("n_non_converged_folds", 0)),
+                "n_valid_folds": int(cv_diagnostics.get("n_valid_folds", 0)),
+                "fold_diagnostics": _to_json_safe(cv_diagnostics.get("fold_diagnostics") or []),
+                "n_iter_final": cv_diagnostics.get("n_iter_final"),
+            }
+        )
+    return rows
+
+
+def _build_tuning_study_id(
+    *,
+    stage: str,
+    strategy: str,
+    model_name: str,
+    balance_mode: str,
+    run_seed: int,
+    run_order: int,
+    detector_variant: Optional[str] = None,
+    prediction_year: Optional[int] = None,
+    training_year: Optional[str] = None,
+    drift: Optional[int] = None,
+) -> str:
+    parts = [
+        stage,
+        strategy,
+        model_name,
+        balance_mode,
+        f"seed_{int(run_seed)}",
+        f"run_{int(run_order)}",
+    ]
+    if detector_variant:
+        parts.append(str(detector_variant))
+    if prediction_year is not None:
+        parts.append(f"pred_{int(prediction_year)}")
+    if training_year:
+        parts.append(f"train_{training_year}")
+    if drift is not None:
+        parts.append(f"drift_{int(drift)}")
+    return _slugify_token("__".join(parts))
+
+
+def _append_tuning_study(
+    study_rows: Optional[List[Dict[str, Any]]],
+    artifact: Optional[Dict[str, Any]],
+    **context: Any,
+) -> None:
+    if study_rows is None or not artifact:
+        return
+    entry = dict(artifact)
+    entry.update(context)
+    study_rows.append(_to_json_safe(entry))
 
 
 def _build_model(
@@ -2304,16 +3778,25 @@ def _build_model(
     n_features: int,
 ):
     if model_name == "Random Forest":
-        criterion = "gini" if str(params.get("splitrule", "gini")) == "gini" else "entropy"
+        splitrule = str(params.get("splitrule", "gini"))
         mtry = int(params.get("mtry", min(6, max(1, n_features))))
+        common_kwargs = {
+            "n_estimators": 400,
+            "max_features": max(1, min(mtry, n_features)),
+            "min_samples_leaf": int(params.get("min_node_size", 1)),
+            "random_state": random_state,
+            "n_jobs": _bounded_estimator_n_jobs(model_name),
+        }
+        if splitrule == "extratrees":
+            return ExtraTreesClassifier(
+                criterion="gini",
+                class_weight="balanced",
+                **common_kwargs,
+            )
         return RandomForestClassifier(
-            n_estimators=400,
-            criterion=criterion,
-            max_features=max(1, min(mtry, n_features)),
-            min_samples_leaf=int(params.get("min_node_size", 1)),
+            criterion="gini",
             class_weight="balanced_subsample",
-            random_state=random_state,
-            n_jobs=-1,
+            **common_kwargs,
         )
 
     if model_name == "AdaBoost":
@@ -2335,6 +3818,10 @@ def _build_model(
             max_iter=int(params.get("maxit", 200)),
             random_state=random_state,
             solver="adam",
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=20,
+            tol=1e-4,
         )
 
     if model_name == "XGBoost":
@@ -2356,7 +3843,7 @@ def _build_model(
             objective="binary:logistic",
             eval_metric="logloss",
             random_state=random_state,
-            n_jobs=-1,
+            n_jobs=_bounded_estimator_n_jobs(model_name),
             verbosity=0,
         )
 
@@ -2379,43 +3866,262 @@ def _cv_auc(
     params: Dict[str, Any],
     folds: int,
     random_state: int,
-) -> float:
-    y_np = np.asarray(y).astype(int)
-    if np.unique(y_np).size < 2:
-        return float("nan")
-
-    min_class = int(np.bincount(y_np).min())
-    effective_folds = max(2, min(int(folds), min_class))
+    balance_mode: str = BALANCE_MODE_NONE,
+    return_diagnostics: bool = False,
+) -> Any:
+    effective_folds = _effective_stratified_folds(y, folds)
     if effective_folds < 2:
-        return float("nan")
+        empty_payload = {
+            "cv_auc": float("nan"),
+            "converged": False,
+            "n_non_converged_folds": 0,
+            "n_valid_folds": 0,
+            "fold_diagnostics": [],
+        }
+        return empty_payload if return_diagnostics else float("nan")
 
+    y_np = np.asarray(y).astype(int)
     skf = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=random_state)
+    splits = list(enumerate(skf.split(X, y_np), start=1))
 
-    aucs: List[float] = []
-    for tr_idx, va_idx in skf.split(X, y_np):
-        X_tr = X.iloc[tr_idx]
-        X_va = X.iloc[va_idx]
+    def evaluate_fold(fold_idx: int, tr_idx: np.ndarray, va_idx: np.ndarray) -> Dict[str, Any]:
+        X_tr_raw = X.iloc[tr_idx]
+        X_va_raw = X.iloc[va_idx]
         y_tr = y_np[tr_idx]
         y_va = y_np[va_idx]
 
         try:
-            model = _build_model(
-                model_name,
+            fill_values = _fit_fill_values(X_tr_raw)
+            X_tr_filled = _apply_fill_values(X_tr_raw, fill_values)
+            X_va_filled = _apply_fill_values(X_va_raw, fill_values)
+            feature_transform = _fit_feature_transform(X_tr_filled, model_name=model_name)
+            X_tr = _apply_feature_transform(X_tr_filled, feature_transform)
+            X_va = _apply_feature_transform(X_va_filled, feature_transform)
+            model_params, smote_params = _split_model_and_smote_params(
                 params,
+                balance_mode=balance_mode,
+            )
+            if balance_mode == BALANCE_MODE_SMOTE:
+                X_fit, y_fit, _ = _apply_smote_balance(
+                    X_tr,
+                    y_tr,
+                    sampling_strategy=float(smote_params.get("sampling_strategy", 1.0)),
+                    k_neighbors=int(smote_params.get("k_neighbors", 5)),
+                    random_state=int(random_state) + int(fold_idx),
+                )
+            else:
+                X_fit, y_fit = X_tr, y_tr
+            model, fit_diagnostics, _ = _fit_model_with_diagnostics(
+                model_name,
+                model_params,
                 random_state=random_state,
                 n_features=X.shape[1],
+                X_fit=X_fit,
+                y_fit=y_fit,
+                allow_retry=False,
             )
-            model.fit(X_tr, y_tr)
+            if str(model_name) == "NNet" and not bool(fit_diagnostics.get("converged", True)):
+                return {
+                    "auc": float("nan"),
+                    "converged": False,
+                    "n_iter_final": fit_diagnostics.get("n_iter_final"),
+                    "fit_warning_count": int(fit_diagnostics.get("fit_warning_count", 0)),
+                }
             scores = _model_scores(model, X_va)
             auc = _safe_auc(y_va, scores)
             if not np.isnan(auc):
-                aucs.append(float(auc))
+                return {
+                    "auc": float(auc),
+                    "converged": bool(fit_diagnostics.get("converged", True)),
+                    "n_iter_final": fit_diagnostics.get("n_iter_final"),
+                    "fit_warning_count": int(fit_diagnostics.get("fit_warning_count", 0)),
+                }
         except Exception:
-            continue
+            return {
+                "auc": float("nan"),
+                "converged": False if str(model_name) == "NNet" else True,
+                "n_iter_final": None,
+                "fit_warning_count": 0,
+            }
+        return {
+            "auc": float("nan"),
+            "converged": False if str(model_name) == "NNet" else True,
+            "n_iter_final": None,
+            "fit_warning_count": 0,
+        }
 
+    parallel_jobs = _parallel_cv_jobs(model_name, effective_folds)
+    if parallel_jobs > 1:
+        fold_payloads = SklearnParallel(n_jobs=parallel_jobs, prefer="threads")(
+            sklearn_delayed(evaluate_fold)(fold_idx, tr_idx, va_idx)
+            for fold_idx, (tr_idx, va_idx) in splits
+        )
+    else:
+        fold_payloads = [evaluate_fold(fold_idx, tr_idx, va_idx) for fold_idx, (tr_idx, va_idx) in splits]
+    aucs = [float(payload.get("auc", float("nan"))) for payload in fold_payloads if np.isfinite(payload.get("auc", float("nan")))]
+    non_converged_folds = int(
+        sum(
+            1
+            for payload in fold_payloads
+            if str(model_name) == "NNet" and not bool(payload.get("converged", True))
+        )
+    )
+    fold_n_iters = [
+        int(payload["n_iter_final"])
+        for payload in fold_payloads
+        if payload.get("n_iter_final") is not None
+    ]
+    diagnostics = {
+        "cv_auc": float(np.mean(aucs)) if aucs else float("nan"),
+        "converged": non_converged_folds == 0,
+        "n_non_converged_folds": non_converged_folds,
+        "n_valid_folds": int(len(aucs)),
+        "n_iter_final": max(fold_n_iters) if fold_n_iters else None,
+        "fold_diagnostics": _to_json_safe(fold_payloads),
+    }
+    if return_diagnostics:
+        return diagnostics
     if not aucs:
         return float("nan")
     return float(np.mean(aucs))
+
+
+def _effective_stratified_folds(y: Sequence[int], folds: int) -> int:
+    y_np = np.asarray(y).astype(int)
+    if np.unique(y_np).size < 2:
+        return 0
+
+    min_class = int(np.bincount(y_np).min())
+    effective_folds = max(2, min(int(folds), min_class))
+    if effective_folds < 2:
+        return 0
+    return int(effective_folds)
+
+
+def _cross_validated_scores(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    model_name: str,
+    params: Dict[str, Any],
+    folds: int,
+    random_state: int,
+    balance_mode: str = BALANCE_MODE_NONE,
+    return_diagnostics: bool = False,
+) -> Any:
+    effective_folds = _effective_stratified_folds(y, folds)
+    scores = np.full(len(X), np.nan, dtype=float)
+    if effective_folds < 2:
+        payload = {
+            "scores": scores,
+            "converged": False,
+            "n_non_converged_folds": 0,
+            "n_valid_folds": 0,
+            "fold_diagnostics": [],
+        }
+        return payload if return_diagnostics else scores
+
+    y_np = np.asarray(y).astype(int)
+    skf = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=random_state)
+    splits = list(enumerate(skf.split(X, y_np), start=1))
+    model_params, smote_params = _split_model_and_smote_params(
+        params,
+        balance_mode=balance_mode,
+    )
+
+    def score_fold(
+        fold_idx: int,
+        tr_idx: np.ndarray,
+        va_idx: np.ndarray,
+    ) -> Dict[str, Any]:
+        X_tr_raw = X.iloc[tr_idx]
+        X_va_raw = X.iloc[va_idx]
+        y_tr = y_np[tr_idx]
+
+        try:
+            fill_values = _fit_fill_values(X_tr_raw)
+            X_tr_filled = _apply_fill_values(X_tr_raw, fill_values)
+            X_va_filled = _apply_fill_values(X_va_raw, fill_values)
+            feature_transform = _fit_feature_transform(X_tr_filled, model_name=model_name)
+            X_tr = _apply_feature_transform(X_tr_filled, feature_transform)
+            X_va = _apply_feature_transform(X_va_filled, feature_transform)
+            if balance_mode == BALANCE_MODE_SMOTE:
+                X_fit, y_fit, _ = _apply_smote_balance(
+                    X_tr,
+                    y_tr,
+                    sampling_strategy=float(smote_params.get("sampling_strategy", 1.0)),
+                    k_neighbors=int(smote_params.get("k_neighbors", 5)),
+                    random_state=int(random_state) + int(fold_idx),
+                )
+            else:
+                X_fit, y_fit = X_tr, y_tr
+            model, fit_diagnostics, _ = _fit_model_with_diagnostics(
+                model_name,
+                model_params,
+                random_state=random_state,
+                n_features=X.shape[1],
+                X_fit=X_fit,
+                y_fit=y_fit,
+                allow_retry=False,
+            )
+            if str(model_name) == "NNet" and not bool(fit_diagnostics.get("converged", True)):
+                return {
+                    "va_idx": np.asarray([], dtype=int),
+                    "scores": np.asarray([], dtype=float),
+                    "converged": False,
+                    "n_iter_final": fit_diagnostics.get("n_iter_final"),
+                    "fit_warning_count": int(fit_diagnostics.get("fit_warning_count", 0)),
+                }
+            return {
+                "va_idx": np.asarray(va_idx, dtype=int),
+                "scores": np.asarray(_model_scores(model, X_va), dtype=float),
+                "converged": bool(fit_diagnostics.get("converged", True)),
+                "n_iter_final": fit_diagnostics.get("n_iter_final"),
+                "fit_warning_count": int(fit_diagnostics.get("fit_warning_count", 0)),
+            }
+        except Exception:
+            return {
+                "va_idx": np.asarray([], dtype=int),
+                "scores": np.asarray([], dtype=float),
+                "converged": False if str(model_name) == "NNet" else True,
+                "n_iter_final": None,
+                "fit_warning_count": 0,
+            }
+
+    parallel_jobs = _parallel_cv_jobs(model_name, effective_folds)
+    if parallel_jobs > 1:
+        fold_results = SklearnParallel(n_jobs=parallel_jobs, prefer="threads")(
+            sklearn_delayed(score_fold)(fold_idx, tr_idx, va_idx)
+            for fold_idx, (tr_idx, va_idx) in splits
+        )
+    else:
+        fold_results = [score_fold(fold_idx, tr_idx, va_idx) for fold_idx, (tr_idx, va_idx) in splits]
+
+    for payload in fold_results:
+        va_idx = np.asarray(payload.get("va_idx", []), dtype=int)
+        fold_scores = np.asarray(payload.get("scores", []), dtype=float)
+        if len(va_idx) and len(fold_scores) == len(va_idx):
+            scores[va_idx] = fold_scores
+    payload = {
+        "scores": scores,
+        "converged": int(
+            sum(1 for item in fold_results if str(model_name) == "NNet" and not bool(item.get("converged", True)))
+        ) == 0,
+        "n_non_converged_folds": int(
+            sum(1 for item in fold_results if str(model_name) == "NNet" and not bool(item.get("converged", True)))
+        ),
+        "n_valid_folds": int(sum(1 for item in fold_results if len(np.asarray(item.get("va_idx", []), dtype=int)))),
+        "n_iter_final": max(
+            [
+                int(item["n_iter_final"])
+                for item in fold_results
+                if item.get("n_iter_final") is not None
+            ],
+            default=None,
+        ),
+        "fold_diagnostics": _to_json_safe(fold_results),
+    }
+    return payload if return_diagnostics else scores
 
 
 def tune_hyperparameters(
@@ -2428,38 +4134,126 @@ def tune_hyperparameters(
     fast_mode: bool = True,
     grid_limit: Optional[int] = None,
     custom_grid: Optional[Dict[str, Sequence[Any]]] = None,
-) -> Tuple[Dict[str, Any], pd.DataFrame]:
-    combinations = _parameter_combinations(
+    balance_mode: str = BALANCE_MODE_NONE,
+    study_id: Optional[str] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[Dict[str, Any], pd.DataFrame, Dict[str, Any]]:
+    _ensure_optuna_available()
+    search_space = _build_model_search_space(
         model_name,
         fast_mode=fast_mode,
-        grid_limit=grid_limit,
         custom_grid=custom_grid,
+        balance_mode=balance_mode,
+    )
+    search_space_size = _search_space_size(search_space)
+    requested_trials = int(grid_limit) if grid_limit is not None and int(grid_limit) > 0 else search_space_size
+    n_trials = max(1, min(int(requested_trials), int(search_space_size)))
+    if study_id is None:
+        study_id = _build_tuning_study_id(
+            stage="generic",
+            strategy="generic",
+            model_name=model_name,
+            balance_mode=balance_mode,
+            run_seed=int(random_state),
+            run_order=1,
+        )
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=TPESampler(seed=int(random_state)),
+        study_name=study_id,
+    )
+    _emit_experiment_progress(
+        progress_callback,
+        ratio=0.0,
+        label="Sintonizando hiperparametros...",
+        detail=f"Modelo {model_name} | 0 / {int(n_trials)} trials",
     )
 
-    rows: List[Dict[str, Any]] = []
-    best_params: Optional[Dict[str, Any]] = None
-    best_auc = -np.inf
-
-    for params in combinations:
-        auc = _cv_auc(
+    def objective(trial: Any) -> float:
+        params = {
+            name: _normalize_param_choice(
+                trial.suggest_categorical(name, list(values))
+            )
+            for name, values in search_space.items()
+        }
+        cv_payload = _cv_auc(
             X,
             y,
             model_name=model_name,
             params=params,
             folds=folds,
             random_state=random_state,
+            balance_mode=balance_mode,
+            return_diagnostics=True,
         )
-        row = {"model": model_name, "cv_auc": auc, "params": json.dumps(params, sort_keys=True)}
-        rows.append(row)
+        trial.set_user_attr("cv_diagnostics", _to_json_safe(cv_payload))
+        auc = float(cv_payload.get("cv_auc", float("nan")))
+        if str(model_name) == "NNet" and not bool(cv_payload.get("converged", True)):
+            return -1.0
+        return float(auc) if np.isfinite(auc) else -1.0
 
-        if not np.isnan(auc) and auc > best_auc:
-            best_auc = auc
-            best_params = dict(params)
+    def optuna_progress(study_obj: Any, _trial: Any) -> None:
+        completed = len(study_obj.trials)
+        best_value = getattr(study_obj, "best_value", None)
+        best_text = "n/a" if best_value is None or not np.isfinite(float(best_value)) else f"{float(best_value):.4f}"
+        _emit_experiment_progress(
+            progress_callback,
+            ratio=float(completed) / float(max(1, int(n_trials))),
+            label="Sintonizando hiperparametros...",
+            detail=f"Modelo {model_name} | Trial {completed} / {int(n_trials)} | Mejor AUC CV {best_text}",
+        )
 
-    if best_params is None:
-        best_params = combinations[0] if combinations else {}
+    study.optimize(objective, n_trials=int(n_trials), show_progress_bar=False, callbacks=[optuna_progress])
+    trials = _normalized_optuna_trials(study, balance_mode=balance_mode)
+    rows: List[Dict[str, Any]] = []
+    for row in trials:
+        rows.append(
+            {
+                "trial_number": int(row["trial_number"]),
+                "model": model_name,
+                "cv_auc": row["cv_auc"],
+                "params": json.dumps(row["params"], sort_keys=True, ensure_ascii=True),
+                "state": str(row["state"]),
+                "balance_mode": balance_mode,
+                "converged": bool(row.get("converged", True)),
+                "n_non_converged_folds": int(row.get("n_non_converged_folds", 0)),
+                "n_valid_folds": int(row.get("n_valid_folds", 0)),
+            }
+        )
 
-    return best_params, pd.DataFrame(rows).sort_values("cv_auc", ascending=False, na_position="last")
+    best_params = _default_search_params(search_space)
+    best_value: Optional[float] = None
+    has_valid_trial = False
+    if study.trials and study.best_value is not None and float(study.best_value) >= 0:
+        best_params = {key: _normalize_param_choice(value) for key, value in study.best_trial.params.items()}
+        best_value = float(study.best_value)
+        has_valid_trial = True
+    invalid_trial_count = int(sum(1 for row in trials if not bool(row.get("converged", True))))
+
+    tuning_artifact = {
+        "study_id": study_id,
+        "model_name": model_name,
+        "balance_mode": balance_mode,
+        "best_value": best_value,
+        "best_params": best_params,
+        "has_valid_trial": bool(has_valid_trial),
+        "invalid_trial_count": invalid_trial_count,
+        "policy_version": _model_policy_version(model_name),
+        "model_params": _split_model_and_smote_params(best_params, balance_mode=balance_mode)[0],
+        "smote_params": _split_model_and_smote_params(best_params, balance_mode=balance_mode)[1],
+        "n_trials": int(n_trials),
+        "requested_trials": int(requested_trials),
+        "search_space_size": int(search_space_size),
+        "search_space": {key: list(values) for key, values in search_space.items()},
+        "trials": trials,
+    }
+    search_df = pd.DataFrame(rows).sort_values(
+        ["converged", "cv_auc"],
+        ascending=[False, False],
+        na_position="last",
+    )
+    return best_params, search_df, tuning_artifact
 
 
 def _prepare_xy(
@@ -2467,11 +4261,358 @@ def _prepare_xy(
     feature_cols: Sequence[str],
     target_col: str,
 ) -> Tuple[pd.DataFrame, pd.Series]:
-    cols = [c for c in feature_cols if c in df.columns]
-    X = df[cols].copy()
-    X = X.fillna(X.median(numeric_only=True)).fillna(0)
-    y = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int)
-    return X, y
+    X_raw, y = _prepare_xy_raw(df, feature_cols, target_col)
+    return _apply_fill_values(X_raw, _fit_fill_values(X_raw)), y
+
+
+def _require_river_streaming() -> None:
+    if river_forest is None or river_drift is None or river_metrics is None:
+        raise ImportError(
+            "Las estrategias online basadas en `river` requieren esa libreria instalada. "
+            "Instale las dependencias del proyecto o revise el entorno activo antes de ejecutar "
+            "`adaptive_arf` o `adaptive_kswin`."
+        )
+
+
+def _build_arf_classifier(
+    variant_name: str,
+    *,
+    random_state: int,
+):
+    _require_river_streaming()
+    if variant_name not in ARF_VARIANT_CONFIGS:
+        raise ValueError(f"Unsupported ARF variant: {variant_name}")
+
+    config = ARF_VARIANT_CONFIGS[variant_name]
+    return river_forest.ARFClassifier(
+        n_models=10,
+        max_features="sqrt",
+        lambda_value=6,
+        metric=river_metrics.Accuracy(),
+        disable_weighted_vote=bool(config["disable_weighted_vote"]),
+        warning_detector=river_drift.ADWIN(delta=float(config["warning_delta"])),
+        drift_detector=river_drift.ADWIN(delta=float(config["drift_delta"])),
+        grace_period=50,
+        leaf_prediction="nba",
+        seed=int(random_state),
+    )
+
+
+def _row_to_online_feature_dict(row: pd.Series) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for key, value in row.items():
+        out[str(key)] = 0.0 if pd.isna(value) else float(value)
+    return out
+
+
+def _score_online_binary_classifier(model: Any, x_dict: Dict[str, float]) -> float:
+    if hasattr(model, "predict_proba_one"):
+        try:
+            proba = model.predict_proba_one(x_dict) or {}
+        except Exception:
+            proba = {}
+        if not proba:
+            return 0.5
+        if 1 in proba:
+            return float(proba.get(1, 0.0))
+        if "1" in proba:
+            return float(proba.get("1", 0.0))
+
+    if hasattr(model, "predict_one"):
+        pred = model.predict_one(x_dict)
+        return 1.0 if str(pred) in {"1", "True"} else 0.0
+
+    return 0.5
+
+
+def _online_counter_value(model: Any, attr_name: str) -> int:
+    value = getattr(model, attr_name, 0)
+    if callable(value):
+        value = value()
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def _select_kswin_monitor_columns(
+    df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    *,
+    top_k: int,
+) -> List[str]:
+    if df is None or df.empty:
+        return []
+
+    out: List[str] = []
+    for col in feature_cols:
+        if col not in df.columns:
+            continue
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        out.append(str(col))
+        if len(out) >= max(1, int(top_k)):
+            break
+    return out
+
+
+def _build_kswin_seasonal_profiles(
+    df: pd.DataFrame,
+    *,
+    monitor_cols: Sequence[str],
+    time_col: str,
+) -> Dict[str, Any]:
+    if df is None or df.empty or time_col not in df.columns:
+        return {"global": {}, "hour": {}, "dow_hour": {}}
+
+    work = df[[time_col] + [c for c in monitor_cols if c in df.columns]].copy()
+    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col]).reset_index(drop=True)
+    if work.empty:
+        return {"global": {}, "hour": {}, "dow_hour": {}}
+
+    work["hour"] = work[time_col].dt.hour.astype(int)
+    work["dow"] = work[time_col].dt.dayofweek.astype(int)
+
+    global_stats: Dict[str, Dict[str, float]] = {}
+    hour_stats: Dict[str, Dict[int, Dict[str, float]]] = {}
+    dow_hour_stats: Dict[str, Dict[Tuple[int, int], Dict[str, float]]] = {}
+
+    for col in monitor_cols:
+        if col not in work.columns:
+            continue
+        series = pd.to_numeric(work[col], errors="coerce")
+        mean = float(series.mean()) if series.notna().any() else 0.0
+        std = float(series.std(ddof=0)) if series.notna().any() else 1.0
+        if not np.isfinite(std) or std <= 0:
+            std = 1.0
+        global_stats[str(col)] = {"mean": mean, "std": std}
+
+        hour_grp = (
+            work.groupby("hour", dropna=False)[col]
+            .agg(["mean", "std"])
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna({"std": std, "mean": mean})
+        )
+        hour_stats[str(col)] = {
+            int(hour): {
+                "mean": float(vals["mean"]) if np.isfinite(vals["mean"]) else mean,
+                "std": float(vals["std"]) if np.isfinite(vals["std"]) and vals["std"] > 0 else std,
+            }
+            for hour, vals in hour_grp.iterrows()
+        }
+
+        dow_hour_grp = (
+            work.groupby(["dow", "hour"], dropna=False)[col]
+            .agg(["mean", "std"])
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna({"std": np.nan, "mean": np.nan})
+        )
+        dow_hour_stats[str(col)] = {}
+        for key, vals in dow_hour_grp.iterrows():
+            dow = int(key[0])
+            hour = int(key[1])
+            mean_val = float(vals["mean"]) if np.isfinite(vals["mean"]) else hour_stats[str(col)].get(hour, global_stats[str(col)])["mean"]
+            std_val = float(vals["std"]) if np.isfinite(vals["std"]) and vals["std"] > 0 else hour_stats[str(col)].get(hour, global_stats[str(col)])["std"]
+            dow_hour_stats[str(col)][(dow, hour)] = {"mean": mean_val, "std": std_val}
+
+    return {"global": global_stats, "hour": hour_stats, "dow_hour": dow_hour_stats}
+
+
+def _transform_kswin_value(
+    *,
+    timestamp: pd.Timestamp,
+    value: float,
+    feature_name: str,
+    variant_name: str,
+    seasonal_profiles: Optional[Dict[str, Any]] = None,
+) -> float:
+    numeric = float(value)
+    if not np.isfinite(numeric):
+        return float("nan")
+    if variant_name != "KSWINseasonal":
+        return numeric
+
+    profiles = seasonal_profiles or {}
+    global_stats = (profiles.get("global") or {}).get(feature_name, {"mean": 0.0, "std": 1.0})
+    hour_stats = (profiles.get("hour") or {}).get(feature_name, {})
+    dow_hour_stats = (profiles.get("dow_hour") or {}).get(feature_name, {})
+
+    ts = pd.Timestamp(timestamp)
+    key = (int(ts.dayofweek), int(ts.hour))
+    ref = dow_hour_stats.get(key)
+    if ref is None:
+        ref = hour_stats.get(int(ts.hour))
+    if ref is None:
+        ref = global_stats
+
+    mean = float(ref.get("mean", global_stats.get("mean", 0.0)))
+    std = float(ref.get("std", global_stats.get("std", 1.0)))
+    if not np.isfinite(std) or std <= 0:
+        std = float(global_stats.get("std", 1.0) or 1.0)
+    return float((numeric - mean) / std)
+
+
+def _build_kswin_detectors(
+    *,
+    variant_name: str,
+    monitor_cols: Sequence[str],
+    warm_df: pd.DataFrame,
+    time_col: str,
+    seasonal_profiles: Optional[Dict[str, Any]],
+    random_state: int,
+) -> Dict[str, Any]:
+    _require_river_streaming()
+    if variant_name not in KSWIN_VARIANT_CONFIGS:
+        raise ValueError(f"Unsupported KSWIN variant: {variant_name}")
+
+    config = KSWIN_VARIANT_CONFIGS[variant_name]
+    warm = warm_df.copy() if isinstance(warm_df, pd.DataFrame) else pd.DataFrame()
+    if not warm.empty and time_col in warm.columns:
+        warm[time_col] = pd.to_datetime(warm[time_col], errors="coerce")
+        warm = warm.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
+
+    detectors: Dict[str, Any] = {}
+    for idx, col in enumerate(monitor_cols):
+        warm_window: List[float] = []
+        if not warm.empty and col in warm.columns and time_col in warm.columns:
+            subset = warm[[time_col, col]].copy()
+            subset[col] = pd.to_numeric(subset[col], errors="coerce")
+            subset = subset.dropna(subset=[col])
+            for row in subset.itertuples(index=False):
+                warm_window.append(
+                    _transform_kswin_value(
+                        timestamp=getattr(row, time_col),
+                        value=float(getattr(row, col)),
+                        feature_name=str(col),
+                        variant_name=variant_name,
+                        seasonal_profiles=seasonal_profiles,
+                    )
+                )
+            warm_window = [float(v) for v in warm_window if np.isfinite(v)]
+            if len(warm_window) > int(config["window_size"]):
+                warm_window = warm_window[-int(config["window_size"]):]
+
+        detectors[str(col)] = river_drift.KSWIN(
+            alpha=float(config["alpha"]),
+            window_size=int(config["window_size"]),
+            stat_size=int(config["stat_size"]),
+            seed=int(random_state) + int(idx),
+            window=warm_window if warm_window else None,
+        )
+    return detectors
+
+
+def _select_kswin_retrain_window(
+    observed_df: pd.DataFrame,
+    *,
+    current_ts: pd.Timestamp,
+    time_col: str,
+    retrain_days: int,
+    min_rows: int,
+    target_col: str,
+) -> pd.DataFrame:
+    if observed_df is None or observed_df.empty or time_col not in observed_df.columns:
+        return pd.DataFrame()
+
+    work = observed_df.copy()
+    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
+    if work.empty:
+        return work
+
+    start_ts = pd.Timestamp(current_ts) - pd.Timedelta(days=max(1, int(retrain_days)))
+    candidate = work.loc[work[time_col] >= start_ts].copy()
+    min_rows = max(10, int(min_rows))
+
+    if len(candidate) < min_rows:
+        candidate = work.tail(min_rows).copy()
+
+    if target_col in candidate.columns:
+        y = pd.to_numeric(candidate[target_col], errors="coerce").fillna(0).astype(int)
+        if y.nunique() < 2:
+            candidate = work.copy()
+
+    return candidate.reset_index(drop=True)
+
+
+def train_arf_with_internal_validation(
+    train_df: pd.DataFrame,
+    *,
+    feature_cols: Sequence[str],
+    target_col: str,
+    time_col: str = "interval_start",
+    variant_name: str,
+    validation_size: float = 0.2,
+    random_state: int = 42,
+) -> Dict[str, Any]:
+    """
+    Calibrates an ARF threshold on the trailing validation block of the base year
+    and returns a model already warmed on the full base-year data.
+    """
+    work = train_df.copy()
+    if time_col in work.columns:
+        work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+        work = work.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
+    else:
+        work = work.reset_index(drop=True)
+
+    if len(work) < 2:
+        raise ValueError("ARF training requires at least two base rows.")
+
+    X_all_raw, y_all = _prepare_xy_raw(work, feature_cols, target_col)
+    if y_all.nunique() < 2:
+        raise ValueError("Training data has a single target class.")
+
+    n_total = int(len(work))
+    n_val = max(1, int(round(n_total * float(validation_size))))
+    n_val = min(n_val, n_total - 1)
+    n_warm = max(1, n_total - n_val)
+    fill_values = _fit_fill_values(X_all_raw.iloc[:n_warm])
+    X_all = _apply_fill_values(X_all_raw, fill_values)
+
+    model = _build_arf_classifier(variant_name, random_state=random_state)
+
+    for idx in range(n_warm):
+        x_dict = _row_to_online_feature_dict(X_all.iloc[idx])
+        y_i = int(y_all.iloc[idx])
+        model.learn_one(x_dict, y_i)
+
+    val_scores: List[float] = []
+    val_y: List[int] = []
+    for idx in range(n_warm, n_total):
+        x_dict = _row_to_online_feature_dict(X_all.iloc[idx])
+        y_i = int(y_all.iloc[idx])
+        val_scores.append(_score_online_binary_classifier(model, x_dict))
+        val_y.append(y_i)
+        model.learn_one(x_dict, y_i)
+
+    youden = youden_threshold(np.asarray(val_y), np.asarray(val_scores))
+    val_metrics = compute_classification_metrics(
+        np.asarray(val_y),
+        np.asarray(val_scores),
+        threshold=float(youden["threshold"]),
+    )
+    config = ARF_VARIANT_CONFIGS[variant_name]
+
+    return {
+        "model": model,
+        "threshold": float(youden["threshold"]),
+        "youden": youden,
+        "val_metrics": val_metrics,
+        "best_params": {
+            "variant": variant_name,
+            "lambda_value": 6,
+            "max_features": "sqrt",
+            "warning_delta": float(config["warning_delta"]),
+            "drift_delta": float(config["drift_delta"]),
+            "disable_weighted_vote": bool(config["disable_weighted_vote"]),
+        },
+        "fill_values": fill_values,
+        "feature_cols": list(X_all.columns),
+        "warm_rows": int(n_warm),
+        "validation_rows": int(n_val),
+    }
 
 
 def train_model_with_internal_validation(
@@ -2479,6 +4620,7 @@ def train_model_with_internal_validation(
     *,
     feature_cols: Sequence[str],
     target_col: str,
+    time_col: Optional[str] = None,
     model_name: str,
     validation_size: float = 0.2,
     folds: int = 5,
@@ -2486,50 +4628,236 @@ def train_model_with_internal_validation(
     fast_mode: bool = True,
     grid_limit: Optional[int] = None,
     custom_grid: Optional[Dict[str, Sequence[Any]]] = None,
+    balance_mode: str = BALANCE_MODE_NONE,
+    study_id: Optional[str] = None,
+    fixed_params: Optional[Dict[str, Any]] = None,
+    fixed_tuning_artifact: Optional[Dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    smote_cache_dir: Optional[Path] = None,
+    smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
     Section 4.5 replication:
     - internal 20% validation split
-    - threshold calibration with Youden criterion
+    - threshold calibration with out-of-fold scores on the full training split
+    - final refit on all available training rows
     """
-    X_all, y_all = _prepare_xy(train_df, feature_cols, target_col)
+    X_all_raw, y_all = _prepare_xy_raw(train_df, feature_cols, target_col)
     if y_all.nunique() < 2:
         raise ValueError("Training data has a single target class.")
+    _emit_experiment_progress(
+        progress_callback,
+        ratio=0.02,
+        label="Preparando entrenamiento batch...",
+        detail=f"Modelo {model_name} | filas {len(train_df):,}",
+    )
+    if (
+        str(model_name) == "NNet"
+        and fixed_tuning_artifact is not None
+        and not bool((fixed_tuning_artifact or {}).get("has_valid_trial", True))
+    ):
+        raise ModelTrainingSkipped(
+            "No converged NNet trials were available in the persisted tuning artifact.",
+            metadata={
+                "model_name": str(model_name),
+                "balance_mode": str(balance_mode),
+                "study_id": str((fixed_tuning_artifact or {}).get("study_id", "")),
+                "reason": "no_valid_tuning_trial",
+            },
+        )
 
-    X_tr, X_va, y_tr, y_va = train_test_split(
-        X_all,
+    X_tr_raw, X_va_raw, y_tr, y_va = train_test_split(
+        X_all_raw,
         y_all,
         test_size=float(validation_size),
         random_state=int(random_state),
         stratify=y_all,
     )
 
-    best_params, search_df = tune_hyperparameters(
-        X_tr,
-        y_tr,
+    if fixed_params is not None:
+        best_params = {str(key): _normalize_param_choice(value) for key, value in dict(fixed_params).items()}
+        tuning_artifact = _to_json_safe(
+            {
+                **dict(fixed_tuning_artifact or {}),
+                "study_id": str((fixed_tuning_artifact or {}).get("study_id") or study_id or ""),
+                "model_name": model_name,
+                "balance_mode": balance_mode,
+                "best_params": best_params,
+                "model_params": _split_model_and_smote_params(best_params, balance_mode=balance_mode)[0],
+                "smote_params": _split_model_and_smote_params(best_params, balance_mode=balance_mode)[1],
+            }
+        )
+        search_df = _tuning_search_df_from_artifact(
+            tuning_artifact,
+            model_name=model_name,
+            balance_mode=balance_mode,
+        )
+        _emit_experiment_progress(
+            progress_callback,
+            ratio=0.70,
+            label="Reutilizando hiperparametros persistidos...",
+            detail=f"Modelo {model_name} | study {str(tuning_artifact.get('study_id', '') or 'cached')}",
+        )
+    else:
+        best_params, search_df, tuning_artifact = tune_hyperparameters(
+            X_tr_raw,
+            y_tr,
+            model_name=model_name,
+            folds=folds,
+            random_state=random_state,
+            fast_mode=fast_mode,
+            grid_limit=grid_limit,
+            custom_grid=custom_grid,
+            balance_mode=balance_mode,
+            study_id=study_id,
+            progress_callback=(
+                None
+                if progress_callback is None
+                else lambda payload: _emit_experiment_progress(
+                    progress_callback,
+                    ratio=0.05 + 0.65 * max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
+                    label=str(payload.get("label", "Sintonizando hiperparametros...")),
+                    detail=str(payload.get("detail", "")),
+                )
+            ),
+        )
+    _emit_experiment_progress(
+        progress_callback,
+        ratio=0.75,
+        label="Calibrando threshold...",
+        detail=f"Modelo {model_name} | validacion interna",
+    )
+
+    model_params, smote_params = _split_model_and_smote_params(
+        best_params,
+        balance_mode=balance_mode,
+    )
+    calibration_payload = _cross_validated_scores(
+        X_all_raw,
+        y_all,
         model_name=model_name,
+        params=best_params,
         folds=folds,
         random_state=random_state,
-        fast_mode=fast_mode,
-        grid_limit=grid_limit,
-        custom_grid=custom_grid,
+        balance_mode=balance_mode,
+        return_diagnostics=True,
     )
+    calibration_scores = np.asarray(calibration_payload.get("scores", np.full(len(X_all_raw), np.nan, dtype=float)), dtype=float)
+    calibration_mask = np.isfinite(calibration_scores)
 
-    model = _build_model(
-        model_name,
-        best_params,
-        random_state=random_state,
-        n_features=X_tr.shape[1],
-    )
-    model.fit(X_tr, y_tr)
+    if calibration_mask.sum() < 2 or np.unique(y_all.to_numpy()[calibration_mask]).size < 2:
+        holdout_fill_values = _fit_fill_values(X_tr_raw)
+        X_tr_filled = _apply_fill_values(X_tr_raw, holdout_fill_values)
+        X_va_filled = _apply_fill_values(X_va_raw, holdout_fill_values)
+        holdout_feature_transform = _fit_feature_transform(X_tr_filled, model_name=model_name)
+        X_tr = _apply_feature_transform(X_tr_filled, holdout_feature_transform)
+        X_va = _apply_feature_transform(X_va_filled, holdout_feature_transform)
+        if balance_mode == BALANCE_MODE_SMOTE:
+            X_holdout_fit, y_holdout_fit, _ = _apply_smote_balance(
+                X_tr,
+                y_tr.to_numpy(),
+                sampling_strategy=float(smote_params.get("sampling_strategy", 1.0)),
+                k_neighbors=int(smote_params.get("k_neighbors", 5)),
+                random_state=int(random_state),
+            )
+        else:
+            X_holdout_fit, y_holdout_fit = X_tr, y_tr.to_numpy()
+        calibration_model, calibration_fit_diagnostics, _ = _fit_model_with_diagnostics(
+            model_name,
+            model_params,
+            random_state=random_state,
+            n_features=X_tr.shape[1],
+            X_fit=X_holdout_fit,
+            y_fit=y_holdout_fit,
+            allow_retry=False,
+        )
+        if str(model_name) == "NNet" and not bool(calibration_fit_diagnostics.get("converged", True)):
+            raise ModelTrainingSkipped(
+                "NNet threshold calibration did not converge on the internal holdout fallback.",
+                metadata={
+                    "model_name": str(model_name),
+                    "balance_mode": str(balance_mode),
+                    "study_id": str((tuning_artifact or {}).get("study_id", study_id or "")),
+                    "reason": "calibration_non_converged",
+                    "fit_warning_count": int(calibration_fit_diagnostics.get("fit_warning_count", 0)),
+                    "n_iter_final": calibration_fit_diagnostics.get("n_iter_final"),
+                },
+            )
+        calibration_y = y_va.to_numpy()
+        calibration_scores = _model_scores(calibration_model, X_va)
+    else:
+        calibration_y = y_all.to_numpy()[calibration_mask]
+        calibration_scores = calibration_scores[calibration_mask]
 
-    val_scores = _model_scores(model, X_va)
-    youden = youden_threshold(y_va.to_numpy(), val_scores)
-
+    youden = youden_threshold(calibration_y, calibration_scores)
     val_metrics = compute_classification_metrics(
-        y_va.to_numpy(),
-        val_scores,
+        calibration_y,
+        calibration_scores,
         threshold=float(youden["threshold"]),
+    )
+    _emit_experiment_progress(
+        progress_callback,
+        ratio=0.9,
+        label="Reentrenando modelo final...",
+        detail=f"Modelo {model_name} | refit con datos completos",
+    )
+
+    fill_values = _fit_fill_values(X_all_raw)
+    X_all_filled = _apply_fill_values(X_all_raw, fill_values)
+    feature_transform = _fit_feature_transform(X_all_filled, model_name=model_name)
+    X_all = _apply_feature_transform(X_all_filled, feature_transform)
+    smote_fit_info: Dict[str, Any] = {
+        "applied": False,
+        "train_rows": int(len(X_all)),
+        "balanced_rows": int(len(X_all)),
+    }
+    if balance_mode == BALANCE_MODE_SMOTE:
+        X_fit, y_fit, smote_fit_info = _load_or_create_smote_artifact(
+            run_id=str(run_id or "local_run"),
+            train_df=train_df,
+            X=X_all,
+            y=y_all.to_numpy(),
+            feature_cols=list(X_all.columns),
+            target_col=target_col,
+            time_col=time_col,
+            sampling_strategy=float(smote_params.get("sampling_strategy", 1.0)),
+            k_neighbors=int(smote_params.get("k_neighbors", 5)),
+            random_state=int(random_state),
+            smote_cache_dir=smote_cache_dir,
+            smote_cache_registry=smote_cache_registry,
+        )
+    else:
+        X_fit, y_fit = X_all, y_all.to_numpy()
+
+    model, fit_diagnostics, final_model_params = _fit_model_with_diagnostics(
+        model_name,
+        model_params,
+        random_state=random_state,
+        n_features=X_all.shape[1],
+        X_fit=X_fit,
+        y_fit=y_fit,
+        allow_retry=True,
+    )
+    if str(model_name) == "NNet" and not bool(fit_diagnostics.get("converged", True)):
+        raise ModelTrainingSkipped(
+            "NNet final refit did not converge after retry.",
+            metadata={
+                "model_name": str(model_name),
+                "balance_mode": str(balance_mode),
+                "study_id": str((tuning_artifact or {}).get("study_id", study_id or "")),
+                "reason": "final_refit_non_converged",
+                "fit_warning_count": int(fit_diagnostics.get("fit_warning_count", 0)),
+                "n_iter_final": fit_diagnostics.get("n_iter_final"),
+                "fit_retry_applied": bool(fit_diagnostics.get("fit_retry_applied", False)),
+                "best_params": dict(best_params),
+            },
+        )
+    _emit_experiment_progress(
+        progress_callback,
+        ratio=1.0,
+        label="Entrenamiento batch completo.",
+        detail=f"Modelo {model_name} | threshold {float(youden['threshold']):.4f}",
     )
 
     return {
@@ -2538,8 +4866,31 @@ def train_model_with_internal_validation(
         "youden": youden,
         "val_metrics": val_metrics,
         "best_params": best_params,
+        "model_params": final_model_params,
+        "smote_params": smote_params,
+        "balance_mode": balance_mode,
         "search_df": search_df,
-        "feature_cols": list(X_tr.columns),
+        "feature_cols": list(X_all_raw.columns),
+        "fill_values": fill_values,
+        "feature_transform": feature_transform,
+        "smote_fit_info": smote_fit_info,
+        "converged": bool(fit_diagnostics.get("converged", True)),
+        "fit_warning_count": int(fit_diagnostics.get("fit_warning_count", 0)),
+        "n_iter_final": fit_diagnostics.get("n_iter_final"),
+        "fit_retry_applied": bool(fit_diagnostics.get("fit_retry_applied", False)),
+        "tuning_artifact": {
+            **tuning_artifact,
+            "best_params": best_params,
+            "model_params": final_model_params,
+            "smote_params": smote_params,
+            "smote_fit_info": smote_fit_info,
+            "feature_transform": _to_json_safe(feature_transform),
+            "converged": bool(fit_diagnostics.get("converged", True)),
+            "fit_warning_count": int(fit_diagnostics.get("fit_warning_count", 0)),
+            "n_iter_final": fit_diagnostics.get("n_iter_final"),
+            "fit_retry_applied": bool(fit_diagnostics.get("fit_retry_applied", False)),
+            "has_valid_trial": bool((tuning_artifact or {}).get("has_valid_trial", True)),
+        },
     }
 
 
@@ -2550,8 +4901,12 @@ def _evaluate_split(
     feature_cols: Sequence[str],
     target_col: str,
     threshold: float,
+    fill_values: Optional[Dict[str, float]] = None,
+    feature_transform: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    X_te, y_te = _prepare_xy(test_df, feature_cols, target_col)
+    X_te_raw, y_te = _prepare_xy_raw(test_df, feature_cols, target_col)
+    X_te_filled = _apply_fill_values(X_te_raw, fill_values or _fit_fill_values(X_te_raw))
+    X_te = _apply_feature_transform(X_te_filled, feature_transform)
     scores = _model_scores(model, X_te)
     metrics = compute_classification_metrics(y_te.to_numpy(), scores, threshold=float(threshold))
     return {
@@ -2591,6 +4946,14 @@ def run_yearly_strategy(
     run_seed: Optional[int] = None,
     run_order: int = 1,
     execution_log: Optional[List[Dict[str, Any]]] = None,
+    balance_mode: str = BALANCE_MODE_NONE,
+    study_collector: Optional[List[Dict[str, Any]]] = None,
+    fixed_params: Optional[Dict[str, Any]] = None,
+    fixed_tuning_artifact: Optional[Dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    smote_cache_dir: Optional[Path] = None,
+    smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """
     Runs static / period-aligned / cumulative yearly experiments.
@@ -2613,9 +4976,27 @@ def run_yearly_strategy(
     effective_seed = int(random_state if run_seed is None else run_seed)
     rows: List[Dict[str, Any]] = []
     roc_payload: List[Dict[str, Any]] = []
+    training_bundle_cache: Dict[Tuple[Any, ...], Tuple[Dict[str, Any], float]] = {}
+    total_splits = max(1, len(model_names) * len(pred_years))
+    split_counter = 0
 
     for model_name in model_names:
         for pred_year in pred_years:
+            split_index = split_counter
+            split_counter += 1
+            split_start_ratio = float(split_index) / float(total_splits)
+            split_end_ratio = float(split_index + 1) / float(total_splits)
+            split_span = split_end_ratio - split_start_ratio
+            split_detail_prefix = (
+                f"Estrategia {strategy} | Modelo {model_name} | "
+                f"Split {split_index + 1} / {total_splits} | Ano prediccion {int(pred_year)}"
+            )
+            _emit_experiment_progress(
+                progress_callback,
+                ratio=split_start_ratio,
+                label="Preparando split anual...",
+                detail=split_detail_prefix,
+            )
             if strategy == "static":
                 train_mask = _as_year_mask(work, time_col, int(base_year))
                 train_label = f"{int(base_year)}"
@@ -2644,6 +5025,7 @@ def run_yearly_strategy(
                     training_year=train_label,
                     run_seed=effective_seed,
                     run_order=run_order,
+                    balance_mode=balance_mode,
                     n_train=int(len(train_df)),
                     n_test=int(len(test_df)),
                 )
@@ -2660,6 +5042,7 @@ def run_yearly_strategy(
                     training_year=train_label,
                     run_seed=effective_seed,
                     run_order=run_order,
+                    balance_mode=balance_mode,
                     n_train=int(len(train_df)),
                     n_test=int(len(test_df)),
                 )
@@ -2676,11 +5059,22 @@ def run_yearly_strategy(
                     training_year=train_label,
                     run_seed=effective_seed,
                     run_order=run_order,
+                    balance_mode=balance_mode,
                     n_train=int(len(train_df)),
                     n_test=int(len(test_df)),
                 )
                 continue
 
+            study_id = _build_tuning_study_id(
+                stage="yearly_train",
+                strategy=strategy,
+                model_name=model_name,
+                balance_mode=balance_mode,
+                run_seed=effective_seed,
+                run_order=run_order,
+                prediction_year=int(pred_year),
+                training_year=train_label,
+            )
             _append_execution_log(
                 execution_log,
                 phase="yearly_train_start",
@@ -2692,41 +5086,147 @@ def run_yearly_strategy(
                 training_year=train_label,
                 run_seed=effective_seed,
                 run_order=run_order,
+                balance_mode=balance_mode,
+                study_id=study_id,
                 n_train=int(len(train_df)),
                 n_test=int(len(test_df)),
             )
-            t0 = time.perf_counter()
-            try:
-                bundle = train_model_with_internal_validation(
-                    train_df,
-                    feature_cols=feature_cols,
-                    target_col=target_col,
-                    model_name=model_name,
-                    validation_size=validation_size,
-                    folds=folds,
-                    random_state=effective_seed,
-                    fast_mode=fast_mode,
-                    grid_limit=grid_limit,
-                    custom_grid=(custom_grids or {}).get(model_name),
+            cache_key: Optional[Tuple[Any, ...]] = None
+            if strategy == "static":
+                cache_key = (
+                    strategy,
+                    model_name,
+                    balance_mode,
+                    int(base_year),
+                    int(effective_seed),
+                    float(validation_size),
+                    int(folds),
+                    bool(fast_mode),
+                    None if grid_limit is None else int(grid_limit),
+                    json.dumps((custom_grids or {}).get(model_name), sort_keys=True, default=str, ensure_ascii=True),
                 )
-            except Exception as exc:
+
+            cached_entry = training_bundle_cache.get(cache_key) if cache_key is not None else None
+            if cached_entry is not None:
+                bundle, train_time = cached_entry
                 _append_execution_log(
                     execution_log,
-                    phase="yearly_train_error",
-                    status="error",
-                    message="Model training failed for yearly strategy split.",
+                    phase="yearly_train_reuse",
+                    status="ok",
+                    message="Reused cached training bundle for identical static training split.",
                     strategy=strategy,
                     model=model_name,
                     prediction_year=int(pred_year),
                     training_year=train_label,
                     run_seed=effective_seed,
                     run_order=run_order,
+                    balance_mode=balance_mode,
+                    study_id=study_id,
                     n_train=int(len(train_df)),
                     n_test=int(len(test_df)),
-                    error=str(exc),
+                    cached_training_time_sec=float(train_time),
                 )
-                continue
-            train_time = time.perf_counter() - t0
+            else:
+                t0 = time.perf_counter()
+                try:
+                    bundle = train_model_with_internal_validation(
+                        train_df,
+                        feature_cols=feature_cols,
+                        target_col=target_col,
+                        time_col=time_col,
+                        model_name=model_name,
+                        validation_size=validation_size,
+                        folds=folds,
+                        random_state=effective_seed,
+                        fast_mode=fast_mode,
+                        grid_limit=grid_limit,
+                        custom_grid=(custom_grids or {}).get(model_name),
+                        balance_mode=balance_mode,
+                        study_id=study_id,
+                        fixed_params=fixed_params,
+                        fixed_tuning_artifact=fixed_tuning_artifact,
+                        run_id=run_id,
+                        smote_cache_dir=smote_cache_dir,
+                        smote_cache_registry=smote_cache_registry,
+                        progress_callback=(
+                            None
+                            if progress_callback is None
+                            else lambda payload, _start=split_start_ratio, _span=split_span, _detail=split_detail_prefix: _emit_experiment_progress(
+                                progress_callback,
+                                ratio=_start + _span * max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)) * 0.9,
+                                label=str(payload.get("label", "Entrenando split anual...")),
+                                detail=f"{_detail} | {str(payload.get('detail', '') or '')}".strip(" |"),
+                            )
+                        ),
+                    )
+                except ModelTrainingSkipped as exc:
+                    skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+                    skip_phase = "nnet_final_refit_skipped"
+                    if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
+                        skip_phase = "nnet_trial_invalid"
+                    _append_execution_log(
+                        execution_log,
+                        phase=skip_phase,
+                        status="skipped",
+                        message="Skipped yearly strategy split because NNet did not produce a stable fitted model.",
+                        strategy=strategy,
+                        model=model_name,
+                        prediction_year=int(pred_year),
+                        training_year=train_label,
+                        run_seed=effective_seed,
+                        run_order=run_order,
+                        balance_mode=balance_mode,
+                        study_id=study_id,
+                        n_train=int(len(train_df)),
+                        n_test=int(len(test_df)),
+                        **skip_metadata,
+                    )
+                    continue
+                except Exception as exc:
+                    _append_execution_log(
+                        execution_log,
+                        phase="yearly_train_error",
+                        status="error",
+                        message="Model training failed for yearly strategy split.",
+                        strategy=strategy,
+                        model=model_name,
+                        prediction_year=int(pred_year),
+                        training_year=train_label,
+                        run_seed=effective_seed,
+                        run_order=run_order,
+                        balance_mode=balance_mode,
+                        study_id=study_id,
+                        n_train=int(len(train_df)),
+                        n_test=int(len(test_df)),
+                        error=str(exc),
+                    )
+                    continue
+                train_time = time.perf_counter() - t0
+                if cache_key is not None:
+                    training_bundle_cache[cache_key] = (bundle, float(train_time))
+                if str(model_name) == "NNet" and bool(bundle.get("fit_retry_applied", False)):
+                    _append_execution_log(
+                        execution_log,
+                        phase="nnet_final_refit_retry",
+                        status="warning",
+                        message="NNet final refit converged only after increasing max_iter.",
+                        strategy=strategy,
+                        model=model_name,
+                        prediction_year=int(pred_year),
+                        training_year=train_label,
+                        run_seed=effective_seed,
+                        run_order=run_order,
+                        balance_mode=balance_mode,
+                        study_id=study_id,
+                        n_iter_final=bundle.get("n_iter_final"),
+                        fit_warning_count=int(bundle.get("fit_warning_count", 0)),
+                    )
+            _emit_experiment_progress(
+                progress_callback,
+                ratio=split_start_ratio + split_span * 0.95,
+                label="Evaluando split anual...",
+                detail=split_detail_prefix,
+            )
 
             eval_payload = _evaluate_split(
                 bundle["model"],
@@ -2734,6 +5234,23 @@ def run_yearly_strategy(
                 feature_cols=feature_cols,
                 target_col=target_col,
                 threshold=float(bundle["threshold"]),
+                fill_values=bundle.get("fill_values"),
+                feature_transform=bundle.get("feature_transform"),
+            )
+
+            _append_tuning_study(
+                study_collector,
+                bundle.get("tuning_artifact"),
+                stage="yearly_train",
+                strategy=strategy,
+                model=model_name,
+                balance_mode=balance_mode,
+                run_seed=effective_seed,
+                run_order=int(run_order),
+                prediction_year=int(pred_year),
+                training_year=train_label,
+                n_train=int(len(train_df)),
+                n_test=int(len(test_df)),
             )
 
             metrics = eval_payload["metrics"]
@@ -2743,6 +5260,7 @@ def run_yearly_strategy(
                 "training_year": train_label,
                 "prediction_year": int(pred_year),
                 "model": model_name,
+                "balance_mode": balance_mode,
                 "auc": float(metrics["auc"]),
                 "sensitivity": float(metrics["sensitivity"]),
                 "specificity": float(metrics["specificity"]),
@@ -2768,6 +5286,8 @@ def run_yearly_strategy(
                 training_year=train_label,
                 run_seed=effective_seed,
                 run_order=run_order,
+                balance_mode=balance_mode,
+                study_id=study_id,
                 threshold=float(bundle["threshold"]),
                 auc=float(metrics["auc"]),
                 sensitivity=float(metrics["sensitivity"]),
@@ -2783,12 +5303,19 @@ def run_yearly_strategy(
                 {
                     "strategy": strategy,
                     "model": model_name,
+                    "balance_mode": balance_mode,
                     "segment": str(pred_year),
                     "y_true": eval_payload["y_true"],
                     "scores": eval_payload["scores"],
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
+            )
+            _emit_experiment_progress(
+                progress_callback,
+                ratio=split_end_ratio,
+                label="Split anual completado.",
+                detail=split_detail_prefix,
             )
 
     return pd.DataFrame(rows), roc_payload
@@ -2884,10 +5411,19 @@ def run_adaptive_strategy(
     grid_limit: Optional[int] = None,
     adwin_delta: float = 0.002,
     min_window: int = 45_000,
+    min_retrain_size: Optional[int] = None,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
     run_seed: Optional[int] = None,
     run_order: int = 1,
     execution_log: Optional[List[Dict[str, Any]]] = None,
+    balance_mode: str = BALANCE_MODE_NONE,
+    study_collector: Optional[List[Dict[str, Any]]] = None,
+    fixed_params: Optional[Dict[str, Any]] = None,
+    fixed_tuning_artifact: Optional[Dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    smote_cache_dir: Optional[Path] = None,
+    smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """
     Runs Section 4.7 adaptive retraining with ADWIN drift detection.
@@ -2912,10 +5448,24 @@ def run_adaptive_strategy(
         return pd.DataFrame(), []
 
     effective_seed = int(random_state if run_seed is None else run_seed)
+    effective_min_retrain_size = max(20, int(min_window) // 10)
+    if min_retrain_size is not None:
+        effective_min_retrain_size = max(2, int(min_retrain_size))
     rows: List[Dict[str, Any]] = []
     roc_payload: List[Dict[str, Any]] = []
 
-    for model_name in model_names:
+    total_models = max(1, len(model_names))
+    for model_idx, model_name in enumerate(model_names):
+        model_start_ratio = float(model_idx) / float(total_models)
+        model_end_ratio = float(model_idx + 1) / float(total_models)
+        model_span = model_end_ratio - model_start_ratio
+        model_detail_prefix = f"Estrategia adaptive_adwin | Modelo {model_name} | {model_idx + 1} / {total_models}"
+        _emit_experiment_progress(
+            progress_callback,
+            ratio=model_start_ratio,
+            label="Preparando bloque adaptive_adwin...",
+            detail=model_detail_prefix,
+        )
         if pd.to_numeric(base_train[target_col], errors="coerce").fillna(0).astype(int).nunique() < 2:
             _append_execution_log(
                 execution_log,
@@ -2927,17 +5477,28 @@ def run_adaptive_strategy(
                 training_year=int(base_year),
                 run_seed=effective_seed,
                 run_order=run_order,
+                balance_mode=balance_mode,
                 n_train=int(len(base_train)),
                 n_stream=int(len(stream)),
             )
             continue
 
+        base_study_id = _build_tuning_study_id(
+            stage="adaptive_base",
+            strategy=ADAPTIVE_ADWIN_STRATEGY,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            run_seed=effective_seed,
+            run_order=run_order,
+            training_year=str(int(base_year)),
+        )
         try:
             t0 = time.perf_counter()
             bundle = train_model_with_internal_validation(
                 base_train,
                 feature_cols=feature_cols,
                 target_col=target_col,
+                time_col=time_col,
                 model_name=model_name,
                 validation_size=validation_size,
                 folds=folds,
@@ -2945,8 +5506,41 @@ def run_adaptive_strategy(
                 fast_mode=fast_mode,
                 grid_limit=grid_limit,
                 custom_grid=(custom_grids or {}).get(model_name),
+                balance_mode=balance_mode,
+                study_id=base_study_id,
+                fixed_params=fixed_params,
+                fixed_tuning_artifact=fixed_tuning_artifact,
+                run_id=run_id,
+                smote_cache_dir=smote_cache_dir,
+                smote_cache_registry=smote_cache_registry,
+                progress_callback=(
+                    None
+                    if progress_callback is None
+                    else lambda payload, _start=model_start_ratio, _span=model_span, _detail=model_detail_prefix: _emit_experiment_progress(
+                        progress_callback,
+                        ratio=_start + _span * (0.05 + 0.30 * max(0.0, min(float(payload.get("ratio", 0.0)), 1.0))),
+                        label=str(payload.get("label", "Entrenando base adaptive_adwin...")),
+                        detail=f"{_detail} | {str(payload.get('detail', '') or '')}".strip(" |"),
+                    )
+                ),
             )
             fit_time = time.perf_counter() - t0
+            if str(model_name) == "NNet" and bool(bundle.get("fit_retry_applied", False)):
+                _append_execution_log(
+                    execution_log,
+                    phase="nnet_final_refit_retry",
+                    status="warning",
+                    message="NNet base adaptive model converged only after increasing max_iter.",
+                    strategy="adaptive_adwin",
+                    model=model_name,
+                    training_year=int(base_year),
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    balance_mode=balance_mode,
+                    study_id=base_study_id,
+                    n_iter_final=bundle.get("n_iter_final"),
+                    fit_warning_count=int(bundle.get("fit_warning_count", 0)),
+                )
             _append_execution_log(
                 execution_log,
                 phase="adaptive_base_train_complete",
@@ -2957,12 +5551,36 @@ def run_adaptive_strategy(
                 training_year=int(base_year),
                 run_seed=effective_seed,
                 run_order=run_order,
+                balance_mode=balance_mode,
+                study_id=base_study_id,
                 threshold=float(bundle["threshold"]),
                 best_params=bundle["best_params"],
                 n_train=int(len(base_train)),
                 n_stream=int(len(stream)),
                 training_time_sec=float(fit_time),
             )
+        except ModelTrainingSkipped as exc:
+            skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+            skip_phase = "nnet_final_refit_skipped"
+            if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
+                skip_phase = "nnet_trial_invalid"
+            _append_execution_log(
+                execution_log,
+                phase=skip_phase,
+                status="skipped",
+                message="Skipped adaptive ADWIN block because NNet did not produce a stable base model.",
+                strategy="adaptive_adwin",
+                model=model_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                balance_mode=balance_mode,
+                study_id=base_study_id,
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+                **skip_metadata,
+            )
+            continue
         except Exception as exc:
             _append_execution_log(
                 execution_log,
@@ -2974,18 +5592,37 @@ def run_adaptive_strategy(
                 training_year=int(base_year),
                 run_seed=effective_seed,
                 run_order=run_order,
+                balance_mode=balance_mode,
+                study_id=base_study_id,
                 n_train=int(len(base_train)),
                 n_stream=int(len(stream)),
                 error=str(exc),
             )
             continue
 
+        _append_tuning_study(
+            study_collector,
+            bundle.get("tuning_artifact"),
+            stage="adaptive_base",
+            strategy=ADAPTIVE_ADWIN_STRATEGY,
+            model=model_name,
+            balance_mode=balance_mode,
+            run_seed=effective_seed,
+            run_order=int(run_order),
+            training_year=int(base_year),
+            n_train=int(len(base_train)),
+            n_stream=int(len(stream)),
+        )
+
         model = bundle["model"]
         threshold = float(bundle["threshold"])
+        fill_values = dict(bundle.get("fill_values") or {})
+        feature_transform = dict(bundle.get("feature_transform") or {}) or None
         detector = SimpleADWIN(delta=adwin_delta, min_window=min_window)
 
-        X_stream, y_stream = _prepare_xy(stream, feature_cols, target_col)
+        X_stream_raw, y_stream = _prepare_xy_raw(stream, feature_cols, target_col)
         ts_stream = pd.to_datetime(stream[time_col], errors="coerce").reset_index(drop=True)
+        stream_progress_step = max(1, len(stream) // 50)
 
         segment_y: List[int] = []
         segment_s: List[float] = []
@@ -2993,11 +5630,19 @@ def run_adaptive_strategy(
         drift_idx = 0
 
         for i in range(len(stream)):
-            x_i = X_stream.iloc[[i]]
+            if i == 0 or (i + 1) % stream_progress_step == 0 or i == len(stream) - 1:
+                _emit_experiment_progress(
+                    progress_callback,
+                    ratio=model_start_ratio + model_span * (0.40 + 0.55 * float(i + 1) / float(max(1, len(stream)))),
+                    label="Evaluando stream adaptive_adwin...",
+                    detail=f"{model_detail_prefix} | fila {i + 1:,} / {len(stream):,}",
+                )
+            x_i = _apply_fill_values(X_stream_raw.iloc[[i]], fill_values)
+            x_i_model = _apply_feature_transform(x_i, feature_transform)
             y_i = int(y_stream.iloc[i])
             ts_i = ts_stream.iloc[i]
 
-            score_i = float(_model_scores(model, x_i)[0])
+            score_i = float(_model_scores(model, x_i_model)[0])
             pred_i = int(score_i >= threshold)
             err_i = float(int(pred_i != y_i))
 
@@ -3022,6 +5667,7 @@ def run_adaptive_strategy(
                     "strategy": "adaptive_adwin",
                     "drift": drift_idx,
                     "drift_date": pd.Timestamp(ts_i),
+                    "balance_mode": balance_mode,
                     "W": int(info["n"]),
                     "W0": int(info["n0"]),
                     "W1": int(info["n1"]),
@@ -3049,6 +5695,7 @@ def run_adaptive_strategy(
                 drift_date=pd.Timestamp(ts_i),
                 run_seed=effective_seed,
                 run_order=run_order,
+                balance_mode=balance_mode,
                 threshold=float(threshold),
                 W=int(info["n"]),
                 W0=int(info["n0"]),
@@ -3064,6 +5711,7 @@ def run_adaptive_strategy(
                 {
                     "strategy": "adaptive_adwin",
                     "model": model_name,
+                    "balance_mode": balance_mode,
                     "segment": f"drift_{drift_idx}",
                     "y_true": np.asarray(segment_y),
                     "scores": np.asarray(segment_s),
@@ -3077,16 +5725,26 @@ def run_adaptive_strategy(
 
             retrain_df = pd.DataFrame(list(training_window_rows))
             if (
-                len(retrain_df) >= int(min_window)
+                len(retrain_df) >= int(effective_min_retrain_size)
                 and target_col in retrain_df.columns
                 and pd.to_numeric(retrain_df[target_col], errors="coerce").fillna(0).astype(int).nunique() >= 2
             ):
+                retrain_study_id = _build_tuning_study_id(
+                    stage="adaptive_retrain",
+                    strategy=ADAPTIVE_ADWIN_STRATEGY,
+                    model_name=model_name,
+                    balance_mode=balance_mode,
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    drift=int(drift_idx),
+                )
                 try:
                     t_fit = time.perf_counter()
                     bundle = train_model_with_internal_validation(
                         retrain_df,
                         feature_cols=feature_cols,
                         target_col=target_col,
+                        time_col=time_col,
                         model_name=model_name,
                         validation_size=validation_size,
                         folds=folds,
@@ -3094,10 +5752,47 @@ def run_adaptive_strategy(
                         fast_mode=fast_mode,
                         grid_limit=grid_limit,
                         custom_grid=(custom_grids or {}).get(model_name),
+                        balance_mode=balance_mode,
+                        study_id=retrain_study_id,
+                        fixed_params=fixed_params,
+                        fixed_tuning_artifact=fixed_tuning_artifact,
+                        run_id=run_id,
+                        smote_cache_dir=smote_cache_dir,
+                        smote_cache_registry=smote_cache_registry,
                     )
                     fit_time = time.perf_counter() - t_fit
+                    if str(model_name) == "NNet" and bool(bundle.get("fit_retry_applied", False)):
+                        _append_execution_log(
+                            execution_log,
+                            phase="nnet_final_refit_retry",
+                            status="warning",
+                            message="NNet adaptive retraining converged only after increasing max_iter.",
+                            strategy="adaptive_adwin",
+                            model=model_name,
+                            drift=int(drift_idx),
+                            run_seed=effective_seed,
+                            run_order=run_order,
+                            balance_mode=balance_mode,
+                            study_id=retrain_study_id,
+                            n_iter_final=bundle.get("n_iter_final"),
+                            fit_warning_count=int(bundle.get("fit_warning_count", 0)),
+                        )
                     model = bundle["model"]
                     threshold = float(bundle["threshold"])
+                    fill_values = dict(bundle.get("fill_values") or {})
+                    feature_transform = dict(bundle.get("feature_transform") or {}) or None
+                    _append_tuning_study(
+                        study_collector,
+                        bundle.get("tuning_artifact"),
+                        stage="adaptive_retrain",
+                        strategy=ADAPTIVE_ADWIN_STRATEGY,
+                        model=model_name,
+                        balance_mode=balance_mode,
+                        run_seed=effective_seed,
+                        run_order=int(run_order),
+                        drift=int(drift_idx),
+                        retrain_rows=int(len(retrain_df)),
+                    )
                     _append_execution_log(
                         execution_log,
                         phase="adaptive_retrain_complete",
@@ -3108,10 +5803,34 @@ def run_adaptive_strategy(
                         drift=int(drift_idx),
                         run_seed=effective_seed,
                         run_order=run_order,
+                        balance_mode=balance_mode,
+                        study_id=retrain_study_id,
                         threshold=float(threshold),
                         best_params=bundle["best_params"],
                         retrain_rows=int(len(retrain_df)),
                         training_time_sec=float(fit_time),
+                        min_retrain_size=int(effective_min_retrain_size),
+                    )
+                except ModelTrainingSkipped as exc:
+                    skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+                    skip_phase = "nnet_final_refit_skipped"
+                    if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
+                        skip_phase = "nnet_trial_invalid"
+                    _append_execution_log(
+                        execution_log,
+                        phase=skip_phase,
+                        status="skipped",
+                        message="Skipped adaptive retraining because NNet did not converge on the drift window.",
+                        strategy="adaptive_adwin",
+                        model=model_name,
+                        drift=int(drift_idx),
+                        run_seed=effective_seed,
+                        run_order=run_order,
+                        balance_mode=balance_mode,
+                        study_id=retrain_study_id,
+                        retrain_rows=int(len(retrain_df)),
+                        min_retrain_size=int(effective_min_retrain_size),
+                        **skip_metadata,
                     )
                 except Exception as exc:
                     _append_execution_log(
@@ -3124,7 +5843,10 @@ def run_adaptive_strategy(
                         drift=int(drift_idx),
                         run_seed=effective_seed,
                         run_order=run_order,
+                        balance_mode=balance_mode,
+                        study_id=retrain_study_id,
                         retrain_rows=int(len(retrain_df)),
+                        min_retrain_size=int(effective_min_retrain_size),
                         error=str(exc),
                     )
 
@@ -3144,6 +5866,7 @@ def run_adaptive_strategy(
                     "strategy": "adaptive_adwin",
                     "drift": drift_idx,
                     "drift_date": pd.Timestamp(ts_stream.iloc[-1]),
+                    "balance_mode": balance_mode,
                     "W": int(len(detector)),
                     "W0": np.nan,
                     "W1": np.nan,
@@ -3170,6 +5893,7 @@ def run_adaptive_strategy(
                 drift_date=pd.Timestamp(ts_stream.iloc[-1]),
                 run_seed=effective_seed,
                 run_order=run_order,
+                balance_mode=balance_mode,
                 threshold=float(threshold),
                 remaining_periods=0,
                 auc=float(seg_metrics["auc"]),
@@ -3181,6 +5905,7 @@ def run_adaptive_strategy(
                 {
                     "strategy": "adaptive_adwin",
                     "model": model_name,
+                    "balance_mode": balance_mode,
                     "segment": "final",
                     "y_true": np.asarray(segment_y),
                     "scores": np.asarray(segment_s),
@@ -3192,7 +5917,1207 @@ def run_adaptive_strategy(
     out = pd.DataFrame(rows)
     if not out.empty:
         out = out.sort_values(["model", "drift"]).reset_index(drop=True)
+    _emit_experiment_progress(
+        progress_callback,
+        ratio=1.0,
+        label="Bloque adaptive_adwin completado.",
+        detail="adaptive_adwin",
+    )
     return out, roc_payload
+
+
+def run_arf_strategy(
+    df: pd.DataFrame,
+    *,
+    feature_cols: Sequence[str],
+    target_col: str = "target",
+    time_col: str = "interval_start",
+    arf_variants: Optional[Sequence[str]] = None,
+    base_year: Optional[int] = None,
+    random_state: int = 42,
+    validation_size: float = 0.2,
+    run_seed: Optional[int] = None,
+    run_order: int = 1,
+    execution_log: Optional[List[Dict[str, Any]]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """
+    Runs immediate-label Adaptive Random Forest (ARF) evaluation year by year
+    after warming on the full base year.
+    """
+    if arf_variants is None:
+        arf_variants = ARF_VARIANT_NAMES
+    balance_mode = BALANCE_MODE_NOT_APPLICABLE
+
+    work = df.copy()
+    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
+    years = _available_prediction_years(work, time_col)
+    if len(years) < 2:
+        return pd.DataFrame(), []
+
+    if base_year is None:
+        base_year = years[0]
+
+    base_train = work.loc[_as_year_mask(work, time_col, int(base_year))].copy()
+    stream = work.loc[pd.to_datetime(work[time_col], errors="coerce").dt.year.gt(int(base_year))].copy()
+
+    if base_train.empty or stream.empty:
+        return pd.DataFrame(), []
+
+    effective_seed = int(random_state if run_seed is None else run_seed)
+    rows: List[Dict[str, Any]] = []
+    roc_payload: List[Dict[str, Any]] = []
+
+    total_variants = max(1, len(arf_variants))
+    for variant_idx, variant_name in enumerate(arf_variants):
+        variant_start_ratio = float(variant_idx) / float(total_variants)
+        variant_end_ratio = float(variant_idx + 1) / float(total_variants)
+        variant_span = variant_end_ratio - variant_start_ratio
+        variant_detail_prefix = f"Estrategia adaptive_arf | Variante {variant_name} | {variant_idx + 1} / {total_variants}"
+        _emit_experiment_progress(
+            progress_callback,
+            ratio=variant_start_ratio,
+            label="Preparando bloque adaptive_arf...",
+            detail=variant_detail_prefix,
+        )
+        if variant_name not in ARF_VARIANT_CONFIGS:
+            raise ValueError(f"Unsupported ARF variant: {variant_name}")
+
+        if pd.to_numeric(base_train[target_col], errors="coerce").fillna(0).astype(int).nunique() < 2:
+            _append_execution_log(
+                execution_log,
+                phase="arf_base_skip",
+                status="skipped",
+                message="Base training split contains a single target class.",
+                strategy=ADAPTIVE_ARF_STRATEGY,
+                model=variant_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                balance_mode=balance_mode,
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+            )
+            continue
+
+        try:
+            t0 = time.perf_counter()
+            bundle = train_arf_with_internal_validation(
+                base_train,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                time_col=time_col,
+                variant_name=variant_name,
+                validation_size=validation_size,
+                random_state=effective_seed,
+            )
+            fit_time = time.perf_counter() - t0
+            _emit_experiment_progress(
+                progress_callback,
+                ratio=variant_start_ratio + variant_span * 0.25,
+                label="Entrenamiento base ARF completo.",
+                detail=variant_detail_prefix,
+            )
+            _append_execution_log(
+                execution_log,
+                phase="arf_base_train_complete",
+                status="ok",
+                message="Finished base training for adaptive ARF strategy.",
+                strategy=ADAPTIVE_ARF_STRATEGY,
+                model=variant_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                balance_mode=balance_mode,
+                threshold=float(bundle["threshold"]),
+                best_params=bundle["best_params"],
+                warm_rows=int(bundle["warm_rows"]),
+                validation_rows=int(bundle["validation_rows"]),
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+                training_time_sec=float(fit_time),
+            )
+        except Exception as exc:
+            _append_execution_log(
+                execution_log,
+                phase="arf_base_train_error",
+                status="error",
+                message="Base training failed for adaptive ARF strategy.",
+                strategy=ADAPTIVE_ARF_STRATEGY,
+                model=variant_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                balance_mode=balance_mode,
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+                error=str(exc),
+            )
+            continue
+
+        model = bundle["model"]
+        threshold = float(bundle["threshold"])
+        fill_values = dict(bundle.get("fill_values") or {})
+        X_stream_raw, y_stream = _prepare_xy_raw(stream, feature_cols, target_col)
+        ts_stream = pd.to_datetime(stream[time_col], errors="coerce").reset_index(drop=True)
+        stream_progress_step = max(1, len(stream) // 50)
+
+        segment_idx = 0
+        current_year: Optional[int] = None
+        segment_y: List[int] = []
+        segment_s: List[float] = []
+        segment_drift_start = _online_counter_value(model, "n_drifts_detected")
+        segment_warning_start = _online_counter_value(model, "n_warnings_detected")
+
+        def flush_year_segment(
+            prediction_year: int,
+            end_ts: pd.Timestamp,
+            remaining_periods: int,
+        ) -> None:
+            nonlocal segment_idx, segment_y, segment_s, segment_drift_start, segment_warning_start
+            if not segment_y:
+                return
+
+            segment_idx += 1
+            seg_metrics = compute_classification_metrics(
+                np.asarray(segment_y),
+                np.asarray(segment_s),
+                threshold=threshold,
+            )
+            current_drifts = _online_counter_value(model, "n_drifts_detected")
+            current_warnings = _online_counter_value(model, "n_warnings_detected")
+            segment_drifts = current_drifts - segment_drift_start
+            segment_warnings = current_warnings - segment_warning_start
+
+            rows.append(
+                {
+                    "strategy": ADAPTIVE_ARF_STRATEGY,
+                    "drift": segment_idx,
+                    "drift_date": pd.Timestamp(end_ts),
+                    "prediction_year": int(prediction_year),
+                    "balance_mode": balance_mode,
+                    "segment_rows": int(len(segment_y)),
+                    "n_internal_drifts": int(segment_drifts),
+                    "n_internal_warnings": int(segment_warnings),
+                    "W": np.nan,
+                    "W0": np.nan,
+                    "W1": np.nan,
+                    "remaining_periods": int(remaining_periods),
+                    "model": variant_name,
+                    "auc": float(seg_metrics["auc"]),
+                    "sensitivity": float(seg_metrics["sensitivity"]),
+                    "specificity": float(seg_metrics["specificity"]),
+                    "error_rate": float(seg_metrics["error_rate"]),
+                    "training_time_sec": float(fit_time),
+                    "threshold": float(threshold),
+                    "run_seed": effective_seed,
+                    "run_order": int(run_order),
+                }
+            )
+
+            _append_execution_log(
+                execution_log,
+                phase="arf_year_segment_complete",
+                status="ok",
+                message="Stored yearly online ARF segment.",
+                strategy=ADAPTIVE_ARF_STRATEGY,
+                model=variant_name,
+                drift=int(segment_idx),
+                prediction_year=int(prediction_year),
+                drift_date=pd.Timestamp(end_ts),
+                n_internal_drifts=int(segment_drifts),
+                n_internal_warnings=int(segment_warnings),
+                segment_rows=int(len(segment_y)),
+                remaining_periods=int(remaining_periods),
+                run_seed=effective_seed,
+                run_order=run_order,
+                balance_mode=balance_mode,
+                threshold=float(threshold),
+                auc=float(seg_metrics["auc"]),
+                sensitivity=float(seg_metrics["sensitivity"]),
+                specificity=float(seg_metrics["specificity"]),
+                error_rate=float(seg_metrics["error_rate"]),
+            )
+
+            roc_payload.append(
+                {
+                    "strategy": ADAPTIVE_ARF_STRATEGY,
+                    "model": variant_name,
+                    "balance_mode": balance_mode,
+                    "segment": str(prediction_year),
+                    "y_true": np.asarray(segment_y),
+                    "scores": np.asarray(segment_s),
+                    "run_seed": effective_seed,
+                    "run_order": int(run_order),
+                }
+            )
+
+            segment_drift_start = current_drifts
+            segment_warning_start = current_warnings
+            segment_y = []
+            segment_s = []
+
+        for i in range(len(stream)):
+            if i == 0 or (i + 1) % stream_progress_step == 0 or i == len(stream) - 1:
+                _emit_experiment_progress(
+                    progress_callback,
+                    ratio=variant_start_ratio + variant_span * (0.30 + 0.65 * float(i + 1) / float(max(1, len(stream)))),
+                    label="Evaluando stream adaptive_arf...",
+                    detail=f"{variant_detail_prefix} | fila {i + 1:,} / {len(stream):,}",
+                )
+            ts_i = ts_stream.iloc[i]
+            year_i = int(ts_i.year)
+
+            if current_year is None:
+                current_year = year_i
+            elif year_i != current_year:
+                flush_year_segment(
+                    int(current_year),
+                    pd.Timestamp(ts_stream.iloc[i - 1]),
+                    int(len(stream) - i),
+                )
+                current_year = year_i
+
+            x_i = _apply_fill_values(X_stream_raw.iloc[[i]], fill_values)
+            x_dict = _row_to_online_feature_dict(x_i.iloc[0])
+            y_i = int(y_stream.iloc[i])
+            score_i = _score_online_binary_classifier(model, x_dict)
+
+            segment_y.append(y_i)
+            segment_s.append(score_i)
+            model.learn_one(x_dict, y_i)
+
+        if current_year is not None and segment_y:
+            flush_year_segment(int(current_year), pd.Timestamp(ts_stream.iloc[-1]), 0)
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["model", "prediction_year", "drift"]).reset_index(drop=True)
+    _emit_experiment_progress(
+        progress_callback,
+        ratio=1.0,
+        label="Bloque adaptive_arf completado.",
+        detail="adaptive_arf",
+    )
+    return out, roc_payload
+
+
+def run_kswin_strategy(
+    df: pd.DataFrame,
+    *,
+    feature_cols: Sequence[str],
+    target_col: str = "target",
+    time_col: str = "interval_start",
+    model_names: Optional[Sequence[str]] = None,
+    kswin_variants: Optional[Sequence[str]] = None,
+    base_year: Optional[int] = None,
+    random_state: int = 42,
+    validation_size: float = 0.2,
+    folds: int = 5,
+    fast_mode: bool = True,
+    grid_limit: Optional[int] = None,
+    kswin_top_k_features: int = 10,
+    kswin_vote_threshold: int = 2,
+    kswin_retrain_days: int = 90,
+    kswin_min_retrain_rows: int = 100,
+    custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
+    run_seed: Optional[int] = None,
+    run_order: int = 1,
+    execution_log: Optional[List[Dict[str, Any]]] = None,
+    balance_mode: str = BALANCE_MODE_NONE,
+    study_collector: Optional[List[Dict[str, Any]]] = None,
+    fixed_params: Optional[Dict[str, Any]] = None,
+    fixed_tuning_artifact: Optional[Dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    smote_cache_dir: Optional[Path] = None,
+    smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """
+    Runs KSWIN-driven adaptive retraining using monitored feature distributions.
+    """
+    if model_names is None:
+        model_names = MODEL_NAMES
+    if kswin_variants is None:
+        kswin_variants = KSWIN_DEFAULT_VARIANTS
+
+    work = df.copy()
+    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
+    years = _available_prediction_years(work, time_col)
+    if len(years) < 2:
+        return pd.DataFrame(), []
+
+    if base_year is None:
+        base_year = years[0]
+
+    base_train = work.loc[_as_year_mask(work, time_col, int(base_year))].copy()
+    stream = work.loc[pd.to_datetime(work[time_col], errors="coerce").dt.year.gt(int(base_year))].copy()
+    if base_train.empty or stream.empty:
+        return pd.DataFrame(), []
+
+    effective_seed = int(random_state if run_seed is None else run_seed)
+    rows: List[Dict[str, Any]] = []
+    roc_payload: List[Dict[str, Any]] = []
+    total_blocks = max(1, len(model_names) * len(kswin_variants))
+    block_counter = 0
+
+    for model_name in model_names:
+        if pd.to_numeric(base_train[target_col], errors="coerce").fillna(0).astype(int).nunique() < 2:
+            _append_execution_log(
+                execution_log,
+                phase="kswin_base_skip",
+                status="skipped",
+                message="Base training split contains a single target class.",
+                strategy=ADAPTIVE_KSWIN_STRATEGY,
+                model=model_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                balance_mode=balance_mode,
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+            )
+            continue
+
+        base_study_id = _build_tuning_study_id(
+            stage="kswin_base",
+            strategy=ADAPTIVE_KSWIN_STRATEGY,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            run_seed=effective_seed,
+            run_order=run_order,
+            training_year=str(int(base_year)),
+        )
+        try:
+            t0 = time.perf_counter()
+            bundle = train_model_with_internal_validation(
+                base_train,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                time_col=time_col,
+                model_name=model_name,
+                validation_size=validation_size,
+                folds=folds,
+                random_state=effective_seed,
+                fast_mode=fast_mode,
+                grid_limit=grid_limit,
+                custom_grid=(custom_grids or {}).get(model_name),
+                balance_mode=balance_mode,
+                study_id=base_study_id,
+                fixed_params=fixed_params,
+                fixed_tuning_artifact=fixed_tuning_artifact,
+                run_id=run_id,
+                smote_cache_dir=smote_cache_dir,
+                smote_cache_registry=smote_cache_registry,
+                progress_callback=(
+                    None
+                    if progress_callback is None
+                    else lambda payload, _base=float(block_counter) / float(total_blocks), _span=1.0 / float(total_blocks), _model=model_name: _emit_experiment_progress(
+                        progress_callback,
+                        ratio=_base + _span * (0.05 + 0.25 * max(0.0, min(float(payload.get("ratio", 0.0)), 1.0))),
+                        label=str(payload.get("label", "Entrenando base KSWIN...")),
+                        detail=f"Estrategia adaptive_kswin | Modelo {_model} | {str(payload.get('detail', '') or '')}".strip(" |"),
+                    )
+                ),
+            )
+            fit_time = time.perf_counter() - t0
+            if str(model_name) == "NNet" and bool(bundle.get("fit_retry_applied", False)):
+                _append_execution_log(
+                    execution_log,
+                    phase="nnet_final_refit_retry",
+                    status="warning",
+                    message="NNet base KSWIN model converged only after increasing max_iter.",
+                    strategy=ADAPTIVE_KSWIN_STRATEGY,
+                    model=model_name,
+                    training_year=int(base_year),
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    balance_mode=balance_mode,
+                    study_id=base_study_id,
+                    n_iter_final=bundle.get("n_iter_final"),
+                    fit_warning_count=int(bundle.get("fit_warning_count", 0)),
+                )
+        except ModelTrainingSkipped as exc:
+            skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+            skip_phase = "nnet_final_refit_skipped"
+            if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
+                skip_phase = "nnet_trial_invalid"
+            _append_execution_log(
+                execution_log,
+                phase=skip_phase,
+                status="skipped",
+                message="Skipped adaptive KSWIN block because NNet did not produce a stable base model.",
+                strategy=ADAPTIVE_KSWIN_STRATEGY,
+                model=model_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                balance_mode=balance_mode,
+                study_id=base_study_id,
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+                **skip_metadata,
+            )
+            continue
+        except Exception as exc:
+            _append_execution_log(
+                execution_log,
+                phase="kswin_base_train_error",
+                status="error",
+                message="Base training failed for adaptive KSWIN strategy.",
+                strategy=ADAPTIVE_KSWIN_STRATEGY,
+                model=model_name,
+                training_year=int(base_year),
+                run_seed=effective_seed,
+                run_order=run_order,
+                balance_mode=balance_mode,
+                study_id=base_study_id,
+                n_train=int(len(base_train)),
+                n_stream=int(len(stream)),
+                error=str(exc),
+            )
+            continue
+
+        base_X_raw, _ = _prepare_xy_raw(base_train, feature_cols, target_col)
+        base_fill_values = dict(bundle.get("fill_values") or {})
+        base_X = _apply_fill_values(base_X_raw, base_fill_values)
+        monitor_cols = _select_kswin_monitor_columns(
+            base_X,
+            feature_cols,
+            top_k=kswin_top_k_features,
+        )
+        effective_vote_threshold = min(max(1, int(kswin_vote_threshold)), max(1, len(monitor_cols)))
+        if not monitor_cols:
+            _append_execution_log(
+                execution_log,
+                phase="kswin_monitor_skip",
+                status="skipped",
+                    message="No numeric monitor features available for KSWIN.",
+                    strategy=ADAPTIVE_KSWIN_STRATEGY,
+                    model=model_name,
+                    training_year=int(base_year),
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    balance_mode=balance_mode,
+                )
+            continue
+
+        _append_tuning_study(
+            study_collector,
+            bundle.get("tuning_artifact"),
+            stage="kswin_base",
+            strategy=ADAPTIVE_KSWIN_STRATEGY,
+            model=model_name,
+            balance_mode=balance_mode,
+            run_seed=effective_seed,
+            run_order=int(run_order),
+            training_year=int(base_year),
+            n_train=int(len(base_train)),
+            n_stream=int(len(stream)),
+            monitor_cols=monitor_cols,
+        )
+        _append_execution_log(
+            execution_log,
+            phase="kswin_base_train_complete",
+            status="ok",
+            message="Finished base training for adaptive KSWIN strategy.",
+            strategy=ADAPTIVE_KSWIN_STRATEGY,
+            model=model_name,
+            training_year=int(base_year),
+            run_seed=effective_seed,
+            run_order=run_order,
+            balance_mode=balance_mode,
+            study_id=base_study_id,
+            threshold=float(bundle["threshold"]),
+            best_params=bundle["best_params"],
+            monitor_cols=monitor_cols,
+            n_train=int(len(base_train)),
+            n_stream=int(len(stream)),
+            training_time_sec=float(fit_time),
+        )
+
+        X_stream_raw, y_stream = _prepare_xy_raw(stream, feature_cols, target_col)
+        ts_stream = pd.to_datetime(stream[time_col], errors="coerce").reset_index(drop=True)
+
+        base_monitor_df = pd.concat(
+            [
+                pd.to_datetime(base_train[time_col], errors="coerce").rename(time_col).reset_index(drop=True),
+                base_X[monitor_cols].reset_index(drop=True),
+            ],
+            axis=1,
+        )
+
+        for variant_name in kswin_variants:
+            variant_index = block_counter
+            block_counter += 1
+            variant_start_ratio = float(variant_index) / float(total_blocks)
+            variant_end_ratio = float(variant_index + 1) / float(total_blocks)
+            variant_span = variant_end_ratio - variant_start_ratio
+            variant_detail_prefix = (
+                f"Estrategia adaptive_kswin | Modelo {model_name} | Detector {variant_name} | "
+                f"{variant_index + 1} / {total_blocks}"
+            )
+            _emit_experiment_progress(
+                progress_callback,
+                ratio=variant_start_ratio,
+                label="Preparando bloque adaptive_kswin...",
+                detail=variant_detail_prefix,
+            )
+            if variant_name not in KSWIN_VARIANT_CONFIGS:
+                raise ValueError(f"Unsupported KSWIN variant: {variant_name}")
+
+            seasonal_profiles = _build_kswin_seasonal_profiles(
+                base_monitor_df,
+                monitor_cols=monitor_cols,
+                time_col=time_col,
+            )
+            detectors = _build_kswin_detectors(
+                variant_name=variant_name,
+                monitor_cols=monitor_cols,
+                warm_df=base_monitor_df,
+                time_col=time_col,
+                seasonal_profiles=seasonal_profiles,
+                random_state=effective_seed,
+            )
+
+            current_model = bundle["model"]
+            threshold = float(bundle["threshold"])
+            current_fill_values = dict(bundle.get("fill_values") or {})
+            current_feature_transform = dict(bundle.get("feature_transform") or {}) or None
+            model_label = f"{model_name} | {variant_name}"
+            segment_y: List[int] = []
+            segment_s: List[float] = []
+            drift_idx = 0
+            stream_progress_step = max(1, len(stream) // 50)
+
+            for i in range(len(stream)):
+                if i == 0 or (i + 1) % stream_progress_step == 0 or i == len(stream) - 1:
+                    _emit_experiment_progress(
+                        progress_callback,
+                        ratio=variant_start_ratio + variant_span * (0.35 + 0.60 * float(i + 1) / float(max(1, len(stream)))),
+                        label="Evaluando stream adaptive_kswin...",
+                        detail=f"{variant_detail_prefix} | fila {i + 1:,} / {len(stream):,}",
+                    )
+                x_i = _apply_fill_values(X_stream_raw.iloc[[i]], current_fill_values)
+                x_i_model = _apply_feature_transform(x_i, current_feature_transform)
+                y_i = int(y_stream.iloc[i])
+                ts_i = pd.Timestamp(ts_stream.iloc[i])
+                score_i = float(_model_scores(current_model, x_i_model)[0])
+
+                segment_y.append(y_i)
+                segment_s.append(score_i)
+
+                fired_features: List[str] = []
+                for feat in monitor_cols:
+                    raw_val = float(x_i.iloc[0][feat])
+                    transformed = _transform_kswin_value(
+                        timestamp=ts_i,
+                        value=raw_val,
+                        feature_name=str(feat),
+                        variant_name=variant_name,
+                        seasonal_profiles=seasonal_profiles,
+                    )
+                    if not np.isfinite(transformed):
+                        continue
+                    detector = detectors[str(feat)]
+                    detector.update(float(transformed))
+                    if bool(getattr(detector, "drift_detected", False)):
+                        fired_features.append(str(feat))
+
+                if len(fired_features) < effective_vote_threshold:
+                    continue
+
+                drift_idx += 1
+                seg_metrics = compute_classification_metrics(
+                    np.asarray(segment_y),
+                    np.asarray(segment_s),
+                    threshold=threshold,
+                )
+
+                observed_df = pd.concat(
+                    [
+                        base_train,
+                        stream.iloc[: i + 1].copy(),
+                    ],
+                    ignore_index=True,
+                )
+                retrain_df = _select_kswin_retrain_window(
+                    observed_df,
+                    current_ts=ts_i,
+                    time_col=time_col,
+                    retrain_days=kswin_retrain_days,
+                    min_rows=kswin_min_retrain_rows,
+                    target_col=target_col,
+                )
+                retrain_rows = int(len(retrain_df))
+                retrain_positive_rows = int(
+                    pd.to_numeric(retrain_df.get(target_col), errors="coerce").fillna(0).astype(int).sum()
+                ) if target_col in retrain_df.columns else 0
+                remaining = int(len(stream) - (i + 1))
+                config = KSWIN_VARIANT_CONFIGS[variant_name]
+
+                rows.append(
+                    {
+                        "strategy": ADAPTIVE_KSWIN_STRATEGY,
+                        "drift": drift_idx,
+                        "drift_date": ts_i,
+                        "prediction_year": int(ts_i.year),
+                        "balance_mode": balance_mode,
+                        "segment_rows": int(len(segment_y)),
+                        "vote_count": int(len(fired_features)),
+                        "vote_threshold": int(effective_vote_threshold),
+                        "monitor_feature_count": int(len(monitor_cols)),
+                        "detected_features": json.dumps(fired_features, ensure_ascii=True),
+                        "monitored_features": json.dumps(list(monitor_cols), ensure_ascii=True),
+                        "retrain_rows": retrain_rows,
+                        "retrain_positive_rows": retrain_positive_rows,
+                        "W": int(config["window_size"]),
+                        "W0": int(config["window_size"] - config["stat_size"]),
+                        "W1": int(config["stat_size"]),
+                        "remaining_periods": remaining,
+                        "base_model": model_name,
+                        "detector_variant": variant_name,
+                        "model": model_label,
+                        "auc": float(seg_metrics["auc"]),
+                        "sensitivity": float(seg_metrics["sensitivity"]),
+                        "specificity": float(seg_metrics["specificity"]),
+                        "error_rate": float(seg_metrics["error_rate"]),
+                        "training_time_sec": float(fit_time),
+                        "threshold": float(threshold),
+                        "run_seed": effective_seed,
+                        "run_order": int(run_order),
+                    }
+                )
+
+                _append_execution_log(
+                    execution_log,
+                    phase="kswin_drift_detected",
+                    status="ok",
+                    message="KSWIN detected drift and closed a prediction segment.",
+                    strategy=ADAPTIVE_KSWIN_STRATEGY,
+                    model=model_label,
+                    base_model=model_name,
+                    detector_variant=variant_name,
+                    drift=int(drift_idx),
+                    prediction_year=int(ts_i.year),
+                    drift_date=ts_i,
+                    vote_count=int(len(fired_features)),
+                    vote_threshold=int(effective_vote_threshold),
+                    detected_features=fired_features,
+                    monitor_feature_count=int(len(monitor_cols)),
+                    monitor_cols=monitor_cols,
+                    retrain_rows=retrain_rows,
+                    retrain_positive_rows=retrain_positive_rows,
+                    remaining_periods=remaining,
+                    threshold=float(threshold),
+                    auc=float(seg_metrics["auc"]),
+                    sensitivity=float(seg_metrics["sensitivity"]),
+                    specificity=float(seg_metrics["specificity"]),
+                    error_rate=float(seg_metrics["error_rate"]),
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    balance_mode=balance_mode,
+                )
+
+                roc_payload.append(
+                    {
+                        "strategy": ADAPTIVE_KSWIN_STRATEGY,
+                        "model": model_label,
+                        "balance_mode": balance_mode,
+                        "segment": f"drift_{drift_idx}",
+                        "y_true": np.asarray(segment_y),
+                        "scores": np.asarray(segment_s),
+                        "run_seed": effective_seed,
+                        "run_order": int(run_order),
+                    }
+                )
+
+                if (
+                    not retrain_df.empty
+                    and target_col in retrain_df.columns
+                    and pd.to_numeric(retrain_df[target_col], errors="coerce").fillna(0).astype(int).nunique() >= 2
+                ):
+                    retrain_study_id = _build_tuning_study_id(
+                        stage="kswin_retrain",
+                        strategy=ADAPTIVE_KSWIN_STRATEGY,
+                        model_name=model_name,
+                        balance_mode=balance_mode,
+                        run_seed=effective_seed,
+                        run_order=run_order,
+                        detector_variant=variant_name,
+                        drift=int(drift_idx),
+                    )
+                    try:
+                        t_fit = time.perf_counter()
+                        retrain_bundle = train_model_with_internal_validation(
+                            retrain_df,
+                            feature_cols=feature_cols,
+                            target_col=target_col,
+                            time_col=time_col,
+                            model_name=model_name,
+                            validation_size=validation_size,
+                            folds=folds,
+                            random_state=effective_seed,
+                            fast_mode=fast_mode,
+                            grid_limit=grid_limit,
+                            custom_grid=(custom_grids or {}).get(model_name),
+                            balance_mode=balance_mode,
+                            study_id=retrain_study_id,
+                            fixed_params=fixed_params,
+                            fixed_tuning_artifact=fixed_tuning_artifact,
+                            run_id=run_id,
+                            smote_cache_dir=smote_cache_dir,
+                            smote_cache_registry=smote_cache_registry,
+                        )
+                        fit_time = time.perf_counter() - t_fit
+                        if str(model_name) == "NNet" and bool(retrain_bundle.get("fit_retry_applied", False)):
+                            _append_execution_log(
+                                execution_log,
+                                phase="nnet_final_refit_retry",
+                                status="warning",
+                                message="NNet KSWIN retraining converged only after increasing max_iter.",
+                                strategy=ADAPTIVE_KSWIN_STRATEGY,
+                                model=model_label,
+                                base_model=model_name,
+                                detector_variant=variant_name,
+                                drift=int(drift_idx),
+                                balance_mode=balance_mode,
+                                study_id=retrain_study_id,
+                                n_iter_final=retrain_bundle.get("n_iter_final"),
+                                fit_warning_count=int(retrain_bundle.get("fit_warning_count", 0)),
+                                run_seed=effective_seed,
+                                run_order=run_order,
+                            )
+                        current_model = retrain_bundle["model"]
+                        threshold = float(retrain_bundle["threshold"])
+                        current_fill_values = dict(retrain_bundle.get("fill_values") or {})
+                        current_feature_transform = dict(retrain_bundle.get("feature_transform") or {}) or None
+                        _append_tuning_study(
+                            study_collector,
+                            retrain_bundle.get("tuning_artifact"),
+                            stage="kswin_retrain",
+                            strategy=ADAPTIVE_KSWIN_STRATEGY,
+                            model=model_name,
+                            base_model=model_name,
+                            detector_variant=variant_name,
+                            balance_mode=balance_mode,
+                            run_seed=effective_seed,
+                            run_order=int(run_order),
+                            drift=int(drift_idx),
+                            retrain_rows=retrain_rows,
+                            retrain_positive_rows=retrain_positive_rows,
+                        )
+                        _append_execution_log(
+                            execution_log,
+                            phase="kswin_retrain_complete",
+                            status="ok",
+                            message="Adaptive retraining completed after KSWIN drift detection.",
+                            strategy=ADAPTIVE_KSWIN_STRATEGY,
+                            model=model_label,
+                            base_model=model_name,
+                            detector_variant=variant_name,
+                            drift=int(drift_idx),
+                            retrain_rows=retrain_rows,
+                            retrain_positive_rows=retrain_positive_rows,
+                            balance_mode=balance_mode,
+                            study_id=retrain_study_id,
+                            threshold=float(threshold),
+                            best_params=retrain_bundle["best_params"],
+                            vote_threshold=int(effective_vote_threshold),
+                            training_time_sec=float(fit_time),
+                            run_seed=effective_seed,
+                            run_order=run_order,
+                        )
+                    except ModelTrainingSkipped as exc:
+                        skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+                        skip_phase = "nnet_final_refit_skipped"
+                        if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
+                            skip_phase = "nnet_trial_invalid"
+                        _append_execution_log(
+                            execution_log,
+                            phase=skip_phase,
+                            status="skipped",
+                            message="Skipped adaptive retraining after KSWIN drift because NNet did not converge.",
+                            strategy=ADAPTIVE_KSWIN_STRATEGY,
+                            model=model_label,
+                            base_model=model_name,
+                            detector_variant=variant_name,
+                            drift=int(drift_idx),
+                            retrain_rows=retrain_rows,
+                            retrain_positive_rows=retrain_positive_rows,
+                            balance_mode=balance_mode,
+                            study_id=retrain_study_id,
+                            run_seed=effective_seed,
+                            run_order=run_order,
+                            **skip_metadata,
+                        )
+                    except Exception as exc:
+                        _append_execution_log(
+                            execution_log,
+                            phase="kswin_retrain_error",
+                            status="error",
+                            message="Adaptive retraining failed after KSWIN drift detection.",
+                            strategy=ADAPTIVE_KSWIN_STRATEGY,
+                            model=model_label,
+                            base_model=model_name,
+                            detector_variant=variant_name,
+                            drift=int(drift_idx),
+                            retrain_rows=retrain_rows,
+                            retrain_positive_rows=retrain_positive_rows,
+                            balance_mode=balance_mode,
+                            study_id=retrain_study_id,
+                            error=str(exc),
+                            run_seed=effective_seed,
+                            run_order=run_order,
+                        )
+
+                warm_monitor_df = pd.concat(
+                    [
+                        pd.to_datetime(retrain_df[time_col], errors="coerce").rename(time_col).reset_index(drop=True),
+                        _apply_fill_values(
+                            _prepare_xy_raw(retrain_df, feature_cols, target_col)[0],
+                            current_fill_values,
+                        )[monitor_cols].reset_index(drop=True),
+                    ],
+                axis=1,
+                ) if not retrain_df.empty else base_monitor_df
+
+                detectors = _build_kswin_detectors(
+                    variant_name=variant_name,
+                    monitor_cols=monitor_cols,
+                    warm_df=warm_monitor_df,
+                    time_col=time_col,
+                    seasonal_profiles=seasonal_profiles,
+                    random_state=effective_seed + drift_idx,
+                )
+
+                segment_y = []
+                segment_s = []
+
+            if segment_y:
+                drift_idx += 1
+                seg_metrics = compute_classification_metrics(
+                    np.asarray(segment_y),
+                    np.asarray(segment_s),
+                    threshold=threshold,
+                )
+                rows.append(
+                    {
+                        "strategy": ADAPTIVE_KSWIN_STRATEGY,
+                        "drift": drift_idx,
+                        "drift_date": pd.Timestamp(ts_stream.iloc[-1]),
+                        "prediction_year": int(pd.Timestamp(ts_stream.iloc[-1]).year),
+                        "balance_mode": balance_mode,
+                        "segment_rows": int(len(segment_y)),
+                        "vote_count": 0,
+                        "vote_threshold": int(effective_vote_threshold),
+                        "monitor_feature_count": int(len(monitor_cols)),
+                        "detected_features": json.dumps([], ensure_ascii=True),
+                        "monitored_features": json.dumps(list(monitor_cols), ensure_ascii=True),
+                        "retrain_rows": 0,
+                        "retrain_positive_rows": 0,
+                        "W": int(KSWIN_VARIANT_CONFIGS[variant_name]["window_size"]),
+                        "W0": int(KSWIN_VARIANT_CONFIGS[variant_name]["window_size"] - KSWIN_VARIANT_CONFIGS[variant_name]["stat_size"]),
+                        "W1": int(KSWIN_VARIANT_CONFIGS[variant_name]["stat_size"]),
+                        "remaining_periods": 0,
+                        "base_model": model_name,
+                        "detector_variant": variant_name,
+                        "model": model_label,
+                        "auc": float(seg_metrics["auc"]),
+                        "sensitivity": float(seg_metrics["sensitivity"]),
+                        "specificity": float(seg_metrics["specificity"]),
+                        "error_rate": float(seg_metrics["error_rate"]),
+                        "training_time_sec": float(fit_time),
+                        "threshold": float(threshold),
+                        "run_seed": effective_seed,
+                        "run_order": int(run_order),
+                    }
+                )
+                _append_execution_log(
+                    execution_log,
+                    phase="kswin_final_segment",
+                    status="ok",
+                    message="Stored final KSWIN adaptive segment after finishing the stream.",
+                    strategy=ADAPTIVE_KSWIN_STRATEGY,
+                    model=model_label,
+                    base_model=model_name,
+                    detector_variant=variant_name,
+                    drift=int(drift_idx),
+                    drift_date=pd.Timestamp(ts_stream.iloc[-1]),
+                    remaining_periods=0,
+                    threshold=float(threshold),
+                    auc=float(seg_metrics["auc"]),
+                    sensitivity=float(seg_metrics["sensitivity"]),
+                    specificity=float(seg_metrics["specificity"]),
+                    error_rate=float(seg_metrics["error_rate"]),
+                    run_seed=effective_seed,
+                    run_order=run_order,
+                    balance_mode=balance_mode,
+                )
+                roc_payload.append(
+                    {
+                        "strategy": ADAPTIVE_KSWIN_STRATEGY,
+                        "model": model_label,
+                        "balance_mode": balance_mode,
+                        "segment": "final",
+                        "y_true": np.asarray(segment_y),
+                        "scores": np.asarray(segment_s),
+                        "run_seed": effective_seed,
+                        "run_order": int(run_order),
+                    }
+                )
+            _emit_experiment_progress(
+                progress_callback,
+                ratio=variant_end_ratio,
+                label="Bloque adaptive_kswin completado.",
+                detail=variant_detail_prefix,
+            )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["model", "drift_date", "drift"]).reset_index(drop=True)
+    return out, roc_payload
+
+
+def _build_experiment_blocks(
+    *,
+    model_names: Sequence[str],
+    strategies: Sequence[str],
+    arf_variants: Sequence[str],
+    kswin_variants: Sequence[str],
+    balance_modes: Sequence[str],
+) -> List[Dict[str, str]]:
+    normalized_balance_modes = [
+        str(mode)
+        for mode in balance_modes
+        if str(mode) in DEFAULT_BATCH_BALANCE_MODES
+    ] or [BALANCE_MODE_NONE]
+    blocks: List[Dict[str, str]] = []
+    for strategy in strategies:
+        if strategy in YEARLY_STRATEGIES or strategy == ADAPTIVE_ADWIN_STRATEGY:
+            for model_name in model_names:
+                for balance_mode in normalized_balance_modes:
+                    blocks.append(
+                        {
+                            "strategy": str(strategy),
+                            "model": str(model_name),
+                            "balance_mode": str(balance_mode),
+                        }
+                    )
+            continue
+        if strategy == ADAPTIVE_ARF_STRATEGY:
+            for variant_name in arf_variants:
+                blocks.append(
+                    {
+                        "strategy": str(strategy),
+                        "model": str(variant_name),
+                        "balance_mode": BALANCE_MODE_NOT_APPLICABLE,
+                    }
+                )
+            continue
+        if strategy == ADAPTIVE_KSWIN_STRATEGY:
+            for model_name in model_names:
+                for variant_name in kswin_variants:
+                    for balance_mode in normalized_balance_modes:
+                        blocks.append(
+                            {
+                                "strategy": str(strategy),
+                                "model": str(model_name),
+                                "detector_variant": str(variant_name),
+                                "balance_mode": str(balance_mode),
+                            }
+                        )
+            continue
+        raise ValueError(f"Unsupported strategy: {strategy}")
+    strategy_priority = {name: idx for idx, name in enumerate(strategies)}
+    balance_priority = {
+        BALANCE_MODE_NONE: 0,
+        BALANCE_MODE_NOT_APPLICABLE: 0,
+        BALANCE_MODE_SMOTE: 1,
+    }
+    blocks.sort(
+        key=lambda block: (
+            int(strategy_priority.get(str(block.get("strategy", "")), 999)),
+            int(balance_priority.get(str(block.get("balance_mode", BALANCE_MODE_NOT_APPLICABLE)), 9)),
+            _model_execution_priority(str(block.get("model", ""))),
+            str(block.get("model", "")),
+            str(block.get("detector_variant", "")),
+        )
+    )
+    return blocks
+
+
+def _normalize_feature_selection_context(
+    feature_selection_context: Optional[Dict[str, Any]],
+    *,
+    feature_cols: Sequence[str],
+) -> Dict[str, Any]:
+    context = dict(feature_selection_context or {})
+    selected_features = [
+        str(col)
+        for col in (context.get("selected_features") or list(feature_cols))
+    ]
+    context["selected_features"] = selected_features
+    context["feature_count"] = int(context.get("feature_count") or len(selected_features))
+    if "feature_export_path" in context and context.get("feature_export_path"):
+        export_path = Path(str(context["feature_export_path"]))
+        context["feature_export_path"] = str(export_path)
+        context.setdefault("feature_export_name", export_path.name)
+    return _to_json_safe(context)
+
+
+def _canonical_base_year(df: pd.DataFrame, *, time_col: str, base_year: Optional[int]) -> Optional[int]:
+    years = _available_prediction_years(df, time_col)
+    if not years:
+        return None
+    if base_year is None:
+        return int(years[0])
+    return int(base_year)
+
+
+def _batch_tuning_tasks(
+    *,
+    model_names: Sequence[str],
+    strategies: Sequence[str],
+    balance_modes: Sequence[str],
+) -> List[Dict[str, Any]]:
+    requires_batch = any(
+        strategy in YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]
+        for strategy in strategies
+    )
+    if not requires_batch:
+        return []
+    normalized_balance_modes = [
+        str(mode)
+        for mode in balance_modes
+        if str(mode) in DEFAULT_BATCH_BALANCE_MODES
+    ] or [BALANCE_MODE_NONE]
+    tasks = [
+        {
+            "model_name": str(model_name),
+            "balance_mode": str(balance_mode),
+        }
+        for model_name in model_names
+        for balance_mode in normalized_balance_modes
+    ]
+    tasks.sort(
+        key=lambda item: (
+            0 if str(item["balance_mode"]) == BALANCE_MODE_NONE else 1,
+            _model_execution_priority(str(item["model_name"])),
+            str(item["model_name"]),
+        )
+    )
+    return tasks
+
+
+def _initial_recalibration_manifest(
+    *,
+    run_id: str,
+    run_manifest: Dict[str, Any],
+    feature_selection_context: Dict[str, Any],
+    experiment_blocks: Sequence[Dict[str, Any]],
+    tuning_tasks: Sequence[Dict[str, Any]],
+    preflight: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "run_id": str(run_id),
+        "status": "running",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "run_manifest": _to_json_safe(run_manifest),
+        "feature_selection_context": _to_json_safe(feature_selection_context),
+        "completed_block_ids": [],
+        "pending_block_ids": [],
+        "failed_block_id": None,
+        "last_error": None,
+        "block_index": {},
+        "tuning_index": {},
+        "smote_index": {},
+        "progress": {
+            "completed_units": 0.0,
+            "total_units": int(run_manifest.get("total_progress_units", 0)),
+            "completed_tuning_tasks": 0,
+            "total_tuning_tasks": int(len(tuning_tasks)),
+            "completed_blocks": 0,
+            "total_blocks": int(len(experiment_blocks)),
+        },
+        "resume": {
+            "auto_resumed": False,
+            "checkpoint_status": "fresh",
+        },
+        "preflight": _to_json_safe(preflight),
+        "memory_summary": {},
+        "global_execution_log": [],
+    }
+
+
+def _update_manifest_progress(
+    manifest: Dict[str, Any],
+    *,
+    completed_units: float,
+    pending_block_ids: Sequence[str],
+) -> None:
+    progress = dict(manifest.get("progress") or {})
+    progress["completed_units"] = float(completed_units)
+    progress["total_units"] = int(manifest.get("run_manifest", {}).get("total_progress_units", progress.get("total_units", 0)))
+    progress["completed_tuning_tasks"] = int(
+        sum(1 for item in (manifest.get("tuning_index") or {}).values() if str(item.get("status")) == "completed")
+    )
+    progress["total_tuning_tasks"] = int(progress.get("total_tuning_tasks", 0))
+    progress["completed_blocks"] = int(len(manifest.get("completed_block_ids") or []))
+    progress["total_blocks"] = int(progress.get("total_blocks", 0))
+    manifest["progress"] = progress
+    manifest["pending_block_ids"] = [str(block_id) for block_id in pending_block_ids]
+
+
+def _load_completed_tuning_cache(paths: Dict[str, Path], manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    artifacts: Dict[str, Dict[str, Any]] = {}
+    for tuning_key, info in (manifest.get("tuning_index") or {}).items():
+        if str(info.get("status")) != "completed":
+            continue
+        tuning_path = paths["tuning_dir"] / str(info.get("filename", ""))
+        payload = _load_tuning_artifact(tuning_path)
+        if payload:
+            artifacts[str(tuning_key)] = payload
+    return artifacts
+
+
+def _persist_drift_recalibration_json(
+    *,
+    run_manifest: Dict[str, Any],
+    feature_selection_context: Dict[str, Any],
+    studies: Sequence[Dict[str, Any]],
+    yearly_results: pd.DataFrame,
+    adaptive_results: pd.DataFrame,
+    summary: pd.DataFrame,
+    appendix_tables: Dict[str, pd.DataFrame],
+    appendix_tables_mean: Dict[str, pd.DataFrame],
+    average_roc: pd.DataFrame,
+    roc_payload: Sequence[Dict[str, Any]],
+    execution_log: pd.DataFrame,
+) -> Path:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = RESULTS_DIR / f"drift_recalibration_optuna_{stamp}.json"
+    run_manifest["optuna_json_path"] = str(out_path)
+    payload = {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "run_manifest": run_manifest,
+        "feature_selection_context": feature_selection_context,
+        "studies": list(studies),
+        "yearly_results": yearly_results,
+        "adaptive_results": adaptive_results,
+        "summary": summary,
+        "appendix_tables": appendix_tables,
+        "appendix_tables_mean": appendix_tables_mean,
+        "average_roc": average_roc,
+        "roc_payload": list(roc_payload),
+        "execution_log": execution_log,
+    }
+    _atomic_write_json(out_path, payload)
+    return out_path
 
 
 def run_recalibration_experiments(
@@ -3205,193 +7130,1035 @@ def run_recalibration_experiments(
     strategies: Optional[Sequence[str]] = None,
     base_year: Optional[int] = None,
     validation_size: float = 0.2,
-    folds: int = 5,
+    folds: int = 3,
     random_state: int = 42,
     fast_mode: bool = True,
-    grid_limit: Optional[int] = None,
+    grid_limit: Optional[int] = 30,
     adwin_delta: float = 0.002,
     min_window: int = 45_000,
+    min_retrain_size: Optional[int] = None,
+    arf_variants: Optional[Sequence[str]] = None,
+    kswin_variants: Optional[Sequence[str]] = None,
+    kswin_top_k_features: int = 10,
+    kswin_vote_threshold: int = 2,
+    kswin_retrain_days: int = 90,
+    kswin_min_retrain_rows: int = 100,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
     repetition_seeds: Optional[Sequence[int]] = None,
+    balance_modes: Optional[Sequence[str]] = None,
+    feature_selection_context: Optional[Dict[str, Any]] = None,
+    checkpoint_root: Optional[Path] = None,
+    auto_resume: bool = True,
+    persist_progress: bool = True,
+    reuse_tuning_cache: bool = True,
+    reuse_smote_cache: bool = True,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Main orchestrator for all four paper strategies.
+    Main orchestrator for yearly, ADWIN-adaptive and ARF-adaptive strategies.
     """
     if model_names is None:
         model_names = MODEL_NAMES
     if strategies is None:
-        strategies = ["static", "period_aligned", "cumulative", "adaptive_adwin"]
+        strategies = EXPERIMENT_STRATEGIES
+    if arf_variants is None:
+        arf_variants = ARF_DEFAULT_VARIANTS
+    if kswin_variants is None:
+        kswin_variants = KSWIN_DEFAULT_VARIANTS
     if repetition_seeds is None:
         repetition_seeds = DEFAULT_REPETITION_SEEDS
+    if balance_modes is None:
+        balance_modes = DEFAULT_BATCH_BALANCE_MODES
+    normalized_feature_selection_context = _normalize_feature_selection_context(
+        feature_selection_context,
+        feature_cols=feature_cols,
+    )
+    effective_base_year = _canonical_base_year(df, time_col=time_col, base_year=base_year)
 
-    progress_models = list(model_names)
-    progress_strategies = list(strategies)
+    experiment_blocks = _build_experiment_blocks(
+        model_names=list(model_names),
+        strategies=list(strategies),
+        arf_variants=list(arf_variants),
+        kswin_variants=list(kswin_variants),
+        balance_modes=list(balance_modes),
+    )
+    if not experiment_blocks:
+        raise ValueError("No experiment blocks were generated. Check selected strategies/models.")
+
     progress_seeds = [int(seed) for seed in repetition_seeds]
-    total_units = max(1, len(progress_models) * len(progress_strategies) * len(progress_seeds))
-    completed_units = 0
+    tuning_tasks = _batch_tuning_tasks(
+        model_names=list(model_names),
+        strategies=list(strategies),
+        balance_modes=list(balance_modes),
+    )
+    total_block_units = len(experiment_blocks) * max(1, len(progress_seeds))
+    total_units = max(1, len(tuning_tasks) + total_block_units)
+    completed_units = 0.0
+    live_status_path: Optional[Path] = None
+    live_events_path: Optional[Path] = None
+    last_live_event_signature: Dict[str, Optional[str]] = {"value": None}
 
     def emit_progress(
         *,
         label: str,
         detail: str = "",
-        completed_override: Optional[int] = None,
+        completed_override: Optional[float] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if progress_callback is None:
+        completed_value = float(completed_units) if completed_override is None else float(completed_override)
+        payload = {
+            "completed_units": float(completed_value),
+            "total_units": int(total_units),
+            "label": str(label),
+            "detail": str(detail),
+        }
+        if progress_callback is not None:
+            progress_callback(payload)
+        if not persist_progress or live_status_path is None:
             return
-        completed_value = completed_units if completed_override is None else int(completed_override)
-        progress_callback(
+        ratio = max(0.0, min(float(completed_value) / float(max(1, int(total_units))), 1.0))
+        context_payload = _to_json_safe(dict(context or {}))
+        live_payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "run_id": str(run_manifest.get("run_id", "")) if isinstance(run_manifest, dict) else "",
+            "status": str((manifest or {}).get("status", "running")),
+            "completed_units": float(completed_value),
+            "total_units": int(total_units),
+            "progress_ratio": float(ratio),
+            "label": str(label),
+            "detail": str(detail),
+            "context": context_payload,
+        }
+        _persist_recalibration_live_status(live_status_path, live_payload)
+        if live_events_path is None:
+            return
+        signature = json.dumps(
             {
-                "completed_units": int(completed_value),
+                "completed_units": round(float(completed_value), 6),
                 "total_units": int(total_units),
                 "label": str(label),
                 "detail": str(detail),
-            }
+                "context": context_payload,
+            },
+            sort_keys=True,
+            ensure_ascii=True,
         )
+        if signature != last_live_event_signature["value"]:
+            _append_recalibration_live_event(live_events_path, live_payload)
+            last_live_event_signature["value"] = signature
 
     all_rows: List[pd.DataFrame] = []
     all_roc: List[Dict[str, Any]] = []
     adaptive_frames: List[pd.DataFrame] = []
     execution_log: List[Dict[str, Any]] = []
+    studies: List[Dict[str, Any]] = []
+    preflight = _estimate_recalibration_workload(
+        df=df,
+        time_col=time_col,
+        model_names=list(model_names),
+        strategies=list(strategies),
+        arf_variants=list(arf_variants),
+        kswin_variants=list(kswin_variants),
+        balance_modes=list(balance_modes),
+        repetition_seeds=list(repetition_seeds),
+        grid_limit=grid_limit,
+        folds=folds,
+    )
+    available_years = _available_prediction_years(df, time_col)
+    prediction_years = [
+        int(year)
+        for year in available_years
+        if effective_base_year is not None and int(year) > int(effective_base_year)
+    ]
 
     run_manifest = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "models": list(model_names),
         "strategies": list(strategies),
+        "arf_variants": list(arf_variants),
+        "kswin_variants": list(kswin_variants),
+        "balance_modes": [str(mode) for mode in balance_modes],
         "repetition_seeds": [int(seed) for seed in repetition_seeds],
-        "base_year": int(base_year) if base_year is not None else None,
+        "base_year": int(effective_base_year) if effective_base_year is not None else None,
+        "available_years": [int(year) for year in available_years],
+        "prediction_years": prediction_years,
         "validation_size": float(validation_size),
         "folds": int(folds),
         "random_state_fallback": int(random_state),
         "fast_mode": bool(fast_mode),
-        "grid_limit": int(grid_limit) if grid_limit is not None else None,
+        "optuna_trials": int(grid_limit) if grid_limit is not None else None,
         "adwin_delta": float(adwin_delta),
         "min_window": int(min_window),
+        "min_retrain_size": None if min_retrain_size is None else int(min_retrain_size),
+        "kswin_top_k_features": int(kswin_top_k_features),
+        "kswin_vote_threshold": int(kswin_vote_threshold),
+        "kswin_retrain_days": int(kswin_retrain_days),
+        "kswin_min_retrain_rows": int(kswin_min_retrain_rows),
         "feature_count": int(len(feature_cols)),
         "feature_cols": list(feature_cols),
         "target_col": str(target_col),
         "time_col": str(time_col),
         "input_rows": int(len(df)),
         "total_progress_units": int(total_units),
+        "total_tuning_tasks": int(len(tuning_tasks)),
+        "total_block_units": int(total_block_units),
+        "feature_selection_context": normalized_feature_selection_context,
+        "preflight": preflight,
     }
+    run_id = _build_recalibration_run_id(
+        df=df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        time_col=time_col,
+        model_names=list(model_names),
+        strategies=list(strategies),
+        arf_variants=list(arf_variants),
+        kswin_variants=list(kswin_variants),
+        balance_modes=list(balance_modes),
+        repetition_seeds=list(repetition_seeds),
+        base_year=effective_base_year,
+        validation_size=float(validation_size),
+        folds=int(folds),
+        random_state=int(random_state),
+        fast_mode=bool(fast_mode),
+        grid_limit=grid_limit,
+        adwin_delta=float(adwin_delta),
+        min_window=int(min_window),
+        min_retrain_size=min_retrain_size,
+        kswin_top_k_features=int(kswin_top_k_features),
+        kswin_vote_threshold=int(kswin_vote_threshold),
+        kswin_retrain_days=int(kswin_retrain_days),
+        kswin_min_retrain_rows=int(kswin_min_retrain_rows),
+        custom_grids=custom_grids,
+        feature_selection_context=normalized_feature_selection_context,
+    )
+    run_dir = _recalibration_run_dir(run_id, checkpoint_root=checkpoint_root)
+    paths = _recalibration_run_paths(run_dir)
+    _ensure_recalibration_run_dirs(paths)
+    live_status_path = paths["live_status"]
+    live_events_path = paths["live_events"]
+    run_manifest["run_id"] = str(run_id)
+    run_manifest["checkpoint_run_dir"] = str(paths["run_dir"])
+    run_manifest["checkpoint_manifest_path"] = str(paths["manifest"])
 
+    manifest: Optional[Dict[str, Any]] = None
+    existing_manifest = _load_manifest(paths["manifest"]) if auto_resume else None
+    if existing_manifest is not None:
+        manifest = _reconcile_recalibration_manifest(existing_manifest, paths=paths)
+        manifest["run_manifest"] = _to_json_safe(run_manifest)
+        manifest["feature_selection_context"] = _to_json_safe(normalized_feature_selection_context)
+        manifest["resume"] = {
+            "auto_resumed": True,
+            "checkpoint_status": str(existing_manifest.get("status", "running")),
+        }
+        if str(existing_manifest.get("status")) != "completed":
+            manifest["status"] = "running"
+    if manifest is None:
+        if persist_progress:
+            _reset_recalibration_live_artifacts(paths)
+        manifest = _initial_recalibration_manifest(
+            run_id=run_id,
+            run_manifest=run_manifest,
+            feature_selection_context=normalized_feature_selection_context,
+            experiment_blocks=experiment_blocks,
+            tuning_tasks=tuning_tasks,
+            preflight=preflight,
+        )
+    if persist_progress:
+        _persist_manifest(paths["manifest"], manifest)
+
+    if auto_resume and str(manifest.get("status")) == "completed":
+        emit_progress(
+            label="Checkpoint ya completado. Cargando resultados persistidos...",
+            detail=f"{total_units} / {total_units} unidades completadas",
+            completed_override=total_units,
+            context={
+                "phase": "checkpoint_load",
+                "checkpoint_status": "completed",
+            },
+        )
+        outputs = _assemble_recalibration_outputs_from_checkpoints(
+            manifest,
+            paths=paths,
+            feature_selection_context=normalized_feature_selection_context,
+        )
+        outputs["optuna_json_path"] = str(outputs["run_manifest"].get("optuna_json_path", ""))
+        outputs["checkpoint_manifest"] = manifest
+        outputs["checkpoint_manifest_path"] = str(paths["manifest"])
+        outputs["checkpoint_run_dir"] = str(paths["run_dir"])
+        outputs["auto_resumed"] = True
+        outputs["preflight"] = preflight
+        return outputs
+
+    tuning_cache = _load_completed_tuning_cache(paths, manifest) if reuse_tuning_cache else {}
+
+    block_specs: List[Dict[str, Any]] = []
+    for run_order, seed in enumerate(repetition_seeds, start=1):
+        for block in experiment_blocks:
+            block_id = _build_recalibration_block_id(block, run_seed=int(seed), run_order=int(run_order))
+            block_specs.append(
+                {
+                    "block_id": block_id,
+                    "block": dict(block),
+                    "run_seed": int(seed),
+                    "run_order": int(run_order),
+                }
+            )
+            manifest["block_index"][block_id] = {
+                **dict((manifest.get("block_index") or {}).get(block_id) or {}),
+                "filename": f"{block_id}.json",
+                "status": str((manifest.get("block_index") or {}).get(block_id, {}).get("status", "pending")),
+                "strategy": str(block.get("strategy", "")),
+                "model": str(block.get("model", "")),
+                "detector_variant": str(block.get("detector_variant", "")),
+                "balance_mode": str(block.get("balance_mode", BALANCE_MODE_NOT_APPLICABLE)),
+                "run_seed": int(seed),
+                "run_order": int(run_order),
+            }
+
+    completed_block_ids = {str(item) for item in manifest.get("completed_block_ids", [])}
+    completed_units = float(len(tuning_cache) + len(completed_block_ids))
+    pending_block_ids = [spec["block_id"] for spec in block_specs if spec["block_id"] not in completed_block_ids]
+    pending_blocks_by_run: Dict[Tuple[int, int], int] = {}
+    for spec in block_specs:
+        if spec["block_id"] in completed_block_ids:
+            continue
+        key = (int(spec["run_seed"]), int(spec["run_order"]))
+        pending_blocks_by_run[key] = pending_blocks_by_run.get(key, 0) + 1
+    _update_manifest_progress(
+        manifest,
+        completed_units=completed_units,
+        pending_block_ids=pending_block_ids,
+    )
+    if persist_progress:
+        _persist_manifest(paths["manifest"], manifest)
+
+    checkpoint_label = "Reanudando checkpoint..." if bool(manifest.get("resume", {}).get("auto_resumed")) else "Iniciando experimentos de recalibracion..."
     emit_progress(
-        label="Iniciando experimentos de recalibracion...",
-        detail=f"0 / {total_units} bloques completados",
-        completed_override=0,
+        label=checkpoint_label,
+        detail=f"{completed_units:.2f} / {total_units} unidades completadas",
+        completed_override=completed_units,
+        context={
+            "phase": "checkpoint_start",
+            "checkpoint_status": str(manifest.get("resume", {}).get("checkpoint_status", "fresh")),
+            "auto_resumed": bool(manifest.get("resume", {}).get("auto_resumed")),
+        },
     )
 
-    for run_order, seed in enumerate(repetition_seeds, start=1):
+    canonical_train_df = pd.DataFrame()
+    if tuning_tasks:
+        if effective_base_year is None:
+            raise ValueError("No se pudo determinar el ano base para el tuning global.")
+        canonical_train_df = df.loc[_as_year_mask(df, time_col, int(effective_base_year))].copy()
+        if canonical_train_df.empty:
+            raise ValueError("El split canonico base para tuning global esta vacio.")
+
+    for task_idx, task in enumerate(tuning_tasks, start=1):
+        model_name = str(task["model_name"])
+        balance_mode = str(task["balance_mode"])
+        tuning_key = _build_global_tuning_key(
+            model_name=model_name,
+            balance_mode=balance_mode,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            time_col=time_col,
+            canonical_train_df=canonical_train_df,
+            validation_size=float(validation_size),
+            folds=int(folds),
+            random_state=int(random_state),
+            fast_mode=bool(fast_mode),
+            grid_limit=grid_limit,
+            custom_grid=(custom_grids or {}).get(model_name),
+        )
+        tuning_filename = f"{tuning_key}.json"
+        manifest["tuning_index"][tuning_key] = {
+            **dict((manifest.get("tuning_index") or {}).get(tuning_key) or {}),
+            "filename": tuning_filename,
+            "status": str((manifest.get("tuning_index") or {}).get(tuning_key, {}).get("status", "pending")),
+            "model_name": model_name,
+            "balance_mode": balance_mode,
+        }
+        if reuse_tuning_cache and tuning_key in tuning_cache:
+            continue
+
+        manifest["tuning_index"][tuning_key]["status"] = "running"
+        if persist_progress:
+            _persist_manifest(paths["manifest"], manifest)
+
+        rss_before = _current_rss_mb()
         _append_execution_log(
-            execution_log,
-            phase="run_start",
+            manifest.get("global_execution_log"),
+            phase="global_tuning_start",
             status="started",
-            message="Starting sequential experiment repetition.",
-            run_seed=int(seed),
-            run_order=int(run_order),
-            strategies=list(strategies),
-            models=list(model_names),
+            message="Starting global tuning on canonical base split.",
+            tuning_key=tuning_key,
+            model=model_name,
+            balance_mode=balance_mode,
+            task_index=int(task_idx),
+            total_tasks=int(len(tuning_tasks)),
+            run_id=run_id,
+            training_year=int(effective_base_year) if effective_base_year is not None else None,
+            rss_before_mb=rss_before,
+        )
+        try:
+            X_tune, y_tune = _prepare_xy_raw(canonical_train_df, feature_cols, target_col)
+            tuning_study_id = _build_tuning_study_id(
+                stage="global_tuning",
+                strategy="canonical_base",
+                model_name=model_name,
+                balance_mode=balance_mode,
+                run_seed=int(random_state),
+                run_order=1,
+                training_year=str(int(effective_base_year)) if effective_base_year is not None else None,
+            )
+            emit_progress(
+                label="Sintonizando hiperparametros globales...",
+                detail=f"Modelo {model_name} | Balance {balance_mode} | tarea {task_idx} / {len(tuning_tasks)}",
+                completed_override=completed_units,
+                context={
+                    "phase": "global_tuning",
+                    "model": model_name,
+                    "balance_mode": balance_mode,
+                    "task_index": int(task_idx),
+                    "total_tasks": int(len(tuning_tasks)),
+                    "study_id": tuning_study_id,
+                },
+            )
+            best_params, search_df, tuning_artifact = tune_hyperparameters(
+                X_tune,
+                y_tune,
+                model_name=model_name,
+                folds=folds,
+                random_state=random_state,
+                fast_mode=fast_mode,
+                grid_limit=grid_limit,
+                custom_grid=(custom_grids or {}).get(model_name),
+                balance_mode=balance_mode,
+                study_id=tuning_study_id,
+                progress_callback=(
+                    None
+                    if progress_callback is None and not persist_progress
+                    else lambda payload, _base=completed_units: emit_progress(
+                        label=str(payload.get("label", "Sintonizando hiperparametros globales...")),
+                        detail=f"Modelo {model_name} | Balance {balance_mode} | {str(payload.get('detail', '') or '')}".strip(" |"),
+                        completed_override=_base + max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
+                        context={
+                            "phase": "global_tuning",
+                            "model": model_name,
+                            "balance_mode": balance_mode,
+                            "task_index": int(task_idx),
+                            "total_tasks": int(len(tuning_tasks)),
+                            "study_id": tuning_study_id,
+                            "tuning_ratio": max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
+                        },
+                    )
+                ),
+            )
+            tuning_payload = {
+                **dict(tuning_artifact),
+                "tuning_key": tuning_key,
+                "stage": "global_tuning",
+                "canonical_base_year": int(effective_base_year) if effective_base_year is not None else None,
+                "model_name": model_name,
+                "balance_mode": balance_mode,
+                "best_params": best_params,
+                "n_train": int(len(canonical_train_df)),
+                "positive_rows": int(pd.to_numeric(canonical_train_df[target_col], errors="coerce").fillna(0).astype(int).sum()),
+                "train_signature": _frame_signature(
+                    canonical_train_df,
+                    columns=[col for col in [time_col, target_col] + list(feature_cols) if col in canonical_train_df.columns],
+                    include_index=True,
+                ),
+                "search_df": [] if search_df.empty else search_df.to_dict(orient="records"),
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            if persist_progress:
+                _persist_tuning_artifact(paths["tuning_dir"] / tuning_filename, tuning_payload)
+            tuning_cache[tuning_key] = tuning_payload
+            manifest["tuning_index"][tuning_key].update(
+                {
+                    "filename": tuning_filename,
+                    "status": "completed",
+                    "study_id": tuning_payload.get("study_id"),
+                }
+            )
+            rss_after = _cleanup_recalibration_memory()
+            _update_memory_summary(
+                manifest,
+                phase="global_tuning_complete",
+                rss_before_mb=rss_before,
+                rss_after_mb=rss_after,
+            )
+            _append_execution_log(
+                manifest.get("global_execution_log"),
+                phase="global_tuning_complete",
+                status="ok",
+                message="Completed global tuning on canonical base split.",
+                tuning_key=tuning_key,
+                model=model_name,
+                balance_mode=balance_mode,
+                study_id=tuning_payload.get("study_id"),
+                best_params=best_params,
+                best_value=tuning_payload.get("best_value"),
+                rss_after_mb=rss_after,
+            )
+            if str(model_name) == "NNet" and int(tuning_payload.get("invalid_trial_count", 0)) > 0:
+                total_non_converged_folds = int(
+                    sum(
+                        int(row.get("n_non_converged_folds", 0))
+                        for row in (tuning_payload.get("trials") or [])
+                    )
+                )
+                _append_execution_log(
+                    manifest.get("global_execution_log"),
+                    phase="nnet_fold_non_converged",
+                    status="warning",
+                    message="NNet tuning produced non-converged cross-validation folds.",
+                    tuning_key=tuning_key,
+                    model=model_name,
+                    balance_mode=balance_mode,
+                    invalid_trial_count=int(tuning_payload.get("invalid_trial_count", 0)),
+                    non_converged_fold_count=total_non_converged_folds,
+                    has_valid_trial=bool(tuning_payload.get("has_valid_trial", True)),
+                    study_id=tuning_payload.get("study_id"),
+                )
+            if str(model_name) == "NNet" and not bool(tuning_payload.get("has_valid_trial", True)):
+                _append_execution_log(
+                    manifest.get("global_execution_log"),
+                    phase="nnet_trial_invalid",
+                    status="skipped",
+                    message="All persisted NNet tuning trials were invalid because none converged.",
+                    tuning_key=tuning_key,
+                    model=model_name,
+                    balance_mode=balance_mode,
+                    invalid_trial_count=int(tuning_payload.get("invalid_trial_count", 0)),
+                    study_id=tuning_payload.get("study_id"),
+                )
+            completed_units += 1.0
+            pending_block_ids = [spec["block_id"] for spec in block_specs if spec["block_id"] not in completed_block_ids]
+            _update_manifest_progress(
+                manifest,
+                completed_units=completed_units,
+                pending_block_ids=pending_block_ids,
+            )
+            if persist_progress:
+                _persist_manifest(paths["manifest"], manifest)
+            emit_progress(
+                label="Tuning global completado.",
+                detail=f"Modelo {model_name} | Balance {balance_mode} | {completed_units:.2f} / {total_units} unidades",
+                completed_override=completed_units,
+                context={
+                    "phase": "global_tuning_complete",
+                    "model": model_name,
+                    "balance_mode": balance_mode,
+                    "task_index": int(task_idx),
+                    "total_tasks": int(len(tuning_tasks)),
+                    "study_id": tuning_payload.get("study_id"),
+                    "best_value": tuning_payload.get("best_value"),
+                },
+            )
+        except Exception as exc:
+            rss_after = _cleanup_recalibration_memory()
+            _update_memory_summary(
+                manifest,
+                phase="global_tuning_error",
+                rss_before_mb=rss_before,
+                rss_after_mb=rss_after,
+            )
+            manifest["status"] = "failed"
+            manifest["failed_block_id"] = None
+            manifest["last_error"] = {
+                "phase": "global_tuning",
+                "model": model_name,
+                "balance_mode": balance_mode,
+                "error": str(exc),
+                "traceback": traceback.format_exc(limit=10),
+            }
+            manifest["tuning_index"][tuning_key]["status"] = "failed"
+            _append_execution_log(
+                manifest.get("global_execution_log"),
+                phase="global_tuning_error",
+                status="error",
+                message="Global tuning failed.",
+                tuning_key=tuning_key,
+                model=model_name,
+                balance_mode=balance_mode,
+                error=str(exc),
+                rss_after_mb=rss_after,
+            )
+            if persist_progress:
+                _persist_manifest(paths["manifest"], manifest)
+            emit_progress(
+                label="Error en tuning global.",
+                detail=f"Modelo {model_name} | Balance {balance_mode} | {exc}",
+                completed_override=completed_units,
+                context={
+                    "phase": "global_tuning_error",
+                    "model": model_name,
+                    "balance_mode": balance_mode,
+                    "task_index": int(task_idx),
+                    "total_tasks": int(len(tuning_tasks)),
+                },
+            )
+            raise
+
+    for spec in block_specs:
+        block_id = str(spec["block_id"])
+        block = dict(spec["block"])
+        run_seed = int(spec["run_seed"])
+        run_order = int(spec["run_order"])
+        if block_id in completed_block_ids:
+            continue
+        run_key = (run_seed, run_order)
+        if pending_blocks_by_run.get(run_key, 0) and pending_blocks_by_run.get(run_key, 0) == sum(
+            1
+            for item in block_specs
+            if int(item["run_seed"]) == run_seed
+            and int(item["run_order"]) == run_order
+            and item["block_id"] not in completed_block_ids
+        ):
+            _append_execution_log(
+                manifest.get("global_execution_log"),
+                phase="run_start",
+                status="started",
+                message="Starting sequential experiment repetition.",
+                run_seed=run_seed,
+                run_order=run_order,
+                strategies=list(strategies),
+                models=list(model_names),
+                arf_variants=list(arf_variants),
+                kswin_variants=list(kswin_variants),
+                balance_modes=list(balance_modes),
+            )
+            if persist_progress:
+                _persist_manifest(paths["manifest"], manifest)
+
+        strategy = str(block["strategy"])
+        model_name = str(block["model"])
+        detector_variant = str(block.get("detector_variant") or "")
+        balance_mode = str(block.get("balance_mode") or BALANCE_MODE_NOT_APPLICABLE)
+        progress_model_label = f"{model_name} | {detector_variant}" if detector_variant else model_name
+        block_detail_prefix = (
+            f"Seed {run_seed} | Strategy {strategy} | Model {progress_model_label} | Balance {balance_mode}"
+        )
+        block_execution_log: List[Dict[str, Any]] = []
+        smote_registry_block: Dict[str, Dict[str, Any]] = {}
+        manifest["block_index"][block_id]["status"] = "running"
+        if persist_progress:
+            _persist_manifest(paths["manifest"], manifest)
+
+        def block_progress(payload: Dict[str, Any]) -> None:
+            block_ratio = max(0.0, min(float(payload.get("ratio", 0.0)), 1.0))
+            inner_detail = str(payload.get("detail", "") or "")
+            detail = block_detail_prefix
+            if inner_detail:
+                detail = f"{detail} | {inner_detail}"
+            detail = f"{detail} | {completed_units + block_ratio:.2f} / {total_units} unidades"
+            emit_progress(
+                label=str(payload.get("label", "Ejecutando bloque de experimentos...")),
+                detail=detail,
+                completed_override=float(completed_units) + block_ratio,
+                context={
+                    "phase": "block_running",
+                    "block_id": block_id,
+                    "strategy": strategy,
+                    "model": model_name,
+                    "detector_variant": detector_variant,
+                    "balance_mode": balance_mode,
+                    "run_seed": run_seed,
+                    "run_order": run_order,
+                    "block_ratio": float(block_ratio),
+                },
+            )
+
+        emit_progress(
+            label="Ejecutando bloque de experimentos...",
+            detail=f"{block_detail_prefix} | {completed_units:.2f} / {total_units} unidades completadas",
+            completed_override=completed_units,
+            context={
+                "phase": "block_start",
+                "block_id": block_id,
+                "strategy": strategy,
+                "model": model_name,
+                "detector_variant": detector_variant,
+                "balance_mode": balance_mode,
+                "run_seed": run_seed,
+                "run_order": run_order,
+            },
         )
 
-        for strategy in strategies:
-            for model_name in model_names:
-                emit_progress(
-                    label="Ejecutando bloque de experimentos...",
-                    detail=(
-                        f"Seed {int(seed)} | Strategy {strategy} | Model {model_name} | "
-                        f"{completed_units} / {total_units} bloques completados"
-                    ),
-                )
+        tuning_refs: List[str] = []
+        fixed_params = None
+        fixed_tuning_artifact = None
+        if strategy in YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]:
+            tuning_key = _build_global_tuning_key(
+                model_name=model_name,
+                balance_mode=balance_mode,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                time_col=time_col,
+                canonical_train_df=canonical_train_df,
+                validation_size=float(validation_size),
+                folds=int(folds),
+                random_state=int(random_state),
+                fast_mode=bool(fast_mode),
+                grid_limit=grid_limit,
+                custom_grid=(custom_grids or {}).get(model_name),
+            )
+            fixed_tuning_artifact = tuning_cache.get(tuning_key)
+            if fixed_tuning_artifact is None:
+                raise RuntimeError(f"Missing global tuning artifact for {model_name} / {balance_mode}.")
+            fixed_params = dict(fixed_tuning_artifact.get("best_params") or {})
+            tuning_refs.append(tuning_key)
 
-                if strategy in {"static", "period_aligned", "cumulative"}:
-                    rows_df, roc_data = run_yearly_strategy(
-                        df,
-                        strategy=strategy,
-                        feature_cols=feature_cols,
-                        target_col=target_col,
-                        time_col=time_col,
-                        model_names=[model_name],
-                        base_year=base_year,
-                        validation_size=validation_size,
-                        folds=folds,
-                        random_state=random_state,
-                        fast_mode=fast_mode,
-                        grid_limit=grid_limit,
-                        custom_grids=custom_grids,
-                        run_seed=int(seed),
-                        run_order=int(run_order),
-                        execution_log=execution_log,
-                    )
-                    if not rows_df.empty:
-                        all_rows.append(rows_df)
-                    all_roc.extend(roc_data)
-
-                elif strategy == "adaptive_adwin":
-                    adaptive_rows, roc_data = run_adaptive_strategy(
-                        df,
-                        feature_cols=feature_cols,
-                        target_col=target_col,
-                        time_col=time_col,
-                        model_names=[model_name],
-                        base_year=base_year,
-                        random_state=random_state,
-                        validation_size=validation_size,
-                        folds=folds,
-                        fast_mode=fast_mode,
-                        grid_limit=grid_limit,
-                        adwin_delta=adwin_delta,
-                        min_window=min_window,
-                        custom_grids=custom_grids,
-                        run_seed=int(seed),
-                        run_order=int(run_order),
-                        execution_log=execution_log,
-                    )
-                    if not adaptive_rows.empty:
-                        adaptive_frames.append(adaptive_rows)
-                    all_roc.extend(roc_data)
-
-                completed_units += 1
-                emit_progress(
-                    label="Bloque completado.",
-                    detail=(
-                        f"Seed {int(seed)} | Strategy {strategy} | Model {model_name} | "
-                        f"{completed_units} / {total_units} bloques completados"
-                    ),
-                )
-
+        rss_before = _current_rss_mb()
         _append_execution_log(
-            execution_log,
-            phase="run_complete",
-            status="ok",
-            message="Completed sequential experiment repetition.",
-            run_seed=int(seed),
-            run_order=int(run_order),
+            block_execution_log,
+            phase="block_start",
+            status="started",
+            message="Starting persisted experiment block.",
+            block_id=block_id,
+            strategy=strategy,
+            model=progress_model_label,
+            balance_mode=balance_mode,
+            run_seed=run_seed,
+            run_order=run_order,
+            tuning_refs=tuning_refs,
+            rss_before_mb=rss_before,
         )
 
-    yearly_results = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
-    adaptive_results = pd.concat(adaptive_frames, ignore_index=True) if adaptive_frames else pd.DataFrame()
-    roc_curves = build_average_roc_curves(all_roc)
-    summary = summarize_results(yearly_results, adaptive_results)
-    appendix = format_appendix_tables(yearly_results, adaptive_results)
-    appendix_mean = format_appendix_tables_mean(yearly_results, adaptive_results)
+        try:
+            yearly_df = pd.DataFrame()
+            adaptive_df = pd.DataFrame()
+            roc_data: List[Dict[str, Any]] = []
+            if (
+                str(model_name) == "NNet"
+                and fixed_tuning_artifact is not None
+                and not bool(fixed_tuning_artifact.get("has_valid_trial", True))
+            ):
+                _append_execution_log(
+                    block_execution_log,
+                    phase="nnet_trial_invalid",
+                    status="skipped",
+                    message="Skipped experiment block because the persisted NNet tuning artifact has no converged trial.",
+                    block_id=block_id,
+                    strategy=strategy,
+                    model=progress_model_label,
+                    balance_mode=balance_mode,
+                    run_seed=run_seed,
+                    run_order=run_order,
+                    tuning_refs=tuning_refs,
+                    study_id=str((fixed_tuning_artifact or {}).get("study_id", "")),
+                    invalid_trial_count=int((fixed_tuning_artifact or {}).get("invalid_trial_count", 0)),
+                )
+            elif strategy in YEARLY_STRATEGIES:
+                yearly_df, roc_data = run_yearly_strategy(
+                    df,
+                    strategy=strategy,
+                    feature_cols=feature_cols,
+                    target_col=target_col,
+                    time_col=time_col,
+                    model_names=[model_name],
+                    base_year=effective_base_year,
+                    validation_size=validation_size,
+                    folds=folds,
+                    random_state=random_state,
+                    fast_mode=fast_mode,
+                    grid_limit=grid_limit,
+                    custom_grids=custom_grids,
+                    run_seed=run_seed,
+                    run_order=run_order,
+                    execution_log=block_execution_log,
+                    balance_mode=balance_mode,
+                    study_collector=None,
+                    fixed_params=fixed_params,
+                    fixed_tuning_artifact=fixed_tuning_artifact,
+                    run_id=run_id,
+                    smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
+                    smote_cache_registry=smote_registry_block,
+                    progress_callback=block_progress,
+                )
+            elif strategy == ADAPTIVE_ADWIN_STRATEGY:
+                adaptive_df, roc_data = run_adaptive_strategy(
+                    df,
+                    feature_cols=feature_cols,
+                    target_col=target_col,
+                    time_col=time_col,
+                    model_names=[model_name],
+                    base_year=effective_base_year,
+                    random_state=random_state,
+                    validation_size=validation_size,
+                    folds=folds,
+                    fast_mode=fast_mode,
+                    grid_limit=grid_limit,
+                    adwin_delta=adwin_delta,
+                    min_window=min_window,
+                    min_retrain_size=min_retrain_size,
+                    custom_grids=custom_grids,
+                    run_seed=run_seed,
+                    run_order=run_order,
+                    execution_log=block_execution_log,
+                    balance_mode=balance_mode,
+                    study_collector=None,
+                    fixed_params=fixed_params,
+                    fixed_tuning_artifact=fixed_tuning_artifact,
+                    run_id=run_id,
+                    smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
+                    smote_cache_registry=smote_registry_block,
+                    progress_callback=block_progress,
+                )
+            elif strategy == ADAPTIVE_ARF_STRATEGY:
+                adaptive_df, roc_data = run_arf_strategy(
+                    df,
+                    feature_cols=feature_cols,
+                    target_col=target_col,
+                    time_col=time_col,
+                    arf_variants=[model_name],
+                    base_year=effective_base_year,
+                    random_state=random_state,
+                    validation_size=validation_size,
+                    run_seed=run_seed,
+                    run_order=run_order,
+                    execution_log=block_execution_log,
+                    progress_callback=block_progress,
+                )
+            elif strategy == ADAPTIVE_KSWIN_STRATEGY:
+                adaptive_df, roc_data = run_kswin_strategy(
+                    df,
+                    feature_cols=feature_cols,
+                    target_col=target_col,
+                    time_col=time_col,
+                    model_names=[model_name],
+                    kswin_variants=[detector_variant],
+                    base_year=effective_base_year,
+                    random_state=random_state,
+                    validation_size=validation_size,
+                    folds=folds,
+                    fast_mode=fast_mode,
+                    grid_limit=grid_limit,
+                    kswin_top_k_features=kswin_top_k_features,
+                    kswin_vote_threshold=kswin_vote_threshold,
+                    kswin_retrain_days=kswin_retrain_days,
+                    kswin_min_retrain_rows=kswin_min_retrain_rows,
+                    custom_grids=custom_grids,
+                    run_seed=run_seed,
+                    run_order=run_order,
+                    execution_log=block_execution_log,
+                    balance_mode=balance_mode,
+                    study_collector=None,
+                    fixed_params=fixed_params,
+                    fixed_tuning_artifact=fixed_tuning_artifact,
+                    run_id=run_id,
+                    smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
+                    smote_cache_registry=smote_registry_block,
+                    progress_callback=block_progress,
+                )
+            else:
+                raise ValueError(f"Unsupported strategy: {strategy}")
+
+            rss_after = _cleanup_recalibration_memory()
+            _update_memory_summary(
+                manifest,
+                phase="block_complete",
+                rss_before_mb=rss_before,
+                rss_after_mb=rss_after,
+            )
+            _append_execution_log(
+                block_execution_log,
+                phase="block_complete",
+                status="ok",
+                message="Completed persisted experiment block.",
+                block_id=block_id,
+                strategy=strategy,
+                model=progress_model_label,
+                balance_mode=balance_mode,
+                run_seed=run_seed,
+                run_order=run_order,
+                rss_after_mb=rss_after,
+            )
+            block_payload = _serialize_block_payload(
+                block_id=block_id,
+                block=block,
+                run_seed=run_seed,
+                run_order=run_order,
+                yearly_rows=yearly_df,
+                adaptive_rows=adaptive_df,
+                roc_payload=roc_data,
+                execution_log=block_execution_log,
+                tuning_refs=tuning_refs,
+                smote_refs=sorted(smote_registry_block.keys()),
+            )
+            if persist_progress:
+                _persist_recalibration_block(paths["blocks_dir"] / f"{block_id}.json", block_payload)
+            manifest["block_index"][block_id].update(
+                {
+                    "status": "completed",
+                    "filename": f"{block_id}.json",
+                    "tuning_refs": tuning_refs,
+                    "smote_refs": sorted(smote_registry_block.keys()),
+                }
+            )
+            for smote_key, smote_info in smote_registry_block.items():
+                manifest["smote_index"][smote_key] = {
+                    "filename": Path(str(smote_info.get("path", f"{smote_key}.duckdb"))).name,
+                    "status": str(smote_info.get("status", "available")),
+                    "path": str(smote_info.get("path", "")),
+                }
+            completed_block_ids.add(block_id)
+            manifest["completed_block_ids"] = sorted(completed_block_ids)
+            manifest["failed_block_id"] = None
+            manifest["last_error"] = None
+            completed_units += 1.0
+            pending_block_ids = [item["block_id"] for item in block_specs if item["block_id"] not in completed_block_ids]
+            pending_blocks_by_run[run_key] = max(0, int(pending_blocks_by_run.get(run_key, 0)) - 1)
+            if pending_blocks_by_run.get(run_key, 0) == 0:
+                _append_execution_log(
+                    manifest.get("global_execution_log"),
+                    phase="run_complete",
+                    status="ok",
+                    message="Completed sequential experiment repetition.",
+                    run_seed=run_seed,
+                    run_order=run_order,
+                )
+            _update_manifest_progress(
+                manifest,
+                completed_units=completed_units,
+                pending_block_ids=pending_block_ids,
+            )
+            if persist_progress:
+                _persist_manifest(paths["manifest"], manifest)
+            emit_progress(
+                label="Bloque completado.",
+                detail=f"{block_detail_prefix} | {completed_units:.2f} / {total_units} unidades",
+                completed_override=completed_units,
+                context={
+                    "phase": "block_complete",
+                    "block_id": block_id,
+                    "strategy": strategy,
+                    "model": model_name,
+                    "detector_variant": detector_variant,
+                    "balance_mode": balance_mode,
+                    "run_seed": run_seed,
+                    "run_order": run_order,
+                    "yearly_rows": int(len(yearly_df)),
+                    "adaptive_rows": int(len(adaptive_df)),
+                },
+            )
+
+            del yearly_df, adaptive_df, roc_data, block_payload
+            _cleanup_recalibration_memory()
+        except Exception as exc:
+            rss_after = _cleanup_recalibration_memory()
+            _update_memory_summary(
+                manifest,
+                phase="block_error",
+                rss_before_mb=rss_before,
+                rss_after_mb=rss_after,
+            )
+            _append_execution_log(
+                block_execution_log,
+                phase="block_error",
+                status="error",
+                message="Experiment block failed.",
+                block_id=block_id,
+                strategy=strategy,
+                model=progress_model_label,
+                balance_mode=balance_mode,
+                run_seed=run_seed,
+                run_order=run_order,
+                error=str(exc),
+                rss_after_mb=rss_after,
+            )
+            manifest["status"] = "failed"
+            manifest["failed_block_id"] = block_id
+            manifest["last_error"] = {
+                "phase": "block",
+                "block_id": block_id,
+                "strategy": strategy,
+                "model": progress_model_label,
+                "balance_mode": balance_mode,
+                "error": str(exc),
+                "traceback": traceback.format_exc(limit=10),
+            }
+            manifest["block_index"][block_id].update(
+                {
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+            if persist_progress:
+                _persist_manifest(paths["manifest"], manifest)
+            emit_progress(
+                label="Error en bloque de experimentos.",
+                detail=f"{block_detail_prefix} | {exc}",
+                completed_override=completed_units,
+                context={
+                    "phase": "block_error",
+                    "block_id": block_id,
+                    "strategy": strategy,
+                    "model": model_name,
+                    "detector_variant": detector_variant,
+                    "balance_mode": balance_mode,
+                    "run_seed": run_seed,
+                    "run_order": run_order,
+                },
+            )
+            raise
+
+    manifest["status"] = "completed"
+    manifest["failed_block_id"] = None
+    manifest["last_error"] = None
+    manifest["resume"] = {
+        "auto_resumed": bool(manifest.get("resume", {}).get("auto_resumed")),
+        "checkpoint_status": "completed",
+    }
+    _update_manifest_progress(
+        manifest,
+        completed_units=float(total_units),
+        pending_block_ids=[],
+    )
+
+    assembled = _assemble_recalibration_outputs_from_checkpoints(
+        manifest,
+        paths=paths,
+        feature_selection_context=normalized_feature_selection_context,
+    )
+    studies = list(assembled.get("studies") or [])
+    optuna_json_path = _persist_drift_recalibration_json(
+        run_manifest=assembled["run_manifest"],
+        feature_selection_context=normalized_feature_selection_context,
+        studies=studies,
+        yearly_results=assembled["yearly_results"],
+        adaptive_results=assembled["adaptive_results"],
+        summary=assembled["summary"],
+        appendix_tables=assembled["appendix_tables"],
+        appendix_tables_mean=assembled["appendix_tables_mean"],
+        average_roc=assembled["average_roc"],
+        roc_payload=assembled["roc_payload"],
+        execution_log=assembled["execution_log"],
+    )
+    manifest["run_manifest"]["optuna_json_path"] = str(optuna_json_path)
+    if persist_progress:
+        _persist_manifest(paths["manifest"], manifest)
 
     emit_progress(
         label="Experimentos de recalibracion completados.",
-        detail=f"{completed_units} / {total_units} bloques completados",
+        detail=f"{total_units} / {total_units} unidades completadas",
         completed_override=total_units,
+        context={
+            "phase": "run_complete",
+            "checkpoint_status": "completed",
+        },
     )
-
-    return {
-        "yearly_results": yearly_results,
-        "adaptive_results": adaptive_results,
-        "roc_payload": all_roc,
-        "average_roc": roc_curves,
-        "summary": summary,
-        "appendix_tables": appendix,
-        "appendix_tables_mean": appendix_mean,
-        "execution_log": pd.DataFrame(execution_log),
-        "run_manifest": run_manifest,
-    }
+    assembled["run_manifest"] = dict(manifest.get("run_manifest") or {})
+    assembled["checkpoint_manifest"] = manifest
+    assembled["feature_selection_context"] = normalized_feature_selection_context
+    assembled["optuna_json_path"] = str(optuna_json_path)
+    assembled["checkpoint_manifest_path"] = str(paths["manifest"])
+    assembled["checkpoint_run_dir"] = str(paths["run_dir"])
+    assembled["auto_resumed"] = bool(manifest.get("resume", {}).get("auto_resumed"))
+    assembled["preflight"] = preflight
+    return assembled
 
 
 def build_average_roc_curves(
@@ -3403,16 +8170,20 @@ def build_average_roc_curves(
     Builds Figure 7 style average ROC curves by strategy/model.
     """
     if not roc_payload:
-        return pd.DataFrame(columns=["strategy", "model", "fpr", "tpr", "label"])
+        return pd.DataFrame(columns=["strategy", "model", "balance_mode", "fpr", "tpr", "label"])
 
     fpr_grid = np.linspace(0.0, 1.0, int(n_points))
     rows: List[Dict[str, Any]] = []
 
-    keys = sorted({(r["strategy"], r["model"]) for r in roc_payload})
-    for strategy, model in keys:
+    keys = sorted({(r["strategy"], r["model"], r.get("balance_mode", BALANCE_MODE_NOT_APPLICABLE)) for r in roc_payload})
+    for strategy, model, balance_mode in keys:
         curves: List[np.ndarray] = []
         for item in roc_payload:
-            if item["strategy"] != strategy or item["model"] != model:
+            if (
+                item["strategy"] != strategy
+                or item["model"] != model
+                or str(item.get("balance_mode", BALANCE_MODE_NOT_APPLICABLE)) != str(balance_mode)
+            ):
                 continue
             y_true = np.asarray(item["y_true"]).astype(int)
             scores = np.asarray(item["scores"]).astype(float)
@@ -3430,12 +8201,13 @@ def build_average_roc_curves(
         if not curves:
             continue
         mean_tpr = np.mean(np.vstack(curves), axis=0)
-        label = f"{strategy} | {model}"
+        label = f"{strategy} | {model} | {balance_mode}"
         for fpr_val, tpr_val in zip(fpr_grid, mean_tpr):
             rows.append(
                 {
                     "strategy": strategy,
                     "model": model,
+                    "balance_mode": str(balance_mode),
                     "fpr": float(fpr_val),
                     "tpr": float(tpr_val),
                     "label": label,
@@ -3443,6 +8215,187 @@ def build_average_roc_curves(
             )
 
     return pd.DataFrame(rows)
+
+
+YEARLY_EVOLUTION_METRICS = [
+    "auc",
+    "sensitivity",
+    "specificity",
+    "error_rate",
+    "threshold",
+    "training_time_sec",
+    "n_train",
+    "n_test",
+]
+ADAPTIVE_EVOLUTION_METRICS = [
+    "auc",
+    "sensitivity",
+    "specificity",
+    "error_rate",
+    "threshold",
+    "training_time_sec",
+    "remaining_periods",
+    "segment_rows",
+    "n_internal_drifts",
+    "n_internal_warnings",
+    "W",
+    "W0",
+    "W1",
+]
+
+
+def _build_experiment_evolution_records(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    metric_candidates: Sequence[str],
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "source",
+                "strategy",
+                "model",
+                "balance_mode",
+                "run_seed",
+                "run_order",
+                "training_year",
+                "prediction_year",
+                "drift",
+                "drift_date",
+                "event_time",
+                "event_order",
+                "event_label",
+                "metric",
+                "value",
+            ]
+        )
+
+    work = df.copy()
+    work["source"] = str(source)
+    for col, default_value in [
+        ("strategy", str(source)),
+        ("model", ""),
+        ("balance_mode", BALANCE_MODE_NOT_APPLICABLE),
+        ("run_seed", np.nan),
+        ("run_order", np.nan),
+        ("training_year", np.nan),
+        ("prediction_year", np.nan),
+        ("drift", np.nan),
+        ("drift_date", pd.NaT),
+    ]:
+        if col not in work.columns:
+            work[col] = default_value
+
+    prediction_year = pd.to_numeric(work["prediction_year"], errors="coerce")
+    drift = pd.to_numeric(work["drift"], errors="coerce")
+    drift_date = pd.to_datetime(work["drift_date"], errors="coerce")
+    year_time = pd.to_datetime(
+        prediction_year.map(lambda value: f"{int(value)}-01-01" if pd.notna(value) else None),
+        errors="coerce",
+    )
+    work["event_time"] = drift_date.where(drift_date.notna(), year_time)
+    work["event_order"] = prediction_year.where(prediction_year.notna(), drift)
+    fallback_order = pd.Series(np.arange(1, len(work) + 1), index=work.index, dtype=float)
+    work["event_order"] = work["event_order"].where(work["event_order"].notna(), fallback_order)
+    event_label = drift_date.dt.strftime("%Y-%m-%d %H:%M").where(drift_date.notna(), None)
+    event_label = event_label.where(event_label.notna(), prediction_year.map(lambda value: str(int(value)) if pd.notna(value) else None))
+    event_label = event_label.where(event_label.notna(), drift.map(lambda value: f"drift_{int(value)}" if pd.notna(value) else None))
+    work["event_label"] = event_label.where(event_label.notna(), fallback_order.map(lambda value: f"step_{int(value)}"))
+
+    metric_cols = [str(col) for col in metric_candidates if str(col) in work.columns]
+    if not metric_cols:
+        return pd.DataFrame()
+
+    id_cols = [
+        "source",
+        "strategy",
+        "model",
+        "balance_mode",
+        "run_seed",
+        "run_order",
+        "training_year",
+        "prediction_year",
+        "drift",
+        "drift_date",
+        "event_time",
+        "event_order",
+        "event_label",
+    ]
+    long_df = work[id_cols + metric_cols].melt(
+        id_vars=id_cols,
+        value_vars=metric_cols,
+        var_name="metric",
+        value_name="value",
+    )
+    long_df["value"] = pd.to_numeric(long_df["value"], errors="coerce")
+    long_df = long_df.loc[long_df["value"].notna()].copy()
+    return long_df.sort_values(["metric", "event_order", "event_time", "strategy", "model"]).reset_index(drop=True)
+
+
+def _build_tuning_trials_frame(studies: Sequence[Dict[str, Any]]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for artifact in studies or []:
+        if not isinstance(artifact, dict):
+            continue
+        model_name = str(artifact.get("model_name") or artifact.get("model") or "")
+        balance_mode = str(artifact.get("balance_mode") or BALANCE_MODE_NOT_APPLICABLE)
+        stage = str(artifact.get("stage") or "tuning")
+        study_id = str(artifact.get("study_id") or "")
+        for trial in artifact.get("trials") or []:
+            rows.append(
+                {
+                    "study_id": study_id,
+                    "stage": stage,
+                    "model": model_name,
+                    "balance_mode": balance_mode,
+                    "trial_number": int(trial.get("trial_number", len(rows))),
+                    "cv_auc": pd.to_numeric(trial.get("cv_auc"), errors="coerce"),
+                    "state": str(trial.get("state", "")),
+                    "converged": bool(trial.get("converged", True)),
+                    "n_non_converged_folds": int(trial.get("n_non_converged_folds", 0)),
+                    "n_valid_folds": int(trial.get("n_valid_folds", 0)),
+                    "n_iter_final": pd.to_numeric(trial.get("n_iter_final"), errors="coerce"),
+                }
+            )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "study_id",
+                "stage",
+                "model",
+                "balance_mode",
+                "trial_number",
+                "cv_auc",
+                "state",
+                "converged",
+                "n_non_converged_folds",
+                "n_valid_folds",
+                "n_iter_final",
+            ]
+        )
+    return pd.DataFrame(rows).sort_values(["model", "balance_mode", "stage", "trial_number"]).reset_index(drop=True)
+
+
+def _build_execution_memory_trace(execution_log: pd.DataFrame) -> pd.DataFrame:
+    if execution_log is None or execution_log.empty:
+        return pd.DataFrame(columns=["order", "metric", "value", "phase", "status"])
+    work = execution_log.copy()
+    for col in ["order", "rss_before_mb", "rss_after_mb", "training_time_sec"]:
+        if col not in work.columns:
+            work[col] = np.nan
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    rows: List[Dict[str, Any]] = []
+    for metric in ["rss_before_mb", "rss_after_mb", "training_time_sec"]:
+        metric_rows = work.loc[work[metric].notna(), ["order", "phase", "status", metric]].copy()
+        if metric_rows.empty:
+            continue
+        metric_rows = metric_rows.rename(columns={metric: "value"})
+        metric_rows["metric"] = metric
+        rows.extend(metric_rows.to_dict(orient="records"))
+    if not rows:
+        return pd.DataFrame(columns=["order", "metric", "value", "phase", "status"])
+    return pd.DataFrame(rows).sort_values(["metric", "order"]).reset_index(drop=True)
 
 
 def summarize_results(
@@ -3453,7 +8406,7 @@ def summarize_results(
     rows: List[pd.DataFrame] = []
     if yearly_results is not None and not yearly_results.empty:
         y = (
-            yearly_results.groupby(["strategy", "model"], dropna=False)
+            yearly_results.groupby(["strategy", "model", "balance_mode"], dropna=False)
             .agg(
                 auc=("auc", "mean"),
                 sensitivity=("sensitivity", "mean"),
@@ -3472,7 +8425,7 @@ def summarize_results(
 
     if adaptive_results is not None and not adaptive_results.empty:
         a = (
-            adaptive_results.groupby(["strategy", "model"], dropna=False)
+            adaptive_results.groupby(["strategy", "model", "balance_mode"], dropna=False)
             .agg(
                 auc=("auc", "mean"),
                 sensitivity=("sensitivity", "mean"),
@@ -3493,7 +8446,7 @@ def summarize_results(
         return pd.DataFrame()
 
     out = pd.concat(rows, ignore_index=True)
-    return out.sort_values(["strategy", "model"]).reset_index(drop=True)
+    return out.sort_values(["strategy", "model", "balance_mode"]).reset_index(drop=True)
 
 
 def format_appendix_tables(
@@ -3514,6 +8467,7 @@ def format_appendix_tables(
             "training_year",
             "prediction_year",
             "model",
+            "balance_mode",
             "auc",
             "sensitivity",
             "specificity",
@@ -3535,8 +8489,23 @@ def format_appendix_tables(
 
     if adaptive_results is not None and not adaptive_results.empty:
         cols = [
+            "strategy",
             "drift",
             "drift_date",
+            "prediction_year",
+            "balance_mode",
+            "segment_rows",
+            "n_internal_drifts",
+            "n_internal_warnings",
+            "vote_count",
+            "vote_threshold",
+            "monitor_feature_count",
+            "retrain_rows",
+            "retrain_positive_rows",
+            "base_model",
+            "detector_variant",
+            "detected_features",
+            "monitored_features",
             "W",
             "W0",
             "W1",
@@ -3551,7 +8520,7 @@ def format_appendix_tables(
             "run_seed",
             "run_order",
         ]
-        tables["A.9"] = adaptive_results[cols].reset_index(drop=True)
+        tables["A.9"] = adaptive_results[[c for c in cols if c in adaptive_results.columns]].reset_index(drop=True)
 
     return tables
 
@@ -3569,7 +8538,7 @@ def format_appendix_tables_mean(
     }
 
     if yearly_results is not None and not yearly_results.empty:
-        group_cols = ["strategy", "iteration", "training_year", "prediction_year", "model"]
+        group_cols = ["strategy", "iteration", "training_year", "prediction_year", "model", "balance_mode"]
         metric_cols = [
             "auc",
             "sensitivity",
@@ -3592,6 +8561,7 @@ def format_appendix_tables_mean(
             "training_year",
             "prediction_year",
             "model",
+            "balance_mode",
             "auc",
             "sensitivity",
             "specificity",
@@ -3609,8 +8579,17 @@ def format_appendix_tables_mean(
         tables["A.8"] = agg_yearly.loc[agg_yearly["strategy"] == "cumulative", common_cols].reset_index(drop=True)
 
     if adaptive_results is not None and not adaptive_results.empty:
-        group_cols = ["strategy", "drift", "model"]
+        group_cols = ["strategy", "drift", "model", "balance_mode"]
         metric_cols = [
+            "prediction_year",
+            "segment_rows",
+            "n_internal_drifts",
+            "n_internal_warnings",
+            "vote_count",
+            "vote_threshold",
+            "monitor_feature_count",
+            "retrain_rows",
+            "retrain_positive_rows",
             "W",
             "W0",
             "W1",
@@ -3622,6 +8601,7 @@ def format_appendix_tables_mean(
             "training_time_sec",
             "threshold",
         ]
+        metric_cols = [c for c in metric_cols if c in adaptive_results.columns]
         agg_adaptive = (
             adaptive_results.groupby(group_cols, dropna=False)[metric_cols]
             .mean()
@@ -3632,6 +8612,10 @@ def format_appendix_tables_mean(
             .agg(
                 drift_date_min=("drift_date", "min"),
                 drift_date_max=("drift_date", "max"),
+                base_model=("base_model", "first") if "base_model" in adaptive_results.columns else ("model", "first"),
+                detector_variant=("detector_variant", "first") if "detector_variant" in adaptive_results.columns else ("model", "first"),
+                detected_features=("detected_features", "first") if "detected_features" in adaptive_results.columns else ("model", "first"),
+                monitored_features=("monitored_features", "first") if "monitored_features" in adaptive_results.columns else ("model", "first"),
             )
             .reset_index()
         )
@@ -3642,9 +8626,24 @@ def format_appendix_tables_mean(
             how="left",
         )
         cols = [
+            "strategy",
             "drift",
+            "balance_mode",
             "drift_date_min",
             "drift_date_max",
+            "prediction_year",
+            "segment_rows",
+            "n_internal_drifts",
+            "n_internal_warnings",
+            "vote_count",
+            "vote_threshold",
+            "monitor_feature_count",
+            "retrain_rows",
+            "retrain_positive_rows",
+            "base_model",
+            "detector_variant",
+            "detected_features",
+            "monitored_features",
             "W",
             "W0",
             "W1",
@@ -3660,7 +8659,7 @@ def format_appendix_tables_mean(
             "seed_list",
             "run_orders",
         ]
-        tables["A.9"] = agg_adaptive[cols].reset_index(drop=True)
+        tables["A.9"] = agg_adaptive[[c for c in cols if c in agg_adaptive.columns]].reset_index(drop=True)
 
     return tables
 
@@ -4067,6 +9066,214 @@ def _load_feature_payload_from_duckdb(path: Path) -> Tuple[pd.DataFrame, pd.Data
         con.close()
 
 
+def _corr_pairs_to_storage_df(corr_pairs: Optional[pd.Series]) -> pd.DataFrame:
+    if not isinstance(corr_pairs, pd.Series) or corr_pairs.empty:
+        return pd.DataFrame(columns=["feature_a", "feature_b", "abs_corr"])
+
+    pairs = corr_pairs.reset_index()
+    if len(pairs.columns) >= 3:
+        pairs = pairs.iloc[:, :3].copy()
+        pairs.columns = ["feature_a", "feature_b", "abs_corr"]
+    else:
+        pairs = pd.DataFrame(columns=["feature_a", "feature_b", "abs_corr"])
+    pairs["feature_a"] = pairs["feature_a"].astype(str)
+    pairs["feature_b"] = pairs["feature_b"].astype(str)
+    pairs["abs_corr"] = pd.to_numeric(pairs["abs_corr"], errors="coerce").astype(float)
+    return pairs
+
+
+def _corr_pairs_from_storage_df(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    work = df.copy()
+    required = {"feature_a", "feature_b", "abs_corr"}
+    if not required.issubset(set(work.columns)):
+        return pd.Series(dtype=float)
+    work["feature_a"] = work["feature_a"].astype(str)
+    work["feature_b"] = work["feature_b"].astype(str)
+    work["abs_corr"] = pd.to_numeric(work["abs_corr"], errors="coerce").astype(float)
+    work = work.dropna(subset=["abs_corr"])
+    if work.empty:
+        return pd.Series(dtype=float)
+    out = pd.Series(
+        work["abs_corr"].to_numpy(),
+        index=pd.MultiIndex.from_frame(work[["feature_a", "feature_b"]]),
+        dtype=float,
+    )
+    return out.sort_values(ascending=False)
+
+
+def _build_feature_selection_payload(
+    *,
+    candidate_features: Optional[Sequence[str]],
+    selected_features: Optional[Sequence[str]],
+    corr_pairs: Optional[pd.Series],
+    importance_df: Optional[pd.DataFrame],
+    config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    has_payload = any(
+        [
+            candidate_features,
+            selected_features,
+            isinstance(corr_pairs, pd.Series) and not corr_pairs.empty,
+            isinstance(importance_df, pd.DataFrame) and not importance_df.empty,
+            bool(config),
+        ]
+    )
+    if not has_payload:
+        return None
+
+    return {
+        "candidate_features": list(candidate_features or []),
+        "selected_features": list(selected_features or []),
+        "corr_pairs": corr_pairs.copy() if isinstance(corr_pairs, pd.Series) else pd.Series(dtype=float),
+        "importance_df": importance_df.copy()
+        if isinstance(importance_df, pd.DataFrame)
+        else pd.DataFrame(columns=["feature", "importance", "rank"]),
+        "config": dict(config or {}),
+    }
+
+
+def _write_feature_selection_payload_to_duckdb(
+    path: Path,
+    *,
+    selection_payload: Optional[Dict[str, Any]],
+) -> None:
+    if duckdb is None:
+        raise ImportError("duckdb is not installed.")
+
+    path = Path(path)
+    con = duckdb.connect(str(path))
+    try:
+        for table_name in [
+            "feature_selection_config",
+            "feature_selection_candidates",
+            "feature_selection_selected",
+            "feature_selection_corr_pairs",
+            "feature_selection_importance",
+        ]:
+            con.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+        if not selection_payload:
+            return
+
+        config = dict(selection_payload.get("config") or {})
+        config_rows = [
+            {"key": str(key), "value": json.dumps(value, default=str, ensure_ascii=True)}
+            for key, value in config.items()
+        ]
+        config_df = pd.DataFrame(config_rows, columns=["key", "value"])
+        if not config_df.empty:
+            con.register("feature_selection_config_view", config_df)
+            con.execute("CREATE TABLE feature_selection_config AS SELECT * FROM feature_selection_config_view")
+
+        candidate_features = list(selection_payload.get("candidate_features") or [])
+        candidate_df = pd.DataFrame(
+            {
+                "feature": candidate_features,
+                "candidate_rank": np.arange(1, len(candidate_features) + 1, dtype=int),
+            }
+        )
+        if not candidate_df.empty:
+            con.register("feature_selection_candidates_view", candidate_df)
+            con.execute("CREATE TABLE feature_selection_candidates AS SELECT * FROM feature_selection_candidates_view")
+
+        selected_features = list(selection_payload.get("selected_features") or [])
+        selected_df = pd.DataFrame(
+            {
+                "feature": selected_features,
+                "selected_rank": np.arange(1, len(selected_features) + 1, dtype=int),
+            }
+        )
+        if not selected_df.empty:
+            con.register("feature_selection_selected_view", selected_df)
+            con.execute("CREATE TABLE feature_selection_selected AS SELECT * FROM feature_selection_selected_view")
+
+        corr_pairs_df = _corr_pairs_to_storage_df(selection_payload.get("corr_pairs"))
+        if not corr_pairs_df.empty:
+            con.register("feature_selection_corr_pairs_view", corr_pairs_df)
+            con.execute("CREATE TABLE feature_selection_corr_pairs AS SELECT * FROM feature_selection_corr_pairs_view")
+
+        importance_df = selection_payload.get("importance_df")
+        if isinstance(importance_df, pd.DataFrame) and not importance_df.empty:
+            con.register("feature_selection_importance_view", importance_df)
+            con.execute("CREATE TABLE feature_selection_importance AS SELECT * FROM feature_selection_importance_view")
+    finally:
+        con.close()
+
+
+def _load_feature_selection_payload_from_duckdb(path: Path) -> Optional[Dict[str, Any]]:
+    if duckdb is None:
+        raise ImportError("duckdb is not installed.")
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"DuckDB file not found: {path}")
+
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        tables = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
+        has_any = bool(
+            {
+                "feature_selection_config",
+                "feature_selection_candidates",
+                "feature_selection_selected",
+                "feature_selection_corr_pairs",
+                "feature_selection_importance",
+            }
+            & tables
+        )
+        if not has_any:
+            return None
+
+        config: Dict[str, Any] = {}
+        if "feature_selection_config" in tables:
+            cfg_df = con.execute("SELECT * FROM feature_selection_config").df()
+            for row in cfg_df.itertuples(index=False):
+                try:
+                    config[str(row.key)] = json.loads(str(row.value))
+                except Exception:
+                    config[str(row.key)] = row.value
+
+        candidate_features: List[str] = []
+        if "feature_selection_candidates" in tables:
+            candidate_order_col = "candidate_rank" if "candidate_rank" in con.execute(
+                "DESCRIBE feature_selection_candidates"
+            ).df()["column_name"].astype(str).tolist() else None
+            order_clause = "candidate_rank" if candidate_order_col else "feature"
+            candidate_df = con.execute(
+                f"SELECT feature FROM feature_selection_candidates ORDER BY {order_clause}"
+            ).df()
+            candidate_features = candidate_df["feature"].astype(str).tolist()
+
+        selected_features: List[str] = []
+        if "feature_selection_selected" in tables:
+            selected_df = con.execute(
+                "SELECT feature FROM feature_selection_selected ORDER BY selected_rank"
+            ).df()
+            selected_features = selected_df["feature"].astype(str).tolist()
+
+        corr_pairs = pd.Series(dtype=float)
+        if "feature_selection_corr_pairs" in tables:
+            corr_pairs = _corr_pairs_from_storage_df(
+                con.execute("SELECT * FROM feature_selection_corr_pairs").df()
+            )
+
+        importance_df = pd.DataFrame(columns=["feature", "importance", "rank"])
+        if "feature_selection_importance" in tables:
+            importance_df = con.execute("SELECT * FROM feature_selection_importance").df()
+
+        return {
+            "candidate_features": candidate_features,
+            "selected_features": selected_features,
+            "corr_pairs": corr_pairs,
+            "importance_df": importance_df,
+            "config": config,
+        }
+    finally:
+        con.close()
+
+
 def _flow_db_summary(db_path: str, table_name: str) -> Dict[str, Any]:
     if duckdb is None:
         raise ImportError("duckdb is not installed.")
@@ -4455,6 +9662,7 @@ def _write_feature_payload_to_duckdb(
     *,
     raw_df: pd.DataFrame,
     clean_df: pd.DataFrame,
+    selection_payload: Optional[Dict[str, Any]] = None,
 ) -> None:
     if duckdb is None:
         raise ImportError("duckdb is not installed.")
@@ -4468,6 +9676,7 @@ def _write_feature_payload_to_duckdb(
         con.execute("CREATE OR REPLACE TABLE clean_features AS SELECT * FROM clean_view")
     finally:
         con.close()
+    _write_feature_selection_payload_to_duckdb(path, selection_payload=selection_payload)
 
 
 def _save_feature_duckdb(
@@ -4476,6 +9685,7 @@ def _save_feature_duckdb(
     *,
     prefix: str = "drift_flow_features",
     path: Optional[Path] = None,
+    selection_payload: Optional[Dict[str, Any]] = None,
 ) -> Path:
     if duckdb is None:
         raise ImportError("duckdb is not installed.")
@@ -4485,8 +9695,76 @@ def _save_feature_duckdb(
         out_path = RESULTS_DIR / f"{prefix}_{stamp}.duckdb"
     else:
         out_path = Path(path)
-    _write_feature_payload_to_duckdb(out_path, raw_df=raw_df, clean_df=clean_df)
+    payload_to_store = selection_payload
+    if payload_to_store:
+        payload_to_store = dict(payload_to_store)
+        payload_to_store["config"] = dict(payload_to_store.get("config") or {})
+        payload_to_store["config"]["linked_duckdb_path"] = str(out_path.resolve())
+        payload_to_store["config"]["linked_duckdb_name"] = out_path.name
+    _write_feature_payload_to_duckdb(
+        out_path,
+        raw_df=raw_df,
+        clean_df=clean_df,
+        selection_payload=payload_to_store,
+    )
     return out_path
+
+
+def _clear_feature_selection_state(*, clear_selected_features: bool = False) -> None:
+    st.session_state["drift_corr_pairs"] = None
+    st.session_state["drift_importance_df"] = None
+    st.session_state["drift_feature_selection_meta"] = None
+    if clear_selected_features:
+        st.session_state["drift_candidate_feature_cols"] = None
+        st.session_state["drift_feature_cols"] = None
+
+
+def _current_feature_selection_payload(*, linked_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    meta = dict(st.session_state.get("drift_feature_selection_meta") or {})
+    corr_pairs = st.session_state.get("drift_corr_pairs")
+    importance_df = st.session_state.get("drift_importance_df")
+
+    has_selection_artifact = bool(meta) or (
+        isinstance(corr_pairs, pd.Series)
+        and not corr_pairs.empty
+    ) or (
+        isinstance(importance_df, pd.DataFrame)
+        and not importance_df.empty
+    )
+    if not has_selection_artifact:
+        return None
+
+    raw_df = st.session_state.get("drift_raw_df")
+    clean_df = st.session_state.get("drift_clean_df")
+    if linked_path is not None:
+        linked_path = Path(linked_path)
+        meta["linked_duckdb_path"] = str(linked_path.resolve())
+        meta["linked_duckdb_name"] = linked_path.name
+    if isinstance(raw_df, pd.DataFrame):
+        meta["raw_rows"] = int(len(raw_df))
+    if isinstance(clean_df, pd.DataFrame):
+        meta["clean_rows"] = int(len(clean_df))
+
+    return _build_feature_selection_payload(
+        candidate_features=st.session_state.get("drift_candidate_feature_cols"),
+        selected_features=st.session_state.get("drift_feature_cols"),
+        corr_pairs=corr_pairs,
+        importance_df=importance_df,
+        config=meta,
+    )
+
+
+def _current_feature_selection_context() -> Dict[str, Any]:
+    meta = dict(st.session_state.get("drift_feature_selection_meta") or {})
+    meta["selected_features"] = list(st.session_state.get("drift_feature_cols") or [])
+    meta["candidate_features"] = list(st.session_state.get("drift_candidate_feature_cols") or [])
+    meta["feature_count"] = int(len(meta["selected_features"]))
+    export_path = st.session_state.get("drift_feature_export_path")
+    if export_path:
+        export = Path(str(export_path))
+        meta["feature_export_path"] = str(export)
+        meta["feature_export_name"] = export.name
+    return meta
 
 
 def _build_tramo_selector_for_feature_tab() -> Optional[Tuple[str, str, str, str]]:
@@ -4641,6 +9919,7 @@ def _init_state() -> None:
     st.session_state.setdefault("drift_candidate_feature_cols", None)
     st.session_state.setdefault("drift_importance_df", None)
     st.session_state.setdefault("drift_corr_pairs", None)
+    st.session_state.setdefault("drift_feature_selection_meta", None)
     st.session_state.setdefault("drift_results", None)
     st.session_state.setdefault("drift_execution_log", None)
     st.session_state.setdefault("drift_run_manifest", None)
@@ -4649,6 +9928,8 @@ def _init_state() -> None:
     st.session_state.setdefault("drift_pipeline_meta", None)
     st.session_state.setdefault("drift_event_files", [])
     st.session_state.setdefault("drift_feature_export_path", None)
+    st.session_state.setdefault("drift_optuna_json_path", None)
+    st.session_state.setdefault("drift_checkpoint_manifest_path", None)
 
 
 def _render_blueprint_tab() -> None:
@@ -4925,6 +10206,7 @@ def _render_feature_engineering_tab() -> None:
                     st.session_state["drift_raw_df"],
                     st.session_state["drift_clean_df"],
                     prefix=export_prefix or "drift_flow_features_manual",
+                    selection_payload=_current_feature_selection_payload(),
                 )
             except Exception as exc:
                 st.error(f"No se pudo exportar: {exc}")
@@ -4943,6 +10225,7 @@ def _render_feature_engineering_tab() -> None:
         if st.button("Cargar archivo", key="drift_load_existing_features"):
             try:
                 raw_df, clean_df = _load_feature_payload_from_duckdb(RESULTS_DIR / selected)
+                selection_payload = _load_feature_selection_payload_from_duckdb(RESULTS_DIR / selected)
             except Exception as exc:
                 st.error(f"No se pudo cargar el archivo: {exc}")
                 return
@@ -4959,7 +10242,7 @@ def _render_feature_engineering_tab() -> None:
                 if "target" in df.columns:
                     df["target"] = pd.to_numeric(df["target"], errors="coerce").fillna(0).astype(int)
 
-            feature_cols = _feature_columns_for_modeling(clean_df, target_col="target")
+            default_feature_cols = _feature_columns_for_modeling(clean_df, target_col="target")
             prep_summary, stage1_info, zero_runs = _rebuild_preparation_artifacts_from_payload(
                 raw_df,
                 clean_df,
@@ -4968,15 +10251,36 @@ def _render_feature_engineering_tab() -> None:
                 time_col="interval_start",
                 min_zero_days=7,
             )
+            _clear_feature_selection_state(clear_selected_features=True)
+            candidate_feature_cols = list(default_feature_cols)
+            selected_feature_cols = list(default_feature_cols)
+            if selection_payload:
+                stored_candidates = [
+                    col for col in selection_payload.get("candidate_features", []) if col in clean_df.columns
+                ]
+                stored_selected = [
+                    col for col in selection_payload.get("selected_features", []) if col in clean_df.columns
+                ]
+                candidate_feature_cols = stored_candidates or list(default_feature_cols)
+                selected_feature_cols = stored_selected or candidate_feature_cols
+                st.session_state["drift_corr_pairs"] = selection_payload.get("corr_pairs")
+                st.session_state["drift_importance_df"] = selection_payload.get("importance_df")
+                st.session_state["drift_feature_selection_meta"] = selection_payload.get("config") or None
+
             st.session_state["drift_raw_df"] = raw_df
             st.session_state["drift_clean_df"] = clean_df
-            st.session_state["drift_candidate_feature_cols"] = feature_cols
-            st.session_state["drift_feature_cols"] = feature_cols
+            st.session_state["drift_candidate_feature_cols"] = candidate_feature_cols
+            st.session_state["drift_feature_cols"] = selected_feature_cols
             st.session_state["drift_stage1_info"] = stage1_info
             st.session_state["drift_zero_runs"] = zero_runs
             st.session_state["drift_prep_summary"] = prep_summary
             st.session_state["drift_pipeline_meta"] = {
-                "steps": [f"Archivo existente cargado: {selected}"],
+                "steps": [
+                    f"Archivo existente cargado: {selected}",
+                    "Resultados de Feature Selection restaurados desde DuckDB."
+                    if selection_payload
+                    else "El archivo no incluye resultados persistidos de Feature Selection.",
+                ],
                 "prep_config": {
                     "missing_threshold": 0.01,
                     "min_zero_days": 7,
@@ -5256,12 +10560,14 @@ def _render_feature_engineering_tab() -> None:
             "Exportando resultado a DuckDB...",
             detail=f"Filas limpias: {len(clean_df):,}",
         )
+        _clear_feature_selection_state()
         try:
             out_path = _save_feature_duckdb(
                 base_df,
                 clean_df,
                 prefix="drift_flow_features",
                 path=out_path,
+                selection_payload=None,
             )
         except Exception as exc:
             progress.set_progress(1.0, "Error exportando DuckDB.", detail=str(exc))
@@ -5375,14 +10681,47 @@ def _render_feature_selection_tab() -> None:
         st.session_state["drift_feature_cols"] = selected_for_experiments
         st.session_state["drift_corr_pairs"] = corr_pairs
         st.session_state["drift_importance_df"] = importance_df
+        st.session_state["drift_feature_selection_meta"] = {
+            "method": "correlation_plus_random_forest",
+            "target_col": str(target_col),
+            "corr_threshold": float(corr_threshold),
+            "top_n": int(top_n),
+            "candidate_feature_count": int(len(kept)),
+            "selected_feature_count": int(len(selected_for_experiments)),
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        export_path = st.session_state.get("drift_feature_export_path")
+        persisted_msg = ""
+        if export_path and Path(str(export_path)).exists():
+            try:
+                _write_feature_selection_payload_to_duckdb(
+                    Path(str(export_path)),
+                    selection_payload=_current_feature_selection_payload(linked_path=Path(str(export_path))),
+                )
+                persisted_msg = f" Persistido en {Path(str(export_path)).name}."
+            except Exception as exc:
+                persisted_msg = f" No se pudo persistir en DuckDB: {exc}"
 
         st.success(
             f"Dropped {len(dropped)} highly correlated features. "
             f"Using top {len(selected_for_experiments)} features for experiments."
+            f"{persisted_msg}"
         )
 
     corr_pairs = st.session_state.get("drift_corr_pairs")
     importance_df = st.session_state.get("drift_importance_df")
+    selection_meta = st.session_state.get("drift_feature_selection_meta") or {}
+
+    export_path = st.session_state.get("drift_feature_export_path")
+    if export_path:
+        linked_name = Path(str(export_path)).name
+        if selection_meta:
+            st.caption(f"Resultado de Feature Selection vinculado a `{linked_name}`.")
+        else:
+            st.caption(
+                f"Si ejecutas Feature Selection, el resultado se persistirá dentro de `{linked_name}`."
+            )
 
     if isinstance(corr_pairs, pd.Series) and not corr_pairs.empty:
         st.markdown("**Figure 5 replica: density of |rho|**")
@@ -5416,42 +10755,334 @@ def _render_experiments_tab() -> None:
     st.caption(
         f"Feature set locked for experiments: {len(feature_cols)} variables after correlation filtering + RF ranking."
     )
+    st.caption(
+        "ARF corre como estrategia online inmediata separada de los modelos batch. "
+        "Los modelos seleccionados abajo aplican a static / period_aligned / cumulative / adaptive_adwin / adaptive_kswin."
+    )
+
+    feature_count = max(1, len(feature_cols))
+    st.session_state["drift_experiment_feature_count"] = feature_count
+    if "drift_experiment_preset" not in st.session_state:
+        st.session_state["drift_experiment_preset"] = DEFAULT_EXPERIMENT_PRESET
+    elif str(st.session_state["drift_experiment_preset"]) not in EXPERIMENT_PRESET_CONFIGS:
+        st.session_state["drift_experiment_preset"] = DEFAULT_EXPERIMENT_PRESET
+    if st.session_state.get("drift_experiment_preset_applied") is None:
+        _apply_experiment_preset(
+            str(st.session_state["drift_experiment_preset"]),
+            feature_count=feature_count,
+        )
+        st.session_state["drift_experiment_preset_applied"] = str(
+            st.session_state["drift_experiment_preset"]
+        )
+    else:
+        _sync_experiment_control_bounds(feature_count)
+
+    preset_name = st.selectbox(
+        "Configuration preset",
+        options=list(EXPERIMENT_PRESET_CONFIGS.keys()),
+        key="drift_experiment_preset",
+        on_change=_on_experiment_preset_change,
+        help="Aplica una configuracion base al formulario. Luego puedes ajustar cualquier campo manualmente.",
+    )
+    preset_meta = EXPERIMENT_PRESET_CONFIGS.get(str(preset_name), {})
+    preset_description = str(preset_meta.get("description", "")).strip()
+    if preset_description:
+        st.caption(preset_description)
 
     target_col_default = "target" if "target" in clean_df.columns else clean_df.columns[-1]
     time_col_default = "interval_start" if "interval_start" in clean_df.columns else clean_df.columns[0]
+    if st.session_state.get("drift_exp_target_col") not in clean_df.columns:
+        st.session_state["drift_exp_target_col"] = target_col_default
+    if st.session_state.get("drift_exp_time_col") not in clean_df.columns:
+        st.session_state["drift_exp_time_col"] = time_col_default
 
-    target_col = st.selectbox("Target column", options=list(clean_df.columns), index=list(clean_df.columns).index(target_col_default))
-    time_col = st.selectbox("Time column", options=list(clean_df.columns), index=list(clean_df.columns).index(time_col_default))
+    target_col = st.selectbox(
+        "Target column",
+        options=list(clean_df.columns),
+        index=list(clean_df.columns).index(target_col_default),
+        key="drift_exp_target_col",
+    )
+    time_col = st.selectbox(
+        "Time column",
+        options=list(clean_df.columns),
+        index=list(clean_df.columns).index(time_col_default),
+        key="drift_exp_time_col",
+    )
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        selected_models = st.multiselect("Models", MODEL_NAMES, default=MODEL_NAMES)
+        selected_models = st.multiselect(
+            "Models",
+            MODEL_NAMES,
+            default=MODEL_NAMES,
+            key="drift_exp_models",
+        )
         selected_strategies = st.multiselect(
             "Strategies",
-            ["static", "period_aligned", "cumulative", "adaptive_adwin"],
-            default=["static", "period_aligned", "cumulative", "adaptive_adwin"],
+            EXPERIMENT_STRATEGIES,
+            default=EXPERIMENT_STRATEGIES,
+            key="drift_exp_strategies",
         )
     with col2:
-        fast_mode = st.checkbox("Fast hyperparameter mode", value=True)
-        grid_limit = st.number_input("Max grid combinations", min_value=1, max_value=2000, value=40, step=1)
-        folds = st.number_input("CV folds", min_value=2, max_value=10, value=5, step=1)
+        fast_mode = st.checkbox(
+            "Fast hyperparameter mode",
+            value=True,
+            key="drift_exp_fast_mode",
+            help=(
+                "Usa una grilla reducida de hiperparametros para los modelos batch y, si aplica, "
+                "tambien una grilla reducida para SMOTE. Sirve para acelerar la sintonia inicial "
+                "o comparaciones rapidas, pero explora menos combinaciones que el modo completo. "
+                "No cambia las metricas ni la metodologia de evaluacion; solo restringe el espacio "
+                "de busqueda. La cantidad de intentos la controla `Optuna trials`."
+            ),
+        )
+        grid_limit = st.number_input(
+            "Optuna trials",
+            min_value=1,
+            max_value=2000,
+            value=30,
+            step=1,
+            key="drift_exp_optuna_trials",
+        )
+        folds = st.number_input(
+            "CV folds",
+            min_value=2,
+            max_value=10,
+            value=3,
+            step=1,
+            key="drift_exp_folds",
+        )
     with col3:
-        validation_size = st.number_input("Validation size", min_value=0.05, max_value=0.5, value=0.2, step=0.05)
-        adwin_delta = st.number_input("ADWIN delta", min_value=0.0001, max_value=0.1, value=0.002, step=0.0005, format="%.4f")
-        min_window = st.number_input("ADWIN min window", min_value=100, max_value=200000, value=45000, step=100)
+        validation_size = st.number_input(
+            "Validation size",
+            min_value=0.05,
+            max_value=0.5,
+            value=0.2,
+            step=0.05,
+            key="drift_exp_validation_size",
+        )
+        adwin_delta = st.number_input(
+            "ADWIN delta",
+            min_value=0.0001,
+            max_value=0.1,
+            value=0.002,
+            step=0.0005,
+            format="%.4f",
+            key="drift_exp_adwin_delta",
+        )
+        min_window = st.number_input(
+            "ADWIN min window",
+            min_value=100,
+            max_value=200000,
+            value=45000,
+            step=100,
+            key="drift_exp_min_window",
+        )
+        min_retrain_size = st.number_input(
+            "ADWIN min retrain rows",
+            min_value=10,
+            max_value=200000,
+            value=max(20, int(min_window) // 10),
+            step=10,
+            key="drift_exp_min_retrain_size",
+            help="Tamano minimo de W1 para permitir reentrenamiento despues de drift. Se separa del `min window` del detector.",
+        )
+
+    arf_variants = st.multiselect(
+        "ARF variants",
+        ARF_VARIANT_NAMES,
+        default=list(ARF_DEFAULT_VARIANTS),
+        key="drift_exp_arf_variants",
+        help="Solo se usan cuando la estrategia `adaptive_arf` esta seleccionada.",
+    )
+    if ADAPTIVE_ARF_STRATEGY in selected_strategies:
+        variant_desc = [
+            f"`{name}`: {ARF_VARIANT_CONFIGS[name]['description']}"
+            for name in arf_variants
+            if name in ARF_VARIANT_CONFIGS
+        ]
+        if variant_desc:
+            st.caption(" | ".join(variant_desc))
+
+    kswin_variants = st.multiselect(
+        "KSWIN variants",
+        KSWIN_VARIANT_NAMES,
+        default=list(KSWIN_DEFAULT_VARIANTS),
+        key="drift_exp_kswin_variants",
+        help="Solo se usan cuando la estrategia `adaptive_kswin` esta seleccionada.",
+    )
+    kswin_col1, kswin_col2, kswin_col3, kswin_col4 = st.columns(4)
+    with kswin_col1:
+        kswin_top_k_features = st.number_input(
+            "KSWIN top-k features",
+            min_value=1,
+            max_value=max(1, len(feature_cols)),
+            value=min(10, max(1, len(feature_cols))),
+            step=1,
+            key="drift_exp_kswin_top_k_features",
+        )
+    with kswin_col2:
+        kswin_vote_threshold = st.number_input(
+            "KSWIN vote threshold",
+            min_value=1,
+            max_value=max(1, min(10, len(feature_cols))),
+            value=min(2, max(1, len(feature_cols))),
+            step=1,
+            key="drift_exp_kswin_vote_threshold",
+        )
+    with kswin_col3:
+        kswin_retrain_days = st.number_input(
+            "KSWIN retrain horizon (days)",
+            min_value=1,
+            max_value=365,
+            value=90,
+            step=1,
+            key="drift_exp_kswin_retrain_days",
+        )
+    with kswin_col4:
+        kswin_min_retrain_rows = st.number_input(
+            "KSWIN min retrain rows",
+            min_value=10,
+            max_value=200000,
+            value=100,
+            step=10,
+            key="drift_exp_kswin_min_retrain_rows",
+        )
+    if ADAPTIVE_KSWIN_STRATEGY in selected_strategies:
+        variant_desc = [
+            f"`{name}`: {KSWIN_VARIANT_CONFIGS[name]['description']}"
+            for name in kswin_variants
+            if name in KSWIN_VARIANT_CONFIGS
+        ]
+        if variant_desc:
+            st.caption(" | ".join(variant_desc))
+
+    balance_modes = st.multiselect(
+        "Balance modes",
+        list(DEFAULT_BATCH_BALANCE_MODES),
+        default=list(DEFAULT_BATCH_BALANCE_MODES),
+        key="drift_exp_balance_modes",
+        help="Se comparan solo en estrategias batch y adaptativas batch; `adaptive_arf` queda como `not_applicable`.",
+    )
 
     seed_text = st.text_input(
         "Sequential repetition seeds",
         value=", ".join(str(seed) for seed in DEFAULT_REPETITION_SEEDS),
+        key="drift_exp_seed_text",
         help="The article reports mean metrics across repeated runs. Seeds are executed sequentially and logged.",
     )
 
-    if st.button("Run full paper experiment set", key="drift_run_experiments"):
+    preflight_payload: Optional[Dict[str, Any]] = None
+    preview_seeds: Optional[List[int]] = None
+    try:
+        preview_seeds = parse_repetition_seeds(seed_text)
+        preflight_payload = _estimate_recalibration_workload(
+            df=clean_df,
+            time_col=time_col,
+            model_names=selected_models,
+            strategies=selected_strategies,
+            arf_variants=arf_variants,
+            kswin_variants=kswin_variants,
+            balance_modes=balance_modes,
+            repetition_seeds=preview_seeds,
+            grid_limit=int(grid_limit),
+            folds=int(folds),
+        )
+    except Exception:
+        preflight_payload = None
+
+    if isinstance(preflight_payload, dict):
+        st.caption(
+            "Preflight: "
+            f"{int(preflight_payload.get('n_tuning_tasks', 0))} tunings globales | "
+            f"{int(preflight_payload.get('n_blocks', 0))} bloques | "
+            f"{int(preflight_payload.get('estimated_batch_fits', 0))} fits batch estimados"
+        )
+        if bool(preflight_payload.get("high_risk_memory")):
+            st.warning(
+                "Configuracion de alto riesgo de memoria detectada: Random Forest + SMOTE + folds/trials altos. "
+                "El pipeline usara checkpoints y resume automatico, pero conviene bajar trials/folds si no necesitas la corrida completa."
+            )
+
+    checkpoint_preview: Optional[Dict[str, Any]] = None
+    if isinstance(preview_seeds, list):
+        checkpoint_preview = _preview_recalibration_checkpoint(
+            clean_df,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            time_col=time_col,
+            model_names=selected_models,
+            strategies=selected_strategies,
+            validation_size=float(validation_size),
+            folds=int(folds),
+            fast_mode=bool(fast_mode),
+            grid_limit=int(grid_limit),
+            adwin_delta=float(adwin_delta),
+            min_window=int(min_window),
+            min_retrain_size=int(min_retrain_size),
+            arf_variants=arf_variants,
+            kswin_variants=kswin_variants,
+            kswin_top_k_features=int(kswin_top_k_features),
+            kswin_vote_threshold=int(kswin_vote_threshold),
+            kswin_retrain_days=int(kswin_retrain_days),
+            kswin_min_retrain_rows=int(kswin_min_retrain_rows),
+            repetition_seeds=preview_seeds,
+            balance_modes=balance_modes,
+            feature_selection_context=_current_feature_selection_context(),
+        )
+
+    execution_mode: Optional[str] = None
+    if isinstance(checkpoint_preview, dict) and bool(checkpoint_preview.get("checkpoint_available")):
+        checkpoint_status = str(checkpoint_preview.get("status", "running"))
+        status_label = "completado" if checkpoint_status == "completed" else "recuperable"
+        st.markdown("**Compatible checkpoint**")
+        st.caption(
+            f"Run `{checkpoint_preview.get('run_id', '')}` | estado {checkpoint_status} ({status_label}) | "
+            f"actualizado {checkpoint_preview.get('updated_at') or 'desconocido'} | "
+            f"tunings {int(checkpoint_preview.get('completed_tuning_tasks', 0))}/{int(checkpoint_preview.get('total_tuning_tasks', 0))} | "
+            f"bloques {int(checkpoint_preview.get('completed_blocks', 0))}/{int(checkpoint_preview.get('total_blocks', 0))} | "
+            f"SMOTE cache {int(checkpoint_preview.get('smote_artifacts', 0))}"
+        )
+        st.caption(f"Manifest: {checkpoint_preview.get('manifest_path', '')}")
+        if bool(checkpoint_preview.get("can_load_completed")):
+            st.info("Existe una corrida compatible ya completada. Puedes cargar ese checkpoint o iniciar una corrida nueva.")
+        else:
+            st.info("Existe un checkpoint compatible recuperable. Puedes reanudarlo desde aqui o forzar una corrida limpia.")
+        action_col_1, action_col_2 = st.columns(2)
+        with action_col_1:
+            resume_label = "Load completed checkpoint" if bool(checkpoint_preview.get("can_load_completed")) else "Resume compatible checkpoint"
+            if st.button(resume_label, key="drift_resume_experiments"):
+                execution_mode = "resume"
+        with action_col_2:
+            if st.button("Start fresh ignoring checkpoint", key="drift_run_experiments_fresh"):
+                execution_mode = "fresh"
+    elif st.button("Run configured experiment set", key="drift_run_experiments"):
+        execution_mode = "resume"
+
+    if execution_mode is not None:
+        requires_batch_models = any(
+            strategy in YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]
+            for strategy in selected_strategies
+        )
+        if requires_batch_models and not selected_models:
+            st.error("Seleccione al menos un modelo para las estrategias batch, `adaptive_adwin` o `adaptive_kswin`.")
+            return
+        if ADAPTIVE_ARF_STRATEGY in selected_strategies and not arf_variants:
+            st.error("Seleccione al menos una variante ARF para ejecutar `adaptive_arf`.")
+            return
+        if ADAPTIVE_KSWIN_STRATEGY in selected_strategies and not kswin_variants:
+            st.error("Seleccione al menos una variante KSWIN para ejecutar `adaptive_kswin`.")
+            return
         try:
             repetition_seeds = parse_repetition_seeds(seed_text)
         except ValueError as exc:
             st.error(f"Invalid seed list: {exc}")
             return
+        st.session_state["drift_results"] = None
+        st.session_state["drift_execution_log"] = None
+        st.session_state["drift_run_manifest"] = None
+        st.session_state["drift_optuna_json_path"] = None
+        st.session_state["drift_checkpoint_manifest_path"] = None
         progress = _ExperimentProgress()
         try:
             results = run_recalibration_experiments(
@@ -5467,7 +11098,17 @@ def _render_experiments_tab() -> None:
                 grid_limit=int(grid_limit),
                 adwin_delta=float(adwin_delta),
                 min_window=int(min_window),
+                min_retrain_size=int(min_retrain_size),
+                arf_variants=arf_variants,
+                kswin_variants=kswin_variants,
+                kswin_top_k_features=int(kswin_top_k_features),
+                kswin_vote_threshold=int(kswin_vote_threshold),
+                kswin_retrain_days=int(kswin_retrain_days),
+                kswin_min_retrain_rows=int(kswin_min_retrain_rows),
                 repetition_seeds=repetition_seeds,
+                balance_modes=balance_modes,
+                feature_selection_context=_current_feature_selection_context(),
+                auto_resume=bool(execution_mode != "fresh"),
                 progress_callback=progress.update,
             )
         except Exception as exc:
@@ -5484,6 +11125,8 @@ def _render_experiments_tab() -> None:
         st.session_state["drift_results"] = results
         st.session_state["drift_execution_log"] = results.get("execution_log")
         st.session_state["drift_run_manifest"] = results.get("run_manifest")
+        st.session_state["drift_optuna_json_path"] = results.get("optuna_json_path")
+        st.session_state["drift_checkpoint_manifest_path"] = results.get("checkpoint_manifest_path")
 
     results = st.session_state.get("drift_results")
     if not isinstance(results, dict):
@@ -5493,57 +11136,319 @@ def _render_experiments_tab() -> None:
     yearly = results.get("yearly_results")
     adaptive = results.get("adaptive_results")
     avg_roc = results.get("average_roc")
+    roc_payload = results.get("roc_payload")
     appendix = results.get("appendix_tables")
     appendix_mean = results.get("appendix_tables_mean")
     execution_log = results.get("execution_log")
     run_manifest = results.get("run_manifest")
+    optuna_json_path = results.get("optuna_json_path")
+    checkpoint_manifest = results.get("checkpoint_manifest")
+    checkpoint_manifest_path = results.get("checkpoint_manifest_path")
+    auto_resumed = bool(results.get("auto_resumed"))
+    preflight = results.get("preflight")
+    studies = list(results.get("studies") or [])
 
     if isinstance(run_manifest, dict):
         st.markdown("**Run manifest**")
         st.json(run_manifest, expanded=False)
+    if isinstance(checkpoint_manifest, dict):
+        progress = checkpoint_manifest.get("progress") or {}
+        st.markdown("**Checkpoint state**")
+        st.caption(
+            f"{'Resume automatico' if auto_resumed else 'Corrida nueva'} | "
+            f"tunings {int(progress.get('completed_tuning_tasks', 0))}/{int(progress.get('total_tuning_tasks', 0))} | "
+            f"bloques {int(progress.get('completed_blocks', 0))}/{int(progress.get('total_blocks', 0))} | "
+            f"SMOTE cache {len(checkpoint_manifest.get('smote_index') or {})} artefactos"
+        )
+        if checkpoint_manifest_path:
+            st.caption(f"Checkpoint manifest: {checkpoint_manifest_path}")
+    if optuna_json_path:
+        st.success(f"Optuna JSON consolidado: {optuna_json_path}")
+    if isinstance(preflight, dict) and bool(preflight.get("high_risk_memory")):
+        st.warning("La configuracion ejecutada fue marcada como de alto riesgo de memoria en el preflight.")
 
-    st.markdown("**Strategy summary**")
-    if isinstance(summary, pd.DataFrame) and not summary.empty:
-        st.dataframe(summary, width="stretch")
+    yearly_evolution = _build_experiment_evolution_records(
+        yearly if isinstance(yearly, pd.DataFrame) else pd.DataFrame(),
+        source="yearly",
+        metric_candidates=YEARLY_EVOLUTION_METRICS,
+    )
+    adaptive_evolution = _build_experiment_evolution_records(
+        adaptive if isinstance(adaptive, pd.DataFrame) else pd.DataFrame(),
+        source="adaptive",
+        metric_candidates=ADAPTIVE_EVOLUTION_METRICS,
+    )
+    tuning_trials = _build_tuning_trials_frame(studies)
+    memory_trace = _build_execution_memory_trace(
+        execution_log if isinstance(execution_log, pd.DataFrame) else pd.DataFrame()
+    )
 
-    st.markdown("**Appendix tables (A.6-A.9) replica**")
-    if isinstance(appendix, dict):
-        for key in ["A.6", "A.7", "A.8", "A.9"]:
-            df_tab = appendix.get(key)
-            st.caption(f"Table {key}")
-            if isinstance(df_tab, pd.DataFrame) and not df_tab.empty:
-                st.dataframe(df_tab, width="stretch")
+    record_col_1, record_col_2, record_col_3, record_col_4, record_col_5 = st.columns(5)
+    record_col_1.metric("Yearly rows", int(len(yearly)) if isinstance(yearly, pd.DataFrame) else 0)
+    record_col_2.metric("Adaptive rows", int(len(adaptive)) if isinstance(adaptive, pd.DataFrame) else 0)
+    record_col_3.metric("Execution log rows", int(len(execution_log)) if isinstance(execution_log, pd.DataFrame) else 0)
+    record_col_4.metric("ROC payloads", int(len(roc_payload)) if isinstance(roc_payload, list) else 0)
+    record_col_5.metric("Tuning trials", int(len(tuning_trials)))
+
+    summary_tab, evolution_tab, records_tab = st.tabs(["Summary", "Online evolution", "Records"])
+
+    with summary_tab:
+        st.markdown("**Strategy summary**")
+        if isinstance(summary, pd.DataFrame) and not summary.empty:
+            st.dataframe(summary, width="stretch")
+
+        st.markdown("**Appendix tables (A.6-A.9) replica**")
+        if isinstance(appendix, dict):
+            for key in ["A.6", "A.7", "A.8", "A.9"]:
+                df_tab = appendix.get(key)
+                st.caption(f"Table {key}")
+                if isinstance(df_tab, pd.DataFrame) and not df_tab.empty:
+                    st.dataframe(df_tab, width="stretch")
+                else:
+                    st.info(f"Table {key} has no rows for current run.")
+
+        if isinstance(appendix_mean, dict):
+            st.markdown("**Appendix mean tables across sequential seeds**")
+            for key in ["A.6", "A.7", "A.8", "A.9"]:
+                df_tab = appendix_mean.get(key)
+                st.caption(f"Mean Table {key}")
+                if isinstance(df_tab, pd.DataFrame) and not df_tab.empty:
+                    st.dataframe(df_tab, width="stretch")
+                else:
+                    st.info(f"Mean Table {key} has no rows for current run.")
+
+        st.markdown("**Figure 7 replica: average ROC curves**")
+        if isinstance(avg_roc, pd.DataFrame) and not avg_roc.empty:
+            pivot = avg_roc.pivot_table(index="fpr", columns="label", values="tpr", aggfunc="mean")
+            st.line_chart(pivot, width="stretch")
+        else:
+            st.info("No ROC curves available.")
+
+    with evolution_tab:
+        st.markdown("**Yearly metric evolution**")
+        if not yearly_evolution.empty:
+            yearly_metric = st.selectbox(
+                "Yearly metric",
+                options=sorted(yearly_evolution["metric"].astype(str).unique().tolist()),
+                index=0,
+                key="drift_yearly_metric",
+            )
+            yearly_models = sorted(yearly_evolution["model"].astype(str).unique().tolist())
+            yearly_strategies = sorted(yearly_evolution["strategy"].astype(str).unique().tolist())
+            yearly_balances = sorted(yearly_evolution["balance_mode"].astype(str).unique().tolist())
+            yearly_filter_col_1, yearly_filter_col_2, yearly_filter_col_3 = st.columns(3)
+            selected_yearly_strategies = yearly_filter_col_1.multiselect(
+                "Yearly strategies",
+                yearly_strategies,
+                default=yearly_strategies,
+                key="drift_yearly_strategies",
+            )
+            selected_yearly_models = yearly_filter_col_2.multiselect(
+                "Yearly models",
+                yearly_models,
+                default=yearly_models,
+                key="drift_yearly_models",
+            )
+            selected_yearly_balances = yearly_filter_col_3.multiselect(
+                "Yearly balances",
+                yearly_balances,
+                default=yearly_balances,
+                key="drift_yearly_balances",
+            )
+            avg_yearly_seeds = st.checkbox("Average yearly seeds", value=True, key="drift_yearly_avg_seeds")
+            yearly_plot = yearly_evolution.loc[
+                yearly_evolution["metric"].eq(yearly_metric)
+                & yearly_evolution["strategy"].astype(str).isin(selected_yearly_strategies)
+                & yearly_evolution["model"].astype(str).isin(selected_yearly_models)
+                & yearly_evolution["balance_mode"].astype(str).isin(selected_yearly_balances)
+            ].copy()
+            if avg_yearly_seeds:
+                yearly_plot["series_label"] = (
+                    yearly_plot["strategy"].astype(str)
+                    + " | "
+                    + yearly_plot["model"].astype(str)
+                    + " | "
+                    + yearly_plot["balance_mode"].astype(str)
+                )
+                yearly_plot = yearly_plot.groupby(
+                    ["prediction_year", "series_label"],
+                    dropna=False,
+                    as_index=False,
+                )["value"].mean()
             else:
-                st.info(f"Table {key} has no rows for current run.")
-
-    if isinstance(appendix_mean, dict):
-        st.markdown("**Appendix mean tables across sequential seeds**")
-        for key in ["A.6", "A.7", "A.8", "A.9"]:
-            df_tab = appendix_mean.get(key)
-            st.caption(f"Mean Table {key}")
-            if isinstance(df_tab, pd.DataFrame) and not df_tab.empty:
-                st.dataframe(df_tab, width="stretch")
+                yearly_plot["series_label"] = (
+                    yearly_plot["strategy"].astype(str)
+                    + " | "
+                    + yearly_plot["model"].astype(str)
+                    + " | "
+                    + yearly_plot["balance_mode"].astype(str)
+                    + " | seed "
+                    + yearly_plot["run_seed"].fillna(-1).astype(int).astype(str)
+                )
+            if not yearly_plot.empty:
+                yearly_pivot = yearly_plot.pivot_table(
+                    index="prediction_year",
+                    columns="series_label",
+                    values="value",
+                    aggfunc="mean",
+                ).sort_index()
+                st.line_chart(yearly_pivot, width="stretch")
+                st.dataframe(yearly_plot, width="stretch")
             else:
-                st.info(f"Mean Table {key} has no rows for current run.")
+                st.info("No yearly rows match the selected filters.")
+        else:
+            st.info("No yearly evolution rows available.")
 
-    st.markdown("**Figure 7 replica: average ROC curves**")
-    if isinstance(avg_roc, pd.DataFrame) and not avg_roc.empty:
-        pivot = avg_roc.pivot_table(index="fpr", columns="label", values="tpr", aggfunc="mean")
-        st.line_chart(pivot, width="stretch")
-    else:
-        st.info("No ROC curves available.")
+        st.markdown("**Adaptive metric evolution**")
+        if not adaptive_evolution.empty:
+            adaptive_metric = st.selectbox(
+                "Adaptive metric",
+                options=sorted(adaptive_evolution["metric"].astype(str).unique().tolist()),
+                index=0,
+                key="drift_adaptive_metric",
+            )
+            adaptive_models = sorted(adaptive_evolution["model"].astype(str).unique().tolist())
+            adaptive_strategies = sorted(adaptive_evolution["strategy"].astype(str).unique().tolist())
+            adaptive_balances = sorted(adaptive_evolution["balance_mode"].astype(str).unique().tolist())
+            adaptive_filter_col_1, adaptive_filter_col_2, adaptive_filter_col_3 = st.columns(3)
+            selected_adaptive_strategies = adaptive_filter_col_1.multiselect(
+                "Adaptive strategies",
+                adaptive_strategies,
+                default=adaptive_strategies,
+                key="drift_adaptive_strategies",
+            )
+            selected_adaptive_models = adaptive_filter_col_2.multiselect(
+                "Adaptive models",
+                adaptive_models,
+                default=adaptive_models,
+                key="drift_adaptive_models",
+            )
+            selected_adaptive_balances = adaptive_filter_col_3.multiselect(
+                "Adaptive balances",
+                adaptive_balances,
+                default=adaptive_balances,
+                key="drift_adaptive_balances",
+            )
+            avg_adaptive_seeds = st.checkbox("Average adaptive seeds", value=True, key="drift_adaptive_avg_seeds")
+            adaptive_plot = adaptive_evolution.loc[
+                adaptive_evolution["metric"].eq(adaptive_metric)
+                & adaptive_evolution["strategy"].astype(str).isin(selected_adaptive_strategies)
+                & adaptive_evolution["model"].astype(str).isin(selected_adaptive_models)
+                & adaptive_evolution["balance_mode"].astype(str).isin(selected_adaptive_balances)
+            ].copy()
+            adaptive_index_col = "event_time" if adaptive_plot["event_time"].notna().all() else "event_order"
+            if avg_adaptive_seeds:
+                adaptive_plot["series_label"] = (
+                    adaptive_plot["strategy"].astype(str)
+                    + " | "
+                    + adaptive_plot["model"].astype(str)
+                    + " | "
+                    + adaptive_plot["balance_mode"].astype(str)
+                )
+                adaptive_plot = adaptive_plot.groupby(
+                    [adaptive_index_col, "event_label", "series_label"],
+                    dropna=False,
+                    as_index=False,
+                )["value"].mean()
+            else:
+                adaptive_plot["series_label"] = (
+                    adaptive_plot["strategy"].astype(str)
+                    + " | "
+                    + adaptive_plot["model"].astype(str)
+                    + " | "
+                    + adaptive_plot["balance_mode"].astype(str)
+                    + " | seed "
+                    + adaptive_plot["run_seed"].fillna(-1).astype(int).astype(str)
+                )
+            if not adaptive_plot.empty:
+                adaptive_pivot = adaptive_plot.pivot_table(
+                    index=adaptive_index_col,
+                    columns="series_label",
+                    values="value",
+                    aggfunc="mean",
+                ).sort_index()
+                st.line_chart(adaptive_pivot, width="stretch")
+                st.dataframe(adaptive_plot, width="stretch")
+            else:
+                st.info("No adaptive rows match the selected filters.")
+        else:
+            st.info("No adaptive evolution rows available.")
 
-    if isinstance(yearly, pd.DataFrame) and not yearly.empty:
-        st.markdown("**Yearly strategy results**")
-        st.dataframe(yearly, width="stretch")
+        st.markdown("**Tuning evolution (Optuna trials)**")
+        if not tuning_trials.empty:
+            tuning_filter_col_1, tuning_filter_col_2 = st.columns(2)
+            selected_tuning_models = tuning_filter_col_1.multiselect(
+                "Tuning models",
+                sorted(tuning_trials["model"].astype(str).unique().tolist()),
+                default=sorted(tuning_trials["model"].astype(str).unique().tolist()),
+                key="drift_tuning_models",
+            )
+            selected_tuning_balances = tuning_filter_col_2.multiselect(
+                "Tuning balances",
+                sorted(tuning_trials["balance_mode"].astype(str).unique().tolist()),
+                default=sorted(tuning_trials["balance_mode"].astype(str).unique().tolist()),
+                key="drift_tuning_balances",
+            )
+            tuning_plot = tuning_trials.loc[
+                tuning_trials["model"].astype(str).isin(selected_tuning_models)
+                & tuning_trials["balance_mode"].astype(str).isin(selected_tuning_balances)
+            ].copy()
+            tuning_plot["series_label"] = (
+                tuning_plot["model"].astype(str)
+                + " | "
+                + tuning_plot["balance_mode"].astype(str)
+                + " | "
+                + tuning_plot["stage"].astype(str)
+            )
+            tuning_pivot = tuning_plot.pivot_table(
+                index="trial_number",
+                columns="series_label",
+                values="cv_auc",
+                aggfunc="max",
+            ).sort_index()
+            st.line_chart(tuning_pivot, width="stretch")
+            st.dataframe(tuning_plot, width="stretch")
+        else:
+            st.info("No tuning trials available.")
 
-    if isinstance(adaptive, pd.DataFrame) and not adaptive.empty:
-        st.markdown("**Adaptive ADWIN drift events**")
-        st.dataframe(adaptive, width="stretch")
+        st.markdown("**Execution resource trace**")
+        if not memory_trace.empty:
+            trace_metric = st.selectbox(
+                "Trace metric",
+                options=sorted(memory_trace["metric"].astype(str).unique().tolist()),
+                index=0,
+                key="drift_trace_metric",
+            )
+            trace_plot = memory_trace.loc[memory_trace["metric"].eq(trace_metric)].copy()
+            trace_plot["series_label"] = trace_plot["phase"].astype(str) + " | " + trace_plot["status"].astype(str)
+            trace_pivot = trace_plot.pivot_table(
+                index="order",
+                columns="series_label",
+                values="value",
+                aggfunc="last",
+            ).sort_index()
+            st.line_chart(trace_pivot, width="stretch")
+            st.dataframe(trace_plot, width="stretch")
+        else:
+            st.info("No execution resource traces available.")
 
-    if isinstance(execution_log, pd.DataFrame) and not execution_log.empty:
-        st.markdown("**Execution log**")
-        st.dataframe(execution_log, width="stretch")
+    with records_tab:
+        if isinstance(yearly, pd.DataFrame) and not yearly.empty:
+            st.markdown("**Yearly strategy results**")
+            st.dataframe(yearly, width="stretch")
+        if isinstance(adaptive, pd.DataFrame) and not adaptive.empty:
+            st.markdown("**Adaptive strategy segments (ADWIN + ARF + KSWIN)**")
+            st.caption(
+                "ADWIN reporta segmentos delimitados por drift detectado. "
+                "ARF reporta segmentos anuales online con su conteo interno de drifts y warnings. "
+                "KSWIN reporta segmentos cerrados por drift en covariables, con voto de features y ventana de reentrenamiento fija."
+            )
+            st.dataframe(adaptive, width="stretch")
+        if isinstance(execution_log, pd.DataFrame) and not execution_log.empty:
+            st.markdown("**Execution log**")
+            st.dataframe(execution_log, width="stretch")
+        if not tuning_trials.empty:
+            st.markdown("**Tuning trials**")
+            st.dataframe(tuning_trials, width="stretch")
 
 
 def _render_coverage_tab() -> None:
@@ -5572,7 +11477,8 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
     st.title("Drift detection")
     st.caption(
         "Replication workspace for the crash prediction recalibration paper "
-        "(static, period-aligned, cumulative, adaptive ADWIN)."
+        "(static, period-aligned, cumulative, adaptive ADWIN) "
+        "with extended online ARF and KSWIN comparisons."
     )
 
     tab_blueprint, tab_events, tab_feature_eng, tab_selection, tab_experiments, tab_coverage = st.tabs(

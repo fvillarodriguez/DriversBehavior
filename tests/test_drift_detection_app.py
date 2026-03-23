@@ -1,12 +1,28 @@
+import json
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.model_selection import train_test_split
+
+import src.drift_detection_app as drift_app
 
 from src.drift_detection_app import (
+    ARF_VARIANT_NAMES,
+    BALANCE_MODE_NONE,
+    BALANCE_MODE_NOT_APPLICABLE,
+    BALANCE_MODE_SMOTE,
     DRIFT_FOCUS_PORTICOS,
     DRIFT_FOCUS_TRAMO,
+    KSWIN_VARIANT_NAMES,
+    _evaluate_split,
     _add_interval_accident_target,
     _build_batch_ranges,
+    _build_feature_selection_payload,
     _count_positive_target_rows,
     _compute_batched_flow_features_to_duckdb,
     _compute_drift_article_features,
@@ -15,9 +31,11 @@ from src.drift_detection_app import (
     _import_external_xgboost,
     _load_feature_payload_from_duckdb,
     _load_feature_df_from_duckdb,
+    _load_feature_selection_payload_from_duckdb,
     _normalize_portico_series,
     _porticos_in_tramo,
     _rebuild_preparation_artifacts_from_payload,
+    _write_feature_payload_to_duckdb,
     SimpleADWIN,
     apply_missing_data_policy,
     article_coverage_percentage,
@@ -28,13 +46,60 @@ from src.drift_detection_app import (
     filter_long_zero_accident_runs,
     generate_synthetic_article_dataset,
     parse_repetition_seeds,
+    run_arf_strategy,
     run_adaptive_strategy,
     run_configurable_preparation_pipeline,
+    run_kswin_strategy,
     run_recalibration_experiments,
     run_yearly_strategy,
+    train_model_with_internal_validation,
     youden_threshold,
     compute_classification_metrics,
 )
+
+
+def _make_kswin_shift_dataset(rows_per_year: int = 360, random_state: int = 123) -> pd.DataFrame:
+    rng = np.random.default_rng(random_state)
+    rows = []
+    yearly_shift = {2018: 0.0, 2019: 4.0, 2020: -3.5}
+
+    for year, shift in yearly_shift.items():
+        ts = pd.date_range(f"{year}-01-01 00:00:00", periods=rows_per_year, freq="5min")
+        idx = np.arange(rows_per_year, dtype=float)
+
+        x1 = rng.normal(loc=shift, scale=0.25, size=rows_per_year)
+        x2 = rng.normal(loc=shift * 0.9, scale=0.3, size=rows_per_year)
+        x3 = rng.normal(loc=0.0, scale=1.0, size=rows_per_year)
+
+        flow_light = 100.0 + 15.0 * x1 + 4.0 * np.sin(idx / 18.0)
+        flow_heavy = 45.0 + 8.0 * x2 + 2.5 * np.cos(idx / 22.0)
+        speed_light = 80.0 - 3.0 * x1 + rng.normal(0.0, 0.8, size=rows_per_year)
+        speed_heavy = 67.0 - 2.5 * x2 + rng.normal(0.0, 0.8, size=rows_per_year)
+        density_light = 20.0 + 2.0 * x1 + rng.normal(0.0, 0.5, size=rows_per_year)
+        density_heavy = 10.0 + 1.5 * x2 + rng.normal(0.0, 0.4, size=rows_per_year)
+        periodic_signal = np.sin(idx / 12.0) + 0.35 * np.cos(idx / 25.0)
+        logits = periodic_signal + 0.25 * x1 - 0.20 * x2 + rng.normal(0.0, 0.35, size=rows_per_year)
+        target = (logits > 0.0).astype(int)
+
+        for i in range(rows_per_year):
+            rows.append(
+                {
+                    "interval_start": ts[i],
+                    "portico": "15",
+                    "flow_light": flow_light[i],
+                    "flow_heavy": flow_heavy[i],
+                    "speed_light": speed_light[i],
+                    "speed_heavy": speed_heavy[i],
+                    "density_light": density_light[i],
+                    "density_heavy": density_heavy[i],
+                    "x1": x1[i],
+                    "x2": x2[i],
+                    "x3": x3[i],
+                    "target": int(target[i]),
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 def test_count_positive_target_rows_uses_final_target_column():
@@ -232,6 +297,1058 @@ def test_run_adaptive_strategy_random_forest():
     assert len(roc_payload) >= 1
 
 
+def test_run_arf_strategy_variants():
+    pytest.importorskip("river")
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=240, random_state=29)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    adaptive_df, roc_payload = run_arf_strategy(
+        df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        arf_variants=["ARFmoderate", "ARFmaj"],
+        validation_size=0.2,
+        random_state=7,
+    )
+
+    assert not adaptive_df.empty
+    assert (adaptive_df["strategy"] == "adaptive_arf").all()
+    assert set(adaptive_df["model"].unique()) == {"ARFmoderate", "ARFmaj"}
+    assert set(adaptive_df["prediction_year"].astype(int).unique()) == {2019, 2020}
+    assert {"segment_rows", "n_internal_drifts", "n_internal_warnings"} <= set(adaptive_df.columns)
+    assert len(roc_payload) == 4
+
+
+def test_run_kswin_strategy_variants():
+    pytest.importorskip("river")
+
+    df = _make_kswin_shift_dataset(rows_per_year=360, random_state=41)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    adaptive_df, roc_payload = run_kswin_strategy(
+        df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        kswin_variants=["KSWINpaper", "KSWINseasonal"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=80,
+    )
+
+    assert not adaptive_df.empty
+    assert (adaptive_df["strategy"] == "adaptive_kswin").all()
+    assert set(adaptive_df["detector_variant"].unique()) == {"KSWINpaper", "KSWINseasonal"}
+    assert set(adaptive_df["base_model"].unique()) == {"Random Forest"}
+    assert adaptive_df["vote_count"].max() >= 1
+    assert adaptive_df["retrain_rows"].max() >= 80
+    assert any("KSWINpaper" in label for label in adaptive_df["model"].tolist())
+    assert len(roc_payload) >= 2
+
+
+def test_build_model_uses_extratrees_classifier_for_extratrees_splitrule():
+    model = drift_app._build_model(
+        "Random Forest",
+        {"splitrule": "extratrees", "mtry": 2, "min_node_size": 1},
+        random_state=13,
+        n_features=5,
+    )
+
+    assert isinstance(model, ExtraTreesClassifier)
+
+
+def test_build_model_bounds_random_forest_n_jobs(monkeypatch):
+    monkeypatch.delenv("SUMO_RF_N_JOBS", raising=False)
+    default_model = drift_app._build_model(
+        "Random Forest",
+        {"splitrule": "gini", "mtry": 2, "min_node_size": 1},
+        random_state=13,
+        n_features=5,
+    )
+
+    monkeypatch.setenv("SUMO_RF_N_JOBS", "1")
+    overridden_model = drift_app._build_model(
+        "Random Forest",
+        {"splitrule": "gini", "mtry": 2, "min_node_size": 1},
+        random_state=13,
+        n_features=5,
+    )
+
+    assert 1 <= int(default_model.n_jobs) <= 2
+    assert int(overridden_model.n_jobs) == 1
+
+
+def test_recalibration_run_id_is_deterministic():
+    df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                [
+                    "2018-01-01 00:00:00",
+                    "2018-01-01 00:05:00",
+                    "2019-01-01 00:00:00",
+                    "2019-01-01 00:05:00",
+                ]
+            ),
+            "x": [0.1, 0.2, 0.3, 0.4],
+            "target": [0, 1, 0, 1],
+        }
+    )
+    feature_selection_context = {"selected_features": ["x"], "feature_count": 1}
+
+    first = drift_app._build_recalibration_run_id(
+        df=df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        arf_variants=["ARFmoderate"],
+        kswin_variants=["KSWINpaper"],
+        balance_modes=[BALANCE_MODE_NONE, BALANCE_MODE_SMOTE],
+        repetition_seeds=[11],
+        base_year=2018,
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        adwin_delta=0.01,
+        min_window=40,
+        min_retrain_size=20,
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=80,
+        custom_grids=None,
+        feature_selection_context=feature_selection_context,
+    )
+    second = drift_app._build_recalibration_run_id(
+        df=df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        arf_variants=["ARFmoderate"],
+        kswin_variants=["KSWINpaper"],
+        balance_modes=[BALANCE_MODE_NONE, BALANCE_MODE_SMOTE],
+        repetition_seeds=[11],
+        base_year=2018,
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        adwin_delta=0.01,
+        min_window=40,
+        min_retrain_size=20,
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=80,
+        custom_grids=None,
+        feature_selection_context=feature_selection_context,
+    )
+    different = drift_app._build_recalibration_run_id(
+        df=df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        arf_variants=["ARFmoderate"],
+        kswin_variants=["KSWINpaper"],
+        balance_modes=[BALANCE_MODE_NONE],
+        repetition_seeds=[11],
+        base_year=2018,
+        validation_size=0.2,
+        folds=3,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        adwin_delta=0.01,
+        min_window=40,
+        min_retrain_size=20,
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=80,
+        custom_grids=None,
+        feature_selection_context=feature_selection_context,
+    )
+
+    assert first == second
+    assert first != different
+
+
+def test_preview_recalibration_checkpoint_detects_resumable_manifest(tmp_path):
+    df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                [
+                    "2018-01-01 00:00:00",
+                    "2018-01-01 00:05:00",
+                    "2019-01-01 00:00:00",
+                    "2019-01-01 00:05:00",
+                ]
+            ),
+            "x": [0.1, 0.2, 0.3, 0.4],
+            "target": [0, 1, 0, 1],
+        }
+    )
+    feature_selection_context = {"selected_features": ["x"], "feature_count": 1}
+    preview = drift_app._preview_recalibration_checkpoint(
+        df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        adwin_delta=0.01,
+        min_window=40,
+        min_retrain_size=20,
+        arf_variants=["ARFmoderate"],
+        kswin_variants=["KSWINpaper"],
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=80,
+        repetition_seeds=[11],
+        balance_modes=[BALANCE_MODE_NONE],
+        feature_selection_context=feature_selection_context,
+        checkpoint_root=tmp_path / "runs",
+    )
+
+    assert preview["checkpoint_available"] is False
+
+    run_dir = Path(preview["run_dir"])
+    paths = drift_app._recalibration_run_paths(run_dir)
+    drift_app._ensure_recalibration_run_dirs(paths)
+    manifest = drift_app._initial_recalibration_manifest(
+        run_id=preview["run_id"],
+        run_manifest={"total_progress_units": 2},
+        feature_selection_context=feature_selection_context,
+        experiment_blocks=[{"strategy": "static", "model": "Random Forest", "balance_mode": BALANCE_MODE_NONE}],
+        tuning_tasks=[{"model_name": "Random Forest", "balance_mode": BALANCE_MODE_NONE}],
+        preflight={},
+    )
+    manifest["status"] = "running"
+    manifest["completed_block_ids"] = ["block_demo"]
+    manifest["tuning_index"] = {
+        "tuning_demo": {"status": "completed", "filename": "tuning_demo.json"}
+    }
+    manifest["smote_index"] = {
+        "smote_demo": {"status": "available", "filename": "smote_demo.duckdb"}
+    }
+    drift_app._update_manifest_progress(
+        manifest,
+        completed_units=2.0,
+        pending_block_ids=["block_pending"],
+    )
+    drift_app._persist_manifest(paths["manifest"], manifest)
+
+    resumed = drift_app._preview_recalibration_checkpoint(
+        df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        adwin_delta=0.01,
+        min_window=40,
+        min_retrain_size=20,
+        arf_variants=["ARFmoderate"],
+        kswin_variants=["KSWINpaper"],
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=80,
+        repetition_seeds=[11],
+        balance_modes=[BALANCE_MODE_NONE],
+        feature_selection_context=feature_selection_context,
+        checkpoint_root=tmp_path / "runs",
+    )
+
+    assert resumed["checkpoint_available"] is True
+    assert resumed["can_resume"] is True
+    assert resumed["can_load_completed"] is False
+    assert resumed["status"] == "running"
+    assert resumed["completed_tuning_tasks"] == 1
+    assert resumed["completed_blocks"] == 1
+    assert resumed["smote_artifacts"] == 1
+    assert resumed["manifest_path"].endswith("manifest.json")
+
+
+def test_cv_auc_parallel_uses_sklearn_parallel_without_warning():
+    rows = 40
+    X = pd.DataFrame(
+        {
+            "x1": np.linspace(0.0, 1.0, rows),
+            "x2": np.tile([0.0, 1.0], rows // 2),
+        }
+    )
+    y = pd.Series(([0, 1] * (rows // 2)), name="target")
+    params = {"iter": 5, "maxdepth": 1, "nu": 0.1}
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        auc = drift_app._cv_auc(
+            X,
+            y,
+            model_name="AdaBoost",
+            params=params,
+            folds=4,
+            random_state=11,
+            balance_mode=BALANCE_MODE_NONE,
+        )
+
+    assert np.isfinite(float(auc))
+    assert not any(
+        "sklearn.utils.parallel.delayed" in str(item.message)
+        for item in caught
+    )
+
+
+def test_build_experiment_evolution_records_supports_yearly_and_adaptive():
+    yearly_df = pd.DataFrame(
+        [
+            {
+                "strategy": "static",
+                "model": "Random Forest",
+                "balance_mode": BALANCE_MODE_NONE,
+                "prediction_year": 2019,
+                "auc": 0.71,
+                "threshold": 0.42,
+                "run_seed": 11,
+                "run_order": 1,
+            }
+        ]
+    )
+    adaptive_df = pd.DataFrame(
+        [
+            {
+                "strategy": "adaptive_adwin",
+                "model": "Random Forest",
+                "balance_mode": BALANCE_MODE_NONE,
+                "drift": 1,
+                "drift_date": "2019-06-01T00:00:00",
+                "auc": 0.69,
+                "remaining_periods": 12,
+                "run_seed": 11,
+                "run_order": 1,
+            }
+        ]
+    )
+
+    yearly_records = drift_app._build_experiment_evolution_records(
+        yearly_df,
+        source="yearly",
+        metric_candidates=drift_app.YEARLY_EVOLUTION_METRICS,
+    )
+    adaptive_records = drift_app._build_experiment_evolution_records(
+        adaptive_df,
+        source="adaptive",
+        metric_candidates=drift_app.ADAPTIVE_EVOLUTION_METRICS,
+    )
+
+    assert not yearly_records.empty
+    assert not adaptive_records.empty
+    assert {"metric", "value", "event_label", "event_order"} <= set(yearly_records.columns)
+    assert {"metric", "value", "event_label", "event_order"} <= set(adaptive_records.columns)
+    assert set(yearly_records["metric"]) >= {"auc", "threshold"}
+    assert set(adaptive_records["metric"]) >= {"auc", "remaining_periods"}
+
+
+def test_train_model_with_internal_validation_refits_final_model_on_full_training_rows(monkeypatch):
+    fit_sizes = []
+
+    class RecordingModel:
+        def fit(self, X, y):
+            fit_sizes.append(len(X))
+            return self
+
+        def predict_proba(self, X):
+            values = pd.to_numeric(X.iloc[:, 0], errors="coerce").fillna(0.0).astype(float).to_numpy()
+            scores = 1.0 / (1.0 + np.exp(-values))
+            return np.column_stack([1.0 - scores, scores])
+
+    def fake_tune_hyperparameters(*args, **kwargs):
+        return (
+            {"splitrule": "gini", "mtry": 1, "min_node_size": 1},
+            pd.DataFrame(),
+            {"study_id": "unit-test-study"},
+        )
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(
+        drift_app,
+        "_build_model",
+        lambda *args, **kwargs: RecordingModel(),
+    )
+
+    train_df = pd.DataFrame(
+        {
+            "x": [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0],
+            "target": [0, 0, 0, 1, 1, 1],
+        }
+    )
+
+    bundle = train_model_with_internal_validation(
+        train_df,
+        feature_cols=["x"],
+        target_col="target",
+        model_name="Random Forest",
+        validation_size=0.33,
+        folds=2,
+        random_state=7,
+        fast_mode=True,
+        grid_limit=1,
+    )
+
+    assert fit_sizes[-1] == len(train_df)
+    assert len(fit_sizes) >= 3
+    assert 0.0 <= float(bundle["threshold"]) <= 1.0
+
+
+def test_fit_nnet_warning_safe_suppresses_convergence_warning():
+    class WarningModel:
+        n_iter_ = 200
+
+        def fit(self, X, y):
+            warnings.warn(
+                "Maximum iterations (200) reached and the optimization hasn't converged yet.",
+                ConvergenceWarning,
+            )
+            return self
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        diagnostics = drift_app._fit_nnet_warning_safe(
+            WarningModel(),
+            pd.DataFrame({"x": [0.0, 1.0]}),
+            np.asarray([0, 1]),
+        )
+
+    assert diagnostics["converged"] is False
+    assert diagnostics["fit_warning_count"] == 1
+    assert diagnostics["n_iter_final"] == 200
+    assert not any(issubclass(item.category, ConvergenceWarning) for item in caught)
+
+
+def test_fit_model_with_diagnostics_retries_nnet_once(monkeypatch):
+    built_params = []
+
+    class DummyModel:
+        pass
+
+    diagnostics_sequence = iter(
+        [
+            {
+                "converged": False,
+                "fit_warning_count": 1,
+                "n_iter_final": 300,
+                "warning_messages": ["first"],
+            },
+            {
+                "converged": True,
+                "fit_warning_count": 0,
+                "n_iter_final": 600,
+                "warning_messages": [],
+            },
+        ]
+    )
+
+    def fake_build_model(model_name, params, **kwargs):
+        built_params.append(dict(params))
+        return DummyModel()
+
+    monkeypatch.setattr(drift_app, "_build_model", fake_build_model)
+    monkeypatch.setattr(
+        drift_app,
+        "_fit_nnet_warning_safe",
+        lambda model, X, y: dict(next(diagnostics_sequence)),
+    )
+
+    _model, diagnostics, params_used = drift_app._fit_model_with_diagnostics(
+        "NNet",
+        {"size": 5, "decay": 0.001, "maxit": 300},
+        random_state=7,
+        n_features=1,
+        X_fit=pd.DataFrame({"x": [0.0, 1.0]}),
+        y_fit=np.asarray([0, 1]),
+        allow_retry=True,
+    )
+
+    assert built_params[0]["maxit"] == 300
+    assert built_params[1]["maxit"] == 600
+    assert diagnostics["fit_retry_applied"] is True
+    assert diagnostics["converged"] is True
+    assert params_used["maxit"] == 600
+
+
+def test_train_model_with_internal_validation_builds_feature_transform_for_nnet(monkeypatch):
+    class PredictiveModel:
+        def predict_proba(self, X):
+            values = pd.to_numeric(X.iloc[:, 0], errors="coerce").fillna(0.0).astype(float).to_numpy()
+            scores = 1.0 / (1.0 + np.exp(-values))
+            return np.column_stack([1.0 - scores, scores])
+
+    def fake_tune_hyperparameters(*args, **kwargs):
+        params = {"size": 5, "decay": 0.001, "maxit": 300}
+        return params, pd.DataFrame(), {"study_id": "nnet-study", "has_valid_trial": True, "trials": []}
+
+    def fake_cross_validated_scores(*args, **kwargs):
+        scores = np.linspace(0.2, 0.8, 8, dtype=float)
+        return {
+            "scores": scores,
+            "converged": True,
+            "n_non_converged_folds": 0,
+            "n_valid_folds": 2,
+            "fold_diagnostics": [],
+        }
+
+    def fake_fit_model_with_diagnostics(*args, **kwargs):
+        params = dict(kwargs.get("model_params", {}) or args[1])
+        return (
+            PredictiveModel(),
+            {
+                "converged": True,
+                "fit_warning_count": 0,
+                "n_iter_final": int(params.get("maxit", 300)),
+                "fit_retry_applied": False,
+            },
+            params,
+        )
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(drift_app, "_cross_validated_scores", fake_cross_validated_scores)
+    monkeypatch.setattr(drift_app, "_fit_model_with_diagnostics", fake_fit_model_with_diagnostics)
+
+    train_df = pd.DataFrame(
+        {
+            "x1": [10.0, 11.0, 9.5, 12.0, -9.0, -10.0, -11.0, -12.0],
+            "x2": [100.0, 99.0, 98.0, 101.0, -95.0, -96.0, -97.0, -98.0],
+            "target": [1, 1, 1, 1, 0, 0, 0, 0],
+        }
+    )
+
+    bundle = train_model_with_internal_validation(
+        train_df,
+        feature_cols=["x1", "x2"],
+        target_col="target",
+        model_name="NNet",
+        validation_size=0.25,
+        folds=2,
+        random_state=5,
+        fast_mode=True,
+        grid_limit=1,
+    )
+
+    assert bundle["feature_transform"]["kind"] == "standard_scaler"
+    assert bundle["feature_transform"]["policy_version"] == drift_app.NNET_TRAINING_POLICY_VERSION
+    assert len(bundle["feature_transform"]["columns"]) == 2
+
+    eval_payload = _evaluate_split(
+        bundle["model"],
+        train_df,
+        feature_cols=["x1", "x2"],
+        target_col="target",
+        threshold=float(bundle["threshold"]),
+        fill_values=bundle.get("fill_values"),
+        feature_transform=bundle.get("feature_transform"),
+    )
+
+    assert len(eval_payload["scores"]) == len(train_df)
+
+
+def test_tune_hyperparameters_caps_adaboost_trials_to_search_space():
+    pytest.importorskip("optuna")
+
+    train_df = pd.DataFrame(
+        {
+            "x1": [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0] * 5,
+            "x2": [1.0, 0.5, 0.2, 0.1, -0.1, -0.2, -0.5, -1.0] * 5,
+            "target": [0, 0, 0, 0, 1, 1, 1, 1] * 5,
+        }
+    )
+    X, y = drift_app._prepare_xy_raw(train_df, ["x1", "x2"], "target")
+
+    _, search_df, artifact = drift_app.tune_hyperparameters(
+        X,
+        y,
+        model_name="AdaBoost",
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=40,
+        balance_mode=BALANCE_MODE_NONE,
+    )
+
+    assert artifact["requested_trials"] == 40
+    assert artifact["search_space_size"] == 8
+    assert artifact["n_trials"] == 8
+    assert len(search_df) == 8
+
+
+def test_recalibration_experiments_skip_nnet_blocks_without_valid_tuning_trial(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019), rows_per_year=60, random_state=101)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    def fake_tune_hyperparameters(X, y, **kwargs):
+        params = {"size": 5, "decay": 0.001, "maxit": 300}
+        search_df = pd.DataFrame(
+            [
+                {
+                    "trial_number": 0,
+                    "model": "NNet",
+                    "cv_auc": np.nan,
+                    "params": json.dumps(params, sort_keys=True),
+                    "state": "COMPLETE",
+                    "balance_mode": kwargs["balance_mode"],
+                    "converged": False,
+                    "n_non_converged_folds": 2,
+                    "n_valid_folds": 0,
+                }
+            ]
+        )
+        artifact = {
+            "study_id": "nnet-invalid",
+            "model_name": "NNet",
+            "balance_mode": kwargs["balance_mode"],
+            "best_value": None,
+            "best_params": params,
+            "model_params": params,
+            "smote_params": {},
+            "n_trials": 1,
+            "requested_trials": 1,
+            "search_space_size": 1,
+            "search_space": {"maxit": [300]},
+            "trials": [
+                {
+                    "trial_number": 0,
+                    "state": "COMPLETE",
+                    "cv_auc": None,
+                    "params": params,
+                    "model_params": params,
+                    "smote_params": {},
+                    "converged": False,
+                    "n_non_converged_folds": 2,
+                    "n_valid_folds": 0,
+                }
+            ],
+            "has_valid_trial": False,
+            "invalid_trial_count": 1,
+            "policy_version": drift_app.NNET_TRAINING_POLICY_VERSION,
+        }
+        return params, search_df, artifact
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(
+        drift_app,
+        "run_yearly_strategy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Yearly strategy should be skipped for invalid NNet tuning")),
+    )
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["NNet"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE,),
+        checkpoint_root=tmp_path / "runs",
+    )
+
+    assert outputs["yearly_results"].empty
+    assert outputs["adaptive_results"].empty
+    assert not outputs["execution_log"].empty
+    assert outputs["execution_log"]["phase"].eq("nnet_trial_invalid").any()
+    assert len(outputs["checkpoint_manifest"]["completed_block_ids"]) == 1
+
+
+def test_nnet_policy_version_changes_run_and_tuning_keys(monkeypatch):
+    df = generate_synthetic_article_dataset(years=(2018, 2019), rows_per_year=40, random_state=131)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+    feature_selection_context = {"selected_features": features}
+    canonical_train_df = df.loc[pd.to_datetime(df["interval_start"], errors="coerce").dt.year.eq(2018)].copy()
+
+    run_id_before = drift_app._build_recalibration_run_id(
+        df=df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["NNet"],
+        strategies=["static"],
+        arf_variants=[],
+        kswin_variants=[],
+        balance_modes=[BALANCE_MODE_NONE],
+        repetition_seeds=[42],
+        base_year=2018,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        grid_limit=30,
+        adwin_delta=0.002,
+        min_window=45_000,
+        min_retrain_size=None,
+        kswin_top_k_features=10,
+        kswin_vote_threshold=2,
+        kswin_retrain_days=90,
+        kswin_min_retrain_rows=100,
+        custom_grids=None,
+        feature_selection_context=feature_selection_context,
+    )
+    tuning_key_before = drift_app._build_global_tuning_key(
+        model_name="NNet",
+        balance_mode=BALANCE_MODE_NONE,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        canonical_train_df=canonical_train_df,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        grid_limit=30,
+        custom_grid=None,
+    )
+
+    monkeypatch.setattr(drift_app, "NNET_TRAINING_POLICY_VERSION", "scaled_early_stopping_v2")
+
+    run_id_after = drift_app._build_recalibration_run_id(
+        df=df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["NNet"],
+        strategies=["static"],
+        arf_variants=[],
+        kswin_variants=[],
+        balance_modes=[BALANCE_MODE_NONE],
+        repetition_seeds=[42],
+        base_year=2018,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        grid_limit=30,
+        adwin_delta=0.002,
+        min_window=45_000,
+        min_retrain_size=None,
+        kswin_top_k_features=10,
+        kswin_vote_threshold=2,
+        kswin_retrain_days=90,
+        kswin_min_retrain_rows=100,
+        custom_grids=None,
+        feature_selection_context=feature_selection_context,
+    )
+    tuning_key_after = drift_app._build_global_tuning_key(
+        model_name="NNet",
+        balance_mode=BALANCE_MODE_NONE,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        canonical_train_df=canonical_train_df,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        grid_limit=30,
+        custom_grid=None,
+    )
+
+    assert run_id_before != run_id_after
+    assert tuning_key_before != tuning_key_after
+
+
+def test_load_or_create_smote_artifact_reuses_exact_signature(tmp_path, monkeypatch):
+    pytest.importorskip("imblearn")
+
+    train_df = pd.DataFrame(
+        {
+            "interval_start": pd.date_range("2018-01-01 00:00:00", periods=8, freq="5min"),
+            "x1": [0.0, 0.2, 0.1, -0.1, 1.0, 1.2, 1.1, 0.9],
+            "x2": [1.0, 0.9, 1.1, 1.2, -0.2, -0.1, -0.3, -0.4],
+            "target": [0, 0, 0, 0, 1, 1, 1, 1],
+        }
+    )
+    X = train_df[["x1", "x2"]].copy()
+    y = train_df["target"].astype(int).to_numpy()
+
+    X_first, y_first, fit_info_first = drift_app._load_or_create_smote_artifact(
+        run_id="run_unit",
+        train_df=train_df,
+        X=X,
+        y=y,
+        feature_cols=["x1", "x2"],
+        target_col="target",
+        time_col="interval_start",
+        sampling_strategy=1.0,
+        k_neighbors=3,
+        random_state=11,
+        smote_cache_dir=tmp_path,
+        smote_cache_registry={},
+    )
+
+    monkeypatch.setattr(
+        drift_app,
+        "_apply_smote_balance",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SMOTE should be loaded from cache")),
+    )
+    X_second, y_second, fit_info_second = drift_app._load_or_create_smote_artifact(
+        run_id="run_unit",
+        train_df=train_df,
+        X=X,
+        y=y,
+        feature_cols=["x1", "x2"],
+        target_col="target",
+        time_col="interval_start",
+        sampling_strategy=1.0,
+        k_neighbors=3,
+        random_state=11,
+        smote_cache_dir=tmp_path,
+        smote_cache_registry={},
+    )
+
+    assert fit_info_first["artifact_key"] == fit_info_second["artifact_key"]
+    assert fit_info_second["artifact_reused"] is True
+    assert X_first.equals(X_second)
+    assert np.array_equal(y_first, y_second)
+
+
+def test_train_model_with_internal_validation_smote_refits_on_full_training_data():
+    pytest.importorskip("imblearn")
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019), rows_per_year=260, random_state=43)
+    year_mask = pd.to_datetime(df["interval_start"], errors="coerce").dt.year.eq(2018)
+    train_df = df.loc[year_mask].copy().reset_index(drop=True)
+    test_df = df.loc[~year_mask].copy().reset_index(drop=True)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    positive_idx = train_df.index[train_df["target"].astype(int).eq(1)].tolist()
+    kept_positive_idx = set(positive_idx[: max(10, len(positive_idx) // 5)])
+    train_df.loc[
+        train_df.index.isin([idx for idx in positive_idx if idx not in kept_positive_idx]),
+        "target",
+    ] = 0
+
+    bundle = train_model_with_internal_validation(
+        train_df,
+        feature_cols=features,
+        target_col="target",
+        model_name="Random Forest",
+        validation_size=0.2,
+        folds=2,
+        random_state=13,
+        fast_mode=True,
+        grid_limit=1,
+        balance_mode=BALANCE_MODE_SMOTE,
+    )
+
+    assert bundle["balance_mode"] == BALANCE_MODE_SMOTE
+    assert bundle["smote_fit_info"]["applied"] is True
+    assert bundle["smote_fit_info"]["train_rows"] == len(train_df)
+    assert bundle["smote_fit_info"]["balanced_rows"] > bundle["smote_fit_info"]["train_rows"]
+    assert bundle["smote_params"]
+    assert bundle["tuning_artifact"]["smote_params"] == bundle["smote_params"]
+    assert bundle["search_df"]["balance_mode"].eq(BALANCE_MODE_SMOTE).all()
+
+    eval_payload = _evaluate_split(
+        bundle["model"],
+        test_df,
+        feature_cols=features,
+        target_col="target",
+        threshold=float(bundle["threshold"]),
+        fill_values=bundle.get("fill_values"),
+    )
+
+    assert len(eval_payload["y_true"]) == len(test_df)
+    assert len(eval_payload["scores"]) == len(test_df)
+
+
+def test_train_arf_with_internal_validation_uses_warm_block_fill_values(monkeypatch):
+    class RecordingOnlineModel:
+        def __init__(self):
+            self.prediction_inputs = []
+
+        def predict_proba_one(self, x_dict):
+            self.prediction_inputs.append(dict(x_dict))
+            return {1: 1.0 if float(x_dict["x"]) > 0 else 0.0}
+
+        def learn_one(self, x_dict, y):
+            return self
+
+    model = RecordingOnlineModel()
+    monkeypatch.setattr(
+        drift_app,
+        "_build_arf_classifier",
+        lambda variant_name, random_state: model,
+    )
+
+    train_df = pd.DataFrame(
+        {
+            "interval_start": pd.date_range("2018-01-01 00:00:00", periods=5, freq="5min"),
+            "x": [0.0, 0.0, 100.0, np.nan, 100.0],
+            "target": [0, 1, 0, 0, 1],
+        }
+    )
+
+    bundle = drift_app.train_arf_with_internal_validation(
+        train_df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        variant_name=ARF_VARIANT_NAMES[0],
+        validation_size=0.4,
+        random_state=5,
+    )
+
+    assert bundle["fill_values"]["x"] == pytest.approx(0.0)
+    assert model.prediction_inputs[0]["x"] == pytest.approx(0.0)
+
+
+def test_run_arf_strategy_uses_base_fill_values_for_stream(monkeypatch):
+    class RecordingOnlineModel:
+        n_drifts_detected = 0
+        n_warnings_detected = 0
+
+        def __init__(self):
+            self.prediction_inputs = []
+
+        def predict_proba_one(self, x_dict):
+            self.prediction_inputs.append(dict(x_dict))
+            return {1: 0.5}
+
+        def learn_one(self, x_dict, y):
+            return self
+
+    model = RecordingOnlineModel()
+
+    def fake_train_arf_with_internal_validation(*args, **kwargs):
+        return {
+            "model": model,
+            "threshold": 0.5,
+            "youden": {"threshold": 0.5},
+            "val_metrics": {},
+            "best_params": {"variant": ARF_VARIANT_NAMES[0]},
+            "fill_values": {"x": 7.0},
+            "warm_rows": 2,
+            "validation_rows": 1,
+        }
+
+    monkeypatch.setattr(
+        drift_app,
+        "train_arf_with_internal_validation",
+        fake_train_arf_with_internal_validation,
+    )
+
+    df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                [
+                    "2018-01-01 00:00:00",
+                    "2018-01-01 00:05:00",
+                    "2019-01-01 00:00:00",
+                    "2019-01-01 00:05:00",
+                ]
+            ),
+            "x": [0.0, 1.0, np.nan, 100.0],
+            "target": [0, 1, 0, 1],
+        }
+    )
+
+    adaptive_df, roc_payload = run_arf_strategy(
+        df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        arf_variants=[ARF_VARIANT_NAMES[0]],
+        validation_size=0.5,
+        random_state=11,
+    )
+
+    assert not adaptive_df.empty
+    assert len(roc_payload) == 1
+    assert model.prediction_inputs[0]["x"] == pytest.approx(7.0)
+
+
 def test_end_to_end_recalibration_and_average_roc():
     df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=220, random_state=23)
     features = [
@@ -292,7 +1409,50 @@ def test_end_to_end_recalibration_and_average_roc():
     assert set(["strategy", "model", "fpr", "tpr", "label"]).issubset(set(roc2.columns))
 
 
-def test_recalibration_experiments_emit_progress_updates():
+def test_recalibration_experiments_compare_balance_modes_end_to_end():
+    pytest.importorskip("imblearn")
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=180, random_state=67)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static", "adaptive_adwin"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        adwin_delta=0.01,
+        min_window=40,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE, BALANCE_MODE_SMOTE),
+    )
+
+    assert set(outputs["yearly_results"]["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
+    assert set(outputs["adaptive_results"]["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
+    assert set(outputs["summary"]["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
+    assert outputs["run_manifest"]["balance_modes"] == [BALANCE_MODE_NONE, BALANCE_MODE_SMOTE]
+
+    log_modes = set(outputs["execution_log"]["balance_mode"].dropna().astype(str).unique())
+    assert {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}.issubset(log_modes)
+
+
+def test_recalibration_experiments_emit_progress_updates(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
     df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=160, random_state=31)
     features = [
         "flow_light",
@@ -324,10 +1484,728 @@ def test_recalibration_experiments_emit_progress_updates():
     assert not outputs["summary"].empty
     assert len(progress_events) >= 3
     assert progress_events[0]["completed_units"] == 0
-    assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 1
+    assert any(
+        0 < float(event["completed_units"]) < float(event["total_units"])
+        and abs(float(event["completed_units"]) - round(float(event["completed_units"]))) > 1e-9
+        for event in progress_events[1:-1]
+    )
+    assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 4
 
 
-def test_parse_repetition_seeds_and_multi_seed_logging():
+def test_recalibration_experiments_support_adaptive_arf(tmp_path, monkeypatch):
+    pytest.importorskip("river")
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=180, random_state=37)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    progress_events = []
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest", "NNet"],
+        strategies=["adaptive_arf"],
+        arf_variants=["ARFmoderate", "ARFfast"],
+        validation_size=0.2,
+        random_state=17,
+        repetition_seeds=(17,),
+        progress_callback=progress_events.append,
+    )
+
+    adaptive = outputs["adaptive_results"]
+    summary = outputs["summary"]
+    roc_df = outputs["average_roc"]
+
+    assert outputs["yearly_results"].empty
+    assert not adaptive.empty
+    assert not summary.empty
+    assert not roc_df.empty
+    assert set(adaptive["model"].unique()) == {"ARFmoderate", "ARFfast"}
+    assert set(summary["strategy"].unique()) == {"adaptive_arf"}
+    assert outputs["run_manifest"]["arf_variants"] == ["ARFmoderate", "ARFfast"]
+    assert ARF_VARIANT_NAMES[:2] == ["ARFmoderate", "ARFmaj"]
+    assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 2
+
+
+def test_recalibration_experiments_support_adaptive_kswin(tmp_path, monkeypatch):
+    pytest.importorskip("river")
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = _make_kswin_shift_dataset(rows_per_year=320, random_state=59)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    progress_events = []
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["adaptive_kswin"],
+        kswin_variants=["KSWINpaper", "KSWINseasonal"],
+        validation_size=0.2,
+        folds=2,
+        random_state=19,
+        fast_mode=True,
+        grid_limit=1,
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=80,
+        repetition_seeds=(19,),
+        progress_callback=progress_events.append,
+    )
+
+    adaptive = outputs["adaptive_results"]
+    summary = outputs["summary"]
+    roc_df = outputs["average_roc"]
+
+    assert outputs["yearly_results"].empty
+    assert not adaptive.empty
+    assert not summary.empty
+    assert not roc_df.empty
+    assert set(adaptive["detector_variant"].unique()) == {"KSWINpaper", "KSWINseasonal"}
+    assert set(adaptive["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
+    assert outputs["run_manifest"]["kswin_variants"] == ["KSWINpaper", "KSWINseasonal"]
+    assert KSWIN_VARIANT_NAMES == ["KSWINpaper", "KSWINseasonal"]
+    assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 6
+
+
+def test_recalibration_experiments_persist_optuna_json(tmp_path, monkeypatch):
+    pytest.importorskip("imblearn")
+
+    features_duckdb = tmp_path / "feature_selection.duckdb"
+    features_duckdb.write_text("", encoding="utf-8")
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=180, random_state=71)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+    feature_selection_context = {
+        "corr_threshold": 0.85,
+        "top_n": len(features),
+        "selected_features": features,
+        "feature_count": len(features),
+        "feature_export_path": str(features_duckdb),
+    }
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE, BALANCE_MODE_SMOTE),
+        feature_selection_context=feature_selection_context,
+    )
+
+    json_path = Path(outputs["optuna_json_path"])
+    assert json_path.exists()
+    assert json_path.parent == tmp_path
+    assert outputs["run_manifest"]["optuna_json_path"] == str(json_path)
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["run_manifest"]["optuna_json_path"] == str(json_path)
+    assert payload["feature_selection_context"]["selected_features"] == features
+    assert payload["feature_selection_context"]["feature_export_path"] == str(features_duckdb)
+    assert payload["studies"]
+    assert any("best_params" in study for study in payload["studies"])
+    assert any("trials" in study for study in payload["studies"])
+    json.dumps(payload)
+
+
+def test_recalibration_experiments_persist_live_status_and_events(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=91)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+    progress_updates = []
+
+    def fake_tune_hyperparameters(X, y, **kwargs):
+        callback = kwargs.get("progress_callback")
+        if callable(callback):
+            callback(
+                {
+                    "ratio": 0.5,
+                    "label": "Sintonizando hiperparametros...",
+                    "detail": "Trial 1 / 1 | Mejor AUC CV 0.73",
+                }
+            )
+        params = {"mtry": 2, "splitrule": "gini", "min_node_size": 1}
+        artifact = {
+            "study_id": "study_rf_none",
+            "model_name": kwargs["model_name"],
+            "balance_mode": kwargs["balance_mode"],
+            "best_value": 0.73,
+            "best_params": params,
+            "model_params": params,
+            "smote_params": {},
+            "n_trials": 1,
+            "requested_trials": 1,
+            "search_space_size": 1,
+            "search_space": {"mtry": [2]},
+            "trials": [
+                {
+                    "trial_number": 0,
+                    "state": "COMPLETE",
+                    "cv_auc": 0.73,
+                    "params": params,
+                    "model_params": params,
+                    "smote_params": {},
+                }
+            ],
+        }
+        search_df = pd.DataFrame(
+            [
+                {
+                    "trial_number": 0,
+                    "model": kwargs["model_name"],
+                    "cv_auc": 0.73,
+                    "params": "{}",
+                    "state": "COMPLETE",
+                    "balance_mode": kwargs["balance_mode"],
+                }
+            ]
+        )
+        return params, search_df, artifact
+
+    def fake_run_yearly_strategy(*args, **kwargs):
+        callback = kwargs.get("progress_callback")
+        if callable(callback):
+            callback({"ratio": 0.35, "label": "Entrenando modelo...", "detail": "Ano 2019"})
+            callback({"ratio": 1.0, "label": "Bloque listo.", "detail": "Ano 2020"})
+        rows = pd.DataFrame(
+            [
+                {
+                    "strategy": kwargs["strategy"],
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": kwargs["model_names"][0],
+                    "balance_mode": kwargs["balance_mode"],
+                    "auc": 0.82,
+                    "sensitivity": 0.71,
+                    "specificity": 0.77,
+                    "error_rate": 0.18,
+                    "threshold": 0.5,
+                    "training_time_sec": 0.1,
+                    "n_train": 10,
+                    "n_test": 10,
+                    "best_params": "{}",
+                    "run_seed": kwargs["run_seed"],
+                    "run_order": kwargs["run_order"],
+                }
+            ]
+        )
+        roc_payload = [
+            {
+                "strategy": kwargs["strategy"],
+                "model": kwargs["model_names"][0],
+                "balance_mode": kwargs["balance_mode"],
+                "segment": "2019",
+                "y_true": np.asarray([0, 1]),
+                "scores": np.asarray([0.1, 0.9]),
+                "run_seed": kwargs["run_seed"],
+                "run_order": kwargs["run_order"],
+            }
+        ]
+        return rows, roc_payload
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(drift_app, "run_yearly_strategy", fake_run_yearly_strategy)
+
+    checkpoint_root = tmp_path / "runs"
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE,),
+        checkpoint_root=checkpoint_root,
+        progress_callback=progress_updates.append,
+    )
+
+    manifest_path = Path(outputs["checkpoint_manifest_path"])
+    run_dir = manifest_path.parent
+    live_status_path = run_dir / "live_status.json"
+    live_events_path = run_dir / "live_events.jsonl"
+
+    assert live_status_path.exists()
+    assert live_events_path.exists()
+
+    live_status = json.loads(live_status_path.read_text(encoding="utf-8"))
+    live_events = [
+        json.loads(line)
+        for line in live_events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert live_status["status"] == "completed"
+    assert live_status["context"]["phase"] == "run_complete"
+    assert live_status["progress_ratio"] == pytest.approx(1.0)
+    assert any(event["context"].get("phase") == "global_tuning" for event in live_events)
+    assert any(event["context"].get("phase") == "block_running" for event in live_events)
+    assert any(event["context"].get("phase") == "block_complete" for event in live_events)
+    assert progress_updates
+
+
+def test_recalibration_experiments_resume_from_failed_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=71)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    tuning_calls = []
+    block_calls = []
+    fail_once = {"enabled": True}
+
+    def fake_tune_hyperparameters(X, y, **kwargs):
+        tuning_calls.append((kwargs["model_name"], kwargs["balance_mode"]))
+        params = {"mtry": 2, "splitrule": "gini", "min_node_size": 1}
+        artifact = {
+            "study_id": f"study_{kwargs['model_name']}_{kwargs['balance_mode']}",
+            "model_name": kwargs["model_name"],
+            "balance_mode": kwargs["balance_mode"],
+            "best_value": 0.75,
+            "best_params": params,
+            "model_params": params,
+            "smote_params": {},
+            "n_trials": 1,
+            "requested_trials": 1,
+            "search_space_size": 1,
+            "search_space": {"mtry": [2]},
+            "trials": [
+                {
+                    "trial_number": 0,
+                    "state": "COMPLETE",
+                    "cv_auc": 0.75,
+                    "params": params,
+                    "model_params": params,
+                    "smote_params": {},
+                }
+            ],
+        }
+        return params, pd.DataFrame([{"trial_number": 0, "model": kwargs["model_name"], "cv_auc": 0.75, "params": "{}", "state": "COMPLETE", "balance_mode": kwargs["balance_mode"]}]), artifact
+
+    def fake_run_yearly_strategy(*args, **kwargs):
+        block_calls.append((kwargs["balance_mode"], kwargs["run_seed"], kwargs["run_order"]))
+        if kwargs["balance_mode"] == BALANCE_MODE_SMOTE and fail_once["enabled"]:
+            raise RuntimeError("forced block failure")
+        rows = pd.DataFrame(
+            [
+                {
+                    "strategy": kwargs["strategy"],
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": kwargs["model_names"][0],
+                    "balance_mode": kwargs["balance_mode"],
+                    "auc": 0.8,
+                    "sensitivity": 0.7,
+                    "specificity": 0.75,
+                    "error_rate": 0.2,
+                    "threshold": 0.5,
+                    "training_time_sec": 0.1,
+                    "n_train": 10,
+                    "n_test": 10,
+                    "best_params": "{}",
+                    "run_seed": kwargs["run_seed"],
+                    "run_order": kwargs["run_order"],
+                }
+            ]
+        )
+        roc_payload = [
+            {
+                "strategy": kwargs["strategy"],
+                "model": kwargs["model_names"][0],
+                "balance_mode": kwargs["balance_mode"],
+                "segment": "2019",
+                "y_true": np.asarray([0, 1]),
+                "scores": np.asarray([0.1, 0.9]),
+                "run_seed": kwargs["run_seed"],
+                "run_order": kwargs["run_order"],
+            }
+        ]
+        return rows, roc_payload
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(drift_app, "run_yearly_strategy", fake_run_yearly_strategy)
+
+    checkpoint_root = tmp_path / "runs"
+    with pytest.raises(RuntimeError, match="forced block failure"):
+        run_recalibration_experiments(
+            df,
+            feature_cols=features,
+            model_names=["Random Forest"],
+            strategies=["static"],
+            validation_size=0.2,
+            folds=2,
+            random_state=11,
+            fast_mode=True,
+            grid_limit=1,
+            repetition_seeds=(11,),
+            balance_modes=(BALANCE_MODE_NONE, BALANCE_MODE_SMOTE),
+            checkpoint_root=checkpoint_root,
+        )
+
+    manifests = sorted(checkpoint_root.glob("run_*/manifest.json"))
+    assert len(manifests) == 1
+    failed_manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert failed_manifest["status"] == "failed"
+    assert len(failed_manifest["completed_block_ids"]) == 1
+    assert len(tuning_calls) == 2
+
+    fail_once["enabled"] = False
+    block_calls.clear()
+    tuning_calls.clear()
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE, BALANCE_MODE_SMOTE),
+        checkpoint_root=checkpoint_root,
+    )
+
+    assert outputs["auto_resumed"] is True
+    assert len(block_calls) == 1
+    assert block_calls[0][0] == BALANCE_MODE_SMOTE
+    assert tuning_calls == []
+    assert set(outputs["yearly_results"]["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
+    assert outputs["checkpoint_manifest"]["status"] == "completed"
+
+
+def test_adaptive_adwin_optuna_studies_capture_base_and_retrains_with_balance_mode():
+    pytest.importorskip("imblearn")
+
+    df = _make_kswin_shift_dataset(rows_per_year=220, random_state=41)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    studies = []
+    adaptive_df, roc_payload = run_adaptive_strategy(
+        df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        validation_size=0.2,
+        folds=2,
+        random_state=5,
+        fast_mode=True,
+        grid_limit=1,
+        adwin_delta=0.05,
+        min_window=120,
+        min_retrain_size=20,
+        balance_mode=BALANCE_MODE_SMOTE,
+        study_collector=studies,
+    )
+
+    assert not adaptive_df.empty
+    assert len(roc_payload) >= 1
+    assert {"adaptive_base", "adaptive_retrain"} <= {study["stage"] for study in studies}
+    assert all(study["balance_mode"] == BALANCE_MODE_SMOTE for study in studies)
+    assert len({study["study_id"] for study in studies}) == len(studies)
+
+
+def test_run_adaptive_strategy_uses_separate_min_retrain_size(monkeypatch):
+    fit_sizes = []
+
+    class FakeBatchModel:
+        def predict_proba(self, X):
+            values = pd.to_numeric(X.iloc[:, 0], errors="coerce").fillna(0.0).astype(float).to_numpy()
+            scores = np.where(values > 0, 0.8, 0.2)
+            return np.column_stack([1.0 - scores, scores])
+
+    class FakeADWIN:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def update(self, value):
+            self.calls += 1
+            if self.calls == 30:
+                return True, {"n": 60.0, "n0": 30.0, "n1": 30.0}
+            return False, None
+
+        def __len__(self):
+            return self.calls
+
+    def fake_train_model_with_internal_validation(train_df, **kwargs):
+        fit_sizes.append(len(train_df))
+        return {
+            "model": FakeBatchModel(),
+            "threshold": 0.5,
+            "best_params": {"splitrule": "gini"},
+            "fill_values": {"x": 0.0},
+            "tuning_artifact": {"study_id": f"study_{len(fit_sizes)}"},
+        }
+
+    monkeypatch.setattr(drift_app, "SimpleADWIN", FakeADWIN)
+    monkeypatch.setattr(
+        drift_app,
+        "train_model_with_internal_validation",
+        fake_train_model_with_internal_validation,
+    )
+
+    base_times = pd.date_range("2018-01-01 00:00:00", periods=10, freq="5min")
+    stream_times = pd.date_range("2019-01-01 00:00:00", periods=40, freq="5min")
+    df = pd.DataFrame(
+        {
+            "interval_start": base_times.append(stream_times),
+            "x": [(-1.0) ** idx for idx in range(50)],
+            "target": [idx % 2 for idx in range(50)],
+        }
+    )
+
+    adaptive_df, roc_payload = run_adaptive_strategy(
+        df,
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        validation_size=0.2,
+        folds=2,
+        random_state=3,
+        fast_mode=True,
+        grid_limit=1,
+        adwin_delta=0.01,
+        min_window=1000,
+        min_retrain_size=30,
+    )
+
+    assert fit_sizes == [10, 30]
+    assert not adaptive_df.empty
+    assert len(roc_payload) >= 1
+
+
+def test_run_yearly_strategy_reuses_static_training_bundle(monkeypatch):
+    fit_calls = []
+
+    class FakeModel:
+        def predict_proba(self, X):
+            values = pd.to_numeric(X.iloc[:, 0], errors="coerce").fillna(0.0).astype(float).to_numpy()
+            scores = np.where(values > 0, 0.8, 0.2)
+            return np.column_stack([1.0 - scores, scores])
+
+    def fake_train_model_with_internal_validation(train_df, **kwargs):
+        fit_calls.append(len(train_df))
+        return {
+            "model": FakeModel(),
+            "threshold": 0.5,
+            "best_params": {"splitrule": "gini"},
+            "fill_values": {"x": 0.0},
+            "tuning_artifact": {"study_id": "cached-static-study"},
+        }
+
+    monkeypatch.setattr(
+        drift_app,
+        "train_model_with_internal_validation",
+        fake_train_model_with_internal_validation,
+    )
+
+    df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                [
+                    "2018-01-01 00:00:00",
+                    "2018-01-01 00:05:00",
+                    "2019-01-01 00:00:00",
+                    "2019-01-01 00:05:00",
+                    "2020-01-01 00:00:00",
+                    "2020-01-01 00:05:00",
+                ]
+            ),
+            "x": [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0],
+            "target": [0, 1, 0, 1, 0, 1],
+        }
+    )
+
+    yearly_df, roc_payload = run_yearly_strategy(
+        df,
+        strategy="static",
+        feature_cols=["x"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        validation_size=0.2,
+        folds=2,
+        random_state=13,
+        fast_mode=True,
+        grid_limit=1,
+    )
+
+    assert fit_calls == [2]
+    assert set(yearly_df["prediction_year"].astype(int)) == {2019, 2020}
+    assert len(roc_payload) == 2
+
+
+def test_kswin_optuna_studies_capture_base_and_retrains_with_balance_mode():
+    pytest.importorskip("river")
+    pytest.importorskip("imblearn")
+
+    df = _make_kswin_shift_dataset(rows_per_year=220, random_state=41)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    studies = []
+    adaptive_df, roc_payload = run_kswin_strategy(
+        df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        kswin_variants=["KSWINpaper"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        kswin_top_k_features=3,
+        kswin_vote_threshold=1,
+        kswin_retrain_days=30,
+        kswin_min_retrain_rows=60,
+        balance_mode=BALANCE_MODE_SMOTE,
+        study_collector=studies,
+    )
+
+    assert not adaptive_df.empty
+    assert len(roc_payload) >= 1
+    assert {"kswin_base", "kswin_retrain"} <= {study["stage"] for study in studies}
+    assert all(study["balance_mode"] == BALANCE_MODE_SMOTE for study in studies)
+    assert len({study["study_id"] for study in studies}) == len(studies)
+
+
+def test_recalibration_experiments_keep_adaptive_arf_outside_balance_duplication():
+    pytest.importorskip("river")
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=180, random_state=37)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static", "adaptive_arf"],
+        arf_variants=["ARFmoderate"],
+        validation_size=0.2,
+        folds=2,
+        random_state=17,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(17,),
+        balance_modes=(BALANCE_MODE_NONE, BALANCE_MODE_SMOTE),
+    )
+
+    yearly = outputs["yearly_results"]
+    arf_rows = outputs["adaptive_results"].loc[outputs["adaptive_results"]["strategy"] == "adaptive_arf"].copy()
+    arf_summary = outputs["summary"].loc[outputs["summary"]["strategy"] == "adaptive_arf"].copy()
+    arf_log = outputs["execution_log"].loc[outputs["execution_log"]["strategy"] == "adaptive_arf"].copy()
+
+    assert set(yearly["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
+    assert not arf_rows.empty
+    assert set(arf_rows["balance_mode"].unique()) == {BALANCE_MODE_NOT_APPLICABLE}
+    assert set(arf_rows["prediction_year"].astype(int).unique()) == {2019, 2020}
+    assert len(arf_rows) == 2
+    assert arf_summary["balance_mode"].eq(BALANCE_MODE_NOT_APPLICABLE).all()
+    assert arf_log["balance_mode"].dropna().eq(BALANCE_MODE_NOT_APPLICABLE).all()
+
+
+def test_parse_repetition_seeds_and_multi_seed_logging(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
     assert parse_repetition_seeds("") == [42, 52, 62]
     assert parse_repetition_seeds("7, 9, 7 11") == [7, 9, 11]
 
@@ -369,6 +2247,45 @@ def test_parse_repetition_seeds_and_multi_seed_logging():
     assert not appendix_mean["A.6"].empty
     assert appendix_mean["A.6"]["n_repetitions"].eq(2).all()
     assert appendix_mean["A.6"]["seed_list"].str.contains("3").all()
+
+
+def test_persisted_recalibration_json_keeps_full_records(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=91)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=19,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(19,),
+    )
+
+    out_path = Path(str(outputs["optuna_json_path"]))
+    assert out_path.exists()
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+
+    assert {"appendix_tables", "appendix_tables_mean", "execution_log", "roc_payload"} <= set(payload.keys())
+    assert payload["execution_log"]
+    assert payload["roc_payload"]
+    assert payload["yearly_results"]
 
 
 def test_batch_range_builder_modes():
@@ -848,3 +2765,73 @@ def test_load_feature_payload_from_duckdb(tmp_path):
     assert not raw_df.empty
     assert not clean_df.empty
     assert set(["interval_start", "portico", "target", "flow_light"]).issubset(set(raw_df.columns))
+
+
+def test_feature_selection_payload_persists_with_feature_duckdb(tmp_path):
+    pytest.importorskip("duckdb")
+
+    db_path = tmp_path / "drift_features_with_selection.duckdb"
+    raw_df = pd.DataFrame(
+        {
+            "interval_start": pd.date_range("2024-01-01", periods=3, freq="5min"),
+            "portico": ["15", "14", "12"],
+            "target": [0, 1, 0],
+            "f1": [1.0, 2.0, 3.0],
+            "f2": [1.1, 2.1, 3.1],
+            "f3": [5.0, 4.0, 3.0],
+        }
+    )
+    clean_df = raw_df[["interval_start", "portico", "target", "f1", "f3"]].copy()
+    corr_pairs = pd.Series(
+        [0.981, 0.744],
+        index=pd.MultiIndex.from_tuples([("f1", "f2"), ("f1", "f3")]),
+        dtype=float,
+    )
+    importance_df = pd.DataFrame(
+        {
+            "feature": ["f1", "f3"],
+            "importance": [0.73, 0.27],
+            "rank": [1, 2],
+        }
+    )
+    selection_payload = _build_feature_selection_payload(
+        candidate_features=["f1", "f2", "f3"],
+        selected_features=["f1", "f3"],
+        corr_pairs=corr_pairs,
+        importance_df=importance_df,
+        config={
+            "method": "correlation_plus_random_forest",
+            "corr_threshold": 0.95,
+            "top_n": 2,
+            "generated_at": "2026-03-20T12:00:00",
+        },
+    )
+
+    _write_feature_payload_to_duckdb(
+        db_path,
+        raw_df=raw_df,
+        clean_df=clean_df,
+        selection_payload=selection_payload,
+    )
+
+    loaded_raw_df, loaded_clean_df = _load_feature_payload_from_duckdb(db_path)
+    loaded_selection = _load_feature_selection_payload_from_duckdb(db_path)
+
+    assert loaded_selection is not None
+    assert list(loaded_raw_df.columns) == list(raw_df.columns)
+    assert list(loaded_clean_df.columns) == list(clean_df.columns)
+    assert loaded_selection["candidate_features"] == ["f1", "f2", "f3"]
+    assert loaded_selection["selected_features"] == ["f1", "f3"]
+    assert loaded_selection["config"]["top_n"] == 2
+    assert loaded_selection["config"]["method"] == "correlation_plus_random_forest"
+    assert list(loaded_selection["importance_df"]["feature"]) == ["f1", "f3"]
+    assert loaded_selection["corr_pairs"].loc[("f1", "f2")] == pytest.approx(0.981)
+
+    _write_feature_payload_to_duckdb(
+        db_path,
+        raw_df=raw_df,
+        clean_df=clean_df,
+        selection_payload=None,
+    )
+
+    assert _load_feature_selection_payload_from_duckdb(db_path) is None

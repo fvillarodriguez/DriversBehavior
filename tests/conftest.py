@@ -1,5 +1,6 @@
 import os
 import sys
+import types
 
 import pytest
 import pandas as pd
@@ -9,6 +10,35 @@ import numpy as np
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+try:
+    import tqdm as _tqdm  # noqa: F401
+except ImportError:
+    fake_tqdm = types.ModuleType("tqdm")
+
+    class _DummyTqdm:
+        def __init__(self, iterable=None, *args, **kwargs):
+            self._iterable = iterable
+
+        def __iter__(self):
+            if self._iterable is None:
+                return iter(())
+            return iter(self._iterable)
+
+        def update(self, *args, **kwargs):
+            return None
+
+        def set_description(self, *args, **kwargs):
+            return None
+
+        def reset(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    fake_tqdm.tqdm = _DummyTqdm
+    sys.modules["tqdm"] = fake_tqdm
 
 @pytest.fixture
 def sample_flow_data():
