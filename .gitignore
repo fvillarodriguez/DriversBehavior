@@ -17,6 +17,9 @@ NLP/
 DRIFT/
 Archivo.zip
 email_config.json
+.claude/
+tmp/
+
 
 # MACOS
 .DS_Store

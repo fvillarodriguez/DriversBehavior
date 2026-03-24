@@ -960,6 +960,9 @@ class _ExperimentProgress:
         if detail:
             self._detail.caption(detail)
         else:
+            if total_units == 1 and abs(completed_units) < 1e-9:
+                self._detail.caption("Inicializando plan de ejecucion...")
+                return
             if abs(completed_units - round(completed_units)) < 1e-9:
                 self._detail.caption(f"{int(round(completed_units))} / {total_units} bloques completados")
             else:
@@ -8046,6 +8049,15 @@ def run_recalibration_experiments(
     """
     Main orchestrator for yearly, ADWIN-adaptive and ARF-adaptive strategies.
     """
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "completed_units": 0.0,
+                "total_units": 1,
+                "label": "Analizando configuracion de experimentos...",
+                "detail": "Construyendo bloques, ventanas de tuning y politica de checkpoint.",
+            }
+        )
     if model_names is None:
         model_names = MODEL_NAMES
     if strategies is None:
@@ -8155,6 +8167,18 @@ def run_recalibration_experiments(
     adaptive_frames: List[pd.DataFrame] = []
     execution_log: List[Dict[str, Any]] = []
     studies: List[Dict[str, Any]] = []
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "completed_units": 0.0,
+                "total_units": int(total_units),
+                "label": "Preparando experimentos...",
+                "detail": (
+                    f"Plan preliminar: {len(tuning_tasks)} tareas de tuning y "
+                    f"{total_block_units} bloques experimentales."
+                ),
+            }
+        )
     preflight = _estimate_recalibration_workload(
         df=df,
         feature_cols=feature_cols,
@@ -8175,6 +8199,15 @@ def run_recalibration_experiments(
         fast_mode=bool(fast_mode),
         custom_grids=custom_grids,
     )
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "completed_units": 0.0,
+                "total_units": int(total_units),
+                "label": "Resolviendo checkpoint compatible...",
+                "detail": "Calculando identificador de corrida y validando artefactos persistidos.",
+            }
+        )
     available_years = _available_prediction_years(df, time_col)
     prediction_years = [
         int(year)
