@@ -1,0 +1,174 @@
+\babel@toc {spanish}{}\relax 
+\contentsline {section}{\numberline {1}Clustering}{4}{section.1}%
+\contentsline {subsection}{\numberline {1.1}Objetivo}{4}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}Datos y preprocesamiento}{4}{subsection.1.2}%
+\contentsline {paragraph}{Normalización de matrícula}{4}{section*.2}%
+\contentsline {paragraph}{Limpieza de carril y duplicados}{4}{section*.3}%
+\contentsline {paragraph}{Tratamiento de atípicos en velocidad}{5}{section*.4}%
+\contentsline {subsection}{\numberline {1.3}Ingeniería de \textit {features} por conductor}{5}{subsection.1.3}%
+\contentsline {subsubsection}{\numberline {1.3.1}Conteos, velocidad media y uso de carril}{5}{subsubsection.1.3.1}%
+\contentsline {subsubsection}{\numberline {1.3.2}Velocidad relativa}{5}{subsubsection.1.3.2}%
+\contentsline {subsubsection}{\numberline {1.3.3}Headway (brecha temporal)}{6}{subsubsection.1.3.3}%
+\contentsline {subsubsection}{\numberline {1.3.4}TTC y tasa de conflictos}{6}{subsubsection.1.3.4}%
+\contentsline {subsubsection}{\numberline {1.3.5}Cambios de carril}{6}{subsubsection.1.3.5}%
+\contentsline {subsubsection}{\numberline {1.3.6}Ponderación mensual (opcional)}{6}{subsubsection.1.3.6}%
+\contentsline {subsubsection}{\numberline {1.3.7}Actividad temporal}{6}{subsubsection.1.3.7}%
+\contentsline {subsection}{\numberline {1.4}Preparación de datos para clustering}{7}{subsection.1.4}%
+\contentsline {subsection}{\numberline {1.5}Métodos de clustering}{7}{subsection.1.5}%
+\contentsline {subsubsection}{\numberline {1.5.1}K-means}{7}{subsubsection.1.5.1}%
+\contentsline {paragraph}{Selección de $K$ (métricas)}{7}{section*.5}%
+\contentsline {subsubsection}{\numberline {1.5.2}Gaussian Mixture Models (GMM)}{7}{subsubsection.1.5.2}%
+\contentsline {subsubsection}{\numberline {1.5.3}HDBSCAN}{7}{subsubsection.1.5.3}%
+\contentsline {subsection}{\numberline {1.6}Conductores frecuentes vs. raros (opcional)}{8}{subsection.1.6}%
+\contentsline {subsection}{\numberline {1.7}Salidas y artefactos}{8}{subsection.1.7}%
+\contentsline {subsection}{\numberline {1.8}Variables de clusters agregadas por pórtico e intervalo}{8}{subsection.1.8}%
+\contentsline {section}{\numberline {2}Predicción de accidentes}{8}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Objetivo}{8}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}Fuentes de datos}{9}{subsection.2.2}%
+\contentsline {paragraph}{Flujos (detecciones)}{9}{section*.6}%
+\contentsline {paragraph}{Eventos (accidentes)}{9}{section*.7}%
+\contentsline {subsection}{\numberline {2.3}Discretización temporal y notación}{9}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}Ingeniería de variables (features)}{9}{subsection.2.4}%
+\contentsline {subsubsection}{\numberline {2.4.1}Variables macro de flujo}{9}{subsubsection.2.4.1}%
+\contentsline {subsubsection}{\numberline {2.4.2}Variables de clusters agregadas (opcional)}{9}{subsubsection.2.4.2}%
+\contentsline {subsection}{\numberline {2.5}Definición del target (etiqueta)}{10}{subsection.2.5}%
+\contentsline {subsection}{\numberline {2.6}Construcción del dataset}{10}{subsection.2.6}%
+\contentsline {subsection}{\numberline {2.7}Partición temporal (train/validación/test)}{10}{subsection.2.7}%
+\contentsline {subsection}{\numberline {2.8}Manejo de desbalance}{10}{subsection.2.8}%
+\contentsline {subsection}{\numberline {2.9}Modelos}{10}{subsection.2.9}%
+\contentsline {subsection}{\numberline {2.10}Calibración de umbral con FAR}{11}{subsection.2.10}%
+\contentsline {subsection}{\numberline {2.11}Métricas de evaluación}{11}{subsection.2.11}%
+\contentsline {subsection}{\numberline {2.12}Selección de variables y optimización}{11}{subsection.2.12}%
+\contentsline {paragraph}{Importancia de variables}{11}{section*.8}%
+\contentsline {paragraph}{Optuna + SMOTE}{11}{section*.9}%
+\contentsline {subsection}{\numberline {2.13}Experimentos: efecto de variables de cluster}{11}{subsection.2.13}%
+\contentsline {subsection}{\numberline {2.14}Artefactos}{11}{subsection.2.14}%
+\contentsline {section}{\numberline {3}Drift detection}{12}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Objetivo, alcance y relaci\'on con el paper}{12}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Dependencias y fuentes de datos}{12}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Mapa de la interfaz tab a tab}{12}{subsection.3.3}%
+\contentsline {paragraph}{Blueprint}{12}{section*.10}%
+\contentsline {paragraph}{Eventos}{13}{section*.11}%
+\contentsline {paragraph}{Feature engineering}{13}{section*.12}%
+\contentsline {paragraph}{Feature Selection}{13}{section*.13}%
+\contentsline {paragraph}{Experiments}{13}{section*.14}%
+\contentsline {paragraph}{Coverage}{13}{section*.15}%
+\contentsline {subsection}{\numberline {3.4}Feature engineering y construcci\'on del target}{13}{subsection.3.4}%
+\contentsline {paragraph}{Notaci\'on operativa}{13}{section*.16}%
+\contentsline {paragraph}{Espacio de variables generado}{14}{section*.17}%
+\contentsline {paragraph}{Variables por p\'ortico y tipo de veh\'iculo}{14}{section*.18}%
+\contentsline {paragraph}{Fracciones composicionales por p\'ortico}{15}{section*.19}%
+\contentsline {paragraph}{Matching por segmento entre p\'orticos consecutivos}{15}{section*.20}%
+\contentsline {paragraph}{Variables por segmento y tipo de veh\'iculo}{16}{section*.21}%
+\contentsline {paragraph}{Variables globales por segmento y por carril de origen}{16}{section*.22}%
+\contentsline {paragraph}{Reglas de borde y consistencia num\'erica}{16}{section*.23}%
+\contentsline {paragraph}{Construcci\'on del target}{17}{section*.24}%
+\contentsline {subsection}{\numberline {3.5}Preparaci\'on de datos: Stage 1 y Stage 2}{17}{subsection.3.5}%
+\contentsline {subsection}{\numberline {3.6}Selecci\'on de variables}{17}{subsection.3.6}%
+\contentsline {subsection}{\numberline {3.7}Dise\~no experimental y estrategias}{17}{subsection.3.7}%
+\contentsline {paragraph}{Configuraci\'on experimental formal}{18}{section*.25}%
+\contentsline {paragraph}{Entrenamiento batch interno y calibraci\'on de threshold}{18}{section*.26}%
+\contentsline {paragraph}{Pol\'itica de estabilidad para NNet}{19}{section*.27}%
+\contentsline {paragraph}{Balanceo con SMOTE}{19}{section*.28}%
+\contentsline {paragraph}{Estrategias batch anuales}{19}{section*.29}%
+\contentsline {paragraph}{Recalibraci\'on adaptativa con ADWIN}{20}{section*.30}%
+\contentsline {paragraph}{Adaptive Random Forest}{20}{section*.31}%
+\contentsline {paragraph}{Recalibraci\'on adaptativa con KSWIN}{21}{section*.32}%
+\contentsline {paragraph}{Semillas, tuning global, persistencia y reanudaci\'on}{22}{section*.33}%
+\contentsline {paragraph}{Resultados esperados}{22}{section*.34}%
+\contentsline {subsection}{\numberline {3.8}M\'etricas, tablas y artefactos finales}{23}{subsection.3.8}%
+\contentsline {subsection}{\numberline {3.9}Validaci\'on mediante pruebas}{23}{subsection.3.9}%
+\contentsline {section}{\numberline {4}Introducción}{24}{section.4}%
+\contentsline {section}{\numberline {5}Preprocesamiento de Datos}{24}{section.5}%
+\contentsline {section}{\numberline {6}Cálculo de Variables (Nivel Evento)}{24}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Headway ($h_i$)}{24}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Velocidad Relativa Indexada ($v_{rel, i}$)}{25}{subsection.6.2}%
+\contentsline {subsection}{\numberline {6.3}Conflicto y TTC (Time To Collision)}{25}{subsection.6.3}%
+\contentsline {section}{\numberline {7}Agregación por Patante}{25}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Variables Agregadas}{25}{subsection.7.1}%
+\contentsline {subsubsection}{\numberline {7.1.1}Velocidad Promedio ($\bar {v}_P$)}{25}{subsubsection.7.1.1}%
+\contentsline {subsubsection}{\numberline {7.1.2}Velocidad Relativa Promedio ($\bar {v}_{rel, P}$)}{25}{subsubsection.7.1.2}%
+\contentsline {subsubsection}{\numberline {7.1.3}Headway Promedio ($\bar {h}_P$)}{25}{subsubsection.7.1.3}%
+\contentsline {subsubsection}{\numberline {7.1.4}Tasa de Conflicto ($CR_P$)}{26}{subsubsection.7.1.4}%
+\contentsline {subsubsection}{\numberline {7.1.5}Uso de Carriles ($Lane_k$)}{26}{subsubsection.7.1.5}%
+\contentsline {subsubsection}{\numberline {7.1.6}Tasa de Cambio de Pista ($LCR_P$)}{26}{subsubsection.7.1.6}%
+\contentsline {subsection}{\numberline {7.2}Estrategias de Consolidación}{26}{subsection.7.2}%
+\contentsline {subsubsection}{\numberline {7.2.1}1. Agregación Global (Default)}{26}{subsubsection.7.2.1}%
+\contentsline {subsubsection}{\numberline {7.2.2}2. Ponderación Mensual}{26}{subsubsection.7.2.2}%
+\contentsline {section}{\numberline {8}Definición de Conductores Frecuentes}{26}{section.8}%
+\contentsline {section}{\numberline {9}Implementación en Python}{27}{section.9}%
+\contentsline {subsection}{\numberline {9.1}Limpieza de Datos: \texttt {clean\_flujos\_for\_clustering}}{27}{subsection.9.1}%
+\contentsline {subsection}{\numberline {9.2}Cálculo de Features: \texttt {Clusterization}}{27}{subsection.9.2}%
+\contentsline {subsubsection}{\numberline {9.2.1}1. Métricas Simples y Pre-cálculo}{27}{subsubsection.9.2.1}%
+\contentsline {subsubsection}{\numberline {9.2.2}2. Velocidad Relativa}{27}{subsubsection.9.2.2}%
+\contentsline {subsubsection}{\numberline {9.2.3}3. Métricas de Interacción (Headway, Conflicto)}{28}{subsubsection.9.2.3}%
+\contentsline {subsubsection}{\numberline {9.2.4}4. Cambios de Pista (\texttt {Lane Changes})}{28}{subsubsection.9.2.4}%
+\contentsline {subsubsection}{\numberline {9.2.5}5. Ponderación (Si aplica)}{28}{subsubsection.9.2.5}%
+\contentsline {section}{\numberline {10}Alcance y metodolog\'ia}{28}{section.10}%
+\contentsline {section}{\numberline {11}Mapa general del pipeline}{29}{section.11}%
+\contentsline {section}{\numberline {12}Pipeline \emph {tab a tab} (Streamlit Graph Builder)}{29}{section.12}%
+\contentsline {subsection}{\numberline {12.1}Eventos}{29}{subsection.12.1}%
+\contentsline {subsection}{\numberline {12.2}Feature Engineering}{29}{subsection.12.2}%
+\contentsline {subsection}{\numberline {12.3}Feature Explorer}{30}{subsection.12.3}%
+\contentsline {subsection}{\numberline {12.4}Feature Selection}{30}{subsection.12.4}%
+\contentsline {subsection}{\numberline {12.5}Graph}{30}{subsection.12.5}%
+\contentsline {subsection}{\numberline {12.6}Visual Graph}{30}{subsection.12.6}%
+\contentsline {subsection}{\numberline {12.7}Network}{30}{subsection.12.7}%
+\contentsline {subsection}{\numberline {12.8}Optuna}{30}{subsection.12.8}%
+\contentsline {subsection}{\numberline {12.9}Balance}{30}{subsection.12.9}%
+\contentsline {subsection}{\numberline {12.10}Training}{31}{subsection.12.10}%
+\contentsline {subsection}{\numberline {12.11}Evaluaci\'on}{31}{subsection.12.11}%
+\contentsline {subsection}{\numberline {12.12}History}{31}{subsection.12.12}%
+\contentsline {subsection}{\numberline {12.13}Experiments}{31}{subsection.12.13}%
+\contentsline {section}{\numberline {13}Modelo de datos del grafo}{31}{section.13}%
+\contentsline {subsection}{\numberline {13.1}Aristas y atributos}{31}{subsection.13.1}%
+\contentsline {subsection}{\numberline {13.2}Etiquetado temporal}{31}{subsection.13.2}%
+\contentsline {section}{\numberline {14}Arquitectura del modelo GNN}{32}{section.14}%
+\contentsline {subsection}{\numberline {14.1}Temporal head (opcional)}{32}{subsection.14.1}%
+\contentsline {subsection}{\numberline {14.2}Registro de variantes GNN (encoder + temporal + aristas)}{32}{subsection.14.2}%
+\contentsline {subsubsection}{\numberline {14.2.1}Idea general de comparabilidad}{32}{subsubsection.14.2.1}%
+\contentsline {paragraph}{Etiquetado ``5 minutos antes''}{32}{section*.35}%
+\contentsline {subsubsection}{\numberline {14.2.2}Variantes implementadas}{33}{subsubsection.14.2.2}%
+\contentsline {subsubsection}{\numberline {14.2.3}Codificaci\'on de aristas (\texttt {edge\_attr})}{33}{subsubsection.14.2.3}%
+\contentsline {subsubsection}{\numberline {14.2.4}Heads temporales y ensamblado de secuencias}{33}{subsubsection.14.2.4}%
+\contentsline {subsubsection}{\numberline {14.2.5}Estrategias de cache temporal (punto cr\'itico)}{33}{subsubsection.14.2.5}%
+\contentsline {subsubsection}{\numberline {14.2.6}Matriz experimental recomendada}{34}{subsubsection.14.2.6}%
+\contentsline {subsubsection}{\numberline {14.2.7}M\'etricas para eventos raros}{34}{subsubsection.14.2.7}%
+\contentsline {subsubsection}{\numberline {14.2.8}Trazabilidad de variantes}{34}{subsubsection.14.2.8}%
+\contentsline {section}{\numberline {15}Entrenamiento y optimizaci\'on}{34}{section.15}%
+\contentsline {subsection}{\numberline {15.1}Flujo del entrenamiento}{34}{subsection.15.1}%
+\contentsline {subsection}{\numberline {15.2}Train-minibatch y regularizaci\'on}{35}{subsection.15.2}%
+\contentsline {section}{\numberline {16}GraphSMOTE: s\'intesis de nodos y aristas}{35}{section.16}%
+\contentsline {subsection}{\numberline {16.1}Paso 1: embeddings}{35}{subsection.16.1}%
+\contentsline {subsection}{\numberline {16.2}Paso 2: SMOTE en embeddings}{35}{subsection.16.2}%
+\contentsline {subsection}{\numberline {16.3}Paso 3: decodificadores z\textrightarrow x}{35}{subsection.16.3}%
+\contentsline {subsection}{\numberline {16.4}Paso 4: inserci\'on de nodos}{36}{subsection.16.4}%
+\contentsline {subsection}{\numberline {16.5}Paso 5: generaci\'on de aristas sint\'eticas}{36}{subsection.16.5}%
+\contentsline {subsection}{\numberline {16.6}Modos de operaci\'on}{36}{subsection.16.6}%
+\contentsline {section}{\numberline {17}ImGAGN: generaci\'on adversarial}{36}{section.17}%
+\contentsline {subsection}{\numberline {17.1}Paso 1: homogenizaci\'on}{36}{subsection.17.1}%
+\contentsline {subsection}{\numberline {17.2}Paso 2: definir cantidad de sint\'eticos}{36}{subsection.17.2}%
+\contentsline {subsection}{\numberline {17.3}Paso 3: generador}{37}{subsection.17.3}%
+\contentsline {subsection}{\numberline {17.4}Paso 4: discriminador}{37}{subsection.17.4}%
+\contentsline {subsection}{\numberline {17.5}Paso 5: entrenamiento adversarial}{37}{subsection.17.5}%
+\contentsline {subsection}{\numberline {17.6}Paso 6: grafo final}{37}{subsection.17.6}%
+\contentsline {section}{\numberline {18}Optuna (b\'usqueda de hiperpar\'ametros)}{37}{section.18}%
+\contentsline {section}{\numberline {19}Evaluaci\'on, calibraci\'on y artefactos}{38}{section.19}%
+\contentsline {section}{\numberline {20}Auditor\'ia t\'ecnica y mejores pr\'acticas}{38}{section.20}%
+\contentsline {subsection}{\numberline {20.1}Fortalezas observadas}{38}{subsection.20.1}%
+\contentsline {subsection}{\numberline {20.2}Riesgos o puntos cr\'iticos (actualizado)}{38}{subsection.20.2}%
+\contentsline {subsection}{\numberline {20.3}Recomendaciones priorizadas (estado actual)}{39}{subsection.20.3}%
+\contentsline {section}{\numberline {21}Anexo: referencias a funciones y archivos}{39}{section.21}%
+\contentsline {section}{\numberline {22}Implementación de MA-AIRL}{39}{section.22}%
+\contentsline {subsection}{\numberline {22.1}Objetivo y alcance}{39}{subsection.22.1}%
+\contentsline {subsection}{\numberline {22.2}Arquitectura general}{39}{subsection.22.2}%
+\contentsline {subsection}{\numberline {22.3}Datos expertos y construcción del estado}{40}{subsection.22.3}%
+\contentsline {subsection}{\numberline {22.4}Acciones expertas (proxy de SUMO)}{40}{subsection.22.4}%
+\contentsline {subsection}{\numberline {22.5}Modelos de MA-AIRL}{40}{subsection.22.5}%
+\contentsline {subsection}{\numberline {22.6}Función discriminadora y objetivo}{40}{subsection.22.6}%
+\contentsline {subsection}{\numberline {22.7}Proxy temporal}{41}{subsection.22.7}%
+\contentsline {subsection}{\numberline {22.8}Métricas de entrenamiento}{41}{subsection.22.8}%
+\contentsline {subsection}{\numberline {22.9}Exportación de parámetros a SUMO}{41}{subsection.22.9}%
+\contentsline {subsection}{\numberline {22.10}Integración en la UI}{41}{subsection.22.10}%
+\contentsline {subsection}{\numberline {22.11}Archivos modificados}{41}{subsection.22.11}%
+\contentsline {subsection}{\numberline {22.12}Limitaciones actuales y próximos pasos}{41}{subsection.22.12}%

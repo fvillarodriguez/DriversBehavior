@@ -226,7 +226,9 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
     assert isinstance(payload["block_df"], pd.DataFrame)
     assert len(payload["block_df"]) == 2
     assert not payload["summary_df"].empty
-    assert set(payload["summary_df"]["source"].unique()) == {"yearly", "adaptive"}
+    assert set(payload["summary_df"]["strategy"].unique()) == {"static", "adaptive_adwin"}
+    assert "n_segments" in payload["summary_df"].columns
+    assert "n_repetitions" in payload["summary_df"].columns
     assert not payload["tuning_trials_df"].empty
     assert not payload["memory_trace_df"].empty
     assert not payload["live_events_df"].empty

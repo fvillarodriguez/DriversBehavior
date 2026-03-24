@@ -230,6 +230,18 @@ def test_simple_adwin_detects_shift():
     assert detections >= 1
 
 
+def test_simple_adwin_uses_canonical_hoeffding_bound():
+    detector = SimpleADWIN(delta=0.002, min_window=80, min_subwindow=20)
+
+    n0 = 40
+    n1 = 60
+    n = n0 + n1
+
+    expected = np.sqrt((1.0 / (2.0 * (1.0 / ((1.0 / n0) + (1.0 / n1))))) * np.log(4.0 * n / detector.delta))
+
+    assert detector._hoeffding_cut_threshold(n0, n1, n) == pytest.approx(expected)
+
+
 def test_run_yearly_strategy_static_random_forest():
     df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=280, random_state=7)
     features = [
@@ -421,6 +433,34 @@ def test_build_model_full_memory_mode_uses_all_visible_cpus(monkeypatch):
     )
 
     assert int(model.n_jobs) == max(1, int(os.cpu_count() or 1))
+
+
+@pytest.mark.parametrize(
+    ("splitrule", "expected_type"),
+    [
+        ("gini", "RandomForestClassifier"),
+        ("extratrees", "ExtraTreesClassifier"),
+    ],
+)
+def test_build_model_disables_class_weight_when_smote(splitrule, expected_type):
+    smote_model = drift_app._build_model(
+        "Random Forest",
+        {"splitrule": splitrule, "mtry": 2, "min_node_size": 1},
+        random_state=13,
+        n_features=5,
+        balance_mode=BALANCE_MODE_SMOTE,
+    )
+    default_model = drift_app._build_model(
+        "Random Forest",
+        {"splitrule": splitrule, "mtry": 2, "min_node_size": 1},
+        random_state=13,
+        n_features=5,
+        balance_mode=BALANCE_MODE_NONE,
+    )
+
+    assert type(smote_model).__name__ == expected_type
+    assert smote_model.class_weight is None
+    assert default_model.class_weight in {"balanced_subsample", "balanced"}
 
 
 def test_recalibration_run_id_is_deterministic():
@@ -856,6 +896,13 @@ def test_train_model_with_internal_validation_refits_final_model_on_full_trainin
     assert fit_sizes[-1] == len(train_df)
     assert len(fit_sizes) >= 3
     assert 0.0 <= float(bundle["threshold"]) <= 1.0
+    assert bundle["operating_threshold"] == pytest.approx(bundle["threshold"])
+    assert bundle["calibration_method"] == drift_app.DEFAULT_CALIBRATION_METHOD
+    assert bundle["threshold_policy"] == drift_app.DEFAULT_THRESHOLD_POLICY
+    assert bundle["fn_cost"] == pytest.approx(drift_app.DEFAULT_THRESHOLD_FN_COST)
+    assert bundle["fp_cost"] == pytest.approx(drift_app.DEFAULT_THRESHOLD_FP_COST)
+    assert "calibration_metadata" in bundle
+    assert "raw_youden_threshold" in bundle
 
 
 def test_fit_nnet_warning_safe_suppresses_convergence_warning():
@@ -995,6 +1042,8 @@ def test_train_model_with_internal_validation_builds_feature_transform_for_nnet(
     assert bundle["feature_transform"]["kind"] == "standard_scaler"
     assert bundle["feature_transform"]["policy_version"] == drift_app.NNET_TRAINING_POLICY_VERSION
     assert len(bundle["feature_transform"]["columns"]) == 2
+    assert bundle["calibration_method"] == drift_app.DEFAULT_CALIBRATION_METHOD
+    assert bundle["operating_threshold"] == pytest.approx(bundle["threshold"])
 
     eval_payload = _evaluate_split(
         bundle["model"],
@@ -1004,9 +1053,12 @@ def test_train_model_with_internal_validation_builds_feature_transform_for_nnet(
         threshold=float(bundle["threshold"]),
         fill_values=bundle.get("fill_values"),
         feature_transform=bundle.get("feature_transform"),
+        calibration_model=bundle.get("calibration_model"),
+        calibration_metadata=bundle.get("calibration_metadata"),
     )
 
     assert len(eval_payload["scores"]) == len(train_df)
+    assert len(eval_payload["calibrated_scores"]) == len(train_df)
 
 
 def test_tune_hyperparameters_caps_adaboost_trials_to_search_space():
@@ -1349,6 +1401,45 @@ def test_resource_mode_changes_run_and_tuning_keys():
     assert restricted_tuning_key != full_tuning_key
 
 
+def test_batch_tuning_tasks_scope_by_window_and_dedupe_identical_train_signatures():
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=40, random_state=223)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    tasks = drift_app._batch_tuning_tasks(
+        df=df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static", "period_aligned", "cumulative", drift_app.ADAPTIVE_ADWIN_STRATEGY],
+        balance_modes=[BALANCE_MODE_NONE],
+        base_year=2018,
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
+        grid_limit=1,
+        custom_grids=None,
+    )
+
+    assert len(tasks) == 3
+    assert len({task["tuning_key"] for task in tasks}) == 3
+    assert any(task["window_kind"] == "base_year" for task in tasks)
+    assert any(task["window_kind"] == "period_aligned" and task["training_year_label"] == "2019" for task in tasks)
+    assert any(task["window_kind"] == "cumulative" and task["prediction_year"] == 2020 for task in tasks)
+
+
 def test_load_or_create_smote_artifact_reuses_exact_signature(tmp_path, monkeypatch):
     pytest.importorskip("imblearn")
 
@@ -1450,6 +1541,8 @@ def test_train_model_with_internal_validation_smote_refits_on_full_training_data
     assert bundle["smote_params"]
     assert bundle["tuning_artifact"]["smote_params"] == bundle["smote_params"]
     assert bundle["search_df"]["balance_mode"].eq(BALANCE_MODE_SMOTE).all()
+    assert bundle["calibration_method"] == drift_app.DEFAULT_CALIBRATION_METHOD
+    assert bundle["threshold_policy"] == drift_app.DEFAULT_THRESHOLD_POLICY
 
     eval_payload = _evaluate_split(
         bundle["model"],
@@ -1458,10 +1551,14 @@ def test_train_model_with_internal_validation_smote_refits_on_full_training_data
         target_col="target",
         threshold=float(bundle["threshold"]),
         fill_values=bundle.get("fill_values"),
+        feature_transform=bundle.get("feature_transform"),
+        calibration_model=bundle.get("calibration_model"),
+        calibration_metadata=bundle.get("calibration_metadata"),
     )
 
     assert len(eval_payload["y_true"]) == len(test_df)
     assert len(eval_payload["scores"]) == len(test_df)
+    assert len(eval_payload["calibrated_scores"]) == len(test_df)
 
 
 def test_train_arf_with_internal_validation_uses_warm_block_fill_values(monkeypatch):
@@ -2013,7 +2110,7 @@ def test_recalibration_experiments_persist_live_status_and_events(tmp_path, monk
     assert live_status["status"] == "completed"
     assert live_status["context"]["phase"] == "run_complete"
     assert live_status["progress_ratio"] == pytest.approx(1.0)
-    assert any(event["context"].get("phase") == "global_tuning" for event in live_events)
+    assert any(event["context"].get("phase") == "window_tuning" for event in live_events)
     assert any(event["context"].get("phase") == "block_running" for event in live_events)
     assert any(event["context"].get("phase") == "block_complete" for event in live_events)
     assert progress_updates
@@ -2160,6 +2257,124 @@ def test_recalibration_experiments_resume_from_failed_checkpoint(tmp_path, monke
     assert tuning_calls == []
     assert set(outputs["yearly_results"]["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
     assert outputs["checkpoint_manifest"]["status"] == "completed"
+
+
+def test_recalibration_experiments_can_skip_failed_blocks_and_continue(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=19)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    block_calls = []
+
+    def fake_tune_hyperparameters(X, y, **kwargs):
+        params = {"mtry": 2, "splitrule": "gini", "min_node_size": 1}
+        artifact = {
+            "study_id": f"study_{kwargs['model_name']}_{kwargs['balance_mode']}",
+            "model_name": kwargs["model_name"],
+            "balance_mode": kwargs["balance_mode"],
+            "best_value": 0.75,
+            "best_params": params,
+            "model_params": params,
+            "smote_params": {},
+            "n_trials": 1,
+            "requested_trials": 1,
+            "search_space_size": 1,
+            "search_space": {"mtry": [2]},
+            "trials": [
+                {
+                    "trial_number": 0,
+                    "state": "COMPLETE",
+                    "cv_auc": 0.75,
+                    "params": params,
+                    "model_params": params,
+                    "smote_params": {},
+                }
+            ],
+        }
+        return params, pd.DataFrame([{"trial_number": 0, "model": kwargs["model_name"], "cv_auc": 0.75, "params": "{}", "state": "COMPLETE", "balance_mode": kwargs["balance_mode"]}]), artifact
+
+    def fake_run_yearly_strategy(*args, **kwargs):
+        block_calls.append((kwargs["balance_mode"], kwargs["run_seed"], kwargs["run_order"]))
+        if kwargs["balance_mode"] == BALANCE_MODE_SMOTE and kwargs["run_seed"] == 11:
+            raise RuntimeError("forced block failure")
+        rows = pd.DataFrame(
+            [
+                {
+                    "strategy": kwargs["strategy"],
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": kwargs["model_names"][0],
+                    "balance_mode": kwargs["balance_mode"],
+                    "auc": 0.8,
+                    "sensitivity": 0.7,
+                    "specificity": 0.75,
+                    "error_rate": 0.2,
+                    "threshold": 0.5,
+                    "training_time_sec": 0.1,
+                    "n_train": 10,
+                    "n_test": 10,
+                    "best_params": "{}",
+                    "run_seed": kwargs["run_seed"],
+                    "run_order": kwargs["run_order"],
+                }
+            ]
+        )
+        roc_payload = [
+            {
+                "strategy": kwargs["strategy"],
+                "model": kwargs["model_names"][0],
+                "balance_mode": kwargs["balance_mode"],
+                "segment": "2019",
+                "y_true": np.asarray([0, 1]),
+                "scores": np.asarray([0.1, 0.9]),
+                "run_seed": kwargs["run_seed"],
+                "run_order": kwargs["run_order"],
+            }
+        ]
+        return rows, roc_payload
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(drift_app, "run_yearly_strategy", fake_run_yearly_strategy)
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11, 12),
+        balance_modes=(BALANCE_MODE_NONE, BALANCE_MODE_SMOTE),
+        checkpoint_root=tmp_path / "runs",
+        continue_on_block_error=True,
+    )
+
+    manifest = outputs["checkpoint_manifest"]
+    assert outputs["auto_resumed"] is False
+    assert manifest["status"] == "completed"
+    assert len(manifest["completed_block_ids"]) == 3
+    assert len(manifest["skipped_failed_block_ids"]) == 1
+    assert len(manifest["nonfatal_block_errors"]) == 1
+    assert manifest["progress"]["skipped_failed_blocks"] == 1
+    assert len(outputs["yearly_results"]) == 3
+    assert len(block_calls) == 4
+    skipped_block_id = manifest["skipped_failed_block_ids"][0]
+    assert manifest["block_index"][skipped_block_id]["status"] == "skipped_failed"
 
 
 def test_adaptive_adwin_optuna_studies_capture_base_and_retrains_with_balance_mode():

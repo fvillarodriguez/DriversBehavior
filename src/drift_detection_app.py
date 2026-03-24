@@ -34,6 +34,7 @@ from joblib import Parallel as JoblibParallel
 from joblib import delayed as joblib_delayed
 from sklearn.ensemble import AdaBoostClassifier, ExtraTreesClassifier, RandomForestClassifier
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
 from sklearn.model_selection import ParameterGrid, StratifiedKFold, train_test_split
 from sklearn.neural_network import MLPClassifier
@@ -110,6 +111,13 @@ PAPER_TITLE = (
 PAPER_TIME_SPAN = "2018-01-01 to 2024-09-30"
 NNET_TRAINING_POLICY_VERSION = "scaled_early_stopping_v1"
 NNET_MAX_ITER_RETRY_CAP = 1000
+WINDOW_TUNING_POLICY_VERSION = "window_scoped_tuning_v1"
+RF_SMOTE_BALANCE_POLICY_VERSION = "rf_disable_class_weight_when_smote_v1"
+THRESHOLD_CALIBRATION_POLICY_VERSION = "platt_expected_cost_fn5_fp1_v1"
+DEFAULT_CALIBRATION_METHOD = "platt"
+DEFAULT_THRESHOLD_POLICY = "expected_cost"
+DEFAULT_THRESHOLD_FN_COST = 5.0
+DEFAULT_THRESHOLD_FP_COST = 1.0
 
 
 class ModelTrainingSkipped(RuntimeError):
@@ -150,6 +158,18 @@ def _import_external_xgboost():
             f"Modulo cargado: {module_path}"
         )
     return xgb
+
+
+def _recalibration_policy_signature() -> Dict[str, Any]:
+    return {
+        "window_tuning_policy_version": WINDOW_TUNING_POLICY_VERSION,
+        "rf_smote_balance_policy_version": RF_SMOTE_BALANCE_POLICY_VERSION,
+        "threshold_calibration_policy_version": THRESHOLD_CALIBRATION_POLICY_VERSION,
+        "calibration_method": DEFAULT_CALIBRATION_METHOD,
+        "threshold_policy": DEFAULT_THRESHOLD_POLICY,
+        "fn_cost": float(DEFAULT_THRESHOLD_FN_COST),
+        "fp_cost": float(DEFAULT_THRESHOLD_FP_COST),
+    }
 
 ARTICLE_SECTIONS: List[Tuple[str, str]] = [
     ("1", "Introduction"),
@@ -2148,6 +2168,134 @@ def youden_threshold(y_true: np.ndarray, scores: np.ndarray) -> Dict[str, float]
     }
 
 
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    clipped = np.clip(arr, -500.0, 500.0)
+    return 1.0 / (1.0 + np.exp(-clipped))
+
+
+def _fit_platt_calibrator(
+    y_true: np.ndarray,
+    raw_scores: np.ndarray,
+) -> Tuple[np.ndarray, Dict[str, Any], Optional[LogisticRegression]]:
+    y = np.asarray(y_true).astype(int)
+    scores = np.asarray(raw_scores, dtype=float)
+    mask = np.isfinite(scores)
+    metadata: Dict[str, Any] = {
+        "method": DEFAULT_CALIBRATION_METHOD,
+        "policy_version": THRESHOLD_CALIBRATION_POLICY_VERSION,
+        "kind": "identity",
+        "applied": False,
+        "coef": 1.0,
+        "intercept": 0.0,
+    }
+    if mask.sum() < 2 or np.unique(y[mask]).size < 2:
+        calibrated = np.full(len(scores), np.nan, dtype=float)
+        calibrated[mask] = np.clip(scores[mask], 0.0, 1.0)
+        metadata["reason"] = "insufficient_classes_or_scores"
+        return calibrated, metadata, None
+
+    model = LogisticRegression(max_iter=1000)
+    try:
+        model.fit(scores[mask].reshape(-1, 1), y[mask])
+    except Exception as exc:
+        calibrated = np.full(len(scores), np.nan, dtype=float)
+        calibrated[mask] = np.clip(scores[mask], 0.0, 1.0)
+        metadata["reason"] = f"fit_failed:{exc}"
+        return calibrated, metadata, None
+
+    calibrated = np.full(len(scores), np.nan, dtype=float)
+    calibrated[mask] = model.predict_proba(scores[mask].reshape(-1, 1))[:, 1]
+    metadata.update(
+        {
+            "kind": "platt",
+            "applied": True,
+            "coef": float(np.asarray(model.coef_, dtype=float).reshape(-1)[0]),
+            "intercept": float(np.asarray(model.intercept_, dtype=float).reshape(-1)[0]),
+        }
+    )
+    return calibrated, metadata, model
+
+
+def _apply_probability_calibration(
+    raw_scores: np.ndarray,
+    *,
+    calibration_model: Optional[LogisticRegression] = None,
+    calibration_metadata: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    scores = np.asarray(raw_scores, dtype=float)
+    mask = np.isfinite(scores)
+    calibrated = np.full(len(scores), np.nan, dtype=float)
+    metadata = dict(calibration_metadata or {})
+    kind = str(metadata.get("kind", "identity"))
+
+    if calibration_model is not None and kind == "platt":
+        calibrated[mask] = calibration_model.predict_proba(scores[mask].reshape(-1, 1))[:, 1]
+        return calibrated
+
+    if kind == "platt":
+        coef = float(metadata.get("coef", 1.0))
+        intercept = float(metadata.get("intercept", 0.0))
+        calibrated[mask] = _sigmoid(coef * scores[mask] + intercept)
+        return calibrated
+
+    calibrated[mask] = np.clip(scores[mask], 0.0, 1.0)
+    return calibrated
+
+
+def _expected_cost_threshold(
+    y_true: np.ndarray,
+    calibrated_scores: np.ndarray,
+    *,
+    fn_cost: float = DEFAULT_THRESHOLD_FN_COST,
+    fp_cost: float = DEFAULT_THRESHOLD_FP_COST,
+) -> Dict[str, float]:
+    y = np.asarray(y_true).astype(int)
+    scores = np.asarray(calibrated_scores, dtype=float)
+    mask = np.isfinite(scores)
+    if mask.sum() < 2 or np.unique(y[mask]).size < 2:
+        threshold = 0.5
+        return {
+            "threshold": float(threshold),
+            "expected_cost": float("nan"),
+            "sensitivity": float("nan"),
+            "specificity": float("nan"),
+            "fn_cost": float(fn_cost),
+            "fp_cost": float(fp_cost),
+        }
+
+    work = pd.DataFrame({"score": scores[mask], "y": y[mask]}).sort_values("score", ascending=False)
+    grouped = (
+        work.groupby("score", sort=False)["y"]
+        .agg(total="size", positives="sum")
+        .reset_index()
+    )
+    grouped["negatives"] = grouped["total"] - grouped["positives"]
+    grouped["tp"] = grouped["positives"].cumsum()
+    grouped["fp"] = grouped["negatives"].cumsum()
+    total_pos = float(grouped["positives"].sum())
+    total_neg = float(grouped["negatives"].sum())
+    grouped["fn"] = total_pos - grouped["tp"]
+    grouped["tn"] = total_neg - grouped["fp"]
+    grouped["expected_cost"] = float(fn_cost) * grouped["fn"] + float(fp_cost) * grouped["fp"]
+    grouped["sensitivity"] = np.where(total_pos > 0, grouped["tp"] / total_pos, np.nan)
+    grouped["specificity"] = np.where(total_neg > 0, grouped["tn"] / total_neg, np.nan)
+
+    grouped = grouped.sort_values(
+        ["expected_cost", "sensitivity", "specificity", "score"],
+        ascending=[True, False, False, True],
+    ).reset_index(drop=True)
+    best = grouped.iloc[0]
+    return {
+        "threshold": float(best["score"]),
+        "expected_cost": float(best["expected_cost"]),
+        "sensitivity": float(best["sensitivity"]),
+        "specificity": float(best["specificity"]),
+        "fn_cost": float(fn_cost),
+        "fp_cost": float(fp_cost),
+    }
+
+
 def _safe_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
     y = np.asarray(y_true).astype(int)
     s = np.asarray(scores).astype(float)
@@ -2164,10 +2312,12 @@ def compute_classification_metrics(
     scores: np.ndarray,
     *,
     threshold: float,
+    decision_scores: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     y = np.asarray(y_true).astype(int)
     s = np.asarray(scores).astype(float)
-    preds = (s >= float(threshold)).astype(int)
+    decision = s if decision_scores is None else np.asarray(decision_scores).astype(float)
+    preds = (decision >= float(threshold)).astype(int)
 
     tn, fp, fn, tp = confusion_matrix(y, preds, labels=[0, 1]).ravel()
     sensitivity = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
@@ -2256,10 +2406,10 @@ EXPERIMENT_PRESET_CONFIGS: Dict[str, Dict[str, Any]] = {
         "min_retrain_size": 4500,
         "arf_variants": ["ARFmoderate"],
         "kswin_variants": ["KSWINpaper"],
-        "kswin_top_k_features": 10,
-        "kswin_vote_threshold": 2,
-        "kswin_retrain_days": 90,
-        "kswin_min_retrain_rows": 100,
+        "kswin_top_k_features": 3,
+        "kswin_vote_threshold": 3,
+        "kswin_retrain_days": 30,
+        "kswin_min_retrain_rows": 50,
         "balance_modes": [BALANCE_MODE_NONE, BALANCE_MODE_SMOTE],
         "repetition_seeds": [42],
     },
@@ -2713,6 +2863,7 @@ def _build_recalibration_run_id(
     kswin_vote_threshold: int,
     kswin_retrain_days: int,
     kswin_min_retrain_rows: int,
+    continue_on_block_error: bool,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]],
     feature_selection_context: Dict[str, Any],
 ) -> str:
@@ -2721,6 +2872,7 @@ def _build_recalibration_run_id(
     payload = {
         "dataset_signature": dataset_signature,
         "feature_export_signature": _feature_export_signature(feature_selection_context),
+        "recalibration_policy": _recalibration_policy_signature(),
         "feature_cols": list(feature_cols),
         "target_col": str(target_col),
         "time_col": str(time_col),
@@ -2743,6 +2895,7 @@ def _build_recalibration_run_id(
         "kswin_vote_threshold": int(kswin_vote_threshold),
         "kswin_retrain_days": int(kswin_retrain_days),
         "kswin_min_retrain_rows": int(kswin_min_retrain_rows),
+        "continue_on_block_error": bool(continue_on_block_error),
         "custom_grids": _to_json_safe(custom_grids or {}),
     }
     if _normalize_experiment_resource_mode(resource_mode) != DEFAULT_EXPERIMENT_RESOURCE_MODE:
@@ -2786,6 +2939,7 @@ def _build_global_tuning_key(
     payload = {
         "model_name": str(model_name),
         "balance_mode": str(balance_mode),
+        "recalibration_policy": _recalibration_policy_signature(),
         "feature_cols": list(feature_cols),
         "target_col": str(target_col),
         "time_col": str(time_col),
@@ -2912,6 +3066,7 @@ def _preview_recalibration_checkpoint(
     kswin_vote_threshold: int = 2,
     kswin_retrain_days: int = 90,
     kswin_min_retrain_rows: int = 100,
+    continue_on_block_error: bool = False,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
     repetition_seeds: Optional[Sequence[int]] = None,
     balance_modes: Optional[Sequence[str]] = None,
@@ -2961,6 +3116,7 @@ def _preview_recalibration_checkpoint(
         kswin_vote_threshold=int(kswin_vote_threshold),
         kswin_retrain_days=int(kswin_retrain_days),
         kswin_min_retrain_rows=int(kswin_min_retrain_rows),
+        continue_on_block_error=bool(continue_on_block_error),
         custom_grids=custom_grids,
         feature_selection_context=normalized_feature_selection_context,
     )
@@ -2984,6 +3140,7 @@ def _preview_recalibration_checkpoint(
         "completed_tuning_tasks": int(progress.get("completed_tuning_tasks", 0)),
         "total_tuning_tasks": int(progress.get("total_tuning_tasks", 0)),
         "completed_blocks": int(progress.get("completed_blocks", 0)),
+        "skipped_failed_blocks": int(progress.get("skipped_failed_blocks", 0)),
         "total_blocks": int(progress.get("total_blocks", 0)),
         "smote_artifacts": len((manifest or {}).get("smote_index") or {}),
         "manifest": manifest,
@@ -3186,6 +3343,8 @@ def _reconcile_recalibration_manifest(manifest: Dict[str, Any], *, paths: Dict[s
     manifest["tuning_index"] = tuning_index
     manifest["smote_index"] = smote_index
     manifest["completed_block_ids"] = sorted(completed_ids)
+    manifest["skipped_failed_block_ids"] = sorted({str(item) for item in manifest.get("skipped_failed_block_ids", [])})
+    manifest["nonfatal_block_errors"] = list(manifest.get("nonfatal_block_errors") or [])
     return manifest
 
 
@@ -3247,6 +3406,8 @@ def _assemble_recalibration_outputs_from_checkpoints(
 def _estimate_recalibration_workload(
     *,
     df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    target_col: str,
     time_col: str,
     model_names: Sequence[str],
     strategies: Sequence[str],
@@ -3254,21 +3415,37 @@ def _estimate_recalibration_workload(
     kswin_variants: Sequence[str],
     balance_modes: Sequence[str],
     repetition_seeds: Sequence[int],
+    base_year: Optional[int],
+    validation_size: float,
     grid_limit: Optional[int],
     folds: int,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    random_state: int = 42,
+    fast_mode: bool = True,
+    custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
 ) -> Dict[str, Any]:
     resource_policy = _resolve_experiment_resource_policy(resource_mode)
     risk_thresholds = dict(resource_policy.get("high_risk_thresholds") or {})
     years = _available_prediction_years(df, time_col)
     pred_years = max(0, len(years) - 1)
     batch_strategies = [s for s in strategies if s in YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]]
-    tuning_tasks = []
-    if batch_strategies:
-        for model_name in model_names:
-            for balance_mode in balance_modes:
-                if str(balance_mode) in DEFAULT_BATCH_BALANCE_MODES:
-                    tuning_tasks.append((str(model_name), str(balance_mode)))
+    tuning_tasks = _batch_tuning_tasks(
+        df=df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        time_col=time_col,
+        model_names=model_names,
+        strategies=batch_strategies,
+        balance_modes=balance_modes,
+        base_year=base_year,
+        validation_size=float(validation_size),
+        folds=int(folds),
+        random_state=int(random_state),
+        fast_mode=bool(fast_mode),
+        resource_mode=str(resource_mode),
+        grid_limit=grid_limit,
+        custom_grids=custom_grids,
+    )
     experiment_blocks = _build_experiment_blocks(
         model_names=list(model_names),
         strategies=list(strategies),
@@ -3602,6 +3779,7 @@ def _fit_model_with_diagnostics(
     y_fit: Sequence[int],
     allow_retry: bool = False,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    balance_mode: str = BALANCE_MODE_NONE,
 ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
     params_used = {str(key): _normalize_param_choice(value) for key, value in dict(model_params).items()}
     model = _build_model(
@@ -3610,6 +3788,7 @@ def _fit_model_with_diagnostics(
         random_state=random_state,
         n_features=n_features,
         resource_mode=resource_mode,
+        balance_mode=balance_mode,
     )
     diagnostics: Dict[str, Any]
     if str(model_name) == "NNet":
@@ -3627,6 +3806,7 @@ def _fit_model_with_diagnostics(
                     random_state=random_state,
                     n_features=n_features,
                     resource_mode=resource_mode,
+                    balance_mode=balance_mode,
                 )
                 retry_diagnostics = _fit_nnet_warning_safe(retry_model, X_fit, y_fit)
                 retry_diagnostics["fit_retry_applied"] = True
@@ -3646,6 +3826,7 @@ def _fit_model_with_diagnostics(
         }
     diagnostics["model_name"] = str(model_name)
     diagnostics["params_used"] = dict(params_used)
+    diagnostics["balance_mode"] = str(balance_mode)
     return model, diagnostics, params_used
 
 
@@ -3897,10 +4078,12 @@ def _build_model(
     random_state: int,
     n_features: int,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    balance_mode: str = BALANCE_MODE_NONE,
 ):
     if model_name == "Random Forest":
         splitrule = str(params.get("splitrule", "gini"))
         mtry = int(params.get("mtry", min(6, max(1, n_features))))
+        class_weight = None if str(balance_mode) == BALANCE_MODE_SMOTE else "balanced_subsample"
         common_kwargs = {
             "n_estimators": 400,
             "max_features": max(1, min(mtry, n_features)),
@@ -3911,12 +4094,12 @@ def _build_model(
         if splitrule == "extratrees":
             return ExtraTreesClassifier(
                 criterion="gini",
-                class_weight="balanced",
+                class_weight=None if str(balance_mode) == BALANCE_MODE_SMOTE else "balanced",
                 **common_kwargs,
             )
         return RandomForestClassifier(
             criterion="gini",
-            class_weight="balanced_subsample",
+            class_weight=class_weight,
             **common_kwargs,
         )
 
@@ -4042,6 +4225,7 @@ def _cv_auc(
                 y_fit=y_fit,
                 allow_retry=False,
                 resource_mode=resource_mode,
+                balance_mode=balance_mode,
             )
             if str(model_name) == "NNet" and not bool(fit_diagnostics.get("converged", True)):
                 return {
@@ -4188,6 +4372,7 @@ def _cross_validated_scores(
                 y_fit=y_fit,
                 allow_retry=False,
                 resource_mode=resource_mode,
+                balance_mode=balance_mode,
             )
             if str(model_name) == "NNet" and not bool(fit_diagnostics.get("converged", True)):
                 return {
@@ -4873,8 +5058,11 @@ def train_model_with_internal_validation(
         return_diagnostics=True,
         resource_mode=resource_mode,
     )
-    calibration_scores = np.asarray(calibration_payload.get("scores", np.full(len(X_all_raw), np.nan, dtype=float)), dtype=float)
-    calibration_mask = np.isfinite(calibration_scores)
+    raw_calibration_scores = np.asarray(
+        calibration_payload.get("scores", np.full(len(X_all_raw), np.nan, dtype=float)),
+        dtype=float,
+    )
+    calibration_mask = np.isfinite(raw_calibration_scores)
 
     if calibration_mask.sum() < 2 or np.unique(y_all.to_numpy()[calibration_mask]).size < 2:
         holdout_fill_values = _fit_fill_values(X_tr_raw)
@@ -4902,6 +5090,7 @@ def train_model_with_internal_validation(
             y_fit=y_holdout_fit,
             allow_retry=False,
             resource_mode=resource_mode,
+            balance_mode=balance_mode,
         )
         if str(model_name) == "NNet" and not bool(calibration_fit_diagnostics.get("converged", True)):
             raise ModelTrainingSkipped(
@@ -4916,16 +5105,27 @@ def train_model_with_internal_validation(
                 },
             )
         calibration_y = y_va.to_numpy()
-        calibration_scores = _model_scores(calibration_model, X_va)
+        raw_calibration_scores = _model_scores(calibration_model, X_va)
     else:
         calibration_y = y_all.to_numpy()[calibration_mask]
-        calibration_scores = calibration_scores[calibration_mask]
+        raw_calibration_scores = raw_calibration_scores[calibration_mask]
 
-    youden = youden_threshold(calibration_y, calibration_scores)
+    raw_youden = youden_threshold(calibration_y, raw_calibration_scores)
+    calibrated_scores, calibration_metadata, probability_calibrator = _fit_platt_calibrator(
+        calibration_y,
+        raw_calibration_scores,
+    )
+    operating_point = _expected_cost_threshold(
+        calibration_y,
+        calibrated_scores,
+        fn_cost=DEFAULT_THRESHOLD_FN_COST,
+        fp_cost=DEFAULT_THRESHOLD_FP_COST,
+    )
     val_metrics = compute_classification_metrics(
         calibration_y,
-        calibration_scores,
-        threshold=float(youden["threshold"]),
+        raw_calibration_scores,
+        threshold=float(operating_point["threshold"]),
+        decision_scores=calibrated_scores,
     )
     _emit_experiment_progress(
         progress_callback,
@@ -4970,6 +5170,7 @@ def train_model_with_internal_validation(
         y_fit=y_fit,
         allow_retry=True,
         resource_mode=resource_mode,
+        balance_mode=balance_mode,
     )
     if str(model_name) == "NNet" and not bool(fit_diagnostics.get("converged", True)):
         raise ModelTrainingSkipped(
@@ -4989,13 +5190,22 @@ def train_model_with_internal_validation(
         progress_callback,
         ratio=1.0,
         label="Entrenamiento batch completo.",
-        detail=f"Modelo {model_name} | threshold {float(youden['threshold']):.4f}",
+        detail=f"Modelo {model_name} | threshold {float(operating_point['threshold']):.4f}",
     )
 
     return {
         "model": model,
-        "threshold": float(youden["threshold"]),
-        "youden": youden,
+        "threshold": float(operating_point["threshold"]),
+        "operating_threshold": float(operating_point["threshold"]),
+        "threshold_policy": DEFAULT_THRESHOLD_POLICY,
+        "fn_cost": float(DEFAULT_THRESHOLD_FN_COST),
+        "fp_cost": float(DEFAULT_THRESHOLD_FP_COST),
+        "raw_youden_threshold": float(raw_youden["threshold"]),
+        "youden": raw_youden,
+        "raw_youden": raw_youden,
+        "calibration_model": probability_calibrator,
+        "calibration_metadata": calibration_metadata,
+        "calibration_method": DEFAULT_CALIBRATION_METHOD,
         "val_metrics": val_metrics,
         "best_params": best_params,
         "model_params": final_model_params,
@@ -5015,6 +5225,13 @@ def train_model_with_internal_validation(
             "best_params": best_params,
             "model_params": final_model_params,
             "smote_params": smote_params,
+            "calibration_method": DEFAULT_CALIBRATION_METHOD,
+            "threshold_policy": DEFAULT_THRESHOLD_POLICY,
+            "fn_cost": float(DEFAULT_THRESHOLD_FN_COST),
+            "fp_cost": float(DEFAULT_THRESHOLD_FP_COST),
+            "operating_threshold": float(operating_point["threshold"]),
+            "raw_youden_threshold": float(raw_youden["threshold"]),
+            "calibration_metadata": _to_json_safe(calibration_metadata),
             "smote_fit_info": smote_fit_info,
             "feature_transform": _to_json_safe(feature_transform),
             "converged": bool(fit_diagnostics.get("converged", True)),
@@ -5035,16 +5252,29 @@ def _evaluate_split(
     threshold: float,
     fill_values: Optional[Dict[str, float]] = None,
     feature_transform: Optional[Dict[str, Any]] = None,
+    calibration_model: Optional[LogisticRegression] = None,
+    calibration_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     X_te_raw, y_te = _prepare_xy_raw(test_df, feature_cols, target_col)
     X_te_filled = _apply_fill_values(X_te_raw, fill_values or _fit_fill_values(X_te_raw))
     X_te = _apply_feature_transform(X_te_filled, feature_transform)
-    scores = _model_scores(model, X_te)
-    metrics = compute_classification_metrics(y_te.to_numpy(), scores, threshold=float(threshold))
+    raw_scores = _model_scores(model, X_te)
+    calibrated_scores = _apply_probability_calibration(
+        raw_scores,
+        calibration_model=calibration_model,
+        calibration_metadata=calibration_metadata,
+    )
+    metrics = compute_classification_metrics(
+        y_te.to_numpy(),
+        raw_scores,
+        threshold=float(threshold),
+        decision_scores=calibrated_scores,
+    )
     return {
         "metrics": metrics,
         "y_true": y_te.to_numpy(),
-        "scores": scores,
+        "scores": raw_scores,
+        "calibrated_scores": calibrated_scores,
     }
 
 
@@ -5083,6 +5313,7 @@ def run_yearly_strategy(
     study_collector: Optional[List[Dict[str, Any]]] = None,
     fixed_params: Optional[Dict[str, Any]] = None,
     fixed_tuning_artifact: Optional[Dict[str, Any]] = None,
+    tuning_resolver: Optional[Callable[..., Dict[str, Any]]] = None,
     run_id: Optional[str] = None,
     smote_cache_dir: Optional[Path] = None,
     smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -5225,6 +5456,24 @@ def run_yearly_strategy(
                 n_test=int(len(test_df)),
             )
             cache_key: Optional[Tuple[Any, ...]] = None
+            resolved_fixed_params = fixed_params
+            resolved_fixed_tuning_artifact = fixed_tuning_artifact
+            if tuning_resolver is not None:
+                resolved_fixed_tuning_artifact = tuning_resolver(
+                    train_df=train_df,
+                    model_name=model_name,
+                    balance_mode=balance_mode,
+                    strategy_context={
+                        "stage": "yearly_train",
+                        "strategy": strategy,
+                        "window_kind": strategy,
+                        "training_year": train_label,
+                        "prediction_year": int(pred_year),
+                        "run_seed": int(effective_seed),
+                        "run_order": int(run_order),
+                    },
+                )
+                resolved_fixed_params = dict((resolved_fixed_tuning_artifact or {}).get("best_params") or {})
             if strategy == "static":
                 cache_key = (
                     strategy,
@@ -5238,6 +5487,7 @@ def run_yearly_strategy(
                         str(_normalize_experiment_resource_mode(resource_mode)),
                         None if grid_limit is None else int(grid_limit),
                         json.dumps((custom_grids or {}).get(model_name), sort_keys=True, default=str, ensure_ascii=True),
+                        str((resolved_fixed_tuning_artifact or {}).get("tuning_key", "")),
                     )
 
             cached_entry = training_bundle_cache.get(cache_key) if cache_key is not None else None
@@ -5278,8 +5528,8 @@ def run_yearly_strategy(
                         custom_grid=(custom_grids or {}).get(model_name),
                         balance_mode=balance_mode,
                         study_id=study_id,
-                        fixed_params=fixed_params,
-                        fixed_tuning_artifact=fixed_tuning_artifact,
+                        fixed_params=resolved_fixed_params,
+                        fixed_tuning_artifact=resolved_fixed_tuning_artifact,
                         run_id=run_id,
                         smote_cache_dir=smote_cache_dir,
                         smote_cache_registry=smote_cache_registry,
@@ -5371,6 +5621,8 @@ def run_yearly_strategy(
                 threshold=float(bundle["threshold"]),
                 fill_values=bundle.get("fill_values"),
                 feature_transform=bundle.get("feature_transform"),
+                calibration_model=bundle.get("calibration_model"),
+                calibration_metadata=bundle.get("calibration_metadata"),
             )
 
             _append_tuning_study(
@@ -5389,6 +5641,7 @@ def run_yearly_strategy(
             )
 
             metrics = eval_payload["metrics"]
+            operating_context = _bundle_operating_context(bundle)
             row = {
                 "strategy": strategy,
                 "iteration": int(pred_year - years[0]),
@@ -5400,7 +5653,13 @@ def run_yearly_strategy(
                 "sensitivity": float(metrics["sensitivity"]),
                 "specificity": float(metrics["specificity"]),
                 "error_rate": float(metrics["error_rate"]),
-                "threshold": float(bundle["threshold"]),
+                "threshold": float(operating_context["threshold"]),
+                "operating_threshold": float(operating_context["operating_threshold"]),
+                "raw_youden_threshold": float(operating_context["raw_youden_threshold"]),
+                "threshold_policy": str(operating_context["threshold_policy"]),
+                "calibration_method": str(operating_context["calibration_method"]),
+                "fn_cost": float(operating_context["fn_cost"]),
+                "fp_cost": float(operating_context["fp_cost"]),
                 "training_time_sec": float(train_time),
                 "n_train": int(len(train_df)),
                 "n_test": int(len(test_df)),
@@ -5423,7 +5682,11 @@ def run_yearly_strategy(
                 run_order=run_order,
                 balance_mode=balance_mode,
                 study_id=study_id,
-                threshold=float(bundle["threshold"]),
+                threshold=float(operating_context["threshold"]),
+                operating_threshold=float(operating_context["operating_threshold"]),
+                raw_youden_threshold=float(operating_context["raw_youden_threshold"]),
+                threshold_policy=str(operating_context["threshold_policy"]),
+                calibration_method=str(operating_context["calibration_method"]),
                 auc=float(metrics["auc"]),
                 sensitivity=float(metrics["sensitivity"]),
                 specificity=float(metrics["specificity"]),
@@ -5458,7 +5721,7 @@ def run_yearly_strategy(
 
 class SimpleADWIN:
     """
-    Lightweight ADWIN-style detector for binary error streams.
+    Lightweight ADWIN detector for binary error streams.
     """
 
     def __init__(
@@ -5474,6 +5737,14 @@ class SimpleADWIN:
         self.min_subwindow = int(min_subwindow)
         self.max_splits = int(max_splits)
         self.window: deque[float] = deque()
+
+    def _hoeffding_cut_threshold(self, n0: int, n1: int, n: int) -> float:
+        """
+        Canonical ADWIN Hoeffding cut from Bifet and Gavaldà (2007).
+        """
+        m = 1.0 / ((1.0 / n0) + (1.0 / n1))
+        delta_prime = max(self.delta, 1e-9) / max(1.0, float(n))
+        return math.sqrt((1.0 / (2.0 * m)) * math.log(4.0 / delta_prime))
 
     def __len__(self) -> int:
         return len(self.window)
@@ -5500,9 +5771,7 @@ class SimpleADWIN:
             mu1 = float(sum1 / n1)
             gap = abs(mu0 - mu1)
 
-            m = 1.0 / ((1.0 / n0) + (1.0 / n1))
-            log_term_inner = max(1.0000001, 4.0 * math.log(max(2.0, float(n))) / max(self.delta, 1e-9))
-            eps = math.sqrt((1.0 / (2.0 * m)) * math.log(log_term_inner))
+            eps = self._hoeffding_cut_threshold(n0, n1, n)
 
             if gap > eps:
                 candidate = {
@@ -5556,6 +5825,7 @@ def run_adaptive_strategy(
     study_collector: Optional[List[Dict[str, Any]]] = None,
     fixed_params: Optional[Dict[str, Any]] = None,
     fixed_tuning_artifact: Optional[Dict[str, Any]] = None,
+    tuning_resolver: Optional[Callable[..., Dict[str, Any]]] = None,
     run_id: Optional[str] = None,
     smote_cache_dir: Optional[Path] = None,
     smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -5630,6 +5900,23 @@ def run_adaptive_strategy(
         )
         try:
             t0 = time.perf_counter()
+            resolved_base_tuning_artifact = fixed_tuning_artifact
+            resolved_base_params = fixed_params
+            if tuning_resolver is not None:
+                resolved_base_tuning_artifact = tuning_resolver(
+                    train_df=base_train,
+                    model_name=model_name,
+                    balance_mode=balance_mode,
+                    strategy_context={
+                        "stage": "adaptive_base",
+                        "strategy": ADAPTIVE_ADWIN_STRATEGY,
+                        "window_kind": "base_year",
+                        "training_year": str(int(base_year)),
+                        "run_seed": int(effective_seed),
+                        "run_order": int(run_order),
+                    },
+                )
+                resolved_base_params = dict((resolved_base_tuning_artifact or {}).get("best_params") or {})
             bundle = train_model_with_internal_validation(
                 base_train,
                 feature_cols=feature_cols,
@@ -5645,8 +5932,8 @@ def run_adaptive_strategy(
                 custom_grid=(custom_grids or {}).get(model_name),
                 balance_mode=balance_mode,
                 study_id=base_study_id,
-                fixed_params=fixed_params,
-                fixed_tuning_artifact=fixed_tuning_artifact,
+                fixed_params=resolved_base_params,
+                fixed_tuning_artifact=resolved_base_tuning_artifact,
                 run_id=run_id,
                 smote_cache_dir=smote_cache_dir,
                 smote_cache_registry=smote_cache_registry,
@@ -5752,7 +6039,15 @@ def run_adaptive_strategy(
         )
 
         model = bundle["model"]
-        threshold = float(bundle["threshold"])
+        operating_context = _bundle_operating_context(bundle)
+        threshold = float(operating_context["threshold"])
+        raw_youden_threshold = float(operating_context["raw_youden_threshold"])
+        threshold_policy = str(operating_context["threshold_policy"])
+        calibration_method = str(operating_context["calibration_method"])
+        fn_cost = float(operating_context["fn_cost"])
+        fp_cost = float(operating_context["fp_cost"])
+        calibration_model = operating_context.get("calibration_model")
+        calibration_metadata = operating_context.get("calibration_metadata")
         fill_values = dict(bundle.get("fill_values") or {})
         feature_transform = dict(bundle.get("feature_transform") or {}) or None
         detector = SimpleADWIN(delta=adwin_delta, min_window=min_window)
@@ -5762,7 +6057,8 @@ def run_adaptive_strategy(
         stream_progress_step = max(1, len(stream) // 50)
 
         segment_y: List[int] = []
-        segment_s: List[float] = []
+        segment_raw_scores: List[float] = []
+        segment_decision_scores: List[float] = []
         training_window_rows: deque[Dict[str, Any]] = deque()
         drift_idx = 0
 
@@ -5779,12 +6075,20 @@ def run_adaptive_strategy(
             y_i = int(y_stream.iloc[i])
             ts_i = ts_stream.iloc[i]
 
-            score_i = float(_model_scores(model, x_i_model)[0])
-            pred_i = int(score_i >= threshold)
+            raw_score_i = float(_model_scores(model, x_i_model)[0])
+            decision_score_i = float(
+                _apply_probability_calibration(
+                    np.asarray([raw_score_i], dtype=float),
+                    calibration_model=calibration_model,
+                    calibration_metadata=calibration_metadata,
+                )[0]
+            )
+            pred_i = int(decision_score_i >= threshold)
             err_i = float(int(pred_i != y_i))
 
             segment_y.append(y_i)
-            segment_s.append(score_i)
+            segment_raw_scores.append(raw_score_i)
+            segment_decision_scores.append(decision_score_i)
             training_window_rows.append(stream.iloc[i].to_dict())
 
             is_drift, info = detector.update(err_i)
@@ -5794,8 +6098,9 @@ def run_adaptive_strategy(
             drift_idx += 1
             seg_metrics = compute_classification_metrics(
                 np.asarray(segment_y),
-                np.asarray(segment_s),
+                np.asarray(segment_raw_scores),
                 threshold=threshold,
+                decision_scores=np.asarray(segment_decision_scores),
             )
 
             remaining = int(len(stream) - (i + 1))
@@ -5816,6 +6121,12 @@ def run_adaptive_strategy(
                     "error_rate": float(seg_metrics["error_rate"]),
                     "training_time_sec": float(fit_time),
                     "threshold": float(threshold),
+                    "operating_threshold": float(threshold),
+                    "raw_youden_threshold": float(raw_youden_threshold),
+                    "threshold_policy": str(threshold_policy),
+                    "calibration_method": str(calibration_method),
+                    "fn_cost": float(fn_cost),
+                    "fp_cost": float(fp_cost),
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
@@ -5834,6 +6145,10 @@ def run_adaptive_strategy(
                 run_order=run_order,
                 balance_mode=balance_mode,
                 threshold=float(threshold),
+                operating_threshold=float(threshold),
+                raw_youden_threshold=float(raw_youden_threshold),
+                threshold_policy=str(threshold_policy),
+                calibration_method=str(calibration_method),
                 W=int(info["n"]),
                 W0=int(info["n0"]),
                 W1=int(info["n1"]),
@@ -5851,7 +6166,7 @@ def run_adaptive_strategy(
                     "balance_mode": balance_mode,
                     "segment": f"drift_{drift_idx}",
                     "y_true": np.asarray(segment_y),
-                    "scores": np.asarray(segment_s),
+                    "scores": np.asarray(segment_raw_scores),
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
@@ -5877,6 +6192,32 @@ def run_adaptive_strategy(
                 )
                 try:
                     t_fit = time.perf_counter()
+                    resolved_retrain_tuning_artifact = fixed_tuning_artifact
+                    resolved_retrain_params = fixed_params
+                    if tuning_resolver is not None:
+                        resolved_retrain_tuning_artifact = tuning_resolver(
+                            train_df=retrain_df,
+                            model_name=model_name,
+                            balance_mode=balance_mode,
+                            strategy_context={
+                                "stage": "adaptive_retrain",
+                                "strategy": ADAPTIVE_ADWIN_STRATEGY,
+                                "window_kind": "adaptive_retrain",
+                                "drift": int(drift_idx),
+                                "drift_date": pd.Timestamp(ts_i),
+                                "retrain_rows": int(len(retrain_df)),
+                                "training_years": sorted(
+                                    pd.to_datetime(retrain_df[time_col], errors="coerce")
+                                    .dt.year.dropna()
+                                    .astype(int)
+                                    .unique()
+                                    .tolist()
+                                ),
+                                "run_seed": int(effective_seed),
+                                "run_order": int(run_order),
+                            },
+                        )
+                        resolved_retrain_params = dict((resolved_retrain_tuning_artifact or {}).get("best_params") or {})
                     bundle = train_model_with_internal_validation(
                         retrain_df,
                         feature_cols=feature_cols,
@@ -5892,8 +6233,8 @@ def run_adaptive_strategy(
                         custom_grid=(custom_grids or {}).get(model_name),
                         balance_mode=balance_mode,
                         study_id=retrain_study_id,
-                        fixed_params=fixed_params,
-                        fixed_tuning_artifact=fixed_tuning_artifact,
+                        fixed_params=resolved_retrain_params,
+                        fixed_tuning_artifact=resolved_retrain_tuning_artifact,
                         run_id=run_id,
                         smote_cache_dir=smote_cache_dir,
                         smote_cache_registry=smote_cache_registry,
@@ -5916,7 +6257,15 @@ def run_adaptive_strategy(
                             fit_warning_count=int(bundle.get("fit_warning_count", 0)),
                         )
                     model = bundle["model"]
-                    threshold = float(bundle["threshold"])
+                    operating_context = _bundle_operating_context(bundle)
+                    threshold = float(operating_context["threshold"])
+                    raw_youden_threshold = float(operating_context["raw_youden_threshold"])
+                    threshold_policy = str(operating_context["threshold_policy"])
+                    calibration_method = str(operating_context["calibration_method"])
+                    fn_cost = float(operating_context["fn_cost"])
+                    fp_cost = float(operating_context["fp_cost"])
+                    calibration_model = operating_context.get("calibration_model")
+                    calibration_metadata = operating_context.get("calibration_metadata")
                     fill_values = dict(bundle.get("fill_values") or {})
                     feature_transform = dict(bundle.get("feature_transform") or {}) or None
                     _append_tuning_study(
@@ -5944,6 +6293,10 @@ def run_adaptive_strategy(
                         balance_mode=balance_mode,
                         study_id=retrain_study_id,
                         threshold=float(threshold),
+                        operating_threshold=float(threshold),
+                        raw_youden_threshold=float(raw_youden_threshold),
+                        threshold_policy=str(threshold_policy),
+                        calibration_method=str(calibration_method),
                         best_params=bundle["best_params"],
                         retrain_rows=int(len(retrain_df)),
                         training_time_sec=float(fit_time),
@@ -5989,15 +6342,17 @@ def run_adaptive_strategy(
                     )
 
             segment_y = []
-            segment_s = []
+            segment_raw_scores = []
+            segment_decision_scores = []
 
         # Final segment row (matches A.9 style "remaining=0")
         if segment_y:
             drift_idx += 1
             seg_metrics = compute_classification_metrics(
                 np.asarray(segment_y),
-                np.asarray(segment_s),
+                np.asarray(segment_raw_scores),
                 threshold=threshold,
+                decision_scores=np.asarray(segment_decision_scores),
             )
             rows.append(
                 {
@@ -6016,6 +6371,12 @@ def run_adaptive_strategy(
                     "error_rate": float(seg_metrics["error_rate"]),
                     "training_time_sec": float(fit_time),
                     "threshold": float(threshold),
+                    "operating_threshold": float(threshold),
+                    "raw_youden_threshold": float(raw_youden_threshold),
+                    "threshold_policy": str(threshold_policy),
+                    "calibration_method": str(calibration_method),
+                    "fn_cost": float(fn_cost),
+                    "fp_cost": float(fp_cost),
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
@@ -6033,6 +6394,10 @@ def run_adaptive_strategy(
                 run_order=run_order,
                 balance_mode=balance_mode,
                 threshold=float(threshold),
+                operating_threshold=float(threshold),
+                raw_youden_threshold=float(raw_youden_threshold),
+                threshold_policy=str(threshold_policy),
+                calibration_method=str(calibration_method),
                 remaining_periods=0,
                 auc=float(seg_metrics["auc"]),
                 sensitivity=float(seg_metrics["sensitivity"]),
@@ -6046,7 +6411,7 @@ def run_adaptive_strategy(
                     "balance_mode": balance_mode,
                     "segment": "final",
                     "y_true": np.asarray(segment_y),
-                    "scores": np.asarray(segment_s),
+                    "scores": np.asarray(segment_raw_scores),
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
@@ -6368,6 +6733,7 @@ def run_kswin_strategy(
     study_collector: Optional[List[Dict[str, Any]]] = None,
     fixed_params: Optional[Dict[str, Any]] = None,
     fixed_tuning_artifact: Optional[Dict[str, Any]] = None,
+    tuning_resolver: Optional[Callable[..., Dict[str, Any]]] = None,
     run_id: Optional[str] = None,
     smote_cache_dir: Optional[Path] = None,
     smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -6431,6 +6797,23 @@ def run_kswin_strategy(
         )
         try:
             t0 = time.perf_counter()
+            resolved_base_tuning_artifact = fixed_tuning_artifact
+            resolved_base_params = fixed_params
+            if tuning_resolver is not None:
+                resolved_base_tuning_artifact = tuning_resolver(
+                    train_df=base_train,
+                    model_name=model_name,
+                    balance_mode=balance_mode,
+                    strategy_context={
+                        "stage": "kswin_base",
+                        "strategy": ADAPTIVE_KSWIN_STRATEGY,
+                        "window_kind": "base_year",
+                        "training_year": str(int(base_year)),
+                        "run_seed": int(effective_seed),
+                        "run_order": int(run_order),
+                    },
+                )
+                resolved_base_params = dict((resolved_base_tuning_artifact or {}).get("best_params") or {})
             bundle = train_model_with_internal_validation(
                 base_train,
                 feature_cols=feature_cols,
@@ -6446,8 +6829,8 @@ def run_kswin_strategy(
                 custom_grid=(custom_grids or {}).get(model_name),
                 balance_mode=balance_mode,
                 study_id=base_study_id,
-                fixed_params=fixed_params,
-                fixed_tuning_artifact=fixed_tuning_artifact,
+                fixed_params=resolved_base_params,
+                fixed_tuning_artifact=resolved_base_tuning_artifact,
                 run_id=run_id,
                 smote_cache_dir=smote_cache_dir,
                 smote_cache_registry=smote_cache_registry,
@@ -6623,12 +7006,21 @@ def run_kswin_strategy(
             )
 
             current_model = bundle["model"]
-            threshold = float(bundle["threshold"])
+            operating_context = _bundle_operating_context(bundle)
+            threshold = float(operating_context["threshold"])
+            raw_youden_threshold = float(operating_context["raw_youden_threshold"])
+            threshold_policy = str(operating_context["threshold_policy"])
+            calibration_method = str(operating_context["calibration_method"])
+            fn_cost = float(operating_context["fn_cost"])
+            fp_cost = float(operating_context["fp_cost"])
+            current_calibration_model = operating_context.get("calibration_model")
+            current_calibration_metadata = operating_context.get("calibration_metadata")
             current_fill_values = dict(bundle.get("fill_values") or {})
             current_feature_transform = dict(bundle.get("feature_transform") or {}) or None
             model_label = f"{model_name} | {variant_name}"
             segment_y: List[int] = []
-            segment_s: List[float] = []
+            segment_raw_scores: List[float] = []
+            segment_decision_scores: List[float] = []
             drift_idx = 0
             stream_progress_step = max(1, len(stream) // 50)
 
@@ -6644,10 +7036,18 @@ def run_kswin_strategy(
                 x_i_model = _apply_feature_transform(x_i, current_feature_transform)
                 y_i = int(y_stream.iloc[i])
                 ts_i = pd.Timestamp(ts_stream.iloc[i])
-                score_i = float(_model_scores(current_model, x_i_model)[0])
+                raw_score_i = float(_model_scores(current_model, x_i_model)[0])
+                decision_score_i = float(
+                    _apply_probability_calibration(
+                        np.asarray([raw_score_i], dtype=float),
+                        calibration_model=current_calibration_model,
+                        calibration_metadata=current_calibration_metadata,
+                    )[0]
+                )
 
                 segment_y.append(y_i)
-                segment_s.append(score_i)
+                segment_raw_scores.append(raw_score_i)
+                segment_decision_scores.append(decision_score_i)
 
                 fired_features: List[str] = []
                 for feat in monitor_cols:
@@ -6672,8 +7072,9 @@ def run_kswin_strategy(
                 drift_idx += 1
                 seg_metrics = compute_classification_metrics(
                     np.asarray(segment_y),
-                    np.asarray(segment_s),
+                    np.asarray(segment_raw_scores),
                     threshold=threshold,
+                    decision_scores=np.asarray(segment_decision_scores),
                 )
 
                 observed_df = pd.concat(
@@ -6726,6 +7127,12 @@ def run_kswin_strategy(
                         "error_rate": float(seg_metrics["error_rate"]),
                         "training_time_sec": float(fit_time),
                         "threshold": float(threshold),
+                        "operating_threshold": float(threshold),
+                        "raw_youden_threshold": float(raw_youden_threshold),
+                        "threshold_policy": str(threshold_policy),
+                        "calibration_method": str(calibration_method),
+                        "fn_cost": float(fn_cost),
+                        "fp_cost": float(fp_cost),
                         "run_seed": effective_seed,
                         "run_order": int(run_order),
                     }
@@ -6752,6 +7159,10 @@ def run_kswin_strategy(
                     retrain_positive_rows=retrain_positive_rows,
                     remaining_periods=remaining,
                     threshold=float(threshold),
+                    operating_threshold=float(threshold),
+                    raw_youden_threshold=float(raw_youden_threshold),
+                    threshold_policy=str(threshold_policy),
+                    calibration_method=str(calibration_method),
                     auc=float(seg_metrics["auc"]),
                     sensitivity=float(seg_metrics["sensitivity"]),
                     specificity=float(seg_metrics["specificity"]),
@@ -6768,7 +7179,7 @@ def run_kswin_strategy(
                         "balance_mode": balance_mode,
                         "segment": f"drift_{drift_idx}",
                         "y_true": np.asarray(segment_y),
-                        "scores": np.asarray(segment_s),
+                        "scores": np.asarray(segment_raw_scores),
                         "run_seed": effective_seed,
                         "run_order": int(run_order),
                     }
@@ -6791,6 +7202,35 @@ def run_kswin_strategy(
                     )
                     try:
                         t_fit = time.perf_counter()
+                        resolved_retrain_tuning_artifact = fixed_tuning_artifact
+                        resolved_retrain_params = fixed_params
+                        if tuning_resolver is not None:
+                            resolved_retrain_tuning_artifact = tuning_resolver(
+                                train_df=retrain_df,
+                                model_name=model_name,
+                                balance_mode=balance_mode,
+                                strategy_context={
+                                    "stage": "kswin_retrain",
+                                    "strategy": ADAPTIVE_KSWIN_STRATEGY,
+                                    "window_kind": "kswin_retrain",
+                                    "detector_variant": variant_name,
+                                    "drift": int(drift_idx),
+                                    "drift_date": ts_i,
+                                    "prediction_year": int(ts_i.year),
+                                    "retrain_rows": int(retrain_rows),
+                                    "retrain_positive_rows": int(retrain_positive_rows),
+                                    "training_years": sorted(
+                                        pd.to_datetime(retrain_df[time_col], errors="coerce")
+                                        .dt.year.dropna()
+                                        .astype(int)
+                                        .unique()
+                                        .tolist()
+                                    ),
+                                    "run_seed": int(effective_seed),
+                                    "run_order": int(run_order),
+                                },
+                            )
+                            resolved_retrain_params = dict((resolved_retrain_tuning_artifact or {}).get("best_params") or {})
                         retrain_bundle = train_model_with_internal_validation(
                             retrain_df,
                             feature_cols=feature_cols,
@@ -6806,8 +7246,8 @@ def run_kswin_strategy(
                             custom_grid=(custom_grids or {}).get(model_name),
                             balance_mode=balance_mode,
                             study_id=retrain_study_id,
-                            fixed_params=fixed_params,
-                            fixed_tuning_artifact=fixed_tuning_artifact,
+                            fixed_params=resolved_retrain_params,
+                            fixed_tuning_artifact=resolved_retrain_tuning_artifact,
                             run_id=run_id,
                             smote_cache_dir=smote_cache_dir,
                             smote_cache_registry=smote_cache_registry,
@@ -6832,7 +7272,15 @@ def run_kswin_strategy(
                                 run_order=run_order,
                             )
                         current_model = retrain_bundle["model"]
-                        threshold = float(retrain_bundle["threshold"])
+                        operating_context = _bundle_operating_context(retrain_bundle)
+                        threshold = float(operating_context["threshold"])
+                        raw_youden_threshold = float(operating_context["raw_youden_threshold"])
+                        threshold_policy = str(operating_context["threshold_policy"])
+                        calibration_method = str(operating_context["calibration_method"])
+                        fn_cost = float(operating_context["fn_cost"])
+                        fp_cost = float(operating_context["fp_cost"])
+                        current_calibration_model = operating_context.get("calibration_model")
+                        current_calibration_metadata = operating_context.get("calibration_metadata")
                         current_fill_values = dict(retrain_bundle.get("fill_values") or {})
                         current_feature_transform = dict(retrain_bundle.get("feature_transform") or {}) or None
                         _append_tuning_study(
@@ -6865,6 +7313,10 @@ def run_kswin_strategy(
                             balance_mode=balance_mode,
                             study_id=retrain_study_id,
                             threshold=float(threshold),
+                            operating_threshold=float(threshold),
+                            raw_youden_threshold=float(raw_youden_threshold),
+                            threshold_policy=str(threshold_policy),
+                            calibration_method=str(calibration_method),
                             best_params=retrain_bundle["best_params"],
                             vote_threshold=int(effective_vote_threshold),
                             training_time_sec=float(fit_time),
@@ -6935,14 +7387,16 @@ def run_kswin_strategy(
                 )
 
                 segment_y = []
-                segment_s = []
+                segment_raw_scores = []
+                segment_decision_scores = []
 
             if segment_y:
                 drift_idx += 1
                 seg_metrics = compute_classification_metrics(
                     np.asarray(segment_y),
-                    np.asarray(segment_s),
+                    np.asarray(segment_raw_scores),
                     threshold=threshold,
+                    decision_scores=np.asarray(segment_decision_scores),
                 )
                 rows.append(
                     {
@@ -6972,6 +7426,12 @@ def run_kswin_strategy(
                         "error_rate": float(seg_metrics["error_rate"]),
                         "training_time_sec": float(fit_time),
                         "threshold": float(threshold),
+                        "operating_threshold": float(threshold),
+                        "raw_youden_threshold": float(raw_youden_threshold),
+                        "threshold_policy": str(threshold_policy),
+                        "calibration_method": str(calibration_method),
+                        "fn_cost": float(fn_cost),
+                        "fp_cost": float(fp_cost),
                         "run_seed": effective_seed,
                         "run_order": int(run_order),
                     }
@@ -6989,6 +7449,10 @@ def run_kswin_strategy(
                     drift_date=pd.Timestamp(ts_stream.iloc[-1]),
                     remaining_periods=0,
                     threshold=float(threshold),
+                    operating_threshold=float(threshold),
+                    raw_youden_threshold=float(raw_youden_threshold),
+                    threshold_policy=str(threshold_policy),
+                    calibration_method=str(calibration_method),
                     auc=float(seg_metrics["auc"]),
                     sensitivity=float(seg_metrics["sensitivity"]),
                     specificity=float(seg_metrics["specificity"]),
@@ -7004,7 +7468,7 @@ def run_kswin_strategy(
                         "balance_mode": balance_mode,
                         "segment": "final",
                         "y_true": np.asarray(segment_y),
-                        "scores": np.asarray(segment_s),
+                        "scores": np.asarray(segment_raw_scores),
                         "run_seed": effective_seed,
                         "run_order": int(run_order),
                     }
@@ -7120,9 +7584,21 @@ def _canonical_base_year(df: pd.DataFrame, *, time_col: str, base_year: Optional
 
 def _batch_tuning_tasks(
     *,
+    df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    target_col: str,
+    time_col: str,
     model_names: Sequence[str],
     strategies: Sequence[str],
     balance_modes: Sequence[str],
+    base_year: Optional[int],
+    validation_size: float,
+    folds: int,
+    random_state: int,
+    fast_mode: bool,
+    resource_mode: str,
+    grid_limit: Optional[int],
+    custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     requires_batch = any(
         strategy in YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]
@@ -7135,22 +7611,164 @@ def _batch_tuning_tasks(
         for mode in balance_modes
         if str(mode) in DEFAULT_BATCH_BALANCE_MODES
     ] or [BALANCE_MODE_NONE]
-    tasks = [
-        {
-            "model_name": str(model_name),
-            "balance_mode": str(balance_mode),
-        }
-        for model_name in model_names
-        for balance_mode in normalized_balance_modes
-    ]
+    work = df.copy()
+    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col]).reset_index(drop=True)
+    effective_base_year = _canonical_base_year(work, time_col=time_col, base_year=base_year)
+    if effective_base_year is None:
+        return []
+    prediction_years = [int(year) for year in _available_prediction_years(work, time_col) if int(year) > int(effective_base_year)]
+    tasks: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    def register_task(
+        *,
+        model_name: str,
+        balance_mode: str,
+        train_df: pd.DataFrame,
+        strategy_context: Dict[str, Any],
+    ) -> None:
+        if train_df.empty:
+            return
+        tuning_key = _build_global_tuning_key(
+            model_name=model_name,
+            balance_mode=balance_mode,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            time_col=time_col,
+            canonical_train_df=train_df,
+            validation_size=float(validation_size),
+            folds=int(folds),
+            random_state=int(random_state),
+            fast_mode=bool(fast_mode),
+            resource_mode=str(resource_mode),
+            grid_limit=grid_limit,
+            custom_grid=(custom_grids or {}).get(str(model_name)),
+        )
+        if tuning_key in seen_keys:
+            return
+        seen_keys.add(tuning_key)
+        times = pd.to_datetime(train_df[time_col], errors="coerce")
+        training_years = sorted(times.dt.year.dropna().astype(int).unique().tolist())
+        y_train = pd.to_numeric(train_df[target_col], errors="coerce").fillna(0).astype(int)
+        tasks.append(
+            {
+                "tuning_key": tuning_key,
+                "model_name": str(model_name),
+                "balance_mode": str(balance_mode),
+                "window_kind": str(strategy_context.get("window_kind", "window")),
+                "base_year": int(effective_base_year),
+                "training_years": training_years,
+                "training_year_label": str(strategy_context.get("training_year", "")),
+                "prediction_year": strategy_context.get("prediction_year"),
+                "strategy_context": _to_json_safe(strategy_context),
+                "positive_rows": int(y_train.sum()),
+                "positive_rate": float(y_train.mean()) if len(y_train) else 0.0,
+            }
+        )
+
+    for model_name in model_names:
+        for balance_mode in normalized_balance_modes:
+            base_train = work.loc[_as_year_mask(work, time_col, int(effective_base_year))].copy()
+            if "static" in strategies or ADAPTIVE_ADWIN_STRATEGY in strategies or ADAPTIVE_KSWIN_STRATEGY in strategies:
+                register_task(
+                    model_name=str(model_name),
+                    balance_mode=str(balance_mode),
+                    train_df=base_train,
+                    strategy_context={
+                        "stage": "window_tuning",
+                        "window_kind": "base_year",
+                        "training_year": str(int(effective_base_year)),
+                    },
+                )
+            if "period_aligned" in strategies:
+                for pred_year in prediction_years:
+                    prev_year = int(pred_year) - 1
+                    register_task(
+                        model_name=str(model_name),
+                        balance_mode=str(balance_mode),
+                        train_df=work.loc[_as_year_mask(work, time_col, prev_year)].copy(),
+                        strategy_context={
+                            "stage": "window_tuning",
+                            "window_kind": "period_aligned",
+                            "training_year": str(prev_year),
+                            "prediction_year": int(pred_year),
+                        },
+                    )
+            if "cumulative" in strategies:
+                for pred_year in prediction_years:
+                    register_task(
+                        model_name=str(model_name),
+                        balance_mode=str(balance_mode),
+                        train_df=work.loc[pd.to_datetime(work[time_col], errors="coerce").dt.year.le(int(pred_year) - 1)].copy(),
+                        strategy_context={
+                            "stage": "window_tuning",
+                            "window_kind": "cumulative",
+                            "training_year": f"[<= {int(pred_year) - 1}]",
+                            "prediction_year": int(pred_year),
+                        },
+                    )
     tasks.sort(
         key=lambda item: (
             0 if str(item["balance_mode"]) == BALANCE_MODE_NONE else 1,
             _model_execution_priority(str(item["model_name"])),
+            len(item.get("training_years") or []),
+            str(item.get("training_year_label", "")),
             str(item["model_name"]),
         )
     )
     return tasks
+
+
+def _materialize_tuning_train_df(
+    df: pd.DataFrame,
+    *,
+    time_col: str,
+    task: Dict[str, Any],
+) -> pd.DataFrame:
+    work = df.copy()
+    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col]).reset_index(drop=True)
+    strategy_context = dict(task.get("strategy_context") or {})
+    window_kind = str(task.get("window_kind") or strategy_context.get("window_kind") or "")
+    prediction_year = strategy_context.get("prediction_year", task.get("prediction_year"))
+    training_years = [
+        int(year)
+        for year in (task.get("training_years") or strategy_context.get("training_years") or [])
+        if pd.notna(year)
+    ]
+
+    if window_kind in {"base_year", "period_aligned"}:
+        if not training_years:
+            raise ValueError(f"Missing training years for tuning task: {task}")
+        return work.loc[_as_year_mask(work, time_col, int(training_years[0]))].copy()
+
+    if window_kind == "cumulative":
+        if prediction_year is None:
+            raise ValueError(f"Missing prediction year for cumulative tuning task: {task}")
+        times = pd.to_datetime(work[time_col], errors="coerce")
+        return work.loc[times.dt.year.le(int(prediction_year) - 1)].copy()
+
+    if training_years:
+        times = pd.to_datetime(work[time_col], errors="coerce")
+        return work.loc[times.dt.year.isin(training_years)].copy()
+
+    raise ValueError(f"Unsupported tuning task context: {task}")
+
+
+def _bundle_operating_context(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    operating_threshold = float(bundle.get("operating_threshold", bundle.get("threshold", 0.5)))
+    return {
+        "threshold": operating_threshold,
+        "operating_threshold": operating_threshold,
+        "threshold_policy": str(bundle.get("threshold_policy", DEFAULT_THRESHOLD_POLICY)),
+        "calibration_method": str(bundle.get("calibration_method", DEFAULT_CALIBRATION_METHOD)),
+        "fn_cost": float(bundle.get("fn_cost", DEFAULT_THRESHOLD_FN_COST)),
+        "fp_cost": float(bundle.get("fp_cost", DEFAULT_THRESHOLD_FP_COST)),
+        "raw_youden_threshold": float(bundle.get("raw_youden_threshold", operating_threshold)),
+        "calibration_model": bundle.get("calibration_model"),
+        "calibration_metadata": bundle.get("calibration_metadata"),
+    }
 
 
 def _initial_recalibration_manifest(
@@ -7170,9 +7788,11 @@ def _initial_recalibration_manifest(
         "run_manifest": _to_json_safe(run_manifest),
         "feature_selection_context": _to_json_safe(feature_selection_context),
         "completed_block_ids": [],
+        "skipped_failed_block_ids": [],
         "pending_block_ids": [],
         "failed_block_id": None,
         "last_error": None,
+        "nonfatal_block_errors": [],
         "block_index": {},
         "tuning_index": {},
         "smote_index": {},
@@ -7182,6 +7802,7 @@ def _initial_recalibration_manifest(
             "completed_tuning_tasks": 0,
             "total_tuning_tasks": int(len(tuning_tasks)),
             "completed_blocks": 0,
+            "skipped_failed_blocks": 0,
             "total_blocks": int(len(experiment_blocks)),
         },
         "resume": {
@@ -7201,15 +7822,21 @@ def _update_manifest_progress(
     pending_block_ids: Sequence[str],
 ) -> None:
     progress = dict(manifest.get("progress") or {})
+    total_tuning_tasks = max(
+        int(progress.get("total_tuning_tasks", 0)),
+        int(len(manifest.get("tuning_index") or {})),
+    )
     progress["completed_units"] = float(completed_units)
     progress["total_units"] = int(manifest.get("run_manifest", {}).get("total_progress_units", progress.get("total_units", 0)))
     progress["completed_tuning_tasks"] = int(
         sum(1 for item in (manifest.get("tuning_index") or {}).values() if str(item.get("status")) == "completed")
     )
-    progress["total_tuning_tasks"] = int(progress.get("total_tuning_tasks", 0))
+    progress["total_tuning_tasks"] = int(total_tuning_tasks)
     progress["completed_blocks"] = int(len(manifest.get("completed_block_ids") or []))
+    progress["skipped_failed_blocks"] = int(len(manifest.get("skipped_failed_block_ids") or []))
     progress["total_blocks"] = int(progress.get("total_blocks", 0))
     manifest["progress"] = progress
+    manifest.setdefault("run_manifest", {})["total_tuning_tasks"] = int(total_tuning_tasks)
     manifest["pending_block_ids"] = [str(block_id) for block_id in pending_block_ids]
 
 
@@ -7223,6 +7850,125 @@ def _load_completed_tuning_cache(paths: Dict[str, Path], manifest: Dict[str, Any
         if payload:
             artifacts[str(tuning_key)] = payload
     return artifacts
+
+
+def _resolve_or_create_tuning_artifact(
+    *,
+    paths: Dict[str, Path],
+    manifest: Dict[str, Any],
+    tuning_cache: Dict[str, Dict[str, Any]],
+    train_df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    target_col: str,
+    time_col: str,
+    model_name: str,
+    balance_mode: str,
+    validation_size: float,
+    folds: int,
+    random_state: int,
+    fast_mode: bool,
+    resource_mode: str,
+    grid_limit: Optional[int],
+    custom_grid: Optional[Dict[str, Sequence[Any]]],
+    tuning_context: Optional[Dict[str, Any]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    persist_progress: bool = True,
+) -> Dict[str, Any]:
+    tuning_key = _build_global_tuning_key(
+        model_name=model_name,
+        balance_mode=balance_mode,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        time_col=time_col,
+        canonical_train_df=train_df,
+        validation_size=float(validation_size),
+        folds=int(folds),
+        random_state=int(random_state),
+        fast_mode=bool(fast_mode),
+        resource_mode=str(resource_mode),
+        grid_limit=grid_limit,
+        custom_grid=custom_grid,
+    )
+    tuning_filename = f"{tuning_key}.json"
+    y_train = pd.to_numeric(train_df[target_col], errors="coerce").fillna(0).astype(int)
+    signature_cols = [col for col in [time_col, target_col] + list(feature_cols) if col in train_df.columns]
+    strategy_context = _to_json_safe(dict(tuning_context or {}))
+
+    manifest["tuning_index"][tuning_key] = {
+        **dict((manifest.get("tuning_index") or {}).get(tuning_key) or {}),
+        "filename": tuning_filename,
+        "status": str((manifest.get("tuning_index") or {}).get(tuning_key, {}).get("status", "pending")),
+        "model_name": str(model_name),
+        "balance_mode": str(balance_mode),
+        "strategy_context": strategy_context,
+    }
+
+    cached = tuning_cache.get(tuning_key)
+    if cached is not None:
+        manifest["tuning_index"][tuning_key].update(
+            {
+                "filename": tuning_filename,
+                "status": "completed",
+                "study_id": cached.get("study_id"),
+            }
+        )
+        return cached
+
+    manifest["tuning_index"][tuning_key]["status"] = "running"
+    if persist_progress:
+        _persist_manifest(paths["manifest"], manifest)
+
+    X_tune, y_tune = _prepare_xy_raw(train_df, feature_cols, target_col)
+    tuning_study_id = f"{tuning_key}__window"
+    try:
+        best_params, search_df, tuning_artifact = tune_hyperparameters(
+            X_tune,
+            y_tune,
+            model_name=model_name,
+            folds=folds,
+            random_state=random_state,
+            fast_mode=fast_mode,
+            resource_mode=resource_mode,
+            grid_limit=grid_limit,
+            custom_grid=custom_grid,
+            balance_mode=balance_mode,
+            study_id=tuning_study_id,
+            progress_callback=progress_callback,
+        )
+    except Exception:
+        manifest["tuning_index"][tuning_key]["status"] = "failed"
+        if persist_progress:
+            _persist_manifest(paths["manifest"], manifest)
+        raise
+    tuning_payload = {
+        **dict(tuning_artifact),
+        "tuning_key": tuning_key,
+        "stage": "window_tuning",
+        "strategy_context": strategy_context,
+        "model_name": str(model_name),
+        "balance_mode": str(balance_mode),
+        "best_params": best_params,
+        "n_train": int(len(train_df)),
+        "positive_rows": int(y_train.sum()),
+        "positive_rate": float(y_train.mean()) if len(y_train) else 0.0,
+        "train_signature": _frame_signature(train_df, columns=signature_cols, include_index=True),
+        "policy_signature": _recalibration_policy_signature(),
+        "search_df": [] if search_df.empty else search_df.to_dict(orient="records"),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if persist_progress:
+        _persist_tuning_artifact(paths["tuning_dir"] / tuning_filename, tuning_payload)
+    tuning_cache[tuning_key] = tuning_payload
+    manifest["tuning_index"][tuning_key].update(
+        {
+            "filename": tuning_filename,
+            "status": "completed",
+            "study_id": tuning_payload.get("study_id"),
+        }
+    )
+    if persist_progress:
+        _persist_manifest(paths["manifest"], manifest)
+    return tuning_payload
 
 
 def _persist_drift_recalibration_json(
@@ -7294,6 +8040,7 @@ def run_recalibration_experiments(
     persist_progress: bool = True,
     reuse_tuning_cache: bool = True,
     reuse_smote_cache: bool = True,
+    continue_on_block_error: bool = False,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
@@ -7331,9 +8078,21 @@ def run_recalibration_experiments(
 
     progress_seeds = [int(seed) for seed in repetition_seeds]
     tuning_tasks = _batch_tuning_tasks(
+        df=df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        time_col=time_col,
         model_names=list(model_names),
         strategies=list(strategies),
         balance_modes=list(balance_modes),
+        base_year=effective_base_year,
+        validation_size=float(validation_size),
+        folds=int(folds),
+        random_state=int(random_state),
+        fast_mode=bool(fast_mode),
+        resource_mode=str(normalized_resource_mode),
+        grid_limit=grid_limit,
+        custom_grids=custom_grids,
     )
     total_block_units = len(experiment_blocks) * max(1, len(progress_seeds))
     total_units = max(1, len(tuning_tasks) + total_block_units)
@@ -7398,6 +8157,8 @@ def run_recalibration_experiments(
     studies: List[Dict[str, Any]] = []
     preflight = _estimate_recalibration_workload(
         df=df,
+        feature_cols=feature_cols,
+        target_col=target_col,
         time_col=time_col,
         model_names=list(model_names),
         strategies=list(strategies),
@@ -7405,9 +8166,14 @@ def run_recalibration_experiments(
         kswin_variants=list(kswin_variants),
         balance_modes=list(balance_modes),
         repetition_seeds=list(repetition_seeds),
+        base_year=effective_base_year,
+        validation_size=float(validation_size),
         grid_limit=grid_limit,
         folds=folds,
         resource_mode=normalized_resource_mode,
+        random_state=int(random_state),
+        fast_mode=bool(fast_mode),
+        custom_grids=custom_grids,
     )
     available_years = _available_prediction_years(df, time_col)
     prediction_years = [
@@ -7442,6 +8208,7 @@ def run_recalibration_experiments(
         "kswin_vote_threshold": int(kswin_vote_threshold),
         "kswin_retrain_days": int(kswin_retrain_days),
         "kswin_min_retrain_rows": int(kswin_min_retrain_rows),
+        "continue_on_block_error": bool(continue_on_block_error),
         "feature_count": int(len(feature_cols)),
         "feature_cols": list(feature_cols),
         "target_col": str(target_col),
@@ -7478,6 +8245,7 @@ def run_recalibration_experiments(
         kswin_vote_threshold=int(kswin_vote_threshold),
         kswin_retrain_days=int(kswin_retrain_days),
         kswin_min_retrain_rows=int(kswin_min_retrain_rows),
+        continue_on_block_error=bool(continue_on_block_error),
         custom_grids=custom_grids,
         feature_selection_context=normalized_feature_selection_context,
     )
@@ -7566,14 +8334,25 @@ def run_recalibration_experiments(
             }
 
     completed_block_ids = {str(item) for item in manifest.get("completed_block_ids", [])}
-    completed_units = float(len(tuning_cache) + len(completed_block_ids))
-    pending_block_ids = [spec["block_id"] for spec in block_specs if spec["block_id"] not in completed_block_ids]
+    skipped_failed_block_ids = {str(item) for item in manifest.get("skipped_failed_block_ids", [])}
+    terminal_block_ids = completed_block_ids | skipped_failed_block_ids
+    completed_units = float(len(tuning_cache) + len(terminal_block_ids))
+    pending_block_ids = [spec["block_id"] for spec in block_specs if spec["block_id"] not in terminal_block_ids]
+    skipped_blocks_by_run: Dict[Tuple[int, int], int] = {}
+    for skipped_block_id in skipped_failed_block_ids:
+        skipped_info = dict((manifest.get("block_index") or {}).get(skipped_block_id) or {})
+        skipped_key = (
+            int(skipped_info.get("run_seed", 0)),
+            int(skipped_info.get("run_order", 0)),
+        )
+        skipped_blocks_by_run[skipped_key] = skipped_blocks_by_run.get(skipped_key, 0) + 1
     pending_blocks_by_run: Dict[Tuple[int, int], int] = {}
     for spec in block_specs:
-        if spec["block_id"] in completed_block_ids:
+        if spec["block_id"] in terminal_block_ids:
             continue
         key = (int(spec["run_seed"]), int(spec["run_order"]))
         pending_blocks_by_run[key] = pending_blocks_by_run.get(key, 0) + 1
+        skipped_blocks_by_run.setdefault(key, 0)
     _update_manifest_progress(
         manifest,
         completed_units=completed_units,
@@ -7594,170 +8373,122 @@ def run_recalibration_experiments(
         },
     )
 
-    canonical_train_df = pd.DataFrame()
-    if tuning_tasks:
-        if effective_base_year is None:
-            raise ValueError("No se pudo determinar el ano base para el tuning global.")
-        canonical_train_df = df.loc[_as_year_mask(df, time_col, int(effective_base_year))].copy()
-        if canonical_train_df.empty:
-            raise ValueError("El split canonico base para tuning global esta vacio.")
-
     for task_idx, task in enumerate(tuning_tasks, start=1):
         model_name = str(task["model_name"])
         balance_mode = str(task["balance_mode"])
-        tuning_key = _build_global_tuning_key(
-            model_name=model_name,
-            balance_mode=balance_mode,
-            feature_cols=feature_cols,
-            target_col=target_col,
-            time_col=time_col,
-            canonical_train_df=canonical_train_df,
-            validation_size=float(validation_size),
-            folds=int(folds),
-            random_state=int(random_state),
-            fast_mode=bool(fast_mode),
-            resource_mode=str(normalized_resource_mode),
-            grid_limit=grid_limit,
-            custom_grid=(custom_grids or {}).get(model_name),
-        )
-        tuning_filename = f"{tuning_key}.json"
-        manifest["tuning_index"][tuning_key] = {
-            **dict((manifest.get("tuning_index") or {}).get(tuning_key) or {}),
-            "filename": tuning_filename,
-            "status": str((manifest.get("tuning_index") or {}).get(tuning_key, {}).get("status", "pending")),
-            "model_name": model_name,
-            "balance_mode": balance_mode,
-        }
+        tuning_key = str(task["tuning_key"])
         if reuse_tuning_cache and tuning_key in tuning_cache:
             continue
 
-        manifest["tuning_index"][tuning_key]["status"] = "running"
-        if persist_progress:
-            _persist_manifest(paths["manifest"], manifest)
-
+        train_df = _materialize_tuning_train_df(
+            df,
+            time_col=time_col,
+            task=task,
+        )
         rss_before = _current_rss_mb()
         _append_execution_log(
             manifest.get("global_execution_log"),
-            phase="global_tuning_start",
+            phase="window_tuning_start",
             status="started",
-            message="Starting global tuning on canonical base split.",
+            message="Starting window-scoped tuning artifact creation.",
             tuning_key=tuning_key,
             model=model_name,
             balance_mode=balance_mode,
             task_index=int(task_idx),
             total_tasks=int(len(tuning_tasks)),
             run_id=run_id,
-            training_year=int(effective_base_year) if effective_base_year is not None else None,
+            training_years=task.get("training_years"),
+            strategy_context=task.get("strategy_context"),
             rss_before_mb=rss_before,
         )
         try:
-            X_tune, y_tune = _prepare_xy_raw(canonical_train_df, feature_cols, target_col)
-            tuning_study_id = _build_tuning_study_id(
-                stage="global_tuning",
-                strategy="canonical_base",
-                model_name=model_name,
-                balance_mode=balance_mode,
-                run_seed=int(random_state),
-                run_order=1,
-                training_year=str(int(effective_base_year)) if effective_base_year is not None else None,
-            )
             emit_progress(
-                label="Sintonizando hiperparametros globales...",
-                detail=f"Modelo {model_name} | Balance {balance_mode} | tarea {task_idx} / {len(tuning_tasks)}",
+                label="Sintonizando hiperparametros por ventana...",
+                detail=(
+                    f"Modelo {model_name} | Balance {balance_mode} | "
+                    f"ventana {task_idx} / {len(tuning_tasks)} | {str(task.get('training_year_label', '') or task.get('window_kind', 'window'))}"
+                ),
                 completed_override=completed_units,
                 context={
-                    "phase": "global_tuning",
+                    "phase": "window_tuning",
                     "model": model_name,
                     "balance_mode": balance_mode,
                     "task_index": int(task_idx),
                     "total_tasks": int(len(tuning_tasks)),
-                    "study_id": tuning_study_id,
+                    "tuning_key": tuning_key,
+                    "window_kind": str(task.get("window_kind", "")),
+                    "training_years": task.get("training_years"),
+                    "prediction_year": task.get("prediction_year"),
                 },
             )
-            best_params, search_df, tuning_artifact = tune_hyperparameters(
-                X_tune,
-                y_tune,
+            tuning_artifact = _resolve_or_create_tuning_artifact(
+                paths=paths,
+                manifest=manifest,
+                tuning_cache=tuning_cache,
+                train_df=train_df,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                time_col=time_col,
                 model_name=model_name,
-                folds=folds,
-                random_state=random_state,
-                fast_mode=fast_mode,
-                resource_mode=normalized_resource_mode,
+                balance_mode=balance_mode,
+                validation_size=float(validation_size),
+                folds=int(folds),
+                random_state=int(random_state),
+                fast_mode=bool(fast_mode),
+                resource_mode=str(normalized_resource_mode),
                 grid_limit=grid_limit,
                 custom_grid=(custom_grids or {}).get(model_name),
-                balance_mode=balance_mode,
-                study_id=tuning_study_id,
+                tuning_context=dict(task.get("strategy_context") or {}),
                 progress_callback=(
                     None
                     if progress_callback is None and not persist_progress
                     else lambda payload, _base=completed_units: emit_progress(
-                        label=str(payload.get("label", "Sintonizando hiperparametros globales...")),
+                        label=str(payload.get("label", "Sintonizando hiperparametros por ventana...")),
                         detail=f"Modelo {model_name} | Balance {balance_mode} | {str(payload.get('detail', '') or '')}".strip(" |"),
                         completed_override=_base + max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
                         context={
-                            "phase": "global_tuning",
+                            "phase": "window_tuning",
                             "model": model_name,
                             "balance_mode": balance_mode,
                             "task_index": int(task_idx),
                             "total_tasks": int(len(tuning_tasks)),
-                            "study_id": tuning_study_id,
+                            "tuning_key": tuning_key,
                             "tuning_ratio": max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
+                            "window_kind": str(task.get("window_kind", "")),
+                            "training_years": task.get("training_years"),
+                            "prediction_year": task.get("prediction_year"),
                         },
                     )
                 ),
-            )
-            tuning_payload = {
-                **dict(tuning_artifact),
-                "tuning_key": tuning_key,
-                "stage": "global_tuning",
-                "canonical_base_year": int(effective_base_year) if effective_base_year is not None else None,
-                "model_name": model_name,
-                "balance_mode": balance_mode,
-                "best_params": best_params,
-                "n_train": int(len(canonical_train_df)),
-                "positive_rows": int(pd.to_numeric(canonical_train_df[target_col], errors="coerce").fillna(0).astype(int).sum()),
-                "train_signature": _frame_signature(
-                    canonical_train_df,
-                    columns=[col for col in [time_col, target_col] + list(feature_cols) if col in canonical_train_df.columns],
-                    include_index=True,
-                ),
-                "search_df": [] if search_df.empty else search_df.to_dict(orient="records"),
-                "saved_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            if persist_progress:
-                _persist_tuning_artifact(paths["tuning_dir"] / tuning_filename, tuning_payload)
-            tuning_cache[tuning_key] = tuning_payload
-            manifest["tuning_index"][tuning_key].update(
-                {
-                    "filename": tuning_filename,
-                    "status": "completed",
-                    "study_id": tuning_payload.get("study_id"),
-                }
+                persist_progress=persist_progress,
             )
             rss_after = _cleanup_recalibration_memory()
             _update_memory_summary(
                 manifest,
-                phase="global_tuning_complete",
+                phase="window_tuning_complete",
                 rss_before_mb=rss_before,
                 rss_after_mb=rss_after,
             )
             _append_execution_log(
                 manifest.get("global_execution_log"),
-                phase="global_tuning_complete",
+                phase="window_tuning_complete",
                 status="ok",
-                message="Completed global tuning on canonical base split.",
+                message="Completed window-scoped tuning artifact creation.",
                 tuning_key=tuning_key,
                 model=model_name,
                 balance_mode=balance_mode,
-                study_id=tuning_payload.get("study_id"),
-                best_params=best_params,
-                best_value=tuning_payload.get("best_value"),
+                study_id=tuning_artifact.get("study_id"),
+                best_params=tuning_artifact.get("best_params"),
+                best_value=tuning_artifact.get("best_value"),
+                training_years=task.get("training_years"),
+                prediction_year=task.get("prediction_year"),
                 rss_after_mb=rss_after,
             )
-            if str(model_name) == "NNet" and int(tuning_payload.get("invalid_trial_count", 0)) > 0:
+            if str(model_name) == "NNet" and int(tuning_artifact.get("invalid_trial_count", 0)) > 0:
                 total_non_converged_folds = int(
                     sum(
                         int(row.get("n_non_converged_folds", 0))
-                        for row in (tuning_payload.get("trials") or [])
+                        for row in (tuning_artifact.get("trials") or [])
                     )
                 )
                 _append_execution_log(
@@ -7768,12 +8499,12 @@ def run_recalibration_experiments(
                     tuning_key=tuning_key,
                     model=model_name,
                     balance_mode=balance_mode,
-                    invalid_trial_count=int(tuning_payload.get("invalid_trial_count", 0)),
+                    invalid_trial_count=int(tuning_artifact.get("invalid_trial_count", 0)),
                     non_converged_fold_count=total_non_converged_folds,
-                    has_valid_trial=bool(tuning_payload.get("has_valid_trial", True)),
-                    study_id=tuning_payload.get("study_id"),
+                    has_valid_trial=bool(tuning_artifact.get("has_valid_trial", True)),
+                    study_id=tuning_artifact.get("study_id"),
                 )
-            if str(model_name) == "NNet" and not bool(tuning_payload.get("has_valid_trial", True)):
+            if str(model_name) == "NNet" and not bool(tuning_artifact.get("has_valid_trial", True)):
                 _append_execution_log(
                     manifest.get("global_execution_log"),
                     phase="nnet_trial_invalid",
@@ -7782,11 +8513,11 @@ def run_recalibration_experiments(
                     tuning_key=tuning_key,
                     model=model_name,
                     balance_mode=balance_mode,
-                    invalid_trial_count=int(tuning_payload.get("invalid_trial_count", 0)),
-                    study_id=tuning_payload.get("study_id"),
+                    invalid_trial_count=int(tuning_artifact.get("invalid_trial_count", 0)),
+                    study_id=tuning_artifact.get("study_id"),
                 )
             completed_units += 1.0
-            pending_block_ids = [spec["block_id"] for spec in block_specs if spec["block_id"] not in completed_block_ids]
+            pending_block_ids = [spec["block_id"] for spec in block_specs if spec["block_id"] not in terminal_block_ids]
             _update_manifest_progress(
                 manifest,
                 completed_units=completed_units,
@@ -7795,42 +8526,45 @@ def run_recalibration_experiments(
             if persist_progress:
                 _persist_manifest(paths["manifest"], manifest)
             emit_progress(
-                label="Tuning global completado.",
+                label="Tuning por ventana completado.",
                 detail=f"Modelo {model_name} | Balance {balance_mode} | {completed_units:.2f} / {total_units} unidades",
                 completed_override=completed_units,
                 context={
-                    "phase": "global_tuning_complete",
+                    "phase": "window_tuning_complete",
                     "model": model_name,
                     "balance_mode": balance_mode,
                     "task_index": int(task_idx),
                     "total_tasks": int(len(tuning_tasks)),
-                    "study_id": tuning_payload.get("study_id"),
-                    "best_value": tuning_payload.get("best_value"),
+                    "study_id": tuning_artifact.get("study_id"),
+                    "best_value": tuning_artifact.get("best_value"),
+                    "tuning_key": tuning_key,
+                    "window_kind": str(task.get("window_kind", "")),
+                    "training_years": task.get("training_years"),
+                    "prediction_year": task.get("prediction_year"),
                 },
             )
         except Exception as exc:
             rss_after = _cleanup_recalibration_memory()
             _update_memory_summary(
                 manifest,
-                phase="global_tuning_error",
+                phase="window_tuning_error",
                 rss_before_mb=rss_before,
                 rss_after_mb=rss_after,
             )
             manifest["status"] = "failed"
             manifest["failed_block_id"] = None
             manifest["last_error"] = {
-                "phase": "global_tuning",
+                "phase": "window_tuning",
                 "model": model_name,
                 "balance_mode": balance_mode,
                 "error": str(exc),
                 "traceback": traceback.format_exc(limit=10),
             }
-            manifest["tuning_index"][tuning_key]["status"] = "failed"
             _append_execution_log(
                 manifest.get("global_execution_log"),
-                phase="global_tuning_error",
+                phase="window_tuning_error",
                 status="error",
-                message="Global tuning failed.",
+                message="Window-scoped tuning failed.",
                 tuning_key=tuning_key,
                 model=model_name,
                 balance_mode=balance_mode,
@@ -7840,15 +8574,16 @@ def run_recalibration_experiments(
             if persist_progress:
                 _persist_manifest(paths["manifest"], manifest)
             emit_progress(
-                label="Error en tuning global.",
+                label="Error en tuning por ventana.",
                 detail=f"Modelo {model_name} | Balance {balance_mode} | {exc}",
                 completed_override=completed_units,
                 context={
-                    "phase": "global_tuning_error",
+                    "phase": "window_tuning_error",
                     "model": model_name,
                     "balance_mode": balance_mode,
                     "task_index": int(task_idx),
                     "total_tasks": int(len(tuning_tasks)),
+                    "tuning_key": tuning_key,
                 },
             )
             raise
@@ -7858,7 +8593,7 @@ def run_recalibration_experiments(
         block = dict(spec["block"])
         run_seed = int(spec["run_seed"])
         run_order = int(spec["run_order"])
-        if block_id in completed_block_ids:
+        if block_id in terminal_block_ids:
             continue
         run_key = (run_seed, run_order)
         if pending_blocks_by_run.get(run_key, 0) and pending_blocks_by_run.get(run_key, 0) == sum(
@@ -7866,7 +8601,7 @@ def run_recalibration_experiments(
             for item in block_specs
             if int(item["run_seed"]) == run_seed
             and int(item["run_order"]) == run_order
-            and item["block_id"] not in completed_block_ids
+            and item["block_id"] not in terminal_block_ids
         ):
             _append_execution_log(
                 manifest.get("global_execution_log"),
@@ -7939,16 +8674,25 @@ def run_recalibration_experiments(
         )
 
         tuning_refs: List[str] = []
-        fixed_params = None
-        fixed_tuning_artifact = None
-        if strategy in YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]:
-            tuning_key = _build_global_tuning_key(
-                model_name=model_name,
-                balance_mode=balance_mode,
+        work_for_tuning = df.copy()
+        work_for_tuning[time_col] = pd.to_datetime(work_for_tuning[time_col], errors="coerce")
+        work_for_tuning = work_for_tuning.dropna(subset=[time_col]).reset_index(drop=True)
+
+        def resolve_block_tuning_artifact(
+            *,
+            train_df: pd.DataFrame,
+            strategy_context: Dict[str, Any],
+        ) -> Dict[str, Any]:
+            artifact = _resolve_or_create_tuning_artifact(
+                paths=paths,
+                manifest=manifest,
+                tuning_cache=tuning_cache,
+                train_df=train_df,
                 feature_cols=feature_cols,
                 target_col=target_col,
                 time_col=time_col,
-                canonical_train_df=canonical_train_df,
+                model_name=model_name,
+                balance_mode=balance_mode,
                 validation_size=float(validation_size),
                 folds=int(folds),
                 random_state=int(random_state),
@@ -7956,12 +8700,20 @@ def run_recalibration_experiments(
                 resource_mode=str(normalized_resource_mode),
                 grid_limit=grid_limit,
                 custom_grid=(custom_grids or {}).get(model_name),
+                tuning_context=strategy_context,
+                persist_progress=persist_progress,
             )
-            fixed_tuning_artifact = tuning_cache.get(tuning_key)
-            if fixed_tuning_artifact is None:
-                raise RuntimeError(f"Missing global tuning artifact for {model_name} / {balance_mode}.")
-            fixed_params = dict(fixed_tuning_artifact.get("best_params") or {})
-            tuning_refs.append(tuning_key)
+            tuning_key = str(artifact.get("tuning_key", ""))
+            if tuning_key and tuning_key not in tuning_refs:
+                tuning_refs.append(tuning_key)
+            return artifact
+
+        base_train_block = pd.DataFrame()
+        if (
+            effective_base_year is not None
+            and strategy in YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]
+        ):
+            base_train_block = work_for_tuning.loc[_as_year_mask(work_for_tuning, time_col, int(effective_base_year))].copy()
 
         rss_before = _current_rss_mb()
         _append_execution_log(
@@ -7983,10 +8735,28 @@ def run_recalibration_experiments(
             yearly_df = pd.DataFrame()
             adaptive_df = pd.DataFrame()
             roc_data: List[Dict[str, Any]] = []
+            initial_tuning_artifact: Optional[Dict[str, Any]] = None
             if (
                 str(model_name) == "NNet"
-                and fixed_tuning_artifact is not None
-                and not bool(fixed_tuning_artifact.get("has_valid_trial", True))
+                and not base_train_block.empty
+                and strategy in {"static", ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY}
+            ):
+                initial_tuning_artifact = resolve_block_tuning_artifact(
+                    train_df=base_train_block,
+                    strategy_context={
+                        "stage": "block_precheck",
+                        "strategy": strategy,
+                        "window_kind": "base_year",
+                        "training_year": str(int(effective_base_year)),
+                        "run_seed": int(run_seed),
+                        "run_order": int(run_order),
+                        "detector_variant": detector_variant or None,
+                    },
+                )
+            if (
+                str(model_name) == "NNet"
+                and initial_tuning_artifact is not None
+                and not bool(initial_tuning_artifact.get("has_valid_trial", True))
             ):
                 _append_execution_log(
                     block_execution_log,
@@ -8000,8 +8770,8 @@ def run_recalibration_experiments(
                     run_seed=run_seed,
                     run_order=run_order,
                     tuning_refs=tuning_refs,
-                    study_id=str((fixed_tuning_artifact or {}).get("study_id", "")),
-                    invalid_trial_count=int((fixed_tuning_artifact or {}).get("invalid_trial_count", 0)),
+                    study_id=str((initial_tuning_artifact or {}).get("study_id", "")),
+                    invalid_trial_count=int((initial_tuning_artifact or {}).get("invalid_trial_count", 0)),
                 )
             elif strategy in YEARLY_STRATEGIES:
                 yearly_df, roc_data = run_yearly_strategy(
@@ -8024,8 +8794,7 @@ def run_recalibration_experiments(
                     execution_log=block_execution_log,
                     balance_mode=balance_mode,
                     study_collector=None,
-                    fixed_params=fixed_params,
-                    fixed_tuning_artifact=fixed_tuning_artifact,
+                    tuning_resolver=resolve_block_tuning_artifact,
                     run_id=run_id,
                     smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
                     smote_cache_registry=smote_registry_block,
@@ -8054,8 +8823,7 @@ def run_recalibration_experiments(
                     execution_log=block_execution_log,
                     balance_mode=balance_mode,
                     study_collector=None,
-                    fixed_params=fixed_params,
-                    fixed_tuning_artifact=fixed_tuning_artifact,
+                    tuning_resolver=resolve_block_tuning_artifact,
                     run_id=run_id,
                     smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
                     smote_cache_registry=smote_registry_block,
@@ -8101,8 +8869,7 @@ def run_recalibration_experiments(
                     execution_log=block_execution_log,
                     balance_mode=balance_mode,
                     study_collector=None,
-                    fixed_params=fixed_params,
-                    fixed_tuning_artifact=fixed_tuning_artifact,
+                    tuning_resolver=resolve_block_tuning_artifact,
                     run_id=run_id,
                     smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
                     smote_cache_registry=smote_registry_block,
@@ -8164,16 +8931,18 @@ def run_recalibration_experiments(
             manifest["failed_block_id"] = None
             manifest["last_error"] = None
             completed_units += 1.0
-            pending_block_ids = [item["block_id"] for item in block_specs if item["block_id"] not in completed_block_ids]
+            terminal_block_ids = completed_block_ids | skipped_failed_block_ids
+            pending_block_ids = [item["block_id"] for item in block_specs if item["block_id"] not in terminal_block_ids]
             pending_blocks_by_run[run_key] = max(0, int(pending_blocks_by_run.get(run_key, 0)) - 1)
             if pending_blocks_by_run.get(run_key, 0) == 0:
                 _append_execution_log(
                     manifest.get("global_execution_log"),
                     phase="run_complete",
-                    status="ok",
+                    status="warning" if int(skipped_blocks_by_run.get(run_key, 0)) > 0 else "ok",
                     message="Completed sequential experiment repetition.",
                     run_seed=run_seed,
                     run_order=run_order,
+                    skipped_failed_blocks=int(skipped_blocks_by_run.get(run_key, 0)),
                 )
             _update_manifest_progress(
                 manifest,
@@ -8258,7 +9027,69 @@ def run_recalibration_experiments(
                     "run_order": run_order,
                 },
             )
-            raise
+            if not continue_on_block_error:
+                raise
+
+            manifest["status"] = "running"
+            manifest["failed_block_id"] = None
+            manifest["last_error"] = None
+            skipped_failed_block_ids.add(block_id)
+            terminal_block_ids = completed_block_ids | skipped_failed_block_ids
+            skipped_blocks_by_run[run_key] = int(skipped_blocks_by_run.get(run_key, 0)) + 1
+            error_payload = {
+                "phase": "block",
+                "block_id": block_id,
+                "strategy": strategy,
+                "model": progress_model_label,
+                "balance_mode": balance_mode,
+                "run_seed": run_seed,
+                "run_order": run_order,
+                "error": str(exc),
+            }
+            manifest["nonfatal_block_errors"] = list(manifest.get("nonfatal_block_errors") or []) + [error_payload]
+            manifest["skipped_failed_block_ids"] = sorted(skipped_failed_block_ids)
+            manifest["block_index"][block_id].update(
+                {
+                    "status": "skipped_failed",
+                    "error": str(exc),
+                }
+            )
+            completed_units += 1.0
+            pending_block_ids = [item["block_id"] for item in block_specs if item["block_id"] not in terminal_block_ids]
+            pending_blocks_by_run[run_key] = max(0, int(pending_blocks_by_run.get(run_key, 0)) - 1)
+            if pending_blocks_by_run.get(run_key, 0) == 0:
+                _append_execution_log(
+                    manifest.get("global_execution_log"),
+                    phase="run_complete",
+                    status="warning",
+                    message="Completed sequential experiment repetition with skipped failed blocks.",
+                    run_seed=run_seed,
+                    run_order=run_order,
+                    skipped_failed_blocks=int(skipped_blocks_by_run.get(run_key, 0)),
+                )
+            _update_manifest_progress(
+                manifest,
+                completed_units=completed_units,
+                pending_block_ids=pending_block_ids,
+            )
+            if persist_progress:
+                _persist_manifest(paths["manifest"], manifest)
+            emit_progress(
+                label="Bloque omitido por error; continuando corrida.",
+                detail=f"{block_detail_prefix} | {exc}",
+                completed_override=completed_units,
+                context={
+                    "phase": "block_skipped_failed",
+                    "block_id": block_id,
+                    "strategy": strategy,
+                    "model": model_name,
+                    "detector_variant": detector_variant,
+                    "balance_mode": balance_mode,
+                    "run_seed": run_seed,
+                    "run_order": run_order,
+                },
+            )
+            continue
 
     manifest["status"] = "completed"
     manifest["failed_block_id"] = None
@@ -10978,13 +11809,11 @@ def _render_experiments_tab() -> None:
     target_col = st.selectbox(
         "Target column",
         options=list(clean_df.columns),
-        index=list(clean_df.columns).index(target_col_default),
         key="drift_exp_target_col",
     )
     time_col = st.selectbox(
         "Time column",
         options=list(clean_df.columns),
-        index=list(clean_df.columns).index(time_col_default),
         key="drift_exp_time_col",
     )
 
@@ -11096,7 +11925,7 @@ def _render_experiments_tab() -> None:
             "KSWIN top-k features",
             min_value=1,
             max_value=max(1, len(feature_cols)),
-            value=min(10, max(1, len(feature_cols))),
+            value=min(3, max(1, len(feature_cols))),
             step=1,
             key="drift_exp_kswin_top_k_features",
         )
@@ -11105,7 +11934,7 @@ def _render_experiments_tab() -> None:
             "KSWIN vote threshold",
             min_value=1,
             max_value=max(1, min(10, len(feature_cols))),
-            value=min(2, max(1, len(feature_cols))),
+            value=min(3, max(1, len(feature_cols))),
             step=1,
             key="drift_exp_kswin_vote_threshold",
         )
@@ -11114,7 +11943,7 @@ def _render_experiments_tab() -> None:
             "KSWIN retrain horizon (days)",
             min_value=1,
             max_value=365,
-            value=90,
+            value=30,
             step=1,
             key="drift_exp_kswin_retrain_days",
         )
@@ -11123,7 +11952,7 @@ def _render_experiments_tab() -> None:
             "KSWIN min retrain rows",
             min_value=10,
             max_value=200000,
-            value=100,
+            value=50,
             step=10,
             key="drift_exp_kswin_min_retrain_rows",
         )
@@ -11144,6 +11973,16 @@ def _render_experiments_tab() -> None:
         help="Se comparan solo en estrategias batch y adaptativas batch; `adaptive_arf` queda como `not_applicable`.",
     )
 
+    continue_on_block_error = st.checkbox(
+        "Skip failed blocks and continue",
+        value=False,
+        key="drift_exp_continue_on_block_error",
+        help=(
+            "Si un bloque batch/adaptativo falla, se marca como `skipped_failed` en el manifest y la corrida sigue "
+            "con el resto. El tuning global sigue siendo fail-fast."
+        ),
+    )
+
     seed_text = st.text_input(
         "Sequential repetition seeds",
         value=", ".join(str(seed) for seed in DEFAULT_REPETITION_SEEDS),
@@ -11157,6 +11996,8 @@ def _render_experiments_tab() -> None:
         preview_seeds = parse_repetition_seeds(seed_text)
         preflight_payload = _estimate_recalibration_workload(
             df=clean_df,
+            feature_cols=feature_cols,
+            target_col=target_col,
             time_col=time_col,
             model_names=selected_models,
             strategies=selected_strategies,
@@ -11164,9 +12005,14 @@ def _render_experiments_tab() -> None:
             kswin_variants=kswin_variants,
             balance_modes=balance_modes,
             repetition_seeds=preview_seeds,
+            base_year=base_year,
+            validation_size=float(validation_size),
             grid_limit=int(grid_limit),
             folds=int(folds),
             resource_mode=resource_mode,
+            random_state=int(random_state),
+            fast_mode=bool(fast_mode),
+            custom_grids=custom_grids,
         )
     except Exception:
         preflight_payload = None
@@ -11174,7 +12020,7 @@ def _render_experiments_tab() -> None:
     if isinstance(preflight_payload, dict):
         st.caption(
             "Preflight: "
-            f"{int(preflight_payload.get('n_tuning_tasks', 0))} tunings globales | "
+            f"{int(preflight_payload.get('n_tuning_tasks', 0))} tunings por ventana conocidos | "
             f"{int(preflight_payload.get('n_blocks', 0))} bloques | "
             f"{int(preflight_payload.get('estimated_batch_fits', 0))} fits batch estimados"
         )
@@ -11208,6 +12054,7 @@ def _render_experiments_tab() -> None:
             kswin_vote_threshold=int(kswin_vote_threshold),
             kswin_retrain_days=int(kswin_retrain_days),
             kswin_min_retrain_rows=int(kswin_min_retrain_rows),
+            continue_on_block_error=bool(continue_on_block_error),
             repetition_seeds=preview_seeds,
             balance_modes=balance_modes,
             feature_selection_context=_current_feature_selection_context(),
@@ -11223,6 +12070,7 @@ def _render_experiments_tab() -> None:
             f"actualizado {checkpoint_preview.get('updated_at') or 'desconocido'} | "
             f"tunings {int(checkpoint_preview.get('completed_tuning_tasks', 0))}/{int(checkpoint_preview.get('total_tuning_tasks', 0))} | "
             f"bloques {int(checkpoint_preview.get('completed_blocks', 0))}/{int(checkpoint_preview.get('total_blocks', 0))} | "
+            f"bloques omitidos {int(checkpoint_preview.get('skipped_failed_blocks', 0))} | "
             f"SMOTE cache {int(checkpoint_preview.get('smote_artifacts', 0))}"
         )
         st.caption(f"Manifest: {checkpoint_preview.get('manifest_path', '')}")
@@ -11292,6 +12140,7 @@ def _render_experiments_tab() -> None:
                 balance_modes=balance_modes,
                 feature_selection_context=_current_feature_selection_context(),
                 auto_resume=bool(execution_mode != "fresh"),
+                continue_on_block_error=bool(continue_on_block_error),
                 progress_callback=progress.update,
             )
         except Exception as exc:

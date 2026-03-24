@@ -297,6 +297,17 @@ Hard predictions are defined by
 \]
 If out-of-fold calibration becomes ill-posed, the code falls back to the internal holdout \(T^{\mathrm{val}}\).
 
+\paragraph{NNet stability policy}
+The \texttt{NNet} model is no longer trained on raw predictors. After median-based imputation on the active training split, the code fits a \texttt{StandardScaler} only on the corresponding training partition and applies the resulting transform to validation, test, or stream rows using the same parameters. For each predictor \(x_j\), the applied transform is
+\[
+z_{i,j} = \frac{x_{i,j} - \mu_j}{\sigma_j},
+\]
+where \(\mu_j\) and \(\sigma_j\) are estimated only from the training subset of the current fold, internal holdout, or retraining window. This prevents leakage across folds and across time, and the same logic is reused during yearly evaluation, \texttt{adaptive\_adwin}, and \texttt{adaptive\_kswin}.
+
+From the optimization perspective, \texttt{MLPClassifier} runs with \texttt{solver = adam}, \texttt{early\_stopping = True}, \texttt{validation\_fraction = 0.1}, \texttt{n\_iter\_no\_change = 20}, and \texttt{tol = 1e-4}. In addition, the \texttt{maxit} grid is tightened to $\{300,500\}$ in \textit{fast mode} and to $\{300,500,800\}$ in full mode. \texttt{ConvergenceWarning} messages from \texttt{scikit-learn} are not allowed to spill into the terminal; they are captured as internal pipeline signals.
+
+Methodologically, a non-converged \texttt{NNet} cross-validation fold is treated as invalid and cannot support a winning trial. If all relevant folds fail, the persisted tuning artifact is marked with \texttt{has\_valid\_trial = false}. During the final refit, the code attempts exactly one extra training pass with doubled \texttt{max\_iter}, capped at \(1000\). If that retry still does not converge, the experiment block is not allowed to crash the full run: it is persisted as \texttt{skipped}, and the \texttt{execution\_log} records explicit events such as \texttt{nnet\_fold\_non\_converged}, \texttt{nnet\_trial\_invalid}, \texttt{nnet\_final\_refit\_retry}, or \texttt{nnet\_final\_refit\_skipped}. Persisted trials also keep \texttt{converged}, \texttt{n\_non\_converged\_folds}, \texttt{n\_valid\_folds}, and \texttt{n\_iter\_final} for online inspection.
+
 \paragraph{Balancing with SMOTE}
 The \texttt{smote} mode is never applied to the test year or to the evaluation stream; it is restricted to training folds and the final refit set. If the minority class has fewer than two observations, or if the minority/majority ratio is already above the requested target, balancing is skipped. Otherwise, SMOTE builds a balanced set \((X^{\mathrm{bal}}, y^{\mathrm{bal}})\) satisfying
 \[
@@ -348,7 +359,10 @@ The \texttt{SimpleADWIN} class maintains an error window \(W\). For each candida
 \[
 m = \left(\frac{1}{n_0} + \frac{1}{n_1}\right)^{-1},
 \qquad
-\epsilon = \sqrt{\frac{1}{2m}\log\left(\max\left(1.0000001,\frac{4\log n}{\delta}\right)\right)},
+\delta' = \frac{\delta}{n},
+\qquad
+\epsilon = \sqrt{\frac{1}{2m}\log\left(\frac{4}{\delta'}\right)}
+= \sqrt{\frac{1}{2m}\log\left(\frac{4n}{\delta}\right)},
 \]
 where \(n = |W|\) and \(\delta = \texttt{adwin\_delta}\). Drift is declared when
 \[
@@ -423,7 +437,9 @@ Each block persists:
   \item its own \texttt{execution\_log};
   \item references to tuning and SMOTE artifacts.
 \end{itemize}
-The central \texttt{manifest.json} maintains progress, completed blocks, available caches, and error status. If a run fails midway, the next execution can resume from the checkpoint and reuse already computed tuning/SMOTE artifacts; this is covered by \texttt{test\_preview\_recalibration\_checkpoint\_detects\_resumable\_manifest} and \texttt{test\_recalibration\_experiments\_resume\_from\_failed\_checkpoint}.
+The central \texttt{manifest.json} maintains progress, completed blocks, skipped-failed blocks, available caches, and error status. By default, a failing block still aborts the run and leaves a resumable checkpoint. Optionally, \texttt{continue\_on\_block\_error=True} changes only the block-level policy: the failing block is marked as \texttt{skipped\_failed}, its error is recorded under \texttt{nonfatal\_block\_errors}, and the run continues with the remaining blocks. Global tuning remains fail-fast. Resume and skip behavior are covered by \texttt{test\_preview\_recalibration\_checkpoint\_detects\_resumable\_manifest}, \texttt{test\_recalibration\_experiments\_resume\_from\_failed\_checkpoint}, and \texttt{test\_recalibration\_experiments\_can\_skip\_failed\_blocks\_and\_continue}.
+
+For \texttt{NNet}, cache compatibility depends not only on the dataset and the search grid. Both \texttt{run\_id} and \texttt{tuning\_key} include an explicit version signature for the training policy (\texttt{NNET\_TRAINING\_POLICY\_VERSION}). As a result, if scaling, early-stopping behavior, or convergence rules change, previous checkpoints and tuning caches automatically become incompatible and are not silently reused.
 
 \paragraph{Expected results}
 Methodologically, a completed experiment must produce seven mutually consistent outputs:

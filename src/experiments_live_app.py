@@ -279,48 +279,8 @@ def _build_drift_average_roc_curves(
     return pd.DataFrame(rows)
 
 
-def _summarize_drift_rows(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(
-            columns=[
-                "source",
-                "strategy",
-                "model",
-                "balance_mode",
-                "auc",
-                "sensitivity",
-                "specificity",
-                "error_rate",
-                "training_time_sec",
-                "n_rows",
-                "n_seeds",
-            ]
-        )
-    work = df.copy()
-    if "balance_mode" not in work.columns:
-        work["balance_mode"] = "not_applicable"
-    for col in ["auc", "sensitivity", "specificity", "error_rate", "training_time_sec", "run_seed"]:
-        if col in work.columns:
-            work[col] = pd.to_numeric(work[col], errors="coerce")
-    agg_map: Dict[str, tuple[str, object]] = {"n_rows": ("strategy", "size")}
-    for metric in ["auc", "sensitivity", "specificity", "error_rate", "training_time_sec"]:
-        if metric in work.columns:
-            agg_map[metric] = (metric, "mean")
-    if "run_seed" in work.columns:
-        agg_map["n_seeds"] = (
-            "run_seed",
-            lambda s: int(pd.Series(s).dropna().astype(int).nunique()) if pd.Series(s).notna().any() else 0,
-        )
-    grouped = (
-        work.groupby(["strategy", "model", "balance_mode"], dropna=False)
-        .agg(**agg_map)
-        .reset_index()
-    )
-    grouped.insert(0, "source", source)
-    if "n_seeds" not in grouped.columns:
-        grouped["n_seeds"] = 0
+def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFrame) -> pd.DataFrame:
     ordered_cols = [
-        "source",
         "strategy",
         "model",
         "balance_mode",
@@ -329,40 +289,50 @@ def _summarize_drift_rows(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
         "specificity",
         "error_rate",
         "training_time_sec",
-        "n_rows",
-        "n_seeds",
+        "n_segments",
+        "n_repetitions",
     ]
-    for col in ordered_cols:
-        if col not in grouped.columns:
-            grouped[col] = pd.NA
-    return grouped[ordered_cols].sort_values(
-        ["source", "strategy", "balance_mode", "model"]
-    ).reset_index(drop=True)
+    frames: list[pd.DataFrame] = []
 
-
-def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFrame) -> pd.DataFrame:
-    frames = [
-        _summarize_drift_rows(yearly_df, source="yearly"),
-        _summarize_drift_rows(adaptive_df, source="adaptive"),
-    ]
-    non_empty = [frame for frame in frames if frame is not None and not frame.empty]
-    if not non_empty:
-        return pd.DataFrame(
-            columns=[
-                "source",
-                "strategy",
-                "model",
-                "balance_mode",
-                "auc",
-                "sensitivity",
-                "specificity",
-                "error_rate",
-                "training_time_sec",
-                "n_rows",
-                "n_seeds",
-            ]
+    for df in [yearly_df, adaptive_df]:
+        if df is None or df.empty:
+            continue
+        work = df.copy()
+        if "balance_mode" not in work.columns:
+            work["balance_mode"] = "not_applicable"
+        if "run_seed" not in work.columns:
+            work["run_seed"] = pd.NA
+        for col in ["auc", "sensitivity", "specificity", "error_rate", "training_time_sec", "run_seed"]:
+            if col in work.columns:
+                work[col] = pd.to_numeric(work[col], errors="coerce")
+        grouped = (
+            work.groupby(["strategy", "model", "balance_mode"], dropna=False)
+            .agg(
+                auc=("auc", "mean"),
+                sensitivity=("sensitivity", "mean"),
+                specificity=("specificity", "mean"),
+                error_rate=("error_rate", "mean"),
+                training_time_sec=("training_time_sec", "mean"),
+                n_segments=("model", "size"),
+                n_repetitions=(
+                    "run_seed",
+                    lambda s: int(s.dropna().astype(int).nunique()) if s.notna().any() else 1,
+                ),
+            )
+            .reset_index()
         )
-    return pd.concat(non_empty, ignore_index=True)
+        frames.append(grouped)
+
+    if not frames:
+        return pd.DataFrame(columns=ordered_cols)
+
+    out = pd.concat(frames, ignore_index=True)
+    for col in ordered_cols:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return out[ordered_cols].sort_values(
+        ["strategy", "model", "balance_mode"]
+    ).reset_index(drop=True)
 
 
 def _display_cell(value: object, *, pending: bool = False) -> object:
@@ -2373,14 +2343,12 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
             key_prefix="partial_drift_roc",
         )
 
-        st.markdown("**Partial strategy summary**")
+        st.markdown("**Strategy summary**")
         if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
             if "auc" in summary_df.columns and summary_df["auc"].notna().any():
                 chart_df = summary_df.copy()
                 chart_df["series_label"] = (
-                    chart_df["source"].astype(str)
-                    + " | "
-                    + chart_df["strategy"].astype(str)
+                    chart_df["strategy"].astype(str)
                     + " | "
                     + chart_df["model"].astype(str)
                     + " | "

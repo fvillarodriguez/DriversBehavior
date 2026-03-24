@@ -297,6 +297,17 @@ Las predicciones duras se definen como
 \]
 Si la calibraci\'on \textit{out-of-fold} falla por falta de variabilidad, el c\'odigo cae a un esquema de respaldo usando el holdout interno \(T^{\mathrm{val}}\).
 
+\paragraph{Pol\'itica de estabilidad para NNet}
+El modelo \texttt{NNet} ya no se entrena sobre variables crudas. Despu\'es de la imputaci\'on por mediana del split de entrenamiento activo, el c\'odigo ajusta un \texttt{StandardScaler} exclusivamente sobre la partici\'on de entrenamiento correspondiente y transforma validaci\'on, test o stream con esos mismos par\'ametros. Para cada predictor \(x_j\), la transformaci\'on aplicada es
+\[
+z_{i,j} = \frac{x_{i,j} - \mu_j}{\sigma_j},
+\]
+donde \(\mu_j\) y \(\sigma_j\) se estiman s\'olo con el subconjunto de entrenamiento del fold, del holdout interno o de la ventana de reentrenamiento que est\'e activa. Esto evita leakage temporal o entre folds, y la misma l\'ogica se reutiliza en evaluaci\'on anual, \texttt{adaptive\_adwin} y \texttt{adaptive\_kswin}.
+
+En t\'erminos de optimizaci\'on, \texttt{MLPClassifier} se ejecuta con \texttt{solver = adam}, \texttt{early\_stopping = True}, \texttt{validation\_fraction = 0.1}, \texttt{n\_iter\_no\_change = 20} y \texttt{tol = 1e-4}. Adem\'as, la grilla de \texttt{maxit} se endurece a $\{300,500\}$ en \textit{fast mode} y a $\{300,500,800\}$ en modo completo. Los \texttt{ConvergenceWarning} de \texttt{scikit-learn} no se dejan escapar a terminal: se capturan como se\~nal interna del pipeline.
+
+Metodol\'ogicamente, un fold de validaci\'on cruzada de \texttt{NNet} que no converge se considera inv\'alido y no puede sostener un trial ganador. Si todos los folds relevantes fallan, el artefacto de tuning queda marcado con \texttt{has\_valid\_trial = false}. Durante el refit final, el c\'odigo intenta una sola vez un reentrenamiento adicional con \texttt{max\_iter} duplicado, acotado superiormente por \(1000\). Si ese reintento tampoco converge, el bloque experimental no se aborta: se persiste como \texttt{skipped} y el \texttt{execution\_log} registra eventos expl\'icitos como \texttt{nnet\_fold\_non\_converged}, \texttt{nnet\_trial\_invalid}, \texttt{nnet\_final\_refit\_retry} o \texttt{nnet\_final\_refit\_skipped}. Los trials persistidos tambi\'en conservan \texttt{converged}, \texttt{n\_non\_converged\_folds}, \texttt{n\_valid\_folds} y \texttt{n\_iter\_final} para inspecci\'on online.
+
 \paragraph{Balanceo con SMOTE}
 El modo \texttt{smote} nunca se aplica sobre test o stream, s\'olo sobre folds de entrenamiento y sobre el refit final. Si la clase minoritaria tiene menos de dos ejemplos, o si la raz\'on minoritaria/mayoritaria ya est\'a por encima del objetivo, el balanceo no se ejecuta. En caso contrario, SMOTE construye un conjunto balanceado \((X^{\mathrm{bal}}, y^{\mathrm{bal}})\) con:
 \[
@@ -348,7 +359,10 @@ La clase \texttt{SimpleADWIN} mantiene una ventana \(W\) de errores. Para cada c
 \[
 m = \left(\frac{1}{n_0} + \frac{1}{n_1}\right)^{-1},
 \qquad
-\epsilon = \sqrt{\frac{1}{2m}\log\left(\max\left(1.0000001,\frac{4\log n}{\delta}\right)\right)},
+\delta' = \frac{\delta}{n},
+\qquad
+\epsilon = \sqrt{\frac{1}{2m}\log\left(\frac{4}{\delta'}\right)}
+= \sqrt{\frac{1}{2m}\log\left(\frac{4n}{\delta}\right)},
 \]
 donde \(n = |W|\) y \(\delta = \texttt{adwin\_delta}\). Se declara drift si
 \[
@@ -423,7 +437,9 @@ Cada bloque persiste:
   \item su propio \texttt{execution\_log};
   \item referencias a tuning y a artefactos SMOTE.
 \end{itemize}
-El \texttt{manifest.json} central mantiene progreso, bloques completados, cach\'es disponibles y errores. Si una corrida falla a mitad de camino, la siguiente ejecuci\'on puede reanudar desde el checkpoint y reutilizar tuning/SMOTE ya calculados; esto est\'a cubierto por \texttt{test\_preview\_recalibration\_checkpoint\_detects\_resumable\_manifest} y \texttt{test\_recalibration\_experiments\_resume\_from\_failed\_checkpoint}.
+El \texttt{manifest.json} central mantiene progreso, bloques completados, bloques omitidos por falla, cach\'es disponibles y errores. Por defecto, un bloque fallido sigue abortando la corrida y deja un checkpoint reanudable. Opcionalmente, \texttt{continue\_on\_block\_error=True} cambia s\'olo la pol\'itica a nivel de bloque: el bloque fallido se marca como \texttt{skipped\_failed}, su error se registra en \texttt{nonfatal\_block\_errors} y la corrida contin\'ua con los bloques restantes. El tuning global sigue siendo \textit{fail-fast}. El soporte de \textit{resume} y de omisi\'on controlada est\'a cubierto por \texttt{test\_preview\_recalibration\_checkpoint\_detects\_resumable\_manifest}, \texttt{test\_recalibration\_experiments\_resume\_from\_failed\_checkpoint} y \texttt{test\_recalibration\_experiments\_can\_skip\_failed\_blocks\_and\_continue}.
+
+Para \texttt{NNet}, la compatibilidad de cach\'e no depende s\'olo del dataset y de la grilla. Tanto el \texttt{run\_id} como el \texttt{tuning\_key} incorporan una firma de versi\'on de la pol\'itica de entrenamiento (\texttt{NNET\_TRAINING\_POLICY\_VERSION}). Por ello, si cambian el escalado, la estrategia de \textit{early stopping} o las reglas de convergencia, los checkpoints y tuning caches previos dejan de ser compatibles y no se reutilizan de manera silenciosa.
 
 \paragraph{Resultados esperados}
 Metodol\'ogicamente, la salida completa del experimento debe contener siete productos coherentes entre s\'i:
