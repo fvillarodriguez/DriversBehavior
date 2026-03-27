@@ -1,6 +1,8 @@
 import streamlit as st
 import src.git_sync as git_sync
 import time
+from collections import Counter
+from pathlib import Path
 
 def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
     if set_page_config:
@@ -162,6 +164,78 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
                 st.rerun()
             else:
                 st.error("Hubo un error al restablecer. Revise los logs.")
+
+    with st.expander("Purgar del repositorio web lo cubierto por .gitignore", expanded=False):
+        st.warning(
+            "⚠️ Esta operación elimina del repositorio remoto los archivos o carpetas "
+            "que hoy están cubiertos por `.gitignore`, pero NO borra tus archivos locales."
+        )
+        st.caption(
+            "Uso recomendado para emergencias: cuando algo sensible o pesado se publicó por error "
+            "y ya agregaste la ruta correspondiente a `.gitignore`."
+        )
+
+        tracked_ignored_paths = sorted(git_sync.get_tracked_ignored_paths())
+        if tracked_ignored_paths:
+            root_counts = Counter(Path(path).parts[0] if Path(path).parts else path for path in tracked_ignored_paths)
+            root_summary = ", ".join(
+                f"{root} ({count})"
+                for root, count in sorted(root_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+            )
+            preview_limit = 120
+
+            st.info(
+                f"Se detectaron {len(tracked_ignored_paths)} rutas que siguen trackeadas en Git "
+                "aunque hoy están ignoradas."
+            )
+            if root_summary:
+                st.caption(f"Raíces afectadas: {root_summary}")
+
+            preview_text = "\n".join(tracked_ignored_paths[:preview_limit])
+            if len(tracked_ignored_paths) > preview_limit:
+                preview_text += f"\n... y {len(tracked_ignored_paths) - preview_limit} rutas más"
+            st.code(preview_text, language="text")
+
+            confirm_purge = st.checkbox(
+                "Entiendo que esto hará un commit y push de borrados en GitHub, sin eliminar mis archivos locales.",
+                key="confirm_gitignore_remote_purge",
+            )
+
+            if st.button(
+                "🚨 Eliminar del repositorio web lo ignorado por .gitignore",
+                type="secondary",
+                disabled=not confirm_purge,
+                help="Hace git rm --cached, commit y push sólo de las rutas actualmente cubiertas por .gitignore.",
+            ):
+                st.session_state["sync_logs"] = []
+                log_placeholder = st.empty()
+                logs = []
+
+                with st.spinner("Purgando archivos ignorados del repositorio remoto..."):
+                    gen = git_sync.remove_ignored_tracked_files_from_remote_stream(push=True)
+                    success = False
+                    try:
+                        while True:
+                            msg = next(gen)
+                            logs.append(msg)
+                            log_placeholder.code("\n".join(logs), language="text")
+                    except StopIteration as e:
+                        success = e.value
+                    except Exception as e:
+                        logs.append(f"Error inesperado: {e}")
+                        log_placeholder.code("\n".join(logs), language="text")
+                        success = False
+
+                st.session_state["sync_logs"] = logs
+
+                if success:
+                    st.success("Purga remota completada.")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("La purga remota falló. Revisa los logs.")
+        else:
+            st.success("No hay rutas trackeadas que coincidan con `.gitignore`.")
 
     # Mostrar logs persistentes si no se está ejecutando (o después de ejecutarse)
     if "sync_logs" in st.session_state and st.session_state["sync_logs"]:

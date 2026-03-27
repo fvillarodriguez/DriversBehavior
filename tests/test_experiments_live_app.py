@@ -106,14 +106,20 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
         "yearly_rows": [
             {
                 "strategy": "static",
+                "prediction_year": 2019,
                 "model": "Random Forest",
                 "balance_mode": "none",
                 "auc": 0.81,
-                "sensitivity": 0.72,
-                "specificity": 0.78,
-                "error_rate": 0.19,
+                "sensitivity": 1.0,
+                "specificity": 1.0,
+                "sensitivity_before_calibration": 0.5,
+                "specificity_before_calibration": 0.75,
+                "sensitivity_after_calibration": 1.0,
+                "specificity_after_calibration": 1.0,
+                "error_rate": 0.0,
                 "training_time_sec": 0.4,
                 "run_seed": 11,
+                "run_order": 1,
             }
         ],
         "adaptive_rows": [
@@ -122,11 +128,16 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
                 "model": "Random Forest",
                 "balance_mode": "smote",
                 "auc": 0.79,
-                "sensitivity": 0.70,
-                "specificity": 0.76,
-                "error_rate": 0.21,
+                "sensitivity": 1.0,
+                "specificity": 1.0,
+                "sensitivity_before_calibration": 0.5,
+                "specificity_before_calibration": 0.75,
+                "sensitivity_after_calibration": 1.0,
+                "specificity_after_calibration": 1.0,
+                "error_rate": 0.0,
                 "training_time_sec": 0.6,
                 "run_seed": 11,
+                "run_order": 1,
             }
         ],
         "execution_log": [
@@ -146,6 +157,16 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
                 "segment": "2019",
                 "y_true": [0, 1],
                 "scores": [0.1, 0.9],
+                "run_seed": 11,
+                "run_order": 1,
+            },
+            {
+                "strategy": "adaptive_adwin",
+                "model": "Random Forest",
+                "balance_mode": "smote",
+                "segment": "final",
+                "y_true": [0, 1],
+                "scores": [0.2, 0.8],
                 "run_seed": 11,
                 "run_order": 1,
             }
@@ -227,8 +248,17 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
     assert len(payload["block_df"]) == 2
     assert not payload["summary_df"].empty
     assert set(payload["summary_df"]["strategy"].unique()) == {"static", "adaptive_adwin"}
+    assert "detector_variant" in payload["summary_df"].columns
     assert "n_segments" in payload["summary_df"].columns
     assert "n_repetitions" in payload["summary_df"].columns
+    assert payload["yearly_df"]["pr_auc"].iloc[0] == 1.0
+    assert payload["yearly_df"]["f1"].iloc[0] == 1.0
+    assert payload["yearly_df"]["sensitivity_before_calibration"].iloc[0] == 0.5
+    assert payload["yearly_df"]["specificity_after_calibration"].iloc[0] == 1.0
+    assert payload["adaptive_df"]["pr_auc"].iloc[0] == 1.0
+    assert payload["adaptive_df"]["f1"].iloc[0] == 1.0
+    assert payload["adaptive_df"]["sensitivity_before_calibration"].iloc[0] == 0.5
+    assert payload["adaptive_df"]["specificity_after_calibration"].iloc[0] == 1.0
     assert not payload["tuning_trials_df"].empty
     assert not payload["memory_trace_df"].empty
     assert not payload["live_events_df"].empty
@@ -257,8 +287,14 @@ def test_build_drift_live_result_tables_fill_pending_slots():
                 "model": "Random Forest",
                 "balance_mode": "none",
                 "auc": 0.81,
+                "pr_auc": 0.77,
+                "f1": 0.63,
                 "sensitivity": 0.72,
                 "specificity": 0.78,
+                "sensitivity_before_calibration": 0.61,
+                "specificity_before_calibration": 0.81,
+                "sensitivity_after_calibration": 0.72,
+                "specificity_after_calibration": 0.78,
                 "error_rate": 0.19,
                 "training_time_sec": 0.4,
                 "threshold": 0.5,
@@ -299,8 +335,178 @@ def test_build_drift_live_result_tables_fill_pending_slots():
         & (tables["A.6"]["balance_mode"] == "none")
     ].iloc[0]
     assert pending_row["auc"] == "Pendiente"
+    assert pending_row["pr_auc"] == "Pendiente"
+    assert pending_row["f1"] == "Pendiente"
+    assert pending_row["sensitivity_before_calibration"] == "Pendiente"
+    assert pending_row["specificity_after_calibration"] == "Pendiente"
     assert pending_row["training_year"] == "2018"
+    completed_row = tables["A.6"].loc[tables["A.6"]["status"] == "Completado"].iloc[0]
+    assert completed_row["pr_auc"] == 0.77
+    assert completed_row["f1"] == 0.63
+    assert completed_row["sensitivity_before_calibration"] == 0.61
+    assert completed_row["specificity_after_calibration"] == 0.78
 
     assert len(tables["A.9"]) == 1
     assert tables["A.9"].iloc[0]["status"] == "Pendiente"
     assert tables["A.9"].iloc[0]["model"] == "Random Forest"
+    assert tables["A.9"].iloc[0]["pr_auc"] == "Pendiente"
+    assert tables["A.9"].iloc[0]["f1"] == "Pendiente"
+
+
+def test_build_drift_live_result_tables_keeps_completed_kswin_blocks_without_rows():
+    manifest = {
+        "run_manifest": {
+            "strategies": ["adaptive_kswin"],
+            "models": ["Random Forest"],
+            "balance_modes": ["none"],
+            "repetition_seeds": [42],
+            "base_year": 2018,
+            "prediction_years": [2019, 2020],
+        }
+    }
+    adaptive_df = pd.DataFrame()
+    block_df = pd.DataFrame(
+        [
+            {
+                "status": "completed",
+                "strategy": "adaptive_kswin",
+                "model": "Random Forest",
+                "balance_mode": "none",
+                "detector_variant": "KSWINpaper",
+                "adaptive_rows": 0,
+                "run_seed": 42,
+                "run_order": 1,
+            }
+        ]
+    )
+
+    tables = live_app._build_drift_live_result_tables(
+        manifest,
+        block_df,
+        pd.DataFrame(),
+        adaptive_df,
+    )
+
+    assert len(tables["A.9"]) == 1
+    assert tables["A.9"].iloc[0]["status"] == "Completado sin filas"
+    assert tables["A.9"].iloc[0]["strategy"] == "adaptive_kswin"
+    assert tables["A.9"].iloc[0]["detector_variant"] == "KSWINpaper"
+    assert tables["A.9"].iloc[0]["segment_rows"] == 0
+
+
+def test_read_drift_run_infers_error_status_for_empty_failed_payload():
+    manifest = {
+        "run_manifest": {
+            "strategies": ["adaptive_kswin"],
+        },
+        "block_index": {
+            "block_a": {
+                "status": "completed",
+                "strategy": "adaptive_kswin",
+                "model": "Random Forest",
+                "balance_mode": "none",
+                "detector_variant": "KSWINpaper",
+                "run_seed": 42,
+                "run_order": 1,
+            }
+        },
+    }
+    block_df = pd.DataFrame(
+        [
+            {
+                "status": "error",
+                "strategy": "adaptive_kswin",
+                "model": "Random Forest",
+                "balance_mode": "none",
+                "detector_variant": "KSWINpaper",
+                "adaptive_rows": 0,
+                "run_seed": 42,
+                "run_order": 1,
+                "error_message": "kswin_base_train_error: tuning resolver mismatch",
+            }
+        ]
+    )
+
+    tables = live_app._build_drift_live_result_tables(
+        manifest,
+        block_df,
+        pd.DataFrame(),
+        pd.DataFrame(),
+    )
+
+    assert len(tables["A.9"]) == 1
+    assert tables["A.9"].iloc[0]["status"] == "Error"
+    assert "resolver mismatch" in str(tables["A.9"].iloc[0]["error_message"])
+
+
+def test_build_drift_partial_summary_normalizes_kswin_for_existing_comparison_table():
+    adaptive_df = pd.DataFrame(
+        [
+            {
+                "strategy": "adaptive_adwin",
+                "model": "Random Forest",
+                "balance_mode": "none",
+                "auc": 0.81,
+                "pr_auc": 0.73,
+                "f1": 0.61,
+                "sensitivity": 0.72,
+                "specificity": 0.78,
+                "sensitivity_before_calibration": 0.66,
+                "specificity_before_calibration": 0.8,
+                "sensitivity_after_calibration": 0.72,
+                "specificity_after_calibration": 0.78,
+                "error_rate": 0.19,
+                "training_time_sec": 0.4,
+                "threshold": 0.5,
+                "run_seed": 11,
+                "run_order": 1,
+            },
+            {
+                "strategy": "adaptive_kswin",
+                "model": "Random Forest | KSWINpaper",
+                "base_model": "Random Forest",
+                "detector_variant": "KSWINpaper",
+                "balance_mode": "none",
+                "auc": 0.79,
+                "pr_auc": 0.69,
+                "f1": 0.58,
+                "sensitivity": 0.7,
+                "specificity": 0.76,
+                "sensitivity_before_calibration": 0.64,
+                "specificity_before_calibration": 0.79,
+                "sensitivity_after_calibration": 0.7,
+                "specificity_after_calibration": 0.76,
+                "error_rate": 0.21,
+                "training_time_sec": 0.6,
+                "threshold": 0.45,
+                "run_seed": 11,
+                "run_order": 1,
+            },
+        ]
+    )
+
+    summary = live_app._build_drift_partial_summary(
+        pd.DataFrame(),
+        adaptive_df,
+    )
+
+    assert len(summary) == 2
+    assert set(summary["strategy"].tolist()) == {"adaptive_adwin", "adaptive_kswin"}
+
+    adwin_row = summary.loc[summary["strategy"] == "adaptive_adwin"].iloc[0]
+    assert adwin_row["model"] == "Random Forest"
+    assert adwin_row["detector_variant"] == "-"
+    assert adwin_row["auc"] == 0.81
+    assert adwin_row["pr_auc"] == 0.73
+    assert adwin_row["f1"] == 0.61
+    assert adwin_row["sensitivity_before_calibration"] == 0.66
+    assert adwin_row["specificity_after_calibration"] == 0.78
+
+    kswin_row = summary.loc[summary["strategy"] == "adaptive_kswin"].iloc[0]
+    assert kswin_row["model"] == "Random Forest"
+    assert kswin_row["detector_variant"] == "KSWINpaper"
+    assert kswin_row["auc"] == 0.79
+    assert kswin_row["pr_auc"] == 0.69
+    assert kswin_row["f1"] == 0.58
+    assert kswin_row["sensitivity_before_calibration"] == 0.64
+    assert kswin_row["specificity_after_calibration"] == 0.76

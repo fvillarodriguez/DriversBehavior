@@ -670,6 +670,7 @@ def test_preview_recalibration_checkpoint_detects_resumable_manifest(tmp_path):
     assert resumed["checkpoint_available"] is True
     assert resumed["can_resume"] is True
     assert resumed["can_load_completed"] is False
+    assert resumed["can_recompute_trainings"] is True
     assert resumed["status"] == "running"
     assert resumed["completed_tuning_tasks"] == 1
     assert resumed["completed_blocks"] == 1
@@ -767,6 +768,387 @@ def test_preview_recalibration_checkpoint_separates_resource_modes(tmp_path):
     assert full_memory["checkpoint_available"] is False
 
 
+def test_preview_recalibration_checkpoint_run_reads_explicit_run_id(tmp_path):
+    run_dir = drift_app._recalibration_run_dir("run_explicit_preview", checkpoint_root=tmp_path / "runs")
+    paths = drift_app._recalibration_run_paths(run_dir)
+    drift_app._ensure_recalibration_run_dirs(paths)
+    manifest = drift_app._initial_recalibration_manifest(
+        run_id="run_explicit_preview",
+        run_manifest={"total_progress_units": 3},
+        feature_selection_context={},
+        experiment_blocks=[],
+        tuning_tasks=[],
+        preflight={},
+    )
+    manifest["status"] = "running"
+    manifest["progress"]["completed_tuning_tasks"] = 2
+    manifest["progress"]["total_tuning_tasks"] = 3
+    manifest["progress"]["completed_blocks"] = 1
+    manifest["progress"]["total_blocks"] = 2
+    drift_app._atomic_write_json(paths["manifest"], manifest)
+
+    preview = drift_app._preview_recalibration_checkpoint_run(
+        "run_explicit_preview",
+        checkpoint_root=tmp_path / "runs",
+    )
+
+    assert preview["checkpoint_available"] is True
+    assert preview["run_id"] == "run_explicit_preview"
+    assert preview["status"] == "running"
+    assert preview["can_resume"] is True
+    assert preview["can_recompute_trainings"] is True
+
+
+def test_recalibration_checkpoint_archive_roundtrip(tmp_path):
+    source_root = tmp_path / "runs_source"
+    run_dir = drift_app._recalibration_run_dir("run_demo_checkpoint", checkpoint_root=source_root)
+    paths = drift_app._recalibration_run_paths(run_dir)
+    drift_app._ensure_recalibration_run_dirs(paths)
+
+    manifest = drift_app._initial_recalibration_manifest(
+        run_id="run_demo_checkpoint",
+        run_manifest={"total_progress_units": 2},
+        feature_selection_context={"selected_features": ["x"], "feature_count": 1},
+        experiment_blocks=[{"strategy": "static", "model": "Random Forest", "balance_mode": BALANCE_MODE_NONE}],
+        tuning_tasks=[{"model_name": "Random Forest", "balance_mode": BALANCE_MODE_NONE}],
+        preflight={},
+    )
+    manifest["status"] = "completed"
+    manifest["completed_block_ids"] = ["block_demo"]
+    manifest["block_index"] = {
+        "block_demo": {"status": "completed", "filename": "block_demo.json"}
+    }
+    manifest["tuning_index"] = {
+        "tuning_demo": {"status": "completed", "filename": "tuning_demo.json", "study_id": "study_demo"}
+    }
+    manifest["smote_index"] = {
+        "smote_demo": {"status": "available", "filename": "smote_demo.duckdb"}
+    }
+    drift_app._update_manifest_progress(
+        manifest,
+        completed_units=2.0,
+        pending_block_ids=[],
+    )
+    drift_app._persist_manifest(paths["manifest"], manifest)
+    drift_app._persist_tuning_artifact(
+        paths["tuning_dir"] / "tuning_demo.json",
+        {"tuning_key": "tuning_demo", "study_id": "study_demo", "best_params": {"mtry": 2}},
+    )
+    drift_app._persist_recalibration_block(
+        paths["blocks_dir"] / "block_demo.json",
+        {
+            "block_id": "block_demo",
+            "block": {"strategy": "static", "model": "Random Forest", "balance_mode": BALANCE_MODE_NONE},
+            "run_seed": 11,
+            "run_order": 1,
+            "yearly_rows": [],
+            "adaptive_rows": [],
+            "roc_payload": [],
+            "execution_log": [],
+            "tuning_refs": ["tuning_demo"],
+            "smote_refs": ["smote_demo"],
+        },
+    )
+    (paths["smote_dir"] / "smote_demo.duckdb").write_text("stub", encoding="utf-8")
+
+    archive_bytes = drift_app._build_recalibration_checkpoint_archive(run_dir)
+    imported = drift_app._import_recalibration_checkpoint_archive(
+        archive_bytes,
+        checkpoint_root=tmp_path / "runs_imported",
+    )
+
+    imported_run_dir = Path(imported["run_dir"])
+    imported_paths = drift_app._recalibration_run_paths(imported_run_dir)
+    imported_manifest = json.loads(imported_paths["manifest"].read_text(encoding="utf-8"))
+
+    assert imported["run_id"] == "run_demo_checkpoint"
+    assert imported["status"] == "completed"
+    assert imported_paths["blocks_dir"].joinpath("block_demo.json").exists()
+    assert imported_paths["tuning_dir"].joinpath("tuning_demo.json").exists()
+    assert imported_paths["smote_dir"].joinpath("smote_demo.duckdb").exists()
+    assert imported_manifest["status"] == "completed"
+    assert imported_manifest["completed_block_ids"] == ["block_demo"]
+
+
+def test_recalibration_checkpoint_archive_import_requires_overwrite_for_existing_run(tmp_path):
+    source_root = tmp_path / "runs_source"
+    run_dir = drift_app._recalibration_run_dir("run_existing_checkpoint", checkpoint_root=source_root)
+    paths = drift_app._recalibration_run_paths(run_dir)
+    drift_app._ensure_recalibration_run_dirs(paths)
+    drift_app._persist_manifest(
+        paths["manifest"],
+        drift_app._initial_recalibration_manifest(
+            run_id="run_existing_checkpoint",
+            run_manifest={"total_progress_units": 1},
+            feature_selection_context={"selected_features": ["x"], "feature_count": 1},
+            experiment_blocks=[],
+            tuning_tasks=[],
+            preflight={},
+        ),
+    )
+
+    archive_bytes = drift_app._build_recalibration_checkpoint_archive(run_dir)
+    target_root = tmp_path / "runs_imported"
+    drift_app._import_recalibration_checkpoint_archive(archive_bytes, checkpoint_root=target_root)
+
+    with pytest.raises(FileExistsError):
+        drift_app._import_recalibration_checkpoint_archive(archive_bytes, checkpoint_root=target_root)
+
+
+def test_list_recalibration_checkpoints_sorts_by_updated_at_desc(tmp_path):
+    checkpoint_root = tmp_path / "runs"
+
+    older_dir = drift_app._recalibration_run_dir("run_older", checkpoint_root=checkpoint_root)
+    older_paths = drift_app._recalibration_run_paths(older_dir)
+    drift_app._ensure_recalibration_run_dirs(older_paths)
+    older_manifest = drift_app._initial_recalibration_manifest(
+        run_id="run_older",
+        run_manifest={"models": ["Random Forest"], "strategies": ["static"], "feature_count": 9},
+        feature_selection_context={"selected_features": ["x1", "x2"], "feature_count": 2},
+        experiment_blocks=[],
+        tuning_tasks=[],
+        preflight={},
+    )
+    older_manifest["updated_at"] = "2026-03-27T10:00:00"
+    older_manifest["status"] = "completed"
+    drift_app._atomic_write_json(older_paths["manifest"], older_manifest)
+
+    newer_dir = drift_app._recalibration_run_dir("run_newer", checkpoint_root=checkpoint_root)
+    newer_paths = drift_app._recalibration_run_paths(newer_dir)
+    drift_app._ensure_recalibration_run_dirs(newer_paths)
+    newer_manifest = drift_app._initial_recalibration_manifest(
+        run_id="run_newer",
+        run_manifest={"models": ["AdaBoost"], "strategies": ["adaptive_adwin"], "feature_count": 7},
+        feature_selection_context={"selected_features": ["x3"], "feature_count": 1},
+        experiment_blocks=[],
+        tuning_tasks=[],
+        preflight={},
+    )
+    newer_manifest["updated_at"] = "2026-03-27T11:00:00"
+    newer_manifest["status"] = "running"
+    drift_app._atomic_write_json(newer_paths["manifest"], newer_manifest)
+
+    checkpoints = drift_app._list_recalibration_checkpoints(checkpoint_root=checkpoint_root)
+
+    assert [item["run_id"] for item in checkpoints[:2]] == ["run_newer", "run_older"]
+    assert checkpoints[0]["status"] == "running"
+    assert checkpoints[1]["status"] == "completed"
+    assert checkpoints[0]["feature_selection_context"]["selected_features"] == ["x3"]
+    assert checkpoints[1]["feature_selection_context"]["selected_features"] == ["x1", "x2"]
+
+
+def test_checkpoint_form_state_from_run_manifest_maps_supported_fields():
+    run_manifest = {
+        "resource_mode": drift_app.EXPERIMENT_RESOURCE_MODE_FULL_MEMORY,
+        "models": ["Random Forest", "UnknownModel"],
+        "strategies": ["static", "adaptive_kswin", "invalid_strategy"],
+        "fast_mode": False,
+        "optuna_trials": 17,
+        "folds": 4,
+        "validation_size": 0.25,
+        "adwin_delta": 0.003,
+        "min_window": 1234,
+        "min_retrain_size": 321,
+        "arf_variants": ["ARFmoderate", "missing_variant"],
+        "kswin_variants": ["KSWINpaper", "missing_variant"],
+        "kswin_top_k_features": 99,
+        "kswin_vote_threshold": 99,
+        "kswin_retrain_days": 45,
+        "kswin_min_retrain_rows": 222,
+        "balance_modes": [BALANCE_MODE_NONE, "invalid_mode"],
+        "repetition_seeds": [7, 11],
+        "continue_on_block_error": True,
+        "target_col": "target",
+        "time_col": "interval_start",
+        "feature_selection_context": {
+            "selected_features": ["x1", "x_missing"],
+            "candidate_features": ["x1", "target", "x_missing"],
+            "feature_export_path": "/tmp/checkpoint_features.duckdb",
+        },
+    }
+
+    updates = drift_app._checkpoint_form_state_from_run_manifest(
+        run_manifest,
+        available_columns=["interval_start", "target", "x1"],
+        feature_count=8,
+    )
+
+    assert updates["drift_exp_resource_mode"] == drift_app.EXPERIMENT_RESOURCE_MODE_FULL_MEMORY
+    assert updates["drift_exp_models"] == ["Random Forest"]
+    assert updates["drift_exp_strategies"] == ["static", "adaptive_kswin"]
+    assert updates["drift_exp_fast_mode"] is False
+    assert updates["drift_exp_optuna_trials"] == 17
+    assert updates["drift_exp_folds"] == 4
+    assert updates["drift_exp_validation_size"] == pytest.approx(0.25)
+    assert updates["drift_exp_adwin_delta"] == pytest.approx(0.003)
+    assert updates["drift_exp_min_window"] == 1234
+    assert updates["drift_exp_min_retrain_size"] == 321
+    assert updates["drift_exp_arf_variants"] == ["ARFmoderate"]
+    assert updates["drift_exp_kswin_variants"] == ["KSWINpaper"]
+    assert updates["drift_exp_kswin_top_k_features"] == 8
+    assert updates["drift_exp_kswin_vote_threshold"] == 8
+    assert updates["drift_exp_kswin_retrain_days"] == 45
+    assert updates["drift_exp_kswin_min_retrain_rows"] == 222
+    assert updates["drift_exp_balance_modes"] == [BALANCE_MODE_NONE]
+    assert updates["drift_exp_seed_text"] == "7, 11"
+    assert updates["drift_exp_continue_on_block_error"] is True
+    assert updates["drift_exp_target_col"] == "target"
+    assert updates["drift_exp_time_col"] == "interval_start"
+    assert updates["drift_feature_cols"] == ["x1"]
+    assert updates["drift_candidate_feature_cols"] == ["x1", "target"]
+    assert updates["drift_feature_export_path"] == "/tmp/checkpoint_features.duckdb"
+    assert updates["drift_feature_selection_meta"]["selected_features"] == ["x1", "x_missing"]
+
+
+def test_checkpoint_form_state_from_run_manifest_resolves_windows_feature_export_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+    feature_path = tmp_path / "checkpoint_features.duckdb"
+    drift_app._write_feature_payload_to_duckdb(
+        feature_path,
+        raw_df=pd.DataFrame(
+            {
+                "interval_start": pd.date_range("2024-01-01", periods=2, freq="h"),
+                "target": [0, 1],
+                "x1": [1.0, 2.0],
+            }
+        ),
+        clean_df=pd.DataFrame(
+            {
+                "interval_start": pd.date_range("2024-01-01", periods=2, freq="h"),
+                "target": [0, 1],
+                "x1": [1.0, 2.0],
+            }
+        ),
+    )
+    run_manifest = {
+        "feature_selection_context": {
+            "selected_features": ["x1"],
+            "feature_export_path": r"C:\Users\usuario\Resultados\checkpoint_features.duckdb",
+        }
+    }
+
+    updates = drift_app._checkpoint_form_state_from_run_manifest(
+        run_manifest,
+        available_columns=["interval_start", "target", "x1"],
+        feature_count=1,
+    )
+
+    assert updates["drift_feature_export_path"] == str(feature_path.resolve())
+    assert updates["drift_feature_selection_meta"]["feature_export_path"] == str(feature_path.resolve())
+
+
+def test_execution_config_from_checkpoint_run_manifest_restores_hidden_tuning_fields():
+    current_config = {
+        "feature_cols": ["flow_light", "x1"],
+        "target_col": "target",
+        "time_col": "interval_start",
+        "model_names": ["Random Forest"],
+        "strategies": ["static"],
+        "validation_size": 0.2,
+        "folds": 3,
+        "base_year": None,
+        "random_state": 42,
+        "fast_mode": True,
+        "resource_mode": drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
+        "grid_limit": 30,
+        "adwin_delta": 0.002,
+        "min_window": 45000,
+        "min_retrain_size": 4500,
+        "arf_variants": list(drift_app.ARF_DEFAULT_VARIANTS),
+        "kswin_variants": list(drift_app.KSWIN_DEFAULT_VARIANTS),
+        "kswin_top_k_features": 2,
+        "kswin_vote_threshold": 2,
+        "kswin_retrain_days": 30,
+        "kswin_min_retrain_rows": 50,
+        "repetition_seeds": (42,),
+        "balance_modes": [BALANCE_MODE_SMOTE],
+        "feature_selection_context": {"selected_features": ["flow_light", "x1"]},
+        "custom_grids": {},
+        "continue_on_block_error": False,
+    }
+    run_manifest = {
+        "models": ["NNet", "Random Forest"],
+        "strategies": ["static", "adaptive_kswin"],
+        "arf_variants": ["ARFmoderate"],
+        "kswin_variants": ["KSWINpaper"],
+        "balance_modes": [BALANCE_MODE_NONE],
+        "repetition_seeds": [11, 13],
+        "validation_size": 0.35,
+        "folds": 5,
+        "base_year": 2018,
+        "random_state_fallback": 99,
+        "fast_mode": False,
+        "resource_mode": drift_app.EXPERIMENT_RESOURCE_MODE_FULL_MEMORY,
+        "optuna_trials": 17,
+        "adwin_delta": 0.003,
+        "min_window": 1234,
+        "min_retrain_size": 321,
+        "kswin_top_k_features": 9,
+        "kswin_vote_threshold": 9,
+        "kswin_retrain_days": 45,
+        "kswin_min_retrain_rows": 222,
+        "target_col": "target",
+        "time_col": "interval_start",
+        "continue_on_block_error": True,
+        "custom_grids": {"NNet": {"hidden_layer_sizes": [[32, 16]]}},
+    }
+    feature_selection_context = {
+        "selected_features": ["x1", "x2", "missing_feature"],
+        "feature_export_path": "/tmp/checkpoint_features.duckdb",
+    }
+
+    execution_config = drift_app._execution_config_from_checkpoint_run_manifest(
+        run_manifest,
+        available_columns=["interval_start", "target", "x1", "x2"],
+        current_config=current_config,
+        feature_selection_context=feature_selection_context,
+    )
+
+    assert execution_config["feature_cols"] == ["x1", "x2"]
+    assert execution_config["model_names"] == ["NNet", "Random Forest"]
+    assert execution_config["strategies"] == ["static", "adaptive_kswin"]
+    assert execution_config["balance_modes"] == [BALANCE_MODE_NONE]
+    assert execution_config["repetition_seeds"] == (11, 13)
+    assert execution_config["validation_size"] == pytest.approx(0.35)
+    assert execution_config["folds"] == 5
+    assert execution_config["base_year"] == 2018
+    assert execution_config["random_state"] == 99
+    assert execution_config["fast_mode"] is False
+    assert execution_config["resource_mode"] == drift_app.EXPERIMENT_RESOURCE_MODE_FULL_MEMORY
+    assert execution_config["grid_limit"] == 17
+    assert execution_config["custom_grids"] == {"NNet": {"hidden_layer_sizes": [[32, 16]]}}
+    assert execution_config["continue_on_block_error"] is True
+
+
+def test_load_checkpoint_feature_bundle_resolves_windows_export_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+    feature_path = tmp_path / "checkpoint_features.duckdb"
+    raw_df = pd.DataFrame(
+        {
+            "interval_start": ["2024-01-01 00:00:00", "2024-01-01 01:00:00"],
+            "portico": ["15", "15"],
+            "target": [0, 1],
+            "x1": [1.0, 2.0],
+        }
+    )
+    clean_df = raw_df.copy()
+    drift_app._write_feature_payload_to_duckdb(feature_path, raw_df=raw_df, clean_df=clean_df)
+
+    bundle = drift_app._load_checkpoint_feature_bundle(
+        run_manifest={
+            "feature_selection_context": {
+                "selected_features": ["x1"],
+                "feature_export_path": r"C:\Users\usuario\Resultados\checkpoint_features.duckdb",
+            }
+        }
+    )
+
+    assert bundle is not None
+    assert bundle["resolved_path"] == str(feature_path.resolve())
+    assert pd.api.types.is_datetime64_any_dtype(bundle["clean_df"]["interval_start"])
+    assert bundle["clean_df"]["target"].tolist() == [0, 1]
+
+
 def test_cv_auc_parallel_uses_sklearn_parallel_without_warning():
     rows = 40
     X = pd.DataFrame(
@@ -795,6 +1177,21 @@ def test_cv_auc_parallel_uses_sklearn_parallel_without_warning():
         "sklearn.utils.parallel.delayed" in str(item.message)
         for item in caught
     )
+
+
+def test_streamlit_arrow_safe_df_casts_mixed_object_columns_to_string():
+    df = pd.DataFrame(
+        {
+            "training_year": [2018, "[<= 2019]", None],
+            "metric": ["auc", "auc", "auc"],
+            "value": [0.81, 0.79, 0.77],
+        }
+    )
+
+    safe_df = drift_app._streamlit_arrow_safe_df(df)
+
+    assert str(safe_df["training_year"].dtype) == "string"
+    assert safe_df["training_year"].tolist()[:2] == ["2018", "[<= 2019]"]
 
 
 def test_build_experiment_evolution_records_supports_yearly_and_adaptive():
@@ -903,6 +1300,9 @@ def test_train_model_with_internal_validation_refits_final_model_on_full_trainin
     assert bundle["fp_cost"] == pytest.approx(drift_app.DEFAULT_THRESHOLD_FP_COST)
     assert "calibration_metadata" in bundle
     assert "raw_youden_threshold" in bundle
+    assert "calibrated_youden_threshold" in bundle
+    assert "val_metrics_before_calibration" in bundle
+    assert "val_metrics_after_calibration" in bundle
 
 
 def test_fit_nnet_warning_safe_suppresses_convergence_warning():
@@ -1044,6 +1444,7 @@ def test_train_model_with_internal_validation_builds_feature_transform_for_nnet(
     assert len(bundle["feature_transform"]["columns"]) == 2
     assert bundle["calibration_method"] == drift_app.DEFAULT_CALIBRATION_METHOD
     assert bundle["operating_threshold"] == pytest.approx(bundle["threshold"])
+    assert bundle["calibrated_youden_threshold"] == pytest.approx(bundle["threshold"])
 
     eval_payload = _evaluate_split(
         bundle["model"],
@@ -1051,6 +1452,7 @@ def test_train_model_with_internal_validation_builds_feature_transform_for_nnet(
         feature_cols=["x1", "x2"],
         target_col="target",
         threshold=float(bundle["threshold"]),
+        raw_threshold=float(bundle["raw_youden_threshold"]),
         fill_values=bundle.get("fill_values"),
         feature_transform=bundle.get("feature_transform"),
         calibration_model=bundle.get("calibration_model"),
@@ -1059,6 +1461,8 @@ def test_train_model_with_internal_validation_builds_feature_transform_for_nnet(
 
     assert len(eval_payload["scores"]) == len(train_df)
     assert len(eval_payload["calibrated_scores"]) == len(train_df)
+    assert "metrics_before_calibration" in eval_payload
+    assert "metrics_after_calibration" in eval_payload
 
 
 def test_tune_hyperparameters_caps_adaboost_trials_to_search_space():
@@ -1550,6 +1954,7 @@ def test_train_model_with_internal_validation_smote_refits_on_full_training_data
         feature_cols=features,
         target_col="target",
         threshold=float(bundle["threshold"]),
+        raw_threshold=float(bundle["raw_youden_threshold"]),
         fill_values=bundle.get("fill_values"),
         feature_transform=bundle.get("feature_transform"),
         calibration_model=bundle.get("calibration_model"),
@@ -1559,6 +1964,8 @@ def test_train_model_with_internal_validation_smote_refits_on_full_training_data
     assert len(eval_payload["y_true"]) == len(test_df)
     assert len(eval_payload["scores"]) == len(test_df)
     assert len(eval_payload["calibrated_scores"]) == len(test_df)
+    assert "metrics_before_calibration" in eval_payload
+    assert "metrics_after_calibration" in eval_payload
 
 
 def test_train_arf_with_internal_validation_uses_warm_block_fill_values(monkeypatch):
@@ -1712,6 +2119,10 @@ def test_end_to_end_recalibration_and_average_roc():
     assert outputs["run_manifest"]["resource_mode"] == drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE
     assert not outputs["execution_log"].empty
     assert "run_seed" in outputs["yearly_results"].columns
+    assert {"pr_auc", "f1"} <= set(outputs["yearly_results"].columns)
+    assert {"pr_auc", "f1"} <= set(outputs["adaptive_results"].columns)
+    assert {"pr_auc", "f1"} <= set(outputs["appendix_tables"]["A.6"].columns)
+    assert {"pr_auc", "f1"} <= set(outputs["appendix_tables"]["A.9"].columns)
 
     # Also validate standalone ROC builder path.
     payload = [
@@ -1906,6 +2317,206 @@ def test_recalibration_experiments_support_adaptive_kswin(tmp_path, monkeypatch)
     assert outputs["run_manifest"]["kswin_variants"] == ["KSWINpaper", "KSWINseasonal"]
     assert KSWIN_VARIANT_NAMES == ["KSWINpaper", "KSWINseasonal"]
     assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 6
+
+
+def test_recalibration_experiments_passes_model_and_balance_to_block_tuning_resolver(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = _make_kswin_shift_dataset(rows_per_year=120, random_state=73)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    resolver_calls = []
+
+    def fake_resolve_or_create_tuning_artifact(**kwargs):
+        resolver_calls.append(
+            (
+                str(kwargs.get("model_name")),
+                str(kwargs.get("balance_mode")),
+                str((kwargs.get("tuning_context") or {}).get("stage")),
+            )
+        )
+        return {
+            "tuning_key": "fake_tuning",
+            "best_params": {},
+            "has_valid_trial": True,
+        }
+
+    def fake_run_kswin_strategy(
+        df,
+        *,
+        model_names,
+        kswin_variants,
+        balance_mode,
+        tuning_resolver=None,
+        run_seed=None,
+        run_order=None,
+        **kwargs,
+    ):
+        assert tuning_resolver is not None
+        tuning_artifact = tuning_resolver(
+            train_df=df.iloc[:40].copy(),
+            model_name=str(model_names[0]),
+            balance_mode=str(balance_mode),
+            strategy_context={
+                "stage": "kswin_base",
+                "strategy": "adaptive_kswin",
+            },
+        )
+        assert tuning_artifact["tuning_key"] == "fake_tuning"
+        adaptive_df = pd.DataFrame(
+            [
+                {
+                    "strategy": "adaptive_kswin",
+                    "drift": 1,
+                    "drift_date": pd.Timestamp("2020-01-15"),
+                    "prediction_year": 2020,
+                    "model": f"{model_names[0]} | {kswin_variants[0]}",
+                    "base_model": str(model_names[0]),
+                    "detector_variant": str(kswin_variants[0]),
+                    "balance_mode": str(balance_mode),
+                    "auc": 0.71,
+                    "sensitivity": 0.63,
+                    "specificity": 0.77,
+                    "error_rate": 0.24,
+                    "training_time_sec": 0.5,
+                    "threshold": 0.4,
+                    "segment_rows": 12,
+                    "run_seed": int(run_seed or 0),
+                    "run_order": int(run_order or 0),
+                }
+            ]
+        )
+        return adaptive_df, []
+
+    monkeypatch.setattr(drift_app, "_resolve_or_create_tuning_artifact", fake_resolve_or_create_tuning_artifact)
+    monkeypatch.setattr(drift_app, "run_kswin_strategy", fake_run_kswin_strategy)
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["adaptive_kswin"],
+        kswin_variants=["KSWINpaper"],
+        balance_modes=["none"],
+        validation_size=0.2,
+        folds=2,
+        random_state=31,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(31,),
+    )
+
+    assert not outputs["adaptive_results"].empty
+    assert ("Random Forest", "none", "kswin_base") in resolver_calls
+
+
+def test_recalibration_experiments_passes_model_and_balance_to_yearly_block_tuning_resolver(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=74)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    resolver_calls = []
+
+    def fake_resolve_or_create_tuning_artifact(**kwargs):
+        resolver_calls.append(
+            (
+                str(kwargs.get("model_name")),
+                str(kwargs.get("balance_mode")),
+                str((kwargs.get("tuning_context") or {}).get("stage")),
+            )
+        )
+        return {
+            "tuning_key": "fake_tuning",
+            "best_params": {},
+            "has_valid_trial": True,
+        }
+
+    def fake_run_yearly_strategy(
+        df,
+        *,
+        strategy,
+        model_names,
+        balance_mode,
+        tuning_resolver=None,
+        run_seed=None,
+        run_order=None,
+        **kwargs,
+    ):
+        assert tuning_resolver is not None
+        tuning_artifact = tuning_resolver(
+            train_df=df.iloc[:40].copy(),
+            model_name=str(model_names[0]),
+            balance_mode=str(balance_mode),
+            strategy_context={
+                "stage": "yearly_train",
+                "strategy": str(strategy),
+            },
+        )
+        assert tuning_artifact["tuning_key"] == "fake_tuning"
+        yearly_df = pd.DataFrame(
+            [
+                {
+                    "strategy": str(strategy),
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": str(model_names[0]),
+                    "balance_mode": str(balance_mode),
+                    "auc": 0.74,
+                    "sensitivity": 0.61,
+                    "specificity": 0.79,
+                    "error_rate": 0.22,
+                    "training_time_sec": 0.4,
+                    "threshold": 0.45,
+                    "n_train": 40,
+                    "n_test": 20,
+                    "run_seed": int(run_seed or 0),
+                    "run_order": int(run_order or 0),
+                }
+            ]
+        )
+        return yearly_df, []
+
+    monkeypatch.setattr(drift_app, "_resolve_or_create_tuning_artifact", fake_resolve_or_create_tuning_artifact)
+    monkeypatch.setattr(drift_app, "run_yearly_strategy", fake_run_yearly_strategy)
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        balance_modes=["none"],
+        validation_size=0.2,
+        folds=2,
+        random_state=31,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(31,),
+    )
+
+    assert not outputs["yearly_results"].empty
+    assert ("Random Forest", "none", "yearly_train") in resolver_calls
 
 
 def test_recalibration_experiments_persist_optuna_json(tmp_path, monkeypatch):
@@ -2257,6 +2868,575 @@ def test_recalibration_experiments_resume_from_failed_checkpoint(tmp_path, monke
     assert tuning_calls == []
     assert set(outputs["yearly_results"]["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
     assert outputs["checkpoint_manifest"]["status"] == "completed"
+
+
+def test_recalibration_experiments_can_load_explicit_checkpoint_run_id_override(tmp_path):
+    checkpoint_root = tmp_path / "runs"
+    run_dir = drift_app._recalibration_run_dir("run_selected_checkpoint", checkpoint_root=checkpoint_root)
+    paths = drift_app._recalibration_run_paths(run_dir)
+    drift_app._ensure_recalibration_run_dirs(paths)
+
+    manifest = drift_app._initial_recalibration_manifest(
+        run_id="run_selected_checkpoint",
+        run_manifest={"total_progress_units": 1},
+        feature_selection_context={"feature_export_path": "/tmp/original.duckdb", "selected_features": ["x1", "x2"]},
+        experiment_blocks=[{"strategy": "static", "model": "Random Forest", "balance_mode": BALANCE_MODE_NONE}],
+        tuning_tasks=[],
+        preflight={},
+    )
+    manifest["status"] = "completed"
+    manifest["completed_block_ids"] = ["block_demo"]
+    manifest["block_index"] = {
+        "block_demo": {"status": "completed", "filename": "block_demo.json"}
+    }
+    drift_app._update_manifest_progress(
+        manifest,
+        completed_units=1.0,
+        pending_block_ids=[],
+    )
+    drift_app._atomic_write_json(paths["manifest"], manifest)
+    drift_app._persist_recalibration_block(
+        paths["blocks_dir"] / "block_demo.json",
+        {
+            "block_id": "block_demo",
+            "block": {"strategy": "static", "model": "Random Forest", "balance_mode": BALANCE_MODE_NONE},
+            "run_seed": 11,
+            "run_order": 1,
+            "yearly_rows": [
+                {
+                    "strategy": "static",
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": "Random Forest",
+                    "balance_mode": BALANCE_MODE_NONE,
+                    "auc": 0.81,
+                    "sensitivity": 0.7,
+                    "specificity": 0.8,
+                    "error_rate": 0.2,
+                    "threshold": 0.5,
+                    "training_time_sec": 0.1,
+                    "n_train": 10,
+                    "n_test": 10,
+                    "run_seed": 11,
+                    "run_order": 1,
+                }
+            ],
+            "adaptive_rows": [],
+            "roc_payload": [
+                {
+                    "strategy": "static",
+                    "model": "Random Forest",
+                    "balance_mode": BALANCE_MODE_NONE,
+                    "segment": "2019",
+                    "y_true": [0, 1],
+                    "scores": [0.1, 0.9],
+                    "run_seed": 11,
+                    "run_order": 1,
+                }
+            ],
+            "execution_log": [],
+            "tuning_refs": [],
+            "smote_refs": [],
+        },
+    )
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=60, random_state=17)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE,),
+        checkpoint_root=checkpoint_root,
+        checkpoint_run_id_override="run_selected_checkpoint",
+        feature_selection_context={"feature_export_path": "/tmp/different.duckdb", "selected_features": ["x1"]},
+    )
+
+    assert outputs["auto_resumed"] is True
+    assert outputs["checkpoint_manifest_path"].endswith("run_selected_checkpoint/manifest.json")
+    assert outputs["run_manifest"]["checkpoint_run_id_override"] == "run_selected_checkpoint"
+    assert outputs["run_manifest"]["computed_run_id"] != "run_selected_checkpoint"
+    assert not outputs["yearly_results"].empty
+
+
+def test_recalibration_experiments_can_recompute_trainings_from_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=77)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    tuning_calls = []
+    block_calls = []
+    block_run_counter = {"value": 0}
+
+    def fake_tune_hyperparameters(X, y, **kwargs):
+        tuning_calls.append((kwargs["model_name"], kwargs["balance_mode"]))
+        params = {"mtry": 2, "splitrule": "gini", "min_node_size": 1}
+        artifact = {
+            "study_id": f"study_{kwargs['model_name']}_{kwargs['balance_mode']}",
+            "model_name": kwargs["model_name"],
+            "balance_mode": kwargs["balance_mode"],
+            "best_value": 0.75,
+            "best_params": params,
+            "model_params": params,
+            "smote_params": {},
+            "n_trials": 1,
+            "requested_trials": 1,
+            "search_space_size": 1,
+            "search_space": {"mtry": [2]},
+            "trials": [
+                {
+                    "trial_number": 0,
+                    "state": "COMPLETE",
+                    "cv_auc": 0.75,
+                    "params": params,
+                    "model_params": params,
+                    "smote_params": {},
+                }
+            ],
+        }
+        return params, pd.DataFrame([{"trial_number": 0, "model": kwargs["model_name"], "cv_auc": 0.75, "params": "{}", "state": "COMPLETE", "balance_mode": kwargs["balance_mode"]}]), artifact
+
+    def fake_run_yearly_strategy(*args, **kwargs):
+        block_run_counter["value"] += 1
+        auc_value = 0.80 + 0.05 * float(block_run_counter["value"])
+        block_calls.append((kwargs["balance_mode"], kwargs["run_seed"], kwargs["run_order"], auc_value))
+        rows = pd.DataFrame(
+            [
+                {
+                    "strategy": kwargs["strategy"],
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": kwargs["model_names"][0],
+                    "balance_mode": kwargs["balance_mode"],
+                    "auc": auc_value,
+                    "sensitivity": 0.7,
+                    "specificity": 0.75,
+                    "error_rate": 0.2,
+                    "threshold": 0.5,
+                    "training_time_sec": 0.1,
+                    "n_train": 10,
+                    "n_test": 10,
+                    "best_params": "{}",
+                    "run_seed": kwargs["run_seed"],
+                    "run_order": kwargs["run_order"],
+                }
+            ]
+        )
+        roc_payload = [
+            {
+                "strategy": kwargs["strategy"],
+                "model": kwargs["model_names"][0],
+                "balance_mode": kwargs["balance_mode"],
+                "segment": "2019",
+                "y_true": np.asarray([0, 1]),
+                "scores": np.asarray([0.1, 0.9]),
+                "run_seed": kwargs["run_seed"],
+                "run_order": kwargs["run_order"],
+            }
+        ]
+        return rows, roc_payload
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(drift_app, "run_yearly_strategy", fake_run_yearly_strategy)
+
+    checkpoint_root = tmp_path / "runs"
+    first_outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE,),
+        checkpoint_root=checkpoint_root,
+    )
+
+    preview = drift_app._preview_recalibration_checkpoint(
+        df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=[11],
+        balance_modes=[BALANCE_MODE_NONE],
+        checkpoint_root=checkpoint_root,
+    )
+
+    assert first_outputs["checkpoint_manifest"]["status"] == "completed"
+    assert len(tuning_calls) == 1
+    assert len(block_calls) == 1
+    assert preview["can_load_completed"] is True
+    assert preview["can_recompute_trainings"] is True
+
+    tuning_calls.clear()
+    block_calls.clear()
+
+    second_outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE,),
+        checkpoint_root=checkpoint_root,
+        recompute_blocks_from_checkpoint=True,
+    )
+
+    assert second_outputs["auto_resumed"] is True
+    assert tuning_calls == []
+    assert len(block_calls) == 1
+    assert second_outputs["checkpoint_manifest"]["resume"]["checkpoint_mode"] == "recompute_blocks"
+    assert second_outputs["checkpoint_manifest"]["status"] == "completed"
+    assert second_outputs["yearly_results"]["auc"].iloc[0] == pytest.approx(0.90)
+
+
+def test_recalibration_experiments_recompute_override_fails_instead_of_retuning_on_feature_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=91)
+    checkpoint_features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+    mismatched_features = checkpoint_features[:-1]
+
+    def fake_tune_hyperparameters(X, y, **kwargs):
+        params = {"mtry": 2, "splitrule": "gini", "min_node_size": 1}
+        artifact = {
+            "study_id": f"study_{kwargs['model_name']}_{kwargs['balance_mode']}",
+            "model_name": kwargs["model_name"],
+            "balance_mode": kwargs["balance_mode"],
+            "best_value": 0.75,
+            "best_params": params,
+            "model_params": params,
+            "smote_params": {},
+            "n_trials": 1,
+            "requested_trials": 1,
+            "search_space_size": 1,
+            "search_space": {"mtry": [2]},
+            "trials": [
+                {
+                    "trial_number": 0,
+                    "state": "COMPLETE",
+                    "cv_auc": 0.75,
+                    "params": params,
+                    "model_params": params,
+                    "smote_params": {},
+                }
+            ],
+        }
+        search_df = pd.DataFrame(
+            [
+                {
+                    "trial_number": 0,
+                    "model": kwargs["model_name"],
+                    "cv_auc": 0.75,
+                    "params": "{}",
+                    "state": "COMPLETE",
+                    "balance_mode": kwargs["balance_mode"],
+                }
+            ]
+        )
+        return params, search_df, artifact
+
+    def fake_run_yearly_strategy(*args, **kwargs):
+        rows = pd.DataFrame(
+            [
+                {
+                    "strategy": kwargs["strategy"],
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": kwargs["model_names"][0],
+                    "balance_mode": kwargs["balance_mode"],
+                    "auc": 0.81,
+                    "sensitivity": 0.7,
+                    "specificity": 0.75,
+                    "error_rate": 0.2,
+                    "threshold": 0.5,
+                    "training_time_sec": 0.1,
+                    "n_train": 10,
+                    "n_test": 10,
+                    "best_params": "{}",
+                    "run_seed": kwargs["run_seed"],
+                    "run_order": kwargs["run_order"],
+                }
+            ]
+        )
+        roc_payload = [
+            {
+                "strategy": kwargs["strategy"],
+                "model": kwargs["model_names"][0],
+                "balance_mode": kwargs["balance_mode"],
+                "segment": "2019",
+                "y_true": np.asarray([0, 1]),
+                "scores": np.asarray([0.1, 0.9]),
+                "run_seed": kwargs["run_seed"],
+                "run_order": kwargs["run_order"],
+            }
+        ]
+        return rows, roc_payload
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(drift_app, "run_yearly_strategy", fake_run_yearly_strategy)
+
+    checkpoint_root = tmp_path / "runs"
+    first_outputs = run_recalibration_experiments(
+        df,
+        feature_cols=checkpoint_features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE,),
+        checkpoint_root=checkpoint_root,
+    )
+
+    run_id = str(first_outputs["run_manifest"]["run_id"])
+
+    def fail_if_re_tuned(*args, **kwargs):
+        pytest.fail("recompute-only mode should not create new tuning artifacts")
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fail_if_re_tuned)
+
+    with pytest.raises(RuntimeError, match="missing persisted tuning artifacts"):
+        run_recalibration_experiments(
+            df,
+            feature_cols=mismatched_features,
+            model_names=["Random Forest"],
+            strategies=["static"],
+            validation_size=0.2,
+            folds=2,
+            random_state=11,
+            fast_mode=True,
+            grid_limit=1,
+            repetition_seeds=(11,),
+            balance_modes=(BALANCE_MODE_NONE,),
+            checkpoint_root=checkpoint_root,
+            checkpoint_run_id_override=run_id,
+            recompute_blocks_from_checkpoint=True,
+        )
+
+
+def test_recalibration_experiments_recompute_accepts_legacy_tuning_key_with_same_train_signature(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=92)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+    checkpoint_root = tmp_path / "runs"
+    run_id = "run_legacy_tuning"
+    run_dir = drift_app._recalibration_run_dir(run_id, checkpoint_root=checkpoint_root)
+    paths = drift_app._recalibration_run_paths(run_dir)
+    drift_app._ensure_recalibration_run_dirs(paths)
+
+    run_manifest = {
+        "run_id": run_id,
+        "models": ["Random Forest"],
+        "strategies": ["static"],
+        "balance_modes": [BALANCE_MODE_NONE],
+        "repetition_seeds": [11],
+        "base_year": 2018,
+        "validation_size": 0.2,
+        "folds": 2,
+        "random_state_fallback": 11,
+        "fast_mode": True,
+        "resource_mode": drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
+        "optuna_trials": 1,
+        "adwin_delta": 0.002,
+        "min_window": 45000,
+        "min_retrain_size": 4500,
+        "kswin_top_k_features": 3,
+        "kswin_vote_threshold": 2,
+        "kswin_retrain_days": 30,
+        "kswin_min_retrain_rows": 50,
+        "continue_on_block_error": False,
+        "feature_count": len(features),
+        "feature_cols": list(features),
+        "target_col": "target",
+        "time_col": "interval_start",
+        "input_rows": int(len(df)),
+        "total_progress_units": 2,
+        "total_tuning_tasks": 1,
+        "total_block_units": 1,
+        "preflight": {},
+    }
+    feature_selection_context = {"selected_features": list(features), "feature_count": len(features)}
+    manifest = drift_app._initial_recalibration_manifest(
+        run_id=run_id,
+        run_manifest=run_manifest,
+        feature_selection_context=feature_selection_context,
+        experiment_blocks=[{"strategy": "static", "model": "Random Forest", "balance_mode": BALANCE_MODE_NONE}],
+        tuning_tasks=[],
+        preflight={},
+    )
+
+    tuning_task = drift_app._batch_tuning_tasks(
+        df=df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        balance_modes=[BALANCE_MODE_NONE],
+        base_year=2018,
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
+        grid_limit=1,
+    )[0]
+    train_df = drift_app._materialize_tuning_train_df(
+        df,
+        time_col="interval_start",
+        task=tuning_task,
+    )
+    signature_cols = [col for col in ["interval_start", "target"] + list(features) if col in train_df.columns]
+    train_signature = drift_app._frame_signature(train_df, columns=signature_cols, include_index=True)
+    legacy_tuning_key = "tuning_legacy_match"
+    legacy_filename = f"{legacy_tuning_key}.json"
+    drift_app._persist_tuning_artifact(
+        paths["tuning_dir"] / legacy_filename,
+        {
+            "tuning_key": legacy_tuning_key,
+            "study_id": "legacy_study",
+            "model_name": "Random Forest",
+            "balance_mode": BALANCE_MODE_NONE,
+            "best_params": {"mtry": 2},
+            "has_valid_trial": True,
+            "train_signature": train_signature,
+            "strategy_context": {"stage": "window_tuning", "window_kind": "base_year", "training_year": "2018"},
+        },
+    )
+    manifest["tuning_index"] = {
+        legacy_tuning_key: {
+            "filename": legacy_filename,
+            "status": "completed",
+            "model_name": "Random Forest",
+            "balance_mode": BALANCE_MODE_NONE,
+        }
+    }
+    drift_app._persist_manifest(paths["manifest"], manifest)
+
+    def fail_if_re_tuned(*args, **kwargs):
+        pytest.fail("legacy-compatible checkpoint artifact should be reused without retuning")
+
+    def fake_run_yearly_strategy(*args, **kwargs):
+        rows = pd.DataFrame(
+            [
+                {
+                    "strategy": kwargs["strategy"],
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": kwargs["model_names"][0],
+                    "balance_mode": kwargs["balance_mode"],
+                    "auc": 0.81,
+                    "sensitivity": 0.7,
+                    "specificity": 0.75,
+                    "error_rate": 0.2,
+                    "threshold": 0.5,
+                    "training_time_sec": 0.1,
+                    "n_train": 10,
+                    "n_test": 10,
+                    "best_params": "{}",
+                    "run_seed": kwargs["run_seed"],
+                    "run_order": kwargs["run_order"],
+                }
+            ]
+        )
+        return rows, []
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fail_if_re_tuned)
+    monkeypatch.setattr(drift_app, "run_yearly_strategy", fake_run_yearly_strategy)
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE,),
+        checkpoint_root=checkpoint_root,
+        checkpoint_run_id_override=run_id,
+        recompute_blocks_from_checkpoint=True,
+    )
+
+    assert outputs["checkpoint_manifest"]["status"] == "completed"
+    current_tuning_key = str(tuning_task["tuning_key"])
+    assert outputs["checkpoint_manifest"]["tuning_index"][current_tuning_key]["matched_legacy_tuning_key"] == legacy_tuning_key
 
 
 def test_recalibration_experiments_can_skip_failed_blocks_and_continue(tmp_path, monkeypatch):
@@ -2684,6 +3864,7 @@ def test_parse_repetition_seeds_and_multi_seed_logging(tmp_path, monkeypatch):
     assert not appendix_mean["A.6"].empty
     assert appendix_mean["A.6"]["n_repetitions"].eq(2).all()
     assert appendix_mean["A.6"]["seed_list"].str.contains("3").all()
+    assert {"pr_auc", "f1"} <= set(appendix_mean["A.6"].columns)
 
 
 def test_persisted_recalibration_json_keeps_full_records(tmp_path, monkeypatch):

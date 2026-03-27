@@ -5,6 +5,7 @@ Streamlit app to monitor experiment results in real time.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -64,6 +65,151 @@ def _safe_int(value: object, default: int = 0) -> int:
     if pd.isna(numeric):
         return int(default)
     return int(numeric)
+
+
+def _maybe_int(value: object) -> Optional[int]:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return None
+    return int(numeric)
+
+
+def _maybe_float(value: object) -> float:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return float("nan")
+    return float(numeric)
+
+
+def _average_precision_from_scores(y_true: list[int], scores: list[float]) -> float:
+    if not y_true or len(y_true) != len(scores):
+        return float("nan")
+    total_pos = int(sum(int(v) for v in y_true))
+    if total_pos <= 0 or total_pos >= len(y_true):
+        return float("nan")
+    ranked = sorted(zip(scores, y_true), key=lambda item: item[0], reverse=True)
+    tp = 0
+    fp = 0
+    ap = 0.0
+    idx = 0
+    while idx < len(ranked):
+        current_score = ranked[idx][0]
+        pos_in_group = 0
+        neg_in_group = 0
+        while idx < len(ranked) and ranked[idx][0] == current_score:
+            if int(ranked[idx][1]) == 1:
+                pos_in_group += 1
+            else:
+                neg_in_group += 1
+            idx += 1
+        tp += pos_in_group
+        fp += neg_in_group
+        precision = tp / float(tp + fp) if (tp + fp) > 0 else 0.0
+        recall_prev = (tp - pos_in_group) / float(total_pos)
+        recall = tp / float(total_pos)
+        ap += (recall - recall_prev) * precision
+    return float(ap)
+
+
+def _derive_f1_from_rates(row: Dict[str, object], y_true: list[int]) -> float:
+    sensitivity = _maybe_float(row.get("sensitivity"))
+    specificity = _maybe_float(row.get("specificity"))
+    if not math.isfinite(sensitivity) or not math.isfinite(specificity):
+        return float("nan")
+    positives = int(sum(int(v) for v in y_true))
+    negatives = int(len(y_true) - positives)
+    tp = int(round(sensitivity * positives))
+    tn = int(round(specificity * negatives))
+    fp = max(0, negatives - tn)
+    fn = max(0, positives - tp)
+    precision = tp / float(tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / float(tp + fn) if (tp + fn) > 0 else 0.0
+    if precision + recall <= 0.0:
+        return 0.0
+    return float(2.0 * precision * recall / (precision + recall))
+
+
+def _is_missing_numeric(value: object) -> bool:
+    numeric = pd.to_numeric(value, errors="coerce")
+    return bool(pd.isna(numeric))
+
+
+def _row_metric_key(row: Dict[str, object]) -> tuple[object, ...]:
+    return (
+        str(row.get("strategy") or ""),
+        str(row.get("model") or ""),
+        str(row.get("balance_mode") or "not_applicable"),
+        _maybe_int(row.get("run_seed")),
+        _maybe_int(row.get("run_order")),
+    )
+
+
+def _roc_metric_key(item: Dict[str, object]) -> tuple[object, ...]:
+    return (
+        str(item.get("strategy") or ""),
+        str(item.get("model") or ""),
+        str(item.get("balance_mode") or "not_applicable"),
+        _maybe_int(item.get("run_seed")),
+        _maybe_int(item.get("run_order")),
+    )
+
+
+def _apply_derived_metrics(
+    row: Dict[str, object],
+    roc_item: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    if not isinstance(roc_item, dict):
+        return row
+    y_true = [int(v) for v in (roc_item.get("y_true") or [])]
+    scores = [float(v) for v in (roc_item.get("scores") or [])]
+    if y_true and scores and len(y_true) == len(scores) and _is_missing_numeric(row.get("pr_auc")):
+        row["pr_auc"] = _average_precision_from_scores(y_true, scores)
+    if y_true and _is_missing_numeric(row.get("f1")):
+        row["f1"] = _derive_f1_from_rates(row, y_true)
+    return row
+
+
+def _enrich_payload_result_rows(
+    rows: list[Dict[str, object]],
+    roc_payload: list[Dict[str, object]],
+    *,
+    yearly: bool,
+) -> list[Dict[str, object]]:
+    enriched = [dict(row) for row in rows if isinstance(row, dict)]
+    roc_items = [dict(item) for item in roc_payload if isinstance(item, dict)]
+    if not enriched or not roc_items:
+        return enriched
+
+    if yearly:
+        exact_lookup: dict[tuple[object, ...], Dict[str, object]] = {}
+        grouped_lookup: dict[tuple[object, ...], list[Dict[str, object]]] = {}
+        for item in roc_items:
+            common_key = _roc_metric_key(item)
+            grouped_lookup.setdefault(common_key, []).append(item)
+            exact_lookup[common_key + (str(item.get("segment") or ""),)] = item
+        for row in enriched:
+            common_key = _row_metric_key(row)
+            match: Optional[Dict[str, object]] = None
+            prediction_year = _maybe_int(row.get("prediction_year"))
+            if prediction_year is not None:
+                match = exact_lookup.get(common_key + (str(prediction_year),))
+            if match is None and len(grouped_lookup.get(common_key, [])) == 1:
+                match = grouped_lookup[common_key][0]
+            _apply_derived_metrics(row, match)
+        return enriched
+
+    grouped_rocs: dict[tuple[object, ...], list[Dict[str, object]]] = {}
+    grouped_rows: dict[tuple[object, ...], list[int]] = {}
+    for item in roc_items:
+        grouped_rocs.setdefault(_roc_metric_key(item), []).append(item)
+    for idx, row in enumerate(enriched):
+        grouped_rows.setdefault(_row_metric_key(row), []).append(idx)
+    for key, row_indices in grouped_rows.items():
+        candidates = grouped_rocs.get(key, [])
+        for ordinal, row_idx in enumerate(row_indices):
+            match = candidates[ordinal] if ordinal < len(candidates) else None
+            _apply_derived_metrics(enriched[row_idx], match)
+    return enriched
 
 
 def _list_drift_manifest_files() -> list[Path]:
@@ -280,13 +426,26 @@ def _build_drift_average_roc_curves(
 
 
 def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFrame) -> pd.DataFrame:
+    calibration_cols = [
+        "sensitivity_before_calibration",
+        "specificity_before_calibration",
+        "sensitivity_after_calibration",
+        "specificity_after_calibration",
+    ]
     ordered_cols = [
         "strategy",
         "model",
+        "detector_variant",
         "balance_mode",
         "auc",
+        "pr_auc",
+        "f1",
         "sensitivity",
         "specificity",
+        "sensitivity_before_calibration",
+        "specificity_before_calibration",
+        "sensitivity_after_calibration",
+        "specificity_after_calibration",
         "error_rate",
         "training_time_sec",
         "n_segments",
@@ -298,19 +457,57 @@ def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFr
         if df is None or df.empty:
             continue
         work = df.copy()
+        if "model" not in work.columns:
+            continue
         if "balance_mode" not in work.columns:
             work["balance_mode"] = "not_applicable"
         if "run_seed" not in work.columns:
             work["run_seed"] = pd.NA
-        for col in ["auc", "sensitivity", "specificity", "error_rate", "training_time_sec", "run_seed"]:
+        if "detector_variant" not in work.columns:
+            work["detector_variant"] = "-"
+        work["detector_variant"] = (
+            work["detector_variant"].astype(str).replace({"": "-", "nan": "-"})
+        )
+        if "base_model" in work.columns:
+            base_model = work["base_model"].astype(str)
+            actual_model = work["model"].astype(str)
+            work["summary_model"] = actual_model.where(
+                base_model.str.strip().eq("") | base_model.eq("nan"),
+                base_model,
+            )
+        else:
+            work["summary_model"] = work["model"].astype(str)
+        for col in calibration_cols:
+            if col not in work.columns:
+                work[col] = pd.NA
+        for col in [
+            "auc",
+            "pr_auc",
+            "f1",
+            "sensitivity",
+            "specificity",
+            "sensitivity_before_calibration",
+            "specificity_before_calibration",
+            "sensitivity_after_calibration",
+            "specificity_after_calibration",
+            "error_rate",
+            "training_time_sec",
+            "run_seed",
+        ]:
             if col in work.columns:
                 work[col] = pd.to_numeric(work[col], errors="coerce")
         grouped = (
-            work.groupby(["strategy", "model", "balance_mode"], dropna=False)
+            work.groupby(["strategy", "summary_model", "detector_variant", "balance_mode"], dropna=False)
             .agg(
                 auc=("auc", "mean"),
+                pr_auc=("pr_auc", "mean"),
+                f1=("f1", "mean"),
                 sensitivity=("sensitivity", "mean"),
                 specificity=("specificity", "mean"),
+                sensitivity_before_calibration=("sensitivity_before_calibration", "mean"),
+                specificity_before_calibration=("specificity_before_calibration", "mean"),
+                sensitivity_after_calibration=("sensitivity_after_calibration", "mean"),
+                specificity_after_calibration=("specificity_after_calibration", "mean"),
                 error_rate=("error_rate", "mean"),
                 training_time_sec=("training_time_sec", "mean"),
                 n_segments=("model", "size"),
@@ -321,6 +518,7 @@ def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFr
             )
             .reset_index()
         )
+        grouped = grouped.rename(columns={"summary_model": "model"})
         frames.append(grouped)
 
     if not frames:
@@ -330,9 +528,11 @@ def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFr
     for col in ordered_cols:
         if col not in out.columns:
             out[col] = pd.NA
-    return out[ordered_cols].sort_values(
-        ["strategy", "model", "balance_mode"]
-    ).reset_index(drop=True)
+    out["_strategy_priority"] = out["strategy"].map(_drift_strategy_priority).fillna(99)
+    out["_model_priority"] = out["model"].map(_drift_model_priority).fillna(99)
+    return out[ordered_cols + ["_strategy_priority", "_model_priority"]].sort_values(
+        ["_strategy_priority", "_model_priority", "model", "detector_variant", "balance_mode"]
+    ).drop(columns=["_strategy_priority", "_model_priority"]).reset_index(drop=True)
 
 
 def _display_cell(value: object, *, pending: bool = False) -> object:
@@ -412,8 +612,14 @@ def _expected_yearly_table(
         "model",
         "balance_mode",
         "auc",
+        "pr_auc",
+        "f1",
         "sensitivity",
         "specificity",
+        "sensitivity_before_calibration",
+        "specificity_before_calibration",
+        "sensitivity_after_calibration",
+        "specificity_after_calibration",
         "error_rate",
         "training_time_sec",
         "threshold",
@@ -457,8 +663,14 @@ def _expected_yearly_table(
                             "model": _display_cell(source_row.get("model")),
                             "balance_mode": _display_cell(source_row.get("balance_mode")),
                             "auc": _display_cell(source_row.get("auc")),
+                            "pr_auc": _display_cell(source_row.get("pr_auc")),
+                            "f1": _display_cell(source_row.get("f1")),
                             "sensitivity": _display_cell(source_row.get("sensitivity")),
                             "specificity": _display_cell(source_row.get("specificity")),
+                            "sensitivity_before_calibration": _display_cell(source_row.get("sensitivity_before_calibration")),
+                            "specificity_before_calibration": _display_cell(source_row.get("specificity_before_calibration")),
+                            "sensitivity_after_calibration": _display_cell(source_row.get("sensitivity_after_calibration")),
+                            "specificity_after_calibration": _display_cell(source_row.get("specificity_after_calibration")),
                             "error_rate": _display_cell(source_row.get("error_rate")),
                             "training_time_sec": _display_cell(source_row.get("training_time_sec")),
                             "threshold": _display_cell(source_row.get("threshold")),
@@ -482,8 +694,14 @@ def _expected_yearly_table(
                             "model": model,
                             "balance_mode": balance_mode,
                             "auc": "Pendiente",
+                            "pr_auc": "Pendiente",
+                            "f1": "Pendiente",
                             "sensitivity": "Pendiente",
                             "specificity": "Pendiente",
+                            "sensitivity_before_calibration": "Pendiente",
+                            "specificity_before_calibration": "Pendiente",
+                            "sensitivity_after_calibration": "Pendiente",
+                            "specificity_after_calibration": "Pendiente",
                             "error_rate": "Pendiente",
                             "training_time_sec": "Pendiente",
                             "threshold": "Pendiente",
@@ -535,13 +753,20 @@ def _expected_adaptive_table(
         "remaining_periods",
         "model",
         "auc",
+        "pr_auc",
+        "f1",
         "sensitivity",
         "specificity",
+        "sensitivity_before_calibration",
+        "specificity_before_calibration",
+        "sensitivity_after_calibration",
+        "specificity_after_calibration",
         "error_rate",
         "training_time_sec",
         "threshold",
         "run_seed",
         "run_order",
+        "error_message",
     ]
 
     rows: list[Dict[str, object]] = []
@@ -558,9 +783,108 @@ def _expected_adaptive_table(
             rows.append({key: _display_cell(value) for key, value in record.items()})
 
     if isinstance(block_df, pd.DataFrame) and not block_df.empty:
+        adaptive_row_counts = pd.to_numeric(
+            block_df["adaptive_rows"] if "adaptive_rows" in block_df.columns else pd.Series(0, index=block_df.index),
+            errors="coerce",
+        ).fillna(0)
+        completed_empty_blocks = block_df.loc[
+            block_df["strategy"].astype(str).isin(adaptive_strategies)
+            & block_df["status"].astype(str).str.lower().eq("completed")
+            & adaptive_row_counts.eq(0)
+        ].copy()
+        for block in completed_empty_blocks.to_dict(orient="records"):
+            rows.append(
+                {
+                    "status": "Completado sin filas",
+                    "strategy": str(block.get("strategy") or "-"),
+                    "drift": "Sin segmentos persistidos",
+                    "drift_date": "-",
+                    "prediction_year": "-",
+                    "balance_mode": str(block.get("balance_mode") or "not_applicable"),
+                    "segment_rows": 0,
+                    "n_internal_drifts": "-",
+                    "n_internal_warnings": "-",
+                    "vote_count": "-",
+                    "vote_threshold": "-",
+                    "monitor_feature_count": "-",
+                    "retrain_rows": "-",
+                    "retrain_positive_rows": "-",
+                    "base_model": str(block.get("model") or "-"),
+                    "detector_variant": _display_cell(block.get("detector_variant")),
+                    "detected_features": "-",
+                    "monitored_features": "-",
+                    "W": "-",
+                    "W0": "-",
+                    "W1": "-",
+                    "remaining_periods": "-",
+                    "model": str(block.get("model") or "-"),
+                    "auc": "-",
+                    "pr_auc": "-",
+                    "f1": "-",
+                    "sensitivity": "-",
+                    "specificity": "-",
+                    "sensitivity_before_calibration": "-",
+                    "specificity_before_calibration": "-",
+                    "sensitivity_after_calibration": "-",
+                    "specificity_after_calibration": "-",
+                    "error_rate": "-",
+                    "training_time_sec": "-",
+                    "threshold": "-",
+                    "run_seed": _display_cell(block.get("run_seed")),
+                    "run_order": _display_cell(block.get("run_order")),
+                    "error_message": _display_cell(block.get("error_message")),
+                }
+            )
+        failed_blocks = block_df.loc[
+            block_df["strategy"].astype(str).isin(adaptive_strategies)
+            & block_df["status"].astype(str).str.lower().isin({"failed", "error", "skipped_failed"})
+        ].copy()
+        for block in failed_blocks.to_dict(orient="records"):
+            rows.append(
+                {
+                    "status": "Error",
+                    "strategy": str(block.get("strategy") or "-"),
+                    "drift": "Error en bloque",
+                    "drift_date": "-",
+                    "prediction_year": "-",
+                    "balance_mode": str(block.get("balance_mode") or "not_applicable"),
+                    "segment_rows": 0,
+                    "n_internal_drifts": "-",
+                    "n_internal_warnings": "-",
+                    "vote_count": "-",
+                    "vote_threshold": "-",
+                    "monitor_feature_count": "-",
+                    "retrain_rows": "-",
+                    "retrain_positive_rows": "-",
+                    "base_model": str(block.get("model") or "-"),
+                    "detector_variant": _display_cell(block.get("detector_variant")),
+                    "detected_features": "-",
+                    "monitored_features": "-",
+                    "W": "-",
+                    "W0": "-",
+                    "W1": "-",
+                    "remaining_periods": "-",
+                    "model": str(block.get("model") or "-"),
+                    "auc": "-",
+                    "pr_auc": "-",
+                    "f1": "-",
+                    "sensitivity": "-",
+                    "specificity": "-",
+                    "sensitivity_before_calibration": "-",
+                    "specificity_before_calibration": "-",
+                    "sensitivity_after_calibration": "-",
+                    "specificity_after_calibration": "-",
+                    "error_rate": "-",
+                    "training_time_sec": "-",
+                    "threshold": "-",
+                    "run_seed": _display_cell(block.get("run_seed")),
+                    "run_order": _display_cell(block.get("run_order")),
+                    "error_message": _display_cell(block.get("error_message")),
+                }
+            )
         pending_blocks = block_df.loc[
             block_df["strategy"].astype(str).isin(adaptive_strategies)
-            & ~block_df["status"].astype(str).str.lower().eq("completed")
+            & block_df["status"].astype(str).str.lower().eq("pending")
         ].copy()
         for block in pending_blocks.to_dict(orient="records"):
             rows.append(
@@ -589,13 +913,20 @@ def _expected_adaptive_table(
                     "remaining_periods": "Pendiente",
                     "model": str(block.get("model") or "-"),
                     "auc": "Pendiente",
+                    "pr_auc": "Pendiente",
+                    "f1": "Pendiente",
                     "sensitivity": "Pendiente",
                     "specificity": "Pendiente",
+                    "sensitivity_before_calibration": "Pendiente",
+                    "specificity_before_calibration": "Pendiente",
+                    "sensitivity_after_calibration": "Pendiente",
+                    "specificity_after_calibration": "Pendiente",
                     "error_rate": "Pendiente",
                     "training_time_sec": "Pendiente",
                     "threshold": "Pendiente",
                     "run_seed": _display_cell(block.get("run_seed")),
                     "run_order": _display_cell(block.get("run_order")),
+                    "error_message": "-",
                 }
             )
 
@@ -666,9 +997,29 @@ def _read_drift_run(manifest_path: Path) -> Dict[str, object]:
         info = dict(block_index.get(block_id) or {})
         payload = dict(payloads_by_block.get(block_id) or {})
         block_config = dict(payload.get("block") or {})
+        payload_execution_log = [
+            entry
+            for entry in (payload.get("execution_log") or [])
+            if isinstance(entry, dict)
+        ]
+        payload_errors = [
+            entry
+            for entry in payload_execution_log
+            if str(entry.get("status", "")).lower() == "error"
+        ]
+        inferred_status = str(info.get("status") or ("completed" if payload else "pending"))
+        if (
+            payload
+            and inferred_status == "completed"
+            and payload_errors
+            and not (payload.get("yearly_rows") or [])
+            and not (payload.get("adaptive_rows") or [])
+        ):
+            inferred_status = "error"
+        latest_error = dict(payload_errors[-1]) if payload_errors else {}
         row = {
             "block_id": block_id,
-            "status": str(info.get("status") or "completed" if payload else "pending"),
+            "status": inferred_status,
             "strategy": str(info.get("strategy") or block_config.get("strategy") or ""),
             "model": str(info.get("model") or block_config.get("model") or ""),
             "detector_variant": str(info.get("detector_variant") or block_config.get("detector_variant") or ""),
@@ -679,6 +1030,7 @@ def _read_drift_run(manifest_path: Path) -> Dict[str, object]:
             "yearly_rows": int(len(payload.get("yearly_rows") or [])),
             "adaptive_rows": int(len(payload.get("adaptive_rows") or [])),
             "execution_log_rows": int(len(payload.get("execution_log") or [])),
+            "error_message": str(latest_error.get("error") or latest_error.get("message") or info.get("error") or ""),
         }
         detector_variant = str(row["detector_variant"] or "")
         balance_mode = str(row["balance_mode"] or "not_applicable")
@@ -701,12 +1053,23 @@ def _read_drift_run(manifest_path: Path) -> Dict[str, object]:
     roc_payload_rows: list[Dict[str, object]] = []
     execution_log_rows = list(manifest.get("global_execution_log") or [])
     for payload in block_payloads:
-        yearly_rows = payload.get("yearly_rows") or []
-        adaptive_rows = payload.get("adaptive_rows") or []
-        roc_payload_rows.extend(
+        roc_payload = [
             item
             for item in (payload.get("roc_payload") or [])
             if isinstance(item, dict)
+        ]
+        yearly_rows = _enrich_payload_result_rows(
+            [row for row in (payload.get("yearly_rows") or []) if isinstance(row, dict)],
+            roc_payload,
+            yearly=True,
+        )
+        adaptive_rows = _enrich_payload_result_rows(
+            [row for row in (payload.get("adaptive_rows") or []) if isinstance(row, dict)],
+            roc_payload,
+            yearly=False,
+        )
+        roc_payload_rows.extend(
+            roc_payload
         )
         if yearly_rows:
             yearly_frames.append(pd.DataFrame(yearly_rows))
@@ -2347,12 +2710,19 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
         if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
             if "auc" in summary_df.columns and summary_df["auc"].notna().any():
                 chart_df = summary_df.copy()
+                detector_variant = (
+                    chart_df["detector_variant"].astype(str)
+                    if "detector_variant" in chart_df.columns
+                    else pd.Series("-", index=chart_df.index)
+                )
+                chart_df["series_label"] = chart_df["strategy"].astype(str) + " | " + chart_df["model"].astype(str)
+                chart_df.loc[detector_variant.ne("-"), "series_label"] = (
+                    chart_df.loc[detector_variant.ne("-"), "series_label"]
+                    + " | "
+                    + detector_variant.loc[detector_variant.ne("-")]
+                )
                 chart_df["series_label"] = (
-                    chart_df["strategy"].astype(str)
-                    + " | "
-                    + chart_df["model"].astype(str)
-                    + " | "
-                    + chart_df["balance_mode"].astype(str)
+                    chart_df["series_label"] + " | " + chart_df["balance_mode"].astype(str)
                 )
                 st.bar_chart(
                     chart_df.set_index("series_label")["auc"],

@@ -11,7 +11,7 @@ import datetime
 import sys
 import os
 from pathlib import Path
-from typing import List, Tuple, Optional, Generator
+from typing import Iterable, List, Tuple, Optional, Generator
 
 GITHUB_FILE_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -98,8 +98,39 @@ def check_git_status() -> bool:
     except subprocess.CalledProcessError:
         return False
 
+
+def has_staged_changes() -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return bool(result.stdout.strip())
+    except subprocess.CalledProcessError:
+        return False
+
 def is_git_repo() -> bool:
     return Path(".git").is_dir()
+
+
+def get_tracked_ignored_paths() -> List[str]:
+    result = subprocess.run(
+        ["git", "ls-files", "-ci", "--exclude-standard", "-z"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return []
+
+    return [path for path in result.stdout.split("\0") if path]
+
+
+def chunked(items: List[str], size: int) -> Iterable[List[str]]:
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 def initialize_repo_stream(remote_url: str) -> Generator[str, None, bool]:
     yield f"Iniciando configuración de repositorio... {remote_url}"
@@ -396,6 +427,89 @@ def sync_with_github_stream() -> Generator[str, None, bool]:
         return True
 
     yield "✅ Repositorio ya sincronizado. No hubo nada que enviar."
+    return True
+
+
+def remove_ignored_tracked_files_from_remote_stream(push: bool = True) -> Generator[str, None, bool]:
+    yield "Buscando archivos rastreados que hoy están cubiertos por .gitignore..."
+
+    tracked_ignored_paths = get_tracked_ignored_paths()
+    if not tracked_ignored_paths:
+        yield "✅ No hay archivos trackeados que coincidan con .gitignore."
+        return True
+
+    yield f"Se encontraron {len(tracked_ignored_paths)} rutas trackeadas e ignoradas."
+
+    if has_staged_changes():
+        yield (
+            "⚠️ Hay cambios ya indexados en Git. La purga se abortó para no mezclar "
+            "este commit de emergencia con otros cambios staged."
+        )
+        return False
+
+    current_branch = get_current_branch()
+    has_remote_branch = False
+
+    if push:
+        success = yield from run_command_stream(["git", "fetch", "origin"], "Trayendo cambios remotos")
+        if not success:
+            yield "No fue posible actualizar referencias remotas antes de la purga."
+            return False
+
+        has_remote_branch = remote_branch_exists(current_branch)
+        ahead, behind = get_branch_divergence(current_branch)
+        yield f"Estado de la rama '{current_branch}' antes de purgar: ahead {ahead}, behind {behind}."
+
+        if behind > 0:
+            yield (
+                "⚠️ La rama local está detrás del remoto. Sincroniza primero y vuelve a "
+                "intentar para evitar sobrescribir cambios remotos."
+            )
+            return False
+
+    for path_batch in chunked(tracked_ignored_paths, 100):
+        success = yield from run_command_stream(
+            ["git", "rm", "--cached", "--ignore-unmatch", "--", *path_batch],
+            f"Quitando del índice {len(path_batch)} archivos ignorados",
+        )
+        if not success:
+            return False
+
+    if not has_staged_changes():
+        yield "ℹ️ No se generaron cambios indexados después de limpiar el índice."
+        return True
+
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    success = yield from run_command_stream(
+        ["git", "commit", "-m", f"Emergency purge ignored files: {ts}"],
+        "Registrando commit de purga",
+    )
+    if not success:
+        return False
+
+    if not push:
+        yield "✅ La purga quedó committeada localmente. Ejecuta Sync Now para publicarla en GitHub."
+        return True
+
+    if not has_remote_branch:
+        success = yield from run_command_stream(
+            ["git", "push", "-u", "origin", f"{current_branch}:{current_branch}"],
+            "Publicando rama local por primera vez",
+        )
+    else:
+        success = yield from run_command_stream(
+            ["git", "push", "-u", "origin", f"{current_branch}:{current_branch}"],
+            "Enviando borrados al remoto",
+        )
+
+    if not success:
+        yield "❌ No fue posible publicar los borrados en GitHub."
+        return False
+
+    yield (
+        "🎉 Los archivos ignorados quedaron eliminados del repositorio remoto. "
+        "Tus archivos locales siguen intactos."
+    )
     return True
 
 # Wrapper para compatibilidad

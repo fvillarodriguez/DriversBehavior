@@ -1130,7 +1130,7 @@ def render_flow_stats_tab(*, db_path: Path) -> None:
         if fig_line is None:
             st.info("No hay datos suficientes para el grafico semanal o falta plotly.")
         else:
-            st.plotly_chart(fig_line, use_container_width=True)
+            st.plotly_chart(fig_line, width="stretch")
 
         st.write("---")
         st.subheader("Superficie 3D (dia vs hora, resolucion 5-min)")
@@ -1194,5 +1194,5 @@ def render_flow_stats_tab(*, db_path: Path) -> None:
                 st.info("No hay datos suficientes para las superficies o falta plotly.")
             else:
                 for title, fig in figs:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
             

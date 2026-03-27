@@ -2485,9 +2485,9 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
                     st.info("Plotly no disponible para perfiles horarios.")
                 else:
                     st.subheader("Perfil horario (flujo)")
-                    st.plotly_chart(fig_flow, use_container_width=True)
+                    st.plotly_chart(fig_flow, width="stretch")
                     st.subheader("Perfil horario (velocidad)")
-                    st.plotly_chart(fig_speed, use_container_width=True)
+                    st.plotly_chart(fig_speed, width="stretch")
 
             if not weekday_flow.empty:
                 fig_line = _plot_weekday_flow_lines_interactive(weekday_flow)
@@ -2495,7 +2495,7 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
                     st.info("Plotly no disponible para el grafico semanal.")
                 else:
                     st.subheader("Flujo promedio por dia de la semana")
-                    st.plotly_chart(fig_line, use_container_width=True)
+                    st.plotly_chart(fig_line, width="stretch")
 
             st.subheader("Superficie 3D (dia vs hora, resolucion 5-min)")
             axis_cols = st.columns(3)
@@ -2534,7 +2534,7 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
                         st.info("Plotly no disponible para las superficies.")
                     else:
                         for _, fig in figs:
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width="stretch")
 
             cache_complete = (
                 flow_complete

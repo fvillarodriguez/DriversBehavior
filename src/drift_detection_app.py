@@ -12,19 +12,22 @@ from __future__ import annotations
 import gc
 import hashlib
 import importlib
+import io
 import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
 import traceback
 import warnings
+import zipfile
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -35,7 +38,7 @@ from joblib import delayed as joblib_delayed
 from sklearn.ensemble import AdaBoostClassifier, ExtraTreesClassifier, RandomForestClassifier
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
+from sklearn.metrics import average_precision_score, confusion_matrix, f1_score, roc_auc_score, roc_curve
 from sklearn.model_selection import ParameterGrid, StratifiedKFold, train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
@@ -113,9 +116,9 @@ NNET_TRAINING_POLICY_VERSION = "scaled_early_stopping_v1"
 NNET_MAX_ITER_RETRY_CAP = 1000
 WINDOW_TUNING_POLICY_VERSION = "window_scoped_tuning_v1"
 RF_SMOTE_BALANCE_POLICY_VERSION = "rf_disable_class_weight_when_smote_v1"
-THRESHOLD_CALIBRATION_POLICY_VERSION = "platt_expected_cost_fn5_fp1_v1"
+THRESHOLD_CALIBRATION_POLICY_VERSION = "platt_youden_v1"
 DEFAULT_CALIBRATION_METHOD = "platt"
-DEFAULT_THRESHOLD_POLICY = "expected_cost"
+DEFAULT_THRESHOLD_POLICY = "youden"
 DEFAULT_THRESHOLD_FN_COST = 5.0
 DEFAULT_THRESHOLD_FP_COST = 1.0
 
@@ -2310,6 +2313,17 @@ def _safe_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
         return float("nan")
 
 
+def _safe_pr_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
+    y = np.asarray(y_true).astype(int)
+    s = np.asarray(scores).astype(float)
+    if np.unique(y).size < 2:
+        return float("nan")
+    try:
+        return float(average_precision_score(y, s))
+    except Exception:
+        return float("nan")
+
+
 def compute_classification_metrics(
     y_true: np.ndarray,
     scores: np.ndarray,
@@ -2329,10 +2343,52 @@ def compute_classification_metrics(
 
     return {
         "auc": _safe_auc(y, s),
+        "pr_auc": _safe_pr_auc(y, s),
+        "f1": float(f1_score(y, preds, zero_division=0)),
         "sensitivity": sensitivity,
         "specificity": specificity,
         "error_rate": error_rate,
         "threshold": float(threshold),
+    }
+
+
+def _compute_calibration_stage_metrics(
+    y_true: np.ndarray,
+    raw_scores: np.ndarray,
+    *,
+    raw_threshold: float,
+    calibrated_scores: Optional[np.ndarray] = None,
+    calibrated_threshold: Optional[float] = None,
+) -> Dict[str, Dict[str, float]]:
+    y = np.asarray(y_true).astype(int)
+    raw = np.asarray(raw_scores).astype(float)
+    before_metrics = compute_classification_metrics(
+        y,
+        raw,
+        threshold=float(raw_threshold),
+    )
+    calibrated = raw if calibrated_scores is None else np.asarray(calibrated_scores).astype(float)
+    after_metrics = compute_classification_metrics(
+        y,
+        raw,
+        threshold=float(raw_threshold if calibrated_threshold is None else calibrated_threshold),
+        decision_scores=calibrated,
+    )
+    return {
+        "before_calibration": before_metrics,
+        "after_calibration": after_metrics,
+    }
+
+
+def _calibration_rate_fields(
+    before_metrics: Dict[str, float],
+    after_metrics: Dict[str, float],
+) -> Dict[str, float]:
+    return {
+        "sensitivity_before_calibration": float(before_metrics["sensitivity"]),
+        "specificity_before_calibration": float(before_metrics["specificity"]),
+        "sensitivity_after_calibration": float(after_metrics["sensitivity"]),
+        "specificity_after_calibration": float(after_metrics["specificity"]),
     }
 
 
@@ -2840,6 +2896,54 @@ def _feature_export_signature(feature_selection_context: Dict[str, Any]) -> str:
     return ",".join(str(col) for col in feature_selection_context.get("selected_features", []))
 
 
+def _portable_path_name(raw_path: Any) -> str:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return ""
+    if "\\" in raw:
+        win_name = str(PureWindowsPath(raw).name).strip()
+        if win_name:
+            return win_name
+    posix_name = str(PurePosixPath(raw).name).strip()
+    if posix_name:
+        return posix_name
+    default_name = str(Path(raw).name).strip()
+    return default_name or raw
+
+
+def _resolve_existing_feature_export_path(raw_path: Any) -> Optional[Path]:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return None
+
+    candidates: List[Path] = []
+    literal_path = Path(raw).expanduser()
+    candidates.append(literal_path)
+    if not literal_path.is_absolute():
+        candidates.append((ROOT_DIR / literal_path).expanduser())
+        candidates.append((RESULTS_DIR / literal_path).expanduser())
+
+    portable_name = _portable_path_name(raw)
+    if portable_name:
+        candidates.extend(
+            [
+                (RESULTS_DIR / portable_name).expanduser(),
+                (ROOT_DIR / portable_name).expanduser(),
+                Path.cwd() / portable_name,
+            ]
+        )
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate_key = str(candidate)
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
 def _build_recalibration_run_id(
     *,
     df: pd.DataFrame,
@@ -2990,7 +3094,7 @@ def _build_smote_key(
 
 
 def _recalibration_run_dir(run_id: str, *, checkpoint_root: Optional[Path] = None) -> Path:
-    root = Path(checkpoint_root) if checkpoint_root is not None else RESULTS_DIR / "drift_recalibration_runs"
+    root = _recalibration_checkpoint_root(checkpoint_root=checkpoint_root)
     return root / str(run_id)
 
 
@@ -3009,6 +3113,10 @@ def _recalibration_run_paths(run_dir: Path) -> Dict[str, Path]:
 def _ensure_recalibration_run_dirs(paths: Dict[str, Path]) -> None:
     for key in ["run_dir", "blocks_dir", "tuning_dir", "smote_dir"]:
         Path(paths[key]).mkdir(parents=True, exist_ok=True)
+
+
+def _recalibration_checkpoint_root(*, checkpoint_root: Optional[Path] = None) -> Path:
+    return Path(checkpoint_root) if checkpoint_root is not None else RESULTS_DIR / "drift_recalibration_runs"
 
 
 def _persist_manifest(path: Path, manifest: Dict[str, Any]) -> None:
@@ -3043,6 +3151,147 @@ def _load_manifest(path: Path) -> Optional[Dict[str, Any]]:
     if isinstance(payload, dict):
         return payload
     return None
+
+
+def _normalized_checkpoint_archive_member(name: str) -> Path:
+    raw_path = Path(str(name).strip())
+    if raw_path.is_absolute():
+        raise ValueError("Checkpoint archive contains absolute paths.")
+    parts = [part for part in raw_path.parts if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("Checkpoint archive contains unsafe relative paths.")
+    return Path(*parts)
+
+
+def _build_recalibration_checkpoint_archive(run_dir: Path) -> bytes:
+    run_path = Path(run_dir)
+    paths = _recalibration_run_paths(run_path)
+    manifest = _load_manifest(paths["manifest"])
+    if manifest is None:
+        raise FileNotFoundError(f"Checkpoint manifest not found at {paths['manifest']}")
+
+    zip_buffer = io.BytesIO()
+    added_files = 0
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for file_path in sorted(run_path.rglob("*")):
+            if not file_path.is_file():
+                continue
+            archive_name = Path(run_path.name) / file_path.relative_to(run_path)
+            archive.write(file_path, arcname=str(archive_name))
+            added_files += 1
+    if added_files == 0:
+        raise ValueError("Checkpoint run directory has no files to export.")
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
+def _import_recalibration_checkpoint_archive(
+    archive_bytes: bytes,
+    *,
+    checkpoint_root: Optional[Path] = None,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    checkpoint_root_path = _recalibration_checkpoint_root(checkpoint_root=checkpoint_root)
+    checkpoint_root_path.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as archive:
+        members: List[Tuple[zipfile.ZipInfo, Path]] = []
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            normalized_member = _normalized_checkpoint_archive_member(info.filename)
+            if normalized_member.parts[0] == "__MACOSX":
+                continue
+            members.append((info, normalized_member))
+
+        if not members:
+            raise ValueError("Checkpoint archive is empty.")
+
+        top_level_dirs = {member.parts[0] for _, member in members}
+        if len(top_level_dirs) != 1:
+            raise ValueError("Checkpoint archive must contain a single run directory.")
+
+        run_id = str(next(iter(top_level_dirs)))
+        manifest_member = Path(run_id) / "manifest.json"
+        if manifest_member not in {member for _, member in members}:
+            raise ValueError("Checkpoint archive does not contain run manifest.json.")
+
+        destination_run_dir = checkpoint_root_path / run_id
+        if destination_run_dir.exists():
+            if not overwrite:
+                raise FileExistsError(f"Checkpoint {run_id} already exists in {checkpoint_root_path}")
+            shutil.rmtree(destination_run_dir)
+
+        with tempfile.TemporaryDirectory(prefix="drift_ckpt_import_", dir=str(checkpoint_root_path)) as tmp_dir:
+            tmp_root = Path(tmp_dir)
+            for info, member in members:
+                target_path = tmp_root / member
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info, "r") as source_handle, target_path.open("wb") as target_handle:
+                    shutil.copyfileobj(source_handle, target_handle)
+
+            imported_run_dir = tmp_root / run_id
+            imported_paths = _recalibration_run_paths(imported_run_dir)
+            manifest = _load_manifest(imported_paths["manifest"])
+            if manifest is None:
+                raise ValueError("Imported checkpoint manifest is invalid.")
+            shutil.move(str(imported_run_dir), str(destination_run_dir))
+
+    final_paths = _recalibration_run_paths(destination_run_dir)
+    manifest = _load_manifest(final_paths["manifest"])
+    if manifest is not None:
+        manifest = _reconcile_recalibration_manifest(manifest, paths=final_paths)
+        _persist_manifest(final_paths["manifest"], manifest)
+    return {
+        "run_id": str(run_id),
+        "run_dir": str(destination_run_dir),
+        "manifest_path": str(final_paths["manifest"]),
+        "status": str((manifest or {}).get("status", "missing")),
+    }
+
+
+def _reset_recalibration_blocks_for_rerun(
+    manifest: Dict[str, Any],
+    *,
+    paths: Dict[str, Path],
+    checkpoint_status: str,
+) -> Dict[str, Any]:
+    for block_path in sorted(Path(paths["blocks_dir"]).glob("*.json")):
+        try:
+            block_path.unlink()
+        except Exception:
+            continue
+
+    progress = dict(manifest.get("progress") or {})
+    completed_tuning_tasks = int(
+        sum(1 for item in (manifest.get("tuning_index") or {}).values() if str(item.get("status")) == "completed")
+    )
+    progress["completed_units"] = float(completed_tuning_tasks)
+    progress["completed_blocks"] = 0
+    progress["skipped_failed_blocks"] = 0
+    progress["total_tuning_tasks"] = max(
+        int(progress.get("total_tuning_tasks", 0)),
+        int(len(manifest.get("tuning_index") or {})),
+    )
+
+    manifest["status"] = "running"
+    manifest["completed_block_ids"] = []
+    manifest["skipped_failed_block_ids"] = []
+    manifest["pending_block_ids"] = []
+    manifest["failed_block_id"] = None
+    manifest["last_error"] = None
+    manifest["nonfatal_block_errors"] = []
+    manifest["block_index"] = {}
+    manifest["progress"] = progress
+    manifest["global_execution_log"] = []
+    manifest["memory_summary"] = {}
+    manifest["restarted_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest["resume"] = {
+        "auto_resumed": True,
+        "checkpoint_status": str(checkpoint_status),
+        "checkpoint_mode": "recompute_blocks",
+    }
+    return manifest
 
 
 def _preview_recalibration_checkpoint(
@@ -3139,6 +3388,7 @@ def _preview_recalibration_checkpoint(
         "checkpoint_available": bool(checkpoint_available),
         "can_resume": bool(checkpoint_available and status != "completed"),
         "can_load_completed": bool(checkpoint_available and status == "completed"),
+        "can_recompute_trainings": bool(checkpoint_available and int(progress.get("completed_tuning_tasks", 0)) > 0),
         "updated_at": None if manifest is None else manifest.get("updated_at"),
         "completed_tuning_tasks": int(progress.get("completed_tuning_tasks", 0)),
         "total_tuning_tasks": int(progress.get("total_tuning_tasks", 0)),
@@ -3149,6 +3399,62 @@ def _preview_recalibration_checkpoint(
         "manifest": manifest,
         "feature_selection_context": normalized_feature_selection_context,
         "effective_base_year": effective_base_year,
+    }
+
+
+def _preview_recalibration_checkpoint_run(
+    run_id: str,
+    *,
+    checkpoint_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    resolved_run_id = str(run_id).strip()
+    if not resolved_run_id:
+        return {
+            "run_id": "",
+            "run_dir": str(_recalibration_run_dir("", checkpoint_root=checkpoint_root)),
+            "manifest_path": str(_recalibration_run_paths(_recalibration_run_dir("", checkpoint_root=checkpoint_root))["manifest"]),
+            "status": "missing",
+            "checkpoint_available": False,
+            "can_resume": False,
+            "can_load_completed": False,
+            "can_recompute_trainings": False,
+            "updated_at": None,
+            "completed_tuning_tasks": 0,
+            "total_tuning_tasks": 0,
+            "completed_blocks": 0,
+            "skipped_failed_blocks": 0,
+            "total_blocks": 0,
+            "smote_artifacts": 0,
+            "manifest": None,
+        }
+
+    run_dir = _recalibration_run_dir(resolved_run_id, checkpoint_root=checkpoint_root)
+    paths = _recalibration_run_paths(run_dir)
+    manifest = _load_manifest(paths["manifest"])
+    if manifest is not None:
+        manifest = _reconcile_recalibration_manifest(manifest, paths=paths)
+    progress = dict((manifest or {}).get("progress") or {})
+    status = str((manifest or {}).get("status", "missing"))
+    checkpoint_available = manifest is not None
+    return {
+        "run_id": resolved_run_id,
+        "run_dir": str(run_dir),
+        "manifest_path": str(paths["manifest"]),
+        "status": status,
+        "checkpoint_available": bool(checkpoint_available),
+        "can_resume": bool(checkpoint_available and status != "completed"),
+        "can_load_completed": bool(checkpoint_available and status == "completed"),
+        "can_recompute_trainings": bool(checkpoint_available and int(progress.get("completed_tuning_tasks", 0)) > 0),
+        "updated_at": None if manifest is None else manifest.get("updated_at"),
+        "completed_tuning_tasks": int(progress.get("completed_tuning_tasks", 0)),
+        "total_tuning_tasks": int(progress.get("total_tuning_tasks", 0)),
+        "completed_blocks": int(progress.get("completed_blocks", 0)),
+        "skipped_failed_blocks": int(progress.get("skipped_failed_blocks", 0)),
+        "total_blocks": int(progress.get("total_blocks", 0)),
+        "smote_artifacts": len((manifest or {}).get("smote_index") or {}),
+        "manifest": manifest,
+        "run_manifest": dict((manifest or {}).get("run_manifest") or {}),
+        "feature_selection_context": dict((manifest or {}).get("feature_selection_context") or {}),
     }
 
 
@@ -5118,18 +5424,18 @@ def train_model_with_internal_validation(
         calibration_y,
         raw_calibration_scores,
     )
-    operating_point = _expected_cost_threshold(
+    calibrated_youden = youden_threshold(
         calibration_y,
         calibrated_scores,
-        fn_cost=DEFAULT_THRESHOLD_FN_COST,
-        fp_cost=DEFAULT_THRESHOLD_FP_COST,
     )
-    val_metrics = compute_classification_metrics(
+    calibration_stage_metrics = _compute_calibration_stage_metrics(
         calibration_y,
         raw_calibration_scores,
-        threshold=float(operating_point["threshold"]),
-        decision_scores=calibrated_scores,
+        raw_threshold=float(raw_youden["threshold"]),
+        calibrated_scores=calibrated_scores,
+        calibrated_threshold=float(calibrated_youden["threshold"]),
     )
+    val_metrics = calibration_stage_metrics["after_calibration"]
     _emit_experiment_progress(
         progress_callback,
         ratio=0.9,
@@ -5193,23 +5499,27 @@ def train_model_with_internal_validation(
         progress_callback,
         ratio=1.0,
         label="Entrenamiento batch completo.",
-        detail=f"Modelo {model_name} | threshold {float(operating_point['threshold']):.4f}",
+        detail=f"Modelo {model_name} | threshold {float(calibrated_youden['threshold']):.4f}",
     )
 
     return {
         "model": model,
-        "threshold": float(operating_point["threshold"]),
-        "operating_threshold": float(operating_point["threshold"]),
+        "threshold": float(calibrated_youden["threshold"]),
+        "operating_threshold": float(calibrated_youden["threshold"]),
         "threshold_policy": DEFAULT_THRESHOLD_POLICY,
         "fn_cost": float(DEFAULT_THRESHOLD_FN_COST),
         "fp_cost": float(DEFAULT_THRESHOLD_FP_COST),
         "raw_youden_threshold": float(raw_youden["threshold"]),
         "youden": raw_youden,
         "raw_youden": raw_youden,
+        "calibrated_youden_threshold": float(calibrated_youden["threshold"]),
+        "calibrated_youden": calibrated_youden,
         "calibration_model": probability_calibrator,
         "calibration_metadata": calibration_metadata,
         "calibration_method": DEFAULT_CALIBRATION_METHOD,
         "val_metrics": val_metrics,
+        "val_metrics_before_calibration": calibration_stage_metrics["before_calibration"],
+        "val_metrics_after_calibration": calibration_stage_metrics["after_calibration"],
         "best_params": best_params,
         "model_params": final_model_params,
         "smote_params": smote_params,
@@ -5232,9 +5542,12 @@ def train_model_with_internal_validation(
             "threshold_policy": DEFAULT_THRESHOLD_POLICY,
             "fn_cost": float(DEFAULT_THRESHOLD_FN_COST),
             "fp_cost": float(DEFAULT_THRESHOLD_FP_COST),
-            "operating_threshold": float(operating_point["threshold"]),
+            "operating_threshold": float(calibrated_youden["threshold"]),
             "raw_youden_threshold": float(raw_youden["threshold"]),
+            "calibrated_youden_threshold": float(calibrated_youden["threshold"]),
             "calibration_metadata": _to_json_safe(calibration_metadata),
+            "val_metrics_before_calibration": calibration_stage_metrics["before_calibration"],
+            "val_metrics_after_calibration": calibration_stage_metrics["after_calibration"],
             "smote_fit_info": smote_fit_info,
             "feature_transform": _to_json_safe(feature_transform),
             "converged": bool(fit_diagnostics.get("converged", True)),
@@ -5253,6 +5566,7 @@ def _evaluate_split(
     feature_cols: Sequence[str],
     target_col: str,
     threshold: float,
+    raw_threshold: Optional[float] = None,
     fill_values: Optional[Dict[str, float]] = None,
     feature_transform: Optional[Dict[str, Any]] = None,
     calibration_model: Optional[LogisticRegression] = None,
@@ -5267,14 +5581,18 @@ def _evaluate_split(
         calibration_model=calibration_model,
         calibration_metadata=calibration_metadata,
     )
-    metrics = compute_classification_metrics(
+    stage_metrics = _compute_calibration_stage_metrics(
         y_te.to_numpy(),
         raw_scores,
-        threshold=float(threshold),
-        decision_scores=calibrated_scores,
+        raw_threshold=float(threshold if raw_threshold is None else raw_threshold),
+        calibrated_scores=calibrated_scores,
+        calibrated_threshold=float(threshold),
     )
+    metrics = stage_metrics["after_calibration"]
     return {
         "metrics": metrics,
+        "metrics_before_calibration": stage_metrics["before_calibration"],
+        "metrics_after_calibration": stage_metrics["after_calibration"],
         "y_true": y_te.to_numpy(),
         "scores": raw_scores,
         "calibrated_scores": calibrated_scores,
@@ -5622,6 +5940,7 @@ def run_yearly_strategy(
                 feature_cols=feature_cols,
                 target_col=target_col,
                 threshold=float(bundle["threshold"]),
+                raw_threshold=float(bundle.get("raw_youden_threshold", bundle["threshold"])),
                 fill_values=bundle.get("fill_values"),
                 feature_transform=bundle.get("feature_transform"),
                 calibration_model=bundle.get("calibration_model"),
@@ -5644,6 +5963,8 @@ def run_yearly_strategy(
             )
 
             metrics = eval_payload["metrics"]
+            metrics_before_calibration = eval_payload["metrics_before_calibration"]
+            metrics_after_calibration = eval_payload["metrics_after_calibration"]
             operating_context = _bundle_operating_context(bundle)
             row = {
                 "strategy": strategy,
@@ -5653,6 +5974,8 @@ def run_yearly_strategy(
                 "model": model_name,
                 "balance_mode": balance_mode,
                 "auc": float(metrics["auc"]),
+                "pr_auc": float(metrics["pr_auc"]),
+                "f1": float(metrics["f1"]),
                 "sensitivity": float(metrics["sensitivity"]),
                 "specificity": float(metrics["specificity"]),
                 "error_rate": float(metrics["error_rate"]),
@@ -5670,6 +5993,7 @@ def run_yearly_strategy(
                 "run_seed": effective_seed,
                 "run_order": int(run_order),
             }
+            row.update(_calibration_rate_fields(metrics_before_calibration, metrics_after_calibration))
             rows.append(row)
 
             _append_execution_log(
@@ -5693,6 +6017,10 @@ def run_yearly_strategy(
                 auc=float(metrics["auc"]),
                 sensitivity=float(metrics["sensitivity"]),
                 specificity=float(metrics["specificity"]),
+                sensitivity_before_calibration=float(metrics_before_calibration["sensitivity"]),
+                specificity_before_calibration=float(metrics_before_calibration["specificity"]),
+                sensitivity_after_calibration=float(metrics_after_calibration["sensitivity"]),
+                specificity_after_calibration=float(metrics_after_calibration["specificity"]),
                 error_rate=float(metrics["error_rate"]),
                 best_params=bundle["best_params"],
                 n_train=int(len(train_df)),
@@ -5708,6 +6036,9 @@ def run_yearly_strategy(
                     "segment": str(pred_year),
                     "y_true": eval_payload["y_true"],
                     "scores": eval_payload["scores"],
+                    "calibrated_scores": eval_payload["calibrated_scores"],
+                    "raw_threshold": float(bundle.get("raw_youden_threshold", bundle["threshold"])),
+                    "calibrated_threshold": float(bundle["threshold"]),
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
@@ -6099,41 +6430,47 @@ def run_adaptive_strategy(
                 continue
 
             drift_idx += 1
-            seg_metrics = compute_classification_metrics(
+            stage_metrics = _compute_calibration_stage_metrics(
                 np.asarray(segment_y),
                 np.asarray(segment_raw_scores),
-                threshold=threshold,
-                decision_scores=np.asarray(segment_decision_scores),
+                raw_threshold=raw_youden_threshold,
+                calibrated_scores=np.asarray(segment_decision_scores),
+                calibrated_threshold=threshold,
             )
+            seg_metrics = stage_metrics["after_calibration"]
+            seg_metrics_before = stage_metrics["before_calibration"]
+            seg_metrics_after = stage_metrics["after_calibration"]
 
             remaining = int(len(stream) - (i + 1))
-            rows.append(
-                {
-                    "strategy": "adaptive_adwin",
-                    "drift": drift_idx,
-                    "drift_date": pd.Timestamp(ts_i),
-                    "balance_mode": balance_mode,
-                    "W": int(info["n"]),
-                    "W0": int(info["n0"]),
-                    "W1": int(info["n1"]),
-                    "remaining_periods": remaining,
-                    "model": model_name,
-                    "auc": float(seg_metrics["auc"]),
-                    "sensitivity": float(seg_metrics["sensitivity"]),
-                    "specificity": float(seg_metrics["specificity"]),
-                    "error_rate": float(seg_metrics["error_rate"]),
-                    "training_time_sec": float(fit_time),
-                    "threshold": float(threshold),
-                    "operating_threshold": float(threshold),
-                    "raw_youden_threshold": float(raw_youden_threshold),
-                    "threshold_policy": str(threshold_policy),
-                    "calibration_method": str(calibration_method),
-                    "fn_cost": float(fn_cost),
-                    "fp_cost": float(fp_cost),
-                    "run_seed": effective_seed,
-                    "run_order": int(run_order),
-                }
-            )
+            row = {
+                "strategy": "adaptive_adwin",
+                "drift": drift_idx,
+                "drift_date": pd.Timestamp(ts_i),
+                "balance_mode": balance_mode,
+                "W": int(info["n"]),
+                "W0": int(info["n0"]),
+                "W1": int(info["n1"]),
+                "remaining_periods": remaining,
+                "model": model_name,
+                "auc": float(seg_metrics["auc"]),
+                "pr_auc": float(seg_metrics["pr_auc"]),
+                "f1": float(seg_metrics["f1"]),
+                "sensitivity": float(seg_metrics["sensitivity"]),
+                "specificity": float(seg_metrics["specificity"]),
+                "error_rate": float(seg_metrics["error_rate"]),
+                "training_time_sec": float(fit_time),
+                "threshold": float(threshold),
+                "operating_threshold": float(threshold),
+                "raw_youden_threshold": float(raw_youden_threshold),
+                "threshold_policy": str(threshold_policy),
+                "calibration_method": str(calibration_method),
+                "fn_cost": float(fn_cost),
+                "fp_cost": float(fp_cost),
+                "run_seed": effective_seed,
+                "run_order": int(run_order),
+            }
+            row.update(_calibration_rate_fields(seg_metrics_before, seg_metrics_after))
+            rows.append(row)
 
             _append_execution_log(
                 execution_log,
@@ -6159,6 +6496,10 @@ def run_adaptive_strategy(
                 auc=float(seg_metrics["auc"]),
                 sensitivity=float(seg_metrics["sensitivity"]),
                 specificity=float(seg_metrics["specificity"]),
+                sensitivity_before_calibration=float(seg_metrics_before["sensitivity"]),
+                specificity_before_calibration=float(seg_metrics_before["specificity"]),
+                sensitivity_after_calibration=float(seg_metrics_after["sensitivity"]),
+                specificity_after_calibration=float(seg_metrics_after["specificity"]),
                 error_rate=float(seg_metrics["error_rate"]),
             )
 
@@ -6170,6 +6511,9 @@ def run_adaptive_strategy(
                     "segment": f"drift_{drift_idx}",
                     "y_true": np.asarray(segment_y),
                     "scores": np.asarray(segment_raw_scores),
+                    "calibrated_scores": np.asarray(segment_decision_scores),
+                    "raw_threshold": float(raw_youden_threshold),
+                    "calibrated_threshold": float(threshold),
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
@@ -6351,39 +6695,45 @@ def run_adaptive_strategy(
         # Final segment row (matches A.9 style "remaining=0")
         if segment_y:
             drift_idx += 1
-            seg_metrics = compute_classification_metrics(
+            stage_metrics = _compute_calibration_stage_metrics(
                 np.asarray(segment_y),
                 np.asarray(segment_raw_scores),
-                threshold=threshold,
-                decision_scores=np.asarray(segment_decision_scores),
+                raw_threshold=raw_youden_threshold,
+                calibrated_scores=np.asarray(segment_decision_scores),
+                calibrated_threshold=threshold,
             )
-            rows.append(
-                {
-                    "strategy": "adaptive_adwin",
-                    "drift": drift_idx,
-                    "drift_date": pd.Timestamp(ts_stream.iloc[-1]),
-                    "balance_mode": balance_mode,
-                    "W": int(len(detector)),
-                    "W0": np.nan,
-                    "W1": np.nan,
-                    "remaining_periods": 0,
-                    "model": model_name,
-                    "auc": float(seg_metrics["auc"]),
-                    "sensitivity": float(seg_metrics["sensitivity"]),
-                    "specificity": float(seg_metrics["specificity"]),
-                    "error_rate": float(seg_metrics["error_rate"]),
-                    "training_time_sec": float(fit_time),
-                    "threshold": float(threshold),
-                    "operating_threshold": float(threshold),
-                    "raw_youden_threshold": float(raw_youden_threshold),
-                    "threshold_policy": str(threshold_policy),
-                    "calibration_method": str(calibration_method),
-                    "fn_cost": float(fn_cost),
-                    "fp_cost": float(fp_cost),
-                    "run_seed": effective_seed,
-                    "run_order": int(run_order),
-                }
-            )
+            seg_metrics = stage_metrics["after_calibration"]
+            seg_metrics_before = stage_metrics["before_calibration"]
+            seg_metrics_after = stage_metrics["after_calibration"]
+            row = {
+                "strategy": "adaptive_adwin",
+                "drift": drift_idx,
+                "drift_date": pd.Timestamp(ts_stream.iloc[-1]),
+                "balance_mode": balance_mode,
+                "W": int(len(detector)),
+                "W0": np.nan,
+                "W1": np.nan,
+                "remaining_periods": 0,
+                "model": model_name,
+                "auc": float(seg_metrics["auc"]),
+                "pr_auc": float(seg_metrics["pr_auc"]),
+                "f1": float(seg_metrics["f1"]),
+                "sensitivity": float(seg_metrics["sensitivity"]),
+                "specificity": float(seg_metrics["specificity"]),
+                "error_rate": float(seg_metrics["error_rate"]),
+                "training_time_sec": float(fit_time),
+                "threshold": float(threshold),
+                "operating_threshold": float(threshold),
+                "raw_youden_threshold": float(raw_youden_threshold),
+                "threshold_policy": str(threshold_policy),
+                "calibration_method": str(calibration_method),
+                "fn_cost": float(fn_cost),
+                "fp_cost": float(fp_cost),
+                "run_seed": effective_seed,
+                "run_order": int(run_order),
+            }
+            row.update(_calibration_rate_fields(seg_metrics_before, seg_metrics_after))
+            rows.append(row)
             _append_execution_log(
                 execution_log,
                 phase="adaptive_final_segment",
@@ -6405,6 +6755,10 @@ def run_adaptive_strategy(
                 auc=float(seg_metrics["auc"]),
                 sensitivity=float(seg_metrics["sensitivity"]),
                 specificity=float(seg_metrics["specificity"]),
+                sensitivity_before_calibration=float(seg_metrics_before["sensitivity"]),
+                specificity_before_calibration=float(seg_metrics_before["specificity"]),
+                sensitivity_after_calibration=float(seg_metrics_after["sensitivity"]),
+                specificity_after_calibration=float(seg_metrics_after["specificity"]),
                 error_rate=float(seg_metrics["error_rate"]),
             )
             roc_payload.append(
@@ -6415,6 +6769,9 @@ def run_adaptive_strategy(
                     "segment": "final",
                     "y_true": np.asarray(segment_y),
                     "scores": np.asarray(segment_raw_scores),
+                    "calibrated_scores": np.asarray(segment_decision_scores),
+                    "raw_threshold": float(raw_youden_threshold),
+                    "calibrated_threshold": float(threshold),
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
@@ -6586,41 +6943,48 @@ def run_arf_strategy(
                 return
 
             segment_idx += 1
-            seg_metrics = compute_classification_metrics(
+            stage_metrics = _compute_calibration_stage_metrics(
                 np.asarray(segment_y),
                 np.asarray(segment_s),
-                threshold=threshold,
+                raw_threshold=threshold,
+                calibrated_scores=np.asarray(segment_s),
+                calibrated_threshold=threshold,
             )
+            seg_metrics = stage_metrics["after_calibration"]
+            seg_metrics_before = stage_metrics["before_calibration"]
+            seg_metrics_after = stage_metrics["after_calibration"]
             current_drifts = _online_counter_value(model, "n_drifts_detected")
             current_warnings = _online_counter_value(model, "n_warnings_detected")
             segment_drifts = current_drifts - segment_drift_start
             segment_warnings = current_warnings - segment_warning_start
 
-            rows.append(
-                {
-                    "strategy": ADAPTIVE_ARF_STRATEGY,
-                    "drift": segment_idx,
-                    "drift_date": pd.Timestamp(end_ts),
-                    "prediction_year": int(prediction_year),
-                    "balance_mode": balance_mode,
-                    "segment_rows": int(len(segment_y)),
-                    "n_internal_drifts": int(segment_drifts),
-                    "n_internal_warnings": int(segment_warnings),
-                    "W": np.nan,
-                    "W0": np.nan,
-                    "W1": np.nan,
-                    "remaining_periods": int(remaining_periods),
-                    "model": variant_name,
-                    "auc": float(seg_metrics["auc"]),
-                    "sensitivity": float(seg_metrics["sensitivity"]),
-                    "specificity": float(seg_metrics["specificity"]),
-                    "error_rate": float(seg_metrics["error_rate"]),
-                    "training_time_sec": float(fit_time),
-                    "threshold": float(threshold),
-                    "run_seed": effective_seed,
-                    "run_order": int(run_order),
-                }
-            )
+            row = {
+                "strategy": ADAPTIVE_ARF_STRATEGY,
+                "drift": segment_idx,
+                "drift_date": pd.Timestamp(end_ts),
+                "prediction_year": int(prediction_year),
+                "balance_mode": balance_mode,
+                "segment_rows": int(len(segment_y)),
+                "n_internal_drifts": int(segment_drifts),
+                "n_internal_warnings": int(segment_warnings),
+                "W": np.nan,
+                "W0": np.nan,
+                "W1": np.nan,
+                "remaining_periods": int(remaining_periods),
+                "model": variant_name,
+                "auc": float(seg_metrics["auc"]),
+                "pr_auc": float(seg_metrics["pr_auc"]),
+                "f1": float(seg_metrics["f1"]),
+                "sensitivity": float(seg_metrics["sensitivity"]),
+                "specificity": float(seg_metrics["specificity"]),
+                "error_rate": float(seg_metrics["error_rate"]),
+                "training_time_sec": float(fit_time),
+                "threshold": float(threshold),
+                "run_seed": effective_seed,
+                "run_order": int(run_order),
+            }
+            row.update(_calibration_rate_fields(seg_metrics_before, seg_metrics_after))
+            rows.append(row)
 
             _append_execution_log(
                 execution_log,
@@ -6643,6 +7007,10 @@ def run_arf_strategy(
                 auc=float(seg_metrics["auc"]),
                 sensitivity=float(seg_metrics["sensitivity"]),
                 specificity=float(seg_metrics["specificity"]),
+                sensitivity_before_calibration=float(seg_metrics_before["sensitivity"]),
+                specificity_before_calibration=float(seg_metrics_before["specificity"]),
+                sensitivity_after_calibration=float(seg_metrics_after["sensitivity"]),
+                specificity_after_calibration=float(seg_metrics_after["specificity"]),
                 error_rate=float(seg_metrics["error_rate"]),
             )
 
@@ -6654,6 +7022,9 @@ def run_arf_strategy(
                     "segment": str(prediction_year),
                     "y_true": np.asarray(segment_y),
                     "scores": np.asarray(segment_s),
+                    "calibrated_scores": np.asarray(segment_s),
+                    "raw_threshold": float(threshold),
+                    "calibrated_threshold": float(threshold),
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
@@ -7073,12 +7444,16 @@ def run_kswin_strategy(
                     continue
 
                 drift_idx += 1
-                seg_metrics = compute_classification_metrics(
+                stage_metrics = _compute_calibration_stage_metrics(
                     np.asarray(segment_y),
                     np.asarray(segment_raw_scores),
-                    threshold=threshold,
-                    decision_scores=np.asarray(segment_decision_scores),
+                    raw_threshold=raw_youden_threshold,
+                    calibrated_scores=np.asarray(segment_decision_scores),
+                    calibrated_threshold=threshold,
                 )
+                seg_metrics = stage_metrics["after_calibration"]
+                seg_metrics_before = stage_metrics["before_calibration"]
+                seg_metrics_after = stage_metrics["after_calibration"]
 
                 observed_df = pd.concat(
                     [
@@ -7102,44 +7477,46 @@ def run_kswin_strategy(
                 remaining = int(len(stream) - (i + 1))
                 config = KSWIN_VARIANT_CONFIGS[variant_name]
 
-                rows.append(
-                    {
-                        "strategy": ADAPTIVE_KSWIN_STRATEGY,
-                        "drift": drift_idx,
-                        "drift_date": ts_i,
-                        "prediction_year": int(ts_i.year),
-                        "balance_mode": balance_mode,
-                        "segment_rows": int(len(segment_y)),
-                        "vote_count": int(len(fired_features)),
-                        "vote_threshold": int(effective_vote_threshold),
-                        "monitor_feature_count": int(len(monitor_cols)),
-                        "detected_features": json.dumps(fired_features, ensure_ascii=True),
-                        "monitored_features": json.dumps(list(monitor_cols), ensure_ascii=True),
-                        "retrain_rows": retrain_rows,
-                        "retrain_positive_rows": retrain_positive_rows,
-                        "W": int(config["window_size"]),
-                        "W0": int(config["window_size"] - config["stat_size"]),
-                        "W1": int(config["stat_size"]),
-                        "remaining_periods": remaining,
-                        "base_model": model_name,
-                        "detector_variant": variant_name,
-                        "model": model_label,
-                        "auc": float(seg_metrics["auc"]),
-                        "sensitivity": float(seg_metrics["sensitivity"]),
-                        "specificity": float(seg_metrics["specificity"]),
-                        "error_rate": float(seg_metrics["error_rate"]),
-                        "training_time_sec": float(fit_time),
-                        "threshold": float(threshold),
-                        "operating_threshold": float(threshold),
-                        "raw_youden_threshold": float(raw_youden_threshold),
-                        "threshold_policy": str(threshold_policy),
-                        "calibration_method": str(calibration_method),
-                        "fn_cost": float(fn_cost),
-                        "fp_cost": float(fp_cost),
-                        "run_seed": effective_seed,
-                        "run_order": int(run_order),
-                    }
-                )
+                row = {
+                    "strategy": ADAPTIVE_KSWIN_STRATEGY,
+                    "drift": drift_idx,
+                    "drift_date": ts_i,
+                    "prediction_year": int(ts_i.year),
+                    "balance_mode": balance_mode,
+                    "segment_rows": int(len(segment_y)),
+                    "vote_count": int(len(fired_features)),
+                    "vote_threshold": int(effective_vote_threshold),
+                    "monitor_feature_count": int(len(monitor_cols)),
+                    "detected_features": json.dumps(fired_features, ensure_ascii=True),
+                    "monitored_features": json.dumps(list(monitor_cols), ensure_ascii=True),
+                    "retrain_rows": retrain_rows,
+                    "retrain_positive_rows": retrain_positive_rows,
+                    "W": int(config["window_size"]),
+                    "W0": int(config["window_size"] - config["stat_size"]),
+                    "W1": int(config["stat_size"]),
+                    "remaining_periods": remaining,
+                    "base_model": model_name,
+                    "detector_variant": variant_name,
+                    "model": model_label,
+                    "auc": float(seg_metrics["auc"]),
+                    "pr_auc": float(seg_metrics["pr_auc"]),
+                    "f1": float(seg_metrics["f1"]),
+                    "sensitivity": float(seg_metrics["sensitivity"]),
+                    "specificity": float(seg_metrics["specificity"]),
+                    "error_rate": float(seg_metrics["error_rate"]),
+                    "training_time_sec": float(fit_time),
+                    "threshold": float(threshold),
+                    "operating_threshold": float(threshold),
+                    "raw_youden_threshold": float(raw_youden_threshold),
+                    "threshold_policy": str(threshold_policy),
+                    "calibration_method": str(calibration_method),
+                    "fn_cost": float(fn_cost),
+                    "fp_cost": float(fp_cost),
+                    "run_seed": effective_seed,
+                    "run_order": int(run_order),
+                }
+                row.update(_calibration_rate_fields(seg_metrics_before, seg_metrics_after))
+                rows.append(row)
 
                 _append_execution_log(
                     execution_log,
@@ -7169,6 +7546,10 @@ def run_kswin_strategy(
                     auc=float(seg_metrics["auc"]),
                     sensitivity=float(seg_metrics["sensitivity"]),
                     specificity=float(seg_metrics["specificity"]),
+                    sensitivity_before_calibration=float(seg_metrics_before["sensitivity"]),
+                    specificity_before_calibration=float(seg_metrics_before["specificity"]),
+                    sensitivity_after_calibration=float(seg_metrics_after["sensitivity"]),
+                    specificity_after_calibration=float(seg_metrics_after["specificity"]),
                     error_rate=float(seg_metrics["error_rate"]),
                     run_seed=effective_seed,
                     run_order=run_order,
@@ -7183,6 +7564,9 @@ def run_kswin_strategy(
                         "segment": f"drift_{drift_idx}",
                         "y_true": np.asarray(segment_y),
                         "scores": np.asarray(segment_raw_scores),
+                        "calibrated_scores": np.asarray(segment_decision_scores),
+                        "raw_threshold": float(raw_youden_threshold),
+                        "calibrated_threshold": float(threshold),
                         "run_seed": effective_seed,
                         "run_order": int(run_order),
                     }
@@ -7395,50 +7779,56 @@ def run_kswin_strategy(
 
             if segment_y:
                 drift_idx += 1
-                seg_metrics = compute_classification_metrics(
+                stage_metrics = _compute_calibration_stage_metrics(
                     np.asarray(segment_y),
                     np.asarray(segment_raw_scores),
-                    threshold=threshold,
-                    decision_scores=np.asarray(segment_decision_scores),
+                    raw_threshold=raw_youden_threshold,
+                    calibrated_scores=np.asarray(segment_decision_scores),
+                    calibrated_threshold=threshold,
                 )
-                rows.append(
-                    {
-                        "strategy": ADAPTIVE_KSWIN_STRATEGY,
-                        "drift": drift_idx,
-                        "drift_date": pd.Timestamp(ts_stream.iloc[-1]),
-                        "prediction_year": int(pd.Timestamp(ts_stream.iloc[-1]).year),
-                        "balance_mode": balance_mode,
-                        "segment_rows": int(len(segment_y)),
-                        "vote_count": 0,
-                        "vote_threshold": int(effective_vote_threshold),
-                        "monitor_feature_count": int(len(monitor_cols)),
-                        "detected_features": json.dumps([], ensure_ascii=True),
-                        "monitored_features": json.dumps(list(monitor_cols), ensure_ascii=True),
-                        "retrain_rows": 0,
-                        "retrain_positive_rows": 0,
-                        "W": int(KSWIN_VARIANT_CONFIGS[variant_name]["window_size"]),
-                        "W0": int(KSWIN_VARIANT_CONFIGS[variant_name]["window_size"] - KSWIN_VARIANT_CONFIGS[variant_name]["stat_size"]),
-                        "W1": int(KSWIN_VARIANT_CONFIGS[variant_name]["stat_size"]),
-                        "remaining_periods": 0,
-                        "base_model": model_name,
-                        "detector_variant": variant_name,
-                        "model": model_label,
-                        "auc": float(seg_metrics["auc"]),
-                        "sensitivity": float(seg_metrics["sensitivity"]),
-                        "specificity": float(seg_metrics["specificity"]),
-                        "error_rate": float(seg_metrics["error_rate"]),
-                        "training_time_sec": float(fit_time),
-                        "threshold": float(threshold),
-                        "operating_threshold": float(threshold),
-                        "raw_youden_threshold": float(raw_youden_threshold),
-                        "threshold_policy": str(threshold_policy),
-                        "calibration_method": str(calibration_method),
-                        "fn_cost": float(fn_cost),
-                        "fp_cost": float(fp_cost),
-                        "run_seed": effective_seed,
-                        "run_order": int(run_order),
-                    }
-                )
+                seg_metrics = stage_metrics["after_calibration"]
+                seg_metrics_before = stage_metrics["before_calibration"]
+                seg_metrics_after = stage_metrics["after_calibration"]
+                row = {
+                    "strategy": ADAPTIVE_KSWIN_STRATEGY,
+                    "drift": drift_idx,
+                    "drift_date": pd.Timestamp(ts_stream.iloc[-1]),
+                    "prediction_year": int(pd.Timestamp(ts_stream.iloc[-1]).year),
+                    "balance_mode": balance_mode,
+                    "segment_rows": int(len(segment_y)),
+                    "vote_count": 0,
+                    "vote_threshold": int(effective_vote_threshold),
+                    "monitor_feature_count": int(len(monitor_cols)),
+                    "detected_features": json.dumps([], ensure_ascii=True),
+                    "monitored_features": json.dumps(list(monitor_cols), ensure_ascii=True),
+                    "retrain_rows": 0,
+                    "retrain_positive_rows": 0,
+                    "W": int(KSWIN_VARIANT_CONFIGS[variant_name]["window_size"]),
+                    "W0": int(KSWIN_VARIANT_CONFIGS[variant_name]["window_size"] - KSWIN_VARIANT_CONFIGS[variant_name]["stat_size"]),
+                    "W1": int(KSWIN_VARIANT_CONFIGS[variant_name]["stat_size"]),
+                    "remaining_periods": 0,
+                    "base_model": model_name,
+                    "detector_variant": variant_name,
+                    "model": model_label,
+                    "auc": float(seg_metrics["auc"]),
+                    "pr_auc": float(seg_metrics["pr_auc"]),
+                    "f1": float(seg_metrics["f1"]),
+                    "sensitivity": float(seg_metrics["sensitivity"]),
+                    "specificity": float(seg_metrics["specificity"]),
+                    "error_rate": float(seg_metrics["error_rate"]),
+                    "training_time_sec": float(fit_time),
+                    "threshold": float(threshold),
+                    "operating_threshold": float(threshold),
+                    "raw_youden_threshold": float(raw_youden_threshold),
+                    "threshold_policy": str(threshold_policy),
+                    "calibration_method": str(calibration_method),
+                    "fn_cost": float(fn_cost),
+                    "fp_cost": float(fp_cost),
+                    "run_seed": effective_seed,
+                    "run_order": int(run_order),
+                }
+                row.update(_calibration_rate_fields(seg_metrics_before, seg_metrics_after))
+                rows.append(row)
                 _append_execution_log(
                     execution_log,
                     phase="kswin_final_segment",
@@ -7459,6 +7849,10 @@ def run_kswin_strategy(
                     auc=float(seg_metrics["auc"]),
                     sensitivity=float(seg_metrics["sensitivity"]),
                     specificity=float(seg_metrics["specificity"]),
+                    sensitivity_before_calibration=float(seg_metrics_before["sensitivity"]),
+                    specificity_before_calibration=float(seg_metrics_before["specificity"]),
+                    sensitivity_after_calibration=float(seg_metrics_after["sensitivity"]),
+                    specificity_after_calibration=float(seg_metrics_after["specificity"]),
                     error_rate=float(seg_metrics["error_rate"]),
                     run_seed=effective_seed,
                     run_order=run_order,
@@ -7472,6 +7866,9 @@ def run_kswin_strategy(
                         "segment": "final",
                         "y_true": np.asarray(segment_y),
                         "scores": np.asarray(segment_raw_scores),
+                        "calibrated_scores": np.asarray(segment_decision_scores),
+                        "raw_threshold": float(raw_youden_threshold),
+                        "calibrated_threshold": float(threshold),
                         "run_seed": effective_seed,
                         "run_order": int(run_order),
                     }
@@ -7570,9 +7967,11 @@ def _normalize_feature_selection_context(
     context["selected_features"] = selected_features
     context["feature_count"] = int(context.get("feature_count") or len(selected_features))
     if "feature_export_path" in context and context.get("feature_export_path"):
-        export_path = Path(str(context["feature_export_path"]))
-        context["feature_export_path"] = str(export_path)
-        context.setdefault("feature_export_name", export_path.name)
+        raw_export_path = str(context["feature_export_path"]).strip()
+        resolved_export_path = _resolve_existing_feature_export_path(raw_export_path)
+        export_path_text = str(resolved_export_path or raw_export_path)
+        context["feature_export_path"] = export_path_text
+        context.setdefault("feature_export_name", _portable_path_name(export_path_text))
     return _to_json_safe(context)
 
 
@@ -7851,8 +8250,71 @@ def _load_completed_tuning_cache(paths: Dict[str, Path], manifest: Dict[str, Any
         tuning_path = paths["tuning_dir"] / str(info.get("filename", ""))
         payload = _load_tuning_artifact(tuning_path)
         if payload:
+            payload = dict(payload)
+            payload["_artifact_filename"] = tuning_path.name
+            payload["_artifact_tuning_key"] = str(tuning_key)
             artifacts[str(tuning_key)] = payload
     return artifacts
+
+
+def _resolve_compatible_cached_tuning_artifact(
+    *,
+    manifest: Dict[str, Any],
+    tuning_cache: Dict[str, Dict[str, Any]],
+    tuning_key: str,
+    train_df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    target_col: str,
+    time_col: str,
+    model_name: str,
+    balance_mode: str,
+    tuning_filename: str,
+) -> Optional[Dict[str, Any]]:
+    cached = tuning_cache.get(str(tuning_key))
+    if cached is not None:
+        return cached
+
+    signature_cols = [col for col in [time_col, target_col] + list(feature_cols) if col in train_df.columns]
+    expected_train_signature = _frame_signature(train_df, columns=signature_cols, include_index=True)
+    matched_key: Optional[str] = None
+    matched_payload: Optional[Dict[str, Any]] = None
+    for cached_key, candidate in tuning_cache.items():
+        if str(cached_key) == str(tuning_key):
+            continue
+        if str(candidate.get("model_name")) != str(model_name):
+            continue
+        if str(candidate.get("balance_mode")) != str(balance_mode):
+            continue
+        if str(candidate.get("train_signature")) != str(expected_train_signature):
+            continue
+        matched_key = str(cached_key)
+        matched_payload = dict(candidate)
+        break
+
+    if matched_payload is None or matched_key is None:
+        return None
+
+    legacy_info = dict((manifest.get("tuning_index") or {}).get(matched_key) or {})
+    legacy_filename = str(
+        legacy_info.get("filename")
+        or matched_payload.get("_artifact_filename")
+        or tuning_filename
+    )
+    alias_payload = dict(matched_payload)
+    alias_payload["tuning_key"] = str(tuning_key)
+    alias_payload["_legacy_tuning_key"] = str(matched_key)
+    alias_payload["_artifact_filename"] = legacy_filename
+    tuning_cache[str(tuning_key)] = alias_payload
+    manifest["tuning_index"][str(tuning_key)].update(
+        {
+            "filename": legacy_filename,
+            "status": "completed",
+            "study_id": alias_payload.get("study_id"),
+            "matched_legacy_tuning_key": str(matched_key),
+            "resolution": "train_signature_legacy_match",
+        }
+    )
+    return alias_payload
 
 
 def _resolve_or_create_tuning_artifact(
@@ -7876,6 +8338,7 @@ def _resolve_or_create_tuning_artifact(
     tuning_context: Optional[Dict[str, Any]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     persist_progress: bool = True,
+    allow_create: bool = True,
 ) -> Dict[str, Any]:
     tuning_key = _build_global_tuning_key(
         model_name=model_name,
@@ -7910,12 +8373,33 @@ def _resolve_or_create_tuning_artifact(
     if cached is not None:
         manifest["tuning_index"][tuning_key].update(
             {
-                "filename": tuning_filename,
+                "filename": str(cached.get("_artifact_filename") or tuning_filename),
                 "status": "completed",
                 "study_id": cached.get("study_id"),
             }
         )
         return cached
+
+    compatible_cached = _resolve_compatible_cached_tuning_artifact(
+        manifest=manifest,
+        tuning_cache=tuning_cache,
+        tuning_key=tuning_key,
+        train_df=train_df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        time_col=time_col,
+        model_name=model_name,
+        balance_mode=balance_mode,
+        tuning_filename=tuning_filename,
+    )
+    if compatible_cached is not None:
+        return compatible_cached
+
+    if not allow_create:
+        raise RuntimeError(
+            "Selected checkpoint is missing the persisted tuning artifact required for recompute-only mode. "
+            f"Model {model_name} | Balance {balance_mode} | tuning_key {tuning_key}"
+        )
 
     manifest["tuning_index"][tuning_key]["status"] = "running"
     if persist_progress:
@@ -8039,7 +8523,9 @@ def run_recalibration_experiments(
     balance_modes: Optional[Sequence[str]] = None,
     feature_selection_context: Optional[Dict[str, Any]] = None,
     checkpoint_root: Optional[Path] = None,
+    checkpoint_run_id_override: Optional[str] = None,
     auto_resume: bool = True,
+    recompute_blocks_from_checkpoint: bool = False,
     persist_progress: bool = True,
     reuse_tuning_cache: bool = True,
     reuse_smote_cache: bool = True,
@@ -8049,13 +8535,21 @@ def run_recalibration_experiments(
     """
     Main orchestrator for yearly, ADWIN-adaptive and ARF-adaptive strategies.
     """
+    initial_progress_label = "Analizando configuracion de experimentos..."
+    initial_progress_detail = "Construyendo bloques, ventanas de tuning y politica de checkpoint."
+    if recompute_blocks_from_checkpoint:
+        initial_progress_label = "Validando checkpoint para recompute-only..."
+        initial_progress_detail = (
+            "Reconstruyendo bloques y tuning_keys esperados para verificar el checkpoint; "
+            "no se crearán nuevos tunings."
+        )
     if progress_callback is not None:
         progress_callback(
             {
                 "completed_units": 0.0,
                 "total_units": 1,
-                "label": "Analizando configuracion de experimentos...",
-                "detail": "Construyendo bloques, ventanas de tuning y politica de checkpoint.",
+                "label": initial_progress_label,
+                "detail": initial_progress_detail,
             }
         )
     if model_names is None:
@@ -8168,15 +8662,23 @@ def run_recalibration_experiments(
     execution_log: List[Dict[str, Any]] = []
     studies: List[Dict[str, Any]] = []
     if progress_callback is not None:
+        preparation_label = "Preparando experimentos..."
+        preparation_detail = (
+            f"Plan preliminar: {len(tuning_tasks)} tareas de tuning y "
+            f"{total_block_units} bloques experimentales."
+        )
+        if recompute_blocks_from_checkpoint:
+            preparation_label = "Preparando recompute desde checkpoint..."
+            preparation_detail = (
+                f"Plan reconstruido: {len(tuning_tasks)} tunings esperados y "
+                f"{total_block_units} bloques. Solo se validarán artefactos persistidos."
+            )
         progress_callback(
             {
                 "completed_units": 0.0,
                 "total_units": int(total_units),
-                "label": "Preparando experimentos...",
-                "detail": (
-                    f"Plan preliminar: {len(tuning_tasks)} tareas de tuning y "
-                    f"{total_block_units} bloques experimentales."
-                ),
+                "label": preparation_label,
+                "detail": preparation_detail,
             }
         )
     preflight = _estimate_recalibration_workload(
@@ -8200,12 +8702,21 @@ def run_recalibration_experiments(
         custom_grids=custom_grids,
     )
     if progress_callback is not None:
+        resolve_checkpoint_label = "Resolviendo checkpoint compatible..."
+        resolve_checkpoint_detail = "Calculando identificador de corrida y validando artefactos persistidos."
+        if recompute_blocks_from_checkpoint:
+            resolve_checkpoint_label = (
+                "Resolviendo checkpoint cargado..."
+                if checkpoint_run_id_override
+                else "Resolviendo checkpoint para recompute..."
+            )
+            resolve_checkpoint_detail = "Leyendo manifest persistido y validando tuning/cache requeridos."
         progress_callback(
             {
                 "completed_units": 0.0,
                 "total_units": int(total_units),
-                "label": "Resolviendo checkpoint compatible...",
-                "detail": "Calculando identificador de corrida y validando artefactos persistidos.",
+                "label": resolve_checkpoint_label,
+                "detail": resolve_checkpoint_detail,
             }
         )
     available_years = _available_prediction_years(df, time_col)
@@ -8233,6 +8744,7 @@ def run_recalibration_experiments(
         "resource_mode": str(normalized_resource_mode),
         "resource_mode_label": str(resource_policy["label"]),
         "resource_policy": _to_json_safe(resource_policy),
+        "custom_grids": _to_json_safe(custom_grids or {}),
         "optuna_trials": int(grid_limit) if grid_limit is not None else None,
         "adwin_delta": float(adwin_delta),
         "min_window": int(min_window),
@@ -8253,7 +8765,7 @@ def run_recalibration_experiments(
         "feature_selection_context": normalized_feature_selection_context,
         "preflight": preflight,
     }
-    run_id = _build_recalibration_run_id(
+    computed_run_id = _build_recalibration_run_id(
         df=df,
         feature_cols=feature_cols,
         target_col=target_col,
@@ -8282,12 +8794,15 @@ def run_recalibration_experiments(
         custom_grids=custom_grids,
         feature_selection_context=normalized_feature_selection_context,
     )
+    run_id = str(checkpoint_run_id_override or computed_run_id)
     run_dir = _recalibration_run_dir(run_id, checkpoint_root=checkpoint_root)
     paths = _recalibration_run_paths(run_dir)
     _ensure_recalibration_run_dirs(paths)
     live_status_path = paths["live_status"]
     live_events_path = paths["live_events"]
     run_manifest["run_id"] = str(run_id)
+    run_manifest["computed_run_id"] = str(computed_run_id)
+    run_manifest["checkpoint_run_id_override"] = None if checkpoint_run_id_override is None else str(checkpoint_run_id_override)
     run_manifest["checkpoint_run_dir"] = str(paths["run_dir"])
     run_manifest["checkpoint_manifest_path"] = str(paths["manifest"])
 
@@ -8297,12 +8812,22 @@ def run_recalibration_experiments(
         manifest = _reconcile_recalibration_manifest(existing_manifest, paths=paths)
         manifest["run_manifest"] = _to_json_safe(run_manifest)
         manifest["feature_selection_context"] = _to_json_safe(normalized_feature_selection_context)
-        manifest["resume"] = {
-            "auto_resumed": True,
-            "checkpoint_status": str(existing_manifest.get("status", "running")),
-        }
-        if str(existing_manifest.get("status")) != "completed":
-            manifest["status"] = "running"
+        existing_status = str(existing_manifest.get("status", "running"))
+        if recompute_blocks_from_checkpoint:
+            if persist_progress:
+                _reset_recalibration_live_artifacts(paths)
+            manifest = _reset_recalibration_blocks_for_rerun(
+                manifest,
+                paths=paths,
+                checkpoint_status=existing_status,
+            )
+        else:
+            manifest["resume"] = {
+                "auto_resumed": True,
+                "checkpoint_status": existing_status,
+            }
+            if existing_status != "completed":
+                manifest["status"] = "running"
     if manifest is None:
         if persist_progress:
             _reset_recalibration_live_artifacts(paths)
@@ -8317,7 +8842,7 @@ def run_recalibration_experiments(
     if persist_progress:
         _persist_manifest(paths["manifest"], manifest)
 
-    if auto_resume and str(manifest.get("status")) == "completed":
+    if auto_resume and not recompute_blocks_from_checkpoint and str(manifest.get("status")) == "completed":
         emit_progress(
             label="Checkpoint ya completado. Cargando resultados persistidos...",
             detail=f"{total_units} / {total_units} unidades completadas",
@@ -8341,6 +8866,74 @@ def run_recalibration_experiments(
         return outputs
 
     tuning_cache = _load_completed_tuning_cache(paths, manifest) if reuse_tuning_cache else {}
+    if recompute_blocks_from_checkpoint:
+        missing_tuning_tasks: List[Dict[str, Any]] = []
+        for task in tuning_tasks:
+            tuning_key = str(task.get("tuning_key", ""))
+            if tuning_key in tuning_cache:
+                continue
+            train_df = _materialize_tuning_train_df(
+                df,
+                time_col=time_col,
+                task=task,
+            )
+            compatible_cached = _resolve_compatible_cached_tuning_artifact(
+                manifest=manifest,
+                tuning_cache=tuning_cache,
+                tuning_key=tuning_key,
+                train_df=train_df,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                time_col=time_col,
+                model_name=str(task.get("model_name", "")),
+                balance_mode=str(task.get("balance_mode", "")),
+                tuning_filename=f"{tuning_key}.json",
+            )
+            if compatible_cached is None:
+                missing_tuning_tasks.append(dict(task))
+        if missing_tuning_tasks:
+            first_missing = missing_tuning_tasks[0]
+            missing_error = RuntimeError(
+                "Selected checkpoint is missing persisted tuning artifacts for the current training configuration. "
+                f"First missing tuning: {first_missing.get('model_name')} | "
+                f"{first_missing.get('balance_mode')} | "
+                f"{first_missing.get('training_year_label') or first_missing.get('window_kind') or 'window'}"
+            )
+            manifest["status"] = "failed"
+            manifest["failed_block_id"] = None
+            manifest["last_error"] = {
+                "phase": "checkpoint_validation",
+                "mode": "recompute_blocks",
+                "error": str(missing_error),
+                "missing_tuning_key": str(first_missing.get("tuning_key", "")),
+            }
+            _append_execution_log(
+                manifest.get("global_execution_log"),
+                phase="checkpoint_validation_error",
+                status="error",
+                message="Recompute-only checkpoint validation detected missing persisted tuning artifacts.",
+                error=str(missing_error),
+                missing_tuning_key=str(first_missing.get("tuning_key", "")),
+                model=str(first_missing.get("model_name", "")),
+                balance_mode=str(first_missing.get("balance_mode", "")),
+                window_kind=str(first_missing.get("window_kind", "")),
+                training_years=first_missing.get("training_years"),
+            )
+            if persist_progress:
+                _persist_manifest(paths["manifest"], manifest)
+            emit_progress(
+                label="Checkpoint incompleto para recompute-only.",
+                detail=str(missing_error),
+                completed_override=float(len(tuning_cache)),
+                context={
+                    "phase": "checkpoint_validation_error",
+                    "checkpoint_mode": "recompute_blocks",
+                    "missing_tuning_key": str(first_missing.get("tuning_key", "")),
+                    "model": str(first_missing.get("model_name", "")),
+                    "balance_mode": str(first_missing.get("balance_mode", "")),
+                },
+            )
+            raise missing_error
 
     block_specs: List[Dict[str, Any]] = []
     for run_order, seed in enumerate(repetition_seeds, start=1):
@@ -8394,7 +8987,13 @@ def run_recalibration_experiments(
     if persist_progress:
         _persist_manifest(paths["manifest"], manifest)
 
-    checkpoint_label = "Reanudando checkpoint..." if bool(manifest.get("resume", {}).get("auto_resumed")) else "Iniciando experimentos de recalibracion..."
+    resume_mode = str(manifest.get("resume", {}).get("checkpoint_mode", "auto"))
+    if resume_mode == "recompute_blocks":
+        checkpoint_label = "Retomando checkpoint y recalculando entrenamientos..."
+    elif bool(manifest.get("resume", {}).get("auto_resumed")):
+        checkpoint_label = "Reanudando checkpoint..."
+    else:
+        checkpoint_label = "Iniciando experimentos de recalibracion..."
     emit_progress(
         label=checkpoint_label,
         detail=f"{completed_units:.2f} / {total_units} unidades completadas",
@@ -8403,6 +9002,7 @@ def run_recalibration_experiments(
             "phase": "checkpoint_start",
             "checkpoint_status": str(manifest.get("resume", {}).get("checkpoint_status", "fresh")),
             "auto_resumed": bool(manifest.get("resume", {}).get("auto_resumed")),
+            "checkpoint_mode": resume_mode,
         },
     )
 
@@ -8494,6 +9094,7 @@ def run_recalibration_experiments(
                     )
                 ),
                 persist_progress=persist_progress,
+                allow_create=not recompute_blocks_from_checkpoint,
             )
             rss_after = _cleanup_recalibration_memory()
             _update_memory_summary(
@@ -8715,7 +9316,11 @@ def run_recalibration_experiments(
             *,
             train_df: pd.DataFrame,
             strategy_context: Dict[str, Any],
+            model_name: Optional[str] = None,
+            balance_mode: Optional[str] = None,
         ) -> Dict[str, Any]:
+            effective_model_name = str(model_name or block.get("model") or "")
+            effective_balance_mode = str(balance_mode or block.get("balance_mode") or BALANCE_MODE_NOT_APPLICABLE)
             artifact = _resolve_or_create_tuning_artifact(
                 paths=paths,
                 manifest=manifest,
@@ -8724,17 +9329,18 @@ def run_recalibration_experiments(
                 feature_cols=feature_cols,
                 target_col=target_col,
                 time_col=time_col,
-                model_name=model_name,
-                balance_mode=balance_mode,
+                model_name=effective_model_name,
+                balance_mode=effective_balance_mode,
                 validation_size=float(validation_size),
                 folds=int(folds),
                 random_state=int(random_state),
                 fast_mode=bool(fast_mode),
                 resource_mode=str(normalized_resource_mode),
                 grid_limit=grid_limit,
-                custom_grid=(custom_grids or {}).get(model_name),
+                custom_grid=(custom_grids or {}).get(effective_model_name),
                 tuning_context=strategy_context,
                 persist_progress=persist_progress,
+                allow_create=not recompute_blocks_from_checkpoint,
             )
             tuning_key = str(artifact.get("tuning_key", ""))
             if tuning_key and tuning_key not in tuning_refs:
@@ -8910,6 +9516,17 @@ def run_recalibration_experiments(
                 )
             else:
                 raise ValueError(f"Unsupported strategy: {strategy}")
+
+            block_errors = [
+                entry
+                for entry in block_execution_log
+                if isinstance(entry, dict) and str(entry.get("status", "")).lower() == "error"
+            ]
+            if yearly_df.empty and adaptive_df.empty and block_errors:
+                last_error = dict(block_errors[-1])
+                error_text = str(last_error.get("error") or last_error.get("message") or "Internal block error.")
+                error_phase = str(last_error.get("phase") or "block_internal_error")
+                raise RuntimeError(f"{error_phase}: {error_text}")
 
             rss_after = _cleanup_recalibration_memory()
             _update_memory_summary(
@@ -9130,6 +9747,7 @@ def run_recalibration_experiments(
     manifest["resume"] = {
         "auto_resumed": bool(manifest.get("resume", {}).get("auto_resumed")),
         "checkpoint_status": "completed",
+        "checkpoint_mode": str(manifest.get("resume", {}).get("checkpoint_mode", "auto")),
     }
     _update_manifest_progress(
         manifest,
@@ -9238,8 +9856,14 @@ def build_average_roc_curves(
 
 YEARLY_EVOLUTION_METRICS = [
     "auc",
+    "pr_auc",
+    "f1",
     "sensitivity",
     "specificity",
+    "sensitivity_before_calibration",
+    "specificity_before_calibration",
+    "sensitivity_after_calibration",
+    "specificity_after_calibration",
     "error_rate",
     "threshold",
     "training_time_sec",
@@ -9248,8 +9872,14 @@ YEARLY_EVOLUTION_METRICS = [
 ]
 ADAPTIVE_EVOLUTION_METRICS = [
     "auc",
+    "pr_auc",
+    "f1",
     "sensitivity",
     "specificity",
+    "sensitivity_before_calibration",
+    "specificity_before_calibration",
+    "sensitivity_after_calibration",
+    "specificity_after_calibration",
     "error_rate",
     "threshold",
     "training_time_sec",
@@ -9417,19 +10047,45 @@ def _build_execution_memory_trace(execution_log: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(["metric", "order"]).reset_index(drop=True)
 
 
+def _streamlit_arrow_safe_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    work = df.copy()
+    for col in work.columns:
+        if pd.api.types.is_object_dtype(work[col]):
+            work[col] = work[col].astype("string")
+    return work
+
+
 def summarize_results(
     yearly_results: pd.DataFrame,
     adaptive_results: pd.DataFrame,
 ) -> pd.DataFrame:
     """Builds compact summary table across strategies and models."""
+    calibration_cols = [
+        "sensitivity_before_calibration",
+        "specificity_before_calibration",
+        "sensitivity_after_calibration",
+        "specificity_after_calibration",
+    ]
     rows: List[pd.DataFrame] = []
     if yearly_results is not None and not yearly_results.empty:
+        yearly_results = yearly_results.copy()
+        for col in ["pr_auc", "f1", *calibration_cols]:
+            if col not in yearly_results.columns:
+                yearly_results[col] = np.nan
         y = (
             yearly_results.groupby(["strategy", "model", "balance_mode"], dropna=False)
             .agg(
                 auc=("auc", "mean"),
+                pr_auc=("pr_auc", "mean"),
+                f1=("f1", "mean"),
                 sensitivity=("sensitivity", "mean"),
                 specificity=("specificity", "mean"),
+                sensitivity_before_calibration=("sensitivity_before_calibration", "mean"),
+                specificity_before_calibration=("specificity_before_calibration", "mean"),
+                sensitivity_after_calibration=("sensitivity_after_calibration", "mean"),
+                specificity_after_calibration=("specificity_after_calibration", "mean"),
                 error_rate=("error_rate", "mean"),
                 training_time_sec=("training_time_sec", "mean"),
                 n_segments=("model", "size"),
@@ -9443,12 +10099,22 @@ def summarize_results(
         rows.append(y)
 
     if adaptive_results is not None and not adaptive_results.empty:
+        adaptive_results = adaptive_results.copy()
+        for col in ["pr_auc", "f1", *calibration_cols]:
+            if col not in adaptive_results.columns:
+                adaptive_results[col] = np.nan
         a = (
             adaptive_results.groupby(["strategy", "model", "balance_mode"], dropna=False)
             .agg(
                 auc=("auc", "mean"),
+                pr_auc=("pr_auc", "mean"),
+                f1=("f1", "mean"),
                 sensitivity=("sensitivity", "mean"),
                 specificity=("specificity", "mean"),
+                sensitivity_before_calibration=("sensitivity_before_calibration", "mean"),
+                specificity_before_calibration=("specificity_before_calibration", "mean"),
+                sensitivity_after_calibration=("sensitivity_after_calibration", "mean"),
+                specificity_after_calibration=("specificity_after_calibration", "mean"),
                 error_rate=("error_rate", "mean"),
                 training_time_sec=("training_time_sec", "mean"),
                 n_segments=("model", "size"),
@@ -9473,6 +10139,12 @@ def format_appendix_tables(
     adaptive_results: pd.DataFrame,
 ) -> Dict[str, pd.DataFrame]:
     """Formats result outputs as paper Appendix A tables A.6-A.9."""
+    calibration_cols = [
+        "sensitivity_before_calibration",
+        "specificity_before_calibration",
+        "sensitivity_after_calibration",
+        "specificity_after_calibration",
+    ]
     tables: Dict[str, pd.DataFrame] = {
         "A.6": pd.DataFrame(),
         "A.7": pd.DataFrame(),
@@ -9481,6 +10153,10 @@ def format_appendix_tables(
     }
 
     if yearly_results is not None and not yearly_results.empty:
+        yearly_results = yearly_results.copy()
+        for col in ["pr_auc", "f1", *calibration_cols]:
+            if col not in yearly_results.columns:
+                yearly_results[col] = np.nan
         common_cols = [
             "iteration",
             "training_year",
@@ -9488,8 +10164,14 @@ def format_appendix_tables(
             "model",
             "balance_mode",
             "auc",
+            "pr_auc",
+            "f1",
             "sensitivity",
             "specificity",
+            "sensitivity_before_calibration",
+            "specificity_before_calibration",
+            "sensitivity_after_calibration",
+            "specificity_after_calibration",
             "error_rate",
             "training_time_sec",
             "threshold",
@@ -9507,6 +10189,10 @@ def format_appendix_tables(
         tables["A.8"] = cumulative.reset_index(drop=True)
 
     if adaptive_results is not None and not adaptive_results.empty:
+        adaptive_results = adaptive_results.copy()
+        for col in ["pr_auc", "f1", *calibration_cols]:
+            if col not in adaptive_results.columns:
+                adaptive_results[col] = np.nan
         cols = [
             "strategy",
             "drift",
@@ -9531,8 +10217,14 @@ def format_appendix_tables(
             "remaining_periods",
             "model",
             "auc",
+            "pr_auc",
+            "f1",
             "sensitivity",
             "specificity",
+            "sensitivity_before_calibration",
+            "specificity_before_calibration",
+            "sensitivity_after_calibration",
+            "specificity_after_calibration",
             "error_rate",
             "training_time_sec",
             "threshold",
@@ -9549,6 +10241,12 @@ def format_appendix_tables_mean(
     adaptive_results: pd.DataFrame,
 ) -> Dict[str, pd.DataFrame]:
     """Formats mean appendix tables across sequential seed repetitions."""
+    calibration_cols = [
+        "sensitivity_before_calibration",
+        "specificity_before_calibration",
+        "sensitivity_after_calibration",
+        "specificity_after_calibration",
+    ]
     tables: Dict[str, pd.DataFrame] = {
         "A.6": pd.DataFrame(),
         "A.7": pd.DataFrame(),
@@ -9557,11 +10255,21 @@ def format_appendix_tables_mean(
     }
 
     if yearly_results is not None and not yearly_results.empty:
+        yearly_results = yearly_results.copy()
+        for col in ["pr_auc", "f1", *calibration_cols]:
+            if col not in yearly_results.columns:
+                yearly_results[col] = np.nan
         group_cols = ["strategy", "iteration", "training_year", "prediction_year", "model", "balance_mode"]
         metric_cols = [
             "auc",
+            "pr_auc",
+            "f1",
             "sensitivity",
             "specificity",
+            "sensitivity_before_calibration",
+            "specificity_before_calibration",
+            "sensitivity_after_calibration",
+            "specificity_after_calibration",
             "error_rate",
             "training_time_sec",
             "threshold",
@@ -9582,8 +10290,14 @@ def format_appendix_tables_mean(
             "model",
             "balance_mode",
             "auc",
+            "pr_auc",
+            "f1",
             "sensitivity",
             "specificity",
+            "sensitivity_before_calibration",
+            "specificity_before_calibration",
+            "sensitivity_after_calibration",
+            "specificity_after_calibration",
             "error_rate",
             "training_time_sec",
             "threshold",
@@ -9598,6 +10312,10 @@ def format_appendix_tables_mean(
         tables["A.8"] = agg_yearly.loc[agg_yearly["strategy"] == "cumulative", common_cols].reset_index(drop=True)
 
     if adaptive_results is not None and not adaptive_results.empty:
+        adaptive_results = adaptive_results.copy()
+        for col in ["pr_auc", "f1", *calibration_cols]:
+            if col not in adaptive_results.columns:
+                adaptive_results[col] = np.nan
         group_cols = ["strategy", "drift", "model", "balance_mode"]
         metric_cols = [
             "prediction_year",
@@ -9614,8 +10332,14 @@ def format_appendix_tables_mean(
             "W1",
             "remaining_periods",
             "auc",
+            "pr_auc",
+            "f1",
             "sensitivity",
             "specificity",
+            "sensitivity_before_calibration",
+            "specificity_before_calibration",
+            "sensitivity_after_calibration",
+            "specificity_after_calibration",
             "error_rate",
             "training_time_sec",
             "threshold",
@@ -9669,8 +10393,14 @@ def format_appendix_tables_mean(
             "remaining_periods",
             "model",
             "auc",
+            "pr_auc",
+            "f1",
             "sensitivity",
             "specificity",
+            "sensitivity_before_calibration",
+            "specificity_before_calibration",
+            "sensitivity_after_calibration",
+            "specificity_after_calibration",
             "error_rate",
             "training_time_sec",
             "threshold",
@@ -10083,6 +10813,57 @@ def _load_feature_payload_from_duckdb(path: Path) -> Tuple[pd.DataFrame, pd.Data
         return raw_df, clean_df
     finally:
         con.close()
+
+
+def _normalize_feature_payload_frames(
+    raw_df: pd.DataFrame,
+    clean_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    normalized_raw_df = raw_df.copy()
+    normalized_clean_df = clean_df.copy()
+    if normalized_clean_df.empty and not normalized_raw_df.empty:
+        normalized_clean_df = normalized_raw_df.copy()
+
+    for frame in (normalized_raw_df, normalized_clean_df):
+        if "interval_start" in frame.columns:
+            frame["interval_start"] = pd.to_datetime(frame["interval_start"], errors="coerce")
+        if "portico" in frame.columns:
+            frame["portico"] = _normalize_portico_series(frame["portico"])
+        if "target" in frame.columns:
+            frame["target"] = pd.to_numeric(frame["target"], errors="coerce").fillna(0).astype(int)
+    return normalized_raw_df, normalized_clean_df
+
+
+def _load_checkpoint_feature_bundle(
+    *,
+    run_manifest: Dict[str, Any],
+    feature_selection_context: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    checkpoint_feature_selection_context = dict(
+        feature_selection_context
+        or run_manifest.get("feature_selection_context")
+        or {}
+    )
+    resolved_export_path = _resolve_existing_feature_export_path(
+        checkpoint_feature_selection_context.get("feature_export_path")
+        or checkpoint_feature_selection_context.get("feature_export_name")
+    )
+    if resolved_export_path is None:
+        return None
+
+    raw_df, clean_df = _load_feature_payload_from_duckdb(resolved_export_path)
+    raw_df, clean_df = _normalize_feature_payload_frames(raw_df, clean_df)
+    selection_payload = _load_feature_selection_payload_from_duckdb(resolved_export_path)
+    resolved_context = dict(checkpoint_feature_selection_context)
+    resolved_context["feature_export_path"] = str(resolved_export_path)
+    resolved_context.setdefault("feature_export_name", resolved_export_path.name)
+    return {
+        "raw_df": raw_df,
+        "clean_df": clean_df,
+        "selection_payload": selection_payload,
+        "resolved_path": str(resolved_export_path),
+        "feature_selection_context": resolved_context,
+    }
 
 
 def _corr_pairs_to_storage_df(corr_pairs: Optional[pd.Series]) -> pd.DataFrame:
@@ -10786,6 +11567,336 @@ def _current_feature_selection_context() -> Dict[str, Any]:
     return meta
 
 
+def _list_recalibration_checkpoints(
+    *,
+    checkpoint_root: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    root = _recalibration_checkpoint_root(checkpoint_root=checkpoint_root)
+    if not root.exists():
+        return []
+
+    def _timestamp_sort_key(value: Any) -> Tuple[int, str]:
+        raw = str(value or "").strip()
+        if not raw:
+            return (0, "")
+        try:
+            return (1, datetime.fromisoformat(raw).isoformat())
+        except Exception:
+            return (1, raw)
+
+    entries: List[Dict[str, Any]] = []
+    for manifest_path in sorted(root.glob("*/manifest.json")):
+        manifest = _load_manifest(manifest_path)
+        if manifest is None:
+            continue
+        run_dir = manifest_path.parent
+        try:
+            manifest = _reconcile_recalibration_manifest(
+                manifest,
+                paths=_recalibration_run_paths(run_dir),
+            )
+        except Exception:
+            pass
+
+        run_manifest = dict(manifest.get("run_manifest") or {})
+        feature_selection_context = dict(
+            manifest.get("feature_selection_context")
+            or run_manifest.get("feature_selection_context")
+            or {}
+        )
+        run_id = str(manifest.get("run_id") or run_manifest.get("run_id") or run_dir.name)
+        status = str(manifest.get("status", "missing"))
+        updated_at = manifest.get("updated_at")
+        models = [str(item) for item in (run_manifest.get("models") or [])]
+        strategies = [str(item) for item in (run_manifest.get("strategies") or [])]
+        feature_count = pd.to_numeric(run_manifest.get("feature_count"), errors="coerce")
+        entries.append(
+            {
+                "run_id": run_id,
+                "status": status,
+                "updated_at": updated_at,
+                "run_dir": str(run_dir),
+                "manifest_path": str(manifest_path),
+                "run_manifest": run_manifest,
+                "manifest": manifest,
+                "feature_selection_context": feature_selection_context,
+                "feature_count": None if pd.isna(feature_count) else int(feature_count),
+                "label": (
+                    f"{run_id} | {status} | {updated_at or 'desconocido'} | "
+                    f"{len(models)} modelos | {len(strategies)} estrategias"
+                ),
+            }
+        )
+
+    entries.sort(
+        key=lambda item: (
+            _timestamp_sort_key(item.get("updated_at")),
+            str(item.get("run_id", "")),
+        ),
+        reverse=True,
+    )
+    return entries
+
+
+def _checkpoint_form_state_from_run_manifest(
+    run_manifest: Dict[str, Any],
+    *,
+    available_columns: Sequence[str],
+    feature_count: int,
+) -> Dict[str, Any]:
+    available_column_set = {str(col) for col in available_columns}
+    bounded_feature_count = max(1, int(feature_count))
+    bounded_vote_max = max(1, min(10, bounded_feature_count))
+    feature_selection_context = dict(run_manifest.get("feature_selection_context") or {})
+
+    normalized_models = [
+        str(item) for item in (run_manifest.get("models") or MODEL_NAMES)
+        if str(item) in MODEL_NAMES
+    ] or list(MODEL_NAMES)
+    normalized_strategies = [
+        str(item) for item in (run_manifest.get("strategies") or EXPERIMENT_STRATEGIES)
+        if str(item) in EXPERIMENT_STRATEGIES
+    ] or list(EXPERIMENT_STRATEGIES)
+    normalized_arf_variants = [
+        str(item) for item in (run_manifest.get("arf_variants") or ARF_DEFAULT_VARIANTS)
+        if str(item) in ARF_VARIANT_NAMES
+    ] or list(ARF_DEFAULT_VARIANTS)
+    normalized_kswin_variants = [
+        str(item) for item in (run_manifest.get("kswin_variants") or KSWIN_DEFAULT_VARIANTS)
+        if str(item) in KSWIN_VARIANT_NAMES
+    ] or list(KSWIN_DEFAULT_VARIANTS)
+    normalized_balance_modes = [
+        str(item) for item in (run_manifest.get("balance_modes") or DEFAULT_BATCH_BALANCE_MODES)
+        if str(item) in DEFAULT_BATCH_BALANCE_MODES
+    ] or list(DEFAULT_BATCH_BALANCE_MODES)
+
+    def _coerced_int(raw_value: Any, default: int) -> int:
+        value = pd.to_numeric(raw_value, errors="coerce")
+        return int(value) if pd.notna(value) else int(default)
+
+    def _coerced_float(raw_value: Any, default: float) -> float:
+        value = pd.to_numeric(raw_value, errors="coerce")
+        return float(value) if pd.notna(value) else float(default)
+
+    min_window = max(100, _coerced_int(run_manifest.get("min_window"), 45_000))
+    min_retrain_size_raw = pd.to_numeric(run_manifest.get("min_retrain_size"), errors="coerce")
+    min_retrain_size = (
+        max(10, int(min_retrain_size_raw))
+        if pd.notna(min_retrain_size_raw)
+        else max(20, int(min_window) // 10)
+    )
+
+    repetition_seeds: List[int] = []
+    for seed in (run_manifest.get("repetition_seeds") or DEFAULT_REPETITION_SEEDS):
+        try:
+            repetition_seeds.append(int(seed))
+        except Exception:
+            continue
+    if not repetition_seeds:
+        repetition_seeds = list(DEFAULT_REPETITION_SEEDS)
+
+    updates: Dict[str, Any] = {
+        "drift_exp_resource_mode": _normalize_experiment_resource_mode(
+            str(run_manifest.get("resource_mode", DEFAULT_EXPERIMENT_RESOURCE_MODE))
+        ),
+        "drift_exp_models": normalized_models,
+        "drift_exp_strategies": normalized_strategies,
+        "drift_exp_fast_mode": bool(run_manifest.get("fast_mode", True)),
+        "drift_exp_optuna_trials": max(1, _coerced_int(run_manifest.get("optuna_trials"), 30)),
+        "drift_exp_folds": max(2, _coerced_int(run_manifest.get("folds"), 3)),
+        "drift_exp_validation_size": _coerced_float(run_manifest.get("validation_size"), 0.2),
+        "drift_exp_adwin_delta": _coerced_float(run_manifest.get("adwin_delta"), 0.002),
+        "drift_exp_min_window": min_window,
+        "drift_exp_min_retrain_size": min_retrain_size,
+        "drift_exp_arf_variants": normalized_arf_variants,
+        "drift_exp_kswin_variants": normalized_kswin_variants,
+        "drift_exp_kswin_top_k_features": min(
+            bounded_feature_count,
+            max(1, _coerced_int(run_manifest.get("kswin_top_k_features"), 10)),
+        ),
+        "drift_exp_kswin_vote_threshold": min(
+            bounded_vote_max,
+            max(1, _coerced_int(run_manifest.get("kswin_vote_threshold"), 2)),
+        ),
+        "drift_exp_kswin_retrain_days": max(1, _coerced_int(run_manifest.get("kswin_retrain_days"), 90)),
+        "drift_exp_kswin_min_retrain_rows": max(10, _coerced_int(run_manifest.get("kswin_min_retrain_rows"), 100)),
+        "drift_exp_balance_modes": normalized_balance_modes,
+        "drift_exp_seed_text": ", ".join(str(seed) for seed in repetition_seeds),
+        "drift_exp_continue_on_block_error": bool(run_manifest.get("continue_on_block_error", False)),
+    }
+
+    target_col = str(run_manifest.get("target_col", "")).strip()
+    if target_col in available_column_set:
+        updates["drift_exp_target_col"] = target_col
+    time_col = str(run_manifest.get("time_col", "")).strip()
+    if time_col in available_column_set:
+        updates["drift_exp_time_col"] = time_col
+
+    selected_features = [
+        str(item)
+        for item in (feature_selection_context.get("selected_features") or [])
+        if str(item) in available_column_set
+    ]
+    candidate_features = [
+        str(item)
+        for item in (feature_selection_context.get("candidate_features") or [])
+        if str(item) in available_column_set
+    ]
+    if candidate_features:
+        updates["drift_candidate_feature_cols"] = candidate_features
+    if selected_features:
+        updates["drift_feature_cols"] = selected_features
+    resolved_export_path = _resolve_existing_feature_export_path(
+        feature_selection_context.get("feature_export_path")
+        or feature_selection_context.get("feature_export_name")
+    )
+    export_path = str(resolved_export_path or feature_selection_context.get("feature_export_path") or "").strip()
+    if export_path:
+        updates["drift_feature_export_path"] = export_path
+    if feature_selection_context:
+        normalized_context = dict(feature_selection_context)
+        if export_path:
+            normalized_context["feature_export_path"] = export_path
+            normalized_context.setdefault("feature_export_name", _portable_path_name(export_path))
+        updates["drift_feature_selection_meta"] = normalized_context
+    return updates
+
+
+def _execution_config_from_checkpoint_run_manifest(
+    run_manifest: Dict[str, Any],
+    *,
+    available_columns: Sequence[str],
+    current_config: Dict[str, Any],
+    feature_selection_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    config = dict(current_config)
+    available_column_set = {str(col) for col in available_columns}
+
+    checkpoint_feature_selection_context = dict(
+        feature_selection_context
+        or run_manifest.get("feature_selection_context")
+        or config.get("feature_selection_context")
+        or {}
+    )
+    resolved_export_path = _resolve_existing_feature_export_path(
+        checkpoint_feature_selection_context.get("feature_export_path")
+        or checkpoint_feature_selection_context.get("feature_export_name")
+    )
+    if resolved_export_path is not None:
+        checkpoint_feature_selection_context["feature_export_path"] = str(resolved_export_path)
+        checkpoint_feature_selection_context.setdefault("feature_export_name", resolved_export_path.name)
+    if checkpoint_feature_selection_context:
+        config["feature_selection_context"] = dict(checkpoint_feature_selection_context)
+        selected_features = [
+            str(item)
+            for item in (checkpoint_feature_selection_context.get("selected_features") or [])
+            if str(item) in available_column_set
+        ]
+        if selected_features:
+            config["feature_cols"] = selected_features
+
+    target_col = str(run_manifest.get("target_col") or "").strip()
+    if target_col in available_column_set:
+        config["target_col"] = target_col
+    time_col = str(run_manifest.get("time_col") or "").strip()
+    if time_col in available_column_set:
+        config["time_col"] = time_col
+
+    def _normalized_list(values: Any, *, allowed: Sequence[str], fallback: Sequence[str]) -> List[str]:
+        normalized = [str(item) for item in (values or []) if str(item) in allowed]
+        if normalized:
+            return normalized
+        return [str(item) for item in fallback if str(item) in allowed]
+
+    config["model_names"] = _normalized_list(
+        run_manifest.get("models"),
+        allowed=MODEL_NAMES,
+        fallback=config.get("model_names") or MODEL_NAMES,
+    )
+    config["strategies"] = _normalized_list(
+        run_manifest.get("strategies"),
+        allowed=EXPERIMENT_STRATEGIES,
+        fallback=config.get("strategies") or EXPERIMENT_STRATEGIES,
+    )
+    config["arf_variants"] = _normalized_list(
+        run_manifest.get("arf_variants"),
+        allowed=ARF_VARIANT_NAMES,
+        fallback=config.get("arf_variants") or ARF_DEFAULT_VARIANTS,
+    )
+    config["kswin_variants"] = _normalized_list(
+        run_manifest.get("kswin_variants"),
+        allowed=KSWIN_VARIANT_NAMES,
+        fallback=config.get("kswin_variants") or KSWIN_DEFAULT_VARIANTS,
+    )
+    config["balance_modes"] = _normalized_list(
+        run_manifest.get("balance_modes"),
+        allowed=DEFAULT_BATCH_BALANCE_MODES,
+        fallback=config.get("balance_modes") or DEFAULT_BATCH_BALANCE_MODES,
+    )
+
+    repetition_seeds: List[int] = []
+    for seed in (run_manifest.get("repetition_seeds") or config.get("repetition_seeds") or DEFAULT_REPETITION_SEEDS):
+        try:
+            repetition_seeds.append(int(seed))
+        except Exception:
+            continue
+    if repetition_seeds:
+        config["repetition_seeds"] = tuple(repetition_seeds)
+
+    def _apply_numeric(key: str, raw_value: Any, *, min_value: Optional[int] = None) -> None:
+        value = pd.to_numeric(raw_value, errors="coerce")
+        if pd.notna(value):
+            numeric = int(value)
+            if min_value is not None:
+                numeric = max(int(min_value), numeric)
+            config[key] = numeric
+
+    validation_size = pd.to_numeric(run_manifest.get("validation_size"), errors="coerce")
+    if pd.notna(validation_size):
+        config["validation_size"] = float(validation_size)
+    _apply_numeric("folds", run_manifest.get("folds"), min_value=2)
+    config["fast_mode"] = bool(run_manifest.get("fast_mode", config.get("fast_mode", True)))
+    config["resource_mode"] = _normalize_experiment_resource_mode(
+        str(run_manifest.get("resource_mode", config.get("resource_mode", DEFAULT_EXPERIMENT_RESOURCE_MODE)))
+    )
+    _apply_numeric("grid_limit", run_manifest.get("optuna_trials"), min_value=1)
+
+    adwin_delta = pd.to_numeric(run_manifest.get("adwin_delta"), errors="coerce")
+    if pd.notna(adwin_delta):
+        config["adwin_delta"] = float(adwin_delta)
+    _apply_numeric("min_window", run_manifest.get("min_window"), min_value=100)
+    min_retrain_size = pd.to_numeric(run_manifest.get("min_retrain_size"), errors="coerce")
+    if pd.notna(min_retrain_size):
+        config["min_retrain_size"] = max(10, int(min_retrain_size))
+
+    feature_count = max(1, len(config.get("feature_cols") or []))
+    vote_threshold_max = max(1, min(10, feature_count))
+    _apply_numeric("kswin_retrain_days", run_manifest.get("kswin_retrain_days"), min_value=1)
+    _apply_numeric("kswin_min_retrain_rows", run_manifest.get("kswin_min_retrain_rows"), min_value=10)
+
+    top_k = pd.to_numeric(run_manifest.get("kswin_top_k_features"), errors="coerce")
+    if pd.notna(top_k):
+        config["kswin_top_k_features"] = min(feature_count, max(1, int(top_k)))
+    vote_threshold = pd.to_numeric(run_manifest.get("kswin_vote_threshold"), errors="coerce")
+    if pd.notna(vote_threshold):
+        config["kswin_vote_threshold"] = min(vote_threshold_max, max(1, int(vote_threshold)))
+
+    config["continue_on_block_error"] = bool(
+        run_manifest.get("continue_on_block_error", config.get("continue_on_block_error", False))
+    )
+
+    base_year = pd.to_numeric(run_manifest.get("base_year"), errors="coerce")
+    config["base_year"] = None if pd.isna(base_year) else int(base_year)
+    random_state = pd.to_numeric(run_manifest.get("random_state_fallback"), errors="coerce")
+    if pd.notna(random_state):
+        config["random_state"] = int(random_state)
+
+    checkpoint_custom_grids = run_manifest.get("custom_grids")
+    if isinstance(checkpoint_custom_grids, dict):
+        config["custom_grids"] = _to_json_safe(checkpoint_custom_grids)
+    return config
+
+
 def _build_tramo_selector_for_feature_tab() -> Optional[Tuple[str, str, str, str]]:
     try:
         porticos_df = load_porticos()
@@ -10949,6 +12060,9 @@ def _init_state() -> None:
     st.session_state.setdefault("drift_feature_export_path", None)
     st.session_state.setdefault("drift_optuna_json_path", None)
     st.session_state.setdefault("drift_checkpoint_manifest_path", None)
+    st.session_state.setdefault("drift_exp_loaded_checkpoint_run_id", None)
+    st.session_state.setdefault("drift_exp_loaded_checkpoint_manifest_path", None)
+    st.session_state.setdefault("drift_exp_loaded_checkpoint_feature_selection_context", None)
 
 
 def _render_blueprint_tab() -> None:
@@ -11746,12 +12860,85 @@ def _render_feature_selection_tab() -> None:
         st.markdown("**Figure 5 replica: density of |rho|**")
         hist, edges = np.histogram(corr_pairs.values, bins=60, range=(0.0, 1.0), density=True)
         centers = (edges[:-1] + edges[1:]) / 2.0
-        density_df = pd.DataFrame({"|rho|": centers, "density": hist})
-        st.line_chart(density_df.set_index("|rho|")["density"], width="stretch")
+        try:
+            import plotly.graph_objects as go
+
+            q1, median, q3 = np.percentile(corr_pairs.values, [25, 50, 75])
+            y_max = float(hist.max())
+
+            fig5 = go.Figure()
+            fig5.add_trace(go.Scatter(
+                x=centers, y=hist, mode="lines",
+                line=dict(color="#1f77b4", width=2), name="Density",
+            ))
+            # Vertical reference lines with staggered y-positions to avoid overlap
+            vline_annotations = [
+                (q1, "Q1", "gray", 0.70),
+                (median, "Median", "gray", 0.85),
+                (q3, "Q3", "gray", 1.00),
+                (0.95, "|ρ|=0.95", "red", 1.00),
+            ]
+            for val, label, color, y_frac in vline_annotations:
+                fig5.add_shape(
+                    type="line", x0=val, x1=val, y0=0, y1=y_max * 1.08,
+                    line=dict(color=color, width=1.5, dash="dot"),
+                )
+                fig5.add_annotation(
+                    x=val, y=y_max * 1.08 * y_frac,
+                    text=f"<b>{label}={val:.2f}</b>" if label != "|ρ|=0.95" else f"<b>{label}</b>",
+                    showarrow=True, arrowhead=0, arrowcolor=color,
+                    ax=30, ay=-20,
+                    font=dict(size=13, color=color),
+                    bordercolor=color, borderwidth=1, borderpad=3,
+                    bgcolor="rgba(255,255,255,0.85)",
+                )
+            fig5.update_layout(
+                title=dict(text="Density of |ρ|", font=dict(size=18)),
+                xaxis=dict(title=dict(text="|ρ|", font=dict(size=15)), tickfont=dict(size=13)),
+                yaxis=dict(title=dict(text="Density", font=dict(size=15)), tickfont=dict(size=13)),
+                template="plotly_white",
+                showlegend=False,
+                height=480,
+                margin=dict(l=60, r=40, t=50, b=50),
+            )
+            st.plotly_chart(fig5, width="stretch")
+        except ImportError:
+            density_df = pd.DataFrame({"|ρ|": centers, "Density": hist})
+            st.line_chart(density_df, x="|ρ|", y="Density", width="stretch")
 
     if isinstance(importance_df, pd.DataFrame) and not importance_df.empty:
         st.markdown("**Figure 6 replica: top feature importances**")
-        st.bar_chart(importance_df.set_index("feature")["importance"], width="stretch")
+        try:
+            import plotly.graph_objects as go
+
+            plot_df = importance_df.sort_values("importance", ascending=True).copy()
+            # Normalize importance to 0-100 scale (average across classes)
+            max_imp = plot_df["importance"].max()
+            if max_imp > 0:
+                plot_df["importance_scaled"] = plot_df["importance"] / max_imp * 100
+            else:
+                plot_df["importance_scaled"] = plot_df["importance"]
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=plot_df["importance_scaled"],
+                y=plot_df["feature"],
+                mode="markers",
+                marker=dict(size=10, color="#5B1A18"),
+            ))
+            fig.update_layout(
+                title="Top 20 Variables by Importance",
+                xaxis_title="Importance (Average across classes)",
+                yaxis_title="Variable",
+                template="plotly_white",
+                height=max(400, len(plot_df) * 28),
+                margin=dict(l=10, r=10, t=40, b=40),
+                xaxis=dict(showgrid=True, gridcolor="#E5E5E5"),
+                yaxis=dict(showgrid=True, gridcolor="#E5E5E5"),
+            )
+            st.plotly_chart(fig, width="stretch")
+        except ImportError:
+            st.bar_chart(importance_df.set_index("feature")["importance"], width="stretch")
         st.dataframe(importance_df, width="stretch")
         st.caption(
             "Experiments use the ordered top-N features shown above, after the correlation filter."
@@ -11780,6 +12967,9 @@ def _render_experiments_tab() -> None:
     )
 
     feature_count = max(1, len(feature_cols))
+    base_year: Optional[int] = None
+    random_state = 42
+    custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None
     st.session_state["drift_experiment_feature_count"] = feature_count
     if _normalize_experiment_resource_mode(st.session_state.get("drift_exp_resource_mode")) != str(
         st.session_state.get("drift_exp_resource_mode", "")
@@ -11799,6 +12989,91 @@ def _render_experiments_tab() -> None:
         )
     else:
         _sync_experiment_control_bounds(feature_count)
+
+    available_checkpoints = _list_recalibration_checkpoints()
+    checkpoint_map = {
+        str(item["run_id"]): item
+        for item in available_checkpoints
+    }
+    checkpoint_selector_options: List[Optional[str]] = [None] + list(checkpoint_map.keys())
+    if (
+        st.session_state.get("drift_exp_checkpoint_selector") not in checkpoint_map
+        and st.session_state.get("drift_exp_checkpoint_selector") is not None
+    ):
+        st.session_state["drift_exp_checkpoint_selector"] = None
+
+    st.markdown("**Checkpoint Autofill**")
+    if available_checkpoints:
+        selected_checkpoint_run_id = st.selectbox(
+            "Available training checkpoints",
+            options=checkpoint_selector_options,
+            key="drift_exp_checkpoint_selector",
+            format_func=lambda run_id: (
+                "Seleccionar checkpoint..."
+                if run_id is None
+                else str(checkpoint_map.get(str(run_id), {}).get("label", run_id))
+            ),
+            help="Carga automaticamente la configuracion del experimento desde el run_manifest de un checkpoint persistido.",
+        )
+        selected_checkpoint = (
+            checkpoint_map.get(str(selected_checkpoint_run_id))
+            if selected_checkpoint_run_id is not None
+            else None
+        )
+        if isinstance(selected_checkpoint, dict):
+            checkpoint_feature_count = selected_checkpoint.get("feature_count")
+            st.caption(
+                f"Checkpoint `{selected_checkpoint['run_id']}` | estado {selected_checkpoint['status']} | "
+                f"actualizado {selected_checkpoint.get('updated_at') or 'desconocido'}"
+            )
+            if checkpoint_feature_count is not None and int(checkpoint_feature_count) != int(feature_count):
+                st.warning(
+                    f"El checkpoint fue ejecutado con {int(checkpoint_feature_count)} features y el dataset actual tiene "
+                    f"{int(feature_count)} features seleccionadas. Se cargará la configuracion y, si las columnas siguen "
+                    "disponibles, tambien se restaurará el feature set del checkpoint."
+                )
+        if st.button("Load checkpoint configuration", key="drift_exp_load_checkpoint_configuration"):
+            if not isinstance(selected_checkpoint, dict):
+                st.warning("Seleccione un checkpoint para cargar su configuracion.")
+            else:
+                checkpoint_run_manifest = dict(selected_checkpoint.get("run_manifest") or {})
+                checkpoint_feature_selection_context = dict(
+                    selected_checkpoint.get("feature_selection_context") or {}
+                )
+                if checkpoint_feature_selection_context:
+                    checkpoint_run_manifest["feature_selection_context"] = checkpoint_feature_selection_context
+                for state_key, state_value in _checkpoint_form_state_from_run_manifest(
+                    checkpoint_run_manifest,
+                    available_columns=list(clean_df.columns),
+                    feature_count=feature_count,
+                ).items():
+                    st.session_state[state_key] = state_value
+                st.session_state["drift_exp_loaded_checkpoint_run_id"] = str(selected_checkpoint["run_id"])
+                st.session_state["drift_exp_loaded_checkpoint_manifest_path"] = str(
+                    selected_checkpoint["manifest_path"]
+                )
+                st.session_state["drift_exp_loaded_checkpoint_feature_selection_context"] = (
+                    checkpoint_feature_selection_context or None
+                )
+                _sync_experiment_control_bounds(feature_count)
+                st.rerun()
+    else:
+        st.caption("No hay checkpoints persistidos disponibles para autocompletar la configuracion.")
+
+    loaded_checkpoint_run_id = st.session_state.get("drift_exp_loaded_checkpoint_run_id")
+    loaded_checkpoint_manifest_path = st.session_state.get("drift_exp_loaded_checkpoint_manifest_path")
+    loaded_checkpoint_preview: Optional[Dict[str, Any]] = None
+    if loaded_checkpoint_run_id:
+        loaded_checkpoint_preview = _preview_recalibration_checkpoint_run(str(loaded_checkpoint_run_id))
+    if loaded_checkpoint_run_id:
+        st.caption(
+            f"Configuracion cargada desde checkpoint `{loaded_checkpoint_run_id}`"
+            + (
+                f" | manifest {loaded_checkpoint_manifest_path}"
+                if loaded_checkpoint_manifest_path
+                else ""
+            )
+        )
 
     preset_name = st.selectbox(
         "Configuration preset",
@@ -12025,37 +13300,48 @@ def _render_experiments_tab() -> None:
 
     preflight_payload: Optional[Dict[str, Any]] = None
     preview_seeds: Optional[List[int]] = None
-    try:
-        preview_seeds = parse_repetition_seeds(seed_text)
-        preflight_payload = _estimate_recalibration_workload(
-            df=clean_df,
-            feature_cols=feature_cols,
-            target_col=target_col,
-            time_col=time_col,
-            model_names=selected_models,
-            strategies=selected_strategies,
-            arf_variants=arf_variants,
-            kswin_variants=kswin_variants,
-            balance_modes=balance_modes,
-            repetition_seeds=preview_seeds,
-            base_year=base_year,
-            validation_size=float(validation_size),
-            grid_limit=int(grid_limit),
-            folds=int(folds),
-            resource_mode=resource_mode,
-            random_state=int(random_state),
-            fast_mode=bool(fast_mode),
-            custom_grids=custom_grids,
+    preflight_from_loaded_checkpoint = False
+    if bool((loaded_checkpoint_preview or {}).get("checkpoint_available")):
+        preflight_payload = dict(
+            ((loaded_checkpoint_preview or {}).get("run_manifest") or {}).get("preflight")
+            or ((loaded_checkpoint_preview or {}).get("manifest") or {}).get("preflight")
+            or {}
         )
-    except Exception:
-        preflight_payload = None
+        preflight_from_loaded_checkpoint = bool(preflight_payload)
+    if not preflight_from_loaded_checkpoint:
+        try:
+            preview_seeds = parse_repetition_seeds(seed_text)
+            preflight_payload = _estimate_recalibration_workload(
+                df=clean_df,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                time_col=time_col,
+                model_names=selected_models,
+                strategies=selected_strategies,
+                arf_variants=arf_variants,
+                kswin_variants=kswin_variants,
+                balance_modes=balance_modes,
+                repetition_seeds=preview_seeds,
+                base_year=base_year,
+                validation_size=float(validation_size),
+                grid_limit=int(grid_limit),
+                folds=int(folds),
+                resource_mode=resource_mode,
+                random_state=int(random_state),
+                fast_mode=bool(fast_mode),
+                custom_grids=custom_grids,
+            )
+        except Exception:
+            preflight_payload = None
 
     if isinstance(preflight_payload, dict):
         st.caption(
-            "Preflight: "
+            ("Preflight (checkpoint cargado): " if preflight_from_loaded_checkpoint else "Preflight: ")
+            + (
             f"{int(preflight_payload.get('n_tuning_tasks', 0))} tunings por ventana conocidos | "
             f"{int(preflight_payload.get('n_blocks', 0))} bloques | "
             f"{int(preflight_payload.get('estimated_batch_fits', 0))} fits batch estimados"
+            )
         )
         if bool(preflight_payload.get("high_risk_memory")):
             st.warning(
@@ -12065,7 +13351,33 @@ def _render_experiments_tab() -> None:
             )
 
     checkpoint_preview: Optional[Dict[str, Any]] = None
-    if isinstance(preview_seeds, list):
+    with st.expander("Checkpoint transfer", expanded=False):
+        uploaded_checkpoint_zip = st.file_uploader(
+            "Import training checkpoint ZIP",
+            type=["zip"],
+            key="drift_training_checkpoint_import_zip",
+            help="Importa un run dir persistido para luego cargarlo, reanudarlo o recalcular entrenamientos.",
+        )
+        overwrite_imported_checkpoint = st.checkbox(
+            "Overwrite imported checkpoint if the same run_id already exists",
+            key="drift_training_checkpoint_overwrite",
+            value=False,
+        )
+        if uploaded_checkpoint_zip is not None and st.button("Import checkpoint ZIP", key="drift_training_checkpoint_import_button"):
+            try:
+                import_result = _import_recalibration_checkpoint_archive(
+                    uploaded_checkpoint_zip.getvalue(),
+                    overwrite=bool(overwrite_imported_checkpoint),
+                )
+                st.success(
+                    f"Checkpoint importado: run `{import_result['run_id']}` | estado {import_result['status']}"
+                )
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"No se pudo importar el checkpoint: {exc}")
+
+    if isinstance(preview_seeds, list) and not bool((loaded_checkpoint_preview or {}).get("checkpoint_available")):
         checkpoint_preview = _preview_recalibration_checkpoint(
             clean_df,
             feature_cols=feature_cols,
@@ -12094,9 +13406,11 @@ def _render_experiments_tab() -> None:
         )
 
     execution_mode: Optional[str] = None
+    execution_checkpoint_run_id_override: Optional[str] = None
     if isinstance(checkpoint_preview, dict) and bool(checkpoint_preview.get("checkpoint_available")):
         checkpoint_status = str(checkpoint_preview.get("status", "running"))
         status_label = "completado" if checkpoint_status == "completed" else "recuperable"
+        can_recompute_trainings = bool(checkpoint_preview.get("can_recompute_trainings"))
         st.markdown("**Compatible checkpoint**")
         st.caption(
             f"Run `{checkpoint_preview.get('run_id', '')}` | estado {checkpoint_status} ({status_label}) | "
@@ -12107,20 +13421,97 @@ def _render_experiments_tab() -> None:
             f"SMOTE cache {int(checkpoint_preview.get('smote_artifacts', 0))}"
         )
         st.caption(f"Manifest: {checkpoint_preview.get('manifest_path', '')}")
+        try:
+            checkpoint_zip = _build_recalibration_checkpoint_archive(Path(str(checkpoint_preview.get("run_dir", ""))))
+            st.download_button(
+                label="Export checkpoint ZIP",
+                data=checkpoint_zip,
+                file_name=f"drift_checkpoint_{checkpoint_preview.get('run_id', 'run')}.zip",
+                mime="application/zip",
+                key="drift_training_checkpoint_export_button",
+            )
+        except Exception as exc:
+            st.caption(f"No se pudo preparar export del checkpoint: {exc}")
         if bool(checkpoint_preview.get("can_load_completed")):
-            st.info("Existe una corrida compatible ya completada. Puedes cargar ese checkpoint o iniciar una corrida nueva.")
+            if can_recompute_trainings:
+                st.info(
+                    "Existe una corrida compatible ya completada. Puedes cargar ese checkpoint, "
+                    "recalcular entrenamientos reutilizando tuning/cache persistidos o iniciar una corrida nueva."
+                )
+            else:
+                st.info("Existe una corrida compatible ya completada. Puedes cargar ese checkpoint o iniciar una corrida nueva.")
         else:
-            st.info("Existe un checkpoint compatible recuperable. Puedes reanudarlo desde aqui o forzar una corrida limpia.")
-        action_col_1, action_col_2 = st.columns(2)
+            if can_recompute_trainings:
+                st.info(
+                    "Existe un checkpoint compatible recuperable. Puedes reanudarlo, reiniciar los bloques "
+                    "reutilizando tuning/cache o forzar una corrida limpia."
+                )
+            else:
+                st.info("Existe un checkpoint compatible recuperable. Puedes reanudarlo desde aqui o forzar una corrida limpia.")
+        action_cols = st.columns(3 if can_recompute_trainings else 2)
+        action_col_1 = action_cols[0]
+        action_col_2 = action_cols[1]
         with action_col_1:
             resume_label = "Load completed checkpoint" if bool(checkpoint_preview.get("can_load_completed")) else "Resume compatible checkpoint"
             if st.button(resume_label, key="drift_resume_experiments"):
                 execution_mode = "resume"
-        with action_col_2:
+                execution_checkpoint_run_id_override = str(checkpoint_preview.get("run_id") or "")
+        if can_recompute_trainings:
+            with action_col_2:
+                if st.button("Recompute trainings from checkpoint", key="drift_recompute_from_checkpoint"):
+                    execution_mode = "retrain"
+                    execution_checkpoint_run_id_override = str(checkpoint_preview.get("run_id") or "")
+            action_col_fresh = action_cols[2]
+        else:
+            action_col_fresh = action_col_2
+        with action_col_fresh:
             if st.button("Start fresh ignoring checkpoint", key="drift_run_experiments_fresh"):
                 execution_mode = "fresh"
     elif st.button("Run configured experiment set", key="drift_run_experiments"):
         execution_mode = "resume"
+
+    if loaded_checkpoint_run_id:
+        compatibility_run_id = str((checkpoint_preview or {}).get("run_id", "")) if isinstance(checkpoint_preview, dict) else ""
+        if (
+            bool(loaded_checkpoint_preview.get("checkpoint_available"))
+            and str(loaded_checkpoint_preview.get("run_id", "")) != compatibility_run_id
+        ):
+            loaded_checkpoint_status = str(loaded_checkpoint_preview.get("status", "running"))
+            loaded_status_label = "completado" if loaded_checkpoint_status == "completed" else "recuperable"
+            loaded_can_recompute = bool(loaded_checkpoint_preview.get("can_recompute_trainings"))
+            st.markdown("**Loaded Checkpoint Actions**")
+            st.caption(
+                f"Run `{loaded_checkpoint_preview.get('run_id', '')}` | estado {loaded_checkpoint_status} ({loaded_status_label}) | "
+                f"actualizado {loaded_checkpoint_preview.get('updated_at') or 'desconocido'} | "
+                f"tunings {int(loaded_checkpoint_preview.get('completed_tuning_tasks', 0))}/{int(loaded_checkpoint_preview.get('total_tuning_tasks', 0))} | "
+                f"bloques {int(loaded_checkpoint_preview.get('completed_blocks', 0))}/{int(loaded_checkpoint_preview.get('total_blocks', 0))} | "
+                f"SMOTE cache {int(loaded_checkpoint_preview.get('smote_artifacts', 0))}"
+            )
+            st.info(
+                "Estas acciones usan directamente el checkpoint cargado desde el selector, "
+                "aunque el preview compatible del formulario actual no coincida exactamente."
+            )
+            loaded_action_cols = st.columns(3 if loaded_can_recompute else 2)
+            with loaded_action_cols[0]:
+                loaded_resume_label = (
+                    "Load loaded checkpoint"
+                    if bool(loaded_checkpoint_preview.get("can_load_completed"))
+                    else "Resume loaded checkpoint"
+                )
+                if st.button(loaded_resume_label, key="drift_resume_loaded_checkpoint"):
+                    execution_mode = "resume"
+                    execution_checkpoint_run_id_override = str(loaded_checkpoint_preview.get("run_id") or "")
+            if loaded_can_recompute:
+                with loaded_action_cols[1]:
+                    if st.button("Recompute trainings from loaded checkpoint", key="drift_recompute_loaded_checkpoint"):
+                        execution_mode = "retrain"
+                        execution_checkpoint_run_id_override = str(loaded_checkpoint_preview.get("run_id") or "")
+                loaded_fresh_col = loaded_action_cols[2]
+            else:
+                loaded_fresh_col = loaded_action_cols[1]
+            with loaded_fresh_col:
+                if st.button("Start fresh with loaded configuration", key="drift_run_loaded_checkpoint_fresh"):
+                    execution_mode = "fresh"
 
     if execution_mode is not None:
         requires_batch_models = any(
@@ -12147,33 +13538,99 @@ def _render_experiments_tab() -> None:
         st.session_state["drift_optuna_json_path"] = None
         st.session_state["drift_checkpoint_manifest_path"] = None
         progress = _ExperimentProgress()
+        execution_config: Dict[str, Any] = {
+            "feature_cols": list(feature_cols),
+            "target_col": target_col,
+            "time_col": time_col,
+            "model_names": list(selected_models),
+            "strategies": list(selected_strategies),
+            "validation_size": float(validation_size),
+            "folds": int(folds),
+            "base_year": base_year,
+            "random_state": int(random_state),
+            "fast_mode": bool(fast_mode),
+            "resource_mode": resource_mode,
+            "grid_limit": int(grid_limit),
+            "adwin_delta": float(adwin_delta),
+            "min_window": int(min_window),
+            "min_retrain_size": int(min_retrain_size),
+            "arf_variants": list(arf_variants),
+            "kswin_variants": list(kswin_variants),
+            "kswin_top_k_features": int(kswin_top_k_features),
+            "kswin_vote_threshold": int(kswin_vote_threshold),
+            "kswin_retrain_days": int(kswin_retrain_days),
+            "kswin_min_retrain_rows": int(kswin_min_retrain_rows),
+            "repetition_seeds": tuple(repetition_seeds),
+            "balance_modes": list(balance_modes),
+            "feature_selection_context": _current_feature_selection_context(),
+            "custom_grids": custom_grids,
+            "continue_on_block_error": bool(continue_on_block_error),
+        }
+        loaded_checkpoint_feature_selection_context = dict(
+            st.session_state.get("drift_exp_loaded_checkpoint_feature_selection_context") or {}
+        )
+        loaded_checkpoint_run_manifest = dict(
+            (loaded_checkpoint_preview or {}).get("run_manifest")
+            or {}
+        )
+        execution_df = clean_df
         try:
+            if (
+                execution_checkpoint_run_id_override
+                and loaded_checkpoint_run_id
+                and str(execution_checkpoint_run_id_override) == str(loaded_checkpoint_run_id)
+            ):
+                checkpoint_feature_bundle = _load_checkpoint_feature_bundle(
+                    run_manifest=loaded_checkpoint_run_manifest,
+                    feature_selection_context=loaded_checkpoint_feature_selection_context,
+                )
+                if checkpoint_feature_bundle is None:
+                    raise RuntimeError(
+                        "Could not resolve the feature DuckDB referenced by the loaded checkpoint. "
+                        "Load or import that feature export before resuming/recomputing."
+                    )
+                execution_df = checkpoint_feature_bundle["clean_df"]
+                loaded_checkpoint_feature_selection_context = dict(
+                    checkpoint_feature_bundle.get("feature_selection_context") or loaded_checkpoint_feature_selection_context
+                )
+                st.session_state["drift_feature_export_path"] = str(checkpoint_feature_bundle["resolved_path"])
+                execution_config = _execution_config_from_checkpoint_run_manifest(
+                    loaded_checkpoint_run_manifest,
+                    available_columns=list(execution_df.columns),
+                    current_config=execution_config,
+                    feature_selection_context=loaded_checkpoint_feature_selection_context,
+                )
             results = run_recalibration_experiments(
-                clean_df,
-                feature_cols=feature_cols,
-                target_col=target_col,
-                time_col=time_col,
-                model_names=selected_models,
-                strategies=selected_strategies,
-                validation_size=float(validation_size),
-                folds=int(folds),
-                fast_mode=bool(fast_mode),
-                resource_mode=resource_mode,
-                grid_limit=int(grid_limit),
-                adwin_delta=float(adwin_delta),
-                min_window=int(min_window),
-                min_retrain_size=int(min_retrain_size),
-                arf_variants=arf_variants,
-                kswin_variants=kswin_variants,
-                kswin_top_k_features=int(kswin_top_k_features),
-                kswin_vote_threshold=int(kswin_vote_threshold),
-                kswin_retrain_days=int(kswin_retrain_days),
-                kswin_min_retrain_rows=int(kswin_min_retrain_rows),
-                repetition_seeds=repetition_seeds,
-                balance_modes=balance_modes,
-                feature_selection_context=_current_feature_selection_context(),
+                execution_df,
+                feature_cols=execution_config["feature_cols"],
+                target_col=execution_config["target_col"],
+                time_col=execution_config["time_col"],
+                model_names=execution_config["model_names"],
+                strategies=execution_config["strategies"],
+                validation_size=execution_config["validation_size"],
+                folds=execution_config["folds"],
+                base_year=execution_config["base_year"],
+                random_state=execution_config["random_state"],
+                fast_mode=execution_config["fast_mode"],
+                resource_mode=execution_config["resource_mode"],
+                grid_limit=execution_config["grid_limit"],
+                adwin_delta=execution_config["adwin_delta"],
+                min_window=execution_config["min_window"],
+                min_retrain_size=execution_config["min_retrain_size"],
+                arf_variants=execution_config["arf_variants"],
+                kswin_variants=execution_config["kswin_variants"],
+                kswin_top_k_features=execution_config["kswin_top_k_features"],
+                kswin_vote_threshold=execution_config["kswin_vote_threshold"],
+                kswin_retrain_days=execution_config["kswin_retrain_days"],
+                kswin_min_retrain_rows=execution_config["kswin_min_retrain_rows"],
+                repetition_seeds=execution_config["repetition_seeds"],
+                balance_modes=execution_config["balance_modes"],
+                feature_selection_context=execution_config["feature_selection_context"],
+                custom_grids=execution_config["custom_grids"],
+                checkpoint_run_id_override=execution_checkpoint_run_id_override,
                 auto_resume=bool(execution_mode != "fresh"),
-                continue_on_block_error=bool(continue_on_block_error),
+                recompute_blocks_from_checkpoint=bool(execution_mode == "retrain"),
+                continue_on_block_error=execution_config["continue_on_block_error"],
                 progress_callback=progress.update,
             )
         except Exception as exc:
@@ -12262,7 +13719,7 @@ def _render_experiments_tab() -> None:
     with summary_tab:
         st.markdown("**Strategy summary**")
         if isinstance(summary, pd.DataFrame) and not summary.empty:
-            st.dataframe(summary, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(summary), width="stretch")
 
         st.markdown("**Appendix tables (A.6-A.9) replica**")
         if isinstance(appendix, dict):
@@ -12270,7 +13727,7 @@ def _render_experiments_tab() -> None:
                 df_tab = appendix.get(key)
                 st.caption(f"Table {key}")
                 if isinstance(df_tab, pd.DataFrame) and not df_tab.empty:
-                    st.dataframe(df_tab, width="stretch")
+                    st.dataframe(_streamlit_arrow_safe_df(df_tab), width="stretch")
                 else:
                     st.info(f"Table {key} has no rows for current run.")
 
@@ -12280,7 +13737,7 @@ def _render_experiments_tab() -> None:
                 df_tab = appendix_mean.get(key)
                 st.caption(f"Mean Table {key}")
                 if isinstance(df_tab, pd.DataFrame) and not df_tab.empty:
-                    st.dataframe(df_tab, width="stretch")
+                    st.dataframe(_streamlit_arrow_safe_df(df_tab), width="stretch")
                 else:
                     st.info(f"Mean Table {key} has no rows for current run.")
 
@@ -12360,7 +13817,7 @@ def _render_experiments_tab() -> None:
                     aggfunc="mean",
                 ).sort_index()
                 st.line_chart(yearly_pivot, width="stretch")
-                st.dataframe(yearly_plot, width="stretch")
+                st.dataframe(_streamlit_arrow_safe_df(yearly_plot), width="stretch")
             else:
                 st.info("No yearly rows match the selected filters.")
         else:
@@ -12435,7 +13892,7 @@ def _render_experiments_tab() -> None:
                     aggfunc="mean",
                 ).sort_index()
                 st.line_chart(adaptive_pivot, width="stretch")
-                st.dataframe(adaptive_plot, width="stretch")
+                st.dataframe(_streamlit_arrow_safe_df(adaptive_plot), width="stretch")
             else:
                 st.info("No adaptive rows match the selected filters.")
         else:
@@ -12474,7 +13931,7 @@ def _render_experiments_tab() -> None:
                 aggfunc="max",
             ).sort_index()
             st.line_chart(tuning_pivot, width="stretch")
-            st.dataframe(tuning_plot, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(tuning_plot), width="stretch")
         else:
             st.info("No tuning trials available.")
 
@@ -12495,14 +13952,14 @@ def _render_experiments_tab() -> None:
                 aggfunc="last",
             ).sort_index()
             st.line_chart(trace_pivot, width="stretch")
-            st.dataframe(trace_plot, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(trace_plot), width="stretch")
         else:
             st.info("No execution resource traces available.")
 
     with records_tab:
         if isinstance(yearly, pd.DataFrame) and not yearly.empty:
             st.markdown("**Yearly strategy results**")
-            st.dataframe(yearly, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(yearly), width="stretch")
         if isinstance(adaptive, pd.DataFrame) and not adaptive.empty:
             st.markdown("**Adaptive strategy segments (ADWIN + ARF + KSWIN)**")
             st.caption(
@@ -12510,13 +13967,13 @@ def _render_experiments_tab() -> None:
                 "ARF reporta segmentos anuales online con su conteo interno de drifts y warnings. "
                 "KSWIN reporta segmentos cerrados por drift en covariables, con voto de features y ventana de reentrenamiento fija."
             )
-            st.dataframe(adaptive, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(adaptive), width="stretch")
         if isinstance(execution_log, pd.DataFrame) and not execution_log.empty:
             st.markdown("**Execution log**")
-            st.dataframe(execution_log, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(execution_log), width="stretch")
         if not tuning_trials.empty:
             st.markdown("**Tuning trials**")
-            st.dataframe(tuning_trials, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(tuning_trials), width="stretch")
 
 
 def _render_coverage_tab() -> None:

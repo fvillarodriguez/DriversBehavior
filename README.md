@@ -17,7 +17,7 @@ El menú principal se define en `streamlit_main.py` y hoy expone estos módulos:
 
 - `Flow database` (`src/flow_database_app.py`): importa, consulta y administra la base DuckDB de flujos.
 - `Files` (`src/files_app.py`): navega y administra artefactos en `Resultados/` y carpetas similares.
-- `GitHub Sync` (`src/github_sync_app.py`): sincroniza el repo local con el remoto.
+- `GitHub Sync` (`src/github_sync_app.py`): sincroniza el repo local con el remoto y permite purgar del remoto archivos ya trackeados que ahora están cubiertos por `.gitignore`, sin borrar la copia local.
 
 ### Análisis & Modelos
 

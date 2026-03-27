@@ -17,8 +17,8 @@ NLP/
 DRIFT/
 Archivo.zip
 email_config.json
-.claude/
-tmp/
+.claude/worktrees
+tmp/pdfs
 
 
 # MACOS

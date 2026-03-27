@@ -2001,7 +2001,7 @@ def _render_optuna_range_analysis(analysis: Dict[str, object]) -> None:
         st.success("Sin alertas de limites en el mejor trial.")
 
     df = pd.DataFrame(analysis["rows"])
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
     suggestions = [
         r.get("suggestion")
