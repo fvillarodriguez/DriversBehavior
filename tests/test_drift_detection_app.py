@@ -1494,6 +1494,38 @@ def test_tune_hyperparameters_caps_adaboost_trials_to_search_space():
     assert len(search_df) == 8
 
 
+def test_cross_validated_scores_without_diagnostics_skips_fold_serialization(monkeypatch):
+    train_df = pd.DataFrame(
+        {
+            "x1": [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0] * 5,
+            "x2": [1.0, 0.5, 0.2, 0.1, -0.1, -0.2, -0.5, -1.0] * 5,
+            "target": [0, 0, 0, 0, 1, 1, 1, 1] * 5,
+        }
+    )
+    X, y = drift_app._prepare_xy_raw(train_df, ["x1", "x2"], "target")
+    params = drift_app._default_search_params(drift_app.FAST_HYPERPARAM_GRIDS["AdaBoost"])
+
+    def fail_json_safe(_value):
+        raise AssertionError("Fold diagnostics should not be serialized when only scores are requested.")
+
+    monkeypatch.setattr(drift_app, "_to_json_safe", fail_json_safe)
+
+    scores = drift_app._cross_validated_scores(
+        X,
+        y,
+        model_name="AdaBoost",
+        params=params,
+        folds=2,
+        random_state=11,
+        balance_mode=BALANCE_MODE_NONE,
+        return_diagnostics=False,
+    )
+
+    assert isinstance(scores, np.ndarray)
+    assert len(scores) == len(X)
+    assert np.isfinite(scores).all()
+
+
 def test_recalibration_experiments_skip_nnet_blocks_without_valid_tuning_trial(tmp_path, monkeypatch):
     monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
 

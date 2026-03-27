@@ -4721,23 +4721,26 @@ def _cross_validated_scores(
         fold_scores = np.asarray(payload.get("scores", []), dtype=float)
         if len(va_idx) and len(fold_scores) == len(va_idx):
             scores[va_idx] = fold_scores
+    non_converged_folds = int(
+        sum(1 for item in fold_results if str(model_name) == "NNet" and not bool(item.get("converged", True)))
+    )
+    n_valid_folds = int(sum(1 for item in fold_results if len(np.asarray(item.get("va_idx", []), dtype=int))))
+    n_iter_final = max(
+        [
+            int(item["n_iter_final"])
+            for item in fold_results
+            if item.get("n_iter_final") is not None
+        ],
+        default=None,
+    )
+    if not return_diagnostics:
+        return scores
     payload = {
         "scores": scores,
-        "converged": int(
-            sum(1 for item in fold_results if str(model_name) == "NNet" and not bool(item.get("converged", True)))
-        ) == 0,
-        "n_non_converged_folds": int(
-            sum(1 for item in fold_results if str(model_name) == "NNet" and not bool(item.get("converged", True)))
-        ),
-        "n_valid_folds": int(sum(1 for item in fold_results if len(np.asarray(item.get("va_idx", []), dtype=int)))),
-        "n_iter_final": max(
-            [
-                int(item["n_iter_final"])
-                for item in fold_results
-                if item.get("n_iter_final") is not None
-            ],
-            default=None,
-        ),
+        "converged": non_converged_folds == 0,
+        "n_non_converged_folds": non_converged_folds,
+        "n_valid_folds": n_valid_folds,
+        "n_iter_final": n_iter_final,
         "fold_diagnostics": _to_json_safe(fold_results),
     }
     return payload if return_diagnostics else scores
@@ -5356,19 +5359,18 @@ def train_model_with_internal_validation(
         best_params,
         balance_mode=balance_mode,
     )
-    calibration_payload = _cross_validated_scores(
-        X_all_raw,
-        y_all,
-        model_name=model_name,
-        params=best_params,
-        folds=folds,
-        random_state=random_state,
-        balance_mode=balance_mode,
-        return_diagnostics=True,
-        resource_mode=resource_mode,
-    )
     raw_calibration_scores = np.asarray(
-        calibration_payload.get("scores", np.full(len(X_all_raw), np.nan, dtype=float)),
+        _cross_validated_scores(
+            X_all_raw,
+            y_all,
+            model_name=model_name,
+            params=best_params,
+            folds=folds,
+            random_state=random_state,
+            balance_mode=balance_mode,
+            return_diagnostics=False,
+            resource_mode=resource_mode,
+        ),
         dtype=float,
     )
     calibration_mask = np.isfinite(raw_calibration_scores)

@@ -31,3 +31,4 @@ GitPython==3.1.46
 SQLAlchemy==2.0.45
 scipy==1.16.3
 latexmk
+psutil
