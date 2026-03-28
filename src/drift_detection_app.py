@@ -2410,7 +2410,7 @@ DEFAULT_BATCH_BALANCE_MODES: Tuple[str, ...] = (BALANCE_MODE_NONE, BALANCE_MODE_
 EXPERIMENT_RESOURCE_MODE_RESTRICTED = "restricted"
 EXPERIMENT_RESOURCE_MODE_FULL_MEMORY = "full_memory"
 DEFAULT_EXPERIMENT_RESOURCE_MODE = EXPERIMENT_RESOURCE_MODE_RESTRICTED
-EXPERIMENT_RESOURCE_POLICY_VERSION = "v1"
+EXPERIMENT_RESOURCE_POLICY_VERSION = "v2"
 EXPERIMENT_RESOURCE_MODE_CONFIGS: Dict[str, Dict[str, Any]] = {
     EXPERIMENT_RESOURCE_MODE_RESTRICTED: {
         "label": "Modo restringido",
@@ -2516,39 +2516,137 @@ def _normalize_experiment_resource_mode(value: Optional[str]) -> str:
     return mode
 
 
+def _default_experiment_resource_policy_overrides(resource_mode: Optional[str]) -> Dict[str, Any]:
+    mode = _normalize_experiment_resource_mode(resource_mode)
+    config = dict(EXPERIMENT_RESOURCE_MODE_CONFIGS.get(mode) or {})
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    estimator_n_jobs: Dict[str, int] = {}
+    for model_name, cap in dict(config.get("estimator_n_jobs") or {}).items():
+        resolved_cap = cpu_count if cap is None else int(cap)
+        estimator_n_jobs[str(model_name)] = max(1, min(int(resolved_cap), cpu_count))
+    return {
+        "estimator_n_jobs": estimator_n_jobs,
+        "parallel_cv_enabled": bool(config.get("parallel_cv_models")),
+    }
+
+
+def _sanitize_experiment_resource_policy_overrides(
+    resource_mode: Optional[str],
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    mode = _normalize_experiment_resource_mode(resource_mode)
+    if mode != EXPERIMENT_RESOURCE_MODE_RESTRICTED:
+        return {}
+
+    defaults = _default_experiment_resource_policy_overrides(mode)
+    raw_overrides = dict(overrides or {})
+    raw_estimator_n_jobs = dict(raw_overrides.get("estimator_n_jobs") or {})
+
+    estimator_n_jobs: Dict[str, int] = {}
+    for model_name, default_cap in dict(defaults.get("estimator_n_jobs") or {}).items():
+        requested = pd.to_numeric(raw_estimator_n_jobs.get(model_name), errors="coerce")
+        resolved = int(default_cap) if pd.isna(requested) else int(requested)
+        estimator_n_jobs[str(model_name)] = max(1, min(int(default_cap), resolved))
+
+    parallel_cv_enabled_raw = raw_overrides.get("parallel_cv_enabled")
+    if parallel_cv_enabled_raw is None and "parallel_cv_models" in raw_overrides:
+        parallel_cv_enabled_raw = bool(raw_overrides.get("parallel_cv_models"))
+    if parallel_cv_enabled_raw is None:
+        parallel_cv_enabled_raw = defaults.get("parallel_cv_enabled", False)
+
+    return {
+        "estimator_n_jobs": estimator_n_jobs,
+        "parallel_cv_enabled": bool(parallel_cv_enabled_raw),
+    }
+
+
+def _resource_policy_overrides_from_run_manifest(
+    run_manifest: Optional[Dict[str, Any]],
+    *,
+    resource_mode: Optional[str],
+    fallback: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(fallback or {})
+    merged_estimator_n_jobs = dict(merged.get("estimator_n_jobs") or {})
+
+    if isinstance(run_manifest, dict):
+        resource_policy = dict(run_manifest.get("resource_policy") or {})
+        manifest_overrides = dict(run_manifest.get("resource_policy_overrides") or {})
+
+        for candidate in (resource_policy, manifest_overrides):
+            if not candidate:
+                continue
+            merged_estimator_n_jobs.update(dict(candidate.get("estimator_n_jobs") or {}))
+            if "parallel_cv_enabled" in candidate:
+                merged["parallel_cv_enabled"] = bool(candidate.get("parallel_cv_enabled"))
+            elif "parallel_cv_models" in candidate:
+                merged["parallel_cv_enabled"] = bool(candidate.get("parallel_cv_models"))
+
+    if merged_estimator_n_jobs:
+        merged["estimator_n_jobs"] = merged_estimator_n_jobs
+    return _sanitize_experiment_resource_policy_overrides(resource_mode, merged)
+
+
 def _experiment_resource_mode_label(resource_mode: Optional[str]) -> str:
     mode = _normalize_experiment_resource_mode(resource_mode)
     return str(EXPERIMENT_RESOURCE_MODE_CONFIGS[mode]["label"])
 
 
-def _resolve_experiment_resource_policy(resource_mode: Optional[str]) -> Dict[str, Any]:
+def _resolve_experiment_resource_policy(
+    resource_mode: Optional[str],
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     mode = _normalize_experiment_resource_mode(resource_mode)
     config = dict(EXPERIMENT_RESOURCE_MODE_CONFIGS[mode])
     cpu_count = max(1, int(os.cpu_count() or 1))
     estimator_caps: Dict[str, int] = {}
+    estimator_max_caps: Dict[str, int] = {}
     for model_name, cap in dict(config.get("estimator_n_jobs") or {}).items():
         resolved_cap = cpu_count if cap is None else int(cap)
-        estimator_caps[str(model_name)] = max(1, min(int(resolved_cap), cpu_count))
+        bounded_cap = max(1, min(int(resolved_cap), cpu_count))
+        estimator_max_caps[str(model_name)] = int(bounded_cap)
+        estimator_caps[str(model_name)] = int(bounded_cap)
+
+    sanitized_overrides = _sanitize_experiment_resource_policy_overrides(mode, overrides)
+    parallel_cv_models = [
+        str(model_name)
+        for model_name in (config.get("parallel_cv_models") or [])
+    ]
+    parallel_cv_enabled = bool(parallel_cv_models)
+    if mode == EXPERIMENT_RESOURCE_MODE_RESTRICTED:
+        for model_name, requested in dict(sanitized_overrides.get("estimator_n_jobs") or {}).items():
+            if str(model_name) not in estimator_caps:
+                continue
+            estimator_caps[str(model_name)] = max(
+                1,
+                min(int(requested), int(estimator_max_caps[str(model_name)])),
+            )
+        parallel_cv_enabled = bool(sanitized_overrides.get("parallel_cv_enabled", parallel_cv_enabled))
+        parallel_cv_models = parallel_cv_models if parallel_cv_enabled else []
+
     return {
         "mode": mode,
         "label": str(config.get("label", mode)),
         "description": str(config.get("description", "")).strip(),
         "cpu_count": int(cpu_count),
         "estimator_n_jobs": estimator_caps,
-        "parallel_cv_models": [
-            str(model_name)
-            for model_name in (config.get("parallel_cv_models") or [])
-        ],
+        "estimator_max_n_jobs": estimator_max_caps,
+        "parallel_cv_models": parallel_cv_models,
+        "parallel_cv_enabled": bool(parallel_cv_enabled),
         "high_risk_thresholds": {
             "folds": max(2, int((config.get("high_risk_thresholds") or {}).get("folds", 5))),
             "trials": max(1, int((config.get("high_risk_thresholds") or {}).get("trials", 20))),
         },
+        "resource_policy_overrides": dict(sanitized_overrides),
         "policy_version": EXPERIMENT_RESOURCE_POLICY_VERSION,
     }
 
 
-def _resource_policy_signature(resource_mode: Optional[str]) -> Dict[str, Any]:
-    policy = _resolve_experiment_resource_policy(resource_mode)
+def _resource_policy_signature(
+    resource_mode: Optional[str],
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    policy = _resolve_experiment_resource_policy(resource_mode, overrides=overrides)
     return {
         "mode": str(policy["mode"]),
         "policy_version": str(policy["policy_version"]),
@@ -2557,13 +2655,34 @@ def _resource_policy_signature(resource_mode: Optional[str]) -> Dict[str, Any]:
     }
 
 
+def _resource_policy_differs_from_default(
+    resource_mode: Optional[str],
+    overrides: Optional[Dict[str, Any]] = None,
+) -> bool:
+    return _resource_policy_signature(
+        resource_mode,
+        overrides=overrides,
+    ) != _resource_policy_signature(DEFAULT_EXPERIMENT_RESOURCE_MODE)
+
+
 def _apply_experiment_preset(preset_name: str, *, feature_count: int) -> None:
     preset = EXPERIMENT_PRESET_CONFIGS.get(preset_name) or EXPERIMENT_PRESET_CONFIGS[DEFAULT_EXPERIMENT_PRESET]
     bounded_feature_count = max(1, int(feature_count))
     bounded_vote_max = max(1, min(10, bounded_feature_count))
+    restricted_defaults = _default_experiment_resource_policy_overrides(EXPERIMENT_RESOURCE_MODE_RESTRICTED)
+    restricted_estimator_n_jobs = dict(restricted_defaults.get("estimator_n_jobs") or {})
 
     st.session_state["drift_exp_resource_mode"] = _normalize_experiment_resource_mode(
         str(preset.get("resource_mode", DEFAULT_EXPERIMENT_RESOURCE_MODE))
+    )
+    st.session_state["drift_exp_restricted_rf_n_jobs"] = int(
+        restricted_estimator_n_jobs.get("Random Forest", 2)
+    )
+    st.session_state["drift_exp_restricted_xgb_n_jobs"] = int(
+        restricted_estimator_n_jobs.get("XGBoost", 4)
+    )
+    st.session_state["drift_exp_restricted_parallel_cv"] = bool(
+        restricted_defaults.get("parallel_cv_enabled", True)
     )
     st.session_state["drift_exp_models"] = list(preset["models"])
     st.session_state["drift_exp_strategies"] = list(preset["strategies"])
@@ -2595,6 +2714,8 @@ def _apply_experiment_preset(preset_name: str, *, feature_count: int) -> None:
 def _sync_experiment_control_bounds(feature_count: int) -> None:
     bounded_feature_count = max(1, int(feature_count))
     bounded_vote_max = max(1, min(10, bounded_feature_count))
+    restricted_defaults = _default_experiment_resource_policy_overrides(EXPERIMENT_RESOURCE_MODE_RESTRICTED)
+    restricted_estimator_n_jobs = dict(restricted_defaults.get("estimator_n_jobs") or {})
 
     if "drift_exp_kswin_top_k_features" in st.session_state:
         st.session_state["drift_exp_kswin_top_k_features"] = min(
@@ -2606,6 +2727,36 @@ def _sync_experiment_control_bounds(feature_count: int) -> None:
             max(1, int(st.session_state["drift_exp_kswin_vote_threshold"])),
             bounded_vote_max,
         )
+    rf_max_jobs = max(1, int(restricted_estimator_n_jobs.get("Random Forest", 2)))
+    xgb_max_jobs = max(1, int(restricted_estimator_n_jobs.get("XGBoost", 4)))
+    st.session_state["drift_exp_restricted_rf_n_jobs"] = max(
+        1,
+        min(int(st.session_state.get("drift_exp_restricted_rf_n_jobs", rf_max_jobs)), rf_max_jobs),
+    )
+    st.session_state["drift_exp_restricted_xgb_n_jobs"] = max(
+        1,
+        min(int(st.session_state.get("drift_exp_restricted_xgb_n_jobs", xgb_max_jobs)), xgb_max_jobs),
+    )
+    st.session_state["drift_exp_restricted_parallel_cv"] = bool(
+        st.session_state.get(
+            "drift_exp_restricted_parallel_cv",
+            restricted_defaults.get("parallel_cv_enabled", True),
+        )
+    )
+
+
+def _experiment_resource_policy_overrides_from_session(resource_mode: Optional[str]) -> Dict[str, Any]:
+    mode = _normalize_experiment_resource_mode(resource_mode)
+    return _sanitize_experiment_resource_policy_overrides(
+        mode,
+        {
+            "estimator_n_jobs": {
+                "Random Forest": st.session_state.get("drift_exp_restricted_rf_n_jobs"),
+                "XGBoost": st.session_state.get("drift_exp_restricted_xgb_n_jobs"),
+            },
+            "parallel_cv_enabled": st.session_state.get("drift_exp_restricted_parallel_cv"),
+        },
+    )
 
 
 def _on_experiment_preset_change() -> None:
@@ -2970,9 +3121,10 @@ def _build_recalibration_run_id(
     kswin_vote_threshold: int,
     kswin_retrain_days: int,
     kswin_min_retrain_rows: int,
-    continue_on_block_error: bool,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]],
     feature_selection_context: Dict[str, Any],
+    continue_on_block_error: bool = False,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> str:
     signature_cols = [col for col in [time_col, target_col] + list(feature_cols) if col in df.columns]
     dataset_signature = _frame_signature(df, columns=signature_cols, include_index=True)
@@ -3005,8 +3157,11 @@ def _build_recalibration_run_id(
         "continue_on_block_error": bool(continue_on_block_error),
         "custom_grids": _to_json_safe(custom_grids or {}),
     }
-    if _normalize_experiment_resource_mode(resource_mode) != DEFAULT_EXPERIMENT_RESOURCE_MODE:
-        payload["resource_policy"] = _resource_policy_signature(resource_mode)
+    if _resource_policy_differs_from_default(resource_mode, overrides=resource_policy_overrides):
+        payload["resource_policy"] = _resource_policy_signature(
+            resource_mode,
+            overrides=resource_policy_overrides,
+        )
     if "NNet" in [str(name) for name in model_names]:
         payload["nnet_training_policy_version"] = NNET_TRAINING_POLICY_VERSION
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
@@ -3041,6 +3196,7 @@ def _build_global_tuning_key(
     resource_mode: str,
     grid_limit: Optional[int],
     custom_grid: Optional[Dict[str, Sequence[Any]]],
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> str:
     signature_cols = [col for col in [time_col, target_col] + list(feature_cols) if col in canonical_train_df.columns]
     payload = {
@@ -3058,8 +3214,11 @@ def _build_global_tuning_key(
         "grid_limit": None if grid_limit is None else int(grid_limit),
         "custom_grid": _to_json_safe(custom_grid or {}),
     }
-    if _normalize_experiment_resource_mode(resource_mode) != DEFAULT_EXPERIMENT_RESOURCE_MODE:
-        payload["resource_policy"] = _resource_policy_signature(resource_mode)
+    if _resource_policy_differs_from_default(resource_mode, overrides=resource_policy_overrides):
+        payload["resource_policy"] = _resource_policy_signature(
+            resource_mode,
+            overrides=resource_policy_overrides,
+        )
     policy_version = _model_policy_version(model_name)
     if policy_version is not None:
         payload["model_policy_version"] = str(policy_version)
@@ -3308,6 +3467,7 @@ def _preview_recalibration_checkpoint(
     random_state: int = 42,
     fast_mode: bool = True,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
     grid_limit: Optional[int] = 30,
     adwin_delta: float = 0.002,
     min_window: int = 45_000,
@@ -3360,6 +3520,7 @@ def _preview_recalibration_checkpoint(
         random_state=int(random_state),
         fast_mode=bool(fast_mode),
         resource_mode=_normalize_experiment_resource_mode(resource_mode),
+        resource_policy_overrides=resource_policy_overrides,
         grid_limit=grid_limit,
         adwin_delta=float(adwin_delta),
         min_window=int(min_window),
@@ -3729,11 +3890,15 @@ def _estimate_recalibration_workload(
     grid_limit: Optional[int],
     folds: int,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
     random_state: int = 42,
     fast_mode: bool = True,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
 ) -> Dict[str, Any]:
-    resource_policy = _resolve_experiment_resource_policy(resource_mode)
+    resource_policy = _resolve_experiment_resource_policy(
+        resource_mode,
+        overrides=resource_policy_overrides,
+    )
     risk_thresholds = dict(resource_policy.get("high_risk_thresholds") or {})
     years = _available_prediction_years(df, time_col)
     pred_years = max(0, len(years) - 1)
@@ -3752,6 +3917,7 @@ def _estimate_recalibration_workload(
         random_state=int(random_state),
         fast_mode=bool(fast_mode),
         resource_mode=str(resource_mode),
+        resource_policy_overrides=resource_policy_overrides,
         grid_limit=grid_limit,
         custom_grids=custom_grids,
     )
@@ -3922,8 +4088,12 @@ def _parallel_cv_jobs(
     effective_folds: int,
     *,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> int:
-    resource_policy = _resolve_experiment_resource_policy(resource_mode)
+    resource_policy = _resolve_experiment_resource_policy(
+        resource_mode,
+        overrides=resource_policy_overrides,
+    )
     if str(model_name) not in set(resource_policy.get("parallel_cv_models") or []):
         return 1
     cpu_count = int(resource_policy.get("cpu_count", os.cpu_count() or 1))
@@ -3934,8 +4104,12 @@ def _bounded_estimator_n_jobs(
     model_name: str,
     *,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> int:
-    resource_policy = _resolve_experiment_resource_policy(resource_mode)
+    resource_policy = _resolve_experiment_resource_policy(
+        resource_mode,
+        overrides=resource_policy_overrides,
+    )
     cpu_count = max(1, int(resource_policy.get("cpu_count", os.cpu_count() or 1)))
     env_var = ""
     default_cap = 1
@@ -4088,6 +4262,7 @@ def _fit_model_with_diagnostics(
     y_fit: Sequence[int],
     allow_retry: bool = False,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
     balance_mode: str = BALANCE_MODE_NONE,
 ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
     params_used = {str(key): _normalize_param_choice(value) for key, value in dict(model_params).items()}
@@ -4097,6 +4272,7 @@ def _fit_model_with_diagnostics(
         random_state=random_state,
         n_features=n_features,
         resource_mode=resource_mode,
+        resource_policy_overrides=resource_policy_overrides,
         balance_mode=balance_mode,
     )
     diagnostics: Dict[str, Any]
@@ -4115,6 +4291,7 @@ def _fit_model_with_diagnostics(
                     random_state=random_state,
                     n_features=n_features,
                     resource_mode=resource_mode,
+                    resource_policy_overrides=resource_policy_overrides,
                     balance_mode=balance_mode,
                 )
                 retry_diagnostics = _fit_nnet_warning_safe(retry_model, X_fit, y_fit)
@@ -4387,6 +4564,7 @@ def _build_model(
     random_state: int,
     n_features: int,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
     balance_mode: str = BALANCE_MODE_NONE,
 ):
     if model_name == "Random Forest":
@@ -4398,7 +4576,11 @@ def _build_model(
             "max_features": max(1, min(mtry, n_features)),
             "min_samples_leaf": int(params.get("min_node_size", 1)),
             "random_state": random_state,
-            "n_jobs": _bounded_estimator_n_jobs(model_name, resource_mode=resource_mode),
+            "n_jobs": _bounded_estimator_n_jobs(
+                model_name,
+                resource_mode=resource_mode,
+                resource_policy_overrides=resource_policy_overrides,
+            ),
         }
         if splitrule == "extratrees":
             return ExtraTreesClassifier(
@@ -4456,7 +4638,11 @@ def _build_model(
             objective="binary:logistic",
             eval_metric="logloss",
             random_state=random_state,
-            n_jobs=_bounded_estimator_n_jobs(model_name, resource_mode=resource_mode),
+            n_jobs=_bounded_estimator_n_jobs(
+                model_name,
+                resource_mode=resource_mode,
+                resource_policy_overrides=resource_policy_overrides,
+            ),
             verbosity=0,
         )
 
@@ -4482,6 +4668,7 @@ def _cv_auc(
     balance_mode: str = BALANCE_MODE_NONE,
     return_diagnostics: bool = False,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> Any:
     effective_folds = _effective_stratified_folds(y, folds)
     if effective_folds < 2:
@@ -4534,6 +4721,7 @@ def _cv_auc(
                 y_fit=y_fit,
                 allow_retry=False,
                 resource_mode=resource_mode,
+                resource_policy_overrides=resource_policy_overrides,
                 balance_mode=balance_mode,
             )
             if str(model_name) == "NNet" and not bool(fit_diagnostics.get("converged", True)):
@@ -4566,7 +4754,12 @@ def _cv_auc(
             "fit_warning_count": 0,
         }
 
-    parallel_jobs = _parallel_cv_jobs(model_name, effective_folds, resource_mode=resource_mode)
+    parallel_jobs = _parallel_cv_jobs(
+        model_name,
+        effective_folds,
+        resource_mode=resource_mode,
+        resource_policy_overrides=resource_policy_overrides,
+    )
     if parallel_jobs > 1:
         fold_payloads = SklearnParallel(n_jobs=parallel_jobs, prefer="threads")(
             sklearn_delayed(evaluate_fold)(fold_idx, tr_idx, va_idx)
@@ -4625,6 +4818,7 @@ def _cross_validated_scores(
     balance_mode: str = BALANCE_MODE_NONE,
     return_diagnostics: bool = False,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> Any:
     effective_folds = _effective_stratified_folds(y, folds)
     scores = np.full(len(X), np.nan, dtype=float)
@@ -4681,6 +4875,7 @@ def _cross_validated_scores(
                 y_fit=y_fit,
                 allow_retry=False,
                 resource_mode=resource_mode,
+                resource_policy_overrides=resource_policy_overrides,
                 balance_mode=balance_mode,
             )
             if str(model_name) == "NNet" and not bool(fit_diagnostics.get("converged", True)):
@@ -4707,7 +4902,12 @@ def _cross_validated_scores(
                 "fit_warning_count": 0,
             }
 
-    parallel_jobs = _parallel_cv_jobs(model_name, effective_folds, resource_mode=resource_mode)
+    parallel_jobs = _parallel_cv_jobs(
+        model_name,
+        effective_folds,
+        resource_mode=resource_mode,
+        resource_policy_overrides=resource_policy_overrides,
+    )
     if parallel_jobs > 1:
         fold_results = SklearnParallel(n_jobs=parallel_jobs, prefer="threads")(
             sklearn_delayed(score_fold)(fold_idx, tr_idx, va_idx)
@@ -4760,6 +4960,7 @@ def tune_hyperparameters(
     study_id: Optional[str] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], pd.DataFrame, Dict[str, Any]]:
     _ensure_optuna_available()
     search_space = _build_model_search_space(
@@ -4810,6 +5011,7 @@ def tune_hyperparameters(
             balance_mode=balance_mode,
             return_diagnostics=True,
             resource_mode=resource_mode,
+            resource_policy_overrides=resource_policy_overrides,
         )
         trial.set_user_attr("cv_diagnostics", _to_json_safe(cv_payload))
         auc = float(cv_payload.get("cv_auc", float("nan")))
@@ -5261,6 +5463,7 @@ def train_model_with_internal_validation(
     smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Section 4.5 replication:
@@ -5337,6 +5540,7 @@ def train_model_with_internal_validation(
             balance_mode=balance_mode,
             study_id=study_id,
             resource_mode=resource_mode,
+            resource_policy_overrides=resource_policy_overrides,
             progress_callback=(
                 None
                 if progress_callback is None
@@ -5359,20 +5563,21 @@ def train_model_with_internal_validation(
         best_params,
         balance_mode=balance_mode,
     )
-    raw_calibration_scores = np.asarray(
-        _cross_validated_scores(
-            X_all_raw,
-            y_all,
-            model_name=model_name,
-            params=best_params,
-            folds=folds,
-            random_state=random_state,
-            balance_mode=balance_mode,
-            return_diagnostics=False,
-            resource_mode=resource_mode,
-        ),
-        dtype=float,
+    calibration_scores_payload = _cross_validated_scores(
+        X_all_raw,
+        y_all,
+        model_name=model_name,
+        params=best_params,
+        folds=folds,
+        random_state=random_state,
+        balance_mode=balance_mode,
+        return_diagnostics=False,
+        resource_mode=resource_mode,
+        resource_policy_overrides=resource_policy_overrides,
     )
+    if isinstance(calibration_scores_payload, dict):
+        calibration_scores_payload = calibration_scores_payload.get("scores", [])
+    raw_calibration_scores = np.asarray(calibration_scores_payload, dtype=float)
     calibration_mask = np.isfinite(raw_calibration_scores)
 
     if calibration_mask.sum() < 2 or np.unique(y_all.to_numpy()[calibration_mask]).size < 2:
@@ -5401,6 +5606,7 @@ def train_model_with_internal_validation(
             y_fit=y_holdout_fit,
             allow_retry=False,
             resource_mode=resource_mode,
+            resource_policy_overrides=resource_policy_overrides,
             balance_mode=balance_mode,
         )
         if str(model_name) == "NNet" and not bool(calibration_fit_diagnostics.get("converged", True)):
@@ -5481,6 +5687,7 @@ def train_model_with_internal_validation(
         y_fit=y_fit,
         allow_retry=True,
         resource_mode=resource_mode,
+        resource_policy_overrides=resource_policy_overrides,
         balance_mode=balance_mode,
     )
     if str(model_name) == "NNet" and not bool(fit_diagnostics.get("converged", True)):
@@ -5627,6 +5834,7 @@ def run_yearly_strategy(
     random_state: int = 42,
     fast_mode: bool = True,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
     grid_limit: Optional[int] = None,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
     run_seed: Optional[int] = None,
@@ -5847,6 +6055,7 @@ def run_yearly_strategy(
                         random_state=effective_seed,
                         fast_mode=fast_mode,
                         resource_mode=resource_mode,
+                        resource_policy_overrides=resource_policy_overrides,
                         grid_limit=grid_limit,
                         custom_grid=(custom_grids or {}).get(model_name),
                         balance_mode=balance_mode,
@@ -6149,6 +6358,7 @@ def run_adaptive_strategy(
     folds: int = 5,
     fast_mode: bool = True,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
     grid_limit: Optional[int] = None,
     adwin_delta: float = 0.002,
     min_window: int = 45_000,
@@ -6264,6 +6474,7 @@ def run_adaptive_strategy(
                 random_state=effective_seed,
                 fast_mode=fast_mode,
                 resource_mode=resource_mode,
+                resource_policy_overrides=resource_policy_overrides,
                 grid_limit=grid_limit,
                 custom_grid=(custom_grids or {}).get(model_name),
                 balance_mode=balance_mode,
@@ -6578,6 +6789,7 @@ def run_adaptive_strategy(
                         random_state=effective_seed,
                         fast_mode=fast_mode,
                         resource_mode=resource_mode,
+                        resource_policy_overrides=resource_policy_overrides,
                         grid_limit=grid_limit,
                         custom_grid=(custom_grids or {}).get(model_name),
                         balance_mode=balance_mode,
@@ -7096,6 +7308,7 @@ def run_kswin_strategy(
     folds: int = 5,
     fast_mode: bool = True,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
     grid_limit: Optional[int] = None,
     kswin_top_k_features: int = 10,
     kswin_vote_threshold: int = 2,
@@ -7201,6 +7414,7 @@ def run_kswin_strategy(
                 random_state=effective_seed,
                 fast_mode=fast_mode,
                 resource_mode=resource_mode,
+                resource_policy_overrides=resource_policy_overrides,
                 grid_limit=grid_limit,
                 custom_grid=(custom_grids or {}).get(model_name),
                 balance_mode=balance_mode,
@@ -7631,6 +7845,7 @@ def run_kswin_strategy(
                             random_state=effective_seed,
                             fast_mode=fast_mode,
                             resource_mode=resource_mode,
+                            resource_policy_overrides=resource_policy_overrides,
                             grid_limit=grid_limit,
                             custom_grid=(custom_grids or {}).get(model_name),
                             balance_mode=balance_mode,
@@ -8003,6 +8218,7 @@ def _batch_tuning_tasks(
     resource_mode: str,
     grid_limit: Optional[int],
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     requires_batch = any(
         strategy in YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]
@@ -8046,6 +8262,7 @@ def _batch_tuning_tasks(
             random_state=int(random_state),
             fast_mode=bool(fast_mode),
             resource_mode=str(resource_mode),
+            resource_policy_overrides=resource_policy_overrides,
             grid_limit=grid_limit,
             custom_grid=(custom_grids or {}).get(str(model_name)),
         )
@@ -8307,6 +8524,7 @@ def _resolve_compatible_cached_tuning_artifact(
     alias_payload["_legacy_tuning_key"] = str(matched_key)
     alias_payload["_artifact_filename"] = legacy_filename
     tuning_cache[str(tuning_key)] = alias_payload
+    manifest.setdefault("tuning_index", {}).setdefault(str(tuning_key), {})
     manifest["tuning_index"][str(tuning_key)].update(
         {
             "filename": legacy_filename,
@@ -8341,6 +8559,7 @@ def _resolve_or_create_tuning_artifact(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     persist_progress: bool = True,
     allow_create: bool = True,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     tuning_key = _build_global_tuning_key(
         model_name=model_name,
@@ -8354,6 +8573,7 @@ def _resolve_or_create_tuning_artifact(
         random_state=int(random_state),
         fast_mode=bool(fast_mode),
         resource_mode=str(resource_mode),
+        resource_policy_overrides=resource_policy_overrides,
         grid_limit=grid_limit,
         custom_grid=custom_grid,
     )
@@ -8418,6 +8638,7 @@ def _resolve_or_create_tuning_artifact(
             random_state=random_state,
             fast_mode=fast_mode,
             resource_mode=resource_mode,
+            resource_policy_overrides=resource_policy_overrides,
             grid_limit=grid_limit,
             custom_grid=custom_grid,
             balance_mode=balance_mode,
@@ -8510,6 +8731,7 @@ def run_recalibration_experiments(
     random_state: int = 42,
     fast_mode: bool = True,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
+    resource_policy_overrides: Optional[Dict[str, Any]] = None,
     grid_limit: Optional[int] = 30,
     adwin_delta: float = 0.002,
     min_window: int = 45_000,
@@ -8571,7 +8793,14 @@ def run_recalibration_experiments(
         feature_cols=feature_cols,
     )
     normalized_resource_mode = _normalize_experiment_resource_mode(resource_mode)
-    resource_policy = _resolve_experiment_resource_policy(normalized_resource_mode)
+    normalized_resource_policy_overrides = _sanitize_experiment_resource_policy_overrides(
+        normalized_resource_mode,
+        resource_policy_overrides,
+    )
+    resource_policy = _resolve_experiment_resource_policy(
+        normalized_resource_mode,
+        overrides=normalized_resource_policy_overrides,
+    )
     effective_base_year = _canonical_base_year(df, time_col=time_col, base_year=base_year)
 
     experiment_blocks = _build_experiment_blocks(
@@ -8599,6 +8828,7 @@ def run_recalibration_experiments(
         random_state=int(random_state),
         fast_mode=bool(fast_mode),
         resource_mode=str(normalized_resource_mode),
+        resource_policy_overrides=normalized_resource_policy_overrides,
         grid_limit=grid_limit,
         custom_grids=custom_grids,
     )
@@ -8699,6 +8929,7 @@ def run_recalibration_experiments(
         grid_limit=grid_limit,
         folds=folds,
         resource_mode=normalized_resource_mode,
+        resource_policy_overrides=normalized_resource_policy_overrides,
         random_state=int(random_state),
         fast_mode=bool(fast_mode),
         custom_grids=custom_grids,
@@ -8746,6 +8977,7 @@ def run_recalibration_experiments(
         "resource_mode": str(normalized_resource_mode),
         "resource_mode_label": str(resource_policy["label"]),
         "resource_policy": _to_json_safe(resource_policy),
+        "resource_policy_overrides": _to_json_safe(normalized_resource_policy_overrides),
         "custom_grids": _to_json_safe(custom_grids or {}),
         "optuna_trials": int(grid_limit) if grid_limit is not None else None,
         "adwin_delta": float(adwin_delta),
@@ -8784,6 +9016,7 @@ def run_recalibration_experiments(
         random_state=int(random_state),
         fast_mode=bool(fast_mode),
         resource_mode=str(normalized_resource_mode),
+        resource_policy_overrides=normalized_resource_policy_overrides,
         grid_limit=grid_limit,
         adwin_delta=float(adwin_delta),
         min_window=int(min_window),
@@ -9071,6 +9304,7 @@ def run_recalibration_experiments(
                 random_state=int(random_state),
                 fast_mode=bool(fast_mode),
                 resource_mode=str(normalized_resource_mode),
+                resource_policy_overrides=normalized_resource_policy_overrides,
                 grid_limit=grid_limit,
                 custom_grid=(custom_grids or {}).get(model_name),
                 tuning_context=dict(task.get("strategy_context") or {}),
@@ -9338,6 +9572,7 @@ def run_recalibration_experiments(
                 random_state=int(random_state),
                 fast_mode=bool(fast_mode),
                 resource_mode=str(normalized_resource_mode),
+                resource_policy_overrides=normalized_resource_policy_overrides,
                 grid_limit=grid_limit,
                 custom_grid=(custom_grids or {}).get(effective_model_name),
                 tuning_context=strategy_context,
@@ -9428,6 +9663,7 @@ def run_recalibration_experiments(
                     random_state=random_state,
                     fast_mode=fast_mode,
                     resource_mode=normalized_resource_mode,
+                    resource_policy_overrides=normalized_resource_policy_overrides,
                     grid_limit=grid_limit,
                     custom_grids=custom_grids,
                     run_seed=run_seed,
@@ -9454,6 +9690,7 @@ def run_recalibration_experiments(
                     folds=folds,
                     fast_mode=fast_mode,
                     resource_mode=normalized_resource_mode,
+                    resource_policy_overrides=normalized_resource_policy_overrides,
                     grid_limit=grid_limit,
                     adwin_delta=adwin_delta,
                     min_window=min_window,
@@ -9499,6 +9736,7 @@ def run_recalibration_experiments(
                     folds=folds,
                     fast_mode=fast_mode,
                     resource_mode=normalized_resource_mode,
+                    resource_policy_overrides=normalized_resource_policy_overrides,
                     grid_limit=grid_limit,
                     kswin_top_k_features=kswin_top_k_features,
                     kswin_vote_threshold=kswin_vote_threshold,
@@ -11697,9 +11935,35 @@ def _checkpoint_form_state_from_run_manifest(
     if not repetition_seeds:
         repetition_seeds = list(DEFAULT_REPETITION_SEEDS)
 
+    normalized_resource_mode = _normalize_experiment_resource_mode(
+        str(run_manifest.get("resource_mode", DEFAULT_EXPERIMENT_RESOURCE_MODE))
+    )
+    resource_policy_overrides = _resource_policy_overrides_from_run_manifest(
+        run_manifest,
+        resource_mode=normalized_resource_mode,
+    )
+    restricted_defaults = _default_experiment_resource_policy_overrides(EXPERIMENT_RESOURCE_MODE_RESTRICTED)
+    restricted_estimator_n_jobs = dict(restricted_defaults.get("estimator_n_jobs") or {})
+
     updates: Dict[str, Any] = {
-        "drift_exp_resource_mode": _normalize_experiment_resource_mode(
-            str(run_manifest.get("resource_mode", DEFAULT_EXPERIMENT_RESOURCE_MODE))
+        "drift_exp_resource_mode": normalized_resource_mode,
+        "drift_exp_restricted_rf_n_jobs": int(
+            (resource_policy_overrides.get("estimator_n_jobs") or {}).get(
+                "Random Forest",
+                restricted_estimator_n_jobs.get("Random Forest", 2),
+            )
+        ),
+        "drift_exp_restricted_xgb_n_jobs": int(
+            (resource_policy_overrides.get("estimator_n_jobs") or {}).get(
+                "XGBoost",
+                restricted_estimator_n_jobs.get("XGBoost", 4),
+            )
+        ),
+        "drift_exp_restricted_parallel_cv": bool(
+            resource_policy_overrides.get(
+                "parallel_cv_enabled",
+                restricted_defaults.get("parallel_cv_enabled", True),
+            )
         ),
         "drift_exp_models": normalized_models,
         "drift_exp_strategies": normalized_strategies,
@@ -11860,6 +12124,11 @@ def _execution_config_from_checkpoint_run_manifest(
     config["fast_mode"] = bool(run_manifest.get("fast_mode", config.get("fast_mode", True)))
     config["resource_mode"] = _normalize_experiment_resource_mode(
         str(run_manifest.get("resource_mode", config.get("resource_mode", DEFAULT_EXPERIMENT_RESOURCE_MODE)))
+    )
+    config["resource_policy_overrides"] = _resource_policy_overrides_from_run_manifest(
+        run_manifest,
+        resource_mode=config["resource_mode"],
+        fallback=dict(config.get("resource_policy_overrides") or {}),
     )
     _apply_numeric("grid_limit", run_manifest.get("optuna_trials"), min_value=1)
 
@@ -13100,7 +13369,39 @@ def _render_experiments_tab() -> None:
             "relaja los limites internos de CPU para aprovechar mas memoria."
         ),
     )
-    resource_policy = _resolve_experiment_resource_policy(resource_mode)
+    restricted_resource_policy = _resolve_experiment_resource_policy(EXPERIMENT_RESOURCE_MODE_RESTRICTED)
+    restricted_max_n_jobs = dict(restricted_resource_policy.get("estimator_max_n_jobs") or {})
+    if resource_mode == EXPERIMENT_RESOURCE_MODE_RESTRICTED:
+        resource_col_1, resource_col_2, resource_col_3 = st.columns(3)
+        with resource_col_1:
+            rf_max_jobs = max(1, int(restricted_max_n_jobs.get("Random Forest", 1)))
+            st.selectbox(
+                "Random Forest hilos",
+                options=list(range(1, rf_max_jobs + 1)),
+                key="drift_exp_restricted_rf_n_jobs",
+                help=f"Numero de hilos para Random Forest dentro del perfil restringido (1 a {rf_max_jobs}).",
+            )
+        with resource_col_2:
+            xgb_max_jobs = max(1, int(restricted_max_n_jobs.get("XGBoost", 1)))
+            st.selectbox(
+                "XGBoost hilos",
+                options=list(range(1, xgb_max_jobs + 1)),
+                key="drift_exp_restricted_xgb_n_jobs",
+                help=f"Numero de hilos para XGBoost dentro del perfil restringido (1 a {xgb_max_jobs}).",
+            )
+        with resource_col_3:
+            st.checkbox(
+                "CV paralela para AdaBoost",
+                key="drift_exp_restricted_parallel_cv",
+                help="Activa o desactiva la paralelizacion interna de los folds de CV para AdaBoost en modo restringido.",
+            )
+    else:
+        st.caption("En `Modo full memoria` los hilos de RF/XGBoost se resuelven automaticamente con todos los cores visibles.")
+    resource_policy_overrides = _experiment_resource_policy_overrides_from_session(resource_mode)
+    resource_policy = _resolve_experiment_resource_policy(
+        resource_mode,
+        overrides=resource_policy_overrides,
+    )
     st.caption(str(resource_policy["description"]))
     st.caption(
         "Perfil efectivo: "
@@ -13329,6 +13630,7 @@ def _render_experiments_tab() -> None:
                 grid_limit=int(grid_limit),
                 folds=int(folds),
                 resource_mode=resource_mode,
+                resource_policy_overrides=resource_policy_overrides,
                 random_state=int(random_state),
                 fast_mode=bool(fast_mode),
                 custom_grids=custom_grids,
@@ -13391,6 +13693,7 @@ def _render_experiments_tab() -> None:
             folds=int(folds),
             fast_mode=bool(fast_mode),
             resource_mode=resource_mode,
+            resource_policy_overrides=resource_policy_overrides,
             grid_limit=int(grid_limit),
             adwin_delta=float(adwin_delta),
             min_window=int(min_window),
@@ -13552,6 +13855,7 @@ def _render_experiments_tab() -> None:
             "random_state": int(random_state),
             "fast_mode": bool(fast_mode),
             "resource_mode": resource_mode,
+            "resource_policy_overrides": resource_policy_overrides,
             "grid_limit": int(grid_limit),
             "adwin_delta": float(adwin_delta),
             "min_window": int(min_window),
@@ -13615,6 +13919,7 @@ def _render_experiments_tab() -> None:
                 random_state=execution_config["random_state"],
                 fast_mode=execution_config["fast_mode"],
                 resource_mode=execution_config["resource_mode"],
+                resource_policy_overrides=execution_config["resource_policy_overrides"],
                 grid_limit=execution_config["grid_limit"],
                 adwin_delta=execution_config["adwin_delta"],
                 min_window=execution_config["min_window"],

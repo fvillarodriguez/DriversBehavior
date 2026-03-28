@@ -435,6 +435,25 @@ def test_build_model_full_memory_mode_uses_all_visible_cpus(monkeypatch):
     assert int(model.n_jobs) == max(1, int(os.cpu_count() or 1))
 
 
+def test_resolve_restricted_resource_policy_applies_overrides():
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    policy = drift_app._resolve_experiment_resource_policy(
+        drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        overrides={
+            "estimator_n_jobs": {
+                "Random Forest": 99,
+                "XGBoost": 1,
+            },
+            "parallel_cv_enabled": False,
+        },
+    )
+
+    assert int((policy.get("estimator_n_jobs") or {}).get("Random Forest", 0)) == min(2, cpu_count)
+    assert int((policy.get("estimator_n_jobs") or {}).get("XGBoost", 0)) == 1
+    assert list(policy.get("parallel_cv_models") or []) == []
+    assert bool(policy.get("parallel_cv_enabled")) is False
+
+
 @pytest.mark.parametrize(
     ("splitrule", "expected_type"),
     [
@@ -1000,6 +1019,30 @@ def test_checkpoint_form_state_from_run_manifest_maps_supported_fields():
     assert updates["drift_feature_selection_meta"]["selected_features"] == ["x1", "x_missing"]
 
 
+def test_checkpoint_form_state_from_run_manifest_restores_restricted_resource_controls():
+    run_manifest = {
+        "resource_mode": drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        "resource_policy": {
+            "estimator_n_jobs": {
+                "Random Forest": 1,
+                "XGBoost": 3,
+            },
+            "parallel_cv_models": [],
+        },
+    }
+
+    updates = drift_app._checkpoint_form_state_from_run_manifest(
+        run_manifest,
+        available_columns=["interval_start", "target", "x1"],
+        feature_count=3,
+    )
+
+    assert updates["drift_exp_resource_mode"] == drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED
+    assert updates["drift_exp_restricted_rf_n_jobs"] == 1
+    assert updates["drift_exp_restricted_xgb_n_jobs"] == min(3, max(1, int(os.cpu_count() or 1)))
+    assert updates["drift_exp_restricted_parallel_cv"] is False
+
+
 def test_checkpoint_form_state_from_run_manifest_resolves_windows_feature_export_path(tmp_path, monkeypatch):
     monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
     feature_path = tmp_path / "checkpoint_features.duckdb"
@@ -1118,6 +1161,63 @@ def test_execution_config_from_checkpoint_run_manifest_restores_hidden_tuning_fi
     assert execution_config["grid_limit"] == 17
     assert execution_config["custom_grids"] == {"NNet": {"hidden_layer_sizes": [[32, 16]]}}
     assert execution_config["continue_on_block_error"] is True
+
+
+def test_execution_config_from_checkpoint_run_manifest_restores_restricted_resource_overrides():
+    current_config = {
+        "feature_cols": ["x1"],
+        "target_col": "target",
+        "time_col": "interval_start",
+        "model_names": ["Random Forest"],
+        "strategies": ["static"],
+        "validation_size": 0.2,
+        "folds": 3,
+        "base_year": None,
+        "random_state": 42,
+        "fast_mode": True,
+        "resource_mode": drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
+        "resource_policy_overrides": {},
+        "grid_limit": 30,
+        "adwin_delta": 0.002,
+        "min_window": 45000,
+        "min_retrain_size": 4500,
+        "arf_variants": list(drift_app.ARF_DEFAULT_VARIANTS),
+        "kswin_variants": list(drift_app.KSWIN_DEFAULT_VARIANTS),
+        "kswin_top_k_features": 1,
+        "kswin_vote_threshold": 1,
+        "kswin_retrain_days": 30,
+        "kswin_min_retrain_rows": 50,
+        "repetition_seeds": (42,),
+        "balance_modes": [BALANCE_MODE_NONE],
+        "feature_selection_context": {"selected_features": ["x1"]},
+        "custom_grids": {},
+        "continue_on_block_error": False,
+    }
+    run_manifest = {
+        "resource_mode": drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        "resource_policy": {
+            "estimator_n_jobs": {
+                "Random Forest": 1,
+                "XGBoost": 2,
+            },
+            "parallel_cv_models": [],
+        },
+    }
+
+    execution_config = drift_app._execution_config_from_checkpoint_run_manifest(
+        run_manifest,
+        available_columns=["interval_start", "target", "x1"],
+        current_config=current_config,
+    )
+
+    assert execution_config["resource_mode"] == drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED
+    assert execution_config["resource_policy_overrides"] == {
+        "estimator_n_jobs": {
+            "Random Forest": 1,
+            "XGBoost": 2,
+        },
+        "parallel_cv_enabled": False,
+    }
 
 
 def test_load_checkpoint_feature_bundle_resolves_windows_export_path(tmp_path, monkeypatch):
@@ -1835,6 +1935,123 @@ def test_resource_mode_changes_run_and_tuning_keys():
 
     assert restricted_run_id != full_run_id
     assert restricted_tuning_key != full_tuning_key
+
+
+def test_restricted_resource_overrides_change_run_and_tuning_keys():
+    df = generate_synthetic_article_dataset(years=(2018, 2019), rows_per_year=40, random_state=211)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+    feature_selection_context = {"selected_features": features}
+    canonical_train_df = df.loc[pd.to_datetime(df["interval_start"], errors="coerce").dt.year.eq(2018)].copy()
+    custom_overrides = {
+        "estimator_n_jobs": {
+            "Random Forest": 1,
+            "XGBoost": 2,
+        },
+        "parallel_cv_enabled": False,
+    }
+
+    default_run_id = drift_app._build_recalibration_run_id(
+        df=df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        arf_variants=[],
+        kswin_variants=[],
+        balance_modes=[BALANCE_MODE_NONE],
+        repetition_seeds=[42],
+        base_year=2018,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        grid_limit=30,
+        adwin_delta=0.002,
+        min_window=45_000,
+        min_retrain_size=None,
+        kswin_top_k_features=10,
+        kswin_vote_threshold=2,
+        kswin_retrain_days=90,
+        kswin_min_retrain_rows=100,
+        custom_grids=None,
+        feature_selection_context=feature_selection_context,
+    )
+    custom_run_id = drift_app._build_recalibration_run_id(
+        df=df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        strategies=["static"],
+        arf_variants=[],
+        kswin_variants=[],
+        balance_modes=[BALANCE_MODE_NONE],
+        repetition_seeds=[42],
+        base_year=2018,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        grid_limit=30,
+        adwin_delta=0.002,
+        min_window=45_000,
+        min_retrain_size=None,
+        kswin_top_k_features=10,
+        kswin_vote_threshold=2,
+        kswin_retrain_days=90,
+        kswin_min_retrain_rows=100,
+        custom_grids=None,
+        feature_selection_context=feature_selection_context,
+        resource_policy_overrides=custom_overrides,
+    )
+
+    default_tuning_key = drift_app._build_global_tuning_key(
+        model_name="Random Forest",
+        balance_mode=BALANCE_MODE_NONE,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        canonical_train_df=canonical_train_df,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        grid_limit=30,
+        custom_grid=None,
+    )
+    custom_tuning_key = drift_app._build_global_tuning_key(
+        model_name="Random Forest",
+        balance_mode=BALANCE_MODE_NONE,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        canonical_train_df=canonical_train_df,
+        validation_size=0.2,
+        folds=3,
+        random_state=42,
+        fast_mode=True,
+        resource_mode=drift_app.EXPERIMENT_RESOURCE_MODE_RESTRICTED,
+        grid_limit=30,
+        custom_grid=None,
+        resource_policy_overrides=custom_overrides,
+    )
+
+    assert default_run_id != custom_run_id
+    assert default_tuning_key != custom_tuning_key
 
 
 def test_batch_tuning_tasks_scope_by_window_and_dedupe_identical_train_signatures():
