@@ -1,9 +1,9 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.3.8)  23 MAR 2026 20:17
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.3.8)  30 MAR 2026 17:55
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
-**docs/main_es.tex
-(./docs/main_es.tex
+**/Users/felipe/Desktop/SUMO/docs/main_es.tex
+(/Users/felipe/Desktop/SUMO/docs/main_es.tex
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
 (/usr/local/texlive/2025/texmf-dist/tex/latex/base/article.cls
@@ -330,7 +330,7 @@ File: l3backend-pdftex.def 2024-05-08 L3 backend support: PDF output (pdfTeX)
 \l__color_backend_stack_int=\count306
 \l__pdf_internal_box=\box55
 )
-(docs/_latex_build/main_es.aux
+(_latex_build/main_es.aux
 LaTeX Info: Redefining \. on input line 11.
 LaTeX Info: Redefining \% on input line 11.
 )
@@ -357,8 +357,7 @@ LaTeX Font Info:    ... okay on input line 20.
 LaTeX Info: Redefining \. on input line 20.
 LaTeX Info: Redefining \% on input line 20.
 Package hyperref Info: Link coloring OFF on input line 20.
- (docs/_latex_build/main_es.out)
-(docs/_latex_build/main_es.out)
+ (_latex_build/main_es.out) (_latex_build/main_es.out)
 \@outlinefile=\write3
 \openout3 = `main_es.out'.
 
@@ -408,7 +407,7 @@ LaTeX Font Info:    Trying to load font information for U+msb on input line 22.
 (/usr/local/texlive/2025/texmf-dist/tex/latex/amsfonts/umsb.fd
 File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 )
-(docs/_latex_build/main_es.toc
+(_latex_build/main_es.toc
 LaTeX Info: Redefining \. on input line 1.
 LaTeX Info: Redefining \% on input line 1.
 
@@ -419,50 +418,50 @@ LaTeX Info: Redefining \% on input line 1.
 al/texlive/2025/texmf-dist/fonts/enc/dvips/cm-super/cm-super-t1.enc}]
 
 [2]
-Overfull \hbox (2.7858pt too wide) detected at line 119
-\T1/cmr/m/n/10.95 12.10. 
+Overfull \hbox (2.7858pt too wide) detected at line 136
+\T1/cmr/m/n/10.95 13.10. 
  []
 
 
-Overfull \hbox (2.7858pt too wide) detected at line 120
-\T1/cmr/m/n/10.95 12.11. 
+Overfull \hbox (2.7858pt too wide) detected at line 137
+\T1/cmr/m/n/10.95 13.11. 
  []
 
 
-Overfull \hbox (2.7858pt too wide) detected at line 121
-\T1/cmr/m/n/10.95 12.12. 
+Overfull \hbox (2.7858pt too wide) detected at line 138
+\T1/cmr/m/n/10.95 13.12. 
  []
 
 
-Overfull \hbox (2.7858pt too wide) detected at line 122
-\T1/cmr/m/n/10.95 12.13. 
+Overfull \hbox (2.7858pt too wide) detected at line 139
+\T1/cmr/m/n/10.95 13.13. 
  []
 
 
 
-[3{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/cm-super/cm-super-ts1.enc
-}]
-Overfull \hbox (2.7858pt too wide) detected at line 172
-\T1/cmr/m/n/10.95 22.10. 
+[3]
+Overfull \hbox (2.7858pt too wide) detected at line 189
+\T1/cmr/m/n/10.95 23.10. 
  []
 
 
-Overfull \hbox (2.7858pt too wide) detected at line 173
-\T1/cmr/m/n/10.95 22.11. 
+Overfull \hbox (2.7858pt too wide) detected at line 190
+\T1/cmr/m/n/10.95 23.11. 
  []
 
 
-Overfull \hbox (2.7858pt too wide) detected at line 174
-\T1/cmr/m/n/10.95 22.12. 
+Overfull \hbox (2.7858pt too wide) detected at line 191
+\T1/cmr/m/n/10.95 23.12. 
  []
 
 )
 \tf@toc=\write4
 \openout4 = `main_es.toc'.
 
- (./docs/sections/clustering_es.tex
+ (./sections/clustering_es.tex
 
-[4]
+[4{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/cm-super/cm-super-ts1.enc
+}]
 Overfull \hbox (86.11928pt too wide) in paragraph at lines 33--34
 \T1/cmr/m/n/10.95 cio-nes so-bre sus pa-sa-das. En la im-ple-men-ta-ción, es-ta
 s va-ria-bles se guar-dan en \T1/cmtt/m/n/10.95 Resultados/cluster_features*.du
@@ -472,6 +471,8 @@ ckdb
 
 
 [5]
+
+[6]
 Overfull \hbox (64.21336pt too wide) detected at line 108
 \OML/cmm/m/it/10.95 n[] \OT1/cmr/m/n/10.95 = [] \OML/cmm/m/it/10.95 ;  n[] \OT1
 /cmr/m/n/10.95 = [] \OML/cmm/m/it/10.95 ;  n[] \OT1/cmr/m/n/10.95 = [] \OML/cmm
@@ -480,8 +481,6 @@ Overfull \hbox (64.21336pt too wide) detected at line 108
 
 
 
-[6]
-
 [7]
 Overfull \hbox (14.42258pt too wide) in paragraph at lines 165--166
 []\T1/cmr/m/n/10.95 Etiquetas por ma-trí-cu-la: \T1/cmtt/m/n/10.95 cluster_kmea
@@ -489,9 +488,11 @@ ns_kK.csv\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 cluster_gmm_kK.csv\T1/cmr/m/n/1
 0.95 , \T1/cmtt/m/n/10.95 cluster_hdbscan.csv\T1/cmr/m/n/10.95 . 
  []
 
-) (./docs/sections/accident_prediction_es.tex
+) (./sections/accident_prediction_es.tex
 
 [8]
+
+[9]
 Overfull \hbox (0.92137pt too wide) in paragraph at lines 48--50
 \T1/cmr/m/n/10.95 Estas va-ria-bles se al-ma-ce-nan co-mo co-lum-nas \T1/cmtt/m
 /n/10.95 cluster_share_*\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 cluster_flow_*\T
@@ -499,8 +500,6 @@ Overfull \hbox (0.92137pt too wide) in paragraph at lines 48--50
  []
 
 
-
-[9]
 Overfull \hbox (22.03365pt too wide) in paragraph at lines 71--72
 []\T1/cmr/m/n/10.95 (Opcional) Cal-cu-lar va-ria-bles de clus-ters por $\OT1/cm
 r/m/n/10.95 (\OML/cmm/m/it/10.95 p; ^^\\OT1/cmr/m/n/10.95 )$ \T1/cmr/m/n/10.95 
@@ -517,9 +516,93 @@ la un ran-king de im-por-tan-cia con Ran-dom Fo-rest (\T1/cmtt/m/n/10.95 featur
 e_importances_\T1/cmr/m/n/10.95 )
  []
 
-) (./docs/sections/drift_detection_es.tex
 
-[11]
+
+[11]) (./sections/nlp_severity_replication_es.tex
+Overfull \hbox (17.09215pt too wide) in paragraph at lines 14--16
+[]\T1/cmr/m/n/10.95 El pro-to-co-lo de ré-pli-ca es-tá de-fi-ni-do por cons-tan
+-tes co-mo \T1/cmtt/m/n/10.95 PAPER_PROTOCOL\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10
+.95 PAPER_EXPECTED_COUNTS\T1/cmr/m/n/10.95 ,
+ []
+
+
+Overfull \hbox (2.9811pt too wide) in paragraph at lines 14--16
+\T1/cmtt/m/n/10.95 PAPER_K_GRID\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 PAPER_VAL
+IDATION_ALPHA \T1/cmr/m/n/10.95 y \T1/cmtt/m/n/10.95 PAPER_COMPARISON_TOLERANCE
+\T1/cmr/m/n/10.95 . La im-ple-men-ta-ción fuer-
+ []
+
+
+
+[12]
+Overfull \hbox (116.5201pt too wide) in paragraph at lines 48--50
+[]\T1/cmr/m/n/10.95 Antes de eje-cu-tar cual-quier ex-pe-ri-men-to, el có-di-go
+ re-vi-sa \T1/cmtt/m/n/10.95 Resultados/nlp_in_severity/paper_replication/<run_
+id>/
+ []
+
+
+Overfull \hbox (97.3658pt too wide) in paragraph at lines 57--59
+[]\T1/cmr/m/n/10.95 La ru-ta \T1/cmtt/m/n/10.95 frozen \T1/cmr/m/n/10.95 car-ga
+ \T1/cmtt/m/n/10.95 NLP/Dataframes/resultado.pkl \T1/cmr/m/n/10.95 y nor-ma-li-
+za el da-ta-set con \T1/cmtt/m/n/10.95 _ensure_paper_dataset_columns\T1/cmr/m/n
+/10.95 .
+ []
+
+
+
+[13]
+Overfull \hbox (76.54787pt too wide) in paragraph at lines 75--76
+[]\T1/cmr/bx/n/10.95 Extracción de em-bed-dings. \T1/cmr/m/n/10.95 Lla-mar a \T
+1/cmtt/m/n/10.95 generate_text_embeddings \T1/cmr/m/n/10.95 con \T1/cmtt/m/n/10
+.95 method = transformer_finetuned\T1/cmr/m/n/10.95 ,
+ []
+
+
+Overfull \hbox (118.05272pt too wide) in paragraph at lines 79--80
+\T1/cmr/m/n/10.95 Estos sub-pa-sos que-dan check-poin-ted co-mo \T1/cmtt/m/n/10
+.95 raw.build.features\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 raw.build.embeddin
+gs\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 raw.build.embedding_selection
+ []
+
+
+
+[14]
+Overfull \hbox (23.31157pt too wide) in paragraph at lines 99--100
+\T1/cmr/m/n/10.95 Cada $\OML/cmm/m/it/10.95 k$ \T1/cmr/m/n/10.95 se re-gis-tra 
+por se-pa-ra-do co-mo \T1/cmtt/m/n/10.95 <ruta>.M<j>.k.<k>\T1/cmr/m/n/10.95 , y
+ ca-da mo-de-lo fi-nal co-mo \T1/cmtt/m/n/10.95 <ruta>.M<j>.final\T1/cmr/m/n/10
+.95 . 
+ []
+
+
+
+[15]
+Overfull \hbox (93.69467pt too wide) in paragraph at lines 154--156
+[]\T1/cmr/m/n/10.95 Después de una co-rri-da exi-to-sa o de una co-rri-da com-p
+le-ta-da pe-ro blo-quea-da, \T1/cmtt/m/n/10.95 _persist_paper_replication_paylo
+ad
+ []
+
+
+Overfull \hbox (24.55675pt too wide) in paragraph at lines 161--162
+\T1/cmr/m/n/10.95 Esa sin-cro-ni-za-ción es idem-po-ten-te y se omi-te cuan-do 
+\T1/cmtt/m/n/10.95 manifest.json \T1/cmr/m/n/10.95 ya in-di-ca \T1/cmtt/m/n/10.
+95 registry_sync.completed
+ []
+
+
+
+[16]
+
+[17]
+Overfull \hbox (55.35728pt too wide) in paragraph at lines 194--195
+[]\T1/cmr/m/n/10.95 si la com-pa-ra-ción pa-só, ins-pec-cio-nar \T1/cmtt/m/n/10
+.95 export/payload.json \T1/cmr/m/n/10.95 y los as-sets pro-mo-vi-dos en \T1/cm
+tt/m/n/10.95 NLP/Latex/images/
+ []
+
+) (./sections/drift_detection_es.tex
 Overfull \hbox (20.28572pt too wide) in paragraph at lines 16--17
 []\T1/cmr/m/n/10.95 La con-fi-gu-ra-ción de re-fe-ren-cia del pa-per se fi-ja c
 on \T1/cmtt/m/n/10.95 PAPER_TIME_SPAN = 2018-01-01 to 2024-09-30\T1/cmr/m/n/10.
@@ -548,6 +631,8 @@ Overfull \hbox (6.59903pt too wide) in paragraph at lines 19--20
  []
 
 
+
+[18]
 Overfull \hbox (1.26738pt too wide) in paragraph at lines 30--31
 []\T1/cmr/m/n/10.95 La fun-ción \T1/cmtt/m/n/10.95 main() \T1/cmr/m/n/10.95 cre
 a seis tabs con eti-que-tas reales \T1/cmtt/m/n/10.95 Blueprint\T1/cmr/m/n/10.9
@@ -557,7 +642,7 @@ gineering\T1/cmr/m/n/10.95 ,
 
 
 
-[12]
+[19]
 Overfull \hbox (15.67056pt too wide) in paragraph at lines 69--71
 \OML/cmm/m/it/10.95 p[]$ \T1/cmr/m/n/10.95 y ca-rril $\OML/cmm/m/it/10.95 `[]$\
 T1/cmr/m/n/10.95 . La app ma-pea \T1/cmtt/m/n/10.95 CATEGORIA \T1/cmr/m/n/10.95
@@ -567,9 +652,7 @@ T1/cmr/m/n/10.95 . La app ma-pea \T1/cmtt/m/n/10.95 CATEGORIA \T1/cmr/m/n/10.95
 
 
 
-[13]
-
-[14]
+[20]
 Overfull \hbox (55.55557pt too wide) in paragraph at lines 134--135
 \T1/cmr/m/n/10.95 Pa-ra ca-da seg-men-to $\OML/cmm/m/it/10.95 s \OT1/cmr/m/n/10
 .95 = (\OML/cmm/m/it/10.95 p[]; p[]\OT1/cmr/m/n/10.95 ) \OMS/cmsy/m/n/10.95 2 \
@@ -580,9 +663,9 @@ t_distance_km()\T1/cmr/m/n/10.95 ,
 
 
 
-[15]
+[21]
 
-[16]
+[22]
 Overfull \hbox (114.23587pt too wide) in paragraph at lines 222--224
 \T1/cmr/m/n/10.95 ocu-rren en el si-guien-te in-ter-va-lo de 5 mi-nu-tos. La pr
 ue-ba \T1/cmtt/m/n/10.95 test_drift_article_features_cover_table4_and_target_sh
@@ -597,6 +680,8 @@ mtt/m/n/10.95 apply_missing_data_policy()\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95
  []
 
 
+
+[23]
 Overfull \hbox (159.40094pt too wide) in paragraph at lines 233--234
 \T1/cmr/m/n/10.95 mo-vi-das, ven-ta-nas de-tec-ta-das y fi-las des-car-ta-das. 
 La prue-ba \T1/cmtt/m/n/10.95 test_configurable_preparation_pipeline_respects_s
@@ -625,8 +710,6 @@ tatic\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 period_aligned\T1/cmr/m/n/10.95 ,
  []
 
 
-
-[17]
 Overfull \hbox (17.65697pt too wide) in paragraph at lines 261--262
  []\T1/cmr/bx/n/10.95 Entrenamiento batch in-terno y ca-li-bra-ción de th-resho
 ld[] \T1/cmr/m/n/10.95 Las es-tra-te-gias batch, \T1/cmtt/m/n/10.95 adaptive_ad
@@ -635,7 +718,9 @@ win
 
 
 
-[18]
+[24]
+
+[25]
 Overfull \hbox (69.03189pt too wide) in paragraph at lines 321--323
 \T1/cmr/m/n/10.95 Los ar-te-fac-tos SMO-TE pue-den per-sis-tir-se y re-uti-li-z
 ar-se por blo-que me-dian-te \T1/cmtt/m/n/10.95 _load_or_create_smote_artifact(
@@ -644,24 +729,24 @@ ar-se por blo-que me-dian-te \T1/cmtt/m/n/10.95 _load_or_create_smote_artifact(
 
 
 
-[19]
-
-[20]
-Overfull \hbox (112.61574pt too wide) in paragraph at lines 395--396
+[26]
+Overfull \hbox (112.61574pt too wide) in paragraph at lines 398--399
 \OML/cmm/m/it/10.95 W=W[]=W[]$\T1/cmr/m/n/10.95 . Las prue-bas \T1/cmtt/m/n/10.
 95 test_run_arf_strategy_variants \T1/cmr/m/n/10.95 y \T1/cmtt/m/n/10.95 test_r
 ecalibration_experiments_support_adaptive_arf
  []
 
 
-Overfull \hbox (1.08308pt too wide) in paragraph at lines 418--420
+
+[27]
+Overfull \hbox (1.08308pt too wide) in paragraph at lines 421--423
 \T1/cmr/m/n/10.95 Cuando eso ocu-rre, se cie-rra el seg-men-to de pre-dic-ción,
  se re-gis-tran \T1/cmtt/m/n/10.95 vote_count\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/1
 0.95 detected_features\T1/cmr/m/n/10.95 ,
  []
 
 
-Overfull \hbox (18.52501pt too wide) in paragraph at lines 425--426
+Overfull \hbox (18.52501pt too wide) in paragraph at lines 428--429
 \T1/cmr/m/n/10.95 adi-cio-na-les co-mo \T1/cmtt/m/n/10.95 vote_threshold\T1/cmr
 /m/n/10.95 , \T1/cmtt/m/n/10.95 monitor_feature_count\T1/cmr/m/n/10.95 , \T1/cm
 tt/m/n/10.95 retrain_rows \T1/cmr/m/n/10.95 y \T1/cmtt/m/n/10.95 retrain_positi
@@ -669,7 +754,7 @@ ve_rows\T1/cmr/m/n/10.95 .
  []
 
 
-Overfull \hbox (72.72339pt too wide) in paragraph at lines 425--426
+Overfull \hbox (72.72339pt too wide) in paragraph at lines 428--429
 \T1/cmr/m/n/10.95 Las prue-bas \T1/cmtt/m/n/10.95 test_run_kswin_strategy_varia
 nts\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 test_recalibration_experiments_suppor
 t_adaptive_kswin
@@ -677,22 +762,36 @@ t_adaptive_kswin
 
 
 
-[21]
-Overfull \hbox (160.84344pt too wide) in paragraph at lines 437--438
-\T1/cmr/m/n/10.95 li-zar tu-ning/SMOTE ya cal-cu-la-dos; es-to es-tá cu-bier-to
- por \T1/cmtt/m/n/10.95 test_preview_recalibration_checkpoint_detects_resumable
-_manifest
+[28]
+Overfull \hbox (15.74277pt too wide) in paragraph at lines 440--441
+\T1/cmr/m/n/10.95 blo-que: el blo-que fa-lli-do se mar-ca co-mo \T1/cmtt/m/n/10
+.95 skipped_failed\T1/cmr/m/n/10.95 , su error se re-gis-tra en \T1/cmtt/m/n/10
+.95 nonfatal_block_errors
  []
 
 
-Overfull \hbox (89.69106pt too wide) in paragraph at lines 439--440
+Overfull \hbox (113.93149pt too wide) in paragraph at lines 440--441
+\T1/cmr/m/it/10.95 su-me \T1/cmr/m/n/10.95 y de omi-sión con-tro-la-da es-tá cu
+-bier-to por \T1/cmtt/m/n/10.95 test_preview_recalibration_checkpoint_detects_r
+esumable_manifest\T1/cmr/m/n/10.95 ,
+ []
+
+
+Overfull \hbox (254.69011pt too wide) in paragraph at lines 440--441
+\T1/cmtt/m/n/10.95 test_recalibration_experiments_resume_from_failed_checkpoint
+ \T1/cmr/m/n/10.95 y \T1/cmtt/m/n/10.95 test_recalibration_experiments_can_skip
+_failed_blocks_and_continue\T1/cmr/m/n/10.95 . 
+ []
+
+
+Overfull \hbox (89.69106pt too wide) in paragraph at lines 442--443
 \T1/cmr/m/n/10.95 co-mo el \T1/cmtt/m/n/10.95 tuning_key \T1/cmr/m/n/10.95 in-c
 or-po-ran una fir-ma de ver-sión de la po-lí-ti-ca de en-tre-na-mien-to (\T1/cm
 tt/m/n/10.95 NNET_TRAINING_POLICY_VERSION\T1/cmr/m/n/10.95 ).
  []
 
 
-Overfull \hbox (26.53146pt too wide) in paragraph at lines 444--445
+Overfull \hbox (26.53146pt too wide) in paragraph at lines 447--448
 []\T1/cmtt/m/n/10.95 yearly_results\T1/cmr/m/n/10.95 : una fi-la por split anua
 l batch, con \T1/cmtt/m/n/10.95 strategy\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 
 prediction_year\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 model\T1/cmr/m/n/10.95 , 
@@ -700,30 +799,30 @@ prediction_year\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 model\T1/cmr/m/n/10.95 ,
  []
 
 
-Overfull \hbox (0.40149pt too wide) in paragraph at lines 445--446
+Overfull \hbox (0.40149pt too wide) in paragraph at lines 448--449
 []\T1/cmtt/m/n/10.95 adaptive_results\T1/cmr/m/n/10.95 : una fi-la por seg-men-
 to adap-ta-ti-vo, ya sea de-li-mi-ta-do por drift AD-WIN/KSWIN
  []
 
 
-
-[22]
-Overfull \hbox (202.86592pt too wide) in paragraph at lines 455--456
+Overfull \hbox (202.86592pt too wide) in paragraph at lines 458--459
 \T1/cmr/m/n/10.95 Las prue-bas \T1/cmtt/m/n/10.95 test_end_to_end_recalibration
 _and_average_roc\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 test_recalibration_exper
 iments_compare_balance_modes_end_to_end
  []
 
 
-Overfull \hbox (142.21883pt too wide) in paragraph at lines 470--471
+
+[29]
+Overfull \hbox (142.21883pt too wide) in paragraph at lines 473--474
 []\T1/cmr/m/n/10.95 JSON fi-nal de re-sul-ta-dos con \T1/cmtt/m/n/10.95 _persis
 t_drift_recalibration_json()\T1/cmr/m/n/10.95 , guar-da-do co-mo \T1/cmtt/m/n/1
 0.95 drift_recalibration_optuna_*.json\T1/cmr/m/n/10.95 . 
  []
 
+) (./sections/clustering_features_detail_es.tex
 
-
-[23]) (./docs/sections/clustering_features_detail_es.tex
+[30]
 Overfull \hbox (148.32233pt too wide) in paragraph at lines 10--11
 []\T1/cmr/bx/n/10.95 Eliminación de Du-pli-ca-dos: \T1/cmr/m/n/10.95 Se eli-mi-
 nan re-gis-tros du-pli-ca-dos con-si-de-ran-do la tu-pla $\OT1/cmr/m/n/10.95 (\
@@ -757,7 +856,7 @@ Package hyperref Warning: Token not allowed in a PDF string (Unicode):
 
 
 
-[24]
+[31]
 
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
 (hyperref)                removing `math shift' on input line 61.
@@ -807,9 +906,6 @@ Package hyperref Warning: Token not allowed in a PDF string (Unicode):
 (hyperref)                removing `math shift' on input line 77.
 
 
-
-[25]
-
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
 (hyperref)                removing `math shift' on input line 83.
 
@@ -821,6 +917,9 @@ Package hyperref Warning: Token not allowed in a PDF string (Unicode):
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
 (hyperref)                removing `math shift' on input line 83.
 
+
+
+[32]
 
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
 (hyperref)                removing `math shift' on input line 89.
@@ -835,7 +934,7 @@ Package hyperref Warning: Token not allowed in a PDF string (Unicode):
 
 
 
-[26]
+[33]
 LaTeX Font Info:    Font shape `T1/cmtt/bx/n' in size <12> not available
 (Font)              Font shape `T1/cmtt/m/n' tried instead on input line 129.
 LaTeX Font Info:    Font shape `T1/cmtt/bx/n' in size <10.95> not available
@@ -849,9 +948,9 @@ mr/m/n/10.95 ).
 
 
 
-[27]) (./docs/sections/gnn_pipeline_audit_es.tex
+[34]) (./sections/gnn_pipeline_audit_es.tex
 
-[28]
+[35]
 Overfull \hbox (68.84741pt too wide) in paragraph at lines 18--19
 []\T1/cmr/bx/n/10.95 Entrenamiento\T1/cmr/m/n/10.95 : He-te-ro-GAT + Tem-po-ra-
 lAg-gre-ga-tor (op-cio-nal) (\T1/cmtt/m/n/10.95 src/gat_model.py\T1/cmr/m/n/10.
@@ -874,9 +973,9 @@ features \T1/cmr/m/n/10.95 (\T1/cmtt/m/n/10.95 src/features.py\T1/cmr/m/n/10.95
 
 
 
-[29]
+[36]
 
-[30]
+[37]
 Overfull \hbox (33.1879pt too wide) in paragraph at lines 128--132
 \T1/cmr/bx/n/10.95 SequenceIndex\T1/cmr/m/n/10.95 : se-cuen-cias tem-po-ra-les 
 con guard band y ho-ri-zon-te fu-tu-ro (\T1/cmtt/m/n/10.95 src/snapshot_sequenc
@@ -885,7 +984,7 @@ es.py\T1/cmr/m/n/10.95 ).
 
 
 
-[31]
+[38]
 Overfull \hbox (15.94797pt too wide) in paragraph at lines 149--156
 []\T1/cmr/m/n/10.95 El pi-pe-li-ne aho-ra in-cor-po-ra un \T1/cmr/bx/n/10.95 re
 -gis-tro de va-rian-tes \T1/cmr/m/n/10.95 con-tro-la-do por \T1/cmtt/m/n/10.95 
@@ -924,22 +1023,22 @@ rc/gnn_main.py::_normalize_gnn_variant\T1/cmr/m/n/10.95 ).
 
 
 
-[32]
+[39]
 
-[33]
+[40]
 
-[34]
+[41]
 
-[35]
+[42]
 Underfull \hbox (badness 10000) in paragraph at lines 354--355
 
  []
 
 
 
-[36]
+[43]
 
-[37]
+[44]
 Overfull \hbox (39.55624pt too wide) in paragraph at lines 409--410
 []\T1/cmr/bx/n/10.95 Guardado\T1/cmr/m/n/10.95 : mo-de-los \T1/cmtt/m/n/10.95 g
 at_model_BEST*.pt\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10.95 GraphSMOTE_embeddings_m
@@ -949,13 +1048,13 @@ odel*.pt\T1/cmr/m/n/10.95 , si-de-car \T1/cmtt/m/n/10.95 _hparams.json\T1/cmr/m
 
 
 
-[38]) (./docs/sections/mairl_implementation_es.tex
+[45]) (./sections/mairl_implementation_es.tex
 
-[39]
+[46]
 
-[40])
+[47])
 
-[41] (docs/_latex_build/main_es.aux
+[48] (_latex_build/main_es.aux
 LaTeX Info: Redefining \. on input line 11.
 LaTeX Info: Redefining \% on input line 11.
 )
@@ -964,16 +1063,16 @@ LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
  ***********
 Package rerunfilecheck Info: File `main_es.out' has not changed.
-(rerunfilecheck)             Checksum: BF73A373BE2D1D7B535423EE9A1735C9;28098.
+(rerunfilecheck)             Checksum: 16CF00A7A6BC7BC6E11A41F210AE6455;32266.
  ) 
 Here is how much of TeX's memory you used:
- 11970 strings out of 473190
- 184756 string characters out of 5715801
- 603922 words of memory out of 5000000
- 34775 multiletter control sequences out of 15000+600000
+ 12042 strings out of 473190
+ 185551 string characters out of 5715801
+ 603990 words of memory out of 5000000
+ 34796 multiletter control sequences out of 15000+600000
  578567 words of font info for 85 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 75i,12n,79p,993b,782s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 75i,12n,79p,1020b,782s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb
 ></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb>
 </usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb><
@@ -1001,10 +1100,10 @@ st/fonts/type1/public/cm-super/sfrm1200.pfb></usr/local/texlive/2025/texmf-dist
 onts/type1/public/cm-super/sfti1095.pfb></usr/local/texlive/2025/texmf-dist/fon
 ts/type1/public/cm-super/sftt1095.pfb></usr/local/texlive/2025/texmf-dist/fonts
 /type1/public/cm-super/sftt1200.pfb>
-Output written on docs/_latex_build/main_es.pdf (41 pages, 613667 bytes).
+Output written on _latex_build/main_es.pdf (48 pages, 633180 bytes).
 PDF statistics:
- 1212 PDF objects out of 1440 (max. 8388607)
- 1100 compressed objects within 11 object streams
- 294 named destinations out of 1000 (max. 500000)
- 1113 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 1362 PDF objects out of 1440 (max. 8388607)
+ 1241 compressed objects within 13 object streams
+ 342 named destinations out of 1000 (max. 500000)
+ 1249 words of extra memory for PDF output out of 10000 (max. 10000000)
 

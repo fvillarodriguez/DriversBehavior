@@ -39,7 +39,7 @@ from sklearn.ensemble import AdaBoostClassifier, ExtraTreesClassifier, RandomFor
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, confusion_matrix, f1_score, roc_auc_score, roc_curve
-from sklearn.model_selection import ParameterGrid, StratifiedKFold, train_test_split
+from sklearn.model_selection import ParameterGrid, train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
@@ -2145,6 +2145,100 @@ def rank_features_random_forest(
     return imp.head(max(1, int(top_n))).reset_index(drop=True)
 
 
+def _rerank_features_after_smote(
+    train_df: pd.DataFrame,
+    *,
+    candidate_feature_cols: Sequence[str],
+    target_col: str = "target",
+    top_n: int = 20,
+    random_state: int = 42,
+    sampling_strategy: float = 1.0,
+    k_neighbors: int = 5,
+) -> Tuple[List[str], pd.DataFrame]:
+    """Re-rank features on SMOTE-balanced data and return the top-N list.
+
+    Applies SMOTE with explicit parameters to the training data, then runs
+    ``rank_features_random_forest`` on the balanced dataset. This ensures that
+    feature importance reflects the same balance regime selected for the window.
+
+    Returns
+    -------
+    selected_features : list[str]
+        Top-N feature names after re-ranking.
+    importance_df : pd.DataFrame
+        Full importance table produced by ``rank_features_random_forest``.
+    """
+    cols = [c for c in candidate_feature_cols if c in train_df.columns]
+    if not cols or target_col not in train_df.columns:
+        return list(cols)[:top_n], pd.DataFrame(columns=["feature", "importance", "rank"])
+
+    X = train_df[cols].copy()
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+    X = X.fillna(X.median(numeric_only=True)).fillna(0)
+    y = pd.to_numeric(train_df[target_col], errors="coerce").fillna(0).astype(int)
+
+    if y.nunique() < 2:
+        return list(cols)[:top_n], pd.DataFrame(columns=["feature", "importance", "rank"])
+
+    try:
+        X_bal, y_bal, _ = _apply_smote_balance(
+            X,
+            y.to_numpy(),
+            sampling_strategy=float(sampling_strategy),
+            k_neighbors=int(k_neighbors),
+            random_state=int(random_state),
+        )
+    except Exception:
+        # Fallback: rank on original data if SMOTE fails
+        importance_df = rank_features_random_forest(
+            train_df, cols, target_col=target_col, top_n=top_n, random_state=random_state,
+        )
+        selected = importance_df["feature"].astype(str).tolist() if not importance_df.empty else list(cols)[:top_n]
+        return selected, importance_df
+
+    bal_df = pd.DataFrame(X_bal, columns=list(X.columns))
+    bal_df[target_col] = np.asarray(y_bal).astype(int)
+
+    importance_df = rank_features_random_forest(
+        bal_df, list(X.columns), target_col=target_col, top_n=top_n, random_state=random_state,
+    )
+    selected = importance_df["feature"].astype(str).tolist() if not importance_df.empty else list(cols)[:top_n]
+    return selected, importance_df
+
+
+def _artifact_selected_feature_cols(
+    artifact: Optional[Dict[str, Any]],
+    *,
+    fallback_feature_cols: Sequence[str],
+) -> List[str]:
+    selected = [
+        str(col)
+        for col in ((artifact or {}).get("selected_feature_cols") or [])
+        if str(col)
+    ]
+    return selected or [str(col) for col in fallback_feature_cols]
+
+
+def _artifact_smote_params(
+    artifact: Optional[Dict[str, Any]],
+    *,
+    fallback_sampling_strategy: float = 1.0,
+    fallback_k_neighbors: int = 5,
+) -> Dict[str, Any]:
+    payload = dict(artifact or {})
+    smote_params = dict(payload.get("smote_params") or {})
+    if not smote_params:
+        smote_params = _split_model_and_smote_params(
+            dict(payload.get("best_params") or {}),
+            balance_mode=BALANCE_MODE_SMOTE,
+        )[1]
+    return {
+        "sampling_strategy": float(smote_params.get("sampling_strategy", fallback_sampling_strategy)),
+        "k_neighbors": int(smote_params.get("k_neighbors", fallback_k_neighbors)),
+    }
+
+
 def youden_threshold(y_true: np.ndarray, scores: np.ndarray) -> Dict[str, float]:
     """
     Returns threshold maximizing Youden J = sensitivity + specificity - 1.
@@ -2221,6 +2315,59 @@ def _fit_platt_calibrator(
         }
     )
     return calibrated, metadata, model
+
+
+def _stabilize_probability_calibration(
+    y_true: np.ndarray,
+    raw_scores: np.ndarray,
+    *,
+    raw_youden: Dict[str, float],
+    calibrated_scores: np.ndarray,
+    calibration_metadata: Optional[Dict[str, Any]],
+    calibration_model: Optional[LogisticRegression],
+) -> Tuple[np.ndarray, Dict[str, float], Dict[str, Any], Optional[LogisticRegression]]:
+    raw = np.asarray(raw_scores, dtype=float)
+    calibrated = np.asarray(calibrated_scores, dtype=float)
+    metadata = dict(calibration_metadata or {})
+    calibrated_youden = youden_threshold(y_true, calibrated)
+
+    rejection_reason = ""
+    if str(metadata.get("kind", "")) == "platt":
+        coef = float(metadata.get("coef", 0.0))
+        if not np.isfinite(coef) or coef <= 0.0:
+            rejection_reason = "rejected_non_positive_platt_slope"
+
+    raw_youden_value = float(raw_youden.get("youden", float("nan")))
+    calibrated_youden_value = float(calibrated_youden.get("youden", float("nan")))
+    if (
+        not rejection_reason
+        and np.isfinite(raw_youden_value)
+        and np.isfinite(calibrated_youden_value)
+        and calibrated_youden_value + 1e-12 < raw_youden_value
+    ):
+        rejection_reason = "rejected_worse_youden_than_raw"
+
+    if not rejection_reason:
+        return calibrated, calibrated_youden, metadata, calibration_model
+
+    stabilized_scores = np.clip(raw, 0.0, 1.0)
+    stabilized_metadata: Dict[str, Any] = {
+        "method": DEFAULT_CALIBRATION_METHOD,
+        "policy_version": THRESHOLD_CALIBRATION_POLICY_VERSION,
+        "kind": "identity",
+        "applied": False,
+        "coef": 1.0,
+        "intercept": 0.0,
+        "reason": rejection_reason,
+        "rejected_kind": str(metadata.get("kind", "")),
+        "raw_youden": raw_youden_value,
+        "rejected_youden": calibrated_youden_value,
+    }
+    if "coef" in metadata and np.isfinite(float(metadata.get("coef", float("nan")))):
+        stabilized_metadata["rejected_coef"] = float(metadata["coef"])
+    if "intercept" in metadata and np.isfinite(float(metadata.get("intercept", float("nan")))):
+        stabilized_metadata["rejected_intercept"] = float(metadata["intercept"])
+    return stabilized_scores, youden_threshold(y_true, stabilized_scores), stabilized_metadata, None
 
 
 def _apply_probability_calibration(
@@ -2499,13 +2646,18 @@ EXPERIMENT_PRESET_CONFIGS: Dict[str, Dict[str, Any]] = {
 }
 
 FAST_SMOTE_SEARCH_SPACE: Dict[str, Sequence[Any]] = {
-    "sampling_strategy": [0.5, 1.0],
-    "k_neighbors": [3, 5],
+    "sampling_strategy": [0.005, 0.01, 0.02, 0.05, 0.1, 0.3],
+    "k_neighbors": [9, 10, 12, 15],
 }
 
 FULL_SMOTE_SEARCH_SPACE: Dict[str, Sequence[Any]] = {
-    "sampling_strategy": [0.3, 0.5, 0.75, 1.0],
-    "k_neighbors": [3, 5, 7],
+    "sampling_strategy": [0.005, 0.01, 0.02, 0.05, 0.1, 0.3],
+    "k_neighbors": [9, 10, 12, 15],
+}
+
+SMOTE_PRE_TUNING_SEARCH_SPACE: Dict[str, Sequence[Any]] = {
+    "sampling_strategy": [0.005, 0.01, 0.02, 0.05, 0.1, 0.3],
+    "k_neighbors": [9, 10, 12, 15],
 }
 
 
@@ -3197,6 +3349,7 @@ def _build_global_tuning_key(
     grid_limit: Optional[int],
     custom_grid: Optional[Dict[str, Sequence[Any]]],
     resource_policy_overrides: Optional[Dict[str, Any]] = None,
+    key_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     signature_cols = [col for col in [time_col, target_col] + list(feature_cols) if col in canonical_train_df.columns]
     payload = {
@@ -3214,6 +3367,8 @@ def _build_global_tuning_key(
         "grid_limit": None if grid_limit is None else int(grid_limit),
         "custom_grid": _to_json_safe(custom_grid or {}),
     }
+    if key_metadata:
+        payload["key_metadata"] = _to_json_safe(key_metadata)
     if _resource_policy_differs_from_default(resource_mode, overrides=resource_policy_overrides):
         payload["resource_policy"] = _resource_policy_signature(
             resource_mode,
@@ -3224,6 +3379,17 @@ def _build_global_tuning_key(
         payload["model_policy_version"] = str(policy_version)
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
     return f"tuning_{digest[:16]}"
+
+
+def _stage_scoped_tuning_key(
+    base_tuning_key: str,
+    *,
+    artifact_stage: str = "window_tuning",
+) -> str:
+    stage_token = _slugify_token(str(artifact_stage or "window_tuning"))
+    if stage_token in {"", "window_tuning"}:
+        return str(base_tuning_key)
+    return f"{stage_token}__{str(base_tuning_key)}"
 
 
 def _build_smote_key(
@@ -3727,6 +3893,7 @@ def _serialize_block_payload(
     execution_log: Sequence[Dict[str, Any]],
     tuning_refs: Sequence[str],
     smote_refs: Sequence[str],
+    smote_rerank_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -3740,6 +3907,7 @@ def _serialize_block_payload(
         "execution_log": _to_json_safe(list(execution_log)),
         "tuning_refs": [str(ref) for ref in tuning_refs],
         "smote_refs": [str(ref) for ref in smote_refs],
+        "smote_rerank_info": _to_json_safe(smote_rerank_info) if smote_rerank_info else None,
     }
 
 
@@ -3894,6 +4062,7 @@ def _estimate_recalibration_workload(
     random_state: int = 42,
     fast_mode: bool = True,
     custom_grids: Optional[Dict[str, Dict[str, Sequence[Any]]]] = None,
+    feature_selection_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     resource_policy = _resolve_experiment_resource_policy(
         resource_mode,
@@ -3921,6 +4090,11 @@ def _estimate_recalibration_workload(
         grid_limit=grid_limit,
         custom_grids=custom_grids,
     )
+    smote_post_rerank_tuning_tasks = _count_smote_post_rerank_tuning_tasks(
+        tuning_tasks,
+        feature_cols=feature_cols,
+        feature_selection_context=feature_selection_context,
+    )
     experiment_blocks = _build_experiment_blocks(
         model_names=list(model_names),
         strategies=list(strategies),
@@ -3943,7 +4117,9 @@ def _estimate_recalibration_workload(
         and (grid_limit is None or int(grid_limit) >= int(risk_thresholds.get("trials", 20)))
     )
     return {
-        "n_tuning_tasks": int(len(tuning_tasks)),
+        "n_tuning_tasks": int(len(tuning_tasks) + smote_post_rerank_tuning_tasks),
+        "n_base_tuning_tasks": int(len(tuning_tasks)),
+        "n_smote_post_rerank_tuning_tasks": int(smote_post_rerank_tuning_tasks),
         "n_blocks": int(len(experiment_blocks) * max(1, len(repetition_seeds))),
         "estimated_batch_fits": int(lower_bound_fits),
         "high_risk_memory": bool(high_risk),
@@ -4040,6 +4216,17 @@ def _prepare_xy_raw(
         X[col] = pd.to_numeric(X[col], errors="coerce")
     y = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int)
     return X, y
+
+
+def _sort_frame_by_time(df: pd.DataFrame, time_col: Optional[str]) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    work = df.copy()
+    if not time_col or time_col not in work.columns:
+        return work.reset_index(drop=True)
+    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
+    return work
 
 
 def _fit_fill_values(X: pd.DataFrame) -> Dict[str, float]:
@@ -4670,8 +4857,8 @@ def _cv_auc(
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
     resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    effective_folds = _effective_stratified_folds(y, folds)
-    if effective_folds < 2:
+    splits = list(enumerate(_temporal_cv_splits(y, folds), start=1))
+    if not splits:
         empty_payload = {
             "cv_auc": float("nan"),
             "converged": False,
@@ -4682,8 +4869,6 @@ def _cv_auc(
         return empty_payload if return_diagnostics else float("nan")
 
     y_np = np.asarray(y).astype(int)
-    skf = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=random_state)
-    splits = list(enumerate(skf.split(X, y_np), start=1))
 
     def evaluate_fold(fold_idx: int, tr_idx: np.ndarray, va_idx: np.ndarray) -> Dict[str, Any]:
         X_tr_raw = X.iloc[tr_idx]
@@ -4756,7 +4941,7 @@ def _cv_auc(
 
     parallel_jobs = _parallel_cv_jobs(
         model_name,
-        effective_folds,
+        len(splits),
         resource_mode=resource_mode,
         resource_policy_overrides=resource_policy_overrides,
     )
@@ -4795,16 +4980,37 @@ def _cv_auc(
     return float(np.mean(aucs))
 
 
-def _effective_stratified_folds(y: Sequence[int], folds: int) -> int:
+def _effective_temporal_folds(y: Sequence[int], folds: int) -> int:
     y_np = np.asarray(y).astype(int)
     if np.unique(y_np).size < 2:
         return 0
 
-    min_class = int(np.bincount(y_np).min())
-    effective_folds = max(2, min(int(folds), min_class))
-    if effective_folds < 2:
+    if len(y_np) < 3:
+        return 0
+    effective_folds = min(int(folds), max(1, len(y_np) - 1))
+    if effective_folds < 1:
         return 0
     return int(effective_folds)
+
+
+def _temporal_cv_splits(y: Sequence[int], folds: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    effective_folds = _effective_temporal_folds(y, folds)
+    if effective_folds < 1:
+        return []
+
+    indices = np.arange(len(y), dtype=int)
+    blocks = [np.asarray(block, dtype=int) for block in np.array_split(indices, effective_folds + 1) if len(block)]
+    if len(blocks) < 2:
+        return []
+
+    splits: List[Tuple[np.ndarray, np.ndarray]] = []
+    for block_idx in range(1, len(blocks)):
+        train_idx = np.concatenate(blocks[:block_idx]).astype(int, copy=False)
+        val_idx = np.asarray(blocks[block_idx], dtype=int)
+        if len(train_idx) == 0 or len(val_idx) == 0:
+            continue
+        splits.append((train_idx, val_idx))
+    return splits
 
 
 def _cross_validated_scores(
@@ -4820,9 +5026,9 @@ def _cross_validated_scores(
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
     resource_policy_overrides: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    effective_folds = _effective_stratified_folds(y, folds)
+    splits = list(enumerate(_temporal_cv_splits(y, folds), start=1))
     scores = np.full(len(X), np.nan, dtype=float)
-    if effective_folds < 2:
+    if not splits:
         payload = {
             "scores": scores,
             "converged": False,
@@ -4833,8 +5039,6 @@ def _cross_validated_scores(
         return payload if return_diagnostics else scores
 
     y_np = np.asarray(y).astype(int)
-    skf = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=random_state)
-    splits = list(enumerate(skf.split(X, y_np), start=1))
     model_params, smote_params = _split_model_and_smote_params(
         params,
         balance_mode=balance_mode,
@@ -4904,7 +5108,7 @@ def _cross_validated_scores(
 
     parallel_jobs = _parallel_cv_jobs(
         model_name,
-        effective_folds,
+        len(splits),
         resource_mode=resource_mode,
         resource_policy_overrides=resource_policy_overrides,
     )
@@ -4961,14 +5165,41 @@ def tune_hyperparameters(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     resource_mode: str = DEFAULT_EXPERIMENT_RESOURCE_MODE,
     resource_policy_overrides: Optional[Dict[str, Any]] = None,
+    fixed_model_params: Optional[Dict[str, Any]] = None,
+    fixed_smote_params: Optional[Dict[str, Any]] = None,
+    smote_search_space: Optional[Dict[str, Sequence[Any]]] = None,
 ) -> Tuple[Dict[str, Any], pd.DataFrame, Dict[str, Any]]:
     _ensure_optuna_available()
+    normalized_fixed_model_params = {
+        str(key): _normalize_param_choice(value)
+        for key, value in dict(fixed_model_params or {}).items()
+    }
+    normalized_fixed_smote_params = {
+        str(key): _normalize_param_choice(value)
+        for key, value in dict(fixed_smote_params or {}).items()
+    }
     search_space = _build_model_search_space(
         model_name,
         fast_mode=fast_mode,
         custom_grid=custom_grid,
         balance_mode=balance_mode,
     )
+    if balance_mode == BALANCE_MODE_SMOTE and normalized_fixed_smote_params:
+        for key in ("sampling_strategy", "k_neighbors"):
+            search_space.pop(key, None)
+    normalized_smote_search_space = {
+        str(key): list(values)
+        for key, values in dict(smote_search_space or {}).items()
+    }
+    if balance_mode == BALANCE_MODE_SMOTE and normalized_smote_search_space:
+        if normalized_fixed_model_params:
+            search_space = {
+                str(key): list(values)
+                for key, values in normalized_smote_search_space.items()
+            }
+        else:
+            for key, values in normalized_smote_search_space.items():
+                search_space[str(key)] = list(values)
     search_space_size = _search_space_size(search_space)
     requested_trials = int(grid_limit) if grid_limit is not None and int(grid_limit) > 0 else search_space_size
     n_trials = max(1, min(int(requested_trials), int(search_space_size)))
@@ -4995,11 +5226,16 @@ def tune_hyperparameters(
     )
 
     def objective(trial: Any) -> float:
-        params = {
+        tuned_params = {
             name: _normalize_param_choice(
                 trial.suggest_categorical(name, list(values))
             )
             for name, values in search_space.items()
+        }
+        params = {
+            **dict(normalized_fixed_model_params),
+            **dict(normalized_fixed_smote_params),
+            **tuned_params,
         }
         cv_payload = _cv_auc(
             X,
@@ -5032,6 +5268,27 @@ def tune_hyperparameters(
 
     study.optimize(objective, n_trials=int(n_trials), show_progress_bar=False, callbacks=[optuna_progress])
     trials = _normalized_optuna_trials(study, balance_mode=balance_mode)
+    if normalized_fixed_model_params or normalized_fixed_smote_params:
+        enriched_trials: List[Dict[str, Any]] = []
+        for row in trials:
+            full_params = {
+                **dict(normalized_fixed_model_params),
+                **dict(normalized_fixed_smote_params),
+                **dict(row.get("params") or {}),
+            }
+            model_params, smote_params = _split_model_and_smote_params(
+                full_params,
+                balance_mode=balance_mode,
+            )
+            enriched_trials.append(
+                {
+                    **dict(row),
+                    "params": full_params,
+                    "model_params": model_params,
+                    "smote_params": smote_params,
+                }
+            )
+        trials = enriched_trials
     rows: List[Dict[str, Any]] = []
     for row in trials:
         rows.append(
@@ -5048,11 +5305,22 @@ def tune_hyperparameters(
             }
         )
 
-    best_params = _default_search_params(search_space)
+    best_params = {
+        **dict(normalized_fixed_model_params),
+        **dict(normalized_fixed_smote_params),
+        **_default_search_params(search_space),
+    }
     best_value: Optional[float] = None
     has_valid_trial = False
     if study.trials and study.best_value is not None and float(study.best_value) >= 0:
-        best_params = {key: _normalize_param_choice(value) for key, value in study.best_trial.params.items()}
+        best_params = {
+            **dict(normalized_fixed_model_params),
+            **dict(normalized_fixed_smote_params),
+            **{
+                key: _normalize_param_choice(value)
+                for key, value in study.best_trial.params.items()
+            },
+        }
         best_value = float(study.best_value)
         has_valid_trial = True
     invalid_trial_count = int(sum(1 for row in trials if not bool(row.get("converged", True))))
@@ -5073,6 +5341,8 @@ def tune_hyperparameters(
         "search_space_size": int(search_space_size),
         "search_space": {key: list(values) for key, values in search_space.items()},
         "trials": trials,
+        "fixed_model_params": dict(normalized_fixed_model_params) if normalized_fixed_model_params else None,
+        "fixed_smote_params": dict(normalized_fixed_smote_params) if normalized_fixed_smote_params else None,
     }
     search_df = pd.DataFrame(rows).sort_values(
         ["converged", "cv_auc"],
@@ -5632,9 +5902,13 @@ def train_model_with_internal_validation(
         calibration_y,
         raw_calibration_scores,
     )
-    calibrated_youden = youden_threshold(
+    calibrated_scores, calibrated_youden, calibration_metadata, probability_calibrator = _stabilize_probability_calibration(
         calibration_y,
-        calibrated_scores,
+        raw_calibration_scores,
+        raw_youden=raw_youden,
+        calibrated_scores=calibrated_scores,
+        calibration_metadata=calibration_metadata,
+        calibration_model=probability_calibrator,
     )
     calibration_stage_metrics = _compute_calibration_stage_metrics(
         calibration_y,
@@ -5989,6 +6263,7 @@ def run_yearly_strategy(
             cache_key: Optional[Tuple[Any, ...]] = None
             resolved_fixed_params = fixed_params
             resolved_fixed_tuning_artifact = fixed_tuning_artifact
+            effective_split_feature_cols = [str(col) for col in feature_cols]
             if tuning_resolver is not None:
                 resolved_fixed_tuning_artifact = tuning_resolver(
                     train_df=train_df,
@@ -6005,6 +6280,10 @@ def run_yearly_strategy(
                     },
                 )
                 resolved_fixed_params = dict((resolved_fixed_tuning_artifact or {}).get("best_params") or {})
+                effective_split_feature_cols = _artifact_selected_feature_cols(
+                    resolved_fixed_tuning_artifact,
+                    fallback_feature_cols=feature_cols,
+                )
             if strategy == "static":
                 cache_key = (
                     strategy,
@@ -6046,7 +6325,7 @@ def run_yearly_strategy(
                 try:
                     bundle = train_model_with_internal_validation(
                         train_df,
-                        feature_cols=feature_cols,
+                        feature_cols=effective_split_feature_cols,
                         target_col=target_col,
                         time_col=time_col,
                         model_name=model_name,
@@ -6065,6 +6344,7 @@ def run_yearly_strategy(
                         run_id=run_id,
                         smote_cache_dir=smote_cache_dir,
                         smote_cache_registry=smote_cache_registry,
+
                         progress_callback=(
                             None
                             if progress_callback is None
@@ -6148,7 +6428,7 @@ def run_yearly_strategy(
             eval_payload = _evaluate_split(
                 bundle["model"],
                 test_df,
-                feature_cols=feature_cols,
+                feature_cols=effective_split_feature_cols,
                 target_col=target_col,
                 threshold=float(bundle["threshold"]),
                 raw_threshold=float(bundle.get("raw_youden_threshold", bundle["threshold"])),
@@ -6448,6 +6728,7 @@ def run_adaptive_strategy(
             t0 = time.perf_counter()
             resolved_base_tuning_artifact = fixed_tuning_artifact
             resolved_base_params = fixed_params
+            effective_base_feature_cols = [str(col) for col in feature_cols]
             if tuning_resolver is not None:
                 resolved_base_tuning_artifact = tuning_resolver(
                     train_df=base_train,
@@ -6463,9 +6744,13 @@ def run_adaptive_strategy(
                     },
                 )
                 resolved_base_params = dict((resolved_base_tuning_artifact or {}).get("best_params") or {})
+                effective_base_feature_cols = _artifact_selected_feature_cols(
+                    resolved_base_tuning_artifact,
+                    fallback_feature_cols=feature_cols,
+                )
             bundle = train_model_with_internal_validation(
                 base_train,
-                feature_cols=feature_cols,
+                feature_cols=effective_base_feature_cols,
                 target_col=target_col,
                 time_col=time_col,
                 model_name=model_name,
@@ -6599,7 +6884,7 @@ def run_adaptive_strategy(
         feature_transform = dict(bundle.get("feature_transform") or {}) or None
         detector = SimpleADWIN(delta=adwin_delta, min_window=min_window)
 
-        X_stream_raw, y_stream = _prepare_xy_raw(stream, feature_cols, target_col)
+        X_stream_raw, y_stream = _prepare_xy_raw(stream, effective_base_feature_cols, target_col)
         ts_stream = pd.to_datetime(stream[time_col], errors="coerce").reset_index(drop=True)
         stream_progress_step = max(1, len(stream) // 50)
 
@@ -6754,6 +7039,7 @@ def run_adaptive_strategy(
                     t_fit = time.perf_counter()
                     resolved_retrain_tuning_artifact = fixed_tuning_artifact
                     resolved_retrain_params = fixed_params
+                    effective_retrain_feature_cols = [str(col) for col in effective_base_feature_cols]
                     if tuning_resolver is not None:
                         resolved_retrain_tuning_artifact = tuning_resolver(
                             train_df=retrain_df,
@@ -6778,9 +7064,13 @@ def run_adaptive_strategy(
                             },
                         )
                         resolved_retrain_params = dict((resolved_retrain_tuning_artifact or {}).get("best_params") or {})
+                        effective_retrain_feature_cols = _artifact_selected_feature_cols(
+                            resolved_retrain_tuning_artifact,
+                            fallback_feature_cols=effective_base_feature_cols,
+                        )
                     bundle = train_model_with_internal_validation(
                         retrain_df,
-                        feature_cols=feature_cols,
+                        feature_cols=effective_retrain_feature_cols,
                         target_col=target_col,
                         time_col=time_col,
                         model_name=model_name,
@@ -6799,6 +7089,7 @@ def run_adaptive_strategy(
                         run_id=run_id,
                         smote_cache_dir=smote_cache_dir,
                         smote_cache_registry=smote_cache_registry,
+
                     )
                     fit_time = time.perf_counter() - t_fit
                     if str(model_name) == "NNet" and bool(bundle.get("fit_retry_applied", False)):
@@ -6829,6 +7120,8 @@ def run_adaptive_strategy(
                     calibration_metadata = operating_context.get("calibration_metadata")
                     fill_values = dict(bundle.get("fill_values") or {})
                     feature_transform = dict(bundle.get("feature_transform") or {}) or None
+                    effective_base_feature_cols = list(effective_retrain_feature_cols)
+                    X_stream_raw, y_stream = _prepare_xy_raw(stream, effective_base_feature_cols, target_col)
                     _append_tuning_study(
                         study_collector,
                         bundle.get("tuning_artifact"),
@@ -7388,6 +7681,7 @@ def run_kswin_strategy(
             t0 = time.perf_counter()
             resolved_base_tuning_artifact = fixed_tuning_artifact
             resolved_base_params = fixed_params
+            effective_base_feature_cols = [str(col) for col in feature_cols]
             if tuning_resolver is not None:
                 resolved_base_tuning_artifact = tuning_resolver(
                     train_df=base_train,
@@ -7403,9 +7697,13 @@ def run_kswin_strategy(
                     },
                 )
                 resolved_base_params = dict((resolved_base_tuning_artifact or {}).get("best_params") or {})
+                effective_base_feature_cols = _artifact_selected_feature_cols(
+                    resolved_base_tuning_artifact,
+                    fallback_feature_cols=feature_cols,
+                )
             bundle = train_model_with_internal_validation(
                 base_train,
-                feature_cols=feature_cols,
+                feature_cols=effective_base_feature_cols,
                 target_col=target_col,
                 time_col=time_col,
                 model_name=model_name,
@@ -7493,12 +7791,12 @@ def run_kswin_strategy(
             )
             continue
 
-        base_X_raw, _ = _prepare_xy_raw(base_train, feature_cols, target_col)
+        base_X_raw, _ = _prepare_xy_raw(base_train, effective_base_feature_cols, target_col)
         base_fill_values = dict(bundle.get("fill_values") or {})
         base_X = _apply_fill_values(base_X_raw, base_fill_values)
         monitor_cols = _select_kswin_monitor_columns(
             base_X,
-            feature_cols,
+            effective_base_feature_cols,
             top_k=kswin_top_k_features,
         )
         effective_vote_threshold = min(max(1, int(kswin_vote_threshold)), max(1, len(monitor_cols)))
@@ -7551,7 +7849,7 @@ def run_kswin_strategy(
             training_time_sec=float(fit_time),
         )
 
-        X_stream_raw, y_stream = _prepare_xy_raw(stream, feature_cols, target_col)
+        X_stream_raw, y_stream = _prepare_xy_raw(stream, effective_base_feature_cols, target_col)
         ts_stream = pd.to_datetime(stream[time_col], errors="coerce").reset_index(drop=True)
 
         base_monitor_df = pd.concat(
@@ -7807,6 +8105,7 @@ def run_kswin_strategy(
                         t_fit = time.perf_counter()
                         resolved_retrain_tuning_artifact = fixed_tuning_artifact
                         resolved_retrain_params = fixed_params
+                        effective_retrain_feature_cols = [str(col) for col in effective_base_feature_cols]
                         if tuning_resolver is not None:
                             resolved_retrain_tuning_artifact = tuning_resolver(
                                 train_df=retrain_df,
@@ -7834,9 +8133,13 @@ def run_kswin_strategy(
                                 },
                             )
                             resolved_retrain_params = dict((resolved_retrain_tuning_artifact or {}).get("best_params") or {})
+                            effective_retrain_feature_cols = _artifact_selected_feature_cols(
+                                resolved_retrain_tuning_artifact,
+                                fallback_feature_cols=effective_base_feature_cols,
+                            )
                         retrain_bundle = train_model_with_internal_validation(
                             retrain_df,
-                            feature_cols=feature_cols,
+                            feature_cols=effective_retrain_feature_cols,
                             target_col=target_col,
                             time_col=time_col,
                             model_name=model_name,
@@ -7855,6 +8158,7 @@ def run_kswin_strategy(
                             run_id=run_id,
                             smote_cache_dir=smote_cache_dir,
                             smote_cache_registry=smote_cache_registry,
+    
                         )
                         fit_time = time.perf_counter() - t_fit
                         if str(model_name) == "NNet" and bool(retrain_bundle.get("fit_retry_applied", False)):
@@ -7887,6 +8191,19 @@ def run_kswin_strategy(
                         current_calibration_metadata = operating_context.get("calibration_metadata")
                         current_fill_values = dict(retrain_bundle.get("fill_values") or {})
                         current_feature_transform = dict(retrain_bundle.get("feature_transform") or {}) or None
+                        effective_base_feature_cols = list(effective_retrain_feature_cols)
+                        X_stream_raw, y_stream = _prepare_xy_raw(stream, effective_base_feature_cols, target_col)
+                        retrain_X_raw, _ = _prepare_xy_raw(retrain_df, effective_base_feature_cols, target_col)
+                        retrain_X = _apply_fill_values(retrain_X_raw, current_fill_values)
+                        monitor_cols = _select_kswin_monitor_columns(
+                            retrain_X,
+                            effective_base_feature_cols,
+                            top_k=kswin_top_k_features,
+                        )
+                        effective_vote_threshold = min(
+                            max(1, int(kswin_vote_threshold)),
+                            max(1, len(monitor_cols)),
+                        )
                         _append_tuning_study(
                             study_collector,
                             retrain_bundle.get("tuning_artifact"),
@@ -7974,7 +8291,7 @@ def run_kswin_strategy(
                     [
                         pd.to_datetime(retrain_df[time_col], errors="coerce").rename(time_col).reset_index(drop=True),
                         _apply_fill_values(
-                            _prepare_xy_raw(retrain_df, feature_cols, target_col)[0],
+                            _prepare_xy_raw(retrain_df, effective_base_feature_cols, target_col)[0],
                             current_fill_values,
                         )[monitor_cols].reset_index(drop=True),
                     ],
@@ -8183,6 +8500,17 @@ def _normalize_feature_selection_context(
     ]
     context["selected_features"] = selected_features
     context["feature_count"] = int(context.get("feature_count") or len(selected_features))
+    raw_smote_rerank_enabled = context.get("smote_rerank_enabled", False)
+    if isinstance(raw_smote_rerank_enabled, str):
+        context["smote_rerank_enabled"] = raw_smote_rerank_enabled.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+    else:
+        context["smote_rerank_enabled"] = bool(raw_smote_rerank_enabled)
     if "feature_export_path" in context and context.get("feature_export_path"):
         raw_export_path = str(context["feature_export_path"]).strip()
         resolved_export_path = _resolve_existing_feature_export_path(raw_export_path)
@@ -8231,9 +8559,7 @@ def _batch_tuning_tasks(
         for mode in balance_modes
         if str(mode) in DEFAULT_BATCH_BALANCE_MODES
     ] or [BALANCE_MODE_NONE]
-    work = df.copy()
-    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
-    work = work.dropna(subset=[time_col]).reset_index(drop=True)
+    work = _sort_frame_by_time(df, time_col)
     effective_base_year = _canonical_base_year(work, time_col=time_col, base_year=base_year)
     if effective_base_year is None:
         return []
@@ -8347,9 +8673,7 @@ def _materialize_tuning_train_df(
     time_col: str,
     task: Dict[str, Any],
 ) -> pd.DataFrame:
-    work = df.copy()
-    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
-    work = work.dropna(subset=[time_col]).reset_index(drop=True)
+    work = _sort_frame_by_time(df, time_col)
     strategy_context = dict(task.get("strategy_context") or {})
     window_kind = str(task.get("window_kind") or strategy_context.get("window_kind") or "")
     prediction_year = strategy_context.get("prediction_year", task.get("prediction_year"))
@@ -8362,19 +8686,32 @@ def _materialize_tuning_train_df(
     if window_kind in {"base_year", "period_aligned"}:
         if not training_years:
             raise ValueError(f"Missing training years for tuning task: {task}")
-        return work.loc[_as_year_mask(work, time_col, int(training_years[0]))].copy()
+        return _sort_frame_by_time(work.loc[_as_year_mask(work, time_col, int(training_years[0]))].copy(), time_col)
 
     if window_kind == "cumulative":
         if prediction_year is None:
             raise ValueError(f"Missing prediction year for cumulative tuning task: {task}")
         times = pd.to_datetime(work[time_col], errors="coerce")
-        return work.loc[times.dt.year.le(int(prediction_year) - 1)].copy()
+        return _sort_frame_by_time(work.loc[times.dt.year.le(int(prediction_year) - 1)].copy(), time_col)
 
     if training_years:
         times = pd.to_datetime(work[time_col], errors="coerce")
-        return work.loc[times.dt.year.isin(training_years)].copy()
+        return _sort_frame_by_time(work.loc[times.dt.year.isin(training_years)].copy(), time_col)
 
     raise ValueError(f"Unsupported tuning task context: {task}")
+
+
+def _count_smote_post_rerank_tuning_tasks(
+    tuning_tasks: Sequence[Dict[str, Any]],
+    *,
+    feature_cols: Sequence[str],
+    feature_selection_context: Optional[Dict[str, Any]] = None,
+) -> int:
+    # Each SMOTE task now adds an explicit pre-tuning stage, even when the
+    # final feature set keeps the original ranking and skips reranking.
+    return int(
+        sum(1 for task in tuning_tasks if str(task.get("balance_mode", "")) == BALANCE_MODE_SMOTE)
+    )
 
 
 def _bundle_operating_context(bundle: Dict[str, Any]) -> Dict[str, Any]:
@@ -8400,6 +8737,7 @@ def _initial_recalibration_manifest(
     experiment_blocks: Sequence[Dict[str, Any]],
     tuning_tasks: Sequence[Dict[str, Any]],
     preflight: Dict[str, Any],
+    total_tuning_tasks: Optional[int] = None,
 ) -> Dict[str, Any]:
     return {
         "run_id": str(run_id),
@@ -8421,7 +8759,7 @@ def _initial_recalibration_manifest(
             "completed_units": 0.0,
             "total_units": int(run_manifest.get("total_progress_units", 0)),
             "completed_tuning_tasks": 0,
-            "total_tuning_tasks": int(len(tuning_tasks)),
+            "total_tuning_tasks": int(total_tuning_tasks if total_tuning_tasks is not None else len(tuning_tasks)),
             "completed_blocks": 0,
             "skipped_failed_blocks": 0,
             "total_blocks": int(len(experiment_blocks)),
@@ -8488,11 +8826,30 @@ def _resolve_compatible_cached_tuning_artifact(
     model_name: str,
     balance_mode: str,
     tuning_filename: str,
+    artifact_stage: str = "window_tuning",
+    custom_grid: Optional[Dict[str, Sequence[Any]]] = None,
+    fixed_model_params: Optional[Dict[str, Any]] = None,
+    fixed_smote_params: Optional[Dict[str, Any]] = None,
+    key_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     cached = tuning_cache.get(str(tuning_key))
     if cached is not None:
         return cached
 
+    expected_custom_grid = _to_json_safe(custom_grid or {})
+    expected_fixed_model_params = _to_json_safe(
+        {
+            str(key): _normalize_param_choice(value)
+            for key, value in dict(fixed_model_params or {}).items()
+        }
+    )
+    expected_fixed_smote_params = _to_json_safe(
+        {
+            str(key): _normalize_param_choice(value)
+            for key, value in dict(fixed_smote_params or {}).items()
+        }
+    )
+    expected_key_metadata = _to_json_safe(key_metadata or {})
     signature_cols = [col for col in [time_col, target_col] + list(feature_cols) if col in train_df.columns]
     expected_train_signature = _frame_signature(train_df, columns=signature_cols, include_index=True)
     matched_key: Optional[str] = None
@@ -8504,7 +8861,17 @@ def _resolve_compatible_cached_tuning_artifact(
             continue
         if str(candidate.get("balance_mode")) != str(balance_mode):
             continue
+        if str(candidate.get("stage", "window_tuning")) != str(artifact_stage):
+            continue
         if str(candidate.get("train_signature")) != str(expected_train_signature):
+            continue
+        if _to_json_safe(candidate.get("custom_grid") or {}) != expected_custom_grid:
+            continue
+        if _to_json_safe(candidate.get("fixed_model_params") or {}) != expected_fixed_model_params:
+            continue
+        if _to_json_safe(candidate.get("fixed_smote_params") or {}) != expected_fixed_smote_params:
+            continue
+        if _to_json_safe(candidate.get("key_metadata") or {}) != expected_key_metadata:
             continue
         matched_key = str(cached_key)
         matched_payload = dict(candidate)
@@ -8532,6 +8899,7 @@ def _resolve_compatible_cached_tuning_artifact(
             "study_id": alias_payload.get("study_id"),
             "matched_legacy_tuning_key": str(matched_key),
             "resolution": "train_signature_legacy_match",
+            "stage": str(alias_payload.get("stage", artifact_stage)),
         }
     )
     return alias_payload
@@ -8556,12 +8924,18 @@ def _resolve_or_create_tuning_artifact(
     grid_limit: Optional[int],
     custom_grid: Optional[Dict[str, Sequence[Any]]],
     tuning_context: Optional[Dict[str, Any]] = None,
+    smote_rerank_info: Optional[Dict[str, Any]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     persist_progress: bool = True,
     allow_create: bool = True,
     resource_policy_overrides: Optional[Dict[str, Any]] = None,
+    artifact_stage: str = "window_tuning",
+    fixed_model_params: Optional[Dict[str, Any]] = None,
+    fixed_smote_params: Optional[Dict[str, Any]] = None,
+    smote_search_space: Optional[Dict[str, Sequence[Any]]] = None,
+    key_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    tuning_key = _build_global_tuning_key(
+    base_tuning_key = _build_global_tuning_key(
         model_name=model_name,
         balance_mode=balance_mode,
         feature_cols=feature_cols,
@@ -8576,6 +8950,11 @@ def _resolve_or_create_tuning_artifact(
         resource_policy_overrides=resource_policy_overrides,
         grid_limit=grid_limit,
         custom_grid=custom_grid,
+        key_metadata=key_metadata,
+    )
+    tuning_key = _stage_scoped_tuning_key(
+        base_tuning_key,
+        artifact_stage=artifact_stage,
     )
     tuning_filename = f"{tuning_key}.json"
     y_train = pd.to_numeric(train_df[target_col], errors="coerce").fillna(0).astype(int)
@@ -8588,11 +8967,16 @@ def _resolve_or_create_tuning_artifact(
         "status": str((manifest.get("tuning_index") or {}).get(tuning_key, {}).get("status", "pending")),
         "model_name": str(model_name),
         "balance_mode": str(balance_mode),
+        "stage": str(artifact_stage),
         "strategy_context": strategy_context,
     }
 
     cached = tuning_cache.get(tuning_key)
     if cached is not None:
+        cached = dict(cached)
+        cached.setdefault("selected_feature_cols", [str(col) for col in feature_cols])
+        if smote_rerank_info and not cached.get("smote_rerank_info"):
+            cached["smote_rerank_info"] = _to_json_safe(smote_rerank_info)
         manifest["tuning_index"][tuning_key].update(
             {
                 "filename": str(cached.get("_artifact_filename") or tuning_filename),
@@ -8613,8 +8997,17 @@ def _resolve_or_create_tuning_artifact(
         model_name=model_name,
         balance_mode=balance_mode,
         tuning_filename=tuning_filename,
+        artifact_stage=artifact_stage,
+        custom_grid=custom_grid,
+        fixed_model_params=fixed_model_params,
+        fixed_smote_params=fixed_smote_params,
+        key_metadata=key_metadata,
     )
     if compatible_cached is not None:
+        compatible_cached = dict(compatible_cached)
+        compatible_cached.setdefault("selected_feature_cols", [str(col) for col in feature_cols])
+        if smote_rerank_info and not compatible_cached.get("smote_rerank_info"):
+            compatible_cached["smote_rerank_info"] = _to_json_safe(smote_rerank_info)
         return compatible_cached
 
     if not allow_create:
@@ -8628,7 +9021,7 @@ def _resolve_or_create_tuning_artifact(
         _persist_manifest(paths["manifest"], manifest)
 
     X_tune, y_tune = _prepare_xy_raw(train_df, feature_cols, target_col)
-    tuning_study_id = f"{tuning_key}__window"
+    tuning_study_id = f"{tuning_key}__{_slugify_token(str(artifact_stage or 'window_tuning'))}"
     try:
         best_params, search_df, tuning_artifact = tune_hyperparameters(
             X_tune,
@@ -8644,6 +9037,9 @@ def _resolve_or_create_tuning_artifact(
             balance_mode=balance_mode,
             study_id=tuning_study_id,
             progress_callback=progress_callback,
+            fixed_model_params=fixed_model_params,
+            fixed_smote_params=fixed_smote_params,
+            smote_search_space=smote_search_space,
         )
     except Exception:
         manifest["tuning_index"][tuning_key]["status"] = "failed"
@@ -8653,7 +9049,7 @@ def _resolve_or_create_tuning_artifact(
     tuning_payload = {
         **dict(tuning_artifact),
         "tuning_key": tuning_key,
-        "stage": "window_tuning",
+        "stage": str(artifact_stage),
         "strategy_context": strategy_context,
         "model_name": str(model_name),
         "balance_mode": str(balance_mode),
@@ -8665,6 +9061,12 @@ def _resolve_or_create_tuning_artifact(
         "policy_signature": _recalibration_policy_signature(),
         "search_df": [] if search_df.empty else search_df.to_dict(orient="records"),
         "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "selected_feature_cols": [str(col) for col in feature_cols],
+        "smote_rerank_info": _to_json_safe(smote_rerank_info) if smote_rerank_info else None,
+        "custom_grid": _to_json_safe(custom_grid or {}),
+        "fixed_model_params": _to_json_safe(fixed_model_params) if fixed_model_params else None,
+        "fixed_smote_params": _to_json_safe(fixed_smote_params) if fixed_smote_params else None,
+        "key_metadata": _to_json_safe(key_metadata) if key_metadata else None,
     }
     if persist_progress:
         _persist_tuning_artifact(paths["tuning_dir"] / tuning_filename, tuning_payload)
@@ -8792,6 +9194,11 @@ def run_recalibration_experiments(
         feature_selection_context,
         feature_cols=feature_cols,
     )
+    smote_rerank_enabled = bool(normalized_feature_selection_context.get("smote_rerank_enabled", False))
+    resolved_candidate_feature_cols: Optional[List[str]] = None
+    raw_candidates = list(normalized_feature_selection_context.get("candidate_features") or [])
+    if raw_candidates and len(raw_candidates) > len(feature_cols):
+        resolved_candidate_feature_cols = [str(c) for c in raw_candidates]
     normalized_resource_mode = _normalize_experiment_resource_mode(resource_mode)
     normalized_resource_policy_overrides = _sanitize_experiment_resource_policy_overrides(
         normalized_resource_mode,
@@ -8832,8 +9239,14 @@ def run_recalibration_experiments(
         grid_limit=grid_limit,
         custom_grids=custom_grids,
     )
+    smote_post_rerank_tuning_tasks = _count_smote_post_rerank_tuning_tasks(
+        tuning_tasks,
+        feature_cols=feature_cols,
+        feature_selection_context=normalized_feature_selection_context,
+    )
+    total_tuning_task_units = int(len(tuning_tasks) + smote_post_rerank_tuning_tasks)
     total_block_units = len(experiment_blocks) * max(1, len(progress_seeds))
-    total_units = max(1, len(tuning_tasks) + total_block_units)
+    total_units = max(1, total_tuning_task_units + total_block_units)
     completed_units = 0.0
     live_status_path: Optional[Path] = None
     live_events_path: Optional[Path] = None
@@ -8888,6 +9301,476 @@ def run_recalibration_experiments(
             _append_recalibration_live_event(live_events_path, live_payload)
             last_live_event_signature["value"] = signature
 
+    smote_rerank_cache: Dict[str, Dict[str, Any]] = {}
+
+    def resolve_window_smote_anchor_spec(
+        train_df: pd.DataFrame,
+        *,
+        model_name: str,
+        balance_mode: str,
+        custom_grid: Optional[Dict[str, Sequence[Any]]],
+    ) -> Dict[str, Any]:
+        base_feature_cols = [str(col) for col in feature_cols]
+        if str(balance_mode) != BALANCE_MODE_SMOTE:
+            return {
+                "required": False,
+                "feature_cols": base_feature_cols,
+                "candidate_cols": [],
+                "rerank_requested": False,
+                "rerank_enabled": False,
+                "tuning_key": "",
+            }
+
+        rerank_requested = bool(smote_rerank_enabled)
+        candidate_cols: List[str] = []
+        if rerank_requested and resolved_candidate_feature_cols is not None:
+            candidate_cols = [
+                str(col)
+                for col in resolved_candidate_feature_cols
+                if str(col) in train_df.columns and str(col) != str(target_col)
+            ]
+        rerank_enabled = bool(rerank_requested and len(candidate_cols) > len(base_feature_cols))
+
+        tuning_key = _build_global_tuning_key(
+            model_name=model_name,
+            balance_mode=BALANCE_MODE_NONE,
+            feature_cols=base_feature_cols,
+            target_col=target_col,
+            time_col=time_col,
+            canonical_train_df=train_df,
+            validation_size=float(validation_size),
+            folds=int(folds),
+            random_state=int(random_state),
+            fast_mode=bool(fast_mode),
+            resource_mode=str(normalized_resource_mode),
+            resource_policy_overrides=normalized_resource_policy_overrides,
+            grid_limit=grid_limit,
+            custom_grid=custom_grid,
+        )
+        return {
+            "required": True,
+            "feature_cols": base_feature_cols,
+            "candidate_cols": candidate_cols,
+            "rerank_requested": rerank_requested,
+            "rerank_enabled": rerank_enabled,
+            "tuning_key": str(tuning_key),
+        }
+
+    def resolve_window_smote_pre_tuning_spec(
+        train_df: pd.DataFrame,
+        *,
+        model_name: str,
+        balance_mode: str,
+        custom_grid: Optional[Dict[str, Sequence[Any]]],
+    ) -> Dict[str, Any]:
+        anchor_spec = resolve_window_smote_anchor_spec(
+            train_df,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            custom_grid=custom_grid,
+        )
+        if not bool(anchor_spec.get("required")):
+            return {
+                **anchor_spec,
+                "smote_search_space": {},
+                "key_metadata": {},
+                "anchor_tuning_key": "",
+            }
+
+        smote_search_space = {
+            str(key): list(values)
+            for key, values in SMOTE_PRE_TUNING_SEARCH_SPACE.items()
+        }
+        key_metadata = {
+            "pre_tuning_mode": "smote_only",
+            "anchor_tuning_key": str(anchor_spec.get("tuning_key", "")),
+            "rerank_requested": bool(anchor_spec.get("rerank_requested", False)),
+            "rerank_enabled": bool(anchor_spec.get("rerank_enabled", False)),
+            "smote_search_space": smote_search_space,
+        }
+        base_tuning_key = _build_global_tuning_key(
+            model_name=model_name,
+            balance_mode=balance_mode,
+            feature_cols=list(anchor_spec.get("feature_cols") or feature_cols),
+            target_col=target_col,
+            time_col=time_col,
+            canonical_train_df=train_df,
+            validation_size=float(validation_size),
+            folds=int(folds),
+            random_state=int(random_state),
+            fast_mode=bool(fast_mode),
+            resource_mode=str(normalized_resource_mode),
+            resource_policy_overrides=normalized_resource_policy_overrides,
+            grid_limit=grid_limit,
+            custom_grid=smote_search_space,
+            key_metadata=key_metadata,
+        )
+        return {
+            **anchor_spec,
+            "smote_search_space": smote_search_space,
+            "key_metadata": key_metadata,
+            "anchor_tuning_key": str(anchor_spec.get("tuning_key", "")),
+            "tuning_key": _stage_scoped_tuning_key(
+                base_tuning_key,
+                artifact_stage="smote_pre_tuning",
+            ),
+        }
+
+    def resolve_window_smote_anchor_artifact(
+        train_df: pd.DataFrame,
+        *,
+        model_name: str,
+        balance_mode: str,
+        custom_grid: Optional[Dict[str, Sequence[Any]]],
+        strategy_context: Optional[Dict[str, Any]] = None,
+        allow_create: bool = True,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        anchor_spec = resolve_window_smote_anchor_spec(
+            train_df,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            custom_grid=custom_grid,
+        )
+        if not bool(anchor_spec.get("required")):
+            return None
+        return _resolve_or_create_tuning_artifact(
+            paths=paths,
+            manifest=manifest,
+            tuning_cache=tuning_cache,
+            train_df=train_df,
+            feature_cols=list(anchor_spec.get("feature_cols") or feature_cols),
+            target_col=target_col,
+            time_col=time_col,
+            model_name=model_name,
+            balance_mode=BALANCE_MODE_NONE,
+            validation_size=float(validation_size),
+            folds=int(folds),
+            random_state=int(random_state),
+            fast_mode=bool(fast_mode),
+            resource_mode=str(normalized_resource_mode),
+            resource_policy_overrides=normalized_resource_policy_overrides,
+            grid_limit=grid_limit,
+            custom_grid=custom_grid,
+            tuning_context=_to_json_safe(dict(strategy_context or {})),
+            progress_callback=progress_callback,
+            persist_progress=persist_progress,
+            allow_create=allow_create,
+            artifact_stage="window_tuning",
+        )
+
+    def resolve_window_smote_pre_tuning_artifact(
+        train_df: pd.DataFrame,
+        *,
+        model_name: str,
+        balance_mode: str,
+        custom_grid: Optional[Dict[str, Sequence[Any]]],
+        strategy_context: Optional[Dict[str, Any]] = None,
+        emit_detail: Optional[Callable[[str, str], None]] = None,
+        allow_create: bool = True,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        pre_tuning_spec = resolve_window_smote_pre_tuning_spec(
+            train_df,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            custom_grid=custom_grid,
+        )
+        if not bool(pre_tuning_spec.get("required")):
+            return None
+
+        candidate_cols = list(pre_tuning_spec.get("candidate_cols") or [])
+        rerank_enabled = bool(pre_tuning_spec.get("rerank_enabled", False))
+        if emit_detail is not None:
+            emit_detail(
+                "Pre-sintonizando SMOTE...",
+                (
+                    f"Modelo {model_name} | "
+                    f"{'rerank habilitado' if rerank_enabled else 'ranking original'} | "
+                    f"top {len(feature_cols)}"
+                ),
+            )
+
+        def remap_progress(
+            start_ratio: float,
+            end_ratio: float,
+            label_override: Optional[str] = None,
+        ) -> Optional[Callable[[Dict[str, Any]], None]]:
+            if progress_callback is None:
+                return None
+
+            def _forward(payload: Dict[str, Any]) -> None:
+                raw_ratio = max(0.0, min(float(payload.get("ratio", 0.0)), 1.0))
+                adjusted_payload = dict(payload)
+                adjusted_payload["ratio"] = float(
+                    start_ratio + (end_ratio - start_ratio) * raw_ratio
+                )
+                if label_override:
+                    adjusted_payload["label"] = str(label_override)
+                progress_callback(adjusted_payload)
+
+            return _forward
+
+        anchor_artifact = resolve_window_smote_anchor_artifact(
+            train_df,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            custom_grid=custom_grid,
+            strategy_context=strategy_context,
+            allow_create=allow_create,
+            progress_callback=remap_progress(
+                0.0,
+                0.45,
+                "Sintonizando modelo base para pre-tuning SMOTE...",
+            ),
+        )
+        anchor_model_params = dict((anchor_artifact or {}).get("model_params") or {})
+        if not anchor_model_params:
+            anchor_best_params = dict((anchor_artifact or {}).get("best_params") or {})
+            anchor_model_params = _split_model_and_smote_params(
+                anchor_best_params,
+                balance_mode=BALANCE_MODE_NONE,
+            )[0]
+
+        pre_tuning_context = {
+            **dict(strategy_context or {}),
+            "stage": "smote_pre_tuning",
+            "anchor_tuning_key": str(pre_tuning_spec.get("anchor_tuning_key", "")),
+            "pre_tuning_mode": "smote_only",
+        }
+        return _resolve_or_create_tuning_artifact(
+            paths=paths,
+            manifest=manifest,
+            tuning_cache=tuning_cache,
+            train_df=train_df,
+            feature_cols=list(pre_tuning_spec.get("feature_cols") or feature_cols),
+            target_col=target_col,
+            time_col=time_col,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            validation_size=float(validation_size),
+            folds=int(folds),
+            random_state=int(random_state),
+            fast_mode=bool(fast_mode),
+            resource_mode=str(normalized_resource_mode),
+            resource_policy_overrides=normalized_resource_policy_overrides,
+            grid_limit=grid_limit,
+            custom_grid=dict(pre_tuning_spec.get("smote_search_space") or {}),
+            tuning_context=pre_tuning_context,
+            progress_callback=remap_progress(
+                0.45,
+                1.0,
+                "Pre-sintonizando SMOTE...",
+            ),
+            persist_progress=persist_progress,
+            allow_create=allow_create,
+            artifact_stage="smote_pre_tuning",
+            fixed_model_params=anchor_model_params,
+            smote_search_space=dict(pre_tuning_spec.get("smote_search_space") or {}),
+            key_metadata=dict(pre_tuning_spec.get("key_metadata") or {}),
+        )
+
+    def resolve_window_feature_spec(
+        train_df: pd.DataFrame,
+        *,
+        model_name: str,
+        balance_mode: str,
+        custom_grid: Optional[Dict[str, Sequence[Any]]],
+        strategy_context: Optional[Dict[str, Any]] = None,
+        emit_detail: Optional[Callable[[str, str], None]] = None,
+        smote_pre_tuning_artifact: Optional[Dict[str, Any]] = None,
+        allow_pre_tuning_create: bool = True,
+    ) -> Dict[str, Any]:
+        effective_feature_cols = [str(col) for col in feature_cols]
+        rerank_info: Dict[str, Any] = {"applied": False}
+        pre_tuning_spec = resolve_window_smote_pre_tuning_spec(
+            train_df,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            custom_grid=custom_grid,
+        )
+        if not bool(pre_tuning_spec.get("required")):
+            return {
+                "feature_cols": effective_feature_cols,
+                "smote_rerank_info": rerank_info,
+                "smote_pre_tuning_key": "",
+                "fixed_smote_params": {},
+            }
+
+        candidate_cols = list(pre_tuning_spec.get("candidate_cols") or [])
+        pre_tuning_artifact = (
+            None
+            if smote_pre_tuning_artifact is None
+            else dict(smote_pre_tuning_artifact)
+        )
+        if pre_tuning_artifact is None:
+            pre_tuning_artifact = resolve_window_smote_pre_tuning_artifact(
+                train_df,
+                model_name=model_name,
+                balance_mode=balance_mode,
+                custom_grid=custom_grid,
+                strategy_context=strategy_context,
+                emit_detail=emit_detail,
+                allow_create=allow_pre_tuning_create,
+                progress_callback=None,
+            )
+        smote_params = _artifact_smote_params(pre_tuning_artifact)
+        rerank_enabled = bool(pre_tuning_spec.get("rerank_enabled", False))
+        rerank_requested = bool(pre_tuning_spec.get("rerank_requested", False))
+
+        if not rerank_enabled:
+            rerank_info = {
+                "applied": False,
+                "reason": "disabled" if not rerank_requested else "candidate_pool_not_wider",
+                "model_name": str(model_name),
+                "balance_mode": str(balance_mode),
+                "original_features": list(effective_feature_cols),
+                "candidate_pool_size": int(len(candidate_cols)),
+                "top_n": int(len(effective_feature_cols)),
+                "smote_params_used": dict(smote_params),
+                "smote_pre_tuning_key": str(pre_tuning_spec.get("tuning_key", "")),
+                "smote_pre_tuning_study_id": str((pre_tuning_artifact or {}).get("study_id", "")),
+            }
+            return {
+                "feature_cols": effective_feature_cols,
+                "smote_rerank_info": rerank_info,
+                "smote_pre_tuning_key": str(pre_tuning_spec.get("tuning_key", "")),
+                "fixed_smote_params": dict(smote_params),
+            }
+
+        cache_signature_cols = [col for col in [time_col, target_col] + candidate_cols if col in train_df.columns]
+        cache_key = json.dumps(
+            {
+                "model_name": str(model_name),
+                "balance_mode": str(balance_mode),
+                "top_n": int(len(effective_feature_cols)),
+                "random_state": int(random_state),
+                "candidate_cols": candidate_cols,
+                "smote_params": smote_params,
+                "smote_pre_tuning_key": str(pre_tuning_spec.get("tuning_key", "")),
+                "train_signature": _frame_signature(
+                    train_df,
+                    columns=cache_signature_cols,
+                    include_index=True,
+                ),
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+        cached = smote_rerank_cache.get(cache_key)
+        if cached is not None:
+            return {
+                "feature_cols": list(cached.get("feature_cols") or effective_feature_cols),
+                "smote_rerank_info": dict(cached.get("smote_rerank_info") or rerank_info),
+                "smote_pre_tuning_key": str(cached.get("smote_pre_tuning_key", pre_tuning_spec.get("tuning_key", ""))),
+                "fixed_smote_params": dict(cached.get("fixed_smote_params") or smote_params),
+            }
+
+        if emit_detail is not None:
+            emit_detail(
+                "Recalculando ranking con SMOTE pre-sintonizado...",
+                (
+                    f"Modelo {model_name} | candidatas {len(candidate_cols)} | "
+                    f"top {len(effective_feature_cols)}"
+                ),
+            )
+
+        reranked_features, rerank_importance_df = _rerank_features_after_smote(
+            train_df,
+            candidate_feature_cols=candidate_cols,
+            target_col=target_col,
+            top_n=len(effective_feature_cols),
+            random_state=int(random_state),
+            sampling_strategy=float(smote_params.get("sampling_strategy", 1.0)),
+            k_neighbors=int(smote_params.get("k_neighbors", 5)),
+        )
+        if reranked_features:
+            rerank_info = {
+                "applied": True,
+                "model_name": str(model_name),
+                "balance_mode": str(balance_mode),
+                "original_features": list(effective_feature_cols),
+                "reranked_features": list(reranked_features),
+                "candidate_pool_size": int(len(candidate_cols)),
+                "top_n": int(len(effective_feature_cols)),
+                "smote_params_used": dict(smote_params),
+                "smote_pre_tuning_key": str(pre_tuning_spec.get("tuning_key", "")),
+                "smote_pre_tuning_study_id": str((pre_tuning_artifact or {}).get("study_id", "")),
+                "importance_df": (
+                    rerank_importance_df.to_dict(orient="records")
+                    if not rerank_importance_df.empty
+                    else []
+                ),
+            }
+            effective_feature_cols = [str(col) for col in reranked_features]
+
+        payload = {
+            "feature_cols": list(effective_feature_cols),
+            "smote_rerank_info": dict(rerank_info),
+            "smote_pre_tuning_key": str(pre_tuning_spec.get("tuning_key", "")),
+            "fixed_smote_params": dict(smote_params),
+        }
+        smote_rerank_cache[cache_key] = payload
+        return {
+            "feature_cols": list(payload["feature_cols"]),
+            "smote_rerank_info": dict(payload["smote_rerank_info"]),
+            "smote_pre_tuning_key": str(payload["smote_pre_tuning_key"]),
+            "fixed_smote_params": dict(payload["fixed_smote_params"]),
+        }
+
+    def resolve_window_tuning_spec(
+        train_df: pd.DataFrame,
+        *,
+        model_name: str,
+        balance_mode: str,
+        custom_grid: Optional[Dict[str, Sequence[Any]]],
+        strategy_context: Optional[Dict[str, Any]] = None,
+        emit_detail: Optional[Callable[[str, str], None]] = None,
+        smote_pre_tuning_artifact: Optional[Dict[str, Any]] = None,
+        allow_pre_tuning_create: bool = True,
+        ) -> Dict[str, Any]:
+        feature_spec = resolve_window_feature_spec(
+            train_df,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            custom_grid=custom_grid,
+            strategy_context=strategy_context,
+            emit_detail=emit_detail,
+            smote_pre_tuning_artifact=smote_pre_tuning_artifact,
+            allow_pre_tuning_create=allow_pre_tuning_create,
+        )
+        effective_feature_cols = list(feature_spec.get("feature_cols") or feature_cols)
+        fixed_smote_params = dict(feature_spec.get("fixed_smote_params") or {})
+        tuning_key_metadata = {
+            "smote_pre_tuning_key": str(feature_spec.get("smote_pre_tuning_key", "")),
+            "fixed_smote_params": fixed_smote_params,
+        } if fixed_smote_params else None
+        tuning_key = _build_global_tuning_key(
+            model_name=model_name,
+            balance_mode=balance_mode,
+            feature_cols=effective_feature_cols,
+            target_col=target_col,
+            time_col=time_col,
+            canonical_train_df=train_df,
+            validation_size=float(validation_size),
+            folds=int(folds),
+            random_state=int(random_state),
+            fast_mode=bool(fast_mode),
+            resource_mode=str(normalized_resource_mode),
+            resource_policy_overrides=normalized_resource_policy_overrides,
+            grid_limit=grid_limit,
+            custom_grid=custom_grid,
+            key_metadata=tuning_key_metadata,
+        )
+        return {
+            "feature_cols": effective_feature_cols,
+            "tuning_key": str(tuning_key),
+            "smote_rerank_info": dict(feature_spec.get("smote_rerank_info") or {"applied": False}),
+            "smote_pre_tuning_key": str(feature_spec.get("smote_pre_tuning_key", "")),
+            "fixed_smote_params": fixed_smote_params,
+            "key_metadata": dict(tuning_key_metadata or {}),
+        }
+
     all_rows: List[pd.DataFrame] = []
     all_roc: List[Dict[str, Any]] = []
     adaptive_frames: List[pd.DataFrame] = []
@@ -8896,13 +9779,13 @@ def run_recalibration_experiments(
     if progress_callback is not None:
         preparation_label = "Preparando experimentos..."
         preparation_detail = (
-            f"Plan preliminar: {len(tuning_tasks)} tareas de tuning y "
+            f"Plan preliminar: {total_tuning_task_units} tareas de tuning y "
             f"{total_block_units} bloques experimentales."
         )
         if recompute_blocks_from_checkpoint:
             preparation_label = "Preparando recompute desde checkpoint..."
             preparation_detail = (
-                f"Plan reconstruido: {len(tuning_tasks)} tunings esperados y "
+                f"Plan reconstruido: {total_tuning_task_units} tunings esperados y "
                 f"{total_block_units} bloques. Solo se validarán artefactos persistidos."
             )
         progress_callback(
@@ -8933,6 +9816,7 @@ def run_recalibration_experiments(
         random_state=int(random_state),
         fast_mode=bool(fast_mode),
         custom_grids=custom_grids,
+        feature_selection_context=normalized_feature_selection_context,
     )
     if progress_callback is not None:
         resolve_checkpoint_label = "Resolviendo checkpoint compatible..."
@@ -8994,7 +9878,8 @@ def run_recalibration_experiments(
         "time_col": str(time_col),
         "input_rows": int(len(df)),
         "total_progress_units": int(total_units),
-        "total_tuning_tasks": int(len(tuning_tasks)),
+        "total_tuning_tasks": int(total_tuning_task_units),
+        "smote_post_rerank_tuning_tasks": int(smote_post_rerank_tuning_tasks),
         "total_block_units": int(total_block_units),
         "feature_selection_context": normalized_feature_selection_context,
         "preflight": preflight,
@@ -9073,6 +9958,7 @@ def run_recalibration_experiments(
             experiment_blocks=experiment_blocks,
             tuning_tasks=tuning_tasks,
             preflight=preflight,
+            total_tuning_tasks=int(total_tuning_task_units),
         )
     if persist_progress:
         _persist_manifest(paths["manifest"], manifest)
@@ -9104,28 +9990,89 @@ def run_recalibration_experiments(
     if recompute_blocks_from_checkpoint:
         missing_tuning_tasks: List[Dict[str, Any]] = []
         for task in tuning_tasks:
-            tuning_key = str(task.get("tuning_key", ""))
-            if tuning_key in tuning_cache:
-                continue
             train_df = _materialize_tuning_train_df(
                 df,
                 time_col=time_col,
                 task=task,
             )
+            task_custom_grid = (custom_grids or {}).get(str(task.get("model_name", "")))
+            pre_tuning_artifact: Optional[Dict[str, Any]] = None
+            pre_tuning_spec = resolve_window_smote_pre_tuning_spec(
+                train_df,
+                model_name=str(task.get("model_name", "")),
+                balance_mode=str(task.get("balance_mode", "")),
+                custom_grid=task_custom_grid,
+            )
+            if bool(pre_tuning_spec.get("required")):
+                pre_tuning_key = str(pre_tuning_spec.get("tuning_key", ""))
+                if pre_tuning_key in tuning_cache:
+                    pre_tuning_artifact = tuning_cache[pre_tuning_key]
+                else:
+                    pre_compatible_cached = _resolve_compatible_cached_tuning_artifact(
+                        manifest=manifest,
+                        tuning_cache=tuning_cache,
+                        tuning_key=pre_tuning_key,
+                        train_df=train_df,
+                        feature_cols=list(pre_tuning_spec.get("feature_cols") or feature_cols),
+                        target_col=target_col,
+                        time_col=time_col,
+                        model_name=str(task.get("model_name", "")),
+                        balance_mode=str(task.get("balance_mode", "")),
+                        tuning_filename=f"{pre_tuning_key}.json",
+                        artifact_stage="smote_pre_tuning",
+                        custom_grid=dict(pre_tuning_spec.get("smote_search_space") or {}),
+                        fixed_model_params=None,
+                        fixed_smote_params=None,
+                        key_metadata=dict(pre_tuning_spec.get("key_metadata") or {}),
+                    )
+                    if pre_compatible_cached is None:
+                        missing_tuning_tasks.append(
+                            {
+                                **dict(task),
+                                "tuning_key": pre_tuning_key,
+                                "selected_feature_cols": list(pre_tuning_spec.get("feature_cols") or feature_cols),
+                                "stage": "smote_pre_tuning",
+                            }
+                        )
+                        continue
+                    pre_tuning_artifact = pre_compatible_cached
+            tuning_spec = resolve_window_tuning_spec(
+                train_df,
+                model_name=str(task.get("model_name", "")),
+                balance_mode=str(task.get("balance_mode", "")),
+                custom_grid=task_custom_grid,
+                strategy_context=dict(task.get("strategy_context") or {}),
+                smote_pre_tuning_artifact=pre_tuning_artifact,
+                allow_pre_tuning_create=False,
+            )
+            tuning_key = str(tuning_spec.get("tuning_key", ""))
+            effective_feature_cols = list(tuning_spec.get("feature_cols") or feature_cols)
+            if tuning_key in tuning_cache:
+                continue
             compatible_cached = _resolve_compatible_cached_tuning_artifact(
                 manifest=manifest,
                 tuning_cache=tuning_cache,
                 tuning_key=tuning_key,
                 train_df=train_df,
-                feature_cols=feature_cols,
+                feature_cols=effective_feature_cols,
                 target_col=target_col,
                 time_col=time_col,
                 model_name=str(task.get("model_name", "")),
                 balance_mode=str(task.get("balance_mode", "")),
                 tuning_filename=f"{tuning_key}.json",
+                custom_grid=task_custom_grid,
+                fixed_model_params=None,
+                fixed_smote_params=dict(tuning_spec.get("fixed_smote_params") or {}),
+                key_metadata=dict(tuning_spec.get("key_metadata") or {}),
             )
             if compatible_cached is None:
-                missing_tuning_tasks.append(dict(task))
+                missing_tuning_tasks.append(
+                    {
+                        **dict(task),
+                        "tuning_key": tuning_key,
+                        "selected_feature_cols": effective_feature_cols,
+                    }
+                )
         if missing_tuning_tasks:
             first_missing = missing_tuning_tasks[0]
             missing_error = RuntimeError(
@@ -9244,15 +10191,224 @@ def run_recalibration_experiments(
     for task_idx, task in enumerate(tuning_tasks, start=1):
         model_name = str(task["model_name"])
         balance_mode = str(task["balance_mode"])
-        tuning_key = str(task["tuning_key"])
-        if reuse_tuning_cache and tuning_key in tuning_cache:
-            continue
+        task_custom_grid = (custom_grids or {}).get(model_name)
 
         train_df = _materialize_tuning_train_df(
             df,
             time_col=time_col,
             task=task,
         )
+        pre_tuning_artifact: Optional[Dict[str, Any]] = None
+        pre_tuning_spec = resolve_window_smote_pre_tuning_spec(
+            train_df,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            custom_grid=task_custom_grid,
+        )
+        pre_tuning_key = str(pre_tuning_spec.get("tuning_key", ""))
+        if bool(pre_tuning_spec.get("required")):
+            if reuse_tuning_cache and pre_tuning_key in tuning_cache:
+                pre_tuning_artifact = tuning_cache[pre_tuning_key]
+            else:
+                pre_rss_before = _current_rss_mb()
+                _append_execution_log(
+                    manifest.get("global_execution_log"),
+                    phase="smote_pre_tuning_start",
+                    status="started",
+                    message="Starting SMOTE pre-tuning before final feature selection.",
+                    tuning_key=pre_tuning_key,
+                    model=model_name,
+                    balance_mode=balance_mode,
+                    task_index=int(task_idx),
+                    total_tasks=int(total_tuning_task_units),
+                    run_id=run_id,
+                    training_years=task.get("training_years"),
+                    strategy_context=task.get("strategy_context"),
+                    rss_before_mb=pre_rss_before,
+                )
+                try:
+                    emit_progress(
+                        label="Pre-sintonizando SMOTE...",
+                        detail=(
+                            f"Modelo {model_name} | Balance {balance_mode} | "
+                            f"ventana {task_idx} / {len(tuning_tasks)} | {str(task.get('training_year_label', '') or task.get('window_kind', 'window'))}"
+                        ),
+                        completed_override=completed_units,
+                        context={
+                            "phase": "smote_pre_tuning",
+                            "model": model_name,
+                            "balance_mode": balance_mode,
+                            "task_index": int(task_idx),
+                            "total_tasks": int(total_tuning_task_units),
+                            "tuning_key": pre_tuning_key,
+                            "window_kind": str(task.get("window_kind", "")),
+                            "training_years": task.get("training_years"),
+                            "prediction_year": task.get("prediction_year"),
+                        },
+                    )
+                    pre_tuning_artifact = resolve_window_smote_pre_tuning_artifact(
+                        train_df,
+                        model_name=model_name,
+                        balance_mode=balance_mode,
+                        custom_grid=task_custom_grid,
+                        strategy_context=dict(task.get("strategy_context") or {}),
+                        emit_detail=(
+                            lambda label, detail, _model=model_name, _balance=balance_mode: emit_progress(
+                                label=label,
+                                detail=f"Modelo {_model} | Balance {_balance} | {detail}".strip(" |"),
+                                completed_override=completed_units,
+                                context={
+                                    "phase": "smote_pre_tuning",
+                                    "model": _model,
+                                    "balance_mode": _balance,
+                                    "task_index": int(task_idx),
+                                    "total_tasks": int(total_tuning_task_units),
+                                    "tuning_key": pre_tuning_key,
+                                    "window_kind": str(task.get("window_kind", "")),
+                                    "training_years": task.get("training_years"),
+                                    "prediction_year": task.get("prediction_year"),
+                                },
+                            )
+                        ),
+                        allow_create=not recompute_blocks_from_checkpoint,
+                        progress_callback=(
+                            None
+                            if progress_callback is None and not persist_progress
+                            else lambda payload, _base=completed_units: emit_progress(
+                                label=str(payload.get("label", "Pre-sintonizando SMOTE...")),
+                                detail=f"Modelo {model_name} | Balance {balance_mode} | {str(payload.get('detail', '') or '')}".strip(" |"),
+                                completed_override=_base + max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
+                                context={
+                                    "phase": "smote_pre_tuning",
+                                    "model": model_name,
+                                    "balance_mode": balance_mode,
+                                    "task_index": int(task_idx),
+                                    "total_tasks": int(total_tuning_task_units),
+                                    "tuning_key": pre_tuning_key,
+                                    "tuning_ratio": max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
+                                    "window_kind": str(task.get("window_kind", "")),
+                                    "training_years": task.get("training_years"),
+                                    "prediction_year": task.get("prediction_year"),
+                                },
+                            )
+                        ),
+                    )
+                    pre_rss_after = _cleanup_recalibration_memory()
+                    _update_memory_summary(
+                        manifest,
+                        phase="smote_pre_tuning_complete",
+                        rss_before_mb=pre_rss_before,
+                        rss_after_mb=pre_rss_after,
+                    )
+                    _append_execution_log(
+                        manifest.get("global_execution_log"),
+                        phase="smote_pre_tuning_complete",
+                        status="ok",
+                        message="Completed SMOTE pre-tuning before final feature selection.",
+                        tuning_key=pre_tuning_key,
+                        model=model_name,
+                        balance_mode=balance_mode,
+                        study_id=(pre_tuning_artifact or {}).get("study_id"),
+                        best_params=(pre_tuning_artifact or {}).get("best_params"),
+                        best_value=(pre_tuning_artifact or {}).get("best_value"),
+                        training_years=task.get("training_years"),
+                        prediction_year=task.get("prediction_year"),
+                        rss_after_mb=pre_rss_after,
+                    )
+                    completed_units += 1.0
+                    pending_block_ids = [spec["block_id"] for spec in block_specs if spec["block_id"] not in terminal_block_ids]
+                    _update_manifest_progress(
+                        manifest,
+                        completed_units=completed_units,
+                        pending_block_ids=pending_block_ids,
+                    )
+                    if persist_progress:
+                        _persist_manifest(paths["manifest"], manifest)
+                    emit_progress(
+                        label="Pre-tuning SMOTE completado.",
+                        detail=f"Modelo {model_name} | Balance {balance_mode} | {completed_units:.2f} / {total_units} unidades",
+                        completed_override=completed_units,
+                        context={
+                            "phase": "smote_pre_tuning_complete",
+                            "model": model_name,
+                            "balance_mode": balance_mode,
+                            "task_index": int(task_idx),
+                            "total_tasks": int(total_tuning_task_units),
+                            "study_id": (pre_tuning_artifact or {}).get("study_id"),
+                            "best_value": (pre_tuning_artifact or {}).get("best_value"),
+                            "tuning_key": pre_tuning_key,
+                            "window_kind": str(task.get("window_kind", "")),
+                            "training_years": task.get("training_years"),
+                            "prediction_year": task.get("prediction_year"),
+                        },
+                    )
+                except Exception as exc:
+                    pre_rss_after = _cleanup_recalibration_memory()
+                    _update_memory_summary(
+                        manifest,
+                        phase="smote_pre_tuning_error",
+                        rss_before_mb=pre_rss_before,
+                        rss_after_mb=pre_rss_after,
+                    )
+                    manifest["status"] = "failed"
+                    manifest["failed_block_id"] = None
+                    manifest["last_error"] = {
+                        "phase": "smote_pre_tuning",
+                        "model": model_name,
+                        "balance_mode": balance_mode,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(limit=10),
+                    }
+                    _append_execution_log(
+                        manifest.get("global_execution_log"),
+                        phase="smote_pre_tuning_error",
+                        status="error",
+                        message="SMOTE pre-tuning failed before final feature selection.",
+                        tuning_key=pre_tuning_key,
+                        model=model_name,
+                        balance_mode=balance_mode,
+                        task_index=int(task_idx),
+                        total_tasks=int(total_tuning_task_units),
+                        error=str(exc),
+                        training_years=task.get("training_years"),
+                        prediction_year=task.get("prediction_year"),
+                        rss_after_mb=pre_rss_after,
+                    )
+                    if persist_progress:
+                        _persist_manifest(paths["manifest"], manifest)
+                    raise
+        tuning_spec = resolve_window_tuning_spec(
+            train_df,
+            model_name=model_name,
+            balance_mode=balance_mode,
+            custom_grid=task_custom_grid,
+            strategy_context=dict(task.get("strategy_context") or {}),
+            emit_detail=(
+                lambda label, detail, _model=model_name, _balance=balance_mode: emit_progress(
+                    label=label,
+                    detail=f"Modelo {_model} | Balance {_balance} | {detail}".strip(" |"),
+                    completed_override=completed_units,
+                    context={
+                        "phase": "window_rerank",
+                        "model": _model,
+                        "balance_mode": _balance,
+                        "task_index": int(task_idx),
+                        "total_tasks": int(total_tuning_task_units),
+                        "window_kind": str(task.get("window_kind", "")),
+                        "training_years": task.get("training_years"),
+                        "prediction_year": task.get("prediction_year"),
+                    },
+                )
+            ),
+            smote_pre_tuning_artifact=pre_tuning_artifact,
+        )
+        tuning_key = str(tuning_spec.get("tuning_key", ""))
+        effective_feature_cols = list(tuning_spec.get("feature_cols") or feature_cols)
+        task_rerank_info = dict(tuning_spec.get("smote_rerank_info") or {"applied": False})
+        task_fixed_smote_params = dict(tuning_spec.get("fixed_smote_params") or {})
+        task_key_metadata = dict(tuning_spec.get("key_metadata") or {})
+        if reuse_tuning_cache and tuning_key in tuning_cache:
+            continue
         rss_before = _current_rss_mb()
         _append_execution_log(
             manifest.get("global_execution_log"),
@@ -9263,7 +10419,7 @@ def run_recalibration_experiments(
             model=model_name,
             balance_mode=balance_mode,
             task_index=int(task_idx),
-            total_tasks=int(len(tuning_tasks)),
+            total_tasks=int(total_tuning_task_units),
             run_id=run_id,
             training_years=task.get("training_years"),
             strategy_context=task.get("strategy_context"),
@@ -9282,7 +10438,7 @@ def run_recalibration_experiments(
                     "model": model_name,
                     "balance_mode": balance_mode,
                     "task_index": int(task_idx),
-                    "total_tasks": int(len(tuning_tasks)),
+                    "total_tasks": int(total_tuning_task_units),
                     "tuning_key": tuning_key,
                     "window_kind": str(task.get("window_kind", "")),
                     "training_years": task.get("training_years"),
@@ -9294,7 +10450,7 @@ def run_recalibration_experiments(
                 manifest=manifest,
                 tuning_cache=tuning_cache,
                 train_df=train_df,
-                feature_cols=feature_cols,
+                feature_cols=effective_feature_cols,
                 target_col=target_col,
                 time_col=time_col,
                 model_name=model_name,
@@ -9306,8 +10462,11 @@ def run_recalibration_experiments(
                 resource_mode=str(normalized_resource_mode),
                 resource_policy_overrides=normalized_resource_policy_overrides,
                 grid_limit=grid_limit,
-                custom_grid=(custom_grids or {}).get(model_name),
+                custom_grid=task_custom_grid,
                 tuning_context=dict(task.get("strategy_context") or {}),
+                smote_rerank_info=task_rerank_info,
+                fixed_smote_params=task_fixed_smote_params,
+                key_metadata=task_key_metadata,
                 progress_callback=(
                     None
                     if progress_callback is None and not persist_progress
@@ -9320,7 +10479,7 @@ def run_recalibration_experiments(
                             "model": model_name,
                             "balance_mode": balance_mode,
                             "task_index": int(task_idx),
-                            "total_tasks": int(len(tuning_tasks)),
+                            "total_tasks": int(total_tuning_task_units),
                             "tuning_key": tuning_key,
                             "tuning_ratio": max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
                             "window_kind": str(task.get("window_kind", "")),
@@ -9404,7 +10563,7 @@ def run_recalibration_experiments(
                     "model": model_name,
                     "balance_mode": balance_mode,
                     "task_index": int(task_idx),
-                    "total_tasks": int(len(tuning_tasks)),
+                    "total_tasks": int(total_tuning_task_units),
                     "study_id": tuning_artifact.get("study_id"),
                     "best_value": tuning_artifact.get("best_value"),
                     "tuning_key": tuning_key,
@@ -9452,7 +10611,7 @@ def run_recalibration_experiments(
                     "model": model_name,
                     "balance_mode": balance_mode,
                     "task_index": int(task_idx),
-                    "total_tasks": int(len(tuning_tasks)),
+                    "total_tasks": int(total_tuning_task_units),
                     "tuning_key": tuning_key,
                 },
             )
@@ -9544,9 +10703,8 @@ def run_recalibration_experiments(
         )
 
         tuning_refs: List[str] = []
-        work_for_tuning = df.copy()
-        work_for_tuning[time_col] = pd.to_datetime(work_for_tuning[time_col], errors="coerce")
-        work_for_tuning = work_for_tuning.dropna(subset=[time_col]).reset_index(drop=True)
+        block_smote_rerank_info: Dict[str, Any] = {"applied": False}
+        work_for_tuning = _sort_frame_by_time(df, time_col)
 
         def resolve_block_tuning_artifact(
             *,
@@ -9555,14 +10713,74 @@ def run_recalibration_experiments(
             model_name: Optional[str] = None,
             balance_mode: Optional[str] = None,
         ) -> Dict[str, Any]:
+            nonlocal block_smote_rerank_info
             effective_model_name = str(model_name or block.get("model") or "")
             effective_balance_mode = str(balance_mode or block.get("balance_mode") or BALANCE_MODE_NOT_APPLICABLE)
+            task_custom_grid = (custom_grids or {}).get(effective_model_name)
+            pre_tuning_artifact = resolve_window_smote_pre_tuning_artifact(
+                train_df,
+                model_name=effective_model_name,
+                balance_mode=effective_balance_mode,
+                custom_grid=task_custom_grid,
+                strategy_context=strategy_context,
+                emit_detail=(
+                    None
+                    if progress_callback is None and not persist_progress
+                    else lambda label, detail: block_progress(
+                        {
+                            "ratio": 0.01,
+                            "label": label,
+                            "detail": detail,
+                        }
+                    )
+                ),
+                allow_create=not recompute_blocks_from_checkpoint,
+                progress_callback=(
+                    None
+                    if progress_callback is None and not persist_progress
+                    else lambda payload: block_progress(
+                        {
+                            "ratio": 0.01 + 0.09 * max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
+                            "label": str(payload.get("label", "Pre-sintonizando SMOTE...")),
+                            "detail": str(payload.get("detail", "")),
+                        }
+                    )
+                ),
+            )
+            tuning_spec = resolve_window_tuning_spec(
+                train_df,
+                model_name=effective_model_name,
+                balance_mode=effective_balance_mode,
+                custom_grid=task_custom_grid,
+                strategy_context=strategy_context,
+                emit_detail=(
+                    None
+                    if progress_callback is None and not persist_progress
+                    else lambda label, detail: block_progress(
+                        {
+                            "ratio": 0.10,
+                            "label": label,
+                            "detail": detail,
+                        }
+                    )
+                ),
+                smote_pre_tuning_artifact=pre_tuning_artifact,
+            )
+            effective_feature_cols = list(tuning_spec.get("feature_cols") or feature_cols)
+            rerank_info = dict(tuning_spec.get("smote_rerank_info") or {"applied": False})
+            fixed_smote_params = dict(tuning_spec.get("fixed_smote_params") or {})
+            tuning_key_metadata = dict(tuning_spec.get("key_metadata") or {})
+            if not bool(block_smote_rerank_info.get("applied")) and bool(rerank_info.get("applied")):
+                block_smote_rerank_info = dict(rerank_info)
+            pre_tuning_key = str(tuning_spec.get("smote_pre_tuning_key", ""))
+            if pre_tuning_key and pre_tuning_key not in tuning_refs:
+                tuning_refs.append(pre_tuning_key)
             artifact = _resolve_or_create_tuning_artifact(
                 paths=paths,
                 manifest=manifest,
                 tuning_cache=tuning_cache,
                 train_df=train_df,
-                feature_cols=feature_cols,
+                feature_cols=effective_feature_cols,
                 target_col=target_col,
                 time_col=time_col,
                 model_name=effective_model_name,
@@ -9574,8 +10792,22 @@ def run_recalibration_experiments(
                 resource_mode=str(normalized_resource_mode),
                 resource_policy_overrides=normalized_resource_policy_overrides,
                 grid_limit=grid_limit,
-                custom_grid=(custom_grids or {}).get(effective_model_name),
+                custom_grid=task_custom_grid,
                 tuning_context=strategy_context,
+                smote_rerank_info=rerank_info,
+                fixed_smote_params=fixed_smote_params,
+                key_metadata=tuning_key_metadata,
+                progress_callback=(
+                    None
+                    if progress_callback is None and not persist_progress
+                    else lambda payload: block_progress(
+                        {
+                            "ratio": 0.20 + 0.18 * max(0.0, min(float(payload.get("ratio", 0.0)), 1.0)),
+                            "label": str(payload.get("label", "Sintonizando hiperparametros...")),
+                            "detail": str(payload.get("detail", "")),
+                        }
+                    )
+                ),
                 persist_progress=persist_progress,
                 allow_create=not recompute_blocks_from_checkpoint,
             )
@@ -9675,6 +10907,7 @@ def run_recalibration_experiments(
                     run_id=run_id,
                     smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
                     smote_cache_registry=smote_registry_block,
+
                     progress_callback=block_progress,
                 )
             elif strategy == ADAPTIVE_ADWIN_STRATEGY:
@@ -9705,6 +10938,7 @@ def run_recalibration_experiments(
                     run_id=run_id,
                     smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
                     smote_cache_registry=smote_registry_block,
+
                     progress_callback=block_progress,
                 )
             elif strategy == ADAPTIVE_ARF_STRATEGY:
@@ -9752,6 +10986,7 @@ def run_recalibration_experiments(
                     run_id=run_id,
                     smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
                     smote_cache_registry=smote_registry_block,
+
                     progress_callback=block_progress,
                 )
             else:
@@ -9799,6 +11034,7 @@ def run_recalibration_experiments(
                 execution_log=block_execution_log,
                 tuning_refs=tuning_refs,
                 smote_refs=sorted(smote_registry_block.keys()),
+                smote_rerank_info=block_smote_rerank_info,
             )
             if persist_progress:
                 _persist_recalibration_block(paths["blocks_dir"] / f"{block_id}.json", block_payload)
@@ -13634,6 +14870,7 @@ def _render_experiments_tab() -> None:
                 random_state=int(random_state),
                 fast_mode=bool(fast_mode),
                 custom_grids=custom_grids,
+                feature_selection_context=feature_selection_context,
             )
         except Exception:
             preflight_payload = None

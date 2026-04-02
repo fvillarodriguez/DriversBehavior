@@ -2,8 +2,97 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import src.experiments_live_app as live_app
+
+
+def test_streamlit_arrow_safe_df_casts_mixed_object_columns_to_string():
+    df = pd.DataFrame(
+        {
+            "training_year": [2018, "[<= 2019]", None],
+            "metric": ["auc", "auc", "auc"],
+            "value": [0.81, 0.79, 0.77],
+        }
+    )
+
+    safe_df = live_app._streamlit_arrow_safe_df(df)
+
+    assert str(safe_df["training_year"].dtype) == "string"
+    assert safe_df["training_year"].tolist()[:2] == ["2018", "[<= 2019]"]
+
+
+def test_apply_derived_metrics_computes_brier_from_calibrated_scores():
+    row = {"auc": 0.81, "pr_auc": None, "f1": None, "brier_score": None}
+    roc_item = {
+        "y_true": [0, 1],
+        "scores": [0.1, 0.9],
+        "calibrated_scores": [0.2, 0.8],
+    }
+
+    enriched = live_app._apply_derived_metrics(row, roc_item)
+
+    assert enriched["pr_auc"] == pytest.approx(1.0)
+    assert enriched["brier_score"] == pytest.approx(0.04)
+
+
+def test_display_cell_handles_infinite_thresholds():
+    assert live_app._display_cell(float("inf")) == "inf"
+    assert live_app._display_cell(float("-inf")) == "-inf"
+
+
+def test_build_drift_tuning_params_frame_compares_smote_against_none():
+    artifacts = [
+        {
+            "study_id": "study_none",
+            "tuning_key": "tk_none",
+            "model_name": "Random Forest",
+            "balance_mode": "none",
+            "stage": "window_tuning",
+            "best_value": 0.74,
+            "best_params": {"mtry": 4, "min_node_size": 2},
+            "n_trials": 8,
+            "requested_trials": 8,
+            "search_space_size": 16,
+            "invalid_trial_count": 0,
+            "has_valid_trial": True,
+            "n_train": 40,
+            "positive_rows": 10,
+            "positive_rate": 0.25,
+            "train_signature": "same_window",
+            "strategy_context": {"strategy": "static", "window_kind": "base_year", "training_year": "2018"},
+        },
+        {
+            "study_id": "study_smote",
+            "tuning_key": "tk_smote",
+            "model_name": "Random Forest",
+            "balance_mode": "smote",
+            "stage": "window_tuning",
+            "best_value": 0.78,
+            "best_params": {"mtry": 6, "min_node_size": 1, "sampling_strategy": 1.0, "k_neighbors": 5},
+            "n_trials": 8,
+            "requested_trials": 8,
+            "search_space_size": 24,
+            "invalid_trial_count": 1,
+            "has_valid_trial": True,
+            "n_train": 40,
+            "positive_rows": 10,
+            "positive_rate": 0.25,
+            "train_signature": "same_window",
+            "strategy_context": {"strategy": "static", "window_kind": "base_year", "training_year": "2018"},
+        },
+    ]
+
+    df = live_app._build_drift_tuning_params_frame(artifacts)
+
+    assert len(df) == 2
+    smote_row = df.loc[df["balance_mode"] == "smote"].iloc[0]
+    assert smote_row["best_cv_auc_none"] == pytest.approx(0.74)
+    assert smote_row["cv_auc_delta_vs_none"] == pytest.approx(0.04)
+    assert smote_row["param_sampling_strategy"] == 1.0
+    assert smote_row["param_k_neighbors"] == 5
+    none_row = df.loc[df["balance_mode"] == "none"].iloc[0]
+    assert none_row["cv_auc_delta_vs_none"] == pytest.approx(0.0)
 
 
 def test_build_live_sources_includes_drift_manifests(tmp_path, monkeypatch):
@@ -12,6 +101,11 @@ def test_build_live_sources_includes_drift_manifests(tmp_path, monkeypatch):
         live_app,
         "DRIFT_RUNS_DIR",
         tmp_path / "drift_recalibration_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_PAPER_RUNS_DIR",
+        tmp_path / "nlp_in_severity" / "paper_replication",
     )
 
     run_dir = live_app.DRIFT_RUNS_DIR / "run_abc123"
@@ -31,6 +125,39 @@ def test_build_live_sources_includes_drift_manifests(tmp_path, monkeypatch):
     assert len(sources) == 1
     assert sources[0]["type"] == "drift_recalibration"
     assert "run_abc123" in str(sources[0]["label"])
+
+
+def test_build_live_sources_includes_paper_replication_manifests(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(
+        live_app,
+        "DRIFT_RUNS_DIR",
+        tmp_path / "drift_recalibration_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_PAPER_RUNS_DIR",
+        tmp_path / "nlp_in_severity" / "paper_replication",
+    )
+
+    paper_run_dir = live_app.NLP_PAPER_RUNS_DIR / "paper_replication_abcd"
+    paper_run_dir.mkdir(parents=True)
+    (paper_run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "paper_replication_abcd",
+                "status": "running",
+                "updated_at": "2026-03-31T09:00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sources = live_app._build_live_sources()
+
+    assert len(sources) == 1
+    assert sources[0]["type"] == "paper_replication"
+    assert "paper_replication_abcd" in str(sources[0]["label"])
 
 
 def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
@@ -157,6 +284,7 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
                 "segment": "2019",
                 "y_true": [0, 1],
                 "scores": [0.1, 0.9],
+                "calibrated_scores": [0.2, 0.8],
                 "run_seed": 11,
                 "run_order": 1,
             },
@@ -167,6 +295,7 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
                 "segment": "final",
                 "y_true": [0, 1],
                 "scores": [0.2, 0.8],
+                "calibrated_scores": [0.25, 0.75],
                 "run_seed": 11,
                 "run_order": 1,
             }
@@ -181,9 +310,22 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
 
     tuning_artifact = {
         "study_id": "study_rf_none",
+        "tuning_key": "tk_rf_none",
         "model_name": "Random Forest",
         "balance_mode": "none",
         "stage": "global_tuning",
+        "best_value": 0.81,
+        "best_params": {"mtry": 4, "min_node_size": 2},
+        "n_trials": 2,
+        "requested_trials": 2,
+        "search_space_size": 4,
+        "invalid_trial_count": 0,
+        "has_valid_trial": True,
+        "n_train": 40,
+        "positive_rows": 10,
+        "positive_rate": 0.25,
+        "train_signature": "global_signature",
+        "strategy_context": {"strategy": "static", "window_kind": "base_year", "training_year": "2018"},
         "trials": [
             {
                 "trial_number": 0,
@@ -199,6 +341,41 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
     }
     (tuning_dir / "tune_a.json").write_text(
         json.dumps(tuning_artifact),
+        encoding="utf-8",
+    )
+    tuning_artifact_smote = {
+        "study_id": "study_rf_smote",
+        "tuning_key": "tk_rf_smote",
+        "model_name": "Random Forest",
+        "balance_mode": "smote",
+        "stage": "global_tuning",
+        "best_value": 0.79,
+        "best_params": {"mtry": 6, "min_node_size": 1, "sampling_strategy": 1.0, "k_neighbors": 5},
+        "n_trials": 2,
+        "requested_trials": 2,
+        "search_space_size": 6,
+        "invalid_trial_count": 0,
+        "has_valid_trial": True,
+        "n_train": 40,
+        "positive_rows": 10,
+        "positive_rate": 0.25,
+        "train_signature": "global_signature",
+        "strategy_context": {"strategy": "static", "window_kind": "base_year", "training_year": "2018"},
+        "trials": [
+            {
+                "trial_number": 0,
+                "state": "COMPLETE",
+                "cv_auc": 0.75,
+            },
+            {
+                "trial_number": 1,
+                "state": "COMPLETE",
+                "cv_auc": 0.79,
+            },
+        ],
+    }
+    (tuning_dir / "tune_b.json").write_text(
+        json.dumps(tuning_artifact_smote),
         encoding="utf-8",
     )
 
@@ -252,18 +429,375 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
     assert "n_segments" in payload["summary_df"].columns
     assert "n_repetitions" in payload["summary_df"].columns
     assert payload["yearly_df"]["pr_auc"].iloc[0] == 1.0
+    assert payload["yearly_df"]["brier_score"].iloc[0] == pytest.approx(0.04)
     assert payload["yearly_df"]["f1"].iloc[0] == 1.0
     assert payload["yearly_df"]["sensitivity_before_calibration"].iloc[0] == 0.5
     assert payload["yearly_df"]["specificity_after_calibration"].iloc[0] == 1.0
     assert payload["adaptive_df"]["pr_auc"].iloc[0] == 1.0
+    assert payload["adaptive_df"]["brier_score"].iloc[0] == pytest.approx(0.0625)
     assert payload["adaptive_df"]["f1"].iloc[0] == 1.0
     assert payload["adaptive_df"]["sensitivity_before_calibration"].iloc[0] == 0.5
     assert payload["adaptive_df"]["specificity_after_calibration"].iloc[0] == 1.0
+    assert payload["summary_df"]["brier_score"].notna().all()
     assert not payload["tuning_trials_df"].empty
+    assert not payload["tuning_params_df"].empty
+    smote_tuning = payload["tuning_params_df"].loc[payload["tuning_params_df"]["balance_mode"] == "smote"].iloc[0]
+    assert smote_tuning["cv_auc_delta_vs_none"] == pytest.approx(-0.02)
+    assert smote_tuning["param_sampling_strategy"] == 1.0
     assert not payload["memory_trace_df"].empty
     assert not payload["live_events_df"].empty
     assert not payload["average_roc_df"].empty
     assert payload["live_events_df"]["progress_pct"].iloc[-1] == 37.5
+
+
+def test_read_paper_replication_run_builds_partial_monitoring_frames(tmp_path):
+    run_dir = tmp_path / "nlp_in_severity" / "paper_replication" / "paper_replication_demo"
+    frozen_m1_dir = run_dir / "frozen" / "models" / "M1"
+    frozen_m2_k_dir = run_dir / "frozen" / "models" / "M2" / "k_results"
+    raw_build_dir = run_dir / "raw_build"
+    frozen_m1_dir.mkdir(parents=True)
+    frozen_m2_k_dir.mkdir(parents=True)
+    raw_build_dir.mkdir(parents=True)
+
+    manifest = {
+        "run_id": "paper_replication_demo",
+        "status": "running",
+        "result_status": "running",
+        "created_at": "2026-03-31T10:00:00",
+        "updated_at": "2026-03-31T10:12:00",
+        "progress": {
+            "current_stage": "raw_build",
+            "current_step_id": "raw.build.embeddings",
+            "completed_steps": 3,
+            "total_steps": 8,
+            "completed_units": 22.0,
+            "total_units": 100.0,
+        },
+        "steps_index": {
+            "frozen.dataset_validation": {
+                "step_id": "frozen.dataset_validation",
+                "stage": "frozen",
+                "description": "frozen dataset validation",
+                "status": "completed",
+                "order": 1,
+                "completed_at": "2026-03-31T10:02:00",
+                "last_message": "frozen: dataset validado.",
+                "artifact_paths": {"dataset_validation": str(run_dir / "frozen" / "dataset_validation.json")},
+            },
+            "frozen.M1.k.10": {
+                "step_id": "frozen.M1.k.10",
+                "stage": "frozen",
+                "description": "M1 nested CV k=10",
+                "status": "completed",
+                "order": 2,
+                "completed_at": "2026-03-31T10:05:00",
+                "last_message": "M1: k=10 persistido.",
+                "artifact_paths": {"k_result": str(frozen_m1_dir / "k_results" / "k_010.json")},
+            },
+            "frozen.M1.final": {
+                "step_id": "frozen.M1.final",
+                "stage": "frozen",
+                "description": "M1 final fit",
+                "status": "completed",
+                "order": 3,
+                "completed_at": "2026-03-31T10:08:00",
+                "last_message": "M1: resultado final persistido.",
+                "artifact_paths": {"summary": str(frozen_m1_dir / "final_summary.json")},
+            },
+            "frozen.M2.k.10": {
+                "step_id": "frozen.M2.k.10",
+                "stage": "frozen",
+                "description": "M2 nested CV k=10",
+                "status": "running",
+                "order": 4,
+                "started_at": "2026-03-31T10:09:00",
+                "last_message": "M2: nested CV para k=10.",
+                "artifact_paths": {},
+            },
+            "raw.build.features": {
+                "step_id": "raw.build.features",
+                "stage": "raw_build",
+                "description": "Reconstruccion de features raw",
+                "status": "completed",
+                "order": 5,
+                "completed_at": "2026-03-31T10:10:00",
+                "last_message": "Features raw persistidos.",
+                "artifact_paths": {"features": str(raw_build_dir / "features.pkl")},
+            },
+            "raw.build.embeddings": {
+                "step_id": "raw.build.embeddings",
+                "stage": "raw_build",
+                "description": "Extraccion de embeddings fine-tuneados",
+                "status": "running",
+                "order": 6,
+                "started_at": "2026-03-31T10:11:00",
+                "last_message": "Generando embeddings [CLS].",
+                "artifact_paths": {},
+            },
+        },
+        "step_sequence": [
+            "frozen.dataset_validation",
+            "frozen.M1.k.10",
+            "frozen.M1.final",
+            "frozen.M2.k.10",
+            "raw.build.features",
+            "raw.build.embeddings",
+        ],
+    }
+    manifest_path = run_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    (run_dir / "frozen").mkdir(parents=True, exist_ok=True)
+    (run_dir / "frozen" / "dataset_validation.json").write_text(
+        json.dumps(
+            {
+                "rows": 2070,
+                "flow_features": 432,
+                "embedding_features": 200,
+                "total_features": 632,
+                "train_rows": 1656,
+                "test_rows": 414,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    (frozen_m1_dir / "k_results").mkdir(parents=True, exist_ok=True)
+    (frozen_m1_dir / "final_summary.json").write_text(
+        json.dumps(
+            {
+                "model_code": "M1",
+                "model_title": "M1 - Flow only",
+                "feature_group": "flow",
+                "candidate_feature_count": 432,
+                "selected_k": 10,
+                "best_cv_score": 0.78,
+                "optimization": {"backend": "gridsearchcv", "requested_backend": "gridsearchcv"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (frozen_m1_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "accuracy": 0.81,
+                "precision": 0.77,
+                "recall": 0.79,
+                "f1_score": 0.78,
+                "roc_auc": 0.85,
+                "false_negatives_positive_class": 12,
+                "class_metrics": {
+                    "0": {"f1_score": 0.74},
+                    "1": {"f1_score": 0.81},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.to_pickle(
+        pd.DataFrame(
+            [
+                {"k": 10, "accuracy": 0.80, "f1_score": 0.78, "false_negatives_pct": 0.12, "validation_score": 0.79},
+                {"k": 15, "accuracy": 0.81, "f1_score": 0.79, "false_negatives_pct": 0.11, "validation_score": 0.80},
+            ]
+        ),
+        frozen_m1_dir / "k_search.pkl",
+    )
+    (frozen_m2_k_dir / "k_010.json").write_text(
+        json.dumps(
+            {
+                "model_code": "M2",
+                "k": 10,
+                "accuracy": 0.75,
+                "f1_score": 0.71,
+                "false_negatives_pct": 0.18,
+                "validation_score": 0.73,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pd.to_pickle(
+        {
+            "dataset_df": pd.DataFrame({"accident_id": ["a1", "a2"], "severity_target": [1, 0]}),
+            "selected_embedding_cols": ["emb_001", "emb_002"],
+            "embedding_meta": {"selected_embedding_count": 2, "transformer_model_label": "bert-demo"},
+        },
+        raw_build_dir / "payload.pkl",
+    )
+
+    live_status = {
+        "run_id": "paper_replication_demo",
+        "status": "running",
+        "result_status": "running",
+        "step_id": "raw.build.embeddings",
+        "step_status": "running",
+        "message": "Generando embeddings [CLS].",
+        "progress": manifest["progress"],
+        "updated_at": "2026-03-31T10:12:00",
+    }
+    (run_dir / "live_status.json").write_text(json.dumps(live_status), encoding="utf-8")
+    (run_dir / "live_events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "run_id": "paper_replication_demo",
+                        "status": "running",
+                        "result_status": "running",
+                        "step_id": "frozen.dataset_validation",
+                        "step_status": "completed",
+                        "message": "frozen: dataset validado.",
+                        "progress": {
+                            "current_stage": "frozen",
+                            "current_step_id": "frozen.dataset_validation",
+                            "completed_steps": 1,
+                            "total_steps": 8,
+                            "completed_units": 6.0,
+                            "total_units": 100.0,
+                        },
+                        "updated_at": "2026-03-31T10:02:00",
+                    }
+                ),
+                json.dumps(live_status),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = live_app._read_paper_replication_run(manifest_path)
+
+    assert isinstance(payload["step_df"], pd.DataFrame)
+    assert len(payload["step_df"]) == 6
+    assert isinstance(payload["route_status_df"], pd.DataFrame)
+    assert set(payload["route_status_df"]["stage"].tolist()) == {"frozen", "raw", "raw_build", "compare", "export"}
+    frozen_row = payload["route_status_df"].loc[payload["route_status_df"]["stage"] == "frozen"].iloc[0]
+    assert frozen_row["status"] == "running"
+    assert frozen_row["rows"] == 2070
+    assert frozen_row["completed_models"] == 1
+    raw_build_row = payload["route_status_df"].loc[payload["route_status_df"]["stage"] == "raw_build"].iloc[0]
+    assert raw_build_row["status"] == "running"
+    assert raw_build_row["embedding_features"] == 2
+    assert isinstance(payload["partial_models_df"], pd.DataFrame)
+    assert set(payload["partial_models_df"]["model_code"].tolist()) == {"M1", "M2"}
+    m1_row = payload["partial_models_df"].loc[payload["partial_models_df"]["model_code"] == "M1"].iloc[0]
+    assert m1_row["status"] == "completed"
+    m2_row = payload["partial_models_df"].loc[payload["partial_models_df"]["model_code"] == "M2"].iloc[0]
+    assert m2_row["status"] == "partial"
+    assert isinstance(payload["k_progress_df"], pd.DataFrame)
+    assert set(payload["k_progress_df"]["model_code"].astype(str).unique()) == {"M1", "M2"}
+    assert payload["live_events_df"]["progress_pct"].iloc[-1] == pytest.approx(22.0)
+    assert payload["current_context"]["current_step_id"] == "raw.build.embeddings"
+    assert not payload["compare_summary_df"].empty
+    assert not payload["export_summary_df"].empty
+
+
+def test_read_paper_replication_run_surfaces_blocked_raw_and_export_state(tmp_path):
+    run_dir = tmp_path / "nlp_in_severity" / "paper_replication" / "paper_replication_blocked"
+    (run_dir / "raw").mkdir(parents=True)
+    (run_dir / "compare").mkdir(parents=True)
+    (run_dir / "export").mkdir(parents=True)
+
+    manifest = {
+        "run_id": "paper_replication_blocked",
+        "status": "completed",
+        "result_status": "blocked",
+        "created_at": "2026-03-31T11:00:00",
+        "updated_at": "2026-03-31T11:10:00",
+        "progress": {
+            "current_stage": "export",
+            "current_step_id": "export.latex_promote",
+            "completed_steps": 4,
+            "total_steps": 4,
+            "completed_units": 100.0,
+            "total_units": 100.0,
+        },
+        "steps_index": {
+            "raw.build.embeddings": {
+                "step_id": "raw.build.embeddings",
+                "stage": "raw_build",
+                "description": "Extraccion de embeddings fine-tuneados",
+                "status": "blocked",
+                "order": 1,
+                "completed_at": "2026-03-31T11:03:00",
+                "last_message": "No se encontraron modelos fine-tuneados reutilizables para la ruta raw.",
+                "artifact_paths": {},
+            },
+            "compare.routes": {
+                "step_id": "compare.routes",
+                "stage": "compare",
+                "description": "Comparacion frozen vs raw",
+                "status": "completed",
+                "order": 2,
+                "completed_at": "2026-03-31T11:05:00",
+                "last_message": "La ruta raw no se pudo completar.",
+                "artifact_paths": {"summary": str(run_dir / "compare" / "summary.json")},
+            },
+            "export.latex_promote": {
+                "step_id": "export.latex_promote",
+                "stage": "export",
+                "description": "Promocion de assets LaTeX",
+                "status": "completed",
+                "order": 3,
+                "completed_at": "2026-03-31T11:08:00",
+                "last_message": "La ruta raw no se pudo completar.",
+                "artifact_paths": {"payload": str(run_dir / "export" / "payload.json")},
+            },
+        },
+        "step_sequence": [
+            "raw.build.embeddings",
+            "compare.routes",
+            "export.latex_promote",
+        ],
+    }
+    manifest_path = run_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    pd.to_pickle(
+        {
+            "status": "blocked",
+            "status_message": "No se encontraron modelos fine-tuneados reutilizables para la ruta raw.",
+            "route_name": "raw",
+            "dataset_validation": {},
+            "model_results": [],
+        },
+        run_dir / "raw" / "route_payload.pkl",
+    )
+    (run_dir / "compare" / "summary.json").write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "reason": "La ruta raw no se pudo completar.",
+                "passed": False,
+                "max_numeric_diff": None,
+                "tolerance": 0.001,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "export" / "payload.json").write_text(
+        json.dumps(
+            {
+                "latex_promoted": False,
+                "result_status": "blocked",
+                "candidate_paths": {"metrics.png": "/tmp/metrics.png"},
+                "promoted_paths": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = live_app._read_paper_replication_run(manifest_path)
+
+    raw_row = payload["route_status_df"].loc[payload["route_status_df"]["stage"] == "raw"].iloc[0]
+    assert raw_row["status"] == "blocked"
+    compare_row = payload["compare_summary_df"].iloc[0]
+    assert compare_row["status"] == "blocked"
+    assert "raw" in str(compare_row["reason"]).lower()
+    export_row = payload["export_summary_df"].iloc[0]
+    assert export_row["result_status"] == "blocked"
+    assert bool(export_row["latex_promoted"]) is False
 
 
 def test_build_drift_live_result_tables_fill_pending_slots():
@@ -288,6 +822,7 @@ def test_build_drift_live_result_tables_fill_pending_slots():
                 "balance_mode": "none",
                 "auc": 0.81,
                 "pr_auc": 0.77,
+                "brier_score": 0.12,
                 "f1": 0.63,
                 "sensitivity": 0.72,
                 "specificity": 0.78,
@@ -336,12 +871,14 @@ def test_build_drift_live_result_tables_fill_pending_slots():
     ].iloc[0]
     assert pending_row["auc"] == "Pendiente"
     assert pending_row["pr_auc"] == "Pendiente"
+    assert pending_row["brier_score"] == "Pendiente"
     assert pending_row["f1"] == "Pendiente"
     assert pending_row["sensitivity_before_calibration"] == "Pendiente"
     assert pending_row["specificity_after_calibration"] == "Pendiente"
     assert pending_row["training_year"] == "2018"
     completed_row = tables["A.6"].loc[tables["A.6"]["status"] == "Completado"].iloc[0]
     assert completed_row["pr_auc"] == 0.77
+    assert completed_row["brier_score"] == 0.12
     assert completed_row["f1"] == 0.63
     assert completed_row["sensitivity_before_calibration"] == 0.61
     assert completed_row["specificity_after_calibration"] == 0.78
@@ -350,6 +887,7 @@ def test_build_drift_live_result_tables_fill_pending_slots():
     assert tables["A.9"].iloc[0]["status"] == "Pendiente"
     assert tables["A.9"].iloc[0]["model"] == "Random Forest"
     assert tables["A.9"].iloc[0]["pr_auc"] == "Pendiente"
+    assert tables["A.9"].iloc[0]["brier_score"] == "Pendiente"
     assert tables["A.9"].iloc[0]["f1"] == "Pendiente"
 
 
@@ -448,6 +986,7 @@ def test_build_drift_partial_summary_normalizes_kswin_for_existing_comparison_ta
                 "balance_mode": "none",
                 "auc": 0.81,
                 "pr_auc": 0.73,
+                "brier_score": 0.11,
                 "f1": 0.61,
                 "sensitivity": 0.72,
                 "specificity": 0.78,
@@ -469,6 +1008,7 @@ def test_build_drift_partial_summary_normalizes_kswin_for_existing_comparison_ta
                 "balance_mode": "none",
                 "auc": 0.79,
                 "pr_auc": 0.69,
+                "brier_score": 0.13,
                 "f1": 0.58,
                 "sensitivity": 0.7,
                 "specificity": 0.76,
@@ -498,6 +1038,7 @@ def test_build_drift_partial_summary_normalizes_kswin_for_existing_comparison_ta
     assert adwin_row["detector_variant"] == "-"
     assert adwin_row["auc"] == 0.81
     assert adwin_row["pr_auc"] == 0.73
+    assert adwin_row["brier_score"] == 0.11
     assert adwin_row["f1"] == 0.61
     assert adwin_row["sensitivity_before_calibration"] == 0.66
     assert adwin_row["specificity_after_calibration"] == 0.78
@@ -507,6 +1048,7 @@ def test_build_drift_partial_summary_normalizes_kswin_for_existing_comparison_ta
     assert kswin_row["detector_variant"] == "KSWINpaper"
     assert kswin_row["auc"] == 0.79
     assert kswin_row["pr_auc"] == 0.69
+    assert kswin_row["brier_score"] == 0.13
     assert kswin_row["f1"] == 0.58
     assert kswin_row["sensitivity_before_calibration"] == 0.64
     assert kswin_row["specificity_after_calibration"] == 0.76

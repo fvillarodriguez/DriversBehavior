@@ -17,6 +17,8 @@ import streamlit as st
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
 DRIFT_RUNS_DIR = RESULTS_DIR / "drift_recalibration_runs"
+NLP_PAPER_RUNS_DIR = RESULTS_DIR / "nlp_in_severity" / "paper_replication"
+PAPER_MODEL_CODES = ("M1", "M2", "M3")
 
 
 def _list_live_db_files() -> list[Path]:
@@ -35,6 +37,15 @@ def _load_json_file(path: Path, default: Any = None) -> Any:
     try:
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
+    except Exception:
+        return default
+
+
+def _load_pickle_file(path: Path, default: Any = None) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return pd.read_pickle(path)
     except Exception:
         return default
 
@@ -81,6 +92,30 @@ def _maybe_float(value: object) -> float:
     return float(numeric)
 
 
+def _sequence_to_numeric(values: object) -> list[float]:
+    if values is None or isinstance(values, (str, bytes)):
+        return []
+    try:
+        raw_values = list(values)
+    except TypeError:
+        return []
+    out: list[float] = []
+    for value in raw_values:
+        numeric = pd.to_numeric(value, errors="coerce")
+        out.append(float("nan") if pd.isna(numeric) else float(numeric))
+    return out
+
+
+def _streamlit_arrow_safe_df(data: object) -> object:
+    if data is None or not isinstance(data, pd.DataFrame) or data.empty:
+        return data
+    work = data.copy()
+    for col in work.columns:
+        if pd.api.types.is_object_dtype(work[col]):
+            work[col] = work[col].astype("string")
+    return work
+
+
 def _average_precision_from_scores(y_true: list[int], scores: list[float]) -> float:
     if not y_true or len(y_true) != len(scores):
         return float("nan")
@@ -109,6 +144,26 @@ def _average_precision_from_scores(y_true: list[int], scores: list[float]) -> fl
         recall = tp / float(total_pos)
         ap += (recall - recall_prev) * precision
     return float(ap)
+
+
+def _brier_score_from_probabilities(y_true: object, scores: object) -> float:
+    y = _sequence_to_numeric(y_true)
+    p = _sequence_to_numeric(scores)
+    if not y or not p or len(y) != len(p):
+        return float("nan")
+    work = pd.DataFrame({"y": y, "p": p}).dropna(subset=["y", "p"])
+    if work.empty:
+        return float("nan")
+    work["y"] = work["y"].clip(0.0, 1.0).round()
+    work["p"] = work["p"].clip(0.0, 1.0)
+    return float(((work["p"] - work["y"]) ** 2).mean())
+
+
+def _probability_scores_for_brier(roc_item: Dict[str, object], *, expected_length: int) -> list[float]:
+    calibrated_scores = _sequence_to_numeric(roc_item.get("calibrated_scores"))
+    if len(calibrated_scores) == expected_length and pd.Series(calibrated_scores).notna().any():
+        return calibrated_scores
+    return _sequence_to_numeric(roc_item.get("scores"))
 
 
 def _derive_f1_from_rates(row: Dict[str, object], y_true: list[int]) -> float:
@@ -160,10 +215,14 @@ def _apply_derived_metrics(
 ) -> Dict[str, object]:
     if not isinstance(roc_item, dict):
         return row
-    y_true = [int(v) for v in (roc_item.get("y_true") or [])]
-    scores = [float(v) for v in (roc_item.get("scores") or [])]
+    y_true_numeric = _sequence_to_numeric(roc_item.get("y_true"))
+    y_true = [int(v) for v in y_true_numeric if not pd.isna(v)]
+    scores = _sequence_to_numeric(roc_item.get("scores"))
     if y_true and scores and len(y_true) == len(scores) and _is_missing_numeric(row.get("pr_auc")):
         row["pr_auc"] = _average_precision_from_scores(y_true, scores)
+    if y_true and _is_missing_numeric(row.get("brier_score")):
+        probability_scores = _probability_scores_for_brier(roc_item, expected_length=len(y_true))
+        row["brier_score"] = _brier_score_from_probabilities(y_true, probability_scores)
     if y_true and _is_missing_numeric(row.get("f1")):
         row["f1"] = _derive_f1_from_rates(row, y_true)
     return row
@@ -222,6 +281,16 @@ def _list_drift_manifest_files() -> list[Path]:
     )
 
 
+def _list_paper_replication_manifest_files() -> list[Path]:
+    if not NLP_PAPER_RUNS_DIR.exists():
+        return []
+    return sorted(
+        NLP_PAPER_RUNS_DIR.glob("*/manifest.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def _build_live_sources() -> list[Dict[str, object]]:
     entries: list[Dict[str, object]] = []
     for path in _list_drift_manifest_files():
@@ -235,6 +304,19 @@ def _build_live_sources() -> list[Dict[str, object]]:
                 "path": path,
                 "sort_key": float(path.stat().st_mtime),
                 "label": f"Drift recalibration | {run_id} | {status} | {updated_at}",
+            }
+        )
+    for path in _list_paper_replication_manifest_files():
+        manifest = _load_json_file(path, default={})
+        run_id = str((manifest or {}).get("run_id") or path.parent.name)
+        status = str((manifest or {}).get("status") or "unknown")
+        updated_at = str((manifest or {}).get("updated_at") or (manifest or {}).get("created_at") or "-")
+        entries.append(
+            {
+                "type": "paper_replication",
+                "path": path,
+                "sort_key": float(path.stat().st_mtime),
+                "label": f"Paper replication | {run_id} | {status} | {updated_at}",
             }
         )
     for path in _list_live_db_files():
@@ -286,6 +368,47 @@ def _drift_block_sort_key(row: Dict[str, object]) -> tuple[int, int, int, int, i
     )
 
 
+def _json_cell(value: object) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=True)
+    except Exception:
+        return str(value)
+
+
+def _artifact_context_dict(artifact: Dict[str, object]) -> Dict[str, object]:
+    context = artifact.get("strategy_context")
+    if isinstance(context, dict):
+        return dict(context)
+    if isinstance(context, str) and context.strip():
+        try:
+            parsed = json.loads(context)
+        except Exception:
+            return {"raw": context}
+        if isinstance(parsed, dict):
+            return dict(parsed)
+    return {}
+
+
+def _flatten_mapping_columns(payload: object, prefix: str) -> Dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    rows: Dict[str, object] = {}
+    for key, value in sorted(payload.items(), key=lambda item: str(item[0])):
+        col = f"{prefix}_{str(key)}"
+        if isinstance(value, dict):
+            nested = _flatten_mapping_columns(value, col)
+            if nested:
+                rows.update(nested)
+            else:
+                rows[col] = "{}"
+            continue
+        if isinstance(value, (list, tuple, set)):
+            rows[col] = _json_cell(list(value))
+            continue
+        rows[col] = value
+    return rows
+
+
 def _build_drift_tuning_trials_frame(artifacts: list[Dict[str, object]]) -> pd.DataFrame:
     rows: list[Dict[str, object]] = []
     for artifact in artifacts:
@@ -316,6 +439,107 @@ def _build_drift_tuning_trials_frame(artifacts: list[Dict[str, object]]) -> pd.D
     return pd.DataFrame(rows).sort_values(
         ["model", "balance_mode", "stage", "trial_number"]
     ).reset_index(drop=True)
+
+
+def _build_drift_tuning_params_frame(artifacts: list[Dict[str, object]]) -> pd.DataFrame:
+    rows: list[Dict[str, object]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        context = _artifact_context_dict(artifact)
+        best_params = dict(artifact.get("best_params") or {})
+        row: Dict[str, object] = {
+            "study_id": str(artifact.get("study_id") or ""),
+            "tuning_key": str(artifact.get("tuning_key") or ""),
+            "model": str(artifact.get("model_name") or artifact.get("model") or ""),
+            "balance_mode": str(artifact.get("balance_mode") or "not_applicable"),
+            "stage": str(artifact.get("stage") or "tuning"),
+            "best_cv_auc": pd.to_numeric(artifact.get("best_value"), errors="coerce"),
+            "n_trials": _safe_int(artifact.get("n_trials"), default=0),
+            "requested_trials": _safe_int(artifact.get("requested_trials"), default=0),
+            "search_space_size": _safe_int(artifact.get("search_space_size"), default=0),
+            "invalid_trial_count": _safe_int(artifact.get("invalid_trial_count"), default=0),
+            "has_valid_trial": bool(artifact.get("has_valid_trial", False)),
+            "n_train": _safe_int(artifact.get("n_train"), default=0),
+            "positive_rows": _safe_int(artifact.get("positive_rows"), default=0),
+            "positive_rate": pd.to_numeric(artifact.get("positive_rate"), errors="coerce"),
+            "train_signature": str(artifact.get("train_signature") or ""),
+            "best_params_json": _json_cell(best_params),
+        }
+        row.update(_flatten_mapping_columns(context, "ctx"))
+        row.update(_flatten_mapping_columns(best_params, "param"))
+        rows.append(row)
+
+    base_columns = [
+        "study_id",
+        "tuning_key",
+        "model",
+        "balance_mode",
+        "stage",
+        "best_cv_auc",
+        "best_cv_auc_none",
+        "cv_auc_delta_vs_none",
+        "n_trials",
+        "requested_trials",
+        "search_space_size",
+        "invalid_trial_count",
+        "has_valid_trial",
+        "n_train",
+        "positive_rows",
+        "positive_rate",
+        "train_signature",
+        "best_params_json",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=base_columns)
+
+    out = pd.DataFrame(rows)
+    compare_cols = [
+        "model",
+        "stage",
+        "train_signature",
+        "ctx_strategy",
+        "ctx_window_kind",
+        "ctx_training_year",
+        "ctx_prediction_year",
+        "ctx_training_years",
+        "n_train",
+        "positive_rows",
+    ]
+    for col in compare_cols:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out["_compare_key"] = out[compare_cols].astype("string").fillna("").agg("|".join, axis=1)
+    none_ref = (
+        out.loc[out["balance_mode"].astype(str).isin(["none", "not_applicable"])]
+        .groupby("_compare_key", dropna=False)["best_cv_auc"]
+        .max()
+    )
+    out["best_cv_auc_none"] = out["_compare_key"].map(none_ref)
+    out["cv_auc_delta_vs_none"] = out["best_cv_auc"] - out["best_cv_auc_none"]
+    balance_priority = {"none": 0, "not_applicable": 0, "smote": 1}
+    out["_balance_priority"] = out["balance_mode"].map(balance_priority).fillna(9)
+
+    context_cols = sorted(
+        col for col in out.columns if col.startswith("ctx_")
+    )
+    param_cols = sorted(
+        col for col in out.columns if col.startswith("param_")
+    )
+    ordered_cols = base_columns[:5] + context_cols + base_columns[5:] + param_cols
+    for col in ordered_cols:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return (
+        out[ordered_cols + ["_balance_priority"]]
+        .sort_values(
+            ["model", "stage", *([col for col in context_cols if col in out.columns]), "_balance_priority", "best_cv_auc"],
+            ascending=[True] * (3 + len(context_cols)) + [False],
+            na_position="last",
+        )
+        .drop(columns=["_balance_priority"])
+        .reset_index(drop=True)
+    )
 
 
 def _build_drift_execution_memory_trace(execution_log: pd.DataFrame) -> pd.DataFrame:
@@ -439,6 +663,7 @@ def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFr
         "balance_mode",
         "auc",
         "pr_auc",
+        "brier_score",
         "f1",
         "sensitivity",
         "specificity",
@@ -483,6 +708,7 @@ def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFr
         for col in [
             "auc",
             "pr_auc",
+            "brier_score",
             "f1",
             "sensitivity",
             "specificity",
@@ -501,6 +727,7 @@ def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFr
             .agg(
                 auc=("auc", "mean"),
                 pr_auc=("pr_auc", "mean"),
+                brier_score=("brier_score", "mean"),
                 f1=("f1", "mean"),
                 sensitivity=("sensitivity", "mean"),
                 specificity=("specificity", "mean"),
@@ -548,10 +775,17 @@ def _display_cell(value: object, *, pending: bool = False) -> object:
         return value.isoformat(sep=" ", timespec="seconds")
     if pd.isna(value):
         return "-"
-    if isinstance(value, float):
-        if abs(value - round(value)) < 1e-9:
-            return int(round(value))
-        return round(value, 4)
+    if isinstance(value, bool):
+        return value
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+    if not math.isfinite(numeric_value):
+        return str(numeric_value)
+    if abs(numeric_value - round(numeric_value)) < 1e-9:
+        return int(round(numeric_value))
+    return round(numeric_value, 4)
     return value
 
 
@@ -613,6 +847,7 @@ def _expected_yearly_table(
         "balance_mode",
         "auc",
         "pr_auc",
+        "brier_score",
         "f1",
         "sensitivity",
         "specificity",
@@ -664,6 +899,7 @@ def _expected_yearly_table(
                             "balance_mode": _display_cell(source_row.get("balance_mode")),
                             "auc": _display_cell(source_row.get("auc")),
                             "pr_auc": _display_cell(source_row.get("pr_auc")),
+                            "brier_score": _display_cell(source_row.get("brier_score")),
                             "f1": _display_cell(source_row.get("f1")),
                             "sensitivity": _display_cell(source_row.get("sensitivity")),
                             "specificity": _display_cell(source_row.get("specificity")),
@@ -695,6 +931,7 @@ def _expected_yearly_table(
                             "balance_mode": balance_mode,
                             "auc": "Pendiente",
                             "pr_auc": "Pendiente",
+                            "brier_score": "Pendiente",
                             "f1": "Pendiente",
                             "sensitivity": "Pendiente",
                             "specificity": "Pendiente",
@@ -754,6 +991,7 @@ def _expected_adaptive_table(
         "model",
         "auc",
         "pr_auc",
+        "brier_score",
         "f1",
         "sensitivity",
         "specificity",
@@ -820,6 +1058,7 @@ def _expected_adaptive_table(
                     "model": str(block.get("model") or "-"),
                     "auc": "-",
                     "pr_auc": "-",
+                    "brier_score": "-",
                     "f1": "-",
                     "sensitivity": "-",
                     "specificity": "-",
@@ -867,6 +1106,7 @@ def _expected_adaptive_table(
                     "model": str(block.get("model") or "-"),
                     "auc": "-",
                     "pr_auc": "-",
+                    "brier_score": "-",
                     "f1": "-",
                     "sensitivity": "-",
                     "specificity": "-",
@@ -914,6 +1154,7 @@ def _expected_adaptive_table(
                     "model": str(block.get("model") or "-"),
                     "auc": "Pendiente",
                     "pr_auc": "Pendiente",
+                    "brier_score": "Pendiente",
                     "f1": "Pendiente",
                     "sensitivity": "Pendiente",
                     "specificity": "Pendiente",
@@ -1092,6 +1333,7 @@ def _read_drift_run(manifest_path: Path) -> Dict[str, object]:
     summary_df = _build_drift_partial_summary(yearly_df, adaptive_df)
     memory_trace_df = _build_drift_execution_memory_trace(execution_log_df)
     average_roc_df = _build_drift_average_roc_curves(roc_payload_rows)
+    tuning_params_df = _build_drift_tuning_params_frame(tuning_artifacts)
 
     live_status = _load_json_file(live_status_path, default={}) or {}
     live_event_rows = _read_jsonl_records(live_events_path)
@@ -1135,11 +1377,563 @@ def _read_drift_run(manifest_path: Path) -> Dict[str, object]:
         "roc_payload": roc_payload_rows,
         "average_roc_df": average_roc_df,
         "tuning_trials_df": tuning_trials_df,
+        "tuning_params_df": tuning_params_df,
         "tuning_artifacts": tuning_artifacts,
         "live_status": live_status,
         "live_events_df": live_events_df,
         "live_status_path": live_status_path,
         "live_events_path": live_events_path,
+    }
+
+
+def _load_csv_file(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _paper_route_dir(run_dir: Path, route_name: str) -> Path:
+    return run_dir / str(route_name)
+
+
+def _paper_stage_step_summary(step_df: pd.DataFrame, prefix: str) -> Dict[str, object]:
+    if not isinstance(step_df, pd.DataFrame) or step_df.empty or "step_id" not in step_df.columns:
+        return {
+            "status": "pending",
+            "current_step_id": "",
+            "status_message": "",
+            "completed_steps": 0,
+            "total_steps": 0,
+        }
+    prefix_text = str(prefix)
+    stage_mask = step_df["step_id"].astype(str).str.startswith(prefix_text)
+    scoped = step_df.loc[stage_mask].copy()
+    if scoped.empty:
+        return {
+            "status": "pending",
+            "current_step_id": "",
+            "status_message": "",
+            "completed_steps": 0,
+            "total_steps": 0,
+        }
+    statuses = scoped["status"].astype(str).str.lower()
+    if statuses.eq("failed").any():
+        status = "failed"
+    elif statuses.eq("blocked").any():
+        status = "blocked"
+    elif statuses.eq("running").any():
+        status = "running"
+    elif statuses.eq("completed").all():
+        status = "completed"
+    elif statuses.eq("completed").any():
+        status = "partial"
+    else:
+        status = "pending"
+    scoped = scoped.sort_values(["order", "started_at", "completed_at"], kind="stable").reset_index(drop=True)
+    current_row = scoped.iloc[-1].to_dict() if not scoped.empty else {}
+    return {
+        "status": status,
+        "current_step_id": str(current_row.get("step_id") or ""),
+        "status_message": str(current_row.get("last_message") or current_row.get("error") or ""),
+        "completed_steps": int(statuses.isin(["completed", "blocked"]).sum()),
+        "total_steps": int(len(scoped)),
+    }
+
+
+def _paper_normalize_live_event(
+    row: Dict[str, object],
+    *,
+    manifest_progress: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    row = dict(row or {})
+    progress = dict(row.get("progress") or {})
+    base_progress = dict(manifest_progress or {})
+    completed_units = pd.to_numeric(
+        row.get("completed_units", progress.get("completed_units", base_progress.get("completed_units", 0.0))),
+        errors="coerce",
+    )
+    total_units = pd.to_numeric(
+        row.get("total_units", progress.get("total_units", base_progress.get("total_units", 0.0))),
+        errors="coerce",
+    )
+    if pd.isna(completed_units):
+        completed_units = 0.0
+    if pd.isna(total_units):
+        total_units = 0.0
+    progress_ratio = pd.to_numeric(row.get("progress_ratio"), errors="coerce")
+    if pd.isna(progress_ratio):
+        progress_ratio = float(completed_units) / float(max(1.0, float(total_units or 0.0)))
+    step_id = str(row.get("step_id") or progress.get("current_step_id") or "")
+    stage = str(row.get("stage") or progress.get("current_stage") or "")
+    if not stage and step_id:
+        stage = step_id.split(".", 1)[0]
+    label = str(row.get("label") or step_id or "Checkpoint state")
+    detail = str(row.get("detail") or row.get("message") or "")
+    timestamp = str(row.get("timestamp") or row.get("updated_at") or row.get("created_at") or "")
+    return {
+        "timestamp": timestamp,
+        "completed_units": float(completed_units),
+        "total_units": float(total_units),
+        "progress_ratio": max(0.0, min(float(progress_ratio), 1.0)),
+        "progress_pct": 100.0 * max(0.0, min(float(progress_ratio), 1.0)),
+        "label": label,
+        "detail": detail,
+        "stage": stage,
+        "step_id": step_id,
+        "step_status": str(row.get("step_status") or row.get("status") or ""),
+        "result_status": str(row.get("result_status") or ""),
+        "status": str(row.get("status") or ""),
+        "event_type": str(row.get("event_type") or ""),
+    }
+
+
+def _paper_build_step_df(manifest: Dict[str, object]) -> pd.DataFrame:
+    steps_index = dict(manifest.get("steps_index") or {})
+    step_sequence = list(manifest.get("step_sequence") or steps_index.keys())
+    rows: list[Dict[str, object]] = []
+    seen: set[str] = set()
+    for step_id in [*step_sequence, *sorted(steps_index.keys())]:
+        step_key = str(step_id)
+        if step_key in seen:
+            continue
+        seen.add(step_key)
+        entry = dict(steps_index.get(step_key) or {})
+        artifact_paths = entry.get("artifact_paths") or {}
+        rows.append(
+            {
+                "step_id": step_key,
+                "stage": str(entry.get("stage") or ""),
+                "description": str(entry.get("description") or ""),
+                "status": str(entry.get("status") or "pending"),
+                "order": _safe_int(entry.get("order"), default=len(rows) + 1),
+                "started_at": entry.get("started_at"),
+                "completed_at": entry.get("completed_at"),
+                "last_message": str(entry.get("last_message") or ""),
+                "error": str(entry.get("error") or ""),
+                "artifact_count": len(artifact_paths) if isinstance(artifact_paths, dict) else 0,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "step_id",
+                "stage",
+                "description",
+                "status",
+                "order",
+                "started_at",
+                "completed_at",
+                "last_message",
+                "error",
+                "artifact_count",
+            ]
+        )
+    return pd.DataFrame(rows).sort_values("order", kind="stable").reset_index(drop=True)
+
+
+def _paper_load_compare_payload(run_dir: Path) -> Dict[str, object]:
+    compare_dir = run_dir / "compare"
+    payload = _load_pickle_file(compare_dir / "payload.pkl", default=None)
+    if isinstance(payload, dict):
+        return payload
+    summary = _load_json_file(compare_dir / "summary.json", default={}) or {}
+    return {
+        "status": summary.get("status"),
+        "reason": summary.get("reason"),
+        "passed": summary.get("passed"),
+        "max_numeric_diff": summary.get("max_numeric_diff"),
+        "tolerance": summary.get("tolerance"),
+        "diff_df": _load_csv_file(compare_dir / "diff.csv"),
+    }
+
+
+def _paper_load_export_payload(run_dir: Path) -> Dict[str, object]:
+    export_dir = run_dir / "export"
+    payload = _load_pickle_file(export_dir / "final_payload.pkl", default=None)
+    if isinstance(payload, dict):
+        return payload
+    summary = _load_json_file(export_dir / "payload.json", default={}) or {}
+    return {
+        "candidate_paths": summary.get("candidate_paths") or {},
+        "promoted_paths": summary.get("promoted_paths") or {},
+        "latex_promoted": bool(summary.get("latex_promoted")),
+        "result_status": summary.get("result_status"),
+    }
+
+
+def _paper_collect_route_models(route_dir: Path, route_name: str) -> Tuple[list[Dict[str, object]], pd.DataFrame, pd.DataFrame]:
+    model_payloads: list[Dict[str, object]] = []
+    model_rows: list[Dict[str, object]] = []
+    k_frames: list[pd.DataFrame] = []
+    models_root = route_dir / "models"
+    model_dirs: list[Path] = []
+    for model_code in PAPER_MODEL_CODES:
+        model_dir = models_root / model_code
+        if model_dir.exists():
+            model_dirs.append(model_dir)
+    if models_root.exists():
+        for model_dir in sorted(models_root.iterdir()):
+            if model_dir.is_dir() and model_dir not in model_dirs:
+                model_dirs.append(model_dir)
+
+    for model_dir in model_dirs:
+        model_code = model_dir.name
+        summary = _load_json_file(model_dir / "final_summary.json", default={}) or {}
+        metrics = _load_json_file(model_dir / "metrics.json", default={}) or {}
+        k_search_df = _load_pickle_file(model_dir / "k_search.pkl", default=pd.DataFrame())
+        if not isinstance(k_search_df, pd.DataFrame):
+            k_search_df = pd.DataFrame()
+        if k_search_df.empty:
+            k_result_rows = _read_jsonl_records(model_dir / "k_results.jsonl")
+            if not k_result_rows:
+                k_result_rows = []
+                k_results_dir = model_dir / "k_results"
+                if k_results_dir.exists():
+                    for k_path in sorted(k_results_dir.glob("k_*.json")):
+                        payload = _load_json_file(k_path, default=None)
+                        if isinstance(payload, dict):
+                            k_result_rows.append(payload)
+            if k_result_rows:
+                k_search_df = pd.DataFrame(k_result_rows)
+        if isinstance(k_search_df, pd.DataFrame) and not k_search_df.empty:
+            work_k_df = k_search_df.copy()
+            if "route_name" in work_k_df.columns:
+                work_k_df["route_name"] = str(route_name)
+            else:
+                work_k_df.insert(0, "route_name", str(route_name))
+            resolved_model_code = str(summary.get("model_code") or model_code)
+            resolved_model_title = str(summary.get("model_title") or model_code)
+            if "model_code" in work_k_df.columns:
+                work_k_df["model_code"] = resolved_model_code
+            else:
+                work_k_df.insert(1, "model_code", resolved_model_code)
+            if "model_title" in work_k_df.columns:
+                work_k_df["model_title"] = resolved_model_title
+            else:
+                insert_loc = 2 if "model_code" in work_k_df.columns else len(work_k_df.columns)
+                work_k_df.insert(insert_loc, "model_title", resolved_model_title)
+            k_frames.append(work_k_df)
+
+        final_available = bool(summary or metrics)
+        if not final_available and k_search_df.empty:
+            continue
+        class_metrics = metrics.get("class_metrics") or {}
+        model_payload = {
+            "route_name": str(route_name),
+            "model_code": str(summary.get("model_code") or model_code),
+            "model_title": str(summary.get("model_title") or model_code),
+            "selected_k": _maybe_int(summary.get("selected_k")),
+            "feature_group": str(summary.get("feature_group") or ""),
+            "candidate_feature_count": _maybe_int(summary.get("candidate_feature_count")),
+            "best_cv_score": pd.to_numeric(summary.get("best_cv_score"), errors="coerce"),
+            "accuracy": pd.to_numeric(metrics.get("accuracy"), errors="coerce"),
+            "precision": pd.to_numeric(metrics.get("precision"), errors="coerce"),
+            "recall": pd.to_numeric(metrics.get("recall"), errors="coerce"),
+            "f1_score": pd.to_numeric(metrics.get("f1_score"), errors="coerce"),
+            "roc_auc": pd.to_numeric(metrics.get("roc_auc"), errors="coerce"),
+            "false_negatives_positive_class": _maybe_int(metrics.get("false_negatives_positive_class")),
+            "no_marc_f1": pd.to_numeric((class_metrics.get("0") or {}).get("f1_score"), errors="coerce"),
+            "marc_f1": pd.to_numeric((class_metrics.get("1") or {}).get("f1_score"), errors="coerce"),
+            "optimization_backend": str((summary.get("optimization") or {}).get("backend") or ""),
+            "requested_optimization_backend": str((summary.get("optimization") or {}).get("requested_backend") or ""),
+            "k_results_count": int(len(k_search_df)) if isinstance(k_search_df, pd.DataFrame) else 0,
+            "final_available": bool(final_available),
+            "status": "completed" if final_available else "partial",
+        }
+        model_payloads.append(
+            {
+                **model_payload,
+                "summary": summary,
+                "metrics": metrics,
+                "k_search_df": k_search_df if isinstance(k_search_df, pd.DataFrame) else pd.DataFrame(),
+            }
+        )
+        model_rows.append(model_payload)
+
+    model_df = pd.DataFrame(model_rows)
+    if not model_df.empty:
+        model_df = model_df.sort_values(["route_name", "model_code"], kind="stable").reset_index(drop=True)
+    k_progress_df = pd.concat(k_frames, ignore_index=True) if k_frames else pd.DataFrame()
+    if not k_progress_df.empty and "k" in k_progress_df.columns:
+        k_progress_df["k"] = pd.to_numeric(k_progress_df["k"], errors="coerce")
+        k_progress_df = k_progress_df.sort_values(["route_name", "model_code", "k"], kind="stable").reset_index(drop=True)
+    return model_payloads, model_df, k_progress_df
+
+
+def _paper_route_status_rows(
+    *,
+    manifest: Dict[str, object],
+    step_df: pd.DataFrame,
+    frozen_payload: Dict[str, object],
+    raw_payload: Dict[str, object],
+    raw_build_payload: Dict[str, object],
+    compare_payload: Dict[str, object],
+    export_payload: Dict[str, object],
+    partial_models_df: pd.DataFrame,
+    k_progress_df: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[Dict[str, object]] = []
+    for route_name, route_payload in (("frozen", frozen_payload), ("raw", raw_payload)):
+        validation = route_payload.get("dataset_validation") or {}
+        step_summary = _paper_stage_step_summary(step_df, f"{route_name}.")
+        route_model_df = (
+            partial_models_df.loc[partial_models_df["route_name"].astype(str) == route_name].copy()
+            if isinstance(partial_models_df, pd.DataFrame) and not partial_models_df.empty and "route_name" in partial_models_df.columns
+            else pd.DataFrame()
+        )
+        route_k_df = (
+            k_progress_df.loc[k_progress_df["route_name"].astype(str) == route_name].copy()
+            if isinstance(k_progress_df, pd.DataFrame) and not k_progress_df.empty and "route_name" in k_progress_df.columns
+            else pd.DataFrame()
+        )
+        status = str(route_payload.get("status") or step_summary.get("status") or "pending")
+        if status == "completed":
+            status = "ok"
+        if not route_payload and not route_model_df.empty and status == "pending":
+            status = "partial"
+        rows.append(
+            {
+                "stage": route_name,
+                "status": status,
+                "status_message": str(route_payload.get("status_message") or step_summary.get("status_message") or ""),
+                "current_step_id": str(step_summary.get("current_step_id") or ""),
+                "rows": validation.get("rows"),
+                "flow_features": validation.get("flow_features"),
+                "embedding_features": validation.get("embedding_features"),
+                "total_features": validation.get("total_features"),
+                "completed_models": int(
+                    route_model_df["final_available"].fillna(False).astype(bool).sum()
+                ) if not route_model_df.empty and "final_available" in route_model_df.columns else 0,
+                "expected_models": len(PAPER_MODEL_CODES),
+                "k_results": int(len(route_k_df)),
+            }
+        )
+
+    raw_build_step = _paper_stage_step_summary(step_df, "raw.build.")
+    raw_build_embedding_meta = dict(raw_build_payload.get("embedding_meta") or {})
+    selected_embedding_cols = raw_build_payload.get("selected_embedding_cols") or []
+    raw_build_dataset = raw_build_payload.get("dataset_df")
+    rows.append(
+        {
+            "stage": "raw_build",
+            "status": str(raw_build_step.get("status") or "pending"),
+            "status_message": str(raw_build_step.get("status_message") or ""),
+            "current_step_id": str(raw_build_step.get("current_step_id") or ""),
+            "rows": int(len(raw_build_dataset)) if isinstance(raw_build_dataset, pd.DataFrame) else None,
+            "flow_features": None,
+            "embedding_features": int(raw_build_embedding_meta.get("selected_embedding_count") or len(selected_embedding_cols or [])),
+            "total_features": None,
+            "completed_models": None,
+            "expected_models": None,
+            "k_results": None,
+        }
+    )
+
+    compare_step = _paper_stage_step_summary(step_df, "compare.")
+    compare_diff_df = compare_payload.get("diff_df")
+    rows.append(
+        {
+            "stage": "compare",
+            "status": str(compare_payload.get("status") or compare_step.get("status") or "pending"),
+            "status_message": str(compare_payload.get("reason") or compare_step.get("status_message") or ""),
+            "current_step_id": str(compare_step.get("current_step_id") or ""),
+            "rows": None,
+            "flow_features": None,
+            "embedding_features": None,
+            "total_features": None,
+            "completed_models": int(bool(compare_payload)),
+            "expected_models": None,
+            "k_results": int(len(compare_diff_df)) if isinstance(compare_diff_df, pd.DataFrame) else 0,
+        }
+    )
+
+    export_step = _paper_stage_step_summary(step_df, "export.")
+    rows.append(
+        {
+            "stage": "export",
+            "status": str(export_payload.get("result_status") or export_step.get("status") or "pending"),
+            "status_message": (
+                "Assets promovidos a LaTeX."
+                if bool(export_payload.get("latex_promoted"))
+                else str(export_step.get("status_message") or "")
+            ),
+            "current_step_id": str(export_step.get("current_step_id") or ""),
+            "rows": None,
+            "flow_features": None,
+            "embedding_features": None,
+            "total_features": None,
+            "completed_models": int(len(export_payload.get("promoted_paths") or {})),
+            "expected_models": int(len(export_payload.get("candidate_paths") or {})),
+            "k_results": None,
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+def _paper_payload_summary(payload: object) -> object:
+    if isinstance(payload, pd.DataFrame):
+        return {
+            "type": "DataFrame",
+            "rows": int(len(payload)),
+            "columns": list(payload.columns),
+        }
+    if isinstance(payload, dict):
+        out: Dict[str, object] = {}
+        for key, value in payload.items():
+            if isinstance(value, pd.DataFrame):
+                out[str(key)] = {
+                    "type": "DataFrame",
+                    "rows": int(len(value)),
+                    "columns": list(value.columns),
+                }
+            elif isinstance(value, dict):
+                out[str(key)] = _paper_payload_summary(value)
+            elif isinstance(value, (list, tuple)):
+                if value and isinstance(value[0], dict):
+                    out[str(key)] = {"type": "list[dict]", "length": len(value)}
+                elif len(value) > 10:
+                    out[str(key)] = {"type": "list", "length": len(value)}
+                else:
+                    out[str(key)] = list(value)
+            else:
+                out[str(key)] = value
+        return out
+    return payload
+
+
+def _read_paper_replication_run(manifest_path: Path) -> Dict[str, object]:
+    manifest = _load_json_file(manifest_path, default={}) or {}
+    run_dir = manifest_path.parent
+    live_status_path = run_dir / "live_status.json"
+    live_events_path = run_dir / "live_events.jsonl"
+    frozen_dir = _paper_route_dir(run_dir, "frozen")
+    raw_dir = _paper_route_dir(run_dir, "raw")
+    raw_build_dir = run_dir / "raw_build"
+
+    live_status = _load_json_file(live_status_path, default={}) or {}
+    manifest_progress = dict(manifest.get("progress") or {})
+    live_event_rows = _read_jsonl_records(live_events_path)
+    if not live_event_rows and isinstance(live_status, dict) and live_status:
+        live_event_rows = [live_status]
+    if not live_event_rows and manifest:
+        live_event_rows = [
+            {
+                "updated_at": manifest.get("updated_at") or manifest.get("created_at"),
+                "progress": manifest_progress,
+                "step_id": manifest_progress.get("current_step_id"),
+                "status": manifest.get("status"),
+                "result_status": manifest.get("result_status"),
+            }
+        ]
+    normalized_events = [
+        _paper_normalize_live_event(row, manifest_progress=manifest_progress)
+        for row in live_event_rows
+        if isinstance(row, dict)
+    ]
+    live_events_df = pd.DataFrame(normalized_events)
+    if not live_events_df.empty:
+        live_events_df["event_index"] = range(1, len(live_events_df) + 1)
+
+    step_df = _paper_build_step_df(manifest)
+    frozen_payload = _load_pickle_file(frozen_dir / "route_payload.pkl", default={}) or {}
+    raw_payload = _load_pickle_file(raw_dir / "route_payload.pkl", default={}) or {}
+    if not frozen_payload:
+        frozen_payload = {
+            "route_name": "frozen",
+            "dataset_validation": _load_json_file(frozen_dir / "dataset_validation.json", default={}) or {},
+        }
+    if not raw_payload:
+        raw_payload = {
+            "route_name": "raw",
+            "dataset_validation": _load_json_file(raw_dir / "dataset_validation.json", default={}) or {},
+        }
+    raw_build_payload = _load_pickle_file(raw_build_dir / "payload.pkl", default={}) or {}
+    compare_payload = _paper_load_compare_payload(run_dir)
+    export_payload = _paper_load_export_payload(run_dir)
+
+    frozen_models, frozen_model_df, frozen_k_df = _paper_collect_route_models(frozen_dir, "frozen")
+    raw_models, raw_model_df, raw_k_df = _paper_collect_route_models(raw_dir, "raw")
+    partial_models_df = pd.concat(
+        [df for df in [frozen_model_df, raw_model_df] if isinstance(df, pd.DataFrame) and not df.empty],
+        ignore_index=True,
+    ) if any(isinstance(df, pd.DataFrame) and not df.empty for df in [frozen_model_df, raw_model_df]) else pd.DataFrame()
+    k_progress_df = pd.concat(
+        [df for df in [frozen_k_df, raw_k_df] if isinstance(df, pd.DataFrame) and not df.empty],
+        ignore_index=True,
+    ) if any(isinstance(df, pd.DataFrame) and not df.empty for df in [frozen_k_df, raw_k_df]) else pd.DataFrame()
+
+    if isinstance(compare_payload.get("diff_df"), pd.DataFrame):
+        compare_diff_df = compare_payload.get("diff_df")
+    else:
+        compare_diff_df = _load_csv_file(run_dir / "compare" / "diff.csv")
+        compare_payload["diff_df"] = compare_diff_df
+
+    compare_summary_df = pd.DataFrame(
+        [
+            {
+                "status": str(compare_payload.get("status") or ""),
+                "passed": bool(compare_payload.get("passed")),
+                "reason": str(compare_payload.get("reason") or ""),
+                "max_numeric_diff": compare_payload.get("max_numeric_diff"),
+                "tolerance": compare_payload.get("tolerance"),
+                "diff_rows": int(len(compare_diff_df)) if isinstance(compare_diff_df, pd.DataFrame) else 0,
+            }
+        ]
+    )
+    export_summary_df = pd.DataFrame(
+        [
+            {
+                "result_status": str(export_payload.get("result_status") or ""),
+                "latex_promoted": bool(export_payload.get("latex_promoted")),
+                "candidate_count": int(len(export_payload.get("candidate_paths") or {})),
+                "promoted_count": int(len(export_payload.get("promoted_paths") or {})),
+            }
+        ]
+    )
+    route_status_df = _paper_route_status_rows(
+        manifest=manifest,
+        step_df=step_df,
+        frozen_payload=frozen_payload,
+        raw_payload=raw_payload,
+        raw_build_payload=raw_build_payload,
+        compare_payload=compare_payload,
+        export_payload=export_payload,
+        partial_models_df=partial_models_df,
+        k_progress_df=k_progress_df,
+    )
+    current_context = {
+        "status": str(live_status.get("status") or manifest.get("status") or ""),
+        "result_status": str(live_status.get("result_status") or manifest.get("result_status") or ""),
+        "current_stage": str(manifest_progress.get("current_stage") or ""),
+        "current_step_id": str(live_status.get("step_id") or manifest_progress.get("current_step_id") or ""),
+        "message": str(live_status.get("message") or ""),
+        "updated_at": str(live_status.get("updated_at") or manifest.get("updated_at") or ""),
+    }
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "run_dir": run_dir,
+        "live_status": live_status,
+        "live_events_df": live_events_df,
+        "live_status_path": live_status_path,
+        "live_events_path": live_events_path,
+        "step_df": step_df,
+        "route_status_df": route_status_df,
+        "partial_models_df": partial_models_df,
+        "k_progress_df": k_progress_df,
+        "compare_summary_df": compare_summary_df,
+        "compare_diff_df": compare_diff_df,
+        "export_summary_df": export_summary_df,
+        "current_context": current_context,
+        "frozen_payload": frozen_payload,
+        "raw_payload": raw_payload,
+        "raw_build_payload": raw_build_payload,
+        "compare_payload": compare_payload,
+        "export_payload": export_payload,
+        "model_payloads": frozen_models + raw_models,
     }
 
 
@@ -2361,7 +3155,7 @@ def _render_best_highway_section_view(
         st.plotly_chart(fig, width="stretch")
 
     st.subheader("Datos")
-    st.dataframe(plot_df, width="stretch")
+    st.dataframe(_streamlit_arrow_safe_df(plot_df), width="stretch")
 
 
 def _render_drift_block_matrix(block_df: pd.DataFrame) -> None:
@@ -2392,7 +3186,7 @@ def _render_drift_block_matrix(block_df: pd.DataFrame) -> None:
         table_df = chart_df[
             ["seed_label", "block_label", "status", "strategy", "model", "balance_mode"]
         ].copy()
-        st.dataframe(table_df, width="stretch")
+        st.dataframe(_streamlit_arrow_safe_df(table_df), width="stretch")
         return
 
     color_domain = ["pending", "running", "completed", "failed"]
@@ -2497,7 +3291,7 @@ def _render_drift_roc_curves(
         fig.update_yaxes(range=[0.0, 1.0])
         st.plotly_chart(fig, width="stretch")
 
-    st.dataframe(plot_df, width="stretch")
+    st.dataframe(_streamlit_arrow_safe_df(plot_df), width="stretch")
 
 
 def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
@@ -2507,6 +3301,7 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
     block_df = data.get("block_df")
     summary_df = data.get("summary_df")
     tuning_trials_df = data.get("tuning_trials_df")
+    tuning_params_df = data.get("tuning_params_df")
     memory_trace_df = data.get("memory_trace_df")
     average_roc_df = data.get("average_roc_df")
     yearly_df = data.get("yearly_df")
@@ -2609,7 +3404,9 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
             if not plot_df.empty:
                 st.line_chart(plot_df.set_index("event_index")["progress_pct"], width="stretch")
             st.dataframe(
-                history_df[["event_index", "timestamp", "label", "detail", "progress_pct"]],
+                _streamlit_arrow_safe_df(
+                    history_df[["event_index", "timestamp", "label", "detail", "progress_pct"]]
+                ),
                 width="stretch",
             )
         else:
@@ -2631,7 +3428,7 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
                 block_status_df.set_index("status")["count"],
                 width="stretch",
             )
-            st.dataframe(block_status_df, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(block_status_df), width="stretch")
         else:
             st.info("No hay estados de bloques para resumir.")
 
@@ -2653,7 +3450,7 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
                 aggfunc="max",
             ).sort_index()
             st.line_chart(tuning_pivot, width="stretch")
-            st.dataframe(tuning_plot, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(tuning_plot), width="stretch")
         else:
             st.info("No hay tuning trials persistidos todavía.")
 
@@ -2679,7 +3476,7 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
                     aggfunc="last",
                 ).sort_index()
                 st.line_chart(trace_pivot, width="stretch")
-            st.dataframe(trace_plot, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(trace_plot), width="stretch")
         else:
             st.info("No hay trazas de recursos disponibles.")
 
@@ -2694,11 +3491,19 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
                 table_df = live_result_tables.get(table_key)
                 st.caption(f"Table {table_key}")
                 if isinstance(table_df, pd.DataFrame) and not table_df.empty:
-                    st.dataframe(table_df, width="stretch")
+                    st.dataframe(_streamlit_arrow_safe_df(table_df), width="stretch")
                 else:
                     st.info(f"Table {table_key} no aplica a la configuracion actual.")
         else:
             st.info("No fue posible reconstruir tablas live para la corrida actual.")
+        st.caption("Table H.1")
+        if isinstance(tuning_params_df, pd.DataFrame) and not tuning_params_df.empty:
+            st.caption(
+                "Mejor configuracion por proceso de tuning. `cv_auc_delta_vs_none` compara contra la corrida equivalente sin balanceo cuando existe."
+            )
+            st.dataframe(_streamlit_arrow_safe_df(tuning_params_df), width="stretch")
+        else:
+            st.info("No hay artefactos de tuning persistidos todavía.")
 
         st.markdown("**ROC-AUC curves by strategy**")
         _render_drift_roc_curves(
@@ -2728,7 +3533,7 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
                     chart_df.set_index("series_label")["auc"],
                     width="stretch",
                 )
-            st.dataframe(summary_df, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(summary_df), width="stretch")
         else:
             st.info("Aún no hay resultados parciales agregables.")
 
@@ -2738,7 +3543,7 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
                 block_df["status"].astype(str).str.lower() == "completed"
             ].copy()
             if not completed_blocks.empty:
-                st.dataframe(completed_blocks, width="stretch")
+                st.dataframe(_streamlit_arrow_safe_df(completed_blocks), width="stretch")
             else:
                 st.info("Todavía no hay bloques completados.")
         else:
@@ -2762,10 +3567,10 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
         )
         if isinstance(yearly_df, pd.DataFrame) and not yearly_df.empty:
             st.markdown("**Yearly preview**")
-            st.dataframe(yearly_df, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(yearly_df), width="stretch")
         if isinstance(adaptive_df, pd.DataFrame) and not adaptive_df.empty:
             st.markdown("**Adaptive preview**")
-            st.dataframe(adaptive_df, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(adaptive_df), width="stretch")
 
     with data_tab:
         st.markdown("**Manifest**")
@@ -2775,13 +3580,246 @@ def _render_drift_recalibration_view(data: Dict[str, object]) -> None:
             st.json(live_status, expanded=False)
         if isinstance(block_df, pd.DataFrame) and not block_df.empty:
             st.markdown("**Block index**")
-            st.dataframe(block_df, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(block_df), width="stretch")
         if isinstance(tuning_trials_df, pd.DataFrame) and not tuning_trials_df.empty:
             st.markdown("**Tuning trials**")
-            st.dataframe(tuning_trials_df, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(tuning_trials_df), width="stretch")
         if isinstance(execution_log_df, pd.DataFrame) and not execution_log_df.empty:
             st.markdown("**Execution log**")
-            st.dataframe(execution_log_df, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(execution_log_df), width="stretch")
+
+
+def _render_paper_replication_live_view(data: Dict[str, object]) -> None:
+    manifest = dict(data.get("manifest") or {})
+    live_status = dict(data.get("live_status") or {})
+    live_events_df = data.get("live_events_df")
+    step_df = data.get("step_df")
+    route_status_df = data.get("route_status_df")
+    partial_models_df = data.get("partial_models_df")
+    k_progress_df = data.get("k_progress_df")
+    compare_summary_df = data.get("compare_summary_df")
+    compare_diff_df = data.get("compare_diff_df")
+    export_summary_df = data.get("export_summary_df")
+    current_context = dict(data.get("current_context") or {})
+
+    st.caption("Experimento detectado: Paper replication")
+    st.caption(f"Checkpoint: {data.get('manifest_path')}")
+    st.caption(f"Run dir: {data.get('run_dir')}")
+
+    progress = dict(manifest.get("progress") or {})
+    total_units = pd.to_numeric(progress.get("total_units", 0.0), errors="coerce")
+    completed_units = pd.to_numeric(progress.get("completed_units", 0.0), errors="coerce")
+    if pd.isna(total_units):
+        total_units = 0.0
+    if pd.isna(completed_units):
+        completed_units = 0.0
+    progress_ratio = float(completed_units) / float(max(1.0, float(total_units or 0.0)))
+    if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty and "progress_ratio" in live_events_df.columns:
+        live_ratio = pd.to_numeric(live_events_df["progress_ratio"], errors="coerce").dropna()
+        if not live_ratio.empty:
+            progress_ratio = float(live_ratio.iloc[-1])
+    progress_ratio = max(0.0, min(progress_ratio, 1.0))
+    status = str(manifest.get("status") or current_context.get("status") or "unknown")
+    result_status = str(manifest.get("result_status") or current_context.get("result_status") or status)
+    updated_at = str(
+        current_context.get("updated_at")
+        or live_status.get("updated_at")
+        or manifest.get("updated_at")
+        or manifest.get("created_at")
+        or "-"
+    )
+    current_stage = str(current_context.get("current_stage") or progress.get("current_stage") or "-")
+    current_step_id = str(current_context.get("current_step_id") or progress.get("current_step_id") or "-")
+    current_message = str(
+        current_context.get("message")
+        or live_status.get("message")
+        or live_status.get("detail")
+        or ""
+    )
+
+    if status == "failed":
+        st.error(f"Corrida fallida: {manifest.get('last_error') or 'sin detalle persistido'}.")
+    elif status == "completed" and result_status == "blocked":
+        st.warning("Corrida completada con bloqueo metodologico. Se muestran resultados y diff persistidos.")
+    elif status == "completed":
+        st.success("Corrida completada. Se muestran resultados finales y parciales persistidos.")
+    else:
+        st.info("Corrida en progreso o reanudable. La vista usa el checkpoint persistido.")
+
+    frozen_status = "-"
+    raw_status = "-"
+    compare_status = "-"
+    latex_status = "No"
+    if isinstance(route_status_df, pd.DataFrame) and not route_status_df.empty:
+        for stage_name, target in [("frozen", "frozen_status"), ("raw", "raw_status"), ("compare", "compare_status")]:
+            match = route_status_df.loc[route_status_df["stage"].astype(str) == stage_name]
+            if not match.empty:
+                value = str(match.iloc[0]["status"] or "-")
+                if target == "frozen_status":
+                    frozen_status = value
+                elif target == "raw_status":
+                    raw_status = value
+                else:
+                    compare_status = value
+    if isinstance(export_summary_df, pd.DataFrame) and not export_summary_df.empty:
+        latex_status = "Si" if bool(export_summary_df.iloc[0]["latex_promoted"]) else "No"
+
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6 = st.columns(6)
+    kpi_1.metric("Estado", status)
+    kpi_2.metric("Resultado", result_status)
+    kpi_3.metric("Progreso", f"{100.0 * progress_ratio:.1f}%")
+    kpi_4.metric(
+        "Pasos",
+        f"{_safe_int(progress.get('completed_steps'))}/{_safe_int(progress.get('total_steps'))}",
+    )
+    kpi_5.metric("Frozen / Raw", f"{frozen_status} / {raw_status}")
+    kpi_6.metric("Compare / LaTeX", f"{compare_status} / {latex_status}")
+
+    st.progress(progress_ratio)
+    st.caption(f"Etapa activa: {current_stage}")
+    st.caption(f"Step activo: {current_step_id}")
+    if current_message:
+        st.caption(current_message)
+    st.caption(f"Ultima actualizacion: {updated_at}")
+
+    live_tab, partial_tab, data_tab = st.tabs(
+        ["Live calculations", "Partial results", "Raw data"]
+    )
+
+    with live_tab:
+        st.markdown("**Progress over time**")
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            history_df = live_events_df.copy()
+            if "event_index" not in history_df.columns:
+                history_df["event_index"] = range(1, len(history_df) + 1)
+            plot_df = history_df[["event_index", "progress_pct"]].dropna(subset=["progress_pct"])
+            if not plot_df.empty:
+                st.line_chart(plot_df.set_index("event_index")["progress_pct"], width="stretch")
+            columns = [
+                col
+                for col in ["event_index", "timestamp", "stage", "step_id", "step_status", "label", "detail", "progress_pct"]
+                if col in history_df.columns
+            ]
+            st.dataframe(_streamlit_arrow_safe_df(history_df[columns]), width="stretch")
+        else:
+            st.info("No hay eventos live persistidos todavía.")
+
+        st.markdown("**Step execution matrix**")
+        if isinstance(step_df, pd.DataFrame) and not step_df.empty:
+            step_status_df = (
+                step_df["status"].astype(str).value_counts().rename_axis("status").reset_index(name="count")
+            )
+            if not step_status_df.empty:
+                st.bar_chart(step_status_df.set_index("status")["count"], width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(step_df), width="stretch")
+        else:
+            st.info("No hay steps persistidos todavía.")
+
+    with partial_tab:
+        st.markdown("**Route summary**")
+        if isinstance(route_status_df, pd.DataFrame) and not route_status_df.empty:
+            st.dataframe(_streamlit_arrow_safe_df(route_status_df), width="stretch")
+        else:
+            st.info("No hay resumen parcial de rutas disponible.")
+
+        st.markdown("**Partial model results**")
+        if isinstance(partial_models_df, pd.DataFrame) and not partial_models_df.empty:
+            st.dataframe(_streamlit_arrow_safe_df(partial_models_df), width="stretch")
+        else:
+            st.info("Todavia no hay modelos finales ni parciales persistidos.")
+
+        st.markdown("**k-search evolution**")
+        if isinstance(k_progress_df, pd.DataFrame) and not k_progress_df.empty:
+            route_options = sorted(k_progress_df["route_name"].astype(str).unique().tolist())
+            selected_route = st.selectbox(
+                "Route",
+                options=route_options,
+                index=0,
+                key="paper_live_route_filter",
+            )
+            route_k_df = k_progress_df.loc[
+                k_progress_df["route_name"].astype(str) == str(selected_route)
+            ].copy()
+            model_options = sorted(route_k_df["model_code"].astype(str).unique().tolist())
+            selected_models = st.multiselect(
+                "Model codes",
+                options=model_options,
+                default=model_options,
+                key="paper_live_model_filter",
+            )
+            if selected_models:
+                route_k_df = route_k_df.loc[
+                    route_k_df["model_code"].astype(str).isin([str(item) for item in selected_models])
+                ].copy()
+            route_k_df["series_label"] = (
+                route_k_df["route_name"].astype(str) + " | " + route_k_df["model_code"].astype(str)
+            )
+            for metric_name in ["accuracy", "f1_score", "false_negatives_pct", "validation_score"]:
+                if metric_name not in route_k_df.columns:
+                    continue
+                plot_df = route_k_df[["k", "series_label", metric_name]].copy()
+                plot_df["k"] = pd.to_numeric(plot_df["k"], errors="coerce")
+                plot_df[metric_name] = pd.to_numeric(plot_df[metric_name], errors="coerce")
+                plot_df = plot_df.dropna(subset=["k", metric_name])
+                if plot_df.empty:
+                    continue
+                st.caption(metric_name)
+                pivot_df = plot_df.pivot_table(
+                    index="k",
+                    columns="series_label",
+                    values=metric_name,
+                    aggfunc="last",
+                ).sort_index()
+                st.line_chart(pivot_df, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(route_k_df), width="stretch")
+        else:
+            st.info("No hay resultados parciales de k persistidos todavía.")
+
+        st.markdown("**Compare status**")
+        if isinstance(compare_summary_df, pd.DataFrame) and not compare_summary_df.empty:
+            st.dataframe(_streamlit_arrow_safe_df(compare_summary_df), width="stretch")
+            if isinstance(compare_diff_df, pd.DataFrame) and not compare_diff_df.empty:
+                st.dataframe(_streamlit_arrow_safe_df(compare_diff_df), width="stretch")
+        else:
+            st.info("No hay payload de comparacion disponible todavía.")
+
+        st.markdown("**Export status**")
+        if isinstance(export_summary_df, pd.DataFrame) and not export_summary_df.empty:
+            st.dataframe(_streamlit_arrow_safe_df(export_summary_df), width="stretch")
+            export_payload = dict(data.get("export_payload") or {})
+            asset_rows = [
+                {
+                    "asset_name": str(asset_name),
+                    "candidate_path": str(candidate_path),
+                    "promoted_path": str((export_payload.get("promoted_paths") or {}).get(str(asset_name)) or ""),
+                }
+                for asset_name, candidate_path in (export_payload.get("candidate_paths") or {}).items()
+            ]
+            if asset_rows:
+                st.dataframe(_streamlit_arrow_safe_df(pd.DataFrame(asset_rows)), width="stretch")
+        else:
+            st.info("No hay payload de exportacion disponible todavía.")
+
+    with data_tab:
+        st.markdown("**Manifest**")
+        st.json(manifest, expanded=False)
+        if live_status:
+            st.markdown("**Live status**")
+            st.json(live_status, expanded=False)
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            st.markdown("**Live events**")
+            st.dataframe(_streamlit_arrow_safe_df(live_events_df), width="stretch")
+        st.markdown("**Payload summaries**")
+        st.json(
+            {
+                "frozen": _paper_payload_summary(data.get("frozen_payload") or {}),
+                "raw_build": _paper_payload_summary(data.get("raw_build_payload") or {}),
+                "raw": _paper_payload_summary(data.get("raw_payload") or {}),
+                "compare": _paper_payload_summary(data.get("compare_payload") or {}),
+                "export": _paper_payload_summary(data.get("export_payload") or {}),
+            },
+            expanded=False,
+        )
 
 
 def main(*, set_page_config: bool = True) -> None:
@@ -2819,6 +3857,9 @@ def main(*, set_page_config: bool = True) -> None:
     if source_type == "drift_recalibration":
         run_data = _read_drift_run(path)
         _render_drift_recalibration_view(run_data)
+    elif source_type == "paper_replication":
+        run_data = _read_paper_replication_run(path)
+        _render_paper_replication_live_view(run_data)
     else:
         meta, df, best_row = _read_live_db(path)
         st.caption(f"Archivo: {path}")

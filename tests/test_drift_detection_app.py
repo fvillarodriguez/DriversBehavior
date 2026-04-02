@@ -1405,6 +1405,126 @@ def test_train_model_with_internal_validation_refits_final_model_on_full_trainin
     assert "val_metrics_after_calibration" in bundle
 
 
+def test_stabilize_probability_calibration_rejects_negative_platt_slope():
+    y_true = np.asarray([0, 0, 1, 1], dtype=int)
+    raw_scores = np.asarray([0.1, 0.2, 0.8, 0.9], dtype=float)
+    raw_youden = youden_threshold(y_true, raw_scores)
+
+    stabilized_scores, stabilized_youden, metadata, calibration_model = drift_app._stabilize_probability_calibration(
+        y_true,
+        raw_scores,
+        raw_youden=raw_youden,
+        calibrated_scores=np.asarray([0.52, 0.51, 0.50, 0.49], dtype=float),
+        calibration_metadata={
+            "method": drift_app.DEFAULT_CALIBRATION_METHOD,
+            "kind": "platt",
+            "applied": True,
+            "coef": -0.1,
+            "intercept": 0.0,
+        },
+        calibration_model=object(),
+    )
+
+    assert np.allclose(stabilized_scores, raw_scores)
+    assert stabilized_youden["threshold"] == pytest.approx(raw_youden["threshold"])
+    assert metadata["kind"] == "identity"
+    assert metadata["reason"] == "rejected_non_positive_platt_slope"
+    assert calibration_model is None
+
+
+def test_stabilize_probability_calibration_rejects_worse_youden_than_raw():
+    y_true = np.asarray([0, 0, 1, 1], dtype=int)
+    raw_scores = np.asarray([0.1, 0.2, 0.8, 0.9], dtype=float)
+    raw_youden = youden_threshold(y_true, raw_scores)
+
+    stabilized_scores, stabilized_youden, metadata, calibration_model = drift_app._stabilize_probability_calibration(
+        y_true,
+        raw_scores,
+        raw_youden=raw_youden,
+        calibrated_scores=np.asarray([0.48, 0.51, 0.49, 0.52], dtype=float),
+        calibration_metadata={
+            "method": drift_app.DEFAULT_CALIBRATION_METHOD,
+            "kind": "platt",
+            "applied": True,
+            "coef": 0.1,
+            "intercept": 0.0,
+        },
+        calibration_model=object(),
+    )
+
+    assert np.allclose(stabilized_scores, raw_scores)
+    assert stabilized_youden["threshold"] == pytest.approx(raw_youden["threshold"])
+    assert metadata["kind"] == "identity"
+    assert metadata["reason"] == "rejected_worse_youden_than_raw"
+    assert calibration_model is None
+
+
+def test_train_model_with_internal_validation_rejects_degenerate_platt_calibration(monkeypatch):
+    class RecordingModel:
+        def fit(self, X, y):
+            return self
+
+        def predict_proba(self, X):
+            values = pd.to_numeric(X.iloc[:, 0], errors="coerce").fillna(0.0).astype(float).to_numpy()
+            scores = 1.0 / (1.0 + np.exp(-values))
+            return np.column_stack([1.0 - scores, scores])
+
+    def fake_tune_hyperparameters(*args, **kwargs):
+        return (
+            {"splitrule": "gini", "mtry": 1, "min_node_size": 1},
+            pd.DataFrame(),
+            {"study_id": "unit-test-study"},
+        )
+
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(drift_app, "_build_model", lambda *args, **kwargs: RecordingModel())
+    monkeypatch.setattr(
+        drift_app,
+        "_cross_validated_scores",
+        lambda *args, **kwargs: np.asarray([0.1, 0.2, 0.3, 0.7, 0.8, 0.9], dtype=float),
+    )
+    monkeypatch.setattr(
+        drift_app,
+        "_fit_platt_calibrator",
+        lambda *args, **kwargs: (
+            np.asarray([0.52, 0.51, 0.50, 0.49, 0.48, 0.47], dtype=float),
+            {
+                "method": drift_app.DEFAULT_CALIBRATION_METHOD,
+                "kind": "platt",
+                "applied": True,
+                "coef": -0.05,
+                "intercept": 0.0,
+            },
+            object(),
+        ),
+    )
+
+    train_df = pd.DataFrame(
+        {
+            "x": [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0],
+            "target": [0, 0, 0, 1, 1, 1],
+        }
+    )
+
+    bundle = train_model_with_internal_validation(
+        train_df,
+        feature_cols=["x"],
+        target_col="target",
+        model_name="Random Forest",
+        validation_size=0.33,
+        folds=2,
+        random_state=7,
+        fast_mode=True,
+        grid_limit=1,
+    )
+
+    assert bundle["threshold"] == pytest.approx(bundle["raw_youden_threshold"])
+    assert bundle["calibration_model"] is None
+    assert bundle["calibration_metadata"]["kind"] == "identity"
+    assert bundle["calibration_metadata"]["reason"] == "rejected_non_positive_platt_slope"
+    assert bundle["val_metrics_before_calibration"] == bundle["val_metrics_after_calibration"]
+
+
 def test_fit_nnet_warning_safe_suppresses_convergence_warning():
     class WarningModel:
         n_iter_ = 200
@@ -1623,7 +1743,20 @@ def test_cross_validated_scores_without_diagnostics_skips_fold_serialization(mon
 
     assert isinstance(scores, np.ndarray)
     assert len(scores) == len(X)
-    assert np.isfinite(scores).all()
+    assert np.isfinite(scores).sum() > 0
+    assert np.isnan(scores).sum() > 0
+
+
+def test_temporal_cv_splits_use_past_for_training_only():
+    y = pd.Series([0, 0, 1, 0, 1, 0, 1, 0, 1, 0], name="target")
+
+    splits = drift_app._temporal_cv_splits(y, folds=3)
+
+    assert len(splits) == 3
+    for train_idx, val_idx in splits:
+        assert len(train_idx) > 0
+        assert len(val_idx) > 0
+        assert int(np.max(train_idx)) < int(np.min(val_idx))
 
 
 def test_recalibration_experiments_skip_nnet_blocks_without_valid_tuning_trial(tmp_path, monkeypatch):
@@ -2184,6 +2317,13 @@ def test_train_model_with_internal_validation_smote_refits_on_full_training_data
         random_state=13,
         fast_mode=True,
         grid_limit=1,
+        custom_grid={
+            "mtry": [2],
+            "splitrule": ["gini"],
+            "min_node_size": [1],
+            "sampling_strategy": [0.1],
+            "k_neighbors": [9],
+        },
         balance_mode=BALANCE_MODE_SMOTE,
     )
 
@@ -2468,7 +2608,7 @@ def test_recalibration_experiments_emit_progress_updates(tmp_path, monkeypatch):
         and abs(float(event["completed_units"]) - round(float(event["completed_units"]))) > 1e-9
         for event in progress_events[1:-1]
     )
-    assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 4
+    assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 5
 
 
 def test_recalibration_experiments_support_adaptive_arf(tmp_path, monkeypatch):
@@ -2766,6 +2906,375 @@ def test_recalibration_experiments_passes_model_and_balance_to_yearly_block_tuni
 
     assert not outputs["yearly_results"].empty
     assert ("Random Forest", "none", "yearly_train") in resolver_calls
+
+
+def test_recalibration_experiments_smote_rerank_reuses_window_tuning_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=75)
+    features = ["x1", "x2"]
+    feature_selection_context = {
+        "selected_features": features,
+        "candidate_features": ["x1", "x2", "x3"],
+        "smote_rerank_enabled": True,
+    }
+
+    tune_feature_cols = []
+    tune_balance_modes = []
+    tune_fixed_model_params = []
+    tune_fixed_smote_params = []
+    tune_custom_grids = []
+    tune_smote_search_spaces = []
+    rerank_calls = []
+    rerank_smote_params = []
+
+    def fake_rerank_features_after_smote(train_df, **kwargs):
+        rerank_calls.append(sorted(pd.to_datetime(train_df["interval_start"]).dt.year.unique().tolist()))
+        rerank_smote_params.append(
+            (
+                float(kwargs.get("sampling_strategy", 0.0)),
+                int(kwargs.get("k_neighbors", 0)),
+            )
+        )
+        return (
+            ["x3", "x1"],
+            pd.DataFrame(
+                {
+                    "feature": ["x3", "x1"],
+                    "importance": [0.9, 0.8],
+                    "rank": [1, 2],
+                }
+            ),
+        )
+
+    def fake_tune_hyperparameters(X, y, **kwargs):
+        tune_feature_cols.append(list(X.columns))
+        tune_balance_modes.append(str(kwargs.get("balance_mode")))
+        tune_fixed_model_params.append(dict(kwargs.get("fixed_model_params") or {}))
+        tune_fixed_smote_params.append(dict(kwargs.get("fixed_smote_params") or {}))
+        tune_custom_grids.append(dict(kwargs.get("custom_grid") or {}))
+        tune_smote_search_spaces.append(dict(kwargs.get("smote_search_space") or {}))
+        base_params = {"mtry": 2, "splitrule": "gini", "min_node_size": 1}
+        balance_mode = str(kwargs.get("balance_mode"))
+        fixed_model_params = dict(kwargs.get("fixed_model_params") or {})
+        fixed_smote_params = dict(kwargs.get("fixed_smote_params") or {})
+        if balance_mode == drift_app.BALANCE_MODE_NONE:
+            params = dict(base_params)
+            search_space = {"mtry": [2]}
+            smote_params = {}
+            model_params = dict(base_params)
+        elif fixed_model_params:
+            assert fixed_model_params == base_params
+            assert dict(kwargs.get("smote_search_space") or {}) == dict(drift_app.SMOTE_PRE_TUNING_SEARCH_SPACE)
+            params = {
+                **dict(base_params),
+                "sampling_strategy": 0.02,
+                "k_neighbors": 5,
+            }
+            search_space = dict(drift_app.SMOTE_PRE_TUNING_SEARCH_SPACE)
+            smote_params = {
+                "sampling_strategy": 0.02,
+                "k_neighbors": 5,
+            }
+            model_params = dict(base_params)
+        elif fixed_smote_params:
+            assert fixed_smote_params == {
+                "sampling_strategy": 0.02,
+                "k_neighbors": 5,
+            }
+            assert dict(kwargs.get("smote_search_space") or {}) == {}
+            params = {
+                **dict(base_params),
+                **dict(fixed_smote_params),
+            }
+            search_space = {"mtry": [2]}
+            smote_params = dict(fixed_smote_params)
+            model_params = dict(base_params)
+        else:
+            params = {
+                **dict(base_params),
+                "sampling_strategy": 0.3,
+                "k_neighbors": 5,
+            }
+            search_space = {"mtry": [2]}
+            smote_params = {
+                "sampling_strategy": 0.3,
+                "k_neighbors": 5,
+            }
+            model_params = dict(base_params)
+        artifact = {
+            "study_id": "study_smote_rerank",
+            "model_name": kwargs["model_name"],
+            "balance_mode": kwargs["balance_mode"],
+            "best_value": 0.74,
+            "best_params": params,
+            "model_params": model_params,
+            "smote_params": smote_params,
+            "n_trials": 1,
+            "requested_trials": 1,
+            "search_space_size": 1,
+            "search_space": search_space,
+            "trials": [
+                {
+                    "trial_number": 0,
+                    "state": "COMPLETE",
+                    "cv_auc": 0.74,
+                    "params": params,
+                    "model_params": model_params,
+                    "smote_params": smote_params,
+                }
+            ],
+        }
+        return params, pd.DataFrame(), artifact
+
+    def fake_run_yearly_strategy(
+        df,
+        *,
+        strategy,
+        model_names,
+        balance_mode,
+        tuning_resolver=None,
+        run_seed=None,
+        run_order=None,
+        **kwargs,
+    ):
+        assert tuning_resolver is not None
+        train_df = df.loc[pd.to_datetime(df["interval_start"]).dt.year.eq(2018)].copy()
+        tuning_artifact = tuning_resolver(
+            train_df=train_df,
+            model_name=str(model_names[0]),
+            balance_mode=str(balance_mode),
+            strategy_context={
+                "stage": "yearly_train",
+                "strategy": str(strategy),
+                "window_kind": "base_year",
+                "training_year": "2018",
+                "prediction_year": 2019,
+            },
+        )
+        assert tuning_artifact["selected_feature_cols"] == ["x3", "x1"]
+        yearly_df = pd.DataFrame(
+            [
+                {
+                    "strategy": str(strategy),
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": str(model_names[0]),
+                    "balance_mode": str(balance_mode),
+                    "auc": 0.74,
+                    "sensitivity": 0.61,
+                    "specificity": 0.79,
+                    "error_rate": 0.22,
+                    "training_time_sec": 0.4,
+                    "threshold": 0.45,
+                    "n_train": int(len(train_df)),
+                    "n_test": 20,
+                    "run_seed": int(run_seed or 0),
+                    "run_order": int(run_order or 0),
+                }
+            ]
+        )
+        return yearly_df, []
+
+    monkeypatch.setattr(drift_app, "_rerank_features_after_smote", fake_rerank_features_after_smote)
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(drift_app, "run_yearly_strategy", fake_run_yearly_strategy)
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        balance_modes=[BALANCE_MODE_SMOTE],
+        validation_size=0.2,
+        folds=2,
+        random_state=31,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(31,),
+        feature_selection_context=feature_selection_context,
+    )
+
+    assert not outputs["yearly_results"].empty
+    assert tune_feature_cols == [["x1", "x2"], ["x1", "x2"], ["x3", "x1"]]
+    assert tune_balance_modes == ["none", drift_app.BALANCE_MODE_SMOTE, drift_app.BALANCE_MODE_SMOTE]
+    assert tune_fixed_model_params == [{}, {"mtry": 2, "splitrule": "gini", "min_node_size": 1}, {}]
+    assert tune_fixed_smote_params == [{}, {}, {"sampling_strategy": 0.02, "k_neighbors": 5}]
+    assert tune_custom_grids == [{}, dict(drift_app.SMOTE_PRE_TUNING_SEARCH_SPACE), {}]
+    assert tune_smote_search_spaces == [{}, dict(drift_app.SMOTE_PRE_TUNING_SEARCH_SPACE), {}]
+    assert rerank_calls == [[2018]]
+    assert rerank_smote_params == [(0.02, 5)]
+
+
+def test_recalibration_experiments_smote_pre_tuning_keeps_original_ranking_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=120, random_state=76)
+    features = ["x1", "x2"]
+    feature_selection_context = {
+        "selected_features": features,
+        "candidate_features": ["x1", "x2", "x3"],
+    }
+
+    tune_feature_cols = []
+    tune_balance_modes = []
+    tune_fixed_model_params = []
+    tune_fixed_smote_params = []
+    tune_custom_grids = []
+    tune_smote_search_spaces = []
+
+    def fail_rerank_features_after_smote(*args, **kwargs):
+        raise AssertionError("SMOTE rerank should stay disabled unless explicitly requested")
+
+    def fake_tune_hyperparameters(X, y, **kwargs):
+        tune_feature_cols.append(list(X.columns))
+        tune_balance_modes.append(str(kwargs.get("balance_mode")))
+        tune_fixed_model_params.append(dict(kwargs.get("fixed_model_params") or {}))
+        tune_fixed_smote_params.append(dict(kwargs.get("fixed_smote_params") or {}))
+        tune_custom_grids.append(dict(kwargs.get("custom_grid") or {}))
+        tune_smote_search_spaces.append(dict(kwargs.get("smote_search_space") or {}))
+        base_params = {"mtry": 2, "splitrule": "gini", "min_node_size": 1}
+        balance_mode = str(kwargs.get("balance_mode"))
+        fixed_model_params = dict(kwargs.get("fixed_model_params") or {})
+        fixed_smote_params = dict(kwargs.get("fixed_smote_params") or {})
+        if balance_mode == drift_app.BALANCE_MODE_NONE:
+            params = dict(base_params)
+            search_space = {"mtry": [2]}
+            smote_params = {}
+            model_params = dict(base_params)
+        elif fixed_model_params:
+            assert fixed_model_params == base_params
+            assert dict(kwargs.get("smote_search_space") or {}) == dict(drift_app.SMOTE_PRE_TUNING_SEARCH_SPACE)
+            params = {
+                **dict(base_params),
+                "sampling_strategy": 0.02,
+                "k_neighbors": 10,
+            }
+            search_space = dict(drift_app.SMOTE_PRE_TUNING_SEARCH_SPACE)
+            smote_params = {
+                "sampling_strategy": 0.02,
+                "k_neighbors": 10,
+            }
+            model_params = dict(base_params)
+        elif fixed_smote_params:
+            assert fixed_smote_params == {
+                "sampling_strategy": 0.02,
+                "k_neighbors": 10,
+            }
+            assert dict(kwargs.get("smote_search_space") or {}) == {}
+            params = {
+                **dict(base_params),
+                **dict(fixed_smote_params),
+            }
+            search_space = {"mtry": [2]}
+            smote_params = dict(fixed_smote_params)
+            model_params = dict(base_params)
+        else:
+            raise AssertionError("Unexpected tuning stage for SMOTE original ranking path")
+        artifact = {
+            "study_id": "study_smote_original_ranking",
+            "model_name": kwargs["model_name"],
+            "balance_mode": kwargs["balance_mode"],
+            "best_value": 0.74,
+            "best_params": params,
+            "model_params": model_params,
+            "smote_params": smote_params,
+            "n_trials": 1,
+            "requested_trials": 1,
+            "search_space_size": 1,
+            "search_space": search_space,
+            "trials": [
+                {
+                    "trial_number": 0,
+                    "state": "COMPLETE",
+                    "cv_auc": 0.74,
+                    "params": params,
+                    "model_params": model_params,
+                    "smote_params": smote_params,
+                }
+            ],
+        }
+        return params, pd.DataFrame(), artifact
+
+    def fake_run_yearly_strategy(
+        df,
+        *,
+        strategy,
+        model_names,
+        balance_mode,
+        tuning_resolver=None,
+        run_seed=None,
+        run_order=None,
+        **kwargs,
+    ):
+        assert tuning_resolver is not None
+        train_df = df.loc[pd.to_datetime(df["interval_start"]).dt.year.eq(2018)].copy()
+        tuning_artifact = tuning_resolver(
+            train_df=train_df,
+            model_name=str(model_names[0]),
+            balance_mode=str(balance_mode),
+            strategy_context={
+                "stage": "yearly_train",
+                "strategy": str(strategy),
+                "window_kind": "base_year",
+                "training_year": "2018",
+                "prediction_year": 2019,
+            },
+        )
+        assert tuning_artifact["selected_feature_cols"] == features
+        assert tuning_artifact["smote_rerank_info"]["applied"] is False
+        assert tuning_artifact["smote_rerank_info"]["reason"] == "disabled"
+        yearly_df = pd.DataFrame(
+            [
+                {
+                    "strategy": str(strategy),
+                    "iteration": 1,
+                    "training_year": "2018",
+                    "prediction_year": 2019,
+                    "model": str(model_names[0]),
+                    "balance_mode": str(balance_mode),
+                    "auc": 0.74,
+                    "sensitivity": 0.61,
+                    "specificity": 0.79,
+                    "error_rate": 0.22,
+                    "training_time_sec": 0.4,
+                    "threshold": 0.45,
+                    "n_train": int(len(train_df)),
+                    "n_test": 20,
+                    "run_seed": int(run_seed or 0),
+                    "run_order": int(run_order or 0),
+                }
+            ]
+        )
+        return yearly_df, []
+
+    monkeypatch.setattr(drift_app, "_rerank_features_after_smote", fail_rerank_features_after_smote)
+    monkeypatch.setattr(drift_app, "tune_hyperparameters", fake_tune_hyperparameters)
+    monkeypatch.setattr(drift_app, "run_yearly_strategy", fake_run_yearly_strategy)
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        balance_modes=[BALANCE_MODE_SMOTE],
+        validation_size=0.2,
+        folds=2,
+        random_state=31,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(31,),
+        feature_selection_context=feature_selection_context,
+    )
+
+    assert not outputs["yearly_results"].empty
+    assert tune_feature_cols == [["x1", "x2"], ["x1", "x2"], ["x1", "x2"]]
+    assert tune_balance_modes == ["none", drift_app.BALANCE_MODE_SMOTE, drift_app.BALANCE_MODE_SMOTE]
+    assert tune_fixed_model_params == [{}, {"mtry": 2, "splitrule": "gini", "min_node_size": 1}, {}]
+    assert tune_fixed_smote_params == [{}, {}, {"sampling_strategy": 0.02, "k_neighbors": 10}]
+    assert tune_custom_grids == [{}, dict(drift_app.SMOTE_PRE_TUNING_SEARCH_SPACE), {}]
+    assert tune_smote_search_spaces == [{}, dict(drift_app.SMOTE_PRE_TUNING_SEARCH_SPACE), {}]
 
 
 def test_recalibration_experiments_persist_optuna_json(tmp_path, monkeypatch):
@@ -3090,7 +3599,11 @@ def test_recalibration_experiments_resume_from_failed_checkpoint(tmp_path, monke
     failed_manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
     assert failed_manifest["status"] == "failed"
     assert len(failed_manifest["completed_block_ids"]) == 1
-    assert len(tuning_calls) == 2
+    assert tuning_calls == [
+        ("Random Forest", BALANCE_MODE_NONE),
+        ("Random Forest", BALANCE_MODE_SMOTE),
+        ("Random Forest", BALANCE_MODE_SMOTE),
+    ]
 
     fail_once["enabled"] = False
     block_calls.clear()
@@ -3976,6 +4489,101 @@ def test_run_yearly_strategy_reuses_static_training_bundle(monkeypatch):
 
     assert fit_calls == [2]
     assert set(yearly_df["prediction_year"].astype(int)) == {2019, 2020}
+    assert len(roc_payload) == 2
+
+
+def test_run_yearly_strategy_uses_selected_feature_cols_from_tuning_artifact(monkeypatch):
+    fit_feature_cols = []
+    eval_feature_cols = []
+
+    class FakeModel:
+        def predict_proba(self, X):
+            scores = np.full(len(X), 0.8, dtype=float)
+            return np.column_stack([1.0 - scores, scores])
+
+    def fake_train_model_with_internal_validation(train_df, **kwargs):
+        fit_feature_cols.append(list(kwargs["feature_cols"]))
+        return {
+            "model": FakeModel(),
+            "threshold": 0.5,
+            "best_params": {"splitrule": "gini"},
+            "fill_values": {"x2": 0.0},
+            "feature_transform": None,
+            "tuning_artifact": {"study_id": "study_selected_cols"},
+        }
+
+    def fake_evaluate_split(model, test_df, **kwargs):
+        eval_feature_cols.append(list(kwargs["feature_cols"]))
+        y_true = np.asarray([0, 1], dtype=int)
+        scores = np.asarray([0.2, 0.8], dtype=float)
+        metrics = {
+            "auc": 0.75,
+            "pr_auc": 0.76,
+            "f1": 0.67,
+            "sensitivity": 0.7,
+            "specificity": 0.8,
+            "error_rate": 0.2,
+        }
+        return {
+            "metrics": metrics,
+            "metrics_before_calibration": metrics,
+            "metrics_after_calibration": metrics,
+            "y_true": y_true,
+            "scores": scores,
+            "calibrated_scores": scores,
+        }
+
+    monkeypatch.setattr(
+        drift_app,
+        "train_model_with_internal_validation",
+        fake_train_model_with_internal_validation,
+    )
+    monkeypatch.setattr(drift_app, "_evaluate_split", fake_evaluate_split)
+
+    df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                [
+                    "2018-01-01 00:00:00",
+                    "2018-01-01 00:05:00",
+                    "2019-01-01 00:00:00",
+                    "2019-01-01 00:05:00",
+                    "2020-01-01 00:00:00",
+                    "2020-01-01 00:05:00",
+                ]
+            ),
+            "x1": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+            "x2": [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0],
+            "target": [0, 1, 0, 1, 0, 1],
+        }
+    )
+
+    def fake_tuning_resolver(**kwargs):
+        return {
+            "tuning_key": "selected_cols_tuning",
+            "best_params": {},
+            "has_valid_trial": True,
+            "selected_feature_cols": ["x2"],
+        }
+
+    yearly_df, roc_payload = run_yearly_strategy(
+        df,
+        strategy="static",
+        feature_cols=["x1"],
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        validation_size=0.2,
+        folds=2,
+        random_state=13,
+        fast_mode=True,
+        grid_limit=1,
+        tuning_resolver=fake_tuning_resolver,
+    )
+
+    assert fit_feature_cols == [["x2"]]
+    assert eval_feature_cols == [["x2"], ["x2"]]
+    assert not yearly_df.empty
     assert len(roc_payload) == 2
 
 

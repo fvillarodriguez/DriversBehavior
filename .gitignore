@@ -10,6 +10,7 @@ sumo-main/
 sumo-docs/
 Datos/
 Resultados/
+docs/
 simulación/
 Graph_old/
 cache/
@@ -17,7 +18,7 @@ NLP/
 DRIFT/
 Archivo.zip
 email_config.json
-.claude/worktrees
+.claude/
 tmp/pdfs
 
 
