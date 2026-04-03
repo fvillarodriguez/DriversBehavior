@@ -18,6 +18,7 @@ import src.nlp_severity_app as nlp_app
 from src.nlp_severity_app import (
     _candidate_feature_caps,
     _classification_metrics,
+    _default_feature_engineering_source,
     _feature_count_slider_bounds,
     _paper_build_interactive_k_chart,
     _paper_chart_axis_range,
@@ -172,6 +173,63 @@ def test_build_severity_feature_dataset_custom_window_size(tmp_path: Path):
         "category_label",
         "flow",
     ]
+
+
+def test_build_severity_feature_dataset_emits_incremental_duckdb_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    flow_db = _build_flow_db(tmp_path / "flows_progress.duckdb")
+    monkeypatch.setattr(nlp_app, "GRANULAR_DUCKDB_PROGRESS_BATCH_SIZE", 4)
+    accidents_df = pd.DataFrame(
+        [
+            {
+                "accidente_time": pd.Timestamp("2024-01-01 10:05:00"),
+                "Km.": 10.5,
+                "Eje": "Ruta 1",
+                "Calzada": "Oriente",
+                "Tipo": "Accidente",
+                "SubTipo": "Choque",
+                "Descripcion": "Prueba controlada",
+                "duracion_accidente": 15,
+                "severidad": 1,
+                "severity_target": 1,
+                "ultimo_portico": "P1",
+                "proximo_portico": "P2",
+                "source_files": "test.csv",
+            }
+        ]
+    )
+
+    progress_events: list[tuple[int, str]] = []
+    features_df, granular_df, _ = build_severity_feature_dataset(
+        accidents_df,
+        flow_db_path=flow_db,
+        windows_before=5,
+        windows_after=5,
+        window_size_minutes=1,
+        text_columns=["accidente_time", "descripcion"],
+        progress_callback=lambda value, message: progress_events.append((int(value), str(message))),
+    )
+
+    assert len(features_df) == 1
+    assert not granular_df.empty
+    duckdb_events = [
+        (value, message)
+        for value, message in progress_events
+        if "Consultando DuckDB y agregando metricas" in message
+    ]
+    intermediate_values = [
+        value
+        for value, message in duckdb_events
+        if "ventanas procesadas" in message
+    ]
+
+    assert duckdb_events[0] == (45, "Consultando DuckDB y agregando metricas para 20 ventanas.")
+    assert len(intermediate_values) >= 2
+    assert intermediate_values == sorted(intermediate_values)
+    assert all(45 < value < 65 for value in intermediate_values)
+    assert any("20/20 ventanas procesadas." in message for _, message in duckdb_events)
 
 
 def test_build_severity_feature_dataset_excludes_accidents_without_flow_coverage(tmp_path: Path):
@@ -371,6 +429,206 @@ def test_feature_count_slider_bounds_default_and_clamp():
     assert _feature_count_slider_bounds(240) == (240, 100)
     assert _feature_count_slider_bounds(80, current_value=120) == (80, 80)
     assert _feature_count_slider_bounds(80, current_value=25) == (80, 25)
+
+
+def test_default_feature_engineering_source_prioritizes_existing_features_without_events():
+    assert _default_feature_engineering_source(has_memory=True, accidents_available=True) == "En memoria"
+    assert _default_feature_engineering_source(has_memory=False, accidents_available=False) == "Cargar existentes"
+    assert _default_feature_engineering_source(has_memory=False, accidents_available=True) == "Calcular nuevas"
+
+
+def test_render_feature_engineering_tab_loads_existing_artifact_without_events(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeStreamlit:
+        def __init__(self):
+            self.session_state = {
+                "nlp_sev_accidents_df": None,
+                "nlp_sev_features_df": None,
+                "nlp_sev_feature_source": "Cargar existentes",
+            }
+            self.info_messages: list[str] = []
+            self.success_messages: list[str] = []
+            self.warning_messages: list[str] = []
+            self.caption_messages: list[str] = []
+
+        def subheader(self, *args, **kwargs):
+            return None
+
+        def radio(self, label, options, horizontal=False, key=None):
+            return self.session_state.get(key, options[0])
+
+        def selectbox(self, label, options, format_func=None, key=None):
+            option_list = list(options)
+            return option_list[0]
+
+        def caption(self, message):
+            self.caption_messages.append(str(message))
+
+        def button(self, label, key=None, **kwargs):
+            return key == "nlp_sev_load_existing_features"
+
+        def success(self, message):
+            self.success_messages.append(str(message))
+
+        def warning(self, message):
+            self.warning_messages.append(str(message))
+
+        def info(self, message):
+            self.info_messages.append(str(message))
+
+    fake_st = FakeStreamlit()
+    features_df = pd.DataFrame(
+        {
+            "accident_id": ["a1", "a2"],
+            "severity_target": [0, 1],
+            "flow_a": [1.0, 2.0],
+        }
+    )
+    granular_df = pd.DataFrame({"accident_id": ["a1", "a2"], "flow": [1.0, 2.0]})
+    catalog = pd.DataFrame(
+        [
+            {
+                "artifact_id": "artifact-1",
+                "run_id": "run-1",
+                "db_path": "/tmp/fake.duckdb",
+                "table_name": "severity_features",
+                "label": "artifact-1",
+                "metadata": {
+                    "window_size_minutes": 1,
+                    "windows_before": 5,
+                    "windows_after": 5,
+                    "selected_metrics": ["flow"],
+                    "include_deltas": True,
+                    "sampling_mode": "Completo",
+                    "sampling_seed": None,
+                    "sampled_events": 2,
+                },
+            }
+        ]
+    )
+    artifact_bundle = {
+        "artifact_id": "artifact-1",
+        "run_id": "run-1",
+        "db_path": "/tmp/fake.duckdb",
+        "table_name": "severity_features",
+        "metadata": catalog.loc[0, "metadata"],
+        "paired_granular": {
+            "artifact_id": "granular-1",
+            "run_id": "run-1",
+            "db_path": "/tmp/fake_granular.duckdb",
+            "table_name": "severity_granular",
+            "metadata": {},
+        },
+    }
+
+    monkeypatch.setattr(nlp_app, "st", fake_st)
+    monkeypatch.setattr(nlp_app, "_list_feature_engineering_artifacts", lambda: catalog)
+    monkeypatch.setattr(
+        nlp_app,
+        "_load_feature_bundle_from_catalog_row",
+        lambda row: (features_df.copy(), granular_df.copy(), dict(artifact_bundle)),
+    )
+    monkeypatch.setattr(
+        nlp_app,
+        "_compute_relevant_feature_ranking",
+        lambda df, top_k, candidate_cols=None: pd.DataFrame(
+            {"feature": ["flow_a"], "score": [1.0]}
+        ),
+    )
+    monkeypatch.setattr(nlp_app, "_reset_nlp_sev_language_state", lambda: None)
+    monkeypatch.setattr(nlp_app, "_log_action", lambda *args, **kwargs: "action-1")
+    monkeypatch.setattr(nlp_app, "_render_feature_engineering_output", lambda: None)
+    monkeypatch.setattr(nlp_app, "_render_registry_caption", lambda: None)
+
+    nlp_app._render_feature_engineering_tab()
+
+    assert fake_st.info_messages == []
+    assert fake_st.warning_messages == []
+    assert fake_st.success_messages == ["Dataset cargado: 2 accidentes con features."]
+    assert fake_st.session_state["nlp_sev_features_df"].equals(features_df)
+    assert fake_st.session_state["nlp_sev_granular_df"].equals(granular_df)
+    assert fake_st.session_state["nlp_sev_features_artifact"]["artifact_id"] == "artifact-1"
+    assert fake_st.session_state["nlp_sev_granular_artifact"]["artifact_id"] == "granular-1"
+
+
+def test_render_historial_tab_removes_compare_sections(monkeypatch: pytest.MonkeyPatch):
+    class _FakeExpander:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeStreamlit:
+        def __init__(self):
+            self.session_state = {}
+            self.markdown_calls: list[str] = []
+            self.subheader_calls: list[str] = []
+            self.dataframes: list[pd.DataFrame] = []
+            self.captions: list[str] = []
+
+        def subheader(self, message):
+            self.subheader_calls.append(str(message))
+
+        def markdown(self, message):
+            self.markdown_calls.append(str(message))
+
+        def dataframe(self, df, **kwargs):
+            self.dataframes.append(df.copy())
+
+        def caption(self, message):
+            self.captions.append(str(message))
+
+        def selectbox(self, label, options, key=None):
+            option_list = list(options)
+            return option_list[0]
+
+        def expander(self, label, expanded=False):
+            return _FakeExpander()
+
+    fake_st = FakeStreamlit()
+    results_df = pd.DataFrame(
+        [
+            {
+                "created_at": "2026-04-03 18:27:14",
+                "run_id": "run-1",
+                "stage": "language_modeling",
+                "model_name": "Transformer demo",
+                "feature_group": "text_bert",
+            },
+            {
+                "created_at": "2026-04-03 18:29:01",
+                "run_id": "run-2",
+                "stage": "language_modeling",
+                "model_name": "XGBoost demo",
+                "feature_group": "hybrid",
+            },
+        ]
+    )
+    manager_calls: list[object] = []
+    caption_calls: list[str] = []
+
+    monkeypatch.setattr(nlp_app, "st", fake_st)
+    monkeypatch.setattr(nlp_app, "_load_model_results", lambda: results_df.copy())
+    monkeypatch.setattr(nlp_app, "_render_paper_replication_history_detail", lambda run_id: None)
+    monkeypatch.setattr(
+        nlp_app,
+        "_render_registry_run_manager",
+        lambda preferred_run_id=None: manager_calls.append(preferred_run_id),
+    )
+    monkeypatch.setattr(nlp_app, "_render_registry_caption", lambda: caption_calls.append("caption"))
+
+    nlp_app._render_historial_tab()
+
+    assert fake_st.subheader_calls == ["Historial de resultados"]
+    assert "### Resultados de modelos" in fake_st.markdown_calls
+    assert "### Detalle por ejecucion" in fake_st.markdown_calls
+    assert "### Filtrar y comparar" not in fake_st.markdown_calls
+    assert "### Comparacion visual" not in fake_st.markdown_calls
+    assert len(fake_st.dataframes) == 1
+    assert manager_calls == ["run-1"]
+    assert caption_calls == ["caption"]
 
 
 def test_paper_chart_axis_range_clamps_zero_for_percent_metrics():
@@ -1070,6 +1328,371 @@ def test_persist_paper_replication_payload_is_idempotent_when_registry_sync_comp
         }
     )
     assert calls == []
+
+
+def test_load_registry_run_summary_includes_artifact_only_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module_results_dir = tmp_path / "Resultados" / "nlp_in_severity"
+    monkeypatch.setattr(nlp_app, "MODULE_RESULTS_DIR", module_results_dir)
+    monkeypatch.setattr(nlp_app, "REGISTRY_DB", module_results_dir / "registry.duckdb")
+    monkeypatch.setattr(nlp_app, "PAPER_REPLICATION_DIR", module_results_dir / "paper_replication")
+
+    nlp_app._persist_artifact(
+        pd.DataFrame({"value": [1, 2, 3]}),
+        stage="feature_engineering",
+        artifact_name="severity_features",
+        run_id="artifact_only_run",
+        metadata={"source": "test"},
+    )
+
+    summary_df = nlp_app._load_registry_run_summary()
+    row = summary_df.loc[summary_df["run_id"] == "artifact_only_run"].iloc[0]
+
+    assert int(row["artifact_count"]) == 1
+    assert int(row["model_result_count"]) == 0
+    assert int(row["action_count"]) >= 1
+    assert "feature_engineering" in str(row["stages"])
+
+
+def test_delete_registry_run_removes_registry_rows_and_module_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module_results_dir = tmp_path / "Resultados" / "nlp_in_severity"
+    registry_db = module_results_dir / "registry.duckdb"
+    paper_replication_dir = module_results_dir / "paper_replication"
+    monkeypatch.setattr(nlp_app, "MODULE_RESULTS_DIR", module_results_dir)
+    monkeypatch.setattr(nlp_app, "REGISTRY_DB", registry_db)
+    monkeypatch.setattr(nlp_app, "PAPER_REPLICATION_DIR", paper_replication_dir)
+
+    run_id = "cleanup_run"
+    other_run_id = "keep_run"
+    stamp_iter = iter(["20260403_182714_a", "20260403_182714_b"])
+    monkeypatch.setattr(nlp_app, "_stamp_now", lambda: next(stamp_iter))
+    artifact = nlp_app._persist_artifact(
+        pd.DataFrame({"value": [10]}),
+        stage="feature_engineering",
+        artifact_name="severity_features",
+        run_id=run_id,
+        metadata={"source": "cleanup"},
+    )
+    other_artifact = nlp_app._persist_artifact(
+        pd.DataFrame({"value": [20]}),
+        stage="feature_engineering",
+        artifact_name="severity_features",
+        run_id=other_run_id,
+        metadata={"source": "keep"},
+    )
+
+    run_root = module_results_dir / "models" / "demo_search" / run_id
+    model_output_dir = run_root / "best_model"
+    model_output_dir.mkdir(parents=True, exist_ok=True)
+    (model_output_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_output_dir / "training_summary.json").write_text("{}", encoding="utf-8")
+    other_run_root = module_results_dir / "models" / "demo_search" / other_run_id
+    other_model_output_dir = other_run_root / "best_model"
+    other_model_output_dir.mkdir(parents=True, exist_ok=True)
+    (other_model_output_dir / "config.json").write_text("{}", encoding="utf-8")
+    (other_model_output_dir / "training_summary.json").write_text("{}", encoding="utf-8")
+
+    paper_run_dir = nlp_app._paper_run_dir(run_id)
+    paper_run_dir.mkdir(parents=True, exist_ok=True)
+    (paper_run_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    other_paper_run_dir = nlp_app._paper_run_dir(other_run_id)
+    other_paper_run_dir.mkdir(parents=True, exist_ok=True)
+    (other_paper_run_dir / "manifest.json").write_text("{}", encoding="utf-8")
+
+    nlp_app._record_model_result(
+        run_id=run_id,
+        stage="language_modeling",
+        model_name="Transformers (demo)",
+        feature_group="text_bert",
+        metrics={"accuracy": 0.91},
+        params={"epochs": 1},
+        metadata={
+            "output_dir": str(model_output_dir),
+            "search_root": str(run_root),
+        },
+    )
+    nlp_app._record_model_result(
+        run_id=other_run_id,
+        stage="language_modeling",
+        model_name="Transformers (demo)",
+        feature_group="text_bert",
+        metrics={"accuracy": 0.88},
+        params={"epochs": 1},
+        metadata={
+            "output_dir": str(other_model_output_dir),
+            "search_root": str(other_run_root),
+        },
+    )
+    nlp_app._log_action(
+        "language_modeling",
+        "save_model",
+        {"output_dir": str(model_output_dir)},
+        run_id=run_id,
+    )
+    nlp_app._log_action(
+        "language_modeling",
+        "save_model",
+        {"output_dir": str(other_model_output_dir)},
+        run_id=other_run_id,
+    )
+
+    summary = nlp_app._describe_registry_run(run_id)
+    assert int(summary["artifact_count"]) == 1
+    assert int(summary["model_result_count"]) == 1
+    assert int(summary["action_count"]) >= 2
+    assert Path(artifact["db_path"]).exists()
+    assert run_root.exists()
+    assert paper_run_dir.exists()
+
+    deletion = nlp_app._delete_registry_run(run_id)
+
+    assert deletion["run_id"] == run_id
+    assert int(deletion["artifact_count"]) == 1
+    assert int(deletion["model_result_count"]) == 1
+    assert int(deletion["deleted_path_count"]) >= 3
+    assert deletion["errors"] == []
+    assert not Path(artifact["db_path"]).exists()
+    assert not run_root.exists()
+    assert not paper_run_dir.exists()
+
+    assert Path(other_artifact["db_path"]).exists()
+    assert other_run_root.exists()
+    assert other_paper_run_dir.exists()
+
+    remaining_runs = nlp_app._load_registry_run_summary()
+    assert run_id not in remaining_runs["run_id"].astype(str).tolist()
+    assert other_run_id in remaining_runs["run_id"].astype(str).tolist()
+    assert nlp_app._load_action_log(run_id=run_id).empty
+    assert run_id not in nlp_app._load_artifact_catalog()["run_id"].astype(str).tolist()
+    remaining_results = nlp_app._load_model_results()
+    assert run_id not in remaining_results["run_id"].astype(str).tolist()
+    assert other_run_id in remaining_results["run_id"].astype(str).tolist()
+
+
+def test_delete_registry_runs_removes_multiple_runs_in_one_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module_results_dir = tmp_path / "Resultados" / "nlp_in_severity"
+    monkeypatch.setattr(nlp_app, "MODULE_RESULTS_DIR", module_results_dir)
+    monkeypatch.setattr(nlp_app, "REGISTRY_DB", module_results_dir / "registry.duckdb")
+    monkeypatch.setattr(nlp_app, "PAPER_REPLICATION_DIR", module_results_dir / "paper_replication")
+
+    stamp_iter = iter(["20260403_182714_c", "20260403_182714_d", "20260403_182714_e"])
+    monkeypatch.setattr(nlp_app, "_stamp_now", lambda: next(stamp_iter))
+
+    for run_id in ["cleanup_run_1", "cleanup_run_2", "keep_run"]:
+        nlp_app._persist_artifact(
+            pd.DataFrame({"value": [1]}),
+            stage="feature_engineering",
+            artifact_name="severity_features",
+            run_id=run_id,
+            metadata={"source": run_id},
+        )
+
+    batch_result = nlp_app._delete_registry_runs(["cleanup_run_1", "cleanup_run_2", "cleanup_run_1"])
+
+    assert int(batch_result["run_count"]) == 2
+    assert batch_result["run_ids"] == ["cleanup_run_1", "cleanup_run_2"]
+    assert int(batch_result["artifact_count"]) == 2
+    assert int(batch_result["model_result_count"]) == 0
+    assert int(batch_result["action_count"]) >= 2
+    assert int(batch_result["deleted_path_count"]) == 2
+    assert batch_result["errors"] == []
+
+    remaining_runs = nlp_app._load_registry_run_summary()
+    remaining_run_ids = remaining_runs["run_id"].astype(str).tolist()
+    assert "cleanup_run_1" not in remaining_run_ids
+    assert "cleanup_run_2" not in remaining_run_ids
+    assert "keep_run" in remaining_run_ids
+    assert nlp_app._load_action_log(run_id="cleanup_run_1").empty
+    assert nlp_app._load_action_log(run_id="cleanup_run_2").empty
+
+
+def test_registry_runs_archive_roundtrip_rewrites_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source_module_results_dir = tmp_path / "source" / "Resultados" / "nlp_in_severity"
+    source_registry_db = source_module_results_dir / "registry.duckdb"
+    source_paper_replication_dir = source_module_results_dir / "paper_replication"
+    monkeypatch.setattr(nlp_app, "MODULE_RESULTS_DIR", source_module_results_dir)
+    monkeypatch.setattr(nlp_app, "REGISTRY_DB", source_registry_db)
+    monkeypatch.setattr(nlp_app, "PAPER_REPLICATION_DIR", source_paper_replication_dir)
+
+    run_id = "portable_run"
+    monkeypatch.setattr(nlp_app, "_stamp_now", lambda: "20260403_190001_bundle")
+
+    artifact = nlp_app._persist_artifact(
+        pd.DataFrame({"value": [1, 2]}),
+        stage="feature_engineering",
+        artifact_name="severity_features",
+        run_id=run_id,
+        metadata={"source": "export_test"},
+    )
+
+    run_root = source_module_results_dir / "models" / "demo_search" / run_id
+    model_output_dir = run_root / "best_model"
+    model_output_dir.mkdir(parents=True, exist_ok=True)
+    (model_output_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_output_dir / "training_summary.json").write_text("{}", encoding="utf-8")
+
+    paper_run_dir = nlp_app._paper_run_dir(run_id)
+    (paper_run_dir / "export").mkdir(parents=True, exist_ok=True)
+    (paper_run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "run_dir": str(paper_run_dir),
+                "model_output_dir": str(model_output_dir),
+            },
+            ensure_ascii=True,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    nlp_app._atomic_write_pickle(
+        {
+            "run_dir": str(paper_run_dir),
+            "candidate_paths": {
+                "manifest": str(paper_run_dir / "manifest.json"),
+                "model_output_dir": str(model_output_dir),
+            },
+        },
+        paper_run_dir / "export" / "final_payload.pkl",
+    )
+    (paper_run_dir / "live_events.jsonl").write_text(
+        json.dumps({"run_dir": str(paper_run_dir), "output_dir": str(model_output_dir)}, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+
+    nlp_app._record_model_result(
+        run_id=run_id,
+        stage="language_modeling",
+        model_name="Transformers (portable)",
+        feature_group="text_bert",
+        metrics={"accuracy": 0.93},
+        params={"epochs": 3},
+        metadata={
+            "output_dir": str(model_output_dir),
+            "search_root": str(run_root),
+            "paper_run_dir": str(paper_run_dir),
+        },
+    )
+    nlp_app._log_action(
+        "language_modeling",
+        "save_model",
+        {
+            "output_dir": str(model_output_dir),
+            "paper_run_dir": str(paper_run_dir),
+        },
+        run_id=run_id,
+    )
+
+    archive_bundle = nlp_app._build_registry_runs_archive([run_id])
+
+    assert archive_bundle["run_ids"] == [run_id]
+    assert int(archive_bundle["run_count"]) == 1
+    assert int(archive_bundle["file_count"]) >= 5
+    assert archive_bundle["bytes"]
+
+    target_module_results_dir = tmp_path / "target" / "Resultados" / "nlp_in_severity"
+    target_registry_db = target_module_results_dir / "registry.duckdb"
+    target_paper_replication_dir = target_module_results_dir / "paper_replication"
+    monkeypatch.setattr(nlp_app, "MODULE_RESULTS_DIR", target_module_results_dir)
+    monkeypatch.setattr(nlp_app, "REGISTRY_DB", target_registry_db)
+    monkeypatch.setattr(nlp_app, "PAPER_REPLICATION_DIR", target_paper_replication_dir)
+
+    import_result = nlp_app._import_registry_runs_archive(archive_bundle["bytes"])
+
+    assert import_result["run_ids"] == [run_id]
+    assert int(import_result["run_count"]) == 1
+    assert int(import_result["artifact_count"]) == 1
+    assert int(import_result["model_result_count"]) == 1
+    assert int(import_result["action_count"]) >= 2
+    assert import_result["overwritten_run_ids"] == []
+
+    summary_df = nlp_app._load_registry_run_summary()
+    assert run_id in summary_df["run_id"].astype(str).tolist()
+
+    catalog_df = nlp_app._load_artifact_catalog()
+    imported_artifact = catalog_df.loc[catalog_df["run_id"].astype(str).eq(run_id)].iloc[0]
+    imported_artifact_path = Path(str(imported_artifact["db_path"]))
+    assert imported_artifact_path.exists()
+    assert imported_artifact_path != Path(str(artifact["db_path"]))
+    assert str(imported_artifact_path).startswith(str(target_module_results_dir))
+
+    imported_results = nlp_app._load_model_results()
+    imported_result_row = imported_results.loc[imported_results["run_id"].astype(str).eq(run_id)].iloc[0]
+    imported_metadata = imported_result_row["metadata"]
+    assert str(imported_metadata["output_dir"]).startswith(str(target_module_results_dir))
+    assert str(imported_metadata["search_root"]).startswith(str(target_module_results_dir))
+    assert str(imported_metadata["paper_run_dir"]).startswith(str(target_module_results_dir))
+
+    imported_actions = nlp_app._load_action_log(run_id=run_id)
+    imported_payload = imported_actions.iloc[0]["payload"]
+    assert str(imported_payload["output_dir"]).startswith(str(target_module_results_dir))
+    assert str(imported_payload["paper_run_dir"]).startswith(str(target_module_results_dir))
+
+    imported_paper_run_dir = nlp_app._paper_run_dir(run_id)
+    manifest_payload = nlp_app._load_json_file(imported_paper_run_dir / "manifest.json", default={})
+    assert str(manifest_payload["run_dir"]).startswith(str(target_module_results_dir))
+    assert str(manifest_payload["model_output_dir"]).startswith(str(target_module_results_dir))
+
+    final_payload = nlp_app._load_pickle_file(
+        imported_paper_run_dir / "export" / "final_payload.pkl",
+        default={},
+    )
+    assert str(final_payload["run_dir"]).startswith(str(target_module_results_dir))
+    assert str(final_payload["candidate_paths"]["manifest"]).startswith(str(target_module_results_dir))
+
+    live_events_lines = (imported_paper_run_dir / "live_events.jsonl").read_text(encoding="utf-8").splitlines()
+    live_event = json.loads(live_events_lines[0])
+    assert str(live_event["run_dir"]).startswith(str(target_module_results_dir))
+    assert str(live_event["output_dir"]).startswith(str(target_module_results_dir))
+
+
+def test_import_registry_runs_archive_requires_overwrite_for_existing_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module_results_dir = tmp_path / "Resultados" / "nlp_in_severity"
+    monkeypatch.setattr(nlp_app, "MODULE_RESULTS_DIR", module_results_dir)
+    monkeypatch.setattr(nlp_app, "REGISTRY_DB", module_results_dir / "registry.duckdb")
+    monkeypatch.setattr(nlp_app, "PAPER_REPLICATION_DIR", module_results_dir / "paper_replication")
+    monkeypatch.setattr(nlp_app, "_stamp_now", lambda: "20260403_190002_bundle")
+
+    run_id = "overwrite_run"
+    nlp_app._persist_artifact(
+        pd.DataFrame({"value": [7]}),
+        stage="feature_engineering",
+        artifact_name="severity_features",
+        run_id=run_id,
+        metadata={"source": "overwrite"},
+    )
+
+    archive_bundle = nlp_app._build_registry_runs_archive([run_id])
+
+    with pytest.raises(ValueError, match="Ya existen runs con esos IDs"):
+        nlp_app._import_registry_runs_archive(archive_bundle["bytes"], overwrite_existing=False)
+
+    import_result = nlp_app._import_registry_runs_archive(
+        archive_bundle["bytes"],
+        overwrite_existing=True,
+    )
+
+    assert import_result["run_ids"] == [run_id]
+    assert import_result["overwritten_run_ids"] == [run_id]
+
+    summary_df = nlp_app._load_registry_run_summary()
+    matching = summary_df.loc[summary_df["run_id"].astype(str).eq(run_id)]
+    assert len(matching) == 1
+    assert int(matching.iloc[0]["artifact_count"]) == 1
 
 
 def test_paper_execution_context_changes_with_route_options(monkeypatch: pytest.MonkeyPatch):

@@ -5,6 +5,7 @@ Streamlit app for the "NLP in Severity" pipeline.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import itertools
 import math
@@ -16,6 +17,7 @@ import tempfile
 import time
 import traceback
 import uuid
+import zipfile
 from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -182,6 +184,7 @@ GRANULAR_METRIC_LABELS = {
     "speed_std": "Speed std",
     "density": "Density",
 }
+GRANULAR_DUCKDB_PROGRESS_BATCH_SIZE = 10_000
 PAPER_K_GRID = [10, 15, 20, 25, 30, 40, 50, 70, 100, 150, 200, 250, 300, 350, 400, 432]
 PAPER_K_GRID_SELECTION_MIN = 1
 PAPER_K_GRID_SELECTION_MAX = len(PAPER_K_GRID)
@@ -216,6 +219,7 @@ PAPER_EXPECTED_COUNTS = {
 PAPER_COMPARISON_TOLERANCE = 0.001
 PAPER_VALIDATION_ALPHA = 0.3
 PAPER_PROTOCOL_VERSION = "paper_replication_checkpoint_v11"
+REGISTRY_EXCHANGE_ARCHIVE_VERSION = "nlp_severity_registry_bundle_v1"
 PAPER_ROUTE_SELECTION_DEFAULTS = {
     "run_frozen": True,
     "run_raw": True,
@@ -810,6 +814,820 @@ def _load_artifact_catalog(
         lambda raw: json.loads(raw) if isinstance(raw, str) and raw else {}
     )
     return df
+
+
+def _load_action_log(*, run_id: Optional[str] = None) -> pd.DataFrame:
+    if duckdb is None or not REGISTRY_DB.exists():
+        return pd.DataFrame()
+    query = """
+        SELECT action_id, run_id, created_at, stage, action, payload_json
+        FROM action_log
+    """
+    params: List[object] = []
+    if run_id is not None:
+        query += " WHERE run_id = ?"
+        params.append(run_id)
+    query += " ORDER BY created_at DESC"
+    con = duckdb.connect(str(REGISTRY_DB), read_only=True)
+    try:
+        df = con.execute(query, params).df()
+    finally:
+        con.close()
+    if df.empty:
+        return df
+    df["payload"] = df["payload_json"].apply(
+        lambda raw: json.loads(raw) if isinstance(raw, str) and raw else {}
+    )
+    return df
+
+
+def _load_registry_run_summary() -> pd.DataFrame:
+    empty_cols = [
+        "run_id",
+        "created_at",
+        "updated_at",
+        "stages",
+        "action_count",
+        "artifact_count",
+        "model_result_count",
+    ]
+    if duckdb is None or not REGISTRY_DB.exists():
+        return pd.DataFrame(columns=empty_cols)
+
+    con = duckdb.connect(str(REGISTRY_DB), read_only=True)
+    try:
+        frames: List[pd.DataFrame] = []
+        for table_name, source_name in [
+            ("action_log", "action_count"),
+            ("artifacts", "artifact_count"),
+            ("model_results", "model_result_count"),
+        ]:
+            frame = con.execute(
+                f"""
+                SELECT run_id, created_at, stage
+                FROM {table_name}
+                WHERE COALESCE(TRIM(run_id), '') <> ''
+                """
+            ).df()
+            if frame.empty:
+                continue
+            frame["source_name"] = source_name
+            frames.append(frame)
+    finally:
+        con.close()
+
+    if not frames:
+        return pd.DataFrame(columns=empty_cols)
+
+    combined = pd.concat(frames, ignore_index=True)
+    records: List[Dict[str, object]] = []
+    for run_id, group in combined.groupby("run_id", sort=False):
+        stages = sorted(
+            {
+                str(stage).strip()
+                for stage in group["stage"].dropna().tolist()
+                if str(stage).strip()
+            }
+        )
+        records.append(
+            {
+                "run_id": str(run_id),
+                "created_at": group["created_at"].min(),
+                "updated_at": group["created_at"].max(),
+                "stages": ", ".join(stages),
+                "action_count": int(group["source_name"].eq("action_count").sum()),
+                "artifact_count": int(group["source_name"].eq("artifact_count").sum()),
+                "model_result_count": int(group["source_name"].eq("model_result_count").sum()),
+            }
+        )
+
+    summary_df = pd.DataFrame(records)
+    if summary_df.empty:
+        return pd.DataFrame(columns=empty_cols)
+    return summary_df.sort_values("updated_at", ascending=False, ignore_index=True)
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except Exception:
+        return False
+
+
+def _iter_nested_values(value: object):
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_nested_values(nested)
+        return
+    if isinstance(value, (list, tuple, set)):
+        for nested in value:
+            yield from _iter_nested_values(nested)
+        return
+    yield value
+
+
+def _coerce_cleanup_path(value: object) -> Optional[Path]:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+    if text.startswith(("http://", "https://", "{", "[")):
+        return None
+    if not any(separator in text for separator in (os.sep, "/", "\\")):
+        return None
+    return Path(text).expanduser()
+
+
+def _normalize_cleanup_path(path: Path, *, run_id: str) -> Optional[Path]:
+    resolved = path.expanduser().resolve(strict=False)
+    module_root = MODULE_RESULTS_DIR.resolve(strict=False)
+    registry_path = REGISTRY_DB.resolve(strict=False)
+    if not _path_is_within(resolved, module_root):
+        return None
+    if resolved in {module_root, registry_path}:
+        return None
+    for candidate in [resolved] + list(resolved.parents):
+        if candidate == module_root:
+            break
+        if candidate.name == str(run_id):
+            return candidate
+    return resolved
+
+
+def _collapse_cleanup_paths(paths: Sequence[Path]) -> List[Path]:
+    collapsed: List[Path] = []
+    unique_paths = sorted(
+        {path.resolve(strict=False) for path in paths},
+        key=lambda item: (len(item.parts), str(item)),
+    )
+    for path in unique_paths:
+        if any(_path_is_within(path, kept) for kept in collapsed):
+            continue
+        collapsed.append(path)
+    return collapsed
+
+
+def _collect_run_cleanup_paths(run_id: str) -> List[Path]:
+    resolved_run_id = str(run_id).strip()
+    if not resolved_run_id:
+        return []
+
+    collected: List[Path] = []
+    catalog_df = _load_artifact_catalog()
+    if not catalog_df.empty:
+        run_catalog = catalog_df.loc[catalog_df["run_id"].astype(str).eq(resolved_run_id)]
+        for _, row in run_catalog.iterrows():
+            db_path = _coerce_cleanup_path(row.get("db_path"))
+            if db_path is None:
+                continue
+            normalized = _normalize_cleanup_path(db_path, run_id=resolved_run_id)
+            if normalized is not None:
+                collected.append(normalized)
+
+    results_df = _load_model_results()
+    if not results_df.empty:
+        run_results = results_df.loc[results_df["run_id"].astype(str).eq(resolved_run_id)]
+        for _, row in run_results.iterrows():
+            for nested_value in _iter_nested_values(row.get("metadata") or {}):
+                candidate = _coerce_cleanup_path(nested_value)
+                if candidate is None:
+                    continue
+                normalized = _normalize_cleanup_path(candidate, run_id=resolved_run_id)
+                if normalized is not None:
+                    collected.append(normalized)
+
+    action_df = _load_action_log(run_id=resolved_run_id)
+    if not action_df.empty:
+        for payload in action_df["payload"].tolist():
+            for nested_value in _iter_nested_values(payload or {}):
+                candidate = _coerce_cleanup_path(nested_value)
+                if candidate is None:
+                    continue
+                normalized = _normalize_cleanup_path(candidate, run_id=resolved_run_id)
+                if normalized is not None:
+                    collected.append(normalized)
+
+    paper_run_dir = _normalize_cleanup_path(_paper_run_dir(resolved_run_id), run_id=resolved_run_id)
+    if paper_run_dir is not None and (paper_run_dir.exists() or paper_run_dir.is_symlink()):
+        collected.append(paper_run_dir)
+
+    return [
+        path
+        for path in _collapse_cleanup_paths(collected)
+        if path.exists() or path.is_symlink()
+    ]
+
+
+def _describe_registry_run(run_id: str) -> Dict[str, object]:
+    resolved_run_id = str(run_id).strip()
+    summary_df = _load_registry_run_summary()
+    row: Dict[str, object] = {}
+    if not summary_df.empty:
+        match = summary_df.loc[summary_df["run_id"].astype(str).eq(resolved_run_id)]
+        if not match.empty:
+            row = match.iloc[0].to_dict()
+    cleanup_paths = _collect_run_cleanup_paths(resolved_run_id)
+    return {
+        "run_id": resolved_run_id,
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "stages": row.get("stages") or "",
+        "action_count": int(row.get("action_count") or 0),
+        "artifact_count": int(row.get("artifact_count") or 0),
+        "model_result_count": int(row.get("model_result_count") or 0),
+        "path_count": int(len(cleanup_paths)),
+        "paths": [str(path) for path in cleanup_paths],
+    }
+
+
+def _delete_registry_run(run_id: str) -> Dict[str, object]:
+    resolved_run_id = str(run_id).strip()
+    if not resolved_run_id:
+        raise ValueError("El run_id a eliminar no puede estar vacio.")
+
+    summary = _describe_registry_run(resolved_run_id)
+    deleted_paths: List[str] = []
+    errors: List[str] = []
+    for raw_path in summary["paths"]:
+        path = Path(str(raw_path))
+        try:
+            if not path.exists() and not path.is_symlink():
+                continue
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+            deleted_paths.append(str(path))
+        except FileNotFoundError:
+            continue
+        except Exception as exc:  # pragma: no cover
+            errors.append(f"{path}: {exc}")
+
+    if duckdb is not None and REGISTRY_DB.exists():
+        con = duckdb.connect(str(REGISTRY_DB))
+        try:
+            con.execute("DELETE FROM action_log WHERE run_id = ?", [resolved_run_id])
+            con.execute("DELETE FROM artifacts WHERE run_id = ?", [resolved_run_id])
+            con.execute("DELETE FROM model_results WHERE run_id = ?", [resolved_run_id])
+        finally:
+            con.close()
+
+    return {
+        **summary,
+        "deleted_paths": deleted_paths,
+        "deleted_path_count": int(len(deleted_paths)),
+        "errors": errors,
+    }
+
+
+def _delete_registry_runs(run_ids: Sequence[object]) -> Dict[str, object]:
+    unique_run_ids: List[str] = []
+    seen: set[str] = set()
+    for run_id in run_ids:
+        resolved_run_id = str(run_id).strip()
+        if not resolved_run_id or resolved_run_id in seen:
+            continue
+        seen.add(resolved_run_id)
+        unique_run_ids.append(resolved_run_id)
+
+    deletions = [_delete_registry_run(run_id) for run_id in unique_run_ids]
+    return {
+        "run_ids": unique_run_ids,
+        "run_count": int(len(unique_run_ids)),
+        "model_result_count": int(sum(int(item.get("model_result_count") or 0) for item in deletions)),
+        "artifact_count": int(sum(int(item.get("artifact_count") or 0) for item in deletions)),
+        "action_count": int(sum(int(item.get("action_count") or 0) for item in deletions)),
+        "deleted_path_count": int(sum(int(item.get("deleted_path_count") or 0) for item in deletions)),
+        "errors": [error for item in deletions for error in (item.get("errors") or [])],
+        "deletions": deletions,
+    }
+
+
+def _registry_export_run_ids(run_ids: Sequence[object]) -> List[str]:
+    resolved: List[str] = []
+    seen: set[str] = set()
+    for run_id in run_ids:
+        text = str(run_id).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        resolved.append(text)
+    return resolved
+
+
+def _load_registry_table_rows(table_name: str, *, run_ids: Sequence[object]) -> List[Dict[str, object]]:
+    resolved_run_ids = _registry_export_run_ids(run_ids)
+    if not resolved_run_ids or duckdb is None or not REGISTRY_DB.exists():
+        return []
+    placeholders = ", ".join(["?"] * len(resolved_run_ids))
+    query = (
+        f"SELECT * FROM {table_name} "
+        f"WHERE run_id IN ({placeholders}) "
+        "ORDER BY created_at ASC"
+    )
+    con = duckdb.connect(str(REGISTRY_DB), read_only=True)
+    try:
+        df = con.execute(query, resolved_run_ids).df()
+    finally:
+        con.close()
+    if df.empty:
+        return []
+    return list(_to_json_safe(df.to_dict(orient="records")))
+
+
+def _module_results_relative_path(path: Path) -> str:
+    relative = path.resolve(strict=False).relative_to(MODULE_RESULTS_DIR.resolve(strict=False))
+    text = relative.as_posix().strip("/")
+    if not text:
+        raise ValueError("La ruta relativa del bundle no puede ser vacia.")
+    return text
+
+
+def _archive_target_path(relative_path: object, *, root: Path) -> Path:
+    text = str(relative_path or "").replace("\\", "/").strip("/")
+    if not text or text == ".":
+        raise ValueError("La ruta del bundle es invalida.")
+    parts = [part for part in text.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("La ruta del bundle intenta escapar el directorio permitido.")
+    target = (Path(root) / Path(*parts)).resolve(strict=False)
+    if not _path_is_within(target, Path(root)):
+        raise ValueError("La ruta del bundle queda fuera de Resultados/nlp_in_severity.")
+    return target
+
+
+def _collect_registry_archive_entries(paths: Sequence[Path]) -> List[Dict[str, object]]:
+    entries: List[Dict[str, object]] = []
+    seen: set[Tuple[str, str]] = set()
+    for root_path in _collapse_cleanup_paths(paths):
+        members = [root_path]
+        if root_path.is_dir():
+            members.extend(sorted(root_path.rglob("*"), key=lambda item: (len(item.parts), str(item))))
+        for member in members:
+            relative_path = _module_results_relative_path(member)
+            if member.is_dir():
+                key = ("dir", relative_path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append(
+                    {
+                        "kind": "dir",
+                        "relative_path": relative_path,
+                    }
+                )
+                continue
+            if not member.exists() and not member.is_symlink():
+                continue
+            key = ("file", relative_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            size = None
+            try:
+                size = int(member.stat().st_size)
+            except Exception:
+                size = None
+            entries.append(
+                {
+                    "kind": "file",
+                    "relative_path": relative_path,
+                    "size": size,
+                    "source_path": str(member),
+                }
+            )
+    return entries
+
+
+def _rebase_rooted_path_text(text: object, *, source_root: Path, target_root: Path) -> object:
+    if isinstance(text, Path):
+        return Path(str(_rebase_rooted_path_text(str(text), source_root=source_root, target_root=target_root)))
+    if not isinstance(text, str):
+        return text
+    raw = str(text)
+    normalized_text = raw.replace("\\", "/")
+    normalized_source = str(Path(source_root)).replace("\\", "/").rstrip("/")
+    if not normalized_source:
+        return raw
+    lower_text = normalized_text.lower()
+    lower_source = normalized_source.lower()
+    if lower_text == lower_source:
+        return str(Path(target_root))
+    prefix = lower_source + "/"
+    if not lower_text.startswith(prefix):
+        return raw
+    suffix = normalized_text[len(normalized_source):].lstrip("/")
+    if not suffix:
+        return str(Path(target_root))
+    return str(Path(target_root) / Path(*[part for part in suffix.split("/") if part]))
+
+
+def _rewrite_payload_paths(
+    value: object,
+    *,
+    source_root: Path,
+    target_root: Path,
+) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_payload_paths(nested, source_root=source_root, target_root=target_root)
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _rewrite_payload_paths(item, source_root=source_root, target_root=target_root)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _rewrite_payload_paths(item, source_root=source_root, target_root=target_root)
+            for item in value
+        )
+    if isinstance(value, set):
+        return {
+            _rewrite_payload_paths(item, source_root=source_root, target_root=target_root)
+            for item in value
+        }
+    if isinstance(value, pd.DataFrame):
+        rewritten = value.copy(deep=True)
+        for column in rewritten.columns:
+            if rewritten[column].dtype == object:
+                rewritten[column] = rewritten[column].apply(
+                    lambda item: _rewrite_payload_paths(
+                        item,
+                        source_root=source_root,
+                        target_root=target_root,
+                    )
+                )
+        return rewritten
+    if isinstance(value, pd.Series):
+        rewritten = value.copy(deep=True)
+        if rewritten.dtype == object:
+            rewritten = rewritten.apply(
+                lambda item: _rewrite_payload_paths(
+                    item,
+                    source_root=source_root,
+                    target_root=target_root,
+                )
+            )
+        return rewritten
+    if isinstance(value, (str, Path)):
+        return _rebase_rooted_path_text(value, source_root=source_root, target_root=target_root)
+    return value
+
+
+def _rewrite_json_string_paths(
+    raw_json: object,
+    *,
+    source_root: Path,
+    target_root: Path,
+) -> str:
+    if isinstance(raw_json, str) and raw_json.strip():
+        payload = json.loads(raw_json)
+    elif raw_json is None:
+        payload = {}
+    else:
+        payload = raw_json
+    rewritten = _rewrite_payload_paths(payload, source_root=source_root, target_root=target_root)
+    return json.dumps(_to_json_safe(rewritten), ensure_ascii=True, default=_json_default)
+
+
+def _rewrite_imported_serialized_file(
+    path: Path,
+    *,
+    source_root: Path,
+    target_root: Path,
+) -> bool:
+    file_path = Path(path)
+    suffix = file_path.suffix.lower()
+    if suffix == ".json":
+        payload = _load_json_file(file_path, default=None)
+        if payload is None:
+            return False
+        _atomic_write_json(
+            file_path,
+            _rewrite_payload_paths(payload, source_root=source_root, target_root=target_root),
+        )
+        return True
+    if suffix == ".jsonl":
+        if not file_path.exists():
+            return False
+        rewritten_lines: List[str] = []
+        with file_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                payload = json.loads(stripped)
+                rewritten_lines.append(
+                    json.dumps(
+                        _to_json_safe(
+                            _rewrite_payload_paths(
+                                payload,
+                                source_root=source_root,
+                                target_root=target_root,
+                            )
+                        ),
+                        ensure_ascii=True,
+                    )
+                )
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{file_path.stem}_",
+            suffix=".tmp",
+            dir=str(file_path.parent),
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                for line in rewritten_lines:
+                    handle.write(line + "\n")
+            os.replace(tmp_path, file_path)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+        return True
+    if suffix == ".pkl":
+        payload = _load_pickle_file(file_path, default=None)
+        if payload is None:
+            return False
+        _atomic_write_pickle(
+            _rewrite_payload_paths(payload, source_root=source_root, target_root=target_root),
+            file_path,
+        )
+        return True
+    return False
+
+
+def _build_registry_runs_archive(run_ids: Sequence[object]) -> Dict[str, object]:
+    resolved_run_ids = _registry_export_run_ids(run_ids)
+    if not resolved_run_ids:
+        raise ValueError("Seleccione al menos un registro para exportar.")
+
+    run_summaries = [_describe_registry_run(run_id) for run_id in resolved_run_ids]
+    archive_entries = _collect_registry_archive_entries(
+        [Path(path) for summary in run_summaries for path in (summary.get("paths") or [])]
+    )
+    registry_rows = {
+        "action_log": _load_registry_table_rows("action_log", run_ids=resolved_run_ids),
+        "artifacts": _load_registry_table_rows("artifacts", run_ids=resolved_run_ids),
+        "model_results": _load_registry_table_rows("model_results", run_ids=resolved_run_ids),
+    }
+    manifest = {
+        "format_version": REGISTRY_EXCHANGE_ARCHIVE_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "source_module_results_dir": str(MODULE_RESULTS_DIR.resolve(strict=False)),
+        "run_ids": resolved_run_ids,
+        "runs": run_summaries,
+        "entries": [
+            {key: value for key, value in entry.items() if key != "source_path"}
+            for entry in archive_entries
+        ],
+        "registry_counts": {
+            table_name: int(len(rows))
+            for table_name, rows in registry_rows.items()
+        },
+    }
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "manifest.json",
+            json.dumps(_to_json_safe(manifest), ensure_ascii=True, indent=2),
+        )
+        for table_name, rows in registry_rows.items():
+            archive.writestr(
+                f"registry/{table_name}.json",
+                json.dumps(_to_json_safe(rows), ensure_ascii=True, indent=2),
+            )
+        for entry in archive_entries:
+            relative_path = str(entry.get("relative_path") or "")
+            archive_name = f"files/{relative_path}"
+            if str(entry.get("kind")) == "dir":
+                archive.writestr(archive_name.rstrip("/") + "/", "")
+                continue
+            archive.write(str(entry["source_path"]), archive_name)
+
+    payload = buffer.getvalue()
+    return {
+        "file_name": f"nlp_severity_registry_export_{_stamp_now()}.zip",
+        "bytes": payload,
+        "run_ids": resolved_run_ids,
+        "run_count": int(len(resolved_run_ids)),
+        "file_count": int(sum(1 for entry in archive_entries if entry.get("kind") == "file")),
+        "directory_count": int(sum(1 for entry in archive_entries if entry.get("kind") == "dir")),
+        "byte_count": int(len(payload)),
+        "manifest": manifest,
+    }
+
+
+def _import_registry_runs_archive(
+    archive_bytes: bytes,
+    *,
+    overwrite_existing: bool = False,
+) -> Dict[str, object]:
+    if not archive_bytes:
+        raise ValueError("El ZIP de importacion esta vacio.")
+
+    with zipfile.ZipFile(io.BytesIO(archive_bytes), mode="r") as archive:
+        manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        if str(manifest.get("format_version") or "") != REGISTRY_EXCHANGE_ARCHIVE_VERSION:
+            raise ValueError("El archivo no corresponde a un export valido de NLP in Severity.")
+
+        imported_run_ids = _registry_export_run_ids(manifest.get("run_ids") or [])
+        if not imported_run_ids:
+            raise ValueError("El archivo no contiene runs para importar.")
+
+        entries = list(manifest.get("entries") or [])
+        registry_rows = {
+            "action_log": json.loads(archive.read("registry/action_log.json").decode("utf-8")),
+            "artifacts": json.loads(archive.read("registry/artifacts.json").decode("utf-8")),
+            "model_results": json.loads(archive.read("registry/model_results.json").decode("utf-8")),
+        }
+
+        existing_runs = set()
+        summary_df = _load_registry_run_summary()
+        if not summary_df.empty:
+            existing_runs = set(summary_df["run_id"].astype(str).tolist())
+        conflicting_run_ids = [run_id for run_id in imported_run_ids if run_id in existing_runs]
+        if conflicting_run_ids and not overwrite_existing:
+            raise ValueError(
+                "Ya existen runs con esos IDs en este equipo: "
+                + ", ".join(conflicting_run_ids[:10])
+            )
+
+        file_conflicts: List[str] = []
+        for entry in entries:
+            if str(entry.get("kind")) != "file":
+                continue
+            target_path = _archive_target_path(entry.get("relative_path"), root=MODULE_RESULTS_DIR)
+            if target_path.exists() or target_path.is_symlink():
+                file_conflicts.append(str(target_path))
+        if file_conflicts and not overwrite_existing and not conflicting_run_ids:
+            raise ValueError(
+                "El ZIP intenta escribir archivos que ya existen en este equipo. "
+                "Use la opcion de reemplazo o limpie esos registros primero."
+            )
+
+        source_root = Path(
+            str(manifest.get("source_module_results_dir") or MODULE_RESULTS_DIR)
+        )
+
+        with tempfile.TemporaryDirectory(prefix="nlp_sev_registry_import_") as tmp_dir_name:
+            staging_root = Path(tmp_dir_name)
+            processed_file_count = 0
+            processed_dir_count = 0
+
+            for entry in entries:
+                target = _archive_target_path(entry.get("relative_path"), root=staging_root)
+                if str(entry.get("kind")) == "dir":
+                    target.mkdir(parents=True, exist_ok=True)
+                    processed_dir_count += 1
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(f"files/{entry['relative_path']}") as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                processed_file_count += 1
+
+            rewritten_serialized_files = 0
+            for entry in entries:
+                if str(entry.get("kind")) != "file":
+                    continue
+                staged_path = _archive_target_path(entry.get("relative_path"), root=staging_root)
+                if _rewrite_imported_serialized_file(
+                    staged_path,
+                    source_root=source_root,
+                    target_root=MODULE_RESULTS_DIR,
+                ):
+                    rewritten_serialized_files += 1
+
+            if conflicting_run_ids and overwrite_existing:
+                _delete_registry_runs(conflicting_run_ids)
+
+            MODULE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            for entry in entries:
+                destination = _archive_target_path(entry.get("relative_path"), root=MODULE_RESULTS_DIR)
+                staged_path = _archive_target_path(entry.get("relative_path"), root=staging_root)
+                if str(entry.get("kind")) == "dir":
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(staged_path, destination)
+
+    imported_run_set = set(imported_run_ids)
+    _ensure_registry_db()
+    imported_counts = {"action_log": 0, "artifacts": 0, "model_results": 0}
+    con = duckdb.connect(str(REGISTRY_DB))
+    try:
+        action_rows: List[List[object]] = []
+        for row in registry_rows.get("action_log") or []:
+            run_id = str(row.get("run_id") or "").strip()
+            if run_id not in imported_run_set:
+                continue
+            action_rows.append(
+                [
+                    row.get("action_id"),
+                    run_id,
+                    row.get("created_at"),
+                    row.get("stage"),
+                    row.get("action"),
+                    _rewrite_json_string_paths(
+                        row.get("payload_json"),
+                        source_root=source_root,
+                        target_root=MODULE_RESULTS_DIR,
+                    ),
+                ]
+            )
+        if action_rows:
+            con.executemany("INSERT INTO action_log VALUES (?, ?, ?, ?, ?, ?)", action_rows)
+            imported_counts["action_log"] = int(len(action_rows))
+
+        artifact_rows: List[List[object]] = []
+        for row in registry_rows.get("artifacts") or []:
+            run_id = str(row.get("run_id") or "").strip()
+            if run_id not in imported_run_set:
+                continue
+            artifact_rows.append(
+                [
+                    row.get("artifact_id"),
+                    run_id,
+                    row.get("created_at"),
+                    row.get("stage"),
+                    row.get("artifact_name"),
+                    str(
+                        _rebase_rooted_path_text(
+                            row.get("db_path") or "",
+                            source_root=source_root,
+                            target_root=MODULE_RESULTS_DIR,
+                        )
+                    ),
+                    row.get("table_name"),
+                    row.get("row_count"),
+                    _rewrite_json_string_paths(
+                        row.get("metadata_json"),
+                        source_root=source_root,
+                        target_root=MODULE_RESULTS_DIR,
+                    ),
+                ]
+            )
+        if artifact_rows:
+            con.executemany("INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", artifact_rows)
+            imported_counts["artifacts"] = int(len(artifact_rows))
+
+        model_rows: List[List[object]] = []
+        for row in registry_rows.get("model_results") or []:
+            run_id = str(row.get("run_id") or "").strip()
+            if run_id not in imported_run_set:
+                continue
+            model_rows.append(
+                [
+                    row.get("result_id"),
+                    run_id,
+                    row.get("created_at"),
+                    row.get("stage"),
+                    row.get("model_name"),
+                    row.get("feature_group"),
+                    _rewrite_json_string_paths(
+                        row.get("metrics_json"),
+                        source_root=source_root,
+                        target_root=MODULE_RESULTS_DIR,
+                    ),
+                    _rewrite_json_string_paths(
+                        row.get("params_json"),
+                        source_root=source_root,
+                        target_root=MODULE_RESULTS_DIR,
+                    ),
+                    _rewrite_json_string_paths(
+                        row.get("metadata_json"),
+                        source_root=source_root,
+                        target_root=MODULE_RESULTS_DIR,
+                    ),
+                ]
+            )
+        if model_rows:
+            con.executemany(
+                "INSERT INTO model_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                model_rows,
+            )
+            imported_counts["model_results"] = int(len(model_rows))
+    finally:
+        con.close()
+
+    return {
+        "run_ids": imported_run_ids,
+        "run_count": int(len(imported_run_ids)),
+        "overwritten_run_ids": conflicting_run_ids,
+        "file_count": int(processed_file_count),
+        "directory_count": int(processed_dir_count),
+        "rewritten_serialized_files": int(rewritten_serialized_files),
+        "action_count": int(imported_counts["action_log"]),
+        "artifact_count": int(imported_counts["artifacts"]),
+        "model_result_count": int(imported_counts["model_results"]),
+    }
 
 
 def _read_artifact_df(db_path: object, table_name: object) -> pd.DataFrame:
@@ -2475,6 +3293,37 @@ def _category_case_sql() -> str:
     return "CASE " + " ".join(clauses) + " ELSE NULL END"
 
 
+def _granular_metrics_duckdb_query(*, windows_table_name: str) -> str:
+    return f"""
+        WITH agg AS (
+            SELECT
+                w.accident_id,
+                w.anchor,
+                w.direction,
+                w.minute_idx,
+                w.window_size_minutes,
+                {_category_case_sql()} AS category_label,
+                COUNT(f.FECHA) AS flow,
+                AVG(TRY_CAST(f.VELOCIDAD AS DOUBLE)) AS speed_mean,
+                COALESCE(STDDEV_SAMP(TRY_CAST(f.VELOCIDAD AS DOUBLE)), 0.0) AS speed_std,
+                CASE
+                    WHEN AVG(TRY_CAST(f.VELOCIDAD AS DOUBLE)) > 0
+                        THEN COUNT(f.FECHA) / AVG(TRY_CAST(f.VELOCIDAD AS DOUBLE))
+                    ELSE 0.0
+                END AS density
+            FROM {windows_table_name} w
+            LEFT JOIN flow_db.{FLOW_TABLE_NAME} f
+                ON TRIM(CAST(f.PORTICO AS VARCHAR)) = w.portico
+               AND f.FECHA >= w.window_start
+               AND f.FECHA < w.window_end
+            GROUP BY 1, 2, 3, 4, 5, 6
+        )
+        SELECT *
+        FROM agg
+        WHERE category_label IS NOT NULL
+    """
+
+
 def _compute_granular_metrics_duckdb(
     accidents_df: pd.DataFrame,
     *,
@@ -2502,50 +3351,48 @@ def _compute_granular_metrics_duckdb(
         45,
         f"Consultando DuckDB y agregando metricas para {len(windows_df):,} ventanas.",
     )
+    total_windows = int(len(windows_df))
+    batch_size = max(1, int(GRANULAR_DUCKDB_PROGRESS_BATCH_SIZE))
+    total_batches = max(1, math.ceil(total_windows / batch_size))
+    base_cols = [
+        "accident_id",
+        "anchor",
+        "direction",
+        "minute_idx",
+        "window_size_minutes",
+        "category_label",
+    ]
     con = duckdb.connect()
     escaped_path = str(flow_db_path).replace("'", "''")
     try:
-        con.register("windows_df", windows_df)
         con.execute(f"ATTACH '{escaped_path}' AS flow_db (READ_ONLY)")
-        query = f"""
-            WITH agg AS (
-                SELECT
-                    w.accident_id,
-                    w.anchor,
-                    w.direction,
-                    w.minute_idx,
-                    w.window_size_minutes,
-                    {_category_case_sql()} AS category_label,
-                    COUNT(f.FECHA) AS flow,
-                    AVG(TRY_CAST(f.VELOCIDAD AS DOUBLE)) AS speed_mean,
-                    COALESCE(STDDEV_SAMP(TRY_CAST(f.VELOCIDAD AS DOUBLE)), 0.0) AS speed_std,
-                    CASE
-                        WHEN AVG(TRY_CAST(f.VELOCIDAD AS DOUBLE)) > 0
-                            THEN COUNT(f.FECHA) / AVG(TRY_CAST(f.VELOCIDAD AS DOUBLE))
-                        ELSE 0.0
-                    END AS density
-                FROM windows_df w
-                LEFT JOIN flow_db.{FLOW_TABLE_NAME} f
-                    ON TRIM(CAST(f.PORTICO AS VARCHAR)) = w.portico
-                   AND f.FECHA >= w.window_start
-                   AND f.FECHA < w.window_end
-                GROUP BY 1, 2, 3, 4, 5, 6
-            )
-            SELECT *
-            FROM agg
-            WHERE category_label IS NOT NULL
-        """
-        df = con.execute(query).df()
-        if df.empty:
-            return df
-        base_cols = [
-            "accident_id",
-            "anchor",
-            "direction",
-            "minute_idx",
-            "window_size_minutes",
-            "category_label",
-        ]
+        frames: List[pd.DataFrame] = []
+        for batch_idx, start in enumerate(range(0, total_windows, batch_size), start=1):
+            end = min(total_windows, start + batch_size)
+            batch_df = windows_df.iloc[start:end].copy()
+            windows_table_name = f"windows_df_batch_{batch_idx}"
+            con.register(windows_table_name, batch_df)
+            try:
+                result_df = con.execute(
+                    _granular_metrics_duckdb_query(windows_table_name=windows_table_name)
+                ).df()
+            finally:
+                try:
+                    con.unregister(windows_table_name)
+                except Exception:  # pragma: no cover
+                    pass
+            if not result_df.empty:
+                frames.append(result_df)
+            if total_batches > 1:
+                progress_value = min(64, 45 + int(round(19 * (end / max(1, total_windows)))))
+                _emit_progress(
+                    progress_callback,
+                    progress_value,
+                    f"Consultando DuckDB y agregando metricas: {end:,}/{total_windows:,} ventanas procesadas.",
+                )
+        if not frames:
+            return pd.DataFrame(columns=base_cols + metric_names)
+        df = pd.concat(frames, ignore_index=True)
         _emit_progress(progress_callback, 65, "Metricas granulares obtenidas desde DuckDB.")
         return df[base_cols + metric_names]
     finally:
@@ -10992,6 +11839,301 @@ def _render_registry_caption() -> None:
     st.caption(f"Registro reproducible: {REGISTRY_DB}")
 
 
+def _clear_deleted_run_from_session(run_id: str) -> None:
+    resolved_run_id = str(run_id).strip()
+    artifact_keys = [
+        "nlp_sev_events_artifact",
+        "nlp_sev_features_artifact",
+        "nlp_sev_granular_artifact",
+        "nlp_sev_language_artifact",
+        "nlp_sev_embeddings_artifact",
+    ]
+    for key in artifact_keys:
+        value = st.session_state.get(key)
+        if isinstance(value, dict) and str(value.get("run_id") or "").strip() == resolved_run_id:
+            st.session_state[key] = None
+    payload = st.session_state.get("nlp_sev_paper_replication_payload")
+    if isinstance(payload, dict) and str(payload.get("run_id") or "").strip() == resolved_run_id:
+        st.session_state["nlp_sev_paper_replication_payload"] = None
+
+
+def _sanitize_registry_run_manager_state(
+    *,
+    available_run_ids: Sequence[object],
+    preferred_run_id: Optional[str] = None,
+) -> List[str]:
+    available = [str(run_id).strip() for run_id in available_run_ids if str(run_id).strip()]
+    available_set = set(available)
+    current_selection = st.session_state.get("nlp_sev_registry_cleanup_runs")
+    filtered_selection: List[str] = []
+    if isinstance(current_selection, list):
+        filtered_selection = [
+            str(run_id).strip()
+            for run_id in current_selection
+            if str(run_id).strip() in available_set
+        ]
+    elif preferred_run_id is not None and str(preferred_run_id).strip() in available_set:
+        filtered_selection = [str(preferred_run_id).strip()]
+
+    if filtered_selection:
+        st.session_state["nlp_sev_registry_cleanup_runs"] = filtered_selection
+    else:
+        st.session_state.pop("nlp_sev_registry_cleanup_runs", None)
+    return filtered_selection
+
+
+def _render_registry_exchange_tools(*, selected_run_ids: Sequence[object]) -> None:
+    resolved_run_ids = _registry_export_run_ids(selected_run_ids)
+    selection_token = hashlib.sha1(
+        "|".join(sorted(resolved_run_ids)).encode("utf-8")
+    ).hexdigest()[:10]
+    export_bundle_key = f"nlp_sev_registry_export_bundle_{selection_token}"
+    export_error: Optional[str] = None
+    import_error: Optional[str] = None
+
+    st.markdown("#### Exportar / importar")
+    exchange_cols = st.columns(2)
+
+    with exchange_cols[0]:
+        st.caption(
+            "Exporte los registros seleccionados en un ZIP autocontenido para mover "
+            "resultados y archivos asociados entre computadores."
+        )
+        if resolved_run_ids:
+            if st.button(
+                "Preparar ZIP de exportacion",
+                key=f"nlp_sev_registry_export_prepare_{selection_token}",
+            ):
+                try:
+                    st.session_state[export_bundle_key] = _build_registry_runs_archive(resolved_run_ids)
+                except Exception as exc:
+                    export_error = str(exc)
+                    st.session_state.pop(export_bundle_key, None)
+            export_bundle = st.session_state.get(export_bundle_key)
+            if export_error:
+                st.error(export_error)
+            if isinstance(export_bundle, dict):
+                st.success(
+                    f"ZIP listo: runs={int(export_bundle.get('run_count') or 0)} | "
+                    f"archivos={int(export_bundle.get('file_count') or 0)} | "
+                    f"carpetas={int(export_bundle.get('directory_count') or 0)} | "
+                    f"tamano={int(export_bundle.get('byte_count') or 0):,} bytes"
+                )
+                st.download_button(
+                    "Descargar ZIP",
+                    data=export_bundle.get("bytes") or b"",
+                    file_name=str(export_bundle.get("file_name") or "nlp_severity_registry_export.zip"),
+                    mime="application/zip",
+                    key=f"nlp_sev_registry_export_download_{selection_token}",
+                )
+        else:
+            st.info("Seleccione al menos un registro para habilitar la exportacion.")
+
+    with exchange_cols[1]:
+        st.caption(
+            "Importe un ZIP exportado desde esta misma pantalla. Puede reemplazar "
+            "runs existentes si ya fueron importados antes."
+        )
+        uploaded_archive = st.file_uploader(
+            "ZIP de registros",
+            type=["zip"],
+            key="nlp_sev_registry_import_archive",
+        )
+        overwrite_existing = st.checkbox(
+            "Reemplazar runs existentes al importar",
+            key="nlp_sev_registry_import_overwrite",
+        )
+        if st.button("Importar ZIP", key="nlp_sev_registry_import_button"):
+            if uploaded_archive is None:
+                import_error = "Seleccione un archivo ZIP antes de importar."
+            else:
+                try:
+                    import_result = _import_registry_runs_archive(
+                        uploaded_archive.getvalue(),
+                        overwrite_existing=overwrite_existing,
+                    )
+                except Exception as exc:
+                    import_error = str(exc)
+                else:
+                    for run_id in import_result.get("overwritten_run_ids") or []:
+                        _clear_deleted_run_from_session(str(run_id))
+                    st.session_state["nlp_sev_registry_import_feedback"] = import_result
+                    st.rerun()
+        if import_error:
+            st.error(import_error)
+
+
+def _render_registry_run_manager(*, preferred_run_id: Optional[str] = None) -> None:
+    st.markdown("### Gestor de registros")
+    feedback = st.session_state.pop("nlp_sev_registry_cleanup_feedback", None)
+    if isinstance(feedback, dict):
+        run_count = int(feedback.get("run_count") or 0)
+        if run_count > 1:
+            st.success(
+                "Registros eliminados: "
+                f"{run_count} | "
+                f"modelos={int(feedback.get('model_result_count') or 0)} | "
+                f"artifacts={int(feedback.get('artifact_count') or 0)} | "
+                f"acciones={int(feedback.get('action_count') or 0)} | "
+                f"rutas={int(feedback.get('deleted_path_count') or 0)}"
+            )
+            run_ids = [str(item) for item in (feedback.get("run_ids") or []) if str(item).strip()]
+            if run_ids:
+                visible_run_ids = run_ids[:10]
+                suffix = "" if len(run_ids) <= len(visible_run_ids) else f" ... (+{len(run_ids) - len(visible_run_ids)})"
+                st.caption("Runs eliminados: " + ", ".join(visible_run_ids) + suffix)
+        else:
+            st.success(
+                "Registro eliminado: "
+                f"{feedback.get('run_id')} | "
+                f"modelos={int(feedback.get('model_result_count') or 0)} | "
+                f"artifacts={int(feedback.get('artifact_count') or 0)} | "
+                f"acciones={int(feedback.get('action_count') or 0)} | "
+                f"rutas={int(feedback.get('deleted_path_count') or 0)}"
+            )
+        errors = feedback.get("errors") or []
+        if errors:
+            st.warning("La limpieza termino con advertencias:\n" + "\n".join(f"- {error}" for error in errors))
+
+    import_feedback = st.session_state.pop("nlp_sev_registry_import_feedback", None)
+    if isinstance(import_feedback, dict):
+        st.success(
+            "Registros importados: "
+            f"{int(import_feedback.get('run_count') or 0)} | "
+            f"modelos={int(import_feedback.get('model_result_count') or 0)} | "
+            f"artifacts={int(import_feedback.get('artifact_count') or 0)} | "
+            f"acciones={int(import_feedback.get('action_count') or 0)} | "
+            f"archivos={int(import_feedback.get('file_count') or 0)}"
+        )
+        overwritten_run_ids = [
+            str(run_id)
+            for run_id in (import_feedback.get("overwritten_run_ids") or [])
+            if str(run_id).strip()
+        ]
+        if overwritten_run_ids:
+            st.caption("Runs reemplazados: " + ", ".join(overwritten_run_ids))
+
+    registry_runs_df = _load_registry_run_summary()
+    if registry_runs_df.empty:
+        st.info("No hay registros persistidos para gestionar.")
+        _render_registry_exchange_tools(selected_run_ids=[])
+        return
+
+    manager_df = registry_runs_df.copy()
+    manager_df["label"] = manager_df.apply(
+        lambda row: (
+            f"{row.get('updated_at')} | {row.get('run_id')} | "
+            f"modelos={int(row.get('model_result_count') or 0)} | "
+            f"artifacts={int(row.get('artifact_count') or 0)} | "
+            f"acciones={int(row.get('action_count') or 0)}"
+        ),
+        axis=1,
+    )
+    run_ids = manager_df["run_id"].astype(str).tolist()
+    default_runs = _sanitize_registry_run_manager_state(
+        available_run_ids=run_ids,
+        preferred_run_id=preferred_run_id,
+    )
+
+    label_by_run = dict(zip(run_ids, manager_df["label"].tolist()))
+    selected_run_ids = st.multiselect(
+        "Registros a gestionar",
+        run_ids,
+        default=default_runs,
+        format_func=lambda run_id: label_by_run.get(str(run_id), str(run_id)),
+        key="nlp_sev_registry_cleanup_runs",
+    )
+    if not selected_run_ids:
+        st.info("Seleccione uno o mas registros para revisar el preview, exportarlos o eliminarlos.")
+        _render_registry_exchange_tools(selected_run_ids=[])
+        return
+
+    selected_summaries = [_describe_registry_run(run_id) for run_id in selected_run_ids]
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Registros", f"{len(selected_summaries):,}")
+    metric_cols[1].metric(
+        "Modelos",
+        f"{sum(int(summary.get('model_result_count') or 0) for summary in selected_summaries):,}",
+    )
+    metric_cols[2].metric(
+        "Artifacts",
+        f"{sum(int(summary.get('artifact_count') or 0) for summary in selected_summaries):,}",
+    )
+    metric_cols[3].metric(
+        "Acciones",
+        f"{sum(int(summary.get('action_count') or 0) for summary in selected_summaries):,}",
+    )
+    metric_cols[4].metric(
+        "Rutas",
+        f"{sum(int(summary.get('path_count') or 0) for summary in selected_summaries):,}",
+    )
+
+    stage_tokens = sorted(
+        {
+            part.strip()
+            for summary in selected_summaries
+            for part in str(summary.get("stages") or "").split(",")
+            if part.strip()
+        }
+    )
+    if stage_tokens:
+        st.caption("Etapas asociadas: " + ", ".join(stage_tokens))
+    st.caption("La limpieza solo elimina rutas detectadas dentro de `Resultados/nlp_in_severity`.")
+
+    selected_rows = manager_df.loc[manager_df["run_id"].astype(str).isin([str(item) for item in selected_run_ids])].copy()
+    selected_display_cols = ["updated_at", "run_id", "model_result_count", "artifact_count", "action_count"]
+    st.dataframe(
+        selected_rows[selected_display_cols],
+        width="stretch",
+        height=min(260, 35 * min(len(selected_rows), 8) + 38),
+    )
+
+    cleanup_preview_rows = [
+        {"run_id": str(summary.get("run_id") or ""), "ruta": str(path)}
+        for summary in selected_summaries
+        for path in (summary.get("paths") or [])
+    ]
+    if cleanup_preview_rows:
+        preview_df = pd.DataFrame(cleanup_preview_rows[:30])
+        st.dataframe(
+            preview_df,
+            width="stretch",
+            height=min(260, 35 * min(len(preview_df), 8) + 38),
+        )
+        remaining = int(len(cleanup_preview_rows) - len(preview_df))
+        if remaining > 0:
+            st.caption(f"Se omitieron {remaining:,} rutas adicionales en el preview.")
+    else:
+        st.info("No se detectaron rutas fisicas asociadas a los registros seleccionados. Se limpiara solo el registry.")
+
+    _render_registry_exchange_tools(selected_run_ids=selected_run_ids)
+
+    selection_token = hashlib.sha1(
+        "|".join(sorted(str(run_id) for run_id in selected_run_ids)).encode("utf-8")
+    ).hexdigest()[:10]
+
+    confirm_delete = st.checkbox(
+        f"Confirmo la eliminacion definitiva de {len(selected_run_ids)} registro(s) y sus archivos asociados.",
+        key=f"nlp_sev_registry_cleanup_confirm_{selection_token}",
+    )
+    if st.button(
+        "Eliminar registros seleccionados y archivos",
+        type="primary",
+        key=f"nlp_sev_registry_cleanup_delete_{selection_token}",
+    ):
+        if not confirm_delete:
+            st.warning("Active la confirmacion antes de eliminar el registro.")
+        else:
+            deletion = _delete_registry_runs(selected_run_ids)
+            for run_id in selected_run_ids:
+                _clear_deleted_run_from_session(str(run_id))
+            if int(deletion.get("run_count") or 0) == 1 and deletion.get("deletions"):
+                st.session_state["nlp_sev_registry_cleanup_feedback"] = deletion["deletions"][0]
+            else:
+                st.session_state["nlp_sev_registry_cleanup_feedback"] = deletion
+            st.rerun()
+
+
 def _reset_nlp_sev_language_state() -> None:
     st.session_state["nlp_sev_language_df"] = None
     st.session_state["nlp_sev_language_artifact"] = None
@@ -11309,19 +12451,28 @@ def _render_events_tab() -> None:
     _render_registry_caption()
 
 
+def _default_feature_engineering_source(*, has_memory: bool, accidents_available: bool) -> str:
+    if has_memory:
+        return "En memoria"
+    if not accidents_available:
+        return "Cargar existentes"
+    return "Calcular nuevas"
+
+
 def _render_feature_engineering_tab() -> None:
     st.subheader("Feature engineering")
     accidents_df = st.session_state.get("nlp_sev_accidents_df")
-    if accidents_df is None or accidents_df.empty:
-        st.info("Primero procese eventos en la pestana Eventos.")
-        return
+    accidents_available = isinstance(accidents_df, pd.DataFrame) and not accidents_df.empty
 
     has_memory = isinstance(st.session_state.get("nlp_sev_features_df"), pd.DataFrame) and not st.session_state.get(
         "nlp_sev_features_df"
     ).empty
     source_options = ["Cargar existentes", "Calcular nuevas", "En memoria"]
     if st.session_state.get("nlp_sev_feature_source") not in source_options:
-        st.session_state["nlp_sev_feature_source"] = "En memoria" if has_memory else "Calcular nuevas"
+        st.session_state["nlp_sev_feature_source"] = _default_feature_engineering_source(
+            has_memory=has_memory,
+            accidents_available=accidents_available,
+        )
 
     source = st.radio(
         "Fuente",
@@ -11401,6 +12552,12 @@ def _render_feature_engineering_tab() -> None:
                         )
                         st.success(f"Dataset cargado: {len(features_df):,} accidentes con features.")
         _render_feature_engineering_output()
+        return
+
+    if not accidents_available:
+        st.info("Para calcular nuevas features, primero procese eventos en la pestana Eventos.")
+        _render_feature_engineering_output()
+        _render_registry_caption()
         return
 
     try:
@@ -13572,157 +14729,65 @@ def _render_historial_tab() -> None:
     st.subheader("Historial de resultados")
 
     results_df = _load_model_results()
+    selected_run: Optional[str] = None
     if results_df.empty:
-        st.info("No hay resultados registrados. Ejecute entrenamientos desde el tab Train.")
-        return
-
-    # ── 1. Tabla resumen de todos los modelos ──
-    st.markdown("### Resultados de modelos")
-    display_cols = [
-        col for col in [
-            "created_at", "run_id", "stage", "model_name", "feature_group",
-            "accuracy", "precision", "recall", "f1_score", "roc_auc",
-            "false_negatives_global",
-        ]
-        if col in results_df.columns
-    ]
-    st.dataframe(
-        results_df[display_cols].head(200),
-        width="stretch",
-        height=min(400, 35 * min(len(results_df), 12) + 38),
-    )
-    st.caption(f"Total de registros: {len(results_df):,}")
-
-    # ── 2. Filtros interactivos ──
-    st.markdown("### Filtrar y comparar")
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
-    with filter_col1:
-        stage_options = sorted(results_df["stage"].dropna().unique().tolist())
-        selected_stages = st.multiselect(
-            "Etapa",
-            stage_options,
-            default=stage_options,
-            key="nlp_sev_hist_stage_filter",
-        )
-    with filter_col2:
-        model_options = sorted(results_df["model_name"].dropna().unique().tolist())
-        selected_models = st.multiselect(
-            "Modelo",
-            model_options,
-            default=model_options,
-            key="nlp_sev_hist_model_filter",
-        )
-    with filter_col3:
-        group_options = sorted(results_df["feature_group"].dropna().unique().tolist())
-        selected_groups = st.multiselect(
-            "Feature group",
-            group_options,
-            default=group_options,
-            key="nlp_sev_hist_group_filter",
-        )
-
-    filtered_df = results_df.copy()
-    if selected_stages:
-        filtered_df = filtered_df[filtered_df["stage"].isin(selected_stages)]
-    if selected_models:
-        filtered_df = filtered_df[filtered_df["model_name"].isin(selected_models)]
-    if selected_groups:
-        filtered_df = filtered_df[filtered_df["feature_group"].isin(selected_groups)]
-
-    if filtered_df.empty:
-        st.warning("No hay resultados que coincidan con los filtros seleccionados.")
-        return
-
-    # ── 3. Tabla comparativa filtrada ──
-    compare_metrics = ["accuracy", "precision", "recall", "f1_score", "roc_auc", "false_negatives_global"]
-    available_metrics = [m for m in compare_metrics if m in filtered_df.columns]
-    compare_cols = ["created_at", "run_id", "stage", "model_name", "feature_group"] + available_metrics
-    compare_cols = [c for c in compare_cols if c in filtered_df.columns]
-    st.dataframe(
-        filtered_df[compare_cols],
-        width="stretch",
-        height=min(500, 35 * min(len(filtered_df), 15) + 38),
-    )
-
-    # ── 4. Grafico comparativo ──
-    if len(filtered_df) >= 2 and available_metrics:
-        st.markdown("### Comparacion visual")
-        chart_metric = st.selectbox(
-            "Metrica a comparar",
-            available_metrics,
-            index=available_metrics.index("f1_score") if "f1_score" in available_metrics else 0,
-            key="nlp_sev_hist_chart_metric",
-        )
-        chart_df = filtered_df[["model_name", "feature_group", "stage", chart_metric, "created_at"]].copy()
-        chart_df[chart_metric] = pd.to_numeric(chart_df[chart_metric], errors="coerce")
-        chart_df = chart_df.dropna(subset=[chart_metric])
-        chart_df["label"] = (
-            chart_df["model_name"].astype(str) + " | "
-            + chart_df["feature_group"].astype(str) + " | "
-            + chart_df["stage"].astype(str)
-        )
-        if not chart_df.empty:
-            fig = px.bar(
-                chart_df.sort_values(chart_metric, ascending=False).head(30),
-                x="label",
-                y=chart_metric,
-                color="stage",
-                title=f"{chart_metric} por modelo y etapa",
-                labels={"label": "Modelo | Grupo | Etapa", chart_metric: chart_metric},
-            )
-            fig.update_layout(xaxis_tickangle=-45, height=450)
-            st.plotly_chart(fig, width="stretch")
-
-    # ── 5. Detalle de un run_id seleccionado ──
-    st.markdown("### Detalle por ejecucion")
-    run_ids = filtered_df["run_id"].dropna().unique().tolist()
-    if run_ids:
-        selected_run = st.selectbox(
-            "Seleccionar run_id",
-            run_ids,
-            key="nlp_sev_hist_run_select",
-        )
-        run_results = filtered_df[filtered_df["run_id"] == selected_run]
-        if (
-            not run_results.empty
-            and "stage" in run_results.columns
-            and run_results["stage"].astype(str).str.startswith("paper_replication_").any()
-        ):
-            _render_paper_replication_history_detail(str(selected_run))
-        for _, row in run_results.iterrows():
-            with st.expander(f"{row.get('model_name', '?')} · {row.get('feature_group', '?')} · {row.get('stage', '?')}"):
-                metric_cols = [c for c in available_metrics if c in row.index and pd.notna(row[c])]
-                if metric_cols:
-                    cols = st.columns(min(len(metric_cols), 4))
-                    for idx, m in enumerate(metric_cols):
-                        value = row[m]
-                        fmt = f"{int(value):,}" if m == "false_negatives_global" else f"{float(value):.4f}"
-                        cols[idx % len(cols)].metric(m, fmt)
-                params = row.get("params")
-                if isinstance(params, dict) and params:
-                    st.json(params)
-                metadata = row.get("metadata")
-                if isinstance(metadata, dict) and metadata:
-                    st.json(metadata)
-
-    # ── 6. Catalogo de artifacts ──
-    st.markdown("### Artifacts persistidos")
-    catalog_df = _load_artifact_catalog()
-    if catalog_df.empty:
-        st.info("No hay artifacts persistidos.")
+        st.info("No hay resultados de modelos registrados. El gestor de limpieza sigue disponible para runs con artifacts.")
     else:
-        catalog_display = [
-            c for c in [
-                "created_at", "run_id", "stage", "artifact_name", "row_count", "db_path",
+        # ── 1. Tabla resumen de todos los modelos ──
+        st.markdown("### Resultados de modelos")
+        compare_metrics = ["accuracy", "precision", "recall", "f1_score", "roc_auc", "false_negatives_global"]
+        available_metrics = [metric for metric in compare_metrics if metric in results_df.columns]
+        display_cols = [
+            col for col in [
+                "created_at", "run_id", "stage", "model_name", "feature_group",
+                "accuracy", "precision", "recall", "f1_score", "roc_auc",
+                "false_negatives_global",
             ]
-            if c in catalog_df.columns
+            if col in results_df.columns
         ]
         st.dataframe(
-            catalog_df[catalog_display].head(100),
+            results_df[display_cols].head(200),
             width="stretch",
-            height=min(350, 35 * min(len(catalog_df), 10) + 38),
+            height=min(400, 35 * min(len(results_df), 12) + 38),
         )
-        st.caption(f"Total de artifacts: {len(catalog_df):,}")
+        st.caption(f"Total de registros: {len(results_df):,}")
+
+        # ── 2. Detalle de un run_id seleccionado ──
+        st.markdown("### Detalle por ejecucion")
+        run_ids = results_df["run_id"].dropna().unique().tolist()
+        if run_ids:
+            current_hist_run = str(st.session_state.get("nlp_sev_hist_run_select") or "").strip()
+            if current_hist_run and current_hist_run not in {str(run_id) for run_id in run_ids}:
+                st.session_state.pop("nlp_sev_hist_run_select", None)
+            selected_run = st.selectbox(
+                "Seleccionar run_id",
+                run_ids,
+                key="nlp_sev_hist_run_select",
+            )
+            run_results = results_df[results_df["run_id"] == selected_run]
+            if (
+                not run_results.empty
+                and "stage" in run_results.columns
+                and run_results["stage"].astype(str).str.startswith("paper_replication_").any()
+            ):
+                _render_paper_replication_history_detail(str(selected_run))
+            for _, row in run_results.iterrows():
+                with st.expander(f"{row.get('model_name', '?')} · {row.get('feature_group', '?')} · {row.get('stage', '?')}"):
+                    metric_cols = [c for c in available_metrics if c in row.index and pd.notna(row[c])]
+                    if metric_cols:
+                        cols = st.columns(min(len(metric_cols), 4))
+                        for idx, m in enumerate(metric_cols):
+                            value = row[m]
+                            fmt = f"{int(value):,}" if m == "false_negatives_global" else f"{float(value):.4f}"
+                            cols[idx % len(cols)].metric(m, fmt)
+                    params = row.get("params")
+                    if isinstance(params, dict) and params:
+                        st.json(params)
+                    metadata = row.get("metadata")
+                    if isinstance(metadata, dict) and metadata:
+                        st.json(metadata)
+
+    _render_registry_run_manager(preferred_run_id=selected_run)
 
     _render_registry_caption()
 
