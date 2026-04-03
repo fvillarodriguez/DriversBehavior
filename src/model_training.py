@@ -80,6 +80,7 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
             subsample=float(params["subsample"]),
             colsample_bytree=float(params["colsample_bytree"]),
             min_child_weight=float(params.get("min_child_weight", 1.0)),
+            reg_alpha=float(params.get("reg_alpha", 0.0)),
             reg_lambda=float(params.get("reg_lambda", 1.0)),
             gamma=float(params.get("gamma", 0.0)),
             random_state=random_state,

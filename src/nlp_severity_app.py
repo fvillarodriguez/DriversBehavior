@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 try:
@@ -181,11 +182,16 @@ GRANULAR_METRIC_LABELS = {
     "speed_std": "Speed std",
     "density": "Density",
 }
-PAPER_K_GRID = [10, 15, 20, 25, 30, 40, 50, 70, 100, 150, 200, 300, 400, 500, 632]
-PAPER_K_GRID_SELECTION_MIN = 2
-PAPER_K_GRID_SELECTION_MAX = 5
-PAPER_K_GRID_DEFAULT_SELECTION = [10, 50, 100, 200, 632]
+PAPER_K_GRID = [10, 15, 20, 25, 30, 40, 50, 70, 100, 150, 200, 250, 300, 350, 400, 432]
+PAPER_K_GRID_SELECTION_MIN = 1
+PAPER_K_GRID_SELECTION_MAX = len(PAPER_K_GRID)
+PAPER_K_GRID_DEFAULT_SELECTION = [10, 50, 100, 200]
+PAPER_K_GRID_MODE_DEFAULT = "manual"
+PAPER_K_GRID_MODE_INTERVAL_MAX = "interval_max"
+PAPER_K_GRID_INTERVAL_OPTIONS = [5, 10, 25, 50, 100]
+PAPER_K_GRID_INTERVAL_DEFAULT = 10
 PAPER_CLASS_LABELS = {0: "No-MARC", 1: "MARC"}
+PAPER_MODEL_SELECTION_DEFAULT = ["M1", "M2", "M3"]
 PAPER_PROTOCOL = {
     "split_mode": "Temporal",
     "test_size": 0.2,
@@ -204,23 +210,41 @@ PAPER_EXPECTED_COUNTS = {
     "total_features": 632,
     "train_rows": 1656,
     "test_rows": 414,
-    "train_class_counts": {"0": 376, "1": 1280},
-    "test_class_counts": {"0": 94, "1": 320},
+    "train_class_counts": {"0": 425, "1": 1231},
+    "test_class_counts": {"0": 44, "1": 370},
 }
 PAPER_COMPARISON_TOLERANCE = 0.001
 PAPER_VALIDATION_ALPHA = 0.3
-PAPER_PROTOCOL_VERSION = "paper_replication_checkpoint_v2"
+PAPER_PROTOCOL_VERSION = "paper_replication_checkpoint_v11"
 PAPER_ROUTE_SELECTION_DEFAULTS = {
     "run_frozen": True,
     "run_raw": True,
     "run_update_embeddings": False,
 }
-PAPER_UPDATE_EMB_TOP_K = 200
 PAPER_CV_FOLDS_DEFAULT = 5
 PAPER_CV_FOLDS_MIN = 2
 PAPER_CV_FOLDS_MAX = 10
 PAPER_OPTIMIZATION_BACKEND_DEFAULT = "gridsearch"
 PAPER_OPTUNA_TRIALS_DEFAULT = 24
+XGB_TUNING_PROFILES = ["Rapida", "Amplia", "GridSearch original"]
+XGB_GRID_PARAM_ORDER = ["max_depth", "learning_rate", "n_estimators", "subsample", "colsample_bytree"]
+XGB_GRID_PARAM_TYPES: Dict[str, Callable[[float], object]] = {
+    "max_depth": int,
+    "learning_rate": float,
+    "n_estimators": int,
+    "subsample": float,
+    "colsample_bytree": float,
+    "min_child_weight": int,
+    "gamma": float,
+    "reg_alpha": float,
+    "reg_lambda": float,
+}
+XGB_REGULARIZATION_PARAM_ORDER = ["min_child_weight", "gamma", "reg_alpha", "reg_lambda"]
+SMOTE_GRID_PARAM_ORDER = ["sampling_strategy", "k_neighbors"]
+SMOTE_GRID_PARAM_TYPES: Dict[str, Callable[[float], object]] = {
+    "sampling_strategy": float,
+    "k_neighbors": int,
+}
 PAPER_SCORING_METRICS = ["f1", "roc_auc", "recall", "precision", "accuracy"]
 PAPER_SCORING_METRIC_DEFAULT = "f1"
 PAPER_SCORING_METRIC_LABELS = {
@@ -261,6 +285,8 @@ STATE_DEFAULTS: Dict[str, object] = {
     "nlp_sev_topic_df": None,
     "nlp_sev_topic_meta": None,
     "nlp_sev_paper_replication_payload": None,
+    "nlp_sev_train_xgb_param_grids": None,
+    "nlp_sev_train_smote_param_grids": None,
 }
 
 
@@ -1284,6 +1310,8 @@ def _paper_route_paths(paths: Dict[str, Path], route_name: str) -> Dict[str, Pat
         "comparison_csv": route_dir / "comparison.csv",
         "metricas_csv": route_dir / "metricas.csv",
         "predictions_csv": route_dir / "predictions.csv",
+        "k_metrics_csv": route_dir / "k_metrics.csv",
+        "k_metrics_json": route_dir / "k_metrics.json",
         "m3_grid_csv": route_dir / "m3_grid.csv",
         "payload": route_dir / "route_payload.pkl",
     }
@@ -1377,6 +1405,21 @@ def _paper_persist_route_payload(route_payload: Dict[str, object], route_paths: 
     predictions_df = route_payload.get("predictions_df")
     if isinstance(predictions_df, pd.DataFrame) and not predictions_df.empty:
         _paper_write_csv(predictions_df, route_paths["predictions_csv"])
+    k_metrics_df = route_payload.get("k_metrics_df")
+    if isinstance(k_metrics_df, pd.DataFrame) and not k_metrics_df.empty:
+        _paper_write_csv(k_metrics_df, route_paths["k_metrics_csv"])
+    _paper_write_json(
+        route_paths["k_metrics_json"],
+        {
+            "route_name": str(route_payload.get("route_name") or ""),
+            "selected_models": list(route_payload.get("selected_models") or []),
+            "records": _to_json_safe(
+                k_metrics_df.to_dict(orient="records")
+                if isinstance(k_metrics_df, pd.DataFrame)
+                else []
+            ),
+        },
+    )
     m3_grid_df = route_payload.get("m3_grid_df")
     if isinstance(m3_grid_df, pd.DataFrame) and not m3_grid_df.empty:
         _paper_write_csv(m3_grid_df, route_paths["m3_grid_csv"])
@@ -1384,6 +1427,7 @@ def _paper_persist_route_payload(route_payload: Dict[str, object], route_paths: 
         "route_name": route_payload.get("route_name"),
         "status": route_payload.get("status"),
         "status_message": route_payload.get("status_message"),
+        "selected_models": list(route_payload.get("selected_models") or []),
         "dataset_validation": route_payload.get("dataset_validation") or {},
         "route_metadata": route_payload.get("route_metadata") or {},
         "raw_build": route_payload.get("raw_build") or {},
@@ -1393,6 +1437,7 @@ def _paper_persist_route_payload(route_payload: Dict[str, object], route_paths: 
     return {
         "summary_json": str(route_paths["summary_json"]),
         "dataset_validation": str(route_paths["dataset_validation"]),
+        "k_metrics_json": str(route_paths["k_metrics_json"]),
         "payload": str(route_paths["payload"]),
     }
 
@@ -1407,17 +1452,20 @@ def _paper_skipped_route_payload(
     *,
     reason: str,
     route_metadata: Optional[Dict[str, object]] = None,
+    selected_models: Optional[Sequence[object]] = None,
 ) -> Dict[str, object]:
     return {
         "status": "skipped",
         "status_message": str(reason),
         "route_name": str(route_name),
         "route_metadata": route_metadata or {},
+        "selected_models": _paper_normalize_model_selection(selected_models),
         "dataset_validation": {},
         "model_results": [],
         "comparison_df": pd.DataFrame(),
         "metricas_df": pd.DataFrame(),
         "predictions_df": pd.DataFrame(),
+        "k_metrics_df": pd.DataFrame(),
         "m3_grid_df": pd.DataFrame(),
     }
 
@@ -1546,14 +1594,31 @@ def _paper_assemble_payload_from_checkpoint(
         compare_payload = _paper_load_compare_payload(_paper_compare_paths(paths)) or {}
         export_payload = _paper_load_export_payload(export_paths)
         manifest_protocol = manifest.get("protocol") or {}
+        manifest_k_grid = manifest_protocol.get("k_grid")
+        manifest_k_grid_mode = _paper_normalize_k_grid_mode(manifest_protocol.get("k_grid_mode"))
         route_options = (manifest_protocol.get("route_options") or PAPER_ROUTE_SELECTION_DEFAULTS)
+        selected_models = _paper_normalize_model_selection(manifest_protocol.get("selected_models"))
         manifest_backend = _paper_normalize_optimization_backend(manifest_protocol.get("optimization_backend"))
         payload = {
             "run_id": str(manifest.get("run_id") or ""),
             "run_dir": str(paths["run_dir"]),
             "route_options": dict(route_options),
-            "k_grid": list(manifest_protocol.get("k_grid") or _paper_normalize_k_grid()),
+            "k_grid": [] if manifest_k_grid == [] else list(manifest_k_grid or _paper_normalize_k_grid()),
+            "k_grid_mode": manifest_k_grid_mode,
+            "k_grid_interval": int(
+                manifest_protocol.get("k_grid_interval")
+                or (
+                    _paper_normalize_k_grid_interval(None)
+                    if manifest_k_grid_mode == PAPER_K_GRID_MODE_INTERVAL_MAX
+                    else 0
+                )
+            ),
+            "selected_models": list(selected_models),
             "cv_folds": int(manifest_protocol.get("cv_folds") or PAPER_CV_FOLDS_DEFAULT),
+            "xgb_tuning_profile": str(
+                manifest_protocol.get("xgb_tuning_profile") or _normalize_xgb_tuning_profile(None)
+            ),
+            "use_regularization": bool(manifest_protocol.get("use_regularization")),
             "optimization_backend": str(manifest_backend),
             "optuna_trials": int(
                 manifest_protocol.get("optuna_trials")
@@ -1579,9 +1644,31 @@ def _paper_assemble_payload_from_checkpoint(
             )
         )
     if "k_grid" not in payload:
-        payload["k_grid"] = list(((manifest.get("protocol") or {}).get("k_grid") or _paper_normalize_k_grid()))
+        protocol_k_grid = (manifest.get("protocol") or {}).get("k_grid")
+        payload["k_grid"] = [] if protocol_k_grid == [] else list(protocol_k_grid or _paper_normalize_k_grid())
+    if "k_grid_mode" not in payload:
+        payload["k_grid_mode"] = _paper_normalize_k_grid_mode((manifest.get("protocol") or {}).get("k_grid_mode"))
+    if "k_grid_interval" not in payload:
+        payload["k_grid_interval"] = int(
+            ((manifest.get("protocol") or {}).get("k_grid_interval"))
+            or (
+                _paper_normalize_k_grid_interval(None)
+                if payload["k_grid_mode"] == PAPER_K_GRID_MODE_INTERVAL_MAX
+                else 0
+            )
+        )
     if "cv_folds" not in payload:
         payload["cv_folds"] = int(((manifest.get("protocol") or {}).get("cv_folds") or PAPER_CV_FOLDS_DEFAULT))
+    if "xgb_tuning_profile" not in payload:
+        payload["xgb_tuning_profile"] = str(
+            ((manifest.get("protocol") or {}).get("xgb_tuning_profile") or _normalize_xgb_tuning_profile(None))
+        )
+    if "scoring_metric" not in payload:
+        payload["scoring_metric"] = str(
+            ((manifest.get("protocol") or {}).get("scoring_metric") or _paper_resolve_scoring_metric(None))
+        )
+    if "use_regularization" not in payload:
+        payload["use_regularization"] = bool((manifest.get("protocol") or {}).get("use_regularization"))
     if "optuna_trials" not in payload:
         manifest_backend = _paper_normalize_optimization_backend(
             ((manifest.get("protocol") or {}).get("optimization_backend"))
@@ -1705,9 +1792,14 @@ def _paper_build_execution_context(
     *,
     route_options: Optional[Dict[str, object]] = None,
     k_grid: Optional[Sequence[object]] = None,
+    k_grid_mode: Optional[object] = None,
+    k_grid_interval: Optional[object] = None,
+    selected_models: Optional[Sequence[object]] = None,
     cv_folds: Optional[object] = None,
     raw_features_artifact_row: Optional[pd.Series] = None,
     transformer_model_row_override: Optional[pd.Series] = None,
+    xgb_tuning_profile: Optional[object] = None,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
     scoring_metric: Optional[str] = None,
@@ -1720,7 +1812,12 @@ def _paper_build_execution_context(
     protocol_snapshot = {
         **_paper_protocol_config(
             k_grid=k_grid,
+            k_grid_mode=k_grid_mode,
+            k_grid_interval=k_grid_interval,
+            selected_models=selected_models,
             cv_folds=cv_folds,
+            xgb_tuning_profile=xgb_tuning_profile,
+            use_regularization=bool(use_regularization),
             optimization_backend=optimization_backend,
             optuna_trials=optuna_trials,
             scoring_metric=scoring_metric,
@@ -3055,15 +3152,85 @@ def _paper_optimization_backend_label(backend: Optional[object]) -> str:
     }.get(normalized, str(backend or "GridSearchCV"))
 
 
+def _paper_normalize_k_grid_mode(k_grid_mode: Optional[object] = None) -> str:
+    normalized = str(k_grid_mode or PAPER_K_GRID_MODE_DEFAULT).strip().lower()
+    if normalized in {PAPER_K_GRID_MODE_INTERVAL_MAX, "interval", "intervalo"}:
+        return PAPER_K_GRID_MODE_INTERVAL_MAX
+    return PAPER_K_GRID_MODE_DEFAULT
+
+
+def _paper_k_grid_mode_label(k_grid_mode: Optional[object]) -> str:
+    return {
+        PAPER_K_GRID_MODE_DEFAULT: "Manual (grilla del paper)",
+        PAPER_K_GRID_MODE_INTERVAL_MAX: "Intervalo hasta el maximo",
+    }.get(_paper_normalize_k_grid_mode(k_grid_mode), str(k_grid_mode or "Manual"))
+
+
+def _paper_normalize_k_grid_interval(k_grid_interval: Optional[object] = None) -> int:
+    numeric = pd.to_numeric(k_grid_interval, errors="coerce")
+    if pd.isna(numeric):
+        return int(PAPER_K_GRID_INTERVAL_DEFAULT)
+    interval = int(numeric)
+    if interval not in PAPER_K_GRID_INTERVAL_OPTIONS:
+        raise ValueError(
+            "Seleccione un intervalo valido para la grilla de k: "
+            + ", ".join(str(int(option)) for option in PAPER_K_GRID_INTERVAL_OPTIONS)
+            + "."
+        )
+    return interval
+
+
+def _paper_interval_k_grid(total_features: int, *, k_grid_interval: Optional[object] = None) -> List[int]:
+    max_features = max(1, int(total_features))
+    interval = _paper_normalize_k_grid_interval(k_grid_interval)
+    values = list(range(interval, max_features + 1, interval))
+    if not values or values[-1] != max_features:
+        values.append(max_features)
+    return sorted({int(value) for value in values if 1 <= int(value) <= max_features})
+
+
+def _paper_compact_int_list(values: Sequence[object], *, head: int = 5, tail: int = 2) -> str:
+    normalized: List[int] = []
+    for value in values:
+        numeric = pd.to_numeric(value, errors="coerce")
+        if pd.isna(numeric):
+            continue
+        normalized.append(int(numeric))
+    if len(normalized) <= head + tail + 1:
+        return str(normalized)
+    head_values = ", ".join(str(value) for value in normalized[:head])
+    tail_values = ", ".join(str(value) for value in normalized[-tail:])
+    return "[" + head_values + ", ..., " + tail_values + "]"
+
+
+def _paper_describe_k_grid(
+    *,
+    k_grid: Optional[Sequence[object]] = None,
+    k_grid_mode: Optional[object] = None,
+    k_grid_interval: Optional[object] = None,
+) -> str:
+    normalized_mode = _paper_normalize_k_grid_mode(k_grid_mode)
+    if normalized_mode == PAPER_K_GRID_MODE_INTERVAL_MAX:
+        interval = _paper_normalize_k_grid_interval(k_grid_interval)
+        return f"cada {interval} hasta el maximo disponible por modelo"
+    return str(_paper_normalize_k_grid(k_grid))
+
+
 def _paper_protocol_config(
     *,
     k_grid: Optional[Sequence[object]] = None,
+    k_grid_mode: Optional[object] = None,
+    k_grid_interval: Optional[object] = None,
+    selected_models: Optional[Sequence[object]] = None,
     cv_folds: Optional[object] = None,
+    xgb_tuning_profile: Optional[object] = None,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
     scoring_metric: Optional[str] = None,
 ) -> Dict[str, object]:
     normalized_backend = _paper_normalize_optimization_backend(optimization_backend)
+    normalized_k_grid_mode = _paper_normalize_k_grid_mode(k_grid_mode)
     resolved_trials = (
         max(1, int(optuna_trials or PAPER_OPTUNA_TRIALS_DEFAULT))
         if normalized_backend == "optuna"
@@ -3072,17 +3239,32 @@ def _paper_protocol_config(
     resolved_scoring = str(scoring_metric or PAPER_SCORING_METRIC_DEFAULT)
     if resolved_scoring not in PAPER_SCORING_METRICS:
         resolved_scoring = PAPER_SCORING_METRIC_DEFAULT
-    return {
+    protocol = {
         **PAPER_PROTOCOL,
-        "k_grid": _paper_normalize_k_grid(k_grid, enforce_limits=k_grid is not None),
+        "k_grid": (
+            []
+            if normalized_k_grid_mode == PAPER_K_GRID_MODE_INTERVAL_MAX
+            else _paper_normalize_k_grid(k_grid, enforce_limits=k_grid is not None)
+        ),
+        "k_grid_mode": normalized_k_grid_mode,
+        "k_grid_interval": (
+            _paper_normalize_k_grid_interval(k_grid_interval)
+            if normalized_k_grid_mode == PAPER_K_GRID_MODE_INTERVAL_MAX
+            else 0
+        ),
+        "selected_models": _paper_normalize_model_selection(selected_models),
         "cv_folds": _paper_normalize_cv_folds(cv_folds),
         "validation_alpha": float(PAPER_VALIDATION_ALPHA),
-        "marginal_epsilon": 0.001,
+        "k_selection_method": "best_validation_score",
         "comparison_tolerance": float(PAPER_COMPARISON_TOLERANCE),
+        "xgb_tuning_profile": _normalize_xgb_tuning_profile(xgb_tuning_profile),
         "optimization_backend": normalized_backend,
         "optuna_trials": resolved_trials,
         "scoring_metric": resolved_scoring,
     }
+    if bool(use_regularization):
+        protocol["use_regularization"] = True
+    return protocol
 
 
 def _paper_normalize_k_grid(
@@ -3112,6 +3294,19 @@ def _paper_normalize_k_grid(
     return normalized
 
 
+def _paper_normalize_model_selection(
+    selected_models: Optional[Sequence[object]] = None,
+) -> List[str]:
+    valid_codes = list(PAPER_PROTOCOL["feature_groups"].keys())
+    if selected_models is None:
+        return list(PAPER_MODEL_SELECTION_DEFAULT)
+    requested = {str(model_code).strip() for model_code in selected_models if str(model_code).strip()}
+    normalized = [model_code for model_code in valid_codes if model_code in requested]
+    if not normalized:
+        raise ValueError("Seleccione al menos un modelo del paper.")
+    return normalized
+
+
 def _paper_normalize_cv_folds(cv_folds: Optional[object] = None) -> int:
     numeric = pd.to_numeric(cv_folds, errors="coerce")
     if pd.isna(numeric):
@@ -3124,8 +3319,16 @@ def _paper_normalize_cv_folds(cv_folds: Optional[object] = None) -> int:
     return value
 
 
-def _paper_candidate_k_values(total_features: int, *, k_grid: Optional[Sequence[object]] = None) -> List[int]:
+def _paper_candidate_k_values(
+    total_features: int,
+    *,
+    k_grid: Optional[Sequence[object]] = None,
+    k_grid_mode: Optional[object] = None,
+    k_grid_interval: Optional[object] = None,
+) -> List[int]:
     max_features = max(1, int(total_features))
+    if _paper_normalize_k_grid_mode(k_grid_mode) == PAPER_K_GRID_MODE_INTERVAL_MAX:
+        return _paper_interval_k_grid(max_features, k_grid_interval=k_grid_interval)
     clipped = sorted(
         {
             value
@@ -3142,6 +3345,8 @@ def _paper_shared_k_search_grid(
     df: pd.DataFrame,
     *,
     k_grid: Optional[Sequence[object]] = None,
+    k_grid_mode: Optional[object] = None,
+    k_grid_interval: Optional[object] = None,
 ) -> List[int]:
     feature_counts = [
         len(_resolve_feature_group(df, str(feature_group)))
@@ -3151,7 +3356,12 @@ def _paper_shared_k_search_grid(
     if not positive_counts:
         raise ValueError("No hay variables disponibles para calcular un K compartido entre M1, M2 y M3.")
     common_cap = min(int(count) for count in positive_counts)
-    return _paper_candidate_k_values(common_cap, k_grid=k_grid)
+    return _paper_candidate_k_values(
+        common_cap,
+        k_grid=k_grid,
+        k_grid_mode=k_grid_mode,
+        k_grid_interval=k_grid_interval,
+    )
 
 
 def _paper_feature_group_to_model_code(feature_group: str) -> str:
@@ -3290,19 +3500,31 @@ def _paper_validation_score(
     return float(metrics.get(fallback_key) or metrics.get("f1_score") or 0.0)
 
 
-def _paper_select_k_from_search(search_df: pd.DataFrame, *, epsilon: float = 0.001) -> int:
+def _paper_select_k_from_search(
+    search_df: pd.DataFrame,
+    *,
+    score_col: str = "validation_score",
+    epsilon: Optional[float] = None,
+) -> int:
+    del epsilon  # Backward-compatible no-op after replacing the marginal-rule selector.
     if search_df is None or search_df.empty or "k" not in search_df.columns:
         raise ValueError("No hay resultados de grid search para seleccionar k.")
-    ordered = search_df.sort_values("k", ascending=True).reset_index(drop=True)
-    previous_row = ordered.iloc[0]
-    for idx in range(1, len(ordered)):
-        current_row = ordered.iloc[idx]
-        previous_score = float(previous_row.get("validation_score") or 0.0)
-        current_score = float(current_row.get("validation_score") or 0.0)
-        if (current_score - previous_score) < float(epsilon):
-            return int(previous_row["k"])
-        previous_row = current_row
-    return int(ordered.iloc[-1]["k"])
+    if score_col not in search_df.columns:
+        raise ValueError(f"No existe la columna requerida para seleccionar k: {score_col}")
+    ordered = search_df.copy()
+    ordered["k"] = pd.to_numeric(ordered["k"], errors="coerce")
+    ordered[score_col] = pd.to_numeric(ordered[score_col], errors="coerce")
+    ordered = ordered.dropna(subset=["k"]).reset_index(drop=True)
+    if ordered.empty:
+        raise ValueError("No hay valores de k validos para seleccionar.")
+    if ordered[score_col].notna().any():
+        best_row = (
+            ordered.sort_values([score_col, "k"], ascending=[False, True], kind="mergesort")
+            .reset_index(drop=True)
+            .iloc[0]
+        )
+        return int(best_row["k"])
+    return int(ordered.sort_values("k", ascending=True, kind="mergesort").iloc[0]["k"])
 
 
 def _paper_load_latest_processed_events() -> Optional[pd.DataFrame]:
@@ -3659,6 +3881,125 @@ def _paper_route_summary_df(route_payload: Dict[str, object]) -> pd.DataFrame:
     )
 
 
+def _paper_load_payload_for_history(run_id: object) -> Optional[Dict[str, object]]:
+    resolved_run_id = str(run_id or "").strip()
+    if not resolved_run_id:
+        return None
+    paths = _paper_run_paths(_paper_run_dir(resolved_run_id))
+    manifest = _paper_load_manifest(Path(paths["manifest"]))
+    if not isinstance(manifest, dict):
+        return None
+    return _paper_assemble_payload_from_checkpoint(
+        paths=paths,
+        manifest=manifest,
+        auto_resumed=False,
+        loaded_from_checkpoint=True,
+    )
+
+
+def _render_paper_replication_history_detail(run_id: str) -> None:
+    payload = _paper_load_payload_for_history(run_id)
+    if not isinstance(payload, dict):
+        st.warning("No se pudo cargar el checkpoint persistido de `paper_replication` para este run.")
+        return
+
+    st.markdown("#### Paper Replication")
+    st.caption(
+        f"run_id={run_id} | folds={int(payload.get('cv_folds') or PAPER_CV_FOLDS_DEFAULT)} | "
+        f"xgb_profile={payload.get('xgb_tuning_profile')} | "
+        f"backend={payload.get('optimization_backend')} | "
+        f"regularizacion={bool(payload.get('use_regularization'))}"
+    )
+
+    route_entries: List[Tuple[str, str, Dict[str, object]]] = []
+    for route_key, route_label in [
+        ("frozen", "Frozen"),
+        ("raw", "Raw"),
+        ("update_emb", "Actualizar Emb"),
+    ]:
+            route_payload = payload.get(route_key) or {}
+            if isinstance(route_payload, dict) and route_payload:
+                route_entries.append((route_key, route_label, route_payload))
+
+    if not route_entries:
+        st.info("No hay rutas persistidas para este checkpoint de `paper_replication`.")
+        return
+
+    route_tabs = st.tabs([label for _, label, _ in route_entries])
+    for route_tab, (route_key, route_label, route_payload) in zip(route_tabs, route_entries):
+        with route_tab:
+            st.dataframe(_paper_route_summary_df(route_payload), width="stretch")
+            route_status = str(route_payload.get("status") or "")
+            if route_status == "skipped":
+                st.info(str(route_payload.get("status_message") or f"La ruta {route_label} fue omitida."))
+            elif route_status == "blocked":
+                st.warning(str(route_payload.get("status_message") or f"La ruta {route_label} quedo bloqueada."))
+            elif route_status not in {"", "ok"}:
+                st.warning(str(route_payload.get("status_message") or f"Estado no esperado: {route_status}"))
+
+            comparison_df = route_payload.get("comparison_df")
+            if not isinstance(comparison_df, pd.DataFrame) or comparison_df.empty:
+                comparison_df = _paper_model_summary_df(route_payload.get("model_results") or [])
+            k_metrics_df = route_payload.get("k_metrics_df")
+            if not isinstance(k_metrics_df, pd.DataFrame) or k_metrics_df.empty:
+                k_metrics_df = _paper_model_k_metrics_df(route_payload.get("model_results") or [])
+            route_scoring_metric = (
+                (route_payload.get("optimization") or {}).get("scoring_metric")
+                or payload.get("scoring_metric")
+                or ((payload.get("checkpoint_manifest") or {}).get("protocol") or {}).get("scoring_metric")
+            )
+
+            if comparison_df.empty or k_metrics_df.empty:
+                st.info("No hay metricas por k disponibles para esta ruta.")
+                continue
+
+            model_rows = comparison_df.copy()
+            if "model_code" in model_rows.columns:
+                model_rows = model_rows.sort_values("model_code", ascending=True).reset_index(drop=True)
+            model_labels = [
+                str(row.get("model_title") or row.get("model_code") or f"Modelo {idx + 1}")
+                for idx, row in enumerate(model_rows.to_dict(orient="records"))
+            ]
+            model_tabs = st.tabs(model_labels)
+            for model_tab, model_row in zip(model_tabs, model_rows.to_dict(orient="records")):
+                with model_tab:
+                    model_code = str(model_row.get("model_code") or "").strip()
+                    model_title = str(model_row.get("model_title") or model_code or "paper_model")
+                    model_frame = k_metrics_df.copy()
+                    if model_code and "model_code" in model_frame.columns:
+                        model_frame = model_frame.loc[model_frame["model_code"].astype(str).eq(model_code)].copy()
+                    model_frame = model_frame.sort_values("k", ascending=True).reset_index(drop=True)
+                    if model_frame.empty:
+                        st.info(f"No hay curvas por k para {model_title}.")
+                        continue
+
+                    summary_cols = st.columns(4)
+                    summary_cols[0].metric("k*", f"{int(model_row.get('selected_k') or 0)}")
+                    summary_cols[1].metric("Accuracy", f"{float(model_row.get('accuracy') or 0.0) * 100:.2f}%")
+                    summary_cols[2].metric("F1", f"{float(model_row.get('f1_score') or 0.0) * 100:.2f}%")
+                    summary_cols[3].metric("Validation", f"{float(model_row.get('validation_score') or 0.0):.4f}")
+
+                    chart_specs = _paper_history_k_chart_specs(route_scoring_metric)
+                    chart_cols = st.columns(2)
+                    for idx, spec in enumerate(chart_specs):
+                        fig = _paper_build_interactive_k_chart(
+                            model_frame,
+                            metric=str(spec["metric"]),
+                            ylabel=str(spec["ylabel"]),
+                            title=str(spec["title"]),
+                            scale=float(spec["scale"]),
+                            suffix=str(spec["suffix"]),
+                            clamp_zero=bool(spec["clamp_zero"]),
+                        )
+                        with chart_cols[idx % 2]:
+                            st.plotly_chart(fig, width="stretch")
+
+                    st.markdown(_paper_replication_metric_interpretation_md(route_scoring_metric))
+
+                    with st.expander("Tabla por k", expanded=False):
+                        st.dataframe(model_frame, width="stretch")
+
+
 def _compare_summary_df(compare_payload: Dict[str, object]) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -3740,6 +4081,7 @@ def _persist_paper_replication_payload(payload: Dict[str, object], *, run_id: Op
             (f"{route_key}_comparison", route_payload.get("comparison_df")),
             (f"{route_key}_metricas", route_payload.get("metricas_df")),
             (f"{route_key}_predictions", route_payload.get("predictions_df")),
+            (f"{route_key}_k_metrics", route_payload.get("k_metrics_df")),
             (f"{route_key}_m3_grid", route_payload.get("m3_grid_df")),
         ):
             if isinstance(frame, pd.DataFrame) and not frame.empty:
@@ -3843,14 +4185,14 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
             "Ejecutar frozen",
             value=True,
             key="nlp_sev_paper_route_frozen",
-            help="Carga `NLP/Dataframes/resultado.pkl` y replica M1/M2/M3 sobre el dataset congelado del paper.",
+            help="Carga `NLP/Dataframes/resultado.pkl` y replica los modelos seleccionados sobre el dataset congelado del paper.",
         )
     with route_cols[1]:
         run_raw = st.checkbox(
             "Ejecutar raw",
             value=True,
             key="nlp_sev_paper_route_raw",
-            help="Reconstruye features + embeddings desde eventos y luego replica M1/M2/M3.",
+            help="Reconstruye features + embeddings desde eventos y luego replica los modelos seleccionados.",
         )
     with route_cols[2]:
         run_update_embeddings = st.checkbox(
@@ -3861,33 +4203,94 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
                 "Usa el dataset congelado (2070 filas con features de flujo), "
                 "busca los textos en features ya calculadas, regenera embeddings "
                 "con el transformer fine-tuneado actual y selecciona los 200 mas "
-                "importantes via RF. Luego ejecuta M1/M2/M3."
+                "importantes via RF. Luego ejecuta los modelos seleccionados."
             ),
         )
     route_options = _paper_route_options(run_frozen=run_frozen, run_raw=run_raw, run_update_embeddings=run_update_embeddings)
     if not any(route_options.values()):
         st.warning("Seleccione al menos una ruta para ejecutar la replica.")
-    st.markdown("**Grilla de k**")
-    selected_k_grid = st.multiselect(
-        "Valores de k a evaluar",
-        options=list(PAPER_K_GRID),
-        default=list(PAPER_K_GRID_DEFAULT_SELECTION),
-        key="nlp_sev_paper_k_grid",
-        help=(
-            "Seleccione entre 2 y 5 valores de la grilla del paper. "
-            "La grilla se recorta automaticamente al total de features disponible en M1, M2 y M3."
-        ),
+    st.markdown("**Modelos del paper**")
+    selected_models = st.multiselect(
+        "Modelos a ejecutar",
+        options=list(PAPER_PROTOCOL["feature_groups"].keys()),
+        default=list(PAPER_MODEL_SELECTION_DEFAULT),
+        format_func=lambda model_code: _paper_model_title(str(model_code)),
+        key="nlp_sev_paper_selected_models",
+        help="Puede ejecutar un solo modelo o cualquier combinacion de M1, M2 y M3.",
     )
-    k_grid_error: Optional[str] = None
+    selected_models_error: Optional[str] = None
     try:
-        normalized_k_grid = _paper_normalize_k_grid(selected_k_grid)
+        normalized_selected_models = _paper_normalize_model_selection(selected_models)
+    except Exception as exc:
+        normalized_selected_models = []
+        selected_models_error = str(exc)
+    if selected_models_error:
+        st.warning(selected_models_error)
+    else:
+        st.caption(
+            "Modelos seleccionados: "
+            + ", ".join(_paper_model_title(model_code) for model_code in normalized_selected_models)
+        )
+    st.markdown("**Grilla de k**")
+    selected_k_grid_mode = st.radio(
+        "Modo de grilla",
+        options=[PAPER_K_GRID_MODE_DEFAULT, PAPER_K_GRID_MODE_INTERVAL_MAX],
+        index=0,
+        horizontal=True,
+        format_func=_paper_k_grid_mode_label,
+        key="nlp_sev_paper_k_grid_mode",
+        help="Puede usar la grilla manual del paper o generar automaticamente k={paso, 2*paso, ..., k_max}.",
+    )
+    normalized_k_grid_mode = _paper_normalize_k_grid_mode(selected_k_grid_mode)
+    selected_k_grid: List[int] = []
+    selected_k_grid_interval: Optional[int] = None
+    if normalized_k_grid_mode == PAPER_K_GRID_MODE_INTERVAL_MAX:
+        selected_k_grid_interval = int(
+            st.selectbox(
+                "Intervalo entre k",
+                options=PAPER_K_GRID_INTERVAL_OPTIONS,
+                index=PAPER_K_GRID_INTERVAL_OPTIONS.index(PAPER_K_GRID_INTERVAL_DEFAULT),
+                key="nlp_sev_paper_k_grid_interval",
+                help=(
+                    "Genera automaticamente k={paso, 2*paso, ..., k_max}. "
+                    "Si k_max no es multiplo exacto del paso, tambien se incluye."
+                ),
+            )
+        )
+    else:
+        selected_k_grid = st.multiselect(
+            "Valores de k a evaluar",
+            options=list(PAPER_K_GRID),
+            default=list(PAPER_K_GRID_DEFAULT_SELECTION),
+            key="nlp_sev_paper_k_grid",
+            help=(
+                f"Seleccione entre {int(PAPER_K_GRID_SELECTION_MIN)} y {int(PAPER_K_GRID_SELECTION_MAX)} valores de la grilla del paper. "
+                "La grilla se recorta automaticamente al total de features disponible en los modelos seleccionados."
+            ),
+        )
+    k_grid_error: Optional[str] = None
+    normalized_k_grid_interval = 0
+    try:
+        if normalized_k_grid_mode == PAPER_K_GRID_MODE_INTERVAL_MAX:
+            normalized_k_grid_interval = _paper_normalize_k_grid_interval(selected_k_grid_interval)
+            normalized_k_grid = []
+        else:
+            normalized_k_grid = _paper_normalize_k_grid(selected_k_grid)
     except Exception as exc:
         normalized_k_grid = []
         k_grid_error = str(exc)
     if k_grid_error:
         st.warning(k_grid_error)
     else:
-        st.caption(f"Grilla seleccionada: {normalized_k_grid}")
+        if normalized_k_grid_mode == PAPER_K_GRID_MODE_INTERVAL_MAX:
+            interval_example = _paper_interval_k_grid(1200, k_grid_interval=normalized_k_grid_interval)
+            st.caption(
+                f"Intervalo seleccionado: cada {normalized_k_grid_interval}. "
+                f"Ejemplo con 1200 features: {_paper_compact_int_list(interval_example)}. "
+                "La grilla se expande y recorta automaticamente segun el maximo disponible por modelo."
+            )
+        else:
+            st.caption(f"Grilla seleccionada: {normalized_k_grid}")
     selected_cv_folds = int(
         st.number_input(
             "K de folds para cross validation",
@@ -3900,8 +4303,16 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
         )
     )
     st.markdown("**Optimizacion XGBoost**")
-    optimization_cols = st.columns(2)
+    optimization_cols = st.columns(3)
     with optimization_cols[0]:
+        selected_xgb_tuning_profile = st.selectbox(
+            "Grilla XGBoost",
+            options=XGB_TUNING_PROFILES,
+            index=0,
+            key="nlp_sev_paper_xgb_tuning_profile",
+            help="Perfil de grilla de hiperparametros XGBoost/SMOTE compartido por la replica del paper.",
+        )
+    with optimization_cols[1]:
         selected_optimization_backend = st.selectbox(
             "Metodo de optimizacion",
             options=["gridsearch", "optuna"],
@@ -3910,7 +4321,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
             key="nlp_sev_paper_optimization_backend",
             help="GridSearchCV recorre la grilla completa; Optuna explora la misma grilla discreta con TPE.",
         )
-    with optimization_cols[1]:
+    with optimization_cols[2]:
         selected_optuna_trials = st.number_input(
             "Trials de Optuna",
             min_value=1,
@@ -3929,9 +4340,30 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
         key="nlp_sev_paper_scoring_metric",
         help=(
             "Metrica usada como scoring en GridSearchCV/Optuna y como "
-            "validation_score para la regla marginal de seleccion de k*."
+            "validation_score para seleccionar el mejor k*."
         ),
     )
+    selected_use_regularization = st.checkbox(
+        "Incorporar regularizacion XGBoost",
+        value=False,
+        key="nlp_sev_paper_xgb_use_regularization",
+        help=(
+            "Si se activa, la replica incorpora `min_child_weight`, `gamma`, `reg_alpha` y `reg_lambda` "
+            "a la grilla compartida de XGBoost."
+        ),
+    )
+    st.caption(
+        f"Grilla `{selected_xgb_tuning_profile}`: "
+        f"{_xgb_search_strategy_help(selected_xgb_tuning_profile)} "
+        f"(base XGBoost={_paper_xgb_search_space_size(_paper_xgb_param_grid(selected_xgb_tuning_profile, use_regularization=selected_use_regularization))}, "
+        f"SMOTE={_paper_xgb_search_space_size(_default_smote_param_grid(selected_xgb_tuning_profile))}, "
+        f"total={_paper_xgb_search_space_size(_paper_xgb_param_grid(selected_xgb_tuning_profile, use_regularization=selected_use_regularization)) * _paper_xgb_search_space_size(_default_smote_param_grid(selected_xgb_tuning_profile))})."
+    )
+    if selected_use_regularization:
+        st.caption(
+            "Regularizacion activa: "
+            f"{_default_xgb_regularization_param_grid(selected_xgb_tuning_profile)}"
+        )
     if _paper_normalize_optimization_backend(selected_optimization_backend) == "optuna" and optuna is None:
         st.warning(
             "Optuna no esta disponible en el entorno activo. La replica caera automaticamente a GridSearchCV."
@@ -3939,25 +4371,50 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
     if k_grid_error:
         protocol = {
             **PAPER_PROTOCOL,
-            "k_grid": list(selected_k_grid),
+            "k_grid": list(selected_k_grid) if normalized_k_grid_mode == PAPER_K_GRID_MODE_DEFAULT else [],
+            "k_grid_mode": normalized_k_grid_mode,
+            "k_grid_interval": (
+                int(selected_k_grid_interval or 0)
+                if normalized_k_grid_mode == PAPER_K_GRID_MODE_INTERVAL_MAX
+                else 0
+            ),
+            "selected_models": list(normalized_selected_models),
             "cv_folds": int(selected_cv_folds),
             "validation_alpha": float(PAPER_VALIDATION_ALPHA),
-            "marginal_epsilon": 0.001,
+            "k_selection_method": "best_validation_score",
             "comparison_tolerance": float(PAPER_COMPARISON_TOLERANCE),
+            "xgb_tuning_profile": _normalize_xgb_tuning_profile(selected_xgb_tuning_profile),
+            "use_regularization": bool(selected_use_regularization),
             "optimization_backend": _paper_normalize_optimization_backend(selected_optimization_backend),
             "optuna_trials": (
                 max(1, int(selected_optuna_trials or PAPER_OPTUNA_TRIALS_DEFAULT))
                 if _paper_normalize_optimization_backend(selected_optimization_backend) == "optuna"
                 else 0
             ),
+            "scoring_metric": str(selected_scoring_metric),
         }
     else:
         protocol = _paper_protocol_config(
             k_grid=normalized_k_grid,
+            k_grid_mode=normalized_k_grid_mode,
+            k_grid_interval=normalized_k_grid_interval,
+            selected_models=normalized_selected_models,
             cv_folds=selected_cv_folds,
+            xgb_tuning_profile=selected_xgb_tuning_profile,
+            use_regularization=bool(selected_use_regularization),
             optimization_backend=selected_optimization_backend,
             optuna_trials=selected_optuna_trials,
+            scoring_metric=selected_scoring_metric,
         )
+    k_grid_summary_text = (
+        "invalida"
+        if k_grid_error
+        else _paper_describe_k_grid(
+            k_grid=normalized_k_grid,
+            k_grid_mode=normalized_k_grid_mode,
+            k_grid_interval=normalized_k_grid_interval,
+        )
+    )
     selected_raw_features_artifact_row: Optional[pd.Series] = None
     selected_transformer_model_row: Optional[pd.Series] = None
     raw_features_mode = "Reconstruir desde eventos"
@@ -3985,7 +4442,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
                 selected_raw_features_artifact_row = feature_catalog.loc[selected_feature_idx]
                 st.caption(
                     "Se reutilizaran las features del artifact seleccionado y la ruta raw solo recalculara "
-                    "embeddings, seleccion supervisada y M1/M2/M3."
+                    "embeddings, seleccion supervisada y los modelos elegidos."
                 )
         transformer_catalog = _list_transformer_finetuned_models()
         if transformer_catalog.empty:
@@ -4015,12 +4472,18 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
         execution_context = _paper_build_execution_context(
             accidents_df,
             route_options=route_options,
-            k_grid=selected_k_grid,
+            k_grid=selected_k_grid if normalized_k_grid_mode == PAPER_K_GRID_MODE_DEFAULT else None,
+            k_grid_mode=normalized_k_grid_mode,
+            k_grid_interval=normalized_k_grid_interval if normalized_k_grid_mode == PAPER_K_GRID_MODE_INTERVAL_MAX else None,
+            selected_models=normalized_selected_models,
             cv_folds=selected_cv_folds,
             raw_features_artifact_row=selected_raw_features_artifact_row,
             transformer_model_row_override=selected_transformer_model_row,
+            xgb_tuning_profile=selected_xgb_tuning_profile,
+            use_regularization=bool(selected_use_regularization),
             optimization_backend=selected_optimization_backend,
             optuna_trials=selected_optuna_trials,
+            scoring_metric=selected_scoring_metric,
         )
         checkpoint_preview = _paper_preview_checkpoint(
             accidents_df,
@@ -4037,16 +4500,20 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
         st.markdown(
             "\n".join(
                 [
-                    "1. `M1` usa solo flujo, `M2` usa solo embeddings narrativos y `M3` usa fusion multimodal.",
-                    "2. El `holdout` final es estratificado `80/20` con `random_state=42` y se congela antes del ranking, la seleccion de `k` y el tuning.",
+                    "1. `M1` usa solo flujo, `M2` usa solo embeddings narrativos y `M3` usa fusion multimodal. La replica permite ejecutar uno o varios de estos modelos.",
+                    "2. El `holdout` final es temporal `80/20` con `random_state=42` y se congela antes del ranking, la seleccion de `k` y el tuning.",
                     "3. La replica usa solo `XGBoost` con nested CV en train, una subgrilla de `k` seleccionada por el usuario y un `K` configurable para cross validation.",
                     "4. La ruta `frozen` carga `NLP/Dataframes/resultado.pkl`; la ruta `raw` reconstruye desde eventos + flujos y embeddings fine-tuneados con proyeccion `[CLS]`.",
-                    "5. El backend de optimizacion puede ser `GridSearchCV` u `Optuna`, pero ambos usan la misma grilla discreta de hiperparametros XGBoost.",
+                    "5. El backend de optimizacion puede ser `GridSearchCV` u `Optuna`, y la grilla discreta aplicada se elige con el perfil `Rapida`, `Amplia` o `GridSearch original`.",
+                    "5b. La regularizacion de XGBoost puede activarse o desactivarse en esta vista para comparar runs con y sin `min_child_weight`, `gamma`, `reg_alpha` y `reg_lambda`.",
                     "6. Solo se promocionan assets hacia `NLP/Latex/` si frozen y raw coinciden con tolerancia `<= 0.001` y conteos discretos identicos.",
                     (
                         f"7. Seleccion actual: frozen={route_options['run_frozen']} | raw={route_options['run_raw']} | "
-                        f"k_grid={normalized_k_grid or 'invalida'} | cv_folds={int(selected_cv_folds)} | "
-                        f"optimizacion={_paper_optimization_backend_label(selected_optimization_backend)}"
+                        f"modelos={normalized_selected_models or 'invalido'} | "
+                        f"k_grid={k_grid_summary_text} | cv_folds={int(selected_cv_folds)} | "
+                        f"optimizacion={_paper_optimization_backend_label(selected_optimization_backend)} | "
+                        f"grilla={_normalize_xgb_tuning_profile(selected_xgb_tuning_profile)} | "
+                        f"regularizacion={bool(selected_use_regularization)}"
                         + (
                             f" ({int(selected_optuna_trials)} trials)"
                             if _paper_normalize_optimization_backend(selected_optimization_backend) == "optuna"
@@ -4088,13 +4555,22 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
         st.caption(
             "Optimizacion XGBoost: "
             + _paper_optimization_backend_label(selected_optimization_backend)
+            + f" | grilla={_normalize_xgb_tuning_profile(selected_xgb_tuning_profile)}"
+            + f" | regularizacion={bool(selected_use_regularization)}"
             + (
                 f" con {int(selected_optuna_trials)} trials"
                 if _paper_normalize_optimization_backend(selected_optimization_backend) == "optuna"
-                else f" sobre {_paper_xgb_search_space_size(_paper_xgb_param_grid())} combinaciones"
+                else (
+                    f" sobre {_paper_xgb_search_space_size(_paper_xgb_param_grid(selected_xgb_tuning_profile, use_regularization=selected_use_regularization))} "
+                    "combinaciones"
+                )
             )
         )
-        st.caption(f"Grilla de k activa: {normalized_k_grid or 'invalida'}")
+        st.caption(
+            "Modelos activos: "
+            + ", ".join(normalized_selected_models or [])
+        )
+        st.caption(f"Grilla de k activa: {k_grid_summary_text}")
         st.caption(f"K de folds activo: {int(selected_cv_folds)}")
 
     if checkpoint_preview_error:
@@ -4157,7 +4633,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
                 if st.button(
                     resume_label,
                     key="nlp_sev_resume_paper_checkpoint",
-                    disabled=bool(k_grid_error),
+                    disabled=bool(k_grid_error) or bool(selected_models_error),
                 ):
                     execution_mode = "resume"
                     execution_checkpoint_run_id_override = str(checkpoint_preview.get("run_id") or "")
@@ -4165,7 +4641,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
                 if st.button(
                     "Start fresh ignoring checkpoint",
                     key="nlp_sev_run_paper_replication_fresh",
-                    disabled=bool(k_grid_error),
+                    disabled=bool(k_grid_error) or bool(selected_models_error),
                 ):
                     execution_mode = "fresh"
         else:
@@ -4186,7 +4662,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
                 if st.button(
                     loaded_label,
                     key="nlp_sev_resume_loaded_paper_checkpoint",
-                    disabled=bool(k_grid_error),
+                    disabled=bool(k_grid_error) or bool(selected_models_error),
                 ):
                     execution_mode = "resume"
                     execution_checkpoint_run_id_override = selected_preview_run_id
@@ -4194,7 +4670,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
                 if st.button(
                     "Start fresh with loaded configuration",
                     key="nlp_sev_fresh_loaded_paper_checkpoint",
-                    disabled=bool(k_grid_error),
+                    disabled=bool(k_grid_error) or bool(selected_models_error),
                 ):
                     execution_mode = "fresh"
         else:
@@ -4203,9 +4679,9 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
             )
 
     if execution_mode is None and st.button(
-        "Replicar paper M1/M2/M3",
+        "Replicar paper",
         key="nlp_sev_run_paper_replication",
-        disabled=(not any(route_options.values())) or bool(k_grid_error),
+        disabled=(not any(route_options.values())) or bool(k_grid_error) or bool(selected_models_error),
     ):
         execution_mode = "resume"
 
@@ -4225,9 +4701,12 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
                 run_update_embeddings=route_options["run_update_embeddings"],
                 features_source_df=st.session_state.get("nlp_sev_features_df"),
                 k_grid=normalized_k_grid,
+                selected_models=normalized_selected_models,
                 cv_folds=selected_cv_folds,
                 raw_features_artifact_row=selected_raw_features_artifact_row,
                 transformer_model_row_override=selected_transformer_model_row,
+                xgb_tuning_profile=selected_xgb_tuning_profile,
+                use_regularization=bool(selected_use_regularization),
                 optimization_backend=selected_optimization_backend,
                 optuna_trials=selected_optuna_trials,
                 scoring_metric=selected_scoring_metric,
@@ -4250,7 +4729,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
     if not isinstance(payload, dict) or not payload:
         payload = previous_payload
     if not isinstance(payload, dict) or not payload:
-        st.info("Ejecute `Replicar paper M1/M2/M3` para generar los artifacts del paper.")
+        st.info("Ejecute `Replicar paper` para generar los artifacts del paper.")
         return
 
     frozen_payload = payload.get("frozen") or {}
@@ -4271,6 +4750,8 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
     st.caption(
         "Optimizacion: "
         + _paper_optimization_backend_label(payload.get("optimization_backend"))
+        + f" | grilla={_normalize_xgb_tuning_profile(payload.get('xgb_tuning_profile'))}"
+        + f" | regularizacion={bool(payload.get('use_regularization'))}"
         + (
             f" | trials={int(payload.get('optuna_trials') or PAPER_OPTUNA_TRIALS_DEFAULT)}"
             if _paper_normalize_optimization_backend(payload.get("optimization_backend")) == "optuna"
@@ -4307,6 +4788,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
         st.dataframe(_paper_route_summary_df(frozen_payload), width="stretch")
         if str(frozen_payload.get("status") or "") == "skipped":
             st.info(str(frozen_payload.get("status_message") or "La ruta frozen fue omitida."))
+        st.caption("Estas metricas corresponden al holdout final temporal.")
         if isinstance(frozen_payload.get("comparison_df"), pd.DataFrame) and not frozen_payload["comparison_df"].empty:
             st.dataframe(frozen_payload["comparison_df"], width="stretch")
         if isinstance(frozen_payload.get("metricas_df"), pd.DataFrame) and not frozen_payload["metricas_df"].empty:
@@ -4327,6 +4809,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
             st.info(str(raw_payload.get("status_message") or "La ruta raw fue omitida."))
         elif str(raw_payload.get("status") or "") != "ok":
             st.warning(str(raw_payload.get("status_message") or "La ruta raw quedo bloqueada."))
+        st.caption("Estas metricas corresponden al holdout final temporal.")
         if isinstance(raw_payload.get("comparison_df"), pd.DataFrame) and not raw_payload["comparison_df"].empty:
             st.dataframe(raw_payload["comparison_df"], width="stretch")
         if isinstance(raw_payload.get("metricas_df"), pd.DataFrame) and not raw_payload["metricas_df"].empty:
@@ -4354,6 +4837,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
                 st.info(str(update_emb_payload.get("status_message") or "La ruta update-emb fue omitida."))
             elif ue_status == "blocked":
                 st.warning(str(update_emb_payload.get("status_message") or "La ruta update-emb quedo bloqueada."))
+            st.caption("Estas metricas corresponden al holdout final temporal.")
             if isinstance(update_emb_payload.get("comparison_df"), pd.DataFrame) and not update_emb_payload["comparison_df"].empty:
                 st.dataframe(update_emb_payload["comparison_df"], width="stretch")
             if isinstance(update_emb_payload.get("metricas_df"), pd.DataFrame) and not update_emb_payload["metricas_df"].empty:
@@ -4378,7 +4862,31 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
             st.dataframe(diff_df, width="stretch")
         export_manifest_df = _paper_export_manifest_df(payload)
         st.dataframe(export_manifest_df, width="stretch")
+        candidate_paths = payload.get("candidate_paths") or {}
+        if candidate_paths:
+            st.caption("Assets candidatos")
+            st.caption(
+                "Los graficos de Accuracy/F1/FNR muestran nested CV sobre la grilla de k; "
+                "el recuadro interno resume el holdout final del modelo."
+            )
+            st.json(candidate_paths)
+            image_names = [
+                "accuracy_vs_k.png",
+                "f1_score_vs_k.png",
+                "validation_score_vs_k.png",
+                "false_negatives_pct_vs_k.png",
+                "metrics.png",
+            ]
+            available_images = [
+                (name, str(candidate_paths.get(name) or ""))
+                for name in image_names
+                if str(candidate_paths.get(name) or "").strip()
+            ]
+            for image_name, image_path in available_images:
+                if Path(image_path).exists():
+                    st.image(image_path, caption=image_name, use_container_width=True)
         if payload.get("promoted_paths"):
+            st.caption("Assets promovidos")
             st.json(payload.get("promoted_paths"))
 
 
@@ -4402,7 +4910,7 @@ def _render_controlled_comparison_protocol(
                 [
                     "1. Se define un unico `holdout` con el `feature group` seleccionado. Ese test queda congelado y se reutiliza en los tres modelos.",
                     "2. El `split` se genera una sola vez con el mismo `random_state`. Si el split temporal no deja ambas clases en train/test, se degrada a estratificado.",
-                    "3. RF + XGBoost usa solo train: imputacion mediana, SMOTE si aplica, ranking RF, seleccion del numero exacto de variables definido en la UI y luego busqueda XGBoost.",
+                    "3. RF + XGBoost usa solo train: imputacion mediana, ranking RF sobre el train real, seleccion del numero exacto de variables definido en la UI y luego optimizacion conjunta de `SMOTE` (`sampling_strategy`, `k_neighbors`) + XGBoost.",
                     "4. Elastic Net usa solo train: imputacion, escalado, SMOTE si aplica, `GridSearchCV` sobre `C in {0.01, 0.1, 1, 10}` y `l1_ratio in {0.1, 0.5, 0.9}`, y luego se conservan exactamente las variables con mayor `|coef|` hasta el numero definido.",
                     "5. SVM + RFE usa solo train: imputacion, escalado, SMOTE si aplica, `RFE` con el numero exacto de variables definido y `GridSearchCV` del SVM con `C in {0.1, 1, 10}` y `kernel in {linear, rbf}`.",
                     "6. Las matrices de confusion finales se calculan sobre exactamente las mismas filas y etiquetas de test.",
@@ -4499,13 +5007,26 @@ def _maybe_balance_training_data(
     y_train: pd.Series,
     *,
     random_state: int,
+    sampling_strategy: Optional[object] = None,
+    k_neighbors: Optional[object] = None,
 ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, object]]:
     if SMOTE is None:
         return X_train, y_train, {"balancing": "none", "reason": "smote_no_instalado"}
     class_counts = y_train.value_counts(dropna=False)
     if class_counts.empty or int(class_counts.min()) < 2:
         return X_train, y_train, {"balancing": "none", "reason": "clase_minoritaria_insuficiente"}
-    sampler = SMOTE(random_state=int(random_state))
+    if int(class_counts.min()) >= int(class_counts.max()):
+        return X_train, y_train, {"balancing": "none", "reason": "train_ya_balanceado"}
+    sampler_kwargs: Dict[str, object] = {"random_state": int(random_state)}
+    if sampling_strategy is not None:
+        sampler_kwargs["sampling_strategy"] = (
+            float(sampling_strategy)
+            if isinstance(sampling_strategy, (int, float, np.integer, np.floating))
+            else sampling_strategy
+        )
+    if k_neighbors is not None:
+        sampler_kwargs["k_neighbors"] = int(k_neighbors)
+    sampler = SMOTE(**sampler_kwargs)
     X_resampled, y_resampled = sampler.fit_resample(X_train, y_train)
     X_bal = pd.DataFrame(X_resampled, columns=X_train.columns)
     y_bal = pd.Series(y_resampled, name=y_train.name)
@@ -4513,6 +5034,9 @@ def _maybe_balance_training_data(
         "balancing": "smote",
         "rows_before": int(len(X_train)),
         "rows_after": int(len(X_bal)),
+        "sampling_strategy": sampler_kwargs.get("sampling_strategy", "default"),
+        "k_neighbors": int(sampler_kwargs.get("k_neighbors", 5)),
+        "stage": "post_feature_selection",
     }
 
 
@@ -4539,8 +5063,316 @@ def _rf_rank_features(
     ).sort_values("importance", ascending=False, ignore_index=True)
 
 
-def _default_xgb_param_grid(profile: str) -> Dict[str, List[object]]:
-    profile = str(profile or "Rapida")
+def _resolve_smote_param_grid(
+    y_train: pd.Series,
+    *,
+    tuning_profile: Optional[str] = None,
+) -> Dict[str, List[object]]:
+    if SMOTE is None:
+        return {}
+    class_counts = pd.Series(y_train).value_counts(dropna=False)
+    if class_counts.empty:
+        return {}
+    min_class = int(class_counts.min())
+    max_class = int(class_counts.max())
+    if min_class < 2 or min_class >= max_class:
+        return {}
+
+    profile = _normalize_xgb_tuning_profile(tuning_profile)
+    base_grid = _default_smote_param_grid(profile)
+    base_sampling = list(base_grid.get("sampling_strategy") or [])
+    base_k_neighbors = list(base_grid.get("k_neighbors") or [])
+
+    current_ratio = float(min_class / max_class) if max_class > 0 else 0.0
+    sampling_candidates = [
+        float(value)
+        for value in base_sampling
+        if float(value) + 1e-12 >= current_ratio and float(value) <= 1.0
+    ]
+    if not sampling_candidates:
+        sampling_candidates = [1.0]
+
+    max_valid_k = max(1, min_class - 1)
+    k_candidates = sorted({int(value) for value in base_k_neighbors if int(value) <= max_valid_k})
+    if not k_candidates:
+        k_candidates = [int(max_valid_k)]
+
+    return {
+        "sampling_strategy": sampling_candidates,
+        "k_neighbors": k_candidates,
+    }
+
+
+def _score_metric_value(
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    y_score: Optional[np.ndarray],
+    *,
+    scoring: str,
+) -> float:
+    y_true_arr = np.asarray(y_true, dtype=int)
+    y_pred_arr = np.asarray(y_pred, dtype=int)
+    average = "binary" if pd.Series(y_true_arr).nunique() <= 2 else "macro"
+
+    if scoring == "accuracy":
+        return float(accuracy_score(y_true_arr, y_pred_arr))
+    if scoring == "precision":
+        return float(precision_score(y_true_arr, y_pred_arr, average=average, zero_division=0))
+    if scoring == "recall":
+        return float(recall_score(y_true_arr, y_pred_arr, average=average, zero_division=0))
+    if scoring == "roc_auc":
+        if y_score is None or pd.Series(y_true_arr).nunique() < 2:
+            return float("nan")
+        return float(roc_auc_score(y_true_arr, np.asarray(y_score, dtype=float)))
+    if scoring in {"f1", "f1_macro"}:
+        resolved_average = "macro" if scoring == "f1_macro" else average
+        return float(f1_score(y_true_arr, y_pred_arr, average=resolved_average, zero_division=0))
+    raise ValueError(f"Scoring no soportado para XGBoost: {scoring}")
+
+
+def _evaluate_xgb_candidate_cv(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    *,
+    random_state: int,
+    cv_folds: int,
+    scoring: str,
+    base_params: Dict[str, object],
+    xgb_params: Dict[str, object],
+    smote_params: Optional[Dict[str, object]],
+) -> Tuple[float, List[float]]:
+    splitter = StratifiedKFold(n_splits=int(cv_folds), shuffle=False)
+    fold_scores: List[float] = []
+
+    for train_idx, val_idx in splitter.split(X_train, y_train):
+        X_fold_train = X_train.iloc[train_idx].reset_index(drop=True)
+        X_fold_val = X_train.iloc[val_idx].reset_index(drop=True)
+        y_fold_train = y_train.iloc[train_idx].reset_index(drop=True)
+        y_fold_val = y_train.iloc[val_idx].reset_index(drop=True)
+        balance_kwargs = dict(smote_params or {})
+        X_fold_fit, y_fold_fit, _ = _maybe_balance_training_data(
+            X_fold_train,
+            y_fold_train,
+            random_state=int(random_state),
+            sampling_strategy=balance_kwargs.get("sampling_strategy"),
+            k_neighbors=balance_kwargs.get("k_neighbors"),
+        )
+        model = build_model(
+            "XGBoost",
+            {**base_params, **xgb_params},
+            random_state=int(random_state),
+        )
+        model.fit(X_fold_fit, y_fold_fit)
+        y_pred = model.predict(X_fold_val)
+        y_score = _predict_model_scores(model, X_fold_val)
+        score = _score_metric_value(
+            y_fold_val,
+            y_pred,
+            y_score,
+            scoring=str(scoring),
+        )
+        fold_scores.append(float(score))
+
+    return float(np.mean(fold_scores)), fold_scores
+
+
+def _search_xgb_with_smote(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    *,
+    random_state: int,
+    param_grid: Dict[str, List[object]],
+    cv_folds: int,
+    scoring: str,
+    optimization_backend: Optional[object] = None,
+    optuna_trials: Optional[object] = None,
+    tuning_profile: Optional[str] = None,
+    use_regularization: bool = False,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+) -> Tuple[Dict[str, object], Dict[str, object], float, pd.DataFrame, Dict[str, object]]:
+    requested_backend = _paper_normalize_optimization_backend(optimization_backend)
+    smote_param_grid = _resolve_smote_param_grid(y_train, tuning_profile=tuning_profile)
+    xgb_space_size = _paper_xgb_search_space_size(param_grid)
+    smote_space_size = _paper_xgb_search_space_size(smote_param_grid) if smote_param_grid else 1
+    search_space_size = int(xgb_space_size * max(1, smote_space_size))
+    resolved_optuna_trials = (
+        max(1, int(optuna_trials or PAPER_OPTUNA_TRIALS_DEFAULT))
+        if requested_backend == "optuna"
+        else 0
+    )
+    effective_optuna_trials = (
+        min(int(resolved_optuna_trials), max(1, int(search_space_size)))
+        if requested_backend == "optuna"
+        else 0
+    )
+    search_meta: Dict[str, object] = {
+        "requested_backend": requested_backend,
+        "backend": requested_backend,
+        "search_space_size": int(search_space_size),
+        "xgb_search_space_size": int(xgb_space_size),
+        "smote_search_space_size": int(smote_space_size if smote_param_grid else 0),
+        "smote_param_grid": {key: list(values) for key, values in smote_param_grid.items()},
+        "use_regularization": bool(use_regularization),
+        "optuna_trials_requested": int(resolved_optuna_trials),
+        "optuna_trials_effective": int(effective_optuna_trials),
+        "optuna_trials_completed": 0,
+    }
+    base_params = _paper_xgb_base_params()
+
+    def _finalize_best_params(
+        best_xgb_params: Dict[str, object],
+        best_smote_params: Dict[str, object],
+        best_score: float,
+        search_df: pd.DataFrame,
+    ) -> Tuple[Dict[str, object], Dict[str, object], float, pd.DataFrame, Dict[str, object]]:
+        search_meta["best_smote_params"] = dict(best_smote_params)
+        search_meta["best_cv_score"] = float(best_score)
+        return best_xgb_params, best_smote_params, best_score, search_df, search_meta
+
+    if requested_backend == "optuna" and optuna is not None:
+        sampler = TPESampler(seed=int(random_state)) if TPESampler is not None else None
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+
+        def _objective(trial: object) -> float:
+            xgb_params = {
+                key: trial.suggest_categorical(str(key), list(values))
+                for key, values in param_grid.items()
+            }
+            smote_params = {
+                key: trial.suggest_categorical(f"smote_{key}", list(values))
+                for key, values in smote_param_grid.items()
+            }
+            score, _ = _evaluate_xgb_candidate_cv(
+                X_train,
+                y_train,
+                random_state=int(random_state),
+                cv_folds=int(cv_folds),
+                scoring=str(scoring),
+                base_params=base_params,
+                xgb_params=xgb_params,
+                smote_params=smote_params,
+            )
+            return float(score)
+
+        def _progress(study_obj: object, trial: object) -> None:
+            completed_trials = int(len(getattr(study_obj, "trials", [])))
+            search_meta["optuna_trials_completed"] = completed_trials
+            _emit_progress(
+                progress_callback,
+                min(100, max(10, int(round((completed_trials / max(1, effective_optuna_trials)) * 100)))),
+                f"Optuna trial {completed_trials}/{effective_optuna_trials} completado.",
+            )
+
+        study.optimize(
+            _objective,
+            n_trials=int(effective_optuna_trials),
+            callbacks=[_progress] if progress_callback is not None else None,
+            show_progress_bar=False,
+        )
+        raw_best_params = dict(study.best_trial.params or {})
+        best_xgb_params = {
+            key: raw_best_params[key]
+            for key in param_grid
+            if key in raw_best_params
+        }
+        best_smote_params = {
+            key: raw_best_params[f"smote_{key}"]
+            for key in smote_param_grid
+            if f"smote_{key}" in raw_best_params
+        }
+        search_meta["optuna_trials_completed"] = int(len(study.trials))
+        search_df = _paper_optuna_search_df(study)
+        return _finalize_best_params(
+            best_xgb_params,
+            best_smote_params,
+            float(study.best_value),
+            search_df,
+        )
+
+    if requested_backend == "optuna" and optuna is None:
+        search_meta["backend"] = "gridsearch"
+        search_meta["fallback_reason"] = "optuna_no_instalado"
+
+    xgb_keys = list(param_grid.keys())
+    xgb_value_product = list(itertools.product(*(list(param_grid[key]) for key in xgb_keys)))
+    smote_keys = list(smote_param_grid.keys())
+    smote_value_product = (
+        list(itertools.product(*(list(smote_param_grid[key]) for key in smote_keys)))
+        if smote_keys
+        else [tuple()]
+    )
+    records: List[Dict[str, object]] = []
+    total_candidates = max(1, len(xgb_value_product) * len(smote_value_product))
+
+    for candidate_index, (xgb_values, smote_values) in enumerate(
+        itertools.product(xgb_value_product, smote_value_product),
+        start=1,
+    ):
+        xgb_params = dict(zip(xgb_keys, xgb_values))
+        smote_params = dict(zip(smote_keys, smote_values))
+        mean_score, fold_scores = _evaluate_xgb_candidate_cv(
+            X_train,
+            y_train,
+            random_state=int(random_state),
+            cv_folds=int(cv_folds),
+            scoring=str(scoring),
+            base_params=base_params,
+            xgb_params=xgb_params,
+            smote_params=smote_params,
+        )
+        record: Dict[str, object] = {
+            "mean_test_score": float(mean_score),
+            "std_test_score": float(np.std(fold_scores, ddof=1)) if len(fold_scores) > 1 else 0.0,
+        }
+        for key, value in xgb_params.items():
+            record[f"param_{key}"] = value
+        for key, value in smote_params.items():
+            record[f"param_smote_{key}"] = value
+        records.append(record)
+        _emit_progress(
+            progress_callback,
+            min(100, max(10, int(round((candidate_index / total_candidates) * 100)))),
+            f"GridSearch combo {candidate_index}/{total_candidates} completada.",
+        )
+
+    search_df = pd.DataFrame(records)
+    if search_df.empty:
+        raise ValueError("La busqueda XGBoost + SMOTE no genero combinaciones validas.")
+    search_df = search_df.sort_values(
+        by=["mean_test_score", "std_test_score"],
+        ascending=[False, True],
+        ignore_index=True,
+    )
+    search_df["rank_test_score"] = (
+        search_df["mean_test_score"].rank(method="min", ascending=False).astype(int)
+    )
+    best_row = search_df.iloc[0]
+    best_xgb_params = {
+        key: best_row[f"param_{key}"]
+        for key in xgb_keys
+    }
+    best_smote_params = {
+        key: best_row[f"param_smote_{key}"]
+        for key in smote_keys
+        if f"param_smote_{key}" in best_row.index and not pd.isna(best_row[f"param_smote_{key}"])
+    }
+    return _finalize_best_params(
+        best_xgb_params,
+        best_smote_params,
+        float(best_row["mean_test_score"]),
+        search_df,
+    )
+
+
+def _normalize_xgb_tuning_profile(profile: object) -> str:
+    normalized = str(profile or "Rapida").strip()
+    if normalized in XGB_TUNING_PROFILES:
+        return normalized
+    return "Rapida"
+
+
+def _builtin_xgb_param_grid(profile: object) -> Dict[str, List[object]]:
+    profile = _normalize_xgb_tuning_profile(profile)
     if profile == "GridSearch original":
         return {
             "max_depth": [3, 5, 7, 10, 15, 20],
@@ -4566,8 +5398,289 @@ def _default_xgb_param_grid(profile: str) -> Dict[str, List[object]]:
     }
 
 
+def _builtin_xgb_regularization_param_grid(profile: object) -> Dict[str, List[object]]:
+    profile = _normalize_xgb_tuning_profile(profile)
+    if profile == "GridSearch original":
+        return {
+            "min_child_weight": [1, 3, 5, 10],
+            "gamma": [0.0, 0.1, 0.3, 0.5],
+            "reg_alpha": [0.0, 0.001, 0.01, 0.1],
+            "reg_lambda": [1.0, 2.0, 5.0, 10.0],
+        }
+    if profile == "Amplia":
+        return {
+            "min_child_weight": [1, 3, 5],
+            "gamma": [0.0, 0.3, 0.5],
+            "reg_alpha": [0.0, 0.01, 0.1],
+            "reg_lambda": [1.0, 2.0, 5.0],
+        }
+    return {
+        "min_child_weight": [1, 3],
+        "gamma": [0.0, 0.3],
+        "reg_alpha": [0.0, 0.1],
+        "reg_lambda": [1.0, 5.0],
+    }
+
+
+def _builtin_smote_param_grid(profile: object) -> Dict[str, List[object]]:
+    profile = _normalize_xgb_tuning_profile(profile)
+    if profile == "Rapida":
+        return {
+            "sampling_strategy": [0.8, 1.0],
+            "k_neighbors": [1, 3, 5],
+        }
+    return {
+        "sampling_strategy": [0.6, 0.8, 1.0],
+        "k_neighbors": [1, 3, 5, 7],
+    }
+
+
+def _coerce_xgb_grid_value_list(values: object, *, param_name: str) -> List[object]:
+    caster = XGB_GRID_PARAM_TYPES[str(param_name)]
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"El grid para `{param_name}` debe ser una lista.")
+    resolved: List[object] = []
+    for raw_value in values:
+        numeric = pd.to_numeric(raw_value, errors="coerce")
+        if pd.isna(numeric):
+            raise ValueError(f"Valor invalido en `{param_name}`: {raw_value}")
+        numeric_value = float(numeric)
+        if caster is int:
+            rounded = int(round(numeric_value))
+            if not np.isclose(numeric_value, rounded):
+                raise ValueError(f"Los valores de `{param_name}` deben ser enteros.")
+            resolved.append(int(rounded))
+        else:
+            resolved.append(float(numeric_value))
+    if not resolved:
+        raise ValueError(f"El grid para `{param_name}` no puede quedar vacio.")
+    deduped: List[object] = []
+    for value in resolved:
+        if value not in deduped:
+            deduped.append(value)
+    return deduped
+
+
+def _coerce_smote_grid_value_list(values: object, *, param_name: str) -> List[object]:
+    caster = SMOTE_GRID_PARAM_TYPES[str(param_name)]
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"El grid para `{param_name}` debe ser una lista.")
+    resolved: List[object] = []
+    for raw_value in values:
+        numeric = pd.to_numeric(raw_value, errors="coerce")
+        if pd.isna(numeric):
+            raise ValueError(f"Valor invalido en `{param_name}`: {raw_value}")
+        numeric_value = float(numeric)
+        if caster is int:
+            rounded = int(round(numeric_value))
+            if not np.isclose(numeric_value, rounded):
+                raise ValueError(f"Los valores de `{param_name}` deben ser enteros.")
+            if rounded < 1:
+                raise ValueError(f"Los valores de `{param_name}` deben ser >= 1.")
+            resolved.append(int(rounded))
+        else:
+            if numeric_value <= 0.0 or numeric_value > 1.0:
+                raise ValueError(f"Los valores de `{param_name}` deben estar en el rango (0, 1].")
+            resolved.append(float(numeric_value))
+    if not resolved:
+        raise ValueError(f"El grid para `{param_name}` no puede quedar vacio.")
+    deduped: List[object] = []
+    for value in resolved:
+        if value not in deduped:
+            deduped.append(value)
+    return deduped
+
+
+def _normalize_train_xgb_param_grid(profile: object, grid: Optional[Dict[str, object]] = None) -> Dict[str, List[object]]:
+    normalized_profile = _normalize_xgb_tuning_profile(profile)
+    base_grid = _builtin_xgb_param_grid(normalized_profile)
+    candidate = grid or base_grid
+    normalized: Dict[str, List[object]] = {}
+    for param_name in XGB_GRID_PARAM_ORDER:
+        try:
+            normalized[param_name] = _coerce_xgb_grid_value_list(
+                candidate.get(param_name, base_grid[param_name]),
+                param_name=param_name,
+            )
+        except Exception:
+            normalized[param_name] = list(base_grid[param_name])
+    return normalized
+
+
+def _normalize_train_xgb_regularization_param_grid(
+    profile: object,
+    grid: Optional[Dict[str, object]] = None,
+) -> Dict[str, List[object]]:
+    normalized_profile = _normalize_xgb_tuning_profile(profile)
+    base_grid = _builtin_xgb_regularization_param_grid(normalized_profile)
+    candidate = grid or base_grid
+    normalized: Dict[str, List[object]] = {}
+    for param_name in XGB_REGULARIZATION_PARAM_ORDER:
+        try:
+            normalized[param_name] = _coerce_xgb_grid_value_list(
+                candidate.get(param_name, base_grid[param_name]),
+                param_name=param_name,
+            )
+        except Exception:
+            normalized[param_name] = list(base_grid[param_name])
+    return normalized
+
+
+def _normalize_train_smote_param_grid(profile: object, grid: Optional[Dict[str, object]] = None) -> Dict[str, List[object]]:
+    normalized_profile = _normalize_xgb_tuning_profile(profile)
+    base_grid = _builtin_smote_param_grid(normalized_profile)
+    candidate = grid or base_grid
+    normalized: Dict[str, List[object]] = {}
+    for param_name in SMOTE_GRID_PARAM_ORDER:
+        try:
+            normalized[param_name] = _coerce_smote_grid_value_list(
+                candidate.get(param_name, base_grid[param_name]),
+                param_name=param_name,
+            )
+        except Exception:
+            normalized[param_name] = list(base_grid[param_name])
+    return normalized
+
+
+def _default_train_xgb_param_grids() -> Dict[str, Dict[str, List[object]]]:
+    return {
+        profile: _normalize_train_xgb_param_grid(profile, _builtin_xgb_param_grid(profile))
+        for profile in XGB_TUNING_PROFILES
+    }
+
+
+def _default_train_xgb_regularization_param_grids() -> Dict[str, Dict[str, List[object]]]:
+    return {
+        profile: _normalize_train_xgb_regularization_param_grid(
+            profile,
+            _builtin_xgb_regularization_param_grid(profile),
+        )
+        for profile in XGB_TUNING_PROFILES
+    }
+
+
+def _default_train_smote_param_grids() -> Dict[str, Dict[str, List[object]]]:
+    return {
+        profile: _normalize_train_smote_param_grid(profile, _builtin_smote_param_grid(profile))
+        for profile in XGB_TUNING_PROFILES
+    }
+
+
+def _get_saved_train_xgb_param_grids() -> Dict[str, Dict[str, List[object]]]:
+    try:
+        stored = st.session_state.get("nlp_sev_train_xgb_param_grids")
+    except Exception:
+        stored = None
+    defaults = _default_train_xgb_param_grids()
+    if not isinstance(stored, dict):
+        return defaults
+    resolved: Dict[str, Dict[str, List[object]]] = {}
+    for profile in XGB_TUNING_PROFILES:
+        grid = stored.get(profile) if isinstance(stored.get(profile), dict) else None
+        resolved[profile] = _normalize_train_xgb_param_grid(profile, grid)
+    return resolved
+
+
+def _get_saved_train_xgb_regularization_param_grids() -> Dict[str, Dict[str, List[object]]]:
+    try:
+        stored = st.session_state.get("nlp_sev_train_xgb_regularization_param_grids")
+    except Exception:
+        stored = None
+    defaults = _default_train_xgb_regularization_param_grids()
+    if not isinstance(stored, dict):
+        return defaults
+    resolved: Dict[str, Dict[str, List[object]]] = {}
+    for profile in XGB_TUNING_PROFILES:
+        grid = stored.get(profile) if isinstance(stored.get(profile), dict) else None
+        resolved[profile] = _normalize_train_xgb_regularization_param_grid(profile, grid)
+    return resolved
+
+
+def _get_saved_train_smote_param_grids() -> Dict[str, Dict[str, List[object]]]:
+    try:
+        stored = st.session_state.get("nlp_sev_train_smote_param_grids")
+    except Exception:
+        stored = None
+    defaults = _default_train_smote_param_grids()
+    if not isinstance(stored, dict):
+        return defaults
+    resolved: Dict[str, Dict[str, List[object]]] = {}
+    for profile in XGB_TUNING_PROFILES:
+        grid = stored.get(profile) if isinstance(stored.get(profile), dict) else None
+        resolved[profile] = _normalize_train_smote_param_grid(profile, grid)
+    return resolved
+
+
+def _serialize_xgb_grid_values(values: Sequence[object]) -> str:
+    return ", ".join(str(value) for value in values)
+
+
+def _parse_xgb_grid_values_text(text: object, *, param_name: str) -> List[object]:
+    tokens = [token.strip() for token in re.split(r"[,\n]+", str(text or "")) if token.strip()]
+    if not tokens:
+        raise ValueError(f"El grid para `{param_name}` no puede quedar vacio.")
+    return _coerce_xgb_grid_value_list(tokens, param_name=param_name)
+
+
+def _serialize_smote_grid_values(values: Sequence[object]) -> str:
+    return ", ".join(str(value) for value in values)
+
+
+def _parse_smote_grid_values_text(text: object, *, param_name: str) -> List[object]:
+    tokens = [token.strip() for token in re.split(r"[,\n]+", str(text or "")) if token.strip()]
+    if not tokens:
+        raise ValueError(f"El grid para `{param_name}` no puede quedar vacio.")
+    return _coerce_smote_grid_value_list(tokens, param_name=param_name)
+
+
+def _default_xgb_param_grid(profile: str) -> Dict[str, List[object]]:
+    normalized_profile = _normalize_xgb_tuning_profile(profile)
+    return _get_saved_train_xgb_param_grids().get(
+        normalized_profile,
+        _builtin_xgb_param_grid(normalized_profile),
+    )
+
+
+def _default_xgb_regularization_param_grid(profile: str) -> Dict[str, List[object]]:
+    normalized_profile = _normalize_xgb_tuning_profile(profile)
+    return _get_saved_train_xgb_regularization_param_grids().get(
+        normalized_profile,
+        _builtin_xgb_regularization_param_grid(normalized_profile),
+    )
+
+
+def _default_smote_param_grid(profile: str) -> Dict[str, List[object]]:
+    normalized_profile = _normalize_xgb_tuning_profile(profile)
+    return _get_saved_train_smote_param_grids().get(
+        normalized_profile,
+        _builtin_smote_param_grid(normalized_profile),
+    )
+
+
+def _xgb_default_regularization_params(profile: object) -> Dict[str, object]:
+    grid = _default_xgb_regularization_param_grid(_normalize_xgb_tuning_profile(profile))
+    return {
+        key: list(values)[-1]
+        for key, values in grid.items()
+        if values
+    }
+
+
+def _resolve_xgb_param_grid(
+    profile: object,
+    *,
+    use_regularization: bool = False,
+) -> Dict[str, List[object]]:
+    resolved = dict(_default_xgb_param_grid(_normalize_xgb_tuning_profile(profile)))
+    if bool(use_regularization):
+        resolved.update(
+            _default_xgb_regularization_param_grid(_normalize_xgb_tuning_profile(profile))
+        )
+    return resolved
+
+
 def _xgb_search_strategy_help(strategy: str) -> str:
-    strategy = str(strategy or "Rapida")
+    strategy = _normalize_xgb_tuning_profile(strategy)
     if strategy == "GridSearch original":
         return (
             "Replica la grilla original de NLP/main.py. Explora 810 combinaciones "
@@ -4592,125 +5705,137 @@ def _optimize_xgb_classifier(
     tune_hyperparameters: bool,
     tuning_folds: int,
     tuning_profile: str,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
 ) -> Tuple[object, Dict[str, object], Optional[float], pd.DataFrame, Dict[str, object]]:
-    base_params = {
-        "n_estimators": 300,
-        "max_depth": 5,
-        "learning_rate": 0.08,
-        "subsample": 0.9,
-        "colsample_bytree": 0.9,
-    }
+    base_params = _paper_xgb_base_params()
     requested_backend = _paper_normalize_optimization_backend(optimization_backend)
-    resolved_optuna_trials = (
-        max(1, int(optuna_trials or PAPER_OPTUNA_TRIALS_DEFAULT))
-        if requested_backend == "optuna"
-        else 0
+    default_regularization_params = (
+        _xgb_default_regularization_params(tuning_profile)
+        if bool(use_regularization)
+        else {}
     )
-    param_grid = _default_xgb_param_grid(tuning_profile)
-    search_space_size = _paper_xgb_search_space_size(param_grid)
-    effective_optuna_trials = (
-        min(int(resolved_optuna_trials), max(1, int(search_space_size)))
-        if requested_backend == "optuna"
-        else 0
+    param_grid = _resolve_xgb_param_grid(
+        tuning_profile,
+        use_regularization=bool(use_regularization),
     )
     search_meta: Dict[str, object] = {
         "requested_backend": requested_backend,
         "backend": requested_backend if bool(tune_hyperparameters) else "disabled",
-        "search_space_size": int(search_space_size),
-        "optuna_trials_requested": int(resolved_optuna_trials),
-        "optuna_trials_effective": int(effective_optuna_trials),
-        "optuna_trials_completed": 0,
         "tuning_profile": str(tuning_profile),
+        "use_regularization": bool(use_regularization),
     }
+
     if not tune_hyperparameters:
-        model = build_model("XGBoost", base_params, random_state=int(random_state))
-        model.fit(X_train, y_train)
-        return model, dict(base_params), None, pd.DataFrame(), search_meta
-
-    min_class = int(y_train.value_counts().min())
-    cv_folds = min(max(2, int(tuning_folds)), min_class)
-    search_meta["effective_inner_folds"] = int(cv_folds)
-    if cv_folds < 2:
-        model = build_model("XGBoost", base_params, random_state=int(random_state))
-        model.fit(X_train, y_train)
-        fallback_params = {
-            **base_params,
-            "tuning_fallback": "clase_minoritaria_insuficiente",
+        best_smote_params = _resolve_smote_param_grid(y_train, tuning_profile=tuning_profile)
+        default_smote_params = {
+            key: list(values)[-1]
+            for key, values in best_smote_params.items()
         }
-        return model, fallback_params, None, pd.DataFrame(), search_meta
-
-    scoring = "f1" if pd.Series(y_train).nunique() <= 2 else "f1_macro"
-    if requested_backend == "optuna" and optuna is not None:
-        sampler = TPESampler(seed=int(random_state)) if TPESampler is not None else None
-        study = optuna.create_study(direction="maximize", sampler=sampler)
-
-        def _objective(trial: object) -> float:
-            params = {
-                key: trial.suggest_categorical(str(key), list(values))
-                for key, values in param_grid.items()
-            }
-            model = build_model(
-                "XGBoost",
-                {**base_params, **params},
-                random_state=int(random_state),
-            )
-            scores = cross_validate(
-                model,
-                X_train,
-                y_train,
-                scoring=scoring,
-                cv=int(cv_folds),
-                n_jobs=1,
-                error_score="raise",
-            )
-            return float(np.mean(scores["test_score"]))
-
-        study.optimize(
-            _objective,
-            n_trials=int(effective_optuna_trials),
-            show_progress_bar=False,
+        X_train_fit, y_train_fit, balancing_meta = _maybe_balance_training_data(
+            X_train,
+            y_train,
+            random_state=int(random_state),
+            sampling_strategy=default_smote_params.get("sampling_strategy"),
+            k_neighbors=default_smote_params.get("k_neighbors"),
         )
-        search_meta["optuna_trials_completed"] = int(len(study.trials))
-        best_params = dict(study.best_trial.params or {})
-        best_model = build_model(
+        model = build_model(
             "XGBoost",
-            {**base_params, **best_params},
+            {**base_params, **default_regularization_params},
             random_state=int(random_state),
         )
-        best_model.fit(X_train, y_train)
-        cv_results_df = _paper_optuna_search_df(study)
-        best_score = float(study.best_value)
-    else:
-        if requested_backend == "optuna" and optuna is None:
-            search_meta["backend"] = "gridsearch"
-            search_meta["fallback_reason"] = "optuna_no_instalado"
-        base_model = build_model("XGBoost", base_params, random_state=int(random_state))
-        search = GridSearchCV(
-            base_model,
-            param_grid=param_grid,
-            scoring=scoring,
-            cv=cv_folds,
-            n_jobs=1,
-            refit=True,
-        )
-        search.fit(X_train, y_train)
-        cv_results_df = pd.DataFrame(search.cv_results_).sort_values(
-            "rank_test_score",
-            ascending=True,
-            ignore_index=True,
-        )
+        model.fit(X_train_fit, y_train_fit)
         best_params = {
-            key: value
-            for key, value in search.best_params_.items()
+            **base_params,
+            **default_regularization_params,
+            **{
+                f"smote_{key}": value
+                for key, value in default_smote_params.items()
+            },
         }
-        best_model = search.best_estimator_
-        best_score = float(search.best_score_)
+        search_meta.update(
+            {
+                "search_space_size": 0,
+                "optuna_trials_requested": 0,
+                "optuna_trials_effective": 0,
+                "optuna_trials_completed": 0,
+                "effective_inner_folds": 0,
+                "best_smote_params": dict(default_smote_params),
+                "final_balancing_meta": balancing_meta,
+            }
+        )
+        return model, best_params, None, pd.DataFrame(), search_meta
+
+    cv_folds = _effective_cv_folds(y_train, int(tuning_folds))
+    search_meta["effective_inner_folds"] = int(cv_folds)
+    if cv_folds < 2:
+        X_train_fit, y_train_fit, balancing_meta = _maybe_balance_training_data(
+            X_train,
+            y_train,
+            random_state=int(random_state),
+        )
+        model = build_model(
+            "XGBoost",
+            {**base_params, **default_regularization_params},
+            random_state=int(random_state),
+        )
+        model.fit(X_train_fit, y_train_fit)
+        fallback_params = {
+            **base_params,
+            **default_regularization_params,
+            "tuning_fallback": "clase_minoritaria_insuficiente",
+        }
+        search_meta.update(
+            {
+                "search_space_size": 0,
+                "optuna_trials_requested": 0,
+                "optuna_trials_effective": 0,
+                "optuna_trials_completed": 0,
+                "best_smote_params": {},
+                "final_balancing_meta": balancing_meta,
+            }
+        )
+        return model, fallback_params, None, pd.DataFrame(), search_meta
+
+    best_xgb_params, best_smote_params, best_score, cv_results_df, search_details = _search_xgb_with_smote(
+        X_train,
+        y_train,
+        random_state=int(random_state),
+        param_grid=param_grid,
+        cv_folds=int(cv_folds),
+        scoring=_training_scoring_name(y_train),
+        optimization_backend=optimization_backend,
+        optuna_trials=optuna_trials,
+        tuning_profile=str(tuning_profile),
+        use_regularization=bool(use_regularization),
+    )
+    search_meta.update(search_details)
+    X_train_fit, y_train_fit, balancing_meta = _maybe_balance_training_data(
+        X_train,
+        y_train,
+        random_state=int(random_state),
+        sampling_strategy=best_smote_params.get("sampling_strategy"),
+        k_neighbors=best_smote_params.get("k_neighbors"),
+    )
+    best_model = build_model(
+        "XGBoost",
+        {**base_params, **best_xgb_params},
+        random_state=int(random_state),
+    )
+    best_model.fit(X_train_fit, y_train_fit)
+    search_meta["final_balancing_meta"] = balancing_meta
     if isinstance(cv_results_df, pd.DataFrame) and not cv_results_df.empty:
         cv_results_df = cv_results_df.copy()
         cv_results_df.insert(0, "optimization_backend", str(search_meta.get("backend") or requested_backend))
         cv_results_df.insert(1, "requested_optimization_backend", str(requested_backend))
+    best_params = {
+        **best_xgb_params,
+        **{
+            f"smote_{key}": value
+            for key, value in best_smote_params.items()
+        },
+    }
     return best_model, best_params, best_score, cv_results_df, search_meta
 
 
@@ -4727,14 +5852,15 @@ def _predict_model_scores(model: object, X: pd.DataFrame) -> Optional[np.ndarray
     return None
 
 
-def _paper_xgb_param_grid() -> Dict[str, List[object]]:
-    return {
-        "max_depth": [3, 5],
-        "learning_rate": [0.05, 0.1],
-        "n_estimators": [150, 300],
-        "subsample": [0.8, 1.0],
-        "colsample_bytree": [0.8, 1.0],
-    }
+def _paper_xgb_param_grid(
+    tuning_profile: Optional[object] = None,
+    *,
+    use_regularization: bool = False,
+) -> Dict[str, List[object]]:
+    return _resolve_xgb_param_grid(
+        _normalize_xgb_tuning_profile(tuning_profile),
+        use_regularization=bool(use_regularization),
+    )
 
 
 def _paper_xgb_base_params() -> Dict[str, object]:
@@ -4785,13 +5911,23 @@ def _paper_optimize_xgb_model(
     random_state: int,
     param_grid: Optional[Dict[str, List[object]]] = None,
     inner_folds: int = 5,
+    xgb_tuning_profile: Optional[object] = None,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
     scoring_metric: Optional[str] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, object]:
-    param_grid = param_grid or _paper_xgb_param_grid()
-    base_params = _paper_xgb_base_params()
+    resolved_tuning_profile = _normalize_xgb_tuning_profile(xgb_tuning_profile)
+    default_regularization_params = (
+        _xgb_default_regularization_params(resolved_tuning_profile)
+        if bool(use_regularization)
+        else {}
+    )
+    param_grid = param_grid or _paper_xgb_param_grid(
+        resolved_tuning_profile,
+        use_regularization=bool(use_regularization),
+    )
     resolved_scoring = str(scoring_metric or "").strip()
     if resolved_scoring and resolved_scoring in PAPER_SCORING_METRICS:
         scoring = resolved_scoring
@@ -4799,111 +5935,78 @@ def _paper_optimize_xgb_model(
         scoring = _training_scoring_name(y_train)
     effective_inner_folds = _effective_cv_folds(y_train, int(inner_folds))
     requested_backend = _paper_normalize_optimization_backend(optimization_backend)
-    resolved_optuna_trials = max(1, int(optuna_trials or PAPER_OPTUNA_TRIALS_DEFAULT))
-    search_space_size = _paper_xgb_search_space_size(param_grid)
-    effective_optuna_trials = min(int(resolved_optuna_trials), max(1, int(search_space_size)))
     search_meta: Dict[str, object] = {
         "requested_backend": requested_backend,
         "backend": requested_backend,
-        "search_space_size": int(search_space_size),
         "effective_inner_folds": int(effective_inner_folds),
-        "optuna_trials_requested": int(resolved_optuna_trials if requested_backend == "optuna" else 0),
-        "optuna_trials_effective": int(effective_optuna_trials if requested_backend == "optuna" else 0),
-        "optuna_trials_completed": 0,
+        "tuning_profile": resolved_tuning_profile,
+        "use_regularization": bool(use_regularization),
     }
     if effective_inner_folds < 2:
         _emit_progress(progress_callback, 15, "Sin CV interna suficiente; ajustando fallback del modelo.")
-        best_model = build_model("XGBoost", base_params, random_state=int(random_state))
-        best_model.fit(X_train, y_train)
+        X_train_fit, y_train_fit, balancing_meta = _maybe_balance_training_data(
+            X_train,
+            y_train,
+            random_state=int(random_state),
+        )
+        best_model = build_model(
+            "XGBoost",
+            {**_paper_xgb_base_params(), **default_regularization_params},
+            random_state=int(random_state),
+        )
+        best_model.fit(X_train_fit, y_train_fit)
+        search_meta["final_balancing_meta"] = balancing_meta
         return {
             "model": best_model,
-            "best_params": {**base_params, "search_fallback": "clase_minoritaria_insuficiente"},
+            "best_params": {
+                **_paper_xgb_base_params(),
+                **default_regularization_params,
+                "search_fallback": "clase_minoritaria_insuficiente",
+            },
             "best_cv_score": np.nan,
             "search_df": pd.DataFrame(),
             "search_meta": search_meta,
         }
 
-    if requested_backend == "optuna" and optuna is not None:
-        _emit_progress(
+    search_start_message = (
+        "Optimizando XGBoost + SMOTE en CV interna."
+        if requested_backend != "optuna"
+        else "Optuna sobre XGBoost + SMOTE."
+    )
+    _emit_progress(progress_callback, 5, search_start_message)
+    best_xgb_params, best_smote_params, best_cv_score, search_df, search_details = _search_xgb_with_smote(
+        X_train,
+        y_train,
+        random_state=int(random_state),
+        param_grid=param_grid,
+        cv_folds=int(effective_inner_folds),
+        scoring=str(scoring),
+        optimization_backend=optimization_backend,
+        optuna_trials=optuna_trials,
+        tuning_profile=resolved_tuning_profile,
+        use_regularization=bool(use_regularization),
+        progress_callback=_subprogress_callback(
             progress_callback,
-            5,
-            f"Optuna sobre {search_meta['search_space_size']} combinaciones discretas ({effective_optuna_trials} trials efectivos).",
-        )
-        sampler = TPESampler(seed=int(random_state)) if TPESampler is not None else None
-        study = optuna.create_study(direction="maximize", sampler=sampler)
-
-        def _objective(trial: object) -> float:
-            params = {
-                key: trial.suggest_categorical(str(key), list(values))
-                for key, values in param_grid.items()
-            }
-            model = build_model(
-                "XGBoost",
-                {**base_params, **params},
-                random_state=int(random_state),
-            )
-            scores = cross_validate(
-                model,
-                X_train,
-                y_train,
-                scoring=scoring,
-                cv=int(effective_inner_folds),
-                n_jobs=1,
-                error_score="raise",
-            )
-            return float(np.mean(scores["test_score"]))
-
-        def _progress_callback(study_obj: object, trial: object) -> None:
-            completed_trials = int(len(getattr(study_obj, "trials", [])))
-            search_meta["optuna_trials_completed"] = completed_trials
-            pct = min(100, max(10, int(round((completed_trials / max(1, effective_optuna_trials)) * 100))))
-            _emit_progress(
-                progress_callback,
-                pct,
-                f"Optuna trial {completed_trials}/{effective_optuna_trials} completado.",
-            )
-
-        study.optimize(
-            _objective,
-            n_trials=int(effective_optuna_trials),
-            callbacks=[_progress_callback],
-            show_progress_bar=False,
-        )
-        best_params = dict(getattr(study, "best_trial").params or {})
-        best_cv_score = float(getattr(study, "best_value"))
-        best_model = build_model(
-            "XGBoost",
-            {**base_params, **best_params},
-            random_state=int(random_state),
-        )
-        best_model.fit(X_train, y_train)
-        search_df = _paper_optuna_search_df(study)
-    else:
-        if requested_backend == "optuna" and optuna is None:
-            search_meta["backend"] = "gridsearch"
-            search_meta["fallback_reason"] = "optuna_no_instalado"
-        _emit_progress(
-            progress_callback,
-            5,
-            f"{_paper_optimization_backend_label(search_meta['backend'])} sobre {search_meta['search_space_size']} combinaciones.",
-        )
-        search = GridSearchCV(
-            build_model("XGBoost", base_params, random_state=int(random_state)),
-            param_grid=param_grid,
-            scoring=scoring,
-            cv=int(effective_inner_folds),
-            n_jobs=1,
-            refit=True,
-        )
-        search.fit(X_train, y_train)
-        best_model = search.best_estimator_
-        best_params = dict(search.best_params_)
-        best_cv_score = float(search.best_score_)
-        search_df = pd.DataFrame(search.cv_results_).sort_values(
-            "rank_test_score",
-            ascending=True,
-            ignore_index=True,
-        )
+            start=10,
+            end=90,
+            prefix="Busqueda XGBoost + SMOTE | ",
+        ),
+    )
+    search_meta.update(search_details)
+    X_train_fit, y_train_fit, balancing_meta = _maybe_balance_training_data(
+        X_train,
+        y_train,
+        random_state=int(random_state),
+        sampling_strategy=best_smote_params.get("sampling_strategy"),
+        k_neighbors=best_smote_params.get("k_neighbors"),
+    )
+    best_model = build_model(
+        "XGBoost",
+        {**_paper_xgb_base_params(), **best_xgb_params},
+        random_state=int(random_state),
+    )
+    best_model.fit(X_train_fit, y_train_fit)
+    search_meta["final_balancing_meta"] = balancing_meta
 
     if isinstance(search_df, pd.DataFrame) and not search_df.empty:
         search_df = search_df.copy()
@@ -4912,7 +6015,13 @@ def _paper_optimize_xgb_model(
     _emit_progress(progress_callback, 100, "Optimizacion de hiperparametros completada.")
     return {
         "model": best_model,
-        "best_params": best_params,
+        "best_params": {
+            **best_xgb_params,
+            **{
+                f"smote_{key}": value
+                for key, value in best_smote_params.items()
+            },
+        },
         "best_cv_score": best_cv_score,
         "search_df": search_df if isinstance(search_df, pd.DataFrame) else pd.DataFrame(),
         "search_meta": search_meta,
@@ -4927,6 +6036,8 @@ def _paper_nested_xgb_validation(
     param_grid: Optional[Dict[str, List[object]]] = None,
     outer_folds: int = 5,
     inner_folds: int = 5,
+    xgb_tuning_profile: Optional[object] = None,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
     scoring_metric: Optional[str] = None,
@@ -4938,7 +6049,10 @@ def _paper_nested_xgb_validation(
     outer_cv_folds = _effective_cv_folds(y, int(outer_folds))
     if outer_cv_folds < 2:
         raise ValueError("No hay suficientes casos por clase para la validacion nested.")
-    param_grid = param_grid or _paper_xgb_param_grid()
+    param_grid = param_grid or _paper_xgb_param_grid(
+        xgb_tuning_profile,
+        use_regularization=bool(use_regularization),
+    )
     outer_cv = StratifiedKFold(
         n_splits=int(outer_cv_folds),
         shuffle=True,
@@ -4962,17 +6076,14 @@ def _paper_nested_xgb_validation(
         y_val_outer = y.iloc[val_idx].reset_index(drop=True)
 
         X_train_imp, X_val_imp, _ = _fit_imputer(X_train_outer, X_val_outer)
-        X_train_bal, y_train_bal, balancing_meta = _maybe_balance_training_data(
+        optimization = _paper_optimize_xgb_model(
             X_train_imp,
             y_train_outer,
             random_state=int(random_state),
-        )
-        optimization = _paper_optimize_xgb_model(
-            X_train_bal,
-            y_train_bal,
-            random_state=int(random_state),
             param_grid=param_grid,
             inner_folds=int(inner_folds),
+            xgb_tuning_profile=xgb_tuning_profile,
+            use_regularization=bool(use_regularization),
             optimization_backend=optimization_backend,
             optuna_trials=optuna_trials,
             scoring_metric=scoring_metric,
@@ -4987,6 +6098,7 @@ def _paper_nested_xgb_validation(
         best_params = dict(optimization.get("best_params") or {})
         best_cv_score = float(optimization.get("best_cv_score")) if not pd.isna(optimization.get("best_cv_score")) else np.nan
         search_meta = dict(optimization.get("search_meta") or {})
+        balancing_meta = dict(search_meta.get("final_balancing_meta") or {})
 
         y_pred = best_model.predict(X_val_imp[feature_cols])
         y_score = _predict_model_scores(best_model, X_val_imp[feature_cols])
@@ -5051,6 +6163,8 @@ def _paper_fit_final_xgb_model(
     random_state: int,
     param_grid: Optional[Dict[str, List[object]]] = None,
     inner_folds: int = 5,
+    xgb_tuning_profile: Optional[object] = None,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
     scoring_metric: Optional[str] = None,
@@ -5059,19 +6173,19 @@ def _paper_fit_final_xgb_model(
     feature_cols = list(X_train.columns)
     _emit_progress(progress_callback, 5, "Preparando datos del modelo final.")
     X_train_imp, X_test_imp, imputer = _fit_imputer(X_train, X_test)
-    X_train_bal, y_train_bal, balancing_meta = _maybe_balance_training_data(
+    param_grid = param_grid or _paper_xgb_param_grid(
+        xgb_tuning_profile,
+        use_regularization=bool(use_regularization),
+    )
+    start_time = time.time()
+    optimization = _paper_optimize_xgb_model(
         X_train_imp,
         y_train,
         random_state=int(random_state),
-    )
-    param_grid = param_grid or _paper_xgb_param_grid()
-    start_time = time.time()
-    optimization = _paper_optimize_xgb_model(
-        X_train_bal,
-        y_train_bal,
-        random_state=int(random_state),
         param_grid=param_grid,
         inner_folds=int(inner_folds),
+        xgb_tuning_profile=xgb_tuning_profile,
+        use_regularization=bool(use_regularization),
         optimization_backend=optimization_backend,
         optuna_trials=optuna_trials,
         scoring_metric=scoring_metric,
@@ -5087,6 +6201,7 @@ def _paper_fit_final_xgb_model(
     best_cv_score = float(optimization.get("best_cv_score")) if not pd.isna(optimization.get("best_cv_score")) else np.nan
     search_df = optimization.get("search_df")
     search_meta = dict(optimization.get("search_meta") or {})
+    balancing_meta = dict(search_meta.get("final_balancing_meta") or {})
     training_time_sec = float(time.time() - start_time)
     _emit_progress(progress_callback, 90, "Evaluando holdout final del paper.")
     y_pred = best_model.predict(X_test_imp[feature_cols])
@@ -5128,11 +6243,15 @@ def _paper_build_model_result(
     model_code: str,
     feature_group: str,
     k_grid: Optional[Sequence[object]] = None,
+    k_grid_mode: Optional[object] = None,
+    k_grid_interval: Optional[object] = None,
     forced_selected_k: Optional[object] = None,
     cv_folds: Optional[object] = None,
     random_state: int,
     inner_folds: int = 5,
     outer_folds: int = 5,
+    xgb_tuning_profile: Optional[object] = None,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
     scoring_metric: Optional[str] = None,
@@ -5164,16 +6283,16 @@ def _paper_build_model_result(
         split_mode=str(PAPER_PROTOCOL["split_mode"]),
     )
     X_train_imp, _, _ = _fit_imputer(X_train, X_test)
-    X_train_bal, y_train_bal, ranking_balancing_meta = _maybe_balance_training_data(
+    ranking_df = _rf_rank_features(
         X_train_imp,
         y_train,
         random_state=int(random_state),
     )
-    ranking_df = _rf_rank_features(
-        X_train_bal,
-        y_train_bal,
-        random_state=int(random_state),
-    )
+    ranking_balancing_meta = {
+        "balancing": "none",
+        "reason": "rf_ranking_pre_smote_protocol",
+        "stage": "rf_ranking",
+    }
     if ranking_df.empty:
         raise ValueError(f"No se pudo rankear variables para {model_code}.")
 
@@ -5184,7 +6303,7 @@ def _paper_build_model_result(
         progress_callback,
         5,
         (
-            f"{model_code}: ranking RF listo, usando K compartido={resolved_forced_k} definido por M3."
+            f"{model_code}: ranking RF listo, reutilizando k={resolved_forced_k} forzado por protocolo."
             if resolved_forced_k is not None
             else f"{model_code}: ranking RF listo, iniciando grilla de k."
         ),
@@ -5198,9 +6317,18 @@ def _paper_build_model_result(
     )
     if resolved_forced_k is None:
         candidate_k_values = (
-            _paper_candidate_k_values(len(feature_cols))
+            _paper_candidate_k_values(
+                len(feature_cols),
+                k_grid_mode=k_grid_mode,
+                k_grid_interval=k_grid_interval,
+            )
             if k_grid is None
-            else _paper_candidate_k_values(len(feature_cols), k_grid=k_grid)
+            else _paper_candidate_k_values(
+                len(feature_cols),
+                k_grid=k_grid,
+                k_grid_mode=k_grid_mode,
+                k_grid_interval=k_grid_interval,
+            )
         )
         total_k = max(1, len(candidate_k_values))
         if model_dir is not None:
@@ -5245,6 +6373,8 @@ def _paper_build_model_result(
                 random_state=int(random_state),
                 outer_folds=int(resolved_outer_folds),
                 inner_folds=int(resolved_inner_folds),
+                xgb_tuning_profile=xgb_tuning_profile,
+                use_regularization=bool(use_regularization),
                 optimization_backend=optimization_backend,
                 optuna_trials=optuna_trials,
                 scoring_metric=scoring_metric,
@@ -5258,7 +6388,9 @@ def _paper_build_model_result(
             summary = nested_payload["summary"]
             k_record = {
                 "model_code": model_code,
+                "model_title": _paper_model_title(model_code),
                 "feature_group": feature_group,
+                "candidate_feature_count": int(len(feature_cols)),
                 "k": int(k_value),
                 "accuracy": float(summary.get("accuracy") or 0.0),
                 "precision": float(summary.get("precision") or 0.0),
@@ -5290,8 +6422,8 @@ def _paper_build_model_result(
                 )
             k_records.append(k_record)
         k_search_df = pd.DataFrame(k_records).sort_values("k", ascending=True).reset_index(drop=True)
-        _emit_progress(progress_callback, 82, f"{model_code}: seleccionando k* con la regla marginal del paper.")
-        selected_k = _paper_select_k_from_search(k_search_df, epsilon=0.001)
+        _emit_progress(progress_callback, 82, f"{model_code}: seleccionando k* por mejor validation_score.")
+        selected_k = _paper_select_k_from_search(k_search_df)
     else:
         if resolved_forced_k > len(feature_cols):
             raise ValueError(
@@ -5302,13 +6434,15 @@ def _paper_build_model_result(
             [
                 {
                     "model_code": model_code,
+                    "model_title": _paper_model_title(model_code),
                     "feature_group": feature_group,
+                    "candidate_feature_count": int(len(feature_cols)),
                     "k": int(selected_k),
                     "selection_mode": "shared_from_m3",
                 }
             ]
         )
-        _emit_progress(progress_callback, 82, f"{model_code}: reutilizando k*={int(selected_k)} definido por M3.")
+        _emit_progress(progress_callback, 82, f"{model_code}: reutilizando k*={int(selected_k)} definido por protocolo.")
     selected_cols = ranking_df["variable"].head(int(selected_k)).tolist()
     if paths is not None and manifest is not None:
         _paper_mark_step_running(
@@ -5327,6 +6461,8 @@ def _paper_build_model_result(
         y_test,
         random_state=int(random_state),
         inner_folds=int(resolved_inner_folds),
+        xgb_tuning_profile=xgb_tuning_profile,
+        use_regularization=bool(use_regularization),
         optimization_backend=optimization_backend,
         optuna_trials=optuna_trials,
         scoring_metric=scoring_metric,
@@ -5363,12 +6499,16 @@ def _paper_build_model_result(
         "optimization": final_payload.get("optimization") or {
             "requested_backend": _paper_normalize_optimization_backend(optimization_backend),
             "backend": _paper_normalize_optimization_backend(optimization_backend),
+            "tuning_profile": _normalize_xgb_tuning_profile(xgb_tuning_profile),
+            "use_regularization": bool(use_regularization),
             "optuna_trials_requested": int(
                 (optuna_trials or PAPER_OPTUNA_TRIALS_DEFAULT)
                 if _paper_normalize_optimization_backend(optimization_backend) == "optuna"
                 else 0
             ),
         },
+        "xgb_tuning_profile": _normalize_xgb_tuning_profile(xgb_tuning_profile),
+        "use_regularization": bool(use_regularization),
         "k_selection_strategy": "shared_from_m3" if resolved_forced_k is not None else "searched_on_this_model",
     }
     if paths is not None and manifest is not None and model_dir is not None:
@@ -5433,6 +6573,20 @@ def _effective_cv_folds(y_train: pd.Series, requested_folds: int) -> int:
 def _candidate_feature_caps(total_features: int, *, max_features: int) -> List[int]:
     capped_total = max(1, min(int(total_features), int(max_features)))
     return [capped_total]
+
+
+def _feature_count_slider_bounds(
+    total_features: int,
+    *,
+    current_value: Optional[object] = None,
+    default_cap: int = 100,
+) -> Tuple[int, int]:
+    max_features = max(1, int(total_features))
+    default_value = min(max_features, max(1, int(default_cap)))
+    numeric = pd.to_numeric(current_value, errors="coerce")
+    if pd.isna(numeric):
+        return max_features, default_value
+    return max_features, min(max(1, int(numeric)), max_features)
 
 
 def _prepare_holdout_split_with_ids(
@@ -5528,8 +6682,10 @@ def _train_rf_xgb_shared_holdout(
     *,
     random_state: int,
     max_features: int,
+    tune_hyperparameters: bool = True,
     tuning_profile: str,
     tuning_folds: int,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
 ) -> Dict[str, object]:
@@ -5544,25 +6700,21 @@ def _train_rf_xgb_shared_holdout(
     selected_cols = ranking_df["variable"].head(max(1, int(max_features))).tolist()
     if not selected_cols:
         raise ValueError("No hay variables disponibles para RF + XGBoost.")
-    # Balance *after* feature selection so XGBoost trains on balanced data.
-    X_train_bal, y_train_bal, balancing_meta = _maybe_balance_training_data(
+    best_model, best_params, best_score, search_df, search_meta = _optimize_xgb_classifier(
         X_train_imp[selected_cols],
         y_train,
         random_state=int(random_state),
-    )
-    best_model, best_params, best_score, search_df, search_meta = _optimize_xgb_classifier(
-        X_train_bal[selected_cols],
-        y_train_bal,
-        random_state=int(random_state),
-        tune_hyperparameters=True,
+        tune_hyperparameters=bool(tune_hyperparameters),
         tuning_folds=int(tuning_folds),
         tuning_profile=str(tuning_profile),
+        use_regularization=bool(use_regularization),
         optimization_backend=optimization_backend,
         optuna_trials=optuna_trials,
     )
     if isinstance(search_df, pd.DataFrame) and not search_df.empty:
         search_df = search_df.copy()
         search_df.insert(0, "rf_top_k", int(len(selected_cols)))
+    balancing_meta = dict(search_meta.get("final_balancing_meta") or {})
 
     y_pred = best_model.predict(X_test_imp[selected_cols])
     y_score = _predict_model_scores(best_model, X_test_imp[selected_cols])
@@ -5579,6 +6731,8 @@ def _train_rf_xgb_shared_holdout(
             "rf_top_k": int(len(selected_cols)),
             "tuning_profile": str(tuning_profile),
             "tuning_folds": int(tuning_folds),
+            "use_regularization": bool(use_regularization),
+            "best_cv_score": best_score,
             "optimization_backend": str(search_meta.get("backend") or _paper_normalize_optimization_backend(optimization_backend)),
             "requested_optimization_backend": str(search_meta.get("requested_backend") or _paper_normalize_optimization_backend(optimization_backend)),
             "optuna_trials_requested": int(search_meta.get("optuna_trials_requested") or 0),
@@ -5587,6 +6741,7 @@ def _train_rf_xgb_shared_holdout(
         "metrics": metrics,
         "predictions": np.asarray(y_pred, dtype=int),
         "scores": y_score,
+        "best_cv_score": best_score,
         "optimization": search_meta,
     }
 
@@ -5828,7 +6983,7 @@ def train_model_comparison_holdout(
         raise ValueError("No hay variables disponibles para entrenar.")
     max_features = _candidate_feature_caps(
         len(feature_cols),
-        max_features=min(int(max_features_per_model), 100),
+        max_features=int(max_features_per_model),
     )[0]
     if progress_callback:
         progress_callback(5, "Preparando split holdout compartido...")
@@ -5972,7 +7127,9 @@ def _paper_model_summary_df(model_results: Sequence[Dict[str, object]]) -> pd.Da
                 "recall": float(metrics.get("recall") or 0.0),
                 "f1_score": float(metrics.get("f1_score") or 0.0),
                 "roc_auc": float(metrics.get("roc_auc")) if not pd.isna(metrics.get("roc_auc")) else np.nan,
+                "validation_score": float(metrics.get("validation_score") or 0.0),
                 "false_negatives_positive_class": int(metrics.get("false_negatives_positive_class") or 0),
+                "false_negatives_pct": float(metrics.get("false_negative_rate_positive_class") or 0.0) * 100.0,
                 "no_marc_precision": float((class_metrics.get("0") or {}).get("precision") or 0.0),
                 "no_marc_recall": float((class_metrics.get("0") or {}).get("recall") or 0.0),
                 "no_marc_f1": float((class_metrics.get("0") or {}).get("f1_score") or 0.0),
@@ -5984,11 +7141,61 @@ def _paper_model_summary_df(model_results: Sequence[Dict[str, object]]) -> pd.Da
     return pd.DataFrame(rows)
 
 
+def _paper_model_k_metrics_df(model_results: Sequence[Dict[str, object]]) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for result in model_results:
+        model_code = str(result.get("model_code") or "")
+        model_title = str(result.get("model_title") or model_code)
+        feature_group = str(result.get("feature_group") or "")
+        candidate_feature_count = int(result.get("candidate_feature_count") or 0)
+        selected_k = int(result.get("selected_k") or 0)
+        k_search_df = result.get("k_search_df")
+        if not isinstance(k_search_df, pd.DataFrame) or k_search_df.empty:
+            continue
+        ordered = k_search_df.copy()
+        if "k" in ordered.columns:
+            ordered = ordered.sort_values("k", ascending=True).reset_index(drop=True)
+        for row in ordered.to_dict(orient="records"):
+            k_value = pd.to_numeric(row.get("k"), errors="coerce")
+            if pd.isna(k_value):
+                continue
+            resolved_k = int(k_value)
+            rows.append(
+                {
+                    "model_code": model_code,
+                    "model_title": model_title,
+                    "feature_group": feature_group,
+                    "candidate_feature_count": candidate_feature_count,
+                    "selected_k": selected_k,
+                    "is_selected_k": bool(resolved_k == selected_k),
+                    "selection_mode": row.get("selection_mode")
+                    or ("best_validation_score" if resolved_k == selected_k else "candidate"),
+                    "k": resolved_k,
+                    "accuracy": pd.to_numeric(row.get("accuracy"), errors="coerce"),
+                    "precision": pd.to_numeric(row.get("precision"), errors="coerce"),
+                    "recall": pd.to_numeric(row.get("recall"), errors="coerce"),
+                    "f1_score": pd.to_numeric(row.get("f1_score"), errors="coerce"),
+                    "roc_auc": pd.to_numeric(row.get("roc_auc"), errors="coerce"),
+                    "false_negatives_pct": pd.to_numeric(row.get("false_negatives_pct"), errors="coerce"),
+                    "validation_score": pd.to_numeric(row.get("validation_score"), errors="coerce"),
+                    "training_time_sec": pd.to_numeric(row.get("training_time_sec"), errors="coerce"),
+                    "optimization_backend": row.get("optimization_backend"),
+                    "requested_optimization_backend": row.get("requested_optimization_backend"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def _paper_metricas_table_df(model_results: Sequence[Dict[str, object]]) -> pd.DataFrame:
     records: List[Dict[str, object]] = []
     summary_df = _paper_model_summary_df(model_results)
     if summary_df.empty:
         return pd.DataFrame()
+    model_cols = [
+        str(model_code)
+        for model_code in summary_df["model_code"].astype(str).tolist()
+        if str(model_code).strip()
+    ]
     code_to_row = {
         str(row["model_code"]): row
         for row in summary_df.to_dict(orient="records")
@@ -5997,9 +7204,10 @@ def _paper_metricas_table_df(model_results: Sequence[Dict[str, object]]) -> pd.D
         {
             "class_label": "All",
             "metric": "False negatives",
-            "M1": int(code_to_row.get("M1", {}).get("false_negatives_positive_class", 0)),
-            "M2": int(code_to_row.get("M2", {}).get("false_negatives_positive_class", 0)),
-            "M3": int(code_to_row.get("M3", {}).get("false_negatives_positive_class", 0)),
+            **{
+                model_code: int(code_to_row.get(model_code, {}).get("false_negatives_positive_class", 0))
+                for model_code in model_cols
+            },
         }
     )
     metric_keys = [
@@ -6013,9 +7221,10 @@ def _paper_metricas_table_df(model_results: Sequence[Dict[str, object]]) -> pd.D
                 {
                     "class_label": class_label,
                     "metric": metric_label,
-                    "M1": float(code_to_row.get("M1", {}).get(f"{prefix}_{suffix}", 0.0)),
-                    "M2": float(code_to_row.get("M2", {}).get(f"{prefix}_{suffix}", 0.0)),
-                    "M3": float(code_to_row.get("M3", {}).get(f"{prefix}_{suffix}", 0.0)),
+                    **{
+                        model_code: float(code_to_row.get(model_code, {}).get(f"{prefix}_{suffix}", 0.0))
+                        for model_code in model_cols
+                    },
                 }
             )
     return pd.DataFrame(records)
@@ -6047,21 +7256,35 @@ def _paper_merge_predictions(model_results: Sequence[Dict[str, object]]) -> pd.D
 def _paper_gridsearch_tex(grid_df: pd.DataFrame) -> str:
     if grid_df is None or grid_df.empty:
         return "% No hay resultados para gridsearch_k.tex\n"
-    ordered = grid_df.sort_values("k", ascending=True).reset_index(drop=True)
-    lines = [
-        "\\begin{tabular}{rrrrrr}",
-        "\\toprule",
-        "$k$ & Accuracy & F1 global & FNR (\\%) & Score$_{val}$ & Training time (s) \\\\",
-        "\\midrule",
-    ]
+    has_model_column = "model_code" in grid_df.columns or "model_title" in grid_df.columns
+    sort_cols = ["k"] if not has_model_column else [col for col in ["model_code", "k"] if col in grid_df.columns]
+    ordered = grid_df.sort_values(sort_cols, ascending=True).reset_index(drop=True)
+    if has_model_column:
+        lines = [
+            "\\begin{tabular}{lrrrrrr}",
+            "\\toprule",
+            "Model & $k$ & CV Accuracy & CV F1 global & FNR (\\%) & Score$_{val}$ & Training time (s) \\\\",
+            "\\midrule",
+        ]
+    else:
+        lines = [
+            "\\begin{tabular}{rrrrrr}",
+            "\\toprule",
+            "$k$ & CV Accuracy & CV F1 global & FNR (\\%) & Score$_{val}$ & Training time (s) \\\\",
+            "\\midrule",
+        ]
     for row in ordered.to_dict(orient="records"):
+        prefix = ""
+        if has_model_column:
+            prefix = f"{str(row.get('model_code') or row.get('model_title') or '')} & "
         lines.append(
-            f"{int(row['k'])} & "
-            f"{float(row['accuracy']):.3f} & "
-            f"{float(row['f1_score']):.3f} & "
-            f"{float(row['false_negatives_pct']):.2f} & "
-            f"{float(row['validation_score']):.3f} & "
-            f"{int(round(float(row['training_time_sec'])))} \\\\"
+            prefix
+            + f"{int(row['k'])} & "
+            + f"{float(row['accuracy']):.3f} & "
+            + f"{float(row['f1_score']):.3f} & "
+            + f"{float(row['false_negatives_pct']):.2f} & "
+            + f"{float(row['validation_score']):.3f} & "
+            + f"{int(round(float(row['training_time_sec'])))} \\\\"
         )
     lines.extend(["\\bottomrule", "\\end{tabular}"])
     return "\n".join(lines) + "\n"
@@ -6070,53 +7293,474 @@ def _paper_gridsearch_tex(grid_df: pd.DataFrame) -> str:
 def _paper_metricas_tex(metricas_df: pd.DataFrame) -> str:
     if metricas_df is None or metricas_df.empty:
         return "% No hay resultados para metricas_modelos.tex\n"
+    model_cols = [col for col in metricas_df.columns if col not in {"class_label", "metric"}]
+    if not model_cols:
+        return "% No hay columnas de modelos para metricas_modelos.tex\n"
     lines = [
-        "\\begin{tabular}{llccc}",
+        f"\\begin{{tabular}}{{ll{'c' * len(model_cols)}}}",
         "\\toprule",
-        "\\textbf{Class} & \\textbf{Metrics} & \\textbf{M1} & \\textbf{M2} & \\textbf{M3} \\\\",
+        "\\textbf{Class} & \\textbf{Metrics} & "
+        + " & ".join(f"\\textbf{{{model_col}}}" for model_col in model_cols)
+        + " \\\\",
         "\\midrule",
     ]
     wrote_class_separator = False
     for row in metricas_df.to_dict(orient="records"):
         class_label = str(row.get("class_label") or "")
         metric = str(row.get("metric") or "")
-        m1_value = row.get("M1")
-        m2_value = row.get("M2")
-        m3_value = row.get("M3")
+        values = [row.get(model_col) for model_col in model_cols]
         if metric == "False negatives":
             lines.append(
                 f"\\multicolumn{{2}}{{l}}{{False negatives}} & "
-                f"{int(m1_value)} & {int(m2_value)} & {int(m3_value)} \\\\"
+                + " & ".join(str(int(value or 0)) for value in values)
+                + " \\\\"
             )
             continue
         if not wrote_class_separator:
             lines.append("\\addlinespace")
-            lines.append("\\multicolumn{5}{l}{\\emph{Performance by class}}\\\\")
+            lines.append(f"\\multicolumn{{{2 + len(model_cols)}}}{{l}}{{\\emph{{Performance by class}}}}\\\\")
             wrote_class_separator = True
         lines.append(
             f"{class_label} & {metric} & "
-            f"{float(m1_value):.2f} & {float(m2_value):.2f} & {float(m3_value):.2f} \\\\"
+            + " & ".join(f"{float(value or 0.0):.2f}" for value in values)
+            + " \\\\"
         )
     lines.extend(["\\bottomrule", "\\end{tabular}"])
     return "\n".join(lines) + "\n"
 
 
-def _paper_plot_k_search(grid_df: pd.DataFrame, output_dir: Path) -> Dict[str, Path]:
+def _paper_holdout_metric_note(
+    summary_df: pd.DataFrame,
+    *,
+    metric: str,
+    model_column: Optional[str],
+    scale: float,
+    suffix: str = "",
+) -> str:
+    if summary_df is None or summary_df.empty or model_column is None or metric not in summary_df.columns:
+        return ""
+    if "selected_k" not in summary_df.columns:
+        return ""
+    rows: List[str] = []
+    for row in summary_df.to_dict(orient="records"):
+        value = pd.to_numeric(row.get(metric), errors="coerce")
+        selected_k = pd.to_numeric(row.get("selected_k"), errors="coerce")
+        if pd.isna(value) or pd.isna(selected_k):
+            continue
+        label = str(row.get(model_column) or row.get("model_code") or "model")
+        rows.append(f"{label}: {float(value) * float(scale):.2f}{suffix} at k*={int(selected_k)}")
+    if not rows:
+        return ""
+    return "Final holdout:\n" + "\n".join(rows)
+
+
+def _paper_resolve_scoring_metric(scoring_metric: Optional[object] = None) -> str:
+    resolved = str(scoring_metric or PAPER_SCORING_METRIC_DEFAULT).strip()
+    if resolved not in PAPER_SCORING_METRICS:
+        return str(PAPER_SCORING_METRIC_DEFAULT)
+    return resolved
+
+
+def _paper_scoring_metric_chart_label(scoring_metric: Optional[object] = None) -> str:
+    resolved = _paper_resolve_scoring_metric(scoring_metric)
+    label = str(PAPER_SCORING_METRIC_LABELS.get(resolved, resolved)).strip()
+    if label == "F1":
+        return "F1 Score"
+    return label
+
+
+def _paper_validation_chart_ylabel(scoring_metric: Optional[object] = None) -> str:
+    return f"Best inner-CV {_paper_scoring_metric_chart_label(scoring_metric)}"
+
+
+def _paper_validation_chart_title(scoring_metric: Optional[object] = None) -> str:
+    return f"{_paper_validation_chart_ylabel(scoring_metric)} vs Number of Metrics (k)"
+
+
+def _paper_outer_cv_chart_title(metric_name: str) -> str:
+    return f"{metric_name} nested CV (outer folds) vs Number of Metrics (k)"
+
+
+def _paper_history_k_chart_specs(scoring_metric: Optional[object] = None) -> List[Dict[str, object]]:
+    validation_metric_label = _paper_validation_chart_ylabel(scoring_metric)
+    return [
+        {
+            "metric": "false_negatives_pct",
+            "ylabel": "False Negative Rate (%)",
+            "title": _paper_outer_cv_chart_title("False Negative Rate"),
+            "scale": 1.0,
+            "suffix": "%",
+            "clamp_zero": True,
+        },
+        {
+            "metric": "accuracy",
+            "ylabel": "Accuracy (%)",
+            "title": _paper_outer_cv_chart_title("Accuracy"),
+            "scale": 100.0,
+            "suffix": "%",
+            "clamp_zero": False,
+        },
+        {
+            "metric": "f1_score",
+            "ylabel": "F1 Score (%)",
+            "title": _paper_outer_cv_chart_title("F1 Score"),
+            "scale": 100.0,
+            "suffix": "%",
+            "clamp_zero": False,
+        },
+        {
+            "metric": "validation_score",
+            "ylabel": validation_metric_label,
+            "title": _paper_validation_chart_title(scoring_metric),
+            "scale": 1.0,
+            "suffix": "",
+            "clamp_zero": False,
+        },
+    ]
+
+
+def _paper_replication_metric_interpretation_md(scoring_metric: Optional[object] = None) -> str:
+    scoring_label = _paper_scoring_metric_chart_label(scoring_metric)
+    validation_label = _paper_validation_chart_ylabel(scoring_metric)
+    return "\n".join(
+        [
+            "**Como interpretar estos graficos**",
+            "",
+            "Cada curva resume el comportamiento del pipeline cuando cambia `k`, donde `k` es el numero de variables retenidas despues del ranking RF previo al ajuste de XGBoost. Cada punto corresponde a un valor concreto de `k` evaluado para este modelo y esta ruta.",
+            "",
+            "Metodologicamente, para cada `k` se fija primero el subconjunto top-`k`, luego se ejecuta `nested CV`: en cada fold externo se optimizan hiperparametros de `XGBoost + SMOTE` usando solo el bloque de entrenamiento de ese fold, y recien despues se evalua en el bloque externo. Eso evita mezclar tuning y evaluacion.",
+            "",
+            "**False Negative Rate nested CV (outer folds)**. Esta curva muestra el promedio, sobre los folds externos, de la tasa de falsos negativos de la clase positiva (`MARC`, clase `1`). En esta implementacion la tasa se calcula como `FN de la clase positiva / total de observaciones del fold`, multiplicado por 100. No es la definicion clasica condicional `FN / (TP + FN)`. Su lectura practica es: que porcentaje del conjunto externo termina siendo un caso severo perdido por el modelo. Cuanto mas bajo, mejor.",
+            "",
+            "**Accuracy nested CV (outer folds)**. Mide la proporcion total de predicciones correctas sobre el fold externo: `(TP + TN) / N`. Es una señal global de desempeño, pero conviene no interpretarla sola. Un modelo puede subir `Accuracy` y aun asi perder demasiados positivos; por eso hay que contrastarla con `False Negative Rate` y `F1`.",
+            "",
+            "**F1 Score nested CV (outer folds)**. En este problema binario se calcula como `F1` binario sobre la clase positiva (`1`), siguiendo `sklearn` con `average='binary'`. Resume el compromiso entre `precision` y `recall` para la clase severa. Cuando `F1` sube y `False Negative Rate` baja, hay evidencia mas solida de mejora real en la clase de interes.",
+            "",
+            f"**{validation_label}**. Esta curva no proviene del fold externo. Para cada `k` y para cada fold externo, el pipeline busca internamente la mejor configuracion de `XGBoost + SMOTE` maximizando `{scoring_label}` en la CV interna. Lo que se grafica aqui es el promedio de esos mejores scores internos. Por eso esta curva describe la calidad del proceso de optimizacion interna para ese `k`, no la generalizacion honesta fuera de muestra.",
+            "",
+            f"En esta replica, `k*` se selecciona por el mayor valor de `{validation_label}`. Si hay empate, se elige el menor `k`. Por eso este cuarto grafico es el criterio de seleccion del pipeline, mientras que los tres primeros son los que mejor reflejan el rendimiento esperado al generalizar.",
+            "",
+            "**Como leerlos en conjunto**. Un `k` atractivo deberia combinar `F1` externo alto, `False Negative Rate` externo bajo, `Accuracy` externa estable y una curva de optimizacion interna que no mejore de forma aislada. Si el score interno sube pero `F1` externo no mejora o el `False Negative Rate` empeora, eso sugiere que el tuning encuentra soluciones mas favorables dentro de la CV interna, pero no necesariamente mas robustas fuera de muestra.",
+            "",
+            "**Lectura recomendada**. Para este problema, conviene priorizar primero la reduccion de perdidas de positivos (`False Negative Rate`), luego la mejora de `F1` sobre la clase severa y, solo como señal complementaria, la `Accuracy`. El cuarto grafico debe interpretarse como una ayuda para entender y justificar la seleccion de `k*`, no como sustituto de las metricas externas.",
+        ]
+    )
+
+
+def _paper_chart_axis_range(
+    values: pd.Series,
+    *,
+    clamp_zero: bool = False,
+) -> Optional[List[float]]:
+    numeric = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if numeric.empty:
+        return None
+    min_value = float(numeric.min())
+    max_value = float(numeric.max())
+    span = max_value - min_value
+    if math.isclose(span, 0.0):
+        if max_value >= 50:
+            padding = 0.75
+        elif max_value >= 2:
+            padding = 0.15
+        else:
+            padding = 0.003
+    else:
+        if max_value >= 50:
+            padding_floor = 0.75
+        elif max_value >= 2:
+            padding_floor = 0.15
+        else:
+            padding_floor = 0.003
+        padding = max(span * 0.12, padding_floor)
+    lower = min_value - padding
+    upper = max_value + padding
+    if clamp_zero:
+        lower = max(0.0, lower)
+    if math.isclose(lower, upper):
+        upper = lower + (0.75 if max_value >= 50 else 0.15 if max_value >= 2 else 0.003)
+    return [float(lower), float(upper)]
+
+
+def _paper_general_trendline(x_values: Sequence[object], y_values: Sequence[object]) -> pd.Series:
+    x_numeric = pd.to_numeric(pd.Series(list(x_values)), errors="coerce")
+    y_numeric = pd.to_numeric(pd.Series(list(y_values)), errors="coerce")
+    valid_mask = x_numeric.notna() & y_numeric.notna()
+    if not valid_mask.any():
+        return pd.Series(dtype=float)
+
+    x = x_numeric.loc[valid_mask].to_numpy(dtype=float)
+    y = y_numeric.loc[valid_mask].to_numpy(dtype=float)
+    if len(x) < 3 or np.allclose(x, x[0]):
+        return pd.Series(y.astype(float))
+
+    x_scaled = np.log1p(x)
+    n_obs = len(x_scaled)
+    neighborhood = min(
+        n_obs,
+        max(3, 5 if n_obs >= 5 else 3, int(math.ceil(n_obs * 0.65))),
+    )
+
+    def _local_linear_fit(extra_weights: Optional[np.ndarray] = None) -> np.ndarray:
+        fitted = np.empty(n_obs, dtype=float)
+        for idx, x0 in enumerate(x_scaled):
+            distances = np.abs(x_scaled - x0)
+            bandwidth_idx = min(n_obs - 1, neighborhood - 1)
+            bandwidth = float(np.partition(distances, bandwidth_idx)[bandwidth_idx])
+            if bandwidth <= 1e-12:
+                positive_distances = distances[distances > 0]
+                bandwidth = float(positive_distances.min()) if positive_distances.size else 1.0
+            scaled_distances = np.clip(distances / bandwidth, 0.0, None)
+            base_weights = np.where(
+                scaled_distances < 1.0,
+                (1.0 - np.power(scaled_distances, 3.0)) ** 3.0,
+                0.0,
+            )
+            if extra_weights is not None:
+                base_weights = base_weights * extra_weights
+            if not np.isfinite(base_weights).any() or float(base_weights.sum()) <= 1e-12:
+                base_weights = np.ones(n_obs, dtype=float)
+            centered_x = x_scaled - x0
+            design = np.column_stack([np.ones(n_obs, dtype=float), centered_x])
+            sqrt_weights = np.sqrt(base_weights)
+            weighted_design = design * sqrt_weights[:, None]
+            weighted_target = y * sqrt_weights
+            try:
+                beta, *_ = np.linalg.lstsq(weighted_design, weighted_target, rcond=None)
+                fitted[idx] = float(beta[0])
+            except np.linalg.LinAlgError:
+                fitted[idx] = float(np.average(y, weights=base_weights))
+        return fitted
+
+    fitted = _local_linear_fit()
+    if n_obs >= 5:
+        residuals = y - fitted
+        mad = float(np.median(np.abs(residuals)))
+        if mad > 1e-12:
+            robust_scale = 6.0 * 1.4826 * mad
+            robust_u = residuals / robust_scale
+            robust_weights = np.where(
+                np.abs(robust_u) < 1.0,
+                (1.0 - np.power(robust_u, 2.0)) ** 2.0,
+                0.0,
+            )
+            fitted = _local_linear_fit(robust_weights)
+
+    return pd.Series(fitted, dtype=float)
+
+
+def _paper_build_interactive_k_chart(
+    grid_df: pd.DataFrame,
+    *,
+    metric: str,
+    ylabel: str,
+    title: str,
+    scale: float,
+    suffix: str = "",
+    clamp_zero: bool = False,
+) -> go.Figure:
+    frame = grid_df.copy() if isinstance(grid_df, pd.DataFrame) else pd.DataFrame()
+    if not frame.empty:
+        frame["k"] = pd.to_numeric(frame.get("k"), errors="coerce")
+        frame[metric] = pd.to_numeric(frame.get(metric), errors="coerce")
+        frame = frame.dropna(subset=["k", metric]).sort_values("k", ascending=True).reset_index(drop=True)
+
+    fig = go.Figure()
+    if frame.empty:
+        fig.add_annotation(
+            text="No data",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font={"size": 16, "color": "#666666"},
+        )
+        tick_values: List[int] = []
+        y_axis_range = None
+    else:
+        y_values = pd.to_numeric(frame[metric], errors="coerce") * float(scale)
+        tick_values = [int(value) for value in frame["k"].tolist()]
+        y_axis_range = _paper_chart_axis_range(y_values, clamp_zero=clamp_zero)
+        trend_values = _paper_general_trendline(frame["k"], y_values)
+        fig.add_trace(
+            go.Scatter(
+                x=tick_values,
+                y=trend_values,
+                mode="lines",
+                showlegend=False,
+                hoverinfo="skip",
+                line={
+                    "color": "rgba(150, 150, 150, 0.95)",
+                    "width": 1.35,
+                    "dash": "dash",
+                    "shape": "spline",
+                    "smoothing": 0.9,
+                },
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=tick_values,
+                y=y_values,
+                mode="lines+markers",
+                showlegend=False,
+                line={
+                    "color": "#3F3F3F",
+                    "width": 2.4,
+                    "shape": "spline",
+                    "smoothing": 1.1,
+                },
+                marker={
+                    "size": 10,
+                    "color": "#F4B13D",
+                    "line": {"color": "#F4B13D", "width": 1},
+                },
+                hovertemplate=(
+                    "k=%{x}<br>"
+                    + f"{ylabel}: "
+                    + ("%{y:.2f}" if scale == 1.0 else "%{y:.2f}")
+                    + f"{suffix}<extra></extra>"
+                ),
+            )
+        )
+
+    fig.update_layout(
+        title={"text": f"<b>{title}</b>", "x": 0.5, "xanchor": "center"},
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=430,
+        margin={"l": 20, "r": 20, "t": 72, "b": 20},
+        showlegend=False,
+        hovermode="closest",
+        font={"size": 14, "color": "#111111"},
+    )
+    fig.update_xaxes(
+        title="Number of Metrics (k)",
+        tickmode="array" if tick_values else "auto",
+        tickvals=tick_values if tick_values else None,
+        showgrid=True,
+        gridcolor="rgba(180, 180, 180, 0.32)",
+        gridwidth=1,
+        zeroline=False,
+        showline=True,
+        linecolor="rgba(0, 0, 0, 0.65)",
+    )
+    fig.update_yaxes(
+        title=ylabel,
+        range=y_axis_range,
+        showgrid=True,
+        gridcolor="rgba(180, 180, 180, 0.32)",
+        gridwidth=1,
+        zeroline=False,
+        showline=True,
+        linecolor="rgba(0, 0, 0, 0.65)",
+    )
+    return fig
+
+
+def _paper_plot_k_search(
+    grid_df: pd.DataFrame,
+    output_dir: Path,
+    *,
+    summary_df: Optional[pd.DataFrame] = None,
+    scoring_metric: Optional[object] = None,
+) -> Dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     file_map: Dict[str, Path] = {}
+    validation_metric_label = _paper_validation_chart_ylabel(scoring_metric)
     metric_specs = [
-        ("accuracy", "Accuracy", "accuracy_vs_k.png"),
-        ("f1_score", "F1 global", "f1_score_vs_k.png"),
-        ("false_negatives_pct", "False Negative Rate (%)", "false_negatives_pct_vs_k.png"),
-        ("validation_score", "Validation score", "validation_score_vs_k.png"),
+        (
+            "accuracy",
+            "Accuracy (%)",
+            _paper_outer_cv_chart_title("Accuracy"),
+            "accuracy_vs_k.png",
+            100.0,
+            "accuracy",
+            "%",
+        ),
+        (
+            "f1_score",
+            "F1 Score (%)",
+            _paper_outer_cv_chart_title("F1 Score"),
+            "f1_score_vs_k.png",
+            100.0,
+            "f1_score",
+            "%",
+        ),
+        (
+            "false_negatives_pct",
+            "False Negative Rate (%)",
+            _paper_outer_cv_chart_title("False Negative Rate"),
+            "false_negatives_pct_vs_k.png",
+            1.0,
+            "false_negatives_pct",
+            "%",
+        ),
+        (
+            "validation_score",
+            validation_metric_label,
+            _paper_validation_chart_title(scoring_metric),
+            "validation_score_vs_k.png",
+            1.0,
+            None,
+            "",
+        ),
     ]
-    for metric, ylabel, filename in metric_specs:
+    frame = grid_df.copy() if isinstance(grid_df, pd.DataFrame) else pd.DataFrame()
+    final_frame = summary_df.copy() if isinstance(summary_df, pd.DataFrame) else pd.DataFrame()
+    model_column = "model_title" if "model_title" in frame.columns else ("model_code" if "model_code" in frame.columns else None)
+    final_model_column = (
+        "model_title"
+        if "model_title" in final_frame.columns
+        else ("model_code" if "model_code" in final_frame.columns else model_column)
+    )
+    for metric, ylabel, title, filename, scale, holdout_metric, note_suffix in metric_specs:
         fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(grid_df["k"], grid_df[metric], marker="o")
-        ax.set_xlabel("k")
+        if not frame.empty and "k" in frame.columns and metric in frame.columns:
+            if model_column is not None and frame[model_column].nunique(dropna=True) > 1:
+                for model_name, subset in frame.groupby(model_column, dropna=False):
+                    ordered_subset = subset.sort_values("k", ascending=True)
+                    ax.plot(
+                        ordered_subset["k"],
+                        pd.to_numeric(ordered_subset[metric], errors="coerce") * float(scale),
+                        marker="o",
+                        label=str(model_name),
+                    )
+                ax.legend(title="Model")
+            else:
+                ordered_frame = frame.sort_values("k", ascending=True)
+                ax.plot(
+                    ordered_frame["k"],
+                    pd.to_numeric(ordered_frame[metric], errors="coerce") * float(scale),
+                    marker="o",
+                )
+        else:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlabel("Number of Metrics (k)")
         ax.set_ylabel(ylabel)
-        ax.set_title(f"{ylabel} vs k")
+        ax.set_title(title)
         ax.grid(alpha=0.25)
+        holdout_note = ""
+        if holdout_metric:
+            holdout_note = _paper_holdout_metric_note(
+                final_frame,
+                metric=holdout_metric,
+                model_column=final_model_column,
+                scale=float(scale),
+                suffix=note_suffix,
+            )
+        if holdout_note:
+            ax.text(
+                0.02,
+                0.98,
+                holdout_note,
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=8,
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "#cccccc"},
+            )
         path = output_dir / filename
         fig.tight_layout()
         fig.savefig(path, dpi=300, bbox_inches="tight")
@@ -6131,15 +7775,17 @@ def _paper_plot_metrics(metricas_df: pd.DataFrame, output_dir: Path) -> Path:
     if filtered.empty:
         raise ValueError("No hay metricas por clase para graficar.")
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    model_cols = ["M1", "M2", "M3"]
+    model_cols = [col for col in filtered.columns if col not in {"class_label", "metric"}]
+    if not model_cols:
+        raise ValueError("No hay columnas de modelos para graficar.")
     x_labels = filtered["metric"].drop_duplicates().tolist()
-    width = 0.22
+    width = min(0.8 / max(1, len(model_cols)), 0.25)
     x_base = np.arange(len(x_labels))
     for ax_idx, (class_label, ax) in enumerate(zip(["No-MARC", "MARC"], axes)):
         subset = filtered[filtered["class_label"] == class_label].reset_index(drop=True)
         for model_idx, model_col in enumerate(model_cols):
             ax.bar(
-                x_base + (model_idx - 1) * width,
+                x_base + (model_idx - ((len(model_cols) - 1) / 2.0)) * width,
                 subset[model_col].to_numpy(dtype=float),
                 width=width,
                 label=model_col if ax_idx == 0 else None,
@@ -6412,25 +8058,28 @@ def _paper_build_raw_dataset(
             _paper_mark_step_running(
                 paths,
                 manifest,
-                selection_step_id,
-                stage="raw_build",
-                description="Seleccion supervisada de embeddings",
-                message="Rankeando embeddings con RF.",
-            )
+                    selection_step_id,
+                    stage="raw_build",
+                    description="Ranking supervisado de embeddings",
+                    message="Rankeando embeddings con RF y conservando todas las dimensiones.",
+                )
         ranking_embed_df = run_embedding_rf_analysis(embeddings_df, embed_cols)
-        selected_embedding_cols = _select_top_embedding_features(
-            ranking_embed_df,
-            top_k=int(PAPER_EXPECTED_COUNTS["embedding_features"]),
-        )
+        selected_embedding_cols = [
+            str(value)
+            for value in ranking_embed_df["variable"].tolist()
+            if isinstance(value, str) and value.startswith("emb_")
+        ]
         if not selected_embedding_cols:
-            error = PaperReplicationBlockedError("No se pudieron seleccionar embeddings supervisados para la ruta raw.")
+            selected_embedding_cols = list(embed_cols)
+        if not selected_embedding_cols:
+            error = PaperReplicationBlockedError("No se encontraron embeddings disponibles para la ruta raw.")
             if paths is not None and manifest is not None:
                 _paper_mark_step_blocked(
                     paths,
                     manifest,
                     selection_step_id,
                     stage="raw_build",
-                    description="Seleccion supervisada de embeddings",
+                    description="Ranking supervisado de embeddings",
                     message=str(error),
                 )
             raise error
@@ -6439,18 +8088,18 @@ def _paper_build_raw_dataset(
             _atomic_write_json(raw_paths["selected_embedding_cols"], list(selected_embedding_cols))
         if paths is not None and manifest is not None and raw_paths is not None:
             _paper_mark_step_completed(
-                paths,
-                manifest,
-                selection_step_id,
-                stage="raw_build",
-                description="Seleccion supervisada de embeddings",
-                message="Seleccion de embeddings persistida.",
-                artifact_paths={
-                    "embedding_ranking": str(raw_paths["embedding_ranking"]),
-                    "selected_embedding_cols": str(raw_paths["selected_embedding_cols"]),
-                },
-                metadata={"selected_embedding_count": int(len(selected_embedding_cols))},
-            )
+                    paths,
+                    manifest,
+                    selection_step_id,
+                    stage="raw_build",
+                    description="Ranking supervisado de embeddings",
+                    message=f"Ranking persistido. Se conservaran {len(selected_embedding_cols)} embeddings.",
+                    artifact_paths={
+                        "embedding_ranking": str(raw_paths["embedding_ranking"]),
+                        "selected_embedding_cols": str(raw_paths["selected_embedding_cols"]),
+                    },
+                    metadata={"selected_embedding_count": int(len(selected_embedding_cols))},
+                )
 
     if paths is not None and manifest is not None:
         _paper_mark_step_running(
@@ -6461,7 +8110,7 @@ def _paper_build_raw_dataset(
             description="Dataset raw final",
             message="Consolidando dataset raw final.",
         )
-    _emit_progress(progress_callback, 85, "Reduciendo embeddings al bloque textual supervisado del paper.")
+    _emit_progress(progress_callback, 85, "Conservando todas las dimensiones de embeddings en el dataset raw.")
     dataset_df = _build_train_dataset_with_selected_embeddings(
         features_df,
         embeddings_df,
@@ -6517,7 +8166,7 @@ def _paper_build_update_embeddings_dataset(
     Takes the frozen dataset (2070 rows with flow features), matches text_bert
     from the Feature Engineering features_df via accident_id, generates fresh
     embeddings with the current fine-tuned transformer, selects top 200 via
-    RF importance, and assembles the final dataset (flow + new top-200 embeddings).
+    RF importance, and assembles the final dataset (flow + all new embeddings).
     """
     ue_paths = _paper_update_emb_build_paths(paths) if paths is not None else None
     final_step_id = "update_emb.build.dataset"
@@ -6705,7 +8354,7 @@ def _paper_build_update_embeddings_dataset(
             )
         _emit_progress(progress_callback, 60, f"Embeddings generados: {len(embed_cols)} dimensiones.")
 
-    # ── Step 4: Select top-200 embeddings via RF importance ─────────────
+    # ── Step 4: Rank embeddings and keep all dimensions ─────────────────
     selection_step_id = "update_emb.build.embedding_selection"
     if (
         paths is not None
@@ -6720,18 +8369,21 @@ def _paper_build_update_embeddings_dataset(
             _paper_mark_step_running(
                 paths, manifest, selection_step_id,
                 stage="update_emb_build",
-                description="Seleccion supervisada de embeddings (top-200)",
-                message="Rankeando embeddings con RF para seleccionar top-200.",
+                description="Ranking supervisado de embeddings",
+                message="Rankeando embeddings con RF y conservando todas las dimensiones.",
             )
-        _emit_progress(progress_callback, 65, "Rankeando embeddings con RF para seleccionar top-200.")
+        _emit_progress(progress_callback, 65, "Rankeando embeddings con RF y conservando todas las dimensiones.")
         ranking_embed_df = run_embedding_rf_analysis(embeddings_df, embed_cols)
-        selected_embedding_cols = _select_top_embedding_features(
-            ranking_embed_df,
-            top_k=int(PAPER_UPDATE_EMB_TOP_K),
-        )
+        selected_embedding_cols = [
+            str(value)
+            for value in ranking_embed_df["variable"].tolist()
+            if isinstance(value, str) and value.startswith("emb_")
+        ]
+        if not selected_embedding_cols:
+            selected_embedding_cols = list(embed_cols)
         if not selected_embedding_cols:
             raise PaperReplicationBlockedError(
-                "No se pudieron seleccionar embeddings supervisados para la ruta update-emb."
+                "No se encontraron embeddings disponibles para la ruta update-emb."
             )
         if ue_paths is not None:
             _atomic_write_pickle(ranking_embed_df, ue_paths["embedding_ranking"])
@@ -6740,17 +8392,17 @@ def _paper_build_update_embeddings_dataset(
             _paper_mark_step_completed(
                 paths, manifest, selection_step_id,
                 stage="update_emb_build",
-                description="Seleccion supervisada de embeddings (top-200)",
-                message=f"Top-{len(selected_embedding_cols)} embeddings seleccionados.",
+                description="Ranking supervisado de embeddings",
+                message=f"Ranking persistido. Se conservaran {len(selected_embedding_cols)} embeddings.",
                 artifact_paths={
                     "embedding_ranking": str(ue_paths["embedding_ranking"]),
                     "selected_embedding_cols": str(ue_paths["selected_embedding_cols"]),
                 },
                 metadata={"selected_embedding_count": int(len(selected_embedding_cols))},
             )
-        _emit_progress(progress_callback, 75, f"Top-{len(selected_embedding_cols)} embeddings seleccionados.")
+        _emit_progress(progress_callback, 75, f"Se conservaran {len(selected_embedding_cols)} embeddings.")
 
-    # ── Step 5: Assemble final dataset (frozen flow + new top-200 emb) ──
+    # ── Step 5: Assemble final dataset (frozen flow + all new emb) ──────
     if paths is not None and manifest is not None:
         _paper_mark_step_running(
             paths, manifest, final_step_id,
@@ -6819,7 +8471,12 @@ def _paper_run_route(
     dataset_df: pd.DataFrame,
     route_metadata: Optional[Dict[str, object]] = None,
     k_grid: Optional[Sequence[object]] = None,
+    k_grid_mode: Optional[object] = None,
+    k_grid_interval: Optional[object] = None,
+    selected_models: Optional[Sequence[object]] = None,
     cv_folds: Optional[object] = None,
+    xgb_tuning_profile: Optional[object] = None,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
     scoring_metric: Optional[str] = None,
@@ -6829,7 +8486,8 @@ def _paper_run_route(
 ) -> Dict[str, object]:
     route_paths = _paper_route_paths(paths, route_name) if paths is not None else None
     dataset_step_id = f"{route_name}.dataset_validation"
-    final_step_ids = [f"{route_name}.{model_code}.final" for model_code in PAPER_PROTOCOL["feature_groups"]]
+    selected_model_codes = _paper_normalize_model_selection(selected_models)
+    final_step_ids = [f"{route_name}.{model_code}.final" for model_code in selected_model_codes]
     if (
         route_paths is not None
         and manifest is not None
@@ -6878,17 +8536,13 @@ def _paper_run_route(
         5,
         f"{route_name}: dataset validado ({int(dataset_validation.get('rows') or 0)} filas).",
     )
-    feature_group_map = {str(model_code): str(feature_group) for model_code, feature_group in PAPER_PROTOCOL["feature_groups"].items()}
-    shared_k_grid = _paper_shared_k_search_grid(work, k_grid=k_grid)
-    execution_order = [model_code for model_code in ["M3", "M1", "M2"] if model_code in feature_group_map]
-    execution_order.extend(
-        model_code
-        for model_code in feature_group_map
-        if model_code not in execution_order
-    )
+    feature_group_map = {
+        str(model_code): str(PAPER_PROTOCOL["feature_groups"][str(model_code)])
+        for model_code in selected_model_codes
+    }
+    execution_order = list(selected_model_codes)
     total_models = max(1, len(execution_order))
     model_results_by_code: Dict[str, Dict[str, object]] = {}
-    shared_selected_k: Optional[int] = None
     for idx, model_code in enumerate(execution_order, start=1):
         feature_group = feature_group_map[str(model_code)]
         model_start = 5 + int(round(((idx - 1) / total_models) * 90))
@@ -6902,10 +8556,13 @@ def _paper_run_route(
             work,
             model_code=str(model_code),
             feature_group=str(feature_group),
-            k_grid=shared_k_grid if str(model_code) == "M3" else None,
-            forced_selected_k=shared_selected_k if str(model_code) != "M3" else None,
+            k_grid=k_grid,
+            k_grid_mode=k_grid_mode,
+            k_grid_interval=k_grid_interval,
             cv_folds=cv_folds,
             random_state=int(PAPER_PROTOCOL["random_state"]),
+            xgb_tuning_profile=xgb_tuning_profile,
+            use_regularization=bool(use_regularization),
             optimization_backend=optimization_backend,
             optuna_trials=optuna_trials,
             scoring_metric=scoring_metric,
@@ -6920,13 +8577,18 @@ def _paper_run_route(
             ),
         )
         model_results_by_code[str(model_code)] = model_result
-        if str(model_code) == "M3":
-            shared_selected_k = int(model_result.get("selected_k") or 0)
     model_results = [
         model_results_by_code[str(model_code)]
-        for model_code in PAPER_PROTOCOL["feature_groups"]
+        for model_code in selected_model_codes
         if str(model_code) in model_results_by_code
     ]
+    k_metrics_df = _paper_model_k_metrics_df(model_results)
+    m3_grid_df = pd.DataFrame()
+    if isinstance(k_metrics_df, pd.DataFrame) and not k_metrics_df.empty and "model_code" in k_metrics_df.columns:
+        m3_grid_df = (
+            k_metrics_df.loc[k_metrics_df["model_code"].astype(str).eq("M3")]
+            .reset_index(drop=True)
+        )
     _emit_progress(progress_callback, 96, f"{route_name}: consolidando tablas y predicciones.")
     predictions_df = _paper_merge_predictions(model_results)
     _emit_progress(progress_callback, 100, f"{route_name}: completado.")
@@ -6935,29 +8597,27 @@ def _paper_run_route(
         "status_message": "",
         "route_name": route_name,
         "route_metadata": route_metadata or {},
+        "selected_models": list(selected_model_codes),
         "dataset_validation": dataset_validation,
         "model_results": model_results,
         "comparison_df": _paper_model_summary_df(model_results),
         "metricas_df": _paper_metricas_table_df(model_results),
         "predictions_df": predictions_df,
+        "k_metrics_df": k_metrics_df,
         "optimization": {
+            "xgb_tuning_profile": _normalize_xgb_tuning_profile(xgb_tuning_profile),
+            "use_regularization": bool(use_regularization),
             "backend": _paper_normalize_optimization_backend(optimization_backend),
+            "scoring_metric": _paper_resolve_scoring_metric(scoring_metric),
             "optuna_trials": int(
                 (optuna_trials or PAPER_OPTUNA_TRIALS_DEFAULT)
                 if _paper_normalize_optimization_backend(optimization_backend) == "optuna"
                 else 0
             ),
         },
-        "shared_k": int(shared_selected_k or 0),
-        "shared_k_grid": list(shared_k_grid),
-        "m3_grid_df": next(
-            (
-                result.get("k_search_df")
-                for result in model_results
-                if str(result.get("model_code")) == "M3"
-            ),
-            pd.DataFrame(),
-        ),
+        "shared_k": 0,
+        "shared_k_grid": [],
+        "m3_grid_df": m3_grid_df,
     }
     if route_paths is not None:
         _paper_persist_route_payload(route_payload, route_paths)
@@ -6976,31 +8636,60 @@ def _paper_stage_route_payload(
         "comparison_csv": route_dir / "comparison.csv",
         "metricas_csv": route_dir / "metricas.csv",
         "predictions_csv": route_dir / "predictions.csv",
+        "k_metrics_csv": route_dir / "k_metrics.csv",
+        "k_metrics_json": route_dir / "k_metrics.json",
         "m3_grid_csv": route_dir / "m3_grid.csv",
         "payload": route_dir / "route_payload.pkl",
     }
     _paper_persist_route_payload(route_payload, route_paths)
 
 
+def _paper_select_export_source_payload(
+    frozen_payload: Optional[Dict[str, object]],
+    raw_payload: Optional[Dict[str, object]],
+    update_emb_payload: Optional[Dict[str, object]],
+) -> Tuple[Optional[str], Dict[str, object]]:
+    for route_name, route_payload in [
+        ("frozen", frozen_payload or {}),
+        ("raw", raw_payload or {}),
+        ("update_emb", update_emb_payload or {}),
+    ]:
+        if str(route_payload.get("status") or "") != "ok":
+            continue
+        k_metrics_df = route_payload.get("k_metrics_df")
+        if isinstance(k_metrics_df, pd.DataFrame) and not k_metrics_df.empty:
+            return route_name, route_payload
+    return None, {}
+
+
 def _paper_stage_latex_candidates(
-    frozen_payload: Dict[str, object],
+    source_payload: Dict[str, object],
     *,
     output_dir: Path,
 ) -> Dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    m3_grid_df = frozen_payload.get("m3_grid_df")
-    if not isinstance(m3_grid_df, pd.DataFrame):
-        m3_grid_df = pd.DataFrame()
-    metricas_df = frozen_payload.get("metricas_df")
+    k_metrics_df = source_payload.get("k_metrics_df")
+    if not isinstance(k_metrics_df, pd.DataFrame):
+        k_metrics_df = pd.DataFrame()
+    metricas_df = source_payload.get("metricas_df")
     if not isinstance(metricas_df, pd.DataFrame):
         metricas_df = pd.DataFrame()
-    image_paths = _paper_plot_k_search(m3_grid_df, output_dir)
+    comparison_df = source_payload.get("comparison_df")
+    if not isinstance(comparison_df, pd.DataFrame):
+        comparison_df = pd.DataFrame()
+    scoring_metric = ((source_payload.get("optimization") or {}).get("scoring_metric"))
+    image_paths = _paper_plot_k_search(
+        k_metrics_df,
+        output_dir,
+        summary_df=comparison_df,
+        scoring_metric=scoring_metric,
+    )
     metrics_path = _paper_plot_metrics(metricas_df, output_dir)
     image_paths[metrics_path.name] = metrics_path
     grid_tex_path = output_dir / "gridsearch_k.tex"
     metricas_tex_path = output_dir / "metricas_modelos.tex"
     grid_tex_path.write_text(
-        _paper_gridsearch_tex(m3_grid_df),
+        _paper_gridsearch_tex(k_metrics_df),
         encoding="utf-8",
     )
     metricas_tex_path.write_text(
@@ -7048,9 +8737,14 @@ def run_paper_replication(
     run_update_embeddings: bool = False,
     features_source_df: Optional[pd.DataFrame] = None,
     k_grid: Optional[Sequence[object]] = None,
+    k_grid_mode: Optional[object] = None,
+    k_grid_interval: Optional[object] = None,
+    selected_models: Optional[Sequence[object]] = None,
     cv_folds: Optional[object] = None,
     raw_features_artifact_row: Optional[pd.Series] = None,
     transformer_model_row_override: Optional[pd.Series] = None,
+    xgb_tuning_profile: Optional[object] = None,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
     scoring_metric: Optional[str] = None,
@@ -7063,6 +8757,7 @@ def run_paper_replication(
     if not any(route_options.values()):
         raise ValueError("Seleccione al menos una ruta para ejecutar la replica del paper.")
     resolved_optimization_backend = _paper_normalize_optimization_backend(optimization_backend)
+    resolved_xgb_tuning_profile = _normalize_xgb_tuning_profile(xgb_tuning_profile)
     resolved_optuna_trials = (
         max(1, int(optuna_trials or PAPER_OPTUNA_TRIALS_DEFAULT))
         if resolved_optimization_backend == "optuna"
@@ -7075,9 +8770,14 @@ def run_paper_replication(
         accidents_df,
         route_options=route_options,
         k_grid=k_grid,
+        k_grid_mode=k_grid_mode,
+        k_grid_interval=k_grid_interval,
+        selected_models=selected_models,
         cv_folds=cv_folds,
         raw_features_artifact_row=raw_features_artifact_row,
         transformer_model_row_override=transformer_model_row_override,
+        xgb_tuning_profile=resolved_xgb_tuning_profile,
+        use_regularization=bool(use_regularization),
         optimization_backend=resolved_optimization_backend,
         optuna_trials=resolved_optuna_trials,
         scoring_metric=resolved_scoring_metric,
@@ -7168,7 +8868,7 @@ def run_paper_replication(
         if route_options["run_frozen"]:
             _emit_progress(progress_callback, 5, "Cargando dataset congelado del paper.")
             frozen_df = pd.read_pickle(PAPER_FROZEN_DATASET_PATH)
-            _emit_progress(progress_callback, 8, "Dataset congelado cargado. Ejecutando protocolo M1/M2/M3.")
+            _emit_progress(progress_callback, 8, "Dataset congelado cargado. Ejecutando modelos seleccionados.")
             frozen_payload = _paper_run_route(
                 route_name="frozen",
                 dataset_df=frozen_df,
@@ -7177,7 +8877,12 @@ def run_paper_replication(
                     "enabled": True,
                 },
                 k_grid=execution_context.get("protocol_snapshot", {}).get("k_grid"),
+                k_grid_mode=execution_context.get("protocol_snapshot", {}).get("k_grid_mode"),
+                k_grid_interval=execution_context.get("protocol_snapshot", {}).get("k_grid_interval"),
+                selected_models=execution_context.get("protocol_snapshot", {}).get("selected_models"),
                 cv_folds=execution_context.get("protocol_snapshot", {}).get("cv_folds"),
+                xgb_tuning_profile=execution_context.get("protocol_snapshot", {}).get("xgb_tuning_profile"),
+                use_regularization=bool(execution_context.get("protocol_snapshot", {}).get("use_regularization")),
                 optimization_backend=resolved_optimization_backend,
                 optuna_trials=resolved_optuna_trials,
                 scoring_metric=resolved_scoring_metric,
@@ -7196,6 +8901,7 @@ def run_paper_replication(
                 "frozen",
                 reason="Ruta frozen omitida por configuracion del usuario.",
                 route_metadata={"enabled": False},
+                selected_models=execution_context.get("protocol_snapshot", {}).get("selected_models"),
             )
             _paper_persist_route_payload(frozen_payload, _paper_route_paths(paths, "frozen"))
 
@@ -7214,7 +8920,7 @@ def run_paper_replication(
                         prefix="Raw build | ",
                     ),
                 )
-                _emit_progress(progress_callback, 59, "Ruta raw reconstruida. Ejecutando protocolo M1/M2/M3.")
+                _emit_progress(progress_callback, 59, "Ruta raw reconstruida. Ejecutando modelos seleccionados.")
                 raw_payload = _paper_run_route(
                     route_name="raw",
                     dataset_df=raw_build["dataset_df"],
@@ -7224,7 +8930,12 @@ def run_paper_replication(
                         "enabled": True,
                     },
                     k_grid=execution_context.get("protocol_snapshot", {}).get("k_grid"),
+                    k_grid_mode=execution_context.get("protocol_snapshot", {}).get("k_grid_mode"),
+                    k_grid_interval=execution_context.get("protocol_snapshot", {}).get("k_grid_interval"),
+                    selected_models=execution_context.get("protocol_snapshot", {}).get("selected_models"),
                     cv_folds=execution_context.get("protocol_snapshot", {}).get("cv_folds"),
+                    xgb_tuning_profile=execution_context.get("protocol_snapshot", {}).get("xgb_tuning_profile"),
+                    use_regularization=bool(execution_context.get("protocol_snapshot", {}).get("use_regularization")),
                     optimization_backend=resolved_optimization_backend,
                     optuna_trials=resolved_optuna_trials,
                     scoring_metric=resolved_scoring_metric,
@@ -7249,12 +8960,16 @@ def run_paper_replication(
                     "status_message": str(exc),
                     "route_name": "raw",
                     "route_metadata": {"enabled": True},
+                    "selected_models": _paper_normalize_model_selection(
+                        execution_context.get("protocol_snapshot", {}).get("selected_models")
+                    ),
                     "raw_build": {},
                     "dataset_validation": {},
                     "model_results": [],
                     "comparison_df": pd.DataFrame(),
                     "metricas_df": pd.DataFrame(),
                     "predictions_df": pd.DataFrame(),
+                    "k_metrics_df": pd.DataFrame(),
                     "m3_grid_df": pd.DataFrame(),
                 }
                 _paper_persist_route_payload(raw_payload, raw_route_paths)
@@ -7264,6 +8979,7 @@ def run_paper_replication(
                 "raw",
                 reason="Ruta raw omitida por configuracion del usuario.",
                 route_metadata={"enabled": False},
+                selected_models=execution_context.get("protocol_snapshot", {}).get("selected_models"),
             )
             raw_payload["raw_build"] = {}
             _paper_persist_route_payload(raw_payload, raw_route_paths)
@@ -7284,7 +9000,7 @@ def run_paper_replication(
                         prefix="Update-emb build | ",
                     ),
                 )
-                _emit_progress(progress_callback, 86, "Dataset update-emb listo. Ejecutando M1/M2/M3.")
+                _emit_progress(progress_callback, 86, "Dataset update-emb listo. Ejecutando modelos seleccionados.")
                 update_emb_payload = _paper_run_route(
                     route_name="update_emb",
                     dataset_df=update_emb_build["dataset_df"],
@@ -7294,7 +9010,12 @@ def run_paper_replication(
                         "enabled": True,
                     },
                     k_grid=execution_context.get("protocol_snapshot", {}).get("k_grid"),
+                    k_grid_mode=execution_context.get("protocol_snapshot", {}).get("k_grid_mode"),
+                    k_grid_interval=execution_context.get("protocol_snapshot", {}).get("k_grid_interval"),
+                    selected_models=execution_context.get("protocol_snapshot", {}).get("selected_models"),
                     cv_folds=execution_context.get("protocol_snapshot", {}).get("cv_folds"),
+                    xgb_tuning_profile=execution_context.get("protocol_snapshot", {}).get("xgb_tuning_profile"),
+                    use_regularization=bool(execution_context.get("protocol_snapshot", {}).get("use_regularization")),
                     optimization_backend=resolved_optimization_backend,
                     optuna_trials=resolved_optuna_trials,
                     scoring_metric=resolved_scoring_metric,
@@ -7318,12 +9039,16 @@ def run_paper_replication(
                     "status_message": str(exc),
                     "route_name": "update_emb",
                     "route_metadata": {"enabled": True},
+                    "selected_models": _paper_normalize_model_selection(
+                        execution_context.get("protocol_snapshot", {}).get("selected_models")
+                    ),
                     "update_emb_build": {},
                     "dataset_validation": {},
                     "model_results": [],
                     "comparison_df": pd.DataFrame(),
                     "metricas_df": pd.DataFrame(),
                     "predictions_df": pd.DataFrame(),
+                    "k_metrics_df": pd.DataFrame(),
                     "m3_grid_df": pd.DataFrame(),
                 }
                 _paper_persist_route_payload(update_emb_payload, update_emb_route_paths)
@@ -7332,6 +9057,7 @@ def run_paper_replication(
                 "update_emb",
                 reason="Ruta update-emb omitida por configuracion del usuario.",
                 route_metadata={"enabled": False},
+                selected_models=execution_context.get("protocol_snapshot", {}).get("selected_models"),
             )
             update_emb_payload["update_emb_build"] = {}
             _paper_persist_route_payload(update_emb_payload, update_emb_route_paths)
@@ -7391,7 +9117,12 @@ def run_paper_replication(
         candidate_step_id = "export.latex_candidates"
         export_payload = _paper_load_export_payload(export_paths) if _paper_is_step_completed(manifest, candidate_step_id) else {}
         candidate_paths: Dict[str, object] = dict(export_payload.get("candidate_paths") or {})
-        if not route_options["run_frozen"]:
+        export_source_name, export_source_payload = _paper_select_export_source_payload(
+            frozen_payload,
+            raw_payload,
+            update_emb_payload,
+        )
+        if export_source_name is None:
             candidate_paths = {}
             if not _paper_is_step_completed(manifest, candidate_step_id):
                 export_artifacts = _paper_persist_export_payload(
@@ -7410,7 +9141,7 @@ def run_paper_replication(
                     candidate_step_id,
                     stage="export",
                     description="Generacion de assets candidatos LaTeX",
-                    message="Assets candidatos omitidos: frozen no fue ejecutado.",
+                    message="Assets candidatos omitidos: no hay una ruta valida con metricas por k.",
                     artifact_paths=export_artifacts,
                     metadata={"candidate_count": 0, "skipped": True},
                 )
@@ -7419,13 +9150,13 @@ def run_paper_replication(
                 paths,
                 manifest,
                 candidate_step_id,
-                stage="export",
-                description="Generacion de assets candidatos LaTeX",
-                message="Generando assets candidatos para LaTeX.",
-            )
-            _emit_progress(progress_callback, 90, "Generando assets candidatos para LaTeX.")
+                    stage="export",
+                    description="Generacion de assets candidatos LaTeX",
+                    message="Generando assets candidatos para LaTeX.",
+                )
+            _emit_progress(progress_callback, 90, f"Generando assets candidatos para LaTeX desde {export_source_name}.")
             staged_candidate_paths = _paper_stage_latex_candidates(
-                frozen_payload,
+                export_source_payload,
                 output_dir=export_paths["latex_candidate_dir"],
             )
             candidate_paths = {key: str(value) for key, value in staged_candidate_paths.items()}
@@ -7442,9 +9173,9 @@ def run_paper_replication(
                 candidate_step_id,
                 stage="export",
                 description="Generacion de assets candidatos LaTeX",
-                message="Assets candidatos persistidos.",
+                message=f"Assets candidatos persistidos desde {export_source_name}.",
                 artifact_paths=export_artifacts,
-                metadata={"candidate_count": int(len(candidate_paths))},
+                metadata={"candidate_count": int(len(candidate_paths)), "source_route": str(export_source_name)},
             )
 
         promote_step_id = "export.latex_promote"
@@ -7518,7 +9249,25 @@ def run_paper_replication(
             "run_dir": str(run_dir),
             "route_options": route_options,
             "k_grid": list(execution_context.get("protocol_snapshot", {}).get("k_grid") or []),
+            "k_grid_mode": str(
+                execution_context.get("protocol_snapshot", {}).get("k_grid_mode")
+                or _paper_normalize_k_grid_mode(None)
+            ),
+            "k_grid_interval": int(execution_context.get("protocol_snapshot", {}).get("k_grid_interval") or 0),
+            "selected_models": list(
+                execution_context.get("protocol_snapshot", {}).get("selected_models")
+                or _paper_normalize_model_selection()
+            ),
             "cv_folds": int(execution_context.get("protocol_snapshot", {}).get("cv_folds") or PAPER_CV_FOLDS_DEFAULT),
+            "xgb_tuning_profile": str(
+                execution_context.get("protocol_snapshot", {}).get("xgb_tuning_profile")
+                or _normalize_xgb_tuning_profile(None)
+            ),
+            "scoring_metric": str(
+                execution_context.get("protocol_snapshot", {}).get("scoring_metric")
+                or _paper_resolve_scoring_metric(None)
+            ),
+            "use_regularization": bool(execution_context.get("protocol_snapshot", {}).get("use_regularization")),
             "optimization_backend": resolved_optimization_backend,
             "optuna_trials": resolved_optuna_trials,
             "frozen": frozen_payload,
@@ -8849,6 +10598,7 @@ def train_rf_xgb_holdout(
     tune_hyperparameters: bool,
     tuning_folds: int,
     tuning_profile: str,
+    use_regularization: bool = False,
     optimization_backend: Optional[object] = None,
     optuna_trials: Optional[object] = None,
 ) -> Dict[str, object]:
@@ -8862,69 +10612,45 @@ def train_rf_xgb_holdout(
         random_state=random_state,
         split_mode=split_mode,
     )
-    X_train_imp, X_test_imp, _ = _fit_imputer(X_train, X_test)
-    X_train_bal, y_train_bal, balancing_meta = _maybe_balance_training_data(
-        X_train_imp,
+    result = _train_rf_xgb_shared_holdout(
+        X_train,
+        X_test,
         y_train,
+        y_test,
         random_state=int(random_state),
-    )
-    ranking_df = _rf_rank_features(
-        X_train_bal,
-        y_train_bal,
-        random_state=int(random_state),
-    )
-    selected_cols = ranking_df["variable"].head(max(1, int(top_k))).tolist()
-    if not selected_cols:
-        raise ValueError("No se pudieron seleccionar variables con Random Forest.")
-
-    xgb_model, best_params, best_score, search_df, search_meta = _optimize_xgb_classifier(
-        X_train_bal[selected_cols],
-        y_train_bal,
-        random_state=int(random_state),
+        max_features=int(top_k),
         tune_hyperparameters=bool(tune_hyperparameters),
-        tuning_folds=int(tuning_folds),
         tuning_profile=str(tuning_profile),
+        tuning_folds=int(tuning_folds),
+        use_regularization=bool(use_regularization),
         optimization_backend=optimization_backend,
         optuna_trials=optuna_trials,
     )
-    xgb_pred = xgb_model.predict(X_test_imp[selected_cols])
-    xgb_score = xgb_model.predict_proba(X_test_imp[selected_cols])[:, 1]
-    xgb_metrics = _classification_metrics(y_test, xgb_pred, xgb_score)
-
     predictions_df = pd.DataFrame(
         {
             "severity_target": y_test.astype(int).tolist(),
-            "pred_xgboost": np.asarray(xgb_pred, dtype=int).tolist(),
+            "pred_xgboost": result["predictions"].tolist(),
         }
     )
-    predictions_df["score_xgboost"] = np.asarray(xgb_score, dtype=float)
+    if result.get("scores") is not None:
+        predictions_df["score_xgboost"] = np.asarray(result["scores"], dtype=float)
 
     return {
         "feature_group": feature_group,
-        "selected_cols": selected_cols,
-        "ranking_df": ranking_df,
-        "balancing_meta": balancing_meta,
+        "selected_cols": result["selected_cols"],
+        "ranking_df": result["ranking_df"],
+        "balancing_meta": result.get("balancing_meta") or {},
         "split_meta": split_meta,
-        "xgb_search_df": search_df,
-        "xgb_best_score": best_score,
-        "xgb_optimization": search_meta,
+        "xgb_search_df": result.get("search_df"),
+        "xgb_best_score": result.get("best_cv_score"),
+        "xgb_optimization": result.get("optimization") or {},
         "predictions_df": predictions_df,
         "results": [
             {
                 "model_name": "XGBoost",
-                "metrics": xgb_metrics,
+                "metrics": result["metrics"],
                 "params": {
-                    **best_params,
-                    "optimization_backend": str(
-                        search_meta.get("backend") or _paper_normalize_optimization_backend(optimization_backend)
-                    ),
-                    "requested_optimization_backend": str(
-                        search_meta.get("requested_backend") or _paper_normalize_optimization_backend(optimization_backend)
-                    ),
-                    "optuna_trials_requested": int(search_meta.get("optuna_trials_requested") or 0),
-                    "optuna_trials_effective": int(search_meta.get("optuna_trials_effective") or 0),
-                    "tuning_profile": str(tuning_profile),
-                    "tuning_folds": int(tuning_folds),
+                    **result["params"],
                 },
             },
         ],
@@ -10807,6 +12533,185 @@ def _append_session_model_result(result: Dict[str, object]) -> None:
     st.session_state["nlp_sev_model_results"] = current + [result]
 
 
+def _train_xgb_grid_widget_key(profile: str, param_name: str) -> str:
+    return f"nlp_sev_train_xgb_grid_{_slug(profile)}_{param_name}"
+
+
+def _train_xgb_regularization_grid_widget_key(profile: str, param_name: str) -> str:
+    return f"nlp_sev_train_xgb_reg_grid_{_slug(profile)}_{param_name}"
+
+
+def _train_smote_grid_widget_key(profile: str, param_name: str) -> str:
+    return f"nlp_sev_train_smote_grid_{_slug(profile)}_{param_name}"
+
+
+def _restore_default_train_xgb_grid_widgets() -> None:
+    xgb_defaults = _default_train_xgb_param_grids()
+    xgb_regularization_defaults = _default_train_xgb_regularization_param_grids()
+    smote_defaults = _default_train_smote_param_grids()
+    st.session_state["nlp_sev_train_xgb_param_grids"] = xgb_defaults
+    st.session_state["nlp_sev_train_xgb_regularization_param_grids"] = xgb_regularization_defaults
+    st.session_state["nlp_sev_train_smote_param_grids"] = smote_defaults
+    for profile, grid in xgb_defaults.items():
+        for param_name, values in grid.items():
+            st.session_state[_train_xgb_grid_widget_key(profile, param_name)] = _serialize_xgb_grid_values(values)
+    for profile, grid in xgb_regularization_defaults.items():
+        for param_name, values in grid.items():
+            st.session_state[_train_xgb_regularization_grid_widget_key(profile, param_name)] = _serialize_xgb_grid_values(values)
+    for profile, grid in smote_defaults.items():
+        for param_name, values in grid.items():
+            st.session_state[_train_smote_grid_widget_key(profile, param_name)] = _serialize_smote_grid_values(values)
+
+
+def _render_train_xgb_grid_config_subtab() -> None:
+    st.markdown("**Configuracion global de grillas XGBoost + SMOTE**")
+    st.caption(
+        "Los valores guardados aqui se usan en todo `Train` y en `Paper replication` para los perfiles "
+        "`Rapida`, `Amplia` y `GridSearch original`."
+    )
+    saved_xgb_grids = _get_saved_train_xgb_param_grids()
+    saved_xgb_regularization_grids = _get_saved_train_xgb_regularization_param_grids()
+    saved_smote_grids = _get_saved_train_smote_param_grids()
+    for profile in XGB_TUNING_PROFILES:
+        for param_name in XGB_GRID_PARAM_ORDER:
+            widget_key = _train_xgb_grid_widget_key(profile, param_name)
+            st.session_state.setdefault(widget_key, _serialize_xgb_grid_values(saved_xgb_grids[profile][param_name]))
+        for param_name in XGB_REGULARIZATION_PARAM_ORDER:
+            widget_key = _train_xgb_regularization_grid_widget_key(profile, param_name)
+            st.session_state.setdefault(
+                widget_key,
+                _serialize_xgb_grid_values(saved_xgb_regularization_grids[profile][param_name]),
+            )
+        for param_name in SMOTE_GRID_PARAM_ORDER:
+            widget_key = _train_smote_grid_widget_key(profile, param_name)
+            st.session_state.setdefault(widget_key, _serialize_smote_grid_values(saved_smote_grids[profile][param_name]))
+
+    for profile in XGB_TUNING_PROFILES:
+        with st.expander(profile, expanded=profile == "Rapida"):
+            st.markdown("`XGBoost`")
+            for param_name in XGB_GRID_PARAM_ORDER:
+                st.text_input(
+                    param_name,
+                    key=_train_xgb_grid_widget_key(profile, param_name),
+                    help="Ingrese una lista separada por comas. Ej: `3, 5, 7`.",
+                )
+            st.markdown("`Regularizacion XGBoost`")
+            for param_name in XGB_REGULARIZATION_PARAM_ORDER:
+                st.text_input(
+                    param_name,
+                    key=_train_xgb_regularization_grid_widget_key(profile, param_name),
+                    help="Ingrese una lista separada por comas. Ej: `1, 3, 5` o `0.0, 0.1, 1.0`.",
+                )
+            st.markdown("`SMOTE`")
+            for param_name in SMOTE_GRID_PARAM_ORDER:
+                st.text_input(
+                    param_name,
+                    key=_train_smote_grid_widget_key(profile, param_name),
+                    help=(
+                        "Ingrese una lista separada por comas. "
+                        "Ej: `0.8, 1.0` para `sampling_strategy` o `1, 3, 5` para `k_neighbors`."
+                    ),
+                )
+            active_xgb_grid = saved_xgb_grids[profile]
+            active_xgb_regularization_grid = saved_xgb_regularization_grids[profile]
+            active_smote_grid = saved_smote_grids[profile]
+            st.caption(
+                f"XGBoost activo: {active_xgb_grid} | "
+                f"combinaciones={_paper_xgb_search_space_size(active_xgb_grid)}"
+            )
+            st.caption(
+                f"Regularizacion XGBoost activa: {active_xgb_regularization_grid} | "
+                f"combinaciones={_paper_xgb_search_space_size(active_xgb_regularization_grid)}"
+            )
+            st.caption(
+                f"SMOTE activo: {active_smote_grid} | "
+                f"combinaciones={_paper_xgb_search_space_size(active_smote_grid)}"
+            )
+            st.caption(
+                "Espacio combinado sin regularizacion: "
+                f"{_paper_xgb_search_space_size(active_xgb_grid) * _paper_xgb_search_space_size(active_smote_grid)}"
+            )
+            st.caption(
+                "Espacio combinado con regularizacion: "
+                f"{_paper_xgb_search_space_size(active_xgb_grid) * _paper_xgb_search_space_size(active_xgb_regularization_grid) * _paper_xgb_search_space_size(active_smote_grid)}"
+            )
+            st.caption(_xgb_search_strategy_help(profile))
+
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        if st.button("Guardar grids de Train", key="nlp_sev_train_xgb_grid_save"):
+            try:
+                updated_xgb_grids: Dict[str, Dict[str, List[object]]] = {}
+                updated_xgb_regularization_grids: Dict[str, Dict[str, List[object]]] = {}
+                updated_smote_grids: Dict[str, Dict[str, List[object]]] = {}
+                for profile in XGB_TUNING_PROFILES:
+                    updated_xgb_grids[profile] = {
+                        param_name: _parse_xgb_grid_values_text(
+                            st.session_state.get(_train_xgb_grid_widget_key(profile, param_name)),
+                            param_name=param_name,
+                        )
+                        for param_name in XGB_GRID_PARAM_ORDER
+                    }
+                    updated_xgb_regularization_grids[profile] = {
+                        param_name: _parse_xgb_grid_values_text(
+                            st.session_state.get(_train_xgb_regularization_grid_widget_key(profile, param_name)),
+                            param_name=param_name,
+                        )
+                        for param_name in XGB_REGULARIZATION_PARAM_ORDER
+                    }
+                    updated_smote_grids[profile] = {
+                        param_name: _parse_smote_grid_values_text(
+                            st.session_state.get(_train_smote_grid_widget_key(profile, param_name)),
+                            param_name=param_name,
+                        )
+                        for param_name in SMOTE_GRID_PARAM_ORDER
+                    }
+            except Exception as exc:
+                st.error(f"No se pudieron guardar las grillas XGBoost/SMOTE: {exc}")
+            else:
+                st.session_state["nlp_sev_train_xgb_param_grids"] = updated_xgb_grids
+                st.session_state["nlp_sev_train_xgb_regularization_param_grids"] = updated_xgb_regularization_grids
+                st.session_state["nlp_sev_train_smote_param_grids"] = updated_smote_grids
+                st.success("Grillas XGBoost + SMOTE guardadas para todo Train.")
+    with action_cols[1]:
+        st.button(
+            "Restaurar defaults",
+            key="nlp_sev_train_xgb_grid_reset",
+            on_click=_restore_default_train_xgb_grid_widgets,
+        )
+
+    st.markdown("**Resumen activo**")
+    active_xgb_grids = _get_saved_train_xgb_param_grids()
+    active_xgb_regularization_grids = _get_saved_train_xgb_regularization_param_grids()
+    active_smote_grids = _get_saved_train_smote_param_grids()
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "profile": profile,
+                    "xgb_grid": json.dumps(active_xgb_grids[profile], ensure_ascii=True),
+                    "xgb_regularization_grid": json.dumps(active_xgb_regularization_grids[profile], ensure_ascii=True),
+                    "smote_grid": json.dumps(active_smote_grids[profile], ensure_ascii=True),
+                    "xgb_search_space_size": _paper_xgb_search_space_size(active_xgb_grids[profile]),
+                    "xgb_regularization_search_space_size": _paper_xgb_search_space_size(active_xgb_regularization_grids[profile]),
+                    "smote_search_space_size": _paper_xgb_search_space_size(active_smote_grids[profile]),
+                    "combined_search_space_size": (
+                        _paper_xgb_search_space_size(active_xgb_grids[profile])
+                        * _paper_xgb_search_space_size(active_smote_grids[profile])
+                    ),
+                    "combined_with_regularization_search_space_size": (
+                        _paper_xgb_search_space_size(active_xgb_grids[profile])
+                        * _paper_xgb_search_space_size(active_xgb_regularization_grids[profile])
+                        * _paper_xgb_search_space_size(active_smote_grids[profile])
+                    ),
+                }
+                for profile in XGB_TUNING_PROFILES
+            ]
+        ),
+        width="stretch",
+    )
+
+
 def _render_train_tab() -> None:
     st.subheader("Train")
     features_df = st.session_state.get("nlp_sev_features_df")
@@ -10853,6 +12758,7 @@ def _render_train_tab() -> None:
     tab_labels = ["Paper replication"]
     if has_train_dataset:
         tab_labels = [
+            "Config grids XGBoost",
             "RF + XGBoost",
             "RF + XGBoost + CV",
             "Elastic Net",
@@ -10863,6 +12769,9 @@ def _render_train_tab() -> None:
     sub_tabs = dict(zip(tab_labels, st.tabs(tab_labels)))
 
     if has_train_dataset:
+        with sub_tabs["Config grids XGBoost"]:
+            _render_train_xgb_grid_config_subtab()
+
         with sub_tabs["RF + XGBoost"]:
             feature_group = st.selectbox(
                 "Feature group",
@@ -10870,14 +12779,19 @@ def _render_train_tab() -> None:
                 key="nlp_sev_holdout_feature_group",
             )
             feature_count = max(1, len(_resolve_feature_group(active_df, feature_group)))
+            top_k_max, top_k_value = _feature_count_slider_bounds(
+                feature_count,
+                current_value=st.session_state.get("nlp_sev_holdout_top_k"),
+            )
+            st.session_state["nlp_sev_holdout_top_k"] = int(top_k_value)
             st.caption(f"Variables disponibles para este entrenamiento: {feature_count}")
             split_mode = st.selectbox("Split", ["Temporal", "Estratificado"], key="nlp_sev_holdout_split_mode")
             test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05, key="nlp_sev_holdout_test_size")
             top_k = st.slider(
                 "Top K por RF",
                 1,
-                feature_count,
-                min(100, feature_count),
+                top_k_max,
+                int(top_k_value),
                 1,
                 key="nlp_sev_holdout_top_k",
             )
@@ -10886,6 +12800,15 @@ def _render_train_tab() -> None:
                 "Optimizar hiperparametros XGBoost",
                 value=True,
                 key="nlp_sev_holdout_tune_xgb",
+            )
+            use_regularization = st.checkbox(
+                "Incorporar regularizacion XGBoost",
+                value=False,
+                key="nlp_sev_holdout_xgb_use_regularization",
+                help=(
+                    "Si se activa, la busqueda de XGBoost incorpora `min_child_weight`, `gamma`, "
+                    "`reg_alpha` y `reg_lambda` usando la grilla global configurada."
+                ),
             )
             tune_col1, tune_col2, tune_col3 = st.columns(3)
             with tune_col1:
@@ -10900,7 +12823,7 @@ def _render_train_tab() -> None:
             with tune_col2:
                 tuning_profile = st.selectbox(
                     "Estrategia de busqueda XGBoost",
-                    ["Rapida", "Amplia", "GridSearch original"],
+                    XGB_TUNING_PROFILES,
                     index=0,
                     key="nlp_sev_holdout_xgb_tuning_profile",
                     disabled=not tune_xgb,
@@ -10939,6 +12862,22 @@ def _render_train_tab() -> None:
                         f"Optuna (TPE) explorara la grilla `{tuning_profile}` con {int(optuna_trials)} trials."
                     )
                 st.caption(_xgb_search_strategy_help(tuning_profile))
+                if use_regularization:
+                    st.caption(
+                        "Regularizacion activa: "
+                        f"{_default_xgb_regularization_param_grid(tuning_profile)}"
+                    )
+                st.caption(
+                    f"Combinaciones base para `{tuning_profile}`: "
+                    f"XGBoost={_paper_xgb_search_space_size(_resolve_xgb_param_grid(tuning_profile, use_regularization=use_regularization))} | "
+                    f"SMOTE={_paper_xgb_search_space_size(_default_smote_param_grid(tuning_profile))} | "
+                    f"Total={_paper_xgb_search_space_size(_resolve_xgb_param_grid(tuning_profile, use_regularization=use_regularization)) * _paper_xgb_search_space_size(_default_smote_param_grid(tuning_profile))}"
+                )
+            elif use_regularization:
+                st.caption(
+                    "Regularizacion activa sin tuning: se aplicaran los ultimos valores de la grilla global "
+                    f"{_xgb_default_regularization_params(tuning_profile)}."
+                )
             if st.button("Entrenar RF y XGBoost", key="nlp_sev_train_holdout"):
                 run_id = _new_run_id("train_holdout")
                 try:
@@ -10952,6 +12891,7 @@ def _render_train_tab() -> None:
                         tune_hyperparameters=bool(tune_xgb),
                         tuning_folds=int(tuning_folds),
                         tuning_profile=str(tuning_profile),
+                        use_regularization=bool(use_regularization),
                         optimization_backend=optimization_backend,
                         optuna_trials=optuna_trials,
                     )
@@ -10980,6 +12920,7 @@ def _render_train_tab() -> None:
                                 "feature_group": feature_group,
                                 "selected_top_k": int(top_k),
                                 "tuning_profile": str(tuning_profile),
+                                "use_regularization": bool(use_regularization),
                                 "tuning_folds": int(tuning_folds),
                                 "optimization_backend": _paper_normalize_optimization_backend(optimization_backend),
                                 "optuna_trials": int(
@@ -11004,6 +12945,7 @@ def _render_train_tab() -> None:
                                 "balancing_meta": payload.get("balancing_meta"),
                                 "xgb_best_score": payload.get("xgb_best_score"),
                                 "tuning_profile": str(tuning_profile) if tune_xgb else "Sin busqueda",
+                                "use_regularization": bool(use_regularization),
                                 "optimization_backend": str(
                                     (payload.get("xgb_optimization") or {}).get("backend")
                                     or _paper_normalize_optimization_backend(optimization_backend)
@@ -11024,6 +12966,7 @@ def _render_train_tab() -> None:
                                 "feature_group": feature_group,
                                 "split_mode": split_mode,
                                 "selected_top_k": int(top_k),
+                                "use_regularization": bool(use_regularization),
                             },
                         )
                     st.success("RF selector + XGBoost entrenados.")
@@ -11236,7 +13179,11 @@ def _render_train_tab() -> None:
                 key="nlp_sev_compare_group",
             )
             feature_count = max(1, len(_resolve_feature_group(active_df, feature_group)))
-            max_feature_cap = min(100, feature_count)
+            max_features_per_model_cap, max_features_per_model_value = _feature_count_slider_bounds(
+                feature_count,
+                current_value=st.session_state.get("nlp_sev_compare_max_features"),
+            )
+            st.session_state["nlp_sev_compare_max_features"] = int(max_features_per_model_value)
             split_mode = st.selectbox(
                 "Split compartido",
                 ["Temporal", "Estratificado"],
@@ -11253,8 +13200,8 @@ def _render_train_tab() -> None:
             max_features_per_model = st.slider(
                 "Numero de variables por modelo",
                 1,
-                max_feature_cap,
-                max_feature_cap,
+                max_features_per_model_cap,
+                int(max_features_per_model_value),
                 1,
                 key="nlp_sev_compare_max_features",
             )
@@ -11278,7 +13225,7 @@ def _render_train_tab() -> None:
             with compare_col2:
                 xgb_tuning_profile = st.selectbox(
                     "Busqueda XGBoost",
-                    ["Rapida", "Amplia", "GridSearch original"],
+                    XGB_TUNING_PROFILES,
                     index=0,
                     key="nlp_sev_compare_xgb_profile",
                 )
@@ -11310,6 +13257,12 @@ def _render_train_tab() -> None:
                 st.caption(
                     f"Optuna (TPE) explorara la grilla `{xgb_tuning_profile}` con {int(xgb_optuna_trials)} trials."
                 )
+            st.caption(
+                f"Combinaciones base para `{xgb_tuning_profile}`: "
+                f"XGBoost={_paper_xgb_search_space_size(_default_xgb_param_grid(xgb_tuning_profile))} | "
+                f"SMOTE={_paper_xgb_search_space_size(_default_smote_param_grid(xgb_tuning_profile))} | "
+                f"Total={_paper_xgb_search_space_size(_default_xgb_param_grid(xgb_tuning_profile)) * _paper_xgb_search_space_size(_default_smote_param_grid(xgb_tuning_profile))}"
+            )
             _render_controlled_comparison_protocol(
                 feature_group=feature_group,
                 feature_count=feature_count,
@@ -11732,6 +13685,12 @@ def _render_historial_tab() -> None:
             key="nlp_sev_hist_run_select",
         )
         run_results = filtered_df[filtered_df["run_id"] == selected_run]
+        if (
+            not run_results.empty
+            and "stage" in run_results.columns
+            and run_results["stage"].astype(str).str.startswith("paper_replication_").any()
+        ):
+            _render_paper_replication_history_detail(str(selected_run))
         for _, row in run_results.iterrows():
             with st.expander(f"{row.get('model_name', '?')} · {row.get('feature_group', '?')} · {row.get('stage', '?')}"):
                 metric_cols = [c for c in available_metrics if c in row.index and pd.notna(row[c])]
@@ -11776,8 +13735,8 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
         st.set_page_config(page_title="NLP in Severity", layout="wide")
     st.title("NLP in Severity")
     st.caption(
-        "Migracion del experimento NLP legacy a la interfaz actual, con feature engineering granular "
-        "a 1 minuto, persistencia DuckDB y logging reproducible."
+        "Clasificación de la Severidad de accidentes con feature engineering granular "
+        "a 1 minuto (5min antes y después) + Embeddings desde Narrativas de accidentes."
     )
 
     if show_exit_button and st.sidebar.button("Cerrar app", key="nlp_sev_close_app"):

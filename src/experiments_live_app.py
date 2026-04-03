@@ -3728,8 +3728,9 @@ def _render_paper_replication_live_view(data: Dict[str, object]) -> None:
         else:
             st.info("Todavia no hay modelos finales ni parciales persistidos.")
 
-        st.markdown("**k-search evolution**")
+        st.markdown("**k-search evolution (nested CV on training folds)**")
         if isinstance(k_progress_df, pd.DataFrame) and not k_progress_df.empty:
+            st.caption("Los resultados finales de la tabla de modelos usan el holdout final temporal.")
             route_options = sorted(k_progress_df["route_name"].astype(str).unique().tolist())
             selected_route = st.selectbox(
                 "Route",

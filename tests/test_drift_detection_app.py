@@ -2705,7 +2705,7 @@ def test_recalibration_experiments_support_adaptive_kswin(tmp_path, monkeypatch)
     assert set(adaptive["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
     assert outputs["run_manifest"]["kswin_variants"] == ["KSWINpaper", "KSWINseasonal"]
     assert KSWIN_VARIANT_NAMES == ["KSWINpaper", "KSWINseasonal"]
-    assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 6
+    assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 7
 
 
 def test_recalibration_experiments_passes_model_and_balance_to_block_tuning_resolver(tmp_path, monkeypatch):
@@ -3630,6 +3630,34 @@ def test_recalibration_experiments_resume_from_failed_checkpoint(tmp_path, monke
     assert tuning_calls == []
     assert set(outputs["yearly_results"]["balance_mode"].unique()) == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
     assert outputs["checkpoint_manifest"]["status"] == "completed"
+
+    block_calls.clear()
+    tuning_calls.clear()
+
+    fresh_outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static"],
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(11,),
+        balance_modes=(BALANCE_MODE_NONE, BALANCE_MODE_SMOTE),
+        checkpoint_root=checkpoint_root,
+        auto_resume=False,
+    )
+
+    assert fresh_outputs["auto_resumed"] is False
+    assert len(block_calls) == 2
+    assert {call[0] for call in block_calls} == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
+    assert tuning_calls == [
+        ("Random Forest", BALANCE_MODE_NONE),
+        ("Random Forest", BALANCE_MODE_SMOTE),
+        ("Random Forest", BALANCE_MODE_SMOTE),
+    ]
 
 
 def test_recalibration_experiments_can_load_explicit_checkpoint_run_id_override(tmp_path):

@@ -14918,34 +14918,8 @@ def _render_experiments_tab() -> None:
             except Exception as exc:
                 st.error(f"No se pudo importar el checkpoint: {exc}")
 
-    if isinstance(preview_seeds, list) and not bool((loaded_checkpoint_preview or {}).get("checkpoint_available")):
-        checkpoint_preview = _preview_recalibration_checkpoint(
-            clean_df,
-            feature_cols=feature_cols,
-            target_col=target_col,
-            time_col=time_col,
-            model_names=selected_models,
-            strategies=selected_strategies,
-            validation_size=float(validation_size),
-            folds=int(folds),
-            fast_mode=bool(fast_mode),
-            resource_mode=resource_mode,
-            resource_policy_overrides=resource_policy_overrides,
-            grid_limit=int(grid_limit),
-            adwin_delta=float(adwin_delta),
-            min_window=int(min_window),
-            min_retrain_size=int(min_retrain_size),
-            arf_variants=arf_variants,
-            kswin_variants=kswin_variants,
-            kswin_top_k_features=int(kswin_top_k_features),
-            kswin_vote_threshold=int(kswin_vote_threshold),
-            kswin_retrain_days=int(kswin_retrain_days),
-            kswin_min_retrain_rows=int(kswin_min_retrain_rows),
-            continue_on_block_error=bool(continue_on_block_error),
-            repetition_seeds=preview_seeds,
-            balance_modes=balance_modes,
-            feature_selection_context=_current_feature_selection_context(),
-        )
+    if bool((loaded_checkpoint_preview or {}).get("checkpoint_available")):
+        checkpoint_preview = loaded_checkpoint_preview
 
     execution_mode: Optional[str] = None
     execution_checkpoint_run_id_override: Optional[str] = None
@@ -14977,83 +14951,44 @@ def _render_experiments_tab() -> None:
         if bool(checkpoint_preview.get("can_load_completed")):
             if can_recompute_trainings:
                 st.info(
-                    "Existe una corrida compatible ya completada. Puedes cargar ese checkpoint, "
+                    "Existe una corrida cargada ya completada. Puedes cargar ese checkpoint, "
                     "recalcular entrenamientos reutilizando tuning/cache persistidos o iniciar una corrida nueva."
                 )
             else:
-                st.info("Existe una corrida compatible ya completada. Puedes cargar ese checkpoint o iniciar una corrida nueva.")
+                st.info("Existe una corrida cargada ya completada. Puedes cargar ese checkpoint o iniciar una corrida nueva.")
         else:
             if can_recompute_trainings:
                 st.info(
-                    "Existe un checkpoint compatible recuperable. Puedes reanudarlo, reiniciar los bloques "
+                    "Existe un checkpoint cargado recuperable. Puedes reanudarlo, reiniciar los bloques "
                     "reutilizando tuning/cache o forzar una corrida limpia."
                 )
             else:
-                st.info("Existe un checkpoint compatible recuperable. Puedes reanudarlo desde aqui o forzar una corrida limpia.")
+                st.info("Existe un checkpoint cargado recuperable. Puedes reanudarlo desde aqui o forzar una corrida limpia.")
         action_cols = st.columns(3 if can_recompute_trainings else 2)
         action_col_1 = action_cols[0]
         action_col_2 = action_cols[1]
         with action_col_1:
-            resume_label = "Load completed checkpoint" if bool(checkpoint_preview.get("can_load_completed")) else "Resume compatible checkpoint"
-            if st.button(resume_label, key="drift_resume_experiments"):
+            resume_label = (
+                "Load completed checkpoint"
+                if bool(checkpoint_preview.get("can_load_completed"))
+                else "Resume loaded checkpoint"
+            )
+            if st.button(resume_label, key="drift_resume_loaded_checkpoint"):
                 execution_mode = "resume"
                 execution_checkpoint_run_id_override = str(checkpoint_preview.get("run_id") or "")
         if can_recompute_trainings:
             with action_col_2:
-                if st.button("Recompute trainings from checkpoint", key="drift_recompute_from_checkpoint"):
+                if st.button("Recompute trainings from loaded checkpoint", key="drift_recompute_loaded_checkpoint"):
                     execution_mode = "retrain"
                     execution_checkpoint_run_id_override = str(checkpoint_preview.get("run_id") or "")
             action_col_fresh = action_cols[2]
         else:
             action_col_fresh = action_col_2
         with action_col_fresh:
-            if st.button("Start fresh ignoring checkpoint", key="drift_run_experiments_fresh"):
+            if st.button("Start fresh with loaded configuration", key="drift_run_loaded_checkpoint_fresh"):
                 execution_mode = "fresh"
     elif st.button("Run configured experiment set", key="drift_run_experiments"):
-        execution_mode = "resume"
-
-    if loaded_checkpoint_run_id:
-        compatibility_run_id = str((checkpoint_preview or {}).get("run_id", "")) if isinstance(checkpoint_preview, dict) else ""
-        if (
-            bool(loaded_checkpoint_preview.get("checkpoint_available"))
-            and str(loaded_checkpoint_preview.get("run_id", "")) != compatibility_run_id
-        ):
-            loaded_checkpoint_status = str(loaded_checkpoint_preview.get("status", "running"))
-            loaded_status_label = "completado" if loaded_checkpoint_status == "completed" else "recuperable"
-            loaded_can_recompute = bool(loaded_checkpoint_preview.get("can_recompute_trainings"))
-            st.markdown("**Loaded Checkpoint Actions**")
-            st.caption(
-                f"Run `{loaded_checkpoint_preview.get('run_id', '')}` | estado {loaded_checkpoint_status} ({loaded_status_label}) | "
-                f"actualizado {loaded_checkpoint_preview.get('updated_at') or 'desconocido'} | "
-                f"tunings {int(loaded_checkpoint_preview.get('completed_tuning_tasks', 0))}/{int(loaded_checkpoint_preview.get('total_tuning_tasks', 0))} | "
-                f"bloques {int(loaded_checkpoint_preview.get('completed_blocks', 0))}/{int(loaded_checkpoint_preview.get('total_blocks', 0))} | "
-                f"SMOTE cache {int(loaded_checkpoint_preview.get('smote_artifacts', 0))}"
-            )
-            st.info(
-                "Estas acciones usan directamente el checkpoint cargado desde el selector, "
-                "aunque el preview compatible del formulario actual no coincida exactamente."
-            )
-            loaded_action_cols = st.columns(3 if loaded_can_recompute else 2)
-            with loaded_action_cols[0]:
-                loaded_resume_label = (
-                    "Load loaded checkpoint"
-                    if bool(loaded_checkpoint_preview.get("can_load_completed"))
-                    else "Resume loaded checkpoint"
-                )
-                if st.button(loaded_resume_label, key="drift_resume_loaded_checkpoint"):
-                    execution_mode = "resume"
-                    execution_checkpoint_run_id_override = str(loaded_checkpoint_preview.get("run_id") or "")
-            if loaded_can_recompute:
-                with loaded_action_cols[1]:
-                    if st.button("Recompute trainings from loaded checkpoint", key="drift_recompute_loaded_checkpoint"):
-                        execution_mode = "retrain"
-                        execution_checkpoint_run_id_override = str(loaded_checkpoint_preview.get("run_id") or "")
-                loaded_fresh_col = loaded_action_cols[2]
-            else:
-                loaded_fresh_col = loaded_action_cols[1]
-            with loaded_fresh_col:
-                if st.button("Start fresh with loaded configuration", key="drift_run_loaded_checkpoint_fresh"):
-                    execution_mode = "fresh"
+        execution_mode = "fresh"
 
     if execution_mode is not None:
         requires_batch_models = any(
@@ -15172,7 +15107,7 @@ def _render_experiments_tab() -> None:
                 feature_selection_context=execution_config["feature_selection_context"],
                 custom_grids=execution_config["custom_grids"],
                 checkpoint_run_id_override=execution_checkpoint_run_id_override,
-                auto_resume=bool(execution_mode != "fresh"),
+                auto_resume=bool(execution_checkpoint_run_id_override) and bool(execution_mode != "fresh"),
                 recompute_blocks_from_checkpoint=bool(execution_mode == "retrain"),
                 continue_on_block_error=execution_config["continue_on_block_error"],
                 progress_callback=progress.update,
