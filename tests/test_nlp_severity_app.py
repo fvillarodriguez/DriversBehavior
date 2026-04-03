@@ -737,6 +737,28 @@ def test_paper_candidate_k_values_clip_to_available_features():
     assert _paper_candidate_k_values(8, k_grid=[10, 15]) == [8]
 
 
+def test_paper_candidate_k_values_support_interval_mode():
+    interval_5 = _paper_candidate_k_values(
+        1200,
+        k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+        k_grid_interval=5,
+    )
+
+    assert interval_5[:5] == [5, 10, 15, 20, 25]
+    assert interval_5[-2:] == [1195, 1200]
+    assert len(interval_5) == 240
+    assert _paper_candidate_k_values(
+        432,
+        k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+        k_grid_interval=100,
+    ) == [100, 200, 300, 400, 432]
+    assert _paper_candidate_k_values(
+        8,
+        k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+        k_grid_interval=10,
+    ) == [8]
+
+
 def test_default_xgb_param_grid_uses_saved_train_override():
     original = nlp_app.st.session_state.get("nlp_sev_train_xgb_param_grids")
     try:
@@ -1103,6 +1125,8 @@ def test_paper_protocol_config_supports_optuna_backend():
     assert default_protocol["optimization_backend"] == "gridsearch"
     assert default_protocol["optuna_trials"] == 0
     assert default_protocol["k_grid"] == nlp_app.PAPER_K_GRID
+    assert default_protocol["k_grid_mode"] == nlp_app.PAPER_K_GRID_MODE_DEFAULT
+    assert default_protocol["k_grid_interval"] == 0
     assert default_protocol["cv_folds"] == nlp_app.PAPER_CV_FOLDS_DEFAULT
     assert default_protocol["xgb_tuning_profile"] == "Rapida"
     assert optuna_protocol["optimization_backend"] == "optuna"
@@ -1110,6 +1134,17 @@ def test_paper_protocol_config_supports_optuna_backend():
     assert optuna_protocol["k_grid"] == [10, 50, 200]
     assert optuna_protocol["cv_folds"] == 4
     assert optuna_protocol["xgb_tuning_profile"] == "GridSearch original"
+
+
+def test_paper_protocol_config_supports_interval_k_grid():
+    interval_protocol = _paper_protocol_config(
+        k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+        k_grid_interval=25,
+    )
+
+    assert interval_protocol["k_grid"] == []
+    assert interval_protocol["k_grid_mode"] == nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX
+    assert interval_protocol["k_grid_interval"] == 25
 
 
 def test_paper_execution_context_changes_with_optimization_backend(monkeypatch: pytest.MonkeyPatch):
@@ -1233,6 +1268,50 @@ def test_paper_execution_context_changes_with_k_grid_selection(monkeypatch: pyte
     assert small_grid["computed_run_id"] != wide_grid["computed_run_id"]
     assert small_grid["protocol_snapshot"]["k_grid"] == [10, 50]
     assert wide_grid["protocol_snapshot"]["k_grid"] == [10, 50, 100, 200]
+
+
+def test_paper_execution_context_changes_with_k_grid_interval_selection(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(nlp_app, "_paper_file_fingerprint", lambda path: {"sha256": "frozen-sha"})
+    monkeypatch.setattr(
+        nlp_app,
+        "_paper_resolve_raw_source",
+        lambda accidents_df: {
+            "source_df": None,
+            "source_kind": "session_accidents",
+            "source_metadata": {"rows": 2},
+            "source_fingerprint": {"kind": "session_accidents", "rows": 2},
+        },
+    )
+    monkeypatch.setattr(
+        nlp_app,
+        "_paper_resolve_transformer_model",
+        lambda: pd.Series(
+            {
+                "model_label": "bert-paper",
+                "output_dir_resolved": "/tmp/model",
+                "created_at": "2026-03-30T10:00:00",
+            }
+        ),
+    )
+
+    interval_5 = nlp_app._paper_build_execution_context(
+        None,
+        route_options={"run_frozen": True, "run_raw": True},
+        k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+        k_grid_interval=5,
+    )
+    interval_25 = nlp_app._paper_build_execution_context(
+        None,
+        route_options={"run_frozen": True, "run_raw": True},
+        k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+        k_grid_interval=25,
+    )
+
+    assert interval_5["computed_run_id"] != interval_25["computed_run_id"]
+    assert interval_5["protocol_snapshot"]["k_grid"] == []
+    assert interval_5["protocol_snapshot"]["k_grid_mode"] == nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX
+    assert interval_5["protocol_snapshot"]["k_grid_interval"] == 5
+    assert interval_25["protocol_snapshot"]["k_grid_interval"] == 25
 
 
 def test_paper_execution_context_changes_with_model_selection(monkeypatch: pytest.MonkeyPatch):
@@ -2465,6 +2544,99 @@ def test_paper_run_route_uses_selected_models_and_collects_k_metrics(monkeypatch
     assert [result["model_code"] for result in payload["model_results"]] == ["M2", "M3"]
     assert [result["selected_k"] for result in payload["model_results"]] == [15, 20]
     assert set(payload["k_metrics_df"]["model_code"].astype(str)) == {"M2", "M3"}
+
+
+def test_paper_run_route_threads_interval_k_grid_mode(monkeypatch: pytest.MonkeyPatch):
+    dataset_df = pd.DataFrame(
+        {
+            "accident_id": ["a1", "a2"],
+            "severity_target": [0, 1],
+            "flow_1": [1.0, 2.0],
+            "emb_1": [0.1, 0.2],
+        }
+    )
+    monkeypatch.setattr(nlp_app, "_ensure_paper_dataset_columns", lambda df, source_name: df.copy())
+    monkeypatch.setattr(
+        nlp_app,
+        "_paper_dataset_validation_report",
+        lambda work, route_name: {"rows": int(len(work)), "is_valid": True},
+    )
+
+    build_calls: list[dict[str, object]] = []
+
+    def fake_build_model_result(
+        df,
+        *,
+        model_code,
+        feature_group,
+        k_grid=None,
+        k_grid_mode=None,
+        k_grid_interval=None,
+        forced_selected_k=None,
+        **kwargs,
+    ):
+        build_calls.append(
+            {
+                "model_code": str(model_code),
+                "k_grid": None if k_grid is None else list(k_grid),
+                "k_grid_mode": k_grid_mode,
+                "k_grid_interval": k_grid_interval,
+                "forced_selected_k": forced_selected_k,
+            }
+        )
+        return {
+            "model_code": str(model_code),
+            "model_title": str(model_code),
+            "feature_group": str(feature_group),
+            "candidate_feature_count": 2,
+            "selected_k": 2,
+            "selected_cols": [],
+            "split_meta": {},
+            "ranking_df": pd.DataFrame(),
+            "k_search_df": pd.DataFrame(),
+            "metrics": {
+                "accuracy": 1.0,
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1_score": 1.0,
+                "roc_auc": 1.0,
+                "false_negatives_positive_class": 0,
+                "class_metrics": {},
+            },
+            "best_params": {},
+            "best_cv_score": 1.0,
+            "search_df": pd.DataFrame(),
+            "predictions_df": pd.DataFrame(
+                {
+                    "accident_id": ["a1", "a2"],
+                    "model_code": [str(model_code), str(model_code)],
+                    "severity_target": [0, 1],
+                    "prediction": [0, 1],
+                }
+            ),
+            "balancing_meta": {},
+            "optimization": {"backend": "gridsearch"},
+        }
+
+    monkeypatch.setattr(nlp_app, "_paper_build_model_result", fake_build_model_result)
+
+    nlp_app._paper_run_route(
+        route_name="frozen",
+        dataset_df=dataset_df,
+        k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+        k_grid_interval=25,
+        selected_models=["M3"],
+    )
+
+    assert build_calls == [
+        {
+            "model_code": "M3",
+            "k_grid": None,
+            "k_grid_mode": nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+            "k_grid_interval": 25,
+            "forced_selected_k": None,
+        }
+    ]
 
 
 def test_paper_persist_route_payload_writes_k_metrics_json(tmp_path: Path):

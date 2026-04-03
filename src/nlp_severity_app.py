@@ -4700,7 +4700,9 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
                 run_raw=route_options["run_raw"],
                 run_update_embeddings=route_options["run_update_embeddings"],
                 features_source_df=st.session_state.get("nlp_sev_features_df"),
-                k_grid=normalized_k_grid,
+                k_grid=normalized_k_grid if normalized_k_grid_mode == PAPER_K_GRID_MODE_DEFAULT else None,
+                k_grid_mode=normalized_k_grid_mode,
+                k_grid_interval=normalized_k_grid_interval if normalized_k_grid_mode == PAPER_K_GRID_MODE_INTERVAL_MAX else None,
                 selected_models=normalized_selected_models,
                 cv_folds=selected_cv_folds,
                 raw_features_artifact_row=selected_raw_features_artifact_row,
@@ -6316,20 +6318,16 @@ def _paper_build_model_result(
         cv_folds if cv_folds is not None else outer_folds
     )
     if resolved_forced_k is None:
-        candidate_k_values = (
-            _paper_candidate_k_values(
+        if _paper_normalize_k_grid_mode(k_grid_mode) == PAPER_K_GRID_MODE_INTERVAL_MAX:
+            candidate_k_values = _paper_candidate_k_values(
                 len(feature_cols),
                 k_grid_mode=k_grid_mode,
                 k_grid_interval=k_grid_interval,
             )
-            if k_grid is None
-            else _paper_candidate_k_values(
-                len(feature_cols),
-                k_grid=k_grid,
-                k_grid_mode=k_grid_mode,
-                k_grid_interval=k_grid_interval,
-            )
-        )
+        elif k_grid is None:
+            candidate_k_values = _paper_candidate_k_values(len(feature_cols))
+        else:
+            candidate_k_values = _paper_candidate_k_values(len(feature_cols), k_grid=k_grid)
         total_k = max(1, len(candidate_k_values))
         if model_dir is not None:
             (Path(model_dir) / "k_results").mkdir(parents=True, exist_ok=True)
