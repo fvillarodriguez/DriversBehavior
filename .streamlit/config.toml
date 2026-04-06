@@ -1,0 +1,5 @@
+[server]
+# Streamlit requiere un entero en MB; usamos un techo alto a nivel de proyecto
+# para que los ZIP de intercambio no queden bloqueados por el default de 200 MB.
+maxUploadSize = 10240
+maxMessageSize = 10240

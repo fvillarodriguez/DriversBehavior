@@ -21,6 +21,9 @@ graphviz==0.21
 river==0.23.0
 torchview==0.2.6
 torch==2.4.1; python_version < '3.13'
+transformers==5.3.0; python_version < '3.13'
+accelerate; python_version < '3.13'
+sentence-transformers; python_version < '3.13'
 torch-geometric==2.7.0
 pyg-lib==0.4.0; python_version < '3.13'
 torch-scatter==2.1.2; python_version < '3.13'

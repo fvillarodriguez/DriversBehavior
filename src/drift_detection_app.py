@@ -13572,29 +13572,6 @@ def _init_state() -> None:
     st.session_state.setdefault("drift_exp_loaded_checkpoint_feature_selection_context", None)
 
 
-def _render_blueprint_tab() -> None:
-    st.subheader("Paper Replication Blueprint")
-    st.caption(PAPER_TITLE)
-
-    blueprint = article_replication_blueprint()
-    st.markdown("**Analyses to replicate**")
-    st.dataframe(blueprint["analyses"], width="stretch")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Figures**")
-        st.dataframe(blueprint["figures"], width="stretch")
-    with c2:
-        st.markdown("**Tables**")
-        st.dataframe(blueprint["tables"], width="stretch")
-
-    st.markdown("**Related work (Table 1 replica)**")
-    st.dataframe(build_related_work_table(), width="stretch")
-
-    st.markdown("**Migration and review plan**")
-    st.dataframe(build_python_migration_review_plan(), width="stretch")
-
-
 def _render_events_tab() -> None:
     st.subheader("Eventos (accidentes)")
     st.markdown("Selecciona uno o varios archivos de eventos desde `Datos/`.")
@@ -15455,23 +15432,6 @@ def _render_experiments_tab() -> None:
             st.dataframe(_streamlit_arrow_safe_df(tuning_trials), width="stretch")
 
 
-def _render_coverage_tab() -> None:
-    st.subheader("Coverage 100% Check")
-    matrix = build_article_coverage_matrix()
-    coverage = article_coverage_percentage(matrix)
-
-    c1, c2 = st.columns(2)
-    c1.metric("Coverage", f"{coverage:.1f}%")
-    c2.metric("Missing items", int((~matrix["implemented"]).sum()))
-
-    if coverage >= 100.0:
-        st.success("Coverage verification passed: 100% of article items mapped.")
-    else:
-        st.warning("Coverage below 100%. Review missing items.")
-
-    st.dataframe(matrix, width="stretch")
-
-
 def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
     if set_page_config:
         st.set_page_config(page_title="Drift detection", layout="wide")
@@ -15485,19 +15445,14 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
         "with extended online ARF and KSWIN comparisons."
     )
 
-    tab_blueprint, tab_events, tab_feature_eng, tab_selection, tab_experiments, tab_coverage = st.tabs(
+    tab_events, tab_feature_eng, tab_selection, tab_experiments = st.tabs(
         [
-            "Blueprint",
             "Eventos",
             "Feature engineering",
             "Feature Selection",
             "Experiments",
-            "Coverage",
         ]
     )
-
-    with tab_blueprint:
-        _render_blueprint_tab()
 
     with tab_events:
         _render_events_tab()
@@ -15510,9 +15465,6 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
 
     with tab_experiments:
         _render_experiments_tab()
-
-    with tab_coverage:
-        _render_coverage_tab()
 
     if show_exit_button and st.sidebar.button("Cerrar app"):
         st.sidebar.write("Cerrando...")

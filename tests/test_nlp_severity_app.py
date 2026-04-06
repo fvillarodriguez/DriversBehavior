@@ -17,6 +17,7 @@ if str(ROOT_DIR) not in sys.path:
 import src.nlp_severity_app as nlp_app
 from src.nlp_severity_app import (
     _candidate_feature_caps,
+    _paper_build_history_model_comparison_chart,
     _classification_metrics,
     _default_feature_engineering_source,
     _feature_count_slider_bounds,
@@ -418,6 +419,210 @@ def test_generate_text_embeddings_tfidf_svd():
     assert len(embed_cols) >= 2
     assert all(col in embedded_df.columns for col in embed_cols)
     assert meta["method"] == "tfidf_svd"
+    assert meta["embedding_feature_columns"] == embed_cols
+
+
+def test_compute_embedding_correlation_summary_returns_signed_matrix_and_absolute_pairs():
+    df = pd.DataFrame(
+        {
+            "emb_000": [1.0, 2.0, 3.0, 4.0],
+            "emb_001": [2.0, 4.0, 6.0, 8.0],
+            "emb_002": [4.0, 3.0, 2.0, 1.0],
+        }
+    )
+
+    corr_df, abs_pairs = nlp_app._compute_embedding_correlation_summary(
+        df,
+        ["emb_000", "emb_001", "emb_002"],
+    )
+
+    assert list(corr_df.columns) == ["emb_000", "emb_001", "emb_002"]
+    assert corr_df.loc["emb_000", "emb_000"] == pytest.approx(1.0)
+    assert corr_df.loc["emb_000", "emb_001"] == pytest.approx(1.0)
+    assert corr_df.loc["emb_000", "emb_002"] == pytest.approx(-1.0)
+    assert len(abs_pairs) == 3
+    assert abs_pairs.loc[("emb_000", "emb_001")] == pytest.approx(1.0)
+    assert abs_pairs.loc[("emb_000", "emb_002")] == pytest.approx(1.0)
+    assert (abs_pairs >= 0).all()
+
+
+def test_list_associated_text_embeddings_artifacts_filters_by_feature_artifact(monkeypatch: pytest.MonkeyPatch):
+    feature_artifact = {"artifact_id": "feat-1", "run_id": "run-feat"}
+    catalog = pd.DataFrame(
+        [
+            {
+                "artifact_id": "emb-1",
+                "run_id": "run-emb-1",
+                "created_at": "2026-04-04T10:00:00",
+                "db_path": "/tmp/emb-1.duckdb",
+                "table_name": "text_embeddings_1",
+                "row_count": 12,
+                "metadata": {
+                    "method": "tfidf_svd",
+                    "text_col": "text_bert",
+                    "embedding_dims": 32,
+                    "source_feature_artifact_id": "feat-1",
+                    "source_feature_run_id": "run-feat",
+                },
+            },
+            {
+                "artifact_id": "emb-legacy",
+                "run_id": "run-feat",
+                "created_at": "2026-04-04T09:00:00",
+                "db_path": "/tmp/emb-legacy.duckdb",
+                "table_name": "text_embeddings_legacy",
+                "row_count": 12,
+                "metadata": {
+                    "method": "tfidf_svd",
+                    "text_col": "text_bert",
+                    "embedding_dims": 16,
+                },
+            },
+            {
+                "artifact_id": "emb-other",
+                "run_id": "run-emb-other",
+                "created_at": "2026-04-04T08:00:00",
+                "db_path": "/tmp/emb-other.duckdb",
+                "table_name": "text_embeddings_other",
+                "row_count": 12,
+                "metadata": {
+                    "method": "tfidf_svd",
+                    "text_col": "text_bert",
+                    "embedding_dims": 64,
+                    "source_feature_artifact_id": "feat-otro",
+                },
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        nlp_app,
+        "_load_artifact_catalog",
+        lambda **kwargs: catalog.copy(),
+    )
+
+    result = nlp_app._list_associated_text_embeddings_artifacts(feature_artifact)
+
+    assert result["artifact_id"].tolist() == ["emb-1", "emb-legacy"]
+    assert "dims=32" in result.iloc[0]["label"]
+
+
+def test_list_associated_embedding_rf_artifacts_prefers_direct_embedding_match(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    feature_artifact = {"artifact_id": "feat-1", "run_id": "run-feat"}
+    embeddings_artifact = {"artifact_id": "emb-2", "run_id": "run-emb-2"}
+    catalog = pd.DataFrame(
+        [
+            {
+                "artifact_id": "rf-other",
+                "run_id": "run-rf-other",
+                "created_at": "2026-04-04T11:00:00",
+                "db_path": "/tmp/rf-other.duckdb",
+                "table_name": "embedding_rf_other",
+                "row_count": 32,
+                "metadata": {
+                    "selected_top_k": 20,
+                    "selected_embedding_cols": ["emb_000"],
+                    "source_feature_artifact_id": "feat-1",
+                    "source_embeddings_artifact_id": "emb-1",
+                },
+            },
+            {
+                "artifact_id": "rf-match",
+                "run_id": "run-rf-match",
+                "created_at": "2026-04-04T10:00:00",
+                "db_path": "/tmp/rf-match.duckdb",
+                "table_name": "embedding_rf_match",
+                "row_count": 32,
+                "metadata": {
+                    "selected_top_k": 10,
+                    "selected_embedding_cols": ["emb_001"],
+                    "source_feature_artifact_id": "feat-1",
+                    "source_embeddings_artifact_id": "emb-2",
+                },
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        nlp_app,
+        "_load_artifact_catalog",
+        lambda **kwargs: catalog.copy(),
+    )
+
+    result = nlp_app._list_associated_embedding_rf_artifacts(feature_artifact, embeddings_artifact)
+
+    assert result["artifact_id"].tolist() == ["rf-match"]
+
+
+def test_load_embedding_bundle_from_catalog_rows_loads_rf_selection(monkeypatch: pytest.MonkeyPatch):
+    embeddings_df = pd.DataFrame(
+        {
+            "accident_id": ["a1", "a2"],
+            "severity_target": [0, 1],
+            "text_bert": ["uno", "dos"],
+            "emb_000": [0.1, 0.2],
+            "emb_001": [0.3, 0.4],
+        }
+    )
+    ranking_df = pd.DataFrame(
+        {
+            "variable": ["emb_001", "emb_000"],
+            "importance": [0.9, 0.7],
+        }
+    )
+    frame_map = {
+        ("/tmp/emb.duckdb", "text_embeddings_table"): embeddings_df,
+        ("/tmp/rf.duckdb", "embedding_rf_table"): ranking_df,
+    }
+
+    monkeypatch.setattr(
+        nlp_app,
+        "_read_artifact_df",
+        lambda db_path, table_name: frame_map[(str(db_path), str(table_name))].copy(),
+    )
+
+    bundle = nlp_app._load_embedding_bundle_from_catalog_rows(
+        pd.Series(
+            {
+                "artifact_id": "emb-1",
+                "run_id": "run-emb-1",
+                "created_at": "2026-04-04T10:00:00",
+                "artifact_name": "text_embeddings",
+                "db_path": "/tmp/emb.duckdb",
+                "table_name": "text_embeddings_table",
+                "row_count": 2,
+                "metadata": {
+                    "method": "tfidf_svd",
+                    "text_col": "text_bert",
+                    "embedding_feature_columns": ["emb_000", "emb_001"],
+                },
+            }
+        ),
+        pd.Series(
+            {
+                "artifact_id": "rf-1",
+                "run_id": "run-rf-1",
+                "created_at": "2026-04-04T10:05:00",
+                "artifact_name": "embedding_rf_ranking",
+                "db_path": "/tmp/rf.duckdb",
+                "table_name": "embedding_rf_table",
+                "row_count": 2,
+                "metadata": {
+                    "selected_top_k": 1,
+                    "selected_embedding_cols": ["emb_001"],
+                },
+            }
+        ),
+    )
+
+    assert bundle["embed_cols"] == ["emb_000", "emb_001"]
+    assert bundle["selected_embedding_cols"] == ["emb_001"]
+    assert bundle["rf_ranking_df"].equals(ranking_df)
+    assert "emb_000" not in bundle["language_df"].columns
+    assert "emb_001" not in bundle["language_df"].columns
+    assert bundle["embedding_artifact"]["artifact_id"] == "emb-1"
 
 
 def test_candidate_feature_caps_respects_requested_cap():
@@ -682,6 +887,30 @@ def test_paper_build_interactive_k_chart_matches_reference_style():
     assert fig.data[1].line.color == "#3F3F3F"
     assert fig.data[1].marker.color == "#F4B13D"
     assert tuple(fig.data[1].x) == (10, 20, 30, 40)
+
+
+def test_paper_build_history_model_comparison_chart_matches_reference_palette():
+    summary_df = pd.DataFrame(
+        [
+            {"model_code": "M1", "accuracy": 0.744, "precision": 0.785, "recall": 0.922, "f1_score": 0.848},
+            {"model_code": "M2", "accuracy": 0.860, "precision": 0.899, "recall": 0.922, "f1_score": 0.911},
+            {"model_code": "M3", "accuracy": 0.944, "precision": 0.946, "recall": 0.984, "f1_score": 0.965},
+        ]
+    )
+
+    fig = _paper_build_history_model_comparison_chart(summary_df)
+
+    assert fig.layout.title.text == "<b>Comparativo de metricas finales</b>"
+    assert fig.layout.barmode == "group"
+    assert fig.layout.yaxis.title.text == "Score"
+    assert tuple(fig.layout.xaxis.categoryarray) == ("Accuracy", "Precision", "Recall", "F1 global")
+    assert [trace.name for trace in fig.data] == ["M1", "M2", "M3"]
+    assert [trace.type for trace in fig.data] == ["bar", "bar", "bar"]
+    assert fig.data[0].marker.color == "#FFA500"
+    assert fig.data[1].marker.color == "#CC8400"
+    assert fig.data[2].marker.color == "#333333"
+    assert tuple(fig.data[0].text) == ("0.744", "0.785", "0.922", "0.848")
+    assert tuple(fig.data[1].x) == ("Accuracy", "Precision", "Recall", "F1 global")
 
 
 def test_paper_history_validation_chart_title_uses_scoring_metric():
@@ -951,6 +1180,85 @@ def test_classification_metrics_include_per_class_stats():
     assert metrics["class_metrics"]["0"]["precision"] == pytest.approx(0.5)
     assert metrics["class_metrics"]["0"]["recall"] == pytest.approx(0.5)
     assert metrics["class_metrics"]["1"]["f1_score"] == pytest.approx(0.5)
+    assert metrics["auprc"] == pytest.approx(0.8333333333333333)
+    assert metrics["mcc"] == pytest.approx(0.0)
+
+
+def test_paper_metricas_tex_includes_auprc_and_mcc_rows():
+    model_results = [
+        {
+            "model_code": "M1",
+            "metrics": {
+                "accuracy": 0.877,
+                "auprc": 0.916,
+                "mcc": 0.002,
+                "false_negatives_positive_class": 8,
+                "class_metrics": {
+                    "0": {"precision": 0.11, "recall": 0.02, "f1_score": 0.04},
+                    "1": {"precision": 0.89, "recall": 0.98, "f1_score": 0.93},
+                },
+            },
+        },
+        {
+            "model_code": "M2",
+            "metrics": {
+                "accuracy": 0.879,
+                "auprc": 0.927,
+                "mcc": 0.047,
+                "false_negatives_positive_class": 8,
+                "class_metrics": {
+                    "0": {"precision": 0.20, "recall": 0.04, "f1_score": 0.07},
+                    "1": {"precision": 0.90, "recall": 0.98, "f1_score": 0.94},
+                },
+            },
+        },
+        {
+            "model_code": "M3",
+            "metrics": {
+                "accuracy": 0.891,
+                "auprc": 0.924,
+                "mcc": 0.103,
+                "false_negatives_positive_class": 3,
+                "class_metrics": {
+                    "0": {"precision": 0.40, "recall": 0.04, "f1_score": 0.08},
+                    "1": {"precision": 0.90, "recall": 0.99, "f1_score": 0.94},
+                },
+            },
+        },
+    ]
+
+    metricas_df = nlp_app._paper_metricas_table_df(model_results)
+    assert metricas_df.loc[metricas_df["class_label"] == "All", "metric"].tolist() == [
+        "Accuracy",
+        "AUPRC (MARC)",
+        "MCC",
+        "False negatives",
+    ]
+
+    tex = nlp_app._paper_metricas_tex(metricas_df)
+    assert "\\multicolumn{2}{l}{AUPRC (MARC)}" in tex
+    assert "\\multicolumn{2}{l}{MCC}" in tex
+
+
+def test_paper_plot_metrics_ignores_global_rows(tmp_path: Path):
+    metricas_df = pd.DataFrame(
+        [
+            {"class_label": "All", "metric": "Accuracy", "M1": 0.80, "M2": 0.81, "M3": 0.82},
+            {"class_label": "All", "metric": "AUPRC (MARC)", "M1": 0.91, "M2": 0.92, "M3": 0.93},
+            {"class_label": "All", "metric": "MCC", "M1": 0.01, "M2": 0.02, "M3": 0.03},
+            {"class_label": "All", "metric": "False negatives", "M1": 8, "M2": 8, "M3": 3},
+            {"class_label": "No-MARC", "metric": "Precision", "M1": 0.11, "M2": 0.20, "M3": 0.40},
+            {"class_label": "No-MARC", "metric": "Recall", "M1": 0.02, "M2": 0.04, "M3": 0.04},
+            {"class_label": "No-MARC", "metric": "F1", "M1": 0.04, "M2": 0.07, "M3": 0.08},
+            {"class_label": "MARC", "metric": "Precision", "M1": 0.89, "M2": 0.90, "M3": 0.90},
+            {"class_label": "MARC", "metric": "Recall", "M1": 0.98, "M2": 0.98, "M3": 0.99},
+            {"class_label": "MARC", "metric": "F1", "M1": 0.93, "M2": 0.94, "M3": 0.94},
+        ]
+    )
+
+    path = nlp_app._paper_plot_metrics(metricas_df, tmp_path)
+
+    assert path.exists()
 
 
 def test_paper_protocol_config_is_locked_to_article_setup():
@@ -2634,7 +2942,7 @@ def test_train_model_comparison_holdout_includes_xgb_optimization_protocol(monke
     y_train = pd.Series([0, 1])
     y_test = pd.Series([0, 1])
     test_ids = pd.Series(["a3", "a4"])
-    captured: list[tuple[str | None, int | None]] = []
+    captured: list[tuple[str | None, int | None, bool]] = []
 
     monkeypatch.setattr(nlp_app, "_resolve_feature_group", lambda df_arg, feature_group: ["f1", "f2"])
     monkeypatch.setattr(
@@ -2651,7 +2959,13 @@ def test_train_model_comparison_holdout_includes_xgb_optimization_protocol(monke
     )
 
     def fake_rf_xgb(*args, **kwargs):
-        captured.append((kwargs.get("optimization_backend"), kwargs.get("optuna_trials")))
+        captured.append(
+            (
+                kwargs.get("optimization_backend"),
+                kwargs.get("optuna_trials"),
+                bool(kwargs.get("use_regularization")),
+            )
+        )
         return {
             "model_name": "RF + XGBoost",
             "feature_strategy": "RF top-2",
@@ -2659,7 +2973,11 @@ def test_train_model_comparison_holdout_includes_xgb_optimization_protocol(monke
             "ranking_df": pd.DataFrame({"variable": ["f1", "f2"], "importance": [0.9, 0.8]}),
             "balancing_meta": {"balanced": False},
             "search_df": pd.DataFrame({"optimization_backend": ["optuna"]}),
-            "params": {"optimization_backend": "optuna", "optuna_trials_requested": 9},
+            "params": {
+                "optimization_backend": "optuna",
+                "optuna_trials_requested": 9,
+                "use_regularization": True,
+            },
             "metrics": {"accuracy": 0.9, "precision": 0.9, "recall": 0.9, "f1_score": 0.9, "roc_auc": 0.95, "false_negatives_global": 0},
             "predictions": np.array([0, 1]),
             "scores": np.array([0.1, 0.9]),
@@ -2692,14 +3010,16 @@ def test_train_model_comparison_holdout_includes_xgb_optimization_protocol(monke
         split_mode="Estratificado",
         max_features_per_model=2,
         xgb_tuning_profile="Rapida",
+        use_regularization=True,
         xgb_optimization_backend="optuna",
         xgb_optuna_trials=9,
         tuning_folds=3,
     )
 
-    assert captured == [("optuna", 9)]
+    assert captured == [("optuna", 9, True)]
     assert payload["protocol"]["xgb_optimization_backend"] == "optuna"
     assert payload["protocol"]["xgb_optuna_trials"] == 9
+    assert payload["protocol"]["use_regularization"] is True
 
 
 def test_train_model_comparison_holdout_respects_feature_group_cap(monkeypatch: pytest.MonkeyPatch):

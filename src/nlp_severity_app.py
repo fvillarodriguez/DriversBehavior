@@ -86,8 +86,10 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     confusion_matrix,
     f1_score,
+    matthews_corrcoef,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -195,6 +197,17 @@ PAPER_K_GRID_INTERVAL_OPTIONS = [5, 10, 25, 50, 100]
 PAPER_K_GRID_INTERVAL_DEFAULT = 10
 PAPER_CLASS_LABELS = {0: "No-MARC", 1: "MARC"}
 PAPER_MODEL_SELECTION_DEFAULT = ["M1", "M2", "M3"]
+PAPER_MODEL_COLOR_MAP = {
+    "M1": "#FFA500",
+    "M2": "#CC8400",
+    "M3": "#333333",
+}
+PAPER_HISTORY_MODEL_METRIC_SPECS: Tuple[Tuple[str, str], ...] = (
+    ("accuracy", "Accuracy"),
+    ("precision", "Precision"),
+    ("recall", "Recall"),
+    ("f1_score", "F1 global"),
+)
 PAPER_PROTOCOL = {
     "split_mode": "Temporal",
     "test_size": 0.2,
@@ -289,6 +302,7 @@ STATE_DEFAULTS: Dict[str, object] = {
     "nlp_sev_topic_df": None,
     "nlp_sev_topic_meta": None,
     "nlp_sev_paper_replication_payload": None,
+    "nlp_sev_stat_test_results": None,
     "nlp_sev_train_xgb_param_grids": None,
     "nlp_sev_train_smote_param_grids": None,
 }
@@ -567,11 +581,14 @@ def _persist_artifact(
 ) -> Dict[str, object]:
     _ensure_registry_db()
     artifact_id = uuid.uuid4().hex
+    created_at = _ts_now()
     table_name = f"{_slug(artifact_name)}_{_stamp_now()}"
     db_path = MODULE_RESULTS_DIR / f"{table_name}.duckdb"
     _write_df_to_duckdb(df, db_path, table_name)
     payload = {
         "artifact_id": artifact_id,
+        "run_id": run_id,
+        "created_at": created_at,
         "artifact_name": artifact_name,
         "db_path": str(db_path),
         "table_name": table_name,
@@ -590,7 +607,7 @@ def _persist_artifact(
             [
                 artifact_id,
                 run_id,
-                _ts_now(),
+                created_at,
                 stage,
                 artifact_name,
                 str(db_path),
@@ -1659,6 +1676,19 @@ def _list_feature_engineering_artifacts() -> pd.DataFrame:
     return catalog
 
 
+def _artifact_payload_from_catalog_row(row: pd.Series) -> Dict[str, object]:
+    return {
+        "artifact_id": row.get("artifact_id"),
+        "run_id": row.get("run_id"),
+        "created_at": row.get("created_at"),
+        "artifact_name": row.get("artifact_name"),
+        "db_path": str(row.get("db_path")),
+        "table_name": row.get("table_name"),
+        "row_count": int(row.get("row_count") or 0),
+        "metadata": row.get("metadata") or {},
+    }
+
+
 def _load_feature_bundle_from_catalog_row(row: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[Dict[str, object]]]:
     features_df = _read_artifact_df(row["db_path"], row["table_name"])
     granular_df = pd.DataFrame()
@@ -1695,6 +1725,162 @@ def _load_feature_bundle_from_catalog_row(row: pd.Series) -> Tuple[pd.DataFrame,
     return features_df, granular_df, feature_artifact if not granular_artifact else {
         **feature_artifact,
         "paired_granular": granular_artifact,
+    }
+
+
+def _artifact_matches_feature_bundle(
+    row: pd.Series,
+    feature_artifact: Optional[Dict[str, object]],
+) -> bool:
+    if not isinstance(feature_artifact, dict):
+        return False
+    metadata = row.get("metadata") or {}
+    feature_artifact_id = str(feature_artifact.get("artifact_id") or "").strip()
+    feature_run_id = str(feature_artifact.get("run_id") or "").strip()
+    source_feature_artifact_id = str(metadata.get("source_feature_artifact_id") or "").strip()
+    source_feature_run_id = str(metadata.get("source_feature_run_id") or "").strip()
+    row_run_id = str(row.get("run_id") or "").strip()
+
+    if feature_artifact_id and source_feature_artifact_id == feature_artifact_id:
+        return True
+    if feature_run_id and source_feature_run_id == feature_run_id:
+        return True
+    if feature_run_id and row_run_id == feature_run_id and not source_feature_artifact_id and not source_feature_run_id:
+        return True
+    return False
+
+
+def _list_associated_text_embeddings_artifacts(
+    feature_artifact: Optional[Dict[str, object]],
+) -> pd.DataFrame:
+    catalog = _load_artifact_catalog(stage="language_modeling", artifact_name="text_embeddings")
+    if catalog.empty:
+        return catalog
+    filtered = catalog.loc[
+        catalog.apply(lambda row: _artifact_matches_feature_bundle(row, feature_artifact), axis=1)
+    ].copy()
+    if filtered.empty:
+        return filtered
+    filtered["label"] = filtered.apply(
+        lambda row: (
+            f"{row.get('created_at')} | "
+            f"{(row.get('metadata') or {}).get('method', '?')} | "
+            f"{(row.get('metadata') or {}).get('text_col', '?')} | "
+            f"dims={int((row.get('metadata') or {}).get('embedding_dims') or 0)} | "
+            f"{Path(str(row.get('db_path'))).name}"
+        ),
+        axis=1,
+    )
+    return filtered
+
+
+def _list_associated_embedding_rf_artifacts(
+    feature_artifact: Optional[Dict[str, object]],
+    embeddings_artifact: Optional[Dict[str, object]],
+) -> pd.DataFrame:
+    catalog = _load_artifact_catalog(stage="language_modeling", artifact_name="embedding_rf_ranking")
+    if catalog.empty:
+        return catalog
+    embedding_artifact_id = (
+        str((embeddings_artifact or {}).get("artifact_id") or "").strip()
+        if isinstance(embeddings_artifact, dict)
+        else ""
+    )
+    embedding_run_id = (
+        str((embeddings_artifact or {}).get("run_id") or "").strip()
+        if isinstance(embeddings_artifact, dict)
+        else ""
+    )
+
+    def _is_direct_match(row: pd.Series) -> bool:
+        metadata = row.get("metadata") or {}
+        source_embedding_artifact_id = str(metadata.get("source_embeddings_artifact_id") or "").strip()
+        source_embedding_run_id = str(metadata.get("source_embeddings_run_id") or "").strip()
+        row_run_id = str(row.get("run_id") or "").strip()
+        if embedding_artifact_id and source_embedding_artifact_id == embedding_artifact_id:
+            return True
+        if embedding_run_id and source_embedding_run_id == embedding_run_id:
+            return True
+        if embedding_run_id and row_run_id == embedding_run_id and not source_embedding_artifact_id and not source_embedding_run_id:
+            return True
+        return False
+
+    catalog = catalog.copy()
+    if embedding_artifact_id or embedding_run_id:
+        direct_mask = catalog.apply(_is_direct_match, axis=1)
+        if bool(direct_mask.any()):
+            filtered = catalog.loc[direct_mask].copy()
+        else:
+            filtered = catalog.loc[
+                catalog.apply(lambda row: _artifact_matches_feature_bundle(row, feature_artifact), axis=1)
+            ].copy()
+    else:
+        filtered = catalog.loc[
+            catalog.apply(lambda row: _artifact_matches_feature_bundle(row, feature_artifact), axis=1)
+        ].copy()
+
+    if filtered.empty:
+        return filtered
+    filtered["label"] = filtered.apply(
+        lambda row: (
+            f"{row.get('created_at')} | "
+            f"top_k={int(((row.get('metadata') or {}).get('selected_top_k') or 0))} | "
+            f"seleccionadas={len((row.get('metadata') or {}).get('selected_embedding_cols') or [])} | "
+            f"{Path(str(row.get('db_path'))).name}"
+        ),
+        axis=1,
+    )
+    return filtered
+
+
+def _load_embedding_bundle_from_catalog_rows(
+    embedding_row: pd.Series,
+    rf_row: Optional[pd.Series] = None,
+) -> Dict[str, object]:
+    embeddings_df = _read_artifact_df(embedding_row["db_path"], embedding_row["table_name"])
+    embedding_meta = dict(embedding_row.get("metadata") or {})
+    embed_cols = [
+        str(col)
+        for col in (embedding_meta.get("embedding_feature_columns") or [])
+        if str(col) in embeddings_df.columns
+    ]
+    if not embed_cols:
+        embed_cols = _embedding_feature_columns(embeddings_df)
+    if not embed_cols:
+        raise ValueError("El artifact seleccionado no contiene columnas de embeddings.")
+
+    language_df = embeddings_df.drop(columns=embed_cols, errors="ignore").copy()
+    ranking_df = pd.DataFrame()
+    selected_embedding_cols: List[str] = []
+    rf_artifact: Optional[Dict[str, object]] = None
+
+    if rf_row is not None:
+        ranking_df = _read_artifact_df(rf_row["db_path"], rf_row["table_name"])
+        rf_metadata = dict(rf_row.get("metadata") or {})
+        selected_embedding_cols = [
+            str(col)
+            for col in (rf_metadata.get("selected_embedding_cols") or [])
+            if str(col) in embed_cols
+        ]
+        if not selected_embedding_cols and not ranking_df.empty:
+            fallback_top_k = int(rf_metadata.get("selected_top_k") or len(ranking_df))
+            selected_embedding_cols = [
+                col
+                for col in _select_top_embedding_features(ranking_df, top_k=max(1, fallback_top_k))
+                if col in set(embed_cols)
+            ]
+        rf_artifact = _artifact_payload_from_catalog_row(rf_row)
+
+    embedding_meta["embedding_feature_columns"] = list(embed_cols)
+    return {
+        "language_df": language_df,
+        "embeddings_df": embeddings_df,
+        "embed_cols": list(embed_cols),
+        "embedding_meta": embedding_meta,
+        "embedding_artifact": _artifact_payload_from_catalog_row(embedding_row),
+        "rf_ranking_df": ranking_df,
+        "selected_embedding_cols": list(selected_embedding_cols),
+        "rf_artifact": rf_artifact,
     }
 
 
@@ -3840,6 +4026,7 @@ def generate_text_embeddings(
     for col in embed_cols:
         work[col] = embed_df[col].astype(float)
     meta["embedding_dims"] = int(len(embed_cols))
+    meta["embedding_feature_columns"] = list(embed_cols)
     meta["rows"] = int(len(work))
     return work, embed_cols, meta
 
@@ -3870,6 +4057,163 @@ def run_embedding_rf_analysis(df: pd.DataFrame, embed_cols: Sequence[str]) -> pd
             "importance": model.feature_importances_,
         }
     ).sort_values("importance", ascending=False, ignore_index=True)
+
+
+def _compute_embedding_correlation_summary(
+    df: pd.DataFrame,
+    embed_cols: Sequence[str],
+) -> Tuple[pd.DataFrame, pd.Series]:
+    if df is None or df.empty or not embed_cols:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    cols = [col for col in embed_cols if col in df.columns]
+    if len(cols) < 2:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    work = df[cols].replace([np.inf, -np.inf], np.nan)
+    if work.dropna(how="all").empty:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    imputer = SimpleImputer(strategy="median")
+    matrix = pd.DataFrame(imputer.fit_transform(work), columns=cols)
+    corr_df = matrix.corr(method="pearson").replace([np.inf, -np.inf], np.nan)
+    corr_df = corr_df.fillna(0.0)
+    if corr_df.empty:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    np.fill_diagonal(corr_df.values, 1.0)
+    upper_mask = np.triu(np.ones(corr_df.shape), k=1).astype(bool)
+    abs_corr_pairs = (
+        corr_df.abs()
+        .where(upper_mask)
+        .stack()
+        .astype(float)
+        .sort_values(ascending=False)
+    )
+    return corr_df, abs_corr_pairs
+
+
+def _build_embedding_correlation_heatmap(corr_df: pd.DataFrame) -> go.Figure:
+    labels = [str(col) for col in corr_df.columns.tolist()]
+    show_tick_labels = len(labels) <= 48
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=corr_df.to_numpy(dtype=float),
+            x=labels,
+            y=labels,
+            zmin=-1.0,
+            zmax=1.0,
+            zmid=0.0,
+            colorscale="RdBu",
+            colorbar=dict(title="r"),
+            hovertemplate="%{y} vs %{x}<br>Pearson r=%{z:.3f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=max(520, min(900, 180 + len(labels) * 10)),
+        margin=dict(l=10, r=10, t=10, b=10),
+    )
+    fig.update_xaxes(
+        side="bottom",
+        tickangle=-45 if show_tick_labels else 0,
+        showticklabels=show_tick_labels,
+    )
+    fig.update_yaxes(
+        autorange="reversed",
+        showticklabels=show_tick_labels,
+        scaleanchor="x",
+        scaleratio=1,
+    )
+    return fig
+
+
+def _build_embedding_abs_correlation_density_figure(abs_corr_pairs: pd.Series) -> Optional[go.Figure]:
+    if not isinstance(abs_corr_pairs, pd.Series) or abs_corr_pairs.empty:
+        return None
+
+    values = pd.to_numeric(abs_corr_pairs, errors="coerce").dropna().to_numpy(dtype=float)
+    values = values[(values >= 0.0) & (values <= 1.0)]
+    if len(values) == 0:
+        return None
+
+    hist, edges = np.histogram(values, bins=45, range=(0.0, 1.0), density=True)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    widths = np.diff(edges)
+    q1, median, q3 = np.percentile(values, [25, 50, 75])
+    y_max = max(float(np.nanmax(hist)), 1e-6)
+    y_top = y_max * 1.08
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=centers,
+            y=hist,
+            width=widths,
+            marker=dict(color="#FFA500", line=dict(color="#FFA500", width=0)),
+            opacity=1.0,
+            hovertemplate="Coefficient |r<sub>ij</sub>|=%{x:.3f}<br>Density=%{y:.3f}<extra></extra>",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[q1, q1],
+            y=[0.0, y_top],
+            mode="lines",
+            line=dict(color="#808080", width=2, dash="dot"),
+            name=f"Q1 = {q1:.3f}",
+            hovertemplate=f"Q1 = {q1:.3f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[median, median],
+            y=[0.0, y_top],
+            mode="lines",
+            line=dict(color="#000000", width=2, dash="dash"),
+            name=f"median = {median:.3f}",
+            hovertemplate=f"median = {median:.3f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[q3, q3],
+            y=[0.0, y_top],
+            mode="lines",
+            line=dict(color="#808080", width=2, dash="dot"),
+            name=f"Q3 = {q3:.3f}",
+            hovertemplate=f"Q3 = {q3:.3f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=520,
+        margin=dict(l=50, r=20, t=10, b=50),
+        bargap=0.0,
+        legend=dict(
+            x=1.0,
+            y=1.0,
+            xanchor="right",
+            yanchor="top",
+            bgcolor="rgba(255,255,255,0.92)",
+            bordercolor="#D0D0D0",
+            borderwidth=1,
+        ),
+    )
+    fig.update_xaxes(
+        title="Coefficient |r<sub>ij</sub>|",
+        range=[0.0, 1.05],
+        showgrid=False,
+        zeroline=False,
+    )
+    fig.update_yaxes(
+        title="Density",
+        range=[0.0, y_top],
+        showgrid=False,
+        zeroline=False,
+    )
+    return fig
 
 
 def _select_top_embedding_features(
@@ -3959,6 +4303,7 @@ def _classification_metrics(
         "precision": float(precision_score(y_true_arr, y_pred_arr, average=average, zero_division=0)),
         "recall": float(recall_score(y_true_arr, y_pred_arr, average=average, zero_division=0)),
         "f1_score": float(f1_score(y_true_arr, y_pred_arr, average=average, zero_division=0)),
+        "mcc": float(matthews_corrcoef(y_true_arr, y_pred_arr)) if len(y_true_arr) > 0 else np.nan,
         "confusion_matrix": cm.tolist(),
         "labels": unique_labels,
         "sample_size": int(len(y_true_arr)),
@@ -3973,13 +4318,181 @@ def _classification_metrics(
         "class_metrics": class_metrics,
     }
     if y_score is not None and len(unique_labels) <= 2:
+        score_arr = np.asarray(y_score, dtype=float)
+        y_true_positive = (y_true_arr == positive_label).astype(int)
         try:
-            metrics["roc_auc"] = float(roc_auc_score(y_true_arr, np.asarray(y_score, dtype=float)))
+            metrics["roc_auc"] = float(roc_auc_score(y_true_arr, score_arr))
         except ValueError:
             metrics["roc_auc"] = np.nan
+        try:
+            metrics["auprc"] = float(average_precision_score(y_true_positive, score_arr))
+        except ValueError:
+            metrics["auprc"] = np.nan
     else:
         metrics["roc_auc"] = np.nan
+        metrics["auprc"] = np.nan
     return metrics
+
+
+# ---------------------------------------------------------------------------
+# Statistical tests – Bootstrap CI & McNemar (Section 5.4 of the paper)
+# ---------------------------------------------------------------------------
+
+def _bootstrap_ci_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_score: Optional[np.ndarray] = None,
+    *,
+    n_boot: int = 10_000,
+    alpha: float = 0.05,
+    random_state: int = 42,
+) -> Dict[str, Dict[str, float]]:
+    """Compute bootstrap 95 % confidence intervals for classification metrics.
+
+    Returns a dict keyed by metric name, each value being
+    ``{"lower": float, "upper": float, "point": float}``.
+    Metrics: accuracy, precision, recall, f1_score, roc_auc,
+    false_negatives_positive_class (count).
+    """
+    rng = np.random.RandomState(random_state)
+    n = len(y_true)
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    has_score = y_score is not None
+    if has_score:
+        y_score = np.asarray(y_score, dtype=float)
+
+    boot: Dict[str, List[float]] = {
+        "accuracy": [],
+        "precision": [],
+        "recall": [],
+        "f1_score": [],
+        "roc_auc": [],
+        "false_negatives_positive_class": [],
+    }
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, size=n)
+        yt, yp = y_true[idx], y_pred[idx]
+        if len(set(yt)) < 2:
+            continue
+        boot["accuracy"].append(float(accuracy_score(yt, yp)))
+        boot["precision"].append(float(precision_score(yt, yp, zero_division=0)))
+        boot["recall"].append(float(recall_score(yt, yp, zero_division=0)))
+        boot["f1_score"].append(float(f1_score(yt, yp, zero_division=0)))
+        cm = confusion_matrix(yt, yp, labels=[0, 1])
+        fn_positive = int(cm[1, 0]) if cm.shape[0] > 1 else 0
+        boot["false_negatives_positive_class"].append(float(fn_positive))
+        if has_score:
+            ys = y_score[idx]
+            try:
+                boot["roc_auc"].append(float(roc_auc_score(yt, ys)))
+            except ValueError:
+                pass
+
+    lo = alpha / 2.0
+    hi = 1.0 - lo
+    point_metrics = _classification_metrics(y_true, y_pred, y_score)
+    result: Dict[str, Dict[str, float]] = {}
+    for key in boot:
+        vals = np.array(boot[key])
+        if len(vals) == 0:
+            continue
+        if key == "roc_auc":
+            point_val = float(point_metrics.get("roc_auc") or np.nan)
+        elif key == "false_negatives_positive_class":
+            point_val = float(point_metrics.get("false_negatives_positive_class", 0))
+        else:
+            point_val = float(point_metrics.get(key, 0.0))
+        result[key] = {
+            "point": point_val,
+            "lower": float(np.percentile(vals, lo * 100)),
+            "upper": float(np.percentile(vals, hi * 100)),
+        }
+    return result
+
+
+def _mcnemar_exact_test(
+    y_true: np.ndarray,
+    pred_a: np.ndarray,
+    pred_b: np.ndarray,
+) -> Dict[str, object]:
+    """McNemar's exact test comparing two models on the same test set.
+
+    Returns dict with discordant cell counts and the two-sided p-value.
+    ``a_correct_b_wrong``: cases model A gets right but model B gets wrong.
+    ``b_correct_a_wrong``: cases model B gets right but model A gets wrong.
+    """
+    from scipy.stats import binomtest
+
+    y_true = np.asarray(y_true, dtype=int)
+    pred_a = np.asarray(pred_a, dtype=int)
+    pred_b = np.asarray(pred_b, dtype=int)
+    correct_a = (pred_a == y_true)
+    correct_b = (pred_b == y_true)
+    a_correct_b_wrong = int(np.sum(correct_a & ~correct_b))
+    b_correct_a_wrong = int(np.sum(correct_b & ~correct_a))
+    n_discordant = a_correct_b_wrong + b_correct_a_wrong
+    if n_discordant == 0:
+        p_value = 1.0
+    else:
+        result = binomtest(a_correct_b_wrong, n_discordant, 0.5, alternative="two-sided")
+        p_value = float(result.pvalue)
+    return {
+        "a_correct_b_wrong": a_correct_b_wrong,
+        "b_correct_a_wrong": b_correct_a_wrong,
+        "n_discordant": n_discordant,
+        "p_value": p_value,
+    }
+
+
+def _paper_statistical_tests(
+    model_results: Sequence[Dict[str, object]],
+    *,
+    n_boot: int = 10_000,
+    alpha: float = 0.05,
+) -> Dict[str, object]:
+    """Run bootstrap CIs and McNemar tests on paper replication model results.
+
+    *model_results* is the list stored in a route payload (frozen/raw/update_emb).
+    Returns ``{"bootstrap": {model_code: ci_dict}, "mcnemar": [comparison_dicts]}``.
+    """
+    predictions_by_code: Dict[str, Dict[str, np.ndarray]] = {}
+    for result in model_results:
+        code = str(result.get("model_code") or "").strip()
+        pdf = result.get("predictions_df")
+        if not isinstance(pdf, pd.DataFrame) or pdf.empty or not code:
+            continue
+        y_true = pdf["severity_target"].values.astype(int)
+        y_pred = pdf["prediction"].values.astype(int)
+        y_score = pdf["score"].values.astype(float) if "score" in pdf.columns else None
+        predictions_by_code[code] = {"y_true": y_true, "y_pred": y_pred, "y_score": y_score}
+
+    bootstrap: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for code, arrays in predictions_by_code.items():
+        bootstrap[code] = _bootstrap_ci_metrics(
+            arrays["y_true"],
+            arrays["y_pred"],
+            arrays["y_score"],
+            n_boot=n_boot,
+            alpha=alpha,
+        )
+
+    mcnemar_results: List[Dict[str, object]] = []
+    codes = sorted(predictions_by_code.keys())
+    for i in range(len(codes)):
+        for j in range(i + 1, len(codes)):
+            code_a, code_b = codes[i], codes[j]
+            a, b = predictions_by_code[code_a], predictions_by_code[code_b]
+            if not np.array_equal(a["y_true"], b["y_true"]):
+                continue
+            test_result = _mcnemar_exact_test(a["y_true"], a["y_pred"], b["y_pred"])
+            mcnemar_results.append({
+                "model_a": code_a,
+                "model_b": code_b,
+                **test_result,
+            })
+
+    return {"bootstrap": bootstrap, "mcnemar": mcnemar_results}
 
 
 def _paper_normalize_optimization_backend(backend: Optional[object]) -> str:
@@ -4784,9 +5297,8 @@ def _render_paper_replication_history_detail(run_id: str) -> None:
             elif route_status not in {"", "ok"}:
                 st.warning(str(route_payload.get("status_message") or f"Estado no esperado: {route_status}"))
 
-            comparison_df = route_payload.get("comparison_df")
-            if not isinstance(comparison_df, pd.DataFrame) or comparison_df.empty:
-                comparison_df = _paper_model_summary_df(route_payload.get("model_results") or [])
+            comparison_df = _paper_resolve_route_comparison_df(route_payload)
+            metricas_df = _paper_resolve_route_metricas_df(route_payload, comparison_df=comparison_df)
             k_metrics_df = route_payload.get("k_metrics_df")
             if not isinstance(k_metrics_df, pd.DataFrame) or k_metrics_df.empty:
                 k_metrics_df = _paper_model_k_metrics_df(route_payload.get("model_results") or [])
@@ -4796,13 +5308,22 @@ def _render_paper_replication_history_detail(run_id: str) -> None:
                 or ((payload.get("checkpoint_manifest") or {}).get("protocol") or {}).get("scoring_metric")
             )
 
-            if comparison_df.empty or k_metrics_df.empty:
-                st.info("No hay metricas por k disponibles para esta ruta.")
+            if comparison_df.empty:
+                st.info("No hay metricas finales disponibles para esta ruta.")
                 continue
 
             model_rows = comparison_df.copy()
             if "model_code" in model_rows.columns:
                 model_rows = model_rows.sort_values("model_code", ascending=True).reset_index(drop=True)
+            comparison_fig = _paper_build_history_model_comparison_chart(model_rows)
+            st.plotly_chart(comparison_fig, width="stretch")
+            with st.expander("Metricas finales", expanded=False):
+                st.dataframe(model_rows, width="stretch")
+                if isinstance(metricas_df, pd.DataFrame) and not metricas_df.empty:
+                    st.dataframe(metricas_df, width="stretch")
+            if k_metrics_df.empty:
+                st.info("No hay metricas por k disponibles para esta ruta.")
+                continue
             model_labels = [
                 str(row.get("model_title") or row.get("model_code") or f"Modelo {idx + 1}")
                 for idx, row in enumerate(model_rows.to_dict(orient="records"))
@@ -4820,11 +5341,21 @@ def _render_paper_replication_history_detail(run_id: str) -> None:
                         st.info(f"No hay curvas por k para {model_title}.")
                         continue
 
-                    summary_cols = st.columns(4)
+                    summary_cols = st.columns(6)
                     summary_cols[0].metric("k*", f"{int(model_row.get('selected_k') or 0)}")
                     summary_cols[1].metric("Accuracy", f"{float(model_row.get('accuracy') or 0.0) * 100:.2f}%")
                     summary_cols[2].metric("F1", f"{float(model_row.get('f1_score') or 0.0) * 100:.2f}%")
-                    summary_cols[3].metric("Validation", f"{float(model_row.get('validation_score') or 0.0):.4f}")
+                    auprc_value = pd.to_numeric(model_row.get("auprc"), errors="coerce")
+                    mcc_value = pd.to_numeric(model_row.get("mcc"), errors="coerce")
+                    summary_cols[3].metric(
+                        "AUPRC (MARC)",
+                        "-" if pd.isna(auprc_value) else f"{float(auprc_value):.3f}",
+                    )
+                    summary_cols[4].metric(
+                        "MCC",
+                        "-" if pd.isna(mcc_value) else f"{float(mcc_value):.3f}",
+                    )
+                    summary_cols[5].metric("Validation", f"{float(model_row.get('validation_score') or 0.0):.4f}")
 
                     chart_specs = _paper_history_k_chart_specs(route_scoring_metric)
                     chart_cols = st.columns(2)
@@ -5750,6 +6281,7 @@ def _render_controlled_comparison_protocol(
     xgb_optimization_backend: str,
     xgb_optuna_trials: int,
     xgb_tuning_profile: str,
+    use_regularization: bool,
     tuning_folds: int,
     protocol: Optional[Dict[str, object]] = None,
 ) -> None:
@@ -5759,7 +6291,7 @@ def _render_controlled_comparison_protocol(
                 [
                     "1. Se define un unico `holdout` con el `feature group` seleccionado. Ese test queda congelado y se reutiliza en los tres modelos.",
                     "2. El `split` se genera una sola vez con el mismo `random_state`. Si el split temporal no deja ambas clases en train/test, se degrada a estratificado.",
-                    "3. RF + XGBoost usa solo train: imputacion mediana, ranking RF sobre el train real, seleccion del numero exacto de variables definido en la UI y luego optimizacion conjunta de `SMOTE` (`sampling_strategy`, `k_neighbors`) + XGBoost.",
+                    "3. RF + XGBoost usa solo train: imputacion mediana, ranking RF sobre el train real, seleccion del numero exacto de variables definido en la UI y luego optimizacion conjunta de `SMOTE` (`sampling_strategy`, `k_neighbors`) + XGBoost, incorporando regularizacion cuando se activa en esta vista.",
                     "4. Elastic Net usa solo train: imputacion, escalado, SMOTE si aplica, `GridSearchCV` sobre `C in {0.01, 0.1, 1, 10}` y `l1_ratio in {0.1, 0.5, 0.9}`, y luego se conservan exactamente las variables con mayor `|coef|` hasta el numero definido.",
                     "5. SVM + RFE usa solo train: imputacion, escalado, SMOTE si aplica, `RFE` con el numero exacto de variables definido y `GridSearchCV` del SVM con `C in {0.1, 1, 10}` y `kernel in {linear, rbf}`.",
                     "6. Las matrices de confusion finales se calculan sobre exactamente las mismas filas y etiquetas de test.",
@@ -5776,7 +6308,8 @@ def _render_controlled_comparison_protocol(
             "Ajuste interno: "
             f"XGBoost={_paper_optimization_backend_label(xgb_optimization_backend)} / {xgb_tuning_profile} | "
             f"folds internos compartidos={int(tuning_folds)} | "
-            f"variables por modelo={feature_count_per_model}"
+            f"variables por modelo={feature_count_per_model} | "
+            f"regularizacion={bool(use_regularization)}"
         )
         xgb_detail = _xgb_search_strategy_help(xgb_tuning_profile)
         if _paper_normalize_optimization_backend(xgb_optimization_backend) == "optuna":
@@ -7818,6 +8351,7 @@ def train_model_comparison_holdout(
     split_mode: str,
     max_features_per_model: int,
     xgb_tuning_profile: str,
+    use_regularization: bool = False,
     xgb_optimization_backend: Optional[object] = None,
     xgb_optuna_trials: Optional[object] = None,
     tuning_folds: int,
@@ -7851,6 +8385,7 @@ def train_model_comparison_holdout(
         random_state=int(random_state),
         max_features=max_features,
         tuning_profile=str(xgb_tuning_profile),
+        use_regularization=bool(use_regularization),
         optimization_backend=xgb_optimization_backend,
         optuna_trials=xgb_optuna_trials,
         tuning_folds=int(tuning_folds),
@@ -7931,6 +8466,7 @@ def train_model_comparison_holdout(
         "random_state": int(random_state),
         "test_size": float(test_size),
         "xgb_tuning_profile": str(xgb_tuning_profile),
+        "use_regularization": bool(use_regularization),
         "xgb_optimization_backend": str(
             _paper_normalize_optimization_backend(xgb_optimization_backend)
         ),
@@ -7972,6 +8508,8 @@ def _paper_model_summary_df(model_results: Sequence[Dict[str, object]]) -> pd.Da
                 "recall": float(metrics.get("recall") or 0.0),
                 "f1_score": float(metrics.get("f1_score") or 0.0),
                 "roc_auc": float(metrics.get("roc_auc")) if not pd.isna(metrics.get("roc_auc")) else np.nan,
+                "auprc": float(metrics.get("auprc")) if not pd.isna(metrics.get("auprc")) else np.nan,
+                "mcc": float(metrics.get("mcc")) if not pd.isna(metrics.get("mcc")) else np.nan,
                 "validation_score": float(metrics.get("validation_score") or 0.0),
                 "false_negatives_positive_class": int(metrics.get("false_negatives_positive_class") or 0),
                 "false_negatives_pct": float(metrics.get("false_negative_rate_positive_class") or 0.0) * 100.0,
@@ -7984,6 +8522,123 @@ def _paper_model_summary_df(model_results: Sequence[Dict[str, object]]) -> pd.Da
             }
         )
     return pd.DataFrame(rows)
+
+
+def _paper_prediction_metrics_by_model(predictions_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    if not isinstance(predictions_df, pd.DataFrame) or predictions_df.empty or "severity_target" not in predictions_df.columns:
+        return {}
+    metrics_by_model: Dict[str, Dict[str, float]] = {}
+    for pred_col in predictions_df.columns:
+        if not str(pred_col).startswith("pred_"):
+            continue
+        suffix = str(pred_col)[len("pred_") :].strip()
+        if not suffix:
+            continue
+        score_col = f"score_{suffix}"
+        required_cols = ["severity_target", pred_col]
+        if score_col in predictions_df.columns:
+            required_cols.append(score_col)
+        work = predictions_df[required_cols].copy()
+        work["severity_target"] = pd.to_numeric(work["severity_target"], errors="coerce")
+        work[pred_col] = pd.to_numeric(work[pred_col], errors="coerce")
+        if score_col in work.columns:
+            work[score_col] = pd.to_numeric(work[score_col], errors="coerce")
+        work = work.dropna(subset=required_cols).reset_index(drop=True)
+        if work.empty:
+            continue
+        metrics = _classification_metrics(
+            work["severity_target"].astype(int).tolist(),
+            work[pred_col].astype(int).tolist(),
+            work[score_col].astype(float).tolist() if score_col in work.columns else None,
+        )
+        metrics_by_model[suffix.upper()] = {
+            "accuracy": float(metrics.get("accuracy") or 0.0),
+            "roc_auc": float(metrics.get("roc_auc")) if not pd.isna(metrics.get("roc_auc")) else np.nan,
+            "auprc": float(metrics.get("auprc")) if not pd.isna(metrics.get("auprc")) else np.nan,
+            "mcc": float(metrics.get("mcc")) if not pd.isna(metrics.get("mcc")) else np.nan,
+            "false_negatives_positive_class": int(metrics.get("false_negatives_positive_class") or 0),
+        }
+    return metrics_by_model
+
+
+def _paper_enrich_summary_with_predictions(
+    summary_df: pd.DataFrame,
+    predictions_df: pd.DataFrame,
+) -> pd.DataFrame:
+    frame = summary_df.copy() if isinstance(summary_df, pd.DataFrame) else pd.DataFrame()
+    if frame.empty or "model_code" not in frame.columns:
+        return frame
+    metrics_by_model = _paper_prediction_metrics_by_model(predictions_df)
+    if not metrics_by_model:
+        return frame
+    for metric_key in ["accuracy", "roc_auc", "auprc", "mcc", "false_negatives_positive_class"]:
+        if metric_key not in frame.columns:
+            frame[metric_key] = np.nan
+    for idx, row in frame.iterrows():
+        model_code = str(row.get("model_code") or "").strip().upper()
+        if not model_code:
+            continue
+        prediction_metrics = metrics_by_model.get(model_code)
+        if not isinstance(prediction_metrics, dict):
+            continue
+        for metric_key, metric_value in prediction_metrics.items():
+            current_value = pd.to_numeric(frame.at[idx, metric_key], errors="coerce")
+            if pd.isna(current_value):
+                frame.at[idx, metric_key] = metric_value
+    return frame
+
+
+def _paper_metricas_table_from_summary_df(summary_df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(summary_df, pd.DataFrame) or summary_df.empty:
+        return pd.DataFrame()
+    model_cols = [
+        str(model_code)
+        for model_code in summary_df["model_code"].astype(str).tolist()
+        if str(model_code).strip()
+    ]
+    if not model_cols:
+        return pd.DataFrame()
+    code_to_row = {
+        str(row["model_code"]): row
+        for row in summary_df.to_dict(orient="records")
+    }
+    records: List[Dict[str, object]] = []
+    global_metric_specs = [
+        ("Accuracy", "accuracy"),
+        ("AUPRC (MARC)", "auprc"),
+        ("MCC", "mcc"),
+        ("False negatives", "false_negatives_positive_class"),
+    ]
+    for metric_label, metric_key in global_metric_specs:
+        values: Dict[str, object] = {}
+        for model_code in model_cols:
+            value = code_to_row.get(model_code, {}).get(metric_key)
+            if metric_label == "False negatives":
+                values[model_code] = int(value or 0)
+            else:
+                numeric_value = pd.to_numeric(value, errors="coerce")
+                values[model_code] = np.nan if pd.isna(numeric_value) else float(numeric_value)
+        if metric_label != "False negatives" and all(pd.isna(value) for value in values.values()):
+            continue
+        records.append({"class_label": "All", "metric": metric_label, **values})
+    metric_keys = [
+        ("Precision", "precision"),
+        ("Recall", "recall"),
+        ("F1", "f1"),
+    ]
+    for _, class_label, prefix in [("0", "No-MARC", "no_marc"), ("1", "MARC", "marc")]:
+        for metric_label, suffix in metric_keys:
+            records.append(
+                {
+                    "class_label": class_label,
+                    "metric": metric_label,
+                    **{
+                        model_code: float(code_to_row.get(model_code, {}).get(f"{prefix}_{suffix}", 0.0))
+                        for model_code in model_cols
+                    },
+                }
+            )
+    return pd.DataFrame(records)
 
 
 def _paper_model_k_metrics_df(model_results: Sequence[Dict[str, object]]) -> pd.DataFrame:
@@ -8031,48 +8686,51 @@ def _paper_model_k_metrics_df(model_results: Sequence[Dict[str, object]]) -> pd.
     return pd.DataFrame(rows)
 
 
-def _paper_metricas_table_df(model_results: Sequence[Dict[str, object]]) -> pd.DataFrame:
-    records: List[Dict[str, object]] = []
-    summary_df = _paper_model_summary_df(model_results)
-    if summary_df.empty:
-        return pd.DataFrame()
-    model_cols = [
-        str(model_code)
-        for model_code in summary_df["model_code"].astype(str).tolist()
-        if str(model_code).strip()
-    ]
-    code_to_row = {
-        str(row["model_code"]): row
-        for row in summary_df.to_dict(orient="records")
-    }
-    records.append(
-        {
-            "class_label": "All",
-            "metric": "False negatives",
-            **{
-                model_code: int(code_to_row.get(model_code, {}).get("false_negatives_positive_class", 0))
-                for model_code in model_cols
-            },
-        }
+def _paper_metricas_table_df(
+    model_results: Sequence[Dict[str, object]],
+    *,
+    summary_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    resolved_summary_df = summary_df.copy() if isinstance(summary_df, pd.DataFrame) else _paper_model_summary_df(model_results)
+    return _paper_metricas_table_from_summary_df(resolved_summary_df)
+
+
+def _paper_metricas_has_required_global_rows(metricas_df: pd.DataFrame) -> bool:
+    if not isinstance(metricas_df, pd.DataFrame) or metricas_df.empty:
+        return False
+    if "class_label" not in metricas_df.columns or "metric" not in metricas_df.columns:
+        return False
+    all_rows = set(
+        metricas_df.loc[metricas_df["class_label"].astype(str).eq("All"), "metric"].astype(str).tolist()
     )
-    metric_keys = [
-        ("Precision", "precision"),
-        ("Recall", "recall"),
-        ("F1", "f1"),
-    ]
-    for class_key, class_label, prefix in [("0", "No-MARC", "no_marc"), ("1", "MARC", "marc")]:
-        for metric_label, suffix in metric_keys:
-            records.append(
-                {
-                    "class_label": class_label,
-                    "metric": metric_label,
-                    **{
-                        model_code: float(code_to_row.get(model_code, {}).get(f"{prefix}_{suffix}", 0.0))
-                        for model_code in model_cols
-                    },
-                }
-            )
-    return pd.DataFrame(records)
+    return {"Accuracy", "AUPRC (MARC)", "MCC", "False negatives"}.issubset(all_rows)
+
+
+def _paper_resolve_route_comparison_df(route_payload: Dict[str, object]) -> pd.DataFrame:
+    comparison_df = route_payload.get("comparison_df")
+    if not isinstance(comparison_df, pd.DataFrame) or comparison_df.empty:
+        comparison_df = _paper_model_summary_df(route_payload.get("model_results") or [])
+    predictions_df = route_payload.get("predictions_df")
+    if not isinstance(predictions_df, pd.DataFrame):
+        predictions_df = pd.DataFrame()
+    return _paper_enrich_summary_with_predictions(comparison_df, predictions_df)
+
+
+def _paper_resolve_route_metricas_df(
+    route_payload: Dict[str, object],
+    *,
+    comparison_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    metricas_df = route_payload.get("metricas_df")
+    if not isinstance(comparison_df, pd.DataFrame):
+        comparison_df = _paper_resolve_route_comparison_df(route_payload)
+    if (
+        not isinstance(metricas_df, pd.DataFrame)
+        or metricas_df.empty
+        or not _paper_metricas_has_required_global_rows(metricas_df)
+    ):
+        return _paper_metricas_table_df(route_payload.get("model_results") or [], summary_df=comparison_df)
+    return metricas_df
 
 
 def _paper_merge_predictions(model_results: Sequence[Dict[str, object]]) -> pd.DataFrame:
@@ -8154,10 +8812,22 @@ def _paper_metricas_tex(metricas_df: pd.DataFrame) -> str:
         class_label = str(row.get("class_label") or "")
         metric = str(row.get("metric") or "")
         values = [row.get(model_col) for model_col in model_cols]
-        if metric == "False negatives":
+        if class_label == "All" and metric == "False negatives":
             lines.append(
                 f"\\multicolumn{{2}}{{l}}{{False negatives}} & "
                 + " & ".join(str(int(value or 0)) for value in values)
+                + " \\\\"
+            )
+            continue
+        if class_label == "All":
+            lines.append(
+                f"\\multicolumn{{2}}{{l}}{{{metric}}} & "
+                + " & ".join(
+                    "-"
+                    if pd.isna(pd.to_numeric(value, errors="coerce"))
+                    else f"{float(pd.to_numeric(value, errors='coerce')):.3f}"
+                    for value in values
+                )
                 + " \\\\"
             )
             continue
@@ -8223,7 +8893,7 @@ def _paper_validation_chart_title(scoring_metric: Optional[object] = None) -> st
 
 
 def _paper_outer_cv_chart_title(metric_name: str) -> str:
-    return f"{metric_name} nested CV (outer folds) vs Number of Metrics (k)"
+    return f"{metric_name} vs Number of Metrics (k)" #nested CV 
 
 
 def _paper_history_k_chart_specs(scoring_metric: Optional[object] = None) -> List[Dict[str, object]]:
@@ -8504,6 +9174,148 @@ def _paper_build_interactive_k_chart(
     return fig
 
 
+def _paper_build_history_model_comparison_chart(
+    summary_df: pd.DataFrame,
+    *,
+    title: str = "Comparativo de metricas finales",
+) -> go.Figure:
+    frame = summary_df.copy() if isinstance(summary_df, pd.DataFrame) else pd.DataFrame()
+    fig = go.Figure()
+    metric_labels = [label for _, label in PAPER_HISTORY_MODEL_METRIC_SPECS]
+    if frame.empty or "model_code" not in frame.columns:
+        fig.add_annotation(
+            text="No data",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font={"size": 16, "color": "#666666"},
+        )
+        y_axis_range = None
+    else:
+        frame["model_code"] = frame["model_code"].astype(str).str.strip()
+        frame = frame.loc[frame["model_code"].ne("")].copy()
+        if not frame.empty:
+            model_order = {model_code: idx for idx, model_code in enumerate(PAPER_MODEL_SELECTION_DEFAULT)}
+            frame["_model_order"] = frame["model_code"].map(model_order).fillna(len(model_order)).astype(int)
+            frame = (
+                frame.sort_values(["_model_order", "model_code"], kind="stable")
+                .drop_duplicates(subset=["model_code"], keep="first")
+                .reset_index(drop=True)
+            )
+        chart_rows: List[Dict[str, object]] = []
+        for row in frame.to_dict(orient="records"):
+            model_code = str(row.get("model_code") or "").strip()
+            if not model_code:
+                continue
+            for metric_key, metric_label in PAPER_HISTORY_MODEL_METRIC_SPECS:
+                if metric_key not in row:
+                    continue
+                score = pd.to_numeric(row.get(metric_key), errors="coerce")
+                if pd.isna(score):
+                    continue
+                chart_rows.append(
+                    {
+                        "model_code": model_code,
+                        "metric_label": metric_label,
+                        "score": float(score),
+                        "model_order": int(row.get("_model_order") or 0),
+                    }
+                )
+        chart_df = pd.DataFrame(chart_rows)
+        if chart_df.empty:
+            fig.add_annotation(
+                text="No data",
+                x=0.5,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font={"size": 16, "color": "#666666"},
+            )
+            y_axis_range = None
+        else:
+            score_range = _paper_chart_axis_range(chart_df["score"], clamp_zero=True)
+            if score_range is None:
+                y_axis_range = None
+            else:
+                y_axis_range = [
+                    float(max(0.0, min(0.8, float(score_range[0])))),
+                    1.0,
+                ]
+            chart_df["metric_label"] = pd.Categorical(
+                chart_df["metric_label"],
+                categories=metric_labels,
+                ordered=True,
+            )
+            chart_df = chart_df.sort_values(["model_order", "metric_label"], kind="stable").reset_index(drop=True)
+            for model_code in chart_df["model_code"].drop_duplicates().tolist():
+                model_slice = chart_df.loc[chart_df["model_code"].astype(str).eq(model_code)].copy()
+                if model_slice.empty:
+                    continue
+                fig.add_trace(
+                    go.Bar(
+                        x=model_slice["metric_label"].tolist(),
+                        y=model_slice["score"].tolist(),
+                        name=model_code,
+                        marker={
+                            "color": PAPER_MODEL_COLOR_MAP.get(model_code, "#666666"),
+                            "line": {"width": 0},
+                        },
+                        text=[f"{float(value):.3f}" for value in model_slice["score"].tolist()],
+                        textposition="outside",
+                        cliponaxis=False,
+                        hovertemplate=f"{model_code}<br>%{{x}}: %{{y:.3f}}<extra></extra>",
+                    )
+                )
+
+    fig.update_layout(
+        title={"text": f"<b>{title}</b>", "x": 0.5, "xanchor": "center"},
+        barmode="group",
+        bargap=0.24,
+        bargroupgap=0.08,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=470,
+        margin={"l": 20, "r": 20, "t": 72, "b": 20},
+        hovermode="closest",
+        font={"size": 14, "color": "#111111"},
+        legend={
+            "title": None,
+            "x": 0.015,
+            "y": 0.985,
+            "xanchor": "left",
+            "yanchor": "top",
+            "bgcolor": "rgba(255, 255, 255, 0.88)",
+            "bordercolor": "rgba(0, 0, 0, 0.15)",
+            "borderwidth": 1,
+        },
+    )
+    fig.update_xaxes(
+        title=None,
+        categoryorder="array",
+        categoryarray=metric_labels,
+        showgrid=False,
+        zeroline=False,
+        showline=True,
+        linecolor="rgba(0, 0, 0, 0.65)",
+    )
+    fig.update_yaxes(
+        title="Score",
+        range=y_axis_range,
+        tickformat=".1f",
+        dtick=0.1,
+        showgrid=True,
+        gridcolor="rgba(180, 180, 180, 0.32)",
+        gridwidth=1,
+        zeroline=False,
+        showline=True,
+        linecolor="rgba(0, 0, 0, 0.65)",
+    )
+    return fig
+
+
 def _paper_plot_k_search(
     grid_df: pd.DataFrame,
     output_dir: Path,
@@ -8616,7 +9428,10 @@ def _paper_plot_k_search(
 
 def _paper_plot_metrics(metricas_df: pd.DataFrame, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    filtered = metricas_df[metricas_df["metric"] != "False negatives"].copy()
+    filtered = metricas_df[
+        metricas_df["metric"].ne("False negatives")
+        & metricas_df["class_label"].isin(["No-MARC", "MARC"])
+    ].copy()
     if filtered.empty:
         raise ValueError("No hay metricas por clase para graficar.")
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
@@ -9516,12 +10331,8 @@ def _paper_stage_latex_candidates(
     k_metrics_df = source_payload.get("k_metrics_df")
     if not isinstance(k_metrics_df, pd.DataFrame):
         k_metrics_df = pd.DataFrame()
-    metricas_df = source_payload.get("metricas_df")
-    if not isinstance(metricas_df, pd.DataFrame):
-        metricas_df = pd.DataFrame()
-    comparison_df = source_payload.get("comparison_df")
-    if not isinstance(comparison_df, pd.DataFrame):
-        comparison_df = pd.DataFrame()
+    comparison_df = _paper_resolve_route_comparison_df(source_payload)
+    metricas_df = _paper_resolve_route_metricas_df(source_payload, comparison_df=comparison_df)
     scoring_metric = ((source_payload.get("optimization") or {}).get("scoring_metric"))
     image_paths = _paper_plot_k_search(
         k_metrics_df,
@@ -10680,11 +11491,15 @@ def run_transformers_finetune(
     trainer_output_dir = output_dir / "trainer_output"
     trainer_output_dir.mkdir(parents=True, exist_ok=True)
 
-    work = df[[text_col]].copy()
+    _has_time = "accidente_time" in df.columns
+    cols_to_copy = [text_col] + (["accidente_time"] if _has_time else [])
+    work = df[cols_to_copy].copy()
     if mode == "classification":
         work["severity_target"] = _severity_series(df)
     work[text_col] = work[text_col].fillna("").astype(str).str.strip()
     work = work.loc[work[text_col] != ""].reset_index(drop=True)
+    if _has_time:
+        work["accidente_time"] = pd.to_datetime(work["accidente_time"], errors="coerce")
     if work.empty:
         raise ValueError("No hay textos validos para entrenar.")
 
@@ -10695,6 +11510,8 @@ def run_transformers_finetune(
     callbacks = []
     data_collator = None
     label_mapping: Dict[str, int] = {}
+    _temporal_ok = False
+    _temporal_ok_mlm = False
     pretrained_load_kwargs = _transformer_pretrained_load_kwargs(model_name)
 
     if mode == "classification":
@@ -10710,13 +11527,30 @@ def run_transformers_finetune(
             raise ValueError("Cada clase necesita al menos 2 filas para entrenar y validar.")
         label_mapping = {str(label): idx for idx, label in enumerate(unique_labels)}
         labels = labels_raw.map(lambda value: label_mapping[str(int(value))]).astype(int)
-        train_texts, eval_texts, train_labels, eval_labels = train_test_split(
-            work[text_col].tolist(),
-            labels.tolist(),
-            test_size=float(test_size),
-            stratify=labels.tolist(),
-            random_state=int(split_random_state if split_random_state is not None else random_state),
-        )
+
+        _temporal_ok = False
+        if _has_time and work["accidente_time"].notna().sum() >= 2:
+            _time_vals = work["accidente_time"].fillna(pd.Timestamp.min)
+            _order = np.argsort(_time_vals.to_numpy())
+            _split_idx = max(1, int(len(_order) * (1.0 - float(test_size))))
+            _train_idx, _test_idx = _order[:_split_idx], _order[_split_idx:]
+            _y_tr = labels.iloc[_train_idx]
+            _y_te = labels.iloc[_test_idx]
+            if _y_tr.nunique() >= 2 and _y_te.nunique() >= 1:
+                train_texts = work[text_col].iloc[_train_idx].tolist()
+                eval_texts = work[text_col].iloc[_test_idx].tolist()
+                train_labels = _y_tr.tolist()
+                eval_labels = _y_te.tolist()
+                _temporal_ok = True
+
+        if not _temporal_ok:
+            train_texts, eval_texts, train_labels, eval_labels = train_test_split(
+                work[text_col].tolist(),
+                labels.tolist(),
+                test_size=float(test_size),
+                stratify=labels.tolist(),
+                random_state=int(split_random_state if split_random_state is not None else random_state),
+            )
         try:
             model = AutoModelForSequenceClassification.from_pretrained(
                 model_name,
@@ -10767,11 +11601,22 @@ def run_transformers_finetune(
         texts = work[text_col].tolist()
         if len(texts) < 2:
             raise ValueError("Se requieren al menos 2 textos para MLM.")
-        train_texts, eval_texts = train_test_split(
-            texts,
-            test_size=float(test_size),
-            random_state=int(split_random_state if split_random_state is not None else random_state),
-        )
+
+        _temporal_ok_mlm = False
+        if _has_time and work["accidente_time"].notna().sum() >= 2:
+            _time_vals = work["accidente_time"].fillna(pd.Timestamp.min)
+            _order = np.argsort(_time_vals.to_numpy())
+            _split_idx = max(1, int(len(_order) * (1.0 - float(test_size))))
+            train_texts = work[text_col].iloc[_order[:_split_idx]].tolist()
+            eval_texts = work[text_col].iloc[_order[_split_idx:]].tolist()
+            _temporal_ok_mlm = True
+
+        if not _temporal_ok_mlm:
+            train_texts, eval_texts = train_test_split(
+                texts,
+                test_size=float(test_size),
+                random_state=int(split_random_state if split_random_state is not None else random_state),
+            )
         try:
             model = AutoModelForMaskedLM.from_pretrained(model_name, **pretrained_load_kwargs)
         except Exception as exc:
@@ -10889,6 +11734,7 @@ def run_transformers_finetune(
             "test_size": float(test_size),
             "random_state": int(random_state),
             "split_random_state": int(split_random_state if split_random_state is not None else random_state),
+            "split_mode": "Temporal" if (mode == "classification" and _temporal_ok) or (mode == "mlm" and _temporal_ok_mlm) else "Estratificado",
             "trainer_random_state": int(trainer_random_state if trainer_random_state is not None else random_state),
             "freeze_layers": bool(froze_layers),
             "mlm_probability": float(mlm_probability),
@@ -10932,37 +11778,45 @@ def run_transformers_hyperparameter_search(
     confirm_trials_dir.mkdir(parents=True, exist_ok=True)
 
     all_configs = _enumerate_transformer_search_configs(search_space)
-    trial_configs, sampling_meta = _sample_transformer_search_configs(
-        all_configs,
-        max_trials=int(max_trials),
-        random_state=int(split_random_state),
-    )
-    if not trial_configs:
+    total_candidates = len(all_configs)
+    if total_candidates == 0:
         raise ValueError("La busqueda no tiene configuraciones para evaluar.")
 
     objective_metric = str(objective_metric).strip()
     greater_is_better = objective_metric not in {"eval_loss", "loss", "perplexity"}
+    effective_trials = min(int(max_trials), total_candidates)
+    use_optuna = optuna is not None and TPESampler is not None and effective_trials < total_candidates
+
+    sampling_meta: Dict[str, object] = {
+        "total_candidates": int(total_candidates),
+        "executed_trials": int(effective_trials),
+        "sampling_mode": "optuna_tpe" if use_optuna else ("grid" if effective_trials >= total_candidates else "random_without_replacement"),
+    }
     _emit_progress(
         progress_callback,
         1,
-        f"Preparando {len(trial_configs):,} trials sobre {sampling_meta.get('total_candidates', 0):,} configuraciones.",
+        f"Preparando {effective_trials:,} trials sobre {total_candidates:,} configuraciones ({sampling_meta['sampling_mode']}).",
     )
 
     config_lookup: Dict[str, Dict[str, object]] = {}
     trial_rows: List[Dict[str, object]] = []
     trial_output_dirs: List[Path] = []
 
-    for trial_index, config in enumerate(trial_configs, start=1):
+    def _run_single_trial(
+        trial_index: int,
+        config: Dict[str, object],
+        n_total: int,
+    ) -> Dict[str, object]:
         config_payload = json.dumps(config, sort_keys=True, default=_json_default)
         config_id = uuid.uuid5(uuid.NAMESPACE_DNS, config_payload).hex[:12]
         config_lookup[config_id] = dict(config)
         trial_dir = search_trials_dir / f"trial_{trial_index:03d}_{config_id}"
         trial_output_dirs.append(trial_dir)
-        progress_start = 5 + int((trial_index - 1) * 55 / max(1, len(trial_configs)))
+        progress_start = 5 + int((trial_index - 1) * 55 / max(1, n_total))
         _emit_progress(
             progress_callback,
             progress_start,
-            f"Trial {trial_index}/{len(trial_configs)}: {config.get('model_name')} | lr={config.get('learning_rate')}.",
+            f"Trial {trial_index}/{n_total}: {config.get('model_name')} | lr={config.get('learning_rate')}.",
         )
         try:
             # Early stopping with patience=1 during search to save compute;
@@ -11040,7 +11894,59 @@ def run_transformers_hyperparameter_search(
                 "error": str(exc),
                 "error_traceback": traceback.format_exc(limit=10),
             }
-        trial_rows.append(row)
+        return row
+
+    if use_optuna:
+        _optuna_trial_counter = [0]
+        _optuna_search_space = {
+            key: [v if not isinstance(v, float) or not math.isnan(v) else str(v) for v in _dedupe_preserve_order(values)]
+            for key, values in search_space.items()
+        }
+
+        def _optuna_objective(trial: object) -> float:
+            config = {}
+            for key, choices in _optuna_search_space.items():
+                val = trial.suggest_categorical(str(key), choices)
+                if key in {"learning_rate", "weight_decay", "warmup_ratio", "test_size", "mlm_probability"}:
+                    val = float(val)
+                elif key in {"num_train_epochs", "batch_size", "max_length"}:
+                    val = int(val)
+                elif key == "freeze_layers":
+                    val = bool(val)
+                config[key] = val
+
+            _optuna_trial_counter[0] += 1
+            row = _run_single_trial(_optuna_trial_counter[0], config, effective_trials)
+            trial_rows.append(row)
+
+            obj = row.get("objective")
+            if row["status"] != "ok" or obj is None or (isinstance(obj, float) and math.isnan(obj)):
+                raise optuna.TrialPruned()
+            return float(obj)
+
+        sampler = TPESampler(seed=int(split_random_state))
+        study = optuna.create_study(
+            direction="maximize" if greater_is_better else "minimize",
+            sampler=sampler,
+        )
+        study.optimize(
+            _optuna_objective,
+            n_trials=int(effective_trials),
+            show_progress_bar=False,
+        )
+        sampling_meta["optuna_trials_completed"] = int(len(study.trials))
+    else:
+        if effective_trials >= total_candidates:
+            trial_configs = all_configs
+        else:
+            trial_configs, _ = _sample_transformer_search_configs(
+                all_configs,
+                max_trials=int(max_trials),
+                random_state=int(split_random_state),
+            )
+        for trial_index, config in enumerate(trial_configs, start=1):
+            row = _run_single_trial(trial_index, config, len(trial_configs))
+            trial_rows.append(row)
 
     trials_df = pd.DataFrame(trial_rows)
     successful_trials = trials_df[trials_df["status"] == "ok"].copy()
@@ -13105,7 +14011,7 @@ def _render_language_modeling_tab() -> None:
                                 "Max trials",
                                 min_value=1,
                                 max_value=64,
-                                value=8,
+                                value=24,
                                 step=1,
                                 key="nlp_sev_tf_search_max_trials",
                             )
@@ -13116,7 +14022,7 @@ def _render_language_modeling_tab() -> None:
                                 "Top-K a confirmar",
                                 min_value=1,
                                 max_value=10,
-                                value=3,
+                                value=5,
                                 step=1,
                                 key="nlp_sev_tf_search_confirm_top_k",
                             )
@@ -13483,112 +14389,226 @@ def _render_language_modeling_tab() -> None:
                         st.dataframe(history_df.tail(20), width="stretch")
 
     with sub_tabs[2]:
+        feature_artifact = st.session_state.get("nlp_sev_features_artifact") or {}
         embed_source_df = st.session_state.get("nlp_sev_language_df")
         if embed_source_df is None or embed_source_df.empty:
             embed_source_df = base_df
         text_cols = [col for col in embed_source_df.columns if "text_bert" in col]
-        if not text_cols:
-            st.info("No hay columnas textuales disponibles. Genere textos primero.")
-        else:
-            method_options = ["tfidf_svd"]
-            if SentenceTransformer is not None:
-                method_options.append("sentence_transformer")
-            finetuned_model_catalog = _list_transformer_finetuned_models()
-            if (
-                AutoModel is not None
-                and AutoTokenizer is not None
-                and torch is not None
-                and not finetuned_model_catalog.empty
-            ):
-                method_options.append("transformer_finetuned")
-            method = st.selectbox("Metodo", method_options, key="nlp_sev_embeddings_method")
-            selected_text_col = None
-            transformer_model_path = None
-            transformer_batch_size = 16
-            transformer_max_length = 256
-            if method == "transformer_finetuned":
-                selected_model_idx = st.selectbox(
-                    "Modelo fine-tuneado",
-                    options=finetuned_model_catalog.index.tolist(),
-                    format_func=lambda idx: str(finetuned_model_catalog.loc[idx, "model_label"]),
-                    key="nlp_sev_embeddings_finetuned_model",
+        embeddings_df_in_memory = st.session_state.get("nlp_sev_embeddings_df")
+        has_embedding_memory = (
+            isinstance(embeddings_df_in_memory, pd.DataFrame)
+            and not embeddings_df_in_memory.empty
+            and bool(st.session_state.get("nlp_sev_embedding_cols") or [])
+        )
+        associated_embeddings_catalog = _list_associated_text_embeddings_artifacts(feature_artifact)
+        embedding_source_options = ["Cargar existentes", "Generar nuevos", "En memoria"]
+        if st.session_state.get("nlp_sev_embeddings_source") not in embedding_source_options:
+            st.session_state["nlp_sev_embeddings_source"] = (
+                "En memoria"
+                if has_embedding_memory
+                else "Cargar existentes"
+                if not associated_embeddings_catalog.empty
+                else "Generar nuevos"
+            )
+        embedding_source = st.radio(
+            "Fuente de embeddings",
+            embedding_source_options,
+            horizontal=True,
+            key="nlp_sev_embeddings_source",
+        )
+
+        if embedding_source == "En memoria" and not has_embedding_memory:
+            st.info("No hay embeddings en memoria.")
+
+        if embedding_source == "Cargar existentes":
+            if not str(feature_artifact.get("artifact_id") or "").strip():
+                st.info("Cargue o calcule un dataset de features persistido para buscar embeddings asociados.")
+            elif associated_embeddings_catalog.empty:
+                st.info("No se encontraron embeddings persistidos asociados al dataset de features activo.")
+            else:
+                selected_embedding_idx = st.selectbox(
+                    "Embeddings persistidos asociados",
+                    options=associated_embeddings_catalog.index.tolist(),
+                    format_func=lambda idx: str(associated_embeddings_catalog.loc[idx, "label"]),
+                    key="nlp_sev_embeddings_artifact_select",
                 )
-                model_row = finetuned_model_catalog.loc[selected_model_idx]
-                model_metadata = model_row.get("metadata") or {}
-                suggested_text_col = str(model_metadata.get("text_col") or "")
-                if suggested_text_col in text_cols:
-                    selected_text_col = suggested_text_col
-                    st.caption(f"Usando la columna textual del modelo: `{selected_text_col}`")
+                selected_embedding_row = associated_embeddings_catalog.loc[selected_embedding_idx]
+                selected_embedding_meta = selected_embedding_row.get("metadata") or {}
+                st.caption(
+                    f"Metodo: {selected_embedding_meta.get('method', '?')} | "
+                    f"Texto: {selected_embedding_meta.get('text_col', '?')} | "
+                    f"Dims: {int(selected_embedding_meta.get('embedding_dims') or 0)} | "
+                    f"Rows: {int(selected_embedding_row.get('row_count') or 0):,}"
+                )
+                selected_embedding_artifact = _artifact_payload_from_catalog_row(selected_embedding_row)
+                associated_rf_catalog = _list_associated_embedding_rf_artifacts(
+                    feature_artifact,
+                    selected_embedding_artifact,
+                )
+                selected_rf_row = associated_rf_catalog.iloc[0] if not associated_rf_catalog.empty else None
+                if selected_rf_row is not None:
+                    selected_rf_meta = selected_rf_row.get("metadata") or {}
+                    st.caption(
+                        f"RF embeddings asociado: top_k={int(selected_rf_meta.get('selected_top_k') or 0)} | "
+                        f"seleccionadas={len(selected_rf_meta.get('selected_embedding_cols') or [])} | "
+                        f"{selected_rf_row.get('created_at')}"
+                    )
+                else:
+                    st.caption("No hay RF embeddings persistidos asociados a esta matriz.")
+                if st.button("Cargar embeddings persistidos", key="nlp_sev_load_existing_embeddings"):
+                    try:
+                        bundle = _load_embedding_bundle_from_catalog_rows(
+                            selected_embedding_row,
+                            selected_rf_row,
+                        )
+                    except Exception as exc:
+                        st.error(f"No se pudieron cargar los embeddings persistidos: {exc}")
+                    else:
+                        st.session_state["nlp_sev_language_df"] = bundle["language_df"]
+                        st.session_state["nlp_sev_embeddings_df"] = bundle["embeddings_df"]
+                        st.session_state["nlp_sev_embedding_cols"] = bundle["embed_cols"]
+                        st.session_state["nlp_sev_embedding_meta"] = bundle["embedding_meta"]
+                        st.session_state["nlp_sev_embeddings_artifact"] = bundle["embedding_artifact"]
+                        st.session_state["nlp_sev_embedding_rf_df"] = (
+                            bundle["rf_ranking_df"]
+                            if isinstance(bundle["rf_ranking_df"], pd.DataFrame) and not bundle["rf_ranking_df"].empty
+                            else None
+                        )
+                        st.session_state["nlp_sev_selected_embedding_cols"] = bundle["selected_embedding_cols"]
+                        _log_action(
+                            "language_modeling",
+                            "load_existing_embeddings",
+                            {
+                                "artifact_id": selected_embedding_artifact.get("artifact_id"),
+                                "run_id": selected_embedding_artifact.get("run_id"),
+                                "rows": int(len(bundle["embeddings_df"])),
+                                "embedding_dims": int(len(bundle["embed_cols"])),
+                                "rf_loaded": bool(
+                                    isinstance(bundle["rf_ranking_df"], pd.DataFrame)
+                                    and not bundle["rf_ranking_df"].empty
+                                ),
+                                "selected_embedding_cols": list(bundle["selected_embedding_cols"]),
+                            },
+                            run_id=selected_embedding_artifact.get("run_id"),
+                        )
+                        success_msg = (
+                            f"Embeddings cargados: {len(bundle['embed_cols'])} dimensiones."
+                        )
+                        if isinstance(bundle["rf_ranking_df"], pd.DataFrame) and not bundle["rf_ranking_df"].empty:
+                            success_msg += " RF embeddings cargado."
+                        st.success(success_msg)
+
+        elif embedding_source == "Generar nuevos":
+            if not text_cols:
+                st.info("No hay columnas textuales disponibles. Genere textos primero.")
+            else:
+                method_options = ["tfidf_svd"]
+                if SentenceTransformer is not None:
+                    method_options.append("sentence_transformer")
+                finetuned_model_catalog = _list_transformer_finetuned_models()
+                if (
+                    AutoModel is not None
+                    and AutoTokenizer is not None
+                    and torch is not None
+                    and not finetuned_model_catalog.empty
+                ):
+                    method_options.append("transformer_finetuned")
+                method = st.selectbox("Metodo", method_options, key="nlp_sev_embeddings_method")
+                selected_text_col = None
+                transformer_model_path = None
+                transformer_batch_size = 16
+                transformer_max_length = 256
+                if method == "transformer_finetuned":
+                    selected_model_idx = st.selectbox(
+                        "Modelo fine-tuneado",
+                        options=finetuned_model_catalog.index.tolist(),
+                        format_func=lambda idx: str(finetuned_model_catalog.loc[idx, "model_label"]),
+                        key="nlp_sev_embeddings_finetuned_model",
+                    )
+                    model_row = finetuned_model_catalog.loc[selected_model_idx]
+                    model_metadata = model_row.get("metadata") or {}
+                    suggested_text_col = str(model_metadata.get("text_col") or "")
+                    if suggested_text_col in text_cols:
+                        selected_text_col = suggested_text_col
+                        st.caption(f"Usando la columna textual del modelo: `{selected_text_col}`")
+                    else:
+                        selected_text_col = st.selectbox(
+                            "Columna de texto para embeddings",
+                            text_cols,
+                            key="nlp_sev_embeddings_col_finetuned",
+                        )
+                    transformer_model_path = str(model_row.get("output_dir_resolved"))
+                    transformer_batch_size = int(
+                        st.selectbox(
+                            "Batch size inferencia",
+                            options=[4, 8, 16, 32],
+                            index=2,
+                            key="nlp_sev_embeddings_ft_batch_size",
+                        )
+                    )
+                    transformer_max_length = int(
+                        st.selectbox(
+                            "Max tokens inferencia",
+                            options=[64, 128, 256, 384, 512],
+                            index=2,
+                            key="nlp_sev_embeddings_ft_max_length",
+                        )
+                    )
+                    st.caption(f"Modelo seleccionado: {transformer_model_path}")
+                    max_features = 0
+                    dims = 0
                 else:
                     selected_text_col = st.selectbox(
                         "Columna de texto para embeddings",
                         text_cols,
-                        key="nlp_sev_embeddings_col_finetuned",
+                        key="nlp_sev_embeddings_col",
                     )
-                transformer_model_path = str(model_row.get("output_dir_resolved"))
-                transformer_batch_size = int(
-                    st.selectbox(
-                        "Batch size inferencia",
-                        options=[4, 8, 16, 32],
-                        index=2,
-                        key="nlp_sev_embeddings_ft_batch_size",
-                    )
-                )
-                transformer_max_length = int(
-                    st.selectbox(
-                        "Max tokens inferencia",
-                        options=[64, 128, 256, 384, 512],
-                        index=2,
-                        key="nlp_sev_embeddings_ft_max_length",
-                    )
-                )
-                st.caption(f"Modelo seleccionado: {transformer_model_path}")
-                max_features = 0
-                dims = 0
-            else:
-                selected_text_col = st.selectbox(
-                    "Columna de texto para embeddings",
-                    text_cols,
-                    key="nlp_sev_embeddings_col",
-                )
-                max_features = st.slider("Max TF-IDF features", 500, 10000, 4000, 500, key="nlp_sev_embeddings_max_features")
-                dims = st.slider("Dimensiones", 2, 128, 32, 2, key="nlp_sev_embeddings_dims")
-            if st.button("Generar embeddings", key="nlp_sev_generate_embeddings"):
-                run_id = _new_run_id("embeddings")
-                try:
-                    embeddings_df, embed_cols, meta = generate_text_embeddings(
-                        embed_source_df,
-                        text_col=selected_text_col,
-                        method=method,
-                        n_components=int(dims),
-                        max_features=int(max_features),
-                        transformer_model_path=transformer_model_path,
-                        transformer_batch_size=int(transformer_batch_size),
-                        transformer_max_length=int(transformer_max_length),
-                    )
-                except Exception as exc:
-                    st.error(f"No se pudieron generar embeddings: {exc}")
-                else:
-                    st.session_state["nlp_sev_embeddings_df"] = embeddings_df
-                    st.session_state["nlp_sev_embedding_cols"] = embed_cols
-                    st.session_state["nlp_sev_embedding_meta"] = meta
-                    st.session_state["nlp_sev_embedding_rf_df"] = None
-                    st.session_state["nlp_sev_selected_embedding_cols"] = []
-                    artifact = _persist_artifact(
-                        embeddings_df,
-                        stage="language_modeling",
-                        artifact_name="text_embeddings",
-                        run_id=run_id,
-                        metadata=meta,
-                    )
-                    st.session_state["nlp_sev_embeddings_artifact"] = artifact
-                    _log_action(
-                        "language_modeling",
-                        "generate_embeddings",
-                        meta,
-                        run_id=run_id,
-                    )
-                    st.success(f"Embeddings generados con {len(embed_cols)} dimensiones.")
+                    max_features = st.slider("Max TF-IDF features", 500, 10000, 4000, 500, key="nlp_sev_embeddings_max_features")
+                    dims = st.slider("Dimensiones", 2, 128, 32, 2, key="nlp_sev_embeddings_dims")
+                if st.button("Generar embeddings", key="nlp_sev_generate_embeddings"):
+                    run_id = _new_run_id("embeddings")
+                    try:
+                        embeddings_df, embed_cols, meta = generate_text_embeddings(
+                            embed_source_df,
+                            text_col=selected_text_col,
+                            method=method,
+                            n_components=int(dims),
+                            max_features=int(max_features),
+                            transformer_model_path=transformer_model_path,
+                            transformer_batch_size=int(transformer_batch_size),
+                            transformer_max_length=int(transformer_max_length),
+                        )
+                    except Exception as exc:
+                        st.error(f"No se pudieron generar embeddings: {exc}")
+                    else:
+                        meta = {
+                            **meta,
+                            "embedding_feature_columns": list(embed_cols),
+                            "source_feature_artifact_id": feature_artifact.get("artifact_id"),
+                            "source_feature_run_id": feature_artifact.get("run_id"),
+                            "source_feature_table_name": feature_artifact.get("table_name"),
+                            "source_feature_db_path": feature_artifact.get("db_path"),
+                        }
+                        st.session_state["nlp_sev_embeddings_df"] = embeddings_df
+                        st.session_state["nlp_sev_embedding_cols"] = embed_cols
+                        st.session_state["nlp_sev_embedding_meta"] = meta
+                        st.session_state["nlp_sev_embedding_rf_df"] = None
+                        st.session_state["nlp_sev_selected_embedding_cols"] = []
+                        artifact = _persist_artifact(
+                            embeddings_df,
+                            stage="language_modeling",
+                            artifact_name="text_embeddings",
+                            run_id=run_id,
+                            metadata=meta,
+                        )
+                        st.session_state["nlp_sev_embeddings_artifact"] = artifact
+                        _log_action(
+                            "language_modeling",
+                            "generate_embeddings",
+                            meta,
+                            run_id=run_id,
+                        )
+                        st.success(f"Embeddings generados con {len(embed_cols)} dimensiones.")
 
         embeddings_df = st.session_state.get("nlp_sev_embeddings_df")
         embed_cols = st.session_state.get("nlp_sev_embedding_cols") or []
@@ -13621,6 +14641,7 @@ def _render_language_modeling_tab() -> None:
         if embeddings_df is None or embeddings_df.empty or not embed_cols:
             st.info("Genere embeddings primero.")
         else:
+            corr_df, abs_corr_pairs = _compute_embedding_correlation_summary(embeddings_df, embed_cols)
             selected_embedding_top_k = int(
                 st.number_input(
                     "Embeddings a conservar para Train",
@@ -13641,6 +14662,8 @@ def _render_language_modeling_tab() -> None:
                 )
                 st.session_state["nlp_sev_selected_embedding_cols"] = selected_embedding_cols
                 if not ranking_df.empty:
+                    embeddings_artifact = st.session_state.get("nlp_sev_embeddings_artifact") or {}
+                    embedding_meta = st.session_state.get("nlp_sev_embedding_meta") or {}
                     _persist_artifact(
                         ranking_df,
                         stage="language_modeling",
@@ -13650,6 +14673,10 @@ def _render_language_modeling_tab() -> None:
                             "embedding_cols": list(embed_cols),
                             "selected_top_k": int(selected_embedding_top_k),
                             "selected_embedding_cols": list(selected_embedding_cols),
+                            "source_embeddings_artifact_id": embeddings_artifact.get("artifact_id"),
+                            "source_embeddings_run_id": embeddings_artifact.get("run_id"),
+                            "source_feature_artifact_id": embedding_meta.get("source_feature_artifact_id"),
+                            "source_feature_run_id": embedding_meta.get("source_feature_run_id"),
                         },
                     )
                 _log_action(
@@ -13666,6 +14693,14 @@ def _render_language_modeling_tab() -> None:
                 st.success(
                     f"Analisis RF ejecutado. Se seleccionaron {len(selected_embedding_cols)} embeddings para Train."
                 )
+            if not corr_df.empty:
+                st.markdown("**Pearson correlation matrix across the embedding dimensions**")
+                st.plotly_chart(_build_embedding_correlation_heatmap(corr_df), width="stretch")
+            if not abs_corr_pairs.empty:
+                st.markdown("**Density estimation of these absolute coefficients**")
+                density_fig = _build_embedding_abs_correlation_density_figure(abs_corr_pairs)
+                if density_fig is not None:
+                    st.plotly_chart(density_fig, width="stretch")
             ranking_df = st.session_state.get("nlp_sev_embedding_rf_df")
             if isinstance(ranking_df, pd.DataFrame) and not ranking_df.empty:
                 selected_embedding_cols = [
@@ -14395,6 +15430,15 @@ def _render_train_tab() -> None:
                         key="nlp_sev_compare_common_folds",
                     )
                 )
+            use_regularization = st.checkbox(
+                "Incorporar regularizacion XGBoost",
+                value=False,
+                key="nlp_sev_compare_xgb_use_regularization",
+                help=(
+                    "Si se activa, la comparacion controlada incorpora `min_child_weight`, `gamma`, "
+                    "`reg_alpha` y `reg_lambda` a la grilla de XGBoost, igual que en `Train` y `Paper replication`."
+                ),
+            )
             xgb_optuna_trials = int(
                 st.number_input(
                     "Trials de Optuna para XGBoost",
@@ -14414,10 +15458,15 @@ def _render_train_tab() -> None:
                 )
             st.caption(
                 f"Combinaciones base para `{xgb_tuning_profile}`: "
-                f"XGBoost={_paper_xgb_search_space_size(_default_xgb_param_grid(xgb_tuning_profile))} | "
+                f"XGBoost={_paper_xgb_search_space_size(_resolve_xgb_param_grid(xgb_tuning_profile, use_regularization=use_regularization))} | "
                 f"SMOTE={_paper_xgb_search_space_size(_default_smote_param_grid(xgb_tuning_profile))} | "
-                f"Total={_paper_xgb_search_space_size(_default_xgb_param_grid(xgb_tuning_profile)) * _paper_xgb_search_space_size(_default_smote_param_grid(xgb_tuning_profile))}"
+                f"Total={_paper_xgb_search_space_size(_resolve_xgb_param_grid(xgb_tuning_profile, use_regularization=use_regularization)) * _paper_xgb_search_space_size(_default_smote_param_grid(xgb_tuning_profile))}"
             )
+            if use_regularization:
+                st.caption(
+                    "Regularizacion activa: "
+                    f"{_default_xgb_regularization_param_grid(xgb_tuning_profile)}"
+                )
             _render_controlled_comparison_protocol(
                 feature_group=feature_group,
                 feature_count=feature_count,
@@ -14428,6 +15477,7 @@ def _render_train_tab() -> None:
                 xgb_optimization_backend=str(xgb_optimization_backend),
                 xgb_optuna_trials=int(xgb_optuna_trials),
                 xgb_tuning_profile=str(xgb_tuning_profile),
+                use_regularization=bool(use_regularization),
                 tuning_folds=int(tuning_folds),
             )
             if st.button("Ejecutar comparacion controlada", key="nlp_sev_train_comparison"):
@@ -14448,6 +15498,7 @@ def _render_train_tab() -> None:
                         split_mode=split_mode,
                         max_features_per_model=int(max_features_per_model),
                         xgb_tuning_profile=str(xgb_tuning_profile),
+                        use_regularization=bool(use_regularization),
                         xgb_optimization_backend=str(xgb_optimization_backend),
                         xgb_optuna_trials=int(xgb_optuna_trials),
                         tuning_folds=int(tuning_folds),
@@ -14541,6 +15592,7 @@ def _render_train_tab() -> None:
                         xgb_optimization_backend=str(xgb_optimization_backend),
                         xgb_optuna_trials=int(xgb_optuna_trials),
                         xgb_tuning_profile=str(xgb_tuning_profile),
+                        use_regularization=bool(use_regularization),
                         tuning_folds=int(tuning_folds),
                         protocol=protocol,
                     )
@@ -14587,6 +15639,7 @@ def _render_experiments_tab() -> None:
             "Datos granulares",
             "Comparativa",
             "BERTopic",
+            "Statistical tests",
         ]
     )
 
@@ -14721,7 +15774,137 @@ def _render_experiments_tab() -> None:
             st.plotly_chart(fig, width="stretch")
             st.dataframe(grouped, width="stretch")
 
+    with exp_tabs[4]:
+        _render_statistical_tests_subtab()
+
     _render_registry_caption()
+
+
+def _render_statistical_tests_subtab() -> None:
+    """Render bootstrap CIs and McNemar pairwise tests from paper replication results."""
+    payload = st.session_state.get("nlp_sev_paper_replication_payload")
+    if not isinstance(payload, dict) or not payload:
+        st.info(
+            "Ejecute Paper replication primero. Los tests estadisticos se calculan "
+            "sobre las predicciones del holdout temporal."
+        )
+        return
+
+    route_names = []
+    route_payloads: Dict[str, Dict[str, object]] = {}
+    for rname in ("frozen", "raw", "update_emb"):
+        rp = payload.get(rname)
+        if isinstance(rp, dict) and rp.get("model_results"):
+            route_names.append(rname)
+            route_payloads[rname] = rp
+
+    if not route_names:
+        st.warning("No hay rutas con resultados de modelo disponibles.")
+        return
+
+    selected_route = st.selectbox(
+        "Ruta de datos",
+        route_names,
+        key="nlp_sev_stat_test_route",
+    )
+    route_data = route_payloads[selected_route]
+    model_results = route_data.get("model_results") or []
+
+    n_boot = int(
+        st.number_input(
+            "Bootstrap resamples (B)",
+            min_value=1_000,
+            max_value=100_000,
+            value=10_000,
+            step=1_000,
+            key="nlp_sev_stat_n_boot",
+        )
+    )
+
+    if st.button("Ejecutar tests estadisticos", key="nlp_sev_run_stat_tests"):
+        with st.spinner("Calculando bootstrap CIs y McNemar tests..."):
+            stat_results = _paper_statistical_tests(
+                model_results,
+                n_boot=n_boot,
+            )
+        st.session_state["nlp_sev_stat_test_results"] = stat_results
+
+    stat_results = st.session_state.get("nlp_sev_stat_test_results")
+    if not isinstance(stat_results, dict) or not stat_results:
+        return
+
+    bootstrap = stat_results.get("bootstrap") or {}
+    mcnemar_list = stat_results.get("mcnemar") or []
+
+    # --- Bootstrap CI table (Table 10 extension) ---
+    st.markdown("### Bootstrap 95 % Confidence Intervals")
+    st.caption(
+        f"B = {n_boot:,} resamples con reemplazo sobre el holdout temporal. "
+        "Los intervalos corresponden a los percentiles 2.5 % y 97.5 %."
+    )
+
+    ci_metric_labels = [
+        ("accuracy", "Accuracy"),
+        ("precision", "Precision"),
+        ("recall", "Recall"),
+        ("f1_score", "F1"),
+        ("roc_auc", "ROC-AUC"),
+        ("false_negatives_positive_class", "False negatives (MARC)"),
+    ]
+    ci_records: List[Dict[str, object]] = []
+    for metric_key, metric_label in ci_metric_labels:
+        row: Dict[str, object] = {"Metric": metric_label}
+        for model_code in sorted(bootstrap.keys()):
+            ci = bootstrap[model_code].get(metric_key)
+            if ci is None:
+                row[model_code] = "—"
+                continue
+            point = ci["point"]
+            lo = ci["lower"]
+            hi = ci["upper"]
+            if metric_key == "false_negatives_positive_class":
+                row[model_code] = f"{point:.0f}  [{lo:.0f}, {hi:.0f}]"
+            else:
+                row[model_code] = f"{point:.3f}  [{lo:.3f}, {hi:.3f}]"
+        ci_records.append(row)
+    if ci_records:
+        st.dataframe(pd.DataFrame(ci_records).set_index("Metric"), width="stretch")
+
+    # --- McNemar pairwise tests (Table 12) ---
+    # --- McNemar pairwise tests (Table 12) ---
+    st.markdown("### McNemar's Exact Test — Pairwise Comparisons")
+    st.caption(
+        "McNemar's exact test (two-sided) evalua si el numero de casos correctamente "
+        "clasificados por un modelo pero no el otro difiere significativamente del azar."
+    )
+    if not mcnemar_list:
+        st.warning(
+            "No hay comparaciones pareadas disponibles. McNemar requiere al menos 2 modelos "
+            "en el mismo run. Ejecute Paper replication con M1, M2 y M3 seleccionados."
+        )
+    else:
+        mc_records: List[Dict[str, object]] = []
+        for mc in mcnemar_list:
+            p = float(mc["p_value"])
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "n.s."
+            mc_records.append({
+                "Comparison": f"{mc['model_a']} vs {mc['model_b']}",
+                f"{mc['model_a']} correct, {mc['model_b']} wrong": int(mc["a_correct_b_wrong"]),
+                f"{mc['model_b']} correct, {mc['model_a']} wrong": int(mc["b_correct_a_wrong"]),
+                "n discordant": int(mc["n_discordant"]),
+                "p-value": f"{p:.4f}",
+                "Sig.": sig,
+            })
+        st.dataframe(pd.DataFrame(mc_records), width="stretch")
+
+        any_significant = any(float(mc["p_value"]) < 0.05 for mc in mcnemar_list)
+        if not any_significant:
+            st.info(
+                "Ninguna comparacion alcanza significancia estadistica (p < 0.05). "
+                "Esto es esperable con un test set de ~414 casos y diferencias de ~1-2 puntos "
+                "en accuracy. Se recomienda reportar las diferencias como tendencias observadas "
+                "y matizar las conclusiones."
+            )
 
 
 def _render_historial_tab() -> None:
@@ -14735,12 +15918,12 @@ def _render_historial_tab() -> None:
     else:
         # ── 1. Tabla resumen de todos los modelos ──
         st.markdown("### Resultados de modelos")
-        compare_metrics = ["accuracy", "precision", "recall", "f1_score", "roc_auc", "false_negatives_global"]
+        compare_metrics = ["accuracy", "precision", "recall", "f1_score", "roc_auc", "auprc", "mcc", "false_negatives_global"]
         available_metrics = [metric for metric in compare_metrics if metric in results_df.columns]
         display_cols = [
             col for col in [
                 "created_at", "run_id", "stage", "model_name", "feature_group",
-                "accuracy", "precision", "recall", "f1_score", "roc_auc",
+                "accuracy", "precision", "recall", "f1_score", "roc_auc", "auprc", "mcc",
                 "false_negatives_global",
             ]
             if col in results_df.columns
