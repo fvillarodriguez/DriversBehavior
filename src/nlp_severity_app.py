@@ -4,10 +4,12 @@ Streamlit app for the "NLP in Severity" pipeline.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
 import itertools
+import logging
 import math
 import os
 import random
@@ -17,6 +19,7 @@ import tempfile
 import time
 import traceback
 import uuid
+import warnings
 import zipfile
 from datetime import datetime, time as dt_time
 from pathlib import Path
@@ -110,6 +113,13 @@ try:
 except ImportError:  # pragma: no cover
     optuna = None
     TPESampler = None
+else:  # pragma: no cover
+    try:
+        optuna.logging.set_verbosity(optuna.logging.ERROR)
+        if hasattr(optuna.logging, "disable_default_handler"):
+            optuna.logging.disable_default_handler()
+    except Exception:
+        pass
 
 from src.model_training import build_model
 from src.utils import (
@@ -306,6 +316,109 @@ STATE_DEFAULTS: Dict[str, object] = {
     "nlp_sev_train_xgb_param_grids": None,
     "nlp_sev_train_smote_param_grids": None,
 }
+
+
+@contextlib.contextmanager
+def _suppress_transformer_terminal_output():
+    """Mute stdout/stderr and library chatter during local transformer runs."""
+    sink = open(os.devnull, "w", encoding="utf-8")
+    env_updates = {
+        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+        "TRANSFORMERS_VERBOSITY": "error",
+    }
+    previous_env = {key: os.environ.get(key) for key in env_updates}
+    logger_states = []
+    logger_names = (
+        "accelerate",
+        "datasets",
+        "huggingface_hub",
+        "tokenizers",
+        "transformers",
+    )
+    try:
+        for key, value in env_updates.items():
+            os.environ[key] = value
+        for logger_name in logger_names:
+            logger_obj = logging.getLogger(logger_name)
+            logger_states.append((logger_obj, logger_obj.level, logger_obj.propagate))
+            logger_obj.setLevel(logging.CRITICAL)
+            logger_obj.propagate = False
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                yield
+    finally:
+        for logger_obj, previous_level, previous_propagate in logger_states:
+            logger_obj.setLevel(previous_level)
+            logger_obj.propagate = previous_propagate
+        for key, previous_value in previous_env.items():
+            if previous_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous_value
+        sink.close()
+
+
+def _run_with_suppressed_transformer_output(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    with _suppress_transformer_terminal_output():
+        return fn(*args, **kwargs)
+
+
+def _is_null_like(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _stringify_streamlit_cell(value: object) -> object:
+    if _is_null_like(value):
+        return None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, set):
+        value = sorted(value, key=str)
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(_to_json_safe(value), ensure_ascii=True, sort_keys=True)
+    return value
+
+
+def _prepare_dataframe_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize object-heavy DataFrames so Streamlit Arrow serialization stays quiet."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    safe_df = df.copy()
+    for column in safe_df.columns:
+        series = safe_df[column]
+        if not pd.api.types.is_object_dtype(series.dtype):
+            continue
+        non_null_values = [value for value in series.tolist() if not _is_null_like(value)]
+        if not non_null_values:
+            continue
+        if any(isinstance(value, (dict, list, tuple, set, Path)) for value in non_null_values):
+            safe_df[column] = series.map(_stringify_streamlit_cell)
+            continue
+        normalized_types = {
+            str
+            if isinstance(value, str)
+            else bool
+            if isinstance(value, (bool, np.bool_))
+            else int
+            if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
+            else float
+            if isinstance(value, (float, np.floating))
+            else type(value)
+            for value in non_null_values[:50]
+        }
+        if len(normalized_types) > 1:
+            safe_df[column] = series.map(
+                lambda value: None if _is_null_like(value) else str(value)
+            )
+    return safe_df
 
 
 def _slug(value: object) -> str:
@@ -702,17 +815,19 @@ def _list_transformer_search_presets() -> pd.DataFrame:
     def _format_preset_label(row: pd.Series) -> str:
         metadata = row.get("metadata") or {}
         search_summary = metadata.get("search_summary") or {}
+        params = row.get("params") or {}
         base_model = metadata.get("base_model") or search_summary.get("best_model_name") or "modelo?"
         text_col = metadata.get("text_col") or "text?"
         mode = metadata.get("mode") or "mode?"
         objective = metadata.get("objective_metric") or "objective?"
+        split_mode = params.get("requested_split_mode") or params.get("split_mode") or "split?"
         metric_value = _resolve_transformer_objective(
             {key: row.get(key) for key in row.index},
             objective_metric=str(objective),
         )
         metric_text = "-" if pd.isna(metric_value) else f"{float(metric_value):.4f}"
         return (
-            f"{row.get('created_at')} | {mode} | {text_col} | {base_model} | "
+            f"{row.get('created_at')} | {mode} | {text_col} | {base_model} | {split_mode} | "
             f"{objective}={metric_text}"
         )
 
@@ -2706,6 +2821,222 @@ def _paper_fingerprint_source_df(source_df: pd.DataFrame) -> Dict[str, object]:
     }
 
 
+def _transformer_training_data_fingerprint(
+    df: Optional[pd.DataFrame],
+    *,
+    text_col: object,
+    mode: object,
+) -> Dict[str, object]:
+    text_col_value = str(text_col or "").strip()
+    mode_value = str(mode or "").strip().lower()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {
+            "kind": "missing",
+            "reason": "empty_dataframe",
+            "text_col": text_col_value,
+            "mode": mode_value,
+        }
+    if not text_col_value:
+        return {
+            "kind": "missing",
+            "reason": "missing_text_col",
+            "text_col": text_col_value,
+            "mode": mode_value,
+        }
+    if text_col_value not in df.columns:
+        return {
+            "kind": "missing",
+            "reason": f"text_col_not_found:{text_col_value}",
+            "text_col": text_col_value,
+            "mode": mode_value,
+        }
+
+    work = df.copy()
+    work[text_col_value] = work[text_col_value].fillna("").astype(str).str.strip()
+    work = work.loc[work[text_col_value] != ""].copy()
+    if work.empty:
+        return {
+            "kind": "missing",
+            "reason": "no_non_empty_text_rows",
+            "text_col": text_col_value,
+            "mode": mode_value,
+        }
+
+    if "accident_id" in work.columns:
+        work["accident_id"] = work["accident_id"].astype(str).str.strip()
+    if "accidente_time" in work.columns:
+        work["accidente_time"] = pd.to_datetime(work["accidente_time"], errors="coerce")
+
+    class_counts: Dict[str, int] = {}
+    if mode_value == "classification":
+        work["severity_target"] = _severity_series(work)
+        work = work.dropna(subset=["severity_target"]).copy()
+        if work.empty:
+            return {
+                "kind": "missing",
+                "reason": "no_valid_labels",
+                "text_col": text_col_value,
+                "mode": mode_value,
+            }
+        work["severity_target"] = work["severity_target"].astype(int)
+        class_counts = {
+            str(label): int(count)
+            for label, count in work["severity_target"].value_counts().sort_index().to_dict().items()
+        }
+
+    signature_cols = [
+        col
+        for col in ["accident_id", "accidente_time", text_col_value]
+        if col in work.columns
+    ]
+    if mode_value == "classification" and "severity_target" in work.columns:
+        signature_cols.append("severity_target")
+    if not signature_cols:
+        signature_cols = [text_col_value]
+
+    sort_cols = [
+        col
+        for col in ["accident_id", "accidente_time", text_col_value]
+        if col in work.columns
+    ]
+    if sort_cols:
+        work = work.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+    else:
+        work = work.reset_index(drop=True)
+
+    return {
+        "kind": "transformer_training_data",
+        "mode": mode_value,
+        "text_col": text_col_value,
+        "rows": int(len(work)),
+        "signature": _frame_signature(work, columns=signature_cols, include_index=False),
+        "signature_columns": list(dict.fromkeys(signature_cols)),
+        "class_counts": class_counts,
+    }
+
+
+def _transformer_model_training_fingerprint(model_row: Optional[pd.Series]) -> Dict[str, object]:
+    if model_row is None:
+        return {"kind": "missing", "reason": "no_transformer_model"}
+
+    metadata = model_row.get("metadata") or {}
+    fingerprint = metadata.get("training_data_fingerprint")
+    if isinstance(fingerprint, dict) and fingerprint:
+        return _to_json_safe(fingerprint)
+
+    summary_path = Path(str(model_row.get("output_dir_resolved") or "")) / "training_summary.json"
+    summary_payload = _load_json_file(summary_path, default={})
+    fingerprint = (
+        summary_payload.get("training_data_fingerprint")
+        if isinstance(summary_payload, dict)
+        else None
+    )
+    if isinstance(fingerprint, dict) and fingerprint:
+        return _to_json_safe(fingerprint)
+
+    return {
+        "kind": "missing",
+        "reason": "training_data_fingerprint_not_found",
+        "output_dir_resolved": str(model_row.get("output_dir_resolved") or ""),
+    }
+
+
+def _has_transformer_training_fingerprint(model_row: Optional[pd.Series]) -> bool:
+    fingerprint = _transformer_model_training_fingerprint(model_row)
+    return bool(str((fingerprint or {}).get("signature") or "").strip())
+
+
+def _paper_validate_transformer_model_compatibility(
+    model_row: Optional[pd.Series],
+    *,
+    candidate_df: Optional[pd.DataFrame],
+    route_name: str,
+) -> Dict[str, object]:
+    if model_row is None:
+        return {
+            "status": "missing_model",
+            "message": f"No se encontro un modelo fine-tuneado para la ruta {route_name}.",
+            "model_fingerprint": {"kind": "missing", "reason": "no_transformer_model"},
+            "candidate_fingerprint": {"kind": "missing", "reason": "no_candidate_df"},
+        }
+
+    model_label = str(model_row.get("model_label") or model_row.get("output_dir_resolved") or "modelo?")
+    metadata = model_row.get("metadata") or {}
+    model_fingerprint = _transformer_model_training_fingerprint(model_row)
+    model_signature = str(model_fingerprint.get("signature") or "").strip()
+    if not model_signature:
+        return {
+            "status": "missing_fingerprint",
+            "message": (
+                f"El modelo fine-tuneado '{model_label}' no expone un "
+                "`training_data_fingerprint` reutilizable. Reentrene el modelo "
+                "con esta version del pipeline antes de usarlo en paper replication."
+            ),
+            "model_fingerprint": model_fingerprint,
+            "candidate_fingerprint": {"kind": "missing", "reason": "not_computed"},
+        }
+
+    expected_mode = str(model_fingerprint.get("mode") or metadata.get("mode") or "classification").strip().lower()
+    expected_text_col = str(model_fingerprint.get("text_col") or metadata.get("text_col") or "").strip()
+    candidate_fingerprint = _transformer_training_data_fingerprint(
+        candidate_df,
+        text_col=expected_text_col,
+        mode=expected_mode,
+    )
+    candidate_signature = str(candidate_fingerprint.get("signature") or "").strip()
+    if not candidate_signature:
+        return {
+            "status": "incompatible",
+            "message": (
+                f"No se pudo calcular un fingerprint compatible para la ruta {route_name} "
+                f"usando `text_col='{expected_text_col}'`."
+            ),
+            "model_fingerprint": model_fingerprint,
+            "candidate_fingerprint": candidate_fingerprint,
+        }
+
+    if expected_mode != str(candidate_fingerprint.get("mode") or "").strip().lower():
+        return {
+            "status": "incompatible",
+            "message": (
+                f"El modelo '{model_label}' fue entrenado en modo `{expected_mode}` y la "
+                f"ruta {route_name} requiere `{candidate_fingerprint.get('mode')}`."
+            ),
+            "model_fingerprint": model_fingerprint,
+            "candidate_fingerprint": candidate_fingerprint,
+        }
+
+    if expected_text_col != str(candidate_fingerprint.get("text_col") or "").strip():
+        return {
+            "status": "incompatible",
+            "message": (
+                f"El modelo '{model_label}' fue entrenado con `text_col='{expected_text_col}'` "
+                "y el dataset actual no coincide."
+            ),
+            "model_fingerprint": model_fingerprint,
+            "candidate_fingerprint": candidate_fingerprint,
+        }
+
+    if model_signature != candidate_signature:
+        return {
+            "status": "incompatible",
+            "message": (
+                f"El modelo '{model_label}' no es compatible con la ruta {route_name}: "
+                "el fingerprint del dataset de entrenamiento no coincide con el dataset "
+                "actual usado para extraer embeddings."
+            ),
+            "model_fingerprint": model_fingerprint,
+            "candidate_fingerprint": candidate_fingerprint,
+        }
+
+    return {
+        "status": "compatible",
+        "message": f"Modelo '{model_label}' compatible con la ruta {route_name}.",
+        "model_fingerprint": model_fingerprint,
+        "candidate_fingerprint": candidate_fingerprint,
+    }
+
+
 def _paper_load_latest_processed_events_entry() -> Tuple[Optional[pd.DataFrame], Optional[pd.Series]]:
     catalog = _load_artifact_catalog(stage="events", artifact_name="processed_events")
     if catalog.empty:
@@ -2761,6 +3092,7 @@ def _paper_fingerprint_transformer_model(model_row: Optional[pd.Series]) -> Dict
         "model_label": str(model_row.get("model_label") or ""),
         "output_dir_resolved": str(model_row.get("output_dir_resolved") or ""),
         "created_at": str(model_row.get("created_at") or ""),
+        "training_data_fingerprint": _transformer_model_training_fingerprint(model_row),
     }
 
 
@@ -4905,6 +5237,15 @@ def _paper_resolve_transformer_model() -> pd.Series:
     work = work[work["mode_value"].eq("classification")].copy()
     if work.empty:
         raise PaperReplicationBlockedError("No hay modelos fine-tuneados de clasificacion disponibles para la ruta raw.")
+    work["has_training_fingerprint"] = [
+        _has_transformer_training_fingerprint(row)
+        for _, row in work.iterrows()
+    ]
+    work = work[work["has_training_fingerprint"]].copy()
+    if work.empty:
+        raise PaperReplicationBlockedError(
+            "No hay modelos fine-tuneados de clasificacion con `training_data_fingerprint` reutilizable."
+        )
     preferred = work[work["text_col_value"].eq("text_bert")].copy()
     if not preferred.empty:
         work = preferred
@@ -9645,6 +9986,23 @@ def _paper_build_raw_dataset(
                     message=str(error),
                 )
             raise error
+        compatibility = _paper_validate_transformer_model_compatibility(
+            model_row,
+            candidate_df=features_df,
+            route_name="raw",
+        )
+        if compatibility.get("status") != "compatible":
+            error = PaperReplicationBlockedError(str(compatibility.get("message") or "Modelo fine-tuneado incompatible para la ruta raw."))
+            if paths is not None and manifest is not None:
+                _paper_mark_step_blocked(
+                    paths,
+                    manifest,
+                    embedding_step_id,
+                    stage="raw_build",
+                    description="Extraccion de embeddings fine-tuneados",
+                    message=str(error),
+                )
+            raise error
         model_path = str(model_row.get("output_dir_resolved") or "")
         if not model_path:
             error = PaperReplicationBlockedError("El modelo fine-tuneado no tiene `output_dir_resolved` valido.")
@@ -9685,6 +10043,8 @@ def _paper_build_raw_dataset(
             "embedding_feature_columns": list(embed_cols),
             "transformer_model_path": model_path,
             "transformer_model_label": str(model_row.get("model_label") or ""),
+            "transformer_training_data_fingerprint": compatibility.get("model_fingerprint") or {},
+            "route_candidate_fingerprint": compatibility.get("candidate_fingerprint") or {},
         }
         if raw_paths is not None:
             _atomic_write_pickle(embeddings_df, raw_paths["embeddings"])
@@ -9718,19 +10078,18 @@ def _paper_build_raw_dataset(
             _paper_mark_step_running(
                 paths,
                 manifest,
-                    selection_step_id,
-                    stage="raw_build",
-                    description="Ranking supervisado de embeddings",
-                    message="Rankeando embeddings con RF y conservando todas las dimensiones.",
-                )
-        ranking_embed_df = run_embedding_rf_analysis(embeddings_df, embed_cols)
-        selected_embedding_cols = [
-            str(value)
-            for value in ranking_embed_df["variable"].tolist()
-            if isinstance(value, str) and value.startswith("emb_")
-        ]
-        if not selected_embedding_cols:
-            selected_embedding_cols = list(embed_cols)
+                selection_step_id,
+                stage="raw_build",
+                description="Preparacion de embeddings para train",
+                message="Conservando todas las dimensiones para que la seleccion supervisada ocurra dentro de train.",
+            )
+        ranking_embed_df = pd.DataFrame(
+            {
+                "variable": list(embed_cols),
+                "selection_stage": ["downstream_train_only"] * len(embed_cols),
+            }
+        )
+        selected_embedding_cols = list(embed_cols)
         if not selected_embedding_cols:
             error = PaperReplicationBlockedError("No se encontraron embeddings disponibles para la ruta raw.")
             if paths is not None and manifest is not None:
@@ -9739,7 +10098,7 @@ def _paper_build_raw_dataset(
                     manifest,
                     selection_step_id,
                     stage="raw_build",
-                    description="Ranking supervisado de embeddings",
+                    description="Preparacion de embeddings para train",
                     message=str(error),
                 )
             raise error
@@ -9748,18 +10107,24 @@ def _paper_build_raw_dataset(
             _atomic_write_json(raw_paths["selected_embedding_cols"], list(selected_embedding_cols))
         if paths is not None and manifest is not None and raw_paths is not None:
             _paper_mark_step_completed(
-                    paths,
-                    manifest,
-                    selection_step_id,
-                    stage="raw_build",
-                    description="Ranking supervisado de embeddings",
-                    message=f"Ranking persistido. Se conservaran {len(selected_embedding_cols)} embeddings.",
-                    artifact_paths={
-                        "embedding_ranking": str(raw_paths["embedding_ranking"]),
-                        "selected_embedding_cols": str(raw_paths["selected_embedding_cols"]),
-                    },
-                    metadata={"selected_embedding_count": int(len(selected_embedding_cols))},
-                )
+                paths,
+                manifest,
+                selection_step_id,
+                stage="raw_build",
+                description="Preparacion de embeddings para train",
+                message=(
+                    f"Se conservaran {len(selected_embedding_cols)} embeddings. "
+                    "La seleccion supervisada se recalculara solo sobre train."
+                ),
+                artifact_paths={
+                    "embedding_ranking": str(raw_paths["embedding_ranking"]),
+                    "selected_embedding_cols": str(raw_paths["selected_embedding_cols"]),
+                },
+                metadata={
+                    "selected_embedding_count": int(len(selected_embedding_cols)),
+                    "selection_stage": "downstream_train_only",
+                },
+            )
 
     if paths is not None and manifest is not None:
         _paper_mark_step_running(
@@ -9966,6 +10331,18 @@ def _paper_build_update_embeddings_dataset(
             raise PaperReplicationBlockedError(
                 "No se encontro modelo fine-tuneado para generar embeddings en update-emb."
             )
+        compatibility = _paper_validate_transformer_model_compatibility(
+            model_row,
+            candidate_df=source_df if isinstance(source_df, pd.DataFrame) and not source_df.empty else features_source_df,
+            route_name="update-emb",
+        )
+        if compatibility.get("status") != "compatible":
+            raise PaperReplicationBlockedError(
+                str(
+                    compatibility.get("message")
+                    or "Modelo fine-tuneado incompatible para la ruta update-emb."
+                )
+            )
         model_path = str(model_row.get("output_dir_resolved") or "")
         if not model_path:
             raise PaperReplicationBlockedError(
@@ -9996,6 +10373,8 @@ def _paper_build_update_embeddings_dataset(
             "embedding_feature_columns": list(embed_cols),
             "transformer_model_path": model_path,
             "transformer_model_label": str(model_row.get("model_label") or ""),
+            "transformer_training_data_fingerprint": compatibility.get("model_fingerprint") or {},
+            "route_candidate_fingerprint": compatibility.get("candidate_fingerprint") or {},
         }
         if ue_paths is not None:
             _atomic_write_pickle(embeddings_df, ue_paths["embeddings"])
@@ -10029,18 +10408,17 @@ def _paper_build_update_embeddings_dataset(
             _paper_mark_step_running(
                 paths, manifest, selection_step_id,
                 stage="update_emb_build",
-                description="Ranking supervisado de embeddings",
-                message="Rankeando embeddings con RF y conservando todas las dimensiones.",
+                description="Preparacion de embeddings para train",
+                message="Conservando todas las dimensiones para que la seleccion supervisada ocurra dentro de train.",
             )
-        _emit_progress(progress_callback, 65, "Rankeando embeddings con RF y conservando todas las dimensiones.")
-        ranking_embed_df = run_embedding_rf_analysis(embeddings_df, embed_cols)
-        selected_embedding_cols = [
-            str(value)
-            for value in ranking_embed_df["variable"].tolist()
-            if isinstance(value, str) and value.startswith("emb_")
-        ]
-        if not selected_embedding_cols:
-            selected_embedding_cols = list(embed_cols)
+        _emit_progress(progress_callback, 65, "Conservando todas las dimensiones para que la seleccion supervisada ocurra dentro de train.")
+        ranking_embed_df = pd.DataFrame(
+            {
+                "variable": list(embed_cols),
+                "selection_stage": ["downstream_train_only"] * len(embed_cols),
+            }
+        )
+        selected_embedding_cols = list(embed_cols)
         if not selected_embedding_cols:
             raise PaperReplicationBlockedError(
                 "No se encontraron embeddings disponibles para la ruta update-emb."
@@ -10052,15 +10430,21 @@ def _paper_build_update_embeddings_dataset(
             _paper_mark_step_completed(
                 paths, manifest, selection_step_id,
                 stage="update_emb_build",
-                description="Ranking supervisado de embeddings",
-                message=f"Ranking persistido. Se conservaran {len(selected_embedding_cols)} embeddings.",
+                description="Preparacion de embeddings para train",
+                message=(
+                    f"Se conservaran {len(selected_embedding_cols)} embeddings. "
+                    "La seleccion supervisada se recalculara solo sobre train."
+                ),
                 artifact_paths={
                     "embedding_ranking": str(ue_paths["embedding_ranking"]),
                     "selected_embedding_cols": str(ue_paths["selected_embedding_cols"]),
                 },
-                metadata={"selected_embedding_count": int(len(selected_embedding_cols))},
+                metadata={
+                    "selected_embedding_count": int(len(selected_embedding_cols)),
+                    "selection_stage": "downstream_train_only",
+                },
             )
-        _emit_progress(progress_callback, 75, f"Se conservaran {len(selected_embedding_cols)} embeddings.")
+        _emit_progress(progress_callback, 75, f"Se conservaran {len(selected_embedding_cols)} embeddings. La seleccion supervisada ocurrira dentro de train.")
 
     # ── Step 5: Assemble final dataset (frozen flow + all new emb) ──────
     if paths is not None and manifest is not None:
@@ -10975,6 +11359,15 @@ def _transformer_model_options() -> Dict[str, str]:
     return options
 
 
+def _normalize_transformer_split_mode(split_mode: object) -> str:
+    normalized = str(split_mode or "").strip().lower()
+    if normalized == "temporal":
+        return "Temporal"
+    if normalized == "estratificado":
+        return "Estratificado"
+    raise ValueError("split_mode debe ser 'Estratificado' o 'Temporal'.")
+
+
 def _softmax_logits(logits: np.ndarray) -> np.ndarray:
     logits = np.asarray(logits, dtype=float)
     logits = logits - np.max(logits, axis=1, keepdims=True)
@@ -11450,6 +11843,38 @@ class _TransformerTextDataset(Dataset):
         return item
 
 
+def _make_weighted_trainer_class(
+    class_weights_tensor: object,
+    focal_gamma: float = 0.0,
+) -> type:
+    """Build a Trainer subclass that applies Focal Loss (or weighted CE when gamma=0)."""
+    if Trainer is None:
+        raise ImportError("transformers.Trainer no disponible.")
+
+    _focal_gamma = float(focal_gamma)
+
+    class _WeightedTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            labels = inputs.pop("labels", None)
+            outputs = model(**inputs)
+            logits = outputs.get("logits") if isinstance(outputs, dict) else outputs[1]
+            if _focal_gamma > 0:
+                # Focal Loss: -alpha_t * (1 - p_t)^gamma * log(p_t)
+                ce_loss = torch.nn.functional.cross_entropy(
+                    logits, labels, weight=class_weights_tensor.to(logits.device), reduction="none",
+                )
+                probs = torch.nn.functional.softmax(logits, dim=1)
+                p_t = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+                focal_weight = (1.0 - p_t) ** _focal_gamma
+                loss = (focal_weight * ce_loss).mean()
+            else:
+                loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights_tensor.to(logits.device))
+                loss = loss_fn(logits, labels)
+            return (loss, outputs) if return_outputs else loss
+
+    return _WeightedTrainer
+
+
 def run_transformers_finetune(
     df: pd.DataFrame,
     *,
@@ -11469,8 +11894,12 @@ def run_transformers_finetune(
     trainer_random_state: Optional[int],
     freeze_layers: bool,
     test_size: float,
+    split_mode: str,
     mlm_probability: float,
     early_stopping_patience: Optional[int] = 2,
+    focal_gamma: float = 2.0,
+    oversample_minority: bool = True,
+    class_weight_power: float = 1.0,
 ) -> Dict[str, object]:
     missing_deps = []
     if torch is None:
@@ -11490,6 +11919,12 @@ def run_transformers_finetune(
     output_dir.mkdir(parents=True, exist_ok=True)
     trainer_output_dir = output_dir / "trainer_output"
     trainer_output_dir.mkdir(parents=True, exist_ok=True)
+    training_data_fingerprint = _transformer_training_data_fingerprint(
+        df,
+        text_col=text_col,
+        mode=mode,
+    )
+    requested_split_mode = _normalize_transformer_split_mode(split_mode)
 
     _has_time = "accidente_time" in df.columns
     cols_to_copy = [text_col] + (["accidente_time"] if _has_time else [])
@@ -11503,7 +11938,11 @@ def run_transformers_finetune(
     if work.empty:
         raise ValueError("No hay textos validos para entrenar.")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    tokenizer = _run_with_suppressed_transformer_output(
+        AutoTokenizer.from_pretrained,
+        model_name,
+        use_fast=True,
+    )
     if getattr(tokenizer, "pad_token", None) is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
 
@@ -11529,19 +11968,33 @@ def run_transformers_finetune(
         labels = labels_raw.map(lambda value: label_mapping[str(int(value))]).astype(int)
 
         _temporal_ok = False
-        if _has_time and work["accidente_time"].notna().sum() >= 2:
+        if requested_split_mode == "Temporal" and _has_time and work["accidente_time"].notna().sum() >= 2:
             _time_vals = work["accidente_time"].fillna(pd.Timestamp.min)
             _order = np.argsort(_time_vals.to_numpy())
             _split_idx = max(1, int(len(_order) * (1.0 - float(test_size))))
             _train_idx, _test_idx = _order[:_split_idx], _order[_split_idx:]
             _y_tr = labels.iloc[_train_idx]
             _y_te = labels.iloc[_test_idx]
-            if _y_tr.nunique() >= 2 and _y_te.nunique() >= 1:
+            if _y_tr.nunique() == len(unique_labels) and _y_te.nunique() == len(unique_labels):
                 train_texts = work[text_col].iloc[_train_idx].tolist()
                 eval_texts = work[text_col].iloc[_test_idx].tolist()
                 train_labels = _y_tr.tolist()
                 eval_labels = _y_te.tolist()
                 _temporal_ok = True
+            else:
+                train_counts = {
+                    str(label): int(count)
+                    for label, count in _y_tr.value_counts().sort_index().to_dict().items()
+                }
+                eval_counts = {
+                    str(label): int(count)
+                    for label, count in _y_te.value_counts().sort_index().to_dict().items()
+                }
+                raise ValueError(
+                    "El split temporal para finetuning no es valido: train/eval deben contener "
+                    f"todas las clases. train={train_counts} | eval={eval_counts} | "
+                    f"test_size={float(test_size):.2f}."
+                )
 
         if not _temporal_ok:
             train_texts, eval_texts, train_labels, eval_labels = train_test_split(
@@ -11551,8 +12004,28 @@ def run_transformers_finetune(
                 stratify=labels.tolist(),
                 random_state=int(split_random_state if split_random_state is not None else random_state),
             )
+
+        # --- Minority oversampling (only on train, never on eval) ---
+        if oversample_minority and len(unique_labels) == 2:
+            _train_labels_arr = np.asarray(train_labels, dtype=int)
+            _label_counts = np.bincount(_train_labels_arr, minlength=len(unique_labels))
+            _majority_count = int(_label_counts.max())
+            _minority_label = int(_label_counts.argmin())
+            _minority_indices = np.where(_train_labels_arr == _minority_label)[0]
+            if len(_minority_indices) > 0 and len(_minority_indices) < _majority_count:
+                _rng = np.random.RandomState(int(split_random_state if split_random_state is not None else random_state))
+                _n_to_add = _majority_count - len(_minority_indices)
+                _resample_indices = _rng.choice(_minority_indices, size=_n_to_add, replace=True)
+                train_texts = train_texts + [train_texts[i] for i in _resample_indices]
+                train_labels = train_labels + [train_labels[i] for i in _resample_indices]
+                # Shuffle to avoid all oversampled examples at the end
+                _shuffle_idx = _rng.permutation(len(train_texts)).tolist()
+                train_texts = [train_texts[i] for i in _shuffle_idx]
+                train_labels = [train_labels[i] for i in _shuffle_idx]
+
         try:
-            model = AutoModelForSequenceClassification.from_pretrained(
+            model = _run_with_suppressed_transformer_output(
+                AutoModelForSequenceClassification.from_pretrained,
                 model_name,
                 num_labels=len(unique_labels),
                 id2label={idx: label for label, idx in label_mapping.items()},
@@ -11590,10 +12063,30 @@ def run_transformers_finetune(
                     metrics["roc_auc"] = float(roc_auc_score(y_true, probs))
                 except ValueError:
                     metrics["roc_auc"] = float("nan")
+                try:
+                    metrics["pr_auc"] = float(average_precision_score(y_true, probs))
+                except ValueError:
+                    metrics["pr_auc"] = float("nan")
+                metrics["mcc"] = float(matthews_corrcoef(y_true, y_pred)) if len(y_true) > 0 else float("nan")
+                _per_class_f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
+                if len(_per_class_f1) > 0:
+                    metrics["f1_class_0"] = float(_per_class_f1[0])
+                if len(_per_class_f1) >= 2 and _per_class_f1[0] + _per_class_f1[1] > 0:
+                    metrics["balanced_f1"] = float(2 * _per_class_f1[0] * _per_class_f1[1] / (_per_class_f1[0] + _per_class_f1[1]))
+                else:
+                    metrics["balanced_f1"] = 0.0
             else:
                 metrics["precision"] = float(precision_score(y_true, y_pred, average="macro", zero_division=0))
                 metrics["recall"] = float(recall_score(y_true, y_pred, average="macro", zero_division=0))
                 metrics["f1"] = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+                metrics["mcc"] = float(matthews_corrcoef(y_true, y_pred)) if len(y_true) > 0 else float("nan")
+                _per_class_f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
+                if len(_per_class_f1) > 0:
+                    metrics["f1_class_0"] = float(_per_class_f1[0])
+                if len(_per_class_f1) >= 2 and _per_class_f1[0] + _per_class_f1[1] > 0:
+                    metrics["balanced_f1"] = float(2 * _per_class_f1[0] * _per_class_f1[1] / (_per_class_f1[0] + _per_class_f1[1]))
+                else:
+                    metrics["balanced_f1"] = 0.0
             return metrics
 
         compute_metrics = _trainer_metrics
@@ -11603,7 +12096,7 @@ def run_transformers_finetune(
             raise ValueError("Se requieren al menos 2 textos para MLM.")
 
         _temporal_ok_mlm = False
-        if _has_time and work["accidente_time"].notna().sum() >= 2:
+        if requested_split_mode == "Temporal" and _has_time and work["accidente_time"].notna().sum() >= 2:
             _time_vals = work["accidente_time"].fillna(pd.Timestamp.min)
             _order = np.argsort(_time_vals.to_numpy())
             _split_idx = max(1, int(len(_order) * (1.0 - float(test_size))))
@@ -11618,7 +12111,11 @@ def run_transformers_finetune(
                 random_state=int(split_random_state if split_random_state is not None else random_state),
             )
         try:
-            model = AutoModelForMaskedLM.from_pretrained(model_name, **pretrained_load_kwargs)
+            model = _run_with_suppressed_transformer_output(
+                AutoModelForMaskedLM.from_pretrained,
+                model_name,
+                **pretrained_load_kwargs,
+            )
         except Exception as exc:
             _raise_transformer_load_error(model_name, exc)
         train_dataset = _TransformerTextDataset(
@@ -11652,7 +12149,7 @@ def run_transformers_finetune(
         warmup_steps=int(warmup_steps),
         warmup_ratio=warmup_ratio,
     )
-    metric_for_best = "f1" if mode == "classification" else "eval_loss"
+    metric_for_best = "balanced_f1" if mode == "classification" else "eval_loss"
     greater_is_better = mode == "classification"
     training_args = TrainingArguments(
         output_dir=str(trainer_output_dir),
@@ -11668,15 +12165,34 @@ def run_transformers_finetune(
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
+        disable_tqdm=True,
         metric_for_best_model=metric_for_best,
         greater_is_better=greater_is_better,
+        log_level="error",
+        log_level_replica="error",
         seed=int(trainer_random_state if trainer_random_state is not None else random_state),
         report_to="none",
         do_train=True,
         do_eval=True,
     )
 
-    trainer = Trainer(
+    _trainer_cls = Trainer
+    if mode == "classification" and torch is not None:
+        _train_labels_arr = np.asarray(train_labels, dtype=int)
+        _class_counts = np.bincount(_train_labels_arr, minlength=len(unique_labels)).astype(float)
+        _class_counts = np.where(_class_counts == 0, 1.0, _class_counts)
+        _weights = float(len(_train_labels_arr)) / (float(len(unique_labels)) * _class_counts)
+        # Apply class_weight_power to amplify imbalance correction
+        if float(class_weight_power) != 1.0:
+            _weights = np.power(_weights, float(class_weight_power))
+        _class_weights_tensor = torch.tensor(_weights, dtype=torch.float32)
+        _trainer_cls = _make_weighted_trainer_class(
+            _class_weights_tensor,
+            focal_gamma=float(focal_gamma),
+        )
+
+    trainer = _run_with_suppressed_transformer_output(
+        _trainer_cls,
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -11686,17 +12202,41 @@ def run_transformers_finetune(
         compute_metrics=compute_metrics,
         callbacks=callbacks,
     )
-    train_output = trainer.train()
-    eval_metrics = trainer.evaluate()
+    train_output = _run_with_suppressed_transformer_output(trainer.train)
+    eval_metrics = _run_with_suppressed_transformer_output(trainer.evaluate)
     history_df = pd.DataFrame(trainer.state.log_history)
 
     if mode == "classification":
-        predictions = trainer.predict(eval_dataset)
+        predictions = _run_with_suppressed_transformer_output(trainer.predict, eval_dataset)
         logits = np.asarray(predictions.predictions)
         y_true = np.asarray(predictions.label_ids, dtype=int)
         y_pred = logits.argmax(axis=1)
         y_score = _softmax_logits(logits)[:, 1] if len(label_mapping) == 2 else None
         metrics = _classification_metrics(y_true, y_pred, y_score)
+
+        # --- Threshold tuning: sweep thresholds to maximize MCC ---
+        if y_score is not None and len(label_mapping) == 2:
+            _best_thr = 0.5
+            _best_mcc = metrics.get("mcc", -1.0)
+            for _thr_candidate in np.arange(0.05, 0.96, 0.01):
+                _y_pred_thr = (y_score >= _thr_candidate).astype(int)
+                if len(set(_y_pred_thr)) < 2:
+                    continue
+                _mcc_thr = float(matthews_corrcoef(y_true, _y_pred_thr))
+                if _mcc_thr > _best_mcc:
+                    _best_mcc = _mcc_thr
+                    _best_thr = float(_thr_candidate)
+            _y_pred_opt = (y_score >= _best_thr).astype(int)
+            _metrics_opt = _classification_metrics(y_true, _y_pred_opt, y_score)
+            metrics["optimal_threshold"] = round(_best_thr, 4)
+            metrics["optimal_mcc"] = float(_metrics_opt.get("mcc", _best_mcc))
+            metrics["optimal_f1_score"] = float(_metrics_opt.get("f1_score", 0.0))
+            metrics["optimal_balanced_f1"] = float(
+                _metrics_opt.get("class_metrics", {}).get("0", {}).get("f1_score", 0.0)
+                + _metrics_opt.get("class_metrics", {}).get("1", {}).get("f1_score", 0.0)
+            ) / 2.0 if _metrics_opt.get("class_metrics") else 0.0
+            metrics["optimal_confusion_matrix"] = _metrics_opt.get("confusion_matrix")
+            metrics["optimal_class_metrics"] = _metrics_opt.get("class_metrics")
     else:
         metrics = {}
         eval_loss = eval_metrics.get("eval_loss")
@@ -11712,8 +12252,8 @@ def run_transformers_finetune(
         if isinstance(value, (int, float)) and key not in metrics:
             metrics[key] = float(value)
 
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
+    _run_with_suppressed_transformer_output(model.save_pretrained, output_dir)
+    _run_with_suppressed_transformer_output(tokenizer.save_pretrained, output_dir)
     summary = {
         "model_name": model_name,
         "mode": mode,
@@ -11734,12 +12274,18 @@ def run_transformers_finetune(
             "test_size": float(test_size),
             "random_state": int(random_state),
             "split_random_state": int(split_random_state if split_random_state is not None else random_state),
+            "requested_split_mode": requested_split_mode,
             "split_mode": "Temporal" if (mode == "classification" and _temporal_ok) or (mode == "mlm" and _temporal_ok_mlm) else "Estratificado",
             "trainer_random_state": int(trainer_random_state if trainer_random_state is not None else random_state),
             "freeze_layers": bool(froze_layers),
             "mlm_probability": float(mlm_probability),
+            "class_weights": _class_weights_tensor.tolist() if mode == "classification" and torch is not None else None,
+            "focal_gamma": float(focal_gamma),
+            "oversample_minority": bool(oversample_minority),
+            "class_weight_power": float(class_weight_power),
         },
         "label_mapping": label_mapping,
+        "training_data_fingerprint": training_data_fingerprint,
     }
     with (output_dir / "training_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, ensure_ascii=True, indent=2, default=_json_default)
@@ -11759,6 +12305,7 @@ def run_transformers_hyperparameter_search(
     search_space: Dict[str, Sequence[object]],
     max_trials: int,
     objective_metric: str,
+    split_mode: str,
     split_random_state: int,
     trainer_seed_base: int,
     confirm_top_k: int,
@@ -11768,6 +12315,7 @@ def run_transformers_hyperparameter_search(
 ) -> Dict[str, object]:
     if mode not in {"classification", "mlm"}:
         raise ValueError(f"Modo de busqueda no soportado: {mode}")
+    requested_split_mode = _normalize_transformer_split_mode(split_mode)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -11839,8 +12387,12 @@ def run_transformers_hyperparameter_search(
                 trainer_random_state=int(trainer_seed_base),
                 freeze_layers=bool(config["freeze_layers"]),
                 test_size=float(config["test_size"]),
+                split_mode=requested_split_mode,
                 mlm_probability=float(config["mlm_probability"]),
                 early_stopping_patience=1,
+                focal_gamma=float(config.get("focal_gamma", 2.0)),
+                oversample_minority=bool(config.get("oversample_minority", True)),
+                class_weight_power=float(config.get("class_weight_power", 1.0)),
             )
             objective_value = _resolve_transformer_objective(
                 result["metrics"],
@@ -11862,7 +12414,11 @@ def run_transformers_hyperparameter_search(
                 "warmup_ratio": float(config["warmup_ratio"]),
                 "freeze_layers": bool(config["freeze_layers"]),
                 "test_size": float(config["test_size"]),
+                "requested_split_mode": requested_split_mode,
                 "mlm_probability": float(config["mlm_probability"]),
+                "focal_gamma": float(config.get("focal_gamma", 2.0)),
+                "oversample_minority": bool(config.get("oversample_minority", True)),
+                "class_weight_power": float(config.get("class_weight_power", 1.0)),
                 "rows_train": int(result["rows_train"]),
                 "rows_eval": int(result["rows_eval"]),
                 "output_dir": str(result["output_dir"]),
@@ -11886,7 +12442,11 @@ def run_transformers_hyperparameter_search(
                 "warmup_ratio": float(config.get("warmup_ratio") or 0.0),
                 "freeze_layers": bool(config.get("freeze_layers")),
                 "test_size": float(config.get("test_size") or 0.0),
+                "requested_split_mode": requested_split_mode,
                 "mlm_probability": float(config.get("mlm_probability") or 0.0),
+                "focal_gamma": float(config.get("focal_gamma", 2.0)),
+                "oversample_minority": bool(config.get("oversample_minority", True)),
+                "class_weight_power": float(config.get("class_weight_power", 1.0)),
                 "rows_train": 0,
                 "rows_eval": 0,
                 "output_dir": str(trial_dir),
@@ -11907,11 +12467,11 @@ def run_transformers_hyperparameter_search(
             config = {}
             for key, choices in _optuna_search_space.items():
                 val = trial.suggest_categorical(str(key), choices)
-                if key in {"learning_rate", "weight_decay", "warmup_ratio", "test_size", "mlm_probability"}:
+                if key in {"learning_rate", "weight_decay", "warmup_ratio", "test_size", "mlm_probability", "focal_gamma", "class_weight_power"}:
                     val = float(val)
                 elif key in {"num_train_epochs", "batch_size", "max_length"}:
                     val = int(val)
-                elif key == "freeze_layers":
+                elif key in {"freeze_layers", "oversample_minority"}:
                     val = bool(val)
                 config[key] = val
 
@@ -11971,6 +12531,7 @@ def run_transformers_hyperparameter_search(
                 "objective_metric": objective_metric,
                 "greater_is_better": bool(greater_is_better),
                 "sampling_meta": sampling_meta,
+                "requested_split_mode": requested_split_mode,
                 "split_random_state": int(split_random_state),
                 "trainer_seed_base": int(trainer_seed_base),
                 "confirm_top_k": int(confirm_top_k),
@@ -12044,7 +12605,11 @@ def run_transformers_hyperparameter_search(
                     trainer_random_state=int(trainer_seed),
                     freeze_layers=bool(config["freeze_layers"]),
                     test_size=float(config["test_size"]),
+                    split_mode=requested_split_mode,
                     mlm_probability=float(config["mlm_probability"]),
+                    focal_gamma=float(config.get("focal_gamma", 2.0)),
+                    oversample_minority=bool(config.get("oversample_minority", True)),
+                    class_weight_power=float(config.get("class_weight_power", 1.0)),
                 )
                 objective_value = _resolve_transformer_objective(
                     result["metrics"],
@@ -12068,7 +12633,11 @@ def run_transformers_hyperparameter_search(
                     "warmup_ratio": float(config["warmup_ratio"]),
                     "freeze_layers": bool(config["freeze_layers"]),
                     "test_size": float(config["test_size"]),
+                    "requested_split_mode": requested_split_mode,
                     "mlm_probability": float(config["mlm_probability"]),
+                    "focal_gamma": float(config.get("focal_gamma", 2.0)),
+                    "oversample_minority": bool(config.get("oversample_minority", True)),
+                    "class_weight_power": float(config.get("class_weight_power", 1.0)),
                     "rows_train": int(result["rows_train"]),
                     "rows_eval": int(result["rows_eval"]),
                     "output_dir": str(result["output_dir"]),
@@ -12093,7 +12662,11 @@ def run_transformers_hyperparameter_search(
                     "warmup_ratio": float(config["warmup_ratio"]),
                     "freeze_layers": bool(config["freeze_layers"]),
                     "test_size": float(config["test_size"]),
+                    "requested_split_mode": requested_split_mode,
                     "mlm_probability": float(config["mlm_probability"]),
+                    "focal_gamma": float(config.get("focal_gamma", 2.0)),
+                    "oversample_minority": bool(config.get("oversample_minority", True)),
+                    "class_weight_power": float(config.get("class_weight_power", 1.0)),
                     "rows_train": 0,
                     "rows_eval": 0,
                     "output_dir": str(confirm_dir),
@@ -12122,6 +12695,9 @@ def run_transformers_hyperparameter_search(
                 freeze_layers=("freeze_layers", "first"),
                 test_size=("test_size", "first"),
                 mlm_probability=("mlm_probability", "first"),
+                focal_gamma=("focal_gamma", "first"),
+                oversample_minority=("oversample_minority", "first"),
+                class_weight_power=("class_weight_power", "first"),
                 search_objective=("search_objective", "first"),
                 confirm_runs=("objective", "count"),
                 confirm_objective_mean=("objective", "mean"),
@@ -12176,7 +12752,11 @@ def run_transformers_hyperparameter_search(
         trainer_random_state=int(trainer_seed_base),
         freeze_layers=bool(best_config["freeze_layers"]),
         test_size=float(best_config["test_size"]),
+        split_mode=requested_split_mode,
         mlm_probability=float(best_config["mlm_probability"]),
+        focal_gamma=float(best_config.get("focal_gamma", 2.0)),
+        oversample_minority=bool(best_config.get("oversample_minority", True)),
+        class_weight_power=float(best_config.get("class_weight_power", 1.0)),
     )
     best_history_df = best_result.pop("history_df", pd.DataFrame())
 
@@ -12194,6 +12774,7 @@ def run_transformers_hyperparameter_search(
         "objective_metric": objective_metric,
         "greater_is_better": bool(greater_is_better),
         "sampling_meta": sampling_meta,
+        "requested_split_mode": requested_split_mode,
         "split_random_state": int(split_random_state),
         "trainer_seed_base": int(trainer_seed_base),
         "confirm_top_k": int(confirm_top_k),
@@ -12236,11 +12817,21 @@ def execute_transformer_finetune_from_preset(
     result_model_name: str,
     action_name: str,
     extra_metadata: Optional[Dict[str, object]] = None,
+    split_mode_override: Optional[object] = None,
 ) -> Dict[str, object]:
     params = preset.get("params") or {}
     text_col = str(preset.get("text_col") or "")
     mode = str(preset.get("mode") or "")
     base_model = str(preset.get("base_model") or "")
+    resolved_split_mode = _normalize_transformer_split_mode(
+        split_mode_override
+        if split_mode_override is not None
+        else (
+            params.get("requested_split_mode")
+            or params.get("split_mode")
+            or "Temporal"
+        )
+    )
     output_dir = Path(output_dir)
     result = run_transformers_finetune(
         df,
@@ -12276,7 +12867,11 @@ def execute_transformer_finetune_from_preset(
         ),
         freeze_layers=bool(params.get("freeze_layers") or False),
         test_size=float(params.get("test_size") or 0.2),
+        split_mode=resolved_split_mode,
         mlm_probability=float(params.get("mlm_probability") or 0.15),
+        focal_gamma=float(params.get("focal_gamma", 2.0)),
+        oversample_minority=bool(params.get("oversample_minority") if params.get("oversample_minority") is not None else True),
+        class_weight_power=float(params.get("class_weight_power", 1.0)),
     )
     history_df = result.pop("history_df", pd.DataFrame())
     metadata = {
@@ -12286,6 +12881,7 @@ def execute_transformer_finetune_from_preset(
         "output_dir": result["output_dir"],
         "rows_train": result["rows_train"],
         "rows_eval": result["rows_eval"],
+        "training_data_fingerprint": result.get("training_data_fingerprint") or {},
         "source_preset_run_id": preset.get("run_id"),
         "source_preset_created_at": preset.get("created_at"),
         "source_preset_label": preset.get("label"),
@@ -13256,6 +13852,8 @@ def _render_transformer_preset_summary(preset: Dict[str, object]) -> None:
             "base_model": preset.get("base_model"),
             "objective_metric": preset.get("objective_metric"),
             "output_dir": preset.get("output_dir"),
+            "requested_split_mode": params.get("requested_split_mode") or params.get("split_mode"),
+            "split_mode_applied": params.get("split_mode"),
             "params": params,
         }
     )
@@ -13840,6 +14438,17 @@ def _render_language_modeling_tab() -> None:
             "Pipeline recomendado: 1) seleccionar hiperparametros guardados o buscar nuevos, "
             "2) aplicar el ajuste final con esos hiperparametros, 3) reutilizar el modelo en Embeddings."
         )
+        split_mode = st.radio(
+            "Tipo de muestreo train/eval",
+            ["Estratificado", "Temporal"],
+            index=1,
+            horizontal=True,
+            key="nlp_sev_tf_split_mode",
+            help=(
+                "Temporal ordena por `accidente_time`. Estratificado mantiene la proporcion "
+                "de clases en clasificacion; en MLM usa un split aleatorio no temporal."
+            ),
+        )
 
         st.markdown("#### Paso 1 · Hiperparametros")
         hyperparam_strategy = st.radio(
@@ -13905,9 +14514,9 @@ def _render_language_modeling_tab() -> None:
                         if "severity_target" in text_df.columns
                         else pd.Series(dtype=float)
                     )
-                    objective_options = ["f1", "accuracy"] if mode == "classification" else ["eval_loss"]
+                    objective_options = ["balanced_f1", "f1", "f1_class_0", "accuracy", "mcc"] if mode == "classification" else ["eval_loss"]
                     if mode == "classification" and severity_values.dropna().nunique() == 2:
-                        objective_options.append("roc_auc")
+                        objective_options = ["balanced_f1", "optimal_mcc", "optimal_balanced_f1", "pr_auc"] + objective_options[1:] + ["roc_auc"]
 
                     cfg3, cfg4, cfg5 = st.columns(3)
                     with cfg3:
@@ -14144,6 +14753,42 @@ def _render_language_modeling_tab() -> None:
                         else:
                             search_mlm_probs = [0.15]
 
+                    if mode == "classification":
+                        st.markdown("##### Balanceo de clases")
+                        bal1, bal2, bal3 = st.columns(3)
+                        with bal1:
+                            focal_gamma_options = [0.0, 1.0, 2.0, 3.0, 5.0]
+                            search_focal_gammas = st.multiselect(
+                                "Focal Loss gamma",
+                                focal_gamma_options,
+                                default=[2.0],
+                                key="nlp_sev_tf_search_focal_gamma",
+                                help="gamma=0 usa CrossEntropy clasica. gamma>0 penaliza ejemplos faciles (recomendado 2.0 para desbalance).",
+                            )
+                        with bal2:
+                            cw_power_options = [1.0, 1.5, 2.0, 3.0]
+                            search_cw_powers = st.multiselect(
+                                "Class weight power",
+                                cw_power_options,
+                                default=[1.0],
+                                key="nlp_sev_tf_search_cw_power",
+                                help="Exponente sobre class_weights. >1 amplifica la correccion por desbalance.",
+                            )
+                        with bal3:
+                            oversample_label_map = {"No": False, "Si": True}
+                            search_oversample_labels = st.multiselect(
+                                "Oversampling minoritaria",
+                                list(oversample_label_map.keys()),
+                                default=["Si"],
+                                key="nlp_sev_tf_search_oversample",
+                                help="Replica muestras de la clase minoritaria hasta igualar la mayoritaria en train.",
+                            )
+                    else:
+                        search_focal_gammas = [0.0]
+                        search_cw_powers = [1.0]
+                        search_oversample_labels = ["No"]
+                        oversample_label_map = {"No": False, "Si": True}
+
                     search_ready = (
                         str(selected_search_validation.get("status") or "") != "incompatible"
                         and
@@ -14156,6 +14801,9 @@ def _render_language_modeling_tab() -> None:
                         and bool(search_warmup_ratios)
                         and bool(selected_freeze_labels)
                         and bool(search_mlm_probs)
+                        and bool(search_focal_gammas)
+                        and bool(search_cw_powers)
+                        and bool(search_oversample_labels)
                     )
 
                     if st.button(
@@ -14182,6 +14830,9 @@ def _render_language_modeling_tab() -> None:
                             "freeze_layers": [freeze_label_map[label] for label in selected_freeze_labels],
                             "test_size": [float(validation_size)],
                             "mlm_probability": [float(value) for value in search_mlm_probs],
+                            "focal_gamma": [float(value) for value in search_focal_gammas],
+                            "oversample_minority": [oversample_label_map[label] for label in search_oversample_labels],
+                            "class_weight_power": [float(value) for value in search_cw_powers],
                         }
                         try:
                             search_root = MODULE_RESULTS_DIR / "models" / _slug(search_output_folder) / run_id
@@ -14193,6 +14844,7 @@ def _render_language_modeling_tab() -> None:
                                 search_space=search_space,
                                 max_trials=int(max_trials),
                                 objective_metric=str(objective_metric),
+                                split_mode=split_mode,
                                 split_random_state=int(split_seed),
                                 trainer_seed_base=int(trainer_seed_base),
                                 confirm_top_k=int(confirm_top_k),
@@ -14243,6 +14895,7 @@ def _render_language_modeling_tab() -> None:
                                     "text_col": selected_text_col,
                                     "mode": mode,
                                     "objective_metric": objective_metric,
+                                    "requested_split_mode": split_mode,
                                     "base_model": best_result.get("model_name"),
                                     "best_output_dir": best_result.get("output_dir"),
                                     "search_summary": search_summary,
@@ -14258,6 +14911,7 @@ def _render_language_modeling_tab() -> None:
                                         "text_col": selected_text_col,
                                         "mode": mode,
                                         "objective_metric": objective_metric,
+                                        "requested_split_mode": split_mode,
                                     },
                                 )
                             if isinstance(confirm_summary_df, pd.DataFrame) and not confirm_summary_df.empty:
@@ -14270,6 +14924,7 @@ def _render_language_modeling_tab() -> None:
                                         "text_col": selected_text_col,
                                         "mode": mode,
                                         "objective_metric": objective_metric,
+                                        "requested_split_mode": split_mode,
                                     },
                                 )
                             if isinstance(best_history_df, pd.DataFrame) and not best_history_df.empty:
@@ -14282,6 +14937,7 @@ def _render_language_modeling_tab() -> None:
                                         "text_col": selected_text_col,
                                         "mode": mode,
                                         "objective_metric": objective_metric,
+                                        "requested_split_mode": split_mode,
                                         "output_dir": best_result.get("output_dir"),
                                     },
                                 )
@@ -14292,6 +14948,7 @@ def _render_language_modeling_tab() -> None:
                                     "text_col": selected_text_col,
                                     "mode": mode,
                                     "objective_metric": objective_metric,
+                                    "requested_split_mode": split_mode,
                                     "executed_trials": int(len(trials_df)),
                                     "confirmed_configs": int(len(confirm_summary_df)) if isinstance(confirm_summary_df, pd.DataFrame) else 0,
                                     "best_output_dir": best_result.get("output_dir"),
@@ -14311,7 +14968,10 @@ def _render_language_modeling_tab() -> None:
                                 "output_dir": best_result.get("output_dir"),
                                 "params": best_result.get("params") or {},
                                 "metrics": best_result.get("metrics") or {},
-                                "metadata": {"search_summary": search_summary},
+                                "metadata": {
+                                    "requested_split_mode": split_mode,
+                                    "search_summary": search_summary,
+                                },
                                 "label": (
                                     f"Busqueda actual | {mode} | {selected_text_col} | "
                                     f"{best_result.get('model_name')}"
@@ -14374,7 +15034,14 @@ def _render_language_modeling_tab() -> None:
                             run_id=run_id,
                             result_model_name="Transformers (Fine-tuned)",
                             action_name="transformers_finetune_from_selected_preset",
-                            extra_metadata={"selection_strategy": hyperparam_strategy},
+                            split_mode_override=split_mode,
+                            extra_metadata={
+                                "selection_strategy": hyperparam_strategy,
+                                "source_feature_artifact_id": (st.session_state.get("nlp_sev_features_artifact") or {}).get("artifact_id"),
+                                "source_feature_run_id": (st.session_state.get("nlp_sev_features_artifact") or {}).get("run_id"),
+                                "source_language_artifact_id": (st.session_state.get("nlp_sev_language_artifact") or {}).get("artifact_id"),
+                                "source_language_run_id": (st.session_state.get("nlp_sev_language_artifact") or {}).get("run_id"),
+                            },
                         )
                 except Exception as exc:
                     st.error(f"No se pudo ejecutar el finetune final: {exc}")
@@ -14691,7 +15358,7 @@ def _render_language_modeling_tab() -> None:
                     run_id=run_id,
                 )
                 st.success(
-                    f"Analisis RF ejecutado. Se seleccionaron {len(selected_embedding_cols)} embeddings para Train."
+                    f"Analisis RF ejecutado. Se marcaron {len(selected_embedding_cols)} embeddings como diagnostico."
                 )
             if not corr_df.empty:
                 st.markdown("**Pearson correlation matrix across the embedding dimensions**")
@@ -14710,7 +15377,7 @@ def _render_language_modeling_tab() -> None:
                 ]
                 if selected_embedding_cols:
                     st.caption(
-                        f"Train usara {len(selected_embedding_cols)} embeddings seleccionados por RF."
+                        f"Diagnostico RF disponible para {len(selected_embedding_cols)} embeddings."
                     )
                     st.code(", ".join(selected_embedding_cols[:20]) + (" ..." if len(selected_embedding_cols) > 20 else ""))
                 st.dataframe(ranking_df.head(50), width="stretch")
@@ -14921,7 +15588,7 @@ def _render_train_tab() -> None:
         active_df = _build_train_dataset_with_selected_embeddings(
             features_df,
             embeddings_df,
-            selected_embedding_cols=selected_embedding_cols,
+            selected_embedding_cols=None,
         )
         if active_df is None or active_df.empty:
             active_df = features_df
@@ -14931,13 +15598,13 @@ def _render_train_tab() -> None:
         feature_group_options.extend(["Solo embeddings", "Todo"])
 
     if has_train_dataset and _embedding_feature_columns(active_df):
+        st.caption(
+            f"Dataset de train cargado con todas las dimensiones de embeddings disponibles ({len(_embedding_feature_columns(active_df))})."
+        )
         if selected_embedding_cols:
             st.caption(
-                f"Dataset de train cargado con {len(_embedding_feature_columns(active_df))} embeddings seleccionados por Analisis RF."
-            )
-        else:
-            st.caption(
-                f"Dataset de train cargado con todas las dimensiones de embeddings disponibles ({len(_embedding_feature_columns(active_df))})."
+                "El RF global de embeddings se conserva solo como diagnostico; "
+                "la seleccion supervisada se recalcula dentro de cada train/holdout."
             )
     else:
         st.info(
@@ -15717,7 +16384,7 @@ def _render_experiments_tab() -> None:
         if comparison_df.empty:
             st.info("No hay resultados persistidos.")
         else:
-            st.dataframe(comparison_df, width="stretch")
+            st.dataframe(_prepare_dataframe_for_streamlit(comparison_df), width="stretch")
 
     with exp_tabs[3]:
         topic_source_df = st.session_state.get("nlp_sev_language_df")

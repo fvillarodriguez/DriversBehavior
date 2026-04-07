@@ -1039,6 +1039,326 @@ def test_transformer_model_options_include_existing_local_model(monkeypatch: pyt
     assert "dccuchile/bert-base-spanish-wwm-cased" in options
 
 
+def test_run_transformers_finetune_rejects_temporal_monoclass_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _DummyTokenizer:
+        pad_token = None
+        eos_token = "[EOS]"
+        unk_token = "[UNK]"
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+    monkeypatch.setattr(nlp_app, "torch", object())
+    monkeypatch.setattr(nlp_app, "AutoTokenizer", _DummyTokenizer)
+    monkeypatch.setattr(nlp_app, "Trainer", object())
+    monkeypatch.setattr(nlp_app, "TrainingArguments", object())
+
+    df = pd.DataFrame(
+        {
+            "accidente_time": pd.date_range("2024-01-01 10:00:00", periods=10, freq="min"),
+            "text_bert": [f"evento {idx}" for idx in range(10)],
+            "severity_target": [0, 1, 0, 1, 0, 1, 0, 1, 1, 1],
+        }
+    )
+
+    with pytest.raises(ValueError, match="split temporal.*todas las clases"):
+        nlp_app.run_transformers_finetune(
+            df,
+            text_col="text_bert",
+            mode="classification",
+            model_name="demo-model",
+            output_dir=tmp_path / "finetune_demo",
+            num_train_epochs=1,
+            batch_size=2,
+            max_length=32,
+            learning_rate=5e-5,
+            weight_decay=0.01,
+            warmup_steps=0,
+            warmup_ratio=None,
+            random_state=42,
+            split_random_state=42,
+            trainer_random_state=42,
+            freeze_layers=False,
+            test_size=0.2,
+            split_mode="Temporal",
+            mlm_probability=0.15,
+        )
+
+
+def test_run_transformers_finetune_suppresses_terminal_noise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    captured_training_args: dict[str, object] = {}
+
+    class _DummyTensor:
+        def squeeze(self, dim=0):
+            return self
+
+    class _DummyTokenizer:
+        pad_token = None
+        eos_token = "[EOS]"
+        unk_token = "[UNK]"
+        pad_token_id = 0
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            print("tokenizer stdout noise")
+            print("tokenizer stderr noise", file=sys.stderr)
+            return cls()
+
+        def __call__(self, *args, **kwargs):
+            return {
+                "input_ids": _DummyTensor(),
+                "attention_mask": _DummyTensor(),
+            }
+
+        def save_pretrained(self, output_dir):
+            print("tokenizer save noise")
+
+    class _DummyModel:
+        def __init__(self):
+            self.config = type("_Cfg", (), {"pad_token_id": None})()
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            print("model stdout noise")
+            print("model stderr noise", file=sys.stderr)
+            return cls()
+
+        def save_pretrained(self, output_dir):
+            print("model save noise")
+
+    class _DummyDataCollator:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class _DummyTrainingArguments:
+        def __init__(self, **kwargs):
+            captured_training_args.update(kwargs)
+
+    class _DummyTrainer:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.state = type("_State", (), {"log_history": [{"loss": 0.1}]})()
+
+        def train(self):
+            print("trainer train stdout noise")
+            print("trainer train stderr noise", file=sys.stderr)
+            return type("_TrainOutput", (), {"metrics": {"train_loss": 0.1}})()
+
+        def evaluate(self):
+            print("trainer eval stdout noise")
+            print("trainer eval stderr noise", file=sys.stderr)
+            return {"eval_loss": 1.25}
+
+    monkeypatch.setattr(nlp_app, "torch", object())
+    monkeypatch.setattr(nlp_app, "AutoTokenizer", _DummyTokenizer)
+    monkeypatch.setattr(nlp_app, "AutoModelForMaskedLM", _DummyModel)
+    monkeypatch.setattr(nlp_app, "Trainer", _DummyTrainer)
+    monkeypatch.setattr(nlp_app, "TrainingArguments", _DummyTrainingArguments)
+    monkeypatch.setattr(nlp_app, "DataCollatorForLanguageModeling", _DummyDataCollator)
+
+    result = nlp_app.run_transformers_finetune(
+        pd.DataFrame(
+            {
+                "text_bert": ["evento uno", "evento dos", "evento tres", "evento cuatro"],
+            }
+        ),
+        text_col="text_bert",
+        mode="mlm",
+        model_name="demo-model",
+        output_dir=tmp_path / "finetune_quiet",
+        num_train_epochs=1,
+        batch_size=2,
+        max_length=32,
+        learning_rate=5e-5,
+        weight_decay=0.01,
+        warmup_steps=0,
+        warmup_ratio=0.0,
+        random_state=42,
+        split_random_state=42,
+        trainer_random_state=42,
+        freeze_layers=False,
+        test_size=0.25,
+        split_mode="Estratificado",
+        mlm_probability=0.15,
+    )
+
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert captured_training_args["disable_tqdm"] is True
+    assert captured_training_args["log_level"] == "error"
+    assert captured_training_args["log_level_replica"] == "error"
+    assert result["metrics"]["eval_loss"] == pytest.approx(1.25)
+
+
+def test_prepare_dataframe_for_streamlit_serializes_metadata_objects():
+    df = pd.DataFrame(
+        {
+            "run_id": ["r1", "r2"],
+            "metadata": [
+                {"selection_strategy": "default", "score": 0.7},
+                {"selection_strategy": "custom", "score": 0.9},
+            ],
+            "mixed_object": [1.5, "fallback"],
+        }
+    )
+
+    prepared = nlp_app._prepare_dataframe_for_streamlit(df)
+
+    assert prepared is not df
+    assert prepared["metadata"].map(type).eq(str).all()
+    assert "\"selection_strategy\": \"default\"" in prepared.loc[0, "metadata"]
+    assert prepared["mixed_object"].tolist() == ["1.5", "fallback"]
+
+
+def test_run_transformers_hyperparameter_search_threads_split_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    observed_split_modes: list[str] = []
+
+    def fake_run_transformers_finetune(df, **kwargs):
+        observed_split_modes.append(str(kwargs.get("split_mode")))
+        requested_split_mode = str(kwargs.get("split_mode"))
+        return {
+            "model_name": str(kwargs.get("model_name")),
+            "mode": str(kwargs.get("mode")),
+            "text_col": str(kwargs.get("text_col")),
+            "output_dir": str(kwargs.get("output_dir")),
+            "rows_train": 8,
+            "rows_eval": 2,
+            "metrics": {"balanced_f1": 0.72},
+            "params": {
+                "requested_split_mode": requested_split_mode,
+                "split_mode": requested_split_mode,
+                "test_size": float(kwargs.get("test_size", 0.2)),
+            },
+            "training_data_fingerprint": {"sha256": "demo"},
+            "history_df": pd.DataFrame({"epoch": [1], "eval_balanced_f1": [0.72]}),
+        }
+
+    monkeypatch.setattr(nlp_app, "run_transformers_finetune", fake_run_transformers_finetune)
+
+    df = pd.DataFrame(
+        {
+            "accidente_time": pd.date_range("2024-01-01 10:00:00", periods=10, freq="min"),
+            "text_bert": [f"evento {idx}" for idx in range(10)],
+            "severity_target": [0, 1] * 5,
+        }
+    )
+
+    result = nlp_app.run_transformers_hyperparameter_search(
+        df,
+        text_col="text_bert",
+        mode="classification",
+        output_dir=tmp_path / "search",
+        search_space={
+            "model_name": ["demo-model"],
+            "num_train_epochs": [1],
+            "batch_size": [2],
+            "max_length": [32],
+            "learning_rate": [5e-5],
+            "weight_decay": [0.01],
+            "warmup_ratio": [0.0],
+            "freeze_layers": [False],
+            "test_size": [0.2],
+            "mlm_probability": [0.15],
+            "focal_gamma": [2.0],
+            "oversample_minority": [True],
+            "class_weight_power": [1.0],
+        },
+        max_trials=1,
+        objective_metric="balanced_f1",
+        split_mode="Estratificado",
+        split_random_state=42,
+        trainer_seed_base=42,
+        confirm_top_k=1,
+        confirm_seed_count=1,
+        keep_trial_artifacts=False,
+    )
+
+    assert observed_split_modes == ["Estratificado", "Estratificado", "Estratificado"]
+    assert result["search_summary"]["requested_split_mode"] == "Estratificado"
+    assert result["best_result"]["params"]["requested_split_mode"] == "Estratificado"
+
+
+def test_execute_transformer_finetune_from_preset_allows_split_mode_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+
+    def fake_run_transformers_finetune(df, **kwargs):
+        captured["split_mode"] = kwargs.get("split_mode")
+        return {
+            "model_name": "demo-model",
+            "mode": str(kwargs.get("mode")),
+            "text_col": str(kwargs.get("text_col")),
+            "output_dir": str(kwargs.get("output_dir")),
+            "rows_train": 8,
+            "rows_eval": 2,
+            "metrics": {"balanced_f1": 0.7},
+            "params": {
+                "requested_split_mode": str(kwargs.get("split_mode")),
+                "split_mode": str(kwargs.get("split_mode")),
+            },
+            "training_data_fingerprint": {"sha256": "demo"},
+            "history_df": pd.DataFrame(),
+        }
+
+    monkeypatch.setattr(nlp_app, "run_transformers_finetune", fake_run_transformers_finetune)
+    monkeypatch.setattr(nlp_app, "_record_model_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(nlp_app, "_persist_artifact", lambda *args, **kwargs: None)
+    monkeypatch.setattr(nlp_app, "_log_action", lambda *args, **kwargs: None)
+
+    preset = {
+        "run_id": "preset-run",
+        "created_at": "2026-04-07T12:00:00",
+        "label": "preset demo",
+        "text_col": "text_bert",
+        "mode": "classification",
+        "base_model": "demo-model",
+        "params": {
+            "epochs": 1,
+            "batch_size": 2,
+            "max_length": 32,
+            "learning_rate": 5e-5,
+            "weight_decay": 0.01,
+            "warmup_steps": 0,
+            "warmup_ratio": 0.0,
+            "random_state": 42,
+            "split_random_state": 42,
+            "trainer_random_state": 42,
+            "freeze_layers": False,
+            "test_size": 0.2,
+            "mlm_probability": 0.15,
+            "requested_split_mode": "Temporal",
+        },
+    }
+
+    result = nlp_app.execute_transformer_finetune_from_preset(
+        pd.DataFrame({"text_bert": ["uno", "dos"], "severity_target": [0, 1]}),
+        preset=preset,
+        output_dir=tmp_path / "final_model",
+        run_id="run-final",
+        result_model_name="Transformers (Fine-tuned)",
+        action_name="transformers_finetune_from_selected_preset",
+        split_mode_override="Estratificado",
+    )
+
+    assert captured["split_mode"] == "Estratificado"
+    assert result["params"]["requested_split_mode"] == "Estratificado"
+
+
 def _paper_compare_fixture_payload() -> dict:
     expected = copy.deepcopy(nlp_app.PAPER_EXPECTED_COUNTS)
     class_metrics = {
@@ -2705,6 +3025,15 @@ def test_paper_build_raw_dataset_uses_precomputed_features_bundle(
             {
                 "output_dir_resolved": "/tmp/manual-model",
                 "model_label": "manual-transformer",
+                "metadata": {
+                    "mode": "classification",
+                    "text_col": "text_bert",
+                    "training_data_fingerprint": nlp_app._transformer_training_data_fingerprint(
+                        features_df,
+                        text_col="text_bert",
+                        mode="classification",
+                    ),
+                },
             }
         ),
     }
@@ -2723,13 +3052,6 @@ def test_paper_build_raw_dataset_uses_precomputed_features_bundle(
             {"model_name": "manual-transformer"},
         ),
     )
-    monkeypatch.setattr(
-        nlp_app,
-        "run_embedding_rf_analysis",
-        lambda df, embed_cols: pd.DataFrame(
-            {"variable": ["emb_001", "emb_000"], "importance": [0.9, 0.8]}
-        ),
-    )
 
     payload = nlp_app._paper_build_raw_dataset(
         accidents_df=None,
@@ -2740,9 +3062,57 @@ def test_paper_build_raw_dataset_uses_precomputed_features_bundle(
 
     assert payload["features_df"].equals(features_df)
     assert payload["granular_df"].equals(granular_df)
-    assert payload["selected_embedding_cols"] == ["emb_001", "emb_000"]
+    assert payload["selected_embedding_cols"] == ["emb_000", "emb_001"]
     assert "emb_000" in payload["dataset_df"].columns
     assert "emb_001" in payload["dataset_df"].columns
+
+
+def test_paper_build_raw_dataset_rejects_transformer_with_incompatible_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    features_df = pd.DataFrame(
+        {
+            "accident_id": ["a1", "a2"],
+            "severity_target": [0, 1],
+            "text_bert": ["uno", "dos"],
+            "flow_feature": [1.0, 2.0],
+        }
+    )
+    incompatible_df = features_df.copy()
+    incompatible_df["text_bert"] = ["texto distinto", "otro texto"]
+    execution_context = {
+        "raw_source_df": None,
+        "raw_features_df": features_df.copy(),
+        "raw_granular_df": pd.DataFrame(),
+        "raw_feature_artifact": {"artifact_id": "feat-1"},
+        "transformer_model_row": pd.Series(
+            {
+                "output_dir_resolved": "/tmp/manual-model",
+                "model_label": "manual-transformer",
+                "metadata": {
+                    "mode": "classification",
+                    "text_col": "text_bert",
+                    "training_data_fingerprint": nlp_app._transformer_training_data_fingerprint(
+                        incompatible_df,
+                        text_col="text_bert",
+                        mode="classification",
+                    ),
+                },
+            }
+        ),
+    }
+
+    monkeypatch.setattr(
+        nlp_app,
+        "build_severity_feature_dataset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no deberia reconstruir features")),
+    )
+
+    with pytest.raises(nlp_app.PaperReplicationBlockedError, match="fingerprint.*no coincide"):
+        nlp_app._paper_build_raw_dataset(
+            accidents_df=None,
+            execution_context=execution_context,
+        )
 
 
 def test_run_paper_replication_can_skip_raw_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

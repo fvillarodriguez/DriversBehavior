@@ -81,6 +81,8 @@ except Exception:
     river_forest = None
     river_metrics = None
 
+import src.Neural_drift_app as neural_drift_app
+
 from src.utils import (
     find_candidate_porticos,
     get_portico_segments,
@@ -13043,6 +13045,20 @@ def _current_feature_selection_context() -> Dict[str, Any]:
     return meta
 
 
+def _build_neural_drift_context() -> Dict[str, Any]:
+    return {
+        "clean_df": st.session_state.get("drift_clean_df"),
+        "raw_df": st.session_state.get("drift_raw_df"),
+        "feature_cols": list(st.session_state.get("drift_feature_cols") or []),
+        "feature_export_path": st.session_state.get("drift_feature_export_path"),
+        "selection_metadata": _current_feature_selection_context(),
+    }
+
+
+def _render_neural_drift_tab() -> None:
+    neural_drift_app.render_tab(_build_neural_drift_context())
+
+
 def _list_recalibration_checkpoints(
     *,
     checkpoint_root: Optional[Path] = None,
@@ -15437,6 +15453,7 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
         st.set_page_config(page_title="Drift detection", layout="wide")
 
     _init_state()
+    neural_drift_app.init_state()
 
     st.title("Drift detection")
     st.caption(
@@ -15445,12 +15462,13 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
         "with extended online ARF and KSWIN comparisons."
     )
 
-    tab_events, tab_feature_eng, tab_selection, tab_experiments = st.tabs(
+    tab_events, tab_feature_eng, tab_selection, tab_experiments, tab_neural_drift = st.tabs(
         [
             "Eventos",
             "Feature engineering",
             "Feature Selection",
             "Experiments",
+            "Neural drift",
         ]
     )
 
@@ -15465,6 +15483,9 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
 
     with tab_experiments:
         _render_experiments_tab()
+
+    with tab_neural_drift:
+        _render_neural_drift_tab()
 
     if show_exit_button and st.sidebar.button("Cerrar app"):
         st.sidebar.write("Cerrando...")

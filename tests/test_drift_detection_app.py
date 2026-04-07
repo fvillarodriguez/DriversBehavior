@@ -5338,3 +5338,75 @@ def test_feature_selection_payload_persists_with_feature_duckdb(tmp_path):
     )
 
     assert _load_feature_selection_payload_from_duckdb(db_path) is None
+
+
+def test_main_mounts_neural_drift_tab_and_passes_context(monkeypatch: pytest.MonkeyPatch):
+    class _FakeTab:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeStreamlit:
+        def __init__(self):
+            self.session_state = {
+                "drift_clean_df": pd.DataFrame(
+                    {
+                        "interval_start": pd.date_range("2024-01-01 00:00:00", periods=3, freq="5min"),
+                        "flow_light": [1.0, 2.0, 3.0],
+                        "target": [0, 1, 0],
+                    }
+                ),
+                "drift_raw_df": pd.DataFrame(
+                    {
+                        "interval_start": pd.date_range("2024-01-01 00:00:00", periods=3, freq="5min"),
+                        "flow_light": [1.0, 2.0, 3.0],
+                        "target": [0, 1, 0],
+                    }
+                ),
+                "drift_feature_cols": ["flow_light"],
+                "drift_feature_export_path": "/tmp/drift_features.duckdb",
+                "drift_feature_selection_meta": {"method": "rf"},
+                "drift_candidate_feature_cols": ["flow_light"],
+            }
+            self.tab_labels = []
+
+        def set_page_config(self, *args, **kwargs):
+            return None
+
+        def title(self, *args, **kwargs):
+            return None
+
+        def caption(self, *args, **kwargs):
+            return None
+
+        def tabs(self, labels):
+            self.tab_labels = list(labels)
+            return [_FakeTab() for _ in labels]
+
+    fake_st = FakeStreamlit()
+    init_calls: list[str] = []
+    render_calls: list[dict] = []
+
+    monkeypatch.setattr(drift_app, "st", fake_st)
+    monkeypatch.setattr(drift_app, "_init_state", lambda: None)
+    monkeypatch.setattr(drift_app, "_render_events_tab", lambda: None)
+    monkeypatch.setattr(drift_app, "_render_feature_engineering_tab", lambda: None)
+    monkeypatch.setattr(drift_app, "_render_feature_selection_tab", lambda: None)
+    monkeypatch.setattr(drift_app, "_render_experiments_tab", lambda: None)
+    monkeypatch.setattr(drift_app.neural_drift_app, "init_state", lambda: init_calls.append("init"))
+    monkeypatch.setattr(
+        drift_app.neural_drift_app,
+        "render_tab",
+        lambda context: render_calls.append(dict(context)),
+    )
+
+    drift_app.main(set_page_config=False, show_exit_button=False)
+
+    assert "Neural drift" in fake_st.tab_labels
+    assert init_calls == ["init"]
+    assert len(render_calls) == 1
+    assert render_calls[0]["feature_cols"] == ["flow_light"]
+    assert render_calls[0]["feature_export_path"] == "/tmp/drift_features.duckdb"
+    assert render_calls[0]["selection_metadata"]["selected_features"] == ["flow_light"]
