@@ -115,6 +115,104 @@ def test_embedding_drift_score_increases_under_regime_shift():
     assert far_payload["channel_scores"][neural_drift_app.DRIFT_EMBEDDING] > near_payload["channel_scores"][neural_drift_app.DRIFT_EMBEDDING]
 
 
+def test_torch_mlp_trains_embedding_autoencoder_monitor():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=180, drift_start=110, random_state=17)
+    augmented_df, augmented_cols = neural_drift_app.augment_feature_frame(
+        df,
+        feature_cols=_feature_bundle(df)["feature_cols"],
+    )
+    dataset = neural_drift_app.build_window_dataset(
+        augmented_df,
+        feature_cols=augmented_cols,
+        lookback_steps=8,
+        horizon_steps=1,
+    )
+    split = neural_drift_app._split_window_dataset(
+        dataset,
+        train_fraction=0.60,
+        validation_fraction=0.20,
+        max_stream_rows=32,
+    )
+
+    artifact = neural_drift_app._train_torch_mlp(
+        split["X_train"],
+        split["y_train"],
+        split["X_val"],
+        split["y_val"],
+        config={
+            **neural_drift_app.DEFAULT_CONFIG,
+            "mlp_epochs": 4,
+            "drift_monitor_epochs": 6,
+            "drift_monitor_hidden_dim": 12,
+            "drift_monitor_bottleneck_dim": 4,
+        },
+    )
+
+    assert artifact["embedding_monitor"] is not None
+    assert "embedding_reconstruction_mean" in artifact["reference"]
+    assert "embedding_reconstruction_std" in artifact["reference"]
+
+
+def test_monitor_architecture_explanation_mentions_key_components():
+    explanation = neural_drift_app._build_monitor_architecture_explanation(
+        {
+            "augmented_feature_count": 18,
+            "predictor_input_dim": 216,
+            "predictor_embedding_dim": 24,
+            "monitor_input_dim": 24,
+            "monitor_hidden_dim": 16,
+            "monitor_bottleneck_dim": 6,
+        },
+        neural_drift_app.DEFAULT_CONFIG,
+        0.65,
+    )
+
+    assert "predice riesgo de accidente" in explanation["overview"]
+    assert any("embedding[24]" in step[0] for step in explanation["predictor_steps"])
+    assert any("bottleneck[6]" in step[0] for step in explanation["monitor_steps"])
+    assert "reconstruction_error" in explanation["score_formula"]
+
+
+def test_drift_monitor_profiles_define_moderate_and_sensitive_presets():
+    moderate = neural_drift_app._drift_monitor_profile_preset(
+        neural_drift_app.DRIFT_MONITOR_PROFILE_MODERATE
+    )
+    sensitive = neural_drift_app._drift_monitor_profile_preset(
+        neural_drift_app.DRIFT_MONITOR_PROFILE_SENSITIVE
+    )
+
+    assert moderate["drift_monitor_bottleneck_dim"] == 6
+    assert moderate["drift_monitor_reconstruction_weight"] == 0.65
+    assert sensitive["drift_monitor_bottleneck_dim"] < moderate["drift_monitor_bottleneck_dim"]
+    assert sensitive["drift_monitor_reconstruction_weight"] > moderate["drift_monitor_reconstruction_weight"]
+
+
+def test_run_signature_changes_when_monitor_profile_changes():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=48, random_state=21)
+    bundle = _feature_bundle(df)
+    bundle["feature_export_path"] = "/tmp/example.duckdb"
+
+    moderate_signature = neural_drift_app._build_run_signature(
+        bundle,
+        {
+            **neural_drift_app.DEFAULT_CONFIG,
+            "drift_monitor_profile": neural_drift_app.DRIFT_MONITOR_PROFILE_MODERATE,
+        },
+    )
+    sensitive_signature = neural_drift_app._build_run_signature(
+        bundle,
+        {
+            **neural_drift_app.DEFAULT_CONFIG,
+            "drift_monitor_profile": neural_drift_app.DRIFT_MONITOR_PROFILE_SENSITIVE,
+            **neural_drift_app._drift_monitor_profile_preset(
+                neural_drift_app.DRIFT_MONITOR_PROFILE_SENSITIVE
+            ),
+        },
+    )
+
+    assert moderate_signature != sensitive_signature
+
+
 def test_run_backtest_pipeline_returns_expected_strategy_rows():
     df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=220, drift_start=140, random_state=7)
     config = {
@@ -230,6 +328,67 @@ def test_resolve_dataset_from_context_falls_back_to_duckdb(tmp_path: Path):
     ]
 
 
+def test_list_feature_engineering_duckdb_artifacts_filters_clean_features(tmp_path: Path):
+    valid_db = tmp_path / "valid_features.duckdb"
+    invalid_db = tmp_path / "other.duckdb"
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=24, random_state=9)
+
+    con = duckdb.connect(str(valid_db))
+    try:
+        con.register("clean_features_view", df)
+        con.execute("CREATE TABLE clean_features AS SELECT * FROM clean_features_view")
+    finally:
+        con.close()
+
+    con = duckdb.connect(str(invalid_db))
+    try:
+        con.execute("CREATE TABLE something_else AS SELECT 1 AS value")
+    finally:
+        con.close()
+
+    artifacts = neural_drift_app.list_feature_engineering_duckdb_artifacts(tmp_path)
+
+    assert len(artifacts) == 1
+    assert artifacts[0]["name"] == "valid_features.duckdb"
+    assert int(artifacts[0]["row_count"]) == len(df)
+
+
+def test_build_dataset_context_for_source_selection_uses_duckdb_selected_features(tmp_path: Path):
+    current_df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=32, random_state=13)
+    selected_df = current_df.rename(columns={"speed_light": "speed_selected"}).copy()
+    selected_df["speed_selected"] = pd.to_numeric(selected_df["speed_selected"], errors="coerce")
+
+    db_path = tmp_path / "selected_features.duckdb"
+    con = duckdb.connect(str(db_path))
+    try:
+        con.register("raw_view", selected_df)
+        con.execute("CREATE TABLE raw_features AS SELECT * FROM raw_view")
+        con.register("clean_view", selected_df)
+        con.execute("CREATE TABLE clean_features AS SELECT * FROM clean_view")
+        con.execute("CREATE TABLE feature_selection_selected(feature VARCHAR, selected_rank INTEGER)")
+        con.execute("INSERT INTO feature_selection_selected VALUES ('speed_selected', 1)")
+        con.execute("CREATE TABLE feature_selection_candidates(feature VARCHAR, candidate_rank INTEGER)")
+        con.execute("INSERT INTO feature_selection_candidates VALUES ('speed_selected', 1)")
+    finally:
+        con.close()
+
+    effective_context = neural_drift_app.build_dataset_context_for_source_selection(
+        {
+            "clean_df": current_df,
+            "raw_df": current_df,
+            "feature_cols": ["flow_light"],
+            "feature_export_path": None,
+            "selection_metadata": {"from_session": True},
+        },
+        selected_feature_export_path=str(db_path),
+    )
+    bundle = neural_drift_app.resolve_dataset_from_context(effective_context)
+
+    assert bundle["source"] == "duckdb_export"
+    assert bundle["feature_cols"] == ["speed_selected"]
+    assert bundle["selection_metadata"]["feature_export_path"] == str(db_path)
+
+
 def test_streamlit_arrow_safe_df_casts_mixed_object_columns():
     df = pd.DataFrame(
         {
@@ -242,3 +401,31 @@ def test_streamlit_arrow_safe_df_casts_mixed_object_columns():
 
     assert str(safe_df["metadata"].dtype) == "string"
     assert safe_df["metadata"].tolist() == ["default", "0.5"]
+
+
+def test_optimize_decision_threshold_prefers_lower_cutoff_for_rare_events():
+    y_true = np.array([0, 0, 0, 0, 0, 0, 0, 1, 1, 1], dtype=int)
+    scores = np.array([0.01, 0.02, 0.03, 0.03, 0.04, 0.05, 0.07, 0.16, 0.22, 0.28], dtype=float)
+
+    info = neural_drift_app._optimize_decision_threshold(y_true, scores, beta=2.0)
+
+    assert 0.0 <= info["threshold"] <= 1.0
+    assert info["threshold"] < 0.5
+    assert info["recall"] >= 0.5
+
+
+def test_baseline_uses_optimized_decision_threshold():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=220, drift_start=140, random_state=31)
+    config = {
+        **neural_drift_app.DEFAULT_CONFIG,
+        "models": [neural_drift_app.MODEL_XGBOOST],
+        "strategies": [neural_drift_app.STRATEGY_FIXED],
+        "xgb_estimators": 12,
+        "max_stream_rows": 40,
+    }
+
+    results = neural_drift_app.run_backtest_pipeline(_feature_bundle(df), config=config)
+
+    baseline = results["baseline"]
+    assert not baseline.empty
+    assert float(baseline.loc[0, "threshold"]) != 0.5

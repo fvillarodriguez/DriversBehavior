@@ -107,6 +107,11 @@ def test_build_live_sources_includes_drift_manifests(tmp_path, monkeypatch):
         "NLP_PAPER_RUNS_DIR",
         tmp_path / "nlp_in_severity" / "paper_replication",
     )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_LANGUAGE_MODELING_LIVE_DIR",
+        tmp_path / "nlp_in_severity" / "language_modeling_live",
+    )
 
     run_dir = live_app.DRIFT_RUNS_DIR / "run_abc123"
     run_dir.mkdir(parents=True)
@@ -139,6 +144,11 @@ def test_build_live_sources_includes_paper_replication_manifests(tmp_path, monke
         "NLP_PAPER_RUNS_DIR",
         tmp_path / "nlp_in_severity" / "paper_replication",
     )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_LANGUAGE_MODELING_LIVE_DIR",
+        tmp_path / "nlp_in_severity" / "language_modeling_live",
+    )
 
     paper_run_dir = live_app.NLP_PAPER_RUNS_DIR / "paper_replication_abcd"
     paper_run_dir.mkdir(parents=True)
@@ -158,6 +168,124 @@ def test_build_live_sources_includes_paper_replication_manifests(tmp_path, monke
     assert len(sources) == 1
     assert sources[0]["type"] == "paper_replication"
     assert "paper_replication_abcd" in str(sources[0]["label"])
+
+
+def test_build_live_sources_includes_language_modeling_manifests(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(
+        live_app,
+        "DRIFT_RUNS_DIR",
+        tmp_path / "drift_recalibration_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_PAPER_RUNS_DIR",
+        tmp_path / "nlp_in_severity" / "paper_replication",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_LANGUAGE_MODELING_LIVE_DIR",
+        tmp_path / "nlp_in_severity" / "language_modeling_live",
+    )
+
+    run_dir = live_app.NLP_LANGUAGE_MODELING_LIVE_DIR / "language_search_demo"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "language_search_demo",
+                "run_type": "transformers_search",
+                "status": "running",
+                "updated_at": "2026-04-07T10:00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sources = live_app._build_live_sources()
+
+    assert len(sources) == 1
+    assert sources[0]["type"] == "language_modeling"
+    assert "transformers_search" in str(sources[0]["label"])
+
+
+def test_read_language_modeling_run_loads_live_artifacts(tmp_path):
+    run_dir = tmp_path / "nlp_in_severity" / "language_modeling_live" / "language_search_demo"
+    run_dir.mkdir(parents=True)
+    search_trials_path = run_dir / "search_trials_live.csv"
+    best_history_path = run_dir / "best_history_live.csv"
+    search_summary_path = run_dir / "search_summary.json"
+    best_result_path = run_dir / "best_result.json"
+
+    pd.DataFrame(
+        [{"trial_index": 1, "status": "ok", "objective": 0.71}]
+    ).to_csv(search_trials_path, index=False)
+    pd.DataFrame(
+        [{"epoch": 1.0, "loss": 0.5, "eval_balanced_f1": 0.72}]
+    ).to_csv(best_history_path, index=False)
+    search_summary_path.write_text(
+        json.dumps({"greater_is_better": True, "objective_metric": "balanced_f1"}),
+        encoding="utf-8",
+    )
+    best_result_path.write_text(
+        json.dumps({"model_name": "demo-model", "output_dir": str(run_dir / "best_model")}),
+        encoding="utf-8",
+    )
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "language_search_demo",
+                "run_type": "transformers_search",
+                "title": "Busqueda robusta demo",
+                "status": "completed",
+                "result_status": "ok",
+                "updated_at": "2026-04-07T10:05:00",
+                "progress_ratio": 1.0,
+                "artifacts": {
+                    "search_trials_csv": str(search_trials_path),
+                    "best_history_csv": str(best_history_path),
+                    "search_summary_json": str(search_summary_path),
+                    "best_result_json": str(best_result_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "live_status.json").write_text(
+        json.dumps(
+            {
+                "stage": "search.completed",
+                "message": "Busqueda robusta completada.",
+                "progress_ratio": 1.0,
+                "status": "completed",
+                "result_status": "ok",
+                "updated_at": "2026-04-07T10:05:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "live_events.jsonl").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-04-07T10:02:00",
+                "stage": "search.trial",
+                "event_type": "search_trial_result",
+                "trial_index": 1,
+                "objective": 0.71,
+                "progress_ratio": 0.55,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    data = live_app._read_language_modeling_run(run_dir / "manifest.json")
+
+    assert data["manifest"]["run_type"] == "transformers_search"
+    assert list(data["search_trials_df"]["trial_index"]) == [1]
+    assert list(data["best_history_df"]["epoch"]) == [1.0]
+    assert data["search_summary"]["objective_metric"] == "balanced_f1"
+    assert data["best_result"]["model_name"] == "demo-model"
 
 
 def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):

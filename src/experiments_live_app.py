@@ -18,6 +18,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
 DRIFT_RUNS_DIR = RESULTS_DIR / "drift_recalibration_runs"
 NLP_PAPER_RUNS_DIR = RESULTS_DIR / "nlp_in_severity" / "paper_replication"
+NLP_LANGUAGE_MODELING_LIVE_DIR = RESULTS_DIR / "nlp_in_severity" / "language_modeling_live"
 PAPER_MODEL_CODES = ("M1", "M2", "M3")
 
 
@@ -291,6 +292,16 @@ def _list_paper_replication_manifest_files() -> list[Path]:
     )
 
 
+def _list_language_modeling_manifest_files() -> list[Path]:
+    if not NLP_LANGUAGE_MODELING_LIVE_DIR.exists():
+        return []
+    return sorted(
+        NLP_LANGUAGE_MODELING_LIVE_DIR.glob("*/manifest.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def _build_live_sources() -> list[Dict[str, object]]:
     entries: list[Dict[str, object]] = []
     for path in _list_drift_manifest_files():
@@ -317,6 +328,20 @@ def _build_live_sources() -> list[Dict[str, object]]:
                 "path": path,
                 "sort_key": float(path.stat().st_mtime),
                 "label": f"Paper replication | {run_id} | {status} | {updated_at}",
+            }
+        )
+    for path in _list_language_modeling_manifest_files():
+        manifest = _load_json_file(path, default={})
+        run_id = str((manifest or {}).get("run_id") or path.parent.name)
+        run_type = str((manifest or {}).get("run_type") or "language_modeling")
+        status = str((manifest or {}).get("status") or "unknown")
+        updated_at = str((manifest or {}).get("updated_at") or (manifest or {}).get("created_at") or "-")
+        entries.append(
+            {
+                "type": "language_modeling",
+                "path": path,
+                "sort_key": float(path.stat().st_mtime),
+                "label": f"Language modeling | {run_type} | {run_id} | {status} | {updated_at}",
             }
         )
     for path in _list_live_db_files():
@@ -1934,6 +1959,181 @@ def _read_paper_replication_run(manifest_path: Path) -> Dict[str, object]:
         "compare_payload": compare_payload,
         "export_payload": export_payload,
         "model_payloads": frozen_models + raw_models,
+    }
+
+
+def _language_modeling_artifact_path(
+    run_dir: Path,
+    manifest: Dict[str, object],
+    key: str,
+) -> Optional[Path]:
+    artifacts = dict(manifest.get("artifacts") or {})
+    raw_path = artifacts.get(key)
+    if not raw_path:
+        return None
+    candidate = Path(str(raw_path))
+    if not candidate.is_absolute():
+        candidate = run_dir / candidate
+    return candidate
+
+
+def _load_optional_csv(path: Optional[Path]) -> pd.DataFrame:
+    if path is None:
+        return pd.DataFrame()
+    return _load_csv_file(path)
+
+
+def _load_optional_json(path: Optional[Path]) -> Dict[str, object]:
+    if path is None:
+        return {}
+    payload = _load_json_file(path, default={}) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _language_modeling_normalize_live_event(
+    row: Dict[str, object],
+    *,
+    manifest: Dict[str, object],
+) -> Dict[str, object]:
+    payload = dict(row or {})
+    progress_ratio = pd.to_numeric(
+        payload.get("progress_ratio", manifest.get("progress_ratio", 0.0)),
+        errors="coerce",
+    )
+    if pd.isna(progress_ratio):
+        progress_ratio = 0.0
+    progress_ratio = max(0.0, min(float(progress_ratio), 1.0))
+    normalized: Dict[str, object] = {
+        "timestamp": str(payload.get("timestamp") or payload.get("updated_at") or manifest.get("updated_at") or ""),
+        "stage": str(payload.get("stage") or ""),
+        "label": str(payload.get("label") or payload.get("message") or payload.get("event_type") or "Checkpoint state"),
+        "detail": str(payload.get("detail") or ""),
+        "status": str(payload.get("status") or manifest.get("status") or ""),
+        "result_status": str(payload.get("result_status") or manifest.get("result_status") or ""),
+        "event_type": str(payload.get("event_type") or ""),
+        "progress_ratio": progress_ratio,
+        "progress_pct": 100.0 * progress_ratio,
+        "message": str(payload.get("message") or ""),
+        "run_type": str(payload.get("run_type") or manifest.get("run_type") or ""),
+        "title": str(payload.get("title") or manifest.get("title") or ""),
+        "phase": str(payload.get("phase") or ""),
+        "model_name": str(payload.get("model_name") or ""),
+    }
+    for key in [
+        "trial_index",
+        "config_rank",
+        "trainer_seed",
+        "objective",
+        "epoch",
+        "global_step",
+        "loss",
+        "eval_loss",
+        "eval_accuracy",
+        "eval_f1",
+        "eval_balanced_f1",
+        "learning_rate",
+    ]:
+        numeric = pd.to_numeric(payload.get(key), errors="coerce")
+        normalized[key] = None if pd.isna(numeric) else float(numeric)
+    return normalized
+
+
+def _language_modeling_search_curve(
+    trials_df: pd.DataFrame,
+    *,
+    greater_is_better: bool,
+) -> pd.DataFrame:
+    if not isinstance(trials_df, pd.DataFrame) or trials_df.empty:
+        return pd.DataFrame(columns=["trial_index", "objective", "best_so_far"])
+    if "trial_index" not in trials_df.columns or "objective" not in trials_df.columns:
+        return pd.DataFrame(columns=["trial_index", "objective", "best_so_far"])
+    work = trials_df.copy()
+    work["trial_index"] = pd.to_numeric(work["trial_index"], errors="coerce")
+    work["objective"] = pd.to_numeric(work["objective"], errors="coerce")
+    if "status" in work.columns:
+        work = work.loc[work["status"].astype(str) == "ok"].copy()
+    work = work.dropna(subset=["trial_index", "objective"]).sort_values("trial_index")
+    if work.empty:
+        return pd.DataFrame(columns=["trial_index", "objective", "best_so_far"])
+    work["best_so_far"] = (
+        work["objective"].cummax()
+        if greater_is_better
+        else work["objective"].cummin()
+    )
+    return work[["trial_index", "objective", "best_so_far"]].reset_index(drop=True)
+
+
+def _read_language_modeling_run(manifest_path: Path) -> Dict[str, object]:
+    manifest = _load_json_file(manifest_path, default={}) or {}
+    run_dir = manifest_path.parent
+    live_status_path = run_dir / "live_status.json"
+    live_events_path = run_dir / "live_events.jsonl"
+    live_status = _load_json_file(live_status_path, default={}) or {}
+    live_event_rows = _read_jsonl_records(live_events_path)
+    if not live_event_rows and isinstance(live_status, dict) and live_status:
+        live_event_rows = [live_status]
+    normalized_events = [
+        _language_modeling_normalize_live_event(row, manifest=manifest)
+        for row in live_event_rows
+        if isinstance(row, dict)
+    ]
+    live_events_df = pd.DataFrame(normalized_events)
+    if not live_events_df.empty:
+        live_events_df["event_index"] = range(1, len(live_events_df) + 1)
+
+    search_trials_df = _load_optional_csv(
+        _language_modeling_artifact_path(run_dir, manifest, "search_trials_csv")
+    )
+    confirmation_trials_df = _load_optional_csv(
+        _language_modeling_artifact_path(run_dir, manifest, "confirmation_trials_csv")
+    )
+    confirmation_summary_df = _load_optional_csv(
+        _language_modeling_artifact_path(run_dir, manifest, "confirmation_summary_csv")
+    )
+    history_df = _load_optional_csv(
+        _language_modeling_artifact_path(run_dir, manifest, "history_csv")
+    )
+    best_history_df = _load_optional_csv(
+        _language_modeling_artifact_path(run_dir, manifest, "best_history_csv")
+    )
+    search_summary = _load_optional_json(
+        _language_modeling_artifact_path(run_dir, manifest, "search_summary_json")
+    )
+    best_result = _load_optional_json(
+        _language_modeling_artifact_path(run_dir, manifest, "best_result_json")
+    )
+    finetune_result = _load_optional_json(
+        _language_modeling_artifact_path(run_dir, manifest, "finetune_result_json")
+    )
+    failure_summary = _load_optional_json(
+        _language_modeling_artifact_path(run_dir, manifest, "search_failure_summary_json")
+    )
+
+    current_context = {
+        "status": str(live_status.get("status") or manifest.get("status") or ""),
+        "result_status": str(live_status.get("result_status") or manifest.get("result_status") or ""),
+        "stage": str(live_status.get("stage") or ""),
+        "message": str(live_status.get("message") or manifest.get("last_message") or ""),
+        "updated_at": str(live_status.get("updated_at") or manifest.get("updated_at") or ""),
+    }
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "run_dir": run_dir,
+        "live_status": live_status,
+        "live_events_df": live_events_df,
+        "live_status_path": live_status_path,
+        "live_events_path": live_events_path,
+        "search_trials_df": search_trials_df,
+        "confirmation_trials_df": confirmation_trials_df,
+        "confirmation_summary_df": confirmation_summary_df,
+        "history_df": history_df,
+        "best_history_df": best_history_df,
+        "search_summary": search_summary,
+        "best_result": best_result,
+        "finetune_result": finetune_result,
+        "failure_summary": failure_summary,
+        "current_context": current_context,
     }
 
 
@@ -3823,6 +4023,186 @@ def _render_paper_replication_live_view(data: Dict[str, object]) -> None:
         )
 
 
+def _render_language_modeling_history(
+    history_df: pd.DataFrame,
+) -> None:
+    if not isinstance(history_df, pd.DataFrame) or history_df.empty:
+        st.info("No hay historial de entrenamiento persistido todavía.")
+        return
+    work = history_df.copy()
+    axis_col = "epoch" if "epoch" in work.columns else "global_step" if "global_step" in work.columns else None
+    if axis_col is None:
+        work["history_index"] = range(1, len(work) + 1)
+        axis_col = "history_index"
+    work[axis_col] = pd.to_numeric(work[axis_col], errors="coerce")
+    preferred_metrics = [
+        "loss",
+        "eval_loss",
+        "eval_accuracy",
+        "eval_f1",
+        "eval_balanced_f1",
+        "learning_rate",
+    ]
+    metric_cols = [col for col in preferred_metrics if col in work.columns]
+    if not metric_cols:
+        metric_cols = [
+            col
+            for col in work.columns
+            if col != axis_col
+            and pd.to_numeric(work[col], errors="coerce").notna().any()
+        ][:6]
+    if metric_cols:
+        plot_df = work[[axis_col, *metric_cols]].copy()
+        for col in metric_cols:
+            plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+        plot_df = plot_df.dropna(subset=[axis_col])
+        if not plot_df.empty:
+            st.line_chart(plot_df.set_index(axis_col)[metric_cols], width="stretch")
+    st.dataframe(_streamlit_arrow_safe_df(work), width="stretch")
+
+
+def _render_language_modeling_live_view(data: Dict[str, object]) -> None:
+    manifest = dict(data.get("manifest") or {})
+    live_status = dict(data.get("live_status") or {})
+    live_events_df = data.get("live_events_df")
+    search_trials_df = data.get("search_trials_df")
+    confirmation_trials_df = data.get("confirmation_trials_df")
+    confirmation_summary_df = data.get("confirmation_summary_df")
+    history_df = data.get("history_df")
+    best_history_df = data.get("best_history_df")
+    search_summary = dict(data.get("search_summary") or {})
+    best_result = dict(data.get("best_result") or {})
+    finetune_result = dict(data.get("finetune_result") or {})
+    failure_summary = dict(data.get("failure_summary") or {})
+    current_context = dict(data.get("current_context") or {})
+
+    run_type = str(manifest.get("run_type") or "language_modeling")
+    title = str(manifest.get("title") or manifest.get("run_id") or run_type)
+    status = str(current_context.get("status") or manifest.get("status") or "unknown")
+    result_status = str(current_context.get("result_status") or manifest.get("result_status") or status)
+    progress_ratio = pd.to_numeric(manifest.get("progress_ratio", 0.0), errors="coerce")
+    if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty and "progress_ratio" in live_events_df.columns:
+        live_ratio = pd.to_numeric(live_events_df["progress_ratio"], errors="coerce").dropna()
+        if not live_ratio.empty:
+            progress_ratio = live_ratio.iloc[-1]
+    if pd.isna(progress_ratio):
+        progress_ratio = 0.0
+    progress_ratio = max(0.0, min(float(progress_ratio), 1.0))
+    current_stage = str(current_context.get("stage") or live_status.get("stage") or "-")
+    current_message = str(current_context.get("message") or live_status.get("message") or "")
+    updated_at = str(current_context.get("updated_at") or live_status.get("updated_at") or manifest.get("updated_at") or "-")
+
+    st.caption("Experimento detectado: Language modeling")
+    st.caption(f"Checkpoint: {data.get('manifest_path')}")
+    st.caption(f"Run dir: {data.get('run_dir')}")
+
+    if status == "failed":
+        st.error(manifest.get("last_error") or current_message or "Corrida fallida sin detalle persistido.")
+    elif status == "completed":
+        st.success("Corrida completada. Se muestran trazas y artefactos persistidos.")
+    else:
+        st.info("Corrida en progreso. La vista usa el tracker live persistido.")
+
+    history_source = (
+        history_df
+        if isinstance(history_df, pd.DataFrame) and not history_df.empty
+        else best_history_df
+    )
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6 = st.columns(6)
+    kpi_1.metric("Run type", run_type)
+    kpi_2.metric("Estado", status)
+    kpi_3.metric("Resultado", result_status)
+    kpi_4.metric("Progreso", f"{100.0 * progress_ratio:.1f}%")
+    kpi_5.metric(
+        "Trials",
+        f"{int(len(search_trials_df)):,}" if isinstance(search_trials_df, pd.DataFrame) and not search_trials_df.empty else "0",
+    )
+    kpi_6.metric(
+        "Hist rows",
+        f"{int(len(history_source)):,}" if isinstance(history_source, pd.DataFrame) and not history_source.empty else "0",
+    )
+
+    st.progress(progress_ratio)
+    st.caption(f"Titulo: {title}")
+    st.caption(f"Etapa activa: {current_stage}")
+    if current_message:
+        st.caption(current_message)
+    st.caption(f"Ultima actualizacion: {updated_at}")
+
+    live_tab, artifact_tab, data_tab = st.tabs(
+        ["Live calculations", "Artifacts", "Raw data"]
+    )
+
+    with live_tab:
+        st.markdown("**Progress over time**")
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            history_live_df = live_events_df.copy()
+            if "event_index" not in history_live_df.columns:
+                history_live_df["event_index"] = range(1, len(history_live_df) + 1)
+            plot_df = history_live_df[["event_index", "progress_pct"]].dropna(subset=["progress_pct"])
+            if not plot_df.empty:
+                st.line_chart(plot_df.set_index("event_index")["progress_pct"], width="stretch")
+            visible_cols = [
+                col
+                for col in ["event_index", "timestamp", "stage", "event_type", "label", "progress_pct"]
+                if col in history_live_df.columns
+            ]
+            st.dataframe(_streamlit_arrow_safe_df(history_live_df[visible_cols]), width="stretch")
+        else:
+            st.info("No hay eventos live persistidos todavía.")
+
+        st.markdown("**Robust hyperparameter search**")
+        if isinstance(search_trials_df, pd.DataFrame) and not search_trials_df.empty:
+            search_curve_df = _language_modeling_search_curve(
+                search_trials_df,
+                greater_is_better=bool(search_summary.get("greater_is_better", True)),
+            )
+            if not search_curve_df.empty:
+                st.line_chart(search_curve_df.set_index("trial_index")[["objective", "best_so_far"]], width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(search_trials_df), width="stretch")
+        else:
+            st.info("No hay trials de busqueda persistidos todavía.")
+
+        st.markdown("**Confirmation stage**")
+        if isinstance(confirmation_trials_df, pd.DataFrame) and not confirmation_trials_df.empty:
+            st.dataframe(_streamlit_arrow_safe_df(confirmation_trials_df), width="stretch")
+            if isinstance(confirmation_summary_df, pd.DataFrame) and not confirmation_summary_df.empty:
+                st.dataframe(_streamlit_arrow_safe_df(confirmation_summary_df), width="stretch")
+        else:
+            st.info("No hay corridas de confirmacion persistidas todavía.")
+
+        st.markdown("**Language model fine-tuning**")
+        _render_language_modeling_history(
+            history_source if isinstance(history_source, pd.DataFrame) else pd.DataFrame()
+        )
+
+    with artifact_tab:
+        if search_summary:
+            st.markdown("**Search summary**")
+            st.json(search_summary, expanded=False)
+        if best_result:
+            st.markdown("**Best search result**")
+            st.json(best_result, expanded=False)
+        if finetune_result:
+            st.markdown("**Fine-tune result**")
+            st.json(finetune_result, expanded=False)
+        if failure_summary:
+            st.markdown("**Failure summary**")
+            st.json(failure_summary, expanded=False)
+        if not any([search_summary, best_result, finetune_result, failure_summary]):
+            st.info("No hay resumenes de artefactos persistidos todavía.")
+
+    with data_tab:
+        st.markdown("**Manifest**")
+        st.json(manifest, expanded=False)
+        if live_status:
+            st.markdown("**Live status**")
+            st.json(live_status, expanded=False)
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            st.markdown("**Live events**")
+            st.dataframe(_streamlit_arrow_safe_df(live_events_df), width="stretch")
+
+
 def main(*, set_page_config: bool = True) -> None:
     if set_page_config:
         st.set_page_config(page_title="Experiments Live", layout="wide")
@@ -3861,6 +4241,9 @@ def main(*, set_page_config: bool = True) -> None:
     elif source_type == "paper_replication":
         run_data = _read_paper_replication_run(path)
         _render_paper_replication_live_view(run_data)
+    elif source_type == "language_modeling":
+        run_data = _read_language_modeling_run(path)
+        _render_language_modeling_live_view(run_data)
     else:
         meta, df, best_row = _read_live_db(path)
         st.caption(f"Archivo: {path}")

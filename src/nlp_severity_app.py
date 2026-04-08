@@ -68,6 +68,7 @@ try:
         DataCollatorForLanguageModeling,
         EarlyStoppingCallback,
         Trainer,
+        TrainerCallback,
         TrainingArguments,
     )
 except ImportError:  # pragma: no cover
@@ -78,6 +79,7 @@ except ImportError:  # pragma: no cover
     DataCollatorForLanguageModeling = None
     EarlyStoppingCallback = None
     Trainer = None
+    TrainerCallback = object
     TrainingArguments = None
 
 from sklearn import __version__ as SKLEARN_VERSION
@@ -139,6 +141,7 @@ DATA_DIR = ROOT_DIR / "Datos"
 RESULTS_DIR = ROOT_DIR / "Resultados"
 MODULE_RESULTS_DIR = RESULTS_DIR / "nlp_in_severity"
 REGISTRY_DB = MODULE_RESULTS_DIR / "registry.duckdb"
+LANGUAGE_MODELING_LIVE_DIR = MODULE_RESULTS_DIR / "language_modeling_live"
 LEGACY_LOCAL_TRANSFORMER_MODEL_DIR = ROOT_DIR / "NLP" / "bert_base_chile_text_bert_128t"
 LOCAL_TRANSFORMER_MODEL_LOCATIONS: Tuple[Tuple[str, Path], ...] = (
     (
@@ -468,6 +471,23 @@ def _atomic_write_json(path: Path, payload: object) -> None:
                 pass
 
 
+def _atomic_write_csv(df: pd.DataFrame, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            df.to_csv(handle, index=False)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
 def _load_json_file(path: Path, *, default: object = None) -> object:
     file_path = Path(path)
     if not file_path.exists():
@@ -550,6 +570,310 @@ def _stamp_now() -> str:
 
 def _new_run_id(prefix: str) -> str:
     return f"{_slug(prefix)}_{_stamp_now()}_{uuid.uuid4().hex[:8]}"
+
+
+def _language_modeling_live_run_dir(run_id: str) -> Path:
+    return LANGUAGE_MODELING_LIVE_DIR / str(run_id).strip()
+
+
+class _LanguageModelingLiveTracker:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        run_type: str,
+        title: str,
+        context: Optional[Dict[str, object]] = None,
+    ) -> None:
+        resolved_run_id = str(run_id).strip()
+        if not resolved_run_id:
+            raise ValueError("run_id no puede estar vacio para live tracking.")
+        self.run_id = resolved_run_id
+        self.run_type = str(run_type).strip() or "language_modeling"
+        self.title = str(title).strip() or self.run_id
+        self.context = _to_json_safe(context or {})
+        self.run_dir = _language_modeling_live_run_dir(self.run_id)
+        self.manifest_path = self.run_dir / "manifest.json"
+        self.live_status_path = self.run_dir / "live_status.json"
+        self.live_events_path = self.run_dir / "live_events.jsonl"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now().isoformat(timespec="seconds")
+        self.manifest: Dict[str, object] = {
+            "run_id": self.run_id,
+            "run_type": self.run_type,
+            "title": self.title,
+            "status": "running",
+            "result_status": "running",
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": None,
+            "progress_ratio": 0.0,
+            "context": self.context,
+            "artifacts": {},
+            "summary": {},
+            "last_message": "",
+            "last_error": None,
+        }
+        self._persist_manifest()
+
+    def _persist_manifest(self) -> None:
+        self.manifest["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        _atomic_write_json(self.manifest_path, self.manifest)
+
+    def _append_live_event(self, payload: Dict[str, object]) -> None:
+        self.live_events_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.live_events_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_to_json_safe(payload), ensure_ascii=True))
+            handle.write("\n")
+
+    def update(
+        self,
+        *,
+        stage: str,
+        message: str,
+        progress_ratio: Optional[float] = None,
+        event_type: str = "status",
+        detail: str = "",
+        status: Optional[str] = None,
+        result_status: Optional[str] = None,
+        payload: Optional[Dict[str, object]] = None,
+        persist_event: bool = True,
+    ) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        resolved_status = str(status or self.manifest.get("status") or "running")
+        resolved_result_status = str(
+            result_status or self.manifest.get("result_status") or resolved_status
+        )
+        safe_ratio = pd.to_numeric(progress_ratio, errors="coerce")
+        if pd.isna(safe_ratio):
+            safe_ratio = pd.to_numeric(self.manifest.get("progress_ratio"), errors="coerce")
+        if pd.isna(safe_ratio):
+            safe_ratio = 0.0
+        safe_ratio = max(0.0, min(float(safe_ratio), 1.0))
+
+        event: Dict[str, object] = {
+            "timestamp": now,
+            "updated_at": now,
+            "run_id": self.run_id,
+            "run_type": self.run_type,
+            "title": self.title,
+            "stage": str(stage or ""),
+            "message": str(message or ""),
+            "label": str(message or ""),
+            "detail": str(detail or ""),
+            "status": resolved_status,
+            "result_status": resolved_result_status,
+            "progress_ratio": safe_ratio,
+            "progress_pct": 100.0 * safe_ratio,
+            "event_type": str(event_type or "status"),
+        }
+        if isinstance(payload, dict) and payload:
+            event.update(_to_json_safe(payload))
+
+        self.manifest["status"] = resolved_status
+        self.manifest["result_status"] = resolved_result_status
+        self.manifest["progress_ratio"] = safe_ratio
+        self.manifest["last_message"] = str(message or "")
+        if resolved_status != "failed":
+            self.manifest["last_error"] = None
+        self._persist_manifest()
+        _atomic_write_json(self.live_status_path, event)
+        if persist_event:
+            self._append_live_event(event)
+
+    def write_dataframe(
+        self,
+        key: str,
+        df: pd.DataFrame,
+        *,
+        filename: Optional[str] = None,
+    ) -> Path:
+        target = self.run_dir / (
+            str(filename).strip()
+            if filename
+            else f"{_slug(key) or 'artifact'}.csv"
+        )
+        _atomic_write_csv(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), target)
+        artifacts = dict(self.manifest.get("artifacts") or {})
+        artifacts[str(key)] = str(target)
+        self.manifest["artifacts"] = artifacts
+        self._persist_manifest()
+        return target
+
+    def write_json(
+        self,
+        key: str,
+        payload: object,
+        *,
+        filename: Optional[str] = None,
+    ) -> Path:
+        target = self.run_dir / (
+            str(filename).strip()
+            if filename
+            else f"{_slug(key) or 'artifact'}.json"
+        )
+        _atomic_write_json(target, payload)
+        artifacts = dict(self.manifest.get("artifacts") or {})
+        artifacts[str(key)] = str(target)
+        self.manifest["artifacts"] = artifacts
+        self._persist_manifest()
+        return target
+
+    def complete(
+        self,
+        *,
+        stage: str,
+        message: str,
+        summary: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if summary:
+            current_summary = dict(self.manifest.get("summary") or {})
+            current_summary.update(_to_json_safe(summary))
+            self.manifest["summary"] = current_summary
+        completed_at = datetime.now().isoformat(timespec="seconds")
+        self.manifest["completed_at"] = completed_at
+        self.update(
+            stage=stage,
+            message=message,
+            progress_ratio=1.0,
+            event_type="completed",
+            status="completed",
+            result_status="ok",
+            payload={"completed_at": completed_at},
+        )
+
+    def fail(
+        self,
+        *,
+        stage: str,
+        message: str,
+        summary: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if summary:
+            current_summary = dict(self.manifest.get("summary") or {})
+            current_summary.update(_to_json_safe(summary))
+            self.manifest["summary"] = current_summary
+        self.manifest["completed_at"] = datetime.now().isoformat(timespec="seconds")
+        self.manifest["last_error"] = str(message or "")
+        self.update(
+            stage=stage,
+            message=message,
+            progress_ratio=pd.to_numeric(self.manifest.get("progress_ratio"), errors="coerce"),
+            event_type="failed",
+            status="failed",
+            result_status="failed",
+            payload={"error": str(message or "")},
+        )
+
+
+class _TransformerLiveCallback(TrainerCallback):
+    def __init__(
+        self,
+        tracker: _LanguageModelingLiveTracker,
+        *,
+        stage: str,
+        label: str,
+        progress_start: float,
+        progress_end: float,
+        expected_total_steps: int,
+        expected_total_epochs: float,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> None:
+        self.tracker = tracker
+        self.stage = str(stage or "finetune.training")
+        self.label = str(label or "Fine-tune")
+        self.progress_start = max(0.0, min(float(progress_start), 1.0))
+        self.progress_end = max(self.progress_start, min(float(progress_end), 1.0))
+        self.expected_total_steps = max(1, int(expected_total_steps or 1))
+        self.expected_total_epochs = max(float(expected_total_epochs or 1.0), 1.0)
+        self.metadata = _to_json_safe(metadata or {})
+
+    def _progress_ratio(self, state: object, logs: Optional[Dict[str, object]] = None) -> float:
+        max_steps = pd.to_numeric(
+            getattr(state, "max_steps", self.expected_total_steps),
+            errors="coerce",
+        )
+        global_step = pd.to_numeric(getattr(state, "global_step", 0), errors="coerce")
+        local_ratio = float("nan")
+        if not pd.isna(max_steps) and float(max_steps) > 0 and not pd.isna(global_step):
+            local_ratio = float(global_step) / float(max_steps)
+        if not math.isfinite(local_ratio):
+            epoch_value = pd.to_numeric(
+                (logs or {}).get("epoch", getattr(state, "epoch", None)),
+                errors="coerce",
+            )
+            if not pd.isna(epoch_value) and self.expected_total_epochs > 0:
+                local_ratio = float(epoch_value) / float(self.expected_total_epochs)
+        if not math.isfinite(local_ratio):
+            local_ratio = 0.0
+        local_ratio = max(0.0, min(local_ratio, 1.0))
+        span = self.progress_end - self.progress_start
+        return self.progress_start + span * local_ratio
+
+    def _event_payload(
+        self,
+        state: object,
+        logs: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        payload: Dict[str, object] = dict(self.metadata)
+        for key, value in (logs or {}).items():
+            if isinstance(value, (bool, str)):
+                payload[str(key)] = value
+                continue
+            numeric = pd.to_numeric(value, errors="coerce")
+            if pd.isna(numeric):
+                continue
+            payload[str(key)] = float(numeric)
+        global_step = pd.to_numeric(getattr(state, "global_step", None), errors="coerce")
+        if not pd.isna(global_step):
+            payload["global_step"] = int(global_step)
+        epoch_value = pd.to_numeric(
+            (logs or {}).get("epoch", getattr(state, "epoch", None)),
+            errors="coerce",
+        )
+        if not pd.isna(epoch_value):
+            payload["epoch"] = float(epoch_value)
+        return payload
+
+    def on_train_begin(self, args, state, control, **kwargs):  # type: ignore[override]
+        self.tracker.update(
+            stage=self.stage,
+            message=f"{self.label}: entrenamiento iniciado.",
+            progress_ratio=self.progress_start,
+            event_type="trainer_train_begin",
+            payload=dict(self.metadata),
+        )
+        return control
+
+    def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
+        payload = self._event_payload(state, logs=logs)
+        step_text = payload.get("global_step")
+        self.tracker.update(
+            stage=self.stage,
+            message=f"{self.label}: step {step_text if step_text is not None else '-'}",
+            progress_ratio=self._progress_ratio(state, logs=logs),
+            event_type="trainer_log",
+            payload=payload,
+        )
+        return control
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):  # type: ignore[override]
+        payload = self._event_payload(state, logs=metrics)
+        metric_preview = ""
+        for metric_key in ["eval_balanced_f1", "eval_f1", "eval_loss", "eval_accuracy"]:
+            metric_value = pd.to_numeric(payload.get(metric_key), errors="coerce")
+            if not pd.isna(metric_value):
+                metric_preview = f" | {metric_key}={float(metric_value):.4f}"
+                break
+        self.tracker.update(
+            stage=self.stage,
+            message=f"{self.label}: evaluacion{metric_preview}",
+            progress_ratio=self._progress_ratio(state, logs=metrics),
+            event_type="trainer_eval",
+            payload=payload,
+        )
+        return control
 
 
 def _normalize_portico(value: object) -> Optional[str]:
@@ -11368,6 +11692,25 @@ def _normalize_transformer_split_mode(split_mode: object) -> str:
     raise ValueError("split_mode debe ser 'Estratificado' o 'Temporal'.")
 
 
+def _render_split_mode_toggle(
+    *,
+    label: str,
+    key: str,
+    default: object = "Temporal",
+    help_text: Optional[str] = None,
+) -> str:
+    options = ["Estratificado", "Temporal"]
+    normalized_default = _normalize_transformer_split_mode(default)
+    return st.radio(
+        label,
+        options,
+        index=options.index(normalized_default),
+        horizontal=True,
+        key=key,
+        help=help_text,
+    )
+
+
 def _softmax_logits(logits: np.ndarray) -> np.ndarray:
     logits = np.asarray(logits, dtype=float)
     logits = logits - np.max(logits, axis=1, keepdims=True)
@@ -11900,6 +12243,13 @@ def run_transformers_finetune(
     focal_gamma: float = 2.0,
     oversample_minority: bool = True,
     class_weight_power: float = 1.0,
+    live_tracker: Optional[_LanguageModelingLiveTracker] = None,
+    live_event_stage: Optional[str] = None,
+    live_progress_start: float = 0.0,
+    live_progress_end: float = 1.0,
+    live_event_label: Optional[str] = None,
+    live_event_context: Optional[Dict[str, object]] = None,
+    live_track_training: bool = False,
 ) -> Dict[str, object]:
     missing_deps = []
     if torch is None:
@@ -11919,6 +12269,23 @@ def run_transformers_finetune(
     output_dir.mkdir(parents=True, exist_ok=True)
     trainer_output_dir = output_dir / "trainer_output"
     trainer_output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_live_stage = str(live_event_stage or "finetune.training")
+    resolved_live_label = str(live_event_label or f"Fine-tune | {Path(str(model_name)).name}")
+    resolved_live_context = dict(live_event_context or {})
+    if live_tracker is not None and live_track_training:
+        live_tracker.update(
+            stage=resolved_live_stage,
+            message=f"{resolved_live_label}: preparando datos.",
+            progress_ratio=float(live_progress_start),
+            event_type="finetune_setup",
+            payload={
+                "model_name": str(model_name),
+                "mode": str(mode),
+                "text_col": str(text_col),
+                "output_dir": str(output_dir),
+                **resolved_live_context,
+            },
+        )
     training_data_fingerprint = _transformer_training_data_fingerprint(
         df,
         text_col=text_col,
@@ -12175,6 +12542,25 @@ def run_transformers_finetune(
         do_train=True,
         do_eval=True,
     )
+    if live_tracker is not None and live_track_training:
+        callbacks.append(
+            _TransformerLiveCallback(
+                live_tracker,
+                stage=resolved_live_stage,
+                label=resolved_live_label,
+                progress_start=float(live_progress_start),
+                progress_end=float(live_progress_end),
+                expected_total_steps=int(total_train_steps),
+                expected_total_epochs=float(num_train_epochs),
+                metadata={
+                    "model_name": str(model_name),
+                    "mode": str(mode),
+                    "text_col": str(text_col),
+                    "output_dir": str(output_dir),
+                    **resolved_live_context,
+                },
+            )
+        )
 
     _trainer_cls = Trainer
     if mode == "classification" and torch is not None:
@@ -12289,6 +12675,24 @@ def run_transformers_finetune(
     }
     with (output_dir / "training_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, ensure_ascii=True, indent=2, default=_json_default)
+    if live_tracker is not None and live_track_training:
+        live_tracker.update(
+            stage=resolved_live_stage,
+            message=f"{resolved_live_label}: entrenamiento finalizado.",
+            progress_ratio=float(live_progress_end),
+            event_type="finetune_result",
+            payload={
+                "model_name": str(model_name),
+                "mode": str(mode),
+                "text_col": str(text_col),
+                "output_dir": str(output_dir),
+                "rows_train": int(len(train_dataset)),
+                "rows_eval": int(len(eval_dataset)),
+                "metrics": metrics,
+                "params": summary["params"],
+                **resolved_live_context,
+            },
+        )
 
     return {
         **summary,
@@ -12312,6 +12716,7 @@ def run_transformers_hyperparameter_search(
     confirm_seed_count: int,
     keep_trial_artifacts: bool,
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    live_tracker: Optional[_LanguageModelingLiveTracker] = None,
 ) -> Dict[str, object]:
     if mode not in {"classification", "mlm"}:
         raise ValueError(f"Modo de busqueda no soportado: {mode}")
@@ -12345,10 +12750,43 @@ def run_transformers_hyperparameter_search(
         1,
         f"Preparando {effective_trials:,} trials sobre {total_candidates:,} configuraciones ({sampling_meta['sampling_mode']}).",
     )
+    if live_tracker is not None:
+        live_tracker.update(
+            stage="search.setup",
+            message=f"Preparando busqueda robusta ({objective_metric}).",
+            progress_ratio=0.01,
+            event_type="search_setup",
+            payload={
+                "text_col": str(text_col),
+                "mode": str(mode),
+                "objective_metric": str(objective_metric),
+                "sampling_mode": str(sampling_meta["sampling_mode"]),
+                "total_candidates": int(total_candidates),
+                "effective_trials": int(effective_trials),
+            },
+        )
 
     config_lookup: Dict[str, Dict[str, object]] = {}
     trial_rows: List[Dict[str, object]] = []
     trial_output_dirs: List[Path] = []
+
+    def _persist_live_search_trials() -> None:
+        if live_tracker is None:
+            return
+        live_tracker.write_dataframe(
+            "search_trials_csv",
+            pd.DataFrame(trial_rows),
+            filename="search_trials_live.csv",
+        )
+
+    def _persist_live_confirmation_rows(confirm_payload: List[Dict[str, object]]) -> None:
+        if live_tracker is None:
+            return
+        live_tracker.write_dataframe(
+            "confirmation_trials_csv",
+            pd.DataFrame(confirm_payload),
+            filename="confirmation_trials_live.csv",
+        )
 
     def _run_single_trial(
         trial_index: int,
@@ -12366,6 +12804,18 @@ def run_transformers_hyperparameter_search(
             progress_start,
             f"Trial {trial_index}/{n_total}: {config.get('model_name')} | lr={config.get('learning_rate')}.",
         )
+        if live_tracker is not None:
+            live_tracker.update(
+                stage="search.trial",
+                message=f"Trial {trial_index}/{n_total}: {config.get('model_name')}",
+                progress_ratio=float(progress_start) / 100.0,
+                event_type="search_trial_start",
+                payload={
+                    "trial_index": int(trial_index),
+                    "n_total": int(n_total),
+                    "config": dict(config),
+                },
+            )
         try:
             # Early stopping with patience=1 during search to save compute;
             # confirmation and final training use default patience=2.
@@ -12478,6 +12928,18 @@ def run_transformers_hyperparameter_search(
             _optuna_trial_counter[0] += 1
             row = _run_single_trial(_optuna_trial_counter[0], config, effective_trials)
             trial_rows.append(row)
+            if live_tracker is not None:
+                live_tracker.update(
+                    stage="search.trial",
+                    message=(
+                        f"Trial {_optuna_trial_counter[0]}/{effective_trials} "
+                        f"{'ok' if row.get('status') == 'ok' else 'error'}"
+                    ),
+                    progress_ratio=(5 + int(_optuna_trial_counter[0] * 55 / max(1, effective_trials))) / 100.0,
+                    event_type="search_trial_result",
+                    payload=dict(row),
+                )
+                _persist_live_search_trials()
 
             obj = row.get("objective")
             if row["status"] != "ok" or obj is None or (isinstance(obj, float) and math.isnan(obj)):
@@ -12507,6 +12969,18 @@ def run_transformers_hyperparameter_search(
         for trial_index, config in enumerate(trial_configs, start=1):
             row = _run_single_trial(trial_index, config, len(trial_configs))
             trial_rows.append(row)
+            if live_tracker is not None:
+                live_tracker.update(
+                    stage="search.trial",
+                    message=(
+                        f"Trial {trial_index}/{len(trial_configs)} "
+                        f"{'ok' if row.get('status') == 'ok' else 'error'}"
+                    ),
+                    progress_ratio=(5 + int(trial_index * 55 / max(1, len(trial_configs)))) / 100.0,
+                    event_type="search_trial_result",
+                    payload=dict(row),
+                )
+                _persist_live_search_trials()
 
     trials_df = pd.DataFrame(trial_rows)
     successful_trials = trials_df[trials_df["status"] == "ok"].copy()
@@ -12549,6 +13023,28 @@ def run_transformers_hyperparameter_search(
         message = "Ningun trial finalizo correctamente en la busqueda de Transformers."
         if error_preview:
             message += f" Top errores: {error_preview}"
+        if live_tracker is not None:
+            _persist_live_search_trials()
+            live_tracker.write_json(
+                "search_failure_summary_json",
+                failure_summary,
+                filename="search_failure_summary.json",
+            )
+            live_tracker.write_json(
+                "search_summary_json",
+                search_result.get("search_summary") or {},
+                filename="search_summary.json",
+            )
+            live_tracker.fail(
+                stage="search.failed",
+                message=message,
+                summary={
+                    "text_col": str(text_col),
+                    "mode": str(mode),
+                    "objective_metric": str(objective_metric),
+                    "executed_trials": int(len(trials_df)),
+                },
+            )
         raise TransformerSearchDebugError(
             message,
             search_result=search_result,
@@ -12584,6 +13080,18 @@ def run_transformers_hyperparameter_search(
                 progress_value,
                 f"Confirmacion {confirm_index}/{confirm_total}: cfg {config_rank} seed {trainer_seed}.",
             )
+            if live_tracker is not None:
+                live_tracker.update(
+                    stage="search.confirmation",
+                    message=f"Confirmacion {confirm_index}/{confirm_total}: cfg {config_rank} seed {trainer_seed}.",
+                    progress_ratio=float(progress_value) / 100.0,
+                    event_type="search_confirmation_start",
+                    payload={
+                        "config_rank": int(config_rank),
+                        "config_id": str(config_id),
+                        "trainer_seed": int(trainer_seed),
+                    },
+                )
             confirm_dir = confirm_trials_dir / f"cfg_{config_rank:02d}_{config_id}" / f"seed_{trainer_seed}"
             confirm_output_dirs.append(confirm_dir)
             try:
@@ -12675,6 +13183,18 @@ def run_transformers_hyperparameter_search(
                     "error_traceback": traceback.format_exc(limit=10),
                 }
             confirm_rows.append(row)
+            if live_tracker is not None:
+                live_tracker.update(
+                    stage="search.confirmation",
+                    message=(
+                        f"Confirmacion {confirm_index}/{confirm_total} "
+                        f"{'ok' if row.get('status') == 'ok' else 'error'}"
+                    ),
+                    progress_ratio=float(progress_value) / 100.0,
+                    event_type="search_confirmation_result",
+                    payload=dict(row),
+                )
+                _persist_live_confirmation_rows(confirm_rows)
 
     confirm_df = pd.DataFrame(confirm_rows)
     confirm_ok_df = confirm_df[confirm_df["status"] == "ok"].copy()
@@ -12734,6 +13254,17 @@ def run_transformers_hyperparameter_search(
 
     best_config = config_lookup[best_config_id]
     _emit_progress(progress_callback, 90, "Entrenando configuracion final seleccionada.")
+    if live_tracker is not None:
+        live_tracker.update(
+            stage="search.final_finetune",
+            message="Entrenando configuracion final seleccionada.",
+            progress_ratio=0.90,
+            event_type="search_final_finetune_start",
+            payload={
+                "best_config_id": str(best_config_id),
+                "best_config": dict(best_config),
+            },
+        )
     best_result = run_transformers_finetune(
         df,
         text_col=text_col,
@@ -12757,6 +13288,16 @@ def run_transformers_hyperparameter_search(
         focal_gamma=float(best_config.get("focal_gamma", 2.0)),
         oversample_minority=bool(best_config.get("oversample_minority", True)),
         class_weight_power=float(best_config.get("class_weight_power", 1.0)),
+        live_tracker=live_tracker,
+        live_event_stage="search.final_finetune",
+        live_progress_start=0.90,
+        live_progress_end=0.98,
+        live_event_label="Busqueda robusta | fine-tune final",
+        live_event_context={
+            "phase": "final_selected",
+            "best_config_id": str(best_config_id),
+        },
+        live_track_training=True,
     )
     best_history_df = best_result.pop("history_df", pd.DataFrame())
 
@@ -12798,6 +13339,52 @@ def run_transformers_hyperparameter_search(
                 shutil.rmtree(path, ignore_errors=True)
 
     _emit_progress(progress_callback, 100, "Busqueda de hiperparametros completada.")
+    if live_tracker is not None:
+        live_tracker.write_dataframe(
+            "search_trials_csv",
+            ranked_trials_df,
+            filename="search_trials_live.csv",
+        )
+        live_tracker.write_dataframe(
+            "confirmation_trials_csv",
+            confirm_df,
+            filename="confirmation_trials_live.csv",
+        )
+        if not confirm_summary_df.empty:
+            live_tracker.write_dataframe(
+                "confirmation_summary_csv",
+                confirm_summary_df,
+                filename="confirmation_summary_live.csv",
+            )
+        if isinstance(best_history_df, pd.DataFrame) and not best_history_df.empty:
+            live_tracker.write_dataframe(
+                "best_history_csv",
+                best_history_df,
+                filename="best_history_live.csv",
+            )
+        live_tracker.write_json(
+            "search_summary_json",
+            search_summary,
+            filename="search_summary.json",
+        )
+        live_tracker.write_json(
+            "best_result_json",
+            best_result,
+            filename="best_result.json",
+        )
+        live_tracker.complete(
+            stage="search.completed",
+            message="Busqueda robusta completada.",
+            summary={
+                "text_col": str(text_col),
+                "mode": str(mode),
+                "objective_metric": str(objective_metric),
+                "executed_trials": int(len(ranked_trials_df)),
+                "confirmed_rows": int(len(confirm_df)),
+                "best_model_name": str(best_result.get("model_name") or ""),
+                "best_output_dir": str(best_result.get("output_dir") or ""),
+            },
+        )
     return {
         "search_summary": search_summary,
         "trials_df": ranked_trials_df,
@@ -12818,6 +13405,7 @@ def execute_transformer_finetune_from_preset(
     action_name: str,
     extra_metadata: Optional[Dict[str, object]] = None,
     split_mode_override: Optional[object] = None,
+    live_tracker: Optional[_LanguageModelingLiveTracker] = None,
 ) -> Dict[str, object]:
     params = preset.get("params") or {}
     text_col = str(preset.get("text_col") or "")
@@ -12833,105 +13421,167 @@ def execute_transformer_finetune_from_preset(
         )
     )
     output_dir = Path(output_dir)
-    result = run_transformers_finetune(
-        df,
-        text_col=text_col,
-        mode=mode,
-        model_name=base_model,
-        output_dir=output_dir,
-        num_train_epochs=int(params.get("epochs") or 3),
-        batch_size=int(params.get("batch_size") or 8),
-        max_length=int(params.get("max_length") or 128),
-        learning_rate=float(params.get("learning_rate") or 5e-5),
-        weight_decay=float(params.get("weight_decay") or 0.01),
-        warmup_steps=int(params.get("warmup_steps") or 0),
-        warmup_ratio=(
-            float(params.get("warmup_ratio"))
-            if params.get("warmup_ratio") is not None
-            else None
-        ),
-        random_state=int(
-            params.get("trainer_random_state")
-            or params.get("random_state")
-            or 42
-        ),
-        split_random_state=int(
-            params.get("split_random_state")
-            or params.get("random_state")
-            or 42
-        ),
-        trainer_random_state=int(
-            params.get("trainer_random_state")
-            or params.get("random_state")
-            or 42
-        ),
-        freeze_layers=bool(params.get("freeze_layers") or False),
-        test_size=float(params.get("test_size") or 0.2),
-        split_mode=resolved_split_mode,
-        mlm_probability=float(params.get("mlm_probability") or 0.15),
-        focal_gamma=float(params.get("focal_gamma", 2.0)),
-        oversample_minority=bool(params.get("oversample_minority") if params.get("oversample_minority") is not None else True),
-        class_weight_power=float(params.get("class_weight_power", 1.0)),
-    )
-    history_df = result.pop("history_df", pd.DataFrame())
-    metadata = {
-        "text_col": text_col,
-        "mode": mode,
-        "base_model": base_model,
-        "output_dir": result["output_dir"],
-        "rows_train": result["rows_train"],
-        "rows_eval": result["rows_eval"],
-        "training_data_fingerprint": result.get("training_data_fingerprint") or {},
-        "source_preset_run_id": preset.get("run_id"),
-        "source_preset_created_at": preset.get("created_at"),
-        "source_preset_label": preset.get("label"),
-    }
-    if extra_metadata:
-        metadata.update(extra_metadata)
-    _record_model_result(
-        run_id=run_id,
-        stage="language_modeling",
-        model_name=result_model_name,
-        feature_group=f"{text_col} [{mode}]",
-        metrics=result["metrics"],
-        params=result["params"],
-        metadata=metadata,
-    )
-    if isinstance(history_df, pd.DataFrame) and not history_df.empty:
-        _persist_artifact(
-            history_df,
-            stage="language_modeling",
-            artifact_name="transformers_finetune_history",
-            run_id=run_id,
-            metadata={
-                "text_col": text_col,
-                "mode": mode,
-                "base_model": base_model,
-                "output_dir": result["output_dir"],
-                "source_preset_run_id": preset.get("run_id"),
+    if live_tracker is not None:
+        live_tracker.update(
+            stage="finetune.setup",
+            message="Preparando ajuste fino final.",
+            progress_ratio=0.02,
+            event_type="finetune_setup",
+            payload={
+                "text_col": str(text_col),
+                "mode": str(mode),
+                "base_model": str(base_model),
+                "source_preset_run_id": str(preset.get("run_id") or ""),
+                "source_preset_label": str(preset.get("label") or ""),
             },
         )
-    _log_action(
-        "language_modeling",
-        action_name,
-        {
+    try:
+        result = run_transformers_finetune(
+            df,
+            text_col=text_col,
+            mode=mode,
+            model_name=base_model,
+            output_dir=output_dir,
+            num_train_epochs=int(params.get("epochs") or 3),
+            batch_size=int(params.get("batch_size") or 8),
+            max_length=int(params.get("max_length") or 128),
+            learning_rate=float(params.get("learning_rate") or 5e-5),
+            weight_decay=float(params.get("weight_decay") or 0.01),
+            warmup_steps=int(params.get("warmup_steps") or 0),
+            warmup_ratio=(
+                float(params.get("warmup_ratio"))
+                if params.get("warmup_ratio") is not None
+                else None
+            ),
+            random_state=int(
+                params.get("trainer_random_state")
+                or params.get("random_state")
+                or 42
+            ),
+            split_random_state=int(
+                params.get("split_random_state")
+                or params.get("random_state")
+                or 42
+            ),
+            trainer_random_state=int(
+                params.get("trainer_random_state")
+                or params.get("random_state")
+                or 42
+            ),
+            freeze_layers=bool(params.get("freeze_layers") or False),
+            test_size=float(params.get("test_size") or 0.2),
+            split_mode=resolved_split_mode,
+            mlm_probability=float(params.get("mlm_probability") or 0.15),
+            focal_gamma=float(params.get("focal_gamma", 2.0)),
+            oversample_minority=bool(params.get("oversample_minority") if params.get("oversample_minority") is not None else True),
+            class_weight_power=float(params.get("class_weight_power", 1.0)),
+            live_tracker=live_tracker,
+            live_event_stage="finetune.training",
+            live_progress_start=0.10,
+            live_progress_end=0.98,
+            live_event_label="Ajuste fino del modelo de lenguaje",
+            live_event_context={
+                "source_preset_run_id": str(preset.get("run_id") or ""),
+                "source_preset_label": str(preset.get("label") or ""),
+                "result_model_name": str(result_model_name),
+            },
+            live_track_training=True,
+        )
+        history_df = result.pop("history_df", pd.DataFrame())
+        metadata = {
             "text_col": text_col,
             "mode": mode,
             "base_model": base_model,
             "output_dir": result["output_dir"],
             "rows_train": result["rows_train"],
             "rows_eval": result["rows_eval"],
-            "metrics": result["metrics"],
-            "params": result["params"],
+            "training_data_fingerprint": result.get("training_data_fingerprint") or {},
             "source_preset_run_id": preset.get("run_id"),
+            "source_preset_created_at": preset.get("created_at"),
             "source_preset_label": preset.get("label"),
-        },
-        run_id=run_id,
-    )
-    return {
-        **result,
-        "history_df": history_df,
-    }
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        _record_model_result(
+            run_id=run_id,
+            stage="language_modeling",
+            model_name=result_model_name,
+            feature_group=f"{text_col} [{mode}]",
+            metrics=result["metrics"],
+            params=result["params"],
+            metadata=metadata,
+        )
+        if isinstance(history_df, pd.DataFrame) and not history_df.empty:
+            _persist_artifact(
+                history_df,
+                stage="language_modeling",
+                artifact_name="transformers_finetune_history",
+                run_id=run_id,
+                metadata={
+                    "text_col": text_col,
+                    "mode": mode,
+                    "base_model": base_model,
+                    "output_dir": result["output_dir"],
+                    "source_preset_run_id": preset.get("run_id"),
+                },
+            )
+        _log_action(
+            "language_modeling",
+            action_name,
+            {
+                "text_col": text_col,
+                "mode": mode,
+                "base_model": base_model,
+                "output_dir": result["output_dir"],
+                "rows_train": result["rows_train"],
+                "rows_eval": result["rows_eval"],
+                "metrics": result["metrics"],
+                "params": result["params"],
+                "source_preset_run_id": preset.get("run_id"),
+                "source_preset_label": preset.get("label"),
+            },
+            run_id=run_id,
+        )
+        if live_tracker is not None:
+            if isinstance(history_df, pd.DataFrame) and not history_df.empty:
+                live_tracker.write_dataframe(
+                    "history_csv",
+                    history_df,
+                    filename="finetune_history_live.csv",
+                )
+            live_tracker.write_json(
+                "finetune_result_json",
+                result,
+                filename="finetune_result.json",
+            )
+            live_tracker.complete(
+                stage="finetune.completed",
+                message="Ajuste fino completado.",
+                summary={
+                    "text_col": str(text_col),
+                    "mode": str(mode),
+                    "base_model": str(base_model),
+                    "output_dir": str(result.get("output_dir") or ""),
+                    "rows_train": int(result.get("rows_train") or 0),
+                    "rows_eval": int(result.get("rows_eval") or 0),
+                },
+            )
+        return {
+            **result,
+            "history_df": history_df,
+        }
+    except Exception as exc:
+        if live_tracker is not None:
+            live_tracker.fail(
+                stage="finetune.failed",
+                message=f"No se pudo ejecutar el finetune final: {exc}",
+                summary={
+                    "text_col": str(text_col),
+                    "mode": str(mode),
+                    "base_model": str(base_model),
+                },
+            )
+        raise
 
 
 def train_rf_xgb_holdout(
@@ -14438,13 +15088,11 @@ def _render_language_modeling_tab() -> None:
             "Pipeline recomendado: 1) seleccionar hiperparametros guardados o buscar nuevos, "
             "2) aplicar el ajuste final con esos hiperparametros, 3) reutilizar el modelo en Embeddings."
         )
-        split_mode = st.radio(
-            "Tipo de muestreo train/eval",
-            ["Estratificado", "Temporal"],
-            index=1,
-            horizontal=True,
+        split_mode = _render_split_mode_toggle(
+            label="Tipo de muestreo train/eval",
             key="nlp_sev_tf_split_mode",
-            help=(
+            default="Temporal",
+            help_text=(
                 "Temporal ordena por `accidente_time`. Estratificado mantiene la proporcion "
                 "de clases en clasificacion; en MLM usa un split aleatorio no temporal."
             ),
@@ -14814,6 +15462,7 @@ def _render_language_modeling_tab() -> None:
                         run_id = _new_run_id("language_search")
                         search_progress = st.progress(0)
                         search_status = st.empty()
+                        search_live_tracker: Optional[_LanguageModelingLiveTracker] = None
 
                         def _update_search_progress(value: int, message: str) -> None:
                             search_progress.progress(int(value))
@@ -14836,6 +15485,22 @@ def _render_language_modeling_tab() -> None:
                         }
                         try:
                             search_root = MODULE_RESULTS_DIR / "models" / _slug(search_output_folder) / run_id
+                            search_live_tracker = _LanguageModelingLiveTracker(
+                                run_id=run_id,
+                                run_type="transformers_search",
+                                title=f"Busqueda robusta | {mode} | {selected_text_col}",
+                                context={
+                                    "text_col": str(selected_text_col),
+                                    "mode": str(mode),
+                                    "objective_metric": str(objective_metric),
+                                    "requested_split_mode": str(split_mode),
+                                    "search_output_dir": str(search_root),
+                                    "candidate_models": [model_options[label] for label in model_candidate_labels],
+                                    "max_trials": int(max_trials),
+                                    "confirm_top_k": int(confirm_top_k),
+                                    "confirm_seed_count": int(confirm_seed_count),
+                                },
+                            )
                             search_result = run_transformers_hyperparameter_search(
                                 text_df,
                                 text_col=selected_text_col,
@@ -14851,8 +15516,19 @@ def _render_language_modeling_tab() -> None:
                                 confirm_seed_count=int(confirm_seed_count),
                                 keep_trial_artifacts=bool(keep_trial_artifacts),
                                 progress_callback=_update_search_progress,
+                                live_tracker=search_live_tracker,
                             )
                         except Exception as exc:
+                            if search_live_tracker is not None:
+                                search_live_tracker.fail(
+                                    stage="search.failed",
+                                    message=f"No se pudo ejecutar la busqueda de hiperparametros: {exc}",
+                                    summary={
+                                        "text_col": str(selected_text_col),
+                                        "mode": str(mode),
+                                        "objective_metric": str(objective_metric),
+                                    },
+                                )
                             search_progress.empty()
                             search_status.empty()
                             st.session_state["nlp_sev_transformer_search_trials_df"] = None
@@ -15019,12 +15695,27 @@ def _render_language_modeling_tab() -> None:
                 disabled=not transformers_ready or not preset_ready,
             ):
                 run_id = _new_run_id("language_finetune")
+                finetune_live_tracker: Optional[_LanguageModelingLiveTracker] = None
                 try:
                     model_output_dir = (
                         MODULE_RESULTS_DIR
                         / "models"
                         / _slug(final_output_folder)
                         / run_id
+                    )
+                    finetune_live_tracker = _LanguageModelingLiveTracker(
+                        run_id=run_id,
+                        run_type="transformers_finetune",
+                        title=f"Fine-tune LLM | {preset_mode} | {preset_text_col}",
+                        context={
+                            "text_col": str(preset_text_col),
+                            "mode": str(preset_mode),
+                            "base_model": str(preset_model_name),
+                            "requested_split_mode": str(split_mode),
+                            "selection_strategy": str(hyperparam_strategy),
+                            "output_dir": str(model_output_dir),
+                            "source_preset_run_id": str(active_preset.get("run_id") or ""),
+                        },
                     )
                     with st.spinner("Aplicando finetune final con hiperparametros seleccionados..."):
                         result = execute_transformer_finetune_from_preset(
@@ -15042,8 +15733,19 @@ def _render_language_modeling_tab() -> None:
                                 "source_language_artifact_id": (st.session_state.get("nlp_sev_language_artifact") or {}).get("artifact_id"),
                                 "source_language_run_id": (st.session_state.get("nlp_sev_language_artifact") or {}).get("run_id"),
                             },
+                            live_tracker=finetune_live_tracker,
                         )
                 except Exception as exc:
+                    if finetune_live_tracker is not None:
+                        finetune_live_tracker.fail(
+                            stage="finetune.failed",
+                            message=f"No se pudo ejecutar el finetune final: {exc}",
+                            summary={
+                                "text_col": str(preset_text_col),
+                                "mode": str(preset_mode),
+                                "base_model": str(preset_model_name),
+                            },
+                        )
                     st.error(f"No se pudo ejecutar el finetune final: {exc}")
                 else:
                     history_df = result.pop("history_df", pd.DataFrame())
@@ -15612,6 +16314,19 @@ def _render_train_tab() -> None:
             "pero la replica del paper puede ejecutarse desde esta misma seccion."
         )
 
+    train_split_mode = None
+    if has_train_dataset:
+        train_split_mode = _render_split_mode_toggle(
+            label="Tipo de muestreo holdout",
+            key="nlp_sev_train_split_mode",
+            default="Temporal",
+            help_text=(
+                "Temporal ordena el holdout por `accidente_time`. Estratificado mantiene la "
+                "proporcion de clases. Si el corte temporal no deja ambas clases en train/test, "
+                "estos entrenamientos degradan a estratificado y lo registran en `split_meta`."
+            ),
+        )
+
     tab_labels = ["Paper replication"]
     if has_train_dataset:
         tab_labels = [
@@ -15642,7 +16357,7 @@ def _render_train_tab() -> None:
             )
             st.session_state["nlp_sev_holdout_top_k"] = int(top_k_value)
             st.caption(f"Variables disponibles para este entrenamiento: {feature_count}")
-            split_mode = st.selectbox("Split", ["Temporal", "Estratificado"], key="nlp_sev_holdout_split_mode")
+            split_mode = str(train_split_mode)
             test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05, key="nlp_sev_holdout_test_size")
             top_k = st.slider(
                 "Top K por RF",
@@ -15916,7 +16631,7 @@ def _render_train_tab() -> None:
             st.caption(
                 f"Variables disponibles para este entrenamiento: {len(_resolve_feature_group(active_df, feature_group))}"
             )
-            split_mode = st.selectbox("Split", ["Temporal", "Estratificado"], key="nlp_sev_elastic_split")
+            split_mode = str(train_split_mode)
             test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05, key="nlp_sev_elastic_test")
             random_state = st.number_input("Random state", 0, 9999, 42, 1, key="nlp_sev_elastic_rs")
             if st.button("Entrenar Elastic Net", key="nlp_sev_train_elastic"):
@@ -15974,7 +16689,7 @@ def _render_train_tab() -> None:
             st.caption(
                 f"Variables disponibles para este entrenamiento: {len(_resolve_feature_group(active_df, feature_group))}"
             )
-            split_mode = st.selectbox("Split", ["Temporal", "Estratificado"], key="nlp_sev_svm_split")
+            split_mode = str(train_split_mode)
             test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05, key="nlp_sev_svm_test")
             max_k = max(2, len(_resolve_feature_group(active_df, feature_group)))
             k_features = st.slider("RFE top K", 2, max_k, min(20, max_k), 1, key="nlp_sev_svm_k")
@@ -16041,11 +16756,7 @@ def _render_train_tab() -> None:
                 current_value=st.session_state.get("nlp_sev_compare_max_features"),
             )
             st.session_state["nlp_sev_compare_max_features"] = int(max_features_per_model_value)
-            split_mode = st.selectbox(
-                "Split compartido",
-                ["Temporal", "Estratificado"],
-                key="nlp_sev_compare_split_mode",
-            )
+            split_mode = str(train_split_mode)
             test_size = st.slider(
                 "Test size compartido",
                 0.1,

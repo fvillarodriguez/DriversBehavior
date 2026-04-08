@@ -1359,6 +1359,170 @@ def test_execute_transformer_finetune_from_preset_allows_split_mode_override(
     assert result["params"]["requested_split_mode"] == "Estratificado"
 
 
+def test_run_transformers_hyperparameter_search_persists_live_tracker_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_run_transformers_finetune(df, **kwargs):
+        return {
+            "model_name": str(kwargs.get("model_name")),
+            "mode": str(kwargs.get("mode")),
+            "text_col": str(kwargs.get("text_col")),
+            "output_dir": str(kwargs.get("output_dir")),
+            "rows_train": 8,
+            "rows_eval": 2,
+            "metrics": {"balanced_f1": 0.74},
+            "params": {
+                "requested_split_mode": str(kwargs.get("split_mode")),
+                "split_mode": str(kwargs.get("split_mode")),
+                "test_size": float(kwargs.get("test_size", 0.2)),
+            },
+            "training_data_fingerprint": {"sha256": "demo"},
+            "history_df": pd.DataFrame({"epoch": [1.0], "loss": [0.4], "eval_balanced_f1": [0.74]}),
+        }
+
+    monkeypatch.setattr(nlp_app, "run_transformers_finetune", fake_run_transformers_finetune)
+    monkeypatch.setattr(
+        nlp_app,
+        "LANGUAGE_MODELING_LIVE_DIR",
+        tmp_path / "language_modeling_live",
+    )
+
+    tracker = nlp_app._LanguageModelingLiveTracker(
+        run_id="language_search_demo",
+        run_type="transformers_search",
+        title="Busqueda robusta demo",
+        context={"mode": "classification"},
+    )
+
+    nlp_app.run_transformers_hyperparameter_search(
+        pd.DataFrame(
+            {
+                "accidente_time": pd.date_range("2024-01-01 10:00:00", periods=10, freq="min"),
+                "text_bert": [f"evento {idx}" for idx in range(10)],
+                "severity_target": [0, 1] * 5,
+            }
+        ),
+        text_col="text_bert",
+        mode="classification",
+        output_dir=tmp_path / "search",
+        search_space={
+            "model_name": ["demo-model"],
+            "num_train_epochs": [1],
+            "batch_size": [2],
+            "max_length": [32],
+            "learning_rate": [5e-5],
+            "weight_decay": [0.01],
+            "warmup_ratio": [0.0],
+            "freeze_layers": [False],
+            "test_size": [0.2],
+            "mlm_probability": [0.15],
+            "focal_gamma": [2.0],
+            "oversample_minority": [True],
+            "class_weight_power": [1.0],
+        },
+        max_trials=1,
+        objective_metric="balanced_f1",
+        split_mode="Estratificado",
+        split_random_state=42,
+        trainer_seed_base=42,
+        confirm_top_k=1,
+        confirm_seed_count=1,
+        keep_trial_artifacts=False,
+        live_tracker=tracker,
+    )
+
+    manifest = json.loads((tracker.run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    assert manifest["status"] == "completed"
+    assert manifest["result_status"] == "ok"
+    assert (tracker.run_dir / "search_trials_live.csv").exists()
+    assert (tracker.run_dir / "confirmation_trials_live.csv").exists()
+    assert (tracker.run_dir / "best_history_live.csv").exists()
+    assert (tracker.run_dir / "best_result.json").exists()
+
+
+def test_execute_transformer_finetune_from_preset_persists_live_tracker_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_run_transformers_finetune(df, **kwargs):
+        return {
+            "model_name": "demo-model",
+            "mode": str(kwargs.get("mode")),
+            "text_col": str(kwargs.get("text_col")),
+            "output_dir": str(kwargs.get("output_dir")),
+            "rows_train": 8,
+            "rows_eval": 2,
+            "metrics": {"balanced_f1": 0.7},
+            "params": {
+                "requested_split_mode": str(kwargs.get("split_mode")),
+                "split_mode": str(kwargs.get("split_mode")),
+            },
+            "training_data_fingerprint": {"sha256": "demo"},
+            "history_df": pd.DataFrame({"epoch": [1.0], "loss": [0.3], "eval_balanced_f1": [0.7]}),
+        }
+
+    monkeypatch.setattr(nlp_app, "run_transformers_finetune", fake_run_transformers_finetune)
+    monkeypatch.setattr(nlp_app, "_record_model_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(nlp_app, "_persist_artifact", lambda *args, **kwargs: None)
+    monkeypatch.setattr(nlp_app, "_log_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        nlp_app,
+        "LANGUAGE_MODELING_LIVE_DIR",
+        tmp_path / "language_modeling_live",
+    )
+
+    tracker = nlp_app._LanguageModelingLiveTracker(
+        run_id="language_finetune_demo",
+        run_type="transformers_finetune",
+        title="Fine-tune demo",
+        context={"mode": "classification"},
+    )
+    preset = {
+        "run_id": "preset-run",
+        "created_at": "2026-04-07T12:00:00",
+        "label": "preset demo",
+        "text_col": "text_bert",
+        "mode": "classification",
+        "base_model": "demo-model",
+        "params": {
+            "epochs": 1,
+            "batch_size": 2,
+            "max_length": 32,
+            "learning_rate": 5e-5,
+            "weight_decay": 0.01,
+            "warmup_steps": 0,
+            "warmup_ratio": 0.0,
+            "random_state": 42,
+            "split_random_state": 42,
+            "trainer_random_state": 42,
+            "freeze_layers": False,
+            "test_size": 0.2,
+            "mlm_probability": 0.15,
+            "requested_split_mode": "Temporal",
+        },
+    }
+
+    nlp_app.execute_transformer_finetune_from_preset(
+        pd.DataFrame({"text_bert": ["uno", "dos"], "severity_target": [0, 1]}),
+        preset=preset,
+        output_dir=tmp_path / "final_model",
+        run_id="run-final",
+        result_model_name="Transformers (Fine-tuned)",
+        action_name="transformers_finetune_from_selected_preset",
+        split_mode_override="Estratificado",
+        live_tracker=tracker,
+    )
+
+    manifest = json.loads((tracker.run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    assert manifest["status"] == "completed"
+    assert manifest["result_status"] == "ok"
+    assert (tracker.run_dir / "finetune_history_live.csv").exists()
+    assert (tracker.run_dir / "finetune_result.json").exists()
+
+
 def _paper_compare_fixture_payload() -> dict:
     expected = copy.deepcopy(nlp_app.PAPER_EXPECTED_COUNTS)
     class_metrics = {
