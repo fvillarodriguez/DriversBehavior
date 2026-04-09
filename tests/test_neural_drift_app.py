@@ -72,6 +72,23 @@ def test_build_window_dataset_preserves_temporal_order():
     assert dataset.X[1].tolist() == [20.0, 30.0, 40.0]
 
 
+def test_subset_dataset_by_percentage_uses_most_recent_rows():
+    df = pd.DataFrame(
+        {
+            "interval_start": pd.date_range("2024-01-01 00:00:00", periods=10, freq="5min"),
+            "flow_light": np.arange(10, dtype=float),
+            "target": [0] * 10,
+        }
+    )
+
+    subset = neural_drift_app._subset_dataset_by_percentage(df, dataset_percent=30)
+
+    assert len(subset) == 3
+    assert subset["interval_start"].tolist() == list(
+        pd.date_range("2024-01-01 00:35:00", periods=3, freq="5min")
+    )
+
+
 def test_embedding_drift_score_increases_under_regime_shift():
     rng = np.random.default_rng(42)
     X_ref = rng.normal(0.0, 1.0, size=(32, 8))
@@ -99,6 +116,7 @@ def test_embedding_drift_score_increases_under_regime_shift():
         calibrated_score=float(scores_ref[0]),
         y_true=int(y_ref[0]),
         embeddings=np.array([0.05, -0.03, 0.02, 0.01], dtype=float),
+        recent_embedding_history=None,
         selected_channels=[neural_drift_app.DRIFT_EMBEDDING],
         detectors=detectors,
     )
@@ -108,6 +126,7 @@ def test_embedding_drift_score_increases_under_regime_shift():
         calibrated_score=float(scores_ref[1]),
         y_true=int(y_ref[1]),
         embeddings=np.array([4.5, 4.8, 5.0, 4.9], dtype=float),
+        recent_embedding_history=None,
         selected_channels=[neural_drift_app.DRIFT_EMBEDDING],
         detectors=detectors,
     )
@@ -142,6 +161,7 @@ def test_torch_mlp_trains_embedding_autoencoder_monitor():
         config={
             **neural_drift_app.DEFAULT_CONFIG,
             "mlp_epochs": 4,
+            "drift_monitor_architecture": neural_drift_app.DRIFT_MONITOR_ARCH_CLASSIC_AE,
             "drift_monitor_epochs": 6,
             "drift_monitor_hidden_dim": 12,
             "drift_monitor_bottleneck_dim": 4,
@@ -149,6 +169,7 @@ def test_torch_mlp_trains_embedding_autoencoder_monitor():
     )
 
     assert artifact["embedding_monitor"] is not None
+    assert artifact["monitor_effective_architecture"] == neural_drift_app.DRIFT_MONITOR_ARCH_CLASSIC_AE
     assert "embedding_reconstruction_mean" in artifact["reference"]
     assert "embedding_reconstruction_std" in artifact["reference"]
 
@@ -187,6 +208,26 @@ def test_drift_monitor_profiles_define_moderate_and_sensitive_presets():
     assert sensitive["drift_monitor_reconstruction_weight"] > moderate["drift_monitor_reconstruction_weight"]
 
 
+def test_detector_sensitivity_presets_span_conservative_to_very_sensitive():
+    conservative = neural_drift_app._detector_sensitivity_preset_config(
+        neural_drift_app.DETECTOR_SENSITIVITY_PRESET_CONSERVATIVE
+    )
+    moderate = neural_drift_app._detector_sensitivity_preset_config(
+        neural_drift_app.DETECTOR_SENSITIVITY_PRESET_MODERATE
+    )
+    very_sensitive = neural_drift_app._detector_sensitivity_preset_config(
+        neural_drift_app.DETECTOR_SENSITIVITY_PRESET_VERY_SENSITIVE
+    )
+
+    assert conservative["severity_threshold"] > moderate["severity_threshold"]
+    assert conservative["recent_window_size"] > moderate["recent_window_size"]
+    assert conservative["detector_adwin_delta"] < moderate["detector_adwin_delta"]
+    assert conservative["drift_point_signal_weight"] < moderate["drift_point_signal_weight"]
+    assert very_sensitive["severity_threshold"] < moderate["severity_threshold"]
+    assert very_sensitive["recent_window_size"] < moderate["recent_window_size"]
+    assert very_sensitive["detector_adwin_delta"] > moderate["detector_adwin_delta"]
+
+
 def test_run_signature_changes_when_monitor_profile_changes():
     df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=48, random_state=21)
     bundle = _feature_bundle(df)
@@ -211,6 +252,29 @@ def test_run_signature_changes_when_monitor_profile_changes():
     )
 
     assert moderate_signature != sensitive_signature
+
+
+def test_run_signature_changes_when_monitor_architecture_changes():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=48, random_state=23)
+    bundle = _feature_bundle(df)
+
+    classic_signature = neural_drift_app._build_run_signature(
+        bundle,
+        {
+            **neural_drift_app.DEFAULT_CONFIG,
+            "drift_monitor_architecture": neural_drift_app.DRIFT_MONITOR_ARCH_CLASSIC_AE,
+        },
+    )
+    attention_signature = neural_drift_app._build_run_signature(
+        bundle,
+        {
+            **neural_drift_app.DEFAULT_CONFIG,
+            "drift_monitor_architecture": neural_drift_app.DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+            "drift_monitor_sequence_length": 10,
+        },
+    )
+
+    assert classic_signature != attention_signature
 
 
 def test_run_backtest_pipeline_returns_expected_strategy_rows():
@@ -268,6 +332,7 @@ def test_run_backtest_pipeline_excludes_fine_tuning_for_xgboost():
         neural_drift_app.STRATEGY_FIXED,
         neural_drift_app.STRATEGY_RETRAIN,
     }
+    assert set(summary["monitor_effective_architecture"].astype(str)) == {"not_available"}
 
 
 def test_xgboost_classic_channels_detect_drift_on_shifted_dataset():
@@ -287,6 +352,27 @@ def test_xgboost_classic_channels_detect_drift_on_shifted_dataset():
     assert not drift_events.empty
     assert "max_channel_score" in drift_events.columns
     assert float(summary.loc[summary["strategy"].eq(neural_drift_app.STRATEGY_RECALIBRATION), "n_drift_events"].iloc[0]) > 0
+
+
+def test_shifted_dataset_produces_multiple_drift_events_for_both_models():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=220, drift_start=140, random_state=7)
+    config = {
+        **neural_drift_app.DEFAULT_CONFIG,
+        "models": [neural_drift_app.MODEL_TORCH_MLP, neural_drift_app.MODEL_XGBOOST],
+        "strategies": [neural_drift_app.STRATEGY_RECALIBRATION],
+        "recent_window_size": 24,
+        "recalibration_min_rows": 16,
+        "max_stream_rows": 48,
+        "mlp_epochs": 2,
+        "drift_monitor_epochs": 2,
+        "xgb_estimators": 8,
+    }
+
+    results = neural_drift_app.run_backtest_pipeline(_feature_bundle(df), config=config)
+    summary = results["summary"].set_index("model")
+
+    assert int(summary.loc[neural_drift_app.MODEL_TORCH_MLP, "n_drift_events"]) > 5
+    assert int(summary.loc[neural_drift_app.MODEL_XGBOOST, "n_drift_events"]) > 5
 
 
 def test_resolve_dataset_from_context_falls_back_to_duckdb(tmp_path: Path):
@@ -429,3 +515,317 @@ def test_baseline_uses_optimized_decision_threshold():
     baseline = results["baseline"]
     assert not baseline.empty
     assert float(baseline.loc[0, "threshold"]) != 0.5
+
+
+def test_run_backtest_pipeline_uses_selected_dataset_percentage():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=120, drift_start=80, random_state=53)
+    config = {
+        **neural_drift_app.DEFAULT_CONFIG,
+        "dataset_percent": 50,
+        "models": [neural_drift_app.MODEL_XGBOOST],
+        "strategies": [neural_drift_app.STRATEGY_FIXED],
+        "xgb_estimators": 8,
+        "max_stream_rows": 24,
+    }
+
+    results = neural_drift_app.run_backtest_pipeline(_feature_bundle(df), config=config)
+
+    assert len(results["dataset"].augmented_df) == 60
+
+
+def test_build_embedding_monitor_sequences_aligns_history_and_target():
+    embeddings = np.arange(30, dtype=float).reshape(10, 3)
+
+    X_seq, y_target, target_indices = neural_drift_app._build_embedding_monitor_sequences(
+        embeddings,
+        sequence_length=4,
+        stride=1,
+    )
+
+    assert X_seq.shape == (6, 4, 3)
+    assert y_target.shape == (6, 3)
+    assert target_indices.tolist() == [4, 5, 6, 7, 8, 9]
+    assert X_seq[0].tolist() == embeddings[0:4].tolist()
+    assert y_target[0].tolist() == embeddings[4].tolist()
+
+
+def test_temporal_attention_monitor_returns_normalized_attention_weights():
+    rng = np.random.default_rng(17)
+    embeddings = rng.normal(0.0, 1.0, size=(24, 6))
+
+    monitor, reconstruction_errors = neural_drift_app._fit_embedding_monitor(
+        embeddings,
+        config={
+            **neural_drift_app.DEFAULT_CONFIG,
+            "drift_monitor_architecture": neural_drift_app.DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+            "drift_monitor_sequence_length": 6,
+            "drift_monitor_attention_hidden_dim": 12,
+            "drift_monitor_epochs": 3,
+            "drift_monitor_batch_size": 8,
+        },
+    )
+
+    assert monitor is not None
+    assert monitor["monitor_effective_architecture"] == neural_drift_app.DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION
+    assert reconstruction_errors is not None
+    assert len(reconstruction_errors) > 0
+
+    details = neural_drift_app._predict_embedding_monitor_details(
+        monitor,
+        embeddings=embeddings[10].reshape(1, -1),
+        recent_embeddings=embeddings[4:10],
+    )
+
+    attention_summary = details["attention_summary"]
+    assert details["warmup"] is False
+    assert attention_summary is not None
+    assert len(attention_summary["temporal_attention_mean"]) == 6
+    assert np.isclose(np.sum(attention_summary["temporal_attention_mean"]), 1.0, atol=1e-5)
+
+
+def test_temporal_attention_monitor_warmup_without_enough_history():
+    rng = np.random.default_rng(18)
+    embeddings = rng.normal(0.0, 1.0, size=(20, 5))
+    monitor, _ = neural_drift_app._fit_embedding_monitor(
+        embeddings,
+        config={
+            **neural_drift_app.DEFAULT_CONFIG,
+            "drift_monitor_architecture": neural_drift_app.DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+            "drift_monitor_sequence_length": 8,
+            "drift_monitor_epochs": 2,
+        },
+    )
+
+    assert monitor is not None
+    details = neural_drift_app._predict_embedding_monitor_details(
+        monitor,
+        embeddings=embeddings[7].reshape(1, -1),
+        recent_embeddings=embeddings[:6],
+    )
+
+    assert details["warmup"] is True
+    assert details["reconstruction_error"] is None
+
+
+def test_temporal_attention_monitor_falls_back_to_classic_for_small_dataset():
+    rng = np.random.default_rng(19)
+    embeddings = rng.normal(0.0, 1.0, size=(10, 5))
+    monitor, reconstruction_errors = neural_drift_app._fit_embedding_monitor(
+        embeddings,
+        config={
+            **neural_drift_app.DEFAULT_CONFIG,
+            "drift_monitor_architecture": neural_drift_app.DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+            "drift_monitor_sequence_length": 12,
+            "drift_monitor_epochs": 2,
+        },
+    )
+
+    assert monitor is not None
+    assert monitor["requested_architecture"] == neural_drift_app.DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION
+    assert monitor["monitor_effective_architecture"] == neural_drift_app.DRIFT_MONITOR_ARCH_CLASSIC_AE
+    assert reconstruction_errors is not None
+
+
+def test_backtest_with_temporal_attention_detector_returns_detector_attention_outputs():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=220, drift_start=140, random_state=59)
+    config = {
+        **neural_drift_app.DEFAULT_CONFIG,
+        "models": [neural_drift_app.MODEL_TORCH_MLP],
+        "strategies": [neural_drift_app.STRATEGY_RECALIBRATION],
+        "drift_monitor_architecture": neural_drift_app.DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+        "drift_monitor_sequence_length": 8,
+        "drift_monitor_attention_hidden_dim": 16,
+        "recent_window_size": 24,
+        "recalibration_min_rows": 16,
+        "max_stream_rows": 48,
+        "mlp_epochs": 2,
+        "drift_monitor_epochs": 2,
+    }
+
+    results = neural_drift_app.run_backtest_pipeline(_feature_bundle(df), config=config)
+
+    summary = results["summary"]
+    detector_temporal = results["detector_attention_temporal_summary"]
+
+    assert not summary.empty
+    assert summary.loc[0, "monitor_effective_architecture"] == neural_drift_app.DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION
+    assert not detector_temporal.empty
+    assert "lag_1" in set(detector_temporal["time_step"].astype(str))
+
+
+def test_backtest_with_predictor_attention_and_detector_attention_reports_shift():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=220, drift_start=140, random_state=61)
+    config = {
+        **neural_drift_app.DEFAULT_CONFIG,
+        "models": [neural_drift_app.MODEL_TORCH_MLP_ATTENTION],
+        "strategies": [neural_drift_app.STRATEGY_RECALIBRATION],
+        "lookback_steps": 8,
+        "drift_monitor_architecture": neural_drift_app.DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+        "drift_monitor_sequence_length": 8,
+        "recent_window_size": 24,
+        "recalibration_min_rows": 16,
+        "max_stream_rows": 48,
+        "mlp_epochs": 2,
+        "drift_monitor_epochs": 2,
+    }
+
+    results = neural_drift_app.run_backtest_pipeline(_feature_bundle(df), config=config)
+
+    summary = results["summary"]
+    detector_shift = results["detector_attention_drift_shift_summary"]
+
+    assert int(summary.loc[0, "n_drift_events"]) > 0
+    assert not detector_shift.empty
+    assert float(detector_shift["abs_delta_attention"].max()) > 0.0
+
+
+def test_torch_attention_model_returns_normalized_attention_summaries():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=180, drift_start=110, random_state=41)
+    augmented_df, augmented_cols = neural_drift_app.augment_feature_frame(
+        df,
+        feature_cols=_feature_bundle(df)["feature_cols"],
+    )
+    dataset = neural_drift_app.build_window_dataset(
+        augmented_df,
+        feature_cols=augmented_cols,
+        lookback_steps=6,
+        horizon_steps=1,
+    )
+    split = neural_drift_app._split_window_dataset(
+        dataset,
+        train_fraction=0.60,
+        validation_fraction=0.20,
+        max_stream_rows=24,
+    )
+
+    artifact = neural_drift_app._train_torch_mlp(
+        split["X_train"],
+        split["y_train"],
+        split["X_val"],
+        split["y_val"],
+        config={
+            **neural_drift_app.DEFAULT_CONFIG,
+            "lookback_steps": 6,
+            "mlp_epochs": 3,
+            "drift_monitor_epochs": 3,
+            "attention_feature_hidden_dim": 24,
+            "attention_temporal_hidden_dim": 20,
+        },
+        model_name=neural_drift_app.MODEL_TORCH_MLP_ATTENTION,
+        feature_metadata={
+            "lookback_steps": 6,
+            "base_feature_cols": _feature_bundle(df)["feature_cols"],
+            "augmented_feature_cols": augmented_cols,
+            "feature_count": len(augmented_cols),
+        },
+    )
+
+    details = neural_drift_app._predict_torch_model_details(artifact, split["X_val"][:4])
+    attention_summary = details["attention_summary"]
+
+    assert artifact["model_family"] == "torch_mlp_attention"
+    assert attention_summary is not None
+    assert len(attention_summary["feature_attention_mean"]) == len(augmented_cols)
+    assert len(attention_summary["temporal_attention_mean"]) == 6
+    assert np.isclose(np.sum(attention_summary["feature_attention_mean"]), 1.0, atol=1e-5)
+    assert np.isclose(np.sum(attention_summary["temporal_attention_mean"]), 1.0, atol=1e-5)
+
+
+def test_plain_torch_mlp_remains_compatible_without_attention_metadata():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=160, drift_start=100, random_state=29)
+    augmented_df, augmented_cols = neural_drift_app.augment_feature_frame(
+        df,
+        feature_cols=_feature_bundle(df)["feature_cols"],
+    )
+    dataset = neural_drift_app.build_window_dataset(
+        augmented_df,
+        feature_cols=augmented_cols,
+        lookback_steps=8,
+        horizon_steps=1,
+    )
+    split = neural_drift_app._split_window_dataset(
+        dataset,
+        train_fraction=0.60,
+        validation_fraction=0.20,
+        max_stream_rows=24,
+    )
+
+    artifact = neural_drift_app._train_torch_mlp(
+        split["X_train"],
+        split["y_train"],
+        split["X_val"],
+        split["y_val"],
+        config={
+            **neural_drift_app.DEFAULT_CONFIG,
+            "mlp_epochs": 3,
+            "drift_monitor_epochs": 3,
+        },
+    )
+
+    assert artifact["model_family"] == "torch_mlp"
+    assert artifact["attention_summary_reference"] is None
+
+
+def test_attention_backtest_returns_attention_outputs_and_labels():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=220, drift_start=140, random_state=23)
+    config = {
+        **neural_drift_app.DEFAULT_CONFIG,
+        "models": [neural_drift_app.MODEL_TORCH_MLP_ATTENTION],
+        "strategies": [
+            neural_drift_app.STRATEGY_FIXED,
+            neural_drift_app.STRATEGY_RECALIBRATION,
+            neural_drift_app.STRATEGY_FINE_TUNING,
+            neural_drift_app.STRATEGY_RETRAIN,
+        ],
+        "lookback_steps": 8,
+        "recent_window_size": 24,
+        "recalibration_min_rows": 16,
+        "retrain_min_rows": 24,
+        "max_stream_rows": 48,
+        "rolling_metric_window": 12,
+        "mlp_epochs": 2,
+        "fine_tune_epochs": 1,
+        "drift_monitor_epochs": 2,
+    }
+
+    results = neural_drift_app.run_backtest_pipeline(_feature_bundle(df), config=config)
+
+    summary = results["summary"]
+    feature_summary = results["attention_feature_summary"]
+    temporal_summary = results["attention_temporal_summary"]
+
+    assert not summary.empty
+    assert set(summary["strategy"].astype(str)) == {
+        neural_drift_app.STRATEGY_FIXED,
+        neural_drift_app.STRATEGY_RECALIBRATION,
+        neural_drift_app.STRATEGY_FINE_TUNING,
+        neural_drift_app.STRATEGY_RETRAIN,
+    }
+    assert not feature_summary.empty
+    assert not temporal_summary.empty
+    assert "flow_light" in set(feature_summary["feature"].astype(str))
+    assert "t-0" in set(temporal_summary["time_step"].astype(str))
+
+
+def test_attention_model_detects_drift_and_reports_attention_shift():
+    df = neural_drift_app.generate_synthetic_neural_drift_dataset(rows=220, drift_start=140, random_state=37)
+    config = {
+        **neural_drift_app.DEFAULT_CONFIG,
+        "models": [neural_drift_app.MODEL_TORCH_MLP_ATTENTION],
+        "strategies": [neural_drift_app.STRATEGY_RECALIBRATION],
+        "lookback_steps": 8,
+        "recent_window_size": 24,
+        "recalibration_min_rows": 16,
+        "max_stream_rows": 48,
+        "mlp_epochs": 2,
+        "drift_monitor_epochs": 2,
+    }
+
+    results = neural_drift_app.run_backtest_pipeline(_feature_bundle(df), config=config)
+
+    summary = results["summary"]
+    shift_df = results["attention_drift_shift_summary"]
+
+    assert int(summary.loc[0, "n_drift_events"]) > 0
+    assert not shift_df.empty
+    assert float(shift_df["abs_delta_attention"].max()) > 0.0

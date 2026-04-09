@@ -50,7 +50,8 @@ RESULTS_DIR = ROOT_DIR / "Resultados"
 
 MODEL_XGBOOST = "XGBoost"
 MODEL_TORCH_MLP = "Torch MLP"
-AVAILABLE_MODELS = [MODEL_XGBOOST, MODEL_TORCH_MLP]
+MODEL_TORCH_MLP_ATTENTION = "Torch MLP + Attention"
+AVAILABLE_MODELS = [MODEL_XGBOOST, MODEL_TORCH_MLP, MODEL_TORCH_MLP_ATTENTION]
 
 STRATEGY_FIXED = "fixed"
 STRATEGY_RECALIBRATION = "recalibration"
@@ -76,6 +77,24 @@ AVAILABLE_DRIFT_MONITOR_PROFILES = [
     DRIFT_MONITOR_PROFILE_SENSITIVE,
 ]
 
+DRIFT_MONITOR_ARCH_CLASSIC_AE = "Autoencoder clasico"
+DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION = "Attention temporal"
+AVAILABLE_DRIFT_MONITOR_ARCHITECTURES = [
+    DRIFT_MONITOR_ARCH_CLASSIC_AE,
+    DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+]
+
+DETECTOR_SENSITIVITY_PRESET_CONSERVATIVE = "Conservador"
+DETECTOR_SENSITIVITY_PRESET_MODERATE = "Moderado"
+DETECTOR_SENSITIVITY_PRESET_SENSITIVE = "Sensible"
+DETECTOR_SENSITIVITY_PRESET_VERY_SENSITIVE = "Muy sensible"
+AVAILABLE_DETECTOR_SENSITIVITY_PRESETS = [
+    DETECTOR_SENSITIVITY_PRESET_CONSERVATIVE,
+    DETECTOR_SENSITIVITY_PRESET_MODERATE,
+    DETECTOR_SENSITIVITY_PRESET_SENSITIVE,
+    DETECTOR_SENSITIVITY_PRESET_VERY_SENSITIVE,
+]
+
 SESSION_DEFAULTS: Dict[str, Any] = {
     "neural_drift_config": None,
     "neural_drift_dataset": None,
@@ -86,15 +105,17 @@ SESSION_DEFAULTS: Dict[str, Any] = {
     "neural_drift_feature_source_choice": None,
     "neural_drift_monitor_profile": DRIFT_MONITOR_PROFILE_MODERATE,
     "neural_drift_last_run_signature": None,
+    "neural_drift_sensitivity_preset": DETECTOR_SENSITIVITY_PRESET_MODERATE,
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "interval_minutes": 5,
+    "dataset_percent": 100,
     "lookback_steps": 12,
     "horizon_steps": 1,
     "train_fraction": 0.60,
     "validation_fraction": 0.20,
-    "models": [MODEL_XGBOOST, MODEL_TORCH_MLP],
+    "models": [MODEL_XGBOOST, MODEL_TORCH_MLP, MODEL_TORCH_MLP_ATTENTION],
     "strategies": [
         STRATEGY_FIXED,
         STRATEGY_RECALIBRATION,
@@ -118,6 +139,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "mlp_epochs": 20,
     "mlp_batch_size": 64,
     "mlp_learning_rate": 1e-3,
+    "attention_feature_hidden_dim": 32,
+    "attention_temporal_hidden_dim": 32,
+    "attention_dropout": 0.10,
+    "attention_top_k": 8,
     "fine_tune_learning_rate": 3e-4,
     "fine_tune_epochs": 6,
     "drift_monitor_hidden_dim": 16,
@@ -127,7 +152,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "drift_monitor_batch_size": 32,
     "drift_monitor_learning_rate": 1e-3,
     "drift_monitor_reconstruction_weight": 0.65,
+    "drift_monitor_architecture": DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+    "drift_monitor_sequence_length": 12,
+    "drift_monitor_attention_hidden_dim": 32,
+    "drift_monitor_attention_dropout": 0.05,
     "drift_monitor_profile": DRIFT_MONITOR_PROFILE_MODERATE,
+    "detector_sensitivity_preset": DETECTOR_SENSITIVITY_PRESET_MODERATE,
+    "detector_adwin_delta": 0.002,
+    "drift_point_signal_weight": 1.0,
 }
 
 DRIFT_MONITOR_PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -153,6 +185,30 @@ class WindowDataset:
     augmented_feature_cols: List[str]
 
 
+def _is_torch_model(model_name: str) -> bool:
+    return str(model_name) in {MODEL_TORCH_MLP, MODEL_TORCH_MLP_ATTENTION}
+
+
+def _has_any_torch_model(models: Sequence[str]) -> bool:
+    return any(_is_torch_model(str(model_name)) for model_name in models)
+
+
+def _resolve_torch_model_family(model_name: str) -> str:
+    if str(model_name) == MODEL_TORCH_MLP_ATTENTION:
+        return "torch_mlp_attention"
+    return "torch_mlp"
+
+
+def _resolve_torch_model_name(model_family: str) -> str:
+    if str(model_family) == "torch_mlp_attention":
+        return MODEL_TORCH_MLP_ATTENTION
+    return MODEL_TORCH_MLP
+
+
+def _time_step_labels(lookback_steps: int) -> List[str]:
+    return [f"t-{offset}" for offset in range(int(lookback_steps) - 1, -1, -1)]
+
+
 def init_state() -> None:
     for key, default_value in SESSION_DEFAULTS.items():
         if key not in st.session_state:
@@ -164,6 +220,13 @@ def _resolve_drift_monitor_profile(value: Any) -> str:
     if profile not in AVAILABLE_DRIFT_MONITOR_PROFILES:
         return DRIFT_MONITOR_PROFILE_MODERATE
     return profile
+
+
+def _resolve_drift_monitor_architecture(value: Any) -> str:
+    architecture = str(value or DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION)
+    if architecture not in AVAILABLE_DRIFT_MONITOR_ARCHITECTURES:
+        return DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION
+    return architecture
 
 
 def _drift_monitor_profile_preset(profile: str) -> Dict[str, Any]:
@@ -181,6 +244,84 @@ def _drift_monitor_profile_description(profile: str) -> str:
     return (
         "Equilibrio entre sensibilidad y estabilidad: mantiene la configuracion base actual "
         "para detectar drift sin disparar falsas alarmas con demasiada facilidad."
+    )
+
+
+def _resolve_detector_sensitivity_preset(value: Any) -> str:
+    preset = str(value or DETECTOR_SENSITIVITY_PRESET_MODERATE)
+    if preset not in AVAILABLE_DETECTOR_SENSITIVITY_PRESETS:
+        return DETECTOR_SENSITIVITY_PRESET_MODERATE
+    return preset
+
+
+def _detector_sensitivity_preset_config(preset: str) -> Dict[str, Any]:
+    resolved = _resolve_detector_sensitivity_preset(preset)
+    if resolved == DETECTOR_SENSITIVITY_PRESET_CONSERVATIVE:
+        return {
+            "severity_threshold": 0.65,
+            "recent_window_size": 120,
+            "detector_adwin_delta": 0.001,
+            "drift_point_signal_weight": 0.35,
+            "drift_monitor_profile": DRIFT_MONITOR_PROFILE_MODERATE,
+            "drift_monitor_bottleneck_dim": 8,
+            "drift_monitor_reconstruction_weight": 0.45,
+        }
+    if resolved == DETECTOR_SENSITIVITY_PRESET_SENSITIVE:
+        return {
+            "severity_threshold": 0.40,
+            "recent_window_size": 48,
+            "detector_adwin_delta": 0.004,
+            "drift_point_signal_weight": 1.0,
+            "drift_monitor_profile": DRIFT_MONITOR_PROFILE_SENSITIVE,
+            "drift_monitor_bottleneck_dim": 4,
+            "drift_monitor_reconstruction_weight": 0.85,
+        }
+    if resolved == DETECTOR_SENSITIVITY_PRESET_VERY_SENSITIVE:
+        return {
+            "severity_threshold": 0.30,
+            "recent_window_size": 24,
+            "detector_adwin_delta": 0.010,
+            "drift_point_signal_weight": 1.0,
+            "drift_monitor_profile": DRIFT_MONITOR_PROFILE_SENSITIVE,
+            "drift_monitor_bottleneck_dim": 3,
+            "drift_monitor_reconstruction_weight": 0.95,
+        }
+    return {
+        "severity_threshold": float(DEFAULT_CONFIG["severity_threshold"]),
+        "recent_window_size": int(DEFAULT_CONFIG["recent_window_size"]),
+        "detector_adwin_delta": float(DEFAULT_CONFIG["detector_adwin_delta"]),
+        "drift_point_signal_weight": float(DEFAULT_CONFIG["drift_point_signal_weight"]),
+        "drift_monitor_profile": DRIFT_MONITOR_PROFILE_MODERATE,
+        "drift_monitor_bottleneck_dim": int(DEFAULT_CONFIG["drift_monitor_bottleneck_dim"]),
+        "drift_monitor_reconstruction_weight": float(DEFAULT_CONFIG["drift_monitor_reconstruction_weight"]),
+    }
+
+
+def _detector_sensitivity_preset_description(preset: str) -> str:
+    resolved = _resolve_detector_sensitivity_preset(preset)
+    if resolved == DETECTOR_SENSITIVITY_PRESET_CONSERVATIVE:
+        return "Prioriza estabilidad y menos falsas alarmas. Usa mas suavizado y menor sensibilidad local."
+    if resolved == DETECTOR_SENSITIVITY_PRESET_SENSITIVE:
+        return "Prioriza reaccion temprana a cambios nuevos. Baja umbrales y sube el peso de senales puntuales."
+    if resolved == DETECTOR_SENSITIVITY_PRESET_VERY_SENSITIVE:
+        return "Maxima reactividad. Puede detectar cambios muy temprano, pero con mayor riesgo de falsas alarmas."
+    return "Equilibrio entre sensibilidad y estabilidad. Replica la configuracion base actual del detector."
+
+
+def _apply_detector_sensitivity_preset_to_session(preset: str) -> None:
+    resolved = _resolve_detector_sensitivity_preset(preset)
+    preset_config = _detector_sensitivity_preset_config(resolved)
+    st.session_state["neural_drift_sensitivity_preset"] = resolved
+    st.session_state["neural_drift_severity_threshold"] = float(preset_config["severity_threshold"])
+    st.session_state["neural_drift_recent_window_size"] = int(preset_config["recent_window_size"])
+    st.session_state["neural_drift_detector_adwin_delta"] = float(preset_config["detector_adwin_delta"])
+    st.session_state["neural_drift_point_signal_weight"] = float(preset_config["drift_point_signal_weight"])
+    st.session_state["neural_drift_monitor_profile"] = str(preset_config["drift_monitor_profile"])
+    st.session_state["neural_drift_monitor_bottleneck_dim"] = int(
+        preset_config["drift_monitor_bottleneck_dim"]
+    )
+    st.session_state["neural_drift_monitor_reconstruction_weight"] = float(
+        preset_config["drift_monitor_reconstruction_weight"]
     )
 
 
@@ -221,6 +362,7 @@ def _build_run_signature(dataset_bundle: Dict[str, Any], config: Dict[str, Any])
         "selection_metadata": _to_json_safe(dataset_bundle.get("selection_metadata") or {}),
         "config": {
             "interval_minutes": int(config.get("interval_minutes", DEFAULT_CONFIG["interval_minutes"])),
+            "dataset_percent": int(config.get("dataset_percent", DEFAULT_CONFIG["dataset_percent"])),
             "lookback_steps": int(config.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"])),
             "horizon_steps": int(config.get("horizon_steps", DEFAULT_CONFIG["horizon_steps"])),
             "train_fraction": float(config.get("train_fraction", DEFAULT_CONFIG["train_fraction"])),
@@ -232,17 +374,53 @@ def _build_run_signature(dataset_bundle: Dict[str, Any], config: Dict[str, Any])
             "recent_window_size": int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])),
             "max_stream_rows": int(config.get("max_stream_rows", DEFAULT_CONFIG["max_stream_rows"])),
             "threshold_beta": float(config.get("threshold_beta", DEFAULT_CONFIG["threshold_beta"])),
+            "detector_sensitivity_preset": str(
+                config.get("detector_sensitivity_preset", DEFAULT_CONFIG["detector_sensitivity_preset"])
+            ),
+            "detector_adwin_delta": float(
+                config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"])
+            ),
+            "drift_point_signal_weight": float(
+                config.get("drift_point_signal_weight", DEFAULT_CONFIG["drift_point_signal_weight"])
+            ),
             "drift_monitor_profile": str(
                 config.get("drift_monitor_profile", DEFAULT_CONFIG["drift_monitor_profile"])
             ),
+            "drift_monitor_architecture": str(
+                config.get("drift_monitor_architecture", DEFAULT_CONFIG["drift_monitor_architecture"])
+            ),
             "drift_monitor_bottleneck_dim": int(
                 config.get("drift_monitor_bottleneck_dim", DEFAULT_CONFIG["drift_monitor_bottleneck_dim"])
+            ),
+            "drift_monitor_sequence_length": int(
+                config.get("drift_monitor_sequence_length", DEFAULT_CONFIG["drift_monitor_sequence_length"])
+            ),
+            "drift_monitor_attention_hidden_dim": int(
+                config.get(
+                    "drift_monitor_attention_hidden_dim",
+                    DEFAULT_CONFIG["drift_monitor_attention_hidden_dim"],
+                )
+            ),
+            "drift_monitor_attention_dropout": float(
+                config.get("drift_monitor_attention_dropout", DEFAULT_CONFIG["drift_monitor_attention_dropout"])
             ),
             "drift_monitor_reconstruction_weight": float(
                 config.get(
                     "drift_monitor_reconstruction_weight",
                     DEFAULT_CONFIG["drift_monitor_reconstruction_weight"],
                 )
+            ),
+            "attention_feature_hidden_dim": int(
+                config.get("attention_feature_hidden_dim", DEFAULT_CONFIG["attention_feature_hidden_dim"])
+            ),
+            "attention_temporal_hidden_dim": int(
+                config.get("attention_temporal_hidden_dim", DEFAULT_CONFIG["attention_temporal_hidden_dim"])
+            ),
+            "attention_dropout": float(
+                config.get("attention_dropout", DEFAULT_CONFIG["attention_dropout"])
+            ),
+            "attention_top_k": int(
+                config.get("attention_top_k", DEFAULT_CONFIG["attention_top_k"])
             ),
         },
     }
@@ -494,6 +672,31 @@ def resolve_dataset_from_context(context: Dict[str, Any]) -> Dict[str, Any]:
         "feature_export_path": None if not feature_export_path else str(feature_export_path),
     }
     return bundle
+
+
+def _subset_dataset_by_percentage(
+    df: pd.DataFrame,
+    *,
+    dataset_percent: float,
+    time_col: str = "interval_start",
+) -> pd.DataFrame:
+    work = _ensure_non_empty_dataframe(df, label="Dataset percentage selection").copy()
+    pct = float(np.clip(dataset_percent, 1.0, 100.0))
+
+    if time_col in work.columns:
+        ordered_time = pd.to_datetime(work[time_col], errors="coerce")
+        work = (
+            work.assign(__dataset_percent_time__=ordered_time)
+            .sort_values("__dataset_percent_time__", kind="stable", na_position="first")
+            .drop(columns="__dataset_percent_time__")
+            .reset_index(drop=True)
+        )
+
+    if pct >= 100.0:
+        return work.reset_index(drop=True).copy()
+
+    keep_rows = max(1, int(math.ceil(len(work) * pct / 100.0)))
+    return work.tail(keep_rows).reset_index(drop=True).copy()
 
 
 def _mean_from_available(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[pd.Series]:
@@ -911,10 +1114,86 @@ class WindowMLP(nn.Module):
     def forward_with_embeddings(self, x):
         embeddings = self.encoder(x)
         logits = self.classifier(embeddings).squeeze(-1)
-        return logits, embeddings
+        return logits, embeddings, {}
 
     def forward(self, x):
-        logits, _ = self.forward_with_embeddings(x)
+        logits, _, _ = self.forward_with_embeddings(x)
+        return logits
+
+
+class WindowAttentionMLP(nn.Module):
+    def __init__(
+        self,
+        *,
+        feature_count: int,
+        lookback_steps: int,
+        feature_hidden_dim: int,
+        temporal_hidden_dim: int,
+        encoder_hidden_dim: int,
+        embedding_dim: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.feature_count = int(feature_count)
+        self.lookback_steps = int(lookback_steps)
+        self.feature_hidden_dim = int(feature_hidden_dim)
+
+        self.feature_projection = nn.Linear(1, feature_hidden_dim)
+        self.feature_identity = nn.Parameter(torch.randn(self.feature_count, feature_hidden_dim) * 0.02)
+        self.feature_attention = nn.Sequential(
+            nn.Linear(feature_hidden_dim, feature_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(feature_hidden_dim, 1),
+        )
+        self.temporal_position = nn.Parameter(torch.randn(self.lookback_steps, feature_hidden_dim) * 0.02)
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(feature_hidden_dim, temporal_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(temporal_hidden_dim, 1),
+        )
+        encoder_hidden_dim = max(int(embedding_dim) + 2, int(encoder_hidden_dim))
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_hidden_dim, encoder_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(encoder_hidden_dim, embedding_dim),
+            nn.ReLU(),
+        )
+        self.classifier = nn.Linear(embedding_dim, 1)
+
+    def _reshape_inputs(self, x):
+        if x.ndim != 2:
+            raise ValueError("WindowAttentionMLP expects flat windows with shape [batch, lookback * features].")
+        expected_dim = self.lookback_steps * self.feature_count
+        if int(x.shape[1]) != expected_dim:
+            raise ValueError(
+                f"WindowAttentionMLP expected input_dim={expected_dim}, got {int(x.shape[1])}."
+            )
+        return x.reshape(x.shape[0], self.lookback_steps, self.feature_count)
+
+    def forward_with_embeddings(self, x):
+        window = self._reshape_inputs(x)
+        feature_tokens = self.feature_projection(window.unsqueeze(-1))
+        feature_tokens = feature_tokens + self.feature_identity.view(1, 1, self.feature_count, self.feature_hidden_dim)
+
+        feature_logits = self.feature_attention(feature_tokens).squeeze(-1)
+        feature_weights = torch.softmax(feature_logits, dim=-1)
+        step_context = torch.sum(feature_weights.unsqueeze(-1) * feature_tokens, dim=2)
+
+        temporal_tokens = step_context + self.temporal_position.view(1, self.lookback_steps, self.feature_hidden_dim)
+        temporal_logits = self.temporal_attention(temporal_tokens).squeeze(-1)
+        temporal_weights = torch.softmax(temporal_logits, dim=1)
+        window_context = torch.sum(temporal_weights.unsqueeze(-1) * temporal_tokens, dim=1)
+
+        embeddings = self.encoder(window_context)
+        logits = self.classifier(embeddings).squeeze(-1)
+        return logits, embeddings, {
+            "feature_attention": feature_weights,
+            "temporal_attention": temporal_weights,
+        }
+
+    def forward(self, x):
+        logits, _, _ = self.forward_with_embeddings(x)
         return logits
 
 
@@ -941,6 +1220,52 @@ class EmbeddingDriftAutoencoder(nn.Module):
         return reconstruction
 
 
+class TemporalAttentionEmbeddingMonitor(nn.Module):
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        attention_hidden_dim: int,
+        bottleneck_dim: int,
+        hidden_dim: int,
+        sequence_length: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.sequence_length = int(sequence_length)
+        self.hidden_dim = int(hidden_dim)
+
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        self.temporal_position = nn.Parameter(torch.randn(self.sequence_length, hidden_dim) * 0.02)
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(hidden_dim, attention_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(attention_hidden_dim, 1),
+        )
+        self.bottleneck = nn.Sequential(
+            nn.Linear(hidden_dim, bottleneck_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(bottleneck_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, input_dim),
+        )
+
+    def forward(self, x):
+        tokens = self.input_projection(x)
+        tokens = tokens + self.temporal_position.view(1, self.sequence_length, self.hidden_dim)
+        attention_logits = self.temporal_attention(tokens).squeeze(-1)
+        attention_weights = torch.softmax(attention_logits, dim=1)
+        context = torch.sum(attention_weights.unsqueeze(-1) * tokens, dim=1)
+        latent = self.bottleneck(context)
+        reconstruction = self.decoder(latent)
+        return reconstruction, attention_weights
+
+
 def _temporal_train_val_split_arrays(
     X: np.ndarray,
     y: np.ndarray,
@@ -958,6 +1283,130 @@ def _temporal_train_val_split_arrays(
     return X_train, X_val, y_train, y_val
 
 
+def _resolve_feature_count(*, input_dim: int, lookback_steps: int, feature_metadata: Optional[Dict[str, Any]]) -> int:
+    if feature_metadata is not None and int(feature_metadata.get("feature_count") or 0) > 0:
+        return int(feature_metadata["feature_count"])
+    lookback = max(1, int(lookback_steps))
+    if int(input_dim) % lookback != 0:
+        raise ValueError(
+            f"Input dimension {int(input_dim)} is not divisible by lookback_steps={lookback}."
+        )
+    return int(input_dim) // lookback
+
+
+def _torch_feature_metadata(
+    *,
+    config: Dict[str, Any],
+    feature_metadata: Optional[Dict[str, Any]],
+    input_dim: int,
+) -> Dict[str, Any]:
+    lookback_steps = int(
+        (feature_metadata or {}).get("lookback_steps", config.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"]))
+    )
+    feature_count = _resolve_feature_count(
+        input_dim=int(input_dim),
+        lookback_steps=lookback_steps,
+        feature_metadata=feature_metadata,
+    )
+    augmented_feature_cols = list((feature_metadata or {}).get("augmented_feature_cols") or [])
+    if len(augmented_feature_cols) != feature_count:
+        augmented_feature_cols = [f"feature_{idx}" for idx in range(feature_count)]
+    base_feature_cols = list((feature_metadata or {}).get("base_feature_cols") or augmented_feature_cols)
+    return {
+        "lookback_steps": int(lookback_steps),
+        "feature_count": int(feature_count),
+        "augmented_feature_cols": list(augmented_feature_cols),
+        "base_feature_cols": list(base_feature_cols),
+        "temporal_labels": _time_step_labels(lookback_steps),
+    }
+
+
+def _summarize_attention_payload(
+    attention_payload: Dict[str, Any],
+    *,
+    feature_labels: Sequence[str],
+    temporal_labels: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    if not attention_payload:
+        return None
+
+    feature_attention = attention_payload.get("feature_attention")
+    temporal_attention = attention_payload.get("temporal_attention")
+    if feature_attention is None or temporal_attention is None:
+        return None
+
+    feature_mean = feature_attention.mean(dim=(0, 1)).detach().cpu().numpy().astype(float)
+    temporal_mean = temporal_attention.mean(dim=0).detach().cpu().numpy().astype(float)
+    return {
+        "feature_attention_mean": feature_mean,
+        "temporal_attention_mean": temporal_mean,
+        "feature_labels": list(feature_labels),
+        "temporal_labels": list(temporal_labels),
+    }
+
+
+def _as_float_array(value: Any) -> np.ndarray:
+    if value is None:
+        return np.asarray([], dtype=float)
+    return np.asarray(value, dtype=float)
+
+
+def _build_embedding_monitor_sequences(
+    embeddings: np.ndarray,
+    *,
+    sequence_length: int,
+    stride: int = 1,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    emb = np.asarray(embeddings, dtype=float)
+    if emb.ndim == 1:
+        emb = emb.reshape(-1, 1)
+
+    seq_len = max(2, int(sequence_length))
+    step = max(1, int(stride))
+    if emb.size == 0 or emb.shape[0] <= seq_len:
+        return (
+            np.empty((0, seq_len, emb.shape[1] if emb.ndim == 2 else 0), dtype=float),
+            np.empty((0, emb.shape[1] if emb.ndim == 2 else 0), dtype=float),
+            np.empty((0,), dtype=int),
+        )
+
+    X_rows: List[np.ndarray] = []
+    y_rows: List[np.ndarray] = []
+    target_indices: List[int] = []
+    for target_idx in range(seq_len, emb.shape[0], step):
+        X_rows.append(emb[target_idx - seq_len : target_idx])
+        y_rows.append(emb[target_idx])
+        target_indices.append(int(target_idx))
+
+    if not X_rows:
+        return (
+            np.empty((0, seq_len, emb.shape[1]), dtype=float),
+            np.empty((0, emb.shape[1]), dtype=float),
+            np.empty((0,), dtype=int),
+        )
+    return (
+        np.asarray(X_rows, dtype=float),
+        np.asarray(y_rows, dtype=float),
+        np.asarray(target_indices, dtype=int),
+    )
+
+
+def _summarize_monitor_attention_weights(
+    attention_weights: np.ndarray,
+    *,
+    sequence_length: int,
+) -> Optional[Dict[str, Any]]:
+    weights = np.asarray(attention_weights, dtype=float)
+    if weights.size == 0:
+        return None
+    if weights.ndim == 1:
+        weights = weights.reshape(1, -1)
+    return {
+        "temporal_attention_mean": weights.mean(axis=0).astype(float),
+        "temporal_labels": [f"lag_{offset}" for offset in range(int(sequence_length), 0, -1)],
+    }
+
+
 def _train_torch_mlp(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -965,12 +1414,15 @@ def _train_torch_mlp(
     y_val: np.ndarray,
     *,
     config: Dict[str, Any],
+    model_name: str = MODEL_TORCH_MLP,
+    feature_metadata: Optional[Dict[str, Any]] = None,
     learning_rate: Optional[float] = None,
     epochs: Optional[int] = None,
     base_model_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     _ensure_torch_available()
     _set_random_seed(int(config.get("random_state", 42)))
+    model_family = _resolve_torch_model_family(model_name)
 
     imputer = _fit_imputer(X_train)
     X_train_imp = _apply_imputer(X_train, imputer)
@@ -979,14 +1431,52 @@ def _train_torch_mlp(
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train_imp)
     X_val_scaled = scaler.transform(X_val_imp)
+    try:
+        torch_metadata = _torch_feature_metadata(
+            config=config,
+            feature_metadata=feature_metadata,
+            input_dim=int(X_train_scaled.shape[1]),
+        )
+    except ValueError:
+        if model_family == "torch_mlp_attention":
+            raise
+        fallback_feature_count = int((feature_metadata or {}).get("feature_count") or int(X_train_scaled.shape[1]))
+        fallback_feature_cols = list((feature_metadata or {}).get("augmented_feature_cols") or [])
+        if len(fallback_feature_cols) != fallback_feature_count:
+            fallback_feature_cols = [f"feature_{idx}" for idx in range(fallback_feature_count)]
+        torch_metadata = {
+            "lookback_steps": int((feature_metadata or {}).get("lookback_steps") or 1),
+            "feature_count": fallback_feature_count,
+            "augmented_feature_cols": list(fallback_feature_cols),
+            "base_feature_cols": list((feature_metadata or {}).get("base_feature_cols") or fallback_feature_cols),
+            "temporal_labels": _time_step_labels(int((feature_metadata or {}).get("lookback_steps") or 1)),
+        }
 
     device = torch.device("cpu")
-    model = WindowMLP(
-        input_dim=int(X_train_scaled.shape[1]),
-        hidden_dim=int(config.get("mlp_hidden_dim", DEFAULT_CONFIG["mlp_hidden_dim"])),
-        embedding_dim=int(config.get("mlp_embedding_dim", DEFAULT_CONFIG["mlp_embedding_dim"])),
-        dropout=float(config.get("mlp_dropout", DEFAULT_CONFIG["mlp_dropout"])),
-    ).to(device)
+    if model_family == "torch_mlp_attention":
+        model = WindowAttentionMLP(
+            feature_count=int(torch_metadata["feature_count"]),
+            lookback_steps=int(torch_metadata["lookback_steps"]),
+            feature_hidden_dim=int(
+                config.get("attention_feature_hidden_dim", DEFAULT_CONFIG["attention_feature_hidden_dim"])
+            ),
+            temporal_hidden_dim=int(
+                config.get("attention_temporal_hidden_dim", DEFAULT_CONFIG["attention_temporal_hidden_dim"])
+            ),
+            encoder_hidden_dim=max(
+                8,
+                int(config.get("mlp_hidden_dim", DEFAULT_CONFIG["mlp_hidden_dim"])) // 2,
+            ),
+            embedding_dim=int(config.get("mlp_embedding_dim", DEFAULT_CONFIG["mlp_embedding_dim"])),
+            dropout=float(config.get("attention_dropout", DEFAULT_CONFIG["attention_dropout"])),
+        ).to(device)
+    else:
+        model = WindowMLP(
+            input_dim=int(X_train_scaled.shape[1]),
+            hidden_dim=int(config.get("mlp_hidden_dim", DEFAULT_CONFIG["mlp_hidden_dim"])),
+            embedding_dim=int(config.get("mlp_embedding_dim", DEFAULT_CONFIG["mlp_embedding_dim"])),
+            dropout=float(config.get("mlp_dropout", DEFAULT_CONFIG["mlp_dropout"])),
+        ).to(device)
     if base_model_state is not None:
         model.load_state_dict(base_model_state)
 
@@ -1040,15 +1530,20 @@ def _train_torch_mlp(
                 break
 
     model.load_state_dict(best_state)
-    raw_val_scores, embeddings = _predict_torch_mlp(
+    prediction_details = _predict_torch_model_details(
         {
             "kind": "torch_mlp",
+            "model_family": model_family,
+            "model_name": str(model_name),
             "model": model,
             "imputer": imputer,
             "scaler": scaler,
+            **torch_metadata,
         },
         X_val,
     )
+    raw_val_scores = prediction_details["probs"]
+    embeddings = prediction_details["embeddings"]
     calibrator = _fit_platt_calibrator(y_val, raw_val_scores)
     calibrated_val_scores = _apply_calibrator(raw_val_scores, calibrator)
     threshold_info = _optimize_decision_threshold(
@@ -1057,6 +1552,10 @@ def _train_torch_mlp(
         beta=float(config.get("threshold_beta", DEFAULT_CONFIG["threshold_beta"])),
     )
     embedding_monitor, reconstruction_errors = _fit_embedding_monitor(embeddings, config=config)
+    attention_summary_reference = prediction_details.get("attention_summary")
+    monitor_effective_architecture = str(
+        (embedding_monitor or {}).get("monitor_effective_architecture", (embedding_monitor or {}).get("kind", "none"))
+    )
     reference = _build_reference_stats(
         X_ref=_apply_imputer(X_val, imputer),
         y_ref=y_val,
@@ -1066,13 +1565,21 @@ def _train_torch_mlp(
     )
     return {
         "kind": "torch_mlp",
-        "model_name": MODEL_TORCH_MLP,
+        "model_family": model_family,
+        "model_name": _resolve_torch_model_name(model_family),
         "model": model,
         "imputer": imputer,
         "scaler": scaler,
         "calibrator": calibrator,
         "reference": reference,
         "embedding_monitor": embedding_monitor,
+        "monitor_effective_architecture": monitor_effective_architecture,
+        "lookback_steps": int(torch_metadata["lookback_steps"]),
+        "feature_count": int(torch_metadata["feature_count"]),
+        "base_feature_cols": list(torch_metadata["base_feature_cols"]),
+        "augmented_feature_cols": list(torch_metadata["augmented_feature_cols"]),
+        "temporal_labels": list(torch_metadata["temporal_labels"]),
+        "attention_summary_reference": attention_summary_reference,
         "decision_threshold": float(threshold_info["threshold"]),
         "threshold_info": threshold_info,
         "base_threshold": float(threshold_info["threshold"]),
@@ -1080,7 +1587,7 @@ def _train_torch_mlp(
     }
 
 
-def _predict_torch_mlp(artifact: Dict[str, Any], X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _predict_torch_model_details(artifact: Dict[str, Any], X: np.ndarray) -> Dict[str, Any]:
     _ensure_torch_available()
     model = artifact["model"]
     imputer = artifact["imputer"]
@@ -1092,10 +1599,32 @@ def _predict_torch_mlp(artifact: Dict[str, Any], X: np.ndarray) -> Tuple[np.ndar
     model.eval()
     with torch.no_grad():
         tensor = torch.tensor(X_scaled, dtype=torch.float32, device=device)
-        logits, embeddings = model.forward_with_embeddings(tensor)
+        outputs = model.forward_with_embeddings(tensor)
+        if len(outputs) == 3:
+            logits, embeddings, attention_payload = outputs
+        else:
+            logits, embeddings = outputs
+            attention_payload = {}
         probs = torch.sigmoid(logits).cpu().numpy()
         emb = embeddings.cpu().numpy()
-    return probs.astype(float), emb.astype(float)
+    attention_summary = _summarize_attention_payload(
+        attention_payload,
+        feature_labels=list(artifact.get("augmented_feature_cols") or []),
+        temporal_labels=list(
+            artifact.get("temporal_labels")
+            or _time_step_labels(int(artifact.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"])))
+        ),
+    )
+    return {
+        "probs": probs.astype(float),
+        "embeddings": emb.astype(float),
+        "attention_summary": attention_summary,
+    }
+
+
+def _predict_torch_mlp(artifact: Dict[str, Any], X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    details = _predict_torch_model_details(artifact, X)
+    return details["probs"], details["embeddings"]
 
 
 def _train_xgboost_model(
@@ -1148,6 +1677,7 @@ def _train_xgboost_model(
         "imputer": imputer,
         "calibrator": calibrator,
         "reference": reference,
+        "monitor_effective_architecture": "not_available",
         "decision_threshold": float(threshold_info["threshold"]),
         "threshold_info": threshold_info,
         "base_threshold": float(threshold_info["threshold"]),
@@ -1172,6 +1702,18 @@ def _predict_with_artifact(artifact: Dict[str, Any], X: np.ndarray) -> Tuple[np.
     return probs, np.empty((len(probs), 0), dtype=float)
 
 
+def _predict_with_artifact_details(artifact: Dict[str, Any], X: np.ndarray) -> Dict[str, Any]:
+    kind = str(artifact.get("kind"))
+    if kind == "torch_mlp":
+        return _predict_torch_model_details(artifact, X)
+    probs, _ = _predict_xgboost(artifact, X)
+    return {
+        "probs": probs,
+        "embeddings": np.empty((len(probs), 0), dtype=float),
+        "attention_summary": None,
+    }
+
+
 def _train_model_artifact(
     model_name: str,
     X_train: np.ndarray,
@@ -1180,9 +1722,18 @@ def _train_model_artifact(
     y_val: np.ndarray,
     *,
     config: Dict[str, Any],
+    feature_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    if str(model_name) == MODEL_TORCH_MLP:
-        return _train_torch_mlp(X_train, y_train, X_val, y_val, config=config)
+    if _is_torch_model(str(model_name)):
+        return _train_torch_mlp(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            config=config,
+            model_name=str(model_name),
+            feature_metadata=feature_metadata,
+        )
     if str(model_name) == MODEL_XGBOOST:
         return _train_xgboost_model(X_train, y_train, X_val, y_val, config=config)
     raise ValueError(f"Unsupported model: {model_name}")
@@ -1197,11 +1748,48 @@ def _fit_embedding_monitor(
     emb = np.asarray(embeddings, dtype=float)
     if emb.ndim == 1:
         emb = emb.reshape(-1, 1)
-    if emb.size == 0 or emb.shape[0] < 8 or emb.shape[1] < 2:
+    if emb.size == 0 or emb.shape[1] < 2:
         return None, None
 
+    requested_architecture = _resolve_drift_monitor_architecture(
+        config.get("drift_monitor_architecture", DEFAULT_CONFIG["drift_monitor_architecture"])
+    )
+    requested_sequence_length = max(
+        2,
+        int(config.get("drift_monitor_sequence_length", DEFAULT_CONFIG["drift_monitor_sequence_length"])),
+    )
+
+    if requested_architecture == DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION:
+        monitor, reconstruction_errors = _fit_temporal_attention_embedding_monitor(
+            emb,
+            config=config,
+            sequence_length=requested_sequence_length,
+        )
+        if monitor is not None:
+            monitor["requested_architecture"] = requested_architecture
+            monitor["monitor_effective_architecture"] = DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION
+            return monitor, reconstruction_errors
+
+    if emb.shape[0] < 8:
+        return None, None
+
+    monitor, reconstruction_errors = _fit_classic_embedding_monitor(emb, config=config)
+    if monitor is None:
+        return None, None
+    monitor["requested_architecture"] = requested_architecture
+    monitor["monitor_effective_architecture"] = DRIFT_MONITOR_ARCH_CLASSIC_AE
+    if requested_architecture == DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION:
+        monitor["fallback_reason"] = "insufficient_embeddings_for_temporal_attention"
+    return monitor, reconstruction_errors
+
+
+def _fit_classic_embedding_monitor(
+    embeddings: np.ndarray,
+    *,
+    config: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[np.ndarray]]:
     scaler = StandardScaler()
-    emb_scaled = scaler.fit_transform(emb)
+    emb_scaled = scaler.fit_transform(embeddings)
     input_dim = int(emb_scaled.shape[1])
     bottleneck_dim = max(
         2,
@@ -1272,6 +1860,7 @@ def _fit_embedding_monitor(
     model.load_state_dict(best_state)
     reconstruction_errors = _predict_embedding_monitor(
         {
+            "kind": DRIFT_MONITOR_ARCH_CLASSIC_AE,
             "model": model,
             "scaler": scaler,
             "input_dim": input_dim,
@@ -1279,10 +1868,11 @@ def _fit_embedding_monitor(
             "bottleneck_dim": bottleneck_dim,
             "dropout": dropout,
         },
-        emb,
+        embeddings,
     )
     return (
         {
+            "kind": DRIFT_MONITOR_ARCH_CLASSIC_AE,
             "model": model,
             "scaler": scaler,
             "input_dim": input_dim,
@@ -1294,24 +1884,262 @@ def _fit_embedding_monitor(
     )
 
 
-def _predict_embedding_monitor(monitor: Dict[str, Any], embeddings: np.ndarray) -> np.ndarray:
+def _fit_temporal_attention_embedding_monitor(
+    embeddings: np.ndarray,
+    *,
+    config: Dict[str, Any],
+    sequence_length: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[np.ndarray]]:
+    _ensure_torch_available()
+    emb = np.asarray(embeddings, dtype=float)
+    if emb.ndim == 1:
+        emb = emb.reshape(-1, 1)
+
+    scaler = StandardScaler()
+    emb_scaled = scaler.fit_transform(emb)
+    X_seq, y_target, target_indices = _build_embedding_monitor_sequences(
+        emb_scaled,
+        sequence_length=sequence_length,
+        stride=1,
+    )
+    if len(target_indices) < 8:
+        return None, None
+
+    val_count = max(1, int(math.ceil(len(target_indices) * 0.2)))
+    val_start = max(1, len(target_indices) - val_count)
+    X_train = X_seq[:val_start]
+    y_train = y_target[:val_start]
+    X_val = X_seq[val_start:]
+    y_val = y_target[val_start:]
+    if len(X_train) == 0 or len(X_val) == 0:
+        return None, None
+
+    input_dim = int(emb_scaled.shape[1])
+    bottleneck_dim = max(
+        2,
+        min(
+            int(config.get("drift_monitor_bottleneck_dim", DEFAULT_CONFIG["drift_monitor_bottleneck_dim"])),
+            max(2, input_dim - 1),
+        ),
+    )
+    hidden_dim = max(
+        bottleneck_dim + 1,
+        int(config.get("drift_monitor_hidden_dim", DEFAULT_CONFIG["drift_monitor_hidden_dim"])),
+    )
+    attention_hidden_dim = max(
+        4,
+        int(
+            config.get(
+                "drift_monitor_attention_hidden_dim",
+                DEFAULT_CONFIG["drift_monitor_attention_hidden_dim"],
+            )
+        ),
+    )
+    dropout = float(
+        config.get("drift_monitor_attention_dropout", DEFAULT_CONFIG["drift_monitor_attention_dropout"])
+    )
+    batch_size = max(8, int(config.get("drift_monitor_batch_size", DEFAULT_CONFIG["drift_monitor_batch_size"])))
+    max_epochs = max(2, int(config.get("drift_monitor_epochs", DEFAULT_CONFIG["drift_monitor_epochs"])))
+    learning_rate = float(config.get("drift_monitor_learning_rate", DEFAULT_CONFIG["drift_monitor_learning_rate"]))
+
+    device = torch.device("cpu")
+    model = TemporalAttentionEmbeddingMonitor(
+        input_dim=input_dim,
+        attention_hidden_dim=attention_hidden_dim,
+        bottleneck_dim=bottleneck_dim,
+        hidden_dim=hidden_dim,
+        sequence_length=sequence_length,
+        dropout=dropout,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+
+    train_loader = DataLoader(
+        TensorDataset(
+            torch.tensor(X_train, dtype=torch.float32),
+            torch.tensor(y_train, dtype=torch.float32),
+        ),
+        batch_size=batch_size,
+        shuffle=True,
+    )
+    X_val_tensor = torch.tensor(X_val, dtype=torch.float32, device=device)
+    y_val_tensor = torch.tensor(y_val, dtype=torch.float32, device=device)
+
+    best_state = copy.deepcopy(model.state_dict())
+    best_loss = float("inf")
+    patience = 3
+    stale_epochs = 0
+    for _epoch in range(max_epochs):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+            optimizer.zero_grad()
+            reconstruction, _attention_weights = model(X_batch)
+            loss = criterion(reconstruction, y_batch)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_reconstruction, _val_attention = model(X_val_tensor)
+            val_loss = float(criterion(val_reconstruction, y_val_tensor).item())
+        if val_loss + 1e-6 < best_loss:
+            best_loss = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+            if stale_epochs >= patience:
+                break
+
+    model.load_state_dict(best_state)
+    full_details = _predict_embedding_monitor_details(
+        {
+            "kind": DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+            "model": model,
+            "scaler": scaler,
+            "input_dim": input_dim,
+            "hidden_dim": hidden_dim,
+            "bottleneck_dim": bottleneck_dim,
+            "dropout": dropout,
+            "sequence_length": int(sequence_length),
+            "attention_hidden_dim": attention_hidden_dim,
+        },
+        embeddings=emb,
+        recent_embeddings=emb,
+        use_internal_sequences=True,
+    )
+    if full_details.get("reconstruction_error") is None:
+        return None, None
+    return (
+        {
+            "kind": DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
+            "model": model,
+            "scaler": scaler,
+            "input_dim": input_dim,
+            "hidden_dim": hidden_dim,
+            "bottleneck_dim": bottleneck_dim,
+            "dropout": dropout,
+            "sequence_length": int(sequence_length),
+            "attention_hidden_dim": attention_hidden_dim,
+            "attention_reference_summary": full_details.get("attention_summary"),
+        },
+        _as_float_array(full_details.get("reconstruction_error")),
+    )
+
+
+def _predict_embedding_monitor_details(
+    monitor: Dict[str, Any],
+    *,
+    embeddings: np.ndarray,
+    recent_embeddings: Optional[np.ndarray] = None,
+    use_internal_sequences: bool = False,
+) -> Dict[str, Any]:
     _ensure_torch_available()
     emb = np.asarray(embeddings, dtype=float)
     if emb.ndim == 1:
         emb = emb.reshape(1, -1)
     if emb.size == 0:
-        return np.asarray([], dtype=float)
+        return {
+            "reconstruction_error": None,
+            "attention_summary": None,
+            "warmup": True,
+        }
 
     scaler = monitor["scaler"]
     model = monitor["model"]
+    kind = str(monitor.get("kind") or DRIFT_MONITOR_ARCH_CLASSIC_AE)
     emb_scaled = scaler.transform(emb)
     device = torch.device("cpu")
     model.eval()
+    if kind == DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION:
+        sequence_length = int(monitor.get("sequence_length", DEFAULT_CONFIG["drift_monitor_sequence_length"]))
+        if use_internal_sequences:
+            history = np.asarray(recent_embeddings if recent_embeddings is not None else embeddings, dtype=float)
+            if history.ndim == 1:
+                history = history.reshape(1, -1)
+            history_scaled = scaler.transform(history)
+            X_seq, y_target, _ = _build_embedding_monitor_sequences(
+                history_scaled,
+                sequence_length=sequence_length,
+                stride=1,
+            )
+            if len(X_seq) == 0:
+                return {
+                    "reconstruction_error": None,
+                    "attention_summary": None,
+                    "warmup": True,
+                }
+            with torch.no_grad():
+                tensor = torch.tensor(X_seq, dtype=torch.float32, device=device)
+                target_tensor = torch.tensor(y_target, dtype=torch.float32, device=device)
+                reconstruction, attention_weights = model(tensor)
+                reconstruction_np = reconstruction.cpu().numpy()
+                target_np = target_tensor.cpu().numpy()
+                attention_np = attention_weights.cpu().numpy()
+            reconstruction_error = np.mean(np.square(reconstruction_np - target_np), axis=1)
+            attention_summary = _summarize_monitor_attention_weights(
+                attention_np,
+                sequence_length=sequence_length,
+            )
+            return {
+                "reconstruction_error": reconstruction_error.astype(float),
+                "attention_summary": attention_summary,
+                "warmup": False,
+            }
+
+        history = np.asarray(recent_embeddings if recent_embeddings is not None else np.empty((0, emb.shape[1])), dtype=float)
+        if history.ndim == 1:
+            history = history.reshape(1, -1)
+        if history.shape[0] < sequence_length:
+            return {
+                "reconstruction_error": None,
+                "attention_summary": None,
+                "warmup": True,
+            }
+        history_scaled = scaler.transform(history[-sequence_length:])
+        with torch.no_grad():
+            tensor = torch.tensor(history_scaled.reshape(1, sequence_length, -1), dtype=torch.float32, device=device)
+            reconstruction, attention_weights = model(tensor)
+            reconstruction_np = reconstruction.cpu().numpy()
+            attention_np = attention_weights.cpu().numpy()
+        reconstruction_error = np.mean(np.square(reconstruction_np - emb_scaled), axis=1)
+        attention_summary = _summarize_monitor_attention_weights(
+            attention_np,
+            sequence_length=sequence_length,
+        )
+        return {
+            "reconstruction_error": reconstruction_error.astype(float),
+            "attention_summary": attention_summary,
+            "warmup": False,
+        }
+
     with torch.no_grad():
         tensor = torch.tensor(emb_scaled, dtype=torch.float32, device=device)
         reconstruction = model(tensor).cpu().numpy()
     reconstruction_error = np.mean(np.square(reconstruction - emb_scaled), axis=1)
-    return reconstruction_error.astype(float)
+    return {
+        "reconstruction_error": reconstruction_error.astype(float),
+        "attention_summary": None,
+        "warmup": False,
+    }
+
+
+def _predict_embedding_monitor(
+    monitor: Dict[str, Any],
+    embeddings: np.ndarray,
+    recent_embeddings: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    details = _predict_embedding_monitor_details(
+        monitor,
+        embeddings=embeddings,
+        recent_embeddings=recent_embeddings,
+    )
+    reconstruction_error = details.get("reconstruction_error")
+    if reconstruction_error is None:
+        return np.asarray([], dtype=float)
+    return _as_float_array(reconstruction_error)
 
 
 def _build_reference_stats(
@@ -1365,7 +2193,9 @@ def _refresh_reference_from_recent(
     *,
     config: Dict[str, Any],
 ) -> None:
-    raw_scores, embeddings = _predict_with_artifact(artifact, recent_X)
+    prediction_details = _predict_with_artifact_details(artifact, recent_X)
+    raw_scores = prediction_details["probs"]
+    embeddings = prediction_details["embeddings"]
     calibrated_scores = _apply_calibrator(raw_scores, artifact.get("calibrator"))
     X_ref = _apply_imputer(recent_X, artifact["imputer"])
     monitor = artifact.get("embedding_monitor")
@@ -1373,6 +2203,10 @@ def _refresh_reference_from_recent(
     if embeddings.size > 0:
         monitor, reconstruction_errors = _fit_embedding_monitor(embeddings, config=config)
         artifact["embedding_monitor"] = monitor
+        if monitor is not None:
+            artifact["monitor_effective_architecture"] = str(
+                monitor.get("monitor_effective_architecture", monitor.get("kind", "none"))
+            )
     artifact["reference"] = _build_reference_stats(
         X_ref=X_ref,
         y_ref=recent_y,
@@ -1380,6 +2214,7 @@ def _refresh_reference_from_recent(
         embeddings=embeddings if embeddings.size else None,
         reconstruction_errors=reconstruction_errors,
     )
+    artifact["attention_summary_reference"] = prediction_details.get("attention_summary")
 
 
 def _normalize_score(value: float, mean: float, std: float) -> float:
@@ -1425,16 +2260,22 @@ def _build_channel_scores(
     calibrated_score: float,
     y_true: int,
     embeddings: np.ndarray,
+    recent_embedding_history: Optional[np.ndarray],
     selected_channels: Sequence[str],
     detectors: Dict[str, ClassicDriftDetector],
     channel_histories: Optional[Dict[str, List[float]]] = None,
     recent_window_size: int = 96,
     embedding_reconstruction_weight: float = 0.65,
+    point_signal_weight: float = 1.0,
 ) -> Dict[str, Any]:
     reference = dict(artifact.get("reference") or {})
     available_scores: Dict[str, float] = {}
     detector_flags: Dict[str, bool] = {}
     raw_channel_values: Dict[str, float] = {}
+    point_weight = float(np.clip(point_signal_weight, 0.0, 1.0))
+    detector_attention_summary: Optional[Dict[str, Any]] = None
+    monitor_warmup = False
+    monitor_effective_architecture = str(artifact.get("monitor_effective_architecture", "none"))
 
     history_limit = max(8, int(recent_window_size))
 
@@ -1453,12 +2294,19 @@ def _build_channel_scores(
         input_value = float(np.mean(np.abs((x_row - feature_mean) / np.maximum(feature_std, 1e-6))))
         raw_channel_values[DRIFT_INPUT] = input_value
         input_window_value = _window_stat(DRIFT_INPUT, input_value)
-        input_score = _normalize_score(
+        input_point_score = _normalize_score(
+            input_value,
+            float(reference.get("input_stat_mean", 0.0)),
+            float(reference.get("input_stat_std", 1.0)),
+        )
+        input_window_score = _normalize_score(
             input_window_value,
             float(reference.get("input_stat_mean", 0.0)),
             float(reference.get("input_stat_std", 1.0)),
         )
         input_drift = detectors[DRIFT_INPUT].update(input_value)
+        input_peak_score = float(max(input_point_score, input_window_score))
+        input_score = float((1.0 - point_weight) * input_window_score + point_weight * input_peak_score)
         available_scores[DRIFT_INPUT] = float(max(input_score, 1.0 if input_drift else 0.0))
         detector_flags[DRIFT_INPUT] = bool(input_drift)
 
@@ -1466,12 +2314,19 @@ def _build_channel_scores(
         score_value = float(calibrated_score)
         raw_channel_values[DRIFT_SCORE] = score_value
         score_window_value = _window_stat(DRIFT_SCORE, score_value)
-        score_score = _normalize_score(
+        score_point_score = _normalize_score(
+            score_value,
+            float(reference.get("score_mean", 0.5)),
+            float(reference.get("score_std", 0.15)),
+        )
+        score_window_score = _normalize_score(
             score_window_value,
             float(reference.get("score_mean", 0.5)),
             float(reference.get("score_std", 0.15)),
         )
         score_drift = detectors[DRIFT_SCORE].update(score_value)
+        score_peak_score = float(max(score_point_score, score_window_score))
+        score_score = float((1.0 - point_weight) * score_window_score + point_weight * score_peak_score)
         available_scores[DRIFT_SCORE] = float(max(score_score, 1.0 if score_drift else 0.0))
         detector_flags[DRIFT_SCORE] = bool(score_drift)
 
@@ -1479,12 +2334,19 @@ def _build_channel_scores(
         error_value = float((float(calibrated_score) - int(y_true)) ** 2)
         raw_channel_values[DRIFT_ERROR] = error_value
         error_window_value = _window_stat(DRIFT_ERROR, error_value)
-        error_score = _normalize_score(
+        error_point_score = _normalize_score(
+            error_value,
+            float(reference.get("error_mean", 0.0)),
+            float(reference.get("error_std", 0.1)),
+        )
+        error_window_score = _normalize_score(
             error_window_value,
             float(reference.get("error_mean", 0.0)),
             float(reference.get("error_std", 0.1)),
         )
         error_drift = detectors[DRIFT_ERROR].update(error_value)
+        error_peak_score = float(max(error_point_score, error_window_score))
+        error_score = float((1.0 - point_weight) * error_window_score + point_weight * error_peak_score)
         available_scores[DRIFT_ERROR] = float(max(error_score, 1.0 if error_drift else 0.0))
         detector_flags[DRIFT_ERROR] = bool(error_drift)
 
@@ -1494,33 +2356,59 @@ def _build_channel_scores(
         raw_channel_values["embedding_distance"] = embedding_distance
 
         distance_window_value = _window_stat("embedding_distance", embedding_distance)
-        distance_score = _normalize_score(
+        distance_point_score = _normalize_score(
+            embedding_distance,
+            float(reference.get("embedding_distance_mean", 0.0)),
+            float(reference.get("embedding_distance_std", 0.1)),
+        )
+        distance_window_score = _normalize_score(
             distance_window_value,
             float(reference.get("embedding_distance_mean", 0.0)),
             float(reference.get("embedding_distance_std", 0.1)),
         )
 
-        component_scores = [distance_score]
-        weighted_sum = (1.0 - float(np.clip(embedding_reconstruction_weight, 0.0, 1.0))) * distance_score
-        weight_total = (1.0 - float(np.clip(embedding_reconstruction_weight, 0.0, 1.0)))
+        component_scores = [distance_point_score, distance_window_score]
+        recon_weight = float(np.clip(embedding_reconstruction_weight, 0.0, 1.0))
+        point_weighted_sum = (1.0 - recon_weight) * distance_point_score
+        window_weighted_sum = (1.0 - recon_weight) * distance_window_score
+        weight_total = (1.0 - recon_weight)
 
         monitor = artifact.get("embedding_monitor")
-        reconstruction_score = None
         if monitor is not None:
-            reconstruction_error = float(_predict_embedding_monitor(monitor, embeddings.reshape(1, -1))[0])
-            raw_channel_values["embedding_reconstruction_error"] = reconstruction_error
-            reconstruction_window_value = _window_stat("embedding_reconstruction_error", reconstruction_error)
-            reconstruction_score = _normalize_score(
-                reconstruction_window_value,
-                float(reference.get("embedding_reconstruction_mean", 0.0)),
-                float(reference.get("embedding_reconstruction_std", 0.1)),
+            monitor_details = _predict_embedding_monitor_details(
+                monitor,
+                embeddings=embeddings.reshape(1, -1),
+                recent_embeddings=recent_embedding_history,
             )
-            component_scores.append(reconstruction_score)
-            recon_weight = float(np.clip(embedding_reconstruction_weight, 0.0, 1.0))
-            weighted_sum += recon_weight * reconstruction_score
-            weight_total += recon_weight
+            detector_attention_summary = monitor_details.get("attention_summary")
+            monitor_warmup = bool(monitor_details.get("warmup", False))
+            monitor_effective_architecture = str(
+                monitor.get("monitor_effective_architecture", monitor.get("kind", monitor_effective_architecture))
+            )
+            reconstruction_values = _as_float_array(monitor_details.get("reconstruction_error"))
+            if reconstruction_values.size > 0:
+                reconstruction_error = float(reconstruction_values[0])
+                raw_channel_values["embedding_reconstruction_error"] = reconstruction_error
+                reconstruction_window_value = _window_stat("embedding_reconstruction_error", reconstruction_error)
+                reconstruction_point_score = _normalize_score(
+                    reconstruction_error,
+                    float(reference.get("embedding_reconstruction_mean", 0.0)),
+                    float(reference.get("embedding_reconstruction_std", 0.1)),
+                )
+                reconstruction_window_score = _normalize_score(
+                    reconstruction_window_value,
+                    float(reference.get("embedding_reconstruction_mean", 0.0)),
+                    float(reference.get("embedding_reconstruction_std", 0.1)),
+                )
+                component_scores.extend([reconstruction_point_score, reconstruction_window_score])
+                point_weighted_sum += recon_weight * reconstruction_point_score
+                window_weighted_sum += recon_weight * reconstruction_window_score
+                weight_total += recon_weight
 
-        embedding_score = float(weighted_sum / max(weight_total, 1e-6))
+        embedding_point_score = float(point_weighted_sum / max(weight_total, 1e-6))
+        embedding_window_score = float(window_weighted_sum / max(weight_total, 1e-6))
+        embedding_peak_score = float(max(embedding_point_score, embedding_window_score))
+        embedding_score = float((1.0 - point_weight) * embedding_window_score + point_weight * embedding_peak_score)
         raw_channel_values[DRIFT_EMBEDDING] = float(
             raw_channel_values.get("embedding_reconstruction_error", embedding_distance)
         )
@@ -1539,6 +2427,9 @@ def _build_channel_scores(
         "severity_score": severity,
         "max_channel_score": max_channel_score,
         "severity_label": _severity_label(severity),
+        "detector_attention_summary": detector_attention_summary,
+        "monitor_warmup": bool(monitor_warmup),
+        "monitor_effective_architecture": monitor_effective_architecture,
     }
 
 
@@ -1577,6 +2468,13 @@ def _fine_tune_artifact(
         X_val,
         y_val,
         config=config,
+        model_name=str(artifact.get("model_name", MODEL_TORCH_MLP)),
+        feature_metadata={
+            "lookback_steps": artifact.get("lookback_steps"),
+            "feature_count": artifact.get("feature_count"),
+            "base_feature_cols": artifact.get("base_feature_cols"),
+            "augmented_feature_cols": artifact.get("augmented_feature_cols"),
+        },
         learning_rate=float(config.get("fine_tune_learning_rate", DEFAULT_CONFIG["fine_tune_learning_rate"])),
         epochs=int(config.get("fine_tune_epochs", DEFAULT_CONFIG["fine_tune_epochs"])),
         base_model_state=artifact.get("base_model_state"),
@@ -1606,6 +2504,12 @@ def _retrain_artifact(
         X_val,
         y_val,
         config=config,
+        feature_metadata={
+            "lookback_steps": artifact.get("lookback_steps"),
+            "feature_count": artifact.get("feature_count"),
+            "base_feature_cols": artifact.get("base_feature_cols"),
+            "augmented_feature_cols": artifact.get("augmented_feature_cols"),
+        },
     )
     _refresh_reference_from_recent(retrained, recent_X, recent_y, config=config)
     return retrained
@@ -1683,9 +2587,203 @@ def _summary_from_stream(stream_df: pd.DataFrame, drift_events: pd.DataFrame) ->
                 "max_trigger_score": float(group["max_channel_score"].max()) if "max_channel_score" in group.columns else float("nan"),
                 "decision_threshold_last": threshold_value,
                 "decision_threshold_mean": float(group["decision_threshold"].mean()) if "decision_threshold" in group.columns else float("nan"),
+                "monitor_effective_architecture": str(group["monitor_effective_architecture"].iloc[-1]) if "monitor_effective_architecture" in group.columns else "none",
+                "monitor_warmup_rows": int(group["monitor_warmup"].sum()) if "monitor_warmup" in group.columns else 0,
             }
         )
     return pd.DataFrame(rows).sort_values(["model", "strategy"]).reset_index(drop=True)
+
+
+def _build_attention_outputs(attention_rows: Sequence[Dict[str, Any]]) -> Dict[str, pd.DataFrame]:
+    feature_acc: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+    temporal_acc: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+    drift_acc: Dict[Tuple[str, str, str, str], Dict[str, float]] = {}
+
+    for row in attention_rows:
+        feature_values = _as_float_array(row.get("feature_attention_mean"))
+        temporal_values = _as_float_array(row.get("temporal_attention_mean"))
+        feature_labels = list(row.get("feature_labels") or [])
+        temporal_labels = list(row.get("temporal_labels") or [])
+        ref_feature_values = _as_float_array(row.get("reference_feature_attention_mean"))
+        ref_temporal_values = _as_float_array(row.get("reference_temporal_attention_mean"))
+        is_drift_event = bool(row.get("is_drift_event"))
+        model_name = str(row.get("model"))
+        strategy = str(row.get("strategy"))
+
+        for label, value in zip(feature_labels, feature_values):
+            key = (model_name, strategy, str(label))
+            acc = feature_acc.setdefault(key, {"sum": 0.0, "count": 0.0, "drift_rows": 0.0})
+            acc["sum"] += float(value)
+            acc["count"] += 1.0
+            if is_drift_event:
+                acc["drift_rows"] += 1.0
+
+        for label, value in zip(temporal_labels, temporal_values):
+            key = (model_name, strategy, str(label))
+            acc = temporal_acc.setdefault(key, {"sum": 0.0, "count": 0.0, "drift_rows": 0.0})
+            acc["sum"] += float(value)
+            acc["count"] += 1.0
+            if is_drift_event:
+                acc["drift_rows"] += 1.0
+
+        if not is_drift_event:
+            continue
+
+        for label, value, ref_value in zip(feature_labels, feature_values, ref_feature_values):
+            key = (model_name, strategy, "feature", str(label))
+            acc = drift_acc.setdefault(key, {"attention_sum": 0.0, "reference_sum": 0.0, "count": 0.0})
+            acc["attention_sum"] += float(value)
+            acc["reference_sum"] += float(ref_value)
+            acc["count"] += 1.0
+
+        for label, value, ref_value in zip(temporal_labels, temporal_values, ref_temporal_values):
+            key = (model_name, strategy, "time", str(label))
+            acc = drift_acc.setdefault(key, {"attention_sum": 0.0, "reference_sum": 0.0, "count": 0.0})
+            acc["attention_sum"] += float(value)
+            acc["reference_sum"] += float(ref_value)
+            acc["count"] += 1.0
+
+    feature_rows = [
+        {
+            "model": model_name,
+            "strategy": strategy,
+            "feature": label,
+            "attention_mean": float(acc["sum"] / max(acc["count"], 1.0)),
+            "n_rows": int(acc["count"]),
+            "drift_event_rows": int(acc["drift_rows"]),
+        }
+        for (model_name, strategy, label), acc in feature_acc.items()
+    ]
+    temporal_rows = [
+        {
+            "model": model_name,
+            "strategy": strategy,
+            "time_step": label,
+            "attention_mean": float(acc["sum"] / max(acc["count"], 1.0)),
+            "n_rows": int(acc["count"]),
+            "drift_event_rows": int(acc["drift_rows"]),
+        }
+        for (model_name, strategy, label), acc in temporal_acc.items()
+    ]
+    drift_rows = [
+        {
+            "model": model_name,
+            "strategy": strategy,
+            "scope": scope,
+            "item": label,
+            "reference_attention": float(acc["reference_sum"] / max(acc["count"], 1.0)),
+            "drift_attention_mean": float(acc["attention_sum"] / max(acc["count"], 1.0)),
+            "delta_attention": float((acc["attention_sum"] - acc["reference_sum"]) / max(acc["count"], 1.0)),
+            "abs_delta_attention": float(
+                abs((acc["attention_sum"] - acc["reference_sum"]) / max(acc["count"], 1.0))
+            ),
+            "n_drift_rows": int(acc["count"]),
+        }
+        for (model_name, strategy, scope, label), acc in drift_acc.items()
+    ]
+
+    feature_df = pd.DataFrame(feature_rows)
+    if not feature_df.empty:
+        feature_df = feature_df.sort_values(
+            ["model", "strategy", "attention_mean", "feature"],
+            ascending=[True, True, False, True],
+        ).reset_index(drop=True)
+
+    temporal_df = pd.DataFrame(temporal_rows)
+    if not temporal_df.empty:
+        temporal_df = temporal_df.sort_values(
+            ["model", "strategy", "attention_mean", "time_step"],
+            ascending=[True, True, False, True],
+        ).reset_index(drop=True)
+
+    drift_df = pd.DataFrame(drift_rows)
+    if not drift_df.empty:
+        drift_df = drift_df.sort_values(
+            ["model", "strategy", "scope", "abs_delta_attention", "item"],
+            ascending=[True, True, True, False, True],
+        ).reset_index(drop=True)
+
+    return {
+        "attention_feature_summary": feature_df,
+        "attention_temporal_summary": temporal_df,
+        "attention_drift_shift_summary": drift_df,
+    }
+
+
+def _build_detector_attention_outputs(detector_attention_rows: Sequence[Dict[str, Any]]) -> Dict[str, pd.DataFrame]:
+    temporal_acc: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+    drift_acc: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+
+    for row in detector_attention_rows:
+        temporal_values = _as_float_array(row.get("temporal_attention_mean"))
+        temporal_labels = list(row.get("temporal_labels") or [])
+        reference_values = _as_float_array(row.get("reference_temporal_attention_mean"))
+        model_name = str(row.get("model"))
+        strategy = str(row.get("strategy"))
+        is_drift_event = bool(row.get("is_drift_event"))
+
+        for label, value in zip(temporal_labels, temporal_values):
+            key = (model_name, strategy, str(label))
+            acc = temporal_acc.setdefault(key, {"sum": 0.0, "count": 0.0, "drift_rows": 0.0})
+            acc["sum"] += float(value)
+            acc["count"] += 1.0
+            if is_drift_event:
+                acc["drift_rows"] += 1.0
+
+        if not is_drift_event:
+            continue
+        for label, value, ref_value in zip(temporal_labels, temporal_values, reference_values):
+            key = (model_name, strategy, str(label))
+            acc = drift_acc.setdefault(key, {"attention_sum": 0.0, "reference_sum": 0.0, "count": 0.0})
+            acc["attention_sum"] += float(value)
+            acc["reference_sum"] += float(ref_value)
+            acc["count"] += 1.0
+
+    temporal_rows = [
+        {
+            "model": model_name,
+            "strategy": strategy,
+            "time_step": label,
+            "attention_mean": float(acc["sum"] / max(acc["count"], 1.0)),
+            "n_rows": int(acc["count"]),
+            "drift_event_rows": int(acc["drift_rows"]),
+        }
+        for (model_name, strategy, label), acc in temporal_acc.items()
+    ]
+    drift_rows = [
+        {
+            "model": model_name,
+            "strategy": strategy,
+            "time_step": label,
+            "reference_attention": float(acc["reference_sum"] / max(acc["count"], 1.0)),
+            "drift_attention_mean": float(acc["attention_sum"] / max(acc["count"], 1.0)),
+            "delta_attention": float((acc["attention_sum"] - acc["reference_sum"]) / max(acc["count"], 1.0)),
+            "abs_delta_attention": float(
+                abs((acc["attention_sum"] - acc["reference_sum"]) / max(acc["count"], 1.0))
+            ),
+            "n_drift_rows": int(acc["count"]),
+        }
+        for (model_name, strategy, label), acc in drift_acc.items()
+    ]
+
+    temporal_df = pd.DataFrame(temporal_rows)
+    if not temporal_df.empty:
+        temporal_df = temporal_df.sort_values(
+            ["model", "strategy", "attention_mean", "time_step"],
+            ascending=[True, True, False, True],
+        ).reset_index(drop=True)
+
+    drift_df = pd.DataFrame(drift_rows)
+    if not drift_df.empty:
+        drift_df = drift_df.sort_values(
+            ["model", "strategy", "abs_delta_attention", "time_step"],
+            ascending=[True, True, False, True],
+        ).reset_index(drop=True)
+
+    return {
+        "detector_attention_temporal_summary": temporal_df,
+        "detector_attention_drift_shift_summary": drift_df,
+    }
 
 
 def run_backtest_pipeline(
@@ -1695,6 +2793,10 @@ def run_backtest_pipeline(
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> Dict[str, Any]:
     df = _ensure_non_empty_dataframe(dataset_bundle.get("df"), label="Neural drift dataset")
+    df = _subset_dataset_by_percentage(
+        df,
+        dataset_percent=float(config.get("dataset_percent", DEFAULT_CONFIG["dataset_percent"])),
+    )
     feature_cols = list(dataset_bundle.get("feature_cols") or [])
     if not feature_cols:
         raise ValueError("Neural drift dataset has no feature columns.")
@@ -1723,6 +2825,14 @@ def run_backtest_pipeline(
     baseline_rows: List[Dict[str, Any]] = []
     stream_rows: List[Dict[str, Any]] = []
     drift_rows: List[Dict[str, Any]] = []
+    attention_rows: List[Dict[str, Any]] = []
+    detector_attention_rows: List[Dict[str, Any]] = []
+    feature_metadata = {
+        "lookback_steps": int(config.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"])),
+        "base_feature_cols": list(dataset.base_feature_cols),
+        "augmented_feature_cols": list(dataset.augmented_feature_cols),
+        "feature_count": int(len(dataset.augmented_feature_cols)),
+    }
 
     selected_models = [model for model in config.get("models", []) if model in AVAILABLE_MODELS]
     selected_strategies = [strategy for strategy in config.get("strategies", []) if strategy in AVAILABLE_STRATEGIES]
@@ -1747,8 +2857,11 @@ def run_backtest_pipeline(
             split["X_val"],
             split["y_val"],
             config=config,
+            feature_metadata=feature_metadata,
         )
-        baseline_raw_scores, baseline_embeddings = _predict_with_artifact(baseline_artifact, split["X_val"])
+        baseline_details = _predict_with_artifact_details(baseline_artifact, split["X_val"])
+        baseline_raw_scores = baseline_details["probs"]
+        baseline_embeddings = baseline_details["embeddings"]
         baseline_scores = _apply_calibrator(baseline_raw_scores, baseline_artifact.get("calibrator"))
         baseline_threshold = float(baseline_artifact.get("decision_threshold", baseline_artifact.get("base_threshold", 0.5)))
         baseline_preds = (baseline_scores >= baseline_threshold).astype(int)
@@ -1765,6 +2878,9 @@ def run_backtest_pipeline(
                 "rows": int(len(split["y_val"])),
                 **baseline_metrics,
                 "embedding_channels_available": bool(baseline_embeddings.size > 0),
+                "monitor_effective_architecture": str(
+                    baseline_artifact.get("monitor_effective_architecture", "not_available")
+                ),
             }
         )
 
@@ -1783,14 +2899,15 @@ def run_backtest_pipeline(
                 split["X_val"],
                 split["y_val"],
                 config=config,
+                feature_metadata=feature_metadata,
             )
             history_X = np.vstack([split["X_train"], split["X_val"]])
             history_y = np.concatenate([split["y_train"], split["y_val"]])
 
             detectors = {
-                DRIFT_INPUT: ClassicDriftDetector(),
-                DRIFT_SCORE: ClassicDriftDetector(),
-                DRIFT_ERROR: ClassicDriftDetector(),
+                DRIFT_INPUT: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+                DRIFT_SCORE: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+                DRIFT_ERROR: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
             }
             channel_histories: Dict[str, List[float]] = {
                 DRIFT_INPUT: [],
@@ -1798,22 +2915,35 @@ def run_backtest_pipeline(
                 DRIFT_ERROR: [],
                 DRIFT_EMBEDDING: [],
             }
+            embedding_buffer: List[np.ndarray] = []
 
             for idx in range(len(split["y_stream"])):
                 x_row = split["X_stream"][idx : idx + 1]
                 y_true = int(split["y_stream"][idx])
                 timestamp = pd.Timestamp(split["metadata_stream"].loc[idx, "prediction_time"])
 
-                raw_scores, embeddings = _predict_with_artifact(artifact, x_row)
+                prediction_details = _predict_with_artifact_details(artifact, x_row)
+                raw_scores = prediction_details["probs"]
+                embeddings = prediction_details["embeddings"]
+                attention_summary = prediction_details.get("attention_summary")
                 score = float(_apply_calibrator(raw_scores, artifact.get("calibrator"))[0])
                 decision_threshold = float(artifact.get("decision_threshold", artifact.get("base_threshold", 0.5)))
                 pred = int(score >= decision_threshold)
+                pre_action_reference_attention = dict(artifact.get("attention_summary_reference") or {})
+                pre_action_monitor = dict(artifact.get("embedding_monitor") or {})
+                detector_attention_reference = dict(pre_action_monitor.get("attention_reference_summary") or {})
+                recent_embedding_history = (
+                    np.vstack(embedding_buffer).astype(float)
+                    if embedding_buffer
+                    else np.empty((0, embeddings.shape[1] if embeddings.ndim == 2 and embeddings.shape[1] > 0 else 0), dtype=float)
+                )
                 channel_payload = _build_channel_scores(
                     artifact=artifact,
                     x_row=_apply_imputer(x_row, artifact["imputer"]).reshape(-1),
                     calibrated_score=score,
                     y_true=y_true,
                     embeddings=embeddings.reshape(-1),
+                    recent_embedding_history=recent_embedding_history,
                     selected_channels=selected_channels,
                     detectors=detectors,
                     channel_histories=channel_histories,
@@ -1824,11 +2954,19 @@ def run_backtest_pipeline(
                             DEFAULT_CONFIG["drift_monitor_reconstruction_weight"],
                         )
                     ),
+                    point_signal_weight=float(
+                        config.get(
+                            "drift_point_signal_weight",
+                            DEFAULT_CONFIG["drift_point_signal_weight"],
+                        )
+                    ),
                 )
 
                 severity_score = float(channel_payload["severity_score"])
                 max_channel_score = float(channel_payload.get("max_channel_score", severity_score))
                 action_taken = "none"
+                monitor_effective_architecture = str(channel_payload.get("monitor_effective_architecture", artifact.get("monitor_effective_architecture", "none")))
+                monitor_warmup = bool(channel_payload.get("monitor_warmup", False))
                 recent_start = max(0, idx - int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])) + 1)
                 recent_X = split["X_stream"][recent_start : idx + 1]
                 recent_y = split["y_stream"][recent_start : idx + 1]
@@ -1876,6 +3014,46 @@ def run_backtest_pipeline(
                             "action_taken": str(action_taken),
                             "recent_rows": int(len(recent_y)),
                             "recent_positive_rows": int(np.sum(recent_y)),
+                            "monitor_effective_architecture": monitor_effective_architecture,
+                            "monitor_warmup": bool(monitor_warmup),
+                        }
+                    )
+
+                if attention_summary is not None:
+                    attention_rows.append(
+                        {
+                            "timestamp": timestamp,
+                            "model": str(model_name),
+                            "strategy": str(strategy),
+                            "is_drift_event": bool(severity_triggered),
+                            "feature_labels": list(attention_summary.get("feature_labels") or []),
+                            "temporal_labels": list(attention_summary.get("temporal_labels") or []),
+                            "feature_attention_mean": _as_float_array(attention_summary.get("feature_attention_mean")),
+                            "temporal_attention_mean": _as_float_array(attention_summary.get("temporal_attention_mean")),
+                            "reference_feature_attention_mean": _as_float_array(
+                                pre_action_reference_attention.get("feature_attention_mean")
+                            ),
+                            "reference_temporal_attention_mean": _as_float_array(
+                                pre_action_reference_attention.get("temporal_attention_mean")
+                            ),
+                        }
+                    )
+
+                detector_attention_summary = channel_payload.get("detector_attention_summary")
+                if detector_attention_summary is not None:
+                    detector_attention_rows.append(
+                        {
+                            "timestamp": timestamp,
+                            "model": str(model_name),
+                            "strategy": str(strategy),
+                            "is_drift_event": bool(severity_triggered),
+                            "temporal_labels": list(detector_attention_summary.get("temporal_labels") or []),
+                            "temporal_attention_mean": _as_float_array(
+                                detector_attention_summary.get("temporal_attention_mean")
+                            ),
+                            "reference_temporal_attention_mean": _as_float_array(
+                                detector_attention_reference.get("temporal_attention_mean")
+                            ),
                         }
                     )
 
@@ -1893,8 +3071,13 @@ def run_backtest_pipeline(
                         "severity_label": str(channel_payload["severity_label"]),
                         "action_taken": str(action_taken),
                         "brier_component": float((score - y_true) ** 2),
+                        "monitor_effective_architecture": monitor_effective_architecture,
+                        "monitor_warmup": bool(monitor_warmup),
                     }
                 )
+
+                if embeddings.size > 0:
+                    embedding_buffer.append(np.asarray(embeddings.reshape(-1), dtype=float))
 
     baseline_df = pd.DataFrame(baseline_rows)
     if not baseline_df.empty:
@@ -1913,12 +3096,15 @@ def run_backtest_pipeline(
             "severity_score",
             "max_channel_score",
             "severity_label",
+            "decision_threshold",
             "channel_scores",
             "raw_channel_values",
             "detector_flags",
             "action_taken",
             "recent_rows",
             "recent_positive_rows",
+            "monitor_effective_architecture",
+            "monitor_warmup",
         ],
     )
     if not drift_df.empty:
@@ -1929,6 +3115,8 @@ def run_backtest_pipeline(
         stream_df,
         rolling_window=int(config.get("rolling_metric_window", DEFAULT_CONFIG["rolling_metric_window"])),
     )
+    attention_outputs = _build_attention_outputs(attention_rows)
+    detector_attention_outputs = _build_detector_attention_outputs(detector_attention_rows)
     return {
         "dataset": dataset,
         "split": split,
@@ -1937,12 +3125,25 @@ def run_backtest_pipeline(
         "stream_metrics": stream_df,
         "rolling_metrics": rolling_df,
         "drift_events": drift_df,
+        **attention_outputs,
+        **detector_attention_outputs,
     }
 
 
 def _download_bundle_from_results(results: Dict[str, Any]) -> Dict[str, str]:
     bundle: Dict[str, str] = {}
-    for key in ["baseline", "summary", "stream_metrics", "rolling_metrics", "drift_events"]:
+    for key in [
+        "baseline",
+        "summary",
+        "stream_metrics",
+        "rolling_metrics",
+        "drift_events",
+        "attention_feature_summary",
+        "attention_temporal_summary",
+        "attention_drift_shift_summary",
+        "detector_attention_temporal_summary",
+        "detector_attention_drift_shift_summary",
+    ]:
         df = results.get(key)
         if isinstance(df, pd.DataFrame) and not df.empty:
             bundle[key] = df.to_csv(index=False)
@@ -1986,18 +3187,17 @@ def generate_synthetic_neural_drift_dataset(
 
 
 def _estimate_network_shapes(dataset_bundle: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, int]:
+    lookback_steps = int(config.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"]))
     try:
         augmented_df, engineered_cols = augment_feature_frame(
             dataset_bundle["df"],
             dataset_bundle.get("feature_cols") or [],
         )
-        input_dim = int(len(engineered_cols) * int(config.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"])))
+        input_dim = int(len(engineered_cols) * lookback_steps)
         augmented_feature_count = int(len(engineered_cols))
         rows = int(len(augmented_df))
     except Exception:
-        input_dim = int(len(dataset_bundle.get("feature_cols") or [])) * int(
-            config.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"])
-        )
+        input_dim = int(len(dataset_bundle.get("feature_cols") or [])) * lookback_steps
         augmented_feature_count = int(len(dataset_bundle.get("feature_cols") or []))
         fallback_df = dataset_bundle.get("df")
         rows = int(len(fallback_df)) if isinstance(fallback_df, pd.DataFrame) else 0
@@ -2007,14 +3207,33 @@ def _estimate_network_shapes(dataset_bundle: Dict[str, Any], config: Dict[str, A
     monitor_bottleneck_dim = int(
         config.get("drift_monitor_bottleneck_dim", DEFAULT_CONFIG["drift_monitor_bottleneck_dim"])
     )
+    monitor_sequence_length = int(
+        config.get("drift_monitor_sequence_length", DEFAULT_CONFIG["drift_monitor_sequence_length"])
+    )
+    monitor_attention_hidden_dim = int(
+        config.get(
+            "drift_monitor_attention_hidden_dim",
+            DEFAULT_CONFIG["drift_monitor_attention_hidden_dim"],
+        )
+    )
     return {
         "rows": rows,
         "augmented_feature_count": augmented_feature_count,
         "predictor_input_dim": input_dim,
+        "predictor_time_steps": lookback_steps,
+        "predictor_feature_count": augmented_feature_count,
         "predictor_embedding_dim": embedding_dim,
+        "attention_feature_hidden_dim": int(
+            config.get("attention_feature_hidden_dim", DEFAULT_CONFIG["attention_feature_hidden_dim"])
+        ),
+        "attention_temporal_hidden_dim": int(
+            config.get("attention_temporal_hidden_dim", DEFAULT_CONFIG["attention_temporal_hidden_dim"])
+        ),
         "monitor_input_dim": embedding_dim,
         "monitor_hidden_dim": max(monitor_bottleneck_dim + 1, monitor_hidden_dim),
         "monitor_bottleneck_dim": max(2, min(monitor_bottleneck_dim, max(2, embedding_dim - 1))),
+        "monitor_sequence_length": monitor_sequence_length,
+        "monitor_attention_hidden_dim": monitor_attention_hidden_dim,
     }
 
 
@@ -2026,6 +3245,39 @@ def _build_monitor_architecture_explanation(
     mlp_hidden_dim = int(config.get("mlp_hidden_dim", DEFAULT_CONFIG["mlp_hidden_dim"]))
     mlp_second_hidden = max(2, mlp_hidden_dim // 2)
     distance_weight = 1.0 - float(reconstruction_weight)
+    predictor_time_steps = int(
+        shapes.get("predictor_time_steps", config.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"]))
+    )
+    predictor_feature_count = int(
+        shapes.get("predictor_feature_count", shapes.get("augmented_feature_count", 0))
+    )
+    attention_feature_hidden_dim = int(
+        shapes.get(
+            "attention_feature_hidden_dim",
+            config.get("attention_feature_hidden_dim", DEFAULT_CONFIG["attention_feature_hidden_dim"]),
+        )
+    )
+    attention_temporal_hidden_dim = int(
+        shapes.get(
+            "attention_temporal_hidden_dim",
+            config.get("attention_temporal_hidden_dim", DEFAULT_CONFIG["attention_temporal_hidden_dim"]),
+        )
+    )
+    monitor_sequence_length = int(
+        shapes.get(
+            "monitor_sequence_length",
+            config.get("drift_monitor_sequence_length", DEFAULT_CONFIG["drift_monitor_sequence_length"]),
+        )
+    )
+    monitor_attention_hidden_dim = int(
+        shapes.get(
+            "monitor_attention_hidden_dim",
+            config.get(
+                "drift_monitor_attention_hidden_dim",
+                DEFAULT_CONFIG["drift_monitor_attention_hidden_dim"],
+            ),
+        )
+    )
     return {
         "overview": (
             "La arquitectura actual muestra dos redes conectadas. La primera predice riesgo de accidente; "
@@ -2054,6 +3306,23 @@ def _build_monitor_architecture_explanation(
                 "Es la probabilidad final de accidente. Se usa para la prediccion operativa, pero no es la unica senal de drift."
             ),
         ],
+        "attention_steps": [
+            (
+                f"`window[{predictor_time_steps}, {predictor_feature_count}]`",
+                "Es la misma ventana del predictor, pero reordenada por tiempo y variables. Esto permite que la red "
+                "aprenda que no todas las variables ni todos los pasos temporales pesan igual al construir el embedding."
+            ),
+            (
+                f"`feature attention hidden[{attention_feature_hidden_dim}]`",
+                "Primero la red asigna pesos a las variables dentro de cada paso temporal. Si una feature recibe mas peso, "
+                "esa variable esta influyendo mas en la representacion latente usada para detectar drift."
+            ),
+            (
+                f"`temporal attention hidden[{attention_temporal_hidden_dim}]`",
+                "Luego la red pondera los distintos pasos del lookback. Esto le permite dar mas importancia a cambios recientes "
+                "o a una secuencia especifica de eventos, no solo a un promedio plano de la ventana."
+            ),
+        ],
         "monitor_steps": [
             (
                 f"`embedding[{shapes['monitor_input_dim']}]`",
@@ -2069,6 +3338,22 @@ def _build_monitor_architecture_explanation(
                 f"`reconstruction[{shapes['monitor_input_dim']}]`",
                 "La salida intenta reconstruir el embedding original. Cuando la reconstruccion empeora, significa que el patron "
                 "actual no se parece a lo que el monitor aprendio como normal."
+            ),
+        ],
+        "monitor_attention_steps": [
+            (
+                f"`sequence[{monitor_sequence_length}, embedding[{shapes['monitor_input_dim']}]]`",
+                "La variante con attention del detector no ve solo un embedding aislado. Usa una secuencia reciente de embeddings "
+                "para entender si el estado actual se puede explicar con el historial operativo inmediato."
+            ),
+            (
+                f"`temporal attention hidden[{monitor_attention_hidden_dim}]`",
+                "La red asigna pesos a los embeddings recientes y aprende que momentos del historial explican mejor el embedding actual."
+            ),
+            (
+                f"`context -> bottleneck[{shapes['monitor_bottleneck_dim']}] -> reconstruction[{shapes['monitor_input_dim']}]`",
+                "El contexto ponderado por attention se comprime y luego intenta reconstruir el embedding actual. Si esa reconstruccion falla, "
+                "el detector interpreta que el estado reciente ya no explica bien el comportamiento actual."
             ),
         ],
         "score_formula": (
@@ -2093,6 +3378,15 @@ def _build_monitor_architecture_explanation(
         ],
         "tuning_guidance": [
             (
+                "`Feature attention hidden dim`",
+                "Controla cuanta capacidad tiene la red para diferenciar variables relevantes dentro de cada paso temporal. "
+                "Si sube demasiado, puede volverse menos interpretable y mas costosa."
+            ),
+            (
+                "`Temporal attention hidden dim`",
+                "Controla cuanta capacidad tiene la red para distinguir que momentos de la ventana son mas importantes para el embedding."
+            ),
+            (
                 "`Monitor hidden dim`",
                 "Subirlo aumenta capacidad del monitor. Util si el embedding es complejo, pero si se exagera el autoencoder "
                 "reconstruira casi todo y perdera sensibilidad."
@@ -2109,6 +3403,18 @@ def _build_monitor_architecture_explanation(
                 "`Peso reconstruction error`",
                 "Si sube, el drift dependera mas de que el autoencoder falle al reconstruir. Si baja, pesara mas el desplazamiento "
                 "del embedding respecto al centroide historico."
+            ),
+            (
+                "`Top-k attention summary`",
+                "No cambia el entrenamiento. Solo define cuantos items se muestran en la UI al resumir variables y pasos temporales mas atendidos."
+            ),
+            (
+                "`Monitor sequence length`",
+                "Define cuantos embeddings recientes usa el detector con attention. Ventanas mas largas capturan contexto, pero tardan mas en salir de warmup."
+            ),
+            (
+                "`Monitor attention hidden dim`",
+                "Controla cuanta capacidad tiene el detector para diferenciar que momentos del historial importan mas."
             ),
         ],
     }
@@ -2179,10 +3485,31 @@ def _render_feature_source_selector(context: Dict[str, Any]) -> Dict[str, Any]:
 def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, Any]:
     st.markdown("**Dataset activo**")
     df = dataset_bundle["df"]
-    metrics_col_1, metrics_col_2, metrics_col_3 = st.columns(3)
+    if "neural_drift_dataset_percent" not in st.session_state:
+        st.session_state["neural_drift_dataset_percent"] = int(DEFAULT_CONFIG["dataset_percent"])
+    dataset_percent = st.slider(
+        "Porcentaje del dataset para Neural drift",
+        min_value=1,
+        max_value=100,
+        step=1,
+        key="neural_drift_dataset_percent",
+        help="Usa el tramo temporal mas reciente del dataset para acelerar experimentos manteniendo el orden temporal.",
+    )
+    active_df = _subset_dataset_by_percentage(df, dataset_percent=float(dataset_percent))
+
+    metrics_col_1, metrics_col_2, metrics_col_3, metrics_col_4 = st.columns(4)
     metrics_col_1.metric("Source", str(dataset_bundle.get("source", "-")))
-    metrics_col_2.metric("Rows", int(len(df)))
-    metrics_col_3.metric("Features", int(len(dataset_bundle.get("feature_cols", []))))
+    metrics_col_2.metric("Rows totales", int(len(df)))
+    metrics_col_3.metric("Rows usados", int(len(active_df)))
+    metrics_col_4.metric("Features", int(len(dataset_bundle.get("feature_cols", []))))
+    if "interval_start" in active_df.columns and not active_df.empty:
+        active_start = pd.to_datetime(active_df["interval_start"], errors="coerce").min()
+        active_end = pd.to_datetime(active_df["interval_start"], errors="coerce").max()
+        if pd.notna(active_start) and pd.notna(active_end):
+            st.caption(
+                "El experimento usara el tramo mas reciente del dataset: "
+                f"{pd.Timestamp(active_start)} -> {pd.Timestamp(active_end)}."
+            )
     if dataset_bundle.get("feature_export_path"):
         st.caption(f"Export DuckDB: {dataset_bundle['feature_export_path']}")
 
@@ -2190,6 +3517,48 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
     max_stream_max = max(max_stream_min, int(len(df)))
     max_stream_default = min(int(DEFAULT_CONFIG["max_stream_rows"]), max_stream_max)
     max_stream_default = max(max_stream_min, max_stream_default)
+
+    config_state_defaults = {
+        "neural_drift_sensitivity_preset": str(DEFAULT_CONFIG["detector_sensitivity_preset"]),
+        "neural_drift_recent_window_size": int(DEFAULT_CONFIG["recent_window_size"]),
+        "neural_drift_severity_threshold": float(DEFAULT_CONFIG["severity_threshold"]),
+        "neural_drift_detector_adwin_delta": float(DEFAULT_CONFIG["detector_adwin_delta"]),
+        "neural_drift_point_signal_weight": float(DEFAULT_CONFIG["drift_point_signal_weight"]),
+    }
+    for state_key, default_value in config_state_defaults.items():
+        if state_key not in st.session_state:
+            st.session_state[state_key] = default_value
+
+    def _on_detector_sensitivity_preset_change() -> None:
+        _apply_detector_sensitivity_preset_to_session(st.session_state.get("neural_drift_sensitivity_preset"))
+
+    st.markdown("**Sensibilidad del detector**")
+    sensitivity_col_1, sensitivity_col_2 = st.columns([1.2, 2.2])
+    sensitivity_preset = sensitivity_col_1.selectbox(
+        "Preset de sensibilidad",
+        AVAILABLE_DETECTOR_SENSITIVITY_PRESETS,
+        key="neural_drift_sensitivity_preset",
+        on_change=_on_detector_sensitivity_preset_change,
+    )
+    sensitivity_col_2.info(_detector_sensitivity_preset_description(sensitivity_preset))
+
+    sensitivity_knob_col_1, sensitivity_knob_col_2 = st.columns(2)
+    detector_adwin_delta = sensitivity_knob_col_1.number_input(
+        "ADWIN delta",
+        min_value=0.0005,
+        max_value=0.0500,
+        step=0.0005,
+        format="%.4f",
+        key="neural_drift_detector_adwin_delta",
+    )
+    point_signal_weight = sensitivity_knob_col_2.slider(
+        "Point signal weight",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.05,
+        key="neural_drift_point_signal_weight",
+        help="0.0 prioriza la senal suavizada por ventana; 1.0 prioriza los picos locales y reproduce la sensibilidad actual.",
+    )
 
     config_col_1, config_col_2, config_col_3 = st.columns(3)
     lookback_steps = config_col_1.number_input(
@@ -2244,7 +3613,6 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         "Recent window size",
         min_value=24,
         max_value=240,
-        value=int(DEFAULT_CONFIG["recent_window_size"]),
         step=8,
         key="neural_drift_recent_window_size",
     )
@@ -2270,7 +3638,6 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         "Severity trigger",
         min_value=0.10,
         max_value=0.95,
-        value=float(DEFAULT_CONFIG["severity_threshold"]),
         step=0.05,
         key="neural_drift_severity_threshold",
     )
@@ -2295,6 +3662,7 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         **DEFAULT_CONFIG,
         "lookback_steps": int(lookback_steps),
         "horizon_steps": int(horizon_steps),
+        "dataset_percent": int(dataset_percent),
         "max_stream_rows": int(max_stream_rows),
         "models": list(selected_models),
         "strategies": list(selected_strategies),
@@ -2303,6 +3671,9 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         "recalibration_min_rows": int(recalibration_min_rows),
         "retrain_min_rows": int(retrain_min_rows),
         "severity_threshold": float(severity_threshold),
+        "detector_sensitivity_preset": str(sensitivity_preset),
+        "detector_adwin_delta": float(detector_adwin_delta),
+        "drift_point_signal_weight": float(point_signal_weight),
         "rolling_metric_window": int(rolling_metric_window),
         "history_sample_size": int(history_sample_size),
     }
@@ -2313,12 +3684,12 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
 def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_config: Dict[str, Any]) -> Dict[str, Any]:
     st.markdown("**Detector neuronal de drift**")
     st.caption(
-        "La senal `embedding drift` se construye con un autoencoder pequeno sobre los embeddings "
-        "del predictor Torch MLP y una distancia al centroide de referencia."
+        "La senal `embedding drift` combina distancia al centroide con un monitor neuronal sobre embeddings. "
+        "Ese monitor puede ser un autoencoder clasico o una variante con attention temporal."
     )
 
-    if MODEL_TORCH_MLP not in list(current_config.get("models") or []):
-        st.info("Para activar la red que monitorea drift debes incluir `Torch MLP` en Models.")
+    if not _has_any_torch_model(list(current_config.get("models") or [])):
+        st.info("Para activar la red que monitorea drift debes incluir `Torch MLP` o `Torch MLP + Attention` en Models.")
     if DRIFT_EMBEDDING not in list(current_config.get("drift_channels") or []):
         st.info("Para usar la red de drift debes incluir `embedding drift` en Drift channels.")
 
@@ -2331,6 +3702,9 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
     st.session_state["neural_drift_monitor_profile"] = monitor_profile
 
     default_monitor_values = {
+        "neural_drift_monitor_architecture": str(
+            current_config.get("drift_monitor_architecture", DEFAULT_CONFIG["drift_monitor_architecture"])
+        ),
         "neural_drift_monitor_hidden_dim": int(
             current_config.get("drift_monitor_hidden_dim", DEFAULT_CONFIG["drift_monitor_hidden_dim"])
         ),
@@ -2364,6 +3738,33 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
                 ),
             )
         ),
+        "neural_drift_monitor_sequence_length": int(
+            current_config.get("drift_monitor_sequence_length", DEFAULT_CONFIG["drift_monitor_sequence_length"])
+        ),
+        "neural_drift_monitor_attention_hidden_dim": int(
+            current_config.get(
+                "drift_monitor_attention_hidden_dim",
+                DEFAULT_CONFIG["drift_monitor_attention_hidden_dim"],
+            )
+        ),
+        "neural_drift_monitor_attention_dropout": float(
+            current_config.get(
+                "drift_monitor_attention_dropout",
+                DEFAULT_CONFIG["drift_monitor_attention_dropout"],
+            )
+        ),
+        "neural_drift_attention_feature_hidden_dim": int(
+            current_config.get("attention_feature_hidden_dim", DEFAULT_CONFIG["attention_feature_hidden_dim"])
+        ),
+        "neural_drift_attention_temporal_hidden_dim": int(
+            current_config.get("attention_temporal_hidden_dim", DEFAULT_CONFIG["attention_temporal_hidden_dim"])
+        ),
+        "neural_drift_attention_dropout": float(
+            current_config.get("attention_dropout", DEFAULT_CONFIG["attention_dropout"])
+        ),
+        "neural_drift_attention_top_k": int(
+            current_config.get("attention_top_k", DEFAULT_CONFIG["attention_top_k"])
+        ),
     }
     for state_key, default_value in default_monitor_values.items():
         if state_key not in st.session_state:
@@ -2381,12 +3782,26 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
     )
     selector_hint_col.info(_drift_monitor_profile_description(monitor_profile))
 
+    detector_arch_col_1, detector_arch_col_2 = st.columns([1.2, 2.2])
+    monitor_architecture = detector_arch_col_1.selectbox(
+        "Arquitectura del detector neuronal",
+        AVAILABLE_DRIFT_MONITOR_ARCHITECTURES,
+        key="neural_drift_monitor_architecture",
+    )
+    if str(monitor_architecture) == DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION:
+        detector_arch_col_2.info(
+            "El detector usara una secuencia reciente de embeddings y attention temporal para reconstruir el embedding actual."
+        )
+    else:
+        detector_arch_col_2.info(
+            "El detector reconstruye cada embedding de forma independiente con un autoencoder clasico."
+        )
+
     arch_col_1, arch_col_2, arch_col_3 = st.columns(3)
     monitor_hidden_dim = arch_col_1.number_input(
         "Monitor hidden dim",
         min_value=4,
         max_value=128,
-        value=int(st.session_state.get("neural_drift_monitor_hidden_dim", current_config.get("drift_monitor_hidden_dim", DEFAULT_CONFIG["drift_monitor_hidden_dim"]))),
         step=2,
         key="neural_drift_monitor_hidden_dim",
     )
@@ -2394,7 +3809,6 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         "Monitor bottleneck dim",
         min_value=2,
         max_value=64,
-        value=int(st.session_state.get("neural_drift_monitor_bottleneck_dim", current_config.get("drift_monitor_bottleneck_dim", DEFAULT_CONFIG["drift_monitor_bottleneck_dim"]))),
         step=1,
         key="neural_drift_monitor_bottleneck_dim",
     )
@@ -2402,7 +3816,6 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         "Monitor dropout",
         min_value=0.0,
         max_value=0.5,
-        value=float(st.session_state.get("neural_drift_monitor_dropout", current_config.get("drift_monitor_dropout", DEFAULT_CONFIG["drift_monitor_dropout"]))),
         step=0.05,
         key="neural_drift_monitor_dropout",
     )
@@ -2412,7 +3825,6 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         "Monitor epochs",
         min_value=4,
         max_value=60,
-        value=int(st.session_state.get("neural_drift_monitor_epochs", current_config.get("drift_monitor_epochs", DEFAULT_CONFIG["drift_monitor_epochs"]))),
         step=2,
         key="neural_drift_monitor_epochs",
     )
@@ -2420,7 +3832,6 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         "Monitor batch size",
         min_value=8,
         max_value=256,
-        value=int(st.session_state.get("neural_drift_monitor_batch_size", current_config.get("drift_monitor_batch_size", DEFAULT_CONFIG["drift_monitor_batch_size"]))),
         step=8,
         key="neural_drift_monitor_batch_size",
     )
@@ -2428,7 +3839,6 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         "Monitor learning rate",
         min_value=1e-4,
         max_value=1e-2,
-        value=float(st.session_state.get("neural_drift_monitor_learning_rate", current_config.get("drift_monitor_learning_rate", DEFAULT_CONFIG["drift_monitor_learning_rate"]))),
         step=1e-4,
         format="%.4f",
         key="neural_drift_monitor_learning_rate",
@@ -2439,15 +3849,83 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         "Peso reconstruction error",
         min_value=0.0,
         max_value=1.0,
-        value=float(st.session_state.get("neural_drift_monitor_reconstruction_weight", current_config.get("drift_monitor_reconstruction_weight", DEFAULT_CONFIG["drift_monitor_reconstruction_weight"]))),
         step=0.05,
         key="neural_drift_monitor_reconstruction_weight",
     )
     mix_col_2.metric("Peso distancia", f"{1.0 - float(reconstruction_weight):.2f}")
 
+    st.markdown("**Attention en el detector neuronal**")
+    st.caption(
+        "Esta seccion controla la red que detecta drift sobre embeddings recientes. Es independiente de la attention del predictor."
+    )
+    detector_attention_col_1, detector_attention_col_2, detector_attention_col_3 = st.columns(3)
+    monitor_sequence_length = detector_attention_col_1.number_input(
+        "Monitor sequence length",
+        min_value=4,
+        max_value=48,
+        step=1,
+        key="neural_drift_monitor_sequence_length",
+    )
+    monitor_attention_hidden_dim = detector_attention_col_2.number_input(
+        "Monitor attention hidden dim",
+        min_value=4,
+        max_value=128,
+        step=4,
+        key="neural_drift_monitor_attention_hidden_dim",
+    )
+    monitor_attention_dropout = detector_attention_col_3.slider(
+        "Monitor attention dropout",
+        min_value=0.0,
+        max_value=0.5,
+        step=0.05,
+        key="neural_drift_monitor_attention_dropout",
+    )
+
+    st.markdown("**Attention en la MLP**")
+    st.caption(
+        "Esta variante agrega dual attention sobre la ventana temporal: primero pondera variables dentro de cada paso "
+        "y luego pondera pasos temporales completos antes de construir el embedding."
+    )
+    if MODEL_TORCH_MLP_ATTENTION not in list(current_config.get("models") or []):
+        st.info(
+            "Los siguientes controles se activan cuando seleccionas `Torch MLP + Attention` en Models. "
+            "La `Torch MLP` clasica sigue disponible para comparacion."
+        )
+
+    attention_col_1, attention_col_2, attention_col_3, attention_col_4 = st.columns(4)
+    attention_feature_hidden_dim = attention_col_1.number_input(
+        "Feature attention hidden dim",
+        min_value=8,
+        max_value=128,
+        step=4,
+        key="neural_drift_attention_feature_hidden_dim",
+    )
+    attention_temporal_hidden_dim = attention_col_2.number_input(
+        "Temporal attention hidden dim",
+        min_value=8,
+        max_value=128,
+        step=4,
+        key="neural_drift_attention_temporal_hidden_dim",
+    )
+    attention_dropout = attention_col_3.slider(
+        "Attention dropout",
+        min_value=0.0,
+        max_value=0.5,
+        step=0.05,
+        key="neural_drift_attention_dropout",
+    )
+    attention_top_k = attention_col_4.number_input(
+        "Top-k attention summary",
+        min_value=3,
+        max_value=20,
+        step=1,
+        key="neural_drift_attention_top_k",
+    )
+
     monitor_config = {
         **current_config,
         "drift_monitor_profile": str(monitor_profile),
+        "drift_monitor_architecture": str(monitor_architecture),
         "drift_monitor_hidden_dim": int(monitor_hidden_dim),
         "drift_monitor_bottleneck_dim": int(monitor_bottleneck_dim),
         "drift_monitor_dropout": float(monitor_dropout),
@@ -2455,6 +3933,13 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         "drift_monitor_batch_size": int(monitor_batch_size),
         "drift_monitor_learning_rate": float(monitor_learning_rate),
         "drift_monitor_reconstruction_weight": float(reconstruction_weight),
+        "drift_monitor_sequence_length": int(monitor_sequence_length),
+        "drift_monitor_attention_hidden_dim": int(monitor_attention_hidden_dim),
+        "drift_monitor_attention_dropout": float(monitor_attention_dropout),
+        "attention_feature_hidden_dim": int(attention_feature_hidden_dim),
+        "attention_temporal_hidden_dim": int(attention_temporal_hidden_dim),
+        "attention_dropout": float(attention_dropout),
+        "attention_top_k": int(attention_top_k),
     }
     st.session_state["neural_drift_config"] = monitor_config
 
@@ -2468,8 +3953,14 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
     architecture_lines = [
         f"Predictor MLP: window[{shapes['predictor_input_dim']}] -> hidden[{int(monitor_config.get('mlp_hidden_dim', DEFAULT_CONFIG['mlp_hidden_dim']))}] -> "
         f"hidden[{max(2, int(monitor_config.get('mlp_hidden_dim', DEFAULT_CONFIG['mlp_hidden_dim'])) // 2)}] -> embedding[{shapes['predictor_embedding_dim']}] -> score[1]",
+        f"Predictor MLP + Attention: window[{shapes['predictor_time_steps']}, {shapes['predictor_feature_count']}] -> "
+        f"feature_attention[{shapes['attention_feature_hidden_dim']}] -> temporal_attention[{shapes['attention_temporal_hidden_dim']}] -> "
+        f"embedding[{shapes['predictor_embedding_dim']}] -> score[1]",
         f"Drift monitor AE: embedding[{shapes['monitor_input_dim']}] -> hidden[{shapes['monitor_hidden_dim']}] -> "
         f"bottleneck[{shapes['monitor_bottleneck_dim']}] -> hidden[{shapes['monitor_hidden_dim']}] -> reconstruction[{shapes['monitor_input_dim']}]",
+        f"Drift monitor + Attention: sequence[{shapes['monitor_sequence_length']}, embedding[{shapes['monitor_input_dim']}]] -> "
+        f"temporal_attention[{shapes['monitor_attention_hidden_dim']}] -> bottleneck[{shapes['monitor_bottleneck_dim']}] -> "
+        f"reconstruction[{shapes['monitor_input_dim']}]",
         f"Embedding drift score = {(1.0 - float(reconstruction_weight)):.2f} * centroid_distance + {float(reconstruction_weight):.2f} * reconstruction_error",
     ]
     st.code("\n".join(architecture_lines), language="text")
@@ -2491,12 +3982,20 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         for title, body in explanation["monitor_steps"]:
             st.markdown(f"- {title}: {body}")
 
-        st.markdown("**3. Como leer el score de drift**")
+        st.markdown("**3. Attention en el detector neuronal**")
+        for title, body in explanation.get("monitor_attention_steps", []):
+            st.markdown(f"- {title}: {body}")
+
+        st.markdown("**4. Attention en la MLP**")
+        for title, body in explanation.get("attention_steps", []):
+            st.markdown(f"- {title}: {body}")
+
+        st.markdown("**5. Como leer el score de drift**")
         st.markdown(explanation["score_formula"])
         for title, body in explanation["score_interpretation"]:
             st.markdown(f"- {title}: {body}")
 
-        st.markdown("**4. Como ajustar los controles**")
+        st.markdown("**6. Como ajustar los controles**")
         for title, body in explanation["tuning_guidance"]:
             st.markdown(f"- {title}: {body}")
 
@@ -2541,6 +4040,11 @@ def _render_backtest_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, An
         "summary": results.get("summary"),
         "stream_metrics": results.get("stream_metrics"),
         "rolling_metrics": results.get("rolling_metrics"),
+        "attention_feature_summary": results.get("attention_feature_summary"),
+        "attention_temporal_summary": results.get("attention_temporal_summary"),
+        "attention_drift_shift_summary": results.get("attention_drift_shift_summary"),
+        "detector_attention_temporal_summary": results.get("detector_attention_temporal_summary"),
+        "detector_attention_drift_shift_summary": results.get("detector_attention_drift_shift_summary"),
     }
     st.session_state["neural_drift_drift_events"] = results.get("drift_events")
     st.session_state["neural_drift_download_bundle"] = _download_bundle_from_results(results)
@@ -2554,10 +4058,16 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
     summary = stream_results.get("summary")
     stream_metrics = stream_results.get("stream_metrics")
     rolling_metrics = stream_results.get("rolling_metrics")
+    attention_feature_summary = stream_results.get("attention_feature_summary")
+    attention_temporal_summary = stream_results.get("attention_temporal_summary")
+    attention_drift_shift_summary = stream_results.get("attention_drift_shift_summary")
+    detector_attention_temporal_summary = stream_results.get("detector_attention_temporal_summary")
+    detector_attention_drift_shift_summary = stream_results.get("detector_attention_drift_shift_summary")
     drift_events = st.session_state.get("neural_drift_drift_events")
     download_bundle = dict(st.session_state.get("neural_drift_download_bundle") or {})
     current_signature = _build_run_signature(dataset_bundle, config)
     last_run_signature = st.session_state.get("neural_drift_last_run_signature")
+    attention_top_k = max(1, int(config.get("attention_top_k", DEFAULT_CONFIG["attention_top_k"])))
 
     if not isinstance(summary, pd.DataFrame) or summary.empty:
         st.info("No hay resultados de Neural drift para mostrar.")
@@ -2567,6 +4077,18 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
         st.warning(
             "Los resultados visibles no corresponden a la configuracion o fuente de features actual. "
             "Vuelve a ejecutar el backtest para ver resultados consistentes con el estado actual."
+        )
+
+    if (
+        isinstance(summary, pd.DataFrame)
+        and not summary.empty
+        and str(config.get("drift_monitor_architecture", DEFAULT_CONFIG["drift_monitor_architecture"]))
+        == DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION
+        and summary["monitor_effective_architecture"].astype(str).eq(DRIFT_MONITOR_ARCH_CLASSIC_AE).any()
+    ):
+        st.warning(
+            "Algunas corridas del detector neuronal cayeron automaticamente a `Autoencoder clasico` "
+            "porque no habia suficientes embeddings para entrenar o usar `Attention temporal`."
         )
 
     if isinstance(baseline, pd.DataFrame) and not baseline.empty:
@@ -2579,6 +4101,51 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
     if isinstance(drift_events, pd.DataFrame) and not drift_events.empty:
         st.markdown("**Drift events**")
         st.dataframe(_streamlit_arrow_safe_df(drift_events), width="stretch")
+
+    if isinstance(attention_feature_summary, pd.DataFrame) and not attention_feature_summary.empty:
+        st.markdown("**Attention sobre variables**")
+        feature_display = (
+            attention_feature_summary.groupby(["model", "strategy"], group_keys=False, dropna=False)
+            .head(attention_top_k)
+            .reset_index(drop=True)
+        )
+        st.dataframe(_streamlit_arrow_safe_df(feature_display), width="stretch")
+
+    if isinstance(attention_temporal_summary, pd.DataFrame) and not attention_temporal_summary.empty:
+        st.markdown("**Attention sobre pasos temporales**")
+        temporal_display = (
+            attention_temporal_summary.groupby(["model", "strategy"], group_keys=False, dropna=False)
+            .head(attention_top_k)
+            .reset_index(drop=True)
+        )
+        st.dataframe(_streamlit_arrow_safe_df(temporal_display), width="stretch")
+
+    if isinstance(attention_drift_shift_summary, pd.DataFrame) and not attention_drift_shift_summary.empty:
+        st.markdown("**Cambio de attention durante drift**")
+        drift_display = (
+            attention_drift_shift_summary.groupby(["model", "strategy", "scope"], group_keys=False, dropna=False)
+            .head(attention_top_k)
+            .reset_index(drop=True)
+        )
+        st.dataframe(_streamlit_arrow_safe_df(drift_display), width="stretch")
+
+    if isinstance(detector_attention_temporal_summary, pd.DataFrame) and not detector_attention_temporal_summary.empty:
+        st.markdown("**Attention temporal del detector de drift**")
+        detector_temporal_display = (
+            detector_attention_temporal_summary.groupby(["model", "strategy"], group_keys=False, dropna=False)
+            .head(attention_top_k)
+            .reset_index(drop=True)
+        )
+        st.dataframe(_streamlit_arrow_safe_df(detector_temporal_display), width="stretch")
+
+    if isinstance(detector_attention_drift_shift_summary, pd.DataFrame) and not detector_attention_drift_shift_summary.empty:
+        st.markdown("**Cambio de attention del detector durante drift**")
+        detector_shift_display = (
+            detector_attention_drift_shift_summary.groupby(["model", "strategy"], group_keys=False, dropna=False)
+            .head(attention_top_k)
+            .reset_index(drop=True)
+        )
+        st.dataframe(_streamlit_arrow_safe_df(detector_shift_display), width="stretch")
 
     if isinstance(rolling_metrics, pd.DataFrame) and not rolling_metrics.empty:
         st.markdown("**Rolling metrics**")
@@ -2607,6 +4174,11 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
         ("summary", "Download summary.csv"),
         ("drift_events", "Download drift_events.csv"),
         ("stream_metrics", "Download stream_metrics.csv"),
+        ("attention_feature_summary", "Download attention_feature_summary.csv"),
+        ("attention_temporal_summary", "Download attention_temporal_summary.csv"),
+        ("attention_drift_shift_summary", "Download attention_drift_shift_summary.csv"),
+        ("detector_attention_temporal_summary", "Download detector_attention_temporal_summary.csv"),
+        ("detector_attention_drift_shift_summary", "Download detector_attention_drift_shift_summary.csv"),
     ]:
         payload = download_bundle.get(key)
         if not payload:

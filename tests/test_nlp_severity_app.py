@@ -1807,6 +1807,20 @@ def test_paper_candidate_k_values_support_interval_mode():
         k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
         k_grid_interval=10,
     ) == [8]
+    assert _paper_candidate_k_values(
+        384,
+        k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+        k_grid_interval=50,
+        k_grid_min=50,
+        k_grid_max=432,
+    ) == [50, 100, 150, 200, 250, 300, 350, 384]
+    assert _paper_candidate_k_values(
+        40,
+        k_grid_mode=nlp_app.PAPER_K_GRID_MODE_INTERVAL_MAX,
+        k_grid_interval=50,
+        k_grid_min=50,
+        k_grid_max=432,
+    ) == [40]
 
 
 def test_default_xgb_param_grid_uses_saved_train_override():
