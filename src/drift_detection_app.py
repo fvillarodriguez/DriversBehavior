@@ -35,6 +35,10 @@ import pandas as pd
 import streamlit as st
 from joblib import Parallel as JoblibParallel
 from joblib import delayed as joblib_delayed
+from src.drift_bias_variance import (
+    BIAS_VARIANCE_NOISE_COLUMNS,
+    enrich_drift_rows_with_bias_variance,
+)
 from sklearn.ensemble import AdaBoostClassifier, ExtraTreesClassifier, RandomForestClassifier
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
@@ -3897,14 +3901,36 @@ def _serialize_block_payload(
     smote_refs: Sequence[str],
     smote_rerank_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    enriched_yearly_rows = (
+        pd.DataFrame(
+            enrich_drift_rows_with_bias_variance(
+                yearly_rows.to_dict(orient="records"),
+                roc_payload,
+                yearly=True,
+            )
+        )
+        if yearly_rows is not None and not yearly_rows.empty
+        else pd.DataFrame()
+    )
+    enriched_adaptive_rows = (
+        pd.DataFrame(
+            enrich_drift_rows_with_bias_variance(
+                adaptive_rows.to_dict(orient="records"),
+                roc_payload,
+                yearly=False,
+            )
+        )
+        if adaptive_rows is not None and not adaptive_rows.empty
+        else pd.DataFrame()
+    )
     return {
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "block_id": str(block_id),
         "block": _to_json_safe(block),
         "run_seed": int(run_seed),
         "run_order": int(run_order),
-        "yearly_rows": [] if yearly_rows is None or yearly_rows.empty else yearly_rows.to_dict(orient="records"),
-        "adaptive_rows": [] if adaptive_rows is None or adaptive_rows.empty else adaptive_rows.to_dict(orient="records"),
+        "yearly_rows": [] if enriched_yearly_rows.empty else enriched_yearly_rows.to_dict(orient="records"),
+        "adaptive_rows": [] if enriched_adaptive_rows.empty else enriched_adaptive_rows.to_dict(orient="records"),
         "roc_payload": _to_json_safe(list(roc_payload)),
         "execution_log": _to_json_safe(list(execution_log)),
         "tuning_refs": [str(ref) for ref in tuning_refs],
@@ -4011,6 +4037,22 @@ def _assemble_recalibration_outputs_from_checkpoints(
 
     yearly_results = pd.concat(yearly_frames, ignore_index=True) if yearly_frames else pd.DataFrame()
     adaptive_results = pd.concat(adaptive_frames, ignore_index=True) if adaptive_frames else pd.DataFrame()
+    if not yearly_results.empty:
+        yearly_results = pd.DataFrame(
+            enrich_drift_rows_with_bias_variance(
+                yearly_results.to_dict(orient="records"),
+                roc_payload,
+                yearly=True,
+            )
+        )
+    if not adaptive_results.empty:
+        adaptive_results = pd.DataFrame(
+            enrich_drift_rows_with_bias_variance(
+                adaptive_results.to_dict(orient="records"),
+                roc_payload,
+                yearly=False,
+            )
+        )
     roc_curves = build_average_roc_curves(roc_payload)
     summary = summarize_results(yearly_results, adaptive_results)
     appendix = format_appendix_tables(yearly_results, adaptive_results)
@@ -9087,6 +9129,7 @@ def _resolve_or_create_tuning_artifact(
 
 def _persist_drift_recalibration_json(
     *,
+    output_dir: Optional[Path] = None,
     run_manifest: Dict[str, Any],
     feature_selection_context: Dict[str, Any],
     studies: Sequence[Dict[str, Any]],
@@ -9099,9 +9142,10 @@ def _persist_drift_recalibration_json(
     roc_payload: Sequence[Dict[str, Any]],
     execution_log: pd.DataFrame,
 ) -> Path:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    target_dir = Path(output_dir) if output_dir is not None else RESULTS_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = RESULTS_DIR / f"drift_recalibration_optuna_{stamp}.json"
+    out_path = target_dir / f"drift_recalibration_optuna_{stamp}.json"
     run_manifest["optuna_json_path"] = str(out_path)
     payload = {
         "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -11240,6 +11284,7 @@ def run_recalibration_experiments(
     )
     studies = list(assembled.get("studies") or [])
     optuna_json_path = _persist_drift_recalibration_json(
+        output_dir=paths["run_dir"],
         run_manifest=assembled["run_manifest"],
         feature_selection_context=normalized_feature_selection_context,
         studies=studies,
@@ -11549,7 +11594,7 @@ def summarize_results(
     rows: List[pd.DataFrame] = []
     if yearly_results is not None and not yearly_results.empty:
         yearly_results = yearly_results.copy()
-        for col in ["pr_auc", "f1", *calibration_cols]:
+        for col in ["pr_auc", "brier_score", *BIAS_VARIANCE_NOISE_COLUMNS, "f1", *calibration_cols]:
             if col not in yearly_results.columns:
                 yearly_results[col] = np.nan
         y = (
@@ -11557,6 +11602,10 @@ def summarize_results(
             .agg(
                 auc=("auc", "mean"),
                 pr_auc=("pr_auc", "mean"),
+                brier_score=("brier_score", "mean"),
+                bias2=("bias2", "mean"),
+                variance=("variance", "mean"),
+                noise=("noise", "mean"),
                 f1=("f1", "mean"),
                 sensitivity=("sensitivity", "mean"),
                 specificity=("specificity", "mean"),
@@ -11578,7 +11627,7 @@ def summarize_results(
 
     if adaptive_results is not None and not adaptive_results.empty:
         adaptive_results = adaptive_results.copy()
-        for col in ["pr_auc", "f1", *calibration_cols]:
+        for col in ["pr_auc", "brier_score", *BIAS_VARIANCE_NOISE_COLUMNS, "f1", *calibration_cols]:
             if col not in adaptive_results.columns:
                 adaptive_results[col] = np.nan
         a = (
@@ -11586,6 +11635,10 @@ def summarize_results(
             .agg(
                 auc=("auc", "mean"),
                 pr_auc=("pr_auc", "mean"),
+                brier_score=("brier_score", "mean"),
+                bias2=("bias2", "mean"),
+                variance=("variance", "mean"),
+                noise=("noise", "mean"),
                 f1=("f1", "mean"),
                 sensitivity=("sensitivity", "mean"),
                 specificity=("specificity", "mean"),
@@ -11632,7 +11685,7 @@ def format_appendix_tables(
 
     if yearly_results is not None and not yearly_results.empty:
         yearly_results = yearly_results.copy()
-        for col in ["pr_auc", "f1", *calibration_cols]:
+        for col in ["pr_auc", "brier_score", *BIAS_VARIANCE_NOISE_COLUMNS, "f1", *calibration_cols]:
             if col not in yearly_results.columns:
                 yearly_results[col] = np.nan
         common_cols = [
@@ -11643,6 +11696,10 @@ def format_appendix_tables(
             "balance_mode",
             "auc",
             "pr_auc",
+            "brier_score",
+            "bias2",
+            "variance",
+            "noise",
             "f1",
             "sensitivity",
             "specificity",
@@ -11668,7 +11725,7 @@ def format_appendix_tables(
 
     if adaptive_results is not None and not adaptive_results.empty:
         adaptive_results = adaptive_results.copy()
-        for col in ["pr_auc", "f1", *calibration_cols]:
+        for col in ["pr_auc", "brier_score", *BIAS_VARIANCE_NOISE_COLUMNS, "f1", *calibration_cols]:
             if col not in adaptive_results.columns:
                 adaptive_results[col] = np.nan
         cols = [
@@ -11696,6 +11753,10 @@ def format_appendix_tables(
             "model",
             "auc",
             "pr_auc",
+            "brier_score",
+            "bias2",
+            "variance",
+            "noise",
             "f1",
             "sensitivity",
             "specificity",
@@ -11734,13 +11795,17 @@ def format_appendix_tables_mean(
 
     if yearly_results is not None and not yearly_results.empty:
         yearly_results = yearly_results.copy()
-        for col in ["pr_auc", "f1", *calibration_cols]:
+        for col in ["pr_auc", "brier_score", *BIAS_VARIANCE_NOISE_COLUMNS, "f1", *calibration_cols]:
             if col not in yearly_results.columns:
                 yearly_results[col] = np.nan
         group_cols = ["strategy", "iteration", "training_year", "prediction_year", "model", "balance_mode"]
         metric_cols = [
             "auc",
             "pr_auc",
+            "brier_score",
+            "bias2",
+            "variance",
+            "noise",
             "f1",
             "sensitivity",
             "specificity",
@@ -11769,6 +11834,10 @@ def format_appendix_tables_mean(
             "balance_mode",
             "auc",
             "pr_auc",
+            "brier_score",
+            "bias2",
+            "variance",
+            "noise",
             "f1",
             "sensitivity",
             "specificity",
@@ -11791,7 +11860,7 @@ def format_appendix_tables_mean(
 
     if adaptive_results is not None and not adaptive_results.empty:
         adaptive_results = adaptive_results.copy()
-        for col in ["pr_auc", "f1", *calibration_cols]:
+        for col in ["pr_auc", "brier_score", *BIAS_VARIANCE_NOISE_COLUMNS, "f1", *calibration_cols]:
             if col not in adaptive_results.columns:
                 adaptive_results[col] = np.nan
         group_cols = ["strategy", "drift", "model", "balance_mode"]
@@ -11811,6 +11880,10 @@ def format_appendix_tables_mean(
             "remaining_periods",
             "auc",
             "pr_auc",
+            "brier_score",
+            "bias2",
+            "variance",
+            "noise",
             "f1",
             "sensitivity",
             "specificity",
@@ -11872,6 +11945,10 @@ def format_appendix_tables_mean(
             "model",
             "auc",
             "pr_auc",
+            "brier_score",
+            "bias2",
+            "variance",
+            "noise",
             "f1",
             "sensitivity",
             "specificity",

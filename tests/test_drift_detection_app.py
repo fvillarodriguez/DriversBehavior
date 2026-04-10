@@ -2508,10 +2508,10 @@ def test_end_to_end_recalibration_and_average_roc():
     assert outputs["run_manifest"]["resource_mode"] == drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE
     assert not outputs["execution_log"].empty
     assert "run_seed" in outputs["yearly_results"].columns
-    assert {"pr_auc", "f1"} <= set(outputs["yearly_results"].columns)
-    assert {"pr_auc", "f1"} <= set(outputs["adaptive_results"].columns)
-    assert {"pr_auc", "f1"} <= set(outputs["appendix_tables"]["A.6"].columns)
-    assert {"pr_auc", "f1"} <= set(outputs["appendix_tables"]["A.9"].columns)
+    assert {"pr_auc", "brier_score", "bias2", "variance", "noise", "f1"} <= set(outputs["yearly_results"].columns)
+    assert {"pr_auc", "brier_score", "bias2", "variance", "noise", "f1"} <= set(outputs["adaptive_results"].columns)
+    assert {"pr_auc", "brier_score", "bias2", "variance", "noise", "f1"} <= set(outputs["appendix_tables"]["A.6"].columns)
+    assert {"pr_auc", "brier_score", "bias2", "variance", "noise", "f1"} <= set(outputs["appendix_tables"]["A.9"].columns)
 
     # Also validate standalone ROC builder path.
     payload = [
@@ -4749,7 +4749,7 @@ def test_parse_repetition_seeds_and_multi_seed_logging(tmp_path, monkeypatch):
     assert not appendix_mean["A.6"].empty
     assert appendix_mean["A.6"]["n_repetitions"].eq(2).all()
     assert appendix_mean["A.6"]["seed_list"].str.contains("3").all()
-    assert {"pr_auc", "f1"} <= set(appendix_mean["A.6"].columns)
+    assert {"pr_auc", "brier_score", "bias2", "variance", "noise", "f1"} <= set(appendix_mean["A.6"].columns)
 
 
 def test_persisted_recalibration_json_keeps_full_records(tmp_path, monkeypatch):

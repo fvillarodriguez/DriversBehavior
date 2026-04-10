@@ -14,6 +14,12 @@ from typing import Any, Dict, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
+from src.drift_bias_variance import (
+    BIAS_VARIANCE_NOISE_COLUMNS,
+    build_bias_variance_noise_lookup,
+    drift_row_group_key,
+)
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
 DRIFT_RUNS_DIR = RESULTS_DIR / "drift_recalibration_runs"
@@ -213,8 +219,14 @@ def _roc_metric_key(item: Dict[str, object]) -> tuple[object, ...]:
 def _apply_derived_metrics(
     row: Dict[str, object],
     roc_item: Optional[Dict[str, object]],
+    *,
+    decomposition_metrics: Optional[Dict[str, float]] = None,
 ) -> Dict[str, object]:
     if not isinstance(roc_item, dict):
+        if isinstance(decomposition_metrics, dict):
+            for col in BIAS_VARIANCE_NOISE_COLUMNS:
+                if _is_missing_numeric(row.get(col)):
+                    row[col] = decomposition_metrics.get(col)
         return row
     y_true_numeric = _sequence_to_numeric(roc_item.get("y_true"))
     y_true = [int(v) for v in y_true_numeric if not pd.isna(v)]
@@ -226,6 +238,10 @@ def _apply_derived_metrics(
         row["brier_score"] = _brier_score_from_probabilities(y_true, probability_scores)
     if y_true and _is_missing_numeric(row.get("f1")):
         row["f1"] = _derive_f1_from_rates(row, y_true)
+    if isinstance(decomposition_metrics, dict):
+        for col in BIAS_VARIANCE_NOISE_COLUMNS:
+            if _is_missing_numeric(row.get(col)):
+                row[col] = decomposition_metrics.get(col)
     return row
 
 
@@ -239,6 +255,7 @@ def _enrich_payload_result_rows(
     roc_items = [dict(item) for item in roc_payload if isinstance(item, dict)]
     if not enriched or not roc_items:
         return enriched
+    decomposition_lookup = build_bias_variance_noise_lookup(roc_items)
 
     if yearly:
         exact_lookup: dict[tuple[object, ...], Dict[str, object]] = {}
@@ -255,7 +272,13 @@ def _enrich_payload_result_rows(
                 match = exact_lookup.get(common_key + (str(prediction_year),))
             if match is None and len(grouped_lookup.get(common_key, [])) == 1:
                 match = grouped_lookup[common_key][0]
-            _apply_derived_metrics(row, match)
+            _apply_derived_metrics(
+                row,
+                match,
+                decomposition_metrics=decomposition_lookup.get(
+                    drift_row_group_key(row, yearly=True)
+                ),
+            )
         return enriched
 
     grouped_rocs: dict[tuple[object, ...], list[Dict[str, object]]] = {}
@@ -268,7 +291,13 @@ def _enrich_payload_result_rows(
         candidates = grouped_rocs.get(key, [])
         for ordinal, row_idx in enumerate(row_indices):
             match = candidates[ordinal] if ordinal < len(candidates) else None
-            _apply_derived_metrics(enriched[row_idx], match)
+            _apply_derived_metrics(
+                enriched[row_idx],
+                match,
+                decomposition_metrics=decomposition_lookup.get(
+                    drift_row_group_key(enriched[row_idx], yearly=False)
+                ),
+            )
     return enriched
 
 
@@ -689,6 +718,9 @@ def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFr
         "auc",
         "pr_auc",
         "brier_score",
+        "bias2",
+        "variance",
+        "noise",
         "f1",
         "sensitivity",
         "specificity",
@@ -730,10 +762,16 @@ def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFr
         for col in calibration_cols:
             if col not in work.columns:
                 work[col] = pd.NA
+        for col in BIAS_VARIANCE_NOISE_COLUMNS:
+            if col not in work.columns:
+                work[col] = pd.NA
         for col in [
             "auc",
             "pr_auc",
             "brier_score",
+            "bias2",
+            "variance",
+            "noise",
             "f1",
             "sensitivity",
             "specificity",
@@ -753,6 +791,9 @@ def _build_drift_partial_summary(yearly_df: pd.DataFrame, adaptive_df: pd.DataFr
                 auc=("auc", "mean"),
                 pr_auc=("pr_auc", "mean"),
                 brier_score=("brier_score", "mean"),
+                bias2=("bias2", "mean"),
+                variance=("variance", "mean"),
+                noise=("noise", "mean"),
                 f1=("f1", "mean"),
                 sensitivity=("sensitivity", "mean"),
                 specificity=("specificity", "mean"),
@@ -873,6 +914,9 @@ def _expected_yearly_table(
         "auc",
         "pr_auc",
         "brier_score",
+        "bias2",
+        "variance",
+        "noise",
         "f1",
         "sensitivity",
         "specificity",
@@ -925,6 +969,9 @@ def _expected_yearly_table(
                             "auc": _display_cell(source_row.get("auc")),
                             "pr_auc": _display_cell(source_row.get("pr_auc")),
                             "brier_score": _display_cell(source_row.get("brier_score")),
+                            "bias2": _display_cell(source_row.get("bias2")),
+                            "variance": _display_cell(source_row.get("variance")),
+                            "noise": _display_cell(source_row.get("noise")),
                             "f1": _display_cell(source_row.get("f1")),
                             "sensitivity": _display_cell(source_row.get("sensitivity")),
                             "specificity": _display_cell(source_row.get("specificity")),
@@ -957,6 +1004,9 @@ def _expected_yearly_table(
                             "auc": "Pendiente",
                             "pr_auc": "Pendiente",
                             "brier_score": "Pendiente",
+                            "bias2": "Pendiente",
+                            "variance": "Pendiente",
+                            "noise": "Pendiente",
                             "f1": "Pendiente",
                             "sensitivity": "Pendiente",
                             "specificity": "Pendiente",
@@ -1017,6 +1067,9 @@ def _expected_adaptive_table(
         "auc",
         "pr_auc",
         "brier_score",
+        "bias2",
+        "variance",
+        "noise",
         "f1",
         "sensitivity",
         "specificity",
@@ -1084,6 +1137,9 @@ def _expected_adaptive_table(
                     "auc": "-",
                     "pr_auc": "-",
                     "brier_score": "-",
+                    "bias2": "-",
+                    "variance": "-",
+                    "noise": "-",
                     "f1": "-",
                     "sensitivity": "-",
                     "specificity": "-",
@@ -1132,6 +1188,9 @@ def _expected_adaptive_table(
                     "auc": "-",
                     "pr_auc": "-",
                     "brier_score": "-",
+                    "bias2": "-",
+                    "variance": "-",
+                    "noise": "-",
                     "f1": "-",
                     "sensitivity": "-",
                     "specificity": "-",
@@ -1180,6 +1239,9 @@ def _expected_adaptive_table(
                     "auc": "Pendiente",
                     "pr_auc": "Pendiente",
                     "brier_score": "Pendiente",
+                    "bias2": "Pendiente",
+                    "variance": "Pendiente",
+                    "noise": "Pendiente",
                     "f1": "Pendiente",
                     "sensitivity": "Pendiente",
                     "specificity": "Pendiente",

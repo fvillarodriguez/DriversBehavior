@@ -36,6 +36,68 @@ def test_apply_derived_metrics_computes_brier_from_calibrated_scores():
     assert enriched["brier_score"] == pytest.approx(0.04)
 
 
+def test_apply_derived_metrics_sets_bias_variance_noise_from_lookup():
+    row = {
+        "auc": 0.81,
+        "pr_auc": None,
+        "f1": None,
+        "brier_score": None,
+        "bias2": None,
+        "variance": None,
+        "noise": None,
+    }
+    roc_item = {
+        "y_true": [0, 1],
+        "scores": [0.1, 0.9],
+        "calibrated_scores": [0.2, 0.8],
+    }
+
+    enriched = live_app._apply_derived_metrics(
+        row,
+        roc_item,
+        decomposition_metrics={"bias2": 0.04, "variance": 0.16, "noise": 0.0},
+    )
+
+    assert enriched["bias2"] == pytest.approx(0.04)
+    assert enriched["variance"] == pytest.approx(0.16)
+    assert enriched["noise"] == pytest.approx(0.0)
+
+
+def test_enrich_payload_result_rows_matches_adaptive_arf_by_prediction_year():
+    rows = [
+        {
+            "strategy": "adaptive_arf",
+            "model": "ARFfast",
+            "balance_mode": "not_applicable",
+            "drift": 1,
+            "prediction_year": 2019,
+            "brier_score": 0.25,
+            "bias2": None,
+            "variance": None,
+            "noise": None,
+        }
+    ]
+    roc_payload = [
+        {
+            "strategy": "adaptive_arf",
+            "model": "ARFfast",
+            "balance_mode": "not_applicable",
+            "segment": "2019",
+            "run_seed": 42,
+            "run_order": 1,
+            "y_true": [0, 1],
+            "scores": [0.4, 0.6],
+            "calibrated_scores": [0.4, 0.6],
+        }
+    ]
+
+    enriched = live_app._enrich_payload_result_rows(rows, roc_payload, yearly=False)
+
+    assert enriched[0]["bias2"] == pytest.approx(0.16)
+    assert enriched[0]["variance"] == pytest.approx(0.24)
+    assert enriched[0]["noise"] == pytest.approx(0.0)
+
+
 def test_display_cell_handles_infinite_thresholds():
     assert live_app._display_cell(float("inf")) == "inf"
     assert live_app._display_cell(float("-inf")) == "-inf"
@@ -567,6 +629,7 @@ def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):
     assert payload["adaptive_df"]["sensitivity_before_calibration"].iloc[0] == 0.5
     assert payload["adaptive_df"]["specificity_after_calibration"].iloc[0] == 1.0
     assert payload["summary_df"]["brier_score"].notna().all()
+    assert {"bias2", "variance", "noise"} <= set(payload["summary_df"].columns)
     assert not payload["tuning_trials_df"].empty
     assert not payload["tuning_params_df"].empty
     smote_tuning = payload["tuning_params_df"].loc[payload["tuning_params_df"]["balance_mode"] == "smote"].iloc[0]

@@ -22,6 +22,7 @@ import pandas as pd
 import streamlit as st
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, confusion_matrix, f1_score, roc_auc_score
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
 try:
@@ -33,6 +34,11 @@ try:
     from river.drift import ADWIN  # type: ignore
 except Exception:
     ADWIN = None
+
+try:
+    from imblearn.over_sampling import SMOTE  # type: ignore
+except Exception:
+    SMOTE = None
 
 try:
     import torch
@@ -52,6 +58,10 @@ MODEL_XGBOOST = "XGBoost"
 MODEL_TORCH_MLP = "Torch MLP"
 MODEL_TORCH_MLP_ATTENTION = "Torch MLP + Attention"
 AVAILABLE_MODELS = [MODEL_XGBOOST, MODEL_TORCH_MLP, MODEL_TORCH_MLP_ATTENTION]
+
+BALANCE_MODE_NONE = "none"
+BALANCE_MODE_SMOTE = "smote"
+AVAILABLE_BALANCE_MODES = [BALANCE_MODE_NONE, BALANCE_MODE_SMOTE]
 
 STRATEGY_FIXED = "fixed"
 STRATEGY_RECALIBRATION = "recalibration"
@@ -95,6 +105,18 @@ AVAILABLE_DETECTOR_SENSITIVITY_PRESETS = [
     DETECTOR_SENSITIVITY_PRESET_VERY_SENSITIVE,
 ]
 
+SMOTE_SAMPLING_STRATEGY_OPTIONS: Tuple[float, ...] = (0.05, 0.1, 0.3, 0.5, 1.0)
+SMOTE_K_NEIGHBORS_OPTIONS: Tuple[int, ...] = (5, 10)
+
+XGB_FINE_TUNE_SELECTION_F_BETA_RECALL = "f_beta_recall"
+XGB_FINE_TUNE_SELECTION_PR_AUC = "pr_auc"
+XGB_FINE_TUNE_SELECTION_BRIER = "brier"
+AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS = [
+    XGB_FINE_TUNE_SELECTION_F_BETA_RECALL,
+    XGB_FINE_TUNE_SELECTION_PR_AUC,
+    XGB_FINE_TUNE_SELECTION_BRIER,
+]
+
 SESSION_DEFAULTS: Dict[str, Any] = {
     "neural_drift_config": None,
     "neural_drift_dataset": None,
@@ -106,6 +128,7 @@ SESSION_DEFAULTS: Dict[str, Any] = {
     "neural_drift_monitor_profile": DRIFT_MONITOR_PROFILE_MODERATE,
     "neural_drift_last_run_signature": None,
     "neural_drift_sensitivity_preset": DETECTOR_SENSITIVITY_PRESET_MODERATE,
+    "neural_drift_xgb_fine_tune_selection_metric": XGB_FINE_TUNE_SELECTION_F_BETA_RECALL,
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -115,6 +138,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "horizon_steps": 1,
     "train_fraction": 0.60,
     "validation_fraction": 0.20,
+    "balance_modes": [BALANCE_MODE_NONE],
     "models": [MODEL_XGBOOST, MODEL_TORCH_MLP, MODEL_TORCH_MLP_ATTENTION],
     "strategies": [
         STRATEGY_FIXED,
@@ -133,6 +157,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "random_state": 42,
     "threshold_beta": 2.0,
     "xgb_estimators": 80,
+    "xgb_fine_tune_estimators": 6,
+    "xgb_fine_tune_selection_metric": XGB_FINE_TUNE_SELECTION_F_BETA_RECALL,
+    "xgb_fine_tune_window_min": 32,
+    "xgb_fine_tune_window_max": 160,
+    "xgb_fine_tune_rounds_min": 2,
+    "xgb_fine_tune_rounds_max": 24,
+    "xgb_fine_tune_eta_multiplier_max": 1.75,
+    "xgb_fine_tune_recent_weight_max": 4.0,
     "mlp_hidden_dim": 96,
     "mlp_embedding_dim": 24,
     "mlp_dropout": 0.10,
@@ -352,6 +384,164 @@ def _to_json_safe(value: Any) -> Any:
     return value
 
 
+def _resolve_balance_mode(value: Any) -> str:
+    mode = str(value or BALANCE_MODE_NONE).strip().lower()
+    if mode not in AVAILABLE_BALANCE_MODES:
+        return BALANCE_MODE_NONE
+    return mode
+
+
+def _resolve_balance_modes(values: Optional[Sequence[Any]]) -> List[str]:
+    modes = [
+        _resolve_balance_mode(value)
+        for value in list(values or [BALANCE_MODE_NONE])
+    ]
+    deduped = list(dict.fromkeys(mode for mode in modes if mode in AVAILABLE_BALANCE_MODES))
+    return deduped or [BALANCE_MODE_NONE]
+
+
+def _resolve_xgb_fine_tune_selection_metric(value: Any) -> str:
+    metric = str(value or XGB_FINE_TUNE_SELECTION_F_BETA_RECALL).strip().lower()
+    if metric not in AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS:
+        return XGB_FINE_TUNE_SELECTION_F_BETA_RECALL
+    return metric
+
+
+def _normalize_smote_params(smote_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    params = dict(smote_params or {})
+    sampling_strategy = float(params.get("sampling_strategy", 1.0))
+    k_neighbors = int(params.get("k_neighbors", 5))
+    return {
+        "sampling_strategy": float(np.clip(sampling_strategy, 0.001, 1.0)),
+        "k_neighbors": max(1, int(k_neighbors)),
+    }
+
+
+def _smote_search_space(config: Dict[str, Any]) -> Dict[str, List[Any]]:
+    sampling_values = [
+        float(value)
+        for value in list(config.get("smote_sampling_strategy_options") or SMOTE_SAMPLING_STRATEGY_OPTIONS)
+        if float(value) > 0.0
+    ]
+    k_values = [
+        int(value)
+        for value in list(config.get("smote_k_neighbors_options") or SMOTE_K_NEIGHBORS_OPTIONS)
+        if int(value) >= 1
+    ]
+    sampling_values = list(dict.fromkeys(sampling_values))
+    k_values = list(dict.fromkeys(k_values))
+    return {
+        "sampling_strategy": sampling_values or list(SMOTE_SAMPLING_STRATEGY_OPTIONS),
+        "k_neighbors": k_values or list(SMOTE_K_NEIGHBORS_OPTIONS),
+    }
+
+
+def _round_to_step(
+    value: float,
+    *,
+    step: int = 8,
+    min_value: Optional[int] = None,
+    max_value: Optional[int] = None,
+) -> int:
+    step_value = max(1, int(step))
+    rounded = int(step_value * round(float(value) / step_value))
+    if min_value is not None:
+        rounded = max(int(min_value), rounded)
+    if max_value is not None:
+        rounded = min(int(max_value), rounded)
+    return int(rounded)
+
+
+def _trigger_score(severity_score: float, max_channel_score: float) -> float:
+    return float(max(float(severity_score), float(max_channel_score)))
+
+
+def _severity_intensity(trigger_score: float, severity_threshold: float) -> float:
+    denominator = max(1e-6, 1.0 - float(severity_threshold))
+    intensity = (float(trigger_score) - float(severity_threshold)) / denominator
+    return float(np.clip(intensity, 0.0, 1.0))
+
+
+def _xgb_fine_tune_window_rows(severity_intensity: float, *, config: Dict[str, Any]) -> int:
+    window_min = int(config.get("xgb_fine_tune_window_min", DEFAULT_CONFIG["xgb_fine_tune_window_min"]))
+    window_max = int(config.get("xgb_fine_tune_window_max", DEFAULT_CONFIG["xgb_fine_tune_window_max"]))
+    lower = max(8, min(window_min, window_max))
+    upper = max(lower, window_max)
+    target = lower + float(np.clip(severity_intensity, 0.0, 1.0)) * float(upper - lower)
+    return _round_to_step(target, step=8, min_value=lower, max_value=upper)
+
+
+def _xgb_fine_tune_eta_multiplier(severity_intensity: float, *, config: Dict[str, Any]) -> float:
+    eta_max = max(
+        1.0,
+        float(
+            config.get(
+                "xgb_fine_tune_eta_multiplier_max",
+                DEFAULT_CONFIG["xgb_fine_tune_eta_multiplier_max"],
+            )
+        ),
+    )
+    return float(1.0 + (eta_max - 1.0) * float(np.clip(severity_intensity, 0.0, 1.0)))
+
+
+def _xgb_fine_tune_recent_weight_max(severity_intensity: float, *, config: Dict[str, Any]) -> float:
+    weight_max = max(
+        1.0,
+        float(
+            config.get(
+                "xgb_fine_tune_recent_weight_max",
+                DEFAULT_CONFIG["xgb_fine_tune_recent_weight_max"],
+            )
+        ),
+    )
+    return float(1.0 + (weight_max - 1.0) * float(np.clip(severity_intensity, 0.0, 1.0)))
+
+
+def _xgb_recent_sample_weights(n_rows: int, recent_weight_max: float) -> np.ndarray:
+    total_rows = max(0, int(n_rows))
+    if total_rows <= 0:
+        return np.asarray([], dtype=float)
+    max_weight = max(1.0, float(recent_weight_max))
+    if total_rows == 1:
+        return np.asarray([max_weight], dtype=float)
+    return np.linspace(1.0, max_weight, num=total_rows, dtype=float)
+
+
+def _xgb_fine_tune_round_candidates(severity_intensity: float, *, config: Dict[str, Any]) -> List[int]:
+    rounds_min = max(1, int(config.get("xgb_fine_tune_rounds_min", DEFAULT_CONFIG["xgb_fine_tune_rounds_min"])))
+    rounds_max = max(
+        rounds_min,
+        int(config.get("xgb_fine_tune_rounds_max", DEFAULT_CONFIG["xgb_fine_tune_rounds_max"])),
+    )
+    anchor = int(round(rounds_min + float(np.clip(severity_intensity, 0.0, 1.0)) * float(rounds_max - rounds_min)))
+    offsets = (-4, -2, 0, 2, 4)
+    candidates = sorted(
+        {
+            max(rounds_min, min(rounds_max, anchor + int(offset)))
+            for offset in offsets
+        }
+    )
+    return candidates or [rounds_min]
+
+
+def _default_xgb_fine_tune_metadata(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "severity_intensity": None,
+        "xgb_adaptation_window_rows": None,
+        "xgb_fine_tune_rounds_selected": None,
+        "xgb_fine_tune_eta_multiplier": None,
+        "xgb_fine_tune_recent_weight_max": None,
+        "xgb_fine_tune_selection_metric": _resolve_xgb_fine_tune_selection_metric(
+            config.get(
+                "xgb_fine_tune_selection_metric",
+                DEFAULT_CONFIG["xgb_fine_tune_selection_metric"],
+            )
+        ),
+        "xgb_fine_tune_selection_score": None,
+        "xgb_fine_tune_skip_reason": None,
+    }
+
+
 def _build_run_signature(dataset_bundle: Dict[str, Any], config: Dict[str, Any]) -> str:
     dataset_df = dataset_bundle.get("df")
     payload = {
@@ -367,6 +557,7 @@ def _build_run_signature(dataset_bundle: Dict[str, Any], config: Dict[str, Any])
             "horizon_steps": int(config.get("horizon_steps", DEFAULT_CONFIG["horizon_steps"])),
             "train_fraction": float(config.get("train_fraction", DEFAULT_CONFIG["train_fraction"])),
             "validation_fraction": float(config.get("validation_fraction", DEFAULT_CONFIG["validation_fraction"])),
+            "balance_modes": _resolve_balance_modes(config.get("balance_modes")),
             "models": list(config.get("models") or []),
             "strategies": list(config.get("strategies") or []),
             "drift_channels": list(config.get("drift_channels") or []),
@@ -374,6 +565,39 @@ def _build_run_signature(dataset_bundle: Dict[str, Any], config: Dict[str, Any])
             "recent_window_size": int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])),
             "max_stream_rows": int(config.get("max_stream_rows", DEFAULT_CONFIG["max_stream_rows"])),
             "threshold_beta": float(config.get("threshold_beta", DEFAULT_CONFIG["threshold_beta"])),
+            "xgb_fine_tune_estimators": int(
+                config.get("xgb_fine_tune_estimators", DEFAULT_CONFIG["xgb_fine_tune_estimators"])
+            ),
+            "xgb_fine_tune_selection_metric": _resolve_xgb_fine_tune_selection_metric(
+                config.get(
+                    "xgb_fine_tune_selection_metric",
+                    DEFAULT_CONFIG["xgb_fine_tune_selection_metric"],
+                )
+            ),
+            "xgb_fine_tune_window_min": int(
+                config.get("xgb_fine_tune_window_min", DEFAULT_CONFIG["xgb_fine_tune_window_min"])
+            ),
+            "xgb_fine_tune_window_max": int(
+                config.get("xgb_fine_tune_window_max", DEFAULT_CONFIG["xgb_fine_tune_window_max"])
+            ),
+            "xgb_fine_tune_rounds_min": int(
+                config.get("xgb_fine_tune_rounds_min", DEFAULT_CONFIG["xgb_fine_tune_rounds_min"])
+            ),
+            "xgb_fine_tune_rounds_max": int(
+                config.get("xgb_fine_tune_rounds_max", DEFAULT_CONFIG["xgb_fine_tune_rounds_max"])
+            ),
+            "xgb_fine_tune_eta_multiplier_max": float(
+                config.get(
+                    "xgb_fine_tune_eta_multiplier_max",
+                    DEFAULT_CONFIG["xgb_fine_tune_eta_multiplier_max"],
+                )
+            ),
+            "xgb_fine_tune_recent_weight_max": float(
+                config.get(
+                    "xgb_fine_tune_recent_weight_max",
+                    DEFAULT_CONFIG["xgb_fine_tune_recent_weight_max"],
+                )
+            ),
             "detector_sensitivity_preset": str(
                 config.get("detector_sensitivity_preset", DEFAULT_CONFIG["detector_sensitivity_preset"])
             ),
@@ -1088,6 +1312,113 @@ def _apply_imputer(X: np.ndarray, medians: np.ndarray) -> np.ndarray:
     return work.astype(float)
 
 
+def _simple_smote_balance(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    sampling_strategy: float,
+    k_neighbors: int,
+    random_state: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    X_np = np.asarray(X, dtype=float)
+    y_np = np.asarray(y).astype(int)
+    classes, counts = np.unique(y_np, return_counts=True)
+    if len(classes) != 2:
+        return X_np, y_np
+
+    majority_index = int(np.argmax(counts))
+    minority_index = int(np.argmin(counts))
+    majority_count = int(counts[majority_index])
+    minority_count = int(counts[minority_index])
+    minority_label = int(classes[minority_index])
+    if minority_count < 2:
+        return X_np, y_np
+
+    target_minority = int(math.ceil(float(sampling_strategy) * majority_count))
+    n_new = max(0, target_minority - minority_count)
+    if n_new <= 0:
+        return X_np, y_np
+
+    X_minority = X_np[y_np == minority_label]
+    effective_k = max(1, min(int(k_neighbors), minority_count - 1))
+    neighbors = NearestNeighbors(n_neighbors=effective_k + 1, metric="euclidean")
+    neighbors.fit(X_minority)
+    _distances, neighbor_indices = neighbors.kneighbors(X_minority, return_distance=True)
+    neighbor_indices = neighbor_indices[:, 1:]
+
+    rng = np.random.default_rng(int(random_state))
+    anchor_indices = rng.integers(0, minority_count, size=n_new)
+    neighbor_choices = rng.integers(0, neighbor_indices.shape[1], size=n_new)
+    chosen_neighbors = neighbor_indices[anchor_indices, neighbor_choices]
+    alpha = rng.random(size=n_new)
+    X_new = (
+        (1.0 - alpha)[:, None] * X_minority[anchor_indices]
+        + alpha[:, None] * X_minority[chosen_neighbors]
+    )
+    y_new = np.full(n_new, minority_label, dtype=y_np.dtype)
+    return np.vstack([X_np, X_new]).astype(float), np.concatenate([y_np, y_new]).astype(int)
+
+
+def _apply_smote_balance(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    sampling_strategy: float,
+    k_neighbors: int,
+    random_state: int,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    X_np = np.asarray(X, dtype=float)
+    y_np = np.asarray(y).astype(int)
+    original_rows = int(len(y_np))
+    base_info = {
+        "applied": False,
+        "original_rows": original_rows,
+        "balanced_rows": original_rows,
+        "sampling_strategy": float(sampling_strategy),
+        "k_neighbors": int(k_neighbors),
+    }
+    if X_np.size == 0 or np.unique(y_np).size < 2:
+        return X_np, y_np, dict(base_info, reason="single_class_or_empty")
+
+    classes, counts = np.unique(y_np, return_counts=True)
+    majority_count = int(counts.max())
+    minority_count = int(counts.min())
+    if minority_count < 2:
+        return X_np, y_np, dict(base_info, reason="insufficient_minority")
+
+    current_ratio = float(minority_count / majority_count) if majority_count > 0 else 1.0
+    if current_ratio >= float(sampling_strategy):
+        return X_np, y_np, dict(base_info, reason="already_at_or_above_target_ratio")
+
+    effective_k = max(1, min(int(k_neighbors), minority_count - 1))
+    if SMOTE is not None:
+        sampler = SMOTE(
+            sampling_strategy=float(sampling_strategy),
+            k_neighbors=int(effective_k),
+            random_state=int(random_state),
+        )
+        X_resampled, y_resampled = sampler.fit_resample(X_np, y_np)
+    else:
+        X_resampled, y_resampled = _simple_smote_balance(
+            X_np,
+            y_np,
+            sampling_strategy=float(sampling_strategy),
+            k_neighbors=int(effective_k),
+            random_state=int(random_state),
+        )
+    return (
+        np.asarray(X_resampled, dtype=float),
+        np.asarray(y_resampled).astype(int),
+        {
+            "applied": True,
+            "original_rows": original_rows,
+            "balanced_rows": int(len(y_resampled)),
+            "sampling_strategy": float(sampling_strategy),
+            "k_neighbors": int(effective_k),
+        },
+    )
+
+
 def _set_random_seed(seed: int) -> None:
     np.random.seed(int(seed))
     if torch is not None:
@@ -1096,8 +1427,23 @@ def _set_random_seed(seed: int) -> None:
             torch.cuda.manual_seed_all(int(seed))
 
 
-class WindowMLP(nn.Module):
+def _resolve_torch_device():
+    if torch is None:
+        raise ImportError("Torch no esta disponible en el entorno activo.")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps_backend is not None and bool(mps_backend.is_available()):
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+_TorchModuleBase = nn.Module if nn is not None else object
+
+
+class WindowMLP(_TorchModuleBase):
     def __init__(self, input_dim: int, hidden_dim: int, embedding_dim: int, dropout: float) -> None:
+        _ensure_torch_available()
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -1121,7 +1467,7 @@ class WindowMLP(nn.Module):
         return logits
 
 
-class WindowAttentionMLP(nn.Module):
+class WindowAttentionMLP(_TorchModuleBase):
     def __init__(
         self,
         *,
@@ -1133,6 +1479,7 @@ class WindowAttentionMLP(nn.Module):
         embedding_dim: int,
         dropout: float,
     ) -> None:
+        _ensure_torch_available()
         super().__init__()
         self.feature_count = int(feature_count)
         self.lookback_steps = int(lookback_steps)
@@ -1197,8 +1544,9 @@ class WindowAttentionMLP(nn.Module):
         return logits
 
 
-class EmbeddingDriftAutoencoder(nn.Module):
+class EmbeddingDriftAutoencoder(_TorchModuleBase):
     def __init__(self, input_dim: int, hidden_dim: int, bottleneck_dim: int, dropout: float) -> None:
+        _ensure_torch_available()
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -1220,7 +1568,7 @@ class EmbeddingDriftAutoencoder(nn.Module):
         return reconstruction
 
 
-class TemporalAttentionEmbeddingMonitor(nn.Module):
+class TemporalAttentionEmbeddingMonitor(_TorchModuleBase):
     def __init__(
         self,
         *,
@@ -1231,6 +1579,7 @@ class TemporalAttentionEmbeddingMonitor(nn.Module):
         sequence_length: int,
         dropout: float,
     ) -> None:
+        _ensure_torch_available()
         super().__init__()
         self.input_dim = int(input_dim)
         self.sequence_length = int(sequence_length)
@@ -1415,6 +1764,8 @@ def _train_torch_mlp(
     *,
     config: Dict[str, Any],
     model_name: str = MODEL_TORCH_MLP,
+    balance_mode: str = BALANCE_MODE_NONE,
+    smote_params: Optional[Dict[str, Any]] = None,
     feature_metadata: Optional[Dict[str, Any]] = None,
     learning_rate: Optional[float] = None,
     epochs: Optional[int] = None,
@@ -1423,9 +1774,29 @@ def _train_torch_mlp(
     _ensure_torch_available()
     _set_random_seed(int(config.get("random_state", 42)))
     model_family = _resolve_torch_model_family(model_name)
+    resolved_balance_mode = _resolve_balance_mode(balance_mode)
+    resolved_smote_params = _normalize_smote_params(smote_params)
+    X_fit = np.asarray(X_train, dtype=float)
+    y_fit = np.asarray(y_train).astype(int)
+    imputer = _fit_imputer(X_fit)
+    X_fit = _apply_imputer(X_fit, imputer)
+    smote_fit_info = {
+        "applied": False,
+        "original_rows": int(len(y_fit)),
+        "balanced_rows": int(len(y_fit)),
+        "sampling_strategy": float(resolved_smote_params["sampling_strategy"]),
+        "k_neighbors": int(resolved_smote_params["k_neighbors"]),
+    }
+    if resolved_balance_mode == BALANCE_MODE_SMOTE:
+        X_fit, y_fit, smote_fit_info = _apply_smote_balance(
+            X_fit,
+            y_fit,
+            sampling_strategy=float(resolved_smote_params["sampling_strategy"]),
+            k_neighbors=int(resolved_smote_params["k_neighbors"]),
+            random_state=int(config.get("random_state", DEFAULT_CONFIG["random_state"])),
+        )
 
-    imputer = _fit_imputer(X_train)
-    X_train_imp = _apply_imputer(X_train, imputer)
+    X_train_imp = np.asarray(X_fit, dtype=float)
     X_val_imp = _apply_imputer(X_val, imputer)
 
     scaler = StandardScaler()
@@ -1452,7 +1823,7 @@ def _train_torch_mlp(
             "temporal_labels": _time_step_labels(int((feature_metadata or {}).get("lookback_steps") or 1)),
         }
 
-    device = torch.device("cpu")
+    device = _resolve_torch_device()
     if model_family == "torch_mlp_attention":
         model = WindowAttentionMLP(
             feature_count=int(torch_metadata["feature_count"]),
@@ -1480,8 +1851,8 @@ def _train_torch_mlp(
     if base_model_state is not None:
         model.load_state_dict(base_model_state)
 
-    pos = max(1, int(np.sum(y_train == 1)))
-    neg = max(1, int(np.sum(y_train == 0)))
+    pos = max(1, int(np.sum(y_fit == 1)))
+    neg = max(1, int(np.sum(y_fit == 0)))
     pos_weight = torch.tensor([float(neg / pos)], dtype=torch.float32, device=device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(
@@ -1494,7 +1865,7 @@ def _train_torch_mlp(
 
     train_dataset = TensorDataset(
         torch.tensor(X_train_scaled, dtype=torch.float32),
-        torch.tensor(y_train.astype(np.float32), dtype=torch.float32),
+        torch.tensor(y_fit.astype(np.float32), dtype=torch.float32),
     )
     train_loader = DataLoader(train_dataset, batch_size=max(8, batch_size), shuffle=True)
 
@@ -1567,6 +1938,9 @@ def _train_torch_mlp(
         "kind": "torch_mlp",
         "model_family": model_family,
         "model_name": _resolve_torch_model_name(model_family),
+        "balance_mode": str(resolved_balance_mode),
+        "smote_params": dict(resolved_smote_params) if resolved_balance_mode == BALANCE_MODE_SMOTE else {},
+        "smote_fit_info": dict(smote_fit_info),
         "model": model,
         "imputer": imputer,
         "scaler": scaler,
@@ -1595,7 +1969,7 @@ def _predict_torch_model_details(artifact: Dict[str, Any], X: np.ndarray) -> Dic
 
     X_imp = _apply_imputer(X, imputer)
     X_scaled = scaler.transform(X_imp)
-    device = torch.device("cpu")
+    device = _resolve_torch_device()
     model.eval()
     with torch.no_grad():
         tensor = torch.tensor(X_scaled, dtype=torch.float32, device=device)
@@ -1634,28 +2008,97 @@ def _train_xgboost_model(
     y_val: np.ndarray,
     *,
     config: Dict[str, Any],
+    balance_mode: str = BALANCE_MODE_NONE,
+    smote_params: Optional[Dict[str, Any]] = None,
+    base_model: Optional[Any] = None,
+    imputer: Optional[np.ndarray] = None,
+    n_estimators_override: Optional[int] = None,
+    learning_rate_override: Optional[float] = None,
+    sample_weight: Optional[np.ndarray] = None,
+    history_training_rows_base: int = 0,
+    xgb_fine_tune_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     xgb = _import_external_xgboost()
-    imputer = _fit_imputer(X_train)
-    X_train_imp = _apply_imputer(X_train, imputer)
-    X_val_imp = _apply_imputer(X_val, imputer)
+    resolved_balance_mode = _resolve_balance_mode(balance_mode)
+    resolved_smote_params = _normalize_smote_params(smote_params)
+    X_fit = np.asarray(X_train, dtype=float)
+    y_fit = np.asarray(y_train).astype(int)
+    imputer_values = np.asarray(imputer, dtype=float) if imputer is not None else _fit_imputer(X_fit)
+    X_fit = _apply_imputer(X_fit, imputer_values)
+    sample_weight_values = None
+    if sample_weight is not None:
+        sample_weight_values = np.asarray(sample_weight, dtype=float).reshape(-1)
+        if sample_weight_values.shape[0] != len(y_fit):
+            raise ValueError("sample_weight must match the number of XGBoost fine-tuning rows.")
+    smote_fit_info = {
+        "applied": False,
+        "original_rows": int(len(y_fit)),
+        "balanced_rows": int(len(y_fit)),
+        "sampling_strategy": float(resolved_smote_params["sampling_strategy"]),
+        "k_neighbors": int(resolved_smote_params["k_neighbors"]),
+    }
+    if resolved_balance_mode == BALANCE_MODE_SMOTE:
+        X_fit, y_fit, smote_fit_info = _apply_smote_balance(
+            X_fit,
+            y_fit,
+            sampling_strategy=float(resolved_smote_params["sampling_strategy"]),
+            k_neighbors=int(resolved_smote_params["k_neighbors"]),
+            random_state=int(config.get("random_state", DEFAULT_CONFIG["random_state"])),
+        )
+        if sample_weight_values is not None and sample_weight_values.shape[0] != len(y_fit):
+            synthetic_rows = max(0, int(len(y_fit) - sample_weight_values.shape[0]))
+            if synthetic_rows > 0:
+                max_recent_weight = float(sample_weight_values.max()) if sample_weight_values.size > 0 else 1.0
+                sample_weight_values = np.concatenate(
+                    [sample_weight_values, np.full(synthetic_rows, max_recent_weight, dtype=float)]
+                )
 
-    pos = max(1, int(np.sum(y_train == 1)))
-    neg = max(1, int(np.sum(y_train == 0)))
-    estimator = xgb.XGBClassifier(
-        n_estimators=int(config.get("xgb_estimators", DEFAULT_CONFIG["xgb_estimators"])),
-        max_depth=3,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.8,
-        objective="binary:logistic",
-        eval_metric="logloss",
-        tree_method="hist",
-        n_jobs=1,
-        random_state=int(config.get("random_state", 42)),
-        scale_pos_weight=float(neg / pos),
+    X_train_imp = np.asarray(X_fit, dtype=float)
+    X_val_imp = _apply_imputer(X_val, imputer_values)
+
+    pos = max(1, int(np.sum(y_fit == 1)))
+    neg = max(1, int(np.sum(y_fit == 0)))
+    learning_rate_value = float(
+        learning_rate_override
+        if learning_rate_override is not None
+        else (base_model.get_params().get("learning_rate", 0.05) if base_model is not None else 0.05)
     )
-    estimator.fit(X_train_imp, y_train, verbose=False)
+    if base_model is None:
+        estimator = xgb.XGBClassifier(
+            n_estimators=int(n_estimators_override or config.get("xgb_estimators", DEFAULT_CONFIG["xgb_estimators"])),
+            max_depth=3,
+            learning_rate=learning_rate_value,
+            subsample=0.9,
+            colsample_bytree=0.8,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            tree_method="hist",
+            n_jobs=1,
+            random_state=int(config.get("random_state", 42)),
+            scale_pos_weight=float(neg / pos),
+        )
+        fit_kwargs = {
+            "verbose": False,
+        }
+        if sample_weight_values is not None:
+            fit_kwargs["sample_weight"] = sample_weight_values
+        estimator.fit(X_train_imp, y_fit, **fit_kwargs)
+    else:
+        params = dict(base_model.get_params())
+        params["n_estimators"] = int(
+            n_estimators_override
+            or config.get("xgb_fine_tune_estimators", DEFAULT_CONFIG["xgb_fine_tune_estimators"])
+        )
+        params["scale_pos_weight"] = float(neg / pos)
+        params["learning_rate"] = learning_rate_value
+        estimator = xgb.XGBClassifier(**params)
+        fit_kwargs = {
+            "verbose": False,
+            "xgb_model": base_model,
+        }
+        if sample_weight_values is not None:
+            fit_kwargs["sample_weight"] = sample_weight_values
+        estimator.fit(X_train_imp, y_fit, **fit_kwargs)
     raw_val_scores = estimator.predict_proba(X_val_imp)[:, 1].astype(float)
     calibrator = _fit_platt_calibrator(y_val, raw_val_scores)
     calibrated_val_scores = _apply_calibrator(raw_val_scores, calibrator)
@@ -1673,15 +2116,19 @@ def _train_xgboost_model(
     return {
         "kind": "xgboost",
         "model_name": MODEL_XGBOOST,
+        "balance_mode": str(resolved_balance_mode),
+        "smote_params": dict(resolved_smote_params) if resolved_balance_mode == BALANCE_MODE_SMOTE else {},
+        "smote_fit_info": dict(smote_fit_info),
         "model": estimator,
-        "imputer": imputer,
+        "imputer": imputer_values,
         "calibrator": calibrator,
         "reference": reference,
         "monitor_effective_architecture": "not_available",
         "decision_threshold": float(threshold_info["threshold"]),
         "threshold_info": threshold_info,
         "base_threshold": float(threshold_info["threshold"]),
-        "history_training_rows": int(len(y_train)),
+        "history_training_rows": int(history_training_rows_base + len(y_train)),
+        "xgb_fine_tune_metadata": dict(xgb_fine_tune_metadata or _default_xgb_fine_tune_metadata(config)),
     }
 
 
@@ -1722,6 +2169,8 @@ def _train_model_artifact(
     y_val: np.ndarray,
     *,
     config: Dict[str, Any],
+    balance_mode: str = BALANCE_MODE_NONE,
+    smote_params: Optional[Dict[str, Any]] = None,
     feature_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if _is_torch_model(str(model_name)):
@@ -1732,11 +2181,104 @@ def _train_model_artifact(
             y_val,
             config=config,
             model_name=str(model_name),
+            balance_mode=str(balance_mode),
+            smote_params=smote_params,
             feature_metadata=feature_metadata,
         )
     if str(model_name) == MODEL_XGBOOST:
-        return _train_xgboost_model(X_train, y_train, X_val, y_val, config=config)
+        return _train_xgboost_model(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            config=config,
+            balance_mode=str(balance_mode),
+            smote_params=smote_params,
+        )
     raise ValueError(f"Unsupported model: {model_name}")
+
+
+def _artifact_selection_score(
+    artifact: Dict[str, Any],
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+) -> Tuple[float, float, float, float]:
+    prediction_details = _predict_with_artifact_details(artifact, X_val)
+    calibrated_scores = _apply_calibrator(prediction_details["probs"], artifact.get("calibrator"))
+    roc_auc = _safe_auc(y_val, calibrated_scores)
+    pr_auc = _safe_pr_auc(y_val, calibrated_scores)
+    smote_fit_info = dict(artifact.get("smote_fit_info") or {})
+    applied = 1.0 if bool(smote_fit_info.get("applied", False)) else 0.0
+    balanced_rows = float(smote_fit_info.get("balanced_rows", len(y_val)))
+    return (
+        -1.0 if not np.isfinite(roc_auc) else float(roc_auc),
+        -1.0 if not np.isfinite(pr_auc) else float(pr_auc),
+        applied,
+        -balanced_rows,
+    )
+
+
+def _train_canonical_artifact(
+    model_name: str,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    *,
+    config: Dict[str, Any],
+    balance_mode: str,
+    feature_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    resolved_balance_mode = _resolve_balance_mode(balance_mode)
+    if resolved_balance_mode != BALANCE_MODE_SMOTE:
+        return _train_model_artifact(
+            model_name,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            config=config,
+            balance_mode=resolved_balance_mode,
+            feature_metadata=feature_metadata,
+        )
+
+    search_space = _smote_search_space(config)
+    best_artifact: Optional[Dict[str, Any]] = None
+    best_score: Optional[Tuple[float, float, float, float]] = None
+    for sampling_strategy in search_space["sampling_strategy"]:
+        for k_neighbors in search_space["k_neighbors"]:
+            candidate_artifact = _train_model_artifact(
+                model_name,
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+                config=config,
+                balance_mode=resolved_balance_mode,
+                smote_params={
+                    "sampling_strategy": float(sampling_strategy),
+                    "k_neighbors": int(k_neighbors),
+                },
+                feature_metadata=feature_metadata,
+            )
+            candidate_score = _artifact_selection_score(candidate_artifact, X_val, y_val)
+            if best_score is None or candidate_score > best_score:
+                best_artifact = candidate_artifact
+                best_score = candidate_score
+
+    if best_artifact is None:
+        best_artifact = _train_model_artifact(
+            model_name,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            config=config,
+            balance_mode=resolved_balance_mode,
+            smote_params=_normalize_smote_params(None),
+            feature_metadata=feature_metadata,
+        )
+    return best_artifact
 
 
 def _fit_embedding_monitor(
@@ -1813,7 +2355,7 @@ def _fit_classic_embedding_monitor(
         validation_fraction=0.2,
     )
 
-    device = torch.device("cpu")
+    device = _resolve_torch_device()
     model = EmbeddingDriftAutoencoder(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
@@ -1942,7 +2484,7 @@ def _fit_temporal_attention_embedding_monitor(
     max_epochs = max(2, int(config.get("drift_monitor_epochs", DEFAULT_CONFIG["drift_monitor_epochs"])))
     learning_rate = float(config.get("drift_monitor_learning_rate", DEFAULT_CONFIG["drift_monitor_learning_rate"]))
 
-    device = torch.device("cpu")
+    device = _resolve_torch_device()
     model = TemporalAttentionEmbeddingMonitor(
         input_dim=input_dim,
         attention_hidden_dim=attention_hidden_dim,
@@ -2051,7 +2593,7 @@ def _predict_embedding_monitor_details(
     model = monitor["model"]
     kind = str(monitor.get("kind") or DRIFT_MONITOR_ARCH_CLASSIC_AE)
     emb_scaled = scaler.transform(emb)
-    device = torch.device("cpu")
+    device = _resolve_torch_device()
     model.eval()
     if kind == DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION:
         sequence_length = int(monitor.get("sequence_length", DEFAULT_CONFIG["drift_monitor_sequence_length"]))
@@ -2437,6 +2979,143 @@ def _split_recent_for_adaptation(X_recent: np.ndarray, y_recent: np.ndarray) -> 
     return _temporal_train_val_split_arrays(X_recent, y_recent, validation_fraction=0.2)
 
 
+def _xgb_base_learning_rate(artifact: Dict[str, Any]) -> float:
+    model = artifact.get("model")
+    if model is not None and hasattr(model, "get_params"):
+        try:
+            return max(1e-6, float(model.get_params().get("learning_rate", 0.05)))
+        except Exception:
+            return 0.05
+    return 0.05
+
+
+def _select_xgb_fine_tune_window(
+    X_available: np.ndarray,
+    y_available: np.ndarray,
+    *,
+    severity_intensity: float,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    available_rows = int(len(y_available))
+    window_min = int(config.get("xgb_fine_tune_window_min", DEFAULT_CONFIG["xgb_fine_tune_window_min"]))
+    window_max = int(config.get("xgb_fine_tune_window_max", DEFAULT_CONFIG["xgb_fine_tune_window_max"]))
+    step = 8
+    effective_window_max = max(window_min, min(window_max, available_rows))
+
+    if available_rows < window_min:
+        return {
+            "applied": False,
+            "skip_reason": "insufficient_available_rows",
+            "window_rows": available_rows,
+            "X_recent": np.asarray(X_available, dtype=float),
+            "y_recent": np.asarray(y_available).astype(int),
+            "X_train": np.asarray([], dtype=float),
+            "X_val": np.asarray([], dtype=float),
+            "y_train": np.asarray([], dtype=int),
+            "y_val": np.asarray([], dtype=int),
+        }
+
+    window_rows = min(
+        effective_window_max,
+        _xgb_fine_tune_window_rows(severity_intensity, config=config),
+    )
+    if window_rows < window_min:
+        window_rows = min(effective_window_max, window_min)
+
+    last_payload: Optional[Dict[str, Any]] = None
+    while True:
+        start = max(0, available_rows - int(window_rows))
+        X_recent = np.asarray(X_available[start:], dtype=float)
+        y_recent = np.asarray(y_available[start:]).astype(int)
+        X_train, X_val, y_train, y_val = _split_recent_for_adaptation(X_recent, y_recent)
+        train_ok = len(y_train) > 0 and len(np.unique(y_train)) >= 2
+        val_ok = len(y_val) > 0 and len(np.unique(y_val)) >= 2
+        last_payload = {
+            "applied": bool(train_ok and val_ok),
+            "skip_reason": None if (train_ok and val_ok) else "insufficient_class_support_after_expansion",
+            "window_rows": int(window_rows),
+            "X_recent": X_recent,
+            "y_recent": y_recent,
+            "X_train": np.asarray(X_train, dtype=float),
+            "X_val": np.asarray(X_val, dtype=float),
+            "y_train": np.asarray(y_train).astype(int),
+            "y_val": np.asarray(y_val).astype(int),
+        }
+        if train_ok and val_ok:
+            return last_payload
+        if int(window_rows) >= effective_window_max or int(window_rows) >= available_rows:
+            return last_payload
+        window_rows = min(effective_window_max, available_rows, int(window_rows) + step)
+
+
+def _sort_metric_desc(value: float) -> float:
+    return -1.0 if not np.isfinite(value) else float(value)
+
+
+def _sort_metric_asc(value: float) -> float:
+    return float("-inf") if not np.isfinite(value) else -float(value)
+
+
+def _evaluate_xgb_fine_tune_candidate(
+    artifact: Dict[str, Any],
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    *,
+    selection_metric: str,
+    rounds_selected: int,
+) -> Dict[str, Any]:
+    prediction_details = _predict_with_artifact_details(artifact, X_val)
+    calibrated_scores = _apply_calibrator(prediction_details["probs"], artifact.get("calibrator"))
+    threshold_info = dict(artifact.get("threshold_info") or {})
+    threshold_value = float(
+        threshold_info.get("threshold", artifact.get("decision_threshold", artifact.get("base_threshold", 0.5)))
+    )
+    metrics = _classification_metrics(y_val, calibrated_scores, threshold=threshold_value)
+    f_beta = float(threshold_info.get("f_beta", float("nan")))
+    recall = float(threshold_info.get("recall", metrics["recall"]))
+    pr_auc = float(metrics["pr_auc"])
+    brier = float(metrics["brier"])
+    resolved_metric = _resolve_xgb_fine_tune_selection_metric(selection_metric)
+
+    if resolved_metric == XGB_FINE_TUNE_SELECTION_PR_AUC:
+        sort_key = (
+            _sort_metric_desc(pr_auc),
+            _sort_metric_desc(f_beta),
+            _sort_metric_desc(recall),
+            _sort_metric_asc(brier),
+            -float(rounds_selected),
+        )
+        selection_score = pr_auc
+    elif resolved_metric == XGB_FINE_TUNE_SELECTION_BRIER:
+        sort_key = (
+            _sort_metric_asc(brier),
+            _sort_metric_desc(pr_auc),
+            _sort_metric_desc(f_beta),
+            _sort_metric_desc(recall),
+            -float(rounds_selected),
+        )
+        selection_score = brier
+    else:
+        sort_key = (
+            _sort_metric_desc(f_beta),
+            _sort_metric_desc(recall),
+            _sort_metric_desc(pr_auc),
+            _sort_metric_asc(brier),
+            -float(rounds_selected),
+        )
+        selection_score = f_beta
+
+    return {
+        "selection_metric": resolved_metric,
+        "selection_score": float(selection_score),
+        "f_beta": f_beta,
+        "recall": recall,
+        "pr_auc": pr_auc,
+        "brier": brier,
+        "sort_key": sort_key,
+    }
+
+
 def _recalibrate_artifact(artifact: Dict[str, Any], X_recent: np.ndarray, y_recent: np.ndarray, *, config: Dict[str, Any]) -> None:
     raw_scores, _embeddings = _predict_with_artifact(artifact, X_recent)
     calibrator = _fit_platt_calibrator(y_recent, raw_scores)
@@ -2458,9 +3137,106 @@ def _fine_tune_artifact(
     y_recent: np.ndarray,
     *,
     config: Dict[str, Any],
-) -> None:
-    if str(artifact.get("kind")) != "torch_mlp":
-        raise ValueError("Fine-tuning solo aplica al modelo Torch MLP.")
+    severity_intensity: Optional[float] = None,
+) -> Dict[str, Any]:
+    artifact_kind = str(artifact.get("kind"))
+    if artifact_kind == "xgboost":
+        resolved_intensity = float(np.clip(float(severity_intensity or 0.0), 0.0, 1.0))
+        window_payload = _select_xgb_fine_tune_window(
+            X_recent,
+            y_recent,
+            severity_intensity=resolved_intensity,
+            config=config,
+        )
+        selection_metric = _resolve_xgb_fine_tune_selection_metric(
+            config.get(
+                "xgb_fine_tune_selection_metric",
+                DEFAULT_CONFIG["xgb_fine_tune_selection_metric"],
+            )
+        )
+        metadata = {
+            **_default_xgb_fine_tune_metadata(config),
+            "severity_intensity": resolved_intensity,
+            "xgb_adaptation_window_rows": int(window_payload.get("window_rows", 0) or 0),
+            "xgb_fine_tune_selection_metric": selection_metric,
+        }
+        if not bool(window_payload.get("applied", False)):
+            metadata["xgb_fine_tune_skip_reason"] = str(
+                window_payload.get("skip_reason") or "insufficient_class_support_after_expansion"
+            )
+            artifact["xgb_fine_tune_metadata"] = metadata
+            return {
+                "applied": False,
+                "xgb_fine_tune_metadata": metadata,
+            }
+
+        eta_multiplier = _xgb_fine_tune_eta_multiplier(resolved_intensity, config=config)
+        recent_weight_max = _xgb_fine_tune_recent_weight_max(resolved_intensity, config=config)
+        learning_rate_value = _xgb_base_learning_rate(artifact) * eta_multiplier
+        sample_weight = _xgb_recent_sample_weights(len(window_payload["y_train"]), recent_weight_max)
+
+        best_artifact: Optional[Dict[str, Any]] = None
+        best_candidate: Optional[Dict[str, Any]] = None
+        for rounds_candidate in _xgb_fine_tune_round_candidates(resolved_intensity, config=config):
+            tuned = _train_xgboost_model(
+                window_payload["X_train"],
+                window_payload["y_train"],
+                window_payload["X_val"],
+                window_payload["y_val"],
+                config=config,
+                balance_mode=str(artifact.get("balance_mode", BALANCE_MODE_NONE)),
+                smote_params=dict(artifact.get("smote_params") or {}),
+                base_model=artifact.get("model"),
+                imputer=artifact.get("imputer"),
+                n_estimators_override=int(rounds_candidate),
+                learning_rate_override=float(learning_rate_value),
+                sample_weight=sample_weight,
+                history_training_rows_base=int(artifact.get("history_training_rows", 0)),
+                xgb_fine_tune_metadata=metadata,
+            )
+            candidate_eval = _evaluate_xgb_fine_tune_candidate(
+                tuned,
+                window_payload["X_val"],
+                window_payload["y_val"],
+                selection_metric=selection_metric,
+                rounds_selected=int(rounds_candidate),
+            )
+            if best_candidate is None or candidate_eval["sort_key"] > best_candidate["sort_key"]:
+                best_artifact = tuned
+                best_candidate = dict(candidate_eval, rounds_selected=int(rounds_candidate))
+
+        if best_artifact is None or best_candidate is None:
+            metadata["xgb_fine_tune_skip_reason"] = "no_candidate_selected"
+            artifact["xgb_fine_tune_metadata"] = metadata
+            return {
+                "applied": False,
+                "xgb_fine_tune_metadata": metadata,
+            }
+
+        metadata.update(
+            {
+                "xgb_fine_tune_rounds_selected": int(best_candidate["rounds_selected"]),
+                "xgb_fine_tune_eta_multiplier": float(eta_multiplier),
+                "xgb_fine_tune_recent_weight_max": float(recent_weight_max),
+                "xgb_fine_tune_selection_score": float(best_candidate["selection_score"]),
+                "xgb_fine_tune_skip_reason": None,
+            }
+        )
+        best_artifact["xgb_fine_tune_metadata"] = dict(metadata)
+        artifact.update(best_artifact)
+        _recalibrate_artifact(
+            artifact,
+            window_payload["X_recent"],
+            window_payload["y_recent"],
+            config=config,
+        )
+        artifact["xgb_fine_tune_metadata"] = dict(metadata)
+        return {
+            "applied": True,
+            "xgb_fine_tune_metadata": metadata,
+        }
+    if artifact_kind != "torch_mlp":
+        raise ValueError("Fine-tuning solo aplica a Torch MLP y XGBoost.")
     X_train, X_val, y_train, y_val = _split_recent_for_adaptation(X_recent, y_recent)
     tuned = _train_torch_mlp(
         X_train,
@@ -2469,6 +3245,8 @@ def _fine_tune_artifact(
         y_val,
         config=config,
         model_name=str(artifact.get("model_name", MODEL_TORCH_MLP)),
+        balance_mode=str(artifact.get("balance_mode", BALANCE_MODE_NONE)),
+        smote_params=dict(artifact.get("smote_params") or {}),
         feature_metadata={
             "lookback_steps": artifact.get("lookback_steps"),
             "feature_count": artifact.get("feature_count"),
@@ -2481,6 +3259,10 @@ def _fine_tune_artifact(
     )
     artifact.update(tuned)
     _refresh_reference_from_recent(artifact, X_recent, y_recent, config=config)
+    return {
+        "applied": True,
+        "xgb_fine_tune_metadata": {},
+    }
 
 
 def _retrain_artifact(
@@ -2504,6 +3286,8 @@ def _retrain_artifact(
         X_val,
         y_val,
         config=config,
+        balance_mode=str(artifact.get("balance_mode", BALANCE_MODE_NONE)),
+        smote_params=dict(artifact.get("smote_params") or {}),
         feature_metadata={
             "lookback_steps": artifact.get("lookback_steps"),
             "feature_count": artifact.get("feature_count"),
@@ -2516,39 +3300,45 @@ def _retrain_artifact(
 
 
 def _allowed_strategies_for_model(model_name: str, strategies: Sequence[str]) -> List[str]:
-    if str(model_name) == MODEL_XGBOOST:
-        return [strategy for strategy in strategies if strategy != STRATEGY_FINE_TUNING]
     return [str(strategy) for strategy in strategies]
 
 
 def _rolling_metric_table(stream_df: pd.DataFrame, *, rolling_window: int) -> pd.DataFrame:
     if stream_df.empty:
         return pd.DataFrame()
-    work = stream_df.copy().reset_index(drop=True)
     rows: List[Dict[str, Any]] = []
-    for idx in range(len(work)):
-        start = max(0, idx - int(rolling_window) + 1)
-        window = work.iloc[start : idx + 1]
-        threshold_value = float(window["decision_threshold"].iloc[-1]) if "decision_threshold" in window.columns else 0.5
-        metrics = _classification_metrics(
-            window["y_true"].to_numpy(),
-            window["score"].to_numpy(),
-            threshold=threshold_value,
-            preds=window["prediction"].to_numpy() if "prediction" in window.columns else None,
-        )
-        rows.append(
-            {
-                "timestamp": pd.Timestamp(work.loc[idx, "timestamp"]),
-                "model": str(work.loc[idx, "model"]),
-                "strategy": str(work.loc[idx, "strategy"]),
-                "pr_auc": metrics["pr_auc"],
-                "recall": metrics["recall"],
-                "fnr": metrics["fnr"],
-                "brier": metrics["brier"],
-                "severity_score": float(window["severity_score"].iloc[-1]),
-                "decision_threshold": threshold_value,
-            }
-        )
+    group_cols = ["model", "strategy", "balance_mode"]
+    work = stream_df.copy().sort_values(group_cols + ["timestamp"]).reset_index(drop=True)
+    for (model_name, strategy, balance_mode), group in work.groupby(group_cols, dropna=False, sort=False):
+        group = group.reset_index(drop=True)
+        for idx in range(len(group)):
+            start = max(0, idx - int(rolling_window) + 1)
+            window = group.iloc[start : idx + 1]
+            threshold_value = (
+                float(window["decision_threshold"].iloc[-1])
+                if "decision_threshold" in window.columns
+                else 0.5
+            )
+            metrics = _classification_metrics(
+                window["y_true"].to_numpy(),
+                window["score"].to_numpy(),
+                threshold=threshold_value,
+                preds=window["prediction"].to_numpy() if "prediction" in window.columns else None,
+            )
+            rows.append(
+                {
+                    "timestamp": pd.Timestamp(group.loc[idx, "timestamp"]),
+                    "model": str(model_name),
+                    "strategy": str(strategy),
+                    "balance_mode": str(balance_mode),
+                    "pr_auc": metrics["pr_auc"],
+                    "recall": metrics["recall"],
+                    "fnr": metrics["fnr"],
+                    "brier": metrics["brier"],
+                    "severity_score": float(window["severity_score"].iloc[-1]),
+                    "decision_threshold": threshold_value,
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -2556,8 +3346,8 @@ def _summary_from_stream(stream_df: pd.DataFrame, drift_events: pd.DataFrame) ->
     if stream_df.empty:
         return pd.DataFrame()
     rows: List[Dict[str, Any]] = []
-    grouped = stream_df.groupby(["model", "strategy"], dropna=False)
-    for (model_name, strategy), group in grouped:
+    grouped = stream_df.groupby(["model", "strategy", "balance_mode"], dropna=False)
+    for (model_name, strategy, balance_mode), group in grouped:
         threshold_value = float(group["decision_threshold"].iloc[-1]) if "decision_threshold" in group.columns else 0.5
         metrics = _classification_metrics(
             group["y_true"].to_numpy(),
@@ -2568,11 +3358,13 @@ def _summary_from_stream(stream_df: pd.DataFrame, drift_events: pd.DataFrame) ->
         related_events = drift_events.loc[
             drift_events["model"].astype(str).eq(str(model_name))
             & drift_events["strategy"].astype(str).eq(str(strategy))
+            & drift_events["balance_mode"].astype(str).eq(str(balance_mode))
         ].copy()
         rows.append(
             {
                 "model": str(model_name),
                 "strategy": str(strategy),
+                "balance_mode": str(balance_mode),
                 "rows": int(len(group)),
                 "roc_auc": metrics["roc_auc"],
                 "pr_auc": metrics["pr_auc"],
@@ -2591,13 +3383,13 @@ def _summary_from_stream(stream_df: pd.DataFrame, drift_events: pd.DataFrame) ->
                 "monitor_warmup_rows": int(group["monitor_warmup"].sum()) if "monitor_warmup" in group.columns else 0,
             }
         )
-    return pd.DataFrame(rows).sort_values(["model", "strategy"]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["model", "balance_mode", "strategy"]).reset_index(drop=True)
 
 
 def _build_attention_outputs(attention_rows: Sequence[Dict[str, Any]]) -> Dict[str, pd.DataFrame]:
-    feature_acc: Dict[Tuple[str, str, str], Dict[str, float]] = {}
-    temporal_acc: Dict[Tuple[str, str, str], Dict[str, float]] = {}
-    drift_acc: Dict[Tuple[str, str, str, str], Dict[str, float]] = {}
+    feature_acc: Dict[Tuple[str, str, str, str], Dict[str, float]] = {}
+    temporal_acc: Dict[Tuple[str, str, str, str], Dict[str, float]] = {}
+    drift_acc: Dict[Tuple[str, str, str, str, str], Dict[str, float]] = {}
 
     for row in attention_rows:
         feature_values = _as_float_array(row.get("feature_attention_mean"))
@@ -2609,9 +3401,10 @@ def _build_attention_outputs(attention_rows: Sequence[Dict[str, Any]]) -> Dict[s
         is_drift_event = bool(row.get("is_drift_event"))
         model_name = str(row.get("model"))
         strategy = str(row.get("strategy"))
+        balance_mode = str(row.get("balance_mode", BALANCE_MODE_NONE))
 
         for label, value in zip(feature_labels, feature_values):
-            key = (model_name, strategy, str(label))
+            key = (model_name, strategy, balance_mode, str(label))
             acc = feature_acc.setdefault(key, {"sum": 0.0, "count": 0.0, "drift_rows": 0.0})
             acc["sum"] += float(value)
             acc["count"] += 1.0
@@ -2619,7 +3412,7 @@ def _build_attention_outputs(attention_rows: Sequence[Dict[str, Any]]) -> Dict[s
                 acc["drift_rows"] += 1.0
 
         for label, value in zip(temporal_labels, temporal_values):
-            key = (model_name, strategy, str(label))
+            key = (model_name, strategy, balance_mode, str(label))
             acc = temporal_acc.setdefault(key, {"sum": 0.0, "count": 0.0, "drift_rows": 0.0})
             acc["sum"] += float(value)
             acc["count"] += 1.0
@@ -2630,14 +3423,14 @@ def _build_attention_outputs(attention_rows: Sequence[Dict[str, Any]]) -> Dict[s
             continue
 
         for label, value, ref_value in zip(feature_labels, feature_values, ref_feature_values):
-            key = (model_name, strategy, "feature", str(label))
+            key = (model_name, strategy, balance_mode, "feature", str(label))
             acc = drift_acc.setdefault(key, {"attention_sum": 0.0, "reference_sum": 0.0, "count": 0.0})
             acc["attention_sum"] += float(value)
             acc["reference_sum"] += float(ref_value)
             acc["count"] += 1.0
 
         for label, value, ref_value in zip(temporal_labels, temporal_values, ref_temporal_values):
-            key = (model_name, strategy, "time", str(label))
+            key = (model_name, strategy, balance_mode, "time", str(label))
             acc = drift_acc.setdefault(key, {"attention_sum": 0.0, "reference_sum": 0.0, "count": 0.0})
             acc["attention_sum"] += float(value)
             acc["reference_sum"] += float(ref_value)
@@ -2647,28 +3440,31 @@ def _build_attention_outputs(attention_rows: Sequence[Dict[str, Any]]) -> Dict[s
         {
             "model": model_name,
             "strategy": strategy,
+            "balance_mode": balance_mode,
             "feature": label,
             "attention_mean": float(acc["sum"] / max(acc["count"], 1.0)),
             "n_rows": int(acc["count"]),
             "drift_event_rows": int(acc["drift_rows"]),
         }
-        for (model_name, strategy, label), acc in feature_acc.items()
+        for (model_name, strategy, balance_mode, label), acc in feature_acc.items()
     ]
     temporal_rows = [
         {
             "model": model_name,
             "strategy": strategy,
+            "balance_mode": balance_mode,
             "time_step": label,
             "attention_mean": float(acc["sum"] / max(acc["count"], 1.0)),
             "n_rows": int(acc["count"]),
             "drift_event_rows": int(acc["drift_rows"]),
         }
-        for (model_name, strategy, label), acc in temporal_acc.items()
+        for (model_name, strategy, balance_mode, label), acc in temporal_acc.items()
     ]
     drift_rows = [
         {
             "model": model_name,
             "strategy": strategy,
+            "balance_mode": balance_mode,
             "scope": scope,
             "item": label,
             "reference_attention": float(acc["reference_sum"] / max(acc["count"], 1.0)),
@@ -2679,28 +3475,28 @@ def _build_attention_outputs(attention_rows: Sequence[Dict[str, Any]]) -> Dict[s
             ),
             "n_drift_rows": int(acc["count"]),
         }
-        for (model_name, strategy, scope, label), acc in drift_acc.items()
+        for (model_name, strategy, balance_mode, scope, label), acc in drift_acc.items()
     ]
 
     feature_df = pd.DataFrame(feature_rows)
     if not feature_df.empty:
         feature_df = feature_df.sort_values(
-            ["model", "strategy", "attention_mean", "feature"],
-            ascending=[True, True, False, True],
+            ["model", "balance_mode", "strategy", "attention_mean", "feature"],
+            ascending=[True, True, True, False, True],
         ).reset_index(drop=True)
 
     temporal_df = pd.DataFrame(temporal_rows)
     if not temporal_df.empty:
         temporal_df = temporal_df.sort_values(
-            ["model", "strategy", "attention_mean", "time_step"],
-            ascending=[True, True, False, True],
+            ["model", "balance_mode", "strategy", "attention_mean", "time_step"],
+            ascending=[True, True, True, False, True],
         ).reset_index(drop=True)
 
     drift_df = pd.DataFrame(drift_rows)
     if not drift_df.empty:
         drift_df = drift_df.sort_values(
-            ["model", "strategy", "scope", "abs_delta_attention", "item"],
-            ascending=[True, True, True, False, True],
+            ["model", "balance_mode", "strategy", "scope", "abs_delta_attention", "item"],
+            ascending=[True, True, True, True, False, True],
         ).reset_index(drop=True)
 
     return {
@@ -2711,8 +3507,8 @@ def _build_attention_outputs(attention_rows: Sequence[Dict[str, Any]]) -> Dict[s
 
 
 def _build_detector_attention_outputs(detector_attention_rows: Sequence[Dict[str, Any]]) -> Dict[str, pd.DataFrame]:
-    temporal_acc: Dict[Tuple[str, str, str], Dict[str, float]] = {}
-    drift_acc: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+    temporal_acc: Dict[Tuple[str, str, str, str], Dict[str, float]] = {}
+    drift_acc: Dict[Tuple[str, str, str, str], Dict[str, float]] = {}
 
     for row in detector_attention_rows:
         temporal_values = _as_float_array(row.get("temporal_attention_mean"))
@@ -2720,10 +3516,11 @@ def _build_detector_attention_outputs(detector_attention_rows: Sequence[Dict[str
         reference_values = _as_float_array(row.get("reference_temporal_attention_mean"))
         model_name = str(row.get("model"))
         strategy = str(row.get("strategy"))
+        balance_mode = str(row.get("balance_mode", BALANCE_MODE_NONE))
         is_drift_event = bool(row.get("is_drift_event"))
 
         for label, value in zip(temporal_labels, temporal_values):
-            key = (model_name, strategy, str(label))
+            key = (model_name, strategy, balance_mode, str(label))
             acc = temporal_acc.setdefault(key, {"sum": 0.0, "count": 0.0, "drift_rows": 0.0})
             acc["sum"] += float(value)
             acc["count"] += 1.0
@@ -2733,7 +3530,7 @@ def _build_detector_attention_outputs(detector_attention_rows: Sequence[Dict[str
         if not is_drift_event:
             continue
         for label, value, ref_value in zip(temporal_labels, temporal_values, reference_values):
-            key = (model_name, strategy, str(label))
+            key = (model_name, strategy, balance_mode, str(label))
             acc = drift_acc.setdefault(key, {"attention_sum": 0.0, "reference_sum": 0.0, "count": 0.0})
             acc["attention_sum"] += float(value)
             acc["reference_sum"] += float(ref_value)
@@ -2743,17 +3540,19 @@ def _build_detector_attention_outputs(detector_attention_rows: Sequence[Dict[str
         {
             "model": model_name,
             "strategy": strategy,
+            "balance_mode": balance_mode,
             "time_step": label,
             "attention_mean": float(acc["sum"] / max(acc["count"], 1.0)),
             "n_rows": int(acc["count"]),
             "drift_event_rows": int(acc["drift_rows"]),
         }
-        for (model_name, strategy, label), acc in temporal_acc.items()
+        for (model_name, strategy, balance_mode, label), acc in temporal_acc.items()
     ]
     drift_rows = [
         {
             "model": model_name,
             "strategy": strategy,
+            "balance_mode": balance_mode,
             "time_step": label,
             "reference_attention": float(acc["reference_sum"] / max(acc["count"], 1.0)),
             "drift_attention_mean": float(acc["attention_sum"] / max(acc["count"], 1.0)),
@@ -2763,21 +3562,21 @@ def _build_detector_attention_outputs(detector_attention_rows: Sequence[Dict[str
             ),
             "n_drift_rows": int(acc["count"]),
         }
-        for (model_name, strategy, label), acc in drift_acc.items()
+        for (model_name, strategy, balance_mode, label), acc in drift_acc.items()
     ]
 
     temporal_df = pd.DataFrame(temporal_rows)
     if not temporal_df.empty:
         temporal_df = temporal_df.sort_values(
-            ["model", "strategy", "attention_mean", "time_step"],
-            ascending=[True, True, False, True],
+            ["model", "balance_mode", "strategy", "attention_mean", "time_step"],
+            ascending=[True, True, True, False, True],
         ).reset_index(drop=True)
 
     drift_df = pd.DataFrame(drift_rows)
     if not drift_df.empty:
         drift_df = drift_df.sort_values(
-            ["model", "strategy", "abs_delta_attention", "time_step"],
-            ascending=[True, True, False, True],
+            ["model", "balance_mode", "strategy", "abs_delta_attention", "time_step"],
+            ascending=[True, True, True, False, True],
         ).reset_index(drop=True)
 
     return {
@@ -2791,6 +3590,7 @@ def run_backtest_pipeline(
     *,
     config: Dict[str, Any],
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    live_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     df = _ensure_non_empty_dataframe(dataset_bundle.get("df"), label="Neural drift dataset")
     df = _subset_dataset_by_percentage(
@@ -2834,258 +3634,382 @@ def run_backtest_pipeline(
         "feature_count": int(len(dataset.augmented_feature_cols)),
     }
 
+    selected_balance_modes = _resolve_balance_modes(config.get("balance_modes"))
     selected_models = [model for model in config.get("models", []) if model in AVAILABLE_MODELS]
     selected_strategies = [strategy for strategy in config.get("strategies", []) if strategy in AVAILABLE_STRATEGIES]
     selected_channels = [channel for channel in config.get("drift_channels", []) if channel in AVAILABLE_DRIFT_CHANNELS]
     if not selected_models or not selected_strategies:
         raise ValueError("Selecciona al menos un modelo y una estrategia para el backtest.")
 
-    loop_total = sum(len(_allowed_strategies_for_model(model, selected_strategies)) for model in selected_models)
+    loop_total = sum(
+        len(_allowed_strategies_for_model(model, selected_strategies)) * len(selected_balance_modes)
+        for model in selected_models
+    )
     loop_total = max(1, loop_total)
     loop_index = 0
 
     for model_name in selected_models:
-        if progress_callback is not None:
-            progress_callback(
-                0.12 + 0.70 * (loop_index / loop_total),
-                f"Entrenando baseline para {model_name}...",
-            )
-        baseline_artifact = _train_model_artifact(
-            model_name,
-            split["X_train"],
-            split["y_train"],
-            split["X_val"],
-            split["y_val"],
-            config=config,
-            feature_metadata=feature_metadata,
-        )
-        baseline_details = _predict_with_artifact_details(baseline_artifact, split["X_val"])
-        baseline_raw_scores = baseline_details["probs"]
-        baseline_embeddings = baseline_details["embeddings"]
-        baseline_scores = _apply_calibrator(baseline_raw_scores, baseline_artifact.get("calibrator"))
-        baseline_threshold = float(baseline_artifact.get("decision_threshold", baseline_artifact.get("base_threshold", 0.5)))
-        baseline_preds = (baseline_scores >= baseline_threshold).astype(int)
-        baseline_metrics = _classification_metrics(
-            split["y_val"],
-            baseline_scores,
-            threshold=baseline_threshold,
-            preds=baseline_preds,
-        )
-        baseline_rows.append(
-            {
-                "model": str(model_name),
-                "split": "validation",
-                "rows": int(len(split["y_val"])),
-                **baseline_metrics,
-                "embedding_channels_available": bool(baseline_embeddings.size > 0),
-                "monitor_effective_architecture": str(
-                    baseline_artifact.get("monitor_effective_architecture", "not_available")
-                ),
-            }
-        )
-
         valid_strategies = _allowed_strategies_for_model(model_name, selected_strategies)
-        for strategy in valid_strategies:
-            loop_index += 1
+        for balance_mode in selected_balance_modes:
             if progress_callback is not None:
                 progress_callback(
-                    0.15 + 0.75 * (loop_index / loop_total),
-                    f"Simulando {model_name} | {strategy}...",
+                    0.12 + 0.70 * (loop_index / loop_total),
+                    f"Entrenando baseline para {model_name} | {balance_mode}...",
                 )
-            artifact = _train_model_artifact(
+            canonical_artifact = _train_canonical_artifact(
                 model_name,
                 split["X_train"],
                 split["y_train"],
                 split["X_val"],
                 split["y_val"],
                 config=config,
+                balance_mode=balance_mode,
                 feature_metadata=feature_metadata,
             )
-            history_X = np.vstack([split["X_train"], split["X_val"]])
-            history_y = np.concatenate([split["y_train"], split["y_val"]])
-
-            detectors = {
-                DRIFT_INPUT: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
-                DRIFT_SCORE: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
-                DRIFT_ERROR: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
-            }
-            channel_histories: Dict[str, List[float]] = {
-                DRIFT_INPUT: [],
-                DRIFT_SCORE: [],
-                DRIFT_ERROR: [],
-                DRIFT_EMBEDDING: [],
-            }
-            embedding_buffer: List[np.ndarray] = []
-
-            for idx in range(len(split["y_stream"])):
-                x_row = split["X_stream"][idx : idx + 1]
-                y_true = int(split["y_stream"][idx])
-                timestamp = pd.Timestamp(split["metadata_stream"].loc[idx, "prediction_time"])
-
-                prediction_details = _predict_with_artifact_details(artifact, x_row)
-                raw_scores = prediction_details["probs"]
-                embeddings = prediction_details["embeddings"]
-                attention_summary = prediction_details.get("attention_summary")
-                score = float(_apply_calibrator(raw_scores, artifact.get("calibrator"))[0])
-                decision_threshold = float(artifact.get("decision_threshold", artifact.get("base_threshold", 0.5)))
-                pred = int(score >= decision_threshold)
-                pre_action_reference_attention = dict(artifact.get("attention_summary_reference") or {})
-                pre_action_monitor = dict(artifact.get("embedding_monitor") or {})
-                detector_attention_reference = dict(pre_action_monitor.get("attention_reference_summary") or {})
-                recent_embedding_history = (
-                    np.vstack(embedding_buffer).astype(float)
-                    if embedding_buffer
-                    else np.empty((0, embeddings.shape[1] if embeddings.ndim == 2 and embeddings.shape[1] > 0 else 0), dtype=float)
-                )
-                channel_payload = _build_channel_scores(
-                    artifact=artifact,
-                    x_row=_apply_imputer(x_row, artifact["imputer"]).reshape(-1),
-                    calibrated_score=score,
-                    y_true=y_true,
-                    embeddings=embeddings.reshape(-1),
-                    recent_embedding_history=recent_embedding_history,
-                    selected_channels=selected_channels,
-                    detectors=detectors,
-                    channel_histories=channel_histories,
-                    recent_window_size=int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])),
-                    embedding_reconstruction_weight=float(
-                        config.get(
-                            "drift_monitor_reconstruction_weight",
-                            DEFAULT_CONFIG["drift_monitor_reconstruction_weight"],
-                        )
+            canonical_smote_info = dict(canonical_artifact.get("smote_fit_info") or {})
+            canonical_smote_params = dict(canonical_artifact.get("smote_params") or {})
+            baseline_details = _predict_with_artifact_details(canonical_artifact, split["X_val"])
+            baseline_raw_scores = baseline_details["probs"]
+            baseline_embeddings = baseline_details["embeddings"]
+            baseline_scores = _apply_calibrator(baseline_raw_scores, canonical_artifact.get("calibrator"))
+            baseline_threshold = float(
+                canonical_artifact.get("decision_threshold", canonical_artifact.get("base_threshold", 0.5))
+            )
+            baseline_preds = (baseline_scores >= baseline_threshold).astype(int)
+            baseline_metrics = _classification_metrics(
+                split["y_val"],
+                baseline_scores,
+                threshold=baseline_threshold,
+                preds=baseline_preds,
+            )
+            baseline_rows.append(
+                {
+                    "model": str(model_name),
+                    "balance_mode": str(balance_mode),
+                    "split": "validation",
+                    "rows": int(len(split["y_val"])),
+                    **baseline_metrics,
+                    "embedding_channels_available": bool(baseline_embeddings.size > 0),
+                    "monitor_effective_architecture": str(
+                        canonical_artifact.get("monitor_effective_architecture", "not_available")
                     ),
-                    point_signal_weight=float(
-                        config.get(
-                            "drift_point_signal_weight",
-                            DEFAULT_CONFIG["drift_point_signal_weight"],
+                    "smote_applied": bool(canonical_smote_info.get("applied", False)),
+                    "smote_balanced_rows": int(canonical_smote_info.get("balanced_rows", len(split["y_train"]))),
+                    "smote_sampling_strategy": canonical_smote_params.get("sampling_strategy"),
+                    "smote_k_neighbors": canonical_smote_params.get("k_neighbors"),
+                }
+            )
+
+            for strategy in valid_strategies:
+                loop_index += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        0.15 + 0.75 * (loop_index / loop_total),
+                        f"Simulando {model_name} | {strategy} | {balance_mode}...",
+                    )
+                if live_update_callback is not None:
+                    live_update_callback(
+                        {
+                            "event": "simulation_start",
+                            "model": str(model_name),
+                            "strategy": str(strategy),
+                            "balance_mode": str(balance_mode),
+                            "severity_threshold": float(
+                                config.get("severity_threshold", DEFAULT_CONFIG["severity_threshold"])
+                            ),
+                            "rolling_metric_window": int(
+                                config.get(
+                                    "rolling_metric_window",
+                                    DEFAULT_CONFIG["rolling_metric_window"],
+                                )
+                            ),
+                            "stream_total_rows": int(len(split["y_stream"])),
+                        }
+                    )
+                try:
+                    artifact = copy.deepcopy(canonical_artifact)
+                except Exception:
+                    artifact = _train_canonical_artifact(
+                        model_name,
+                        split["X_train"],
+                        split["y_train"],
+                        split["X_val"],
+                        split["y_val"],
+                        config=config,
+                        balance_mode=balance_mode,
+                        feature_metadata=feature_metadata,
+                    )
+                history_X = np.vstack([split["X_train"], split["X_val"]])
+                history_y = np.concatenate([split["y_train"], split["y_val"]])
+
+                detectors = {
+                    DRIFT_INPUT: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+                    DRIFT_SCORE: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+                    DRIFT_ERROR: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+                }
+                channel_histories: Dict[str, List[float]] = {
+                    DRIFT_INPUT: [],
+                    DRIFT_SCORE: [],
+                    DRIFT_ERROR: [],
+                    DRIFT_EMBEDDING: [],
+                }
+                embedding_buffer: List[np.ndarray] = []
+
+                for idx in range(len(split["y_stream"])):
+                    x_row = split["X_stream"][idx : idx + 1]
+                    y_true = int(split["y_stream"][idx])
+                    timestamp = pd.Timestamp(split["metadata_stream"].loc[idx, "prediction_time"])
+
+                    prediction_details = _predict_with_artifact_details(artifact, x_row)
+                    raw_scores = prediction_details["probs"]
+                    embeddings = prediction_details["embeddings"]
+                    attention_summary = prediction_details.get("attention_summary")
+                    score = float(_apply_calibrator(raw_scores, artifact.get("calibrator"))[0])
+                    decision_threshold = float(
+                        artifact.get("decision_threshold", artifact.get("base_threshold", 0.5))
+                    )
+                    pred = int(score >= decision_threshold)
+                    pre_action_reference_attention = dict(artifact.get("attention_summary_reference") or {})
+                    pre_action_monitor = dict(artifact.get("embedding_monitor") or {})
+                    detector_attention_reference = dict(pre_action_monitor.get("attention_reference_summary") or {})
+                    recent_embedding_history = (
+                        np.vstack(embedding_buffer).astype(float)
+                        if embedding_buffer
+                        else np.empty(
+                            (0, embeddings.shape[1] if embeddings.ndim == 2 and embeddings.shape[1] > 0 else 0),
+                            dtype=float,
                         )
-                    ),
-                )
+                    )
+                    channel_payload = _build_channel_scores(
+                        artifact=artifact,
+                        x_row=_apply_imputer(x_row, artifact["imputer"]).reshape(-1),
+                        calibrated_score=score,
+                        y_true=y_true,
+                        embeddings=embeddings.reshape(-1),
+                        recent_embedding_history=recent_embedding_history,
+                        selected_channels=selected_channels,
+                        detectors=detectors,
+                        channel_histories=channel_histories,
+                        recent_window_size=int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])),
+                        embedding_reconstruction_weight=float(
+                            config.get(
+                                "drift_monitor_reconstruction_weight",
+                                DEFAULT_CONFIG["drift_monitor_reconstruction_weight"],
+                            )
+                        ),
+                        point_signal_weight=float(
+                            config.get(
+                                "drift_point_signal_weight",
+                                DEFAULT_CONFIG["drift_point_signal_weight"],
+                            )
+                        ),
+                    )
 
-                severity_score = float(channel_payload["severity_score"])
-                max_channel_score = float(channel_payload.get("max_channel_score", severity_score))
-                action_taken = "none"
-                monitor_effective_architecture = str(channel_payload.get("monitor_effective_architecture", artifact.get("monitor_effective_architecture", "none")))
-                monitor_warmup = bool(channel_payload.get("monitor_warmup", False))
-                recent_start = max(0, idx - int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])) + 1)
-                recent_X = split["X_stream"][recent_start : idx + 1]
-                recent_y = split["y_stream"][recent_start : idx + 1]
-                recent_has_two_classes = len(np.unique(recent_y)) >= 2
-                severity_threshold = float(config.get("severity_threshold", DEFAULT_CONFIG["severity_threshold"]))
-                severity_triggered = bool(
-                    severity_score >= severity_threshold
-                    or max_channel_score >= severity_threshold
-                )
-
-                if severity_triggered:
-                    if strategy == STRATEGY_FIXED:
-                        action_taken = "none"
-                    elif strategy == STRATEGY_RECALIBRATION and len(recent_y) >= int(config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])) and recent_has_two_classes:
-                        _recalibrate_artifact(artifact, recent_X, recent_y, config=config)
-                        action_taken = "recalibration"
-                    elif strategy == STRATEGY_FINE_TUNING and len(recent_y) >= int(config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])) and recent_has_two_classes:
-                        _fine_tune_artifact(artifact, recent_X, recent_y, config=config)
-                        action_taken = "fine_tuning"
-                    elif strategy == STRATEGY_RETRAIN and len(recent_y) >= int(config.get("retrain_min_rows", DEFAULT_CONFIG["retrain_min_rows"])) and recent_has_two_classes:
-                        artifact = _retrain_artifact(
-                            model_name,
-                            artifact,
-                            history_X,
-                            history_y,
-                            recent_X,
-                            recent_y,
-                            config=config,
+                    severity_score = float(channel_payload["severity_score"])
+                    max_channel_score = float(channel_payload.get("max_channel_score", severity_score))
+                    action_taken = "none"
+                    monitor_effective_architecture = str(
+                        channel_payload.get(
+                            "monitor_effective_architecture",
+                            artifact.get("monitor_effective_architecture", "none"),
                         )
-                        action_taken = "retrain"
-                    event_threshold = float(artifact.get("decision_threshold", decision_threshold))
+                    )
+                    monitor_warmup = bool(channel_payload.get("monitor_warmup", False))
+                    recent_start = max(
+                        0,
+                        idx - int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])) + 1,
+                    )
+                    recent_X = split["X_stream"][recent_start : idx + 1]
+                    recent_y = split["y_stream"][recent_start : idx + 1]
+                    recent_has_two_classes = len(np.unique(recent_y)) >= 2
+                    severity_threshold = float(config.get("severity_threshold", DEFAULT_CONFIG["severity_threshold"]))
+                    trigger_score = _trigger_score(severity_score, max_channel_score)
+                    severity_intensity = _severity_intensity(trigger_score, severity_threshold)
+                    severity_triggered = bool(
+                        severity_score >= severity_threshold
+                        or max_channel_score >= severity_threshold
+                    )
+                    xgb_event_metadata: Dict[str, Any] = {}
 
-                    drift_rows.append(
+                    if severity_triggered:
+                        if strategy == STRATEGY_FIXED:
+                            action_taken = "none"
+                        elif strategy == STRATEGY_RECALIBRATION and len(recent_y) >= int(config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])) and recent_has_two_classes:
+                            _recalibrate_artifact(artifact, recent_X, recent_y, config=config)
+                            action_taken = "recalibration"
+                        elif strategy == STRATEGY_FINE_TUNING:
+                            if str(model_name) == MODEL_XGBOOST:
+                                fine_tune_result = _fine_tune_artifact(
+                                    artifact,
+                                    split["X_stream"][: idx + 1],
+                                    split["y_stream"][: idx + 1],
+                                    config=config,
+                                    severity_intensity=severity_intensity,
+                                )
+                                xgb_event_metadata = dict(
+                                    fine_tune_result.get("xgb_fine_tune_metadata") or {}
+                                )
+                                action_taken = "fine_tuning" if bool(fine_tune_result.get("applied", False)) else "none"
+                            elif len(recent_y) >= int(config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])) and recent_has_two_classes:
+                                _fine_tune_artifact(artifact, recent_X, recent_y, config=config)
+                                action_taken = "fine_tuning"
+                        elif strategy == STRATEGY_RETRAIN and len(recent_y) >= int(config.get("retrain_min_rows", DEFAULT_CONFIG["retrain_min_rows"])) and recent_has_two_classes:
+                            artifact = _retrain_artifact(
+                                model_name,
+                                artifact,
+                                history_X,
+                                history_y,
+                                recent_X,
+                                recent_y,
+                                config=config,
+                            )
+                            action_taken = "retrain"
+                        event_threshold = float(artifact.get("decision_threshold", decision_threshold))
+                        current_smote_params = dict(artifact.get("smote_params") or {})
+                        current_smote_info = dict(artifact.get("smote_fit_info") or {})
+
+                        drift_rows.append(
+                            {
+                                "timestamp": timestamp,
+                                "model": str(model_name),
+                                "strategy": str(strategy),
+                                "balance_mode": str(balance_mode),
+                                "severity_score": severity_score,
+                                "severity_intensity": severity_intensity,
+                                "max_channel_score": max_channel_score,
+                                "severity_label": str(channel_payload["severity_label"]),
+                                "decision_threshold": event_threshold,
+                                "channel_scores": json.dumps(_to_json_safe(channel_payload["channel_scores"]), ensure_ascii=True, sort_keys=True),
+                                "raw_channel_values": json.dumps(_to_json_safe(channel_payload.get("raw_channel_values") or {}), ensure_ascii=True, sort_keys=True),
+                                "detector_flags": json.dumps(_to_json_safe(channel_payload["detector_flags"]), ensure_ascii=True, sort_keys=True),
+                                "action_taken": str(action_taken),
+                                "recent_rows": int(len(recent_y)),
+                                "recent_positive_rows": int(np.sum(recent_y)),
+                                "monitor_effective_architecture": monitor_effective_architecture,
+                                "monitor_warmup": bool(monitor_warmup),
+                                "smote_applied": bool(current_smote_info.get("applied", False)),
+                                "smote_sampling_strategy": current_smote_params.get("sampling_strategy"),
+                                "smote_k_neighbors": current_smote_params.get("k_neighbors"),
+                                "xgb_adaptation_window_rows": xgb_event_metadata.get("xgb_adaptation_window_rows"),
+                                "xgb_fine_tune_rounds_selected": xgb_event_metadata.get("xgb_fine_tune_rounds_selected"),
+                                "xgb_fine_tune_eta_multiplier": xgb_event_metadata.get("xgb_fine_tune_eta_multiplier"),
+                                "xgb_fine_tune_recent_weight_max": xgb_event_metadata.get("xgb_fine_tune_recent_weight_max"),
+                                "xgb_fine_tune_selection_metric": xgb_event_metadata.get("xgb_fine_tune_selection_metric"),
+                                "xgb_fine_tune_selection_score": xgb_event_metadata.get("xgb_fine_tune_selection_score"),
+                                "xgb_fine_tune_skip_reason": xgb_event_metadata.get("xgb_fine_tune_skip_reason"),
+                            }
+                        )
+
+                    if attention_summary is not None:
+                        attention_rows.append(
+                            {
+                                "timestamp": timestamp,
+                                "model": str(model_name),
+                                "strategy": str(strategy),
+                                "balance_mode": str(balance_mode),
+                                "is_drift_event": bool(severity_triggered),
+                                "feature_labels": list(attention_summary.get("feature_labels") or []),
+                                "temporal_labels": list(attention_summary.get("temporal_labels") or []),
+                                "feature_attention_mean": _as_float_array(attention_summary.get("feature_attention_mean")),
+                                "temporal_attention_mean": _as_float_array(attention_summary.get("temporal_attention_mean")),
+                                "reference_feature_attention_mean": _as_float_array(
+                                    pre_action_reference_attention.get("feature_attention_mean")
+                                ),
+                                "reference_temporal_attention_mean": _as_float_array(
+                                    pre_action_reference_attention.get("temporal_attention_mean")
+                                ),
+                            }
+                        )
+
+                    detector_attention_summary = channel_payload.get("detector_attention_summary")
+                    if detector_attention_summary is not None:
+                        detector_attention_rows.append(
+                            {
+                                "timestamp": timestamp,
+                                "model": str(model_name),
+                                "strategy": str(strategy),
+                                "balance_mode": str(balance_mode),
+                                "is_drift_event": bool(severity_triggered),
+                                "temporal_labels": list(detector_attention_summary.get("temporal_labels") or []),
+                                "temporal_attention_mean": _as_float_array(
+                                    detector_attention_summary.get("temporal_attention_mean")
+                                ),
+                                "reference_temporal_attention_mean": _as_float_array(
+                                    detector_attention_reference.get("temporal_attention_mean")
+                                ),
+                            }
+                        )
+
+                    current_smote_params = dict(artifact.get("smote_params") or {})
+                    current_smote_info = dict(artifact.get("smote_fit_info") or {})
+                    stream_rows.append(
                         {
                             "timestamp": timestamp,
                             "model": str(model_name),
                             "strategy": str(strategy),
+                            "balance_mode": str(balance_mode),
+                            "y_true": int(y_true),
+                            "prediction": int(pred),
+                            "score": float(score),
+                            "decision_threshold": decision_threshold,
                             "severity_score": severity_score,
+                            "severity_intensity": severity_intensity,
                             "max_channel_score": max_channel_score,
                             "severity_label": str(channel_payload["severity_label"]),
-                            "decision_threshold": event_threshold,
-                            "channel_scores": json.dumps(_to_json_safe(channel_payload["channel_scores"]), ensure_ascii=True, sort_keys=True),
-                            "raw_channel_values": json.dumps(_to_json_safe(channel_payload.get("raw_channel_values") or {}), ensure_ascii=True, sort_keys=True),
-                            "detector_flags": json.dumps(_to_json_safe(channel_payload["detector_flags"]), ensure_ascii=True, sort_keys=True),
                             "action_taken": str(action_taken),
-                            "recent_rows": int(len(recent_y)),
-                            "recent_positive_rows": int(np.sum(recent_y)),
+                            "brier_component": float((score - y_true) ** 2),
                             "monitor_effective_architecture": monitor_effective_architecture,
                             "monitor_warmup": bool(monitor_warmup),
+                            "smote_applied": bool(current_smote_info.get("applied", False)),
+                            "smote_sampling_strategy": current_smote_params.get("sampling_strategy"),
+                            "smote_k_neighbors": current_smote_params.get("k_neighbors"),
+                            "xgb_adaptation_window_rows": xgb_event_metadata.get("xgb_adaptation_window_rows"),
+                            "xgb_fine_tune_rounds_selected": xgb_event_metadata.get("xgb_fine_tune_rounds_selected"),
+                            "xgb_fine_tune_eta_multiplier": xgb_event_metadata.get("xgb_fine_tune_eta_multiplier"),
+                            "xgb_fine_tune_recent_weight_max": xgb_event_metadata.get("xgb_fine_tune_recent_weight_max"),
+                            "xgb_fine_tune_selection_metric": xgb_event_metadata.get("xgb_fine_tune_selection_metric"),
+                            "xgb_fine_tune_selection_score": xgb_event_metadata.get("xgb_fine_tune_selection_score"),
+                            "xgb_fine_tune_skip_reason": xgb_event_metadata.get("xgb_fine_tune_skip_reason"),
                         }
                     )
+                    if live_update_callback is not None:
+                        live_update_callback(
+                            {
+                                "event": "stream_step",
+                                "timestamp": timestamp,
+                                "model": str(model_name),
+                                "strategy": str(strategy),
+                                "balance_mode": str(balance_mode),
+                                "severity_score": severity_score,
+                                "max_channel_score": max_channel_score,
+                                "severity_threshold": severity_threshold,
+                                "is_drift_event": bool(severity_triggered),
+                                "action_taken": str(action_taken),
+                                "score": float(score),
+                                "decision_threshold": decision_threshold,
+                                "y_true": int(y_true),
+                                "prediction": int(pred),
+                                "rolling_metric_window": int(
+                                    config.get(
+                                        "rolling_metric_window",
+                                        DEFAULT_CONFIG["rolling_metric_window"],
+                                    )
+                                ),
+                                "stream_step_index": int(idx + 1),
+                                "stream_total_rows": int(len(split["y_stream"])),
+                            }
+                        )
 
-                if attention_summary is not None:
-                    attention_rows.append(
-                        {
-                            "timestamp": timestamp,
-                            "model": str(model_name),
-                            "strategy": str(strategy),
-                            "is_drift_event": bool(severity_triggered),
-                            "feature_labels": list(attention_summary.get("feature_labels") or []),
-                            "temporal_labels": list(attention_summary.get("temporal_labels") or []),
-                            "feature_attention_mean": _as_float_array(attention_summary.get("feature_attention_mean")),
-                            "temporal_attention_mean": _as_float_array(attention_summary.get("temporal_attention_mean")),
-                            "reference_feature_attention_mean": _as_float_array(
-                                pre_action_reference_attention.get("feature_attention_mean")
-                            ),
-                            "reference_temporal_attention_mean": _as_float_array(
-                                pre_action_reference_attention.get("temporal_attention_mean")
-                            ),
-                        }
-                    )
-
-                detector_attention_summary = channel_payload.get("detector_attention_summary")
-                if detector_attention_summary is not None:
-                    detector_attention_rows.append(
-                        {
-                            "timestamp": timestamp,
-                            "model": str(model_name),
-                            "strategy": str(strategy),
-                            "is_drift_event": bool(severity_triggered),
-                            "temporal_labels": list(detector_attention_summary.get("temporal_labels") or []),
-                            "temporal_attention_mean": _as_float_array(
-                                detector_attention_summary.get("temporal_attention_mean")
-                            ),
-                            "reference_temporal_attention_mean": _as_float_array(
-                                detector_attention_reference.get("temporal_attention_mean")
-                            ),
-                        }
-                    )
-
-                stream_rows.append(
-                    {
-                        "timestamp": timestamp,
-                        "model": str(model_name),
-                        "strategy": str(strategy),
-                        "y_true": int(y_true),
-                        "prediction": int(pred),
-                        "score": float(score),
-                        "decision_threshold": decision_threshold,
-                        "severity_score": severity_score,
-                        "max_channel_score": max_channel_score,
-                        "severity_label": str(channel_payload["severity_label"]),
-                        "action_taken": str(action_taken),
-                        "brier_component": float((score - y_true) ** 2),
-                        "monitor_effective_architecture": monitor_effective_architecture,
-                        "monitor_warmup": bool(monitor_warmup),
-                    }
-                )
-
-                if embeddings.size > 0:
-                    embedding_buffer.append(np.asarray(embeddings.reshape(-1), dtype=float))
+                    if embeddings.size > 0:
+                        embedding_buffer.append(np.asarray(embeddings.reshape(-1), dtype=float))
 
     baseline_df = pd.DataFrame(baseline_rows)
     if not baseline_df.empty:
-        baseline_df = baseline_df.sort_values(["model"]).reset_index(drop=True)
+        baseline_df = baseline_df.sort_values(["model", "balance_mode"]).reset_index(drop=True)
 
     stream_df = pd.DataFrame(stream_rows)
     if not stream_df.empty:
-        stream_df = stream_df.sort_values(["model", "strategy", "timestamp"]).reset_index(drop=True)
+        stream_df = stream_df.sort_values(["model", "balance_mode", "strategy", "timestamp"]).reset_index(drop=True)
 
     drift_df = pd.DataFrame(
         drift_rows,
@@ -3093,7 +4017,9 @@ def run_backtest_pipeline(
             "timestamp",
             "model",
             "strategy",
+            "balance_mode",
             "severity_score",
+            "severity_intensity",
             "max_channel_score",
             "severity_label",
             "decision_threshold",
@@ -3105,10 +4031,20 @@ def run_backtest_pipeline(
             "recent_positive_rows",
             "monitor_effective_architecture",
             "monitor_warmup",
+            "smote_applied",
+            "smote_sampling_strategy",
+            "smote_k_neighbors",
+            "xgb_adaptation_window_rows",
+            "xgb_fine_tune_rounds_selected",
+            "xgb_fine_tune_eta_multiplier",
+            "xgb_fine_tune_recent_weight_max",
+            "xgb_fine_tune_selection_metric",
+            "xgb_fine_tune_selection_score",
+            "xgb_fine_tune_skip_reason",
         ],
     )
     if not drift_df.empty:
-        drift_df = drift_df.sort_values(["model", "strategy", "timestamp"]).reset_index(drop=True)
+        drift_df = drift_df.sort_values(["model", "balance_mode", "strategy", "timestamp"]).reset_index(drop=True)
 
     summary_df = _summary_from_stream(stream_df, drift_df)
     rolling_df = _rolling_metric_table(
@@ -3148,6 +4084,77 @@ def _download_bundle_from_results(results: Dict[str, Any]) -> Dict[str, str]:
         if isinstance(df, pd.DataFrame) and not df.empty:
             bundle[key] = df.to_csv(index=False)
     return bundle
+
+
+def _live_backtest_chart_frames(
+    stream_rows: Sequence[Dict[str, Any]],
+    *,
+    rolling_window: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not stream_rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    stream_df = pd.DataFrame(stream_rows).copy()
+    if stream_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    stream_df["timestamp"] = pd.to_datetime(stream_df["timestamp"])
+    stream_df = stream_df.sort_values("timestamp").reset_index(drop=True)
+
+    drift_chart = pd.DataFrame(
+        {
+            "timestamp": stream_df["timestamp"],
+            "severity_score": pd.to_numeric(stream_df["severity_score"], errors="coerce"),
+            "max_channel_score": pd.to_numeric(stream_df["max_channel_score"], errors="coerce"),
+            "severity_threshold": pd.to_numeric(stream_df["severity_threshold"], errors="coerce"),
+            "drift_event_flag": stream_df["is_drift_event"].astype(bool).astype(int),
+            "adaptation_flag": stream_df["action_taken"].astype(str).ne("none").astype(int),
+        }
+    ).set_index("timestamp").sort_index()
+
+    rolling_source = stream_df[
+        [
+            "timestamp",
+            "model",
+            "strategy",
+            "balance_mode",
+            "y_true",
+            "prediction",
+            "score",
+            "decision_threshold",
+            "severity_score",
+        ]
+    ].copy()
+    rolling_df = _rolling_metric_table(
+        rolling_source,
+        rolling_window=max(1, int(rolling_window)),
+    )
+    if rolling_df.empty:
+        return drift_chart, pd.DataFrame()
+
+    metrics_chart = (
+        rolling_df.set_index("timestamp")[["recall", "fnr", "brier"]]
+        .sort_index()
+    )
+    return drift_chart, metrics_chart
+
+
+def _live_backtest_status_line(
+    stream_rows: Sequence[Dict[str, Any]],
+    *,
+    model: str,
+    strategy: str,
+    balance_mode: str,
+    stream_total_rows: int,
+) -> str:
+    processed_rows = int(len(stream_rows))
+    drift_events = int(sum(bool(row.get("is_drift_event", False)) for row in stream_rows))
+    applied_actions = int(sum(str(row.get("action_taken", "none")) != "none" for row in stream_rows))
+    return (
+        f"Simulacion en vivo: {model} | {strategy} | {balance_mode} · "
+        f"fila {processed_rows}/{max(1, int(stream_total_rows))} · "
+        f"drifts {drift_events} · adaptaciones {applied_actions}"
+    )
 
 
 def generate_synthetic_neural_drift_dataset(
@@ -3420,6 +4427,161 @@ def _build_monitor_architecture_explanation(
     }
 
 
+def _build_configuration_controls_explanation(config: Dict[str, Any]) -> Dict[str, Any]:
+    severity_threshold = float(config.get("severity_threshold", DEFAULT_CONFIG["severity_threshold"]))
+    recent_window_size = int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"]))
+    xgb_fine_tune_selection_metric = _resolve_xgb_fine_tune_selection_metric(
+        config.get(
+            "xgb_fine_tune_selection_metric",
+            DEFAULT_CONFIG["xgb_fine_tune_selection_metric"],
+        )
+    )
+    recalibration_min_rows = int(
+        config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])
+    )
+    retrain_min_rows = int(config.get("retrain_min_rows", DEFAULT_CONFIG["retrain_min_rows"]))
+    lookback_steps = int(config.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"]))
+    horizon_steps = int(config.get("horizon_steps", DEFAULT_CONFIG["horizon_steps"]))
+    max_stream_rows = int(config.get("max_stream_rows", DEFAULT_CONFIG["max_stream_rows"]))
+    dataset_percent = int(config.get("dataset_percent", DEFAULT_CONFIG["dataset_percent"]))
+    rolling_metric_window = int(
+        config.get("rolling_metric_window", DEFAULT_CONFIG["rolling_metric_window"])
+    )
+    history_sample_size = int(config.get("history_sample_size", DEFAULT_CONFIG["history_sample_size"]))
+    point_signal_weight = float(
+        config.get("drift_point_signal_weight", DEFAULT_CONFIG["drift_point_signal_weight"])
+    )
+    detector_adwin_delta = float(
+        config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"])
+    )
+    selected_balance_modes = [f"`{mode}`" for mode in _resolve_balance_modes(config.get("balance_modes"))]
+    selected_models = [f"`{model}`" for model in config.get("models", []) if str(model).strip()]
+    selected_strategies = [f"`{strategy}`" for strategy in config.get("strategies", []) if str(strategy).strip()]
+    selected_channels = [
+        f"`{channel}`" for channel in config.get("drift_channels", []) if str(channel).strip()
+    ]
+    balance_summary = ", ".join(selected_balance_modes) if selected_balance_modes else "ninguno"
+    models_summary = ", ".join(selected_models) if selected_models else "ninguno"
+    strategies_summary = ", ".join(selected_strategies) if selected_strategies else "ninguna"
+    channels_summary = ", ".join(selected_channels) if selected_channels else "ninguno"
+
+    return {
+        "overview": (
+            "Esta configuracion define que tramo temporal se evalua, como se calcula la severidad del drift, "
+            "y que tipo de adaptacion se ejecuta cuando el detector decide que el cambio ya es suficientemente fuerte."
+        ),
+        "decision_rule": (
+            f"`drift event if severity_score >= {severity_threshold:.2f} "
+            f"or max_channel_score >= {severity_threshold:.2f}`"
+        ),
+        "scope_steps": [
+            (
+                f"`Porcentaje del dataset = {dataset_percent}%`",
+                "Usa solo el tramo mas reciente del dataset. Bajar este valor acelera el backtest y enfoca el analisis "
+                "en el regimen mas actual, pero deja menos historia disponible para ver transiciones largas."
+            ),
+            (
+                f"`Lookback steps = {lookback_steps}` y `Horizon steps = {horizon_steps}`",
+                "El lookback define cuantas observaciones pasadas ve el predictor para construir cada ventana. "
+                "El horizon define cuan adelante esta la etiqueta objetivo que se quiere anticipar."
+            ),
+            (
+                f"`Max stream rows = {max_stream_rows}`",
+                "Limita cuantas filas del tramo de stream se usan en la simulacion online. Sirve para comparar estrategias "
+                "sin tener que recorrer siempre todo el historial disponible."
+            ),
+        ],
+        "sensitivity_steps": [
+            (
+                f"`Preset de sensibilidad`, `ADWIN delta = {detector_adwin_delta:.4f}`",
+                "El preset mueve varios controles a la vez. `ADWIN delta` afecta a los canales clasicos "
+                "(`input drift`, `score drift`, `error drift`): valores mas altos reaccionan antes; valores mas bajos exigen cambios mas consistentes."
+            ),
+            (
+                f"`Point signal weight = {point_signal_weight:.2f}`",
+                "Mezcla dos lecturas del drift: la senal suavizada por ventana y los picos locales. Si sube hacia 1.0, "
+                "el detector reacciona mas a cambios puntuales; si baja hacia 0.0, prioriza una tendencia mas estable."
+            ),
+            (
+                f"`Severity trigger = {severity_threshold:.2f}`",
+                "Es la compuerta final. No calcula el drift por si solo: decide cuando el score ya es suficientemente alto "
+                "para registrar un evento y permitir acciones de adaptacion. Bajarlo genera mas eventos; subirlo los vuelve mas exigentes."
+            ),
+        ],
+        "execution_steps": [
+            (
+                f"`Balance modes = {balance_summary}`",
+                "Corre cada combinacion con `none` y/o `smote`. Cuando eliges `smote`, los parametros "
+                "`sampling_strategy` y `k_neighbors` se buscan sobre train/validation y el oversampling "
+                "solo se aplica en entrenamiento, nunca sobre validation ni stream."
+            ),
+            (
+                f"`Models = {models_summary}`",
+                "Define que predictores se comparan en paralelo. `Torch MLP` y `Torch MLP + Attention` habilitan tambien "
+                "la senal neuronal `embedding drift`; `XGBoost` se queda en canales clasicos."
+            ),
+            (
+                f"`Strategies = {strategies_summary}`",
+                "`fixed` nunca adapta el modelo; `recalibration` ajusta calibrador y threshold; `fine_tuning` actualiza "
+                "el modelo con la ventana reciente; `retrain` vuelve a entrenar usando historia mas un bloque reciente."
+            ),
+            (
+                f"`XGBoost fine-tuning metric = {xgb_fine_tune_selection_metric}`",
+                "Cuando `XGBoost` usa `fine_tuning`, la app prueba varias cantidades de rondas nuevas sobre una ventana "
+                "adaptativa y se queda con la candidata que mejor rinde segun esta metrica (`f_beta_recall`, `pr_auc` o `brier`)."
+            ),
+            (
+                f"`Drift channels = {channels_summary}`",
+                "Cada canal aporta una parte del score: cambio en covariables (`input drift`), cambio en scores "
+                "del predictor (`score drift`), cambio en error (`error drift`) y cambio en embeddings (`embedding drift`)."
+            ),
+        ],
+        "adaptation_steps": [
+            (
+                f"`Recent window size = {recent_window_size}`",
+                "Es la ventana fija del detector: suaviza la lectura de severidad y define el bloque reciente con el "
+                "que se recalibra o reentrena. En `XGBoost` + `fine_tuning`, la actualizacion usa internamente una "
+                "ventana adaptativa propia guiada por `severity_intensity`, sin cambiar esta ventana del detector."
+            ),
+            (
+                f"`Recalibration min rows = {recalibration_min_rows}` y `Retrain min rows = {retrain_min_rows}`",
+                "Evitan adaptar con muy pocos datos. Si hay trigger pero la ventana reciente no alcanza estas cotas "
+                "o no tiene al menos dos clases, el evento se registra y la accion queda en `none`."
+            ),
+            (
+                "`Ventana adaptativa de XGBoost`",
+                "Solo afecta a `fine_tuning` de `XGBoost`. A mayor severidad, aumenta la ventana usada para actualizar, "
+                "sube el peso relativo de las observaciones mas nuevas y se habilitan mas rondas candidatas del booster."
+            ),
+            (
+                f"`Hybrid history sample = {history_sample_size}`",
+                "Solo afecta a `retrain`. Controla cuanto historial previo se conserva al armar el bloque hibrido "
+                "historia + reciente para reentrenar."
+            ),
+            (
+                f"`Rolling metric window = {rolling_metric_window}`",
+                "No cambia el entrenamiento ni el detector. Solo define el tamano de la ventana con la que se resumen "
+                "metricas como `pr_auc`, `recall`, `fnr`, `brier` y `severity_score` en la vista de resultados."
+            ),
+        ],
+        "tuning_guidance": [
+            (
+                "Si ves demasiados triggers",
+                "Sube `Severity trigger`, usa un preset mas conservador, baja `Point signal weight` y/o aumenta `Recent window size`."
+            ),
+            (
+                "Si el detector llega tarde",
+                "Baja `Severity trigger`, usa un preset mas sensible y reduce `Recent window size` para que la senal responda antes."
+            ),
+            (
+                "Si quieres saber donde nace el trigger",
+                "Revisa `Drift events` y compara `severity_score`, `max_channel_score`, `channel_scores` y `action_taken`. "
+                "Ahi se ve si el evento vino por consenso entre canales o por un pico fuerte en uno solo."
+            ),
+        ],
+    }
+
+
 def _render_feature_source_selector(context: Dict[str, Any]) -> Dict[str, Any]:
     current_export_path = str(context.get("feature_export_path") or "").strip()
     has_memory_dataset = isinstance(context.get("clean_df"), pd.DataFrame) and not context["clean_df"].empty
@@ -3540,7 +4702,9 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         key="neural_drift_sensitivity_preset",
         on_change=_on_detector_sensitivity_preset_change,
     )
-    sensitivity_col_2.info(_detector_sensitivity_preset_description(sensitivity_preset))
+    sensitivity_description = _detector_sensitivity_preset_description(sensitivity_preset)
+    if sensitivity_description:
+        sensitivity_col_2.info(sensitivity_description)
 
     sensitivity_knob_col_1, sensitivity_knob_col_2 = st.columns(2)
     detector_adwin_delta = sensitivity_knob_col_1.number_input(
@@ -3586,7 +4750,7 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         key="neural_drift_max_stream_rows",
     )
 
-    model_col, strategy_col, channel_col = st.columns(3)
+    model_col, strategy_col, balance_col, channel_col = st.columns(4)
     selected_models = model_col.multiselect(
         "Models",
         AVAILABLE_MODELS,
@@ -3599,6 +4763,13 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         default=list(DEFAULT_CONFIG["strategies"]),
         key="neural_drift_strategies",
     )
+    selected_balance_modes = balance_col.multiselect(
+        "Balance modes",
+        AVAILABLE_BALANCE_MODES,
+        default=[BALANCE_MODE_NONE, BALANCE_MODE_SMOTE],
+        key="neural_drift_balance_modes",
+        help="`smote` se sintoniza solo sobre train/validation y nunca se aplica sobre el stream.",
+    )
     selected_channels = channel_col.multiselect(
         "Drift channels",
         AVAILABLE_DRIFT_CHANNELS,
@@ -3606,7 +4777,35 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         key="neural_drift_channels",
     )
     if MODEL_XGBOOST in selected_models and STRATEGY_FINE_TUNING in selected_strategies:
-        st.caption("`fine_tuning` se excluira automaticamente para XGBoost.")
+        st.caption(
+            "En `XGBoost`, `fine_tuning` mantiene fija la ventana del detector (`Recent window size`), "
+            "pero calcula internamente una ventana adaptativa segun la severidad del drift."
+        )
+    if BALANCE_MODE_SMOTE in selected_balance_modes:
+        st.caption(
+            "El modo `smote` busca internamente `sampling_strategy` y `k_neighbors` sobre el split de entrenamiento; "
+            "la validacion y el stream se mantienen siempre sin oversampling."
+        )
+
+    xgb_policy_col_1, xgb_policy_col_2 = st.columns([1.3, 2.7])
+    xgb_fine_tune_selection_metric = xgb_policy_col_1.selectbox(
+        "XGBoost fine-tuning metric",
+        AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS,
+        index=AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS.index(
+            _resolve_xgb_fine_tune_selection_metric(
+                st.session_state.get(
+                    "neural_drift_xgb_fine_tune_selection_metric",
+                    DEFAULT_CONFIG["xgb_fine_tune_selection_metric"],
+                )
+            )
+        ),
+        key="neural_drift_xgb_fine_tune_selection_metric",
+        help="Selecciona como se elige la mejor cantidad de rondas nuevas en el `fine_tuning` adaptativo de `XGBoost`.",
+    )
+    xgb_policy_col_2.info(
+        "Solo afecta a `XGBoost` + `fine_tuning`: el booster continua desde el modelo actual, "
+        "aumenta el peso de las filas mas recientes y busca la mejor cantidad de rondas nuevas con la metrica elegida."
+    )
 
     backtest_col_1, backtest_col_2, backtest_col_3 = st.columns(3)
     recent_window_size = backtest_col_1.number_input(
@@ -3664,6 +4863,7 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         "horizon_steps": int(horizon_steps),
         "dataset_percent": int(dataset_percent),
         "max_stream_rows": int(max_stream_rows),
+        "balance_modes": _resolve_balance_modes(selected_balance_modes),
         "models": list(selected_models),
         "strategies": list(selected_strategies),
         "drift_channels": list(selected_channels),
@@ -3676,8 +4876,38 @@ def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, An
         "drift_point_signal_weight": float(point_signal_weight),
         "rolling_metric_window": int(rolling_metric_window),
         "history_sample_size": int(history_sample_size),
+        "xgb_fine_tune_selection_metric": _resolve_xgb_fine_tune_selection_metric(
+            xgb_fine_tune_selection_metric
+        ),
     }
     st.session_state["neural_drift_config"] = config
+
+    explanation = _build_configuration_controls_explanation(config)
+    st.markdown("**Como interpretar esta configuracion**")
+    st.write(explanation["overview"])
+
+    with st.expander("Lectura guiada de los controles", expanded=True):
+        st.markdown("**1. Alcance temporal del experimento**")
+        for title, body in explanation["scope_steps"]:
+            st.markdown(f"- {title}: {body}")
+
+        st.markdown("**2. Sensibilidad y disparo de drift**")
+        st.markdown(explanation["decision_rule"])
+        for title, body in explanation["sensitivity_steps"]:
+            st.markdown(f"- {title}: {body}")
+
+        st.markdown("**3. Modelos, estrategias y canales**")
+        for title, body in explanation["execution_steps"]:
+            st.markdown(f"- {title}: {body}")
+
+        st.markdown("**4. Ventanas y acciones de adaptacion**")
+        for title, body in explanation["adaptation_steps"]:
+            st.markdown(f"- {title}: {body}")
+
+        st.markdown("**5. Como ajustar los controles**")
+        for title, body in explanation["tuning_guidance"]:
+            st.markdown(f"- {title}: {body}")
+
     return config
 
 
@@ -4015,10 +5245,83 @@ def _render_backtest_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, An
 
     progress_bar = st.progress(0.0)
     status = st.empty()
+    live_status = st.empty()
+    live_left, live_right = st.columns(2)
+    with live_left:
+        st.markdown("**Deteccion de drift en vivo**")
+        drift_chart_placeholder = st.empty()
+    with live_right:
+        st.markdown("**Evaluacion del modelo en vivo**")
+        metrics_chart_placeholder = st.empty()
+    live_status.caption("La simulacion en vivo aparecera aqui cuando comience el stream.")
+    drift_chart_placeholder.info("Esperando puntos de drift...")
+    metrics_chart_placeholder.info("Esperando metricas rolling...")
+    live_state: Dict[str, Any] = {
+        "key": None,
+        "rows": [],
+        "stream_total_rows": 0,
+    }
 
     def _callback(ratio: float, message: str) -> None:
         progress_bar.progress(float(np.clip(ratio, 0.0, 1.0)))
         status.caption(str(message))
+
+    def _live_callback(payload: Dict[str, Any]) -> None:
+        event = str(payload.get("event") or "")
+        if event == "simulation_start":
+            live_state["key"] = (
+                str(payload.get("model", "")),
+                str(payload.get("strategy", "")),
+                str(payload.get("balance_mode", "")),
+            )
+            live_state["rows"] = []
+            live_state["stream_total_rows"] = int(payload.get("stream_total_rows", 0))
+            live_status.caption(
+                f"Simulacion en vivo: {live_state['key'][0]} | {live_state['key'][1]} | {live_state['key'][2]} · preparando stream..."
+            )
+            drift_chart_placeholder.info("Esperando primeros puntos de drift...")
+            metrics_chart_placeholder.info("Esperando primeras metricas rolling...")
+            return
+        if event != "stream_step":
+            return
+
+        payload_key = (
+            str(payload.get("model", "")),
+            str(payload.get("strategy", "")),
+            str(payload.get("balance_mode", "")),
+        )
+        if live_state.get("key") != payload_key:
+            live_state["key"] = payload_key
+            live_state["rows"] = []
+        live_state["stream_total_rows"] = int(payload.get("stream_total_rows", live_state.get("stream_total_rows", 0)))
+        live_state["rows"].append(dict(payload))
+
+        drift_chart, metrics_chart = _live_backtest_chart_frames(
+            live_state["rows"],
+            rolling_window=int(
+                payload.get(
+                    "rolling_metric_window",
+                    DEFAULT_CONFIG["rolling_metric_window"],
+                )
+            ),
+        )
+        live_status.caption(
+            _live_backtest_status_line(
+                live_state["rows"],
+                model=payload_key[0],
+                strategy=payload_key[1],
+                balance_mode=payload_key[2],
+                stream_total_rows=int(live_state["stream_total_rows"]),
+            )
+        )
+        if drift_chart.empty:
+            drift_chart_placeholder.info("Esperando primeros puntos de drift...")
+        else:
+            drift_chart_placeholder.line_chart(drift_chart, width="stretch")
+        if metrics_chart.empty:
+            metrics_chart_placeholder.info("Esperando primeras metricas rolling...")
+        else:
+            metrics_chart_placeholder.line_chart(metrics_chart, width="stretch")
 
     try:
         with st.spinner("Ejecutando Neural drift backtest..."):
@@ -4026,10 +5329,12 @@ def _render_backtest_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, An
                 dataset_bundle,
                 config=config,
                 progress_callback=_callback,
+                live_update_callback=_live_callback,
             )
     except Exception as exc:
         progress_bar.progress(1.0)
         status.caption("Backtest interrumpido.")
+        live_status.caption("Backtest interrumpido.")
         st.error(f"No se pudo ejecutar Neural drift: {exc}")
         return
 
@@ -4105,7 +5410,7 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
     if isinstance(attention_feature_summary, pd.DataFrame) and not attention_feature_summary.empty:
         st.markdown("**Attention sobre variables**")
         feature_display = (
-            attention_feature_summary.groupby(["model", "strategy"], group_keys=False, dropna=False)
+            attention_feature_summary.groupby(["model", "balance_mode", "strategy"], group_keys=False, dropna=False)
             .head(attention_top_k)
             .reset_index(drop=True)
         )
@@ -4114,7 +5419,7 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
     if isinstance(attention_temporal_summary, pd.DataFrame) and not attention_temporal_summary.empty:
         st.markdown("**Attention sobre pasos temporales**")
         temporal_display = (
-            attention_temporal_summary.groupby(["model", "strategy"], group_keys=False, dropna=False)
+            attention_temporal_summary.groupby(["model", "balance_mode", "strategy"], group_keys=False, dropna=False)
             .head(attention_top_k)
             .reset_index(drop=True)
         )
@@ -4123,7 +5428,11 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
     if isinstance(attention_drift_shift_summary, pd.DataFrame) and not attention_drift_shift_summary.empty:
         st.markdown("**Cambio de attention durante drift**")
         drift_display = (
-            attention_drift_shift_summary.groupby(["model", "strategy", "scope"], group_keys=False, dropna=False)
+            attention_drift_shift_summary.groupby(
+                ["model", "balance_mode", "strategy", "scope"],
+                group_keys=False,
+                dropna=False,
+            )
             .head(attention_top_k)
             .reset_index(drop=True)
         )
@@ -4132,7 +5441,11 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
     if isinstance(detector_attention_temporal_summary, pd.DataFrame) and not detector_attention_temporal_summary.empty:
         st.markdown("**Attention temporal del detector de drift**")
         detector_temporal_display = (
-            detector_attention_temporal_summary.groupby(["model", "strategy"], group_keys=False, dropna=False)
+            detector_attention_temporal_summary.groupby(
+                ["model", "balance_mode", "strategy"],
+                group_keys=False,
+                dropna=False,
+            )
             .head(attention_top_k)
             .reset_index(drop=True)
         )
@@ -4141,7 +5454,11 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
     if isinstance(detector_attention_drift_shift_summary, pd.DataFrame) and not detector_attention_drift_shift_summary.empty:
         st.markdown("**Cambio de attention del detector durante drift**")
         detector_shift_display = (
-            detector_attention_drift_shift_summary.groupby(["model", "strategy"], group_keys=False, dropna=False)
+            detector_attention_drift_shift_summary.groupby(
+                ["model", "balance_mode", "strategy"],
+                group_keys=False,
+                dropna=False,
+            )
             .head(attention_top_k)
             .reset_index(drop=True)
         )
@@ -4155,7 +5472,13 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
             key="neural_drift_metric_selector",
         )
         plot_df = rolling_metrics.copy()
-        plot_df["series_label"] = plot_df["model"].astype(str) + " | " + plot_df["strategy"].astype(str)
+        plot_df["series_label"] = (
+            plot_df["model"].astype(str)
+            + " | "
+            + plot_df["balance_mode"].astype(str)
+            + " | "
+            + plot_df["strategy"].astype(str)
+        )
         chart_df = plot_df.pivot_table(
             index="timestamp",
             columns="series_label",
