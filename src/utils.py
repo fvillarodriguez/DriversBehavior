@@ -217,6 +217,7 @@ def read_csv_with_progress(
                 unit="B",
                 unit_scale=True,
                 desc=f"Cargando CSV ({encoding})",
+                disable=True,
             ) as pbar:
                 reader = pd.read_csv(
                     f_text, sep=separator, chunksize=chunk_size, low_memory=False

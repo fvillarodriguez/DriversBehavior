@@ -6098,6 +6098,10 @@ def _evaluate_split(
     feature_transform: Optional[Dict[str, Any]] = None,
     calibration_model: Optional[LogisticRegression] = None,
     calibration_metadata: Optional[Dict[str, Any]] = None,
+    time_col: str = "interval_start",
+    stream_record_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    callback_context: Optional[Dict[str, Any]] = None,
+    action_first_row_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     X_te_raw, y_te = _prepare_xy_raw(test_df, feature_cols, target_col)
     X_te_filled = _apply_fill_values(X_te_raw, fill_values or _fit_fill_values(X_te_raw))
@@ -6116,6 +6120,27 @@ def _evaluate_split(
         calibrated_threshold=float(threshold),
     )
     metrics = stage_metrics["after_calibration"]
+    if stream_record_callback is not None:
+        timestamps = pd.to_datetime(test_df.get(time_col), errors="coerce")
+        preds = (np.asarray(calibrated_scores, dtype=float) >= float(threshold)).astype(int)
+        context = dict(callback_context or {})
+        y_values = y_te.to_numpy()
+        for idx in range(len(y_values)):
+            timestamp = pd.Timestamp(timestamps.iloc[idx]) if idx < len(timestamps) and pd.notna(timestamps.iloc[idx]) else pd.NaT
+            stream_record_callback(
+                {
+                    **context,
+                    "timestamp": timestamp,
+                    "record_index": int(idx),
+                    "y_true": int(y_values[idx]),
+                    "raw_score": float(raw_scores[idx]),
+                    "score": float(calibrated_scores[idx]),
+                    "prediction": int(preds[idx]),
+                    "decision_threshold": float(threshold),
+                    "raw_threshold": float(threshold if raw_threshold is None else raw_threshold),
+                    "action_taken": str(action_first_row_label) if idx == 0 and action_first_row_label else "none",
+                }
+            )
     return {
         "metrics": metrics,
         "metrics_before_calibration": stage_metrics["before_calibration"],
@@ -6166,6 +6191,7 @@ def run_yearly_strategy(
     run_id: Optional[str] = None,
     smote_cache_dir: Optional[Path] = None,
     smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
+    stream_record_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """
@@ -6480,6 +6506,22 @@ def run_yearly_strategy(
                 feature_transform=bundle.get("feature_transform"),
                 calibration_model=bundle.get("calibration_model"),
                 calibration_metadata=bundle.get("calibration_metadata"),
+                time_col=time_col,
+                stream_record_callback=stream_record_callback,
+                callback_context={
+                    "strategy": str(strategy),
+                    "model": str(model_name),
+                    "balance_mode": str(balance_mode),
+                    "prediction_year": int(pred_year),
+                    "training_year": str(train_label),
+                    "run_seed": int(effective_seed),
+                    "run_order": int(run_order),
+                },
+                action_first_row_label=(
+                    "retrain"
+                    if str(strategy) in {"period_aligned", "cumulative"}
+                    else None
+                ),
             )
 
             _append_tuning_study(
@@ -6699,6 +6741,7 @@ def run_adaptive_strategy(
     run_id: Optional[str] = None,
     smote_cache_dir: Optional[Path] = None,
     smote_cache_registry: Optional[Dict[str, Dict[str, Any]]] = None,
+    stream_record_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """
@@ -6961,6 +7004,9 @@ def run_adaptive_strategy(
             )
             pred_i = int(decision_score_i >= threshold)
             err_i = float(int(pred_i != y_i))
+            prediction_threshold = float(threshold)
+            prediction_raw_youden_threshold = float(raw_youden_threshold)
+            action_taken = "none"
 
             segment_y.append(y_i)
             segment_raw_scores.append(raw_score_i)
@@ -6968,180 +7014,219 @@ def run_adaptive_strategy(
             training_window_rows.append(stream.iloc[i].to_dict())
 
             is_drift, info = detector.update(err_i)
-            if not is_drift or info is None:
-                continue
+            if is_drift and info is not None:
+                drift_idx += 1
+                stage_metrics = _compute_calibration_stage_metrics(
+                    np.asarray(segment_y),
+                    np.asarray(segment_raw_scores),
+                    raw_threshold=raw_youden_threshold,
+                    calibrated_scores=np.asarray(segment_decision_scores),
+                    calibrated_threshold=threshold,
+                )
+                seg_metrics = stage_metrics["after_calibration"]
+                seg_metrics_before = stage_metrics["before_calibration"]
+                seg_metrics_after = stage_metrics["after_calibration"]
 
-            drift_idx += 1
-            stage_metrics = _compute_calibration_stage_metrics(
-                np.asarray(segment_y),
-                np.asarray(segment_raw_scores),
-                raw_threshold=raw_youden_threshold,
-                calibrated_scores=np.asarray(segment_decision_scores),
-                calibrated_threshold=threshold,
-            )
-            seg_metrics = stage_metrics["after_calibration"]
-            seg_metrics_before = stage_metrics["before_calibration"]
-            seg_metrics_after = stage_metrics["after_calibration"]
-
-            remaining = int(len(stream) - (i + 1))
-            row = {
-                "strategy": "adaptive_adwin",
-                "drift": drift_idx,
-                "drift_date": pd.Timestamp(ts_i),
-                "balance_mode": balance_mode,
-                "W": int(info["n"]),
-                "W0": int(info["n0"]),
-                "W1": int(info["n1"]),
-                "remaining_periods": remaining,
-                "model": model_name,
-                "auc": float(seg_metrics["auc"]),
-                "pr_auc": float(seg_metrics["pr_auc"]),
-                "f1": float(seg_metrics["f1"]),
-                "sensitivity": float(seg_metrics["sensitivity"]),
-                "specificity": float(seg_metrics["specificity"]),
-                "error_rate": float(seg_metrics["error_rate"]),
-                "training_time_sec": float(fit_time),
-                "threshold": float(threshold),
-                "operating_threshold": float(threshold),
-                "raw_youden_threshold": float(raw_youden_threshold),
-                "threshold_policy": str(threshold_policy),
-                "calibration_method": str(calibration_method),
-                "fn_cost": float(fn_cost),
-                "fp_cost": float(fp_cost),
-                "run_seed": effective_seed,
-                "run_order": int(run_order),
-            }
-            row.update(_calibration_rate_fields(seg_metrics_before, seg_metrics_after))
-            rows.append(row)
-
-            _append_execution_log(
-                execution_log,
-                phase="adaptive_drift_detected",
-                status="ok",
-                message="ADWIN detected drift and closed a prediction segment.",
-                strategy="adaptive_adwin",
-                model=model_name,
-                drift=int(drift_idx),
-                drift_date=pd.Timestamp(ts_i),
-                run_seed=effective_seed,
-                run_order=run_order,
-                balance_mode=balance_mode,
-                threshold=float(threshold),
-                operating_threshold=float(threshold),
-                raw_youden_threshold=float(raw_youden_threshold),
-                threshold_policy=str(threshold_policy),
-                calibration_method=str(calibration_method),
-                W=int(info["n"]),
-                W0=int(info["n0"]),
-                W1=int(info["n1"]),
-                remaining_periods=remaining,
-                auc=float(seg_metrics["auc"]),
-                sensitivity=float(seg_metrics["sensitivity"]),
-                specificity=float(seg_metrics["specificity"]),
-                sensitivity_before_calibration=float(seg_metrics_before["sensitivity"]),
-                specificity_before_calibration=float(seg_metrics_before["specificity"]),
-                sensitivity_after_calibration=float(seg_metrics_after["sensitivity"]),
-                specificity_after_calibration=float(seg_metrics_after["specificity"]),
-                error_rate=float(seg_metrics["error_rate"]),
-            )
-
-            roc_payload.append(
-                {
+                remaining = int(len(stream) - (i + 1))
+                row = {
                     "strategy": "adaptive_adwin",
-                    "model": model_name,
+                    "drift": drift_idx,
+                    "drift_date": pd.Timestamp(ts_i),
                     "balance_mode": balance_mode,
-                    "segment": f"drift_{drift_idx}",
-                    "y_true": np.asarray(segment_y),
-                    "scores": np.asarray(segment_raw_scores),
-                    "calibrated_scores": np.asarray(segment_decision_scores),
-                    "raw_threshold": float(raw_youden_threshold),
-                    "calibrated_threshold": float(threshold),
+                    "W": int(info["n"]),
+                    "W0": int(info["n0"]),
+                    "W1": int(info["n1"]),
+                    "remaining_periods": remaining,
+                    "model": model_name,
+                    "auc": float(seg_metrics["auc"]),
+                    "pr_auc": float(seg_metrics["pr_auc"]),
+                    "f1": float(seg_metrics["f1"]),
+                    "sensitivity": float(seg_metrics["sensitivity"]),
+                    "specificity": float(seg_metrics["specificity"]),
+                    "error_rate": float(seg_metrics["error_rate"]),
+                    "training_time_sec": float(fit_time),
+                    "threshold": float(threshold),
+                    "operating_threshold": float(threshold),
+                    "raw_youden_threshold": float(raw_youden_threshold),
+                    "threshold_policy": str(threshold_policy),
+                    "calibration_method": str(calibration_method),
+                    "fn_cost": float(fn_cost),
+                    "fp_cost": float(fp_cost),
                     "run_seed": effective_seed,
                     "run_order": int(run_order),
                 }
-            )
+                row.update(_calibration_rate_fields(seg_metrics_before, seg_metrics_after))
+                rows.append(row)
 
-            while len(training_window_rows) > int(info["n1"]):
-                training_window_rows.popleft()
-
-            retrain_df = pd.DataFrame(list(training_window_rows))
-            if (
-                len(retrain_df) >= int(effective_min_retrain_size)
-                and target_col in retrain_df.columns
-                and pd.to_numeric(retrain_df[target_col], errors="coerce").fillna(0).astype(int).nunique() >= 2
-            ):
-                retrain_study_id = _build_tuning_study_id(
-                    stage="adaptive_retrain",
-                    strategy=ADAPTIVE_ADWIN_STRATEGY,
-                    model_name=model_name,
-                    balance_mode=balance_mode,
+                _append_execution_log(
+                    execution_log,
+                    phase="adaptive_drift_detected",
+                    status="ok",
+                    message="ADWIN detected drift and closed a prediction segment.",
+                    strategy="adaptive_adwin",
+                    model=model_name,
+                    drift=int(drift_idx),
+                    drift_date=pd.Timestamp(ts_i),
                     run_seed=effective_seed,
                     run_order=run_order,
-                    drift=int(drift_idx),
+                    balance_mode=balance_mode,
+                    threshold=float(threshold),
+                    operating_threshold=float(threshold),
+                    raw_youden_threshold=float(raw_youden_threshold),
+                    threshold_policy=str(threshold_policy),
+                    calibration_method=str(calibration_method),
+                    W=int(info["n"]),
+                    W0=int(info["n0"]),
+                    W1=int(info["n1"]),
+                    remaining_periods=remaining,
+                    auc=float(seg_metrics["auc"]),
+                    sensitivity=float(seg_metrics["sensitivity"]),
+                    specificity=float(seg_metrics["specificity"]),
+                    sensitivity_before_calibration=float(seg_metrics_before["sensitivity"]),
+                    specificity_before_calibration=float(seg_metrics_before["specificity"]),
+                    sensitivity_after_calibration=float(seg_metrics_after["sensitivity"]),
+                    specificity_after_calibration=float(seg_metrics_after["specificity"]),
+                    error_rate=float(seg_metrics["error_rate"]),
                 )
-                try:
-                    t_fit = time.perf_counter()
-                    resolved_retrain_tuning_artifact = fixed_tuning_artifact
-                    resolved_retrain_params = fixed_params
-                    effective_retrain_feature_cols = [str(col) for col in effective_base_feature_cols]
-                    if tuning_resolver is not None:
-                        resolved_retrain_tuning_artifact = tuning_resolver(
-                            train_df=retrain_df,
-                            model_name=model_name,
-                            balance_mode=balance_mode,
-                            strategy_context={
-                                "stage": "adaptive_retrain",
-                                "strategy": ADAPTIVE_ADWIN_STRATEGY,
-                                "window_kind": "adaptive_retrain",
-                                "drift": int(drift_idx),
-                                "drift_date": pd.Timestamp(ts_i),
-                                "retrain_rows": int(len(retrain_df)),
-                                "training_years": sorted(
-                                    pd.to_datetime(retrain_df[time_col], errors="coerce")
-                                    .dt.year.dropna()
-                                    .astype(int)
-                                    .unique()
-                                    .tolist()
-                                ),
-                                "run_seed": int(effective_seed),
-                                "run_order": int(run_order),
-                            },
-                        )
-                        resolved_retrain_params = dict((resolved_retrain_tuning_artifact or {}).get("best_params") or {})
-                        effective_retrain_feature_cols = _artifact_selected_feature_cols(
-                            resolved_retrain_tuning_artifact,
-                            fallback_feature_cols=effective_base_feature_cols,
-                        )
-                    bundle = train_model_with_internal_validation(
-                        retrain_df,
-                        feature_cols=effective_retrain_feature_cols,
-                        target_col=target_col,
-                        time_col=time_col,
-                        model_name=model_name,
-                        validation_size=validation_size,
-                        folds=folds,
-                        random_state=effective_seed,
-                        fast_mode=fast_mode,
-                        resource_mode=resource_mode,
-                        resource_policy_overrides=resource_policy_overrides,
-                        grid_limit=grid_limit,
-                        custom_grid=(custom_grids or {}).get(model_name),
-                        balance_mode=balance_mode,
-                        study_id=retrain_study_id,
-                        fixed_params=resolved_retrain_params,
-                        fixed_tuning_artifact=resolved_retrain_tuning_artifact,
-                        run_id=run_id,
-                        smote_cache_dir=smote_cache_dir,
-                        smote_cache_registry=smote_cache_registry,
 
+                roc_payload.append(
+                    {
+                        "strategy": "adaptive_adwin",
+                        "model": model_name,
+                        "balance_mode": balance_mode,
+                        "segment": f"drift_{drift_idx}",
+                        "y_true": np.asarray(segment_y),
+                        "scores": np.asarray(segment_raw_scores),
+                        "calibrated_scores": np.asarray(segment_decision_scores),
+                        "raw_threshold": float(raw_youden_threshold),
+                        "calibrated_threshold": float(threshold),
+                        "run_seed": effective_seed,
+                        "run_order": int(run_order),
+                    }
+                )
+
+                while len(training_window_rows) > int(info["n1"]):
+                    training_window_rows.popleft()
+
+                retrain_df = pd.DataFrame(list(training_window_rows))
+                if (
+                    len(retrain_df) >= int(effective_min_retrain_size)
+                    and target_col in retrain_df.columns
+                    and pd.to_numeric(retrain_df[target_col], errors="coerce").fillna(0).astype(int).nunique() >= 2
+                ):
+                    retrain_study_id = _build_tuning_study_id(
+                        stage="adaptive_retrain",
+                        strategy=ADAPTIVE_ADWIN_STRATEGY,
+                        model_name=model_name,
+                        balance_mode=balance_mode,
+                        run_seed=effective_seed,
+                        run_order=run_order,
+                        drift=int(drift_idx),
                     )
-                    fit_time = time.perf_counter() - t_fit
-                    if str(model_name) == "NNet" and bool(bundle.get("fit_retry_applied", False)):
+                    try:
+                        t_fit = time.perf_counter()
+                        resolved_retrain_tuning_artifact = fixed_tuning_artifact
+                        resolved_retrain_params = fixed_params
+                        effective_retrain_feature_cols = [str(col) for col in effective_base_feature_cols]
+                        if tuning_resolver is not None:
+                            resolved_retrain_tuning_artifact = tuning_resolver(
+                                train_df=retrain_df,
+                                model_name=model_name,
+                                balance_mode=balance_mode,
+                                strategy_context={
+                                    "stage": "adaptive_retrain",
+                                    "strategy": ADAPTIVE_ADWIN_STRATEGY,
+                                    "window_kind": "adaptive_retrain",
+                                    "drift": int(drift_idx),
+                                    "drift_date": pd.Timestamp(ts_i),
+                                    "retrain_rows": int(len(retrain_df)),
+                                    "training_years": sorted(
+                                        pd.to_datetime(retrain_df[time_col], errors="coerce")
+                                        .dt.year.dropna()
+                                        .astype(int)
+                                        .unique()
+                                        .tolist()
+                                    ),
+                                    "run_seed": int(effective_seed),
+                                    "run_order": int(run_order),
+                                },
+                            )
+                            resolved_retrain_params = dict((resolved_retrain_tuning_artifact or {}).get("best_params") or {})
+                            effective_retrain_feature_cols = _artifact_selected_feature_cols(
+                                resolved_retrain_tuning_artifact,
+                                fallback_feature_cols=effective_base_feature_cols,
+                            )
+                        bundle = train_model_with_internal_validation(
+                            retrain_df,
+                            feature_cols=effective_retrain_feature_cols,
+                            target_col=target_col,
+                            time_col=time_col,
+                            model_name=model_name,
+                            validation_size=validation_size,
+                            folds=folds,
+                            random_state=effective_seed,
+                            fast_mode=fast_mode,
+                            resource_mode=resource_mode,
+                            resource_policy_overrides=resource_policy_overrides,
+                            grid_limit=grid_limit,
+                            custom_grid=(custom_grids or {}).get(model_name),
+                            balance_mode=balance_mode,
+                            study_id=retrain_study_id,
+                            fixed_params=resolved_retrain_params,
+                            fixed_tuning_artifact=resolved_retrain_tuning_artifact,
+                            run_id=run_id,
+                            smote_cache_dir=smote_cache_dir,
+                            smote_cache_registry=smote_cache_registry,
+
+                        )
+                        fit_time = time.perf_counter() - t_fit
+                        if str(model_name) == "NNet" and bool(bundle.get("fit_retry_applied", False)):
+                            _append_execution_log(
+                                execution_log,
+                                phase="nnet_final_refit_retry",
+                                status="warning",
+                                message="NNet adaptive retraining converged only after increasing max_iter.",
+                                strategy="adaptive_adwin",
+                                model=model_name,
+                                drift=int(drift_idx),
+                                run_seed=effective_seed,
+                                run_order=run_order,
+                                balance_mode=balance_mode,
+                                study_id=retrain_study_id,
+                                n_iter_final=bundle.get("n_iter_final"),
+                                fit_warning_count=int(bundle.get("fit_warning_count", 0)),
+                            )
+                        model = bundle["model"]
+                        operating_context = _bundle_operating_context(bundle)
+                        threshold = float(operating_context["threshold"])
+                        raw_youden_threshold = float(operating_context["raw_youden_threshold"])
+                        threshold_policy = str(operating_context["threshold_policy"])
+                        calibration_method = str(operating_context["calibration_method"])
+                        fn_cost = float(operating_context["fn_cost"])
+                        fp_cost = float(operating_context["fp_cost"])
+                        calibration_model = operating_context.get("calibration_model")
+                        calibration_metadata = operating_context.get("calibration_metadata")
+                        fill_values = dict(bundle.get("fill_values") or {})
+                        feature_transform = dict(bundle.get("feature_transform") or {}) or None
+                        effective_base_feature_cols = list(effective_retrain_feature_cols)
+                        X_stream_raw, y_stream = _prepare_xy_raw(stream, effective_base_feature_cols, target_col)
+                        _append_tuning_study(
+                            study_collector,
+                            bundle.get("tuning_artifact"),
+                            stage="adaptive_retrain",
+                            strategy=ADAPTIVE_ADWIN_STRATEGY,
+                            model=model_name,
+                            balance_mode=balance_mode,
+                            run_seed=effective_seed,
+                            run_order=int(run_order),
+                            drift=int(drift_idx),
+                            retrain_rows=int(len(retrain_df)),
+                        )
                         _append_execution_log(
                             execution_log,
-                            phase="nnet_final_refit_retry",
-                            status="warning",
-                            message="NNet adaptive retraining converged only after increasing max_iter.",
+                            phase="adaptive_retrain_complete",
+                            status="ok",
+                            message="Adaptive retraining completed using ADWIN window W1.",
                             strategy="adaptive_adwin",
                             model=model_name,
                             drift=int(drift_idx),
@@ -7149,99 +7234,80 @@ def run_adaptive_strategy(
                             run_order=run_order,
                             balance_mode=balance_mode,
                             study_id=retrain_study_id,
-                            n_iter_final=bundle.get("n_iter_final"),
-                            fit_warning_count=int(bundle.get("fit_warning_count", 0)),
+                            threshold=float(threshold),
+                            operating_threshold=float(threshold),
+                            raw_youden_threshold=float(raw_youden_threshold),
+                            threshold_policy=str(threshold_policy),
+                            calibration_method=str(calibration_method),
+                            best_params=bundle["best_params"],
+                            retrain_rows=int(len(retrain_df)),
+                            training_time_sec=float(fit_time),
+                            min_retrain_size=int(effective_min_retrain_size),
                         )
-                    model = bundle["model"]
-                    operating_context = _bundle_operating_context(bundle)
-                    threshold = float(operating_context["threshold"])
-                    raw_youden_threshold = float(operating_context["raw_youden_threshold"])
-                    threshold_policy = str(operating_context["threshold_policy"])
-                    calibration_method = str(operating_context["calibration_method"])
-                    fn_cost = float(operating_context["fn_cost"])
-                    fp_cost = float(operating_context["fp_cost"])
-                    calibration_model = operating_context.get("calibration_model")
-                    calibration_metadata = operating_context.get("calibration_metadata")
-                    fill_values = dict(bundle.get("fill_values") or {})
-                    feature_transform = dict(bundle.get("feature_transform") or {}) or None
-                    effective_base_feature_cols = list(effective_retrain_feature_cols)
-                    X_stream_raw, y_stream = _prepare_xy_raw(stream, effective_base_feature_cols, target_col)
-                    _append_tuning_study(
-                        study_collector,
-                        bundle.get("tuning_artifact"),
-                        stage="adaptive_retrain",
-                        strategy=ADAPTIVE_ADWIN_STRATEGY,
-                        model=model_name,
-                        balance_mode=balance_mode,
-                        run_seed=effective_seed,
-                        run_order=int(run_order),
-                        drift=int(drift_idx),
-                        retrain_rows=int(len(retrain_df)),
-                    )
-                    _append_execution_log(
-                        execution_log,
-                        phase="adaptive_retrain_complete",
-                        status="ok",
-                        message="Adaptive retraining completed using ADWIN window W1.",
-                        strategy="adaptive_adwin",
-                        model=model_name,
-                        drift=int(drift_idx),
-                        run_seed=effective_seed,
-                        run_order=run_order,
-                        balance_mode=balance_mode,
-                        study_id=retrain_study_id,
-                        threshold=float(threshold),
-                        operating_threshold=float(threshold),
-                        raw_youden_threshold=float(raw_youden_threshold),
-                        threshold_policy=str(threshold_policy),
-                        calibration_method=str(calibration_method),
-                        best_params=bundle["best_params"],
-                        retrain_rows=int(len(retrain_df)),
-                        training_time_sec=float(fit_time),
-                        min_retrain_size=int(effective_min_retrain_size),
-                    )
-                except ModelTrainingSkipped as exc:
-                    skip_metadata = dict(getattr(exc, "metadata", {}) or {})
-                    skip_phase = "nnet_final_refit_skipped"
-                    if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
-                        skip_phase = "nnet_trial_invalid"
-                    _append_execution_log(
-                        execution_log,
-                        phase=skip_phase,
-                        status="skipped",
-                        message="Skipped adaptive retraining because NNet did not converge on the drift window.",
-                        strategy="adaptive_adwin",
-                        model=model_name,
-                        drift=int(drift_idx),
-                        run_seed=effective_seed,
-                        run_order=run_order,
-                        balance_mode=balance_mode,
-                        study_id=retrain_study_id,
-                        retrain_rows=int(len(retrain_df)),
-                        min_retrain_size=int(effective_min_retrain_size),
-                        **skip_metadata,
-                    )
-                except Exception as exc:
-                    _append_execution_log(
-                        execution_log,
-                        phase="adaptive_retrain_error",
-                        status="error",
-                        message="Adaptive retraining failed after drift detection.",
-                        strategy="adaptive_adwin",
-                        model=model_name,
-                        drift=int(drift_idx),
-                        run_seed=effective_seed,
-                        run_order=run_order,
-                        balance_mode=balance_mode,
-                        study_id=retrain_study_id,
-                        retrain_rows=int(len(retrain_df)),
-                        min_retrain_size=int(effective_min_retrain_size),
-                        error=str(exc),
-                    )
+                        action_taken = "retrain"
+                    except ModelTrainingSkipped as exc:
+                        skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+                        skip_phase = "nnet_final_refit_skipped"
+                        if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
+                            skip_phase = "nnet_trial_invalid"
+                        _append_execution_log(
+                            execution_log,
+                            phase=skip_phase,
+                            status="skipped",
+                            message="Skipped adaptive retraining because NNet did not converge on the drift window.",
+                            strategy="adaptive_adwin",
+                            model=model_name,
+                            drift=int(drift_idx),
+                            run_seed=effective_seed,
+                            run_order=run_order,
+                            balance_mode=balance_mode,
+                            study_id=retrain_study_id,
+                            retrain_rows=int(len(retrain_df)),
+                            min_retrain_size=int(effective_min_retrain_size),
+                            **skip_metadata,
+                        )
+                    except Exception as exc:
+                        _append_execution_log(
+                            execution_log,
+                            phase="adaptive_retrain_error",
+                            status="error",
+                            message="Adaptive retraining failed after drift detection.",
+                            strategy="adaptive_adwin",
+                            model=model_name,
+                            drift=int(drift_idx),
+                            run_seed=effective_seed,
+                            run_order=run_order,
+                            balance_mode=balance_mode,
+                            study_id=retrain_study_id,
+                            retrain_rows=int(len(retrain_df)),
+                            min_retrain_size=int(effective_min_retrain_size),
+                            error=str(exc),
+                        )
 
-            segment_y = []
-            segment_raw_scores = []
-            segment_decision_scores = []
+                segment_y = []
+                segment_raw_scores = []
+                segment_decision_scores = []
+
+            if stream_record_callback is not None:
+                stream_record_callback(
+                    {
+                        "timestamp": pd.Timestamp(ts_i),
+                        "record_index": int(i),
+                        "strategy": ADAPTIVE_ADWIN_STRATEGY,
+                        "model": str(model_name),
+                        "balance_mode": str(balance_mode),
+                        "run_seed": int(effective_seed),
+                        "run_order": int(run_order),
+                        "prediction_year": int(pd.Timestamp(ts_i).year),
+                        "y_true": int(y_i),
+                        "raw_score": float(raw_score_i),
+                        "score": float(decision_score_i),
+                        "prediction": int(pred_i),
+                        "decision_threshold": float(prediction_threshold),
+                        "raw_threshold": float(prediction_raw_youden_threshold),
+                        "action_taken": str(action_taken),
+                    }
+                )
 
         # Final segment row (matches A.9 style "remaining=0")
         if segment_y:
@@ -15534,9 +15600,9 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
 
     st.title("Drift detection")
     st.caption(
-        "Replication workspace for the crash prediction recalibration paper "
-        "(static, period-aligned, cumulative, adaptive ADWIN) "
-        "with extended online ARF and KSWIN comparisons."
+        "Workspace for crash prediction recalibration (static, period-aligned, "
+        "cumulative, adaptive ADWIN, online ARF and KSWIN comparisons) and "
+        "the design of a new approach to \"Neural drift\"."
     )
 
     tab_events, tab_feature_eng, tab_selection, tab_experiments, tab_neural_drift = st.tabs(

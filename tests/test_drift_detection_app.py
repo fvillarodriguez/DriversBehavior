@@ -310,6 +310,128 @@ def test_run_adaptive_strategy_random_forest():
     assert len(roc_payload) >= 1
 
 
+def test_run_yearly_strategy_emits_stream_record_callback_payloads(monkeypatch):
+    df = _make_kswin_shift_dataset(rows_per_year=36, random_state=321)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    class _FakeModel:
+        def predict_proba(self, X):
+            X_np = np.asarray(X, dtype=float)
+            base = np.clip(0.35 + 0.03 * np.nan_to_num(X_np[:, 0], nan=0.0), 0.05, 0.95)
+            return np.column_stack([1.0 - base, base])
+
+    def fake_train_model_with_internal_validation(*args, **kwargs):
+        return {
+            "model": _FakeModel(),
+            "threshold": 0.5,
+            "operating_threshold": 0.5,
+            "raw_youden_threshold": 0.5,
+            "calibration_model": None,
+            "calibration_metadata": None,
+            "feature_transform": None,
+            "fill_values": {},
+            "best_params": {},
+            "tuning_artifact": {"best_params": {}},
+        }
+
+    callbacks: list[dict] = []
+    monkeypatch.setattr(drift_app, "train_model_with_internal_validation", fake_train_model_with_internal_validation)
+
+    yearly_df, roc_payload = run_yearly_strategy(
+        df,
+        strategy="cumulative",
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        validation_size=0.2,
+        folds=2,
+        random_state=42,
+        fast_mode=True,
+        grid_limit=1,
+        stream_record_callback=lambda payload: callbacks.append(dict(payload)),
+    )
+
+    assert not yearly_df.empty
+    assert roc_payload
+    assert callbacks
+    assert {int(row["prediction_year"]) for row in callbacks} == set(yearly_df["prediction_year"].astype(int))
+    assert any(str(row["action_taken"]) == "retrain" for row in callbacks)
+    assert all(pd.notna(row["timestamp"]) for row in callbacks)
+    assert {"timestamp", "score", "prediction", "action_taken"} <= set(callbacks[0].keys())
+
+
+def test_run_adaptive_strategy_emits_stream_record_callback_for_each_stream_row(monkeypatch):
+    df = _make_kswin_shift_dataset(rows_per_year=30, random_state=654)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    class _FakeModel:
+        def predict_proba(self, X):
+            X_np = np.asarray(X, dtype=float)
+            base = np.clip(0.30 + 0.02 * np.nan_to_num(X_np[:, 0], nan=0.0), 0.05, 0.95)
+            return np.column_stack([1.0 - base, base])
+
+    def fake_train_model_with_internal_validation(*args, **kwargs):
+        return {
+            "model": _FakeModel(),
+            "threshold": 0.5,
+            "operating_threshold": 0.5,
+            "raw_youden_threshold": 0.5,
+            "calibration_model": None,
+            "calibration_metadata": None,
+            "feature_transform": None,
+            "fill_values": {},
+            "best_params": {},
+            "tuning_artifact": {"best_params": {}},
+        }
+
+    callbacks: list[dict] = []
+    expected_stream_rows = int(pd.to_datetime(df["interval_start"]).dt.year.gt(2018).sum())
+    monkeypatch.setattr(drift_app, "train_model_with_internal_validation", fake_train_model_with_internal_validation)
+
+    adaptive_df, roc_payload = run_adaptive_strategy(
+        df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=["Random Forest"],
+        validation_size=0.2,
+        folds=2,
+        random_state=42,
+        fast_mode=True,
+        grid_limit=1,
+        min_window=10_000,
+        stream_record_callback=lambda payload: callbacks.append(dict(payload)),
+    )
+
+    assert len(callbacks) == expected_stream_rows
+    assert callbacks[0]["record_index"] == 0
+    assert callbacks[-1]["record_index"] == expected_stream_rows - 1
+    assert all(pd.notna(row["timestamp"]) for row in callbacks)
+    assert set(str(row["action_taken"]) for row in callbacks).issubset({"none", "retrain"})
+    assert roc_payload or adaptive_df.empty
+
+
 def test_run_arf_strategy_variants():
     pytest.importorskip("river")
 

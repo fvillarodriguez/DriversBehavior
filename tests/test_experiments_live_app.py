@@ -166,6 +166,11 @@ def test_build_live_sources_includes_drift_manifests(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         live_app,
+        "NEURAL_DRIFT_EXPERIMENTS_DIR",
+        tmp_path / "neural_drift_experiments",
+    )
+    monkeypatch.setattr(
+        live_app,
         "NLP_PAPER_RUNS_DIR",
         tmp_path / "nlp_in_severity" / "paper_replication",
     )
@@ -203,6 +208,11 @@ def test_build_live_sources_includes_paper_replication_manifests(tmp_path, monke
     )
     monkeypatch.setattr(
         live_app,
+        "NEURAL_DRIFT_EXPERIMENTS_DIR",
+        tmp_path / "neural_drift_experiments",
+    )
+    monkeypatch.setattr(
+        live_app,
         "NLP_PAPER_RUNS_DIR",
         tmp_path / "nlp_in_severity" / "paper_replication",
     )
@@ -232,12 +242,60 @@ def test_build_live_sources_includes_paper_replication_manifests(tmp_path, monke
     assert "paper_replication_abcd" in str(sources[0]["label"])
 
 
+def test_build_live_sources_includes_neural_drift_experiment_manifests(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(
+        live_app,
+        "DRIFT_RUNS_DIR",
+        tmp_path / "drift_recalibration_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NEURAL_DRIFT_EXPERIMENTS_DIR",
+        tmp_path / "neural_drift_experiments",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_PAPER_RUNS_DIR",
+        tmp_path / "nlp_in_severity" / "paper_replication",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_LANGUAGE_MODELING_LIVE_DIR",
+        tmp_path / "nlp_in_severity" / "language_modeling_live",
+    )
+
+    run_dir = live_app.NEURAL_DRIFT_EXPERIMENTS_DIR / "run_experiment_001"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run_experiment_001",
+                "status": "running",
+                "updated_at": "2026-04-11T15:00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sources = live_app._build_live_sources()
+
+    assert len(sources) == 1
+    assert sources[0]["type"] == "neural_drift_experiment"
+    assert "run_experiment_001" in str(sources[0]["label"])
+
+
 def test_build_live_sources_includes_language_modeling_manifests(tmp_path, monkeypatch):
     monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
     monkeypatch.setattr(
         live_app,
         "DRIFT_RUNS_DIR",
         tmp_path / "drift_recalibration_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NEURAL_DRIFT_EXPERIMENTS_DIR",
+        tmp_path / "neural_drift_experiments",
     )
     monkeypatch.setattr(
         live_app,
@@ -882,6 +940,171 @@ def test_read_paper_replication_run_builds_partial_monitoring_frames(tmp_path):
     assert payload["current_context"]["current_step_id"] == "raw.build.embeddings"
     assert not payload["compare_summary_df"].empty
     assert not payload["export_summary_df"].empty
+
+
+def test_read_neural_drift_experiment_run_builds_live_and_partial_frames(tmp_path):
+    run_dir = tmp_path / "neural_drift_experiments" / "run_demo"
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+
+    manifest = {
+        "run_id": "run_demo",
+        "status": "running",
+        "result_status": "running",
+        "created_at": "2026-04-11T10:00:00",
+        "updated_at": "2026-04-11T10:10:00",
+        "progress": {
+            "completed_units": 12.0,
+            "total_units": 50.0,
+            "progress_ratio": 0.24,
+        },
+        "baseline": {
+            "status": "completed",
+            "seed_metrics": [
+                {
+                    "seed": 42,
+                    "dev": {"score": 0.71, "monthly_pr_auc_median": 0.74, "monthly_pr_auc_std": 0.03},
+                    "holdout": {"score": 0.70, "monthly_pr_auc_median": 0.73, "monthly_pr_auc_std": 0.04},
+                }
+            ],
+        },
+        "studies": {
+            "adwin": {
+                "phases": {
+                    "phase_1": {
+                        "phase": 1,
+                        "status": "running",
+                        "n_trials_budget": 40,
+                        "completed_trials": 12,
+                        "best_value": 0.77,
+                        "best_trial_number": 9,
+                        "storage_path": str(run_dir / "optuna" / "adwin_phase_1.sqlite"),
+                    }
+                }
+            },
+            "neural": {
+                "phases": {
+                    "phase_1": {
+                        "phase": 1,
+                        "status": "pending",
+                        "n_trials_budget": 40,
+                        "completed_trials": 0,
+                    }
+                }
+            },
+        },
+        "winner": {"study": "neural", "eligible_for_promotion": False},
+        "artifacts": {
+            "leaderboard_dev": str(artifacts_dir / "leaderboard_dev.csv"),
+            "leaderboard_holdout": str(artifacts_dir / "leaderboard_holdout.csv"),
+            "monthly_metrics": str(artifacts_dir / "monthly_metrics.csv"),
+            "pairwise_stats": str(artifacts_dir / "pairwise_stats.csv"),
+            "param_importances": str(artifacts_dir / "param_importances.csv"),
+            "pareto": str(artifacts_dir / "pareto.csv"),
+            "winner_config": str(artifacts_dir / "winner_config.json"),
+        },
+    }
+    manifest_path = run_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    pd.DataFrame(
+        [
+            {"label": "cumulative", "study": "cumulative", "phase": 0, "dev_score": 0.71},
+            {"label": "adwin", "study": "adwin", "phase": 1, "dev_score": 0.77},
+        ]
+    ).to_csv(artifacts_dir / "leaderboard_dev.csv", index=False)
+    pd.DataFrame(
+        [
+            {"label": "cumulative", "study": "cumulative", "phase": 0, "holdout_score": 0.70},
+        ]
+    ).to_csv(artifacts_dir / "leaderboard_holdout.csv", index=False)
+    pd.DataFrame(
+        [
+            {"month": "2023-01-01", "split": "holdout", "label": "cumulative", "pr_auc": 0.72},
+            {"month": "2023-01-01", "split": "holdout", "label": "adwin", "pr_auc": 0.75},
+        ]
+    ).to_csv(artifacts_dir / "monthly_metrics.csv", index=False)
+    pd.DataFrame(
+        [
+            {"left": "adwin", "right": "cumulative", "passes_gate": False},
+        ]
+    ).to_csv(artifacts_dir / "pairwise_stats.csv", index=False)
+    pd.DataFrame(
+        [
+            {"study": "adwin", "phase": 1, "parameter": "adwin_delta", "importance": 0.42},
+        ]
+    ).to_csv(artifacts_dir / "param_importances.csv", index=False)
+    pd.DataFrame(
+        [
+            {"study": "cumulative", "dev_monthly_pr_auc_median": 0.74, "dev_n_actions": 0.0, "pareto_optimal": True},
+        ]
+    ).to_csv(artifacts_dir / "pareto.csv", index=False)
+    (artifacts_dir / "winner_config.json").write_text(
+        json.dumps({"study": "neural", "eligible_for_promotion": False}),
+        encoding="utf-8",
+    )
+
+    live_status = {
+        "timestamp": "2026-04-11T10:09:00",
+        "status": "running",
+        "result_status": "running",
+        "completed_units": 12.0,
+        "total_units": 50.0,
+        "progress_ratio": 0.24,
+        "label": "Ejecutando estudio",
+        "detail": "adwin | Fase 1 | trial 12/40",
+        "context": {"study": "adwin", "phase": 1},
+    }
+    (run_dir / "live_status.json").write_text(json.dumps(live_status), encoding="utf-8")
+    (run_dir / "live_events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-11T10:01:00",
+                        "event": "baseline_seed_complete",
+                        "payload": {
+                            "completed_units": 1.0,
+                            "total_units": 50.0,
+                            "progress_ratio": 0.02,
+                            "label": "Ejecutando baseline cumulative",
+                            "detail": "seed 1/3",
+                            "context": {"seed": 42},
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-11T10:09:00",
+                        "event": "trial_complete",
+                        "payload": {
+                            "completed_units": 12.0,
+                            "total_units": 50.0,
+                            "progress_ratio": 0.24,
+                            "label": "Ejecutando estudio",
+                            "detail": "adwin | Fase 1 | trial 12/40",
+                            "context": {"study": "adwin", "phase": 1},
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = live_app._read_neural_drift_experiment_run(manifest_path)
+
+    assert payload["manifest"]["run_id"] == "run_demo"
+    assert not payload["live_events_df"].empty
+    assert payload["live_events_df"]["progress_pct"].iloc[-1] == pytest.approx(24.0)
+    assert not payload["phase_status_df"].empty
+    assert payload["phase_status_df"]["completed_trials"].iloc[0] == 12
+    assert not payload["baseline_seed_df"].empty
+    assert payload["baseline_seed_df"]["seed"].iloc[0] == 42
+    assert not payload["leaderboard_dev"].empty
+    assert not payload["monthly_metrics"].empty
+    assert payload["winner_config"]["study"] == "neural"
 
 
 def test_read_paper_replication_run_surfaces_blocked_raw_and_export_state(tmp_path):

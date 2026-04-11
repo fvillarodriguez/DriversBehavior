@@ -23,6 +23,7 @@ from src.drift_bias_variance import (
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
 DRIFT_RUNS_DIR = RESULTS_DIR / "drift_recalibration_runs"
+NEURAL_DRIFT_EXPERIMENTS_DIR = RESULTS_DIR / "neural_drift_experiments"
 NLP_PAPER_RUNS_DIR = RESULTS_DIR / "nlp_in_severity" / "paper_replication"
 NLP_LANGUAGE_MODELING_LIVE_DIR = RESULTS_DIR / "nlp_in_severity" / "language_modeling_live"
 PAPER_MODEL_CODES = ("M1", "M2", "M3")
@@ -321,6 +322,16 @@ def _list_paper_replication_manifest_files() -> list[Path]:
     )
 
 
+def _list_neural_drift_experiment_manifest_files() -> list[Path]:
+    if not NEURAL_DRIFT_EXPERIMENTS_DIR.exists():
+        return []
+    return sorted(
+        NEURAL_DRIFT_EXPERIMENTS_DIR.glob("*/manifest.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def _list_language_modeling_manifest_files() -> list[Path]:
     if not NLP_LANGUAGE_MODELING_LIVE_DIR.exists():
         return []
@@ -357,6 +368,19 @@ def _build_live_sources() -> list[Dict[str, object]]:
                 "path": path,
                 "sort_key": float(path.stat().st_mtime),
                 "label": f"Paper replication | {run_id} | {status} | {updated_at}",
+            }
+        )
+    for path in _list_neural_drift_experiment_manifest_files():
+        manifest = _load_json_file(path, default={})
+        run_id = str((manifest or {}).get("run_id") or path.parent.name)
+        status = str((manifest or {}).get("status") or "unknown")
+        updated_at = str((manifest or {}).get("updated_at") or (manifest or {}).get("created_at") or "-")
+        entries.append(
+            {
+                "type": "neural_drift_experiment",
+                "path": path,
+                "sort_key": float(path.stat().st_mtime),
+                "label": f"Neural drift experiments | {run_id} | {status} | {updated_at}",
             }
         )
     for path in _list_language_modeling_manifest_files():
@@ -1480,6 +1504,197 @@ def _load_csv_file(path: Path) -> pd.DataFrame:
         return pd.read_csv(path)
     except Exception:
         return pd.DataFrame()
+
+
+def _neural_drift_experiment_artifact_path(
+    run_dir: Path,
+    manifest: Dict[str, object],
+    artifact_name: str,
+    *,
+    suffix: str,
+) -> Path:
+    artifacts = dict(manifest.get("artifacts") or {})
+    candidate = str(artifacts.get(artifact_name) or "").strip()
+    if candidate:
+        return Path(candidate)
+    return run_dir / "artifacts" / f"{artifact_name}.{suffix}"
+
+
+def _normalize_neural_drift_experiment_live_event(
+    payload: Dict[str, object],
+    *,
+    manifest: Dict[str, object],
+) -> Dict[str, object]:
+    nested = dict(payload.get("payload") or {}) if isinstance(payload.get("payload"), dict) else {}
+    manifest_progress = dict(manifest.get("progress") or {})
+    context = payload.get("context")
+    if not isinstance(context, dict):
+        context = nested.get("context")
+    if not isinstance(context, dict):
+        context = {}
+
+    completed_units = pd.to_numeric(
+        payload.get("completed_units", nested.get("completed_units", manifest_progress.get("completed_units", 0.0))),
+        errors="coerce",
+    )
+    total_units = pd.to_numeric(
+        payload.get("total_units", nested.get("total_units", manifest_progress.get("total_units", 0.0))),
+        errors="coerce",
+    )
+    progress_ratio = pd.to_numeric(
+        payload.get("progress_ratio", nested.get("progress_ratio")),
+        errors="coerce",
+    )
+    if pd.isna(completed_units):
+        completed_units = 0.0
+    if pd.isna(total_units) or float(total_units) <= 0.0:
+        total_units = max(1.0, float(manifest_progress.get("total_units", 1.0) or 1.0))
+    if pd.isna(progress_ratio):
+        progress_ratio = float(completed_units) / float(max(1.0, float(total_units)))
+
+    return {
+        "timestamp": str(payload.get("timestamp") or nested.get("timestamp") or manifest.get("updated_at") or manifest.get("created_at") or ""),
+        "event_type": str(payload.get("event") or nested.get("event") or ""),
+        "status": str(payload.get("status") or nested.get("status") or manifest.get("status") or ""),
+        "result_status": str(payload.get("result_status") or nested.get("result_status") or manifest.get("result_status") or ""),
+        "label": str(payload.get("label") or nested.get("label") or payload.get("event") or "checkpoint"),
+        "detail": str(payload.get("detail") or nested.get("detail") or ""),
+        "completed_units": float(completed_units),
+        "total_units": float(total_units),
+        "progress_ratio": max(0.0, min(float(progress_ratio), 1.0)),
+        "study": str(context.get("study") or nested.get("study") or ""),
+        "phase": str(context.get("phase") or nested.get("phase") or ""),
+        "context": context,
+    }
+
+
+def _read_neural_drift_experiment_run(manifest_path: Path) -> Dict[str, object]:
+    manifest = _load_json_file(manifest_path, default={}) or {}
+    run_dir = manifest_path.parent
+    live_status_path = run_dir / "live_status.json"
+    live_events_path = run_dir / "live_events.jsonl"
+    live_status = _load_json_file(live_status_path, default={}) or {}
+    live_event_rows = _read_jsonl_records(live_events_path)
+    if not live_event_rows and isinstance(live_status, dict) and live_status:
+        live_event_rows = [live_status]
+    if not live_event_rows and manifest:
+        progress = dict(manifest.get("progress") or {})
+        live_event_rows = [
+            {
+                "timestamp": manifest.get("updated_at") or manifest.get("created_at"),
+                "completed_units": progress.get("completed_units", 0.0),
+                "total_units": progress.get("total_units", 1.0),
+                "progress_ratio": float(progress.get("progress_ratio", 0.0) or 0.0),
+                "label": "Checkpoint state",
+                "detail": "",
+                "context": {},
+            }
+        ]
+    normalized_events = [
+        _normalize_neural_drift_experiment_live_event(row, manifest=manifest)
+        for row in live_event_rows
+        if isinstance(row, dict)
+    ]
+    live_events_df = pd.DataFrame(normalized_events)
+    if not live_events_df.empty:
+        live_events_df["progress_pct"] = 100.0 * pd.to_numeric(live_events_df["progress_ratio"], errors="coerce")
+        live_events_df["event_index"] = range(1, len(live_events_df) + 1)
+
+    leaderboard_dev = _load_csv_file(
+        _neural_drift_experiment_artifact_path(run_dir, manifest, "leaderboard_dev", suffix="csv")
+    )
+    leaderboard_holdout = _load_csv_file(
+        _neural_drift_experiment_artifact_path(run_dir, manifest, "leaderboard_holdout", suffix="csv")
+    )
+    monthly_metrics = _load_csv_file(
+        _neural_drift_experiment_artifact_path(run_dir, manifest, "monthly_metrics", suffix="csv")
+    )
+    pairwise_stats = _load_csv_file(
+        _neural_drift_experiment_artifact_path(run_dir, manifest, "pairwise_stats", suffix="csv")
+    )
+    param_importances = _load_csv_file(
+        _neural_drift_experiment_artifact_path(run_dir, manifest, "param_importances", suffix="csv")
+    )
+    pareto = _load_csv_file(
+        _neural_drift_experiment_artifact_path(run_dir, manifest, "pareto", suffix="csv")
+    )
+    winner_config = _load_json_file(
+        _neural_drift_experiment_artifact_path(run_dir, manifest, "winner_config", suffix="json"),
+        default={},
+    ) or {}
+
+    for df in [leaderboard_dev, leaderboard_holdout, monthly_metrics, pairwise_stats, param_importances, pareto]:
+        if isinstance(df, pd.DataFrame):
+            for col in ["month", "timestamp"]:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    phase_rows: list[Dict[str, object]] = []
+    for study_name, study_payload in dict(manifest.get("studies") or {}).items():
+        phases = dict((study_payload or {}).get("phases") or {})
+        for phase_key, phase_payload in phases.items():
+            del phase_key
+            budget = _safe_int(phase_payload.get("n_trials_budget"), default=0)
+            completed_trials = _safe_int(phase_payload.get("completed_trials"), default=0)
+            phase_rows.append(
+                {
+                    "study": str(study_name),
+                    "phase": _safe_int(phase_payload.get("phase"), default=0),
+                    "status": str(phase_payload.get("status") or "pending"),
+                    "completed_trials": completed_trials,
+                    "n_trials_budget": budget,
+                    "progress_ratio": float(completed_trials) / float(max(1, budget)) if budget > 0 else float("nan"),
+                    "best_value": pd.to_numeric(phase_payload.get("best_value"), errors="coerce"),
+                    "best_trial_number": pd.to_numeric(phase_payload.get("best_trial_number"), errors="coerce"),
+                    "error": str(phase_payload.get("error") or ""),
+                    "storage_path": str(phase_payload.get("storage_path") or ""),
+                }
+            )
+    phase_status_df = pd.DataFrame(phase_rows)
+    if not phase_status_df.empty:
+        phase_status_df["progress_pct"] = 100.0 * pd.to_numeric(phase_status_df["progress_ratio"], errors="coerce")
+        phase_status_df = phase_status_df.sort_values(["study", "phase"]).reset_index(drop=True)
+
+    baseline_seed_rows: list[Dict[str, object]] = []
+    baseline = dict(manifest.get("baseline") or {})
+    for item in baseline.get("seed_metrics") or []:
+        if not isinstance(item, dict):
+            continue
+        dev = dict(item.get("dev") or {})
+        holdout = dict(item.get("holdout") or {})
+        baseline_seed_rows.append(
+            {
+                "seed": _safe_int(item.get("seed"), default=0),
+                "dev_score": pd.to_numeric(dev.get("score"), errors="coerce"),
+                "dev_monthly_pr_auc_median": pd.to_numeric(dev.get("monthly_pr_auc_median"), errors="coerce"),
+                "dev_monthly_pr_auc_std": pd.to_numeric(dev.get("monthly_pr_auc_std"), errors="coerce"),
+                "holdout_score": pd.to_numeric(holdout.get("score"), errors="coerce"),
+                "holdout_monthly_pr_auc_median": pd.to_numeric(holdout.get("monthly_pr_auc_median"), errors="coerce"),
+                "holdout_monthly_pr_auc_std": pd.to_numeric(holdout.get("monthly_pr_auc_std"), errors="coerce"),
+            }
+        )
+    baseline_seed_df = pd.DataFrame(baseline_seed_rows)
+    if not baseline_seed_df.empty:
+        baseline_seed_df = baseline_seed_df.sort_values("seed").reset_index(drop=True)
+
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "run_dir": run_dir,
+        "live_status": live_status,
+        "live_events_df": live_events_df,
+        "live_status_path": live_status_path,
+        "live_events_path": live_events_path,
+        "phase_status_df": phase_status_df,
+        "baseline_seed_df": baseline_seed_df,
+        "leaderboard_dev": leaderboard_dev,
+        "leaderboard_holdout": leaderboard_holdout,
+        "monthly_metrics": monthly_metrics,
+        "pairwise_stats": pairwise_stats,
+        "param_importances": param_importances,
+        "pareto": pareto,
+        "winner_config": winner_config,
+    }
 
 
 def _paper_route_dir(run_dir: Path, route_name: str) -> Path:
@@ -4265,6 +4480,207 @@ def _render_language_modeling_live_view(data: Dict[str, object]) -> None:
             st.dataframe(_streamlit_arrow_safe_df(live_events_df), width="stretch")
 
 
+def _render_neural_drift_experiment_live_view(data: Dict[str, object]) -> None:
+    manifest = dict(data.get("manifest") or {})
+    live_status = dict(data.get("live_status") or {})
+    live_events_df = data.get("live_events_df")
+    phase_status_df = data.get("phase_status_df")
+    baseline_seed_df = data.get("baseline_seed_df")
+    leaderboard_dev = data.get("leaderboard_dev")
+    leaderboard_holdout = data.get("leaderboard_holdout")
+    monthly_metrics = data.get("monthly_metrics")
+    pairwise_stats = data.get("pairwise_stats")
+    param_importances = data.get("param_importances")
+    pareto = data.get("pareto")
+    winner_config = dict(data.get("winner_config") or {})
+
+    progress = dict(manifest.get("progress") or {})
+    total_units = pd.to_numeric(
+        live_status.get("total_units", progress.get("total_units", 1.0)),
+        errors="coerce",
+    )
+    completed_units = pd.to_numeric(
+        live_status.get("completed_units", progress.get("completed_units", 0.0)),
+        errors="coerce",
+    )
+    progress_ratio = pd.to_numeric(
+        live_status.get("progress_ratio", progress.get("progress_ratio", 0.0)),
+        errors="coerce",
+    )
+    if pd.isna(total_units) or float(total_units) <= 0.0:
+        total_units = 1.0
+    if pd.isna(completed_units):
+        completed_units = 0.0
+    if pd.isna(progress_ratio):
+        progress_ratio = float(completed_units) / float(max(1.0, float(total_units)))
+    progress_ratio = max(0.0, min(float(progress_ratio), 1.0))
+
+    status = str(live_status.get("status") or manifest.get("status") or "unknown")
+    result_status = str(live_status.get("result_status") or manifest.get("result_status") or status)
+    updated_at = str(
+        live_status.get("timestamp")
+        or manifest.get("updated_at")
+        or manifest.get("created_at")
+        or "-"
+    )
+    current_label = str(live_status.get("label") or "Sin actividad registrada")
+    current_detail = str(live_status.get("detail") or "")
+    current_context = dict(live_status.get("context") or {})
+
+    st.caption("Experimento detectado: Neural drift experiments")
+    st.caption(f"Checkpoint: {data.get('manifest_path')}")
+    st.caption(f"Run dir: {data.get('run_dir')}")
+
+    if status == "failed":
+        st.error(manifest.get("last_error") or "Corrida fallida sin detalle persistido.")
+    elif status == "completed":
+        st.success("Corrida completada. Se muestran resultados y trazas parciales/finales.")
+    else:
+        st.info("Corrida en progreso. La vista se alimenta del checkpoint persistido.")
+
+    completed_phases = 0
+    total_phases = 0
+    if isinstance(phase_status_df, pd.DataFrame) and not phase_status_df.empty:
+        total_phases = int(len(phase_status_df))
+        completed_phases = int(
+            phase_status_df["status"].astype(str).str.lower().eq("completed").sum()
+        )
+    baseline_completed = int(len(baseline_seed_df)) if isinstance(baseline_seed_df, pd.DataFrame) else 0
+
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6 = st.columns(6)
+    kpi_1.metric("Estado", status)
+    kpi_2.metric("Resultado", result_status)
+    kpi_3.metric("Progreso", f"{100.0 * progress_ratio:.1f}%")
+    kpi_4.metric("Baseline seeds", f"{baseline_completed}/3")
+    kpi_5.metric("Fases", f"{completed_phases}/{total_phases}")
+    kpi_6.metric("Ultima actualizacion", updated_at)
+
+    st.progress(progress_ratio)
+    st.caption(current_label)
+    if current_detail:
+        st.caption(current_detail)
+
+    active_col_1, active_col_2, active_col_3, active_col_4 = st.columns(4)
+    active_col_1.metric("Study activo", str(current_context.get("study") or manifest.get("selected_study") or "-"))
+    active_col_2.metric("Phase activa", str(current_context.get("phase") or manifest.get("selected_phase") or "-"))
+    active_col_3.metric("Balance", str(manifest.get("balance_mode") or "-"))
+    active_col_4.metric("Run id", str(manifest.get("run_id") or "-"))
+
+    live_tab, partial_tab, data_tab = st.tabs(
+        ["Live calculations", "Partial results", "Raw data"]
+    )
+
+    with live_tab:
+        st.markdown("**Progress over time**")
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            history_df = live_events_df.copy()
+            plot_df = history_df[["event_index", "progress_pct"]].dropna(subset=["progress_pct"])
+            if not plot_df.empty:
+                st.line_chart(plot_df.set_index("event_index")["progress_pct"], width="stretch")
+            visible_cols = [
+                col
+                for col in ["event_index", "timestamp", "event_type", "label", "detail", "study", "phase", "progress_pct"]
+                if col in history_df.columns
+            ]
+            st.dataframe(_streamlit_arrow_safe_df(history_df[visible_cols]), width="stretch")
+        else:
+            st.info("No hay eventos live persistidos todavía.")
+
+        st.markdown("**Phase execution matrix**")
+        if isinstance(phase_status_df, pd.DataFrame) and not phase_status_df.empty:
+            status_df = (
+                phase_status_df["status"].astype(str).value_counts().rename_axis("status").reset_index(name="count")
+            )
+            if not status_df.empty:
+                st.bar_chart(status_df.set_index("status")["count"], width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(phase_status_df), width="stretch")
+        else:
+            st.info("No hay fases persistidas todavía.")
+
+        st.markdown("**Baseline cumulative**")
+        if isinstance(baseline_seed_df, pd.DataFrame) and not baseline_seed_df.empty:
+            st.dataframe(_streamlit_arrow_safe_df(baseline_seed_df), width="stretch")
+        else:
+            st.info("No hay seeds de baseline persistidas todavía.")
+
+    with partial_tab:
+        st.markdown("**Leaderboard dev**")
+        if isinstance(leaderboard_dev, pd.DataFrame) and not leaderboard_dev.empty:
+            st.dataframe(_streamlit_arrow_safe_df(leaderboard_dev), width="stretch")
+        else:
+            st.info("Todavía no hay leaderboard dev persistido.")
+
+        st.markdown("**Leaderboard holdout**")
+        if isinstance(leaderboard_holdout, pd.DataFrame) and not leaderboard_holdout.empty:
+            st.dataframe(_streamlit_arrow_safe_df(leaderboard_holdout), width="stretch")
+        else:
+            st.info("Todavía no hay leaderboard holdout persistido.")
+
+        st.markdown("**PR-AUC mensual**")
+        if isinstance(monthly_metrics, pd.DataFrame) and not monthly_metrics.empty:
+            plot_df = monthly_metrics.copy()
+            if {"month", "label", "pr_auc"} <= set(plot_df.columns):
+                split_options = sorted(plot_df["split"].astype(str).dropna().unique().tolist()) if "split" in plot_df.columns else []
+                selected_split = split_options[0] if len(split_options) == 1 else None
+                if len(split_options) > 1:
+                    selected_split = st.selectbox(
+                        "Split mensual",
+                        options=split_options,
+                        index=0,
+                        key="neural_drift_experiment_live_split",
+                    )
+                if selected_split is not None and "split" in plot_df.columns:
+                    plot_df = plot_df.loc[plot_df["split"].astype(str) == str(selected_split)].copy()
+                pivot_df = plot_df.pivot_table(
+                    index="month",
+                    columns="label",
+                    values="pr_auc",
+                    aggfunc="last",
+                ).sort_index()
+                if not pivot_df.empty:
+                    st.line_chart(pivot_df, width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(monthly_metrics), width="stretch")
+        else:
+            st.info("No hay métricas mensuales persistidas todavía.")
+
+        st.markdown("**Comparaciones estadísticas**")
+        if isinstance(pairwise_stats, pd.DataFrame) and not pairwise_stats.empty:
+            st.dataframe(_streamlit_arrow_safe_df(pairwise_stats), width="stretch")
+        else:
+            st.info("No hay comparaciones pareadas persistidas todavía.")
+
+        st.markdown("**Importancias fANOVA**")
+        if isinstance(param_importances, pd.DataFrame) and not param_importances.empty:
+            st.dataframe(_streamlit_arrow_safe_df(param_importances), width="stretch")
+        else:
+            st.info("No hay importancias persistidas todavía.")
+
+        st.markdown("**Pareto frontier**")
+        if isinstance(pareto, pd.DataFrame) and not pareto.empty:
+            st.dataframe(_streamlit_arrow_safe_df(pareto), width="stretch")
+        else:
+            st.info("No hay Pareto persistido todavía.")
+
+        st.markdown("**Winner config**")
+        if winner_config:
+            st.json(winner_config, expanded=False)
+        else:
+            st.info("No hay winner config persistido todavía.")
+
+    with data_tab:
+        st.markdown("**Manifest**")
+        st.json(manifest, expanded=False)
+        if live_status:
+            st.markdown("**Live status**")
+            st.json(live_status, expanded=False)
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            st.markdown("**Live events**")
+            st.dataframe(_streamlit_arrow_safe_df(live_events_df), width="stretch")
+        if isinstance(phase_status_df, pd.DataFrame) and not phase_status_df.empty:
+            st.markdown("**Phase status**")
+            st.dataframe(_streamlit_arrow_safe_df(phase_status_df), width="stretch")
+
+
 def main(*, set_page_config: bool = True) -> None:
     if set_page_config:
         st.set_page_config(page_title="Experiments Live", layout="wide")
@@ -4300,6 +4716,9 @@ def main(*, set_page_config: bool = True) -> None:
     if source_type == "drift_recalibration":
         run_data = _read_drift_run(path)
         _render_drift_recalibration_view(run_data)
+    elif source_type == "neural_drift_experiment":
+        run_data = _read_neural_drift_experiment_run(path)
+        _render_neural_drift_experiment_live_view(run_data)
     elif source_type == "paper_replication":
         run_data = _read_paper_replication_run(path)
         _render_paper_replication_live_view(run_data)

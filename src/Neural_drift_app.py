@@ -8,12 +8,15 @@ through a minimal bridge without introducing an import cycle.
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import io
 import json
 import math
 import sys
+import traceback
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -21,7 +24,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, confusion_matrix, f1_score, roc_auc_score
+from sklearn.metrics import average_precision_score, confusion_matrix, f1_score, matthews_corrcoef, roc_auc_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
@@ -53,11 +56,27 @@ except Exception:
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
+NEURAL_DRIFT_RUNS_DIR = RESULTS_DIR / "neural_drift_runs"
+NEURAL_DRIFT_RUN_TYPE = "neural_drift_backtest"
+NEURAL_DRIFT_LIVE_STATUS_HEARTBEAT_STEPS = 25
+NEURAL_DRIFT_RESULT_KEYS: Tuple[str, ...] = (
+    "baseline",
+    "summary",
+    "stream_metrics",
+    "rolling_metrics",
+    "drift_events",
+    "attention_feature_summary",
+    "attention_temporal_summary",
+    "attention_drift_shift_summary",
+    "detector_attention_temporal_summary",
+    "detector_attention_drift_shift_summary",
+)
 
 MODEL_XGBOOST = "XGBoost"
 MODEL_TORCH_MLP = "Torch MLP"
 MODEL_TORCH_MLP_ATTENTION = "Torch MLP + Attention"
 AVAILABLE_MODELS = [MODEL_XGBOOST, MODEL_TORCH_MLP, MODEL_TORCH_MLP_ATTENTION]
+XGB_PARALLEL_NEURAL_MODEL = MODEL_TORCH_MLP
 
 BALANCE_MODE_NONE = "none"
 BALANCE_MODE_SMOTE = "smote"
@@ -93,6 +112,9 @@ AVAILABLE_DRIFT_MONITOR_ARCHITECTURES = [
     DRIFT_MONITOR_ARCH_CLASSIC_AE,
     DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION,
 ]
+DRIFT_MONITOR_SOURCE_PREDICTOR_EMBEDDINGS = "predictor_embeddings"
+DRIFT_MONITOR_SOURCE_XGB_PARALLEL_NEURAL_BRANCH = "xgb_parallel_neural_branch"
+DRIFT_MONITOR_SOURCE_NOT_AVAILABLE = "not_available"
 
 DETECTOR_SENSITIVITY_PRESET_CONSERVATIVE = "Conservador"
 DETECTOR_SENSITIVITY_PRESET_MODERATE = "Moderado"
@@ -111,11 +133,28 @@ SMOTE_K_NEIGHBORS_OPTIONS: Tuple[int, ...] = (5, 10)
 XGB_FINE_TUNE_SELECTION_F_BETA_RECALL = "f_beta_recall"
 XGB_FINE_TUNE_SELECTION_PR_AUC = "pr_auc"
 XGB_FINE_TUNE_SELECTION_BRIER = "brier"
+XGB_FINE_TUNE_SELECTION_F1 = "f1"
+XGB_FINE_TUNE_SELECTION_ROC_AUC = "roc_auc"
+XGB_FINE_TUNE_SELECTION_BALANCED_F1 = "balanced_f1"
+XGB_FINE_TUNE_SELECTION_MCC = "mcc"
 AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS = [
     XGB_FINE_TUNE_SELECTION_F_BETA_RECALL,
     XGB_FINE_TUNE_SELECTION_PR_AUC,
     XGB_FINE_TUNE_SELECTION_BRIER,
+    XGB_FINE_TUNE_SELECTION_F1,
+    XGB_FINE_TUNE_SELECTION_ROC_AUC,
+    XGB_FINE_TUNE_SELECTION_BALANCED_F1,
+    XGB_FINE_TUNE_SELECTION_MCC,
 ]
+XGB_FINE_TUNE_SELECTION_METRIC_LABELS: Dict[str, str] = {
+    XGB_FINE_TUNE_SELECTION_F_BETA_RECALL: "F-beta recall",
+    XGB_FINE_TUNE_SELECTION_PR_AUC: "PR-AUC",
+    XGB_FINE_TUNE_SELECTION_BRIER: "Brier",
+    XGB_FINE_TUNE_SELECTION_F1: "F1",
+    XGB_FINE_TUNE_SELECTION_ROC_AUC: "ROC-AUC",
+    XGB_FINE_TUNE_SELECTION_BALANCED_F1: "Balanced F1",
+    XGB_FINE_TUNE_SELECTION_MCC: "MCC",
+}
 
 SESSION_DEFAULTS: Dict[str, Any] = {
     "neural_drift_config": None,
@@ -129,11 +168,21 @@ SESSION_DEFAULTS: Dict[str, Any] = {
     "neural_drift_last_run_signature": None,
     "neural_drift_sensitivity_preset": DETECTOR_SENSITIVITY_PRESET_MODERATE,
     "neural_drift_xgb_fine_tune_selection_metric": XGB_FINE_TUNE_SELECTION_F_BETA_RECALL,
+    "neural_drift_active_run_id": None,
+    "neural_drift_active_manifest_path": None,
+    "neural_drift_history_selected_run_id": None,
+    "neural_drift_loaded_checkpoint_run_id": None,
+    "neural_drift_prepared_resume_run_id": None,
+    "neural_drift_prepared_resume_manifest_path": None,
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "interval_minutes": 5,
     "dataset_percent": 100,
+    "split_mode": "fractions",
+    "base_start": "2018-01-01",
+    "base_end": "2018-12-31",
+    "stream_start": "2019-01-01",
     "lookback_steps": 12,
     "horizon_steps": 1,
     "train_fraction": 0.60,
@@ -157,6 +206,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "random_state": 42,
     "threshold_beta": 2.0,
     "xgb_estimators": 80,
+    "xgb_parallel_neural_enabled": True,
     "xgb_fine_tune_estimators": 6,
     "xgb_fine_tune_selection_metric": XGB_FINE_TUNE_SELECTION_F_BETA_RECALL,
     "xgb_fine_tune_window_min": 32,
@@ -259,6 +309,40 @@ def _resolve_drift_monitor_architecture(value: Any) -> str:
     if architecture not in AVAILABLE_DRIFT_MONITOR_ARCHITECTURES:
         return DRIFT_MONITOR_ARCH_TEMPORAL_ATTENTION
     return architecture
+
+
+def _resolve_xgb_parallel_neural_enabled(value: Any) -> bool:
+    if value is None:
+        return bool(DEFAULT_CONFIG["xgb_parallel_neural_enabled"])
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)
+
+
+def _xgb_parallel_neural_enabled(config: Dict[str, Any]) -> bool:
+    return _resolve_xgb_parallel_neural_enabled(
+        config.get("xgb_parallel_neural_enabled", DEFAULT_CONFIG["xgb_parallel_neural_enabled"])
+    )
+
+
+def _artifact_has_xgb_parallel_neural_branch(artifact: Dict[str, Any]) -> bool:
+    return (
+        str(artifact.get("kind")) == "xgboost"
+        and bool(artifact.get("parallel_neural_enabled", False))
+        and isinstance(artifact.get("parallel_neural_branch"), dict)
+    )
+
+
+def _artifact_drift_monitor_source(artifact: Dict[str, Any]) -> str:
+    if _artifact_has_xgb_parallel_neural_branch(artifact):
+        return DRIFT_MONITOR_SOURCE_XGB_PARALLEL_NEURAL_BRANCH
+    if str(artifact.get("kind")) == "xgboost":
+        return DRIFT_MONITOR_SOURCE_NOT_AVAILABLE
+    return DRIFT_MONITOR_SOURCE_PREDICTOR_EMBEDDINGS
 
 
 def _drift_monitor_profile_preset(profile: str) -> Dict[str, Any]:
@@ -384,6 +468,70 @@ def _to_json_safe(value: Any) -> Any:
     return value
 
 
+def _load_json_file(path: Path, default: Any = None) -> Any:
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return default
+
+
+def _read_jsonl_records(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(dict(payload))
+    except Exception:
+        return []
+    return rows
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{path.name}.tmp"
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    _atomic_write_text(
+        path,
+        json.dumps(_to_json_safe(payload), ensure_ascii=True, indent=2, sort_keys=True),
+    )
+
+
+def _atomic_write_df_csv(path: Path, df: pd.DataFrame) -> None:
+    _atomic_write_text(path, df.to_csv(index=False))
+
+
+def _append_jsonl_record(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_to_json_safe(payload), ensure_ascii=True, sort_keys=True))
+        handle.write("\n")
+
+
 def _resolve_balance_mode(value: Any) -> str:
     mode = str(value or BALANCE_MODE_NONE).strip().lower()
     if mode not in AVAILABLE_BALANCE_MODES:
@@ -405,6 +553,35 @@ def _resolve_xgb_fine_tune_selection_metric(value: Any) -> str:
     if metric not in AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS:
         return XGB_FINE_TUNE_SELECTION_F_BETA_RECALL
     return metric
+
+
+def _xgb_fine_tune_selection_metric_label(value: Any) -> str:
+    metric = _resolve_xgb_fine_tune_selection_metric(value)
+    return str(XGB_FINE_TUNE_SELECTION_METRIC_LABELS.get(metric, metric))
+
+
+def _balanced_f1_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true_arr = np.asarray(y_true).astype(int)
+    y_pred_arr = np.asarray(y_pred).astype(int)
+    labels = sorted(set(y_true_arr.tolist()) | set(y_pred_arr.tolist()))
+    if not labels:
+        return 0.0
+    per_class_f1 = np.asarray(
+        f1_score(
+            y_true_arr,
+            y_pred_arr,
+            labels=labels,
+            average=None,
+            zero_division=0,
+        ),
+        dtype=float,
+    )
+    if per_class_f1.size == 0 or np.any(per_class_f1 <= 0):
+        return 0.0
+    denominator = float(np.sum(1.0 / per_class_f1))
+    if denominator <= 0:
+        return 0.0
+    return float(len(per_class_f1) / denominator)
 
 
 def _normalize_smote_params(smote_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -469,6 +646,33 @@ def _xgb_fine_tune_window_rows(severity_intensity: float, *, config: Dict[str, A
     upper = max(lower, window_max)
     target = lower + float(np.clip(severity_intensity, 0.0, 1.0)) * float(upper - lower)
     return _round_to_step(target, step=8, min_value=lower, max_value=upper)
+
+
+def _sanitize_xgb_learning_rate(
+    value: Any,
+    *,
+    fallback: float = 0.05,
+    prefer_fallback_on_upper_overflow: bool = False,
+) -> float:
+    fallback_value = 0.05
+    try:
+        fallback_candidate = float(fallback)
+        if np.isfinite(fallback_candidate) and fallback_candidate > 0.0:
+            fallback_value = float(np.clip(fallback_candidate, 1e-6, 1.0))
+    except Exception:
+        fallback_value = 0.05
+
+    try:
+        learning_rate_value = float(value)
+    except Exception:
+        return fallback_value
+    if not np.isfinite(learning_rate_value) or learning_rate_value <= 0.0:
+        return fallback_value
+    if learning_rate_value > 1.0:
+        if prefer_fallback_on_upper_overflow:
+            return fallback_value
+        return 1.0
+    return float(np.clip(learning_rate_value, 1e-6, 1.0))
 
 
 def _xgb_fine_tune_eta_multiplier(severity_intensity: float, *, config: Dict[str, Any]) -> float:
@@ -553,6 +757,10 @@ def _build_run_signature(dataset_bundle: Dict[str, Any], config: Dict[str, Any])
         "config": {
             "interval_minutes": int(config.get("interval_minutes", DEFAULT_CONFIG["interval_minutes"])),
             "dataset_percent": int(config.get("dataset_percent", DEFAULT_CONFIG["dataset_percent"])),
+            "split_mode": str(config.get("split_mode", DEFAULT_CONFIG["split_mode"])),
+            "base_start": str(config.get("base_start", DEFAULT_CONFIG["base_start"])),
+            "base_end": str(config.get("base_end", DEFAULT_CONFIG["base_end"])),
+            "stream_start": str(config.get("stream_start", DEFAULT_CONFIG["stream_start"])),
             "lookback_steps": int(config.get("lookback_steps", DEFAULT_CONFIG["lookback_steps"])),
             "horizon_steps": int(config.get("horizon_steps", DEFAULT_CONFIG["horizon_steps"])),
             "train_fraction": float(config.get("train_fraction", DEFAULT_CONFIG["train_fraction"])),
@@ -649,6 +857,36 @@ def _build_run_signature(dataset_bundle: Dict[str, Any], config: Dict[str, Any])
         },
     }
     return json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)
+
+
+def _slugify_token(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "na"
+    chars: List[str] = []
+    previous_was_sep = False
+    for ch in text:
+        if ch.isalnum():
+            chars.append(ch)
+            previous_was_sep = False
+            continue
+        if not previous_was_sep:
+            chars.append("_")
+            previous_was_sep = True
+    slug = "".join(chars).strip("_")
+    return slug or "na"
+
+
+def _build_neural_drift_baseline_key(model_name: str, balance_mode: str) -> str:
+    return f"{_slugify_token(model_name)}__{_slugify_token(balance_mode)}"
+
+
+def _build_neural_drift_experiment_key(model_name: str, strategy: str, balance_mode: str) -> str:
+    return (
+        f"{_slugify_token(model_name)}__"
+        f"{_slugify_token(strategy)}__"
+        f"{_slugify_token(balance_mode)}"
+    )
 
 
 def _import_external_xgboost():
@@ -1153,6 +1391,72 @@ def _split_window_dataset(
     }
 
 
+def _split_window_dataset_fixed_dates(
+    dataset: WindowDataset,
+    *,
+    base_start: str,
+    base_end: str,
+    stream_start: str,
+    validation_fraction: float,
+    max_stream_rows: Optional[int] = None,
+) -> Dict[str, Any]:
+    metadata = dataset.metadata.copy()
+    if metadata.empty or "prediction_time" not in metadata.columns:
+        raise ValueError("Fixed-date split requires `prediction_time` metadata.")
+
+    prediction_times = pd.to_datetime(metadata["prediction_time"], errors="coerce")
+    base_start_ts = pd.Timestamp(base_start)
+    base_end_ts = pd.Timestamp(base_end) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    stream_start_ts = pd.Timestamp(stream_start)
+    if stream_start_ts <= base_end_ts:
+        raise ValueError("`stream_start` must be strictly after `base_end`.")
+
+    base_mask = prediction_times.between(base_start_ts, base_end_ts, inclusive="both")
+    stream_mask = prediction_times.ge(stream_start_ts)
+
+    base_indices = np.flatnonzero(base_mask.to_numpy(dtype=bool))
+    stream_indices = np.flatnonzero(stream_mask.to_numpy(dtype=bool))
+    if len(base_indices) < 15 or len(stream_indices) < 5:
+        raise ValueError("The fixed-date split does not leave enough base or stream samples.")
+
+    validation_count = max(1, int(math.floor(len(base_indices) * float(validation_fraction))))
+    if len(base_indices) - validation_count < 10:
+        raise ValueError("The 2018 base split does not leave enough samples for train/validation.")
+
+    train_indices = base_indices[:-validation_count]
+    val_indices = base_indices[-validation_count:]
+
+    X_train = dataset.X[train_indices]
+    y_train = dataset.y[train_indices]
+    X_val = dataset.X[val_indices]
+    y_val = dataset.y[val_indices]
+    X_stream = dataset.X[stream_indices]
+    y_stream = dataset.y[stream_indices]
+    metadata_train = metadata.iloc[train_indices].reset_index(drop=True)
+    metadata_val = metadata.iloc[val_indices].reset_index(drop=True)
+    metadata_stream = metadata.iloc[stream_indices].reset_index(drop=True)
+
+    if max_stream_rows is not None and int(max_stream_rows) > 0 and len(y_stream) > int(max_stream_rows):
+        X_stream = X_stream[-int(max_stream_rows) :]
+        y_stream = y_stream[-int(max_stream_rows) :]
+        metadata_stream = metadata_stream.iloc[-int(max_stream_rows) :].reset_index(drop=True)
+
+    if len(y_train) < 10 or len(y_val) < 5 or len(y_stream) < 5:
+        raise ValueError("The fixed-date split did not leave enough samples for train/validation/stream.")
+
+    return {
+        "X_train": X_train,
+        "y_train": y_train,
+        "X_val": X_val,
+        "y_val": y_val,
+        "X_stream": X_stream,
+        "y_stream": y_stream,
+        "metadata_train": metadata_train,
+        "metadata_val": metadata_val,
+        "metadata_stream": metadata_stream,
+    }
+
+
 def _safe_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
     y = np.asarray(y_true).astype(int)
     s = np.asarray(scores).astype(float)
@@ -1194,10 +1498,16 @@ def _classification_metrics(
     specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else float("nan")
     fnr = float(fn / (tp + fn)) if (tp + fn) > 0 else float("nan")
     brier = float(np.mean((s - y) ** 2))
+    try:
+        mcc = float(matthews_corrcoef(y, pred_array)) if len(y) > 0 else float("nan")
+    except Exception:
+        mcc = float("nan")
     return {
         "roc_auc": _safe_auc(y, s),
         "pr_auc": _safe_pr_auc(y, s),
         "f1": float(f1_score(y, pred_array, zero_division=0)),
+        "balanced_f1": float(_balanced_f1_score(y, pred_array)),
+        "mcc": mcc,
         "recall": recall,
         "specificity": specificity,
         "fnr": fnr,
@@ -1958,6 +2268,9 @@ def _train_torch_mlp(
         "threshold_info": threshold_info,
         "base_threshold": float(threshold_info["threshold"]),
         "base_model_state": copy.deepcopy(model.state_dict()),
+        "parallel_neural_enabled": False,
+        "parallel_neural_model": "not_applicable",
+        "drift_monitor_source": DRIFT_MONITOR_SOURCE_PREDICTOR_EMBEDDINGS,
     }
 
 
@@ -1999,6 +2312,96 @@ def _predict_torch_model_details(artifact: Dict[str, Any], X: np.ndarray) -> Dic
 def _predict_torch_mlp(artifact: Dict[str, Any], X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     details = _predict_torch_model_details(artifact, X)
     return details["probs"], details["embeddings"]
+
+
+def _train_xgb_parallel_neural_branch(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    *,
+    config: Dict[str, Any],
+    balance_mode: str,
+    smote_params: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    try:
+        _ensure_torch_available()
+    except ImportError as exc:
+        raise ImportError(
+            "Torch no esta disponible; la rama neuronal paralela de `XGBoost` requiere Torch."
+        ) from exc
+    return _train_torch_mlp(
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        config=config,
+        model_name=XGB_PARALLEL_NEURAL_MODEL,
+        balance_mode=balance_mode,
+        smote_params=smote_params,
+    )
+
+
+def _merge_parallel_branch_reference_stats(
+    reference: Dict[str, Any],
+    parallel_branch_reference: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    merged = dict(reference)
+    branch_reference = dict(parallel_branch_reference or {})
+    aux_key_map = {
+        "score_mean": "aux_score_mean",
+        "score_std": "aux_score_std",
+        "error_mean": "aux_error_mean",
+        "error_std": "aux_error_std",
+    }
+    for src_key, dst_key in aux_key_map.items():
+        if src_key in branch_reference:
+            merged[dst_key] = float(branch_reference[src_key])
+    for key in [
+        "embedding_centroid",
+        "embedding_distance_mean",
+        "embedding_distance_std",
+        "embedding_reconstruction_mean",
+        "embedding_reconstruction_std",
+    ]:
+        if key not in branch_reference:
+            continue
+        value = branch_reference[key]
+        if isinstance(value, np.ndarray):
+            merged[key] = np.asarray(value, dtype=float).copy()
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _sync_xgb_parallel_branch_state(artifact: Dict[str, Any]) -> None:
+    branch = artifact.get("parallel_neural_branch")
+    enabled = (
+        str(artifact.get("kind")) == "xgboost"
+        and bool(artifact.get("parallel_neural_enabled", False))
+        and isinstance(branch, dict)
+    )
+    artifact["parallel_neural_enabled"] = bool(enabled)
+    artifact["parallel_neural_model"] = (
+        str(branch.get("model_name", XGB_PARALLEL_NEURAL_MODEL))
+        if enabled
+        else DRIFT_MONITOR_SOURCE_NOT_AVAILABLE
+    )
+    artifact["drift_monitor_source"] = (
+        DRIFT_MONITOR_SOURCE_XGB_PARALLEL_NEURAL_BRANCH
+        if enabled
+        else DRIFT_MONITOR_SOURCE_NOT_AVAILABLE
+    )
+    if enabled:
+        artifact["embedding_monitor"] = branch.get("embedding_monitor")
+        artifact["monitor_effective_architecture"] = str(
+            branch.get("monitor_effective_architecture", branch.get("kind", "none"))
+        )
+        artifact["attention_summary_reference"] = branch.get("attention_summary_reference")
+        return
+    artifact["embedding_monitor"] = None
+    artifact["monitor_effective_architecture"] = DRIFT_MONITOR_SOURCE_NOT_AVAILABLE
+    artifact["attention_summary_reference"] = None
 
 
 def _train_xgboost_model(
@@ -2058,10 +2461,11 @@ def _train_xgboost_model(
 
     pos = max(1, int(np.sum(y_fit == 1)))
     neg = max(1, int(np.sum(y_fit == 0)))
-    learning_rate_value = float(
+    learning_rate_value = _sanitize_xgb_learning_rate(
         learning_rate_override
         if learning_rate_override is not None
-        else (base_model.get_params().get("learning_rate", 0.05) if base_model is not None else 0.05)
+        else (base_model.get_params().get("learning_rate", 0.05) if base_model is not None else 0.05),
+        fallback=_xgb_base_learning_rate({"model": base_model}) if base_model is not None else 0.05,
     )
     if base_model is None:
         estimator = xgb.XGBClassifier(
@@ -2113,7 +2517,23 @@ def _train_xgboost_model(
         calibrated_scores=calibrated_val_scores,
         embeddings=None,
     )
-    return {
+    parallel_neural_enabled = _xgb_parallel_neural_enabled(config)
+    parallel_neural_branch = None
+    if parallel_neural_enabled:
+        parallel_neural_branch = _train_xgb_parallel_neural_branch(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            config=config,
+            balance_mode=str(resolved_balance_mode),
+            smote_params=dict(resolved_smote_params) if resolved_balance_mode == BALANCE_MODE_SMOTE else None,
+        )
+        reference = _merge_parallel_branch_reference_stats(
+            reference,
+            parallel_neural_branch.get("reference"),
+        )
+    artifact = {
         "kind": "xgboost",
         "model_name": MODEL_XGBOOST,
         "balance_mode": str(resolved_balance_mode),
@@ -2123,13 +2543,16 @@ def _train_xgboost_model(
         "imputer": imputer_values,
         "calibrator": calibrator,
         "reference": reference,
-        "monitor_effective_architecture": "not_available",
         "decision_threshold": float(threshold_info["threshold"]),
         "threshold_info": threshold_info,
         "base_threshold": float(threshold_info["threshold"]),
         "history_training_rows": int(history_training_rows_base + len(y_train)),
         "xgb_fine_tune_metadata": dict(xgb_fine_tune_metadata or _default_xgb_fine_tune_metadata(config)),
+        "parallel_neural_enabled": bool(parallel_neural_enabled),
+        "parallel_neural_branch": parallel_neural_branch,
     }
+    _sync_xgb_parallel_branch_state(artifact)
+    return artifact
 
 
 def _predict_xgboost(artifact: Dict[str, Any], X: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -2141,23 +2564,51 @@ def _predict_xgboost(artifact: Dict[str, Any], X: np.ndarray) -> Tuple[np.ndarra
 
 
 def _predict_with_artifact(artifact: Dict[str, Any], X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    kind = str(artifact.get("kind"))
-    if kind == "torch_mlp":
-        probs, embeddings = _predict_torch_mlp(artifact, X)
-        return probs, embeddings
-    probs, _ = _predict_xgboost(artifact, X)
-    return probs, np.empty((len(probs), 0), dtype=float)
+    details = _predict_with_artifact_details(artifact, X)
+    return np.asarray(details["probs"], dtype=float), np.asarray(details["embeddings"], dtype=float)
 
 
 def _predict_with_artifact_details(artifact: Dict[str, Any], X: np.ndarray) -> Dict[str, Any]:
     kind = str(artifact.get("kind"))
     if kind == "torch_mlp":
-        return _predict_torch_model_details(artifact, X)
+        details = _predict_torch_model_details(artifact, X)
+        return {
+            **details,
+            "auxiliary_raw_probs": np.asarray([], dtype=float),
+            "auxiliary_probs": np.asarray([], dtype=float),
+            "parallel_neural_enabled": False,
+            "parallel_neural_model": "not_applicable",
+            "drift_monitor_source": str(
+                artifact.get("drift_monitor_source", DRIFT_MONITOR_SOURCE_PREDICTOR_EMBEDDINGS)
+            ),
+        }
     probs, _ = _predict_xgboost(artifact, X)
+    auxiliary_raw_probs = np.asarray([], dtype=float)
+    auxiliary_probs = np.asarray([], dtype=float)
+    auxiliary_embeddings = np.empty((len(probs), 0), dtype=float)
+    parallel_neural_enabled = bool(artifact.get("parallel_neural_enabled", False))
+    if _artifact_has_xgb_parallel_neural_branch(artifact):
+        branch_artifact = dict(artifact.get("parallel_neural_branch") or {})
+        branch_details = _predict_torch_model_details(branch_artifact, X)
+        auxiliary_raw_probs = np.asarray(branch_details.get("probs"), dtype=float).reshape(-1)
+        auxiliary_probs = _apply_calibrator(auxiliary_raw_probs, branch_artifact.get("calibrator"))
+        auxiliary_embeddings = np.asarray(branch_details.get("embeddings"), dtype=float)
     return {
         "probs": probs,
-        "embeddings": np.empty((len(probs), 0), dtype=float),
+        "embeddings": auxiliary_embeddings,
         "attention_summary": None,
+        "auxiliary_raw_probs": auxiliary_raw_probs,
+        "auxiliary_probs": auxiliary_probs,
+        "parallel_neural_enabled": parallel_neural_enabled,
+        "parallel_neural_model": str(
+            artifact.get(
+                "parallel_neural_model",
+                XGB_PARALLEL_NEURAL_MODEL if parallel_neural_enabled else DRIFT_MONITOR_SOURCE_NOT_AVAILABLE,
+            )
+        ),
+        "drift_monitor_source": str(
+            artifact.get("drift_monitor_source", _artifact_drift_monitor_source(artifact))
+        ),
     }
 
 
@@ -2245,15 +2696,19 @@ def _train_canonical_artifact(
     search_space = _smote_search_space(config)
     best_artifact: Optional[Dict[str, Any]] = None
     best_score: Optional[Tuple[float, float, float, float]] = None
+    best_smote_params: Optional[Dict[str, Any]] = None
     for sampling_strategy in search_space["sampling_strategy"]:
         for k_neighbors in search_space["k_neighbors"]:
+            candidate_config = dict(config)
+            if str(model_name) == MODEL_XGBOOST and _xgb_parallel_neural_enabled(config):
+                candidate_config["xgb_parallel_neural_enabled"] = False
             candidate_artifact = _train_model_artifact(
                 model_name,
                 X_train,
                 y_train,
                 X_val,
                 y_val,
-                config=config,
+                config=candidate_config,
                 balance_mode=resolved_balance_mode,
                 smote_params={
                     "sampling_strategy": float(sampling_strategy),
@@ -2265,9 +2720,25 @@ def _train_canonical_artifact(
             if best_score is None or candidate_score > best_score:
                 best_artifact = candidate_artifact
                 best_score = candidate_score
+                best_smote_params = {
+                    "sampling_strategy": float(sampling_strategy),
+                    "k_neighbors": int(k_neighbors),
+                }
 
+    if best_smote_params is not None:
+        return _train_model_artifact(
+            model_name,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            config=config,
+            balance_mode=resolved_balance_mode,
+            smote_params=best_smote_params,
+            feature_metadata=feature_metadata,
+        )
     if best_artifact is None:
-        best_artifact = _train_model_artifact(
+        return _train_model_artifact(
             model_name,
             X_train,
             y_train,
@@ -2728,6 +3199,43 @@ def _build_reference_stats(
     return reference
 
 
+def _refresh_parallel_branch_from_recent(
+    branch_artifact: Dict[str, Any],
+    recent_X: np.ndarray,
+    recent_y: np.ndarray,
+    *,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    branch_details = _predict_torch_model_details(branch_artifact, recent_X)
+    branch_raw_scores = np.asarray(branch_details["probs"], dtype=float)
+    branch_embeddings = np.asarray(branch_details["embeddings"], dtype=float)
+    branch_scores = _apply_calibrator(branch_raw_scores, branch_artifact.get("calibrator"))
+    branch_X_ref = _apply_imputer(recent_X, branch_artifact["imputer"])
+    branch_monitor = branch_artifact.get("embedding_monitor")
+    reconstruction_errors = None
+    if branch_embeddings.size > 0:
+        branch_monitor, reconstruction_errors = _fit_embedding_monitor(branch_embeddings, config=config)
+        branch_artifact["embedding_monitor"] = branch_monitor
+        if branch_monitor is not None:
+            branch_artifact["monitor_effective_architecture"] = str(
+                branch_monitor.get("monitor_effective_architecture", branch_monitor.get("kind", "none"))
+            )
+    branch_artifact["reference"] = _build_reference_stats(
+        X_ref=branch_X_ref,
+        y_ref=recent_y,
+        calibrated_scores=branch_scores,
+        embeddings=branch_embeddings if branch_embeddings.size else None,
+        reconstruction_errors=reconstruction_errors,
+    )
+    branch_artifact["attention_summary_reference"] = branch_details.get("attention_summary")
+    branch_artifact["drift_monitor_source"] = DRIFT_MONITOR_SOURCE_PREDICTOR_EMBEDDINGS
+    return {
+        "details": branch_details,
+        "calibrated_scores": branch_scores,
+        "reconstruction_errors": reconstruction_errors,
+    }
+
+
 def _refresh_reference_from_recent(
     artifact: Dict[str, Any],
     recent_X: np.ndarray,
@@ -2735,6 +3243,31 @@ def _refresh_reference_from_recent(
     *,
     config: Dict[str, Any],
 ) -> None:
+    if _artifact_has_xgb_parallel_neural_branch(artifact):
+        prediction_details = _predict_with_artifact_details(artifact, recent_X)
+        raw_scores = np.asarray(prediction_details["probs"], dtype=float)
+        calibrated_scores = _apply_calibrator(raw_scores, artifact.get("calibrator"))
+        X_ref = _apply_imputer(recent_X, artifact["imputer"])
+        branch_artifact = artifact["parallel_neural_branch"]
+        branch_refresh = _refresh_parallel_branch_from_recent(
+            branch_artifact,
+            recent_X,
+            recent_y,
+            config=config,
+        )
+        branch_embeddings = np.asarray(branch_refresh["details"].get("embeddings"), dtype=float)
+        artifact["reference"] = _merge_parallel_branch_reference_stats(
+            _build_reference_stats(
+                X_ref=X_ref,
+                y_ref=recent_y,
+                calibrated_scores=calibrated_scores,
+                embeddings=branch_embeddings if branch_embeddings.size else None,
+                reconstruction_errors=branch_refresh.get("reconstruction_errors"),
+            ),
+            branch_artifact.get("reference"),
+        )
+        _sync_xgb_parallel_branch_state(artifact)
+        return
     prediction_details = _predict_with_artifact_details(artifact, recent_X)
     raw_scores = prediction_details["probs"]
     embeddings = prediction_details["embeddings"]
@@ -2757,6 +3290,7 @@ def _refresh_reference_from_recent(
         reconstruction_errors=reconstruction_errors,
     )
     artifact["attention_summary_reference"] = prediction_details.get("attention_summary")
+    artifact["drift_monitor_source"] = _artifact_drift_monitor_source(artifact)
 
 
 def _normalize_score(value: float, mean: float, std: float) -> float:
@@ -2809,15 +3343,20 @@ def _build_channel_scores(
     recent_window_size: int = 96,
     embedding_reconstruction_weight: float = 0.65,
     point_signal_weight: float = 1.0,
+    auxiliary_calibrated_score: Optional[float] = None,
 ) -> Dict[str, Any]:
     reference = dict(artifact.get("reference") or {})
     available_scores: Dict[str, float] = {}
-    detector_flags: Dict[str, bool] = {}
-    raw_channel_values: Dict[str, float] = {}
+    channel_score_details: Dict[str, Any] = {}
+    detector_flags: Dict[str, Any] = {}
+    raw_channel_values: Dict[str, Any] = {}
     point_weight = float(np.clip(point_signal_weight, 0.0, 1.0))
     detector_attention_summary: Optional[Dict[str, Any]] = None
     monitor_warmup = False
     monitor_effective_architecture = str(artifact.get("monitor_effective_architecture", "none"))
+    drift_monitor_source = str(
+        artifact.get("drift_monitor_source", _artifact_drift_monitor_source(artifact))
+    )
 
     history_limit = max(8, int(recent_window_size))
 
@@ -2829,6 +3368,28 @@ def _build_channel_scores(
         if len(history) > history_limit:
             del history[:-history_limit]
         return float(np.mean(history))
+
+    def _component_channel_payload(
+        *,
+        value: float,
+        history_key: str,
+        detector_key: str,
+        reference_mean: float,
+        reference_std: float,
+    ) -> Dict[str, Any]:
+        window_value = _window_stat(history_key, value)
+        point_score = _normalize_score(value, reference_mean, reference_std)
+        window_score = _normalize_score(window_value, reference_mean, reference_std)
+        detector = detectors.get(detector_key)
+        drift_flag = bool(detector.update(value)) if detector is not None else False
+        peak_score = float(max(point_score, window_score))
+        blended_score = float((1.0 - point_weight) * window_score + point_weight * peak_score)
+        return {
+            "raw_value": float(value),
+            "window_value": float(window_value),
+            "score": float(max(blended_score, 1.0 if drift_flag else 0.0)),
+            "flag": bool(drift_flag),
+        }
 
     if DRIFT_INPUT in selected_channels:
         feature_mean = np.asarray(reference.get("feature_mean"), dtype=float)
@@ -2853,44 +3414,106 @@ def _build_channel_scores(
         detector_flags[DRIFT_INPUT] = bool(input_drift)
 
     if DRIFT_SCORE in selected_channels:
-        score_value = float(calibrated_score)
-        raw_channel_values[DRIFT_SCORE] = score_value
-        score_window_value = _window_stat(DRIFT_SCORE, score_value)
-        score_point_score = _normalize_score(
-            score_value,
-            float(reference.get("score_mean", 0.5)),
-            float(reference.get("score_std", 0.15)),
+        xgb_score_payload = _component_channel_payload(
+            value=float(calibrated_score),
+            history_key=DRIFT_SCORE,
+            detector_key=DRIFT_SCORE,
+            reference_mean=float(reference.get("score_mean", 0.5)),
+            reference_std=float(reference.get("score_std", 0.15)),
         )
-        score_window_score = _normalize_score(
-            score_window_value,
-            float(reference.get("score_mean", 0.5)),
-            float(reference.get("score_std", 0.15)),
+        combined_score_payload = dict(xgb_score_payload)
+        score_components = {
+            "xgboost": float(xgb_score_payload["score"]),
+        }
+        score_raw_components = {
+            "xgboost": float(xgb_score_payload["raw_value"]),
+        }
+        score_flag_components = {
+            "xgboost": bool(xgb_score_payload["flag"]),
+        }
+        auxiliary_score_ready = (
+            auxiliary_calibrated_score is not None
+            and np.isfinite(float(auxiliary_calibrated_score))
+            and "aux_score_mean" in reference
+            and "aux_score_std" in reference
         )
-        score_drift = detectors[DRIFT_SCORE].update(score_value)
-        score_peak_score = float(max(score_point_score, score_window_score))
-        score_score = float((1.0 - point_weight) * score_window_score + point_weight * score_peak_score)
-        available_scores[DRIFT_SCORE] = float(max(score_score, 1.0 if score_drift else 0.0))
-        detector_flags[DRIFT_SCORE] = bool(score_drift)
+        if auxiliary_score_ready:
+            neural_score_payload = _component_channel_payload(
+                value=float(auxiliary_calibrated_score),
+                history_key="score_neural",
+                detector_key="score_neural",
+                reference_mean=float(reference.get("aux_score_mean", reference.get("score_mean", 0.5))),
+                reference_std=float(reference.get("aux_score_std", reference.get("score_std", 0.15))),
+            )
+            combined_score_payload = (
+                neural_score_payload
+                if float(neural_score_payload["score"]) > float(xgb_score_payload["score"])
+                else xgb_score_payload
+            )
+            score_components["parallel_neural"] = float(neural_score_payload["score"])
+            score_raw_components["parallel_neural"] = float(neural_score_payload["raw_value"])
+            score_flag_components["parallel_neural"] = bool(neural_score_payload["flag"])
+        available_scores[DRIFT_SCORE] = float(combined_score_payload["score"])
+        raw_channel_values[DRIFT_SCORE] = float(combined_score_payload["raw_value"])
+        detector_flags[DRIFT_SCORE] = bool(any(score_flag_components.values()))
+        if len(score_components) > 1:
+            score_components["combined"] = float(combined_score_payload["score"])
+            score_raw_components["combined"] = float(combined_score_payload["raw_value"])
+            score_flag_components["combined"] = bool(any(score_flag_components.values()))
+            channel_score_details["score_components"] = score_components
+            raw_channel_values["score_components"] = score_raw_components
+            detector_flags["score_components"] = score_flag_components
 
     if DRIFT_ERROR in selected_channels:
-        error_value = float((float(calibrated_score) - int(y_true)) ** 2)
-        raw_channel_values[DRIFT_ERROR] = error_value
-        error_window_value = _window_stat(DRIFT_ERROR, error_value)
-        error_point_score = _normalize_score(
-            error_value,
-            float(reference.get("error_mean", 0.0)),
-            float(reference.get("error_std", 0.1)),
+        xgb_error_payload = _component_channel_payload(
+            value=float((float(calibrated_score) - int(y_true)) ** 2),
+            history_key=DRIFT_ERROR,
+            detector_key=DRIFT_ERROR,
+            reference_mean=float(reference.get("error_mean", 0.0)),
+            reference_std=float(reference.get("error_std", 0.1)),
         )
-        error_window_score = _normalize_score(
-            error_window_value,
-            float(reference.get("error_mean", 0.0)),
-            float(reference.get("error_std", 0.1)),
+        combined_error_payload = dict(xgb_error_payload)
+        error_components = {
+            "xgboost": float(xgb_error_payload["score"]),
+        }
+        error_raw_components = {
+            "xgboost": float(xgb_error_payload["raw_value"]),
+        }
+        error_flag_components = {
+            "xgboost": bool(xgb_error_payload["flag"]),
+        }
+        auxiliary_error_ready = (
+            auxiliary_calibrated_score is not None
+            and np.isfinite(float(auxiliary_calibrated_score))
+            and "aux_error_mean" in reference
+            and "aux_error_std" in reference
         )
-        error_drift = detectors[DRIFT_ERROR].update(error_value)
-        error_peak_score = float(max(error_point_score, error_window_score))
-        error_score = float((1.0 - point_weight) * error_window_score + point_weight * error_peak_score)
-        available_scores[DRIFT_ERROR] = float(max(error_score, 1.0 if error_drift else 0.0))
-        detector_flags[DRIFT_ERROR] = bool(error_drift)
+        if auxiliary_error_ready:
+            neural_error_payload = _component_channel_payload(
+                value=float((float(auxiliary_calibrated_score) - int(y_true)) ** 2),
+                history_key="error_neural",
+                detector_key="error_neural",
+                reference_mean=float(reference.get("aux_error_mean", reference.get("error_mean", 0.0))),
+                reference_std=float(reference.get("aux_error_std", reference.get("error_std", 0.1))),
+            )
+            combined_error_payload = (
+                neural_error_payload
+                if float(neural_error_payload["score"]) > float(xgb_error_payload["score"])
+                else xgb_error_payload
+            )
+            error_components["parallel_neural"] = float(neural_error_payload["score"])
+            error_raw_components["parallel_neural"] = float(neural_error_payload["raw_value"])
+            error_flag_components["parallel_neural"] = bool(neural_error_payload["flag"])
+        available_scores[DRIFT_ERROR] = float(combined_error_payload["score"])
+        raw_channel_values[DRIFT_ERROR] = float(combined_error_payload["raw_value"])
+        detector_flags[DRIFT_ERROR] = bool(any(error_flag_components.values()))
+        if len(error_components) > 1:
+            error_components["combined"] = float(combined_error_payload["score"])
+            error_raw_components["combined"] = float(combined_error_payload["raw_value"])
+            error_flag_components["combined"] = bool(any(error_flag_components.values()))
+            channel_score_details["error_components"] = error_components
+            raw_channel_values["error_components"] = error_raw_components
+            detector_flags["error_components"] = error_flag_components
 
     if DRIFT_EMBEDDING in selected_channels and embeddings.size > 0 and "embedding_centroid" in reference:
         centroid = np.asarray(reference["embedding_centroid"], dtype=float)
@@ -2963,7 +3586,7 @@ def _build_channel_scores(
     severity = float(np.mean(list(available_scores.values()))) if available_scores else 0.0
     max_channel_score = float(max(available_scores.values())) if available_scores else 0.0
     return {
-        "channel_scores": available_scores,
+        "channel_scores": {**available_scores, **channel_score_details},
         "raw_channel_values": raw_channel_values,
         "detector_flags": detector_flags,
         "severity_score": severity,
@@ -2972,6 +3595,7 @@ def _build_channel_scores(
         "detector_attention_summary": detector_attention_summary,
         "monitor_warmup": bool(monitor_warmup),
         "monitor_effective_architecture": monitor_effective_architecture,
+        "drift_monitor_source": drift_monitor_source,
     }
 
 
@@ -2983,7 +3607,11 @@ def _xgb_base_learning_rate(artifact: Dict[str, Any]) -> float:
     model = artifact.get("model")
     if model is not None and hasattr(model, "get_params"):
         try:
-            return max(1e-6, float(model.get_params().get("learning_rate", 0.05)))
+            return _sanitize_xgb_learning_rate(
+                model.get_params().get("learning_rate", 0.05),
+                fallback=0.05,
+                prefer_fallback_on_upper_overflow=True,
+            )
         except Exception:
             return 0.05
     return 0.05
@@ -3073,6 +3701,10 @@ def _evaluate_xgb_fine_tune_candidate(
     metrics = _classification_metrics(y_val, calibrated_scores, threshold=threshold_value)
     f_beta = float(threshold_info.get("f_beta", float("nan")))
     recall = float(threshold_info.get("recall", metrics["recall"]))
+    f1 = float(metrics["f1"])
+    roc_auc = float(metrics["roc_auc"])
+    balanced_f1 = float(metrics["balanced_f1"])
+    mcc = float(metrics["mcc"])
     pr_auc = float(metrics["pr_auc"])
     brier = float(metrics["brier"])
     resolved_metric = _resolve_xgb_fine_tune_selection_metric(selection_metric)
@@ -3080,25 +3712,89 @@ def _evaluate_xgb_fine_tune_candidate(
     if resolved_metric == XGB_FINE_TUNE_SELECTION_PR_AUC:
         sort_key = (
             _sort_metric_desc(pr_auc),
+            _sort_metric_desc(roc_auc),
+            _sort_metric_desc(f1),
+            _sort_metric_desc(balanced_f1),
+            _sort_metric_desc(mcc),
             _sort_metric_desc(f_beta),
             _sort_metric_desc(recall),
             _sort_metric_asc(brier),
             -float(rounds_selected),
         )
         selection_score = pr_auc
+    elif resolved_metric == XGB_FINE_TUNE_SELECTION_ROC_AUC:
+        sort_key = (
+            _sort_metric_desc(roc_auc),
+            _sort_metric_desc(pr_auc),
+            _sort_metric_desc(f1),
+            _sort_metric_desc(balanced_f1),
+            _sort_metric_desc(mcc),
+            _sort_metric_desc(f_beta),
+            _sort_metric_desc(recall),
+            _sort_metric_asc(brier),
+            -float(rounds_selected),
+        )
+        selection_score = roc_auc
     elif resolved_metric == XGB_FINE_TUNE_SELECTION_BRIER:
         sort_key = (
             _sort_metric_asc(brier),
+            _sort_metric_desc(roc_auc),
             _sort_metric_desc(pr_auc),
+            _sort_metric_desc(f1),
+            _sort_metric_desc(balanced_f1),
+            _sort_metric_desc(mcc),
             _sort_metric_desc(f_beta),
             _sort_metric_desc(recall),
             -float(rounds_selected),
         )
         selection_score = brier
+    elif resolved_metric == XGB_FINE_TUNE_SELECTION_F1:
+        sort_key = (
+            _sort_metric_desc(f1),
+            _sort_metric_desc(balanced_f1),
+            _sort_metric_desc(mcc),
+            _sort_metric_desc(roc_auc),
+            _sort_metric_desc(pr_auc),
+            _sort_metric_desc(f_beta),
+            _sort_metric_desc(recall),
+            _sort_metric_asc(brier),
+            -float(rounds_selected),
+        )
+        selection_score = f1
+    elif resolved_metric == XGB_FINE_TUNE_SELECTION_BALANCED_F1:
+        sort_key = (
+            _sort_metric_desc(balanced_f1),
+            _sort_metric_desc(f1),
+            _sort_metric_desc(mcc),
+            _sort_metric_desc(roc_auc),
+            _sort_metric_desc(pr_auc),
+            _sort_metric_desc(f_beta),
+            _sort_metric_desc(recall),
+            _sort_metric_asc(brier),
+            -float(rounds_selected),
+        )
+        selection_score = balanced_f1
+    elif resolved_metric == XGB_FINE_TUNE_SELECTION_MCC:
+        sort_key = (
+            _sort_metric_desc(mcc),
+            _sort_metric_desc(balanced_f1),
+            _sort_metric_desc(f1),
+            _sort_metric_desc(roc_auc),
+            _sort_metric_desc(pr_auc),
+            _sort_metric_desc(f_beta),
+            _sort_metric_desc(recall),
+            _sort_metric_asc(brier),
+            -float(rounds_selected),
+        )
+        selection_score = mcc
     else:
         sort_key = (
             _sort_metric_desc(f_beta),
             _sort_metric_desc(recall),
+            _sort_metric_desc(f1),
+            _sort_metric_desc(balanced_f1),
+            _sort_metric_desc(mcc),
+            _sort_metric_desc(roc_auc),
             _sort_metric_desc(pr_auc),
             _sort_metric_asc(brier),
             -float(rounds_selected),
@@ -3110,6 +3806,10 @@ def _evaluate_xgb_fine_tune_candidate(
         "selection_score": float(selection_score),
         "f_beta": f_beta,
         "recall": recall,
+        "f1": f1,
+        "roc_auc": roc_auc,
+        "balanced_f1": balanced_f1,
+        "mcc": mcc,
         "pr_auc": pr_auc,
         "brier": brier,
         "sort_key": sort_key,
@@ -3117,6 +3817,21 @@ def _evaluate_xgb_fine_tune_candidate(
 
 
 def _recalibrate_artifact(artifact: Dict[str, Any], X_recent: np.ndarray, y_recent: np.ndarray, *, config: Dict[str, Any]) -> None:
+    if _artifact_has_xgb_parallel_neural_branch(artifact):
+        raw_scores, _embeddings = _predict_xgboost(artifact, X_recent)
+        calibrator = _fit_platt_calibrator(y_recent, raw_scores)
+        artifact["calibrator"] = calibrator
+        calibrated_scores = _apply_calibrator(raw_scores, calibrator)
+        threshold_info = _optimize_decision_threshold(
+            y_recent,
+            calibrated_scores,
+            beta=float(config.get("threshold_beta", DEFAULT_CONFIG["threshold_beta"])),
+        )
+        artifact["decision_threshold"] = float(threshold_info["threshold"])
+        artifact["threshold_info"] = threshold_info
+        _recalibrate_artifact(artifact["parallel_neural_branch"], X_recent, y_recent, config=config)
+        _refresh_reference_from_recent(artifact, X_recent, y_recent, config=config)
+        return
     raw_scores, _embeddings = _predict_with_artifact(artifact, X_recent)
     calibrator = _fit_platt_calibrator(y_recent, raw_scores)
     artifact["calibrator"] = calibrator
@@ -3172,18 +3887,24 @@ def _fine_tune_artifact(
 
         eta_multiplier = _xgb_fine_tune_eta_multiplier(resolved_intensity, config=config)
         recent_weight_max = _xgb_fine_tune_recent_weight_max(resolved_intensity, config=config)
-        learning_rate_value = _xgb_base_learning_rate(artifact) * eta_multiplier
+        learning_rate_value = _sanitize_xgb_learning_rate(
+            _xgb_base_learning_rate(artifact) * eta_multiplier,
+            fallback=_xgb_base_learning_rate(artifact),
+        )
         sample_weight = _xgb_recent_sample_weights(len(window_payload["y_train"]), recent_weight_max)
 
         best_artifact: Optional[Dict[str, Any]] = None
         best_candidate: Optional[Dict[str, Any]] = None
+        candidate_config = dict(config)
+        if _artifact_has_xgb_parallel_neural_branch(artifact):
+            candidate_config["xgb_parallel_neural_enabled"] = False
         for rounds_candidate in _xgb_fine_tune_round_candidates(resolved_intensity, config=config):
             tuned = _train_xgboost_model(
                 window_payload["X_train"],
                 window_payload["y_train"],
                 window_payload["X_val"],
                 window_payload["y_val"],
-                config=config,
+                config=candidate_config,
                 balance_mode=str(artifact.get("balance_mode", BALANCE_MODE_NONE)),
                 smote_params=dict(artifact.get("smote_params") or {}),
                 base_model=artifact.get("model"),
@@ -3223,7 +3944,19 @@ def _fine_tune_artifact(
             }
         )
         best_artifact["xgb_fine_tune_metadata"] = dict(metadata)
+        parallel_branch_artifact = artifact.get("parallel_neural_branch")
+        parallel_enabled = _artifact_has_xgb_parallel_neural_branch(artifact)
         artifact.update(best_artifact)
+        if parallel_enabled and isinstance(parallel_branch_artifact, dict):
+            artifact["parallel_neural_enabled"] = True
+            artifact["parallel_neural_branch"] = parallel_branch_artifact
+            _fine_tune_artifact(
+                parallel_branch_artifact,
+                window_payload["X_recent"],
+                window_payload["y_recent"],
+                config=config,
+            )
+            _sync_xgb_parallel_branch_state(artifact)
         _recalibrate_artifact(
             artifact,
             window_payload["X_recent"],
@@ -3380,6 +4113,9 @@ def _summary_from_stream(stream_df: pd.DataFrame, drift_events: pd.DataFrame) ->
                 "decision_threshold_last": threshold_value,
                 "decision_threshold_mean": float(group["decision_threshold"].mean()) if "decision_threshold" in group.columns else float("nan"),
                 "monitor_effective_architecture": str(group["monitor_effective_architecture"].iloc[-1]) if "monitor_effective_architecture" in group.columns else "none",
+                "parallel_neural_enabled": bool(group["parallel_neural_enabled"].iloc[-1]) if "parallel_neural_enabled" in group.columns else False,
+                "parallel_neural_model": str(group["parallel_neural_model"].iloc[-1]) if "parallel_neural_model" in group.columns else "not_available",
+                "drift_monitor_source": str(group["drift_monitor_source"].iloc[-1]) if "drift_monitor_source" in group.columns else DRIFT_MONITOR_SOURCE_NOT_AVAILABLE,
                 "monitor_warmup_rows": int(group["monitor_warmup"].sum()) if "monitor_warmup" in group.columns else 0,
             }
         )
@@ -3585,12 +4321,11 @@ def _build_detector_attention_outputs(detector_attention_rows: Sequence[Dict[str
     }
 
 
-def run_backtest_pipeline(
+def _prepare_backtest_runtime(
     dataset_bundle: Dict[str, Any],
     *,
     config: Dict[str, Any],
     progress_callback: Optional[Callable[[float, str], None]] = None,
-    live_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     df = _ensure_non_empty_dataframe(dataset_bundle.get("df"), label="Neural drift dataset")
     df = _subset_dataset_by_percentage(
@@ -3615,12 +4350,25 @@ def run_backtest_pipeline(
 
     if progress_callback is not None:
         progress_callback(0.08, "Construyendo split temporal...")
-    split = _split_window_dataset(
-        dataset,
-        train_fraction=float(config.get("train_fraction", DEFAULT_CONFIG["train_fraction"])),
-        validation_fraction=float(config.get("validation_fraction", DEFAULT_CONFIG["validation_fraction"])),
-        max_stream_rows=int(config.get("max_stream_rows", DEFAULT_CONFIG["max_stream_rows"])),
-    )
+    split_mode = str(config.get("split_mode", DEFAULT_CONFIG["split_mode"])).strip().lower()
+    max_stream_rows_raw = config.get("max_stream_rows", DEFAULT_CONFIG["max_stream_rows"])
+    max_stream_rows = None if max_stream_rows_raw is None else int(max_stream_rows_raw)
+    if split_mode == "fixed_dates":
+        split = _split_window_dataset_fixed_dates(
+            dataset,
+            base_start=str(config.get("base_start", DEFAULT_CONFIG["base_start"])),
+            base_end=str(config.get("base_end", DEFAULT_CONFIG["base_end"])),
+            stream_start=str(config.get("stream_start", DEFAULT_CONFIG["stream_start"])),
+            validation_fraction=float(config.get("validation_fraction", DEFAULT_CONFIG["validation_fraction"])),
+            max_stream_rows=max_stream_rows,
+        )
+    else:
+        split = _split_window_dataset(
+            dataset,
+            train_fraction=float(config.get("train_fraction", DEFAULT_CONFIG["train_fraction"])),
+            validation_fraction=float(config.get("validation_fraction", DEFAULT_CONFIG["validation_fraction"])),
+            max_stream_rows=max_stream_rows,
+        )
 
     baseline_rows: List[Dict[str, Any]] = []
     stream_rows: List[Dict[str, Any]] = []
@@ -3641,378 +4389,462 @@ def run_backtest_pipeline(
     if not selected_models or not selected_strategies:
         raise ValueError("Selecciona al menos un modelo y una estrategia para el backtest.")
 
-    loop_total = sum(
-        len(_allowed_strategies_for_model(model, selected_strategies)) * len(selected_balance_modes)
-        for model in selected_models
-    )
-    loop_total = max(1, loop_total)
-    loop_index = 0
-
+    baseline_specs: List[Dict[str, Any]] = []
+    experiment_specs: List[Dict[str, Any]] = []
     for model_name in selected_models:
         valid_strategies = _allowed_strategies_for_model(model_name, selected_strategies)
         for balance_mode in selected_balance_modes:
-            if progress_callback is not None:
-                progress_callback(
-                    0.12 + 0.70 * (loop_index / loop_total),
-                    f"Entrenando baseline para {model_name} | {balance_mode}...",
+            baseline_key = _build_neural_drift_baseline_key(str(model_name), str(balance_mode))
+            baseline_experiment_specs: List[Dict[str, Any]] = []
+            for strategy in valid_strategies:
+                experiment_key = _build_neural_drift_experiment_key(
+                    str(model_name),
+                    str(strategy),
+                    str(balance_mode),
                 )
-            canonical_artifact = _train_canonical_artifact(
-                model_name,
-                split["X_train"],
-                split["y_train"],
-                split["X_val"],
-                split["y_val"],
-                config=config,
-                balance_mode=balance_mode,
-                feature_metadata=feature_metadata,
-            )
-            canonical_smote_info = dict(canonical_artifact.get("smote_fit_info") or {})
-            canonical_smote_params = dict(canonical_artifact.get("smote_params") or {})
-            baseline_details = _predict_with_artifact_details(canonical_artifact, split["X_val"])
-            baseline_raw_scores = baseline_details["probs"]
-            baseline_embeddings = baseline_details["embeddings"]
-            baseline_scores = _apply_calibrator(baseline_raw_scores, canonical_artifact.get("calibrator"))
-            baseline_threshold = float(
-                canonical_artifact.get("decision_threshold", canonical_artifact.get("base_threshold", 0.5))
-            )
-            baseline_preds = (baseline_scores >= baseline_threshold).astype(int)
-            baseline_metrics = _classification_metrics(
-                split["y_val"],
-                baseline_scores,
-                threshold=baseline_threshold,
-                preds=baseline_preds,
-            )
-            baseline_rows.append(
+                experiment_spec = {
+                    "experiment_key": experiment_key,
+                    "model": str(model_name),
+                    "strategy": str(strategy),
+                    "balance_mode": str(balance_mode),
+                    "baseline_key": baseline_key,
+                }
+                baseline_experiment_specs.append(experiment_spec)
+                experiment_specs.append(experiment_spec)
+            baseline_specs.append(
                 {
+                    "baseline_key": baseline_key,
                     "model": str(model_name),
                     "balance_mode": str(balance_mode),
-                    "split": "validation",
-                    "rows": int(len(split["y_val"])),
-                    **baseline_metrics,
-                    "embedding_channels_available": bool(baseline_embeddings.size > 0),
-                    "monitor_effective_architecture": str(
-                        canonical_artifact.get("monitor_effective_architecture", "not_available")
-                    ),
-                    "smote_applied": bool(canonical_smote_info.get("applied", False)),
-                    "smote_balanced_rows": int(canonical_smote_info.get("balanced_rows", len(split["y_train"]))),
-                    "smote_sampling_strategy": canonical_smote_params.get("sampling_strategy"),
-                    "smote_k_neighbors": canonical_smote_params.get("k_neighbors"),
+                    "strategies": [str(item) for item in valid_strategies],
+                    "experiment_specs": baseline_experiment_specs,
+                }
+            )
+    return {
+        "dataset": dataset,
+        "split": split,
+        "feature_metadata": feature_metadata,
+        "selected_channels": selected_channels,
+        "baseline_specs": baseline_specs,
+        "experiment_specs": experiment_specs,
+    }
+
+
+def _build_baseline_result_row(
+    model_name: str,
+    balance_mode: str,
+    canonical_artifact: Dict[str, Any],
+    split: Dict[str, Any],
+) -> Dict[str, Any]:
+    canonical_smote_info = dict(canonical_artifact.get("smote_fit_info") or {})
+    canonical_smote_params = dict(canonical_artifact.get("smote_params") or {})
+    baseline_details = _predict_with_artifact_details(canonical_artifact, split["X_val"])
+    baseline_raw_scores = baseline_details["probs"]
+    baseline_embeddings = baseline_details["embeddings"]
+    baseline_scores = _apply_calibrator(baseline_raw_scores, canonical_artifact.get("calibrator"))
+    baseline_threshold = float(
+        canonical_artifact.get("decision_threshold", canonical_artifact.get("base_threshold", 0.5))
+    )
+    baseline_preds = (baseline_scores >= baseline_threshold).astype(int)
+    baseline_metrics = _classification_metrics(
+        split["y_val"],
+        baseline_scores,
+        threshold=baseline_threshold,
+        preds=baseline_preds,
+    )
+    return {
+        "model": str(model_name),
+        "balance_mode": str(balance_mode),
+        "split": "validation",
+        "rows": int(len(split["y_val"])),
+        **baseline_metrics,
+        "embedding_channels_available": bool(baseline_embeddings.size > 0),
+        "monitor_effective_architecture": str(
+            canonical_artifact.get("monitor_effective_architecture", "not_available")
+        ),
+        "parallel_neural_enabled": bool(canonical_artifact.get("parallel_neural_enabled", False)),
+        "parallel_neural_model": str(
+            canonical_artifact.get("parallel_neural_model", "not_available")
+        ),
+        "drift_monitor_source": str(
+            canonical_artifact.get(
+                "drift_monitor_source",
+                _artifact_drift_monitor_source(canonical_artifact),
+            )
+        ),
+        "smote_applied": bool(canonical_smote_info.get("applied", False)),
+        "smote_balanced_rows": int(canonical_smote_info.get("balanced_rows", len(split["y_train"]))),
+        "smote_sampling_strategy": canonical_smote_params.get("sampling_strategy"),
+        "smote_k_neighbors": canonical_smote_params.get("k_neighbors"),
+    }
+
+
+def _execute_backtest_experiment(
+    *,
+    model_name: str,
+    strategy: str,
+    balance_mode: str,
+    canonical_artifact: Dict[str, Any],
+    split: Dict[str, Any],
+    config: Dict[str, Any],
+    selected_channels: Sequence[str],
+    live_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    if live_update_callback is not None:
+        live_update_callback(
+            {
+                "event": "simulation_start",
+                "model": str(model_name),
+                "strategy": str(strategy),
+                "balance_mode": str(balance_mode),
+                "severity_threshold": float(
+                    config.get("severity_threshold", DEFAULT_CONFIG["severity_threshold"])
+                ),
+                "rolling_metric_window": int(
+                    config.get(
+                        "rolling_metric_window",
+                        DEFAULT_CONFIG["rolling_metric_window"],
+                    )
+                ),
+                "stream_total_rows": int(len(split["y_stream"])),
+            }
+        )
+    try:
+        artifact = copy.deepcopy(canonical_artifact)
+    except Exception:
+        artifact = canonical_artifact
+    history_X = np.vstack([split["X_train"], split["X_val"]])
+    history_y = np.concatenate([split["y_train"], split["y_val"]])
+
+    detectors = {
+        DRIFT_INPUT: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+        DRIFT_SCORE: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+        DRIFT_ERROR: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+        "score_neural": ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+        "error_neural": ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+    }
+    channel_histories: Dict[str, List[float]] = {
+        DRIFT_INPUT: [],
+        DRIFT_SCORE: [],
+        DRIFT_ERROR: [],
+        DRIFT_EMBEDDING: [],
+        "score_neural": [],
+        "error_neural": [],
+    }
+    embedding_buffer: List[np.ndarray] = []
+    stream_rows: List[Dict[str, Any]] = []
+    drift_rows: List[Dict[str, Any]] = []
+    attention_rows: List[Dict[str, Any]] = []
+    detector_attention_rows: List[Dict[str, Any]] = []
+
+    for idx in range(len(split["y_stream"])):
+        x_row = split["X_stream"][idx : idx + 1]
+        y_true = int(split["y_stream"][idx])
+        timestamp = pd.Timestamp(split["metadata_stream"].loc[idx, "prediction_time"])
+
+        prediction_details = _predict_with_artifact_details(artifact, x_row)
+        raw_scores = prediction_details["probs"]
+        embeddings = prediction_details["embeddings"]
+        attention_summary = prediction_details.get("attention_summary")
+        score = float(_apply_calibrator(raw_scores, artifact.get("calibrator"))[0])
+        auxiliary_probs = _as_float_array(prediction_details.get("auxiliary_probs"))
+        auxiliary_score = (
+            float(auxiliary_probs.reshape(-1)[0])
+            if auxiliary_probs.size > 0
+            else None
+        )
+        decision_threshold = float(
+            artifact.get("decision_threshold", artifact.get("base_threshold", 0.5))
+        )
+        pred = int(score >= decision_threshold)
+        pre_action_reference_attention = dict(artifact.get("attention_summary_reference") or {})
+        pre_action_monitor = dict(artifact.get("embedding_monitor") or {})
+        detector_attention_reference = dict(pre_action_monitor.get("attention_reference_summary") or {})
+        recent_embedding_history = (
+            np.vstack(embedding_buffer).astype(float)
+            if embedding_buffer
+            else np.empty(
+                (0, embeddings.shape[1] if embeddings.ndim == 2 and embeddings.shape[1] > 0 else 0),
+                dtype=float,
+            )
+        )
+        channel_payload = _build_channel_scores(
+            artifact=artifact,
+            x_row=_apply_imputer(x_row, artifact["imputer"]).reshape(-1),
+            calibrated_score=score,
+            auxiliary_calibrated_score=auxiliary_score,
+            y_true=y_true,
+            embeddings=embeddings.reshape(-1),
+            recent_embedding_history=recent_embedding_history,
+            selected_channels=selected_channels,
+            detectors=detectors,
+            channel_histories=channel_histories,
+            recent_window_size=int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])),
+            embedding_reconstruction_weight=float(
+                config.get(
+                    "drift_monitor_reconstruction_weight",
+                    DEFAULT_CONFIG["drift_monitor_reconstruction_weight"],
+                )
+            ),
+            point_signal_weight=float(
+                config.get(
+                    "drift_point_signal_weight",
+                    DEFAULT_CONFIG["drift_point_signal_weight"],
+                )
+            ),
+        )
+
+        severity_score = float(channel_payload["severity_score"])
+        max_channel_score = float(channel_payload.get("max_channel_score", severity_score))
+        action_taken = "none"
+        monitor_effective_architecture = str(
+            channel_payload.get(
+                "monitor_effective_architecture",
+                artifact.get("monitor_effective_architecture", "none"),
+            )
+        )
+        drift_monitor_source = str(
+            channel_payload.get(
+                "drift_monitor_source",
+                artifact.get("drift_monitor_source", _artifact_drift_monitor_source(artifact)),
+            )
+        )
+        monitor_warmup = bool(channel_payload.get("monitor_warmup", False))
+        parallel_neural_enabled = bool(
+            prediction_details.get(
+                "parallel_neural_enabled",
+                artifact.get("parallel_neural_enabled", False),
+            )
+        )
+        parallel_neural_model = str(
+            prediction_details.get(
+                "parallel_neural_model",
+                artifact.get("parallel_neural_model", "not_available"),
+            )
+        )
+        recent_start = max(
+            0,
+            idx - int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])) + 1,
+        )
+        recent_X = split["X_stream"][recent_start : idx + 1]
+        recent_y = split["y_stream"][recent_start : idx + 1]
+        recent_has_two_classes = len(np.unique(recent_y)) >= 2
+        severity_threshold = float(config.get("severity_threshold", DEFAULT_CONFIG["severity_threshold"]))
+        trigger_score = _trigger_score(severity_score, max_channel_score)
+        severity_intensity = _severity_intensity(trigger_score, severity_threshold)
+        severity_triggered = bool(
+            severity_score >= severity_threshold
+            or max_channel_score >= severity_threshold
+        )
+        xgb_event_metadata: Dict[str, Any] = {}
+
+        if severity_triggered:
+            if strategy == STRATEGY_FIXED:
+                action_taken = "none"
+            elif strategy == STRATEGY_RECALIBRATION and len(recent_y) >= int(config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])) and recent_has_two_classes:
+                _recalibrate_artifact(artifact, recent_X, recent_y, config=config)
+                action_taken = "recalibration"
+            elif strategy == STRATEGY_FINE_TUNING:
+                if str(model_name) == MODEL_XGBOOST:
+                    fine_tune_result = _fine_tune_artifact(
+                        artifact,
+                        split["X_stream"][: idx + 1],
+                        split["y_stream"][: idx + 1],
+                        config=config,
+                        severity_intensity=severity_intensity,
+                    )
+                    xgb_event_metadata = dict(
+                        fine_tune_result.get("xgb_fine_tune_metadata") or {}
+                    )
+                    action_taken = "fine_tuning" if bool(fine_tune_result.get("applied", False)) else "none"
+                elif len(recent_y) >= int(config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])) and recent_has_two_classes:
+                    _fine_tune_artifact(artifact, recent_X, recent_y, config=config)
+                    action_taken = "fine_tuning"
+            elif strategy == STRATEGY_RETRAIN and len(recent_y) >= int(config.get("retrain_min_rows", DEFAULT_CONFIG["retrain_min_rows"])) and recent_has_two_classes:
+                artifact = _retrain_artifact(
+                    model_name,
+                    artifact,
+                    history_X,
+                    history_y,
+                    recent_X,
+                    recent_y,
+                    config=config,
+                )
+                action_taken = "retrain"
+            event_threshold = float(artifact.get("decision_threshold", decision_threshold))
+            current_smote_params = dict(artifact.get("smote_params") or {})
+            current_smote_info = dict(artifact.get("smote_fit_info") or {})
+
+            drift_rows.append(
+                {
+                    "timestamp": timestamp,
+                    "model": str(model_name),
+                    "strategy": str(strategy),
+                    "balance_mode": str(balance_mode),
+                    "severity_score": severity_score,
+                    "severity_intensity": severity_intensity,
+                    "max_channel_score": max_channel_score,
+                    "severity_label": str(channel_payload["severity_label"]),
+                    "decision_threshold": event_threshold,
+                    "channel_scores": json.dumps(_to_json_safe(channel_payload["channel_scores"]), ensure_ascii=True, sort_keys=True),
+                    "raw_channel_values": json.dumps(_to_json_safe(channel_payload.get("raw_channel_values") or {}), ensure_ascii=True, sort_keys=True),
+                    "detector_flags": json.dumps(_to_json_safe(channel_payload["detector_flags"]), ensure_ascii=True, sort_keys=True),
+                    "action_taken": str(action_taken),
+                    "recent_rows": int(len(recent_y)),
+                    "recent_positive_rows": int(np.sum(recent_y)),
+                    "monitor_effective_architecture": monitor_effective_architecture,
+                    "parallel_neural_enabled": bool(parallel_neural_enabled),
+                    "parallel_neural_model": parallel_neural_model,
+                    "drift_monitor_source": drift_monitor_source,
+                    "monitor_warmup": bool(monitor_warmup),
+                    "smote_applied": bool(current_smote_info.get("applied", False)),
+                    "smote_sampling_strategy": current_smote_params.get("sampling_strategy"),
+                    "smote_k_neighbors": current_smote_params.get("k_neighbors"),
+                    "xgb_adaptation_window_rows": xgb_event_metadata.get("xgb_adaptation_window_rows"),
+                    "xgb_fine_tune_rounds_selected": xgb_event_metadata.get("xgb_fine_tune_rounds_selected"),
+                    "xgb_fine_tune_eta_multiplier": xgb_event_metadata.get("xgb_fine_tune_eta_multiplier"),
+                    "xgb_fine_tune_recent_weight_max": xgb_event_metadata.get("xgb_fine_tune_recent_weight_max"),
+                    "xgb_fine_tune_selection_metric": xgb_event_metadata.get("xgb_fine_tune_selection_metric"),
+                    "xgb_fine_tune_selection_score": xgb_event_metadata.get("xgb_fine_tune_selection_score"),
+                    "xgb_fine_tune_skip_reason": xgb_event_metadata.get("xgb_fine_tune_skip_reason"),
                 }
             )
 
-            for strategy in valid_strategies:
-                loop_index += 1
-                if progress_callback is not None:
-                    progress_callback(
-                        0.15 + 0.75 * (loop_index / loop_total),
-                        f"Simulando {model_name} | {strategy} | {balance_mode}...",
-                    )
-                if live_update_callback is not None:
-                    live_update_callback(
-                        {
-                            "event": "simulation_start",
-                            "model": str(model_name),
-                            "strategy": str(strategy),
-                            "balance_mode": str(balance_mode),
-                            "severity_threshold": float(
-                                config.get("severity_threshold", DEFAULT_CONFIG["severity_threshold"])
-                            ),
-                            "rolling_metric_window": int(
-                                config.get(
-                                    "rolling_metric_window",
-                                    DEFAULT_CONFIG["rolling_metric_window"],
-                                )
-                            ),
-                            "stream_total_rows": int(len(split["y_stream"])),
-                        }
-                    )
-                try:
-                    artifact = copy.deepcopy(canonical_artifact)
-                except Exception:
-                    artifact = _train_canonical_artifact(
-                        model_name,
-                        split["X_train"],
-                        split["y_train"],
-                        split["X_val"],
-                        split["y_val"],
-                        config=config,
-                        balance_mode=balance_mode,
-                        feature_metadata=feature_metadata,
-                    )
-                history_X = np.vstack([split["X_train"], split["X_val"]])
-                history_y = np.concatenate([split["y_train"], split["y_val"]])
-
-                detectors = {
-                    DRIFT_INPUT: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
-                    DRIFT_SCORE: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
-                    DRIFT_ERROR: ClassicDriftDetector(delta=float(config.get("detector_adwin_delta", DEFAULT_CONFIG["detector_adwin_delta"]))),
+        if attention_summary is not None:
+            attention_rows.append(
+                {
+                    "timestamp": timestamp,
+                    "model": str(model_name),
+                    "strategy": str(strategy),
+                    "balance_mode": str(balance_mode),
+                    "is_drift_event": bool(severity_triggered),
+                    "feature_labels": list(attention_summary.get("feature_labels") or []),
+                    "temporal_labels": list(attention_summary.get("temporal_labels") or []),
+                    "feature_attention_mean": _as_float_array(attention_summary.get("feature_attention_mean")),
+                    "temporal_attention_mean": _as_float_array(attention_summary.get("temporal_attention_mean")),
+                    "reference_feature_attention_mean": _as_float_array(
+                        pre_action_reference_attention.get("feature_attention_mean")
+                    ),
+                    "reference_temporal_attention_mean": _as_float_array(
+                        pre_action_reference_attention.get("temporal_attention_mean")
+                    ),
                 }
-                channel_histories: Dict[str, List[float]] = {
-                    DRIFT_INPUT: [],
-                    DRIFT_SCORE: [],
-                    DRIFT_ERROR: [],
-                    DRIFT_EMBEDDING: [],
+            )
+
+        detector_attention_summary = channel_payload.get("detector_attention_summary")
+        if detector_attention_summary is not None:
+            detector_attention_rows.append(
+                {
+                    "timestamp": timestamp,
+                    "model": str(model_name),
+                    "strategy": str(strategy),
+                    "balance_mode": str(balance_mode),
+                    "is_drift_event": bool(severity_triggered),
+                    "temporal_labels": list(detector_attention_summary.get("temporal_labels") or []),
+                    "temporal_attention_mean": _as_float_array(
+                        detector_attention_summary.get("temporal_attention_mean")
+                    ),
+                    "reference_temporal_attention_mean": _as_float_array(
+                        detector_attention_reference.get("temporal_attention_mean")
+                    ),
                 }
-                embedding_buffer: List[np.ndarray] = []
+            )
 
-                for idx in range(len(split["y_stream"])):
-                    x_row = split["X_stream"][idx : idx + 1]
-                    y_true = int(split["y_stream"][idx])
-                    timestamp = pd.Timestamp(split["metadata_stream"].loc[idx, "prediction_time"])
-
-                    prediction_details = _predict_with_artifact_details(artifact, x_row)
-                    raw_scores = prediction_details["probs"]
-                    embeddings = prediction_details["embeddings"]
-                    attention_summary = prediction_details.get("attention_summary")
-                    score = float(_apply_calibrator(raw_scores, artifact.get("calibrator"))[0])
-                    decision_threshold = float(
-                        artifact.get("decision_threshold", artifact.get("base_threshold", 0.5))
-                    )
-                    pred = int(score >= decision_threshold)
-                    pre_action_reference_attention = dict(artifact.get("attention_summary_reference") or {})
-                    pre_action_monitor = dict(artifact.get("embedding_monitor") or {})
-                    detector_attention_reference = dict(pre_action_monitor.get("attention_reference_summary") or {})
-                    recent_embedding_history = (
-                        np.vstack(embedding_buffer).astype(float)
-                        if embedding_buffer
-                        else np.empty(
-                            (0, embeddings.shape[1] if embeddings.ndim == 2 and embeddings.shape[1] > 0 else 0),
-                            dtype=float,
+        current_smote_params = dict(artifact.get("smote_params") or {})
+        current_smote_info = dict(artifact.get("smote_fit_info") or {})
+        stream_rows.append(
+            {
+                "timestamp": timestamp,
+                "model": str(model_name),
+                "strategy": str(strategy),
+                "balance_mode": str(balance_mode),
+                "y_true": int(y_true),
+                "prediction": int(pred),
+                "score": float(score),
+                "decision_threshold": decision_threshold,
+                "severity_score": severity_score,
+                "severity_intensity": severity_intensity,
+                "max_channel_score": max_channel_score,
+                "severity_label": str(channel_payload["severity_label"]),
+                "action_taken": str(action_taken),
+                "brier_component": float((score - y_true) ** 2),
+                "monitor_effective_architecture": monitor_effective_architecture,
+                "parallel_neural_enabled": bool(parallel_neural_enabled),
+                "parallel_neural_model": parallel_neural_model,
+                "drift_monitor_source": drift_monitor_source,
+                "monitor_warmup": bool(monitor_warmup),
+                "smote_applied": bool(current_smote_info.get("applied", False)),
+                "smote_sampling_strategy": current_smote_params.get("sampling_strategy"),
+                "smote_k_neighbors": current_smote_params.get("k_neighbors"),
+                "xgb_adaptation_window_rows": xgb_event_metadata.get("xgb_adaptation_window_rows"),
+                "xgb_fine_tune_rounds_selected": xgb_event_metadata.get("xgb_fine_tune_rounds_selected"),
+                "xgb_fine_tune_eta_multiplier": xgb_event_metadata.get("xgb_fine_tune_eta_multiplier"),
+                "xgb_fine_tune_recent_weight_max": xgb_event_metadata.get("xgb_fine_tune_recent_weight_max"),
+                "xgb_fine_tune_selection_metric": xgb_event_metadata.get("xgb_fine_tune_selection_metric"),
+                "xgb_fine_tune_selection_score": xgb_event_metadata.get("xgb_fine_tune_selection_score"),
+                "xgb_fine_tune_skip_reason": xgb_event_metadata.get("xgb_fine_tune_skip_reason"),
+            }
+        )
+        if live_update_callback is not None:
+            live_update_callback(
+                {
+                    "event": "stream_step",
+                    "timestamp": timestamp,
+                    "model": str(model_name),
+                    "strategy": str(strategy),
+                    "balance_mode": str(balance_mode),
+                    "severity_score": severity_score,
+                    "max_channel_score": max_channel_score,
+                    "severity_threshold": severity_threshold,
+                    "is_drift_event": bool(severity_triggered),
+                    "action_taken": str(action_taken),
+                    "score": float(score),
+                    "decision_threshold": decision_threshold,
+                    "y_true": int(y_true),
+                    "prediction": int(pred),
+                    "rolling_metric_window": int(
+                        config.get(
+                            "rolling_metric_window",
+                            DEFAULT_CONFIG["rolling_metric_window"],
                         )
-                    )
-                    channel_payload = _build_channel_scores(
-                        artifact=artifact,
-                        x_row=_apply_imputer(x_row, artifact["imputer"]).reshape(-1),
-                        calibrated_score=score,
-                        y_true=y_true,
-                        embeddings=embeddings.reshape(-1),
-                        recent_embedding_history=recent_embedding_history,
-                        selected_channels=selected_channels,
-                        detectors=detectors,
-                        channel_histories=channel_histories,
-                        recent_window_size=int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])),
-                        embedding_reconstruction_weight=float(
-                            config.get(
-                                "drift_monitor_reconstruction_weight",
-                                DEFAULT_CONFIG["drift_monitor_reconstruction_weight"],
-                            )
-                        ),
-                        point_signal_weight=float(
-                            config.get(
-                                "drift_point_signal_weight",
-                                DEFAULT_CONFIG["drift_point_signal_weight"],
-                            )
-                        ),
-                    )
+                    ),
+                    "stream_step_index": int(idx + 1),
+                    "stream_total_rows": int(len(split["y_stream"])),
+                }
+            )
 
-                    severity_score = float(channel_payload["severity_score"])
-                    max_channel_score = float(channel_payload.get("max_channel_score", severity_score))
-                    action_taken = "none"
-                    monitor_effective_architecture = str(
-                        channel_payload.get(
-                            "monitor_effective_architecture",
-                            artifact.get("monitor_effective_architecture", "none"),
-                        )
-                    )
-                    monitor_warmup = bool(channel_payload.get("monitor_warmup", False))
-                    recent_start = max(
-                        0,
-                        idx - int(config.get("recent_window_size", DEFAULT_CONFIG["recent_window_size"])) + 1,
-                    )
-                    recent_X = split["X_stream"][recent_start : idx + 1]
-                    recent_y = split["y_stream"][recent_start : idx + 1]
-                    recent_has_two_classes = len(np.unique(recent_y)) >= 2
-                    severity_threshold = float(config.get("severity_threshold", DEFAULT_CONFIG["severity_threshold"]))
-                    trigger_score = _trigger_score(severity_score, max_channel_score)
-                    severity_intensity = _severity_intensity(trigger_score, severity_threshold)
-                    severity_triggered = bool(
-                        severity_score >= severity_threshold
-                        or max_channel_score >= severity_threshold
-                    )
-                    xgb_event_metadata: Dict[str, Any] = {}
+        if embeddings.size > 0:
+            embedding_buffer.append(np.asarray(embeddings.reshape(-1), dtype=float))
 
-                    if severity_triggered:
-                        if strategy == STRATEGY_FIXED:
-                            action_taken = "none"
-                        elif strategy == STRATEGY_RECALIBRATION and len(recent_y) >= int(config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])) and recent_has_two_classes:
-                            _recalibrate_artifact(artifact, recent_X, recent_y, config=config)
-                            action_taken = "recalibration"
-                        elif strategy == STRATEGY_FINE_TUNING:
-                            if str(model_name) == MODEL_XGBOOST:
-                                fine_tune_result = _fine_tune_artifact(
-                                    artifact,
-                                    split["X_stream"][: idx + 1],
-                                    split["y_stream"][: idx + 1],
-                                    config=config,
-                                    severity_intensity=severity_intensity,
-                                )
-                                xgb_event_metadata = dict(
-                                    fine_tune_result.get("xgb_fine_tune_metadata") or {}
-                                )
-                                action_taken = "fine_tuning" if bool(fine_tune_result.get("applied", False)) else "none"
-                            elif len(recent_y) >= int(config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])) and recent_has_two_classes:
-                                _fine_tune_artifact(artifact, recent_X, recent_y, config=config)
-                                action_taken = "fine_tuning"
-                        elif strategy == STRATEGY_RETRAIN and len(recent_y) >= int(config.get("retrain_min_rows", DEFAULT_CONFIG["retrain_min_rows"])) and recent_has_two_classes:
-                            artifact = _retrain_artifact(
-                                model_name,
-                                artifact,
-                                history_X,
-                                history_y,
-                                recent_X,
-                                recent_y,
-                                config=config,
-                            )
-                            action_taken = "retrain"
-                        event_threshold = float(artifact.get("decision_threshold", decision_threshold))
-                        current_smote_params = dict(artifact.get("smote_params") or {})
-                        current_smote_info = dict(artifact.get("smote_fit_info") or {})
+    return {
+        "stream_rows": stream_rows,
+        "drift_rows": drift_rows,
+        "attention_rows": attention_rows,
+        "detector_attention_rows": detector_attention_rows,
+    }
 
-                        drift_rows.append(
-                            {
-                                "timestamp": timestamp,
-                                "model": str(model_name),
-                                "strategy": str(strategy),
-                                "balance_mode": str(balance_mode),
-                                "severity_score": severity_score,
-                                "severity_intensity": severity_intensity,
-                                "max_channel_score": max_channel_score,
-                                "severity_label": str(channel_payload["severity_label"]),
-                                "decision_threshold": event_threshold,
-                                "channel_scores": json.dumps(_to_json_safe(channel_payload["channel_scores"]), ensure_ascii=True, sort_keys=True),
-                                "raw_channel_values": json.dumps(_to_json_safe(channel_payload.get("raw_channel_values") or {}), ensure_ascii=True, sort_keys=True),
-                                "detector_flags": json.dumps(_to_json_safe(channel_payload["detector_flags"]), ensure_ascii=True, sort_keys=True),
-                                "action_taken": str(action_taken),
-                                "recent_rows": int(len(recent_y)),
-                                "recent_positive_rows": int(np.sum(recent_y)),
-                                "monitor_effective_architecture": monitor_effective_architecture,
-                                "monitor_warmup": bool(monitor_warmup),
-                                "smote_applied": bool(current_smote_info.get("applied", False)),
-                                "smote_sampling_strategy": current_smote_params.get("sampling_strategy"),
-                                "smote_k_neighbors": current_smote_params.get("k_neighbors"),
-                                "xgb_adaptation_window_rows": xgb_event_metadata.get("xgb_adaptation_window_rows"),
-                                "xgb_fine_tune_rounds_selected": xgb_event_metadata.get("xgb_fine_tune_rounds_selected"),
-                                "xgb_fine_tune_eta_multiplier": xgb_event_metadata.get("xgb_fine_tune_eta_multiplier"),
-                                "xgb_fine_tune_recent_weight_max": xgb_event_metadata.get("xgb_fine_tune_recent_weight_max"),
-                                "xgb_fine_tune_selection_metric": xgb_event_metadata.get("xgb_fine_tune_selection_metric"),
-                                "xgb_fine_tune_selection_score": xgb_event_metadata.get("xgb_fine_tune_selection_score"),
-                                "xgb_fine_tune_skip_reason": xgb_event_metadata.get("xgb_fine_tune_skip_reason"),
-                            }
-                        )
 
-                    if attention_summary is not None:
-                        attention_rows.append(
-                            {
-                                "timestamp": timestamp,
-                                "model": str(model_name),
-                                "strategy": str(strategy),
-                                "balance_mode": str(balance_mode),
-                                "is_drift_event": bool(severity_triggered),
-                                "feature_labels": list(attention_summary.get("feature_labels") or []),
-                                "temporal_labels": list(attention_summary.get("temporal_labels") or []),
-                                "feature_attention_mean": _as_float_array(attention_summary.get("feature_attention_mean")),
-                                "temporal_attention_mean": _as_float_array(attention_summary.get("temporal_attention_mean")),
-                                "reference_feature_attention_mean": _as_float_array(
-                                    pre_action_reference_attention.get("feature_attention_mean")
-                                ),
-                                "reference_temporal_attention_mean": _as_float_array(
-                                    pre_action_reference_attention.get("temporal_attention_mean")
-                                ),
-                            }
-                        )
-
-                    detector_attention_summary = channel_payload.get("detector_attention_summary")
-                    if detector_attention_summary is not None:
-                        detector_attention_rows.append(
-                            {
-                                "timestamp": timestamp,
-                                "model": str(model_name),
-                                "strategy": str(strategy),
-                                "balance_mode": str(balance_mode),
-                                "is_drift_event": bool(severity_triggered),
-                                "temporal_labels": list(detector_attention_summary.get("temporal_labels") or []),
-                                "temporal_attention_mean": _as_float_array(
-                                    detector_attention_summary.get("temporal_attention_mean")
-                                ),
-                                "reference_temporal_attention_mean": _as_float_array(
-                                    detector_attention_reference.get("temporal_attention_mean")
-                                ),
-                            }
-                        )
-
-                    current_smote_params = dict(artifact.get("smote_params") or {})
-                    current_smote_info = dict(artifact.get("smote_fit_info") or {})
-                    stream_rows.append(
-                        {
-                            "timestamp": timestamp,
-                            "model": str(model_name),
-                            "strategy": str(strategy),
-                            "balance_mode": str(balance_mode),
-                            "y_true": int(y_true),
-                            "prediction": int(pred),
-                            "score": float(score),
-                            "decision_threshold": decision_threshold,
-                            "severity_score": severity_score,
-                            "severity_intensity": severity_intensity,
-                            "max_channel_score": max_channel_score,
-                            "severity_label": str(channel_payload["severity_label"]),
-                            "action_taken": str(action_taken),
-                            "brier_component": float((score - y_true) ** 2),
-                            "monitor_effective_architecture": monitor_effective_architecture,
-                            "monitor_warmup": bool(monitor_warmup),
-                            "smote_applied": bool(current_smote_info.get("applied", False)),
-                            "smote_sampling_strategy": current_smote_params.get("sampling_strategy"),
-                            "smote_k_neighbors": current_smote_params.get("k_neighbors"),
-                            "xgb_adaptation_window_rows": xgb_event_metadata.get("xgb_adaptation_window_rows"),
-                            "xgb_fine_tune_rounds_selected": xgb_event_metadata.get("xgb_fine_tune_rounds_selected"),
-                            "xgb_fine_tune_eta_multiplier": xgb_event_metadata.get("xgb_fine_tune_eta_multiplier"),
-                            "xgb_fine_tune_recent_weight_max": xgb_event_metadata.get("xgb_fine_tune_recent_weight_max"),
-                            "xgb_fine_tune_selection_metric": xgb_event_metadata.get("xgb_fine_tune_selection_metric"),
-                            "xgb_fine_tune_selection_score": xgb_event_metadata.get("xgb_fine_tune_selection_score"),
-                            "xgb_fine_tune_skip_reason": xgb_event_metadata.get("xgb_fine_tune_skip_reason"),
-                        }
-                    )
-                    if live_update_callback is not None:
-                        live_update_callback(
-                            {
-                                "event": "stream_step",
-                                "timestamp": timestamp,
-                                "model": str(model_name),
-                                "strategy": str(strategy),
-                                "balance_mode": str(balance_mode),
-                                "severity_score": severity_score,
-                                "max_channel_score": max_channel_score,
-                                "severity_threshold": severity_threshold,
-                                "is_drift_event": bool(severity_triggered),
-                                "action_taken": str(action_taken),
-                                "score": float(score),
-                                "decision_threshold": decision_threshold,
-                                "y_true": int(y_true),
-                                "prediction": int(pred),
-                                "rolling_metric_window": int(
-                                    config.get(
-                                        "rolling_metric_window",
-                                        DEFAULT_CONFIG["rolling_metric_window"],
-                                    )
-                                ),
-                                "stream_step_index": int(idx + 1),
-                                "stream_total_rows": int(len(split["y_stream"])),
-                            }
-                        )
-
-                    if embeddings.size > 0:
-                        embedding_buffer.append(np.asarray(embeddings.reshape(-1), dtype=float))
-
-    baseline_df = pd.DataFrame(baseline_rows)
+def _finalize_backtest_results(
+    *,
+    dataset: WindowDataset,
+    split: Dict[str, Any],
+    baseline_rows: Sequence[Dict[str, Any]],
+    stream_rows: Sequence[Dict[str, Any]],
+    drift_rows: Sequence[Dict[str, Any]],
+    attention_rows: Sequence[Dict[str, Any]],
+    detector_attention_rows: Sequence[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    baseline_df = pd.DataFrame(list(baseline_rows))
     if not baseline_df.empty:
         baseline_df = baseline_df.sort_values(["model", "balance_mode"]).reset_index(drop=True)
 
-    stream_df = pd.DataFrame(stream_rows)
+    stream_df = pd.DataFrame(list(stream_rows))
     if not stream_df.empty:
         stream_df = stream_df.sort_values(["model", "balance_mode", "strategy", "timestamp"]).reset_index(drop=True)
 
     drift_df = pd.DataFrame(
-        drift_rows,
+        list(drift_rows),
         columns=[
             "timestamp",
             "model",
@@ -4030,6 +4862,9 @@ def run_backtest_pipeline(
             "recent_rows",
             "recent_positive_rows",
             "monitor_effective_architecture",
+            "parallel_neural_enabled",
+            "parallel_neural_model",
+            "drift_monitor_source",
             "monitor_warmup",
             "smote_applied",
             "smote_sampling_strategy",
@@ -4051,8 +4886,8 @@ def run_backtest_pipeline(
         stream_df,
         rolling_window=int(config.get("rolling_metric_window", DEFAULT_CONFIG["rolling_metric_window"])),
     )
-    attention_outputs = _build_attention_outputs(attention_rows)
-    detector_attention_outputs = _build_detector_attention_outputs(detector_attention_rows)
+    attention_outputs = _build_attention_outputs(list(attention_rows))
+    detector_attention_outputs = _build_detector_attention_outputs(list(detector_attention_rows))
     return {
         "dataset": dataset,
         "split": split,
@@ -4066,24 +4901,962 @@ def run_backtest_pipeline(
     }
 
 
+def run_backtest_pipeline(
+    dataset_bundle: Dict[str, Any],
+    *,
+    config: Dict[str, Any],
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    live_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    runtime = _prepare_backtest_runtime(
+        dataset_bundle,
+        config=config,
+        progress_callback=progress_callback,
+    )
+    baseline_rows: List[Dict[str, Any]] = []
+    stream_rows: List[Dict[str, Any]] = []
+    drift_rows: List[Dict[str, Any]] = []
+    attention_rows: List[Dict[str, Any]] = []
+    detector_attention_rows: List[Dict[str, Any]] = []
+    loop_total = max(1, int(len(runtime["experiment_specs"])))
+    loop_index = 0
+
+    for baseline_spec in runtime["baseline_specs"]:
+        model_name = str(baseline_spec["model"])
+        balance_mode = str(baseline_spec["balance_mode"])
+        if progress_callback is not None:
+            progress_callback(
+                0.12 + 0.70 * (loop_index / loop_total),
+                f"Entrenando baseline para {model_name} | {balance_mode}...",
+            )
+        canonical_artifact = _train_canonical_artifact(
+            model_name,
+            runtime["split"]["X_train"],
+            runtime["split"]["y_train"],
+            runtime["split"]["X_val"],
+            runtime["split"]["y_val"],
+            config=config,
+            balance_mode=balance_mode,
+            feature_metadata=runtime["feature_metadata"],
+        )
+        baseline_rows.append(
+            _build_baseline_result_row(
+                model_name,
+                balance_mode,
+                canonical_artifact,
+                runtime["split"],
+            )
+        )
+        for experiment_spec in baseline_spec["experiment_specs"]:
+            loop_index += 1
+            strategy = str(experiment_spec["strategy"])
+            if progress_callback is not None:
+                progress_callback(
+                    0.15 + 0.75 * (loop_index / loop_total),
+                    f"Simulando {model_name} | {strategy} | {balance_mode}...",
+                )
+            experiment_payload = _execute_backtest_experiment(
+                model_name=model_name,
+                strategy=strategy,
+                balance_mode=balance_mode,
+                canonical_artifact=canonical_artifact,
+                split=runtime["split"],
+                config=config,
+                selected_channels=runtime["selected_channels"],
+                live_update_callback=live_update_callback,
+            )
+            stream_rows.extend(experiment_payload["stream_rows"])
+            drift_rows.extend(experiment_payload["drift_rows"])
+            attention_rows.extend(experiment_payload["attention_rows"])
+            detector_attention_rows.extend(experiment_payload["detector_attention_rows"])
+
+    return _finalize_backtest_results(
+        dataset=runtime["dataset"],
+        split=runtime["split"],
+        baseline_rows=baseline_rows,
+        stream_rows=stream_rows,
+        drift_rows=drift_rows,
+        attention_rows=attention_rows,
+        detector_attention_rows=detector_attention_rows,
+        config=config,
+    )
+
+
 def _download_bundle_from_results(results: Dict[str, Any]) -> Dict[str, str]:
     bundle: Dict[str, str] = {}
-    for key in [
-        "baseline",
-        "summary",
-        "stream_metrics",
-        "rolling_metrics",
-        "drift_events",
-        "attention_feature_summary",
-        "attention_temporal_summary",
-        "attention_drift_shift_summary",
-        "detector_attention_temporal_summary",
-        "detector_attention_drift_shift_summary",
-    ]:
+    for key in NEURAL_DRIFT_RESULT_KEYS:
         df = results.get(key)
         if isinstance(df, pd.DataFrame) and not df.empty:
             bundle[key] = df.to_csv(index=False)
     return bundle
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _neural_drift_checkpoint_root(*, checkpoint_root: Optional[Path] = None) -> Path:
+    return Path(checkpoint_root) if checkpoint_root is not None else NEURAL_DRIFT_RUNS_DIR
+
+
+def _neural_drift_run_dir(run_id: str, *, checkpoint_root: Optional[Path] = None) -> Path:
+    return _neural_drift_checkpoint_root(checkpoint_root=checkpoint_root) / str(run_id)
+
+
+def _neural_drift_run_paths(run_dir: Path) -> Dict[str, Path]:
+    return {
+        "run_dir": run_dir,
+        "manifest": run_dir / "manifest.json",
+        "live_status": run_dir / "live_status.json",
+        "live_events": run_dir / "live_events.jsonl",
+        "artifacts_dir": run_dir / "artifacts",
+        "experiments_dir": run_dir / "experiments",
+        "baselines_dir": run_dir / "baselines",
+    }
+
+
+def _ensure_neural_drift_run_dirs(paths: Dict[str, Path]) -> None:
+    for key in ["run_dir", "artifacts_dir", "experiments_dir", "baselines_dir"]:
+        Path(paths[key]).mkdir(parents=True, exist_ok=True)
+
+
+def _build_neural_drift_run_id(run_signature: str) -> str:
+    created_token = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    digest = hashlib.sha256(f"{created_token}|{run_signature}".encode("utf-8")).hexdigest()
+    return f"run_{created_token}_{digest[:8]}"
+
+
+def _build_neural_drift_dataset_context(
+    dataset_bundle: Dict[str, Any],
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    dataset_df = dataset_bundle.get("df")
+    active_df = (
+        _subset_dataset_by_percentage(
+            dataset_df,
+            dataset_percent=float(config.get("dataset_percent", DEFAULT_CONFIG["dataset_percent"])),
+        )
+        if isinstance(dataset_df, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    return {
+        "source": str(dataset_bundle.get("source") or ""),
+        "rows_total": int(len(dataset_df)) if isinstance(dataset_df, pd.DataFrame) else 0,
+        "rows_used": int(len(active_df)),
+        "feature_cols": list(dataset_bundle.get("feature_cols") or []),
+        "feature_export_path": str(dataset_bundle.get("feature_export_path") or ""),
+        "selection_metadata": _to_json_safe(dataset_bundle.get("selection_metadata") or {}),
+        "feature_source_choice": str(st.session_state.get("neural_drift_feature_source_choice") or ""),
+    }
+
+
+def _initial_neural_drift_manifest(
+    *,
+    run_id: str,
+    run_signature: str,
+    dataset_context: Dict[str, Any],
+    config: Dict[str, Any],
+    baseline_specs: Sequence[Dict[str, Any]],
+    experiment_specs: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    created_at = _now_iso()
+    baseline_index = {
+        str(spec["baseline_key"]): {
+            "baseline_key": str(spec["baseline_key"]),
+            "model": str(spec["model"]),
+            "balance_mode": str(spec["balance_mode"]),
+            "status": "pending",
+            "artifact_paths": {},
+            "error": None,
+        }
+        for spec in baseline_specs
+    }
+    experiment_index = {
+        str(spec["experiment_key"]): {
+            "experiment_key": str(spec["experiment_key"]),
+            "baseline_key": str(spec["baseline_key"]),
+            "model": str(spec["model"]),
+            "strategy": str(spec["strategy"]),
+            "balance_mode": str(spec["balance_mode"]),
+            "status": "pending",
+            "artifact_paths": {},
+            "error": None,
+        }
+        for spec in experiment_specs
+    }
+    manifest = {
+        "schema_version": 1,
+        "run_id": str(run_id),
+        "run_signature": str(run_signature),
+        "run_type": NEURAL_DRIFT_RUN_TYPE,
+        "status": "running",
+        "result_status": "running",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "dataset_context": _to_json_safe(dataset_context),
+        "config": _to_json_safe(config),
+        "progress": {},
+        "baseline_index": baseline_index,
+        "experiment_index": experiment_index,
+        "artifacts": {},
+        "last_error": None,
+        "resume": {
+            "auto_resumed": False,
+            "checkpoint_status": "fresh",
+        },
+    }
+    _update_neural_drift_manifest_progress(manifest)
+    return manifest
+
+
+def _reconcile_neural_drift_manifest(
+    manifest: Dict[str, Any],
+    *,
+    baseline_specs: Sequence[Dict[str, Any]],
+    experiment_specs: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    reconciled = dict(manifest or {})
+    baseline_index = dict(reconciled.get("baseline_index") or {})
+    experiment_index = dict(reconciled.get("experiment_index") or {})
+    for spec in baseline_specs:
+        key = str(spec["baseline_key"])
+        current = dict(baseline_index.get(key) or {})
+        status = str(current.get("status") or "pending")
+        if status not in {"completed", "pending"}:
+            status = "pending"
+        baseline_index[key] = {
+            "baseline_key": key,
+            "model": str(spec["model"]),
+            "balance_mode": str(spec["balance_mode"]),
+            "status": status,
+            "artifact_paths": dict(current.get("artifact_paths") or {}),
+            "error": current.get("error"),
+        }
+    for spec in experiment_specs:
+        key = str(spec["experiment_key"])
+        current = dict(experiment_index.get(key) or {})
+        status = str(current.get("status") or "pending")
+        if status != "completed":
+            status = "pending"
+        experiment_index[key] = {
+            "experiment_key": key,
+            "baseline_key": str(spec["baseline_key"]),
+            "model": str(spec["model"]),
+            "strategy": str(spec["strategy"]),
+            "balance_mode": str(spec["balance_mode"]),
+            "status": status,
+            "artifact_paths": dict(current.get("artifact_paths") or {}),
+            "error": current.get("error"),
+        }
+    reconciled["baseline_index"] = baseline_index
+    reconciled["experiment_index"] = experiment_index
+    reconciled.setdefault("artifacts", {})
+    reconciled.setdefault("last_error", None)
+    reconciled.setdefault("resume", {"auto_resumed": False, "checkpoint_status": "unknown"})
+    _update_neural_drift_manifest_progress(reconciled)
+    return reconciled
+
+
+def _update_neural_drift_manifest_progress(manifest: Dict[str, Any]) -> None:
+    baseline_index = dict(manifest.get("baseline_index") or {})
+    experiment_index = dict(manifest.get("experiment_index") or {})
+    completed_baselines = sum(
+        1 for item in baseline_index.values() if str(item.get("status") or "") == "completed"
+    )
+    completed_experiments = sum(
+        1 for item in experiment_index.values() if str(item.get("status") or "") == "completed"
+    )
+    total_baselines = int(len(baseline_index))
+    total_experiments = int(len(experiment_index))
+    total_units = max(1, total_baselines + total_experiments)
+    completed_units = completed_baselines + completed_experiments
+    current_baseline_key = next(
+        (
+            str(key)
+            for key, item in baseline_index.items()
+            if str(item.get("status") or "") == "running"
+        ),
+        None,
+    )
+    current_experiment_key = next(
+        (
+            str(key)
+            for key, item in experiment_index.items()
+            if str(item.get("status") or "") == "running"
+        ),
+        None,
+    )
+    manifest["progress"] = {
+        "completed_units": int(completed_units),
+        "total_units": int(total_units),
+        "progress_ratio": float(completed_units / total_units),
+        "completed_baselines": int(completed_baselines),
+        "total_baselines": int(total_baselines),
+        "completed_experiments": int(completed_experiments),
+        "total_experiments": int(total_experiments),
+        "pending_experiments": int(total_experiments - completed_experiments),
+        "current_baseline_key": current_baseline_key,
+        "current_experiment_key": current_experiment_key,
+    }
+
+
+def _persist_neural_drift_manifest(path: Path, manifest: Dict[str, Any]) -> None:
+    manifest["updated_at"] = _now_iso()
+    _atomic_write_json(path, manifest)
+
+
+def _persist_neural_drift_live_status(path: Path, payload: Dict[str, Any]) -> None:
+    _atomic_write_json(path, payload)
+
+
+def _append_neural_drift_live_event(path: Path, payload: Dict[str, Any]) -> None:
+    _append_jsonl_record(path, payload)
+
+
+def _build_neural_drift_live_status_payload(
+    manifest: Dict[str, Any],
+    *,
+    label: str,
+    detail: str = "",
+    status: Optional[str] = None,
+    result_status: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    progress = dict(manifest.get("progress") or {})
+    return {
+        "timestamp": _now_iso(),
+        "run_id": str(manifest.get("run_id") or ""),
+        "status": str(status or manifest.get("status") or "unknown"),
+        "result_status": str(result_status or manifest.get("result_status") or "unknown"),
+        "completed_units": int(progress.get("completed_units", 0)),
+        "total_units": int(progress.get("total_units", 0)),
+        "progress_ratio": float(progress.get("progress_ratio", 0.0)),
+        "label": str(label),
+        "detail": str(detail),
+        "context": _to_json_safe(context or {}),
+    }
+
+
+def _baseline_artifact_path(paths: Dict[str, Path], baseline_key: str) -> Path:
+    return Path(paths["baselines_dir"]) / f"{baseline_key}.csv"
+
+
+def _experiment_dir(paths: Dict[str, Path], experiment_key: str) -> Path:
+    return Path(paths["experiments_dir"]) / str(experiment_key)
+
+
+def _persist_neural_drift_baseline_checkpoint(
+    paths: Dict[str, Path],
+    *,
+    baseline_key: str,
+    baseline_row: Dict[str, Any],
+) -> Dict[str, str]:
+    artifact_path = _baseline_artifact_path(paths, baseline_key)
+    _atomic_write_df_csv(artifact_path, pd.DataFrame([baseline_row]))
+    return {"baseline": str(artifact_path)}
+
+
+def _persist_neural_drift_result_artifacts(
+    base_dir: Path,
+    results: Dict[str, Any],
+    *,
+    keys: Sequence[str],
+) -> Dict[str, str]:
+    artifact_paths: Dict[str, str] = {}
+    for key in keys:
+        df = results.get(key)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        artifact_path = base_dir / f"{key}.csv"
+        _atomic_write_df_csv(artifact_path, df)
+        artifact_paths[str(key)] = str(artifact_path)
+    return artifact_paths
+
+
+def _read_persisted_neural_drift_dataframe(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+    for col in ["timestamp", "prediction_time", "window_end", "horizon_end"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+
+def _sort_persisted_neural_drift_results(results: Dict[str, Any]) -> Dict[str, Any]:
+    ordered = dict(results)
+    sort_specs = {
+        "baseline": ["model", "balance_mode"],
+        "summary": ["model", "balance_mode", "strategy"],
+        "stream_metrics": ["model", "balance_mode", "strategy", "timestamp"],
+        "rolling_metrics": ["model", "balance_mode", "strategy", "timestamp"],
+        "drift_events": ["model", "balance_mode", "strategy", "timestamp"],
+        "attention_feature_summary": ["model", "balance_mode", "strategy"],
+        "attention_temporal_summary": ["model", "balance_mode", "strategy"],
+        "attention_drift_shift_summary": ["model", "balance_mode", "strategy"],
+        "detector_attention_temporal_summary": ["model", "balance_mode", "strategy"],
+        "detector_attention_drift_shift_summary": ["model", "balance_mode", "strategy"],
+    }
+    for key, columns in sort_specs.items():
+        df = ordered.get(key)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        available = [col for col in columns if col in df.columns]
+        if available:
+            ordered[key] = df.sort_values(available).reset_index(drop=True)
+    return ordered
+
+
+def _assemble_persisted_neural_drift_results(
+    manifest: Dict[str, Any],
+    *,
+    run_dir: Path,
+) -> Dict[str, Any]:
+    results: Dict[str, Any] = {}
+    artifact_paths = dict(manifest.get("artifacts") or {})
+    use_run_level_artifacts = (
+        str(manifest.get("status") or "") == "completed"
+        and str(manifest.get("result_status") or "") == "success"
+    )
+    if use_run_level_artifacts:
+        for key in NEURAL_DRIFT_RESULT_KEYS:
+            raw_path = artifact_paths.get(key)
+            if not raw_path:
+                continue
+            results[key] = _read_persisted_neural_drift_dataframe(Path(str(raw_path)))
+    if results.get("summary") is not None and isinstance(results.get("summary"), pd.DataFrame):
+        return _sort_persisted_neural_drift_results(results)
+
+    baseline_frames: List[pd.DataFrame] = []
+    experiment_frames: Dict[str, List[pd.DataFrame]] = {key: [] for key in NEURAL_DRIFT_RESULT_KEYS if key != "baseline"}
+    for item in (manifest.get("baseline_index") or {}).values():
+        if str(item.get("status") or "") != "completed":
+            continue
+        raw_path = str((item.get("artifact_paths") or {}).get("baseline") or "")
+        if not raw_path:
+            continue
+        frame = _read_persisted_neural_drift_dataframe(Path(raw_path))
+        if not frame.empty:
+            baseline_frames.append(frame)
+    for item in (manifest.get("experiment_index") or {}).values():
+        if str(item.get("status") or "") != "completed":
+            continue
+        paths_map = dict(item.get("artifact_paths") or {})
+        for key in experiment_frames.keys():
+            raw_path = str(paths_map.get(key) or "")
+            if not raw_path:
+                continue
+            frame = _read_persisted_neural_drift_dataframe(Path(raw_path))
+            if not frame.empty:
+                experiment_frames[key].append(frame)
+    if baseline_frames:
+        results["baseline"] = pd.concat(baseline_frames, ignore_index=True)
+    for key, frames in experiment_frames.items():
+        if frames:
+            results[key] = pd.concat(frames, ignore_index=True)
+    return _sort_persisted_neural_drift_results(results)
+
+
+def _load_persisted_neural_drift_run(manifest_path: Path) -> Dict[str, Any]:
+    manifest = dict(_load_json_file(manifest_path, default={}) or {})
+    run_dir = manifest_path.parent
+    results = _assemble_persisted_neural_drift_results(manifest, run_dir=run_dir)
+    return {
+        "run_id": str(manifest.get("run_id") or run_dir.name),
+        "run_signature": str(manifest.get("run_signature") or ""),
+        "manifest": manifest,
+        "manifest_path": str(manifest_path),
+        "run_dir": str(run_dir),
+        "results": results,
+        "download_bundle": _download_bundle_from_results(results),
+    }
+
+
+def _store_neural_drift_results_in_session_state(
+    results: Dict[str, Any],
+    *,
+    run_signature: str,
+    run_id: Optional[str] = None,
+    manifest_path: Optional[str] = None,
+) -> None:
+    st.session_state["neural_drift_baseline_results"] = results.get("baseline")
+    st.session_state["neural_drift_stream_results"] = {
+        "summary": results.get("summary"),
+        "stream_metrics": results.get("stream_metrics"),
+        "rolling_metrics": results.get("rolling_metrics"),
+        "attention_feature_summary": results.get("attention_feature_summary"),
+        "attention_temporal_summary": results.get("attention_temporal_summary"),
+        "attention_drift_shift_summary": results.get("attention_drift_shift_summary"),
+        "detector_attention_temporal_summary": results.get("detector_attention_temporal_summary"),
+        "detector_attention_drift_shift_summary": results.get("detector_attention_drift_shift_summary"),
+    }
+    st.session_state["neural_drift_drift_events"] = results.get("drift_events")
+    st.session_state["neural_drift_download_bundle"] = _download_bundle_from_results(results)
+    st.session_state["neural_drift_last_run_signature"] = str(run_signature)
+    st.session_state["neural_drift_active_run_id"] = None if run_id is None else str(run_id)
+    st.session_state["neural_drift_active_manifest_path"] = None if manifest_path is None else str(manifest_path)
+
+
+def _apply_persisted_neural_drift_run_to_session_state(payload: Dict[str, Any]) -> None:
+    _store_neural_drift_results_in_session_state(
+        dict(payload.get("results") or {}),
+        run_signature=str(payload.get("run_signature") or ""),
+        run_id=str(payload.get("run_id") or ""),
+        manifest_path=str(payload.get("manifest_path") or ""),
+    )
+    st.session_state["neural_drift_loaded_checkpoint_run_id"] = str(payload.get("run_id") or "")
+
+
+def _list_persisted_neural_drift_runs(
+    *,
+    checkpoint_root: Path = NEURAL_DRIFT_RUNS_DIR,
+) -> List[Dict[str, Any]]:
+    if not checkpoint_root.exists():
+        return []
+    entries: List[Dict[str, Any]] = []
+    for manifest_path in sorted(checkpoint_root.glob("*/manifest.json")):
+        manifest = dict(_load_json_file(manifest_path, default={}) or {})
+        progress = dict(manifest.get("progress") or {})
+        updated_at = str(manifest.get("updated_at") or manifest.get("created_at") or "")
+        updated_ts = pd.to_datetime(updated_at, errors="coerce")
+        entries.append(
+            {
+                "run_id": str(manifest.get("run_id") or manifest_path.parent.name),
+                "run_signature": str(manifest.get("run_signature") or ""),
+                "manifest_path": str(manifest_path),
+                "run_dir": str(manifest_path.parent),
+                "status": str(manifest.get("status") or "unknown"),
+                "result_status": str(manifest.get("result_status") or "unknown"),
+                "updated_at": updated_at,
+                "sort_key": (
+                    float(updated_ts.timestamp())
+                    if pd.notna(updated_ts)
+                    else float(manifest_path.stat().st_mtime)
+                ),
+                "source": str((manifest.get("dataset_context") or {}).get("source") or ""),
+                "rows_used": int((manifest.get("dataset_context") or {}).get("rows_used") or 0),
+                "completed_experiments": int(progress.get("completed_experiments", 0)),
+                "total_experiments": int(progress.get("total_experiments", 0)),
+                "can_resume": str(manifest.get("status") or "") in {"running", "failed"},
+                "label": (
+                    f"{manifest.get('run_id') or manifest_path.parent.name} | "
+                    f"{manifest.get('status') or 'unknown'} | "
+                    f"{updated_at or '-'} | "
+                    f"{int(progress.get('completed_experiments', 0))}/{int(progress.get('total_experiments', 0))} experimentos"
+                ),
+            }
+        )
+    entries.sort(key=lambda item: float(item.get("sort_key", 0.0)), reverse=True)
+    return entries
+
+
+def run_backtest_with_checkpoints(
+    dataset_bundle: Dict[str, Any],
+    *,
+    config: Dict[str, Any],
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    live_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    resume_run_id: Optional[str] = None,
+    checkpoint_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    runtime = _prepare_backtest_runtime(
+        dataset_bundle,
+        config=config,
+        progress_callback=progress_callback,
+    )
+    run_signature = _build_run_signature(dataset_bundle, config)
+    dataset_context = _build_neural_drift_dataset_context(dataset_bundle, config)
+
+    if resume_run_id:
+        run_dir = _neural_drift_run_dir(str(resume_run_id), checkpoint_root=checkpoint_root)
+        paths = _neural_drift_run_paths(run_dir)
+        manifest = dict(_load_json_file(paths["manifest"], default={}) or {})
+        if not manifest:
+            raise FileNotFoundError(f"No existe un checkpoint de Neural drift para `{resume_run_id}`.")
+        if str(manifest.get("run_signature") or "") != run_signature:
+            raise ValueError(
+                "La configuracion o la fuente de datos actual no coincide con la corrida preparada para reanudar."
+            )
+        manifest = _reconcile_neural_drift_manifest(
+            manifest,
+            baseline_specs=runtime["baseline_specs"],
+            experiment_specs=runtime["experiment_specs"],
+        )
+        if str(manifest.get("status") or "") == "completed" and str(manifest.get("result_status") or "") == "success":
+            loaded = _load_persisted_neural_drift_run(paths["manifest"])
+            return {
+                **dict(loaded.get("results") or {}),
+                "run_id": str(loaded.get("run_id") or ""),
+                "run_signature": str(loaded.get("run_signature") or ""),
+                "manifest": dict(loaded.get("manifest") or {}),
+                "manifest_path": str(loaded.get("manifest_path") or ""),
+                "run_dir": str(loaded.get("run_dir") or ""),
+                "download_bundle": dict(loaded.get("download_bundle") or {}),
+            }
+        previous_status = str(manifest.get("status") or "unknown")
+        manifest["status"] = "running"
+        manifest["result_status"] = "running"
+        manifest["last_error"] = None
+        manifest["config"] = _to_json_safe(config)
+        manifest["dataset_context"] = _to_json_safe(dataset_context)
+        manifest["resume"] = {
+            "auto_resumed": True,
+            "checkpoint_status": previous_status,
+        }
+        start_event_type = "resume"
+        run_id = str(manifest.get("run_id") or resume_run_id)
+    else:
+        run_id = _build_neural_drift_run_id(run_signature)
+        run_dir = _neural_drift_run_dir(run_id, checkpoint_root=checkpoint_root)
+        paths = _neural_drift_run_paths(run_dir)
+        manifest = _initial_neural_drift_manifest(
+            run_id=run_id,
+            run_signature=run_signature,
+            dataset_context=dataset_context,
+            config=config,
+            baseline_specs=runtime["baseline_specs"],
+            experiment_specs=runtime["experiment_specs"],
+        )
+        start_event_type = "run_start"
+
+    _ensure_neural_drift_run_dirs(paths)
+    _persist_neural_drift_manifest(paths["manifest"], manifest)
+    _persist_neural_drift_live_status(
+        paths["live_status"],
+        _build_neural_drift_live_status_payload(
+            manifest,
+            label="Iniciando Neural drift persistente...",
+            detail="Preparando runtime y checkpoints.",
+            context={"event": start_event_type},
+        ),
+    )
+    _append_neural_drift_live_event(
+        paths["live_events"],
+        {
+            "timestamp": _now_iso(),
+            "event": start_event_type,
+            "run_id": run_id,
+            "run_signature": run_signature,
+        },
+    )
+
+    total_units = max(1, int((manifest.get("progress") or {}).get("total_units", 1)))
+
+    def _progress_message(label: str) -> None:
+        if progress_callback is None:
+            return
+        progress = dict(manifest.get("progress") or {})
+        ratio = float(progress.get("progress_ratio", 0.0))
+        progress_callback(0.10 + 0.85 * ratio, label)
+
+    try:
+        for baseline_spec in runtime["baseline_specs"]:
+            baseline_key = str(baseline_spec["baseline_key"])
+            baseline_entry = dict((manifest.get("baseline_index") or {}).get(baseline_key) or {})
+            pending_experiment_specs = [
+                dict(spec)
+                for spec in baseline_spec["experiment_specs"]
+                if str(
+                    ((manifest.get("experiment_index") or {}).get(str(spec["experiment_key"])) or {}).get("status")
+                    or "pending"
+                )
+                != "completed"
+            ]
+            if not pending_experiment_specs:
+                continue
+
+            model_name = str(baseline_spec["model"])
+            balance_mode = str(baseline_spec["balance_mode"])
+            baseline_entry["status"] = "running"
+            baseline_entry["error"] = None
+            manifest["baseline_index"][baseline_key] = baseline_entry
+            _update_neural_drift_manifest_progress(manifest)
+            _persist_neural_drift_manifest(paths["manifest"], manifest)
+            _persist_neural_drift_live_status(
+                paths["live_status"],
+                _build_neural_drift_live_status_payload(
+                    manifest,
+                    label=f"Entrenando baseline {model_name} | {balance_mode}",
+                    detail=f"{manifest['progress']['completed_units']} / {total_units} unidades completadas.",
+                    context={
+                        "event": "baseline_start",
+                        "baseline_key": baseline_key,
+                        "model": model_name,
+                        "balance_mode": balance_mode,
+                    },
+                ),
+            )
+            _progress_message(f"Entrenando baseline persistente para {model_name} | {balance_mode}...")
+
+            canonical_artifact = _train_canonical_artifact(
+                model_name,
+                runtime["split"]["X_train"],
+                runtime["split"]["y_train"],
+                runtime["split"]["X_val"],
+                runtime["split"]["y_val"],
+                config=config,
+                balance_mode=balance_mode,
+                feature_metadata=runtime["feature_metadata"],
+            )
+            baseline_row = _build_baseline_result_row(
+                model_name,
+                balance_mode,
+                canonical_artifact,
+                runtime["split"],
+            )
+            baseline_paths = _persist_neural_drift_baseline_checkpoint(
+                paths,
+                baseline_key=baseline_key,
+                baseline_row=baseline_row,
+            )
+            manifest["baseline_index"][baseline_key] = {
+                **baseline_entry,
+                "status": "completed",
+                "artifact_paths": baseline_paths,
+                "error": None,
+                "completed_at": _now_iso(),
+            }
+            _update_neural_drift_manifest_progress(manifest)
+            _persist_neural_drift_manifest(paths["manifest"], manifest)
+            _append_neural_drift_live_event(
+                paths["live_events"],
+                {
+                    "timestamp": _now_iso(),
+                    "event": "baseline_complete",
+                    "run_id": run_id,
+                    "baseline_key": baseline_key,
+                    "model": model_name,
+                    "balance_mode": balance_mode,
+                },
+            )
+
+            for experiment_spec in pending_experiment_specs:
+                experiment_key = str(experiment_spec["experiment_key"])
+                strategy = str(experiment_spec["strategy"])
+                manifest["experiment_index"][experiment_key]["status"] = "running"
+                manifest["experiment_index"][experiment_key]["error"] = None
+                _update_neural_drift_manifest_progress(manifest)
+                _persist_neural_drift_manifest(paths["manifest"], manifest)
+                _append_neural_drift_live_event(
+                    paths["live_events"],
+                    {
+                        "timestamp": _now_iso(),
+                        "event": "experiment_start",
+                        "run_id": run_id,
+                        "experiment_key": experiment_key,
+                        "model": model_name,
+                        "strategy": strategy,
+                        "balance_mode": balance_mode,
+                    },
+                )
+                _persist_neural_drift_live_status(
+                    paths["live_status"],
+                    _build_neural_drift_live_status_payload(
+                        manifest,
+                        label=f"Simulando {model_name} | {strategy} | {balance_mode}",
+                        detail=f"{manifest['progress']['completed_units']} / {total_units} unidades completadas.",
+                        context={
+                            "event": "experiment_start",
+                            "experiment_key": experiment_key,
+                            "model": model_name,
+                            "strategy": strategy,
+                            "balance_mode": balance_mode,
+                        },
+                    ),
+                )
+                _progress_message(f"Simulando {model_name} | {strategy} | {balance_mode}...")
+
+                def _persisting_live_callback(payload: Dict[str, Any]) -> None:
+                    if live_update_callback is not None:
+                        live_update_callback(payload)
+                    if str(payload.get("event") or "") != "stream_step":
+                        return
+                    step_index = int(payload.get("stream_step_index", 0))
+                    total_rows = max(1, int(payload.get("stream_total_rows", 0)))
+                    if step_index <= 0:
+                        return
+                    if (
+                        step_index % NEURAL_DRIFT_LIVE_STATUS_HEARTBEAT_STEPS != 0
+                        and step_index != total_rows
+                    ):
+                        return
+                    _persist_neural_drift_live_status(
+                        paths["live_status"],
+                        _build_neural_drift_live_status_payload(
+                            manifest,
+                            label=f"Streaming {model_name} | {strategy} | {balance_mode}",
+                            detail=(
+                                f"Paso {step_index}/{total_rows} | "
+                                f"severity={float(payload.get('severity_score', 0.0)):.3f} | "
+                                f"action={payload.get('action_taken', 'none')}"
+                            ),
+                            context={
+                                "event": "stream_heartbeat",
+                                "experiment_key": experiment_key,
+                                "model": model_name,
+                                "strategy": strategy,
+                                "balance_mode": balance_mode,
+                                "stream_step_index": step_index,
+                                "stream_total_rows": total_rows,
+                            },
+                        ),
+                    )
+
+                experiment_payload = _execute_backtest_experiment(
+                    model_name=model_name,
+                    strategy=strategy,
+                    balance_mode=balance_mode,
+                    canonical_artifact=canonical_artifact,
+                    split=runtime["split"],
+                    config=config,
+                    selected_channels=runtime["selected_channels"],
+                    live_update_callback=_persisting_live_callback,
+                )
+                experiment_results = _finalize_backtest_results(
+                    dataset=runtime["dataset"],
+                    split=runtime["split"],
+                    baseline_rows=[baseline_row],
+                    stream_rows=experiment_payload["stream_rows"],
+                    drift_rows=experiment_payload["drift_rows"],
+                    attention_rows=experiment_payload["attention_rows"],
+                    detector_attention_rows=experiment_payload["detector_attention_rows"],
+                    config=config,
+                )
+                experiment_artifact_paths = _persist_neural_drift_result_artifacts(
+                    _experiment_dir(paths, experiment_key),
+                    experiment_results,
+                    keys=[key for key in NEURAL_DRIFT_RESULT_KEYS if key != "baseline"],
+                )
+                summary_df = experiment_results.get("summary")
+                drift_df = experiment_results.get("drift_events")
+                manifest["experiment_index"][experiment_key] = {
+                    **dict(manifest["experiment_index"][experiment_key]),
+                    "status": "completed",
+                    "artifact_paths": experiment_artifact_paths,
+                    "error": None,
+                    "completed_at": _now_iso(),
+                    "summary_rows": (
+                        int(len(summary_df))
+                        if isinstance(summary_df, pd.DataFrame)
+                        else 0
+                    ),
+                    "n_drift_events": (
+                        int(len(drift_df))
+                        if isinstance(drift_df, pd.DataFrame)
+                        else 0
+                    ),
+                }
+                _update_neural_drift_manifest_progress(manifest)
+                _persist_neural_drift_manifest(paths["manifest"], manifest)
+                _append_neural_drift_live_event(
+                    paths["live_events"],
+                    {
+                        "timestamp": _now_iso(),
+                        "event": "experiment_complete",
+                        "run_id": run_id,
+                        "experiment_key": experiment_key,
+                        "model": model_name,
+                        "strategy": strategy,
+                        "balance_mode": balance_mode,
+                    },
+                )
+                _progress_message(f"Experimento completado: {model_name} | {strategy} | {balance_mode}.")
+
+        assembled_results = _assemble_persisted_neural_drift_results(manifest, run_dir=paths["run_dir"])
+        manifest["artifacts"] = _persist_neural_drift_result_artifacts(
+            paths["artifacts_dir"],
+            assembled_results,
+            keys=NEURAL_DRIFT_RESULT_KEYS,
+        )
+        manifest["status"] = "completed"
+        manifest["result_status"] = "success"
+        manifest["last_error"] = None
+        manifest["resume"] = {
+            "auto_resumed": bool(resume_run_id),
+            "checkpoint_status": "completed",
+        }
+        _update_neural_drift_manifest_progress(manifest)
+        _persist_neural_drift_manifest(paths["manifest"], manifest)
+        _persist_neural_drift_live_status(
+            paths["live_status"],
+            _build_neural_drift_live_status_payload(
+                manifest,
+                label="Corrida Neural drift completada.",
+                detail=f"{manifest['progress']['completed_units']} / {total_units} unidades completadas.",
+                status="completed",
+                result_status="success",
+                context={"event": "run_complete"},
+            ),
+        )
+        _append_neural_drift_live_event(
+            paths["live_events"],
+            {
+                "timestamp": _now_iso(),
+                "event": "run_complete",
+                "run_id": run_id,
+            },
+        )
+        _progress_message("Corrida persistente completada.")
+        return {
+            **assembled_results,
+            "run_id": str(run_id),
+            "run_signature": str(run_signature),
+            "manifest": manifest,
+            "manifest_path": str(paths["manifest"]),
+            "run_dir": str(paths["run_dir"]),
+            "download_bundle": _download_bundle_from_results(assembled_results),
+        }
+    except Exception as exc:
+        baseline_index = dict(manifest.get("baseline_index") or {})
+        experiment_index = dict(manifest.get("experiment_index") or {})
+        for key, item in baseline_index.items():
+            if str(item.get("status") or "") == "running":
+                baseline_index[str(key)] = {
+                    **dict(item),
+                    "status": "failed",
+                    "error": str(exc),
+                }
+        for key, item in experiment_index.items():
+            if str(item.get("status") or "") == "running":
+                experiment_index[str(key)] = {
+                    **dict(item),
+                    "status": "failed",
+                    "error": str(exc),
+                }
+        manifest["baseline_index"] = baseline_index
+        manifest["experiment_index"] = experiment_index
+        manifest["status"] = "failed"
+        manifest["result_status"] = "failed"
+        manifest["last_error"] = {
+            "message": str(exc),
+            "traceback": traceback.format_exc(limit=10),
+        }
+        _update_neural_drift_manifest_progress(manifest)
+        _persist_neural_drift_manifest(paths["manifest"], manifest)
+        _persist_neural_drift_live_status(
+            paths["live_status"],
+            _build_neural_drift_live_status_payload(
+                manifest,
+                label="Corrida Neural drift fallida.",
+                detail=str(exc),
+                status="failed",
+                result_status="failed",
+                context={"event": "error"},
+            ),
+        )
+        _append_neural_drift_live_event(
+            paths["live_events"],
+            {
+                "timestamp": _now_iso(),
+                "event": "error",
+                "run_id": str(manifest.get("run_id") or run_id),
+                "message": str(exc),
+            },
+        )
+        raise
 
 
 def _live_backtest_chart_frames(
@@ -4436,6 +6209,29 @@ def _build_configuration_controls_explanation(config: Dict[str, Any]) -> Dict[st
             DEFAULT_CONFIG["xgb_fine_tune_selection_metric"],
         )
     )
+    xgb_fine_tune_selection_metric_label = _xgb_fine_tune_selection_metric_label(
+        xgb_fine_tune_selection_metric
+    )
+    available_metric_labels = ", ".join(
+        f"`{_xgb_fine_tune_selection_metric_label(metric)}`"
+        for metric in AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS
+    )
+    xgb_window_min = int(config.get("xgb_fine_tune_window_min", DEFAULT_CONFIG["xgb_fine_tune_window_min"]))
+    xgb_window_max = int(config.get("xgb_fine_tune_window_max", DEFAULT_CONFIG["xgb_fine_tune_window_max"]))
+    xgb_rounds_min = int(config.get("xgb_fine_tune_rounds_min", DEFAULT_CONFIG["xgb_fine_tune_rounds_min"]))
+    xgb_rounds_max = int(config.get("xgb_fine_tune_rounds_max", DEFAULT_CONFIG["xgb_fine_tune_rounds_max"]))
+    xgb_eta_multiplier_max = float(
+        config.get(
+            "xgb_fine_tune_eta_multiplier_max",
+            DEFAULT_CONFIG["xgb_fine_tune_eta_multiplier_max"],
+        )
+    )
+    xgb_recent_weight_max = float(
+        config.get(
+            "xgb_fine_tune_recent_weight_max",
+            DEFAULT_CONFIG["xgb_fine_tune_recent_weight_max"],
+        )
+    )
     recalibration_min_rows = int(
         config.get("recalibration_min_rows", DEFAULT_CONFIG["recalibration_min_rows"])
     )
@@ -4448,6 +6244,7 @@ def _build_configuration_controls_explanation(config: Dict[str, Any]) -> Dict[st
         config.get("rolling_metric_window", DEFAULT_CONFIG["rolling_metric_window"])
     )
     history_sample_size = int(config.get("history_sample_size", DEFAULT_CONFIG["history_sample_size"]))
+    xgb_parallel_neural_enabled = _xgb_parallel_neural_enabled(config)
     point_signal_weight = float(
         config.get("drift_point_signal_weight", DEFAULT_CONFIG["drift_point_signal_weight"])
     )
@@ -4517,8 +6314,14 @@ def _build_configuration_controls_explanation(config: Dict[str, Any]) -> Dict[st
             ),
             (
                 f"`Models = {models_summary}`",
-                "Define que predictores se comparan en paralelo. `Torch MLP` y `Torch MLP + Attention` habilitan tambien "
-                "la senal neuronal `embedding drift`; `XGBoost` se queda en canales clasicos."
+                "Define que predictores se comparan en paralelo. `Torch MLP` y `Torch MLP + Attention` usan sus propios "
+                "embeddings para `embedding drift`. `XGBoost` puede activar una rama neuronal auxiliar paralela para sumar "
+                "senales de `score drift`, `error drift` y `embedding drift`."
+            ),
+            (
+                f"`XGBoost parallel neural branch = {'on' if xgb_parallel_neural_enabled else 'off'}`",
+                "Cuando esta activa, `XGBoost` mantiene una `Torch MLP` auxiliar sincronizada con el mismo stream para "
+                "detectar drift neuronal sin cambiar el rol de `XGBoost` como predictor oficial."
             ),
             (
                 f"`Strategies = {strategies_summary}`",
@@ -4526,9 +6329,10 @@ def _build_configuration_controls_explanation(config: Dict[str, Any]) -> Dict[st
                 "el modelo con la ventana reciente; `retrain` vuelve a entrenar usando historia mas un bloque reciente."
             ),
             (
-                f"`XGBoost fine-tuning metric = {xgb_fine_tune_selection_metric}`",
+                f"`XGBoost fine-tuning metric = {xgb_fine_tune_selection_metric_label}`",
                 "Cuando `XGBoost` usa `fine_tuning`, la app prueba varias cantidades de rondas nuevas sobre una ventana "
-                "adaptativa y se queda con la candidata que mejor rinde segun esta metrica (`f_beta_recall`, `pr_auc` o `brier`)."
+                "adaptativa y se queda con la candidata que mejor rinde segun esta metrica. "
+                f"Opciones disponibles: {available_metric_labels}."
             ),
             (
                 f"`Drift channels = {channels_summary}`",
@@ -4552,6 +6356,13 @@ def _build_configuration_controls_explanation(config: Dict[str, Any]) -> Dict[st
                 "`Ventana adaptativa de XGBoost`",
                 "Solo afecta a `fine_tuning` de `XGBoost`. A mayor severidad, aumenta la ventana usada para actualizar, "
                 "sube el peso relativo de las observaciones mas nuevas y se habilitan mas rondas candidatas del booster."
+            ),
+            (
+                "`Optimizador de XGBoost fine-tuning`",
+                "Los controles `Window min/max`, `Rounds min/max`, `Eta multiplier max` y `Recent weight max` "
+                "definen el rango que explora la actualizacion adaptativa. "
+                f"Ahora mismo estan en window `{xgb_window_min}`-`{xgb_window_max}`, rounds `{xgb_rounds_min}`-`{xgb_rounds_max}`, "
+                f"`eta` max `{xgb_eta_multiplier_max:.2f}` y peso reciente max `{xgb_recent_weight_max:.2f}`."
             ),
             (
                 f"`Hybrid history sample = {history_sample_size}`",
@@ -4645,239 +6456,422 @@ def _render_feature_source_selector(context: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _render_configuration_subtab(dataset_bundle: Dict[str, Any]) -> Dict[str, Any]:
-    st.markdown("**Dataset activo**")
     df = dataset_bundle["df"]
-    if "neural_drift_dataset_percent" not in st.session_state:
-        st.session_state["neural_drift_dataset_percent"] = int(DEFAULT_CONFIG["dataset_percent"])
-    dataset_percent = st.slider(
-        "Porcentaje del dataset para Neural drift",
-        min_value=1,
-        max_value=100,
-        step=1,
-        key="neural_drift_dataset_percent",
-        help="Usa el tramo temporal mas reciente del dataset para acelerar experimentos manteniendo el orden temporal.",
-    )
-    active_df = _subset_dataset_by_percentage(df, dataset_percent=float(dataset_percent))
-
-    metrics_col_1, metrics_col_2, metrics_col_3, metrics_col_4 = st.columns(4)
-    metrics_col_1.metric("Source", str(dataset_bundle.get("source", "-")))
-    metrics_col_2.metric("Rows totales", int(len(df)))
-    metrics_col_3.metric("Rows usados", int(len(active_df)))
-    metrics_col_4.metric("Features", int(len(dataset_bundle.get("feature_cols", []))))
-    if "interval_start" in active_df.columns and not active_df.empty:
-        active_start = pd.to_datetime(active_df["interval_start"], errors="coerce").min()
-        active_end = pd.to_datetime(active_df["interval_start"], errors="coerce").max()
-        if pd.notna(active_start) and pd.notna(active_end):
-            st.caption(
-                "El experimento usara el tramo mas reciente del dataset: "
-                f"{pd.Timestamp(active_start)} -> {pd.Timestamp(active_end)}."
-            )
-    if dataset_bundle.get("feature_export_path"):
-        st.caption(f"Export DuckDB: {dataset_bundle['feature_export_path']}")
-
     max_stream_min = 48
     max_stream_max = max(max_stream_min, int(len(df)))
     max_stream_default = min(int(DEFAULT_CONFIG["max_stream_rows"]), max_stream_max)
     max_stream_default = max(max_stream_min, max_stream_default)
 
     config_state_defaults = {
+        "neural_drift_dataset_percent": int(DEFAULT_CONFIG["dataset_percent"]),
         "neural_drift_sensitivity_preset": str(DEFAULT_CONFIG["detector_sensitivity_preset"]),
         "neural_drift_recent_window_size": int(DEFAULT_CONFIG["recent_window_size"]),
         "neural_drift_severity_threshold": float(DEFAULT_CONFIG["severity_threshold"]),
         "neural_drift_detector_adwin_delta": float(DEFAULT_CONFIG["detector_adwin_delta"]),
         "neural_drift_point_signal_weight": float(DEFAULT_CONFIG["drift_point_signal_weight"]),
+        "neural_drift_xgb_fine_tune_selection_metric": str(DEFAULT_CONFIG["xgb_fine_tune_selection_metric"]),
+        "neural_drift_xgb_fine_tune_window_min": int(DEFAULT_CONFIG["xgb_fine_tune_window_min"]),
+        "neural_drift_xgb_fine_tune_window_max": int(DEFAULT_CONFIG["xgb_fine_tune_window_max"]),
+        "neural_drift_xgb_fine_tune_rounds_min": int(DEFAULT_CONFIG["xgb_fine_tune_rounds_min"]),
+        "neural_drift_xgb_fine_tune_rounds_max": int(DEFAULT_CONFIG["xgb_fine_tune_rounds_max"]),
+        "neural_drift_xgb_fine_tune_eta_multiplier_max": float(
+            DEFAULT_CONFIG["xgb_fine_tune_eta_multiplier_max"]
+        ),
+        "neural_drift_xgb_fine_tune_recent_weight_max": float(
+            DEFAULT_CONFIG["xgb_fine_tune_recent_weight_max"]
+        ),
     }
     for state_key, default_value in config_state_defaults.items():
         if state_key not in st.session_state:
             st.session_state[state_key] = default_value
 
+    st.session_state["neural_drift_xgb_fine_tune_window_min"] = int(
+        st.session_state.get(
+            "neural_drift_xgb_fine_tune_window_min",
+            DEFAULT_CONFIG["xgb_fine_tune_window_min"],
+        )
+    )
+    st.session_state["neural_drift_xgb_fine_tune_window_max"] = max(
+        int(st.session_state["neural_drift_xgb_fine_tune_window_min"]),
+        int(
+            st.session_state.get(
+                "neural_drift_xgb_fine_tune_window_max",
+                DEFAULT_CONFIG["xgb_fine_tune_window_max"],
+            )
+        ),
+    )
+    st.session_state["neural_drift_xgb_fine_tune_rounds_min"] = int(
+        st.session_state.get(
+            "neural_drift_xgb_fine_tune_rounds_min",
+            DEFAULT_CONFIG["xgb_fine_tune_rounds_min"],
+        )
+    )
+    st.session_state["neural_drift_xgb_fine_tune_rounds_max"] = max(
+        int(st.session_state["neural_drift_xgb_fine_tune_rounds_min"]),
+        int(
+            st.session_state.get(
+                "neural_drift_xgb_fine_tune_rounds_max",
+                DEFAULT_CONFIG["xgb_fine_tune_rounds_max"],
+            )
+        ),
+    )
+
     def _on_detector_sensitivity_preset_change() -> None:
         _apply_detector_sensitivity_preset_to_session(st.session_state.get("neural_drift_sensitivity_preset"))
 
-    st.markdown("**Sensibilidad del detector**")
-    sensitivity_col_1, sensitivity_col_2 = st.columns([1.2, 2.2])
-    sensitivity_preset = sensitivity_col_1.selectbox(
-        "Preset de sensibilidad",
-        AVAILABLE_DETECTOR_SENSITIVITY_PRESETS,
-        key="neural_drift_sensitivity_preset",
-        on_change=_on_detector_sensitivity_preset_change,
-    )
-    sensitivity_description = _detector_sensitivity_preset_description(sensitivity_preset)
-    if sensitivity_description:
-        sensitivity_col_2.info(sensitivity_description)
+    selected_models: List[str] = list(DEFAULT_CONFIG["models"])
+    selected_strategies: List[str] = list(DEFAULT_CONFIG["strategies"])
+    selected_balance_modes: List[str] = [BALANCE_MODE_NONE, BALANCE_MODE_SMOTE]
 
-    sensitivity_knob_col_1, sensitivity_knob_col_2 = st.columns(2)
-    detector_adwin_delta = sensitivity_knob_col_1.number_input(
-        "ADWIN delta",
-        min_value=0.0005,
-        max_value=0.0500,
-        step=0.0005,
-        format="%.4f",
-        key="neural_drift_detector_adwin_delta",
-    )
-    point_signal_weight = sensitivity_knob_col_2.slider(
-        "Point signal weight",
-        min_value=0.0,
-        max_value=1.0,
-        step=0.05,
-        key="neural_drift_point_signal_weight",
-        help="0.0 prioriza la senal suavizada por ventana; 1.0 prioriza los picos locales y reproduce la sensibilidad actual.",
+    general_tab, adwin_tab, models_tab, adaptation_tab = st.tabs(
+        ["General", "ADWIN", "Modelos", "Adaptación y XGBoost"]
     )
 
-    config_col_1, config_col_2, config_col_3 = st.columns(3)
-    lookback_steps = config_col_1.number_input(
-        "Lookback steps",
-        min_value=4,
-        max_value=36,
-        value=int(DEFAULT_CONFIG["lookback_steps"]),
-        step=1,
-        key="neural_drift_lookback_steps",
-    )
-    horizon_steps = config_col_2.number_input(
-        "Horizon steps",
-        min_value=1,
-        max_value=6,
-        value=int(DEFAULT_CONFIG["horizon_steps"]),
-        step=1,
-        key="neural_drift_horizon_steps",
-    )
-    max_stream_rows = config_col_3.number_input(
-        "Max stream rows",
-        min_value=max_stream_min,
-        max_value=max_stream_max,
-        value=max_stream_default,
-        step=24,
-        key="neural_drift_max_stream_rows",
-    )
-
-    model_col, strategy_col, balance_col, channel_col = st.columns(4)
-    selected_models = model_col.multiselect(
-        "Models",
-        AVAILABLE_MODELS,
-        default=list(DEFAULT_CONFIG["models"]),
-        key="neural_drift_models",
-    )
-    selected_strategies = strategy_col.multiselect(
-        "Strategies",
-        AVAILABLE_STRATEGIES,
-        default=list(DEFAULT_CONFIG["strategies"]),
-        key="neural_drift_strategies",
-    )
-    selected_balance_modes = balance_col.multiselect(
-        "Balance modes",
-        AVAILABLE_BALANCE_MODES,
-        default=[BALANCE_MODE_NONE, BALANCE_MODE_SMOTE],
-        key="neural_drift_balance_modes",
-        help="`smote` se sintoniza solo sobre train/validation y nunca se aplica sobre el stream.",
-    )
-    selected_channels = channel_col.multiselect(
-        "Drift channels",
-        AVAILABLE_DRIFT_CHANNELS,
-        default=list(DEFAULT_CONFIG["drift_channels"]),
-        key="neural_drift_channels",
-    )
-    if MODEL_XGBOOST in selected_models and STRATEGY_FINE_TUNING in selected_strategies:
-        st.caption(
-            "En `XGBoost`, `fine_tuning` mantiene fija la ventana del detector (`Recent window size`), "
-            "pero calcula internamente una ventana adaptativa segun la severidad del drift."
+    with general_tab:
+        st.markdown("**Dataset activo**")
+        dataset_percent = st.slider(
+            "Porcentaje del dataset para Neural drift",
+            min_value=1,
+            max_value=100,
+            step=1,
+            key="neural_drift_dataset_percent",
+            help="Usa el tramo temporal mas reciente del dataset para acelerar experimentos manteniendo el orden temporal.",
         )
-    if BALANCE_MODE_SMOTE in selected_balance_modes:
-        st.caption(
-            "El modo `smote` busca internamente `sampling_strategy` y `k_neighbors` sobre el split de entrenamiento; "
-            "la validacion y el stream se mantienen siempre sin oversampling."
-        )
+        active_df = _subset_dataset_by_percentage(df, dataset_percent=float(dataset_percent))
 
-    xgb_policy_col_1, xgb_policy_col_2 = st.columns([1.3, 2.7])
-    xgb_fine_tune_selection_metric = xgb_policy_col_1.selectbox(
-        "XGBoost fine-tuning metric",
-        AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS,
-        index=AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS.index(
-            _resolve_xgb_fine_tune_selection_metric(
-                st.session_state.get(
-                    "neural_drift_xgb_fine_tune_selection_metric",
-                    DEFAULT_CONFIG["xgb_fine_tune_selection_metric"],
+        metrics_col_1, metrics_col_2, metrics_col_3, metrics_col_4 = st.columns(4)
+        metrics_col_1.metric("Source", str(dataset_bundle.get("source", "-")))
+        metrics_col_2.metric("Rows totales", int(len(df)))
+        metrics_col_3.metric("Rows usados", int(len(active_df)))
+        metrics_col_4.metric("Features", int(len(dataset_bundle.get("feature_cols", []))))
+        if "interval_start" in active_df.columns and not active_df.empty:
+            active_start = pd.to_datetime(active_df["interval_start"], errors="coerce").min()
+            active_end = pd.to_datetime(active_df["interval_start"], errors="coerce").max()
+            if pd.notna(active_start) and pd.notna(active_end):
+                st.caption(
+                    "El experimento usara el tramo mas reciente del dataset: "
+                    f"{pd.Timestamp(active_start)} -> {pd.Timestamp(active_end)}."
                 )
+        if dataset_bundle.get("feature_export_path"):
+            st.caption(f"Export DuckDB: {dataset_bundle['feature_export_path']}")
+
+        config_col_1, config_col_2, config_col_3 = st.columns(3)
+        config_col_1.number_input(
+            "Lookback steps",
+            min_value=4,
+            max_value=36,
+            value=int(DEFAULT_CONFIG["lookback_steps"]),
+            step=1,
+            key="neural_drift_lookback_steps",
+        )
+        config_col_2.number_input(
+            "Horizon steps",
+            min_value=1,
+            max_value=6,
+            value=int(DEFAULT_CONFIG["horizon_steps"]),
+            step=1,
+            key="neural_drift_horizon_steps",
+        )
+        config_col_3.number_input(
+            "Max stream rows",
+            min_value=max_stream_min,
+            max_value=max_stream_max,
+            value=max_stream_default,
+            step=24,
+            key="neural_drift_max_stream_rows",
+        )
+
+    with adwin_tab:
+        st.markdown("**Sensibilidad del detector**")
+        sensitivity_col_1, sensitivity_col_2 = st.columns([1.2, 2.2])
+        sensitivity_preset = sensitivity_col_1.selectbox(
+            "Preset de sensibilidad",
+            AVAILABLE_DETECTOR_SENSITIVITY_PRESETS,
+            key="neural_drift_sensitivity_preset",
+            on_change=_on_detector_sensitivity_preset_change,
+        )
+        sensitivity_description = _detector_sensitivity_preset_description(sensitivity_preset)
+        if sensitivity_description:
+            sensitivity_col_2.info(sensitivity_description)
+
+        sensitivity_knob_col_1, sensitivity_knob_col_2 = st.columns(2)
+        sensitivity_knob_col_1.number_input(
+            "ADWIN delta",
+            min_value=0.0005,
+            max_value=0.0500,
+            step=0.0005,
+            format="%.4f",
+            key="neural_drift_detector_adwin_delta",
+        )
+        sensitivity_knob_col_2.slider(
+            "Point signal weight",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="neural_drift_point_signal_weight",
+            help="0.0 prioriza la senal suavizada por ventana; 1.0 prioriza los picos locales y reproduce la sensibilidad actual.",
+        )
+        st.slider(
+            "Severity trigger",
+            min_value=0.10,
+            max_value=0.95,
+            step=0.05,
+            key="neural_drift_severity_threshold",
+        )
+
+    with models_tab:
+        model_col, strategy_col, balance_col, channel_col = st.columns(4)
+        selected_models = model_col.multiselect(
+            "Models",
+            AVAILABLE_MODELS,
+            default=list(DEFAULT_CONFIG["models"]),
+            key="neural_drift_models",
+        )
+        selected_strategies = strategy_col.multiselect(
+            "Strategies",
+            AVAILABLE_STRATEGIES,
+            default=list(DEFAULT_CONFIG["strategies"]),
+            key="neural_drift_strategies",
+        )
+        selected_balance_modes = balance_col.multiselect(
+            "Balance modes",
+            AVAILABLE_BALANCE_MODES,
+            default=[BALANCE_MODE_NONE, BALANCE_MODE_SMOTE],
+            key="neural_drift_balance_modes",
+            help="`smote` se sintoniza solo sobre train/validation y nunca se aplica sobre el stream.",
+        )
+        channel_col.multiselect(
+            "Drift channels",
+            AVAILABLE_DRIFT_CHANNELS,
+            default=list(DEFAULT_CONFIG["drift_channels"]),
+            key="neural_drift_channels",
+        )
+        if MODEL_XGBOOST in selected_models and STRATEGY_FINE_TUNING in selected_strategies:
+            st.caption(
+                "En `XGBoost`, `fine_tuning` mantiene fija la ventana del detector (`Recent window size`), "
+                "pero calcula internamente una ventana adaptativa segun la severidad del drift."
             )
-        ),
-        key="neural_drift_xgb_fine_tune_selection_metric",
-        help="Selecciona como se elige la mejor cantidad de rondas nuevas en el `fine_tuning` adaptativo de `XGBoost`.",
-    )
-    xgb_policy_col_2.info(
-        "Solo afecta a `XGBoost` + `fine_tuning`: el booster continua desde el modelo actual, "
-        "aumenta el peso de las filas mas recientes y busca la mejor cantidad de rondas nuevas con la metrica elegida."
-    )
+        if BALANCE_MODE_SMOTE in selected_balance_modes:
+            st.caption(
+                "El modo `smote` busca internamente `sampling_strategy` y `k_neighbors` sobre el split de entrenamiento; "
+                "la validacion y el stream se mantienen siempre sin oversampling."
+            )
 
-    backtest_col_1, backtest_col_2, backtest_col_3 = st.columns(3)
-    recent_window_size = backtest_col_1.number_input(
-        "Recent window size",
-        min_value=24,
-        max_value=240,
-        step=8,
-        key="neural_drift_recent_window_size",
-    )
-    recalibration_min_rows = backtest_col_2.number_input(
-        "Recalibration min rows",
-        min_value=16,
-        max_value=160,
-        value=int(DEFAULT_CONFIG["recalibration_min_rows"]),
-        step=8,
-        key="neural_drift_recalibration_min_rows",
-    )
-    retrain_min_rows = backtest_col_3.number_input(
-        "Retrain min rows",
-        min_value=24,
-        max_value=240,
-        value=int(DEFAULT_CONFIG["retrain_min_rows"]),
-        step=8,
-        key="neural_drift_retrain_min_rows",
-    )
+    with adaptation_tab:
+        backtest_col_1, backtest_col_2, backtest_col_3 = st.columns(3)
+        backtest_col_1.number_input(
+            "Recent window size",
+            min_value=24,
+            max_value=240,
+            step=8,
+            key="neural_drift_recent_window_size",
+        )
+        backtest_col_2.number_input(
+            "Recalibration min rows",
+            min_value=16,
+            max_value=160,
+            value=int(DEFAULT_CONFIG["recalibration_min_rows"]),
+            step=8,
+            key="neural_drift_recalibration_min_rows",
+        )
+        backtest_col_3.number_input(
+            "Retrain min rows",
+            min_value=24,
+            max_value=240,
+            value=int(DEFAULT_CONFIG["retrain_min_rows"]),
+            step=8,
+            key="neural_drift_retrain_min_rows",
+        )
 
-    severity_col_1, severity_col_2, severity_col_3 = st.columns(3)
-    severity_threshold = severity_col_1.slider(
-        "Severity trigger",
-        min_value=0.10,
-        max_value=0.95,
-        step=0.05,
-        key="neural_drift_severity_threshold",
-    )
-    rolling_metric_window = severity_col_2.number_input(
-        "Rolling metric window",
-        min_value=12,
-        max_value=120,
-        value=int(DEFAULT_CONFIG["rolling_metric_window"]),
-        step=6,
-        key="neural_drift_rolling_metric_window",
-    )
-    history_sample_size = severity_col_3.number_input(
-        "Hybrid history sample",
-        min_value=64,
-        max_value=512,
-        value=int(DEFAULT_CONFIG["history_sample_size"]),
-        step=32,
-        key="neural_drift_history_sample_size",
-    )
+        adaptation_col_1, adaptation_col_2 = st.columns(2)
+        adaptation_col_1.number_input(
+            "Rolling metric window",
+            min_value=12,
+            max_value=120,
+            value=int(DEFAULT_CONFIG["rolling_metric_window"]),
+            step=6,
+            key="neural_drift_rolling_metric_window",
+        )
+        adaptation_col_2.number_input(
+            "Hybrid history sample",
+            min_value=64,
+            max_value=512,
+            value=int(DEFAULT_CONFIG["history_sample_size"]),
+            step=32,
+            key="neural_drift_history_sample_size",
+        )
 
-    config = {
+        st.markdown("**Optimizador de XGBoost fine-tuning**")
+        xgb_policy_col_1, xgb_policy_col_2 = st.columns([1.3, 2.7])
+        xgb_policy_col_1.selectbox(
+            "XGBoost fine-tuning metric",
+            AVAILABLE_XGB_FINE_TUNE_SELECTION_METRICS,
+            key="neural_drift_xgb_fine_tune_selection_metric",
+            format_func=_xgb_fine_tune_selection_metric_label,
+            help="Selecciona como se elige la mejor cantidad de rondas nuevas en el `fine_tuning` adaptativo de `XGBoost`.",
+        )
+        xgb_policy_col_2.info(
+            "Solo afecta a `XGBoost` + `fine_tuning`: el booster continua desde el modelo actual, "
+            "aumenta el peso de las filas mas recientes y busca la mejor cantidad de rondas nuevas con la metrica elegida."
+        )
+        st.caption(
+            "Estos controles ajustan el rango del optimizador adaptativo: tamano de ventana, rondas candidatas, "
+            "escalado maximo de learning rate (`eta`) y peso maximo para observaciones recientes."
+        )
+
+        xgb_window_col_1, xgb_window_col_2 = st.columns(2)
+        xgb_window_col_1.number_input(
+            "XGBoost fine-tuning window min",
+            min_value=16,
+            max_value=512,
+            step=8,
+            key="neural_drift_xgb_fine_tune_window_min",
+        )
+        xgb_window_col_2.number_input(
+            "XGBoost fine-tuning window max",
+            min_value=int(st.session_state.get("neural_drift_xgb_fine_tune_window_min", 16)),
+            max_value=1024,
+            step=8,
+            key="neural_drift_xgb_fine_tune_window_max",
+        )
+
+        xgb_rounds_col_1, xgb_rounds_col_2 = st.columns(2)
+        xgb_rounds_col_1.number_input(
+            "XGBoost fine-tuning rounds min",
+            min_value=1,
+            max_value=128,
+            step=1,
+            key="neural_drift_xgb_fine_tune_rounds_min",
+        )
+        xgb_rounds_col_2.number_input(
+            "XGBoost fine-tuning rounds max",
+            min_value=int(st.session_state.get("neural_drift_xgb_fine_tune_rounds_min", 1)),
+            max_value=256,
+            step=1,
+            key="neural_drift_xgb_fine_tune_rounds_max",
+        )
+
+        xgb_optimizer_col_1, xgb_optimizer_col_2 = st.columns(2)
+        xgb_optimizer_col_1.number_input(
+            "XGBoost eta multiplier max",
+            min_value=1.0,
+            max_value=4.0,
+            step=0.05,
+            format="%.2f",
+            key="neural_drift_xgb_fine_tune_eta_multiplier_max",
+        )
+        xgb_optimizer_col_2.number_input(
+            "XGBoost recent weight max",
+            min_value=1.0,
+            max_value=8.0,
+            step=0.10,
+            format="%.2f",
+            key="neural_drift_xgb_fine_tune_recent_weight_max",
+        )
+
+    base_config = {
         **DEFAULT_CONFIG,
-        "lookback_steps": int(lookback_steps),
-        "horizon_steps": int(horizon_steps),
-        "dataset_percent": int(dataset_percent),
-        "max_stream_rows": int(max_stream_rows),
-        "balance_modes": _resolve_balance_modes(selected_balance_modes),
+        **dict(st.session_state.get("neural_drift_config") or {}),
+    }
+    config = {
+        **base_config,
+        "lookback_steps": int(
+            st.session_state.get("neural_drift_lookback_steps", base_config["lookback_steps"])
+        ),
+        "horizon_steps": int(
+            st.session_state.get("neural_drift_horizon_steps", base_config["horizon_steps"])
+        ),
+        "dataset_percent": int(
+            st.session_state.get("neural_drift_dataset_percent", base_config["dataset_percent"])
+        ),
+        "max_stream_rows": int(
+            st.session_state.get("neural_drift_max_stream_rows", max_stream_default)
+        ),
+        "balance_modes": _resolve_balance_modes(
+            st.session_state.get("neural_drift_balance_modes", selected_balance_modes)
+        ),
         "models": list(selected_models),
         "strategies": list(selected_strategies),
-        "drift_channels": list(selected_channels),
-        "recent_window_size": int(recent_window_size),
-        "recalibration_min_rows": int(recalibration_min_rows),
-        "retrain_min_rows": int(retrain_min_rows),
-        "severity_threshold": float(severity_threshold),
-        "detector_sensitivity_preset": str(sensitivity_preset),
-        "detector_adwin_delta": float(detector_adwin_delta),
-        "drift_point_signal_weight": float(point_signal_weight),
-        "rolling_metric_window": int(rolling_metric_window),
-        "history_sample_size": int(history_sample_size),
+        "drift_channels": list(
+            st.session_state.get("neural_drift_channels", base_config["drift_channels"])
+        ),
+        "recent_window_size": int(
+            st.session_state.get("neural_drift_recent_window_size", base_config["recent_window_size"])
+        ),
+        "recalibration_min_rows": int(
+            st.session_state.get(
+                "neural_drift_recalibration_min_rows",
+                base_config["recalibration_min_rows"],
+            )
+        ),
+        "retrain_min_rows": int(
+            st.session_state.get("neural_drift_retrain_min_rows", base_config["retrain_min_rows"])
+        ),
+        "severity_threshold": float(
+            st.session_state.get("neural_drift_severity_threshold", base_config["severity_threshold"])
+        ),
+        "detector_sensitivity_preset": str(
+            st.session_state.get(
+                "neural_drift_sensitivity_preset",
+                base_config["detector_sensitivity_preset"],
+            )
+        ),
+        "detector_adwin_delta": float(
+            st.session_state.get("neural_drift_detector_adwin_delta", base_config["detector_adwin_delta"])
+        ),
+        "drift_point_signal_weight": float(
+            st.session_state.get(
+                "neural_drift_point_signal_weight",
+                base_config["drift_point_signal_weight"],
+            )
+        ),
+        "rolling_metric_window": int(
+            st.session_state.get("neural_drift_rolling_metric_window", base_config["rolling_metric_window"])
+        ),
+        "history_sample_size": int(
+            st.session_state.get("neural_drift_history_sample_size", base_config["history_sample_size"])
+        ),
         "xgb_fine_tune_selection_metric": _resolve_xgb_fine_tune_selection_metric(
-            xgb_fine_tune_selection_metric
+            st.session_state.get(
+                "neural_drift_xgb_fine_tune_selection_metric",
+                base_config["xgb_fine_tune_selection_metric"],
+            )
+        ),
+        "xgb_fine_tune_window_min": int(
+            st.session_state.get(
+                "neural_drift_xgb_fine_tune_window_min",
+                base_config["xgb_fine_tune_window_min"],
+            )
+        ),
+        "xgb_fine_tune_window_max": int(
+            st.session_state.get(
+                "neural_drift_xgb_fine_tune_window_max",
+                base_config["xgb_fine_tune_window_max"],
+            )
+        ),
+        "xgb_fine_tune_rounds_min": int(
+            st.session_state.get(
+                "neural_drift_xgb_fine_tune_rounds_min",
+                base_config["xgb_fine_tune_rounds_min"],
+            )
+        ),
+        "xgb_fine_tune_rounds_max": int(
+            st.session_state.get(
+                "neural_drift_xgb_fine_tune_rounds_max",
+                base_config["xgb_fine_tune_rounds_max"],
+            )
+        ),
+        "xgb_fine_tune_eta_multiplier_max": float(
+            st.session_state.get(
+                "neural_drift_xgb_fine_tune_eta_multiplier_max",
+                base_config["xgb_fine_tune_eta_multiplier_max"],
+            )
+        ),
+        "xgb_fine_tune_recent_weight_max": float(
+            st.session_state.get(
+                "neural_drift_xgb_fine_tune_recent_weight_max",
+                base_config["xgb_fine_tune_recent_weight_max"],
+            )
         ),
     }
     st.session_state["neural_drift_config"] = config
@@ -4917,9 +6911,16 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         "La senal `embedding drift` combina distancia al centroide con un monitor neuronal sobre embeddings. "
         "Ese monitor puede ser un autoencoder clasico o una variante con attention temporal."
     )
+    selected_models = list(current_config.get("models") or [])
+    xgb_parallel_neural_enabled = _xgb_parallel_neural_enabled(current_config)
 
-    if not _has_any_torch_model(list(current_config.get("models") or [])):
-        st.info("Para activar la red que monitorea drift debes incluir `Torch MLP` o `Torch MLP + Attention` en Models.")
+    if not _has_any_torch_model(selected_models) and not (
+        MODEL_XGBOOST in selected_models and xgb_parallel_neural_enabled
+    ):
+        st.info(
+            "Para activar la red que monitorea drift debes incluir `Torch MLP`, `Torch MLP + Attention` "
+            "o habilitar la rama neuronal paralela de `XGBoost`."
+        )
     if DRIFT_EMBEDDING not in list(current_config.get("drift_channels") or []):
         st.info("Para usar la red de drift debes incluir `embedding drift` en Drift channels.")
 
@@ -4983,6 +6984,9 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
                 DEFAULT_CONFIG["drift_monitor_attention_dropout"],
             )
         ),
+        "neural_drift_xgb_parallel_neural_enabled": bool(
+            current_config.get("xgb_parallel_neural_enabled", DEFAULT_CONFIG["xgb_parallel_neural_enabled"])
+        ),
         "neural_drift_attention_feature_hidden_dim": int(
             current_config.get("attention_feature_hidden_dim", DEFAULT_CONFIG["attention_feature_hidden_dim"])
         ),
@@ -5002,6 +7006,22 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
 
     def _on_monitor_profile_change() -> None:
         _apply_drift_monitor_profile_to_session(st.session_state.get("neural_drift_monitor_profile"))
+
+    xgb_parallel_col_1, xgb_parallel_col_2 = st.columns([1.2, 2.2])
+    xgb_parallel_neural_enabled = xgb_parallel_col_1.checkbox(
+        "Usar rama neuronal paralela para XGBoost",
+        key="neural_drift_xgb_parallel_neural_enabled",
+    )
+    if xgb_parallel_neural_enabled:
+        xgb_parallel_col_2.info(
+            "`XGBoost` mantendra una `Torch MLP` auxiliar sincronizada para aportar `embedding drift`, "
+            "`score drift` y `error drift` a la deteccion/adaptacion."
+        )
+    else:
+        xgb_parallel_col_2.info(
+            "Si desactivas esta rama, `XGBoost` vuelve a usar solo canales clasicos y la arquitectura del detector "
+            "quedara como `not_available`."
+        )
 
     selector_col, selector_hint_col = st.columns([1.2, 2.2])
     monitor_profile = selector_col.selectbox(
@@ -5166,6 +7186,7 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
         "drift_monitor_sequence_length": int(monitor_sequence_length),
         "drift_monitor_attention_hidden_dim": int(monitor_attention_hidden_dim),
         "drift_monitor_attention_dropout": float(monitor_attention_dropout),
+        "xgb_parallel_neural_enabled": bool(xgb_parallel_neural_enabled),
         "attention_feature_hidden_dim": int(attention_feature_hidden_dim),
         "attention_temporal_hidden_dim": int(attention_temporal_hidden_dim),
         "attention_dropout": float(attention_dropout),
@@ -5237,10 +7258,205 @@ def _render_monitor_network_subtab(dataset_bundle: Dict[str, Any], current_confi
     return monitor_config
 
 
+def _render_history_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any]) -> None:
+    st.markdown("**Historial de corridas persistidas**")
+    runs = _list_persisted_neural_drift_runs()
+    if not runs:
+        st.info("Todavia no hay corridas persistidas de Neural drift.")
+        return
+
+    run_ids = [str(entry["run_id"]) for entry in runs]
+    if st.session_state.get("neural_drift_history_selected_run_id") not in run_ids:
+        st.session_state["neural_drift_history_selected_run_id"] = run_ids[0]
+
+    history_rows = [
+        {
+            "run_id": str(entry["run_id"]),
+            "status": str(entry["status"]),
+            "result_status": str(entry["result_status"]),
+            "updated_at": str(entry["updated_at"]),
+            "source": str(entry["source"]),
+            "rows_used": int(entry["rows_used"]),
+            "experiments": f"{int(entry['completed_experiments'])}/{int(entry['total_experiments'])}",
+        }
+        for entry in runs
+    ]
+    st.dataframe(_streamlit_arrow_safe_df(pd.DataFrame(history_rows)), width="stretch")
+
+    selected_run_id = str(
+        st.selectbox(
+            "Corrida persistida",
+            run_ids,
+            key="neural_drift_history_selected_run_id",
+        )
+    )
+    selected_entry = next(
+        entry for entry in runs if str(entry.get("run_id") or "") == selected_run_id
+    )
+    manifest_path = Path(str(selected_entry["manifest_path"]))
+    manifest = dict(_load_json_file(manifest_path, default={}) or {})
+    progress = dict(manifest.get("progress") or {})
+    current_signature = _build_run_signature(dataset_bundle, config)
+    selected_signature = str(selected_entry.get("run_signature") or "")
+    signature_matches = bool(selected_signature) and selected_signature == current_signature
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Estado", str(selected_entry["status"]))
+    metric_cols[1].metric(
+        "Experimentos",
+        f"{int(progress.get('completed_experiments', 0))}/{int(progress.get('total_experiments', 0))}",
+    )
+    metric_cols[2].metric("Rows", int(selected_entry["rows_used"]))
+    metric_cols[3].metric("Resultado", str(selected_entry["result_status"]))
+
+    st.caption(f"Run signature: {selected_signature or '-'}")
+    st.caption(f"Manifest: {manifest_path}")
+    if selected_signature and not signature_matches:
+        st.warning(
+            "La firma de esta corrida no coincide con la configuracion o dataset activo. "
+            "Puedes cargar los resultados para analizarlos, pero la reanudacion queda bloqueada."
+        )
+
+    dataset_context = dict(manifest.get("dataset_context") or {})
+    if dataset_context:
+        st.caption(
+            "Source: "
+            f"{dataset_context.get('source') or '-'} | "
+            f"Rows usadas: {int(dataset_context.get('rows_used') or 0)} | "
+            f"Rows totales: {int(dataset_context.get('rows_total') or 0)}"
+        )
+
+    artifacts = dict(manifest.get("artifacts") or {})
+    if artifacts:
+        artifact_rows = [
+            {
+                "artifact": key,
+                "available": bool(path),
+                "path": str(path),
+            }
+            for key, path in sorted(artifacts.items())
+        ]
+        st.dataframe(_streamlit_arrow_safe_df(pd.DataFrame(artifact_rows)), width="stretch")
+
+    action_left, action_right = st.columns(2)
+    load_clicked = action_left.button(
+        "Cargar resultados persistidos",
+        key=f"neural_drift_load_persisted_{selected_run_id}",
+    )
+    resume_clicked = action_right.button(
+        "Preparar reanudacion",
+        key=f"neural_drift_prepare_resume_{selected_run_id}",
+        disabled=not bool(selected_entry.get("can_resume")) or not signature_matches,
+    )
+
+    if load_clicked:
+        payload = _load_persisted_neural_drift_run(manifest_path)
+        _apply_persisted_neural_drift_run_to_session_state(payload)
+        st.success(f"Resultados cargados desde la corrida `{selected_run_id}`.")
+
+    if resume_clicked:
+        st.session_state["neural_drift_prepared_resume_run_id"] = str(selected_run_id)
+        st.session_state["neural_drift_prepared_resume_manifest_path"] = str(manifest_path)
+        st.success(
+            f"Reanudacion preparada para `{selected_run_id}`. Ejecuta el backtest para continuar la corrida."
+        )
+
+
+def _apply_experiment_winner_config_to_session_state(winner_config: Dict[str, Any]) -> None:
+    if not isinstance(winner_config, dict) or not winner_config:
+        return
+
+    visible_key_map = {
+        "lookback_steps": "neural_drift_lookback_steps",
+        "horizon_steps": "neural_drift_horizon_steps",
+        "dataset_percent": "neural_drift_dataset_percent",
+        "max_stream_rows": "neural_drift_max_stream_rows",
+        "balance_modes": "neural_drift_balance_modes",
+        "models": "neural_drift_models",
+        "strategies": "neural_drift_strategies",
+        "drift_channels": "neural_drift_channels",
+        "recent_window_size": "neural_drift_recent_window_size",
+        "recalibration_min_rows": "neural_drift_recalibration_min_rows",
+        "retrain_min_rows": "neural_drift_retrain_min_rows",
+        "severity_threshold": "neural_drift_severity_threshold",
+        "detector_sensitivity_preset": "neural_drift_sensitivity_preset",
+        "detector_adwin_delta": "neural_drift_detector_adwin_delta",
+        "drift_point_signal_weight": "neural_drift_point_signal_weight",
+        "rolling_metric_window": "neural_drift_rolling_metric_window",
+        "history_sample_size": "neural_drift_history_sample_size",
+        "xgb_fine_tune_selection_metric": "neural_drift_xgb_fine_tune_selection_metric",
+        "xgb_fine_tune_window_min": "neural_drift_xgb_fine_tune_window_min",
+        "xgb_fine_tune_window_max": "neural_drift_xgb_fine_tune_window_max",
+        "xgb_fine_tune_rounds_min": "neural_drift_xgb_fine_tune_rounds_min",
+        "xgb_fine_tune_rounds_max": "neural_drift_xgb_fine_tune_rounds_max",
+        "xgb_fine_tune_eta_multiplier_max": "neural_drift_xgb_fine_tune_eta_multiplier_max",
+        "xgb_fine_tune_recent_weight_max": "neural_drift_xgb_fine_tune_recent_weight_max",
+        "drift_monitor_profile": "neural_drift_monitor_profile",
+        "drift_monitor_architecture": "neural_drift_monitor_architecture",
+        "drift_monitor_hidden_dim": "neural_drift_monitor_hidden_dim",
+        "drift_monitor_bottleneck_dim": "neural_drift_monitor_bottleneck_dim",
+        "drift_monitor_dropout": "neural_drift_monitor_dropout",
+        "drift_monitor_epochs": "neural_drift_monitor_epochs",
+        "drift_monitor_batch_size": "neural_drift_monitor_batch_size",
+        "drift_monitor_learning_rate": "neural_drift_monitor_learning_rate",
+        "drift_monitor_reconstruction_weight": "neural_drift_monitor_reconstruction_weight",
+        "drift_monitor_sequence_length": "neural_drift_monitor_sequence_length",
+        "drift_monitor_attention_hidden_dim": "neural_drift_monitor_attention_hidden_dim",
+        "drift_monitor_attention_dropout": "neural_drift_monitor_attention_dropout",
+        "xgb_parallel_neural_enabled": "neural_drift_xgb_parallel_neural_enabled",
+        "attention_feature_hidden_dim": "neural_drift_attention_feature_hidden_dim",
+        "attention_temporal_hidden_dim": "neural_drift_attention_temporal_hidden_dim",
+        "attention_dropout": "neural_drift_attention_dropout",
+        "attention_top_k": "neural_drift_attention_top_k",
+    }
+    for config_key, session_key in visible_key_map.items():
+        if config_key in winner_config:
+            st.session_state[session_key] = winner_config[config_key]
+
+    merged_config = {
+        **DEFAULT_CONFIG,
+        **dict(st.session_state.get("neural_drift_config") or {}),
+        **dict(winner_config),
+    }
+    st.session_state["neural_drift_config"] = merged_config
+
+
+def _render_experiments_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any]) -> None:
+    import src.neural_drift_experiments as neural_drift_experiments
+
+    neural_drift_experiments.render_experiments_tab(
+        dataset_bundle,
+        config,
+        apply_winner_config_callback=_apply_experiment_winner_config_to_session_state,
+    )
+
+
 def _render_backtest_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any]) -> None:
-    run_clicked = st.button("Run Neural drift backtest", key="neural_drift_run_backtest")
+    prepared_resume_run_id = st.session_state.get("neural_drift_prepared_resume_run_id")
+    prepared_resume_manifest_path = st.session_state.get("neural_drift_prepared_resume_manifest_path")
+    if prepared_resume_run_id:
+        st.info(
+            "Hay una corrida preparada para reanudacion: "
+            f"`{prepared_resume_run_id}` ({prepared_resume_manifest_path or 'manifest no disponible'})."
+        )
+        if st.button(
+            "Limpiar reanudacion preparada",
+            key="neural_drift_clear_prepared_resume",
+        ):
+            st.session_state["neural_drift_prepared_resume_run_id"] = None
+            st.session_state["neural_drift_prepared_resume_manifest_path"] = None
+            prepared_resume_run_id = None
+
+    run_clicked = st.button(
+        "Resume Neural drift backtest" if prepared_resume_run_id else "Run Neural drift backtest",
+        key="neural_drift_run_backtest",
+    )
     if not run_clicked:
-        st.info("Configura el experimento y ejecuta el backtest temporal.")
+        st.info(
+            "Configura el experimento y ejecuta el backtest temporal."
+            if not prepared_resume_run_id
+            else "La corrida preparada se reanudara cuando ejecutes el backtest."
+        )
         return
 
     progress_bar = st.progress(0.0)
@@ -5325,11 +7541,16 @@ def _render_backtest_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, An
 
     try:
         with st.spinner("Ejecutando Neural drift backtest..."):
-            results = run_backtest_pipeline(
+            results = run_backtest_with_checkpoints(
                 dataset_bundle,
                 config=config,
                 progress_callback=_callback,
                 live_update_callback=_live_callback,
+                resume_run_id=(
+                    str(prepared_resume_run_id)
+                    if prepared_resume_run_id is not None
+                    else None
+                ),
             )
     except Exception as exc:
         progress_bar.progress(1.0)
@@ -5340,21 +7561,28 @@ def _render_backtest_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, An
 
     progress_bar.progress(1.0)
     status.caption("Backtest completado.")
-    st.session_state["neural_drift_baseline_results"] = results.get("baseline")
-    st.session_state["neural_drift_stream_results"] = {
-        "summary": results.get("summary"),
-        "stream_metrics": results.get("stream_metrics"),
-        "rolling_metrics": results.get("rolling_metrics"),
-        "attention_feature_summary": results.get("attention_feature_summary"),
-        "attention_temporal_summary": results.get("attention_temporal_summary"),
-        "attention_drift_shift_summary": results.get("attention_drift_shift_summary"),
-        "detector_attention_temporal_summary": results.get("detector_attention_temporal_summary"),
-        "detector_attention_drift_shift_summary": results.get("detector_attention_drift_shift_summary"),
-    }
-    st.session_state["neural_drift_drift_events"] = results.get("drift_events")
-    st.session_state["neural_drift_download_bundle"] = _download_bundle_from_results(results)
-    st.session_state["neural_drift_last_run_signature"] = _build_run_signature(dataset_bundle, config)
-    st.success("Neural drift finalizado.")
+    _store_neural_drift_results_in_session_state(
+        results,
+        run_signature=str(results.get("run_signature") or _build_run_signature(dataset_bundle, config)),
+        run_id=(
+            str(results.get("run_id"))
+            if results.get("run_id") is not None
+            else None
+        ),
+        manifest_path=(
+            str(results.get("manifest_path"))
+            if results.get("manifest_path") is not None
+            else None
+        ),
+    )
+    st.session_state["neural_drift_loaded_checkpoint_run_id"] = None
+    st.session_state["neural_drift_prepared_resume_run_id"] = None
+    st.session_state["neural_drift_prepared_resume_manifest_path"] = None
+    st.success(
+        "Neural drift finalizado."
+        if not results.get("run_id")
+        else f"Neural drift finalizado. Run: {results.get('run_id')}"
+    )
 
 
 def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any]) -> None:
@@ -5372,6 +7600,9 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
     download_bundle = dict(st.session_state.get("neural_drift_download_bundle") or {})
     current_signature = _build_run_signature(dataset_bundle, config)
     last_run_signature = st.session_state.get("neural_drift_last_run_signature")
+    active_run_id = st.session_state.get("neural_drift_active_run_id")
+    active_manifest_path = st.session_state.get("neural_drift_active_manifest_path")
+    loaded_checkpoint_run_id = st.session_state.get("neural_drift_loaded_checkpoint_run_id")
     attention_top_k = max(1, int(config.get("attention_top_k", DEFAULT_CONFIG["attention_top_k"])))
 
     if not isinstance(summary, pd.DataFrame) or summary.empty:
@@ -5382,6 +7613,17 @@ def _render_results_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
         st.warning(
             "Los resultados visibles no corresponden a la configuracion o fuente de features actual. "
             "Vuelve a ejecutar el backtest para ver resultados consistentes con el estado actual."
+        )
+
+    if active_run_id:
+        origin_label = (
+            "checkpoint cargado"
+            if str(loaded_checkpoint_run_id or "") == str(active_run_id)
+            else "corrida activa"
+        )
+        st.caption(
+            f"Mostrando {origin_label}: `{active_run_id}`"
+            + (f" | manifest: {active_manifest_path}" if active_manifest_path else "")
         )
 
     if (
@@ -5549,8 +7791,8 @@ def render_tab(context: Dict[str, Any]) -> None:
         "selection_metadata": _to_json_safe(dataset_bundle.get("selection_metadata") or {}),
     }
 
-    config_tab, monitor_tab, backtest_tab, results_tab = st.tabs(
-        ["Configuración", "Red de drift", "Backtest", "Resultados"]
+    config_tab, monitor_tab, backtest_tab, results_tab, history_tab, experiments_tab = st.tabs(
+        ["Configuración", "Red de drift", "Backtest", "Resultados", "Historial", "Experimentos"]
     )
     with config_tab:
         config = _render_configuration_subtab(dataset_bundle)
@@ -5562,3 +7804,9 @@ def render_tab(context: Dict[str, Any]) -> None:
     with results_tab:
         config = dict(st.session_state.get("neural_drift_config") or DEFAULT_CONFIG)
         _render_results_subtab(dataset_bundle, config)
+    with history_tab:
+        config = dict(st.session_state.get("neural_drift_config") or DEFAULT_CONFIG)
+        _render_history_subtab(dataset_bundle, config)
+    with experiments_tab:
+        config = dict(st.session_state.get("neural_drift_config") or DEFAULT_CONFIG)
+        _render_experiments_subtab(dataset_bundle, config)
