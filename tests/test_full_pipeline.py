@@ -31,6 +31,15 @@ def test_full_pipeline_end_to_end(tmp_path):
     )
     metrics = result.get("metrics", {})
     assert "f1" in metrics and "far" in metrics
+    xai_payload = result.get("xai_payload", {})
+    assert isinstance(xai_payload, dict)
+    background_rows = xai_payload.get("background_rows")
+    explain_rows = xai_payload.get("explain_rows")
+    assert background_rows is not None and not background_rows.empty
+    assert explain_rows is not None and not explain_rows.empty
+    assert len(background_rows) <= 128
+    assert len(explain_rows) <= 64
+    assert {"target", "score", "pred", "threshold"}.issubset(explain_rows.columns)
 
     train_val_df, test_df = temporal_train_test_split(base_df, test_size=0.2)
     train_df, val_df = temporal_train_test_split(train_val_df, test_size=0.2)

@@ -124,6 +124,34 @@ def _streamlit_arrow_safe_df(data: object) -> object:
     return work
 
 
+def _ensure_balance_strategy_column(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    work = df.copy()
+    if "balance_strategy" in work.columns:
+        if "balance_mode" in work.columns:
+            work["balance_strategy"] = work["balance_strategy"].where(
+                work["balance_strategy"].notna(), work["balance_mode"]
+            )
+        return work
+    if "balance_mode" in work.columns:
+        work["balance_strategy"] = work["balance_mode"]
+        return work
+    if "smote_optimo" in work.columns:
+        flag = work["smote_optimo"].astype(str).str.lower()
+        work["balance_strategy"] = flag.map(
+            {
+                "true": "smote",
+                "1": "smote",
+                "yes": "smote",
+                "false": "none",
+                "0": "none",
+                "no": "none",
+            }
+        ).fillna("not_specified")
+    return work
+
+
 def _average_precision_from_scores(y_true: list[int], scores: list[float]) -> float:
     if not y_true or len(y_true) != len(scores):
         return float("nan")
@@ -451,6 +479,33 @@ def _json_cell(value: object) -> str:
         return json.dumps(value, sort_keys=True, ensure_ascii=True)
     except Exception:
         return str(value)
+
+
+def _parse_jsonish_cell(value: object) -> object:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def _jsonish_to_text(value: object) -> str:
+    parsed = _parse_jsonish_cell(value)
+    if isinstance(parsed, list):
+        return ", ".join(str(item) for item in parsed)
+    if isinstance(parsed, dict):
+        return json.dumps(parsed, ensure_ascii=False)
+    if parsed is None:
+        return ""
+    return str(parsed)
 
 
 def _artifact_context_dict(artifact: Dict[str, object]) -> Dict[str, object]:
@@ -2701,11 +2756,259 @@ def _render_features_sampler_view(df: pd.DataFrame) -> None:
         st.dataframe(df, width="stretch")
 
 
+def _render_controlled_comparison_live_view(
+    meta: Dict[str, object],
+    df: pd.DataFrame,
+    best_row: Optional[Dict[str, object]],
+) -> None:
+    st.caption("Experimento detectado: Comparación controlada con Clusters")
+    plot_df = _ensure_balance_strategy_column(df.copy())
+    if plot_df.empty:
+        st.warning("No hay resultados en la base de datos.")
+        return
+
+    objective_metric = str(meta.get("objective_metric") or "").strip().lower()
+    if not objective_metric and "objective_metric" in plot_df.columns:
+        metric_values = plot_df["objective_metric"].dropna().astype(str)
+        if not metric_values.empty:
+            objective_metric = str(metric_values.iloc[0]).strip().lower()
+    if not objective_metric:
+        objective_metric = "roc_auc"
+
+    objective_label = str(meta.get("objective_label") or "").strip()
+    if not objective_label and "objective_label" in plot_df.columns:
+        label_values = plot_df["objective_label"].dropna().astype(str)
+        if not label_values.empty:
+            objective_label = str(label_values.iloc[0]).strip()
+    if not objective_label:
+        objective_label = objective_metric.upper()
+
+    metric_col = (
+        "val_objective_score"
+        if "val_objective_score" in plot_df.columns
+        else {
+            "roc_auc": "val_roc_auc",
+            "f1": "val_f1",
+            "mcc": "val_mcc",
+        }.get(objective_metric, "val_roc_auc")
+    )
+
+    numeric_cols = [
+        "k",
+        "val_objective_score",
+        "test_objective_score",
+        "val_roc_auc",
+        "test_roc_auc",
+        "val_f1",
+        "test_f1",
+        "val_mcc",
+        "test_mcc",
+        "decision_threshold",
+        "train_rows",
+        "val_rows",
+        "test_rows",
+        "optuna_trials_completed",
+    ]
+    for col in numeric_cols:
+        if col in plot_df.columns:
+            plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+
+    completed_df = plot_df.copy()
+    if "status" in completed_df.columns:
+        completed_df = completed_df[
+            completed_df["status"].astype(str).str.lower() == "completed"
+        ].copy()
+
+    status_counts = (
+        plot_df["status"].astype(str).value_counts().to_dict()
+        if "status" in plot_df.columns
+        else {}
+    )
+    completed_count = int(status_counts.get("completed", len(completed_df)))
+    failed_count = int(status_counts.get("failed", 0))
+    pending_count = int(
+        sum(
+            count
+            for status, count in status_counts.items()
+            if status not in {"completed", "failed"}
+        )
+    )
+
+    segment_info = meta.get("segment_info")
+    if isinstance(segment_info, dict) and segment_info:
+        st.caption(
+            f"Tramo: {segment_info.get('segment_label') or segment_info}"
+        )
+    st.caption(
+        f"Objetivo: {objective_label} | "
+        f"Eventos: {meta.get('dataset_name') or '-'} | "
+        f"Features: {meta.get('features_name') or '-'}"
+    )
+
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6 = st.columns(6)
+    kpi_1.metric("Estado", str(meta.get("run_mode") or "live"))
+    kpi_2.metric("Completadas", f"{completed_count}")
+    kpi_3.metric("Fallidas", f"{failed_count}")
+    kpi_4.metric("Pendientes", f"{pending_count}")
+    kpi_5.metric("Objetivo", objective_label)
+    kpi_6.metric("Optuna jobs", str(meta.get("optuna_n_jobs") or "-"))
+
+    if completed_df.empty:
+        st.info("Aún no hay combinaciones completadas.")
+        st.dataframe(_streamlit_arrow_safe_df(plot_df), width="stretch")
+        return
+
+    if best_row is None and metric_col in completed_df.columns:
+        candidate_df = completed_df.dropna(subset=[metric_col]).copy()
+        if not candidate_df.empty:
+            best_row = candidate_df.sort_values(
+                [metric_col, "k"],
+                ascending=[False, True],
+            ).iloc[0].to_dict()
+
+    if best_row:
+        st.markdown("**Mejor combinación observada hasta ahora**")
+        best_payload = {
+            "model_name": best_row.get("model_name"),
+            "feature_set": best_row.get("feature_set"),
+            "balance_mode": best_row.get("balance_mode"),
+            "k": best_row.get("k"),
+            "objective": best_row.get("objective_label") or objective_label,
+            "val_objective_score": best_row.get("val_objective_score"),
+            "test_objective_score": best_row.get("test_objective_score"),
+            "test_roc_auc": best_row.get("test_roc_auc"),
+            "test_f1": best_row.get("test_f1"),
+            "test_mcc": best_row.get("test_mcc"),
+            "decision_threshold": best_row.get("decision_threshold"),
+        }
+        st.json(best_payload)
+
+    summary_df = completed_df.copy()
+    summary_cols = [
+        "model_name",
+        "feature_set",
+        metric_col,
+        "test_objective_score",
+        "test_roc_auc",
+        "test_f1",
+        "test_mcc",
+        "k",
+        "balance_mode",
+        "decision_threshold",
+        "selected_features",
+        "best_params",
+        "smote_params",
+    ]
+    summary_df = summary_df[[col for col in summary_cols if col in summary_df.columns]]
+    if {"model_name", "feature_set", metric_col}.issubset(completed_df.columns):
+        best_idx = (
+            completed_df.dropna(subset=[metric_col])
+            .sort_values(["model_name", "feature_set", metric_col, "k"], ascending=[True, True, False, True])
+            .groupby(["model_name", "feature_set"], dropna=False)
+            .head(1)
+            .index
+        )
+        summary_df = completed_df.loc[best_idx, [col for col in summary_cols if col in completed_df.columns]].copy()
+    if "selected_features" in summary_df.columns:
+        summary_df["selected_features"] = summary_df["selected_features"].apply(_jsonish_to_text)
+    if "best_params" in summary_df.columns:
+        summary_df["best_params"] = summary_df["best_params"].apply(_jsonish_to_text)
+    if "smote_params" in summary_df.columns:
+        summary_df["smote_params"] = summary_df["smote_params"].apply(_jsonish_to_text)
+
+    tab_summary, tab_curves, tab_data = st.tabs(["Resumen", "Curvas", "Datos"])
+    with tab_summary:
+        st.markdown("**Mejor resultado por modelo y conjunto**")
+        st.dataframe(_streamlit_arrow_safe_df(summary_df), width="stretch")
+        if failed_count > 0 and "status" in plot_df.columns:
+            failed_df = plot_df[
+                plot_df["status"].astype(str).str.lower() == "failed"
+            ].copy()
+            if not failed_df.empty:
+                visible_cols = [
+                    col
+                    for col in [
+                        "model_name",
+                        "feature_set",
+                        "balance_mode",
+                        "k",
+                        "error",
+                    ]
+                    if col in failed_df.columns
+                ]
+                st.markdown("**Combinaciones fallidas**")
+                st.dataframe(_streamlit_arrow_safe_df(failed_df[visible_cols]), width="stretch")
+
+    with tab_curves:
+        balance_options = (
+            sorted(completed_df["balance_mode"].dropna().astype(str).unique().tolist())
+            if "balance_mode" in completed_df.columns
+            else []
+        )
+        if not balance_options:
+            balance_options = ["none"]
+            completed_df["balance_mode"] = "none"
+        selected_balance = st.selectbox(
+            "Balanceo",
+            options=balance_options,
+            key="live_controlled_balance_mode",
+        )
+        curve_df = completed_df[
+            completed_df["balance_mode"].astype(str) == str(selected_balance)
+        ].copy()
+        if curve_df.empty or metric_col not in curve_df.columns:
+            st.info("No hay datos suficientes para graficar.")
+        else:
+            try:
+                import altair as alt
+                chart = (
+                    alt.Chart(curve_df)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("k:Q", axis=alt.Axis(title="K")),
+                        y=alt.Y(
+                            f"{metric_col}:Q",
+                            axis=alt.Axis(title=f"Validación {objective_label}"),
+                        ),
+                        color=alt.Color("feature_set:N", title="Conjunto"),
+                        row=alt.Row(
+                            "model_name:N",
+                            title=None,
+                            header=alt.Header(labelAngle=0),
+                        ),
+                        tooltip=[
+                            alt.Tooltip("model_name:N", title="Modelo"),
+                            alt.Tooltip("feature_set:N", title="Conjunto"),
+                            alt.Tooltip("balance_mode:N", title="Balanceo"),
+                            alt.Tooltip("k:Q", title="K"),
+                            alt.Tooltip(f"{metric_col}:Q", title=f"Val {objective_label}", format=".4f"),
+                            alt.Tooltip("test_roc_auc:Q", title="Test ROC-AUC", format=".4f"),
+                            alt.Tooltip("test_f1:Q", title="Test F1", format=".4f"),
+                            alt.Tooltip("test_mcc:Q", title="Test MCC", format=".4f"),
+                        ],
+                    )
+                    .properties(height=150)
+                    .interactive()
+                )
+                st.altair_chart(chart, width="stretch")
+            except ImportError:
+                pivot_df = curve_df.pivot_table(
+                    index="k",
+                    columns=["model_name", "feature_set"],
+                    values=metric_col,
+                    aggfunc="max",
+                ).sort_index()
+                st.line_chart(pivot_df, width="stretch")
+
+    with tab_data:
+        st.dataframe(_streamlit_arrow_safe_df(plot_df), width="stretch")
+
+
 def _render_gnn_optuna_objectives_view(
     df: pd.DataFrame, best_row: Optional[Dict[str, object]]
 ) -> None:
     st.caption("Experimento detectado: GNN Optuna Objectives")
-    plot_df = df.copy()
+    plot_df = _ensure_balance_strategy_column(df.copy())
     metric_cols = [
         "test_f1",
         "test_precision",
@@ -2764,10 +3067,13 @@ def _render_gnn_optuna_objectives_view(
             best_row = valid.loc[valid["test_f1"].idxmax()].to_dict()
 
     if best_row:
+        balance_value = best_row.get("balance_strategy")
+        if balance_value in (None, ""):
+            balance_value = best_row.get("balance_mode")
         st.markdown("**Resultado optimo (test_f1)**")
         metrics_payload = {
             "gnn_variant": best_row.get("gnn_variant"),
-            "balance_strategy": best_row.get("balance_strategy"),
+            "balance_strategy": balance_value,
             "objective": best_row.get("objective_label"),
             "test_f1": best_row.get("test_f1"),
             "test_precision": best_row.get("test_precision"),
@@ -2820,16 +3126,21 @@ def _render_gnn_optuna_objectives_view(
                 try:
                     import altair as alt
                     tooltip_fields = [
-                        "objective_label",
-                        "balance_strategy",
+                        alt.Tooltip("objective_label:N", title="Objetivo"),
                     ]
+                    if "balance_strategy" in plot_df.columns:
+                        tooltip_fields.append(
+                            alt.Tooltip("balance_strategy:N", title="Balanceo")
+                        )
                     if "gnn_variant" in plot_df.columns:
-                        tooltip_fields.append("gnn_variant")
+                        tooltip_fields.append(
+                            alt.Tooltip("gnn_variant:N", title="Variante GNN")
+                        )
                     tooltip_fields += [
-                        "test_f1",
-                        "test_precision",
-                        "test_recall",
-                        "test_far",
+                        alt.Tooltip("test_f1:Q", title="Test F1", format=".4f"),
+                        alt.Tooltip("test_precision:Q", title="Test Precision", format=".4f"),
+                        alt.Tooltip("test_recall:Q", title="Test Recall", format=".4f"),
+                        alt.Tooltip("test_far:Q", title="Test FAR", format=".4f"),
                     ]
                     color_enc = (
                         alt.Color("balance_strategy:N", title="Balanceo")
@@ -2878,7 +3189,7 @@ def _render_gnn_recursive_view(
     df: pd.DataFrame, best_row: Optional[Dict[str, object]]
 ) -> None:
     st.caption("Experimento detectado: Opt.Recursiva (Optuna vs Ray)")
-    plot_df = df.copy()
+    plot_df = _ensure_balance_strategy_column(df.copy())
 
     include_errors = st.checkbox(
         "Incluir registros con error",
@@ -3033,14 +3344,24 @@ def _render_gnn_recursive_view(
                 st.info("No hay datos suficientes para graficar.")
             else:
                 line_tooltip = [
-                    "iteration",
-                    "optimizer",
-                    "balance_strategy",
-                    "objective_label",
-                    selected_metric,
+                    alt.Tooltip("iteration:Q", title="Iteracion"),
+                    alt.Tooltip("optimizer:N", title="Optimizador"),
                 ]
                 if "gnn_variant" in base.columns:
-                    line_tooltip.insert(2, "gnn_variant")
+                    line_tooltip.append(
+                        alt.Tooltip("gnn_variant:N", title="Variante GNN")
+                    )
+                if "balance_strategy" in base.columns:
+                    line_tooltip.append(
+                        alt.Tooltip("balance_strategy:N", title="Balanceo")
+                    )
+                if "objective_label" in base.columns:
+                    line_tooltip.append(
+                        alt.Tooltip("objective_label:N", title="Objetivo")
+                    )
+                line_tooltip.append(
+                    alt.Tooltip(f"{selected_metric}:Q", title=selected_metric, format=".4f")
+                )
                 chart = (
                     alt.Chart(base)
                     .mark_line(point=True)
@@ -4736,6 +5057,25 @@ def main(*, set_page_config: bool = True) -> None:
             st.warning("No hay resultados en la base de datos.")
         else:
             experiment_name = str(meta.get("experiment", "")).lower()
+            is_controlled_comparison = (
+                "controlled comparison" in experiment_name
+                or "comparación controlada" in experiment_name
+                or df.get("experiment", pd.Series())
+                .astype(str)
+                .str.contains(
+                    "controlled comparison|comparaci[oó]n controlada",
+                    case=False,
+                    na=False,
+                )
+                .any()
+                or {
+                    "model_name",
+                    "feature_set",
+                    "balance_mode",
+                    "k",
+                    "val_objective_score",
+                }.issubset(df.columns)
+            )
             is_find_samples = (
                 "find samples" in experiment_name
                 or df.get("experiment", pd.Series())
@@ -4780,7 +5120,9 @@ def main(*, set_page_config: bool = True) -> None:
                 }.issubset(df.columns)
             )
 
-            if is_gnn_sampler_memory:
+            if is_controlled_comparison:
+                _render_controlled_comparison_live_view(meta, df, best_row)
+            elif is_gnn_sampler_memory:
                 _render_gnn_sampler_memory_budget_view(df, best_row)
             elif is_best_section:
                 _render_best_highway_section_view(df, best_row)

@@ -33,5 +33,6 @@ torch-spline-conv==1.2.2; python_version < '3.13'
 GitPython==3.1.46
 SQLAlchemy==2.0.45
 scipy==1.16.3
+shap
 latexmk
 psutil

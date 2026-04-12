@@ -17,6 +17,9 @@ from sklearn.metrics import (
     roc_curve,
 )
 
+XAI_BACKGROUND_MAX_ROWS = 128
+XAI_EXPLAIN_MAX_ROWS = 64
+
 
 def _import_external_xgboost():
     src_dir = str(Path(__file__).resolve().parent)
@@ -60,8 +63,12 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
         return RandomForestClassifier(
             n_estimators=int(params["n_estimators"]),
             max_depth=params.get("max_depth"),
+            min_samples_split=int(params.get("min_samples_split", 2)),
+            min_samples_leaf=int(params.get("min_samples_leaf", 1)),
+            max_features=params.get("max_features", "sqrt"),
             random_state=random_state,
             class_weight="balanced",
+            n_jobs=params.get("n_jobs"),
         )
 
     if model_name == "XGBoost":
@@ -83,6 +90,7 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
             reg_alpha=float(params.get("reg_alpha", 0.0)),
             reg_lambda=float(params.get("reg_lambda", 1.0)),
             gamma=float(params.get("gamma", 0.0)),
+            n_jobs=int(params.get("n_jobs", 1)),
             random_state=random_state,
             objective="binary:logistic",
             eval_metric="logloss",
@@ -101,6 +109,9 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
                     SVC(
                         C=float(params["C"]),
                         kernel=str(params["kernel"]),
+                        gamma=params.get("gamma", "scale"),
+                        degree=int(params.get("degree", 3)),
+                        coef0=float(params.get("coef0", 0.0)),
                         probability=True,
                         random_state=random_state,
                     ),
@@ -258,6 +269,112 @@ def split_train_val_for_threshold(
         return train_df_final, val_df
 
 
+def _sample_frame_rows(df: pd.DataFrame, *, max_rows: int) -> pd.DataFrame:
+    if df.empty or len(df) <= max_rows:
+        return df.reset_index(drop=True)
+    idx = np.linspace(0, len(df) - 1, num=max_rows, dtype=int)
+    return df.iloc[idx].reset_index(drop=True)
+
+
+def _build_xai_background_rows(
+    train_df: pd.DataFrame,
+    feature_cols: List[str],
+) -> pd.DataFrame:
+    synthetic_mask = (
+        train_df["synthetic"].astype(bool)
+        if "synthetic" in train_df.columns
+        else pd.Series(False, index=train_df.index)
+    )
+    real_train_df = train_df.loc[~synthetic_mask].copy()
+    if real_train_df.empty:
+        real_train_df = train_df.copy()
+    feature_df = real_train_df[feature_cols].fillna(0)
+    return _sample_frame_rows(feature_df, max_rows=XAI_BACKGROUND_MAX_ROWS)
+
+
+def _build_xai_explain_rows(
+    test_df: pd.DataFrame,
+    *,
+    feature_cols: List[str],
+    scores_test: np.ndarray,
+    preds: np.ndarray,
+    threshold: float,
+) -> pd.DataFrame:
+    work = test_df.copy().reset_index(drop=False).rename(
+        columns={"index": "source_index"}
+    )
+    work[feature_cols] = work[feature_cols].fillna(0)
+    work["target"] = work["target"].astype(int)
+    work["score"] = np.asarray(scores_test, dtype=float)
+    work["pred"] = np.asarray(preds, dtype=int)
+    work["threshold"] = float(threshold)
+    work["case_hint"] = ""
+
+    selected_idx: List[int] = []
+
+    def _append_first(mask: pd.Series, label: str) -> None:
+        if not mask.any():
+            return
+        idx = int(
+            work.loc[mask]
+            .sort_values("score", ascending=False)
+            .index[0]
+        )
+        if idx in selected_idx:
+            return
+        selected_idx.append(idx)
+        work.loc[idx, "case_hint"] = label
+
+    _append_first(pd.Series(True, index=work.index), "highest_score")
+    _append_first((work["target"] == 1) & (work["pred"] == 1), "true_positive")
+    _append_first((work["target"] == 0) & (work["pred"] == 1), "false_positive")
+    _append_first((work["target"] == 1) & (work["pred"] == 0), "false_negative")
+
+    score_ranked = list(
+        work.sort_values("score", ascending=False).index.astype(int)
+    )
+    for idx in score_ranked:
+        if idx in selected_idx:
+            continue
+        selected_idx.append(int(idx))
+        if len(selected_idx) >= XAI_EXPLAIN_MAX_ROWS:
+            break
+
+    explain_df = work.loc[selected_idx].copy()
+    return explain_df.reset_index(drop=True)
+
+
+def _build_xai_payload(
+    *,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: List[str],
+    scores_test: np.ndarray,
+    preds: np.ndarray,
+    threshold: float,
+) -> Dict[str, object]:
+    return {
+        "background_rows": _build_xai_background_rows(train_df, feature_cols),
+        "explain_rows": _build_xai_explain_rows(
+            test_df,
+            feature_cols=feature_cols,
+            scores_test=scores_test,
+            preds=preds,
+            threshold=threshold,
+        ),
+        "split_info": {
+            "train_rows": int(len(train_df)),
+            "val_rows": int(len(val_df)),
+            "test_rows": int(len(test_df)),
+        },
+        "xai_limits": {
+            "background_max_rows": int(XAI_BACKGROUND_MAX_ROWS),
+            "explain_max_rows": int(XAI_EXPLAIN_MAX_ROWS),
+        },
+    }
+
+
 def train_model(
     df: pd.DataFrame,
     feature_cols: List[str],
@@ -326,15 +443,25 @@ def train_model(
     else:
         metrics["roc_auc"] = float("nan")
     cm = confusion_matrix(y_test, preds, labels=[0, 1])
+    split_info = {
+        "train_rows": int(len(train_df)),
+        "val_rows": int(len(val_df)),
+        "test_rows": int(len(test_df)),
+    }
     return {
         "metrics": metrics,
         "confusion_matrix": cm.tolist(),
         "model": model,
-        "split_info": {
-            "train_rows": int(len(train_df)),
-            "val_rows": int(len(val_df)),
-            "test_rows": int(len(test_df)),
-        },
+        "split_info": split_info,
+        "xai_payload": _build_xai_payload(
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            feature_cols=feature_cols,
+            scores_test=scores_test,
+            preds=preds,
+            threshold=threshold,
+        ),
     }
 
 
@@ -395,13 +522,23 @@ def train_model_on_split(
     else:
         metrics["roc_auc"] = float("nan")
     cm = confusion_matrix(y_test, preds, labels=[0, 1])
+    split_info = {
+        "train_rows": int(len(train_df)),
+        "val_rows": int(len(val_df)),
+        "test_rows": int(len(test_df)),
+    }
     return {
         "metrics": metrics,
         "confusion_matrix": cm.tolist(),
         "model": model,
-        "split_info": {
-            "train_rows": int(len(train_df)),
-            "val_rows": int(len(val_df)),
-            "test_rows": int(len(test_df)),
-        },
+        "split_info": split_info,
+        "xai_payload": _build_xai_payload(
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            feature_cols=feature_cols,
+            scores_test=scores_test,
+            preds=preds,
+            threshold=threshold,
+        ),
     }
