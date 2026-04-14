@@ -103,6 +103,51 @@ def test_display_cell_handles_infinite_thresholds():
     assert live_app._display_cell(float("-inf")) == "-inf"
 
 
+def test_controlled_live_best_payload_uses_best_test_fallbacks():
+    row = {
+        "model_name": "XGBoost",
+        "feature_set": "Base",
+        "balance_mode": "none",
+        "k_optimo": 25,
+        "objective_label": "ROC-AUC",
+        "val_objective_score": 0.91,
+        "test_objective_score": 0.84,
+        "best_test_accuracy": 0.97,
+        "best_test_recall": 0.40,
+        "best_test_sensitivity": 0.40,
+        "best_test_f1_global": 0.68,
+        "best_test_f1_class_0": 0.99,
+        "best_test_f1_class_1": 0.37,
+        "best_test_false_negatives": 9,
+        "best_test_false_positives": 3,
+        "best_test_roc_auc": 0.85,
+        "best_test_pr_auc": 0.23,
+        "best_test_mcc": 0.31,
+        "decision_threshold": 0.5,
+        "best_test_confusion_matrix": "[[100, 3], [9, 6]]",
+    }
+
+    payload = live_app._controlled_live_best_payload(
+        row,
+        objective_label="ROC-AUC",
+    )
+
+    assert payload["test_accuracy"] == pytest.approx(0.97)
+    assert payload["test_recall"] == pytest.approx(0.40)
+    assert payload["test_sensitivity"] == pytest.approx(0.40)
+    assert payload["test_f1_global"] == pytest.approx(0.68)
+    assert payload["test_f1_class_0"] == pytest.approx(0.99)
+    assert payload["test_f1_class_1"] == pytest.approx(0.37)
+    assert payload["test_false_negatives"] == 9
+    assert payload["test_false_positives"] == 3
+    assert payload["test_roc_auc"] == pytest.approx(0.85)
+    assert payload["test_pr_auc"] == pytest.approx(0.23)
+    assert payload["test_mcc"] == pytest.approx(0.31)
+    assert live_app._coerce_confusion_matrix_cell(
+        row["best_test_confusion_matrix"]
+    ) == [[100, 3], [9, 6]]
+
+
 def test_build_drift_tuning_params_frame_compares_smote_against_none():
     artifacts = [
         {

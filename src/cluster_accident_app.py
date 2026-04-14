@@ -42,6 +42,10 @@ from src.utils import (
     read_csv_with_progress,
 )
 from src.model_training import (
+    BALANCE_STRATEGY_LABELS,
+    CALIBRATION_METHOD_LABELS,
+    THRESHOLD_OBJECTIVE_LABELS,
+    THRESHOLD_PROTOCOL_LABELS,
     build_model as _build_model,
     get_model_scores as _get_model_scores,
     select_threshold_for_far as _select_threshold_for_far,
@@ -53,7 +57,9 @@ from src.model_training import (
 )
 from src.model_xai import compute_xai_report, save_xai_bundle
 from src.experiments_logic import (
+    CONTROLLED_COMPARISON_MODELS,
     ExperimentsRunner,
+    _controlled_comparison_paths,
     _k_grid_values,
     build_controlled_comparison_context,
     estimate_controlled_comparison_parallelism,
@@ -226,6 +232,70 @@ def _render_optuna_n_jobs_input(
             ),
         )
     )
+
+
+def _render_model_n_jobs_input(
+    label: str,
+    *,
+    key: str,
+    default: int = 1,
+) -> int:
+    max_jobs = _max_optuna_parallel_jobs()
+    raw_default = st.session_state.get(key, default)
+    try:
+        default_jobs = int(raw_default)
+    except (TypeError, ValueError):
+        default_jobs = int(default)
+    default_jobs = max(1, min(max_jobs, default_jobs))
+    return int(
+        st.number_input(
+            label,
+            min_value=1,
+            max_value=max_jobs,
+            value=default_jobs,
+            step=1,
+            key=key,
+            help=(
+                "Controla `n_jobs`, es decir, los hilos internos usados por el "
+                "modelo durante el entrenamiento. Subirlo acelera modelos "
+                "paralelizables, pero puede competir con otros procesos."
+            ),
+        )
+    )
+
+
+def _queue_controlled_job_config_apply(
+    *,
+    parallel_jobs: int,
+    optuna_n_jobs: int,
+    xgb_parallel_jobs: int,
+    notice: str,
+) -> None:
+    st.session_state["exp_controlled_pending_job_config"] = {
+        "parallel_jobs": int(parallel_jobs),
+        "optuna_n_jobs": int(optuna_n_jobs),
+        "xgb_parallel_jobs": int(xgb_parallel_jobs),
+        "notice": str(notice),
+    }
+    st.rerun()
+
+
+def _apply_pending_controlled_job_config() -> None:
+    payload = st.session_state.pop("exp_controlled_pending_job_config", None)
+    if not isinstance(payload, dict):
+        return
+    st.session_state["exp_controlled_parallel_jobs"] = int(
+        payload.get("parallel_jobs", 1)
+    )
+    st.session_state["exp_controlled_optuna_n_jobs"] = int(
+        payload.get("optuna_n_jobs", 1)
+    )
+    st.session_state["exp_controlled_xgb_parallel_jobs"] = int(
+        payload.get("xgb_parallel_jobs", 1)
+    )
+    notice = str(payload.get("notice") or "").strip()
+    if notice:
+        st.session_state["exp_controlled_memory_notice"] = notice
 
 
 def _format_bytes(value: object) -> str:
@@ -1414,6 +1484,56 @@ def _append_experiment_best(
         return
 
 
+def _seed_controlled_comparison_live_db(
+    db_path: Optional[Path],
+    *,
+    checkpoint_run_dir: Optional[object],
+    dataset_name: str,
+    features_name: str,
+    segment_info: Optional[Dict[str, object]],
+) -> int:
+    if not db_path:
+        return 0
+    run_dir_text = str(checkpoint_run_dir or "").strip()
+    if not run_dir_text:
+        return 0
+
+    run_dir = Path(run_dir_text)
+    grid_results_path = _controlled_comparison_paths(run_dir)["grid_results"]
+    if not grid_results_path.exists():
+        return 0
+
+    con = None
+    try:
+        con = sqlite3.connect(db_path)
+        row_count = con.execute("SELECT COUNT(*) FROM results").fetchone()
+        if row_count and int(row_count[0]) > 0:
+            return 0
+    except Exception:
+        return 0
+    finally:
+        if con is not None:
+            con.close()
+
+    try:
+        grid_results_df = pd.read_csv(grid_results_path)
+    except Exception:
+        return 0
+    if grid_results_df.empty:
+        return 0
+
+    seeded = 0
+    for record in grid_results_df.to_dict(orient="records"):
+        payload = dict(record)
+        payload["experiment"] = "Controlled comparison"
+        payload["dataset_name"] = dataset_name
+        payload["features_name"] = features_name
+        payload["segment_info"] = dict(segment_info or {})
+        _append_experiment_result(db_path, payload)
+        seeded += 1
+    return int(seeded)
+
+
 def _append_history_entry(entry: Dict[str, object]) -> None:
     try:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1610,7 +1730,8 @@ def _summarize_optuna(
     feature_key: str,
     feature_id: str,
     base_feature_cols: List[str],
-    cluster_feature_cols: Optional[List[str]],
+    cluster_only_feature_cols: Optional[List[str]] = None,
+    cluster_feature_cols: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     summary: Dict[str, object] = {
         "active_key": st.session_state.get("optuna_active_key")
@@ -1689,6 +1810,47 @@ def _summarize_optuna(
                 optuna_key=cluster_key,
                 optuna_id=cluster_id,
                 feature_cols=cluster_feature_cols,
+            )
+
+    if (
+        cluster_only_feature_cols
+        and set(cluster_only_feature_cols) != set(base_feature_cols)
+        and set(cluster_only_feature_cols) != set(cluster_feature_cols or [])
+    ):
+        cluster_only_key = _optuna_result_key(feature_key, cluster_only_feature_cols)
+        cluster_only_id = _optuna_result_id(feature_id, cluster_only_feature_cols)
+        cluster_only_entry = store.get(cluster_only_key)
+        cluster_only_results: Optional[Dict[str, object]] = None
+        if isinstance(cluster_only_entry, dict) and isinstance(
+            cluster_only_entry.get("results"), dict
+        ):
+            cluster_only_results = cluster_only_entry["results"]
+        else:
+            payload, _ = _load_optuna_result_from_disk(cluster_only_id)
+            if isinstance(payload, dict):
+                if isinstance(payload.get("results"), dict):
+                    cluster_only_results = payload["results"]
+                else:
+                    legacy_choice = payload.get("model_choice") or "legacy"
+                    cluster_only_results = {
+                        str(legacy_choice): {
+                            "model_choice": legacy_choice,
+                            "best_score": payload.get("best_score"),
+                            "best_smote_params": payload.get("best_smote_params", {}),
+                            "best_model_params": payload.get("best_model_params", {}),
+                            "optuna_settings": payload.get("optuna_settings", {}),
+                            "search_space": payload.get("search_space", {}),
+                            "saved_at": payload.get("saved_at"),
+                            "trials_csv": payload.get("trials_csv"),
+                        }
+                    }
+
+        if isinstance(cluster_only_results, dict) and cluster_only_results:
+            summary["cluster"] = _optuna_summary_from_results(
+                cluster_only_results,
+                optuna_key=cluster_only_key,
+                optuna_id=cluster_only_id,
+                feature_cols=cluster_only_feature_cols,
             )
 
     return summary
@@ -1800,6 +1962,29 @@ def _save_model_bundle_artifact(
     }
 
 
+def _history_protocol_results_summary(
+    protocol_results: Dict[str, object],
+) -> Dict[str, object]:
+    summary: Dict[str, object] = {}
+    for feature_set, value in dict(protocol_results or {}).items():
+        if not isinstance(value, dict):
+            continue
+        protocol_summary: Dict[str, object] = {}
+        for protocol, result in value.items():
+            if not isinstance(result, dict):
+                continue
+            protocol_summary[str(protocol)] = {
+                "metrics": result.get("metrics", {}),
+                "validation_metrics": result.get("validation_metrics", {}),
+                "confusion_matrix": result.get("confusion_matrix"),
+                "split_info": result.get("split_info", {}),
+                "threshold_info": result.get("threshold_info", {}),
+                "note": result.get("note"),
+            }
+        summary[str(feature_set)] = protocol_summary
+    return summary
+
+
 def _record_experiment_history(
     *,
     base_df: pd.DataFrame,
@@ -1817,10 +2002,23 @@ def _record_experiment_history(
     val_size: float,
     far_target: float,
     use_balanced: bool,
+    protocol_results: Optional[Dict[str, object]] = None,
+    threshold_protocols: Optional[List[str]] = None,
+    threshold_objective: str = "far",
+    calibration_method: str = "none",
+    alerts_per_day: float = 5.0,
+    fn_cost: float = 10.0,
+    fp_cost: float = 1.0,
+    robust_folds: int = 3,
+    balance_strategy: str = "none",
+    cluster_only_feature_cols: Optional[List[str]] = None,
+    cluster_only_result: Optional[Dict[str, object]] = None,
+    model_params_cluster_only: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     signature_payload = {
         "model_choice": model_choice,
         "model_params_base": model_params_base,
+        "model_params_cluster_only": model_params_cluster_only,
         "model_params_cluster": model_params_cluster,
         "random_state": random_state,
         "time": time.time(),
@@ -1847,6 +2045,7 @@ def _record_experiment_history(
         feature_key=feature_key,
         feature_id=feature_id,
         base_feature_cols=base_feature_cols,
+        cluster_only_feature_cols=cluster_only_feature_cols,
         cluster_feature_cols=cluster_feature_cols,
     )
     balance_summary = _summarize_balance(
@@ -1881,6 +2080,37 @@ def _record_experiment_history(
         "feature_cols": list(base_feature_cols),
         "split_info": base_result.get("split_info", {}),
     }
+    if cluster_only_result is not None and cluster_only_feature_cols is not None:
+        cluster_only_bundle = _save_model_bundle_artifact(
+            model=cluster_only_result.get("model"),
+            run_id=run_id,
+            label="cluster",
+            model_name=model_choice,
+            model_params=(
+                dict(model_params_cluster_only) if model_params_cluster_only else {}
+            ),
+            feature_cols=cluster_only_feature_cols,
+            result=cluster_only_result,
+            feature_summary=feature_summary,
+            feature_selection_summary=feature_selection_summary,
+            dataset_summary=dataset_summary,
+            use_balanced=use_balanced,
+        )
+        models["Cluster"] = {
+            "model_name": model_choice,
+            "model_params": (
+                dict(model_params_cluster_only) if model_params_cluster_only else {}
+            ),
+            "metrics": cluster_only_result.get("metrics", {}),
+            "confusion_matrix": cluster_only_result.get("confusion_matrix"),
+            "model_path": cluster_only_bundle.get("model_path"),
+            "bundle_path": cluster_only_bundle.get("bundle_path"),
+            "manifest_path": cluster_only_bundle.get("manifest_path"),
+            "xai_bundle_path": cluster_only_bundle.get("bundle_path"),
+            "xai_error": cluster_only_bundle.get("error"),
+            "feature_cols": list(cluster_only_feature_cols),
+            "split_info": cluster_only_result.get("split_info", {}),
+        }
     cluster_xai_summary = {
         "available": False,
         "bundle_path": None,
@@ -1931,6 +2161,14 @@ def _record_experiment_history(
             "val_size": float(val_size),
             "far_target": float(far_target),
             "random_state": int(random_state),
+            "threshold_protocols": list(threshold_protocols or []),
+            "threshold_objective": threshold_objective,
+            "calibration_method": calibration_method,
+            "alerts_per_day": float(alerts_per_day),
+            "fn_cost": float(fn_cost),
+            "fp_cost": float(fp_cost),
+            "robust_folds": int(robust_folds),
+            "balance_strategy": balance_strategy,
         },
         "features": feature_summary,
         "feature_selection": feature_selection_summary,
@@ -1938,6 +2176,9 @@ def _record_experiment_history(
         "balance": balance_summary,
         "xai": {"base_cluster": cluster_xai_summary},
         "models": models,
+        "protocol_results": _history_protocol_results_summary(
+            protocol_results or {}
+        ),
     }
     _append_history_entry(entry)
     return entry
@@ -2004,6 +2245,35 @@ def _jsonish_to_text(value: object) -> str:
     if parsed is None:
         return ""
     return str(parsed)
+
+
+def _coerce_confusion_matrix(value: object) -> Optional[List[List[int]]]:
+    parsed = _parse_jsonish(value)
+    if isinstance(parsed, list) and len(parsed) == 4 and not isinstance(
+        parsed[0], (list, tuple)
+    ):
+        try:
+            tn, fp, fn, tp = [int(item) for item in parsed]
+            return [[tn, fp], [fn, tp]]
+        except Exception:
+            return None
+    if (
+        isinstance(parsed, list)
+        and len(parsed) == 2
+        and all(isinstance(row, (list, tuple)) and len(row) == 2 for row in parsed)
+    ):
+        try:
+            return [[int(parsed[0][0]), int(parsed[0][1])], [int(parsed[1][0]), int(parsed[1][1])]]
+        except Exception:
+            return None
+    return None
+
+
+def _confusion_matrix_to_text(value: object) -> str:
+    matrix = _coerce_confusion_matrix(value)
+    if matrix is None:
+        return _jsonish_to_text(value)
+    return json.dumps(matrix, ensure_ascii=False)
 
 
 def _inspect_controlled_feature_schema(path: Path) -> pd.DataFrame:
@@ -2157,7 +2427,7 @@ def _build_controlled_comparison_curve_chart(
             x=alt.X("k:Q", axis=alt.Axis(title="K")),
             y=alt.Y(
                 f"{metric_col}:Q",
-                axis=alt.Axis(title=f"Validation {metric_label}"),
+                axis=alt.Axis(title=str(metric_label)),
             ),
             color=alt.Color(
                 "feature_set:N",
@@ -2168,8 +2438,9 @@ def _build_controlled_comparison_curve_chart(
                 alt.Tooltip("model_name:N", title="Modelo"),
                 alt.Tooltip("feature_set:N", title="Conjunto"),
                 alt.Tooltip("balance_mode:N", title="Balance"),
+                alt.Tooltip("threshold_protocol:N", title="Protocolo"),
                 alt.Tooltip("k:Q", title="K"),
-                alt.Tooltip(f"{metric_col}:Q", title=f"Val {metric_label}", format=".4f"),
+                alt.Tooltip(f"{metric_col}:Q", title=str(metric_label), format=".4f"),
             ],
         )
         .properties(height=260)
@@ -2177,10 +2448,166 @@ def _build_controlled_comparison_curve_chart(
     )
 
 
+def _controlled_comparison_metric_options(
+    df: pd.DataFrame,
+    *,
+    objective_label: str,
+) -> List[Tuple[str, str]]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    catalog = [
+        (f"Validación {objective_label} (objetivo)", "val_objective_score"),
+        (f"Test {objective_label} (objetivo)", "test_objective_score"),
+        ("Validación Accuracy", "val_accuracy"),
+        ("Test Accuracy", "test_accuracy"),
+        ("Validación Recall", "val_recall"),
+        ("Test Recall", "test_recall"),
+        ("Validación Sensibilidad", "val_sensitivity"),
+        ("Test Sensibilidad", "test_sensitivity"),
+        ("Validación ROC-AUC", "val_roc_auc"),
+        ("Test ROC-AUC", "test_roc_auc"),
+        ("Validación PR-AUC", "val_pr_auc"),
+        ("Test PR-AUC", "test_pr_auc"),
+        ("Validación F1", "val_f1"),
+        ("Test F1", "test_f1"),
+        ("Validación F1 Global", "val_f1_global"),
+        ("Test F1 Global", "test_f1_global"),
+        ("Validación Balanced F1", "val_balanced_f1"),
+        ("Test Balanced F1", "test_balanced_f1"),
+        ("Validación F1 Clase 0", "val_f1_class_0"),
+        ("Test F1 Clase 0", "test_f1_class_0"),
+        ("Validación F1 Clase 1", "val_f1_class_1"),
+        ("Test F1 Clase 1", "test_f1_class_1"),
+        ("Validación MCC", "val_mcc"),
+        ("Test MCC", "test_mcc"),
+        ("Validación Alertas/día", "val_alerts_per_day"),
+        ("Test Alertas/día", "test_alerts_per_day"),
+        ("Validación Falsas alarmas/día", "val_false_alarms_per_day"),
+        ("Test Falsas alarmas/día", "test_false_alarms_per_day"),
+        ("Validación Recall evento aprox.", "val_event_recall_approx"),
+        ("Test Recall evento aprox.", "test_event_recall_approx"),
+        ("Validación Costo operacional", "val_operational_cost"),
+        ("Test Costo operacional", "test_operational_cost"),
+        ("Validación Costo/día", "val_cost_per_day"),
+        ("Test Costo/día", "test_cost_per_day"),
+        ("Validación Falsos Negativos", "val_false_negatives"),
+        ("Test Falsos Negativos", "test_false_negatives"),
+        ("Validación Falsos Positivos", "val_false_positives"),
+        ("Test Falsos Positivos", "test_false_positives"),
+        ("Validación Verdaderos Negativos", "val_true_negatives"),
+        ("Test Verdaderos Negativos", "test_true_negatives"),
+        ("Validación Verdaderos Positivos", "val_true_positives"),
+        ("Test Verdaderos Positivos", "test_true_positives"),
+        ("Threshold de decisión", "decision_threshold"),
+    ]
+    available: List[Tuple[str, str]] = []
+    for label, col in catalog:
+        if col not in df.columns:
+            continue
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        if numeric.notna().any():
+            available.append((label, col))
+    return available
+
+
+def _prepare_controlled_comparison_detail_display(detail_df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(detail_df, pd.DataFrame) or detail_df.empty:
+        return pd.DataFrame()
+    display_df = detail_df.copy()
+    for json_col in [
+        "selected_features",
+        "best_params",
+        "smote_params",
+    ]:
+        if json_col in display_df.columns:
+            display_df[json_col] = display_df[json_col].apply(_jsonish_to_text)
+    for matrix_col in ["val_confusion_matrix", "test_confusion_matrix"]:
+        if matrix_col in display_df.columns:
+            display_df[matrix_col] = display_df[matrix_col].apply(
+                _confusion_matrix_to_text
+            )
+    sort_cols = [
+        col
+        for col in ["model_name", "balance_mode", "feature_set", "k"]
+        if col in display_df.columns
+    ]
+    if sort_cols:
+        display_df = display_df.sort_values(sort_cols).reset_index(drop=True)
+    preferred_cols = [
+        "model_name",
+        "feature_set",
+        "balance_mode",
+        "threshold_protocol",
+        "threshold_protocol_label",
+        "threshold_objective",
+        "threshold_objective_label",
+        "calibration_method",
+        "k",
+        "status",
+        "objective_label",
+        "val_objective_score",
+        "test_objective_score",
+        "val_accuracy",
+        "test_accuracy",
+        "val_recall",
+        "test_recall",
+        "val_sensitivity",
+        "test_sensitivity",
+        "val_roc_auc",
+        "test_roc_auc",
+        "val_pr_auc",
+        "test_pr_auc",
+        "val_f1",
+        "test_f1",
+        "val_f1_global",
+        "test_f1_global",
+        "val_balanced_f1",
+        "test_balanced_f1",
+        "val_f1_class_0",
+        "test_f1_class_0",
+        "val_f1_class_1",
+        "test_f1_class_1",
+        "val_mcc",
+        "test_mcc",
+        "val_alerts_per_day",
+        "test_alerts_per_day",
+        "val_false_alarms_per_day",
+        "test_false_alarms_per_day",
+        "val_event_recall_approx",
+        "test_event_recall_approx",
+        "val_operational_cost",
+        "test_operational_cost",
+        "val_cost_per_day",
+        "test_cost_per_day",
+        "alerts_per_day_budget",
+        "fn_cost",
+        "fp_cost",
+        "val_false_negatives",
+        "test_false_negatives",
+        "val_false_positives",
+        "test_false_positives",
+        "val_true_negatives",
+        "test_true_negatives",
+        "val_true_positives",
+        "test_true_positives",
+        "val_confusion_matrix",
+        "test_confusion_matrix",
+        "decision_threshold",
+        "selected_features",
+        "best_params",
+        "smote_params",
+        "error",
+    ]
+    visible_cols = [col for col in preferred_cols if col in display_df.columns]
+    remaining_cols = [col for col in display_df.columns if col not in visible_cols]
+    return display_df[visible_cols + remaining_cols]
+
+
 def _render_controlled_comparison_results(
     summary_df: pd.DataFrame,
     curves_df: pd.DataFrame,
     *,
+    grid_results_df: Optional[pd.DataFrame] = None,
     key_prefix: str,
 ) -> None:
     objective_metric = "roc_auc"
@@ -2203,15 +2630,55 @@ def _render_controlled_comparison_results(
         )
     objective_label_map = {
         "roc_auc": "ROC-AUC",
+        "pr_auc": "PR-AUC",
         "f1": "F1",
+        "balanced_f1": "Balanced F1",
         "mcc": "MCC",
+        "recall_at_alerts_per_day": "Recall@N alertas/día",
+        "operational_cost": "Costo operacional",
     }
     objective_label = objective_label_map.get(objective_metric, objective_metric.upper())
-    curve_metric_col = (
-        "val_objective_score"
-        if "val_objective_score" in curves_df.columns
-        else "val_roc_auc"
+
+    detail_df = (
+        grid_results_df.copy()
+        if isinstance(grid_results_df, pd.DataFrame)
+        else pd.DataFrame()
     )
+    plot_source_df = detail_df.copy() if not detail_df.empty else curves_df.copy()
+    if "status" in plot_source_df.columns:
+        plot_source_df = plot_source_df[
+            plot_source_df["status"].astype(str).str.lower() == "completed"
+        ].copy()
+    metric_options = _controlled_comparison_metric_options(
+        plot_source_df,
+        objective_label=objective_label,
+    )
+    selected_metric_col = (
+        "val_objective_score"
+        if "val_objective_score" in plot_source_df.columns
+        else ("val_roc_auc" if "val_roc_auc" in plot_source_df.columns else "")
+    )
+    selected_metric_label = (
+        f"Validación {objective_label} (objetivo)"
+        if selected_metric_col == "val_objective_score"
+        else "Validación ROC-AUC"
+    )
+    if metric_options:
+        metric_labels = [label for label, _ in metric_options]
+        default_label = (
+            f"Validación {objective_label} (objetivo)"
+            if f"Validación {objective_label} (objetivo)" in metric_labels
+            else metric_labels[0]
+        )
+        selected_metric_label = st.selectbox(
+            "Métrica a graficar",
+            metric_labels,
+            index=metric_labels.index(default_label),
+            key=f"{key_prefix}_metric_selector",
+        )
+        selected_metric_col = next(
+            col for label, col in metric_options if label == selected_metric_label
+        )
 
     summary_display = summary_df.copy()
     if not summary_display.empty:
@@ -2227,22 +2694,59 @@ def _render_controlled_comparison_results(
             summary_display["smote_params"] = summary_display["smote_params"].apply(
                 _jsonish_to_text
             )
+        if "best_test_confusion_matrix" in summary_display.columns:
+            summary_display["best_test_confusion_matrix"] = summary_display[
+                "best_test_confusion_matrix"
+            ].apply(_confusion_matrix_to_text)
         if {"model_name", "feature_set"}.issubset(summary_display.columns):
-            summary_display = summary_display.sort_values(
-                ["model_name", "feature_set"]
-            ).reset_index(drop=True)
+            sort_cols = [
+                col
+                for col in [
+                    "model_name",
+                    "feature_set",
+                    "balance_mode",
+                    "threshold_protocol",
+                ]
+                if col in summary_display.columns
+            ]
+            summary_display = summary_display.sort_values(sort_cols).reset_index(
+                drop=True
+            )
         preferred_cols = [
             "model_name",
             "feature_set",
+            "balance_mode",
+            "threshold_protocol",
+            "threshold_protocol_label",
+            "threshold_objective",
+            "threshold_objective_label",
+            "calibration_method",
             "objective_label",
             "val_objective_score",
             "test_objective_score",
+            "best_test_accuracy",
+            "best_test_recall",
+            "best_test_sensitivity",
             "best_test_roc_auc",
+            "best_test_pr_auc",
+            "best_test_f1_global",
+            "best_test_balanced_f1",
+            "best_test_f1_class_0",
+            "best_test_f1_class_1",
             "best_test_f1",
             "best_test_mcc",
+            "best_test_alerts_per_day",
+            "best_test_false_alarms_per_day",
+            "best_test_event_recall_approx",
+            "best_test_operational_cost",
+            "best_test_cost_per_day",
+            "best_test_false_negatives",
+            "best_test_false_positives",
+            "best_test_true_negatives",
+            "best_test_true_positives",
+            "best_test_confusion_matrix",
             "k_optimo",
             "smote_optimo",
-            "balance_mode",
             "decision_threshold",
             "selected_features",
             "best_params",
@@ -2261,58 +2765,226 @@ def _render_controlled_comparison_results(
     st.markdown("**Tabla resumen**")
     st.dataframe(summary_display, width="stretch")
 
-    if curves_df.empty:
-        st.info("No hay curvas disponibles para esta corrida.")
-        return
-
-    st.caption(
-        f"Las curvas muestran {objective_label} en validación; el test final queda reservado para la tabla resumen."
-    )
-    tab_none, tab_smote = st.tabs(["Sin SMOTE", "Con SMOTE"])
-    tab_specs = [
-        ("none", tab_none),
-        ("smote", tab_smote),
-    ]
-    for balance_mode, tab in tab_specs:
-        with tab:
-            mode_df = curves_df[
-                curves_df["balance_mode"].astype(str) == str(balance_mode)
-            ].copy()
-            if mode_df.empty:
-                st.info("No hay resultados para este modo de balance.")
-                continue
-            for model_name in ["Random Forest", "SVM", "XGBoost"]:
-                st.markdown(f"**{model_name}**")
-                chart = _build_controlled_comparison_curve_chart(
-                    mode_df,
-                    model_name=model_name,
-                    balance_mode=balance_mode,
-                    metric_col=curve_metric_col,
-                    metric_label=objective_label,
-                )
-                if chart is not None:
-                    st.altair_chart(chart, width="stretch")
+    if not summary_df.empty and "best_test_confusion_matrix" in summary_df.columns:
+        with st.expander("Matrices de confusión de test", expanded=False):
+            details_df = summary_df.copy()
+            if {"model_name", "feature_set"}.issubset(details_df.columns):
+                details_df = details_df.sort_values(
+                    ["model_name", "feature_set"]
+                ).reset_index(drop=True)
+            for _, row in details_df.iterrows():
+                matrix = _coerce_confusion_matrix(row.get("best_test_confusion_matrix"))
+                if matrix is None:
                     continue
-                fallback_df = mode_df[
-                    mode_df["model_name"].astype(str) == str(model_name)
-                ].copy()
-                if fallback_df.empty:
-                    st.info("No hay datos para este modelo.")
-                    continue
-                pivot_df = (
-                    fallback_df.pivot_table(
-                        index="k",
-                        columns="feature_set",
-                        values=curve_metric_col,
-                        aggfunc="max",
-                    )
-                    .sort_index()
+                title = (
+                    f"{row.get('model_name', '-')} | {row.get('feature_set', '-')} "
+                    f"| {row.get('balance_mode', '-')} | "
+                    f"{row.get('threshold_protocol', '-')} "
+                    f"| K={row.get('k_optimo', '-')}"
                 )
-                st.line_chart(pivot_df, height=260)
+                st.markdown(f"**{title}**")
                 st.dataframe(
-                    fallback_df.sort_values(["feature_set", "k"]),
+                    pd.DataFrame(
+                        matrix,
+                        index=["Actual 0", "Actual 1"],
+                        columns=["Pred 0", "Pred 1"],
+                    ),
                     width="stretch",
                 )
+
+    if plot_source_df.empty or not selected_metric_col:
+        st.info("No hay datos suficientes para construir gráficos para esta corrida.")
+    else:
+        st.caption(
+            "Las curvas usan todas las combinaciones completadas. "
+            f"Métrica seleccionada: {selected_metric_label}."
+        )
+        tab_none, tab_smote = st.tabs(["Sin SMOTE", "Con SMOTE"])
+        tab_specs = [
+            ("none", tab_none),
+            ("smote", tab_smote),
+        ]
+        for balance_mode, tab in tab_specs:
+            with tab:
+                mode_df = plot_source_df[
+                    plot_source_df["balance_mode"].astype(str) == str(balance_mode)
+                ].copy()
+                if mode_df.empty:
+                    st.info("No hay resultados para este modo de balance.")
+                    continue
+                mode_df["k"] = pd.to_numeric(mode_df.get("k"), errors="coerce")
+                mode_df[selected_metric_col] = pd.to_numeric(
+                    mode_df.get(selected_metric_col),
+                    errors="coerce",
+                )
+                mode_df = mode_df.dropna(subset=["k", selected_metric_col])
+                if mode_df.empty:
+                    st.info("No hay datos numéricos para esta métrica en este balance.")
+                    continue
+                for model_name in ["Random Forest", "SVM", "XGBoost"]:
+                    st.markdown(f"**{model_name}**")
+                    chart = _build_controlled_comparison_curve_chart(
+                        mode_df,
+                        model_name=model_name,
+                        balance_mode=balance_mode,
+                        metric_col=selected_metric_col,
+                        metric_label=selected_metric_label,
+                    )
+                    if chart is not None:
+                        st.altair_chart(chart, width="stretch")
+                        continue
+                    fallback_df = mode_df[
+                        mode_df["model_name"].astype(str) == str(model_name)
+                    ].copy()
+                    if fallback_df.empty:
+                        st.info("No hay datos para este modelo.")
+                        continue
+                    pivot_df = (
+                        fallback_df.pivot_table(
+                            index="k",
+                            columns="feature_set",
+                            values=selected_metric_col,
+                            aggfunc="max",
+                        )
+                        .sort_index()
+                    )
+                    st.line_chart(pivot_df, height=260)
+
+    detail_source_df = detail_df.copy()
+    if detail_source_df.empty and not curves_df.empty:
+        detail_source_df = curves_df.copy()
+    detail_display = _prepare_controlled_comparison_detail_display(detail_source_df)
+    st.markdown("**Tabla completa por K / modelo / balanceo**")
+    if detail_display.empty:
+        st.info("No hay tabla detallada disponible para esta corrida.")
+        return
+
+    filtered_df = detail_display.copy()
+    filter_cols = st.columns(5)
+    filter_specs = [
+        ("model_name", "Modelo"),
+        ("feature_set", "Conjunto"),
+        ("balance_mode", "Balanceo"),
+        ("threshold_protocol", "Protocolo"),
+        ("status", "Status"),
+    ]
+    for idx, (column_name, label) in enumerate(filter_specs):
+        if column_name not in filtered_df.columns:
+            continue
+        options = sorted(
+            [
+                str(value)
+                for value in filtered_df[column_name]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+                if str(value).strip()
+            ]
+        )
+        if not options:
+            continue
+        selected = filter_cols[idx].multiselect(
+            label,
+            options=options,
+            default=options,
+            key=f"{key_prefix}_{column_name}_filter",
+        )
+        if selected:
+            filtered_df = filtered_df[
+                filtered_df[column_name].astype(str).isin(selected)
+            ].copy()
+    st.dataframe(filtered_df, width="stretch")
+
+
+def _render_controlled_comparison_results_panel(
+    summary_df: pd.DataFrame,
+    curves_df: pd.DataFrame,
+    *,
+    grid_results_df: Optional[pd.DataFrame] = None,
+    key_prefix: str,
+) -> None:
+    _render_controlled_comparison_results(
+        summary_df,
+        curves_df,
+        grid_results_df=grid_results_df,
+        key_prefix=key_prefix,
+    )
+
+
+if hasattr(st, "fragment"):
+    _render_controlled_comparison_results_panel = st.fragment(
+        _render_controlled_comparison_results_panel
+    )
+
+
+def _load_controlled_comparison_result_frames(
+    result_state: Dict[str, object],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def _load_frame(path_value: object, fallback: object) -> pd.DataFrame:
+        path_text = str(path_value or "").strip()
+        if path_text:
+            path = Path(path_text)
+            if path.exists():
+                try:
+                    return pd.read_csv(path)
+                except Exception:
+                    pass
+        if isinstance(fallback, pd.DataFrame):
+            return fallback
+        return pd.DataFrame()
+
+    summary_df = _load_frame(
+        result_state.get("summary_path"),
+        result_state.get("summary_df"),
+    )
+    curves_df = _load_frame(
+        result_state.get("curves_path"),
+        result_state.get("curves_df"),
+    )
+    grid_results_df = _load_frame(
+        result_state.get("detail_path"),
+        result_state.get("grid_results_df"),
+    )
+    return summary_df, curves_df, grid_results_df
+
+
+def _render_controlled_comparison_current_result(
+    *,
+    checkpoint_root: Path,
+) -> None:
+    result_state = st.session_state.get("exp_controlled_last_results")
+    if not isinstance(result_state, dict) or not result_state:
+        return
+
+    summary_df, curves_df, grid_results_df = _load_controlled_comparison_result_frames(
+        result_state
+    )
+
+    run_id = result_state.get("run_id")
+    st.success(f"Comparación controlada finalizada. Run ID: {run_id}.")
+    if result_state.get("loaded_from_checkpoint"):
+        st.caption("Se cargó un checkpoint ya completado.")
+    elif result_state.get("auto_resumed"):
+        st.caption("La corrida se reanudó desde un checkpoint compatible.")
+    st.caption(
+        f"Checkpoint: {result_state.get('checkpoint_run_dir') or checkpoint_root}"
+    )
+    summary_name = result_state.get("summary_name") or "-"
+    curves_name = result_state.get("curves_name") or "-"
+    detail_name = result_state.get("detail_name") or "-"
+    st.caption(
+        "Resumen: "
+        f"{summary_name} | "
+        f"Curvas: {curves_name} | "
+        f"Detalle: {detail_name}"
+    )
+    _render_controlled_comparison_results_panel(
+        summary_df,
+        curves_df,
+        grid_results_df=grid_results_df,
+        key_prefix=f"controlled_current_{run_id}",
+    )
 
 
 def _render_controlled_comparison_memory_estimator(
@@ -2327,6 +2999,8 @@ def _render_controlled_comparison_memory_estimator(
     k_min: int,
     k_max: int,
     k_step: int,
+    xgb_parallel_jobs: int,
+    selected_models: List[str],
     search_space: Dict[str, object],
 ) -> None:
     snapshot = _system_memory_snapshot()
@@ -2348,6 +3022,7 @@ def _render_controlled_comparison_memory_estimator(
         "k_min": int(k_min),
         "k_max": int(k_max),
         "k_step": int(k_step),
+        "selected_models": list(selected_models),
         "search_space": search_space,
         "memory_budget_gb": float(
             st.session_state.get("exp_controlled_memory_budget_gb", default_budget_gb)
@@ -2386,7 +3061,8 @@ def _render_controlled_comparison_memory_estimator(
             help=(
                 "Techo de RAM que el experimento puede consumir. "
                 "Se usa para sugerir combinaciones seguras de "
-                "`Jobs paralelos RF/ranking` y `Optuna jobs paralelos`."
+                "`Jobs paralelos RF/ranking`, `Optuna jobs paralelos` "
+                "y `Jobs paralelos XGBoost`."
             ),
         )
         st.caption(
@@ -2428,6 +3104,8 @@ def _render_controlled_comparison_memory_estimator(
                         k_step=int(k_step),
                         search_space_config=search_space,
                         memory_budget_bytes=int(float(memory_budget_gb) * (1024 ** 3)),
+                        xgb_parallel_jobs=int(xgb_parallel_jobs),
+                        selected_models=list(selected_models),
                     )
                 st.session_state["exp_controlled_memory_estimate"] = estimate_payload
                 st.session_state[
@@ -2440,8 +3118,9 @@ def _render_controlled_comparison_memory_estimator(
         if not isinstance(estimate_payload, dict):
             st.info(
                 "Ejecuta este cálculo para obtener: "
-                "`max RF/ranking con Optuna=1`, "
-                "`max Optuna con RF=1` y una frontera segura combinada."
+                "`max RF/ranking con Optuna=1 y XGBoost=1`, "
+                "`max Optuna con RF=1 y XGBoost=1`, "
+                "`max XGBoost con RF=1 y Optuna=1` y una frontera segura combinada."
             )
             return
 
@@ -2463,51 +3142,68 @@ def _render_controlled_comparison_memory_estimator(
         max_optuna_jobs = int(
             estimate_payload.get("max_optuna_jobs_when_parallel_1") or 0
         )
+        max_xgb_jobs = int(
+            estimate_payload.get("max_xgb_parallel_jobs_when_parallel_1_optuna_1")
+            or 0
+        )
         safe_pairs = int(len(safe_frontier_df))
+        xgb_selected = "XGBoost" in selected_models
 
-        kpi_1, kpi_2, kpi_3, kpi_4 = st.columns(4)
+        kpi_1, kpi_2, kpi_3, kpi_4, kpi_5 = st.columns(5)
         kpi_1.metric(
             "Max RF/ranking",
             str(max_parallel_jobs) if max_parallel_jobs > 0 else "0",
-            "con Optuna=1",
+            "con Optuna=1, XGBoost=1",
         )
         kpi_2.metric(
             "Max Optuna",
             str(max_optuna_jobs) if max_optuna_jobs > 0 else "0",
-            "con RF=1",
+            "con RF=1, XGBoost=1",
+        )
+        kpi_3.metric(
+            "Max XGBoost",
+            (
+                str(max_xgb_jobs)
+                if xgb_selected and max_xgb_jobs > 0
+                else ("0" if xgb_selected else "N/A")
+            ),
+            "con RF=1, Optuna=1",
         )
         if recommended_pair:
-            kpi_3.metric(
-                "Pareja segura",
+            kpi_4.metric(
+                "Config. segura",
                 (
                     f"{int(recommended_pair['parallel_jobs'])} / "
-                    f"{int(recommended_pair['optuna_n_jobs'])}"
+                    f"{int(recommended_pair['optuna_n_jobs'])} / "
+                    f"{int(recommended_pair['xgb_parallel_jobs'])}"
                 ),
                 str(recommended_pair.get("dominant_model") or "-"),
             )
         else:
-            kpi_3.metric("Pareja segura", "N/A")
-        kpi_4.metric(
+            kpi_4.metric("Config. segura", "N/A")
+        kpi_5.metric(
             "Presupuesto",
             f"{float(memory_budget_gb):.1f} GB",
-            f"{safe_pairs} parejas seguras",
+            f"{safe_pairs} configuraciones seguras",
         )
 
         st.caption(
-            "Lectura correcta: los máximos `RF/ranking` y `Optuna` son límites "
-            "independientes. Si quieres aplicar ambos a la vez, usa la `Pareja segura` "
-            "o la tabla de frontera."
+            "Lectura correcta: los máximos `RF/ranking`, `Optuna` y `XGBoost` son "
+            "límites independientes con los otros ejes en 1. Si quieres aplicarlos a la vez, "
+            "usa la `Config. segura` o la tabla de frontera."
         )
 
         if safe_frontier_df.empty:
             st.warning(
-                "Con el presupuesto actual no se encontró una pareja segura estimada. "
+                "Con el presupuesto actual no se encontró una configuración segura estimada. "
                 "Reduce `K`, acota la grilla o aumenta el presupuesto de RAM."
             )
 
         render_df = safe_frontier_df.copy() if not safe_frontier_df.empty else frontier_df.copy()
         if not render_df.empty:
-            render_df = render_df.sort_values("parallel_jobs").reset_index(drop=True)
+            render_df = render_df.sort_values(
+                ["parallel_jobs", "xgb_parallel_jobs", "max_optuna_jobs"]
+            ).reset_index(drop=True)
             render_df["peak_gb"] = (
                 pd.to_numeric(
                     render_df.get("optimization_peak_bytes"), errors="coerce"
@@ -2532,7 +3228,10 @@ def _render_controlled_comparison_memory_estimator(
                 render_df[
                     [
                         "parallel_jobs",
+                        "xgb_parallel_jobs",
                         "max_optuna_jobs",
+                        "cpu_limited_optuna_jobs",
+                        "memory_limited_optuna_jobs",
                         "dominant_model",
                         "ranking_peak_gb",
                         "peak_gb",
@@ -2542,7 +3241,10 @@ def _render_controlled_comparison_memory_estimator(
                 ].rename(
                     columns={
                         "parallel_jobs": "RF/ranking jobs",
+                        "xgb_parallel_jobs": "XGBoost jobs",
                         "max_optuna_jobs": "Optuna jobs",
+                        "cpu_limited_optuna_jobs": "Limite CPU Optuna",
+                        "memory_limited_optuna_jobs": "Limite RAM Optuna",
                         "dominant_model": "Modelo dominante",
                         "ranking_peak_gb": "Peak ranking RF (GB)",
                         "peak_gb": "Peak optimización (GB)",
@@ -2553,44 +3255,58 @@ def _render_controlled_comparison_memory_estimator(
                 width="stretch",
             )
 
-        button_col_1, button_col_2, button_col_3 = st.columns(3)
+        button_col_1, button_col_2, button_col_3, button_col_4 = st.columns(4)
         with button_col_1:
             if recommended_pair and st.button(
-                "Usar pareja segura",
+                "Usar config. segura",
                 key="exp_controlled_apply_safe_pair",
             ):
-                st.session_state["exp_controlled_parallel_jobs"] = int(
-                    recommended_pair["parallel_jobs"]
+                _queue_controlled_job_config_apply(
+                    parallel_jobs=int(recommended_pair["parallel_jobs"]),
+                    optuna_n_jobs=int(recommended_pair["optuna_n_jobs"]),
+                    xgb_parallel_jobs=int(recommended_pair["xgb_parallel_jobs"]),
+                    notice="Se aplicó la configuración segura recomendada por memoria.",
                 )
-                st.session_state["exp_controlled_optuna_n_jobs"] = int(
-                    recommended_pair["optuna_n_jobs"]
-                )
-                st.session_state["exp_controlled_memory_notice"] = (
-                    "Se aplicó la pareja segura recomendada por memoria."
-                )
-                st.rerun()
         with button_col_2:
             if max_parallel_jobs > 0 and st.button(
-                "Usar max RF (Optuna=1)",
+                "Usar max RF",
                 key="exp_controlled_apply_parallel_max",
             ):
-                st.session_state["exp_controlled_parallel_jobs"] = int(max_parallel_jobs)
-                st.session_state["exp_controlled_optuna_n_jobs"] = 1
-                st.session_state["exp_controlled_memory_notice"] = (
-                    "Se aplicó el máximo RF/ranking seguro con Optuna=1."
+                _queue_controlled_job_config_apply(
+                    parallel_jobs=int(max_parallel_jobs),
+                    optuna_n_jobs=1,
+                    xgb_parallel_jobs=1,
+                    notice=(
+                        "Se aplicó el máximo RF/ranking seguro con Optuna=1 y "
+                        "XGBoost=1."
+                    ),
                 )
-                st.rerun()
         with button_col_3:
             if max_optuna_jobs > 0 and st.button(
-                "Usar max Optuna (RF=1)",
+                "Usar max Optuna",
                 key="exp_controlled_apply_optuna_max",
             ):
-                st.session_state["exp_controlled_parallel_jobs"] = 1
-                st.session_state["exp_controlled_optuna_n_jobs"] = int(max_optuna_jobs)
-                st.session_state["exp_controlled_memory_notice"] = (
-                    "Se aplicó el máximo Optuna seguro con RF/ranking=1."
+                _queue_controlled_job_config_apply(
+                    parallel_jobs=1,
+                    optuna_n_jobs=int(max_optuna_jobs),
+                    xgb_parallel_jobs=1,
+                    notice=(
+                        "Se aplicó el máximo Optuna seguro con RF=1 y XGBoost=1."
+                    ),
                 )
-                st.rerun()
+        with button_col_4:
+            if xgb_selected and max_xgb_jobs > 0 and st.button(
+                "Usar max XGBoost",
+                key="exp_controlled_apply_xgb_max",
+            ):
+                _queue_controlled_job_config_apply(
+                    parallel_jobs=1,
+                    optuna_n_jobs=1,
+                    xgb_parallel_jobs=int(max_xgb_jobs),
+                    notice=(
+                        "Se aplicó el máximo XGBoost seguro con RF=1 y Optuna=1."
+                    ),
+                )
 
         detail_payload = {
             "estimator_version": estimate_payload.get("estimator_version"),
@@ -2608,6 +3324,13 @@ def _render_controlled_comparison_memory_estimator(
             "ranking_feature_count": int(
                 estimate_payload.get("ranking_feature_count") or 0
             ),
+            "xgb_parallel_jobs": int(
+                estimate_payload.get("xgb_parallel_jobs") or 0
+            ),
+            "max_xgb_parallel_jobs_when_parallel_1_optuna_1": int(
+                estimate_payload.get("max_xgb_parallel_jobs_when_parallel_1_optuna_1")
+                or 0
+            ),
         }
         components = dict(estimate_payload.get("components") or {})
         if components:
@@ -2622,6 +3345,14 @@ def _render_controlled_comparison_memory_estimator(
 def _render_controlled_comparison_protocol_description(
     *,
     objective_label: str,
+    selected_models: List[str],
+    threshold_protocols: List[str],
+    threshold_objective_label: str,
+    calibration_method: str,
+    alerts_per_day: float,
+    fn_cost: float,
+    fp_cost: float,
+    robust_folds: int,
     test_size: float,
     val_size: float,
     k_min: int,
@@ -2631,7 +3362,10 @@ def _render_controlled_comparison_protocol_description(
     timeout: int,
     optuna_n_jobs: int,
     parallel_jobs: int,
+    xgb_parallel_jobs: int,
 ) -> None:
+    selected_models_text = ", ".join(selected_models) if selected_models else "(ninguno)"
+    protocol_text = ", ".join(threshold_protocols) if threshold_protocols else "(ninguno)"
     with st.expander("Descripción detallada del experimento", expanded=True):
         st.markdown(
             "\n".join(
@@ -2643,27 +3377,32 @@ def _render_controlled_comparison_protocol_description(
                     "5. **Sin leakage en feature selection.** El ranking de importancia se calcula únicamente sobre `train`, nunca sobre `val`, `test` ni sobre el dataset completo del tramo. Esto evita que la selección de variables vea información futura.",
                     "6. **Tres conjuntos de variables.** Se construyen y evalúan tres vistas distintas del mismo problema: `Base` (solo flujo), `Cluster` (solo variables de cluster) y `Base + Cluster` (todas las variables numéricas disponibles).",
                     "7. **Grilla efectiva de K.** La grilla configurada por el usuario (`min`, `max`, `step`) se recorta automáticamente al tamaño real de cada conjunto. Si el máximo real no cae justo en el paso, también se incluye para no perder el borde superior evaluable.",
-                    "8. **Estimación opcional de memoria.** Antes de ejecutar, la UI puede calcular jobs seguros usando el dataset real del tramo, el mayor `K` evaluable y el peor caso estimado de SMOTE/modelo. Ese cálculo reporta máximos independientes y una frontera segura combinada para `RF/ranking jobs` y `Optuna jobs` bajo un presupuesto explícito de RAM.",
-                    "9. **Combinaciones evaluadas.** Para cada corrida se recorren todas las combinaciones `modelo × conjunto × balance_mode × K`, donde los modelos son `Random Forest`, `SVM` y `XGBoost`, y los modos de balance son `sin SMOTE` y `con SMOTE`.",
+                    "8. **Estimación opcional de memoria.** Antes de ejecutar, la UI puede calcular jobs seguros usando el dataset real del tramo, el mayor `K` evaluable y el peor caso estimado de SMOTE/modelo. Ese cálculo reporta máximos independientes y una frontera segura combinada para `RF/ranking jobs`, `Optuna jobs` y `XGBoost jobs` bajo un presupuesto explícito de RAM.",
+                    "9. **Combinaciones evaluadas.** Para cada corrida se recorren todas las combinaciones `modelo × conjunto × balance_mode × protocolo_threshold × K` usando sólo los modelos y protocolos seleccionados en la UI. Los modos de balance son `sin SMOTE` y `con SMOTE`.",
                     "10. **Optimización con Optuna.** Para cada combinación se ejecuta una búsqueda con Optuna usando exactamente el objetivo seleccionado en esta UI: "
                     f"`{objective_label}`. Se optimizan los hiperparámetros del modelo y, cuando corresponde, también los hiperparámetros de SMOTE.",
-                    "11. **Cómo se mide el objetivo.** Si el objetivo es `ROC-AUC`, cada trial se evalúa directamente sobre scores de validación. Si el objetivo es `F1` o `MCC`, en cada trial se busca sobre validación el threshold que maximiza esa métrica y ese threshold queda asociado al mejor trial.",
+                    "11. **Separación objetivo/threshold.** Optuna optimiza la métrica de ranking o clasificación seleccionada. Después, el threshold operativo se escoge con el objetivo de threshold configurado, de modo que PR-AUC puede ordenar modelos sin imponer un umbral arbitrario.",
                     "12. **Uso correcto de SMOTE.** SMOTE se aplica solamente sobre el bloque de entrenamiento del trial. Nunca se usa sobre `val` ni sobre `test`, de modo que la evaluación se mantiene honesta.",
-                    "13. **Refit final.** Una vez encontrado el mejor trial para una combinación, el modelo se reentrena usando `train + val`. Luego se evalúa una sola vez sobre el `test` congelado. Para `F1` y `MCC`, el threshold seleccionado en validación se conserva para la evaluación final.",
-                    "14. **Selección del mejor K.** Dentro de cada par `modelo + conjunto`, el `K` óptimo se define por la mejor métrica objetivo en validación. En empate, se privilegia el `K` más pequeño para evitar complejidad innecesaria.",
-                    "15. **Resultados reportados.** La tabla resumen muestra el mejor resultado por `modelo + conjunto`, indicando el `K` óptimo, si la mejor variante usó SMOTE, el threshold final aplicado y las métricas de test más relevantes (`ROC-AUC`, `F1`, `MCC`). Los gráficos muestran la evolución de la métrica objetivo en validación a través de los distintos `K`.",
+                    "13. **Protocolos de threshold.** Conservador entrena con `train`, calibra/elige threshold en `val` y evalúa ese mismo modelo en `test`. Robusto genera scores OOF temporales dentro de `train + val`, elige threshold con esos scores, reentrena en `train + val` y evalúa una sola vez en `test`.",
+                    "14. **Selección del mejor K.** Dentro de cada grupo `modelo + conjunto + balance + protocolo`, el `K` óptimo se define por la mejor métrica objetivo en validación/OOF. En empate, se privilegia el `K` más pequeño para evitar complejidad innecesaria.",
+                    "15. **Resultados reportados.** La tabla resumen muestra el mejor resultado por `modelo + conjunto + balance + protocolo`, indicando el `K` óptimo, threshold aplicado, PR-AUC, Balanced F1, falsas alarmas/día, recall aproximado por evento y costo operacional.",
                     "16. **Checkpoint y reanudación.** Cada corrida guarda checkpoints reanudables, estado live y artefactos intermedios. Si la configuración coincide exactamente con una corrida previa incompleta, la UI permite reanudar sin recalcular combinaciones ya resueltas.",
-                    "17. **Paralelización.** `Random Forest` usa `n_jobs` para acelerar ranking y entrenamiento. `SVM` no expone `n_jobs`, por lo que su aceleración ocurre a nivel de trials de Optuna. En este protocolo, `XGBoost` se fija con `n_jobs=1` para evitar sobrecarga cuando ya existe paralelismo externo.",
+                    "17. **Paralelización.** `Random Forest` usa `n_jobs` para acelerar ranking y entrenamiento. `SVM` no expone `n_jobs`, por lo que su aceleración ocurre a nivel de trials de Optuna. `XGBoost` también puede configurarse con sus propios jobs paralelos. Para evitar oversubscription, la optimización limita automáticamente `Optuna jobs` por modelo cuando `RF` o `XGBoost` ya están usando hilos internos; aun así conviene usar el estimador antes de subir simultáneamente `Optuna jobs` y `XGBoost jobs`.",
                     "18. **Combinaciones inválidas.** Si una combinación falla por falta de clases, `K` imposible o configuración de SMOTE inválida para ese split, se registra como fallida y la corrida continúa con el resto de la matriz experimental.",
                 ]
             )
         )
         st.caption(
             "Configuración actual: "
-            f"objetivo={objective_label} | test_size={float(test_size):.2f} | "
+            f"modelos={selected_models_text} | "
+            f"objetivo Optuna={objective_label} | protocolos={protocol_text} | "
+            f"threshold={threshold_objective_label} | calibración={calibration_method} | "
+            f"alertas/día={float(alerts_per_day):.1f} | costo FN/FP={float(fn_cost):.1f}/{float(fp_cost):.1f} | "
+            f"folds robustos={int(robust_folds)} | test_size={float(test_size):.2f} | "
             f"val_size={float(val_size):.2f} | K=[{int(k_min)}, {int(k_max)}] paso {int(k_step)} | "
             f"trials={int(n_trials)} | timeout={int(timeout)} s | "
-            f"Optuna jobs={int(optuna_n_jobs)} | RF/ranking jobs={int(parallel_jobs)}"
+            f"Optuna jobs={int(optuna_n_jobs)} | RF/ranking jobs={int(parallel_jobs)} | "
+            f"XGBoost jobs={int(xgb_parallel_jobs)}"
         )
 
 
@@ -3338,7 +4077,42 @@ def _resolve_feature_cols(
             col
             for col in selected_features
             if col not in allowed_cols and col not in cluster_cols
-        ]
+    ]
+    return selected, missing
+
+
+def _resolve_feature_group_cols(
+    df: pd.DataFrame,
+    selected_features: Optional[List[str]],
+    *,
+    feature_group: str,
+) -> Tuple[List[str], List[str]]:
+    numeric_cols = _get_feature_cols(df)
+    cluster_cols_set = set(_get_cluster_cols(df))
+    base_cols = [col for col in numeric_cols if col not in cluster_cols_set]
+    cluster_cols = [col for col in numeric_cols if col in cluster_cols_set]
+    if feature_group == "base":
+        allowed_cols = base_cols
+        ignored_cols = set(cluster_cols)
+    elif feature_group == "cluster":
+        allowed_cols = cluster_cols
+        ignored_cols = set(base_cols)
+    elif feature_group == "base_cluster":
+        allowed_cols = numeric_cols
+        ignored_cols = set()
+    else:
+        raise ValueError(f"Grupo de features no soportado: {feature_group}")
+
+    if selected_features is None:
+        return allowed_cols, []
+    if not selected_features:
+        return [], []
+    selected = [col for col in selected_features if col in allowed_cols]
+    missing = [
+        col
+        for col in selected_features
+        if col not in allowed_cols and col not in ignored_cols
+    ]
     return selected, missing
 
 
@@ -7147,7 +7921,7 @@ def _render_balance_tab() -> None:
 
 def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]:
     params = {}
-    if model_choice == "Random Forest":
+    if model_choice in {"Random Forest", "Balanced Random Forest"}:
         n_estimators = st.number_input(
             "n_estimators",
             min_value=50,
@@ -7162,10 +7936,25 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
             step=1,
             key=f"{prefix}model_rf_max_depth",
         )
+        class_weight = None
+        if model_choice == "Random Forest":
+            class_weight_label = st.selectbox(
+                "class_weight",
+                ["balanced", "None"],
+                key=f"{prefix}model_rf_class_weight",
+                help=(
+                    "Peso de clases para Random Forest. Valores: balanced o None. "
+                    "Default: balanced. Balanced compensa el desbalance; usar None "
+                    "puede favorecer la clase mayoritaria."
+                ),
+            )
+            class_weight = None if class_weight_label == "None" else class_weight_label
         params = {
             "n_estimators": int(n_estimators),
             "max_depth": int(max_depth) if max_depth else None,
         }
+        if model_choice == "Random Forest":
+            params["class_weight"] = class_weight
     elif model_choice == "XGBoost":
         n_estimators = st.number_input(
             "n_estimators",
@@ -7229,6 +8018,20 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
             format="%.2f",
             key=f"{prefix}model_xgb_gamma",
         )
+        scale_pos_weight = st.number_input(
+            "scale_pos_weight (0 = auto)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            format="%.2f",
+            key=f"{prefix}model_xgb_scale_pos_weight",
+            help=(
+                "Peso de la clase positiva para XGBoost. Use 0 para calcular "
+                "negativos/positivos automáticamente cuando la estrategia de "
+                "desbalance lo requiera; valores manuales altos suben recall pero "
+                "pueden disparar falsas alarmas."
+            ),
+        )
         params = {
             "n_estimators": int(n_estimators),
             "max_depth": int(max_depth),
@@ -7239,6 +8042,10 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
             "reg_lambda": float(reg_lambda),
             "gamma": float(gamma),
         }
+        if float(scale_pos_weight) > 0:
+            params["scale_pos_weight"] = float(scale_pos_weight)
+        else:
+            params["scale_pos_weight"] = "auto"
     else:
         kernel = st.selectbox(
             "kernel",
@@ -7248,7 +8055,22 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
         c_value = st.number_input(
             "C", min_value=0.01, value=1.0, step=0.1, key=f"{prefix}model_svm_c"
         )
-        params = {"kernel": kernel, "C": float(c_value)}
+        class_weight_label = st.selectbox(
+            "class_weight",
+            ["balanced", "None"],
+            key=f"{prefix}model_svm_class_weight",
+            help=(
+                "Peso de clases para SVM. Valores: balanced o None. Default: "
+                "balanced. Usar None en datos raros suele reducir sensibilidad "
+                "a accidentes."
+            ),
+        )
+        params = {
+            "kernel": kernel,
+            "C": float(c_value),
+            "class_weight": None if class_weight_label == "None" else class_weight_label,
+            "probability": False,
+        }
     return params
 
 
@@ -7303,6 +8125,11 @@ def _render_model_tab() -> None:
         value=float(st.session_state.get("far_target", 0.2)),
         step=0.01,
         key="far_target",
+        help=(
+            "Falsa alarma máxima aceptada cuando el objetivo de threshold es FAR. "
+            "Rango: 0.00 a 0.50. Default: 0.20. No es una probabilidad calibrada; "
+            "controla tasa de falsos positivos en validación."
+        ),
     )
     val_size = st.slider(
         "Validation size",
@@ -7311,17 +8138,176 @@ def _render_model_tab() -> None:
         value=float(st.session_state.get("val_size", 0.2)),
         step=0.05,
         key="val_size",
+        help=(
+            "Fracción temporal de train+val reservada para seleccionar threshold. "
+            "Rango: 0.05 a 0.40. Default: 0.20. Una validación demasiado pequeña "
+            "vuelve inestable el threshold en eventos raros."
+        ),
     )
+
+    protocol_options = {
+        "Conservador": "conservative",
+        "Robusto": "robust",
+    }
+    selected_protocol_labels = st.multiselect(
+        "Protocolos de evaluación",
+        list(protocol_options.keys()),
+        default=list(protocol_options.keys()),
+        key="model_threshold_protocols",
+        help=(
+            "Permite entrenar/evaluar Conservador, Robusto o ambos. Conservador "
+            "elige threshold en validación y evalúa ese mismo modelo en test. "
+            "Robusto usa folds temporales OOF dentro de train+val. Elegir ambos "
+            "duplica aproximadamente el tiempo de entrenamiento."
+        ),
+    )
+    threshold_protocols = [
+        protocol_options[label]
+        for label in selected_protocol_labels
+        if label in protocol_options
+    ] or ["conservative"]
+
+    threshold_objective_options = {
+        "Recall@N alertas/día": "recall_at_alerts_per_day",
+        "FAR": "far",
+        "Balanced F1": "balanced_f1",
+        "F1": "f1",
+        "MCC": "mcc",
+        "Costo operacional": "operational_cost",
+    }
+    col_thr_a, col_thr_b, col_thr_c = st.columns(3)
+    with col_thr_a:
+        threshold_objective_label = st.selectbox(
+            "Objetivo de threshold",
+            list(threshold_objective_options.keys()),
+            index=0,
+            key="model_threshold_objective",
+            help=(
+                "Métrica usada para escoger el umbral operativo. Valores: FAR, "
+                "Balanced F1, F1, MCC, Recall@N alertas/día o Costo operacional. "
+                "Default: Recall@N alertas/día. Usar solo F1 puede ignorar carga "
+                "operacional de falsas alarmas."
+            ),
+        )
+    with col_thr_b:
+        alerts_per_day = st.number_input(
+            "Alertas máximas por día",
+            min_value=0.1,
+            max_value=50.0,
+            value=5.0,
+            step=0.5,
+            key="model_alerts_per_day",
+            help=(
+                "Presupuesto diario de alertas para Recall@N y métricas "
+                "operacionales. Rango práctico: 0.1 a 50. Default: 5.0. "
+                "Valores muy bajos pueden ocultar eventos detectables."
+            ),
+        )
+    with col_thr_c:
+        calibration_method = st.selectbox(
+            "Calibración",
+            ["sigmoid", "none", "isotonic"],
+            index=0,
+            key="model_calibration_method",
+            help=(
+                "Transforma scores antes de elegir threshold. Valores: sigmoid, "
+                "none, isotonic. Default: sigmoid. Isotonic puede sobreajustar "
+                "con pocos positivos."
+            ),
+        )
+    col_cost_a, col_cost_b, col_cost_c = st.columns(3)
+    with col_cost_a:
+        fn_cost = st.number_input(
+            "Costo FN",
+            min_value=0.0,
+            value=10.0,
+            step=1.0,
+            key="model_fn_cost",
+            help=(
+                "Costo de no alertar un accidente real. Default: 10.0. Subirlo "
+                "favorece recall, pero puede aumentar falsas alarmas."
+            ),
+        )
+    with col_cost_b:
+        fp_cost = st.number_input(
+            "Costo FP",
+            min_value=0.0,
+            value=1.0,
+            step=0.5,
+            key="model_fp_cost",
+            help=(
+                "Costo de una falsa alarma. Default: 1.0. Subirlo reduce alertas, "
+                "pero puede bajar recall."
+            ),
+        )
+    with col_cost_c:
+        robust_folds = st.number_input(
+            "Folds robustos",
+            min_value=2,
+            max_value=10,
+            value=3,
+            step=1,
+            key="model_robust_folds",
+            help=(
+                "Número de folds temporales OOF para el protocolo robusto. "
+                "Rango: 2 a 10. Default: 3. Más folds cuestan más y pueden fallar "
+                "si cada ventana tiene pocos accidentes."
+            ),
+        )
+    threshold_objective = threshold_objective_options.get(
+        threshold_objective_label,
+        "recall_at_alerts_per_day",
+    )
+    balance_strategy_options = {
+        "Sin balance interno": "none",
+        "Class weight / scale_pos_weight": "class_weight",
+        "SMOTE interno": "smote",
+    }
+    balance_strategy_label = st.selectbox(
+        "Estrategia de desbalance",
+        list(balance_strategy_options.keys()),
+        index=1,
+        key="model_balance_strategy",
+        help=(
+            "Define cómo manejar el desbalance dentro de los folds de entrenamiento. "
+            "Valores: sin balance, class_weight/scale_pos_weight o SMOTE interno. "
+            "Default: class_weight/scale_pos_weight. SMOTE se aplica solo a train, "
+            "nunca a validación ni test."
+        ),
+    )
+    balance_strategy = balance_strategy_options.get(balance_strategy_label, "class_weight")
 
     model_choice = st.selectbox(
         "Modelo",
-        ["Random Forest", "XGBoost", "SVM"],
+        ["Random Forest", "Balanced Random Forest", "XGBoost", "SVM"],
         key="model_choice",
+        help=(
+            "Modelo a entrenar en la pestaña Modelos. Balanced Random Forest "
+            "requiere imbalanced-learn y compara submuestreo balanceado frente a RF."
+        ),
     )
 
     random_state = st.number_input(
         "random_state", min_value=0, value=42, step=1, key="model_random_state"
     )
+    model_n_jobs: Optional[int] = None
+    if model_choice in {"Random Forest", "Balanced Random Forest"}:
+        model_n_jobs = _render_model_n_jobs_input(
+            "Jobs paralelos RF/ranking",
+            key="model_rf_parallel_jobs",
+            default=min(10, _max_optuna_parallel_jobs()),
+        )
+    elif model_choice == "XGBoost":
+        model_n_jobs = _render_model_n_jobs_input(
+            "Jobs paralelos XGBoost",
+            key="model_xgb_parallel_jobs",
+            default=1,
+        )
+    else:
+        st.caption(
+            "SVM no expone `n_jobs`; en Comparación controlada se paraleliza "
+            "a través de Optuna."
+        )
 
     optuna_model_params = st.session_state.get("optuna_best_model_params")
     optuna_model_choice = st.session_state.get("optuna_best_model_choice")
@@ -7342,17 +8328,26 @@ def _render_model_tab() -> None:
         cols_all = [col for col in selected_features if col in numeric_cols]
     
     cols_base = [c for c in cols_all if c not in cluster_cols]
+    cols_cluster_only = [c for c in cols_all if c in cluster_cols]
     
     key_base = _optuna_result_key(feature_key, cols_base)
+    key_cluster_only = _optuna_result_key(feature_key, cols_cluster_only)
     key_cluster = _optuna_result_key(feature_key, cols_all)
     
     optuna_matches_base = optuna_active_key == key_base
+    optuna_matches_cluster_only = (
+        bool(cols_cluster_only) and optuna_active_key == key_cluster_only
+    )
     optuna_matches_cluster = optuna_active_key == key_cluster
     
     optuna_ready = (
         isinstance(optuna_model_params, dict)
         and optuna_model_choice == model_choice
-        and (optuna_matches_base or optuna_matches_cluster)
+        and (
+            optuna_matches_base
+            or optuna_matches_cluster_only
+            or optuna_matches_cluster
+        )
     )
     if optuna_ready:
         try:
@@ -7362,7 +8357,7 @@ def _render_model_tab() -> None:
         except TypeError:
             params_signature = str(optuna_model_params)
         optuna_signature = f"{optuna_active_key}|{optuna_model_choice}|{params_signature}"
-        if model_choice == "Random Forest":
+        if model_choice in {"Random Forest", "Balanced Random Forest"}:
             required_keys = ["model_rf_n_estimators", "model_rf_max_depth"]
         elif model_choice == "XGBoost":
             required_keys = [
@@ -7381,6 +8376,8 @@ def _render_model_tab() -> None:
         target_prefixes = []
         if optuna_matches_base:
             target_prefixes.append("base_")
+        if optuna_matches_cluster_only:
+            target_prefixes.append("cluster_only_")
         if optuna_matches_cluster:
             target_prefixes.append("cluster_")
 
@@ -7388,7 +8385,7 @@ def _render_model_tab() -> None:
             "optuna_model_params_applied_signature"
         )
         if applied_signature != optuna_signature:
-            if model_choice == "Random Forest":
+            if model_choice in {"Random Forest", "Balanced Random Forest"}:
                 n_estimators = int(optuna_model_params.get("n_estimators", 200))
                 max_depth = optuna_model_params.get("max_depth")
                 for prefix in target_prefixes:
@@ -7433,11 +8430,26 @@ def _render_model_tab() -> None:
     elif isinstance(optuna_model_params, dict) and optuna_model_choice:
         st.caption(f"Optuna disponible para {optuna_model_choice}.")
 
-    param_tabs = st.tabs(["Parámetros Base", "Parámetros Base + Cluster"])
+    param_tabs = st.tabs(
+        ["Parámetros Base", "Parámetros Cluster", "Parámetros Base + Cluster"]
+    )
     with param_tabs[0]:
         model_params_base = _render_model_params_ui(model_choice, "base_")
     with param_tabs[1]:
+        model_params_cluster_only = _render_model_params_ui(
+            model_choice,
+            "cluster_only_",
+        )
+    with param_tabs[2]:
         model_params_cluster = _render_model_params_ui(model_choice, "cluster_")
+    if model_n_jobs is not None:
+        model_params_base["n_jobs"] = int(model_n_jobs)
+        model_params_cluster_only["n_jobs"] = int(model_n_jobs)
+        model_params_cluster["n_jobs"] = int(model_n_jobs)
+        st.caption(
+            f"`n_jobs` efectivo para {model_choice}: {int(model_n_jobs)} "
+            "(se aplicará a Base, Cluster y Base + Cluster)."
+        )
 
     st.markdown(
         "El selector permite entrenar con el dataset balanceado "
@@ -7456,6 +8468,129 @@ def _render_model_tab() -> None:
     )
     st.session_state["use_balanced_base"] = use_balanced
     st.session_state["use_balanced_cluster"] = use_balanced
+    if use_balanced and balance_strategy == "smote":
+        st.warning(
+            "El dataset balanceado legacy ya contiene SMOTE en train. "
+            "Para evitar doble SMOTE, esta corrida usará 'Sin balance interno' "
+            "sobre ese split prebalanceado."
+        )
+
+    def _primary_protocol_result(
+        results_by_protocol: Dict[str, Dict[str, object]]
+    ) -> Dict[str, object]:
+        if "robust" in results_by_protocol:
+            return results_by_protocol["robust"]
+        if "conservative" in results_by_protocol:
+            return results_by_protocol["conservative"]
+        return next(iter(results_by_protocol.values()))
+
+    def _train_selected_protocols(
+        *,
+        use_split: bool,
+        df: Optional[pd.DataFrame] = None,
+        train_df: Optional[pd.DataFrame] = None,
+        test_df: Optional[pd.DataFrame] = None,
+        feature_cols: List[str],
+        model_params: Dict[str, object],
+    ) -> Dict[str, Dict[str, object]]:
+        by_protocol: Dict[str, Dict[str, object]] = {}
+        effective_balance_strategy = (
+            "none" if (use_balanced and use_split) else balance_strategy
+        )
+        for protocol in threshold_protocols:
+            common_kwargs = {
+                "val_size": float(val_size),
+                "far_target": float(far_target),
+                "random_state": int(random_state),
+                "threshold_protocol": protocol,
+                "threshold_objective": threshold_objective,
+                "calibration_method": str(calibration_method),
+                "alerts_per_day": float(alerts_per_day),
+                "fn_cost": float(fn_cost),
+                "fp_cost": float(fp_cost),
+                "robust_folds": int(robust_folds),
+                "balance_strategy": effective_balance_strategy,
+            }
+            if use_split:
+                if train_df is None or test_df is None:
+                    raise ValueError("Split train/test requerido.")
+                by_protocol[protocol] = _train_model_on_split(
+                    train_df,
+                    test_df,
+                    feature_cols,
+                    model_choice,
+                    model_params,
+                    **common_kwargs,
+                )
+            else:
+                if df is None:
+                    raise ValueError("Dataset requerido.")
+                by_protocol[protocol] = _train_model(
+                    df,
+                    feature_cols,
+                    model_choice,
+                    model_params,
+                    test_size=float(test_size),
+                    **common_kwargs,
+                )
+        return by_protocol
+
+    def _resolve_model_feature_group_cols(
+        df: pd.DataFrame,
+        *,
+        feature_group: str,
+        label: str,
+    ) -> List[str]:
+        selected_features = st.session_state.get("selected_features")
+        feature_cols, missing = _resolve_feature_group_cols(
+            df,
+            selected_features,
+            feature_group=feature_group,
+        )
+        if selected_features is not None and missing:
+            st.warning(
+                f"Variables seleccionadas no estan en el dataset para {label}: "
+                + ", ".join(missing)
+            )
+        if selected_features is not None and not feature_cols:
+            raise ValueError(
+                f"Seleccione al menos una variable del grupo {label} en Feature selection."
+            )
+        if not feature_cols:
+            raise ValueError(f"No hay variables numericas para {label}.")
+        return list(feature_cols)
+
+    def _train_feature_group_protocols(
+        *,
+        label: str,
+        feature_group: str,
+        model_params: Dict[str, object],
+        use_split: bool,
+        df: Optional[pd.DataFrame] = None,
+        train_df: Optional[pd.DataFrame] = None,
+        test_df: Optional[pd.DataFrame] = None,
+    ) -> Tuple[Dict[str, Dict[str, object]], Dict[str, object], List[str]]:
+        feature_source_df = train_df if use_split else df
+        if feature_source_df is None:
+            raise ValueError(f"Dataset requerido para {label}.")
+        feature_cols = _resolve_model_feature_group_cols(
+            feature_source_df,
+            feature_group=feature_group,
+            label=label,
+        )
+        results_by_protocol = _train_selected_protocols(
+            use_split=use_split,
+            df=df,
+            train_df=train_df,
+            test_df=test_df,
+            feature_cols=feature_cols,
+            model_params=model_params,
+        )
+        return (
+            results_by_protocol,
+            _primary_protocol_result(results_by_protocol),
+            feature_cols,
+        )
 
     if st.button("Entrenar modelos"):
         use_balanced = bool(st.session_state.get("use_balanced_base", False))
@@ -7467,14 +8602,16 @@ def _render_model_tab() -> None:
         )
         has_cluster = has_cluster_features or cluster_cols_in_balanced
         base_feature_cols_used: List[str] = []
+        cluster_only_feature_cols_used: Optional[List[str]] = None
         cluster_feature_cols_used: Optional[List[str]] = None
-        total_steps = 2 + (1 if has_cluster else 0)
+        total_steps = 2 + (2 if has_cluster else 0)
         progress = _StreamlitProgress(total=total_steps)
         with st.spinner("Entrenando modelos..."):
             progress.set_description("Preparando datasets")
             progress.update(1)
 
             base_result: Optional[Dict[str, object]] = None
+            base_results_by_protocol: Dict[str, Dict[str, object]] = {}
             if use_balanced and balanced_df is None:
                 st.warning("No hay dataset balanceado. Usando original.")
 
@@ -7490,46 +8627,19 @@ def _render_model_tab() -> None:
                     st.caption(
                         f"Base (train/test): {len(train_df):,} / {len(test_df):,}"
                     )
-                    selected_features = st.session_state.get("selected_features")
-
-                    known_cluster_cols = set(_get_cluster_cols(base_df))
-                    selected_features_base = None
-                    if selected_features is not None:
-                        selected_features_base = [f for f in selected_features if f not in known_cluster_cols]
-
-                    base_feature_cols, missing = _resolve_feature_cols(
-                        train_df,
-                        selected_features_base,
-                        include_cluster_features=False,
-                    )
-                    base_feature_cols_used = list(base_feature_cols)
-                    if selected_features is not None:
-                        if missing:
-                            st.warning(
-                                "Variables seleccionadas no estan en el dataset: "
-                                + ", ".join(missing)
-                            )
-                        if not base_feature_cols:
-                            progress.close()
-                            st.warning(
-                                "Seleccione al menos una variable en Feature selection."
-                            )
-                            return
-                    if not base_feature_cols:
-                        progress.close()
-                        st.warning("No hay variables numericas para entrenar.")
-                        return
                     try:
                         progress.set_description("Entrenando modelo Base")
-                        base_result = _train_model_on_split(
-                            train_df,
-                            test_df,
-                            base_feature_cols,
-                            model_choice,
-                            model_params_base,
-                            val_size=float(val_size),
-                            far_target=float(far_target),
-                            random_state=int(random_state),
+                        (
+                            base_results_by_protocol,
+                            base_result,
+                            base_feature_cols_used,
+                        ) = _train_feature_group_protocols(
+                            label="Base",
+                            feature_group="base",
+                            model_params=model_params_base,
+                            use_split=True,
+                            train_df=train_df,
+                            test_df=test_df,
                         )
                     except Exception as exc:
                         progress.close()
@@ -7545,40 +8655,18 @@ def _render_model_tab() -> None:
                     progress.close()
                     st.warning("No se encontraron accidentes alineados con las variables.")
                     return
-                selected_features = st.session_state.get("selected_features")
-                base_feature_cols, missing = _resolve_feature_cols(
-                    base_df,
-                    selected_features,
-                    include_cluster_features=False,
-                )
-                base_feature_cols_used = list(base_feature_cols)
-                if selected_features is not None:
-                    if missing:
-                        st.warning(
-                            "Variables seleccionadas no estan en el dataset: "
-                            + ", ".join(missing)
-                        )
-                    if not base_feature_cols:
-                        progress.close()
-                        st.warning(
-                            "Seleccione al menos una variable en Feature selection."
-                        )
-                        return
-                if not base_feature_cols:
-                    progress.close()
-                    st.warning("No hay variables numericas para entrenar.")
-                    return
                 try:
                     progress.set_description("Entrenando modelo Base")
-                    base_result = _train_model(
-                        base_df,
-                        base_feature_cols,
-                        model_choice,
-                        model_params_base,
-                        test_size=float(test_size),
-                        val_size=float(val_size),
-                        far_target=float(far_target),
-                        random_state=int(random_state),
+                    (
+                        base_results_by_protocol,
+                        base_result,
+                        base_feature_cols_used,
+                    ) = _train_feature_group_protocols(
+                        label="Base",
+                        feature_group="base",
+                        model_params=model_params_base,
+                        use_split=False,
+                        df=base_df,
                     )
                 except Exception as exc:
                     progress.close()
@@ -7586,17 +8674,24 @@ def _render_model_tab() -> None:
                     return
 
             progress.update(1)
-            results = {"Base": base_result["metrics"]}
+            results = {
+                ("Base", protocol): result["metrics"]
+                for protocol, result in base_results_by_protocol.items()
+            }
 
+            cluster_only_result: Optional[Dict[str, object]] = None
+            cluster_only_results_by_protocol: Dict[str, Dict[str, object]] = {}
             cluster_result: Optional[Dict[str, object]] = None
+            cluster_results_by_protocol: Dict[str, Dict[str, object]] = {}
             if has_cluster:
-                progress.set_description("Entrenando modelo Base + Cluster")
                 balanced_cluster_df = st.session_state.get("balanced_cluster_df")
                 if use_balanced and balanced_cluster_df is None:
                     st.warning(
-                        "No hay dataset balanceado para Base + Cluster (quizas no se genero). Usando original."
+                        "No hay dataset balanceado para Cluster/Base + Cluster "
+                        "(quizas no se genero). Usando original."
                     )
 
+                cluster_split: Optional[Tuple[pd.DataFrame, pd.DataFrame]] = None
                 if use_balanced and balanced_cluster_df is not None:
                     split = _split_balanced_dataset(balanced_cluster_df)
                     if split is None:
@@ -7612,112 +8707,147 @@ def _render_model_tab() -> None:
                                 "Usando dataset original."
                             )
                         else:
-                            selected_features = st.session_state.get("selected_features")
-                            cluster_feature_cols, missing = _resolve_feature_cols(
-                                train_df,
-                                selected_features,
-                                include_cluster_features=True,
-                            )
-                            cluster_feature_cols_used = list(cluster_feature_cols)
-                            if selected_features is not None:
-                                if missing:
-                                    st.warning(
-                                        "Variables seleccionadas no estan en el dataset: "
-                                        + ", ".join(missing)
-                                    )
-                                if not cluster_feature_cols:
-                                    progress.close()
-                                    st.warning(
-                                        "Seleccione al menos una variable en Feature selection."
-                                    )
-                                    return
-                            if not cluster_feature_cols:
-                                progress.close()
-                                st.warning("No hay variables numericas para entrenar.")
-                                return
-                            try:
-                                cluster_result = _train_model_on_split(
-                                    train_df,
-                                    test_df,
-                                    cluster_feature_cols,
-                                    model_choice,
-                                    model_params_cluster,
-                                    val_size=float(val_size),
-                                    far_target=float(far_target),
-                                    random_state=int(random_state),
-                                )
-                            except Exception as exc:
-                                progress.close()
-                                st.error(
-                                    f"No se pudo entrenar el modelo con clusters: {exc}"
-                                )
-                                return
-                        if cluster_result is None:
-                            split = None
+                            cluster_split = (train_df, test_df)
 
-                if cluster_result is None:
+                if cluster_split is not None:
+                    train_df, test_df = cluster_split
+                    st.caption(
+                        "Cluster/Base + Cluster (train/test): "
+                        f"{len(train_df):,} / {len(test_df):,}"
+                    )
+                    try:
+                        progress.set_description("Entrenando modelo Cluster")
+                        (
+                            cluster_only_results_by_protocol,
+                            cluster_only_result,
+                            cluster_only_feature_cols_used,
+                        ) = _train_feature_group_protocols(
+                            label="Cluster",
+                            feature_group="cluster",
+                            model_params=model_params_cluster_only,
+                            use_split=True,
+                            train_df=train_df,
+                            test_df=test_df,
+                        )
+                    except Exception as exc:
+                        progress.close()
+                        st.error(f"No se pudo entrenar el modelo Cluster: {exc}")
+                        return
+                    progress.update(1)
+
+                    try:
+                        progress.set_description("Entrenando modelo Base + Cluster")
+                        (
+                            cluster_results_by_protocol,
+                            cluster_result,
+                            cluster_feature_cols_used,
+                        ) = _train_feature_group_protocols(
+                            label="Base + Cluster",
+                            feature_group="base_cluster",
+                            model_params=model_params_cluster,
+                            use_split=True,
+                            train_df=train_df,
+                            test_df=test_df,
+                        )
+                    except Exception as exc:
+                        progress.close()
+                        st.error(
+                            f"No se pudo entrenar el modelo Base + Cluster: {exc}"
+                        )
+                        return
+                    progress.update(1)
+                else:
                     cluster_train_df = _build_cluster_dataset(
                         base_df,
                         cluster_features_df=cluster_features_df,
                     )
                     if cluster_train_df is not None:
-                        selected_features = st.session_state.get("selected_features")
-                        cluster_feature_cols, missing = _resolve_feature_cols(
-                            cluster_train_df,
-                            selected_features,
-                            include_cluster_features=True,
-                        )
-                        cluster_feature_cols_used = list(cluster_feature_cols)
-                        if selected_features is not None:
-                            if missing:
-                                st.warning(
-                                    "Variables seleccionadas no estan en el dataset: "
-                                    + ", ".join(missing)
-                                )
-                            if not cluster_feature_cols:
-                                progress.close()
-                                st.warning(
-                                    "Seleccione al menos una variable en Feature selection."
-                                )
-                                return
-                        if not cluster_feature_cols:
-                            progress.close()
-                            st.warning("No hay variables numericas para entrenar.")
-                            return
                         try:
-                            cluster_result = _train_model(
-                                cluster_train_df,
-                                cluster_feature_cols,
-                                model_choice,
-                                model_params_cluster,
-                                test_size=float(test_size),
-                                val_size=float(val_size),
-                                far_target=float(far_target),
-                                random_state=int(random_state),
+                            progress.set_description("Entrenando modelo Cluster")
+                            (
+                                cluster_only_results_by_protocol,
+                                cluster_only_result,
+                                cluster_only_feature_cols_used,
+                            ) = _train_feature_group_protocols(
+                                label="Cluster",
+                                feature_group="cluster",
+                                model_params=model_params_cluster_only,
+                                use_split=False,
+                                df=cluster_train_df,
+                            )
+                        except Exception as exc:
+                            progress.close()
+                            st.error(f"No se pudo entrenar el modelo Cluster: {exc}")
+                            return
+                        progress.update(1)
+
+                        try:
+                            progress.set_description("Entrenando modelo Base + Cluster")
+                            (
+                                cluster_results_by_protocol,
+                                cluster_result,
+                                cluster_feature_cols_used,
+                            ) = _train_feature_group_protocols(
+                                label="Base + Cluster",
+                                feature_group="base_cluster",
+                                model_params=model_params_cluster,
+                                use_split=False,
+                                df=cluster_train_df,
                             )
                         except Exception as exc:
                             progress.close()
                             st.error(
-                                f"No se pudo entrenar el modelo con clusters: {exc}"
+                                f"No se pudo entrenar el modelo Base + Cluster: {exc}"
                             )
                             return
+                        progress.update(1)
 
+                if cluster_only_result is not None:
+                    for protocol, result in cluster_only_results_by_protocol.items():
+                        results[("Cluster", protocol)] = result["metrics"]
                 if cluster_result is not None:
-                    results["Base + Cluster"] = cluster_result["metrics"]
-                progress.update(1)
+                    for protocol, result in cluster_results_by_protocol.items():
+                        results[("Base + Cluster", protocol)] = result["metrics"]
 
             metrics_df = pd.DataFrame(results).T
+            if isinstance(metrics_df.index, pd.MultiIndex):
+                metrics_df.index = metrics_df.index.set_names(
+                    ["feature_set", "threshold_protocol"]
+            )
             st.subheader("Resultados")
             st.dataframe(metrics_df, width="stretch")
-            if "Base + Cluster" in results:
-                delta = metrics_df.loc["Base + Cluster"] - metrics_df.loc["Base"]
-                delta_df = delta.to_frame(name="delta").T
+            if cluster_only_results_by_protocol or cluster_results_by_protocol:
+                delta_rows: Dict[Tuple[str, str], pd.Series] = {}
+                for protocol in threshold_protocols:
+                    base_key = ("Base", protocol)
+                    if base_key not in metrics_df.index:
+                        continue
+                    base_numeric = pd.to_numeric(
+                        metrics_df.loc[base_key],
+                        errors="coerce",
+                    )
+                    for feature_label in ["Cluster", "Base + Cluster"]:
+                        compare_key = (feature_label, protocol)
+                        if compare_key not in metrics_df.index:
+                            continue
+                        compare_numeric = pd.to_numeric(
+                            metrics_df.loc[compare_key],
+                            errors="coerce",
+                        )
+                        delta_rows[(feature_label, protocol)] = (
+                            compare_numeric - base_numeric
+                        )
+                delta_df = pd.DataFrame(delta_rows).T
+                if isinstance(delta_df.index, pd.MultiIndex):
+                    delta_df.index = delta_df.index.set_names(
+                        ["feature_set", "threshold_protocol"]
+                    )
                 st.subheader("Delta vs Base")
                 st.dataframe(delta_df, width="stretch")
             st.subheader("Matriz de confusion")
-            col_a, col_b = st.columns(2)
+            col_a, col_b, col_c = st.columns(3)
             with col_a:
-                st.caption("Base")
+                st.caption("Base (protocolo principal)")
                 base_cm = base_result.get("confusion_matrix")
                 if base_cm is not None:
                     base_cm_df = pd.DataFrame(
@@ -7727,8 +8857,19 @@ def _render_model_tab() -> None:
                     )
                     st.dataframe(base_cm_df, width="stretch")
             with col_b:
-                if "Base + Cluster" in results:
-                    st.caption("Base + Cluster")
+                if cluster_only_result is not None:
+                    st.caption("Cluster (protocolo principal)")
+                    cluster_only_cm = cluster_only_result.get("confusion_matrix")
+                    if cluster_only_cm is not None:
+                        cluster_only_cm_df = pd.DataFrame(
+                            cluster_only_cm,
+                            index=["Actual 0", "Actual 1"],
+                            columns=["Pred 0", "Pred 1"],
+                        )
+                        st.dataframe(cluster_only_cm_df, width="stretch")
+            with col_c:
+                if cluster_result is not None:
+                    st.caption("Base + Cluster (protocolo principal)")
                     cluster_cm = cluster_result.get("confusion_matrix")
                     if cluster_cm is not None:
                         cluster_cm_df = pd.DataFrame(
@@ -7737,6 +8878,25 @@ def _render_model_tab() -> None:
                             columns=["Pred 0", "Pred 1"],
                         )
                         st.dataframe(cluster_cm_df, width="stretch")
+            if len(threshold_protocols) > 1:
+                with st.expander("Matrices por protocolo", expanded=False):
+                    for label, protocol_results in [
+                        ("Base", base_results_by_protocol),
+                        ("Cluster", cluster_only_results_by_protocol),
+                        ("Base + Cluster", cluster_results_by_protocol),
+                    ]:
+                        for protocol, result in protocol_results.items():
+                            st.caption(f"{label} | {protocol}")
+                            matrix = result.get("confusion_matrix")
+                            if matrix is not None:
+                                st.dataframe(
+                                    pd.DataFrame(
+                                        matrix,
+                                        index=["Actual 0", "Actual 1"],
+                                        columns=["Pred 0", "Pred 1"],
+                                    ),
+                                    width="stretch",
+                                )
             history_entry: Optional[Dict[str, object]] = None
             try:
                 history_entry = _record_experiment_history(
@@ -7745,21 +8905,37 @@ def _render_model_tab() -> None:
                     balanced_df=balanced_df,
                     base_feature_cols=base_feature_cols_used,
                     base_result=base_result,
+                    cluster_only_feature_cols=cluster_only_feature_cols_used,
+                    cluster_only_result=cluster_only_result,
                     cluster_feature_cols=cluster_feature_cols_used,
                     cluster_result=cluster_result,
                     model_choice=model_choice,
                     model_params_base=model_params_base,
+                    model_params_cluster_only=model_params_cluster_only,
                     model_params_cluster=model_params_cluster,
                     random_state=int(random_state),
                     test_size=float(test_size),
                     val_size=float(val_size),
                     far_target=float(far_target),
                     use_balanced=bool(use_balanced),
+                    protocol_results={
+                        "Base": base_results_by_protocol,
+                        "Cluster": cluster_only_results_by_protocol,
+                        "Base + Cluster": cluster_results_by_protocol,
+                    },
+                    threshold_protocols=list(threshold_protocols),
+                    threshold_objective=threshold_objective,
+                    calibration_method=str(calibration_method),
+                    alerts_per_day=float(alerts_per_day),
+                    fn_cost=float(fn_cost),
+                    fp_cost=float(fp_cost),
+                    robust_folds=int(robust_folds),
+                    balance_strategy=balance_strategy,
                 )
                 st.caption("Historial actualizado y modelos guardados.")
             except Exception as exc:
                 st.warning(f"No se pudo guardar en History: {exc}")
-            if history_entry is not None and "Base + Cluster" in results:
+            if history_entry is not None and cluster_result is not None:
                 _render_base_cluster_xai_block(
                     history_entry,
                     key_prefix=f"model_run_{history_entry.get('run_id', 'latest')}",
@@ -11110,10 +12286,12 @@ def _render_best_highway_section_k_experiment() -> None:
 
 
 def _render_controlled_comparison_experiment() -> None:
+    _apply_pending_controlled_job_config()
     st.subheader("Comparación controlada")
     st.caption(
-        "Compara Random Forest, SVM y XGBoost sobre Base, Cluster y Base + Cluster, "
-        "con y sin SMOTE, usando un único split temporal congelado."
+        "Compara los modelos seleccionados entre Random Forest, SVM y XGBoost "
+        "sobre Base, Cluster y Base + Cluster, con y sin SMOTE, usando un "
+        "único split temporal congelado."
     )
 
     event_files = _list_event_files()
@@ -11172,9 +12350,25 @@ def _render_controlled_comparison_experiment() -> None:
         "segment_label": f"{eje} | {calzada} | {p_start} -> {p_end}",
     }
     objective_options = {
+        "PR-AUC": "pr_auc",
         "ROC-AUC": "roc_auc",
+        "Balanced F1": "balanced_f1",
         "F1": "f1",
         "MCC": "mcc",
+        "Recall@N alertas/día": "recall_at_alerts_per_day",
+        "Costo operacional": "operational_cost",
+    }
+    threshold_objective_options = {
+        "Recall@N alertas/día": "recall_at_alerts_per_day",
+        "FAR": "far",
+        "Balanced F1": "balanced_f1",
+        "F1": "f1",
+        "MCC": "mcc",
+        "Costo operacional": "operational_cost",
+    }
+    protocol_options = {
+        "Conservador": "conservative",
+        "Robusto": "robust",
     }
 
     st.markdown("**Configuración general**")
@@ -11205,14 +12399,157 @@ def _render_controlled_comparison_experiment() -> None:
         )
     with col_cfg4:
         objective_label = st.selectbox(
-            "Objetivo de optimización",
+            "Métrica Optuna/ranking",
             list(objective_options.keys()),
             index=0,
             key="exp_controlled_objective_metric",
+            help=(
+                "Define la métrica que Optuna maximiza para elegir hiperparámetros. "
+                "Valores permitidos: PR-AUC, ROC-AUC, Balanced F1, F1, MCC, "
+                "Recall@N alertas/día o Costo operacional. Default: PR-AUC. "
+                "Usar F1 con eventos raros puede sobreajustar el threshold de validación."
+            ),
         )
-    objective_metric = objective_options.get(objective_label, "roc_auc")
+    objective_metric = objective_options.get(objective_label, "pr_auc")
+    selected_models = st.multiselect(
+        "Modelos a comparar",
+        list(CONTROLLED_COMPARISON_MODELS),
+        default=list(CONTROLLED_COMPARISON_MODELS),
+        key="exp_controlled_selected_models",
+        help=(
+            "Selecciona el subconjunto de modelos que quieres ejecutar en la "
+            "comparación controlada. Incluye Balanced Random Forest si quieres "
+            "comparar submuestreo balanceado; si falta imbalanced-learn, esa "
+            "combinación fallará y quedará registrada."
+        ),
+    )
+    if not selected_models:
+        st.warning("Seleccione al menos un modelo para la comparación controlada.")
 
-    col_split1, col_split2, col_split3 = st.columns(3)
+    selected_protocol_labels = st.multiselect(
+        "Protocolos de evaluación",
+        list(protocol_options.keys()),
+        default=list(protocol_options.keys()),
+        key="exp_controlled_threshold_protocols",
+        help=(
+            "Permite elegir Conservador, Robusto o ambos. Conservador ajusta el "
+            "threshold en la validación temporal y evalúa el mismo modelo en test. "
+            "Robusto usa folds temporales OOF dentro de train+val y luego evalúa "
+            "test una sola vez. Elegir ambos duplica aproximadamente el tiempo de "
+            "ejecución y no debe mezclarse con resultados v2 antiguos."
+        ),
+    )
+    threshold_protocols = [
+        protocol_options[label]
+        for label in selected_protocol_labels
+        if label in protocol_options
+    ] or ["conservative"]
+
+    st.markdown("**Threshold operacional**")
+    col_thr1, col_thr2, col_thr3, col_thr4 = st.columns(4)
+    with col_thr1:
+        threshold_objective_label = st.selectbox(
+            "Objetivo de threshold",
+            list(threshold_objective_options.keys()),
+            index=0,
+            key="exp_controlled_threshold_objective",
+            help=(
+                "Define cómo se escoge el umbral operativo después de entrenar. "
+                "Valores permitidos: FAR, Balanced F1, F1, MCC, Recall@N "
+                "alertas/día o Costo operacional. Default: Recall@N alertas/día. "
+                "No uses métricas puramente de fila si la operación exige limitar "
+                "alertas diarias."
+            ),
+        )
+    with col_thr2:
+        controlled_alerts_per_day = st.number_input(
+            "Alertas máximas por día",
+            min_value=0.1,
+            max_value=50.0,
+            value=5.0,
+            step=0.5,
+            key="exp_controlled_alerts_per_day",
+            help=(
+                "Presupuesto diario de alertas para Recall@N. Rango práctico: "
+                "0.1 a 50. Default: 5.0. Baja este valor si necesitas menos "
+                "revisiones humanas; un valor demasiado bajo puede esconder "
+                "accidentes detectables."
+            ),
+        )
+    with col_thr3:
+        controlled_far_target = st.slider(
+            "FAR target",
+            min_value=0.0,
+            max_value=0.5,
+            value=0.2,
+            step=0.01,
+            key="exp_controlled_far_target",
+            help=(
+                "Falsa alarma máxima aceptada cuando el objetivo de threshold es "
+                "FAR. Rango: 0.00 a 0.50. Default: 0.20. No lo interpretes como "
+                "probabilidad calibrada; controla tasa de falsos positivos en "
+                "validación."
+            ),
+        )
+    with col_thr4:
+        calibration_label = st.selectbox(
+            "Calibración",
+            ["sigmoid", "none", "isotonic"],
+            index=0,
+            key="exp_controlled_calibration_method",
+            help=(
+                "Transforma scores antes de elegir threshold. Valores: sigmoid, "
+                "none, isotonic. Default: sigmoid. Isotonic puede sobreajustar "
+                "cuando hay pocos accidentes positivos en validación."
+            ),
+        )
+    col_cost1, col_cost2, col_cost3 = st.columns(3)
+    with col_cost1:
+        controlled_fn_cost = st.number_input(
+            "Costo FN",
+            min_value=0.0,
+            value=10.0,
+            step=1.0,
+            key="exp_controlled_fn_cost",
+            help=(
+                "Costo unitario de no alertar un accidente real. Default: 10.0. "
+                "Aumentarlo empuja thresholds más sensibles; valores extremos "
+                "pueden producir demasiadas falsas alarmas."
+            ),
+        )
+    with col_cost2:
+        controlled_fp_cost = st.number_input(
+            "Costo FP",
+            min_value=0.0,
+            value=1.0,
+            step=0.5,
+            key="exp_controlled_fp_cost",
+            help=(
+                "Costo unitario de una falsa alarma. Default: 1.0. Aumentarlo "
+                "endurece el threshold; valores altos pueden bajar mucho el recall."
+            ),
+        )
+    with col_cost3:
+        robust_folds = st.number_input(
+            "Folds robustos",
+            min_value=2,
+            max_value=10,
+            value=3,
+            step=1,
+            key="exp_controlled_robust_folds",
+            help=(
+                "Número de folds temporales OOF usados por el protocolo robusto. "
+                "Rango: 2 a 10. Default: 3. Más folds aumentan costo y pueden "
+                "fallar si cada ventana queda con muy pocos accidentes."
+            ),
+        )
+    threshold_objective = threshold_objective_options.get(
+        threshold_objective_label,
+        "recall_at_alerts_per_day",
+    )
+    calibration_method = str(calibration_label)
+
+    col_split1, col_split2, col_split3, col_split4 = st.columns(4)
     with col_split1:
         test_size = st.slider(
             "Test size",
@@ -11231,24 +12568,56 @@ def _render_controlled_comparison_experiment() -> None:
             step=0.05,
             key="exp_controlled_val_size",
         )
+    max_parallel_input_jobs = _max_optuna_parallel_jobs()
     with col_split3:
         parallel_jobs = st.number_input(
             "Jobs paralelos RF/ranking",
             min_value=1,
-            value=1,
+            max_value=max_parallel_input_jobs,
+            value=10,
             step=1,
             key="exp_controlled_parallel_jobs",
+        )
+    with col_split4:
+        xgb_parallel_jobs = st.number_input(
+            "Jobs paralelos XGBoost",
+            min_value=1,
+            max_value=max_parallel_input_jobs,
+            value=1,
+            step=1,
+            key="exp_controlled_xgb_parallel_jobs",
         )
 
     optuna_n_jobs = _render_optuna_n_jobs_input(
         "Optuna jobs paralelos",
         key="exp_controlled_optuna_n_jobs",
-        default=1,
+        default=5,
     )
     st.caption(
         "SVM se paraleliza a través de Optuna. Random Forest usa `n_jobs`; "
-        "XGBoost se fuerza a `n_jobs=1` para evitar oversubscription."
+        "XGBoost usa su propio `n_jobs`, configurable en esta UI."
     )
+    cpu_overlap_caps: List[str] = []
+    if "Random Forest" in selected_models:
+        rf_optuna_cap = max(1, max_parallel_input_jobs // max(1, int(parallel_jobs)))
+        cpu_overlap_caps.append(
+            f"RF -> Optuna <= {int(rf_optuna_cap)} con RF jobs={int(parallel_jobs)}"
+        )
+    if "XGBoost" in selected_models:
+        xgb_optuna_cap = max(
+            1,
+            max_parallel_input_jobs // max(1, int(xgb_parallel_jobs)),
+        )
+        cpu_overlap_caps.append(
+            "XGBoost -> Optuna <= "
+            f"{int(xgb_optuna_cap)} con XGBoost jobs={int(xgb_parallel_jobs)}"
+        )
+    if cpu_overlap_caps:
+        st.caption(
+            "Guardia anti-solape CPU: "
+            + " | ".join(cpu_overlap_caps)
+            + ". En esos combos, Optuna se ajusta automáticamente si pides más."
+        )
 
     st.markdown("**Grilla de K**")
     col_k1, col_k2, col_k3 = st.columns(3)
@@ -11296,7 +12665,7 @@ def _render_controlled_comparison_experiment() -> None:
                 "SMOTE k max",
                 min_value=1,
                 max_value=50,
-                value=10,
+                value=15,
                 step=1,
                 key="exp_controlled_smote_k_max",
             )
@@ -11313,7 +12682,7 @@ def _render_controlled_comparison_experiment() -> None:
                 "Sampling strategy min",
                 min_value=0.1,
                 max_value=1.0,
-                value=0.5,
+                value=0.1,
                 step=0.1,
                 format="%.2f",
                 key="exp_controlled_smote_str_min",
@@ -11367,7 +12736,7 @@ def _render_controlled_comparison_experiment() -> None:
         with col_rf2:
             rf_depth_min = st.number_input(
                 "RF max_depth min",
-                min_value=0,
+                min_value=1,
                 max_value=100,
                 value=3,
                 step=1,
@@ -11375,7 +12744,7 @@ def _render_controlled_comparison_experiment() -> None:
             )
             rf_depth_max = st.number_input(
                 "RF max_depth max",
-                min_value=0,
+                min_value=1,
                 max_value=100,
                 value=15,
                 step=1,
@@ -11842,6 +13211,7 @@ def _render_controlled_comparison_experiment() -> None:
                 "step": int(rf_leaf_step),
             },
             "max_features": rf_max_features,
+            "class_weight": [None, "balanced"],
         },
         "svm": {
             "C": {
@@ -11861,6 +13231,7 @@ def _render_controlled_comparison_experiment() -> None:
                 "max": float(svm_coef0_max),
                 "step": float(svm_coef0_step),
             },
+            "class_weight": [None, "balanced"],
         },
         "xgb": {
             "n_estimators": {
@@ -11908,6 +13279,11 @@ def _render_controlled_comparison_experiment() -> None:
                 "max": float(xgb_gamma_max),
                 "step": float(xgb_gamma_step),
             },
+            "scale_pos_weight_multipliers": [0.5, 1.0, 2.0, 5.0, 10.0],
+            "max_delta_step": [0.0, 1.0],
+        },
+        "balanced_rf": {
+            "replacement": [False],
         },
     }
 
@@ -11976,8 +13352,19 @@ def _render_controlled_comparison_experiment() -> None:
                 "metric": objective_metric,
                 "objective_metric": objective_metric,
                 "objective_label": objective_label,
+                "optuna_objective_metric": objective_metric,
+                "optuna_objective_label": objective_label,
+                "threshold_protocols": list(threshold_protocols),
+                "threshold_objective": threshold_objective,
+                "threshold_objective_label": threshold_objective_label,
+                "calibration_method": calibration_method,
+                "far_target": float(controlled_far_target),
+                "alerts_per_day": float(controlled_alerts_per_day),
+                "fn_cost": float(controlled_fn_cost),
+                "fp_cost": float(controlled_fp_cost),
+                "robust_folds": int(robust_folds),
                 "test_only_final": True,
-                "models": ["Random Forest", "SVM", "XGBoost"],
+                "models": list(selected_models),
                 "feature_sets": ["Base", "Cluster", "Base + Cluster"],
                 "balance_modes": ["none", "smote"],
                 "test_size": float(test_size),
@@ -11990,6 +13377,7 @@ def _render_controlled_comparison_experiment() -> None:
                 "timeout": int(timeout),
                 "optuna_n_jobs": int(optuna_n_jobs),
                 "parallel_jobs": int(parallel_jobs),
+                "xgb_parallel_jobs": int(xgb_parallel_jobs),
                 "search_space_config": search_space,
                 "segment_info": segment_info,
                 "event_path": str(selected_event_path),
@@ -12044,6 +13432,8 @@ def _render_controlled_comparison_experiment() -> None:
                 k_min=int(k_min),
                 k_max=int(k_max),
                 k_step=int(k_step),
+                xgb_parallel_jobs=int(xgb_parallel_jobs),
+                selected_models=list(selected_models),
                 search_space=search_space,
             )
 
@@ -12062,6 +13452,15 @@ def _render_controlled_comparison_experiment() -> None:
             return
         if float(val_size) <= 0 or float(val_size) >= 1:
             st.error("Validation size debe estar entre 0 y 1.")
+            return
+        if not selected_models:
+            st.error("Seleccione al menos un modelo para ejecutar la comparación controlada.")
+            return
+        if not threshold_protocols:
+            st.error("Seleccione al menos un protocolo de evaluación.")
+            return
+        if int(rf_depth_min) > int(rf_depth_max):
+            st.error("RF max_depth min no puede ser mayor que RF max_depth max.")
             return
         if not base_schema_cols or not cluster_schema_cols:
             st.error("La configuración actual no tiene conjuntos Base y Cluster válidos.")
@@ -12084,10 +13483,21 @@ def _render_controlled_comparison_experiment() -> None:
             "random_state": int(random_state),
             "objective_metric": objective_metric,
             "objective_label": objective_label,
+            "threshold_protocols": list(threshold_protocols),
+            "threshold_objective": threshold_objective,
+            "threshold_objective_label": threshold_objective_label,
+            "calibration_method": calibration_method,
+            "far_target": float(controlled_far_target),
+            "alerts_per_day": float(controlled_alerts_per_day),
+            "fn_cost": float(controlled_fn_cost),
+            "fp_cost": float(controlled_fp_cost),
+            "robust_folds": int(robust_folds),
             "n_trials": int(n_trials),
             "timeout": int(timeout),
             "optuna_n_jobs": int(optuna_n_jobs),
             "parallel_jobs": int(parallel_jobs),
+            "xgb_parallel_jobs": int(xgb_parallel_jobs),
+            "selected_models": list(selected_models),
             "test_size": float(test_size),
             "val_size": float(val_size),
             "k_min": int(k_min),
@@ -12096,9 +13506,23 @@ def _render_controlled_comparison_experiment() -> None:
             "segment_info": segment_info,
             "search_space_config": search_space,
         }
+        if checkpoint_mode != "Start fresh" and checkpoint_preview:
+            exp_meta["checkpoint_run_dir"] = checkpoint_preview.get("run_dir")
         exp_db_path = _init_experiment_db("Controlled comparison", exp_meta)
         if exp_db_path:
             st.caption(f"DB live: {exp_db_path}")
+            if checkpoint_mode != "Start fresh" and checkpoint_preview:
+                seeded_rows = _seed_controlled_comparison_live_db(
+                    exp_db_path,
+                    checkpoint_run_dir=checkpoint_preview.get("run_dir"),
+                    dataset_name=selected_event,
+                    features_name=selected_features,
+                    segment_info=segment_info,
+                )
+                if seeded_rows > 0:
+                    st.caption(
+                        f"DB live inicializada con {seeded_rows} resultados del checkpoint."
+                    )
 
         progress_bar = st.progress(0, text="Preparando comparación controlada...")
 
@@ -12124,6 +13548,14 @@ def _render_controlled_comparison_experiment() -> None:
                 features_path=selected_features_path,
                 segment_info=segment_info,
                 objective_metric=objective_metric,
+                threshold_protocols=list(threshold_protocols),
+                threshold_objective=threshold_objective,
+                calibration_method=calibration_method,
+                far_target=float(controlled_far_target),
+                alerts_per_day=float(controlled_alerts_per_day),
+                fn_cost=float(controlled_fn_cost),
+                fp_cost=float(controlled_fp_cost),
+                robust_folds=int(robust_folds),
                 test_size=float(test_size),
                 val_size=float(val_size),
                 k_min=int(k_min),
@@ -12133,11 +13565,11 @@ def _render_controlled_comparison_experiment() -> None:
                 timeout=int(timeout),
                 optuna_n_jobs=int(optuna_n_jobs),
                 parallel_jobs=int(parallel_jobs),
+                xgb_parallel_jobs=int(xgb_parallel_jobs),
+                selected_models=list(selected_models),
                 search_space_config=search_space,
                 progress_callback=_progress_callback,
-                result_callback=(
-                    _result_callback if checkpoint_mode == "Start fresh" else None
-                ),
+                result_callback=_result_callback,
                 checkpoint_root=checkpoint_root,
                 auto_resume=checkpoint_mode in {
                     "Resume checkpoint",
@@ -12161,17 +13593,6 @@ def _render_controlled_comparison_experiment() -> None:
         if not isinstance(grid_results_df, pd.DataFrame):
             grid_results_df = pd.DataFrame()
 
-        if exp_db_path and (
-            payload.get("auto_resumed") or payload.get("loaded_from_checkpoint")
-        ):
-            for record in grid_results_df.to_dict(orient="records"):
-                record_out = dict(record)
-                record_out["experiment"] = "Controlled comparison"
-                record_out["dataset_name"] = selected_event
-                record_out["features_name"] = selected_features
-                record_out["segment_info"] = segment_info
-                _append_experiment_result(exp_db_path, record_out)
-
         for record in summary_df.to_dict(orient="records"):
             record_out = dict(record)
             record_out["dataset_name"] = selected_event
@@ -12182,29 +13603,38 @@ def _render_controlled_comparison_experiment() -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         summary_path = RESULTS_DIR / f"controlled_comparison_summary_{stamp}.csv"
         curves_path = RESULTS_DIR / f"controlled_comparison_curves_{stamp}.csv"
+        detail_path = RESULTS_DIR / f"controlled_comparison_grid_{stamp}.csv"
         summary_df.to_csv(summary_path, index=False)
         curves_df.to_csv(curves_path, index=False)
+        grid_results_df.to_csv(detail_path, index=False)
 
-        st.success(
-            "Comparación controlada finalizada. "
-            f"Run ID: {payload.get('run_id')}."
-        )
-        if payload.get("loaded_from_checkpoint"):
-            st.caption("Se cargó un checkpoint ya completado.")
-        elif payload.get("auto_resumed"):
-            st.caption("La corrida se reanudó desde un checkpoint compatible.")
-        st.caption(
-            f"Checkpoint: {payload.get('checkpoint_run_dir') or checkpoint_root}"
-        )
-        st.caption(f"Resumen: {summary_path.name} | Curvas: {curves_path.name}")
-        _render_controlled_comparison_results(
-            summary_df,
-            curves_df,
-            key_prefix=f"controlled_current_{payload.get('run_id')}",
-        )
+        st.session_state["exp_controlled_last_results"] = {
+            "run_id": payload.get("run_id"),
+            "checkpoint_run_dir": payload.get("checkpoint_run_dir"),
+            "loaded_from_checkpoint": bool(payload.get("loaded_from_checkpoint")),
+            "auto_resumed": bool(payload.get("auto_resumed")),
+            "summary_name": summary_path.name,
+            "curves_name": curves_path.name,
+            "detail_name": detail_path.name,
+            "summary_path": str(summary_path),
+            "curves_path": str(curves_path),
+            "detail_path": str(detail_path),
+        }
+
+    _render_controlled_comparison_current_result(
+        checkpoint_root=checkpoint_root,
+    )
 
     _render_controlled_comparison_protocol_description(
         objective_label=objective_label,
+        selected_models=list(selected_models),
+        threshold_protocols=list(threshold_protocols),
+        threshold_objective_label=threshold_objective_label,
+        calibration_method=calibration_method,
+        alerts_per_day=float(controlled_alerts_per_day),
+        fn_cost=float(controlled_fn_cost),
+        fp_cost=float(controlled_fp_cost),
+        robust_folds=int(robust_folds),
         test_size=float(test_size),
         val_size=float(val_size),
         k_min=int(k_min),
@@ -12214,6 +13644,7 @@ def _render_controlled_comparison_experiment() -> None:
         timeout=int(timeout),
         optuna_n_jobs=int(optuna_n_jobs),
         parallel_jobs=int(parallel_jobs),
+        xgb_parallel_jobs=int(xgb_parallel_jobs),
     )
 
 
@@ -12337,19 +13768,30 @@ def _render_experiments_tab() -> None:
                     if is_controlled_comparison:
                         st.caption("Experimento detectado: Controlled comparison")
                         curves_df = pd.DataFrame()
+                        detail_df = pd.DataFrame()
                         if timestamp:
                             curves_path = (
                                 RESULTS_DIR
                                 / f"controlled_comparison_curves_{timestamp}.csv"
+                            )
+                            detail_path = (
+                                RESULTS_DIR
+                                / f"controlled_comparison_grid_{timestamp}.csv"
                             )
                             if curves_path.exists():
                                 try:
                                     curves_df = pd.read_csv(curves_path)
                                 except Exception:
                                     curves_df = pd.DataFrame()
-                        _render_controlled_comparison_results(
+                            if detail_path.exists():
+                                try:
+                                    detail_df = pd.read_csv(detail_path)
+                                except Exception:
+                                    detail_df = pd.DataFrame()
+                        _render_controlled_comparison_results_panel(
                             past_df,
                             curves_df,
+                            grid_results_df=detail_df,
                             key_prefix=f"history_controlled_{timestamp or 'na'}",
                         )
                     elif is_find_samples:
@@ -13583,7 +15025,7 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
     _init_state()
     if set_page_config:
         st.set_page_config(page_title="Cluster/Accident", layout="wide")
-    st.title("Drivers Behavior Modeling and Simulation")
+    st.title("Crash prediction by Drivers Behavior")
 
 
 

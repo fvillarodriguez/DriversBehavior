@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -10,6 +11,7 @@ pytest.importorskip("imblearn")
 
 import src.experiments_logic as experiments_logic_module
 from src.experiments_logic import (
+    CONTROLLED_COMPARISON_MODELS,
     ExperimentsRunner,
     build_controlled_comparison_context,
     estimate_controlled_comparison_parallelism,
@@ -185,6 +187,10 @@ def test_estimate_controlled_comparison_parallelism_builds_safe_frontier(tmp_pat
     assert isinstance(estimate["recommended_pair"], dict)
     assert int(estimate["recommended_pair"]["parallel_jobs"]) >= 1
     assert int(estimate["recommended_pair"]["optuna_n_jobs"]) >= 1
+    assert int(estimate["recommended_pair"]["xgb_parallel_jobs"]) >= 1
+    assert estimate["max_xgb_parallel_jobs_when_parallel_1_optuna_1"] >= 1
+    assert "xgb_parallel_jobs" in estimate["frontier_df"].columns
+    assert "cpu_limited_optuna_jobs" in estimate["frontier_df"].columns
 
 
 def test_estimate_controlled_comparison_parallelism_handles_tiny_budget(tmp_path):
@@ -335,20 +341,156 @@ def test_run_controlled_comparison_normalizes_k_and_builds_summary(
         )
         assert observed == expected_k
 
-    expected_total = 3 * 2 * sum(len(values) for values in expected_by_set.values())
+    expected_model_count = len(CONTROLLED_COMPARISON_MODELS)
+    expected_protocol_count = 1
+    expected_total = (
+        expected_model_count
+        * 2
+        * expected_protocol_count
+        * sum(len(values) for values in expected_by_set.values())
+    )
     assert len(grid_df) == expected_total
-    assert len(summary_df) == 9
+    assert len(summary_df) == expected_model_count * 3 * 2 * expected_protocol_count
     assert {
         "k_optimo",
         "smote_optimo",
+        "balance_mode",
+        "threshold_protocol",
+        "threshold_objective",
+        "calibration_method",
+        "best_test_accuracy",
+        "best_test_recall",
+        "best_test_sensitivity",
         "best_test_roc_auc",
+        "best_test_pr_auc",
+        "best_test_balanced_f1",
+        "best_test_alerts_per_day",
+        "best_test_false_alarms_per_day",
+        "best_test_event_recall_approx",
+        "best_test_operational_cost",
+        "best_test_f1_global",
+        "best_test_f1_class_0",
+        "best_test_f1_class_1",
+        "best_test_false_negatives",
+        "best_test_false_positives",
+        "best_test_confusion_matrix",
         "val_roc_auc",
         "val_objective_score",
         "test_objective_score",
     }.issubset(
         summary_df.columns
     )
-    assert summary_df["smote_optimo"].astype(bool).all()
+    assert set(summary_df["balance_mode"].astype(str)) == {"none", "smote"}
+    assert set(summary_df["threshold_protocol"].astype(str)) == {"conservative"}
+
+
+def test_run_controlled_comparison_uses_selected_model_subset(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, feature_cols, base_cols, cluster_cols = build_synthetic_base_df(tmp_path)
+    event_path = tmp_path / "events.csv"
+    features_path = tmp_path / "features.duckdb"
+    event_path.write_text("events", encoding="utf-8")
+    features_path.write_text("features", encoding="utf-8")
+
+    runner = ExperimentsRunner(random_state=42)
+    selected_models = ["Random Forest", "SVM"]
+
+    def _fake_importance(self, df, feature_cols, **kwargs):
+        return pd.DataFrame(
+            {
+                "variable": list(feature_cols),
+                "importance": list(range(len(feature_cols), 0, -1)),
+            }
+        )
+
+    def _fake_optimize(
+        self,
+        *,
+        model_name,
+        feature_set,
+        balance_mode,
+        selected_features,
+        train_df,
+        val_df,
+        test_df,
+        **kwargs,
+    ):
+        score = 0.7 + (0.01 if balance_mode == "smote" else 0.0)
+        return {
+            "status": "completed",
+            "model_name": model_name,
+            "feature_set": feature_set,
+            "balance_mode": balance_mode,
+            "objective_metric": "roc_auc",
+            "objective_label": "ROC-AUC",
+            "k": int(len(selected_features)),
+            "selected_features": list(selected_features),
+            "selected_feature_count": int(len(selected_features)),
+            "decision_threshold": 0.5,
+            "val_objective_score": score,
+            "test_objective_score": score - 0.01,
+            "val_roc_auc": score,
+            "test_roc_auc": score - 0.01,
+            "val_f1": 0.6,
+            "test_f1": 0.59,
+            "val_mcc": 0.4,
+            "test_mcc": 0.39,
+            "best_params": {"model": model_name},
+            "smote_params": {},
+            "optuna_trials_completed": 1,
+            "optuna_n_jobs": int(kwargs["optuna_n_jobs"]),
+            "parallel_jobs": int(kwargs["parallel_jobs"]),
+            "train_rows": int(len(train_df)),
+            "val_rows": int(len(val_df)),
+            "test_rows": int(len(test_df)),
+            "trials_df": pd.DataFrame([{"value": score, "state": "COMPLETE"}]),
+        }
+
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "calculate_feature_importance",
+        _fake_importance,
+    )
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "_optimize_controlled_combo",
+        _fake_optimize,
+    )
+
+    payload = runner.run_controlled_comparison(
+        base_df,
+        event_path=event_path,
+        features_path=features_path,
+        segment_info={"segment": "A"},
+        test_size=0.2,
+        val_size=0.25,
+        k_min=1,
+        k_max=1,
+        k_step=1,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=1,
+        parallel_jobs=1,
+        search_space_config=_controlled_search_space(),
+        checkpoint_root=tmp_path / "controlled_ckpt_subset",
+        selected_models=selected_models,
+        start_fresh=True,
+    )
+
+    grid_df = payload["grid_results_df"]
+    summary_df = payload["best_summary_df"]
+
+    assert payload["protocol"]["models"] == selected_models
+    assert sorted(grid_df["model_name"].unique().tolist()) == sorted(selected_models)
+    assert sorted(summary_df["model_name"].unique().tolist()) == sorted(selected_models)
+    assert len(grid_df) == len(selected_models) * 3 * 2
+    assert len(summary_df) == len(selected_models) * 3 * 2
+    assert set(summary_df["threshold_protocol"].astype(str)) == {"conservative"}
 
 
 def test_run_controlled_comparison_ranking_uses_train_only(tmp_path, monkeypatch):
@@ -538,7 +680,7 @@ def test_run_controlled_comparison_resume_skips_completed_combos(
         start_fresh=True,
     )
     initial_calls = call_counter["count"]
-    assert initial_calls == 18
+    assert initial_calls == len(CONTROLLED_COMPARISON_MODELS) * 3 * 2
 
     run_dir = Path(str(first_payload["checkpoint_run_dir"]))
     grid_path = run_dir / "results" / "grid_results.csv"
@@ -579,7 +721,7 @@ def test_run_controlled_comparison_resume_skips_completed_combos(
     assert call_counter["count"] == initial_calls + 1
     assert second_payload["auto_resumed"] is True
     assert second_payload["loaded_from_checkpoint"] is False
-    assert len(second_payload["grid_results_df"]) == 18
+    assert len(second_payload["grid_results_df"]) == initial_calls
 
 
 def test_controlled_comparison_checkpoint_compatibility(tmp_path, monkeypatch):
@@ -719,6 +861,14 @@ class _DummyModel:
         return pd.DataFrame({"p0": [1 - score for score in scores], "p1": scores}).to_numpy()
 
 
+class _ReverseDecisionModel:
+    def fit(self, X, y):
+        return self
+
+    def decision_function(self, X):
+        return -np.asarray(X.iloc[:, 0], dtype=float)
+
+
 def test_controlled_combo_random_forest_forwards_parallel_jobs(
     tmp_path, monkeypatch
 ):
@@ -746,6 +896,7 @@ def test_controlled_combo_random_forest_forwards_parallel_jobs(
         model_name="Random Forest",
         feature_set="Base",
         balance_mode="none",
+        objective_metric="roc_auc",
         selected_features=base_cols[:2],
         train_df=train_df,
         val_df=val_df,
@@ -755,6 +906,7 @@ def test_controlled_combo_random_forest_forwards_parallel_jobs(
         optuna_n_jobs=1,
         search_space_config=_controlled_search_space(),
         parallel_jobs=3,
+        xgb_parallel_jobs=1,
     )
 
     assert captured_params
@@ -792,6 +944,7 @@ def test_controlled_combo_svm_forwards_optuna_n_jobs(tmp_path, monkeypatch):
         model_name="SVM",
         feature_set="Base",
         balance_mode="none",
+        objective_metric="roc_auc",
         selected_features=base_cols[:2],
         train_df=train_df,
         val_df=val_df,
@@ -801,7 +954,222 @@ def test_controlled_combo_svm_forwards_optuna_n_jobs(tmp_path, monkeypatch):
         optuna_n_jobs=2,
         search_space_config=_controlled_search_space(),
         parallel_jobs=4,
+        xgb_parallel_jobs=1,
     )
 
     assert captured["n_jobs"] == 2
     assert result["optuna_n_jobs"] == 2
+
+
+def test_controlled_trial_params_svm_only_samples_kernel_relevant_values():
+    optuna = pytest.importorskip("optuna")
+
+    runner = ExperimentsRunner(random_state=42)
+    model_space = {
+        "C": [0.5],
+        "kernel": ["linear", "rbf"],
+        "gamma": ["scale"],
+        "degree": [2],
+        "coef0": [0.0],
+    }
+
+    linear_params, linear_smote = runner._controlled_comparison_trial_params(
+        optuna.trial.FixedTrial({"kernel": "linear", "C": 0.5}),
+        model_name="SVM",
+        model_space=model_space,
+        smote_space={},
+        balance_mode="none",
+        parallel_jobs=1,
+        xgb_parallel_jobs=1,
+    )
+    assert linear_smote == {}
+    assert linear_params == {
+        "kernel": "linear",
+        "C": 0.5,
+        "probability": False,
+    }
+
+    rbf_params, rbf_smote = runner._controlled_comparison_trial_params(
+        optuna.trial.FixedTrial({"kernel": "rbf", "C": 0.5, "gamma": "scale"}),
+        model_name="SVM",
+        model_space=model_space,
+        smote_space={},
+        balance_mode="none",
+        parallel_jobs=1,
+        xgb_parallel_jobs=1,
+    )
+    assert rbf_smote == {}
+    assert rbf_params == {
+        "kernel": "rbf",
+        "C": 0.5,
+        "gamma": "scale",
+        "probability": False,
+    }
+
+
+def test_controlled_combo_svm_orients_scores_and_disables_probability(monkeypatch):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    runner = ExperimentsRunner(random_state=42)
+    train_df = pd.DataFrame(
+        {
+            "signal": [0.1, 0.2, 0.3, 0.7, 0.8, 0.9],
+            "target": [0, 0, 0, 1, 1, 1],
+            "interval_start": pd.date_range("2024-01-01", periods=6, freq="D"),
+        }
+    )
+    val_df = pd.DataFrame(
+        {
+            "signal": [0.15, 0.25, 0.75, 0.85],
+            "target": [0, 0, 1, 1],
+            "interval_start": pd.date_range("2024-02-01", periods=4, freq="D"),
+        }
+    )
+    test_df = pd.DataFrame(
+        {
+            "signal": [0.12, 0.22, 0.72, 0.82],
+            "target": [0, 0, 1, 1],
+            "interval_start": pd.date_range("2024-03-01", periods=4, freq="D"),
+        }
+    )
+    captured_params = []
+
+    def _fake_build_model(model_name, params, random_state):
+        captured_params.append(dict(params))
+        return _ReverseDecisionModel()
+
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "build_model",
+        _fake_build_model,
+    )
+
+    result = runner._optimize_controlled_combo(
+        model_name="SVM",
+        feature_set="Base",
+        balance_mode="none",
+        objective_metric="roc_auc",
+        selected_features=["signal"],
+        train_df=train_df,
+        val_df=val_df,
+        test_df=test_df,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=1,
+        search_space_config=_controlled_search_space(),
+        parallel_jobs=1,
+        xgb_parallel_jobs=1,
+    )
+
+    assert captured_params
+    assert all(params.get("probability") is False for params in captured_params)
+    assert result["test_accuracy"] == pytest.approx(1.0)
+    assert result["test_recall"] == pytest.approx(1.0)
+    assert result["test_sensitivity"] == pytest.approx(1.0)
+    assert result["val_roc_auc"] == pytest.approx(1.0)
+    assert result["test_roc_auc"] == pytest.approx(1.0)
+    assert result["test_pr_auc"] == pytest.approx(1.0)
+    assert result["test_f1_global"] == pytest.approx(1.0)
+    assert result["test_f1_class_0"] == pytest.approx(1.0)
+    assert result["test_f1_class_1"] == pytest.approx(1.0)
+    assert result["test_mcc"] == pytest.approx(1.0)
+    assert result["test_false_negatives"] == 0
+    assert result["test_false_positives"] == 0
+    assert result["test_confusion_matrix"] == [[2, 0], [0, 2]]
+
+
+def test_controlled_combo_xgboost_forwards_xgb_parallel_jobs(tmp_path, monkeypatch):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, _feature_cols, base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    runner = ExperimentsRunner(random_state=42)
+    train_val_df, test_df = temporal_train_test_split(base_df, test_size=0.2)
+    train_df, val_df = temporal_train_test_split(train_val_df, test_size=0.25)
+    captured_params = []
+
+    def _fake_build_model(model_name, params, random_state):
+        captured_params.append(dict(params))
+        return _DummyModel()
+
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "build_model",
+        _fake_build_model,
+    )
+
+    result = runner._optimize_controlled_combo(
+        model_name="XGBoost",
+        feature_set="Base",
+        balance_mode="none",
+        objective_metric="roc_auc",
+        selected_features=base_cols[:2],
+        train_df=train_df,
+        val_df=val_df,
+        test_df=test_df,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=1,
+        search_space_config=_controlled_search_space(),
+        parallel_jobs=4,
+        xgb_parallel_jobs=6,
+    )
+
+    assert captured_params
+    assert all(params["n_jobs"] == 6 for params in captured_params)
+    assert result["xgb_parallel_jobs"] == 6
+
+
+def test_controlled_combo_xgboost_caps_optuna_jobs_to_avoid_overlap(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("sklearn")
+    optuna = pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, _feature_cols, base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    runner = ExperimentsRunner(random_state=42)
+    train_val_df, test_df = temporal_train_test_split(base_df, test_size=0.2)
+    train_df, val_df = temporal_train_test_split(train_val_df, test_size=0.25)
+    captured = {}
+    original_optimize = optuna.study.Study.optimize
+
+    def _fake_build_model(model_name, params, random_state):
+        return _DummyModel()
+
+    def _wrapped_optimize(self, *args, **kwargs):
+        captured["n_jobs"] = kwargs.get("n_jobs")
+        return original_optimize(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "build_model",
+        _fake_build_model,
+    )
+    monkeypatch.setattr(optuna.study.Study, "optimize", _wrapped_optimize)
+    monkeypatch.setattr(experiments_logic_module.os, "cpu_count", lambda: 8)
+
+    result = runner._optimize_controlled_combo(
+        model_name="XGBoost",
+        feature_set="Base",
+        balance_mode="none",
+        objective_metric="roc_auc",
+        selected_features=base_cols[:2],
+        train_df=train_df,
+        val_df=val_df,
+        test_df=test_df,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=5,
+        search_space_config=_controlled_search_space(),
+        parallel_jobs=4,
+        xgb_parallel_jobs=3,
+    )
+
+    assert captured["n_jobs"] == 2
+    assert result["optuna_n_jobs"] == 2
+    assert result["requested_optuna_n_jobs"] == 5
+    assert result["max_optuna_jobs_without_overlap"] == 2

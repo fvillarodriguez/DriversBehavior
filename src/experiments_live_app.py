@@ -508,6 +508,97 @@ def _jsonish_to_text(value: object) -> str:
     return str(parsed)
 
 
+def _coerce_confusion_matrix_cell(value: object) -> Optional[list[list[int]]]:
+    parsed = _parse_jsonish_cell(value)
+    if isinstance(parsed, list) and len(parsed) == 4 and not isinstance(
+        parsed[0], (list, tuple)
+    ):
+        try:
+            tn, fp, fn, tp = [int(item) for item in parsed]
+            return [[tn, fp], [fn, tp]]
+        except Exception:
+            return None
+    if (
+        isinstance(parsed, list)
+        and len(parsed) == 2
+        and all(isinstance(row, (list, tuple)) and len(row) == 2 for row in parsed)
+    ):
+        try:
+            return [
+                [int(parsed[0][0]), int(parsed[0][1])],
+                [int(parsed[1][0]), int(parsed[1][1])],
+            ]
+        except Exception:
+            return None
+    return None
+
+
+def _confusion_matrix_text(value: object) -> str:
+    matrix = _coerce_confusion_matrix_cell(value)
+    if matrix is None:
+        return _jsonish_to_text(value)
+    return json.dumps(matrix, ensure_ascii=False)
+
+
+def _first_present_metric(row: Dict[str, object], *keys: str) -> object:
+    for key in keys:
+        if key in row and row.get(key) is not None:
+            return row.get(key)
+    return None
+
+
+def _controlled_live_best_payload(
+    row: Dict[str, object],
+    *,
+    objective_label: str,
+) -> Dict[str, object]:
+    return {
+        "model_name": row.get("model_name"),
+        "feature_set": row.get("feature_set"),
+        "balance_mode": row.get("balance_mode"),
+        "k": row.get("k", row.get("k_optimo")),
+        "objective": row.get("objective_label") or objective_label,
+        "val_objective_score": row.get("val_objective_score"),
+        "test_objective_score": row.get("test_objective_score"),
+        "test_accuracy": _first_present_metric(row, "test_accuracy", "best_test_accuracy"),
+        "test_recall": _first_present_metric(row, "test_recall", "best_test_recall"),
+        "test_sensitivity": _first_present_metric(
+            row,
+            "test_sensitivity",
+            "best_test_sensitivity",
+        ),
+        "test_f1_global": _first_present_metric(
+            row,
+            "test_f1_global",
+            "best_test_f1_global",
+        ),
+        "test_f1_class_0": _first_present_metric(
+            row,
+            "test_f1_class_0",
+            "best_test_f1_class_0",
+        ),
+        "test_f1_class_1": _first_present_metric(
+            row,
+            "test_f1_class_1",
+            "best_test_f1_class_1",
+        ),
+        "test_false_negatives": _first_present_metric(
+            row,
+            "test_false_negatives",
+            "best_test_false_negatives",
+        ),
+        "test_false_positives": _first_present_metric(
+            row,
+            "test_false_positives",
+            "best_test_false_positives",
+        ),
+        "test_roc_auc": _first_present_metric(row, "test_roc_auc", "best_test_roc_auc"),
+        "test_pr_auc": _first_present_metric(row, "test_pr_auc", "best_test_pr_auc"),
+        "test_mcc": _first_present_metric(row, "test_mcc", "best_test_mcc"),
+        "decision_threshold": row.get("decision_threshold"),
+    }
+
+
 def _artifact_context_dict(artifact: Dict[str, object]) -> Dict[str, object]:
     context = artifact.get("strategy_context")
     if isinstance(context, dict):
@@ -2797,12 +2888,23 @@ def _render_controlled_comparison_live_view(
         "k",
         "val_objective_score",
         "test_objective_score",
+        "test_accuracy",
+        "test_recall",
+        "test_sensitivity",
         "val_roc_auc",
         "test_roc_auc",
+        "test_pr_auc",
         "val_f1",
         "test_f1",
+        "test_f1_global",
+        "test_f1_class_0",
+        "test_f1_class_1",
         "val_mcc",
         "test_mcc",
+        "test_false_negatives",
+        "test_false_positives",
+        "test_true_negatives",
+        "test_true_positives",
         "decision_threshold",
         "train_rows",
         "val_rows",
@@ -2868,20 +2970,28 @@ def _render_controlled_comparison_live_view(
 
     if best_row:
         st.markdown("**Mejor combinación observada hasta ahora**")
-        best_payload = {
-            "model_name": best_row.get("model_name"),
-            "feature_set": best_row.get("feature_set"),
-            "balance_mode": best_row.get("balance_mode"),
-            "k": best_row.get("k"),
-            "objective": best_row.get("objective_label") or objective_label,
-            "val_objective_score": best_row.get("val_objective_score"),
-            "test_objective_score": best_row.get("test_objective_score"),
-            "test_roc_auc": best_row.get("test_roc_auc"),
-            "test_f1": best_row.get("test_f1"),
-            "test_mcc": best_row.get("test_mcc"),
-            "decision_threshold": best_row.get("decision_threshold"),
-        }
+        best_payload = _controlled_live_best_payload(
+            dict(best_row),
+            objective_label=objective_label,
+        )
         st.json(best_payload)
+        best_matrix = _coerce_confusion_matrix_cell(
+            _first_present_metric(
+                dict(best_row),
+                "test_confusion_matrix",
+                "best_test_confusion_matrix",
+            )
+        )
+        if best_matrix is not None:
+            st.caption("Matriz de confusión de test")
+            st.dataframe(
+                pd.DataFrame(
+                    best_matrix,
+                    index=["Actual 0", "Actual 1"],
+                    columns=["Pred 0", "Pred 1"],
+                ),
+                width="stretch",
+            )
 
     summary_df = completed_df.copy()
     summary_cols = [
@@ -2889,9 +2999,18 @@ def _render_controlled_comparison_live_view(
         "feature_set",
         metric_col,
         "test_objective_score",
+        "test_accuracy",
+        "test_recall",
+        "test_sensitivity",
         "test_roc_auc",
-        "test_f1",
+        "test_pr_auc",
+        "test_f1_global",
+        "test_f1_class_0",
+        "test_f1_class_1",
         "test_mcc",
+        "test_false_negatives",
+        "test_false_positives",
+        "test_confusion_matrix",
         "k",
         "balance_mode",
         "decision_threshold",
@@ -2915,11 +3034,46 @@ def _render_controlled_comparison_live_view(
         summary_df["best_params"] = summary_df["best_params"].apply(_jsonish_to_text)
     if "smote_params" in summary_df.columns:
         summary_df["smote_params"] = summary_df["smote_params"].apply(_jsonish_to_text)
+    if "test_confusion_matrix" in summary_df.columns:
+        summary_df["test_confusion_matrix"] = summary_df["test_confusion_matrix"].apply(
+            _confusion_matrix_text
+        )
 
     tab_summary, tab_curves, tab_data = st.tabs(["Resumen", "Curvas", "Datos"])
     with tab_summary:
         st.markdown("**Mejor resultado por modelo y conjunto**")
         st.dataframe(_streamlit_arrow_safe_df(summary_df), width="stretch")
+        if "test_confusion_matrix" in completed_df.columns:
+            with st.expander("Matrices de confusión de test", expanded=False):
+                matrix_df = completed_df.copy()
+                if {"model_name", "feature_set", metric_col}.issubset(matrix_df.columns):
+                    best_idx = (
+                        matrix_df.dropna(subset=[metric_col])
+                        .sort_values(
+                            ["model_name", "feature_set", metric_col, "k"],
+                            ascending=[True, True, False, True],
+                        )
+                        .groupby(["model_name", "feature_set"], dropna=False)
+                        .head(1)
+                        .index
+                    )
+                    matrix_df = matrix_df.loc[best_idx].copy()
+                for _, row in matrix_df.iterrows():
+                    matrix = _coerce_confusion_matrix_cell(row.get("test_confusion_matrix"))
+                    if matrix is None:
+                        continue
+                    st.markdown(
+                        f"**{row.get('model_name', '-')} | {row.get('feature_set', '-')} | "
+                        f"K={row.get('k', '-')}**"
+                    )
+                    st.dataframe(
+                        pd.DataFrame(
+                            matrix,
+                            index=["Actual 0", "Actual 1"],
+                            columns=["Pred 0", "Pred 1"],
+                        ),
+                        width="stretch",
+                    )
         if failed_count > 0 and "status" in plot_df.columns:
             failed_df = plot_df[
                 plot_df["status"].astype(str).str.lower() == "failed"
@@ -2982,9 +3136,17 @@ def _render_controlled_comparison_live_view(
                             alt.Tooltip("balance_mode:N", title="Balanceo"),
                             alt.Tooltip("k:Q", title="K"),
                             alt.Tooltip(f"{metric_col}:Q", title=f"Val {objective_label}", format=".4f"),
+                            alt.Tooltip("test_accuracy:Q", title="Test Accuracy", format=".4f"),
+                            alt.Tooltip("test_recall:Q", title="Test Recall", format=".4f"),
+                            alt.Tooltip("test_sensitivity:Q", title="Test Sensitivity", format=".4f"),
                             alt.Tooltip("test_roc_auc:Q", title="Test ROC-AUC", format=".4f"),
-                            alt.Tooltip("test_f1:Q", title="Test F1", format=".4f"),
+                            alt.Tooltip("test_pr_auc:Q", title="Test PR-AUC", format=".4f"),
+                            alt.Tooltip("test_f1_global:Q", title="Test F1 Global", format=".4f"),
+                            alt.Tooltip("test_f1_class_0:Q", title="Test F1 Clase 0", format=".4f"),
+                            alt.Tooltip("test_f1_class_1:Q", title="Test F1 Clase 1", format=".4f"),
                             alt.Tooltip("test_mcc:Q", title="Test MCC", format=".4f"),
+                            alt.Tooltip("test_false_negatives:Q", title="FN Test"),
+                            alt.Tooltip("test_false_positives:Q", title="FP Test"),
                         ],
                     )
                     .properties(height=150)

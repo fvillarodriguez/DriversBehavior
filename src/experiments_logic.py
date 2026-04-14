@@ -19,6 +19,7 @@ from imblearn.over_sampling import SMOTE
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     confusion_matrix,
     f1_score,
     matthews_corrcoef,
@@ -28,11 +29,19 @@ from sklearn.metrics import (
 )
 
 from src.model_training import (
+    THRESHOLD_OBJECTIVE_LABELS,
+    THRESHOLD_PROTOCOL_LABELS,
     build_model,
+    compute_extended_metrics,
     far_and_sensitivity,
     get_model_scores,
+    normalize_calibration_method,
+    normalize_threshold_objective,
+    normalize_threshold_protocol,
+    select_threshold_for_metric,
     select_threshold_for_far,
     temporal_train_test_split,
+    train_model_with_protocol,
 )
 
 try:
@@ -41,16 +50,25 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
     duckdb = None
 
 
-CONTROLLED_COMPARISON_PROTOCOL_VERSION = "controlled_comparison_v2"
-CONTROLLED_COMPARISON_MODELS = ("Random Forest", "SVM", "XGBoost")
+CONTROLLED_COMPARISON_PROTOCOL_VERSION = "controlled_comparison_v3"
+CONTROLLED_COMPARISON_MODELS = (
+    "Random Forest",
+    "Balanced Random Forest",
+    "SVM",
+    "XGBoost",
+)
 CONTROLLED_COMPARISON_FEATURE_SETS = ("Base", "Cluster", "Base + Cluster")
 CONTROLLED_COMPARISON_BALANCE_MODES = ("none", "smote")
 CONTROLLED_COMPARISON_OBJECTIVE_LABELS = {
     "roc_auc": "ROC-AUC",
+    "pr_auc": "PR-AUC",
     "f1": "F1",
+    "balanced_f1": "Balanced F1",
     "mcc": "MCC",
+    "recall_at_alerts_per_day": "Recall@N alertas/dia",
+    "operational_cost": "Costo operacional",
 }
-CONTROLLED_COMPARISON_MEMORY_ESTIMATOR_VERSION = "controlled_comparison_memory_v1"
+CONTROLLED_COMPARISON_MEMORY_ESTIMATOR_VERSION = "controlled_comparison_memory_v2"
 _MEMORY_MB = 1024 ** 2
 _CONTROLLED_MEMORY_PROCESS_OVERHEAD_BYTES = 256 * _MEMORY_MB
 _CONTROLLED_MEMORY_RF_MODEL_OVERHEAD_BYTES = 128 * _MEMORY_MB
@@ -161,11 +179,20 @@ def _cluster_feature_cols(df: pd.DataFrame) -> List[str]:
     return valid_cols
 
 
-def _combo_id(model_name: str, feature_set: str, balance_mode: str, k: int) -> str:
-    return (
+def _combo_id(
+    model_name: str,
+    feature_set: str,
+    balance_mode: str,
+    k: int,
+    threshold_protocol: Optional[object] = None,
+) -> str:
+    base = (
         f"combo__{_slugify(model_name)}__{_slugify(feature_set)}__"
         f"{_slugify(balance_mode)}__k{int(k)}"
     )
+    if threshold_protocol is None:
+        return base
+    return f"{base}__{_slugify(threshold_protocol)}"
 
 
 def _maybe_roc_auc(y_true: Sequence[object], scores: Sequence[object]) -> float:
@@ -178,6 +205,16 @@ def _maybe_roc_auc(y_true: Sequence[object], scores: Sequence[object]) -> float:
         return float("nan")
 
 
+def _maybe_pr_auc(y_true: Sequence[object], scores: Sequence[object]) -> float:
+    y_arr = pd.Series(y_true).astype(int)
+    if y_arr.nunique() < 2:
+        return float("nan")
+    try:
+        return float(average_precision_score(y_arr, np.asarray(scores, dtype=float)))
+    except Exception:
+        return float("nan")
+
+
 def _normalize_controlled_objective_metric(value: object) -> str:
     text = str(value or "").strip().lower()
     aliases = {
@@ -185,10 +222,68 @@ def _normalize_controlled_objective_metric(value: object) -> str:
         "rocauc": "roc_auc",
         "roc_auc": "roc_auc",
         "roc-auc": "roc_auc",
+        "pr_auc": "pr_auc",
+        "pr-auc": "pr_auc",
+        "average_precision": "pr_auc",
         "f1": "f1",
+        "balanced_f1": "balanced_f1",
+        "balanced f1": "balanced_f1",
+        "macro_f1": "balanced_f1",
+        "f1_global": "balanced_f1",
         "mcc": "mcc",
+        "recall_at_alerts_per_day": "recall_at_alerts_per_day",
+        "recall@n": "recall_at_alerts_per_day",
+        "operational_cost": "operational_cost",
+        "cost": "operational_cost",
     }
     return aliases.get(text, "roc_auc")
+
+
+def _normalize_controlled_threshold_protocols(
+    threshold_protocols: Optional[Sequence[object]],
+) -> List[str]:
+    if threshold_protocols is None:
+        return ["conservative"]
+    normalized: List[str] = []
+    for value in threshold_protocols:
+        protocol = normalize_threshold_protocol(value)
+        if protocol not in normalized:
+            normalized.append(protocol)
+    return normalized or ["conservative"]
+
+
+def _controlled_objective_score_from_metrics(
+    metrics: Dict[str, object],
+    objective_metric: str,
+) -> float:
+    metric_key = _normalize_controlled_objective_metric(objective_metric)
+    if metric_key == "operational_cost":
+        return -float(metrics.get("operational_cost", float("inf")))
+    if metric_key == "balanced_f1":
+        return float(
+            metrics.get(
+                "balanced_f1",
+                metrics.get("f1_global", float("nan")),
+            )
+        )
+    return float(metrics.get(metric_key, float("nan")))
+
+
+def _resolve_controlled_models(
+    selected_models: Optional[Sequence[object]] = None,
+) -> List[str]:
+    allowed = list(CONTROLLED_COMPARISON_MODELS)
+    if selected_models is None:
+        return allowed
+
+    normalized: List[str] = []
+    for model_name in selected_models:
+        text = str(model_name or "").strip()
+        if text in CONTROLLED_COMPARISON_MODELS and text not in normalized:
+            normalized.append(text)
+    if not normalized:
+        raise ValueError("Debe seleccionar al menos un modelo para la comparación controlada.")
+    return normalized
 
 
 def _threshold_candidates(scores: Sequence[object]) -> np.ndarray:
@@ -255,6 +350,81 @@ def _estimate_smote_resampled_rows(
     return int(majority + target_minority)
 
 
+def _clamp_controlled_jobs(value: object, *, cpu_count: int) -> int:
+    return max(1, min(int(value), max(1, int(cpu_count))))
+
+
+def _controlled_model_trial_threads(
+    model_name: str,
+    *,
+    parallel_jobs: int,
+    xgb_parallel_jobs: int,
+) -> int:
+    if model_name in {"Random Forest", "Balanced Random Forest"}:
+        return max(1, int(parallel_jobs))
+    if model_name == "XGBoost":
+        return max(1, int(xgb_parallel_jobs))
+    return 1
+
+
+def _controlled_cpu_limited_optuna_jobs(
+    model_names: Sequence[str],
+    *,
+    parallel_jobs: int,
+    xgb_parallel_jobs: int,
+    cpu_count: int,
+) -> int:
+    if not model_names:
+        return 0
+    caps = [
+        max(
+            1,
+            int(cpu_count)
+            // _controlled_model_trial_threads(
+                str(model_name),
+                parallel_jobs=parallel_jobs,
+                xgb_parallel_jobs=xgb_parallel_jobs,
+            ),
+        )
+        for model_name in model_names
+    ]
+    return int(min(caps)) if caps else 0
+
+
+def _resolve_controlled_optimization_parallelism(
+    *,
+    model_name: str,
+    requested_optuna_n_jobs: int,
+    parallel_jobs: int,
+    xgb_parallel_jobs: int,
+    max_cpu_count: Optional[int] = None,
+) -> Dict[str, int]:
+    cpu_count = max(1, int(max_cpu_count or os.cpu_count() or 1))
+    resolved_parallel_jobs = _clamp_controlled_jobs(parallel_jobs, cpu_count=cpu_count)
+    resolved_xgb_parallel_jobs = _clamp_controlled_jobs(
+        xgb_parallel_jobs,
+        cpu_count=cpu_count,
+    )
+    trial_threads = _controlled_model_trial_threads(
+        model_name,
+        parallel_jobs=resolved_parallel_jobs,
+        xgb_parallel_jobs=resolved_xgb_parallel_jobs,
+    )
+    cpu_limited_optuna_jobs = max(1, cpu_count // max(1, int(trial_threads)))
+    resolved_optuna_n_jobs = max(
+        1,
+        min(int(requested_optuna_n_jobs), int(cpu_limited_optuna_jobs)),
+    )
+    return {
+        "cpu_count": int(cpu_count),
+        "parallel_jobs": int(resolved_parallel_jobs),
+        "xgb_parallel_jobs": int(resolved_xgb_parallel_jobs),
+        "trial_threads": int(trial_threads),
+        "cpu_limited_optuna_jobs": int(cpu_limited_optuna_jobs),
+        "optuna_n_jobs": int(resolved_optuna_n_jobs),
+    }
+
+
 def estimate_controlled_comparison_parallelism(
     base_df: pd.DataFrame,
     *,
@@ -265,6 +435,8 @@ def estimate_controlled_comparison_parallelism(
     k_step: int,
     search_space_config: Optional[Dict[str, object]],
     memory_budget_bytes: int,
+    xgb_parallel_jobs: int = 1,
+    selected_models: Optional[Sequence[object]] = None,
     max_cpu_count: Optional[int] = None,
 ) -> Dict[str, object]:
     if base_df is None or base_df.empty:
@@ -284,6 +456,7 @@ def estimate_controlled_comparison_parallelism(
         raise ValueError("No hay variables base disponibles para estimar recursos.")
     if not cluster_cols:
         raise ValueError("No hay variables de cluster disponibles para estimar recursos.")
+    resolved_models = _resolve_controlled_models(selected_models)
 
     feature_sets = {
         "Base": list(base_cols),
@@ -370,14 +543,27 @@ def estimate_controlled_comparison_parallelism(
         + val_matrix_bytes
         + _CONTROLLED_MEMORY_XGB_MODEL_OVERHEAD_BYTES
     )
+    xgb_extra_thread_bytes = max(
+        _CONTROLLED_MEMORY_PER_THREAD_MIN_BYTES,
+        int(train_matrix_bytes * 0.22),
+    )
 
     cpu_count = max(1, int(max_cpu_count or os.cpu_count() or 1))
+    requested_xgb_parallel_jobs = _clamp_controlled_jobs(
+        xgb_parallel_jobs,
+        cpu_count=cpu_count,
+    )
     budget_bytes = int(memory_budget_bytes)
     available_for_workers = max(
         0,
         budget_bytes - _CONTROLLED_MEMORY_PROCESS_OVERHEAD_BYTES,
     )
 
+    xgb_candidates = (
+        list(range(1, cpu_count + 1))
+        if "XGBoost" in resolved_models
+        else [int(requested_xgb_parallel_jobs)]
+    )
     frontier_rows: List[Dict[str, object]] = []
     for parallel_jobs in range(1, cpu_count + 1):
         ranking_worker_bytes = int(
@@ -391,45 +577,82 @@ def estimate_controlled_comparison_parallelism(
             rf_serial_worker_bytes
             + max(0, parallel_jobs - 1) * rf_extra_thread_bytes
         )
-        workers_by_model = {
-            "Random Forest": rf_worker_bytes,
-            "SVM": int(svm_worker_bytes),
-            "XGBoost": int(xgb_worker_bytes),
-        }
-        dominant_model = max(workers_by_model, key=workers_by_model.get)
-        worst_worker_bytes = int(workers_by_model[dominant_model])
-        max_optuna_jobs = 0
-        if worst_worker_bytes > 0 and available_for_workers >= worst_worker_bytes:
-            max_optuna_jobs = int(
-                min(cpu_count, available_for_workers // worst_worker_bytes)
-            )
-        optimization_peak_bytes = int(
-            _CONTROLLED_MEMORY_PROCESS_OVERHEAD_BYTES
-            + max(1, max_optuna_jobs) * worst_worker_bytes
-        )
-        frontier_rows.append(
-            {
-                "parallel_jobs": int(parallel_jobs),
-                "max_optuna_jobs": int(max_optuna_jobs),
-                "dominant_model": str(dominant_model),
-                "ranking_peak_bytes": int(ranking_peak_bytes),
-                "worst_worker_bytes": int(worst_worker_bytes),
-                "optimization_peak_bytes": int(optimization_peak_bytes),
-                "ranking_usage_fraction": float(ranking_peak_bytes) / float(budget_bytes),
-                "optimization_usage_fraction": float(optimization_peak_bytes) / float(budget_bytes),
-                "fits_ranking_budget": bool(ranking_peak_bytes <= budget_bytes),
-                "fits_single_trial_budget": bool(
-                    (_CONTROLLED_MEMORY_PROCESS_OVERHEAD_BYTES + worst_worker_bytes)
-                    <= budget_bytes
+        for candidate_xgb_jobs in xgb_candidates:
+            workers_by_model = {
+                "Random Forest": rf_worker_bytes,
+                "Balanced Random Forest": rf_worker_bytes,
+                "SVM": int(svm_worker_bytes),
+                "XGBoost": int(
+                    xgb_worker_bytes
+                    + max(0, candidate_xgb_jobs - 1) * xgb_extra_thread_bytes
                 ),
-                "fits_combined_budget": bool(
-                    max_optuna_jobs >= 1
-                    and ranking_peak_bytes <= budget_bytes
-                    and optimization_peak_bytes <= budget_bytes
-                ),
-                "throughput_score": int(parallel_jobs * max_optuna_jobs),
             }
-        )
+            workers_by_model = {
+                model_name: workers_by_model[model_name]
+                for model_name in resolved_models
+            }
+            dominant_model = max(workers_by_model, key=workers_by_model.get)
+            worst_worker_bytes = int(workers_by_model[dominant_model])
+            memory_limited_optuna_jobs = 0
+            if worst_worker_bytes > 0 and available_for_workers >= worst_worker_bytes:
+                memory_limited_optuna_jobs = int(
+                    min(cpu_count, available_for_workers // worst_worker_bytes)
+                )
+            cpu_limited_optuna_jobs = _controlled_cpu_limited_optuna_jobs(
+                resolved_models,
+                parallel_jobs=int(parallel_jobs),
+                xgb_parallel_jobs=int(candidate_xgb_jobs),
+                cpu_count=int(cpu_count),
+            )
+            max_optuna_jobs = int(
+                min(memory_limited_optuna_jobs, cpu_limited_optuna_jobs)
+            )
+            optimization_peak_bytes = int(
+                _CONTROLLED_MEMORY_PROCESS_OVERHEAD_BYTES
+                + max(1, max_optuna_jobs) * worst_worker_bytes
+            )
+            trial_threads_by_model = {
+                model_name: _controlled_model_trial_threads(
+                    model_name,
+                    parallel_jobs=int(parallel_jobs),
+                    xgb_parallel_jobs=int(candidate_xgb_jobs),
+                )
+                for model_name in resolved_models
+            }
+            optimization_capacity_score = int(
+                sum(
+                    max_optuna_jobs * int(trial_threads_by_model[model_name])
+                    for model_name in resolved_models
+                )
+            )
+            frontier_rows.append(
+                {
+                    "parallel_jobs": int(parallel_jobs),
+                    "xgb_parallel_jobs": int(candidate_xgb_jobs),
+                    "max_optuna_jobs": int(max_optuna_jobs),
+                    "memory_limited_optuna_jobs": int(memory_limited_optuna_jobs),
+                    "cpu_limited_optuna_jobs": int(cpu_limited_optuna_jobs),
+                    "dominant_model": str(dominant_model),
+                    "ranking_peak_bytes": int(ranking_peak_bytes),
+                    "worst_worker_bytes": int(worst_worker_bytes),
+                    "optimization_peak_bytes": int(optimization_peak_bytes),
+                    "ranking_usage_fraction": float(ranking_peak_bytes) / float(budget_bytes),
+                    "optimization_usage_fraction": float(optimization_peak_bytes) / float(budget_bytes),
+                    "fits_ranking_budget": bool(ranking_peak_bytes <= budget_bytes),
+                    "fits_single_trial_budget": bool(
+                        (_CONTROLLED_MEMORY_PROCESS_OVERHEAD_BYTES + worst_worker_bytes)
+                        <= budget_bytes
+                    ),
+                    "fits_combined_budget": bool(
+                        max_optuna_jobs >= 1
+                        and ranking_peak_bytes <= budget_bytes
+                        and optimization_peak_bytes <= budget_bytes
+                    ),
+                    "throughput_score": int(
+                        int(parallel_jobs) + int(optimization_capacity_score)
+                    ),
+                }
+            )
 
     frontier_df = pd.DataFrame(frontier_rows)
     safe_frontier_df = frontier_df.loc[
@@ -440,6 +663,10 @@ def estimate_controlled_comparison_parallelism(
         frontier_df["fits_ranking_budget"].astype(bool)
         & frontier_df["fits_single_trial_budget"].astype(bool)
     ].copy()
+    if "XGBoost" in resolved_models and not independent_parallel_rows.empty:
+        independent_parallel_rows = independent_parallel_rows.loc[
+            independent_parallel_rows["xgb_parallel_jobs"].astype(int) == 1
+        ].copy()
     if independent_parallel_rows.empty:
         max_parallel_jobs_when_optuna_1 = 0
     else:
@@ -450,28 +677,61 @@ def estimate_controlled_comparison_parallelism(
     parallel_one_row = frontier_df.loc[
         frontier_df["parallel_jobs"].astype(int) == 1
     ].copy()
+    if "XGBoost" in resolved_models and not parallel_one_row.empty:
+        parallel_one_row = parallel_one_row.loc[
+            parallel_one_row["xgb_parallel_jobs"].astype(int) == 1
+        ].copy()
     if parallel_one_row.empty:
         max_optuna_jobs_when_parallel_1 = 0
     else:
-        row = parallel_one_row.iloc[0]
+        ranked_parallel_one = parallel_one_row.sort_values(
+            ["max_optuna_jobs", "memory_limited_optuna_jobs"],
+            ascending=[False, False],
+        )
+        row = ranked_parallel_one.iloc[0]
         if bool(row.get("fits_ranking_budget")):
             max_optuna_jobs_when_parallel_1 = int(row.get("max_optuna_jobs") or 0)
         else:
             max_optuna_jobs_when_parallel_1 = 0
 
+    if "XGBoost" in resolved_models:
+        xgb_one_rows = frontier_df.loc[
+            (frontier_df["parallel_jobs"].astype(int) == 1)
+            & frontier_df["fits_ranking_budget"].astype(bool)
+            & frontier_df["fits_single_trial_budget"].astype(bool)
+        ].copy()
+        if xgb_one_rows.empty:
+            max_xgb_parallel_jobs_when_parallel_1_optuna_1 = 0
+        else:
+            max_xgb_parallel_jobs_when_parallel_1_optuna_1 = int(
+                xgb_one_rows["xgb_parallel_jobs"].max()
+            )
+    else:
+        max_xgb_parallel_jobs_when_parallel_1_optuna_1 = 0
+
     recommended_pair = None
     if not safe_frontier_df.empty:
         ranked_frontier = safe_frontier_df.sort_values(
-            ["throughput_score", "max_optuna_jobs", "parallel_jobs"],
-            ascending=[False, False, True],
+            [
+                "throughput_score",
+                "max_optuna_jobs",
+                "xgb_parallel_jobs",
+                "parallel_jobs",
+            ],
+            ascending=[False, False, False, True],
         )
         best_row = ranked_frontier.iloc[0]
         recommended_pair = {
             "parallel_jobs": int(best_row["parallel_jobs"]),
             "optuna_n_jobs": int(best_row["max_optuna_jobs"]),
+            "xgb_parallel_jobs": int(best_row["xgb_parallel_jobs"]),
             "dominant_model": str(best_row["dominant_model"]),
             "estimated_peak_bytes": int(best_row["optimization_peak_bytes"]),
             "usage_fraction": float(best_row["optimization_usage_fraction"]),
+            "memory_limited_optuna_jobs": int(
+                best_row["memory_limited_optuna_jobs"]
+            ),
+            "cpu_limited_optuna_jobs": int(best_row["cpu_limited_optuna_jobs"]),
             "throughput_score": int(best_row["throughput_score"]),
         }
 
@@ -479,6 +739,9 @@ def estimate_controlled_comparison_parallelism(
         "estimator_version": CONTROLLED_COMPARISON_MEMORY_ESTIMATOR_VERSION,
         "cpu_count": int(cpu_count),
         "memory_budget_bytes": int(budget_bytes),
+        "xgb_parallel_jobs": int(requested_xgb_parallel_jobs),
+        "requested_xgb_parallel_jobs": int(requested_xgb_parallel_jobs),
+        "selected_models": list(resolved_models),
         "process_overhead_bytes": int(_CONTROLLED_MEMORY_PROCESS_OVERHEAD_BYTES),
         "train_rows": int(train_rows),
         "val_rows": int(val_rows),
@@ -494,6 +757,9 @@ def estimate_controlled_comparison_parallelism(
         "ranking_feature_count": int(ranking_feature_count),
         "max_parallel_jobs_when_optuna_1": int(max_parallel_jobs_when_optuna_1),
         "max_optuna_jobs_when_parallel_1": int(max_optuna_jobs_when_parallel_1),
+        "max_xgb_parallel_jobs_when_parallel_1_optuna_1": int(
+            max_xgb_parallel_jobs_when_parallel_1_optuna_1
+        ),
         "recommended_pair": recommended_pair,
         "frontier_df": frontier_df,
         "safe_frontier_df": safe_frontier_df,
@@ -511,6 +777,7 @@ def estimate_controlled_comparison_parallelism(
             "rf_extra_thread_bytes": int(rf_extra_thread_bytes),
             "svm_worker_bytes": int(svm_worker_bytes),
             "xgb_worker_bytes": int(xgb_worker_bytes),
+            "xgb_extra_thread_bytes": int(xgb_extra_thread_bytes),
         },
     }
 
@@ -529,8 +796,15 @@ def _metric_at_threshold(
     try:
         if metric_name == "f1":
             return float(f1_score(y_arr, preds, zero_division=0))
+        if metric_name == "balanced_f1":
+            return float(f1_score(y_arr, preds, average="macro", zero_division=0))
         if metric_name == "mcc":
             return float(matthews_corrcoef(y_arr, preds))
+        if metric_name == "recall_at_alerts_per_day":
+            return float(recall_score(y_arr, preds, zero_division=0))
+        if metric_name == "operational_cost":
+            tn, fp, fn, tp = confusion_matrix(y_arr, preds, labels=[0, 1]).ravel()
+            return -float((10.0 * fn) + fp)
     except Exception:
         return float("nan")
     raise ValueError(f"Metrica no soportada: {metric}")
@@ -545,6 +819,8 @@ def _best_threshold_for_metric(
     metric_name = _normalize_controlled_objective_metric(metric)
     if metric_name == "roc_auc":
         return _maybe_roc_auc(y_true, scores), 0.5
+    if metric_name == "pr_auc":
+        return _maybe_pr_auc(y_true, scores), 0.5
 
     best_score = float("-inf")
     best_threshold = 0.5
@@ -574,15 +850,49 @@ def _classification_metrics_from_scores(
     scores: Sequence[object],
     *,
     threshold: float,
-) -> Dict[str, float]:
-    y_arr = pd.Series(y_true).astype(int)
-    scores_arr = np.asarray(scores, dtype=float)
-    preds = (scores_arr >= float(threshold)).astype(int)
-    return {
-        "roc_auc": _maybe_roc_auc(y_arr, scores_arr),
-        "f1": float(f1_score(y_arr, preds, zero_division=0)),
-        "mcc": float(matthews_corrcoef(y_arr, preds)),
-    }
+    eval_df: Optional[pd.DataFrame] = None,
+    alerts_per_day: float = 5.0,
+    fn_cost: float = 10.0,
+    fp_cost: float = 1.0,
+) -> Dict[str, object]:
+    metrics = compute_extended_metrics(
+        pd.Series(y_true).astype(int).to_numpy(),
+        np.asarray(scores, dtype=float),
+        threshold=float(threshold),
+        eval_df=eval_df,
+        alerts_per_day=float(alerts_per_day),
+        fn_cost=float(fn_cost),
+        fp_cost=float(fp_cost),
+    )
+    return dict(metrics)
+
+
+def _orient_scores_for_metric(
+    y_true: Sequence[object],
+    scores: Sequence[object],
+    *,
+    metric: str,
+) -> Tuple[np.ndarray, float, float]:
+    raw_scores = np.asarray(scores, dtype=float)
+    pos_score, _ = _best_threshold_for_metric(
+        y_true,
+        raw_scores,
+        metric=metric,
+    )
+    neg_score, _ = _best_threshold_for_metric(
+        y_true,
+        -raw_scores,
+        metric=metric,
+    )
+    if pd.isna(pos_score) and pd.isna(neg_score):
+        return raw_scores, 1.0, float("nan")
+    if pd.isna(pos_score):
+        return -raw_scores, -1.0, float(neg_score)
+    if pd.isna(neg_score):
+        return raw_scores, 1.0, float(pos_score)
+    if float(neg_score) > float(pos_score) + 1e-12:
+        return -raw_scores, -1.0, float(neg_score)
+    return raw_scores, 1.0, float(pos_score)
 
 
 def _discrete_range_values(
@@ -1395,42 +1705,70 @@ class ExperimentsRunner:
         search_space_config: Dict[str, object],
         y_train: pd.Series,
     ) -> Dict[str, List[object]]:
-        if model_name == "Random Forest":
+        if model_name in {"Random Forest", "Balanced Random Forest"}:
+            rf_cfg_key = "balanced_rf" if model_name == "Balanced Random Forest" else "rf"
             model_space = {
                 "n_estimators": _discrete_range_values(
-                    search_space_config.get("rf", {}).get("n_estimators"),
+                    search_space_config.get(rf_cfg_key, {}).get(
+                        "n_estimators",
+                        search_space_config.get("rf", {}).get("n_estimators"),
+                    ),
                     default_min=50,
                     default_max=300,
                     default_step=10,
                     caster=int,
                 ),
                 "max_depth": _discrete_range_values(
-                    search_space_config.get("rf", {}).get("max_depth"),
+                    search_space_config.get(rf_cfg_key, {}).get(
+                        "max_depth",
+                        search_space_config.get("rf", {}).get("max_depth"),
+                    ),
                     default_min=3,
                     default_max=15,
                     default_step=1,
                     caster=int,
                 ),
                 "min_samples_split": _discrete_range_values(
-                    search_space_config.get("rf", {}).get("min_samples_split"),
+                    search_space_config.get(rf_cfg_key, {}).get(
+                        "min_samples_split",
+                        search_space_config.get("rf", {}).get("min_samples_split"),
+                    ),
                     default_min=2,
                     default_max=10,
                     default_step=1,
                     caster=int,
                 ),
                 "min_samples_leaf": _discrete_range_values(
-                    search_space_config.get("rf", {}).get("min_samples_leaf"),
+                    search_space_config.get(rf_cfg_key, {}).get(
+                        "min_samples_leaf",
+                        search_space_config.get("rf", {}).get("min_samples_leaf"),
+                    ),
                     default_min=1,
                     default_max=5,
                     default_step=1,
                     caster=int,
                 ),
                 "max_features": list(
-                    search_space_config.get("rf", {}).get(
-                        "max_features", ["sqrt", "log2", None]
+                    search_space_config.get(rf_cfg_key, {}).get(
+                        "max_features",
+                        search_space_config.get("rf", {}).get(
+                            "max_features", ["sqrt", "log2", None]
+                        ),
                     )
                 ),
             }
+            if model_name == "Random Forest":
+                model_space["class_weight"] = list(
+                    search_space_config.get("rf", {}).get(
+                        "class_weight", [None, "balanced"]
+                    )
+                )
+            else:
+                model_space["replacement"] = list(
+                    search_space_config.get("balanced_rf", {}).get(
+                        "replacement", [False]
+                    )
+                )
         elif model_name == "SVM":
             model_space = {
                 "C": _discrete_range_values(
@@ -1460,8 +1798,22 @@ class ExperimentsRunner:
                     default_step=0.2,
                     caster=float,
                 ),
+                "class_weight": list(
+                    search_space_config.get("svm", {}).get(
+                        "class_weight", [None, "balanced"]
+                    )
+                ),
             }
         elif model_name == "XGBoost":
+            class_counts = pd.Series(y_train).astype(int).value_counts()
+            pos = int(class_counts.get(1, 0))
+            neg = int(class_counts.get(0, 0))
+            base_spw = float(neg / pos) if pos > 0 else 1.0
+            spw_multipliers = list(
+                search_space_config.get("xgb", {}).get(
+                    "scale_pos_weight_multipliers", [0.5, 1.0, 2.0, 5.0, 10.0]
+                )
+            )
             model_space = {
                 "n_estimators": _discrete_range_values(
                     search_space_config.get("xgb", {}).get("n_estimators"),
@@ -1526,6 +1878,15 @@ class ExperimentsRunner:
                     default_step=0.1,
                     caster=float,
                 ),
+                "scale_pos_weight": [
+                    round(float(base_spw) * float(multiplier), 10)
+                    for multiplier in spw_multipliers
+                ],
+                "max_delta_step": list(
+                    search_space_config.get("xgb", {}).get(
+                        "max_delta_step", [0.0, 1.0]
+                    )
+                ),
             }
         else:
             raise ValueError(f"Modelo no soportado: {model_name}")
@@ -1578,6 +1939,7 @@ class ExperimentsRunner:
         smote_space: Dict[str, List[object]],
         balance_mode: str,
         parallel_jobs: int,
+        xgb_parallel_jobs: int,
     ) -> Tuple[Dict[str, object], Dict[str, object]]:
         if balance_mode == "smote":
             smote_params = {
@@ -1592,18 +1954,77 @@ class ExperimentsRunner:
             smote_params = {}
 
         model_params: Dict[str, object] = {}
+        if model_name == "SVM":
+            kernels = list(model_space.get("kernel") or ["rbf"])
+            model_params["kernel"] = trial.suggest_categorical(
+                "kernel", kernels
+            )
+            c_values = list(model_space.get("C") or [1.0])
+            model_params["C"] = trial.suggest_categorical("C", c_values)
+            kernel_name = str(model_params["kernel"])
+            if kernel_name in {"rbf", "poly", "sigmoid"}:
+                gamma_values = list(model_space.get("gamma") or ["scale"])
+                model_params["gamma"] = trial.suggest_categorical(
+                    "gamma", gamma_values
+                )
+            if kernel_name == "poly":
+                degree_values = list(model_space.get("degree") or [3])
+                model_params["degree"] = trial.suggest_categorical(
+                    "degree", degree_values
+                )
+            if kernel_name in {"poly", "sigmoid"}:
+                coef0_values = list(model_space.get("coef0") or [0.0])
+                model_params["coef0"] = trial.suggest_categorical(
+                    "coef0", coef0_values
+                )
+            class_weight_values = list(model_space.get("class_weight") or [None])
+            if len(class_weight_values) > 1:
+                class_weight_value = trial.suggest_categorical(
+                    "class_weight", class_weight_values
+                )
+            else:
+                class_weight_value = class_weight_values[0]
+            if class_weight_value is not None:
+                model_params["class_weight"] = class_weight_value
+            model_params["probability"] = False
+            return model_params, smote_params
+
         for key, values in model_space.items():
             if not values:
                 continue
             model_params[key] = trial.suggest_categorical(str(key), list(values))
 
-        if model_name == "Random Forest":
+        if model_name in {"Random Forest", "Balanced Random Forest"}:
             model_params["n_jobs"] = int(parallel_jobs)
             if model_params.get("max_depth") in {0, "0"}:
                 model_params["max_depth"] = None
         elif model_name == "XGBoost":
-            model_params["n_jobs"] = 1
+            model_params["n_jobs"] = int(xgb_parallel_jobs)
         return model_params, smote_params
+
+    def _controlled_model_scores(
+        self,
+        model: object,
+        X: pd.DataFrame,
+        *,
+        model_name: str,
+        objective_metric: str,
+        y_ref: Optional[Sequence[object]] = None,
+        orientation: Optional[float] = None,
+    ) -> Tuple[np.ndarray, float]:
+        scores = np.asarray(get_model_scores(model, X), dtype=float)
+        if model_name != "SVM":
+            return scores, 1.0
+        if orientation is not None:
+            return scores * float(orientation), float(orientation)
+        if y_ref is None:
+            return scores, 1.0
+        oriented_scores, score_orientation, _ = _orient_scores_for_metric(
+            y_ref,
+            scores,
+            metric=objective_metric,
+        )
+        return oriented_scores, float(score_orientation)
 
     def _apply_smote(
         self,
@@ -1632,6 +2053,14 @@ class ExperimentsRunner:
         feature_set: str,
         balance_mode: str,
         objective_metric: str,
+        threshold_protocol: str = "conservative",
+        threshold_objective: Optional[str] = None,
+        calibration_method: str = "none",
+        far_target: float = 0.20,
+        alerts_per_day: float = 5.0,
+        fn_cost: float = 10.0,
+        fp_cost: float = 1.0,
+        robust_folds: int = 3,
         selected_features: List[str],
         train_df: pd.DataFrame,
         val_df: pd.DataFrame,
@@ -1641,6 +2070,7 @@ class ExperimentsRunner:
         optuna_n_jobs: int,
         search_space_config: Dict[str, object],
         parallel_jobs: int,
+        xgb_parallel_jobs: int = 1,
     ) -> Dict[str, object]:
         X_train = train_df[selected_features].fillna(0).astype("float32")
         y_train = train_df["target"].astype(int)
@@ -1657,9 +2087,30 @@ class ExperimentsRunner:
             raise ValueError("Solo existe una clase en test.")
 
         objective_metric = _normalize_controlled_objective_metric(objective_metric)
+        threshold_protocol = normalize_threshold_protocol(threshold_protocol)
+        threshold_objective = normalize_threshold_objective(
+            threshold_objective or objective_metric
+        )
+        calibration_method = normalize_calibration_method(calibration_method)
         objective_label = CONTROLLED_COMPARISON_OBJECTIVE_LABELS.get(
             objective_metric, str(objective_metric).upper()
         )
+        threshold_objective_label = THRESHOLD_OBJECTIVE_LABELS.get(
+            threshold_objective, str(threshold_objective).upper()
+        )
+        effective_parallelism = _resolve_controlled_optimization_parallelism(
+            model_name=model_name,
+            requested_optuna_n_jobs=int(optuna_n_jobs),
+            parallel_jobs=int(parallel_jobs),
+            xgb_parallel_jobs=int(xgb_parallel_jobs),
+        )
+        resolved_parallel_jobs = int(effective_parallelism["parallel_jobs"])
+        resolved_xgb_parallel_jobs = int(effective_parallelism["xgb_parallel_jobs"])
+        effective_optuna_n_jobs = int(effective_parallelism["optuna_n_jobs"])
+        max_optuna_jobs_without_overlap = int(
+            effective_parallelism["cpu_limited_optuna_jobs"]
+        )
+        cpu_count = int(effective_parallelism["cpu_count"])
 
         search_space = self._controlled_comparison_search_space(
             model_name=model_name,
@@ -1674,9 +2125,16 @@ class ExperimentsRunner:
         ):
             raise ValueError("SMOTE no es valido para el split actual.")
 
+        sampler_kwargs: Dict[str, object] = {"seed": self.random_state}
+        if int(effective_optuna_n_jobs) > 1:
+            sampler_kwargs["constant_liar"] = True
+        try:
+            sampler = optuna.samplers.TPESampler(**sampler_kwargs)
+        except TypeError:
+            sampler = optuna.samplers.TPESampler(seed=self.random_state)
         study = optuna.create_study(
             direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=self.random_state),
+            sampler=sampler,
         )
 
         def objective(trial: optuna.Trial) -> float:
@@ -1686,7 +2144,8 @@ class ExperimentsRunner:
                 model_space=model_space,
                 smote_space=smote_space,
                 balance_mode=balance_mode,
-                parallel_jobs=parallel_jobs,
+                parallel_jobs=resolved_parallel_jobs,
+                xgb_parallel_jobs=resolved_xgb_parallel_jobs,
             )
             try:
                 X_fit, y_fit = self._apply_smote(
@@ -1696,12 +2155,31 @@ class ExperimentsRunner:
                 )
                 model = build_model(model_name, model_params, self.random_state)
                 model.fit(X_fit, y_fit)
-                scores_val = get_model_scores(model, X_val)
-                score, _threshold = _best_threshold_for_metric(
-                    y_val,
-                    scores_val,
-                    metric=objective_metric,
+                scores_val, _ = self._controlled_model_scores(
+                    model,
+                    X_val,
+                    model_name=model_name,
+                    objective_metric=objective_metric,
+                    y_ref=y_val,
                 )
+                if objective_metric in {"roc_auc", "pr_auc"}:
+                    score, _threshold = _best_threshold_for_metric(
+                        y_val,
+                        scores_val,
+                        metric=objective_metric,
+                    )
+                else:
+                    threshold_info = select_threshold_for_metric(
+                        y_val.to_numpy(),
+                        scores_val,
+                        objective=objective_metric,
+                        eval_df=val_df,
+                        far_target=float(far_target),
+                        alerts_per_day=float(alerts_per_day),
+                        fn_cost=float(fn_cost),
+                        fp_cost=float(fp_cost),
+                    )
+                    score = float(threshold_info.get("objective_score", float("nan")))
             except Exception as exc:
                 raise optuna.TrialPruned(str(exc)) from exc
             if pd.isna(score):
@@ -1714,7 +2192,7 @@ class ExperimentsRunner:
             objective,
             n_trials=max(1, int(n_trials)),
             timeout=max(1, int(timeout)),
-            n_jobs=max(1, int(optuna_n_jobs)),
+            n_jobs=max(1, int(effective_optuna_n_jobs)),
         )
 
         completed_trials = [
@@ -1737,49 +2215,44 @@ class ExperimentsRunner:
                 "k_neighbors": int(best_raw_params["smote_k_neighbors"]),
                 "sampling_strategy": float(best_raw_params["smote_sampling_strategy"]),
             }
-        if model_name == "Random Forest":
-            best_model_params["n_jobs"] = int(parallel_jobs)
+        if model_name in {"Random Forest", "Balanced Random Forest"}:
+            best_model_params["n_jobs"] = int(resolved_parallel_jobs)
             if best_model_params.get("max_depth") in {0, "0"}:
                 best_model_params["max_depth"] = None
         elif model_name == "XGBoost":
-            best_model_params["n_jobs"] = 1
+            best_model_params["n_jobs"] = int(resolved_xgb_parallel_jobs)
+        elif model_name == "SVM":
+            best_model_params["probability"] = False
 
-        X_best_train, y_best_train = self._apply_smote(
-            X_train,
-            y_train,
+        protocol_result = train_model_with_protocol(
+            train_df,
+            val_df,
+            test_df,
+            selected_features,
+            model_name,
+            best_model_params,
+            threshold_protocol=threshold_protocol,
+            threshold_objective=threshold_objective,
+            calibration_method=calibration_method,
+            far_target=float(far_target),
+            alerts_per_day=float(alerts_per_day),
+            fn_cost=float(fn_cost),
+            fp_cost=float(fp_cost),
+            robust_folds=int(robust_folds),
+            balance_strategy="smote" if balance_mode == "smote" else "none",
             smote_params=best_smote_params,
+            random_state=self.random_state,
         )
-        best_val_model = build_model(
-            model_name, best_model_params, self.random_state
+        val_metrics = dict(protocol_result.get("validation_metrics") or {})
+        test_metrics = dict(protocol_result.get("metrics") or {})
+        decision_threshold = float(test_metrics.get("threshold", 0.5))
+        val_objective_score = _controlled_objective_score_from_metrics(
+            val_metrics,
+            objective_metric,
         )
-        best_val_model.fit(X_best_train, y_best_train)
-        val_scores = get_model_scores(best_val_model, X_val)
-        val_objective_score, decision_threshold = _best_threshold_for_metric(
-            y_val,
-            val_scores,
-            metric=objective_metric,
-        )
-        val_metrics = _classification_metrics_from_scores(
-            y_val,
-            val_scores,
-            threshold=float(decision_threshold),
-        )
-
-        train_val_df = pd.concat([train_df, val_df], ignore_index=True)
-        X_train_val = train_val_df[selected_features].fillna(0).astype("float32")
-        y_train_val = train_val_df["target"].astype(int)
-        X_fit, y_fit = self._apply_smote(
-            X_train_val,
-            y_train_val,
-            smote_params=best_smote_params,
-        )
-        final_model = build_model(model_name, best_model_params, self.random_state)
-        final_model.fit(X_fit, y_fit)
-        test_scores = get_model_scores(final_model, X_test)
-        test_metrics = _classification_metrics_from_scores(
-            y_test,
-            test_scores,
-            threshold=float(decision_threshold),
+        test_objective_score = _controlled_objective_score_from_metrics(
+            test_metrics,
+            objective_metric,
         )
 
         trials_df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
@@ -1791,6 +2264,13 @@ class ExperimentsRunner:
             "model_name": model_name,
             "feature_set": feature_set,
             "balance_mode": balance_mode,
+            "threshold_protocol": threshold_protocol,
+            "threshold_protocol_label": THRESHOLD_PROTOCOL_LABELS.get(
+                threshold_protocol, threshold_protocol
+            ),
+            "threshold_objective": threshold_objective,
+            "threshold_objective_label": threshold_objective_label,
+            "calibration_method": calibration_method,
             "objective_metric": objective_metric,
             "objective_label": objective_label,
             "k": int(len(selected_features)),
@@ -1798,18 +2278,73 @@ class ExperimentsRunner:
             "selected_feature_count": int(len(selected_features)),
             "decision_threshold": float(decision_threshold),
             "val_objective_score": float(val_objective_score),
-            "test_objective_score": float(test_metrics.get(objective_metric, float("nan"))),
+            "test_objective_score": float(test_objective_score),
+            "val_accuracy": float(val_metrics.get("accuracy", float("nan"))),
+            "test_accuracy": float(test_metrics.get("accuracy", float("nan"))),
+            "val_recall": float(val_metrics.get("recall", float("nan"))),
+            "test_recall": float(test_metrics.get("recall", float("nan"))),
+            "val_sensitivity": float(val_metrics.get("sensitivity", float("nan"))),
+            "test_sensitivity": float(test_metrics.get("sensitivity", float("nan"))),
             "val_roc_auc": float(val_metrics.get("roc_auc", float("nan"))),
             "test_roc_auc": float(test_metrics.get("roc_auc", float("nan"))),
+            "val_pr_auc": float(val_metrics.get("pr_auc", float("nan"))),
+            "test_pr_auc": float(test_metrics.get("pr_auc", float("nan"))),
             "val_f1": float(val_metrics.get("f1", float("nan"))),
             "test_f1": float(test_metrics.get("f1", float("nan"))),
+            "val_f1_global": float(val_metrics.get("f1_global", float("nan"))),
+            "test_f1_global": float(test_metrics.get("f1_global", float("nan"))),
+            "val_balanced_f1": float(
+                val_metrics.get(
+                    "balanced_f1",
+                    val_metrics.get("f1_global", float("nan")),
+                )
+            ),
+            "test_balanced_f1": float(
+                test_metrics.get(
+                    "balanced_f1",
+                    test_metrics.get("f1_global", float("nan")),
+                )
+            ),
+            "val_f1_class_0": float(val_metrics.get("f1_class_0", float("nan"))),
+            "test_f1_class_0": float(test_metrics.get("f1_class_0", float("nan"))),
+            "val_f1_class_1": float(val_metrics.get("f1_class_1", float("nan"))),
+            "test_f1_class_1": float(test_metrics.get("f1_class_1", float("nan"))),
             "val_mcc": float(val_metrics.get("mcc", float("nan"))),
             "test_mcc": float(test_metrics.get("mcc", float("nan"))),
+            "val_alerts_per_day": float(val_metrics.get("alerts_per_day", float("nan"))),
+            "test_alerts_per_day": float(test_metrics.get("alerts_per_day", float("nan"))),
+            "val_false_alarms_per_day": float(val_metrics.get("false_alarms_per_day", float("nan"))),
+            "test_false_alarms_per_day": float(test_metrics.get("false_alarms_per_day", float("nan"))),
+            "val_event_recall_approx": float(val_metrics.get("event_recall_approx", float("nan"))),
+            "test_event_recall_approx": float(test_metrics.get("event_recall_approx", float("nan"))),
+            "val_operational_cost": float(val_metrics.get("operational_cost", float("nan"))),
+            "test_operational_cost": float(test_metrics.get("operational_cost", float("nan"))),
+            "val_cost_per_day": float(val_metrics.get("cost_per_day", float("nan"))),
+            "test_cost_per_day": float(test_metrics.get("cost_per_day", float("nan"))),
+            "alerts_per_day_budget": float(alerts_per_day),
+            "fn_cost": float(fn_cost),
+            "fp_cost": float(fp_cost),
+            "val_false_negatives": int(val_metrics.get("false_negatives", 0)),
+            "test_false_negatives": int(test_metrics.get("false_negatives", 0)),
+            "val_false_positives": int(val_metrics.get("false_positives", 0)),
+            "test_false_positives": int(test_metrics.get("false_positives", 0)),
+            "val_true_negatives": int(val_metrics.get("true_negatives", 0)),
+            "test_true_negatives": int(test_metrics.get("true_negatives", 0)),
+            "val_true_positives": int(val_metrics.get("true_positives", 0)),
+            "test_true_positives": int(test_metrics.get("true_positives", 0)),
+            "val_confusion_matrix": val_metrics.get("confusion_matrix"),
+            "test_confusion_matrix": test_metrics.get("confusion_matrix"),
             "best_params": best_model_params,
             "smote_params": best_smote_params,
             "optuna_trials_completed": int(len(completed_trials)),
-            "optuna_n_jobs": int(optuna_n_jobs),
-            "parallel_jobs": int(parallel_jobs),
+            "optuna_n_jobs": int(effective_optuna_n_jobs),
+            "parallel_jobs": int(resolved_parallel_jobs),
+            "xgb_parallel_jobs": int(resolved_xgb_parallel_jobs),
+            "requested_optuna_n_jobs": int(optuna_n_jobs),
+            "requested_parallel_jobs": int(parallel_jobs),
+            "requested_xgb_parallel_jobs": int(xgb_parallel_jobs),
+            "max_optuna_jobs_without_overlap": int(max_optuna_jobs_without_overlap),
+            "cpu_count": int(cpu_count),
             "train_rows": int(len(train_df)),
             "val_rows": int(len(val_df)),
             "test_rows": int(len(test_df)),
@@ -1905,7 +2440,17 @@ class ExperimentsRunner:
         optuna_n_jobs: int,
         parallel_jobs: int,
         search_space_config: Dict[str, object],
+        xgb_parallel_jobs: int = 1,
+        selected_models: Optional[Sequence[object]] = None,
         objective_metric: str = "roc_auc",
+        threshold_protocols: Optional[Sequence[object]] = None,
+        threshold_objective: str = "recall_at_alerts_per_day",
+        calibration_method: str = "sigmoid",
+        far_target: float = 0.20,
+        alerts_per_day: float = 5.0,
+        fn_cost: float = 10.0,
+        fp_cost: float = 1.0,
+        robust_folds: int = 3,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         result_callback: Optional[Callable[[Dict[str, object]], None]] = None,
         checkpoint_root: Optional[Path] = None,
@@ -1927,8 +2472,18 @@ class ExperimentsRunner:
         if pd.Series(base_df["target"]).astype(int).nunique() < 2:
             raise ValueError("El target debe tener al menos dos clases.")
         objective_metric = _normalize_controlled_objective_metric(objective_metric)
+        resolved_models = _resolve_controlled_models(selected_models)
+        resolved_threshold_protocols = _normalize_controlled_threshold_protocols(
+            threshold_protocols
+        )
+        threshold_objective = normalize_threshold_objective(threshold_objective)
+        calibration_method = normalize_calibration_method(calibration_method)
         objective_label = CONTROLLED_COMPARISON_OBJECTIVE_LABELS.get(
             objective_metric, str(objective_metric).upper()
+        )
+        threshold_objective_label = THRESHOLD_OBJECTIVE_LABELS.get(
+            threshold_objective,
+            str(threshold_objective).upper(),
         )
 
         k_grid_by_set = {
@@ -1959,8 +2514,19 @@ class ExperimentsRunner:
             "metric": objective_metric,
             "objective_metric": objective_metric,
             "objective_label": objective_label,
+            "optuna_objective_metric": objective_metric,
+            "optuna_objective_label": objective_label,
+            "threshold_protocols": list(resolved_threshold_protocols),
+            "threshold_objective": threshold_objective,
+            "threshold_objective_label": threshold_objective_label,
+            "calibration_method": calibration_method,
+            "far_target": float(far_target),
+            "alerts_per_day": float(alerts_per_day),
+            "fn_cost": float(fn_cost),
+            "fp_cost": float(fp_cost),
+            "robust_folds": int(robust_folds),
             "test_only_final": True,
-            "models": list(CONTROLLED_COMPARISON_MODELS),
+            "models": list(resolved_models),
             "feature_sets": list(CONTROLLED_COMPARISON_FEATURE_SETS),
             "balance_modes": list(CONTROLLED_COMPARISON_BALANCE_MODES),
             "test_size": float(test_size),
@@ -1973,6 +2539,7 @@ class ExperimentsRunner:
             "timeout": int(timeout),
             "optuna_n_jobs": int(optuna_n_jobs),
             "parallel_jobs": int(parallel_jobs),
+            "xgb_parallel_jobs": int(xgb_parallel_jobs),
             "search_space_config": search_space_config,
             "segment_info": dict(segment_info or {}),
             "event_path": str(event_path or ""),
@@ -2047,13 +2614,20 @@ class ExperimentsRunner:
                 "ranking_base_cluster",
             ]
             for feature_set_name, k_values in k_grid_by_set.items():
-                for model_name, balance_mode, k_value in itertools.product(
-                    CONTROLLED_COMPARISON_MODELS,
+                for model_name, balance_mode, threshold_protocol, k_value in itertools.product(
+                    resolved_models,
                     CONTROLLED_COMPARISON_BALANCE_MODES,
+                    resolved_threshold_protocols,
                     k_values,
                 ):
                     step_sequence.append(
-                        _combo_id(model_name, feature_set_name, balance_mode, int(k_value))
+                        _combo_id(
+                            model_name,
+                            feature_set_name,
+                            balance_mode,
+                            int(k_value),
+                            threshold_protocol,
+                        )
                     )
             manifest = {
                 "protocol_version": CONTROLLED_COMPARISON_PROTOCOL_VERSION,
@@ -2175,25 +2749,38 @@ class ExperimentsRunner:
             else []
         )
 
-        combo_specs: List[Tuple[str, str, str, int]] = []
+        combo_specs: List[Tuple[str, str, str, str, int]] = []
         for feature_set_name, k_values in k_grid_by_set.items():
             combo_specs.extend(
                 list(
                     itertools.product(
-                        CONTROLLED_COMPARISON_MODELS,
+                        resolved_models,
                         [feature_set_name],
                         CONTROLLED_COMPARISON_BALANCE_MODES,
+                        resolved_threshold_protocols,
                         k_values,
                     )
                 )
             )
         total_combos = max(1, len(combo_specs))
 
-        for combo_index, (model_name, feature_set_name, balance_mode, k_value) in enumerate(
+        for combo_index, (
+            model_name,
+            feature_set_name,
+            balance_mode,
+            threshold_protocol,
+            k_value,
+        ) in enumerate(
             combo_specs,
             start=1,
         ):
-            combo_step_id = _combo_id(model_name, feature_set_name, balance_mode, int(k_value))
+            combo_step_id = _combo_id(
+                model_name,
+                feature_set_name,
+                balance_mode,
+                int(k_value),
+                threshold_protocol,
+            )
             if combo_step_id in existing_combo_ids:
                 continue
             if progress_callback:
@@ -2201,7 +2788,7 @@ class ExperimentsRunner:
                     min(95, 15 + int(round((combo_index / total_combos) * 75))),
                     (
                         f"Evaluando {model_name} | {feature_set_name} | "
-                        f"{balance_mode} | K={int(k_value)}"
+                        f"{balance_mode} | {threshold_protocol} | K={int(k_value)}"
                     ),
                 )
             selected_features = (
@@ -2215,8 +2802,17 @@ class ExperimentsRunner:
                 "model_name": model_name,
                 "feature_set": feature_set_name,
                 "balance_mode": balance_mode,
+                "threshold_protocol": threshold_protocol,
+                "threshold_protocol_label": THRESHOLD_PROTOCOL_LABELS.get(
+                    threshold_protocol, threshold_protocol
+                ),
+                "threshold_objective": threshold_objective,
+                "threshold_objective_label": threshold_objective_label,
+                "calibration_method": calibration_method,
                 "objective_metric": objective_metric,
                 "objective_label": objective_label,
+                "optuna_objective_metric": objective_metric,
+                "optuna_objective_label": objective_label,
                 "k": int(k_value),
                 "selected_features": json.dumps(selected_features, ensure_ascii=True),
                 "selected_feature_count": int(len(selected_features)),
@@ -2226,6 +2822,7 @@ class ExperimentsRunner:
                 "features_path": str(features_path or ""),
                 "optuna_n_jobs": int(optuna_n_jobs),
                 "parallel_jobs": int(parallel_jobs),
+                "xgb_parallel_jobs": int(xgb_parallel_jobs),
             }
             try:
                 result = self._optimize_controlled_combo(
@@ -2233,6 +2830,14 @@ class ExperimentsRunner:
                     feature_set=feature_set_name,
                     balance_mode=balance_mode,
                     objective_metric=objective_metric,
+                    threshold_protocol=threshold_protocol,
+                    threshold_objective=threshold_objective,
+                    calibration_method=calibration_method,
+                    far_target=float(far_target),
+                    alerts_per_day=float(alerts_per_day),
+                    fn_cost=float(fn_cost),
+                    fp_cost=float(fp_cost),
+                    robust_folds=int(robust_folds),
                     selected_features=selected_features,
                     train_df=train_df,
                     val_df=val_df,
@@ -2242,21 +2847,100 @@ class ExperimentsRunner:
                     optuna_n_jobs=int(optuna_n_jobs),
                     search_space_config=search_space_config,
                     parallel_jobs=int(parallel_jobs),
+                    xgb_parallel_jobs=int(xgb_parallel_jobs),
                 )
                 payload.update(
                     {
                         "status": result["status"],
                         "objective_metric": result["objective_metric"],
                         "objective_label": result["objective_label"],
+                        "optuna_objective_metric": result["objective_metric"],
+                        "optuna_objective_label": result["objective_label"],
+                        "threshold_protocol": result.get(
+                            "threshold_protocol", threshold_protocol
+                        ),
+                        "threshold_protocol_label": result.get(
+                            "threshold_protocol_label",
+                            THRESHOLD_PROTOCOL_LABELS.get(
+                                threshold_protocol, threshold_protocol
+                            ),
+                        ),
+                        "threshold_objective": result.get(
+                            "threshold_objective", threshold_objective
+                        ),
+                        "threshold_objective_label": result.get(
+                            "threshold_objective_label",
+                            threshold_objective_label,
+                        ),
+                        "calibration_method": result.get(
+                            "calibration_method", calibration_method
+                        ),
                         "decision_threshold": result["decision_threshold"],
                         "val_objective_score": result["val_objective_score"],
                         "test_objective_score": result["test_objective_score"],
+                        "val_accuracy": result.get("val_accuracy"),
+                        "test_accuracy": result.get("test_accuracy"),
+                        "val_recall": result.get("val_recall"),
+                        "test_recall": result.get("test_recall"),
+                        "val_sensitivity": result.get("val_sensitivity"),
+                        "test_sensitivity": result.get("test_sensitivity"),
                         "val_roc_auc": result["val_roc_auc"],
                         "test_roc_auc": result["test_roc_auc"],
+                        "val_pr_auc": result.get("val_pr_auc"),
+                        "test_pr_auc": result.get("test_pr_auc"),
                         "val_f1": result["val_f1"],
                         "test_f1": result["test_f1"],
+                        "val_f1_global": result.get("val_f1_global"),
+                        "test_f1_global": result.get("test_f1_global"),
+                        "val_balanced_f1": result.get("val_balanced_f1"),
+                        "test_balanced_f1": result.get("test_balanced_f1"),
+                        "val_f1_class_0": result.get("val_f1_class_0"),
+                        "test_f1_class_0": result.get("test_f1_class_0"),
+                        "val_f1_class_1": result.get("val_f1_class_1"),
+                        "test_f1_class_1": result.get("test_f1_class_1"),
                         "val_mcc": result["val_mcc"],
                         "test_mcc": result["test_mcc"],
+                        "val_alerts_per_day": result.get("val_alerts_per_day"),
+                        "test_alerts_per_day": result.get("test_alerts_per_day"),
+                        "val_false_alarms_per_day": result.get(
+                            "val_false_alarms_per_day"
+                        ),
+                        "test_false_alarms_per_day": result.get(
+                            "test_false_alarms_per_day"
+                        ),
+                        "val_event_recall_approx": result.get(
+                            "val_event_recall_approx"
+                        ),
+                        "test_event_recall_approx": result.get(
+                            "test_event_recall_approx"
+                        ),
+                        "val_operational_cost": result.get("val_operational_cost"),
+                        "test_operational_cost": result.get("test_operational_cost"),
+                        "val_cost_per_day": result.get("val_cost_per_day"),
+                        "test_cost_per_day": result.get("test_cost_per_day"),
+                        "alerts_per_day_budget": result.get(
+                            "alerts_per_day_budget"
+                        ),
+                        "fn_cost": result.get("fn_cost"),
+                        "fp_cost": result.get("fp_cost"),
+                        "val_false_negatives": result.get("val_false_negatives"),
+                        "test_false_negatives": result.get("test_false_negatives"),
+                        "val_false_positives": result.get("val_false_positives"),
+                        "test_false_positives": result.get("test_false_positives"),
+                        "val_true_negatives": result.get("val_true_negatives"),
+                        "test_true_negatives": result.get("test_true_negatives"),
+                        "val_true_positives": result.get("val_true_positives"),
+                        "test_true_positives": result.get("test_true_positives"),
+                        "val_confusion_matrix": json.dumps(
+                            result.get("val_confusion_matrix"),
+                            ensure_ascii=True,
+                            default=_json_default,
+                        ),
+                        "test_confusion_matrix": json.dumps(
+                            result.get("test_confusion_matrix"),
+                            ensure_ascii=True,
+                            default=_json_default,
+                        ),
                         "best_params": json.dumps(result["best_params"], ensure_ascii=True, default=_json_default),
                         "smote_params": json.dumps(result["smote_params"], ensure_ascii=True, default=_json_default),
                         "smote_optimo": bool(balance_mode == "smote"),
@@ -2264,6 +2948,19 @@ class ExperimentsRunner:
                         "val_rows": int(result["val_rows"]),
                         "test_rows": int(result["test_rows"]),
                         "optuna_trials_completed": int(result["optuna_trials_completed"]),
+                        "effective_optuna_n_jobs": int(
+                            result.get("optuna_n_jobs", optuna_n_jobs)
+                        ),
+                        "effective_parallel_jobs": int(
+                            result.get("parallel_jobs", parallel_jobs)
+                        ),
+                        "effective_xgb_parallel_jobs": int(
+                            result.get("xgb_parallel_jobs", xgb_parallel_jobs)
+                        ),
+                        "max_optuna_jobs_without_overlap": int(
+                            result.get("max_optuna_jobs_without_overlap", 0)
+                        ),
+                        "cpu_count": int(result.get("cpu_count", os.cpu_count() or 1)),
                     }
                 )
                 trials_path = paths["trials_dir"] / f"{combo_step_id}.csv"
@@ -2280,6 +2977,7 @@ class ExperimentsRunner:
                         "model_name": model_name,
                         "feature_set": feature_set_name,
                         "balance_mode": balance_mode,
+                        "threshold_protocol": threshold_protocol,
                         "k": int(k_value),
                         "objective_metric": objective_metric,
                         "val_objective_score": payload.get("val_objective_score"),
@@ -2298,6 +2996,7 @@ class ExperimentsRunner:
                         "model_name": model_name,
                         "feature_set": feature_set_name,
                         "balance_mode": balance_mode,
+                        "threshold_protocol": threshold_protocol,
                         "k": int(k_value),
                     },
                 )
@@ -2317,12 +3016,49 @@ class ExperimentsRunner:
                 "decision_threshold",
                 "val_objective_score",
                 "test_objective_score",
+                "val_accuracy",
+                "test_accuracy",
+                "val_recall",
+                "test_recall",
+                "val_sensitivity",
+                "test_sensitivity",
                 "val_roc_auc",
                 "test_roc_auc",
+                "val_pr_auc",
+                "test_pr_auc",
                 "val_f1",
                 "test_f1",
+                "val_f1_global",
+                "test_f1_global",
+                "val_balanced_f1",
+                "test_balanced_f1",
+                "val_f1_class_0",
+                "test_f1_class_0",
+                "val_f1_class_1",
+                "test_f1_class_1",
                 "val_mcc",
                 "test_mcc",
+                "val_alerts_per_day",
+                "test_alerts_per_day",
+                "val_false_alarms_per_day",
+                "test_false_alarms_per_day",
+                "val_event_recall_approx",
+                "test_event_recall_approx",
+                "val_operational_cost",
+                "test_operational_cost",
+                "val_cost_per_day",
+                "test_cost_per_day",
+                "alerts_per_day_budget",
+                "fn_cost",
+                "fp_cost",
+                "val_false_negatives",
+                "test_false_negatives",
+                "val_false_positives",
+                "test_false_positives",
+                "val_true_negatives",
+                "test_true_negatives",
+                "val_true_positives",
+                "test_true_positives",
             ]:
                 if metric_col in completed_grid_df.columns:
                     completed_grid_df[metric_col] = pd.to_numeric(
@@ -2332,11 +3068,21 @@ class ExperimentsRunner:
         best_summary_rows: List[Dict[str, object]] = []
         if not completed_grid_df.empty:
             sort_df = completed_grid_df.sort_values(
-                ["model_name", "feature_set", "val_objective_score", "k"],
-                ascending=[True, True, False, True],
+                [
+                    "model_name",
+                    "feature_set",
+                    "balance_mode",
+                    "threshold_protocol",
+                    "val_objective_score",
+                    "k",
+                ],
+                ascending=[True, True, True, True, False, True],
             )
-            grouped = sort_df.groupby(["model_name", "feature_set"], dropna=False)
-            for (_, _), group in grouped:
+            grouped = sort_df.groupby(
+                ["model_name", "feature_set", "balance_mode", "threshold_protocol"],
+                dropna=False,
+            )
+            for (_, _, _, _), group in grouped:
                 best_row = group.iloc[0]
                 best_summary_rows.append(
                     {
@@ -2344,20 +3090,84 @@ class ExperimentsRunner:
                         "run_id": effective_run_id,
                         "model_name": best_row.get("model_name"),
                         "feature_set": best_row.get("feature_set"),
+                        "balance_mode": best_row.get("balance_mode"),
+                        "threshold_protocol": best_row.get("threshold_protocol"),
+                        "threshold_protocol_label": best_row.get(
+                            "threshold_protocol_label"
+                        ),
+                        "threshold_objective": best_row.get("threshold_objective"),
+                        "threshold_objective_label": best_row.get(
+                            "threshold_objective_label"
+                        ),
+                        "calibration_method": best_row.get("calibration_method"),
                         "objective_metric": best_row.get("objective_metric"),
                         "objective_label": best_row.get("objective_label"),
+                        "optuna_objective_metric": best_row.get(
+                            "optuna_objective_metric",
+                            best_row.get("objective_metric"),
+                        ),
+                        "optuna_objective_label": best_row.get(
+                            "optuna_objective_label",
+                            best_row.get("objective_label"),
+                        ),
                         "decision_threshold": best_row.get("decision_threshold"),
                         "val_objective_score": best_row.get("val_objective_score"),
                         "test_objective_score": best_row.get("test_objective_score"),
+                        "best_test_accuracy": best_row.get("test_accuracy"),
+                        "best_test_recall": best_row.get("test_recall"),
+                        "best_test_sensitivity": best_row.get("test_sensitivity"),
                         "best_test_roc_auc": best_row.get("test_roc_auc"),
+                        "best_test_pr_auc": best_row.get("test_pr_auc"),
                         "val_roc_auc": best_row.get("val_roc_auc"),
                         "best_test_f1": best_row.get("test_f1"),
+                        "best_test_f1_global": best_row.get("test_f1_global"),
+                        "best_test_balanced_f1": best_row.get(
+                            "test_balanced_f1",
+                            best_row.get("test_f1_global"),
+                        ),
+                        "best_test_f1_class_0": best_row.get("test_f1_class_0"),
+                        "best_test_f1_class_1": best_row.get(
+                            "test_f1_class_1",
+                            best_row.get("test_f1"),
+                        ),
+                        "best_test_false_negatives": best_row.get(
+                            "test_false_negatives"
+                        ),
+                        "best_test_false_positives": best_row.get(
+                            "test_false_positives"
+                        ),
+                        "best_test_true_negatives": best_row.get(
+                            "test_true_negatives"
+                        ),
+                        "best_test_true_positives": best_row.get(
+                            "test_true_positives"
+                        ),
+                        "best_test_confusion_matrix": best_row.get(
+                            "test_confusion_matrix"
+                        ),
+                        "best_test_alerts_per_day": best_row.get(
+                            "test_alerts_per_day"
+                        ),
+                        "best_test_false_alarms_per_day": best_row.get(
+                            "test_false_alarms_per_day"
+                        ),
+                        "best_test_event_recall_approx": best_row.get(
+                            "test_event_recall_approx"
+                        ),
+                        "best_test_operational_cost": best_row.get(
+                            "test_operational_cost"
+                        ),
+                        "best_test_cost_per_day": best_row.get("test_cost_per_day"),
+                        "alerts_per_day_budget": best_row.get(
+                            "alerts_per_day_budget"
+                        ),
+                        "fn_cost": best_row.get("fn_cost"),
+                        "fp_cost": best_row.get("fp_cost"),
                         "val_f1": best_row.get("val_f1"),
                         "best_test_mcc": best_row.get("test_mcc"),
                         "val_mcc": best_row.get("val_mcc"),
                         "k_optimo": int(best_row.get("k") or 0),
                         "smote_optimo": bool(best_row.get("balance_mode") == "smote"),
-                        "balance_mode": best_row.get("balance_mode"),
                         "selected_features": best_row.get("selected_features"),
                         "best_params": best_row.get("best_params"),
                         "smote_params": best_row.get("smote_params"),
@@ -2376,13 +3186,26 @@ class ExperimentsRunner:
                     "model_name",
                     "feature_set",
                     "balance_mode",
+                    "threshold_protocol",
+                    "threshold_protocol_label",
+                    "threshold_objective",
+                    "threshold_objective_label",
+                    "calibration_method",
                     "objective_metric",
                     "objective_label",
                     "k",
                     "val_objective_score",
                     "val_roc_auc",
                     "val_f1",
+                    "val_pr_auc",
+                    "val_f1_global",
+                    "val_balanced_f1",
                     "val_mcc",
+                    "val_alerts_per_day",
+                    "val_false_alarms_per_day",
+                    "val_event_recall_approx",
+                    "val_operational_cost",
+                    "val_cost_per_day",
                     "selected_feature_count",
                     "status",
                 ]

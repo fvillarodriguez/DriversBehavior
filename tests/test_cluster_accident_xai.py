@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -119,3 +120,150 @@ def test_resolve_base_cluster_xai_info_handles_legacy_entry():
     )
     assert bundle_path is None
     assert bundle_error is None
+
+
+def test_controlled_comparison_metric_options_include_extended_metrics():
+    df = pd.DataFrame(
+        [
+            {
+                "val_objective_score": 0.81,
+                "test_objective_score": 0.79,
+                "test_accuracy": 0.95,
+                "test_pr_auc": 0.22,
+                "test_mcc": 0.11,
+                "test_false_negatives": 3,
+                "decision_threshold": 0.45,
+            }
+        ]
+    )
+
+    options = app._controlled_comparison_metric_options(
+        df,
+        objective_label="ROC-AUC",
+    )
+    labels_by_col = {column: label for label, column in options}
+
+    assert labels_by_col["val_objective_score"] == "Validación ROC-AUC (objetivo)"
+    assert labels_by_col["test_accuracy"] == "Test Accuracy"
+    assert labels_by_col["test_pr_auc"] == "Test PR-AUC"
+    assert labels_by_col["test_mcc"] == "Test MCC"
+    assert labels_by_col["test_false_negatives"] == "Test Falsos Negativos"
+    assert labels_by_col["decision_threshold"] == "Threshold de decisión"
+
+
+def test_prepare_controlled_comparison_detail_display_formats_all_values():
+    detail_df = pd.DataFrame(
+        [
+            {
+                "model_name": "XGBoost",
+                "feature_set": "Base",
+                "balance_mode": "none",
+                "k": 25,
+                "status": "completed",
+                "selected_features": '["f1","f2"]',
+                "best_params": '{"max_depth": 4}',
+                "smote_params": '{"sampling_strategy": 0.5}',
+                "test_confusion_matrix": "[[10, 2], [3, 4]]",
+                "val_confusion_matrix": [[8, 1], [2, 5]],
+                "test_accuracy": 0.91,
+            }
+        ]
+    )
+
+    display_df = app._prepare_controlled_comparison_detail_display(detail_df)
+
+    assert list(display_df.columns[:4]) == [
+        "model_name",
+        "feature_set",
+        "balance_mode",
+        "k",
+    ]
+    row = display_df.iloc[0]
+    assert row["selected_features"] == "f1, f2"
+    assert "max_depth" in row["best_params"]
+    assert "sampling_strategy" in row["smote_params"]
+    assert row["test_confusion_matrix"] == "[[10, 2], [3, 4]]"
+    assert row["val_confusion_matrix"] == "[[8, 1], [2, 5]]"
+
+
+def test_seed_controlled_comparison_live_db_backfills_checkpoint_results(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(app, "RESULTS_DIR", tmp_path)
+
+    db_path = app._init_experiment_db(
+        "Controlled comparison",
+        {"dataset_name": "events.csv", "features_name": "features.duckdb"},
+    )
+    assert db_path is not None
+
+    checkpoint_run_dir = tmp_path / "controlled_run"
+    results_dir = checkpoint_run_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "combo_id": "combo__rf__base__none__k5",
+                "run_id": "controlled_001",
+                "model_name": "Random Forest",
+                "feature_set": "Base",
+                "balance_mode": "none",
+                "k": 5,
+                "status": "completed",
+                "val_objective_score": 0.73,
+            }
+        ]
+    ).to_csv(results_dir / "grid_results.csv", index=False)
+
+    seeded = app._seed_controlled_comparison_live_db(
+        db_path,
+        checkpoint_run_dir=checkpoint_run_dir,
+        dataset_name="events.csv",
+        features_name="features.duckdb",
+        segment_info={"segment_label": "P1 -> P2"},
+    )
+
+    assert seeded == 1
+
+    con = sqlite3.connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT payload_json FROM results ORDER BY id"
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert len(rows) == 1
+    payload = json.loads(rows[0][0])
+    assert payload["experiment"] == "Controlled comparison"
+    assert payload["dataset_name"] == "events.csv"
+    assert payload["features_name"] == "features.duckdb"
+    assert payload["segment_info"]["segment_label"] == "P1 -> P2"
+    assert payload["combo_id"] == "combo__rf__base__none__k5"
+
+
+def test_load_controlled_comparison_result_frames_reads_paths(tmp_path):
+    summary_df = pd.DataFrame([{"model_name": "Random Forest", "k_optimo": 5}])
+    curves_df = pd.DataFrame([{"model_name": "Random Forest", "k": 5}])
+    detail_df = pd.DataFrame([{"combo_id": "combo__rf__base__none__k5"}])
+
+    summary_path = tmp_path / "summary.csv"
+    curves_path = tmp_path / "curves.csv"
+    detail_path = tmp_path / "detail.csv"
+    summary_df.to_csv(summary_path, index=False)
+    curves_df.to_csv(curves_path, index=False)
+    detail_df.to_csv(detail_path, index=False)
+
+    loaded_summary, loaded_curves, loaded_detail = (
+        app._load_controlled_comparison_result_frames(
+            {
+                "summary_path": str(summary_path),
+                "curves_path": str(curves_path),
+                "detail_path": str(detail_path),
+            }
+        )
+    )
+
+    pd.testing.assert_frame_equal(loaded_summary, summary_df)
+    pd.testing.assert_frame_equal(loaded_curves, curves_df)
+    pd.testing.assert_frame_equal(loaded_detail, detail_df)
