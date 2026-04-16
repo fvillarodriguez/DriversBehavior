@@ -152,7 +152,7 @@ def _init_state() -> None:
     st.session_state.setdefault("optuna_trials_df", None)
     st.session_state.setdefault("optuna_results_store", {})
     st.session_state.setdefault("optuna_active_key", None)
-    st.session_state.setdefault("optuna_model_params_applied_signature", None)
+    st.session_state.setdefault("optuna_model_params_applied_signatures", {})
     st.session_state.setdefault("optuna_n_trials", 30)
     st.session_state.setdefault("optuna_timeout", 3600)
     st.session_state.setdefault("optuna_n_jobs", 1)
@@ -4574,11 +4574,61 @@ def _collect_optuna_best_feature_options(
     return options
 
 
-def _apply_feature_source_for_model_tab(*, model_choice: str) -> Optional[Dict[str, object]]:
+_MODEL_FEATURE_GROUP_OVERRIDE_KEYS: Dict[str, str] = {
+    "base": "selected_features_override_base",
+    "cluster": "selected_features_override_cluster",
+    "base_cluster": "selected_features_override_base_cluster",
+}
+
+
+def _clear_model_feature_group_overrides() -> None:
+    for state_key in _MODEL_FEATURE_GROUP_OVERRIDE_KEYS.values():
+        st.session_state.pop(state_key, None)
+
+
+def _lookup_optuna_best_feature_cols(
+    *,
+    store: Dict[str, object],
+    feature_key: str,
+    cols: List[str],
+    model_choice: str,
+) -> Optional[Dict[str, object]]:
+    if not cols:
+        return None
+    key = _optuna_result_key(feature_key, cols)
+    entry = store.get(key)
+    if not isinstance(entry, dict):
+        return None
+    results = entry.get("results")
+    if not isinstance(results, dict):
+        return None
+    result = results.get(model_choice)
+    if not isinstance(result, dict):
+        return None
+    settings = result.get("optuna_settings") or {}
+    best_cols = settings.get("best_feature_cols") or entry.get("feature_cols")
+    if not best_cols:
+        return None
+    return {
+        "best_feature_cols": list(best_cols),
+        "best_top_k": settings.get("best_top_k"),
+        "ranking_method_label": settings.get("ranking_method_label"),
+        "best_score": result.get("best_score"),
+        "objective_label": settings.get("objective_label"),
+    }
+
+
+def _apply_feature_source_for_model_tab(
+    *,
+    model_choice: str,
+    base_df: Optional[pd.DataFrame] = None,
+    features_df: Optional[pd.DataFrame] = None,
+) -> Optional[Dict[str, object]]:
     """Radio para elegir origen de variables en la pestana Modelos.
 
-    Si el usuario elige Optuna, sobreescribe `selected_features` con el
-    `best_feature_cols` del optuna elegido. Retorna el payload elegido (o None).
+    Si el usuario elige Optuna, matchea automaticamente los best_feature_cols
+    de cada corrida de Optuna (Base, Cluster, Base + Cluster) con el modelo
+    correspondiente que se entrena en Modelos.
     """
     source = st.session_state.get("model_feature_source", "feature_selection")
     source_options = {
@@ -4595,46 +4645,104 @@ def _apply_feature_source_for_model_tab(*, model_choice: str) -> Optional[Dict[s
         key="model_feature_source_radio",
         help=(
             "Feature selection: usa la seleccion manual de la pestana Feature "
-            "selection (ranking sobre train). Optuna: usa best_feature_cols "
-            "producido por Optuna con top_k optimo."
+            "selection (ranking sobre train). Optuna: matchea automaticamente "
+            "los best_feature_cols de Optuna con los modelos Base, Cluster y "
+            "Base + Cluster."
         ),
     )
     st.session_state["model_feature_source"] = source_options[chosen_label]
 
     if st.session_state["model_feature_source"] != "optuna":
+        _clear_model_feature_group_overrides()
         return None
 
-    options = _collect_optuna_best_feature_options(model_choice=model_choice)
-    if not options:
+    dataset_df = base_df if isinstance(base_df, pd.DataFrame) else features_df
+    if not isinstance(dataset_df, pd.DataFrame) or dataset_df.empty:
+        _clear_model_feature_group_overrides()
         st.warning(
-            "No hay resultados de Optuna con best_feature_cols para el modelo "
-            f"'{model_choice}'. Ejecute Optuna primero o cambie el modelo."
+            "No hay dataset cargado para calcular el match automatico con Optuna."
         )
         return None
 
-    labels = [opt["label"] for opt in options]
-    remembered = st.session_state.get("model_feature_source_config_label")
-    index = labels.index(remembered) if remembered in labels else 0
-    chosen_opt_label = st.selectbox(
-        "Resultado de Optuna a utilizar",
-        labels,
-        index=index,
-        key="model_feature_source_config_label",
+    features_df_state = (
+        features_df
+        if isinstance(features_df, pd.DataFrame)
+        else st.session_state.get("flow_features_df")
     )
-    chosen_opt = next(opt for opt in options if opt["label"] == chosen_opt_label)
-    best_cols = list(chosen_opt["best_feature_cols"])
-    st.session_state["selected_features"] = best_cols
-    info_parts = [f"{len(best_cols)} variables"]
-    if chosen_opt.get("best_top_k") is not None:
-        info_parts.append(f"top_k={int(chosen_opt['best_top_k'])}")
-    if chosen_opt.get("ranking_method_label"):
-        info_parts.append(f"ranking={chosen_opt['ranking_method_label']}")
-    if chosen_opt.get("best_score") is not None:
-        info_parts.append(
-            f"best {chosen_opt.get('objective_label') or 'score'}={float(chosen_opt['best_score']):.4f}"
+    features_path = st.session_state.get("flow_features_path")
+    features_source = st.session_state.get("flow_features_source")
+    feature_key = _feature_selection_key(
+        features_path,
+        features_source,
+        features_df_state if isinstance(features_df_state, pd.DataFrame) else dataset_df,
+    )
+
+    selected_features = st.session_state.get("selected_features")
+    numeric_cols = _get_feature_cols(dataset_df)
+    cluster_cols_set = set(_get_cluster_cols(dataset_df))
+    if selected_features is None:
+        cols_all = list(numeric_cols)
+    else:
+        cols_all = [col for col in selected_features if col in numeric_cols]
+    cols_base = [col for col in cols_all if col not in cluster_cols_set]
+    cols_cluster_only = [col for col in cols_all if col in cluster_cols_set]
+
+    store = st.session_state.get("optuna_results_store") or {}
+
+    groups = [
+        ("base", "Base", cols_base),
+        ("cluster", "Cluster", cols_cluster_only),
+        ("base_cluster", "Base + Cluster", cols_all),
+    ]
+
+    summary_lines: List[str] = []
+    any_match = False
+    for group_key, group_label, cols in groups:
+        state_key = _MODEL_FEATURE_GROUP_OVERRIDE_KEYS[group_key]
+
+        if group_key == "cluster" and not cols_cluster_only:
+            st.session_state.pop(state_key, None)
+            summary_lines.append(f"{group_label}: sin variables de cluster")
+            continue
+        if (
+            group_key == "base_cluster"
+            and cols_cluster_only == []
+            and set(cols_all) == set(cols_base)
+        ):
+            st.session_state.pop(state_key, None)
+            summary_lines.append(f"{group_label}: igual a Base")
+            continue
+
+        match = _lookup_optuna_best_feature_cols(
+            store=store,
+            feature_key=feature_key,
+            cols=cols,
+            model_choice=model_choice,
         )
-    st.caption("Origen: Optuna — " + " | ".join(info_parts))
-    return chosen_opt
+        if match is None:
+            st.session_state.pop(state_key, None)
+            summary_lines.append(f"✗ {group_label}: sin Optuna")
+            continue
+
+        st.session_state[state_key] = list(match["best_feature_cols"])
+        any_match = True
+        parts = [f"{len(match['best_feature_cols'])} vars"]
+        if match.get("best_top_k") is not None:
+            parts.append(f"top_k={int(match['best_top_k'])}")
+        if match.get("best_score") is not None:
+            label = match.get("objective_label") or "score"
+            parts.append(f"best {label}={float(match['best_score']):.4f}")
+        summary_lines.append(f"✓ {group_label}: " + ", ".join(parts))
+
+    if not any_match:
+        st.warning(
+            "No se encontraron resultados de Optuna para el modelo "
+            f"'{model_choice}' que coincidan con los grupos Base, Cluster o "
+            "Base + Cluster. Ejecute Optuna primero o cambie el modelo."
+        )
+
+    st.caption("Match Optuna por grupo — " + "   ".join(summary_lines))
+    return None
 
 
 def _render_flow_features_preview(features_df: pd.DataFrame) -> None:
@@ -9403,18 +9511,71 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
     return params
 
 
+def _apply_model_params_to_prefix(
+    *,
+    model_choice: str,
+    prefix: str,
+    params: Dict[str, object],
+) -> None:
+    if model_choice in {"Random Forest", "Balanced Random Forest"}:
+        n_estimators = int(params.get("n_estimators", 200))
+        max_depth = params.get("max_depth")
+        st.session_state[f"{prefix}model_rf_n_estimators"] = max(50, n_estimators)
+        st.session_state[f"{prefix}model_rf_max_depth"] = int(max_depth or 0)
+    elif model_choice == "XGBoost":
+        n_estimators = int(params.get("n_estimators", 300))
+        max_depth = int(params.get("max_depth", 6))
+        learning_rate = float(params.get("learning_rate", 0.1))
+        subsample = float(params.get("subsample", 1.0))
+        colsample = float(params.get("colsample_bytree", 1.0))
+        reg_alpha = float(params.get("reg_alpha", 0.0))
+        reg_lambda = float(params.get("reg_lambda", 1.0))
+        gamma = float(params.get("gamma", 0.0))
+        st.session_state[f"{prefix}model_xgb_n_estimators"] = max(50, n_estimators)
+        st.session_state[f"{prefix}model_xgb_max_depth"] = max(2, max_depth)
+        st.session_state[f"{prefix}model_xgb_learning_rate"] = max(0.01, learning_rate)
+        st.session_state[f"{prefix}model_xgb_subsample"] = max(0.5, subsample)
+        st.session_state[f"{prefix}model_xgb_colsample"] = max(0.5, colsample)
+        st.session_state[f"{prefix}model_xgb_reg_alpha"] = max(0.0, reg_alpha)
+        st.session_state[f"{prefix}model_xgb_reg_lambda"] = max(0.0, reg_lambda)
+        st.session_state[f"{prefix}model_xgb_gamma"] = max(0.0, gamma)
+    elif model_choice == "Neural Network":
+        hidden_dim = int(params.get("hidden_dim", 256))
+        num_layers = int(params.get("num_layers", 2))
+        dropout = float(params.get("dropout", 0.2))
+        learning_rate = float(params.get("learning_rate", 0.001))
+        weight_decay = float(params.get("weight_decay", 1e-5))
+        batch_size = int(params.get("batch_size", 1024))
+        # epochs no se optimiza en Optuna: se conserva el valor maximo fijado
+        # en los widgets de Modelos (early stopping decide cuando cortar).
+        st.session_state[f"{prefix}model_nn_hidden_dim"] = max(32, hidden_dim)
+        st.session_state[f"{prefix}model_nn_num_layers"] = max(1, num_layers)
+        st.session_state[f"{prefix}model_nn_dropout"] = max(0.0, min(0.5, dropout))
+        st.session_state[f"{prefix}model_nn_learning_rate"] = max(0.0001, learning_rate)
+        st.session_state[f"{prefix}model_nn_weight_decay"] = max(0.0, weight_decay)
+        st.session_state[f"{prefix}model_nn_batch_size"] = batch_size
+    elif model_choice == "SVM":
+        kernel_value = params.get("kernel", "rbf")
+        if kernel_value not in {"rbf", "linear", "poly", "sigmoid"}:
+            kernel_value = "rbf"
+        c_value = float(params.get("C", 1.0))
+        st.session_state[f"{prefix}model_svm_kernel"] = str(kernel_value)
+        st.session_state[f"{prefix}model_svm_c"] = max(0.01, c_value)
+
+
 def _apply_optuna_model_params_to_state(
     *,
     model_choice: str,
     base_df: pd.DataFrame,
     features_df: pd.DataFrame,
 ) -> Optional[str]:
-    optuna_model_params = st.session_state.get("optuna_best_model_params")
-    optuna_model_choice = st.session_state.get("optuna_best_model_choice")
-    optuna_active_key = st.session_state.get("optuna_active_key")
-    if not isinstance(optuna_model_params, dict) or not optuna_model_params:
-        return None
+    """Aplica los best_model_params de Optuna a los selectores de params por grupo.
 
+    Para cada grupo (Base, Cluster, Base + Cluster), busca la corrida de Optuna
+    que coincide con las columnas del grupo y el model_choice. Si la encuentra,
+    sobreescribe los widgets del prefijo correspondiente (base_/cluster_only_/
+    cluster_). El match y la aplicacion ocurren por grupo de forma independiente.
+    """
     features_path = st.session_state.get("flow_features_path")
     features_source = st.session_state.get("flow_features_source")
     feature_key = _feature_selection_key(
@@ -9425,105 +9586,99 @@ def _apply_optuna_model_params_to_state(
 
     selected_features = st.session_state.get("selected_features")
     numeric_cols = _get_feature_cols(base_df)
-    cluster_cols = _get_cluster_cols(base_df)
+    cluster_cols_set = set(_get_cluster_cols(base_df))
     if selected_features is None:
-        cols_all = numeric_cols
+        cols_all = list(numeric_cols)
     else:
         cols_all = [col for col in selected_features if col in numeric_cols]
+    cols_base = [col for col in cols_all if col not in cluster_cols_set]
+    cols_cluster_only = [col for col in cols_all if col in cluster_cols_set]
 
-    cols_base = [col for col in cols_all if col not in cluster_cols]
-    cols_cluster_only = [col for col in cols_all if col in cluster_cols]
+    store = st.session_state.get("optuna_results_store") or {}
 
-    key_base = _optuna_result_key(feature_key, cols_base)
-    key_cluster_only = _optuna_result_key(feature_key, cols_cluster_only)
-    key_cluster = _optuna_result_key(feature_key, cols_all)
+    group_defs = [
+        ("base", "Base", "base_", cols_base),
+        ("cluster_only", "Cluster", "cluster_only_", cols_cluster_only),
+        ("base_cluster", "Base + Cluster", "cluster_", cols_all),
+    ]
 
-    optuna_matches_base = optuna_active_key == key_base
-    optuna_matches_cluster_only = (
-        bool(cols_cluster_only) and optuna_active_key == key_cluster_only
+    signatures_map: Dict[str, str] = dict(
+        st.session_state.get("optuna_model_params_applied_signatures") or {}
     )
-    optuna_matches_cluster = optuna_active_key == key_cluster
-    optuna_ready = (
-        optuna_model_choice == model_choice
-        and (
-            optuna_matches_base
-            or optuna_matches_cluster_only
-            or optuna_matches_cluster
+
+    applied_labels: List[str] = []
+    already_labels: List[str] = []
+    missing_labels: List[str] = []
+
+    for group_key, group_label, prefix, cols in group_defs:
+        if group_key == "cluster_only" and not cols_cluster_only:
+            signatures_map.pop(prefix, None)
+            continue
+        if group_key == "base_cluster" and set(cols_all) == set(cols_base):
+            signatures_map.pop(prefix, None)
+            continue
+        if not cols:
+            signatures_map.pop(prefix, None)
+            continue
+
+        key = _optuna_result_key(feature_key, cols)
+        entry = store.get(key)
+        if not isinstance(entry, dict):
+            missing_labels.append(group_label)
+            signatures_map.pop(prefix, None)
+            continue
+        results = entry.get("results")
+        if not isinstance(results, dict):
+            missing_labels.append(group_label)
+            signatures_map.pop(prefix, None)
+            continue
+        result = results.get(model_choice)
+        if not isinstance(result, dict):
+            missing_labels.append(group_label)
+            signatures_map.pop(prefix, None)
+            continue
+        best_model_params = result.get("best_model_params")
+        if not isinstance(best_model_params, dict) or not best_model_params:
+            missing_labels.append(group_label)
+            signatures_map.pop(prefix, None)
+            continue
+
+        try:
+            params_sig = json.dumps(best_model_params, sort_keys=True)
+        except TypeError:
+            params_sig = str(best_model_params)
+        full_sig = f"{key}|{model_choice}|{params_sig}"
+        if signatures_map.get(prefix) == full_sig:
+            already_labels.append(group_label)
+            continue
+
+        _apply_model_params_to_prefix(
+            model_choice=model_choice,
+            prefix=prefix,
+            params=best_model_params,
         )
-    )
-    if not optuna_ready:
-        if optuna_model_choice:
-            return f"Optuna disponible para {optuna_model_choice}."
+        signatures_map[prefix] = full_sig
+        applied_labels.append(group_label)
+
+    st.session_state["optuna_model_params_applied_signatures"] = signatures_map
+
+    if not applied_labels and not already_labels:
+        if missing_labels:
+            return (
+                f"Optuna sin resultados para {model_choice} en: "
+                + ", ".join(missing_labels)
+                + "."
+            )
         return None
 
-    try:
-        params_signature = json.dumps(optuna_model_params, sort_keys=True)
-    except TypeError:
-        params_signature = str(optuna_model_params)
-    optuna_signature = f"{optuna_active_key}|{optuna_model_choice}|{params_signature}"
-
-    target_prefixes = []
-    if optuna_matches_base:
-        target_prefixes.append("base_")
-    if optuna_matches_cluster_only:
-        target_prefixes.append("cluster_only_")
-    if optuna_matches_cluster:
-        target_prefixes.append("cluster_")
-
-    if st.session_state.get("optuna_model_params_applied_signature") == optuna_signature:
-        return "Parametros Optuna cargados en los selectores."
-
-    if model_choice in {"Random Forest", "Balanced Random Forest"}:
-        n_estimators = int(optuna_model_params.get("n_estimators", 200))
-        max_depth = optuna_model_params.get("max_depth")
-        for prefix in target_prefixes:
-            st.session_state[f"{prefix}model_rf_n_estimators"] = max(50, n_estimators)
-            st.session_state[f"{prefix}model_rf_max_depth"] = int(max_depth or 0)
-    elif model_choice == "XGBoost":
-        n_estimators = int(optuna_model_params.get("n_estimators", 300))
-        max_depth = int(optuna_model_params.get("max_depth", 6))
-        learning_rate = float(optuna_model_params.get("learning_rate", 0.1))
-        subsample = float(optuna_model_params.get("subsample", 1.0))
-        colsample = float(optuna_model_params.get("colsample_bytree", 1.0))
-        reg_alpha = float(optuna_model_params.get("reg_alpha", 0.0))
-        reg_lambda = float(optuna_model_params.get("reg_lambda", 1.0))
-        gamma = float(optuna_model_params.get("gamma", 0.0))
-        for prefix in target_prefixes:
-            st.session_state[f"{prefix}model_xgb_n_estimators"] = max(50, n_estimators)
-            st.session_state[f"{prefix}model_xgb_max_depth"] = max(2, max_depth)
-            st.session_state[f"{prefix}model_xgb_learning_rate"] = max(0.01, learning_rate)
-            st.session_state[f"{prefix}model_xgb_subsample"] = max(0.5, subsample)
-            st.session_state[f"{prefix}model_xgb_colsample"] = max(0.5, colsample)
-            st.session_state[f"{prefix}model_xgb_reg_alpha"] = max(0.0, reg_alpha)
-            st.session_state[f"{prefix}model_xgb_reg_lambda"] = max(0.0, reg_lambda)
-            st.session_state[f"{prefix}model_xgb_gamma"] = max(0.0, gamma)
-    elif model_choice == "Neural Network":
-        hidden_dim = int(optuna_model_params.get("hidden_dim", 256))
-        num_layers = int(optuna_model_params.get("num_layers", 2))
-        dropout = float(optuna_model_params.get("dropout", 0.2))
-        learning_rate = float(optuna_model_params.get("learning_rate", 0.001))
-        weight_decay = float(optuna_model_params.get("weight_decay", 1e-5))
-        batch_size = int(optuna_model_params.get("batch_size", 1024))
-        # epochs no se optimiza en Optuna: se conserva el valor maximo fijado
-        # en los widgets de Modelos (early stopping decide cuando cortar).
-        for prefix in target_prefixes:
-            st.session_state[f"{prefix}model_nn_hidden_dim"] = max(32, hidden_dim)
-            st.session_state[f"{prefix}model_nn_num_layers"] = max(1, num_layers)
-            st.session_state[f"{prefix}model_nn_dropout"] = max(0.0, min(0.5, dropout))
-            st.session_state[f"{prefix}model_nn_learning_rate"] = max(0.0001, learning_rate)
-            st.session_state[f"{prefix}model_nn_weight_decay"] = max(0.0, weight_decay)
-            st.session_state[f"{prefix}model_nn_batch_size"] = batch_size
-    elif model_choice == "SVM":
-        kernel_value = optuna_model_params.get("kernel", "rbf")
-        if kernel_value not in {"rbf", "linear", "poly", "sigmoid"}:
-            kernel_value = "rbf"
-        c_value = float(optuna_model_params.get("C", 1.0))
-        for prefix in target_prefixes:
-            st.session_state[f"{prefix}model_svm_kernel"] = str(kernel_value)
-            st.session_state[f"{prefix}model_svm_c"] = max(0.01, c_value)
-
-    st.session_state["optuna_model_params_applied_signature"] = optuna_signature
-    return "Parametros Optuna cargados en los selectores."
+    parts: List[str] = []
+    if applied_labels:
+        parts.append("aplicados: " + ", ".join(applied_labels))
+    if already_labels:
+        parts.append("ya cargados: " + ", ".join(already_labels))
+    if missing_labels:
+        parts.append("sin match: " + ", ".join(missing_labels))
+    return "Parametros Optuna — " + " | ".join(parts)
 
 
 def _render_model_tab() -> None:
@@ -9744,7 +9899,11 @@ def _render_model_tab() -> None:
         ),
     )
 
-    _apply_feature_source_for_model_tab(model_choice=model_choice)
+    _apply_feature_source_for_model_tab(
+        model_choice=model_choice,
+        base_df=base_df,
+        features_df=features_df,
+    )
     _render_selected_features_info()
 
     random_state = st.number_input(
@@ -9894,7 +10053,14 @@ def _render_model_tab() -> None:
         feature_group: str,
         label: str,
     ) -> List[str]:
-        selected_features = st.session_state.get("selected_features")
+        override_key = _MODEL_FEATURE_GROUP_OVERRIDE_KEYS.get(feature_group)
+        override = (
+            st.session_state.get(override_key) if override_key else None
+        )
+        if override is not None:
+            selected_features: Optional[List[str]] = list(override)
+        else:
+            selected_features = st.session_state.get("selected_features")
         feature_cols, missing = _resolve_feature_group_cols(
             df,
             selected_features,
