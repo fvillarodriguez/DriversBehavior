@@ -153,8 +153,8 @@ def _init_state() -> None:
     st.session_state.setdefault("optuna_results_store", {})
     st.session_state.setdefault("optuna_active_key", None)
     st.session_state.setdefault("optuna_model_params_applied_signatures", {})
-    st.session_state.setdefault("optuna_n_trials", 30)
-    st.session_state.setdefault("optuna_timeout", 3600)
+    st.session_state.setdefault("optuna_n_trials", 500)
+    st.session_state.setdefault("optuna_timeout", 86400)
     st.session_state.setdefault("optuna_n_jobs", 1)
     st.session_state.setdefault("optuna_random_state", 42)
     st.session_state.setdefault("optuna_pruner_enabled", True)
@@ -7056,16 +7056,16 @@ def _render_optuna_tab() -> None:
     n_trials = st.number_input(
         "n_trials",
         min_value=5,
-        max_value=300,
-        value=int(st.session_state.get("optuna_n_trials", 30)),
+        max_value=1000,
+        value=int(st.session_state.get("optuna_n_trials", 500)),
         step=5,
         key="optuna_n_trials",
     )
     timeout = st.number_input(
         "timeout (segundos)",
         min_value=60,
-        max_value=36000,
-        value=int(st.session_state.get("optuna_timeout", 3600)),
+        max_value=99999999999,
+        value=int(st.session_state.get("optuna_timeout", 86400)),
         step=60,
         key="optuna_timeout",
     )
@@ -7074,6 +7074,28 @@ def _render_optuna_tab() -> None:
         key="optuna_n_jobs",
         default=1,
     )
+    optuna_rf_n_jobs: Optional[int] = None
+    optuna_xgb_n_jobs: Optional[int] = None
+    max_internal_jobs = _max_optuna_parallel_jobs()
+    if model_choice in {"Random Forest", "Balanced Random Forest"}:
+        optuna_rf_n_jobs = _render_model_n_jobs_input(
+            "Random Forest n_jobs (trials)",
+            key="optuna_rf_n_jobs",
+            default=max_internal_jobs,
+        )
+    elif model_choice == "XGBoost":
+        optuna_xgb_n_jobs = _render_model_n_jobs_input(
+            "XGBoost n_jobs (trials)",
+            key="optuna_xgb_n_jobs",
+            default=max_internal_jobs,
+        )
+    if optuna_rf_n_jobs is not None or optuna_xgb_n_jobs is not None:
+        st.caption(
+            "Hilos internos del modelo dentro de cada trial. "
+            f"CPUs detectadas: {max_internal_jobs}. "
+            "Si `Optuna jobs paralelos` > 1, los trials compiten por esos hilos; "
+            "considere bajar uno de los dos para evitar oversuscripcion."
+        )
     optuna_random_state = st.number_input(
         "random_state",
         min_value=0,
@@ -8199,6 +8221,8 @@ def _render_optuna_tab() -> None:
                         "n_estimators": int(n_estimators),
                         "max_depth": None if max_depth == 0 else int(max_depth),
                     }
+                    if optuna_rf_n_jobs is not None:
+                        model_params["n_jobs"] = int(optuna_rf_n_jobs)
                 elif model_choice == "XGBoost":
                     n_estimators = trial.suggest_int(
                         "xgb_n_estimators",
@@ -8258,6 +8282,8 @@ def _render_optuna_tab() -> None:
                         "reg_lambda": float(reg_lambda),
                         "gamma": float(gamma),
                     }
+                    if optuna_xgb_n_jobs is not None:
+                        model_params["n_jobs"] = int(optuna_xgb_n_jobs)
                 elif model_choice == "Neural Network":
                     hidden_dim = trial.suggest_int(
                         "nn_hidden_dim",
