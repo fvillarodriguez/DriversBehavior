@@ -1,12 +1,15 @@
 """
 Shared model training and evaluation logic for the Crash Prediction App.
 """
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import importlib
+import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
 import sys
+from joblib import Parallel, delayed
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -45,6 +48,15 @@ BALANCE_STRATEGY_LABELS = {
     "class_weight": "Class weight / scale_pos_weight",
     "smote": "SMOTE interno",
 }
+
+
+def _coerce_threshold_n_jobs(n_jobs: Optional[object]) -> int:
+    try:
+        requested = int(n_jobs if n_jobs is not None else 1)
+    except (TypeError, ValueError):
+        requested = 1
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    return max(1, min(requested, cpu_count))
 
 
 def normalize_threshold_protocol(value: object) -> str:
@@ -152,6 +164,263 @@ def _import_external_xgboost():
     return xgb
 
 
+class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
+    """Sklearn-compatible wrapper around MLPNet for the crash prediction pipeline."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 1e-5,
+        batch_size: int = 1024,
+        epochs: int = 30,
+        early_stopping_patience: int = 5,
+        pos_weight: float = 1.0,
+        val_fraction: float = 0.15,
+        random_state: int = 42,
+    ):
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.early_stopping_patience = early_stopping_patience
+        self.pos_weight = pos_weight
+        self.val_fraction = val_fraction
+        self.random_state = random_state
+        self.model_ = None
+        self.in_dim_ = None
+        self.device_ = None
+        self.classes_ = np.array([0, 1])
+
+    @staticmethod
+    def _resolve_device():
+        import torch
+
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+
+    @staticmethod
+    def _fits_on_device(n_rows: int, n_cols: int, device) -> bool:
+        """Heuristica: decide si el tensor (fp32) cabe comodamente en memoria.
+
+        Para MPS/CUDA preferimos precargar todo cuando el dataset sea <= 2 GB.
+        Para CPU siempre devolvemos True (RAM).
+        """
+        # 4 bytes por float32. Incluimos y (int64, 8B) -> aproximamos con factor 5.
+        est_bytes = int(n_rows) * int(n_cols) * 5
+        if device.type == "cpu":
+            return True
+        # 2 GB por defecto como umbral de seguridad.
+        return est_bytes <= 2 * 1024 ** 3
+
+    def fit(self, X, y):
+        import torch
+        import torch.nn.functional as F
+        from src.mlp_tabular import MLPNet
+
+        X_np = np.asarray(X, dtype=np.float32)
+        y_np = np.asarray(y, dtype=np.int64)
+        self.in_dim_ = X_np.shape[1]
+        self.device_ = self._resolve_device()
+
+        torch.manual_seed(self.random_state)
+
+        # cudnn.benchmark acelera capas lineales con inputs de tamano fijo (CUDA).
+        if self.device_.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+
+        use_early_stopping = (
+            self.early_stopping_patience > 0
+            and int(self.val_fraction * len(y_np)) >= 2
+        )
+        if use_early_stopping:
+            from sklearn.model_selection import train_test_split as _split
+
+            minority_count = int(np.min(np.bincount(y_np)))
+            stratify = y_np if minority_count >= 2 else None
+            X_tr, X_es, y_tr, y_es = _split(
+                X_np, y_np,
+                test_size=self.val_fraction,
+                random_state=self.random_state,
+                stratify=stratify,
+            )
+        else:
+            X_tr, y_tr = X_np, y_np
+            X_es, y_es = None, None
+
+        class_weight = torch.tensor(
+            [1.0, float(self.pos_weight)],
+            dtype=torch.float32,
+            device=self.device_,
+        )
+
+        model = MLPNet(
+            self.in_dim_, self.hidden_dim, self.num_layers, self.dropout,
+        ).to(self.device_)
+
+        # AdamW fused solo en CUDA (no soportado en MPS).
+        adamw_kwargs = {
+            "lr": self.learning_rate,
+            "weight_decay": self.weight_decay,
+        }
+        if self.device_.type == "cuda":
+            try:
+                optimizer = torch.optim.AdamW(
+                    model.parameters(), fused=True, **adamw_kwargs
+                )
+            except (TypeError, RuntimeError):
+                optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+        else:
+            optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+
+        preload_to_device = self._fits_on_device(
+            X_tr.shape[0], X_tr.shape[1], self.device_
+        )
+
+        # Modo rapido (tabular <= 2GB): cargamos todo a device una sola vez y
+        # evitamos H2D por batch. Sliceamos con index_select sobre un tensor
+        # de indices generado en device. Esto es clave para saturar la GPU
+        # (MPS/CUDA), donde el H2D repetido dominaba el tiempo.
+        if preload_to_device:
+            X_tr_t = torch.from_numpy(X_tr).to(
+                self.device_, non_blocking=True
+            )
+            y_tr_t = torch.from_numpy(y_tr).to(
+                self.device_, non_blocking=True
+            )
+            if X_es is not None:
+                X_es_t = torch.from_numpy(X_es).to(
+                    self.device_, non_blocking=True
+                )
+            else:
+                X_es_t = None
+        else:
+            # Fallback streaming via DataLoader (datasets gigantes).
+            from torch.utils.data import TensorDataset, DataLoader
+
+            train_ds = TensorDataset(
+                torch.from_numpy(X_tr).float(),
+                torch.from_numpy(y_tr).long(),
+            )
+            pin_mem = self.device_.type == "cuda"
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+
+        n_train = int(X_tr.shape[0])
+        batch_size = max(1, int(self.batch_size))
+
+        best_val_score = -np.inf
+        best_state = None
+        no_improve = 0
+
+        cpu_gen = torch.Generator(device="cpu").manual_seed(
+            int(self.random_state)
+        )
+
+        for _epoch in range(self.epochs):
+            model.train()
+            if preload_to_device:
+                # Permutacion en CPU (randperm en MPS no es siempre estable)
+                # y la subimos al device una sola vez por epoca.
+                perm = torch.randperm(n_train, generator=cpu_gen)
+                perm_dev = perm.to(self.device_, non_blocking=True)
+                for start in range(0, n_train, batch_size):
+                    idx = perm_dev[start : start + batch_size]
+                    xb = X_tr_t.index_select(0, idx)
+                    yb = y_tr_t.index_select(0, idx)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss = F.cross_entropy(model(xb), yb, weight=class_weight)
+                    loss.backward()
+                    optimizer.step()
+            else:
+                non_block = self.device_.type == "cuda"
+                for xb, yb in train_loader:
+                    xb = xb.to(self.device_, non_blocking=non_block)
+                    yb = yb.to(self.device_, non_blocking=non_block)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss = F.cross_entropy(model(xb), yb, weight=class_weight)
+                    loss.backward()
+                    optimizer.step()
+
+            if use_early_stopping and X_es is not None:
+                model.eval()
+                with torch.inference_mode():
+                    if preload_to_device and X_es_t is not None:
+                        es_tensor = X_es_t
+                    else:
+                        es_tensor = torch.from_numpy(X_es).to(
+                            self.device_, non_blocking=True
+                        )
+                    es_out = model(es_tensor)
+                    es_probs = (
+                        F.softmax(es_out, dim=1)[:, 1].detach().cpu().numpy()
+                    )
+                from sklearn.metrics import average_precision_score
+
+                if len(np.unique(y_es)) > 1:
+                    val_score = average_precision_score(y_es, es_probs)
+                else:
+                    val_score = 0.0
+
+                if val_score > best_val_score + 1e-6:
+                    best_val_score = val_score
+                    best_state = {
+                        k: v.detach().cpu().clone()
+                        for k, v in model.state_dict().items()
+                    }
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                if no_improve >= self.early_stopping_patience:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        model.to(self.device_)
+        self.model_ = model
+        return self
+
+    def predict_proba(self, X):
+        import torch
+        import torch.nn.functional as F
+
+        X_np = np.asarray(X, dtype=np.float32)
+        n = int(X_np.shape[0])
+        # Chunk para evitar picos de memoria en inferencia sobre datasets grandes.
+        # Batch grande pero acotado ~= saturacion de GPU sin OOM.
+        chunk = max(1, min(n, 65536))
+        out_parts: list = []
+        self.model_.eval()
+        with torch.inference_mode():
+            for start in range(0, n, chunk):
+                end = min(start + chunk, n)
+                tensor = torch.from_numpy(X_np[start:end]).to(
+                    self.device_, non_blocking=True
+                )
+                logits = self.model_(tensor)
+                probs_chunk = F.softmax(logits, dim=1).detach().cpu().numpy()
+                out_parts.append(probs_chunk)
+        if not out_parts:
+            return np.empty((0, 2), dtype=np.float32)
+        return np.concatenate(out_parts, axis=0)
+
+    def predict(self, X):
+        return np.argmax(self.predict_proba(X), axis=1)
+
+
 def _normalize_class_weight(value: object) -> Optional[object]:
     if value is None:
         return None
@@ -254,6 +523,33 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
                         class_weight=_normalize_class_weight(
                             params.get("class_weight")
                         ),
+                        random_state=random_state,
+                    ),
+                ),
+            ]
+        )
+
+    if model_name == "Neural Network":
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        return Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                (
+                    "model",
+                    MLPClassifierWrapper(
+                        hidden_dim=int(params.get("hidden_dim", 256)),
+                        num_layers=int(params.get("num_layers", 2)),
+                        dropout=float(params.get("dropout", 0.2)),
+                        learning_rate=float(params.get("learning_rate", 1e-3)),
+                        weight_decay=float(params.get("weight_decay", 1e-5)),
+                        batch_size=int(params.get("batch_size", 1024)),
+                        epochs=int(params.get("epochs", 30)),
+                        early_stopping_patience=int(
+                            params.get("early_stopping_patience", 5)
+                        ),
+                        pos_weight=float(params.get("pos_weight", 1.0)),
                         random_state=random_state,
                     ),
                 ),
@@ -481,12 +777,44 @@ def _event_groups_from_frame(
     return [np.asarray(group, dtype=int) for group in groups_out]
 
 
+def _event_group_ids_from_frame(
+    y_true: np.ndarray,
+    eval_df: Optional[pd.DataFrame],
+) -> Tuple[np.ndarray, int]:
+    y_arr = np.asarray(y_true).astype(int)
+    group_ids = np.full(len(y_arr), -1, dtype=np.int32)
+    groups = _event_groups_from_frame(y_arr, eval_df)
+    for group_id, group in enumerate(groups):
+        group_ids[np.asarray(group, dtype=int)] = int(group_id)
+    return group_ids, int(len(groups))
+
+
 def event_recall_approx(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     eval_df: Optional[pd.DataFrame] = None,
+    *,
+    event_groups: Optional[Sequence[np.ndarray]] = None,
+    event_group_ids: Optional[np.ndarray] = None,
+    event_group_count: Optional[int] = None,
 ) -> float:
-    groups = _event_groups_from_frame(y_true, eval_df)
+    if event_group_ids is not None and event_group_count is not None:
+        count = int(event_group_count)
+        if count <= 0:
+            return float("nan")
+        preds = np.asarray(y_pred).astype(int)
+        ids = np.asarray(event_group_ids, dtype=np.int32)
+        hit_ids = ids[(ids >= 0) & (preds == 1)]
+        if hit_ids.size == 0:
+            return 0.0
+        detected = np.bincount(hit_ids, minlength=count)[:count] > 0
+        return float(np.count_nonzero(detected) / count)
+
+    groups = (
+        list(event_groups)
+        if event_groups is not None
+        else _event_groups_from_frame(y_true, eval_df)
+    )
     if not groups:
         return float("nan")
     preds = np.asarray(y_pred).astype(int)
@@ -503,6 +831,11 @@ def compute_extended_metrics(
     alerts_per_day: float = 5.0,
     fn_cost: float = 10.0,
     fp_cost: float = 1.0,
+    event_groups: Optional[Sequence[np.ndarray]] = None,
+    event_group_ids: Optional[np.ndarray] = None,
+    event_group_count: Optional[int] = None,
+    recall_at_info: Optional[Dict[str, float]] = None,
+    frame_days: Optional[float] = None,
 ) -> Dict[str, object]:
     y_arr = np.asarray(y_true).astype(int)
     scores_arr = np.asarray(scores, dtype=float)
@@ -516,16 +849,21 @@ def compute_extended_metrics(
         average=None,
         zero_division=0,
     )
-    days = estimate_frame_days(eval_df, len(y_arr))
+    days = (
+        float(frame_days)
+        if frame_days is not None
+        else estimate_frame_days(eval_df, len(y_arr))
+    )
     alert_count = int(tp + fp)
     false_alarm_count = int(fp)
     operational_cost = float(fn_cost) * float(fn) + float(fp_cost) * float(fp)
-    recall_at_info = recall_at_alerts_per_day(
-        y_arr,
-        scores_arr,
-        eval_df=eval_df,
-        alerts_per_day=float(alerts_per_day),
-    )
+    if recall_at_info is None:
+        recall_at_info = recall_at_alerts_per_day(
+            y_arr,
+            scores_arr,
+            eval_df=eval_df,
+            alerts_per_day=float(alerts_per_day),
+        )
     return {
         "accuracy": float(accuracy_score(y_arr, preds)),
         "precision": float(precision_score(y_arr, preds, zero_division=0)),
@@ -548,7 +886,14 @@ def compute_extended_metrics(
         "alerts": int(alert_count),
         "alerts_per_day": float(alert_count / days),
         "false_alarms_per_day": float(false_alarm_count / days),
-        "event_recall_approx": event_recall_approx(y_arr, preds, eval_df),
+        "event_recall_approx": event_recall_approx(
+            y_arr,
+            preds,
+            eval_df,
+            event_groups=event_groups,
+            event_group_ids=event_group_ids,
+            event_group_count=event_group_count,
+        ),
         "operational_cost": float(operational_cost),
         "cost_per_day": float(operational_cost / days),
         "recall_at_alerts_per_day": float(recall_at_info["recall"]),
@@ -594,6 +939,11 @@ def _metric_value_at_threshold(
     alerts_per_day: float,
     fn_cost: float,
     fp_cost: float,
+    event_groups: Optional[Sequence[np.ndarray]] = None,
+    event_group_ids: Optional[np.ndarray] = None,
+    event_group_count: Optional[int] = None,
+    recall_at_info: Optional[Dict[str, float]] = None,
+    frame_days: Optional[float] = None,
 ) -> float:
     metrics = compute_extended_metrics(
         y_true,
@@ -603,7 +953,20 @@ def _metric_value_at_threshold(
         alerts_per_day=float(alerts_per_day),
         fn_cost=float(fn_cost),
         fp_cost=float(fp_cost),
+        event_groups=event_groups,
+        event_group_ids=event_group_ids,
+        event_group_count=event_group_count,
+        recall_at_info=recall_at_info,
+        frame_days=frame_days,
     )
+    return _metric_value_from_metrics(metrics, objective=objective)
+
+
+def _metric_value_from_metrics(
+    metrics: Dict[str, object],
+    *,
+    objective: str,
+) -> float:
     if objective == "operational_cost":
         return -float(metrics.get("operational_cost", float("inf")))
     if objective == "recall_at_alerts_per_day":
@@ -619,6 +982,38 @@ def _metric_value_at_threshold(
     if objective == "roc_auc":
         return float(metrics.get("roc_auc", float("nan")))
     return float(metrics.get("f1", 0.0))
+
+
+def _threshold_candidate_metrics(
+    threshold: float,
+    y_true: np.ndarray,
+    scores: np.ndarray,
+    *,
+    objective: str,
+    eval_df: Optional[pd.DataFrame],
+    alerts_per_day: float,
+    fn_cost: float,
+    fp_cost: float,
+    event_group_ids: np.ndarray,
+    event_group_count: int,
+    recall_at_info: Dict[str, float],
+    frame_days: float,
+) -> Tuple[float, Dict[str, object], float]:
+    metrics = compute_extended_metrics(
+        y_true,
+        scores,
+        threshold=float(threshold),
+        eval_df=eval_df,
+        alerts_per_day=float(alerts_per_day),
+        fn_cost=float(fn_cost),
+        fp_cost=float(fp_cost),
+        event_group_ids=event_group_ids,
+        event_group_count=int(event_group_count),
+        recall_at_info=recall_at_info,
+        frame_days=float(frame_days),
+    )
+    score = _metric_value_from_metrics(metrics, objective=objective)
+    return float(threshold), metrics, float(score)
 
 
 def _orientation_score(
@@ -673,8 +1068,10 @@ def select_threshold_for_metric(
     alerts_per_day: float = 5.0,
     fn_cost: float = 10.0,
     fp_cost: float = 1.0,
+    n_jobs: int = 1,
 ) -> Dict[str, object]:
     objective_key = normalize_threshold_objective(objective)
+    threshold_n_jobs = _coerce_threshold_n_jobs(n_jobs)
     y_arr = np.asarray(y_true).astype(int)
     scores_arr = np.asarray(scores, dtype=float)
     if np.unique(y_arr).size < 2:
@@ -682,16 +1079,30 @@ def select_threshold_for_metric(
             "threshold": 0.5,
             "objective": objective_key,
             "objective_score": float("nan"),
+            "threshold_n_jobs": int(threshold_n_jobs),
             "note": "Validacion con una sola clase.",
         }
     if objective_key in {"pr_auc", "roc_auc"}:
-        score = _maybe_pr_auc(y_arr, scores_arr) if objective_key == "pr_auc" else _maybe_roc_auc(y_arr, scores_arr)
+        score = (
+            _maybe_pr_auc(y_arr, scores_arr)
+            if objective_key == "pr_auc"
+            else _maybe_roc_auc(y_arr, scores_arr)
+        )
         return {
             "threshold": 0.5,
             "objective": objective_key,
             "objective_score": float(score),
+            "threshold_n_jobs": int(threshold_n_jobs),
             "note": "Metrica de ranking; threshold operativo 0.5.",
         }
+    frame_days = estimate_frame_days(eval_df, len(y_arr))
+    event_group_ids, event_group_count = _event_group_ids_from_frame(y_arr, eval_df)
+    recall_at_info = recall_at_alerts_per_day(
+        y_arr,
+        scores_arr,
+        eval_df=eval_df,
+        alerts_per_day=float(alerts_per_day),
+    )
     if objective_key == "far":
         info = select_threshold_for_far(
             y_arr,
@@ -708,11 +1119,16 @@ def select_threshold_for_metric(
             alerts_per_day=alerts_per_day,
             fn_cost=fn_cost,
             fp_cost=fp_cost,
+            event_group_ids=event_group_ids,
+            event_group_count=event_group_count,
+            recall_at_info=recall_at_info,
+            frame_days=frame_days,
         )
         info.update(
             {
                 "objective": objective_key,
                 "objective_score": float(score),
+                "threshold_n_jobs": int(threshold_n_jobs),
             }
         )
         return info
@@ -720,30 +1136,59 @@ def select_threshold_for_metric(
     best_score = float("-inf")
     best_threshold = 0.5
     best_alerts_per_day = float("inf")
-    for threshold in threshold_candidates(scores_arr):
-        metrics = compute_extended_metrics(
-            y_arr,
-            scores_arr,
-            threshold=float(threshold),
-            eval_df=eval_df,
-            alerts_per_day=float(alerts_per_day),
-            fn_cost=float(fn_cost),
-            fp_cost=float(fp_cost),
-        )
+    candidates = threshold_candidates(scores_arr)
+    if threshold_n_jobs > 1 and len(candidates) >= max(8, threshold_n_jobs * 2):
+        def _run_parallel_thresholds(prefer_backend: str) -> List[Tuple[float, Dict[str, object], float]]:
+            return Parallel(
+                n_jobs=int(threshold_n_jobs),
+                prefer=prefer_backend,
+                max_nbytes="1M",
+                batch_size="auto",
+            )(
+                delayed(_threshold_candidate_metrics)(
+                    float(threshold),
+                    y_arr,
+                    scores_arr,
+                    objective=objective_key,
+                    eval_df=None,
+                    alerts_per_day=float(alerts_per_day),
+                    fn_cost=float(fn_cost),
+                    fp_cost=float(fp_cost),
+                    event_group_ids=event_group_ids,
+                    event_group_count=int(event_group_count),
+                    recall_at_info=recall_at_info,
+                    frame_days=float(frame_days),
+                )
+                for threshold in candidates
+            )
+
+        try:
+            evaluated = _run_parallel_thresholds("processes")
+        except (OSError, NotImplementedError, RuntimeError):
+            evaluated = _run_parallel_thresholds("threads")
+    else:
+        evaluated = [
+            _threshold_candidate_metrics(
+                float(threshold),
+                y_arr,
+                scores_arr,
+                objective=objective_key,
+                eval_df=None,
+                alerts_per_day=float(alerts_per_day),
+                fn_cost=float(fn_cost),
+                fp_cost=float(fp_cost),
+                event_group_ids=event_group_ids,
+                event_group_count=int(event_group_count),
+                recall_at_info=recall_at_info,
+                frame_days=float(frame_days),
+            )
+            for threshold in candidates
+        ]
+    for threshold, metrics, score in evaluated:
         if objective_key == "recall_at_alerts_per_day" and float(
             metrics.get("alerts_per_day", float("inf"))
         ) > float(alerts_per_day) + 1e-12:
             continue
-        score = _metric_value_at_threshold(
-            y_arr,
-            scores_arr,
-            threshold=float(threshold),
-            objective=objective_key,
-            eval_df=eval_df,
-            alerts_per_day=alerts_per_day,
-            fn_cost=fn_cost,
-            fp_cost=fp_cost,
-        )
         if pd.isna(score):
             continue
         alerts_value = float(metrics.get("alerts_per_day", float("inf")))
@@ -756,16 +1201,13 @@ def select_threshold_for_metric(
             if alerts_value < best_alerts_per_day - 1e-12:
                 best_threshold = float(threshold)
                 best_alerts_per_day = alerts_value
-            elif abs(alerts_value - best_alerts_per_day) <= 1e-12 and abs(float(threshold) - 0.5) < abs(best_threshold - 0.5):
+            elif abs(alerts_value - best_alerts_per_day) <= 1e-12 and abs(
+                float(threshold) - 0.5
+            ) < abs(best_threshold - 0.5):
                 best_threshold = float(threshold)
 
     if best_score == float("-inf"):
-        best_threshold = float(recall_at_alerts_per_day(
-            y_arr,
-            scores_arr,
-            eval_df=eval_df,
-            alerts_per_day=alerts_per_day,
-        )["threshold"])
+        best_threshold = float(recall_at_info["threshold"])
         best_score = _metric_value_at_threshold(
             y_arr,
             scores_arr,
@@ -775,6 +1217,10 @@ def select_threshold_for_metric(
             alerts_per_day=alerts_per_day,
             fn_cost=fn_cost,
             fp_cost=fp_cost,
+            event_group_ids=event_group_ids,
+            event_group_count=event_group_count,
+            recall_at_info=recall_at_info,
+            frame_days=frame_days,
         )
     metrics = compute_extended_metrics(
         y_arr,
@@ -784,11 +1230,16 @@ def select_threshold_for_metric(
         alerts_per_day=float(alerts_per_day),
         fn_cost=float(fn_cost),
         fp_cost=float(fp_cost),
+        event_group_ids=event_group_ids,
+        event_group_count=event_group_count,
+        recall_at_info=recall_at_info,
+        frame_days=frame_days,
     )
     return {
         "threshold": float(best_threshold),
         "objective": objective_key,
         "objective_score": float(best_score),
+        "threshold_n_jobs": int(threshold_n_jobs),
         "far_val": float(metrics.get("far", np.nan)),
         "sens_val": float(metrics.get("sensitivity", np.nan)),
         "alerts_per_day": float(metrics.get("alerts_per_day", np.nan)),
@@ -1016,6 +1467,14 @@ def _resolve_training_model_params(
             params["scale_pos_weight"] = _scale_pos_weight_from_y(y_train)
         elif raw_scale is not None:
             params["scale_pos_weight"] = float(raw_scale)
+    elif model_name == "Neural Network":
+        raw_pw = params.get("pos_weight")
+        if raw_pw in {"auto", "Auto", "AUTO"} or (
+            raw_pw is None and balance_key == "class_weight"
+        ):
+            params["pos_weight"] = _scale_pos_weight_from_y(y_train)
+        elif raw_pw is not None:
+            params["pos_weight"] = float(raw_pw)
     elif model_name in {"Random Forest", "SVM"}:
         if balance_key == "class_weight" and params.get("class_weight") is None:
             params["class_weight"] = "balanced"
@@ -1137,12 +1596,18 @@ def train_model_with_protocol(
     robust_folds: int = 3,
     balance_strategy: str = "none",
     smote_params: Optional[Dict[str, object]] = None,
+    threshold_n_jobs: Optional[int] = None,
     random_state: int,
 ) -> Dict[str, object]:
     protocol_key = normalize_threshold_protocol(threshold_protocol)
     objective_key = normalize_threshold_objective(threshold_objective)
     calibration_key = normalize_calibration_method(calibration_method)
     balance_key = normalize_balance_strategy(balance_strategy)
+    effective_threshold_n_jobs = _coerce_threshold_n_jobs(
+        threshold_n_jobs
+        if threshold_n_jobs is not None
+        else dict(model_params or {}).get("n_jobs", 1)
+    )
 
     if train_df["target"].astype(int).nunique() < 2:
         raise ValueError("Solo existe una clase en train.")
@@ -1205,6 +1670,7 @@ def train_model_with_protocol(
                     alerts_per_day=float(alerts_per_day),
                     fn_cost=float(fn_cost),
                     fp_cost=float(fp_cost),
+                    n_jobs=int(effective_threshold_n_jobs),
                 )
                 threshold = float(thr_info["threshold"])
                 final_model = _fit_protocol_model(
@@ -1254,6 +1720,7 @@ def train_model_with_protocol(
                         "threshold_objective_score": float(
                             thr_info.get("objective_score", np.nan)
                         ),
+                        "threshold_n_jobs": int(effective_threshold_n_jobs),
                     }
                 )
                 split_info = {
@@ -1323,6 +1790,7 @@ def train_model_with_protocol(
         alerts_per_day=float(alerts_per_day),
         fn_cost=float(fn_cost),
         fp_cost=float(fp_cost),
+        n_jobs=int(effective_threshold_n_jobs),
     )
     threshold = float(thr_info["threshold"])
     scores_test = calibrator.transform(
@@ -1358,6 +1826,7 @@ def train_model_with_protocol(
             "calibration_method": calibration_key,
             "balance_strategy": balance_key,
             "threshold_objective_score": float(thr_info.get("objective_score", np.nan)),
+            "threshold_n_jobs": int(effective_threshold_n_jobs),
         }
     )
     split_info = {

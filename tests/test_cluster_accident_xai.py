@@ -122,6 +122,95 @@ def test_resolve_base_cluster_xai_info_handles_legacy_entry():
     assert bundle_error is None
 
 
+def test_apply_optuna_model_params_to_state_targets_base_cluster(tmp_path, monkeypatch):
+    base_df, feature_cols, _base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    features_df = base_df.drop(columns=["target"]).copy()
+    features_path = str(tmp_path / "flow_features.duckdb")
+    feature_key = app._feature_selection_key(features_path, "duckdb", features_df)
+    optuna_key = app._optuna_result_key(feature_key, feature_cols)
+    optuna_params = {
+        "n_estimators": 200,
+        "max_depth": 4,
+        "learning_rate": 0.01,
+        "subsample": 0.9,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 3.6,
+        "reg_lambda": 8.3,
+        "gamma": 0.0,
+    }
+    fake_st = _FakeStreamlit()
+    fake_st.session_state.update(
+        {
+            "flow_features_path": features_path,
+            "flow_features_source": "duckdb",
+            "selected_features": feature_cols,
+            "optuna_best_model_params": optuna_params,
+            "optuna_best_model_choice": "XGBoost",
+            "optuna_active_key": optuna_key,
+            "optuna_model_params_applied_signature": None,
+        }
+    )
+    monkeypatch.setattr(app, "st", fake_st)
+
+    status = app._apply_optuna_model_params_to_state(
+        model_choice="XGBoost",
+        base_df=base_df,
+        features_df=features_df,
+    )
+
+    assert status == "Parametros Optuna cargados en los selectores."
+    assert fake_st.session_state["cluster_model_xgb_n_estimators"] == 200
+    assert fake_st.session_state["cluster_model_xgb_max_depth"] == 4
+    assert fake_st.session_state["cluster_model_xgb_learning_rate"] == pytest.approx(0.01)
+    assert fake_st.session_state["cluster_model_xgb_subsample"] == pytest.approx(0.9)
+    assert fake_st.session_state["cluster_model_xgb_colsample"] == pytest.approx(0.8)
+    assert fake_st.session_state["cluster_model_xgb_reg_alpha"] == pytest.approx(3.6)
+    assert fake_st.session_state["cluster_model_xgb_reg_lambda"] == pytest.approx(8.3)
+    assert "cluster_model_xgb_n_jobs" not in fake_st.session_state
+    assert "base_model_xgb_n_estimators" not in fake_st.session_state
+    assert fake_st.session_state["optuna_model_params_applied_signature"]
+
+
+def test_controlled_feature_date_bounds_and_loader_filter_interval(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    features_path = tmp_path / "features.duckdb"
+    raw_df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                ["2024-01-01 08:00:00", "2024-01-02 08:00:00", "2024-01-03 08:00:00"]
+            ),
+            "eje": ["N", "N", "N"],
+            "calzada": ["Oriente", "Oriente", "Oriente"],
+            "portico_last": ["1", "1", "1"],
+            "portico_next": ["2", "2", "2"],
+            "flow_light": [10.0, 11.0, 12.0],
+            "cluster_count_0": [1.0, 2.0, 3.0],
+        }
+    )
+    con = duckdb.connect(str(features_path))
+    try:
+        con.register("features_view", raw_df)
+        con.execute("CREATE TABLE flow_features AS SELECT * FROM features_view")
+    finally:
+        con.close()
+
+    bounds = app._controlled_feature_timestamp_bounds(features_path)
+    assert bounds is not None
+    assert bounds[0] == pd.Timestamp("2024-01-01 08:00:00")
+    assert bounds[1] == pd.Timestamp("2024-01-03 08:00:00")
+
+    filtered = app._load_controlled_features_df(
+        features_path,
+        ("N", "Oriente", "1", "2"),
+        date_start=pd.Timestamp("2024-01-02 00:00:00"),
+        date_end=pd.Timestamp("2024-01-02 23:59:59"),
+    )
+
+    assert len(filtered) == 1
+    assert filtered["interval_start"].iloc[0] == pd.Timestamp("2024-01-02 08:00:00")
+    assert filtered["flow_light"].iloc[0] == pytest.approx(11.0)
+
+
 def test_controlled_comparison_metric_options_include_extended_metrics():
     df = pd.DataFrame(
         [
@@ -186,6 +275,53 @@ def test_prepare_controlled_comparison_detail_display_formats_all_values():
     assert row["val_confusion_matrix"] == "[[8, 1], [2, 5]]"
 
 
+def test_prepare_controlled_comparison_detail_display_keeps_ablation_columns():
+    detail_df = pd.DataFrame(
+        [
+            {
+                "model_name": "XGBoost",
+                "feature_set": "Base + Cluster",
+                "ablation_phase": "cross_eval",
+                "params_source_feature_set": "Base",
+                "target_feature_set": "Base + Cluster",
+                "source_combo_id": "ablation_source",
+                "frozen_tuning": True,
+                "threshold_freeze_policy": "recalibrate_per_target",
+                "balance_mode": "smote",
+                "threshold_protocol": "conservative",
+                "k": 2,
+                "effective_k": 2,
+                "selected_base_feature_count": 1,
+                "selected_cluster_feature_count": 1,
+                "selected_features": '["flow","cluster_count_0"]',
+                "best_params": '{"source": "Base"}',
+                "effective_model_params": '{"source": "Base", "n_jobs": 1}',
+                "smote_params": '{"sampling_strategy": 0.5}',
+                "status": "completed",
+            }
+        ]
+    )
+
+    display_df = app._prepare_controlled_comparison_detail_display(detail_df)
+    expected_cols = [
+        "model_name",
+        "feature_set",
+        "ablation_phase",
+        "params_source_feature_set",
+        "target_feature_set",
+        "source_combo_id",
+        "frozen_tuning",
+        "threshold_freeze_policy",
+    ]
+
+    assert list(display_df.columns[: len(expected_cols)]) == expected_cols
+    row = display_df.iloc[0]
+    assert row["selected_features"] == "flow, cluster_count_0"
+    assert "source" in row["best_params"]
+    assert "n_jobs" in row["effective_model_params"]
+    assert "sampling_strategy" in row["smote_params"]
+
+
 def test_seed_controlled_comparison_live_db_backfills_checkpoint_results(
     tmp_path, monkeypatch
 ):
@@ -246,20 +382,24 @@ def test_load_controlled_comparison_result_frames_reads_paths(tmp_path):
     summary_df = pd.DataFrame([{"model_name": "Random Forest", "k_optimo": 5}])
     curves_df = pd.DataFrame([{"model_name": "Random Forest", "k": 5}])
     detail_df = pd.DataFrame([{"combo_id": "combo__rf__base__none__k5"}])
+    deltas_df = pd.DataFrame([{"effect_type": "feature_effect", "k": 5}])
 
     summary_path = tmp_path / "summary.csv"
     curves_path = tmp_path / "curves.csv"
     detail_path = tmp_path / "detail.csv"
+    deltas_path = tmp_path / "deltas.csv"
     summary_df.to_csv(summary_path, index=False)
     curves_df.to_csv(curves_path, index=False)
     detail_df.to_csv(detail_path, index=False)
+    deltas_df.to_csv(deltas_path, index=False)
 
-    loaded_summary, loaded_curves, loaded_detail = (
+    loaded_summary, loaded_curves, loaded_detail, loaded_deltas = (
         app._load_controlled_comparison_result_frames(
             {
                 "summary_path": str(summary_path),
                 "curves_path": str(curves_path),
                 "detail_path": str(detail_path),
+                "ablation_deltas_path": str(deltas_path),
             }
         )
     )
@@ -267,3 +407,23 @@ def test_load_controlled_comparison_result_frames_reads_paths(tmp_path):
     pd.testing.assert_frame_equal(loaded_summary, summary_df)
     pd.testing.assert_frame_equal(loaded_curves, curves_df)
     pd.testing.assert_frame_equal(loaded_detail, detail_df)
+    pd.testing.assert_frame_equal(loaded_deltas, deltas_df)
+
+
+def test_load_controlled_comparison_result_frames_tolerates_legacy_without_deltas(tmp_path):
+    summary_df = pd.DataFrame([{"model_name": "Random Forest", "k_optimo": 5}])
+    summary_path = tmp_path / "summary.csv"
+    summary_df.to_csv(summary_path, index=False)
+
+    loaded_summary, loaded_curves, loaded_detail, loaded_deltas = (
+        app._load_controlled_comparison_result_frames(
+            {
+                "summary_path": str(summary_path),
+            }
+        )
+    )
+
+    pd.testing.assert_frame_equal(loaded_summary, summary_df)
+    assert loaded_curves.empty
+    assert loaded_detail.empty
+    assert loaded_deltas.empty

@@ -58,6 +58,9 @@ from src.model_training import (
 from src.model_xai import compute_xai_report, save_xai_bundle
 from src.experiments_logic import (
     CONTROLLED_COMPARISON_MODELS,
+    FROZEN_TUNING_ABLATION_CONFIG,
+    FROZEN_TUNING_ABLATION_FEATURE_SETS,
+    FROZEN_TUNING_ABLATION_PROTOCOL_FAMILY,
     ExperimentsRunner,
     _controlled_comparison_paths,
     _k_grid_values,
@@ -127,6 +130,7 @@ def _init_state() -> None:
     st.session_state.setdefault("feature_selection_store", {})
     st.session_state.setdefault("feature_selection_active_key", None)
     st.session_state.setdefault("balanced_base_df", None)
+    st.session_state.setdefault("balanced_cluster_only_df", None)
     st.session_state.setdefault("balanced_cluster_df", None)
     st.session_state.setdefault("use_balanced_base", False)
     st.session_state.setdefault("use_balanced_cluster", False)
@@ -226,9 +230,9 @@ def _render_optuna_n_jobs_input(
             step=1,
             key=key,
             help=(
-                "Paraleliza los trials de Optuna. En SVM acelera la busqueda de "
-                "hiperparametros; en XGBoost o modelos ya paralelizados puede "
-                "convenir dejar 1 para evitar sobrecarga."
+                "Paraleliza los trials de Optuna. No modifica `n_jobs` interno "
+                "de Random Forest ni de XGBoost; esos hilos se controlan con los "
+                "selectores de jobs del modelo."
             ),
         )
     )
@@ -239,15 +243,19 @@ def _render_model_n_jobs_input(
     *,
     key: str,
     default: int = 1,
+    shared_key: Optional[str] = None,
 ) -> int:
     max_jobs = _max_optuna_parallel_jobs()
-    raw_default = st.session_state.get(key, default)
+    raw_default = st.session_state.get(
+        key,
+        st.session_state.get(shared_key, default) if shared_key else default,
+    )
     try:
         default_jobs = int(raw_default)
     except (TypeError, ValueError):
         default_jobs = int(default)
     default_jobs = max(1, min(max_jobs, default_jobs))
-    return int(
+    value = int(
         st.number_input(
             label,
             min_value=1,
@@ -257,11 +265,14 @@ def _render_model_n_jobs_input(
             key=key,
             help=(
                 "Controla `n_jobs`, es decir, los hilos internos usados por el "
-                "modelo durante el entrenamiento. Subirlo acelera modelos "
-                "paralelizables, pero puede competir con otros procesos."
+                "modelo durante el entrenamiento. Este valor de la UI prevalece "
+                "sobre cualquier resultado previo de Optuna."
             ),
         )
     )
+    if shared_key:
+        st.session_state[shared_key] = int(value)
+    return value
 
 
 def _queue_controlled_job_config_apply(
@@ -1112,6 +1123,7 @@ def _list_experiment_result_files() -> List[Path]:
         "find_samples_sizes_results_*.csv",
         "best_highway_section_results_*.csv",
         "best_highway_section_k_results_*.csv",
+        "best_highway_section_controlled_summary_*.csv",
         "controlled_comparison_summary_*.csv",
     ]
     files: List[Path] = []
@@ -2169,6 +2181,21 @@ def _record_experiment_history(
             "fp_cost": float(fp_cost),
             "robust_folds": int(robust_folds),
             "balance_strategy": balance_strategy,
+            "model_n_jobs": (
+                int(model_params_cluster.get("n_jobs"))
+                if isinstance(model_params_cluster, dict)
+                and model_params_cluster.get("n_jobs") is not None
+                else (
+                    int(model_params_cluster_only.get("n_jobs"))
+                    if isinstance(model_params_cluster_only, dict)
+                    and model_params_cluster_only.get("n_jobs") is not None
+                    else (
+                        int(model_params_base.get("n_jobs"))
+                        if model_params_base.get("n_jobs") is not None
+                        else None
+                    )
+                )
+            ),
         },
         "features": feature_summary,
         "feature_selection": feature_selection_summary,
@@ -2297,9 +2324,132 @@ def _inspect_controlled_feature_schema(path: Path) -> pd.DataFrame:
         con.close()
 
 
+def _controlled_feature_timestamp_bounds(
+    path: Path,
+) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    if path.suffix.lower() != ".duckdb" or duckdb is None:
+        return None
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        table_rows = con.execute("SHOW TABLES").fetchall()
+        tables = [row[0] for row in table_rows]
+        table_name = _pick_duckdb_table(
+            tables,
+            ["flow_features", "features", "cluster_features"],
+        )
+        if not table_name:
+            return None
+        table_ref = _duckdb_quote_identifier(table_name)
+        cols_info = con.execute(f"DESCRIBE {table_ref}").fetchall()
+        columns = {row[0] for row in cols_info}
+        if "interval_start" not in columns:
+            return None
+        interval_ref = _duckdb_quote_identifier("interval_start")
+        bounds = con.execute(
+            "SELECT "
+            f"MIN(TRY_CAST({interval_ref} AS TIMESTAMP)) AS min_ts, "
+            f"MAX(TRY_CAST({interval_ref} AS TIMESTAMP)) AS max_ts "
+            f"FROM {table_ref}"
+        ).fetchone()
+    finally:
+        con.close()
+    if not bounds or bounds[0] is None or bounds[1] is None:
+        return None
+    return pd.Timestamp(bounds[0]), pd.Timestamp(bounds[1])
+
+
+def _sync_controlled_feature_date_defaults(
+    path: Path,
+    *,
+    bounds: Optional[Tuple[pd.Timestamp, pd.Timestamp]],
+    key_prefix: str = "exp_controlled",
+) -> None:
+    if bounds is None:
+        return
+    state_path_key = f"{key_prefix}_feature_date_file"
+    start_key = f"{key_prefix}_dataset_start_date"
+    end_key = f"{key_prefix}_dataset_end_date"
+    path_key = str(path)
+    min_date = bounds[0].date()
+    max_date = bounds[1].date()
+    should_reset = st.session_state.get(state_path_key) != path_key
+    if should_reset:
+        st.session_state[start_key] = min_date
+        st.session_state[end_key] = max_date
+        st.session_state[state_path_key] = path_key
+        return
+    for key, fallback in [(start_key, min_date), (end_key, max_date)]:
+        raw_value = st.session_state.get(key, fallback)
+        try:
+            current = pd.Timestamp(raw_value).date()
+        except Exception:
+            current = fallback
+        st.session_state[key] = min(max(current, min_date), max_date)
+
+
+def _render_controlled_feature_date_range_inputs(
+    path: Path,
+    *,
+    key_prefix: str = "exp_controlled",
+) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp], bool]:
+    bounds = _controlled_feature_timestamp_bounds(path)
+    if bounds is None:
+        st.warning(
+            "No se pudo inferir `interval_start` desde el archivo de features; "
+            "la comparación usará el rango completo disponible."
+        )
+        return None, None, True
+
+    _sync_controlled_feature_date_defaults(path, bounds=bounds, key_prefix=key_prefix)
+    min_date = bounds[0].date()
+    max_date = bounds[1].date()
+    col_start, col_end = st.columns(2)
+    with col_start:
+        start_date = st.date_input(
+            "Fecha inicio dataset",
+            min_value=min_date,
+            max_value=max_date,
+            key=f"{key_prefix}_dataset_start_date",
+            help=(
+                "Define la primera fecha incluida desde el DuckDB de features. "
+                f"Rango disponible: {min_date} a {max_date}. Afecta filas, "
+                "accidentes considerados, split temporal, checkpoints y métricas. "
+                "Evite seleccionar una ventana tan corta que deje una sola clase."
+            ),
+        )
+    with col_end:
+        end_date = st.date_input(
+            "Fecha fin dataset",
+            min_value=min_date,
+            max_value=max_date,
+            key=f"{key_prefix}_dataset_end_date",
+            help=(
+                "Define la última fecha incluida desde el DuckDB de features. "
+                f"Rango disponible: {min_date} a {max_date}. El filtro es "
+                "inclusivo hasta el fin del día y cambia la grilla evaluada. "
+                "No debe ser anterior a la fecha de inicio."
+            ),
+        )
+
+    date_start = pd.Timestamp(datetime.combine(start_date, dt_time(0, 0)))
+    date_end = pd.Timestamp(datetime.combine(end_date, dt_time(23, 59, 59)))
+    if date_end < date_start:
+        st.error("La fecha fin del dataset debe ser igual o posterior a la fecha inicio.")
+        return date_start, date_end, False
+    st.caption(
+        "Rango temporal seleccionado: "
+        f"{date_start:%Y-%m-%d} a {date_end:%Y-%m-%d} "
+        f"(disponible: {bounds[0]:%Y-%m-%d %H:%M} a {bounds[1]:%Y-%m-%d %H:%M})."
+    )
+    return date_start, date_end, True
+
+
 def _load_controlled_features_df(
     path: Path,
     tramo_tuple: Optional[Tuple[str, str, str, str]],
+    *,
+    date_start: Optional[pd.Timestamp] = None,
+    date_end: Optional[pd.Timestamp] = None,
 ) -> pd.DataFrame:
     if path.suffix.lower() != ".duckdb":
         raise ValueError("El archivo de features debe ser .duckdb.")
@@ -2325,6 +2475,14 @@ def _load_controlled_features_df(
             raise ValueError(
                 "El archivo de features no permite filtrar el tramo seleccionado."
             )
+        if "interval_start" in columns:
+            interval_ref = _duckdb_quote_identifier("interval_start")
+            if date_start is not None:
+                clauses.append(f"TRY_CAST({interval_ref} AS TIMESTAMP) >= ?")
+                params.append(pd.Timestamp(date_start))
+            if date_end is not None:
+                clauses.append(f"TRY_CAST({interval_ref} AS TIMESTAMP) <= ?")
+                params.append(pd.Timestamp(date_end))
         query = f"SELECT * FROM {table_ref}"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
@@ -2354,6 +2512,8 @@ def _prepare_controlled_comparison_base_df(
     accidents_df_for_tramo: Optional[pd.DataFrame],
     selected_features_path: Path,
     tramo_tuple: Tuple[str, str, str, str],
+    date_start: Optional[pd.Timestamp] = None,
+    date_end: Optional[pd.Timestamp] = None,
 ) -> pd.DataFrame:
     accidents_segment, filter_ok = _apply_tramo_filter_df(
         accidents_df_for_tramo
@@ -2365,8 +2525,32 @@ def _prepare_controlled_comparison_base_df(
         raise ValueError("No se pudo filtrar el tramo seleccionado en accidentes.")
     if accidents_segment.empty:
         raise ValueError("No hay accidentes para el tramo seleccionado.")
+    if "accidente_time" in accidents_segment.columns and (
+        date_start is not None or date_end is not None
+    ):
+        accidents_segment = accidents_segment.copy()
+        accidents_segment["accidente_time"] = pd.to_datetime(
+            accidents_segment["accidente_time"], errors="coerce"
+        )
+        if date_start is not None:
+            accidents_segment = accidents_segment[
+                accidents_segment["accidente_time"] >= pd.Timestamp(date_start)
+            ]
+        if date_end is not None:
+            accidents_segment = accidents_segment[
+                accidents_segment["accidente_time"] <= pd.Timestamp(date_end)
+            ]
+        if accidents_segment.empty:
+            raise ValueError(
+                "No hay accidentes para el tramo en el rango de fechas seleccionado."
+            )
 
-    features_df = _load_controlled_features_df(selected_features_path, tramo_tuple)
+    features_df = _load_controlled_features_df(
+        selected_features_path,
+        tramo_tuple,
+        date_start=date_start,
+        date_end=date_end,
+    )
     if features_df.empty:
         raise ValueError("No hay features para el tramo seleccionado.")
     if "interval_start" not in features_df.columns:
@@ -2410,16 +2594,43 @@ def _build_controlled_comparison_curve_chart(
     ].copy()
     if plot_df.empty:
         return None
-    plot_df = plot_df.sort_values(["feature_set", "k"]).reset_index(drop=True)
+    series_col = "feature_set"
+    series_title = "Conjunto"
+    use_ablation_series = {
+        "params_source_feature_set",
+        "target_feature_set",
+    }.issubset(plot_df.columns)
+    if use_ablation_series:
+        plot_df["ablation_pair"] = (
+            plot_df["params_source_feature_set"].astype(str)
+            + " -> "
+            + plot_df["target_feature_set"].astype(str)
+        )
+        series_col = "ablation_pair"
+        series_title = "Fuente -> Target"
+    plot_df = plot_df.sort_values([series_col, "k"]).reset_index(drop=True)
 
     alt = _import_altair()
     if alt is None:
         return None
 
-    color_scale = alt.Scale(
-        domain=["Base", "Cluster", "Base + Cluster"],
-        range=["#2f6c7a", "#c66a10", "#7a3e48"],
-    )
+    color_kwargs = {"title": series_title}
+    if series_col == "feature_set":
+        color_kwargs["scale"] = alt.Scale(
+            domain=["Base", "Cluster", "Base + Cluster"],
+            range=["#2f6c7a", "#c66a10", "#7a3e48"],
+        )
+    tooltips = [
+        alt.Tooltip("model_name:N", title="Modelo"),
+        alt.Tooltip("feature_set:N", title="Conjunto"),
+        alt.Tooltip("balance_mode:N", title="Balance"),
+        alt.Tooltip("threshold_protocol:N", title="Protocolo"),
+        alt.Tooltip("k:Q", title="K"),
+        alt.Tooltip(f"{metric_col}:Q", title=str(metric_label), format=".4f"),
+    ]
+    if use_ablation_series:
+        tooltips.insert(2, alt.Tooltip("params_source_feature_set:N", title="Fuente params"))
+        tooltips.insert(3, alt.Tooltip("target_feature_set:N", title="Target"))
     return (
         alt.Chart(plot_df)
         .mark_line(point=True)
@@ -2430,18 +2641,10 @@ def _build_controlled_comparison_curve_chart(
                 axis=alt.Axis(title=str(metric_label)),
             ),
             color=alt.Color(
-                "feature_set:N",
-                title="Conjunto",
-                scale=color_scale,
+                f"{series_col}:N",
+                **color_kwargs,
             ),
-            tooltip=[
-                alt.Tooltip("model_name:N", title="Modelo"),
-                alt.Tooltip("feature_set:N", title="Conjunto"),
-                alt.Tooltip("balance_mode:N", title="Balance"),
-                alt.Tooltip("threshold_protocol:N", title="Protocolo"),
-                alt.Tooltip("k:Q", title="K"),
-                alt.Tooltip(f"{metric_col}:Q", title=str(metric_label), format=".4f"),
-            ],
+            tooltip=tooltips,
         )
         .properties(height=260)
         .interactive()
@@ -2516,7 +2719,9 @@ def _prepare_controlled_comparison_detail_display(detail_df: pd.DataFrame) -> pd
     display_df = detail_df.copy()
     for json_col in [
         "selected_features",
+        "selected_features_global",
         "best_params",
+        "effective_model_params",
         "smote_params",
     ]:
         if json_col in display_df.columns:
@@ -2528,14 +2733,28 @@ def _prepare_controlled_comparison_detail_display(detail_df: pd.DataFrame) -> pd
             )
     sort_cols = [
         col
-        for col in ["model_name", "balance_mode", "feature_set", "k"]
+        for col in [
+            "model_name",
+            "balance_mode",
+            "params_source_feature_set",
+            "target_feature_set",
+            "feature_set",
+            "k",
+        ]
         if col in display_df.columns
     ]
     if sort_cols:
         display_df = display_df.sort_values(sort_cols).reset_index(drop=True)
     preferred_cols = [
+        "protocol_family",
         "model_name",
         "feature_set",
+        "ablation_phase",
+        "params_source_feature_set",
+        "target_feature_set",
+        "source_combo_id",
+        "frozen_tuning",
+        "threshold_freeze_policy",
         "balance_mode",
         "threshold_protocol",
         "threshold_protocol_label",
@@ -2543,6 +2762,10 @@ def _prepare_controlled_comparison_detail_display(detail_df: pd.DataFrame) -> pd
         "threshold_objective_label",
         "calibration_method",
         "k",
+        "k_global",
+        "effective_k",
+        "selected_base_feature_count",
+        "selected_cluster_feature_count",
         "status",
         "objective_label",
         "val_objective_score",
@@ -2593,8 +2816,13 @@ def _prepare_controlled_comparison_detail_display(detail_df: pd.DataFrame) -> pd
         "val_confusion_matrix",
         "test_confusion_matrix",
         "decision_threshold",
+        "feature_ranking_mode",
+        "ranking_protocol",
+        "selected_features_global",
         "selected_features",
         "best_params",
+        "effective_model_params",
+        "effective_threshold_n_jobs",
         "smote_params",
         "error",
     ]
@@ -2608,6 +2836,7 @@ def _render_controlled_comparison_results(
     curves_df: pd.DataFrame,
     *,
     grid_results_df: Optional[pd.DataFrame] = None,
+    ablation_deltas_df: Optional[pd.DataFrame] = None,
     key_prefix: str,
 ) -> None:
     objective_metric = "roc_auc"
@@ -2686,10 +2915,18 @@ def _render_controlled_comparison_results(
             summary_display["selected_features"] = summary_display[
                 "selected_features"
             ].apply(_jsonish_to_text)
+        if "selected_features_global" in summary_display.columns:
+            summary_display["selected_features_global"] = summary_display[
+                "selected_features_global"
+            ].apply(_jsonish_to_text)
         if "best_params" in summary_display.columns:
             summary_display["best_params"] = summary_display["best_params"].apply(
                 _jsonish_to_text
             )
+        if "effective_model_params" in summary_display.columns:
+            summary_display["effective_model_params"] = summary_display[
+                "effective_model_params"
+            ].apply(_jsonish_to_text)
         if "smote_params" in summary_display.columns:
             summary_display["smote_params"] = summary_display["smote_params"].apply(
                 _jsonish_to_text
@@ -2713,8 +2950,15 @@ def _render_controlled_comparison_results(
                 drop=True
             )
         preferred_cols = [
+            "protocol_family",
             "model_name",
             "feature_set",
+            "ablation_phase",
+            "params_source_feature_set",
+            "target_feature_set",
+            "source_combo_id",
+            "frozen_tuning",
+            "threshold_freeze_policy",
             "balance_mode",
             "threshold_protocol",
             "threshold_protocol_label",
@@ -2746,10 +2990,19 @@ def _render_controlled_comparison_results(
             "best_test_true_positives",
             "best_test_confusion_matrix",
             "k_optimo",
+            "k_global",
+            "effective_k",
+            "selected_base_feature_count",
+            "selected_cluster_feature_count",
             "smote_optimo",
             "decision_threshold",
+            "feature_ranking_mode",
+            "ranking_protocol",
+            "selected_features_global",
             "selected_features",
             "best_params",
+            "effective_model_params",
+            "effective_threshold_n_jobs",
             "smote_params",
             "status",
             "error",
@@ -2764,6 +3017,53 @@ def _render_controlled_comparison_results(
 
     st.markdown("**Tabla resumen**")
     st.dataframe(summary_display, width="stretch")
+
+    if isinstance(ablation_deltas_df, pd.DataFrame) and not ablation_deltas_df.empty:
+        deltas_display = ablation_deltas_df.copy()
+        preferred_delta_cols = [
+            "effect_type",
+            "comparison",
+            "model_name",
+            "balance_mode",
+            "threshold_protocol",
+            "objective_metric",
+            "k",
+            "params_source_feature_set",
+            "target_feature_set",
+            "delta_val_objective_score",
+            "delta_test_objective_score",
+            "delta_val_roc_auc",
+            "delta_test_roc_auc",
+            "delta_val_pr_auc",
+            "delta_test_pr_auc",
+            "delta_val_f1",
+            "delta_test_f1",
+            "delta_val_mcc",
+            "delta_test_mcc",
+            "delta_val_recall",
+            "delta_test_recall",
+            "delta_val_false_positives",
+            "delta_test_false_positives",
+            "delta_val_false_alarms_per_day",
+            "delta_test_false_alarms_per_day",
+            "delta_val_cost_per_day",
+            "delta_test_cost_per_day",
+            "baseline_combo_id",
+            "comparison_combo_id",
+        ]
+        visible_delta_cols = [
+            col for col in preferred_delta_cols if col in deltas_display.columns
+        ]
+        remaining_delta_cols = [
+            col for col in deltas_display.columns if col not in visible_delta_cols
+        ]
+        st.markdown("**Deltas de ablación cruzada**")
+        st.caption(
+            "Feature effect compara target Base + Cluster menos target Base con la "
+            "misma fuente de tuning. Tuning effect compara params Base + Cluster "
+            "menos params Base sobre el mismo target."
+        )
+        st.dataframe(deltas_display[visible_delta_cols + remaining_delta_cols], width="stretch")
 
     if not summary_df.empty and "best_test_confusion_matrix" in summary_df.columns:
         with st.expander("Matrices de confusión de test", expanded=False):
@@ -2839,10 +3139,21 @@ def _render_controlled_comparison_results(
                     if fallback_df.empty:
                         st.info("No hay datos para este modelo.")
                         continue
+                    pivot_column = "feature_set"
+                    if {
+                        "params_source_feature_set",
+                        "target_feature_set",
+                    }.issubset(fallback_df.columns):
+                        fallback_df["ablation_pair"] = (
+                            fallback_df["params_source_feature_set"].astype(str)
+                            + " -> "
+                            + fallback_df["target_feature_set"].astype(str)
+                        )
+                        pivot_column = "ablation_pair"
                     pivot_df = (
                         fallback_df.pivot_table(
                             index="k",
-                            columns="feature_set",
+                            columns=pivot_column,
                             values=selected_metric_col,
                             aggfunc="max",
                         )
@@ -2860,14 +3171,16 @@ def _render_controlled_comparison_results(
         return
 
     filtered_df = detail_display.copy()
-    filter_cols = st.columns(5)
     filter_specs = [
         ("model_name", "Modelo"),
         ("feature_set", "Conjunto"),
+        ("params_source_feature_set", "Fuente params"),
+        ("target_feature_set", "Target"),
         ("balance_mode", "Balanceo"),
         ("threshold_protocol", "Protocolo"),
         ("status", "Status"),
     ]
+    filter_cols = st.columns(len(filter_specs))
     for idx, (column_name, label) in enumerate(filter_specs):
         if column_name not in filtered_df.columns:
             continue
@@ -2902,12 +3215,14 @@ def _render_controlled_comparison_results_panel(
     curves_df: pd.DataFrame,
     *,
     grid_results_df: Optional[pd.DataFrame] = None,
+    ablation_deltas_df: Optional[pd.DataFrame] = None,
     key_prefix: str,
 ) -> None:
     _render_controlled_comparison_results(
         summary_df,
         curves_df,
         grid_results_df=grid_results_df,
+        ablation_deltas_df=ablation_deltas_df,
         key_prefix=key_prefix,
     )
 
@@ -2920,7 +3235,7 @@ if hasattr(st, "fragment"):
 
 def _load_controlled_comparison_result_frames(
     result_state: Dict[str, object],
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     def _load_frame(path_value: object, fallback: object) -> pd.DataFrame:
         path_text = str(path_value or "").strip()
         if path_text:
@@ -2946,7 +3261,11 @@ def _load_controlled_comparison_result_frames(
         result_state.get("detail_path"),
         result_state.get("grid_results_df"),
     )
-    return summary_df, curves_df, grid_results_df
+    ablation_deltas_df = _load_frame(
+        result_state.get("ablation_deltas_path"),
+        result_state.get("ablation_deltas_df"),
+    )
+    return summary_df, curves_df, grid_results_df, ablation_deltas_df
 
 
 def _render_controlled_comparison_current_result(
@@ -2957,9 +3276,12 @@ def _render_controlled_comparison_current_result(
     if not isinstance(result_state, dict) or not result_state:
         return
 
-    summary_df, curves_df, grid_results_df = _load_controlled_comparison_result_frames(
-        result_state
-    )
+    (
+        summary_df,
+        curves_df,
+        grid_results_df,
+        ablation_deltas_df,
+    ) = _load_controlled_comparison_result_frames(result_state)
 
     run_id = result_state.get("run_id")
     st.success(f"Comparación controlada finalizada. Run ID: {run_id}.")
@@ -2973,16 +3295,19 @@ def _render_controlled_comparison_current_result(
     summary_name = result_state.get("summary_name") or "-"
     curves_name = result_state.get("curves_name") or "-"
     detail_name = result_state.get("detail_name") or "-"
+    ablation_deltas_name = result_state.get("ablation_deltas_name") or ""
     st.caption(
         "Resumen: "
         f"{summary_name} | "
         f"Curvas: {curves_name} | "
         f"Detalle: {detail_name}"
+        + (f" | Deltas: {ablation_deltas_name}" if ablation_deltas_name else "")
     )
     _render_controlled_comparison_results_panel(
         summary_df,
         curves_df,
         grid_results_df=grid_results_df,
+        ablation_deltas_df=ablation_deltas_df,
         key_prefix=f"controlled_current_{run_id}",
     )
 
@@ -2994,6 +3319,8 @@ def _render_controlled_comparison_memory_estimator(
     selected_features_path: Path,
     tramo_tuple: Tuple[str, str, str, str],
     segment_info: Dict[str, object],
+    dataset_date_start: Optional[pd.Timestamp],
+    dataset_date_end: Optional[pd.Timestamp],
     test_size: float,
     val_size: float,
     k_min: int,
@@ -3017,6 +3344,12 @@ def _render_controlled_comparison_memory_estimator(
         "event_path": str(selected_event_path),
         "features_path": str(selected_features_path),
         "segment_info": dict(segment_info or {}),
+        "dataset_date_start": (
+            None if dataset_date_start is None else str(pd.Timestamp(dataset_date_start))
+        ),
+        "dataset_date_end": (
+            None if dataset_date_end is None else str(pd.Timestamp(dataset_date_end))
+        ),
         "test_size": float(test_size),
         "val_size": float(val_size),
         "k_min": int(k_min),
@@ -3094,6 +3427,8 @@ def _render_controlled_comparison_memory_estimator(
                         accidents_df_for_tramo=accidents_df_for_tramo,
                         selected_features_path=selected_features_path,
                         tramo_tuple=tramo_tuple,
+                        date_start=dataset_date_start,
+                        date_end=dataset_date_end,
                     )
                     estimate_payload = estimate_controlled_comparison_parallelism(
                         base_df,
@@ -3243,7 +3578,7 @@ def _render_controlled_comparison_memory_estimator(
                         "parallel_jobs": "RF/ranking jobs",
                         "xgb_parallel_jobs": "XGBoost jobs",
                         "max_optuna_jobs": "Optuna jobs",
-                        "cpu_limited_optuna_jobs": "Limite CPU Optuna",
+                        "cpu_limited_optuna_jobs": "Tope CPU Optuna",
                         "memory_limited_optuna_jobs": "Limite RAM Optuna",
                         "dominant_model": "Modelo dominante",
                         "ranking_peak_gb": "Peak ranking RF (GB)",
@@ -3387,7 +3722,7 @@ def _render_controlled_comparison_protocol_description(
                     "14. **Selección del mejor K.** Dentro de cada grupo `modelo + conjunto + balance + protocolo`, el `K` óptimo se define por la mejor métrica objetivo en validación/OOF. En empate, se privilegia el `K` más pequeño para evitar complejidad innecesaria.",
                     "15. **Resultados reportados.** La tabla resumen muestra el mejor resultado por `modelo + conjunto + balance + protocolo`, indicando el `K` óptimo, threshold aplicado, PR-AUC, Balanced F1, falsas alarmas/día, recall aproximado por evento y costo operacional.",
                     "16. **Checkpoint y reanudación.** Cada corrida guarda checkpoints reanudables, estado live y artefactos intermedios. Si la configuración coincide exactamente con una corrida previa incompleta, la UI permite reanudar sin recalcular combinaciones ya resueltas.",
-                    "17. **Paralelización.** `Random Forest` usa `n_jobs` para acelerar ranking y entrenamiento. `SVM` no expone `n_jobs`, por lo que su aceleración ocurre a nivel de trials de Optuna. `XGBoost` también puede configurarse con sus propios jobs paralelos. Para evitar oversubscription, la optimización limita automáticamente `Optuna jobs` por modelo cuando `RF` o `XGBoost` ya están usando hilos internos; aun así conviene usar el estimador antes de subir simultáneamente `Optuna jobs` y `XGBoost jobs`.",
+                    "17. **Paralelización.** `Random Forest` usa `n_jobs` para acelerar ranking y entrenamiento. `SVM` no expone `n_jobs`, por lo que su aceleración ocurre a nivel de trials de Optuna. `XGBoost` usa su propio `n_jobs`. La calibración de threshold reutiliza los jobs del modelo cuando aplica. En todos los casos, los valores declarados en la UI se respetan como fuente de verdad; Optuna no reduce automáticamente los jobs internos del modelo.",
                     "18. **Combinaciones inválidas.** Si una combinación falla por falta de clases, `K` imposible o configuración de SMOTE inválida para ese split, se registra como fallida y la corrida continúa con el resto de la matriz experimental.",
                 ]
             )
@@ -6123,6 +6458,13 @@ def _render_optuna_tab() -> None:
     })
     
     if set(feature_cols_cluster) != set(feature_cols_base):
+        if selected_cluster_cols:
+            configs.append({
+                "label": "Cluster",
+                "cols": selected_cluster_cols,
+                "key": _optuna_result_key(feature_key, selected_cluster_cols),
+                "id": _optuna_result_id(feature_id, selected_cluster_cols),
+            })
         configs.append({
             "label": "Base + Cluster",
             "cols": feature_cols_cluster,
@@ -6323,7 +6665,7 @@ def _render_optuna_tab() -> None:
 
     model_choice = st.selectbox(
         "Modelo",
-        ["XGBoost", "Random Forest", "SVM"],
+        ["XGBoost", "Random Forest", "SVM", "Neural Network"],
         key="optuna_model_choice",
     )
     model_result: Optional[Dict[str, object]] = None
@@ -6472,10 +6814,10 @@ def _render_optuna_tab() -> None:
     with col1:
         smote_sampling_min = st.number_input(
             "smote_sampling_min",
-            min_value=0.05,
+            min_value=0.01,
             max_value=1.0,
-            value=0.5,
-            step=0.05,
+            value=0.01,
+            step=0.01,
             format="%.2f",
             key="optuna_smote_sampling_min",
         )
@@ -6494,7 +6836,7 @@ def _render_optuna_tab() -> None:
             "smote_sampling_step",
             min_value=0.01,
             max_value=0.5,
-            value=0.05,
+            value=0.01,
             step=0.01,
             format="%.2f",
             key="optuna_smote_sampling_step",
@@ -6798,7 +7140,236 @@ def _render_optuna_tab() -> None:
                 format="%.2f",
                 key="optuna_xgb_gamma_step",
             )
-    else:
+    elif model_choice == "Neural Network":
+        st.markdown("**Neural Network**")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            nn_hidden_min = st.number_input(
+                "nn_hidden_dim_min",
+                min_value=32,
+                value=64,
+                step=32,
+                key="optuna_nn_hidden_min",
+            )
+        with col2:
+            nn_hidden_max = st.number_input(
+                "nn_hidden_dim_max",
+                min_value=32,
+                value=512,
+                step=32,
+                key="optuna_nn_hidden_max",
+            )
+        with col3:
+            nn_hidden_step = st.number_input(
+                "nn_hidden_dim_step",
+                min_value=1,
+                value=64,
+                step=1,
+                key="optuna_nn_hidden_step",
+            )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            nn_layers_min = st.number_input(
+                "nn_num_layers_min",
+                min_value=1,
+                value=1,
+                step=1,
+                key="optuna_nn_layers_min",
+            )
+        with col2:
+            nn_layers_max = st.number_input(
+                "nn_num_layers_max",
+                min_value=1,
+                value=4,
+                step=1,
+                key="optuna_nn_layers_max",
+            )
+        with col3:
+            nn_layers_step = st.number_input(
+                "nn_num_layers_step",
+                min_value=1,
+                value=1,
+                step=1,
+                key="optuna_nn_layers_step",
+            )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            nn_dropout_min = st.number_input(
+                "nn_dropout_min",
+                min_value=0.0,
+                max_value=0.9,
+                value=0.0,
+                step=0.05,
+                format="%.2f",
+                key="optuna_nn_dropout_min",
+            )
+        with col2:
+            nn_dropout_max = st.number_input(
+                "nn_dropout_max",
+                min_value=0.0,
+                max_value=0.9,
+                value=0.5,
+                step=0.05,
+                format="%.2f",
+                key="optuna_nn_dropout_max",
+            )
+        with col3:
+            nn_dropout_step = st.number_input(
+                "nn_dropout_step",
+                min_value=0.01,
+                max_value=0.5,
+                value=0.1,
+                step=0.01,
+                format="%.2f",
+                key="optuna_nn_dropout_step",
+            )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            nn_lr_min = st.number_input(
+                "nn_learning_rate_min",
+                min_value=0.00001,
+                max_value=0.1,
+                value=0.0001,
+                step=0.0001,
+                format="%.5f",
+                key="optuna_nn_lr_min",
+            )
+        with col2:
+            nn_lr_max = st.number_input(
+                "nn_learning_rate_max",
+                min_value=0.00001,
+                max_value=0.1,
+                value=0.01,
+                step=0.0001,
+                format="%.5f",
+                key="optuna_nn_lr_max",
+            )
+        with col3:
+            nn_lr_step = st.number_input(
+                "nn_learning_rate_step",
+                min_value=0.00001,
+                max_value=0.01,
+                value=0.0001,
+                step=0.00001,
+                format="%.5f",
+                key="optuna_nn_lr_step",
+            )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            nn_wd_min = st.number_input(
+                "nn_weight_decay_min",
+                min_value=0.0,
+                max_value=0.1,
+                value=1e-6,
+                step=1e-6,
+                format="%.7f",
+                key="optuna_nn_wd_min",
+            )
+        with col2:
+            nn_wd_max = st.number_input(
+                "nn_weight_decay_max",
+                min_value=0.0,
+                max_value=0.1,
+                value=1e-3,
+                step=1e-6,
+                format="%.7f",
+                key="optuna_nn_wd_max",
+            )
+        with col3:
+            nn_wd_step = st.number_input(
+                "nn_weight_decay_step",
+                min_value=1e-7,
+                max_value=1e-2,
+                value=1e-6,
+                step=1e-7,
+                format="%.7f",
+                key="optuna_nn_wd_step",
+            )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            nn_pw_min = st.number_input(
+                "nn_pos_weight_min",
+                min_value=0.1,
+                max_value=500.0,
+                value=1.0,
+                step=0.1,
+                format="%.2f",
+                key="optuna_nn_pw_min",
+            )
+        with col2:
+            nn_pw_max = st.number_input(
+                "nn_pos_weight_max",
+                min_value=0.1,
+                max_value=500.0,
+                value=50.0,
+                step=0.1,
+                format="%.2f",
+                key="optuna_nn_pw_max",
+            )
+        with col3:
+            nn_pw_step = st.number_input(
+                "nn_pos_weight_step",
+                min_value=0.1,
+                max_value=50.0,
+                value=0.5,
+                step=0.1,
+                format="%.2f",
+                key="optuna_nn_pw_step",
+            )
+
+        nn_batch_options = st.multiselect(
+            "nn_batch_size",
+            [128, 256, 512, 1024, 2048, 4096, 8192],
+            default=[1024, 2048, 4096],
+            key="optuna_nn_batch_sizes",
+        )
+        st.caption(
+            "epochs no se optimiza aqui: cada trial entrena hasta convergencia "
+            "con early stopping (paciencia 5). El maximo de epochs se "
+            "configura en la pestana Modelos."
+        )
+        # Hints de GPU / paralelismo
+        try:
+            import torch as _torch
+
+            if hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+                _device_name = "MPS (Apple Silicon)"
+                _on_gpu = True
+            elif _torch.cuda.is_available():
+                _device_name = f"CUDA ({_torch.cuda.get_device_name(0)})"
+                _on_gpu = True
+            else:
+                _device_name = "CPU"
+                _on_gpu = False
+        except Exception:
+            _device_name = "CPU"
+            _on_gpu = False
+        if _on_gpu:
+            st.info(
+                f"Dispositivo NN detectado: **{_device_name}**. "
+                "Para maximizar la GPU: usa batch_size grandes (>=1024) y "
+                "deja **Optuna n_jobs = 1** (trials paralelos comparten el "
+                "mismo device y se serializan, sin ganancia de velocidad). "
+                "El wrapper precarga train/val en device para evitar H2D "
+                "por batch."
+            )
+            if int(optuna_n_jobs) > 1:
+                st.warning(
+                    "⚠️ Optuna n_jobs > 1 con Neural Network en GPU no "
+                    "acelera: los trials se encolan en el mismo dispositivo. "
+                    "Se recomienda n_jobs=1."
+                )
+        else:
+            st.caption(
+                f"Dispositivo NN detectado: {_device_name}. "
+                "Instale PyTorch con MPS/CUDA para acelerar con GPU."
+            )
+    elif model_choice == "SVM":
         st.markdown("**SVM**")
         kernel_options = ["rbf", "linear", "poly", "sigmoid"]
         svm_kernels = st.multiselect(
@@ -6998,7 +7569,35 @@ def _render_optuna_tab() -> None:
             if xgb_gamma_step <= 0:
                 st.warning("xgb_gamma_step debe ser mayor a 0.")
                 return
-        else:
+        elif model_choice == "Neural Network":
+            if nn_hidden_min > nn_hidden_max:
+                st.warning("nn_hidden_dim_min > nn_hidden_dim_max.")
+                return
+            if nn_layers_min > nn_layers_max:
+                st.warning("nn_num_layers_min > nn_num_layers_max.")
+                return
+            if nn_dropout_min > nn_dropout_max:
+                st.warning("nn_dropout_min > nn_dropout_max.")
+                return
+            if nn_lr_min > nn_lr_max:
+                st.warning("nn_learning_rate_min > nn_learning_rate_max.")
+                return
+            if nn_wd_min > nn_wd_max:
+                st.warning("nn_weight_decay_min > nn_weight_decay_max.")
+                return
+            if nn_wd_step <= 0:
+                st.warning("nn_weight_decay_step debe ser mayor a 0.")
+                return
+            if nn_pw_min > nn_pw_max:
+                st.warning("nn_pos_weight_min > nn_pos_weight_max.")
+                return
+            if nn_pw_step <= 0:
+                st.warning("nn_pos_weight_step debe ser mayor a 0.")
+                return
+            if not nn_batch_options:
+                st.warning("Seleccione al menos un batch_size para Neural Network.")
+                return
+        elif model_choice == "SVM":
             if not svm_kernels:
                 st.warning("Seleccione al menos un kernel para SVM.")
                 return
@@ -7134,6 +7733,60 @@ def _render_optuna_tab() -> None:
                         "reg_alpha": float(reg_alpha),
                         "reg_lambda": float(reg_lambda),
                         "gamma": float(gamma),
+                    }
+                elif model_choice == "Neural Network":
+                    hidden_dim = trial.suggest_int(
+                        "nn_hidden_dim",
+                        int(nn_hidden_min),
+                        int(nn_hidden_max),
+                        step=int(nn_hidden_step),
+                    )
+                    num_layers = trial.suggest_int(
+                        "nn_num_layers",
+                        int(nn_layers_min),
+                        int(nn_layers_max),
+                        step=int(nn_layers_step),
+                    )
+                    dropout = trial.suggest_float(
+                        "nn_dropout",
+                        float(nn_dropout_min),
+                        float(nn_dropout_max),
+                        step=float(nn_dropout_step),
+                    )
+                    learning_rate = trial.suggest_float(
+                        "nn_learning_rate",
+                        float(nn_lr_min),
+                        float(nn_lr_max),
+                        step=float(nn_lr_step),
+                    )
+                    weight_decay = trial.suggest_float(
+                        "nn_weight_decay",
+                        float(nn_wd_min),
+                        float(nn_wd_max),
+                        step=float(nn_wd_step),
+                    )
+                    pos_weight = trial.suggest_float(
+                        "nn_pos_weight",
+                        float(nn_pw_min),
+                        float(nn_pw_max),
+                        step=float(nn_pw_step),
+                    )
+                    batch_size = trial.suggest_categorical(
+                        "nn_batch_size", list(nn_batch_options)
+                    )
+                    # epochs fijo interno alto: el early stopping (patience=5)
+                    # cortara antes cuando la metrica de validacion deje de mejorar.
+                    # El maximo real se configura en la pestana Modelos.
+                    model_params = {
+                        "hidden_dim": int(hidden_dim),
+                        "num_layers": int(num_layers),
+                        "dropout": float(dropout),
+                        "learning_rate": float(learning_rate),
+                        "weight_decay": float(weight_decay),
+                        "pos_weight": float(pos_weight),
+                        "batch_size": int(batch_size),
+                        "epochs": 100,
+                        "early_stopping_patience": 5,
                     }
                 else:
                     kernel = trial.suggest_categorical(
@@ -7307,6 +7960,18 @@ def _render_optuna_tab() -> None:
                     "reg_alpha": float(best_params["xgb_reg_alpha"]),
                     "reg_lambda": float(best_params["xgb_reg_lambda"]),
                     "gamma": float(best_params["xgb_gamma"]),
+                }
+            elif model_choice == "Neural Network":
+                # epochs no se optimiza: se fija al maximo configurado en Modelos.
+                # early_stopping_patience=5 asegura convergencia sin overfitting.
+                model_params = {
+                    "hidden_dim": int(best_params["nn_hidden_dim"]),
+                    "num_layers": int(best_params["nn_num_layers"]),
+                    "dropout": float(best_params["nn_dropout"]),
+                    "learning_rate": float(best_params["nn_learning_rate"]),
+                    "weight_decay": float(best_params["nn_weight_decay"]),
+                    "pos_weight": float(best_params["nn_pos_weight"]),
+                    "batch_size": int(best_params["nn_batch_size"]),
                 }
             else:
                 model_params = {
@@ -7609,6 +8274,7 @@ def _render_balance_tab() -> None:
                                         "se marco todo como False."
                                     )
                                 st.session_state["balanced_base_df"] = loaded_df
+                                st.session_state["balanced_cluster_only_df"] = None
                                 st.session_state["balanced_cluster_df"] = None
                                 st.session_state["balance_last_stats"] = (
                                     _balance_stats_from_df(loaded_df)
@@ -7709,7 +8375,7 @@ def _render_balance_tab() -> None:
         st.session_state["smote_sampling_strategy"] = smote_sampling_strategy
 
         if st.button("Aplicar SMOTE"):
-            progress = _StreamlitProgress(total=4)
+            progress = _StreamlitProgress(total=5)
             with st.spinner("Aplicando SMOTE..."):
                 progress.set_description("Preparando dataset")
                 dataset_df = base_df
@@ -7718,14 +8384,14 @@ def _render_balance_tab() -> None:
                 try:
                     progress.set_description("Aplicando SMOTE (Base)")
                     selected_features = st.session_state.get("selected_features")
-                    
-                    # 1. Base (Flow only)
-                    feature_cols_base, missing_base = _resolve_feature_cols(
+
+                    # 1. Base (Flow only) — alineado con el modelo "Base" de Optuna
+                    feature_cols_base, missing_base = _resolve_feature_group_cols(
                         dataset_df,
                         selected_features,
-                        include_cluster_features=False,
+                        feature_group="base",
                     )
-                    
+
                     balanced_base_df = None
                     dist_before_base = dist_after_base = dist_test_base = None
                     k_used_base = None
@@ -7748,18 +8414,49 @@ def _render_balance_tab() -> None:
                         )
                     progress.update(1)
 
-                    # 2. Cluster (Flow + Cluster)
-                    progress.set_description("Aplicando SMOTE (Base + Cluster)")
-                    balanced_cluster_df = None
-                    
+                    # 2. Cluster (cluster-only) — alineado con el modelo "Cluster" de Optuna
+                    progress.set_description("Aplicando SMOTE (Cluster)")
+                    balanced_cluster_only_df = None
+                    dist_before_cluster_only = dist_after_cluster_only = dist_test_cluster_only = None
+                    k_used_cluster_only = None
+
                     has_cluster_cols = bool(_get_cluster_cols(dataset_df))
+                    feature_cols_cluster_only: List[str] = []
                     if has_cluster_cols:
-                        feature_cols_cluster, missing_cluster = _resolve_feature_cols(
+                        feature_cols_cluster_only, _ = _resolve_feature_group_cols(
                             dataset_df,
                             selected_features,
-                            include_cluster_features=True,
+                            feature_group="cluster",
                         )
-                        # Only run if cluster features are actually included and different
+                        if feature_cols_cluster_only:
+                            (
+                                balanced_cluster_only_df,
+                                dist_before_cluster_only,
+                                dist_after_cluster_only,
+                                dist_test_cluster_only,
+                                k_used_cluster_only,
+                            ) = _apply_smote_dataset(
+                                dataset_df,
+                                feature_cols_cluster_only,
+                                test_size=float(test_size),
+                                split_random_state=int(smote_random_state),
+                                random_state=int(smote_random_state),
+                                smote_k_neighbors=int(smote_k),
+                                smote_sampling_strategy=smote_sampling_strategy,
+                            )
+                    progress.update(1)
+
+                    # 3. Base + Cluster — alineado con el modelo "Base + Cluster" de Optuna
+                    progress.set_description("Aplicando SMOTE (Base + Cluster)")
+                    balanced_cluster_df = None
+
+                    if has_cluster_cols:
+                        feature_cols_cluster, missing_cluster = _resolve_feature_group_cols(
+                            dataset_df,
+                            selected_features,
+                            feature_group="base_cluster",
+                        )
+                        # Solo si hay diferencia real con Base (es decir, existen cluster cols seleccionadas)
                         if set(feature_cols_cluster) != set(feature_cols_base):
                             (
                                 balanced_cluster_df,
@@ -7784,8 +8481,9 @@ def _render_balance_tab() -> None:
                 else:
                     progress.set_description("Finalizando")
                     st.session_state["balanced_base_df"] = balanced_base_df
+                    st.session_state["balanced_cluster_only_df"] = balanced_cluster_only_df
                     st.session_state["balanced_cluster_df"] = balanced_cluster_df
-                    
+
                     # Store stats for base (primary)
                     st.session_state["balance_last_stats"] = {
                         "train_before": dist_before_base.to_dict(orient="records") if dist_before_base is not None else [],
@@ -7799,15 +8497,17 @@ def _render_balance_tab() -> None:
                         "k_neighbors": int(k_used_base) if k_used_base else 0,
                         "sampling_strategy": smote_sampling_strategy,
                     }
-                    
+
                     msg = []
                     if balanced_base_df is not None:
                         msg.append(f"Base: {len(balanced_base_df):,} filas")
+                    if balanced_cluster_only_df is not None:
+                        msg.append(f"Cluster: {len(balanced_cluster_only_df):,} filas")
                     if balanced_cluster_df is not None:
-                        msg.append(f"Cluster: {len(balanced_cluster_df):,} filas")
-                    
+                        msg.append(f"Base + Cluster: {len(balanced_cluster_df):,} filas")
+
                     st.success(f"Datasets balanceados generados. {', '.join(msg)}")
-                    
+
                     if dist_before_base is not None:
                         st.caption(f"SMOTE k_neighbors usado (Base): {k_used_base}")
                         col_a, col_b, col_c = st.columns(3)
@@ -7825,11 +8525,16 @@ def _render_balance_tab() -> None:
                     progress.close()
 
     else:
-        st.subheader("Dataset balanceado en memoria")
+        st.subheader("Datasets balanceados en memoria")
         balanced_base = st.session_state.get("balanced_base_df")
+        balanced_cluster_only = st.session_state.get("balanced_cluster_only_df")
         balanced_cluster = st.session_state.get("balanced_cluster_df")
 
-        if balanced_base is None and balanced_cluster is None:
+        if (
+            balanced_base is None
+            and balanced_cluster_only is None
+            and balanced_cluster is None
+        ):
             st.info("No hay dataset balanceado en memoria.")
         else:
             # Validate consistency with selected features
@@ -7837,17 +8542,30 @@ def _render_balance_tab() -> None:
             if selected_features:
                 # Identify cluster cols in the standard set to distinguish flow vs cluster
                 all_cluster_cols = set(_get_cluster_cols(features_df))
-                
+
                 if balanced_base is not None:
                     missing_inv = [
-                        c 
-                        for c in selected_features 
+                        c
+                        for c in selected_features
                         if c not in balanced_base.columns and c not in all_cluster_cols
                     ]
                     if missing_inv:
                         st.warning(
                             "⚠️ El dataset Base en memoria no contiene variables de flujo "
                             f"seleccionadas: {', '.join(missing_inv)}"
+                        )
+
+                if balanced_cluster_only is not None:
+                    cluster_selected = [
+                        c for c in selected_features if c in all_cluster_cols
+                    ]
+                    missing_co = [
+                        c for c in cluster_selected if c not in balanced_cluster_only.columns
+                    ]
+                    if missing_co:
+                        st.warning(
+                            "⚠️ El dataset Cluster en memoria no contiene variables "
+                            f"de cluster seleccionadas: {', '.join(missing_co)}"
                         )
 
                 if balanced_cluster is not None:
@@ -7860,8 +8578,8 @@ def _render_balance_tab() -> None:
                             f"seleccionadas: {', '.join(missing_all)}"
                         )
 
-            tabs = st.tabs(["Base (Flujo)", "Base + Cluster"])
-            
+            tabs = st.tabs(["Base (Flujo)", "Cluster", "Base + Cluster"])
+
             def _show_balanced_info(df: pd.DataFrame, label: str):
                 if df is None:
                     st.info(f"No hay dataset {label} balanceado.")
@@ -7882,16 +8600,22 @@ def _render_balance_tab() -> None:
             with tabs[0]:
                 _show_balanced_info(balanced_base, "Base")
             with tabs[1]:
+                _show_balanced_info(balanced_cluster_only, "Cluster")
+            with tabs[2]:
                 _show_balanced_info(balanced_cluster, "Base + Cluster")
 
-        if balanced_base is not None or balanced_cluster is not None:
+        if (
+            balanced_base is not None
+            or balanced_cluster_only is not None
+            or balanced_cluster is not None
+        ):
             st.subheader("Exportar dataset balanceado")
             export_name = st.text_input(
                 "Nombre de archivo (sin .csv)",
                 value="accident_balanced",
                 key="export_balanced_name",
             )
-            col_exp1, col_exp2 = st.columns(2)
+            col_exp1, col_exp2, col_exp3 = st.columns(3)
             with col_exp1:
                 if balanced_base is not None and st.button("Exportar Base"):
                     out_path = RESULTS_DIR / f"{export_name.strip()}_base.csv"
@@ -7902,12 +8626,21 @@ def _render_balance_tab() -> None:
                     except Exception as exc:
                         st.error(f"Error: {exc}")
             with col_exp2:
-                if balanced_cluster is not None and st.button("Exportar Cluster"):
-                    out_path = RESULTS_DIR / f"{export_name.strip()}_cluster.csv"
+                if balanced_cluster_only is not None and st.button("Exportar Cluster"):
+                    out_path = RESULTS_DIR / f"{export_name.strip()}_cluster_only.csv"
+                    try:
+                        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                        balanced_cluster_only.to_csv(out_path, index=False)
+                        st.success(f"Cluster exportado en {out_path}")
+                    except Exception as exc:
+                        st.error(f"Error: {exc}")
+            with col_exp3:
+                if balanced_cluster is not None and st.button("Exportar Base + Cluster"):
+                    out_path = RESULTS_DIR / f"{export_name.strip()}_base_cluster.csv"
                     try:
                         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
                         balanced_cluster.to_csv(out_path, index=False)
-                        st.success(f"Cluster exportado en {out_path}")
+                        st.success(f"Base + Cluster exportado en {out_path}")
                     except Exception as exc:
                         st.error(f"Error: {exc}")
 
@@ -8046,7 +8779,101 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
             params["scale_pos_weight"] = float(scale_pos_weight)
         else:
             params["scale_pos_weight"] = "auto"
-    else:
+    elif model_choice == "Neural Network":
+        hidden_dim = st.number_input(
+            "hidden_dim",
+            min_value=32,
+            value=256,
+            step=32,
+            key=f"{prefix}model_nn_hidden_dim",
+        )
+        num_layers = st.number_input(
+            "num_layers",
+            min_value=1,
+            value=2,
+            step=1,
+            key=f"{prefix}model_nn_num_layers",
+        )
+        dropout = st.number_input(
+            "dropout",
+            min_value=0.0,
+            value=0.2,
+            step=0.05,
+            format="%.2f",
+            key=f"{prefix}model_nn_dropout",
+        )
+        learning_rate = st.number_input(
+            "learning_rate",
+            min_value=0.0001,
+            value=0.001,
+            step=0.0001,
+            format="%.4f",
+            key=f"{prefix}model_nn_learning_rate",
+        )
+        weight_decay = st.number_input(
+            "weight_decay",
+            min_value=0.0,
+            value=0.00001,
+            step=0.00001,
+            format="%.6f",
+            key=f"{prefix}model_nn_weight_decay",
+        )
+        batch_size = st.selectbox(
+            "batch_size",
+            [256, 512, 1024, 2048, 4096, 8192],
+            index=2,
+            key=f"{prefix}model_nn_batch_size",
+            help=(
+                "Batch mayor = mejor ocupacion de GPU (MPS/CUDA). "
+                "El wrapper precarga train/val en device y evita copias H2D "
+                "por batch; elige >=1024 si tienes GPU disponible."
+            ),
+        )
+        epochs = st.number_input(
+            "epochs (maximo)",
+            min_value=5,
+            value=100,
+            step=5,
+            key=f"{prefix}model_nn_epochs",
+            help=(
+                "Maximo de epocas de entrenamiento. El early stopping "
+                "(paciencia 5) cortara antes si la metrica de validacion "
+                "deja de mejorar."
+            ),
+        )
+        early_stopping_patience = 5
+        st.caption(
+            f"Early stopping activo | paciencia = {early_stopping_patience} "
+            "| val_fraction = 0.15"
+        )
+        pos_weight = st.number_input(
+            "pos_weight (0 = auto)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            format="%.2f",
+            key=f"{prefix}model_nn_pos_weight",
+            help=(
+                "Peso de la clase positiva en CrossEntropyLoss. "
+                "Use 0 para calcular negativos/positivos automáticamente "
+                "cuando la estrategia de desbalance lo requiera."
+            ),
+        )
+        params = {
+            "hidden_dim": int(hidden_dim),
+            "num_layers": int(num_layers),
+            "dropout": float(dropout),
+            "learning_rate": float(learning_rate),
+            "weight_decay": float(weight_decay),
+            "batch_size": int(batch_size),
+            "epochs": int(epochs),
+            "early_stopping_patience": int(early_stopping_patience),
+        }
+        if float(pos_weight) > 0:
+            params["pos_weight"] = float(pos_weight)
+        else:
+            params["pos_weight"] = "auto"
+    elif model_choice == "SVM":
         kernel = st.selectbox(
             "kernel",
             ["rbf", "linear", "poly", "sigmoid"],
@@ -8072,6 +8899,129 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
             "probability": False,
         }
     return params
+
+
+def _apply_optuna_model_params_to_state(
+    *,
+    model_choice: str,
+    base_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+) -> Optional[str]:
+    optuna_model_params = st.session_state.get("optuna_best_model_params")
+    optuna_model_choice = st.session_state.get("optuna_best_model_choice")
+    optuna_active_key = st.session_state.get("optuna_active_key")
+    if not isinstance(optuna_model_params, dict) or not optuna_model_params:
+        return None
+
+    features_path = st.session_state.get("flow_features_path")
+    features_source = st.session_state.get("flow_features_source")
+    feature_key = _feature_selection_key(
+        features_path,
+        features_source,
+        features_df,
+    )
+
+    selected_features = st.session_state.get("selected_features")
+    numeric_cols = _get_feature_cols(base_df)
+    cluster_cols = _get_cluster_cols(base_df)
+    if selected_features is None:
+        cols_all = numeric_cols
+    else:
+        cols_all = [col for col in selected_features if col in numeric_cols]
+
+    cols_base = [col for col in cols_all if col not in cluster_cols]
+    cols_cluster_only = [col for col in cols_all if col in cluster_cols]
+
+    key_base = _optuna_result_key(feature_key, cols_base)
+    key_cluster_only = _optuna_result_key(feature_key, cols_cluster_only)
+    key_cluster = _optuna_result_key(feature_key, cols_all)
+
+    optuna_matches_base = optuna_active_key == key_base
+    optuna_matches_cluster_only = (
+        bool(cols_cluster_only) and optuna_active_key == key_cluster_only
+    )
+    optuna_matches_cluster = optuna_active_key == key_cluster
+    optuna_ready = (
+        optuna_model_choice == model_choice
+        and (
+            optuna_matches_base
+            or optuna_matches_cluster_only
+            or optuna_matches_cluster
+        )
+    )
+    if not optuna_ready:
+        if optuna_model_choice:
+            return f"Optuna disponible para {optuna_model_choice}."
+        return None
+
+    try:
+        params_signature = json.dumps(optuna_model_params, sort_keys=True)
+    except TypeError:
+        params_signature = str(optuna_model_params)
+    optuna_signature = f"{optuna_active_key}|{optuna_model_choice}|{params_signature}"
+
+    target_prefixes = []
+    if optuna_matches_base:
+        target_prefixes.append("base_")
+    if optuna_matches_cluster_only:
+        target_prefixes.append("cluster_only_")
+    if optuna_matches_cluster:
+        target_prefixes.append("cluster_")
+
+    if st.session_state.get("optuna_model_params_applied_signature") == optuna_signature:
+        return "Parametros Optuna cargados en los selectores."
+
+    if model_choice in {"Random Forest", "Balanced Random Forest"}:
+        n_estimators = int(optuna_model_params.get("n_estimators", 200))
+        max_depth = optuna_model_params.get("max_depth")
+        for prefix in target_prefixes:
+            st.session_state[f"{prefix}model_rf_n_estimators"] = max(50, n_estimators)
+            st.session_state[f"{prefix}model_rf_max_depth"] = int(max_depth or 0)
+    elif model_choice == "XGBoost":
+        n_estimators = int(optuna_model_params.get("n_estimators", 300))
+        max_depth = int(optuna_model_params.get("max_depth", 6))
+        learning_rate = float(optuna_model_params.get("learning_rate", 0.1))
+        subsample = float(optuna_model_params.get("subsample", 1.0))
+        colsample = float(optuna_model_params.get("colsample_bytree", 1.0))
+        reg_alpha = float(optuna_model_params.get("reg_alpha", 0.0))
+        reg_lambda = float(optuna_model_params.get("reg_lambda", 1.0))
+        gamma = float(optuna_model_params.get("gamma", 0.0))
+        for prefix in target_prefixes:
+            st.session_state[f"{prefix}model_xgb_n_estimators"] = max(50, n_estimators)
+            st.session_state[f"{prefix}model_xgb_max_depth"] = max(2, max_depth)
+            st.session_state[f"{prefix}model_xgb_learning_rate"] = max(0.01, learning_rate)
+            st.session_state[f"{prefix}model_xgb_subsample"] = max(0.5, subsample)
+            st.session_state[f"{prefix}model_xgb_colsample"] = max(0.5, colsample)
+            st.session_state[f"{prefix}model_xgb_reg_alpha"] = max(0.0, reg_alpha)
+            st.session_state[f"{prefix}model_xgb_reg_lambda"] = max(0.0, reg_lambda)
+            st.session_state[f"{prefix}model_xgb_gamma"] = max(0.0, gamma)
+    elif model_choice == "Neural Network":
+        hidden_dim = int(optuna_model_params.get("hidden_dim", 256))
+        num_layers = int(optuna_model_params.get("num_layers", 2))
+        dropout = float(optuna_model_params.get("dropout", 0.2))
+        learning_rate = float(optuna_model_params.get("learning_rate", 0.001))
+        weight_decay = float(optuna_model_params.get("weight_decay", 1e-5))
+        batch_size = int(optuna_model_params.get("batch_size", 1024))
+        # epochs no se optimiza en Optuna: se conserva el valor maximo fijado
+        # en los widgets de Modelos (early stopping decide cuando cortar).
+        for prefix in target_prefixes:
+            st.session_state[f"{prefix}model_nn_hidden_dim"] = max(32, hidden_dim)
+            st.session_state[f"{prefix}model_nn_num_layers"] = max(1, num_layers)
+            st.session_state[f"{prefix}model_nn_dropout"] = max(0.0, min(0.5, dropout))
+            st.session_state[f"{prefix}model_nn_learning_rate"] = max(0.0001, learning_rate)
+            st.session_state[f"{prefix}model_nn_weight_decay"] = max(0.0, weight_decay)
+            st.session_state[f"{prefix}model_nn_batch_size"] = batch_size
+    elif model_choice == "SVM":
+        kernel_value = optuna_model_params.get("kernel", "rbf")
+        if kernel_value not in {"rbf", "linear", "poly", "sigmoid"}:
+            kernel_value = "rbf"
+        c_value = float(optuna_model_params.get("C", 1.0))
+        for prefix in target_prefixes:
+            st.session_state[f"{prefix}model_svm_kernel"] = str(kernel_value)
+            st.session_state[f"{prefix}model_svm_c"] = max(0.01, c_value)
+
+    st.session_state["optuna_model_params_applied_signature"] = optuna_signature
+    return "Parametros Optuna cargados en los selectores."
 
 
 def _render_model_tab() -> None:
@@ -8104,9 +9054,14 @@ def _render_model_tab() -> None:
         and not features_df.empty
         and bool(_get_cluster_cols(features_df))
     )
+    balanced_cluster_only_df_chk = st.session_state.get("balanced_cluster_only_df")
     balanced_cluster_df_chk = st.session_state.get("balanced_cluster_df")
-    cluster_cols_in_balanced = balanced_df is not None and bool(
-        _get_cluster_cols(balanced_cluster_df_chk if balanced_cluster_df_chk is not None else pd.DataFrame())
+    cluster_cols_in_balanced = (
+        balanced_cluster_only_df_chk is not None
+        and bool(_get_cluster_cols(balanced_cluster_only_df_chk))
+    ) or (
+        balanced_cluster_df_chk is not None
+        and bool(_get_cluster_cols(balanced_cluster_df_chk))
     )
     has_cluster_features = (
         isinstance(cluster_features_df, pd.DataFrame)
@@ -8279,11 +9234,12 @@ def _render_model_tab() -> None:
 
     model_choice = st.selectbox(
         "Modelo",
-        ["Random Forest", "Balanced Random Forest", "XGBoost", "SVM"],
+        ["Random Forest", "Balanced Random Forest", "XGBoost", "SVM", "Neural Network"],
         key="model_choice",
         help=(
             "Modelo a entrenar en la pestaña Modelos. Balanced Random Forest "
-            "requiere imbalanced-learn y compara submuestreo balanceado frente a RF."
+            "requiere imbalanced-learn y compara submuestreo balanceado frente a RF. "
+            "Neural Network usa un MLP con PyTorch (StandardScaler + early stopping)."
         ),
     )
 
@@ -8302,133 +9258,26 @@ def _render_model_tab() -> None:
             "Jobs paralelos XGBoost",
             key="model_xgb_parallel_jobs",
             default=1,
+            shared_key="global_xgb_parallel_jobs",
         )
-    else:
+    elif model_choice == "Neural Network":
+        st.caption(
+            "Neural Network entrena en dispositivo (MPS/CUDA/CPU); "
+            "no requiere n_jobs. Se paraleliza a través de Optuna."
+        )
+    elif model_choice == "SVM":
         st.caption(
             "SVM no expone `n_jobs`; en Comparación controlada se paraleliza "
             "a través de Optuna."
         )
 
-    optuna_model_params = st.session_state.get("optuna_best_model_params")
-    optuna_model_choice = st.session_state.get("optuna_best_model_choice")
-    optuna_active_key = st.session_state.get("optuna_active_key")
-    features_path = st.session_state.get("flow_features_path")
-    features_source = st.session_state.get("flow_features_source")
-    feature_key = _feature_selection_key(
-        features_path, features_source, features_df
+    optuna_status = _apply_optuna_model_params_to_state(
+        model_choice=model_choice,
+        base_df=base_df,
+        features_df=features_df,
     )
-    
-    selected_features = st.session_state.get("selected_features")
-    numeric_cols = _get_feature_cols(base_df)
-    cluster_cols = _get_cluster_cols(base_df)
-
-    if selected_features is None:
-        cols_all = numeric_cols
-    else:
-        cols_all = [col for col in selected_features if col in numeric_cols]
-    
-    cols_base = [c for c in cols_all if c not in cluster_cols]
-    cols_cluster_only = [c for c in cols_all if c in cluster_cols]
-    
-    key_base = _optuna_result_key(feature_key, cols_base)
-    key_cluster_only = _optuna_result_key(feature_key, cols_cluster_only)
-    key_cluster = _optuna_result_key(feature_key, cols_all)
-    
-    optuna_matches_base = optuna_active_key == key_base
-    optuna_matches_cluster_only = (
-        bool(cols_cluster_only) and optuna_active_key == key_cluster_only
-    )
-    optuna_matches_cluster = optuna_active_key == key_cluster
-    
-    optuna_ready = (
-        isinstance(optuna_model_params, dict)
-        and optuna_model_choice == model_choice
-        and (
-            optuna_matches_base
-            or optuna_matches_cluster_only
-            or optuna_matches_cluster
-        )
-    )
-    if optuna_ready:
-        try:
-            params_signature = json.dumps(
-                optuna_model_params, sort_keys=True
-            )
-        except TypeError:
-            params_signature = str(optuna_model_params)
-        optuna_signature = f"{optuna_active_key}|{optuna_model_choice}|{params_signature}"
-        if model_choice in {"Random Forest", "Balanced Random Forest"}:
-            required_keys = ["model_rf_n_estimators", "model_rf_max_depth"]
-        elif model_choice == "XGBoost":
-            required_keys = [
-                "model_xgb_n_estimators",
-                "model_xgb_max_depth",
-                "model_xgb_learning_rate",
-                "model_xgb_subsample",
-                "model_xgb_colsample",
-                "model_xgb_reg_alpha",
-                "model_xgb_reg_lambda",
-                "model_xgb_gamma",
-            ]
-        else:
-            required_keys = ["model_svm_kernel", "model_svm_c"]
-
-        target_prefixes = []
-        if optuna_matches_base:
-            target_prefixes.append("base_")
-        if optuna_matches_cluster_only:
-            target_prefixes.append("cluster_only_")
-        if optuna_matches_cluster:
-            target_prefixes.append("cluster_")
-
-        applied_signature = st.session_state.get(
-            "optuna_model_params_applied_signature"
-        )
-        if applied_signature != optuna_signature:
-            if model_choice in {"Random Forest", "Balanced Random Forest"}:
-                n_estimators = int(optuna_model_params.get("n_estimators", 200))
-                max_depth = optuna_model_params.get("max_depth")
-                for prefix in target_prefixes:
-                    st.session_state[f"{prefix}model_rf_n_estimators"] = max(50, n_estimators)
-                    st.session_state[f"{prefix}model_rf_max_depth"] = int(max_depth or 0)
-            elif model_choice == "XGBoost":
-                n_estimators = int(optuna_model_params.get("n_estimators", 300))
-                max_depth = int(optuna_model_params.get("max_depth", 6))
-                learning_rate = float(
-                    optuna_model_params.get("learning_rate", 0.1)
-                )
-                subsample = float(
-                    optuna_model_params.get("subsample", 1.0)
-                )
-                colsample = float(
-                    optuna_model_params.get("colsample_bytree", 1.0)
-                )
-                reg_alpha = float(optuna_model_params.get("reg_alpha", 0.0))
-                reg_lambda = float(optuna_model_params.get("reg_lambda", 1.0))
-                gamma = float(optuna_model_params.get("gamma", 0.0))
-                for prefix in target_prefixes:
-                    st.session_state[f"{prefix}model_xgb_n_estimators"] = max(50, n_estimators)
-                    st.session_state[f"{prefix}model_xgb_max_depth"] = max(2, max_depth)
-                    st.session_state[f"{prefix}model_xgb_learning_rate"] = max(0.01, learning_rate)
-                    st.session_state[f"{prefix}model_xgb_subsample"] = max(0.5, subsample)
-                    st.session_state[f"{prefix}model_xgb_colsample"] = max(0.5, colsample)
-                    st.session_state[f"{prefix}model_xgb_reg_alpha"] = max(0.0, reg_alpha)
-                    st.session_state[f"{prefix}model_xgb_reg_lambda"] = max(0.0, reg_lambda)
-                    st.session_state[f"{prefix}model_xgb_gamma"] = max(0.0, gamma)
-            else:
-                kernel_value = optuna_model_params.get("kernel", "rbf")
-                if kernel_value not in {"rbf", "linear", "poly", "sigmoid"}:
-                    kernel_value = "rbf"
-                c_value = float(optuna_model_params.get("C", 1.0))
-                for prefix in target_prefixes:
-                    st.session_state[f"{prefix}model_svm_kernel"] = str(kernel_value)
-                    st.session_state[f"{prefix}model_svm_c"] = max(0.01, c_value)
-            st.session_state["optuna_model_params_applied_signature"] = (
-                optuna_signature
-            )
-        st.caption("Parametros Optuna cargados en los selectores.")
-    elif isinstance(optuna_model_params, dict) and optuna_model_choice:
-        st.caption(f"Optuna disponible para {optuna_model_choice}.")
+    if optuna_status:
+        st.caption(optuna_status)
 
     param_tabs = st.tabs(
         ["Parámetros Base", "Parámetros Cluster", "Parámetros Base + Cluster"]
@@ -8596,9 +9445,13 @@ def _render_model_tab() -> None:
         use_balanced = bool(st.session_state.get("use_balanced_base", False))
         balanced_df = st.session_state.get("balanced_base_df")
         if balanced_df is None:
+            balanced_df = st.session_state.get("balanced_cluster_only_df")
+        if balanced_df is None:
             balanced_df = st.session_state.get("balanced_cluster_df")
-        cluster_cols_in_balanced = balanced_df is not None and bool(
-            _get_cluster_cols(balanced_df)
+        cluster_cols_in_balanced = bool(
+            _get_cluster_cols(st.session_state.get("balanced_cluster_only_df") if st.session_state.get("balanced_cluster_only_df") is not None else pd.DataFrame())
+        ) or bool(
+            _get_cluster_cols(st.session_state.get("balanced_cluster_df") if st.session_state.get("balanced_cluster_df") is not None else pd.DataFrame())
         )
         has_cluster = has_cluster_features or cluster_cols_in_balanced
         base_feature_cols_used: List[str] = []
@@ -8684,36 +9537,68 @@ def _render_model_tab() -> None:
             cluster_result: Optional[Dict[str, object]] = None
             cluster_results_by_protocol: Dict[str, Dict[str, object]] = {}
             if has_cluster:
+                balanced_cluster_only_df = st.session_state.get(
+                    "balanced_cluster_only_df"
+                )
                 balanced_cluster_df = st.session_state.get("balanced_cluster_df")
-                if use_balanced and balanced_cluster_df is None:
+
+                if use_balanced and balanced_cluster_only_df is None and balanced_cluster_df is None:
                     st.warning(
                         "No hay dataset balanceado para Cluster/Base + Cluster "
                         "(quizas no se genero). Usando original."
                     )
 
+                # Dataset balanceado para modelo Cluster-only (aligned con Optuna "Cluster")
+                cluster_only_split: Optional[Tuple[pd.DataFrame, pd.DataFrame]] = None
+                if use_balanced and balanced_cluster_only_df is not None:
+                    split_co = _split_balanced_dataset(balanced_cluster_only_df)
+                    if split_co is None:
+                        st.warning(
+                            "El dataset balanceado Cluster no tiene split valido. "
+                            "Usando dataset original para Cluster."
+                        )
+                    else:
+                        train_co, test_co = split_co
+                        if not _get_cluster_cols(train_co):
+                            st.warning(
+                                "El dataset balanceado Cluster no incluye variables de cluster. "
+                                "Usando dataset original para Cluster."
+                            )
+                        else:
+                            cluster_only_split = (train_co, test_co)
+
+                # Dataset balanceado para modelo Base + Cluster (aligned con Optuna "Base + Cluster")
                 cluster_split: Optional[Tuple[pd.DataFrame, pd.DataFrame]] = None
                 if use_balanced and balanced_cluster_df is not None:
                     split = _split_balanced_dataset(balanced_cluster_df)
                     if split is None:
                         st.warning(
-                            "El dataset balanceado no tiene split valido. "
+                            "El dataset balanceado Base + Cluster no tiene split valido. "
                             "Usando dataset original."
                         )
                     else:
                         train_df, test_df = split
                         if not _get_cluster_cols(train_df):
                             st.warning(
-                                "El dataset balanceado no incluye variables de cluster. "
+                                "El dataset balanceado Base + Cluster no incluye variables de cluster. "
                                 "Usando dataset original."
                             )
                         else:
                             cluster_split = (train_df, test_df)
 
-                if cluster_split is not None:
-                    train_df, test_df = cluster_split
+                # Fallback: construir cluster_train_df desde el original si alguno falta
+                cluster_train_df: Optional[pd.DataFrame] = None
+                if cluster_only_split is None or cluster_split is None:
+                    cluster_train_df = _build_cluster_dataset(
+                        base_df,
+                        cluster_features_df=cluster_features_df,
+                    )
+
+                # Entrenamiento modelo Cluster-only
+                if cluster_only_split is not None:
+                    train_co, test_co = cluster_only_split
                     st.caption(
-                        "Cluster/Base + Cluster (train/test): "
-                        f"{len(train_df):,} / {len(test_df):,}"
+                        f"Cluster (train/test): {len(train_co):,} / {len(test_co):,}"
                     )
                     try:
                         progress.set_description("Entrenando modelo Cluster")
@@ -8726,8 +9611,27 @@ def _render_model_tab() -> None:
                             feature_group="cluster",
                             model_params=model_params_cluster_only,
                             use_split=True,
-                            train_df=train_df,
-                            test_df=test_df,
+                            train_df=train_co,
+                            test_df=test_co,
+                        )
+                    except Exception as exc:
+                        progress.close()
+                        st.error(f"No se pudo entrenar el modelo Cluster: {exc}")
+                        return
+                    progress.update(1)
+                elif cluster_train_df is not None:
+                    try:
+                        progress.set_description("Entrenando modelo Cluster")
+                        (
+                            cluster_only_results_by_protocol,
+                            cluster_only_result,
+                            cluster_only_feature_cols_used,
+                        ) = _train_feature_group_protocols(
+                            label="Cluster",
+                            feature_group="cluster",
+                            model_params=model_params_cluster_only,
+                            use_split=False,
+                            df=cluster_train_df,
                         )
                     except Exception as exc:
                         progress.close()
@@ -8735,6 +9639,12 @@ def _render_model_tab() -> None:
                         return
                     progress.update(1)
 
+                # Entrenamiento modelo Base + Cluster
+                if cluster_split is not None:
+                    train_df, test_df = cluster_split
+                    st.caption(
+                        f"Base + Cluster (train/test): {len(train_df):,} / {len(test_df):,}"
+                    )
                     try:
                         progress.set_description("Entrenando modelo Base + Cluster")
                         (
@@ -8756,51 +9666,27 @@ def _render_model_tab() -> None:
                         )
                         return
                     progress.update(1)
-                else:
-                    cluster_train_df = _build_cluster_dataset(
-                        base_df,
-                        cluster_features_df=cluster_features_df,
-                    )
-                    if cluster_train_df is not None:
-                        try:
-                            progress.set_description("Entrenando modelo Cluster")
-                            (
-                                cluster_only_results_by_protocol,
-                                cluster_only_result,
-                                cluster_only_feature_cols_used,
-                            ) = _train_feature_group_protocols(
-                                label="Cluster",
-                                feature_group="cluster",
-                                model_params=model_params_cluster_only,
-                                use_split=False,
-                                df=cluster_train_df,
-                            )
-                        except Exception as exc:
-                            progress.close()
-                            st.error(f"No se pudo entrenar el modelo Cluster: {exc}")
-                            return
-                        progress.update(1)
-
-                        try:
-                            progress.set_description("Entrenando modelo Base + Cluster")
-                            (
-                                cluster_results_by_protocol,
-                                cluster_result,
-                                cluster_feature_cols_used,
-                            ) = _train_feature_group_protocols(
-                                label="Base + Cluster",
-                                feature_group="base_cluster",
-                                model_params=model_params_cluster,
-                                use_split=False,
-                                df=cluster_train_df,
-                            )
-                        except Exception as exc:
-                            progress.close()
-                            st.error(
-                                f"No se pudo entrenar el modelo Base + Cluster: {exc}"
-                            )
-                            return
-                        progress.update(1)
+                elif cluster_train_df is not None:
+                    try:
+                        progress.set_description("Entrenando modelo Base + Cluster")
+                        (
+                            cluster_results_by_protocol,
+                            cluster_result,
+                            cluster_feature_cols_used,
+                        ) = _train_feature_group_protocols(
+                            label="Base + Cluster",
+                            feature_group="base_cluster",
+                            model_params=model_params_cluster,
+                            use_split=False,
+                            df=cluster_train_df,
+                        )
+                    except Exception as exc:
+                        progress.close()
+                        st.error(
+                            f"No se pudo entrenar el modelo Base + Cluster: {exc}"
+                        )
+                        return
+                    progress.update(1)
 
                 if cluster_only_result is not None:
                     for protocol, result in cluster_only_results_by_protocol.items():
@@ -11287,6 +12173,921 @@ def _render_best_highway_section_experiment() -> None:
         st.success(f"Resultados guardados en {res_path}")
 
 
+def _default_controlled_comparison_search_space() -> Dict[str, object]:
+    return {
+        "smote": {
+            "k_neighbors": {"min": 1, "max": 15, "step": 1},
+            "sampling_strategy": {"min": 0.001, "max": 0.1, "step": 0.005},
+        },
+        "rf": {
+            "n_estimators": {"min": 50, "max": 300, "step": 25},
+            "max_depth": {"min": 3, "max": 15, "step": 1},
+            "min_samples_split": {"min": 2, "max": 10, "step": 1},
+            "min_samples_leaf": {"min": 1, "max": 5, "step": 1},
+            "max_features": ["sqrt", "log2", None],
+            "class_weight": [None, "balanced"],
+        },
+        "svm": {
+            "C": {"min": 0.1, "max": 10.0, "step": 0.5},
+            "kernel": ["rbf", "linear"],
+            "gamma": ["scale", "auto"],
+            "degree": {"min": 2, "max": 5, "step": 1},
+            "coef0": {"min": 0.0, "max": 1.0, "step": 0.2},
+            "class_weight": [None, "balanced"],
+        },
+        "xgb": {
+            "n_estimators": {"min": 50, "max": 300, "step": 25},
+            "max_depth": {"min": 3, "max": 15, "step": 1},
+            "learning_rate": {"min": 0.01, "max": 0.30, "step": 0.01},
+            "subsample": {"min": 0.5, "max": 1.0, "step": 0.1},
+            "colsample_bytree": {"min": 0.5, "max": 1.0, "step": 0.1},
+            "min_child_weight": {"min": 1.0, "max": 10.0, "step": 1.0},
+            "reg_alpha": {"min": 0.0, "max": 5.0, "step": 0.1},
+            "reg_lambda": {"min": 1.0, "max": 10.0, "step": 0.1},
+            "gamma": {"min": 0.0, "max": 5.0, "step": 0.1},
+            "scale_pos_weight_multipliers": [0.5, 1.0, 2.0, 5.0, 10.0],
+            "max_delta_step": [0.0, 1.0],
+        },
+        "balanced_rf": {
+            "replacement": [False],
+        },
+    }
+
+
+def _enrich_best_section_controlled_frame(
+    frame: object,
+    *,
+    run_id: str,
+    dataset_name: str,
+    features_name: str,
+    segment_index: int,
+    segment_info: Dict[str, object],
+    checkpoint_run_dir: Optional[object] = None,
+) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    enriched = frame.copy()
+    enriched["experiment"] = "Best highway section"
+    enriched["protocol_family"] = "Controlled comparison"
+    enriched["sweep_run_id"] = run_id
+    enriched["dataset_name"] = dataset_name
+    enriched["features_name"] = features_name
+    enriched["segment_index"] = int(segment_index)
+    enriched["segment_eje"] = segment_info.get("eje")
+    enriched["segment_calzada"] = segment_info.get("calzada")
+    enriched["segment_portico_last"] = segment_info.get("portico_inicio")
+    enriched["segment_portico_next"] = segment_info.get("portico_fin")
+    enriched["segment_label"] = segment_info.get("segment_label")
+    enriched["segment_info"] = json.dumps(
+        segment_info,
+        ensure_ascii=True,
+        default=_json_default,
+    )
+    if checkpoint_run_dir:
+        enriched["checkpoint_run_dir"] = str(checkpoint_run_dir)
+    return enriched
+
+
+def _render_best_highway_section_controlled_experiment() -> None:
+    st.subheader("Best highway section")
+    st.caption(
+        "Barre tramos usando el mismo protocolo de Comparación controlada: "
+        "split temporal congelado por tramo, ranking solo en train, Base/Cluster/Base + Cluster, "
+        "sin/con SMOTE y protocolos Conservador/Robusto."
+    )
+
+    event_files = _list_event_files()
+    if not event_files:
+        st.warning("No hay archivos de eventos (accidents) en Datos.")
+        return
+    feature_files = _list_flow_feature_files()
+    if not feature_files:
+        st.warning("No hay archivos de features en Resultados.")
+        return
+
+    event_names = [p.name for p in event_files]
+    feature_names = [p.name for p in feature_files]
+    selected_event = st.selectbox(
+        "Archivo de Eventos",
+        event_names,
+        key="exp_best_section_controlled_event_file",
+    )
+    selected_features = st.selectbox(
+        "Archivo de Features",
+        feature_names,
+        key="exp_best_section_controlled_feature_file",
+    )
+    selected_event_path = next(
+        (p for p in event_files if p.name == selected_event),
+        None,
+    )
+    selected_features_path = next(
+        (p for p in feature_files if p.name == selected_features),
+        None,
+    )
+    if selected_event_path is None or selected_features_path is None:
+        st.error("No se pudieron resolver los archivos seleccionados.")
+        return
+
+    dataset_date_start, dataset_date_end, dataset_date_valid = (
+        _render_controlled_feature_date_range_inputs(
+            selected_features_path,
+            key_prefix="exp_best_section_controlled",
+        )
+    )
+    if not dataset_date_valid:
+        return
+
+    try:
+        schema_df = _inspect_controlled_feature_schema(selected_features_path)
+    except Exception as exc:
+        st.error(f"No se pudo inspeccionar el archivo de features: {exc}")
+        return
+
+    all_schema_cols = _get_feature_cols(schema_df)
+    cluster_schema_cols = _get_cluster_cols(schema_df)
+    base_schema_cols = [
+        col for col in all_schema_cols if col not in cluster_schema_cols
+    ]
+    if not cluster_schema_cols:
+        st.error(
+            "El archivo seleccionado no contiene variables de cluster. "
+            "Este barrido usa el estándar de Comparación controlada y requiere "
+            "Base, Cluster y Base + Cluster."
+        )
+        return
+    if not base_schema_cols:
+        st.error("No hay variables Base disponibles para comparar.")
+        return
+    max_available_features = max(1, len(all_schema_cols))
+
+    objective_options = {
+        "PR-AUC": "pr_auc",
+        "ROC-AUC": "roc_auc",
+        "Balanced F1": "balanced_f1",
+        "F1": "f1",
+        "MCC": "mcc",
+        "Recall@N alertas/día": "recall_at_alerts_per_day",
+        "Costo operacional": "operational_cost",
+    }
+    threshold_objective_options = {
+        "Recall@N alertas/día": "recall_at_alerts_per_day",
+        "FAR": "far",
+        "Balanced F1": "balanced_f1",
+        "F1": "f1",
+        "MCC": "mcc",
+        "Costo operacional": "operational_cost",
+    }
+    protocol_options = {
+        "Conservador": "conservative",
+        "Robusto": "robust",
+    }
+
+    st.markdown("**Configuración general**")
+    cfg1, cfg2, cfg3, cfg4 = st.columns(4)
+    with cfg1:
+        random_state = st.number_input(
+            "Random state",
+            min_value=0,
+            value=42,
+            step=1,
+            key="exp_best_section_controlled_random_state",
+        )
+    with cfg2:
+        n_trials = st.number_input(
+            "Optuna trials",
+            min_value=1,
+            value=30,
+            step=1,
+            key="exp_best_section_controlled_n_trials",
+        )
+    with cfg3:
+        timeout = st.number_input(
+            "Optuna timeout (seg)",
+            min_value=1,
+            value=3600,
+            step=10,
+            key="exp_best_section_controlled_timeout",
+        )
+    with cfg4:
+        objective_labels = list(objective_options.keys())
+        objective_label = st.selectbox(
+            "Métrica Optuna/ranking",
+            objective_labels,
+            index=objective_labels.index("Balanced F1"),
+            key="exp_best_section_controlled_objective_metric",
+        )
+    objective_metric = objective_options.get(objective_label, "balanced_f1")
+
+    selected_models = st.multiselect(
+        "Modelos a comparar",
+        list(CONTROLLED_COMPARISON_MODELS),
+        default=list(CONTROLLED_COMPARISON_MODELS),
+        key="exp_best_section_controlled_selected_models",
+    )
+    selected_protocol_labels = st.multiselect(
+        "Protocolos de evaluación",
+        list(protocol_options.keys()),
+        default=list(protocol_options.keys()),
+        key="exp_best_section_controlled_threshold_protocols",
+    )
+    threshold_protocols = [
+        protocol_options[label]
+        for label in selected_protocol_labels
+        if label in protocol_options
+    ] or ["conservative"]
+
+    st.markdown("**Threshold operacional**")
+    thr1, thr2, thr3, thr4 = st.columns(4)
+    with thr1:
+        threshold_objective_label = st.selectbox(
+            "Objetivo de threshold",
+            list(threshold_objective_options.keys()),
+            index=0,
+            key="exp_best_section_controlled_threshold_objective",
+        )
+    with thr2:
+        alerts_per_day = st.number_input(
+            "Alertas máximas por día",
+            min_value=0.1,
+            max_value=50.0,
+            value=5.0,
+            step=0.5,
+            key="exp_best_section_controlled_alerts_per_day",
+        )
+    with thr3:
+        far_target = st.slider(
+            "FAR target",
+            min_value=0.0,
+            max_value=0.5,
+            value=0.2,
+            step=0.01,
+            key="exp_best_section_controlled_far_target",
+        )
+    with thr4:
+        calibration_method = st.selectbox(
+            "Calibración",
+            ["sigmoid", "none", "isotonic"],
+            index=0,
+            key="exp_best_section_controlled_calibration_method",
+        )
+    threshold_objective = threshold_objective_options.get(
+        threshold_objective_label,
+        "recall_at_alerts_per_day",
+    )
+
+    cost1, cost2, cost3 = st.columns(3)
+    with cost1:
+        fn_cost = st.number_input(
+            "Costo FN",
+            min_value=0.0,
+            value=10.0,
+            step=1.0,
+            key="exp_best_section_controlled_fn_cost",
+        )
+    with cost2:
+        fp_cost = st.number_input(
+            "Costo FP",
+            min_value=0.0,
+            value=1.0,
+            step=0.5,
+            key="exp_best_section_controlled_fp_cost",
+        )
+    with cost3:
+        robust_folds = st.number_input(
+            "Folds robustos",
+            min_value=2,
+            max_value=10,
+            value=3,
+            step=1,
+            key="exp_best_section_controlled_robust_folds",
+        )
+
+    st.markdown("**Split, K y paralelización**")
+    split1, split2, split3, split4 = st.columns(4)
+    with split1:
+        test_size = st.slider(
+            "Test size",
+            min_value=0.1,
+            max_value=0.5,
+            value=0.2,
+            step=0.05,
+            key="exp_best_section_controlled_test_size",
+        )
+    with split2:
+        val_size = st.slider(
+            "Validation size",
+            min_value=0.1,
+            max_value=0.5,
+            value=0.2,
+            step=0.05,
+            key="exp_best_section_controlled_val_size",
+        )
+    with split3:
+        parallel_jobs = st.number_input(
+            "Jobs paralelos RF/ranking",
+            min_value=1,
+            max_value=_max_optuna_parallel_jobs(),
+            value=min(10, _max_optuna_parallel_jobs()),
+            step=1,
+            key="exp_best_section_controlled_parallel_jobs",
+        )
+    with split4:
+        xgb_parallel_jobs = _render_model_n_jobs_input(
+            "Jobs paralelos XGBoost",
+            key="exp_best_section_controlled_xgb_parallel_jobs",
+            default=1,
+            shared_key="global_xgb_parallel_jobs",
+        )
+    optuna_n_jobs = _render_optuna_n_jobs_input(
+        "Optuna jobs paralelos",
+        key="exp_best_section_controlled_optuna_n_jobs",
+        default=5,
+    )
+
+    k_state_file_key = "exp_best_section_controlled_k_feature_file"
+    if st.session_state.get(k_state_file_key) != str(selected_features_path):
+        st.session_state["exp_best_section_controlled_k_min"] = min(
+            10,
+            max_available_features,
+        )
+        st.session_state["exp_best_section_controlled_k_max"] = max_available_features
+        st.session_state["exp_best_section_controlled_k_step"] = min(
+            5,
+            max_available_features,
+        )
+        st.session_state[k_state_file_key] = str(selected_features_path)
+
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        k_min = st.number_input(
+            "K mínimo",
+            min_value=1,
+            max_value=max_available_features,
+            value=min(10, max_available_features),
+            step=1,
+            key="exp_best_section_controlled_k_min",
+        )
+    with k2:
+        k_max = st.number_input(
+            "K máximo",
+            min_value=1,
+            max_value=max_available_features,
+            value=max_available_features,
+            step=1,
+            key="exp_best_section_controlled_k_max",
+        )
+    with k3:
+        k_step = st.number_input(
+            "Paso K",
+            min_value=1,
+            max_value=max_available_features,
+            value=min(5, max_available_features),
+            step=1,
+            key="exp_best_section_controlled_k_step",
+        )
+
+    reuse_checkpoints = st.checkbox(
+        "Reutilizar checkpoints compatibles por tramo",
+        value=True,
+        key="exp_best_section_controlled_reuse_checkpoints",
+        help=(
+            "Si ya existe una corrida compatible por tramo, se carga o reanuda. "
+            "Desactívalo para recalcular todo desde cero."
+        ),
+    )
+    search_space = _default_controlled_comparison_search_space()
+    with st.expander("Rangos equivalentes a Comparación controlada", expanded=False):
+        st.json(search_space)
+
+    k_grid_by_set = {
+        "Base": _k_grid_values(
+            k_min=int(k_min),
+            k_max=int(k_max),
+            k_step=int(k_step),
+            feature_count=len(base_schema_cols),
+        ),
+        "Cluster": _k_grid_values(
+            k_min=int(k_min),
+            k_max=int(k_max),
+            k_step=int(k_step),
+            feature_count=len(cluster_schema_cols),
+        ),
+        "Base + Cluster": _k_grid_values(
+            k_min=int(k_min),
+            k_max=int(k_max),
+            k_step=int(k_step),
+            feature_count=len(all_schema_cols),
+        ),
+    }
+    st.caption(
+        "Variables detectadas: "
+        f"Base={len(base_schema_cols)} | Cluster={len(cluster_schema_cols)} | "
+        f"Base + Cluster={len(all_schema_cols)}. "
+        "Grilla K: "
+        f"Base={k_grid_by_set['Base']} | "
+        f"Cluster={k_grid_by_set['Cluster']} | "
+        f"Base + Cluster={k_grid_by_set['Base + Cluster']}."
+    )
+
+    if st.button(
+        "Iniciar barrido controlado por tramo",
+        key="exp_best_section_controlled_run",
+    ):
+        if not selected_models:
+            st.error("Seleccione al menos un modelo para ejecutar el barrido.")
+            return
+        if not threshold_protocols:
+            st.error("Seleccione al menos un protocolo de evaluación.")
+            return
+        if int(k_min) > int(k_max):
+            st.error("K mínimo no puede ser mayor que K máximo.")
+            return
+
+        accidents_df_for_tramo = _load_accidents_for_event(selected_event_path)
+        if accidents_df_for_tramo is None or accidents_df_for_tramo.empty:
+            st.error("No se pudieron cargar accidentes procesados para el evento seleccionado.")
+            return
+
+        try:
+            con = duckdb.connect(str(selected_features_path), read_only=True)
+            table_rows = con.execute("SHOW TABLES").fetchall()
+            tables = [row[0] for row in table_rows]
+            table_name = _pick_duckdb_table(
+                tables,
+                ["flow_features", "features", "cluster_features"],
+            )
+            if not table_name:
+                st.error("La base de datos de features está vacía.")
+                return
+            table_ref = _duckdb_quote_identifier(table_name)
+            cols_info = con.execute(f"DESCRIBE {table_ref}").fetchall()
+            columns = {row[0] for row in cols_info}
+            if {"portico_last", "portico_next"}.issubset(columns):
+                segment_cols = ("portico_last", "portico_next")
+            elif {"portico_inicio", "portico_fin"}.issubset(columns):
+                segment_cols = ("portico_inicio", "portico_fin")
+            else:
+                st.error(
+                    "El archivo de features no contiene columnas de tramo "
+                    "(portico_last/portico_next o portico_inicio/portico_fin)."
+                )
+                return
+            select_parts = [
+                f"{_duckdb_quote_identifier(segment_cols[0])} AS portico_last",
+                f"{_duckdb_quote_identifier(segment_cols[1])} AS portico_next",
+            ]
+            if "eje" in columns:
+                select_parts.append(f"{_duckdb_quote_identifier('eje')} AS eje")
+            if "calzada" in columns:
+                select_parts.append(f"{_duckdb_quote_identifier('calzada')} AS calzada")
+            clauses = [
+                f"{_duckdb_quote_identifier(segment_cols[0])} IS NOT NULL",
+                f"{_duckdb_quote_identifier(segment_cols[1])} IS NOT NULL",
+            ]
+            params: List[object] = []
+            if "interval_start" in columns:
+                interval_ref = _duckdb_quote_identifier("interval_start")
+                if dataset_date_start is not None:
+                    clauses.append(f"TRY_CAST({interval_ref} AS TIMESTAMP) >= ?")
+                    params.append(pd.Timestamp(dataset_date_start))
+                if dataset_date_end is not None:
+                    clauses.append(f"TRY_CAST({interval_ref} AS TIMESTAMP) <= ?")
+                    params.append(pd.Timestamp(dataset_date_end))
+            segments_df = con.execute(
+                "SELECT DISTINCT "
+                + ", ".join(select_parts)
+                + f" FROM {table_ref} WHERE "
+                + " AND ".join(clauses),
+                params,
+            ).df()
+        except Exception as exc:
+            st.error(f"Error leyendo tramos desde features: {exc}")
+            return
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+        if segments_df.empty:
+            st.warning("No se encontraron tramos con datos en el rango seleccionado.")
+            return
+        segments_df = segments_df.copy()
+        segments_df["portico_last_raw"] = segments_df["portico_last"].astype(str).str.strip()
+        segments_df["portico_next_raw"] = segments_df["portico_next"].astype(str).str.strip()
+        segments_df["portico_last_norm"] = _normalize_portico_series(
+            segments_df["portico_last_raw"]
+        )
+        segments_df["portico_next_norm"] = _normalize_portico_series(
+            segments_df["portico_next_raw"]
+        )
+        segments_df = segments_df.dropna(
+            subset=["portico_last_norm", "portico_next_norm"]
+        )
+        if segments_df.empty:
+            st.warning("No hay tramos válidos en el archivo de features.")
+            return
+        if not {"eje", "calzada"}.issubset(segments_df.columns):
+            try:
+                porticos_df = load_porticos()
+                seg_meta = get_portico_segments(porticos_df)
+                if seg_meta is not None and not seg_meta.empty:
+                    seg_meta = seg_meta.copy()
+                    seg_meta["portico_last_norm"] = _normalize_portico_series(
+                        seg_meta["portico_last"]
+                    )
+                    seg_meta["portico_next_norm"] = _normalize_portico_series(
+                        seg_meta["portico_next"]
+                    )
+                    segments_df = segments_df.merge(
+                        seg_meta[
+                            [
+                                "eje",
+                                "calzada",
+                                "portico_last_norm",
+                                "portico_next_norm",
+                            ]
+                        ],
+                        on=["portico_last_norm", "portico_next_norm"],
+                        how="left",
+                    )
+            except Exception:
+                pass
+        segments_df = segments_df.drop_duplicates(
+            subset=[
+                col
+                for col in ["eje", "calzada", "portico_last_raw", "portico_next_raw"]
+                if col in segments_df.columns
+            ]
+        ).reset_index(drop=True)
+
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        exp_meta = {
+            "run_id": run_id,
+            "protocol_family": "Controlled comparison",
+            "dataset_name": selected_event,
+            "features_name": selected_features,
+            "dataset_date_start": (
+                None
+                if dataset_date_start is None
+                else str(pd.Timestamp(dataset_date_start))
+            ),
+            "dataset_date_end": (
+                None
+                if dataset_date_end is None
+                else str(pd.Timestamp(dataset_date_end))
+            ),
+            "random_state": int(random_state),
+            "objective_metric": objective_metric,
+            "objective_label": objective_label,
+            "threshold_protocols": list(threshold_protocols),
+            "threshold_objective": threshold_objective,
+            "threshold_objective_label": threshold_objective_label,
+            "calibration_method": calibration_method,
+            "far_target": float(far_target),
+            "alerts_per_day": float(alerts_per_day),
+            "fn_cost": float(fn_cost),
+            "fp_cost": float(fp_cost),
+            "robust_folds": int(robust_folds),
+            "selected_models": list(selected_models),
+            "test_size": float(test_size),
+            "val_size": float(val_size),
+            "k_min": int(k_min),
+            "k_max": int(k_max),
+            "k_step": int(k_step),
+            "k_grid_by_set": k_grid_by_set,
+            "n_trials": int(n_trials),
+            "timeout": int(timeout),
+            "optuna_n_jobs": int(optuna_n_jobs),
+            "parallel_jobs": int(parallel_jobs),
+            "xgb_parallel_jobs": int(xgb_parallel_jobs),
+            "search_space_config": search_space,
+            "segment_count": int(len(segments_df)),
+            "reuse_checkpoints": bool(reuse_checkpoints),
+        }
+        exp_db_path = _init_experiment_db("Best highway section", exp_meta)
+        if exp_db_path:
+            st.caption(f"DB live: {exp_db_path}")
+
+        runner = ExperimentsRunner(random_state=int(random_state))
+        checkpoint_root = RESULTS_DIR / "best_highway_section_controlled_runs"
+        total_segments = int(len(segments_df))
+        progress_bar = st.progress(0, text="Preparando barrido controlado por tramo...")
+        summary_frames: List[pd.DataFrame] = []
+        curve_frames: List[pd.DataFrame] = []
+        grid_frames: List[pd.DataFrame] = []
+        error_records: List[Dict[str, object]] = []
+
+        for idx, row in enumerate(segments_df.itertuples(index=False), start=1):
+            seg_last_raw = str(getattr(row, "portico_last_raw", "")).strip()
+            seg_next_raw = str(getattr(row, "portico_next_raw", "")).strip()
+            eje = getattr(row, "eje", None)
+            calzada = getattr(row, "calzada", None)
+            segment_label = (
+                f"{'' if pd.isna(eje) else str(eje)} | "
+                f"{'' if pd.isna(calzada) else str(calzada)} | "
+                f"{seg_last_raw} -> {seg_next_raw}"
+            ).strip(" |")
+            segment_info = {
+                "eje": None if pd.isna(eje) else str(eje),
+                "calzada": None if pd.isna(calzada) else str(calzada),
+                "portico_inicio": seg_last_raw,
+                "portico_fin": seg_next_raw,
+                "segment_label": segment_label,
+            }
+            tramo_tuple = (
+                segment_info["eje"],
+                segment_info["calzada"],
+                seg_last_raw,
+                seg_next_raw,
+            )
+
+            progress_bar.progress(
+                int(((idx - 1) / max(1, total_segments)) * 100),
+                text=f"Preparando tramo {idx}/{total_segments}: {segment_label}",
+            )
+
+            try:
+                base_df = _prepare_controlled_comparison_base_df(
+                    accidents_df_for_tramo=accidents_df_for_tramo,
+                    selected_features_path=selected_features_path,
+                    tramo_tuple=tramo_tuple,
+                    date_start=dataset_date_start,
+                    date_end=dataset_date_end,
+                )
+            except Exception as exc:
+                error_payload = {
+                    "experiment": "Best highway section",
+                    "protocol_family": "Controlled comparison",
+                    "sweep_run_id": run_id,
+                    "dataset_name": selected_event,
+                    "features_name": selected_features,
+                    "segment_index": int(idx),
+                    "segment_eje": segment_info["eje"],
+                    "segment_calzada": segment_info["calzada"],
+                    "segment_portico_last": seg_last_raw,
+                    "segment_portico_next": seg_next_raw,
+                    "segment_label": segment_label,
+                    "objective_metric": objective_metric,
+                    "objective_label": objective_label,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+                error_records.append(error_payload)
+                grid_frames.append(pd.DataFrame([error_payload]))
+                _append_experiment_result(exp_db_path, error_payload)
+                continue
+
+            def _progress_callback(value: int, message: str) -> None:
+                bounded = max(0, min(100, int(value)))
+                overall = int((((idx - 1) + bounded / 100.0) / max(1, total_segments)) * 100)
+                progress_bar.progress(
+                    max(0, min(100, overall)),
+                    text=f"Tramo {idx}/{total_segments}: {message}",
+                )
+
+            def _result_callback(payload: Dict[str, object]) -> None:
+                payload_df = _enrich_best_section_controlled_frame(
+                    pd.DataFrame([payload]),
+                    run_id=run_id,
+                    dataset_name=selected_event,
+                    features_name=selected_features,
+                    segment_index=idx,
+                    segment_info=segment_info,
+                )
+                if not payload_df.empty:
+                    _append_experiment_result(
+                        exp_db_path,
+                        payload_df.iloc[0].to_dict(),
+                    )
+
+            try:
+                payload = runner.run_controlled_comparison(
+                    base_df,
+                    event_path=selected_event_path,
+                    features_path=selected_features_path,
+                    segment_info=segment_info,
+                    dataset_date_start=dataset_date_start,
+                    dataset_date_end=dataset_date_end,
+                    objective_metric=objective_metric,
+                    threshold_protocols=list(threshold_protocols),
+                    threshold_objective=threshold_objective,
+                    calibration_method=str(calibration_method),
+                    far_target=float(far_target),
+                    alerts_per_day=float(alerts_per_day),
+                    fn_cost=float(fn_cost),
+                    fp_cost=float(fp_cost),
+                    robust_folds=int(robust_folds),
+                    test_size=float(test_size),
+                    val_size=float(val_size),
+                    k_min=int(k_min),
+                    k_max=int(k_max),
+                    k_step=int(k_step),
+                    n_trials=int(n_trials),
+                    timeout=int(timeout),
+                    optuna_n_jobs=int(optuna_n_jobs),
+                    parallel_jobs=int(parallel_jobs),
+                    xgb_parallel_jobs=int(xgb_parallel_jobs),
+                    selected_models=list(selected_models),
+                    search_space_config=search_space,
+                    progress_callback=_progress_callback,
+                    result_callback=_result_callback,
+                    checkpoint_root=checkpoint_root,
+                    auto_resume=bool(reuse_checkpoints),
+                    start_fresh=not bool(reuse_checkpoints),
+                )
+            except Exception as exc:
+                error_payload = {
+                    "experiment": "Best highway section",
+                    "protocol_family": "Controlled comparison",
+                    "sweep_run_id": run_id,
+                    "dataset_name": selected_event,
+                    "features_name": selected_features,
+                    "segment_index": int(idx),
+                    "segment_eje": segment_info["eje"],
+                    "segment_calzada": segment_info["calzada"],
+                    "segment_portico_last": seg_last_raw,
+                    "segment_portico_next": seg_next_raw,
+                    "segment_label": segment_label,
+                    "objective_metric": objective_metric,
+                    "objective_label": objective_label,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+                error_records.append(error_payload)
+                grid_frames.append(pd.DataFrame([error_payload]))
+                _append_experiment_result(exp_db_path, error_payload)
+                continue
+
+            checkpoint_run_dir = payload.get("checkpoint_run_dir")
+            summary_frames.append(
+                _enrich_best_section_controlled_frame(
+                    payload.get("best_summary_df"),
+                    run_id=run_id,
+                    dataset_name=selected_event,
+                    features_name=selected_features,
+                    segment_index=idx,
+                    segment_info=segment_info,
+                    checkpoint_run_dir=checkpoint_run_dir,
+                )
+            )
+            curve_frames.append(
+                _enrich_best_section_controlled_frame(
+                    payload.get("curves_df"),
+                    run_id=run_id,
+                    dataset_name=selected_event,
+                    features_name=selected_features,
+                    segment_index=idx,
+                    segment_info=segment_info,
+                    checkpoint_run_dir=checkpoint_run_dir,
+                )
+            )
+            grid_frames.append(
+                _enrich_best_section_controlled_frame(
+                    payload.get("grid_results_df"),
+                    run_id=run_id,
+                    dataset_name=selected_event,
+                    features_name=selected_features,
+                    segment_index=idx,
+                    segment_info=segment_info,
+                    checkpoint_run_dir=checkpoint_run_dir,
+                )
+            )
+
+        progress_bar.empty()
+
+        summary_df = (
+            pd.concat([frame for frame in summary_frames if not frame.empty], ignore_index=True)
+            if any(not frame.empty for frame in summary_frames)
+            else pd.DataFrame()
+        )
+        curves_df = (
+            pd.concat([frame for frame in curve_frames if not frame.empty], ignore_index=True)
+            if any(not frame.empty for frame in curve_frames)
+            else pd.DataFrame()
+        )
+        grid_results_df = (
+            pd.concat([frame for frame in grid_frames if not frame.empty], ignore_index=True)
+            if any(not frame.empty for frame in grid_frames)
+            else pd.DataFrame()
+        )
+
+        best_row = None
+        if not summary_df.empty and "val_objective_score" in summary_df.columns:
+            summary_df = summary_df.copy()
+            summary_df["val_objective_score"] = pd.to_numeric(
+                summary_df["val_objective_score"],
+                errors="coerce",
+            )
+            valid_summary = summary_df.copy()
+            if "status" in valid_summary.columns:
+                valid_summary = valid_summary[
+                    valid_summary["status"].astype(str).str.lower() == "completed"
+                ]
+            valid_summary = valid_summary.dropna(subset=["val_objective_score"])
+            summary_df["is_best"] = False
+            summary_df["is_best_segment"] = False
+            if not valid_summary.empty:
+                best_idx = valid_summary["val_objective_score"].idxmax()
+                summary_df.loc[best_idx, "is_best"] = True
+                best_row = summary_df.loc[best_idx]
+                if "segment_label" in valid_summary.columns:
+                    segment_best_idx = valid_summary.groupby(
+                        "segment_label",
+                        dropna=False,
+                    )["val_objective_score"].idxmax()
+                    summary_df.loc[segment_best_idx, "is_best_segment"] = True
+                rank_df = valid_summary[["val_objective_score"]].copy()
+                rank_df["rank_global"] = (
+                    rank_df["val_objective_score"]
+                    .rank(method="first", ascending=False)
+                    .astype(int)
+                )
+                summary_df.loc[rank_df.index, "rank_global"] = rank_df["rank_global"]
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_path = RESULTS_DIR / f"best_highway_section_controlled_summary_{stamp}.csv"
+        curves_path = RESULTS_DIR / f"best_highway_section_controlled_curves_{stamp}.csv"
+        detail_path = RESULTS_DIR / f"best_highway_section_controlled_grid_{stamp}.csv"
+        summary_df.to_csv(summary_path, index=False)
+        curves_df.to_csv(curves_path, index=False)
+        grid_results_df.to_csv(detail_path, index=False)
+
+        st.session_state["exp_best_section_controlled_last_results"] = {
+            "summary_path": str(summary_path),
+            "curves_path": str(curves_path),
+            "detail_path": str(detail_path),
+            "summary_df": summary_df,
+            "curves_df": curves_df,
+            "grid_results_df": grid_results_df,
+            "run_id": run_id,
+        }
+
+        if error_records:
+            st.warning(
+                f"{len(error_records)} tramo(s) no pudieron evaluarse; quedaron registrados en la tabla completa."
+            )
+        if best_row is not None:
+            best_payload = dict(best_row)
+            _append_experiment_best(exp_db_path, best_payload)
+            st.success(
+                "Mejor tramo por validación "
+                f"{objective_label}: {best_payload.get('segment_label', '?')} | "
+                f"{best_payload.get('model_name', '-')} | "
+                f"{best_payload.get('feature_set', '-')} | "
+                f"{best_payload.get('balance_mode', '-')} | "
+                f"{best_payload.get('threshold_protocol', '-')} | "
+                f"K={best_payload.get('k_optimo', '?')}"
+            )
+        elif summary_df.empty:
+            st.warning("No se generaron resultados completados.")
+
+        st.caption(f"Resumen guardado: {summary_path}")
+        st.caption(f"Curvas guardadas: {curves_path}")
+        st.caption(f"Detalle guardado: {detail_path}")
+
+        if not summary_df.empty or not grid_results_df.empty:
+            if "is_best_segment" in summary_df.columns:
+                section_rank = summary_df[
+                    summary_df["is_best_segment"].astype(str).str.lower().isin(
+                        {"true", "1"}
+                    )
+                ].copy()
+                if not section_rank.empty:
+                    section_rank = section_rank.sort_values(
+                        "val_objective_score",
+                        ascending=False,
+                    )
+                    st.markdown("**Mejor combinación por tramo**")
+                    preferred_cols = [
+                        "rank_global",
+                        "segment_label",
+                        "model_name",
+                        "feature_set",
+                        "balance_mode",
+                        "threshold_protocol",
+                        "k_optimo",
+                        "val_objective_score",
+                        "test_objective_score",
+                        "best_test_balanced_f1",
+                        "best_test_pr_auc",
+                        "best_test_false_alarms_per_day",
+                    ]
+                    st.dataframe(
+                        section_rank[
+                            [col for col in preferred_cols if col in section_rank.columns]
+                        ],
+                        width="stretch",
+                    )
+            _render_controlled_comparison_results_panel(
+                summary_df,
+                curves_df,
+                grid_results_df=grid_results_df,
+                key_prefix=f"best_section_controlled_{stamp}",
+            )
+
+
 def _render_best_highway_section_k_experiment() -> None:
     st.subheader("Best mix Highway section & K")
     st.caption(
@@ -12328,12 +14129,42 @@ def _render_controlled_comparison_experiment() -> None:
         st.error("No se pudieron resolver los archivos seleccionados.")
         return
 
+    dataset_date_start, dataset_date_end, dataset_date_valid = (
+        _render_controlled_feature_date_range_inputs(selected_features_path)
+    )
+    if not dataset_date_valid:
+        return
+
+    schema_df = pd.DataFrame()
+    schema_error = None
+    try:
+        schema_df = _inspect_controlled_feature_schema(selected_features_path)
+    except Exception as exc:
+        schema_error = str(exc)
+
+    if schema_error:
+        st.error(f"No se pudo inspeccionar el archivo de features: {schema_error}")
+        return
+
+    all_schema_cols = _get_feature_cols(schema_df)
+    cluster_schema_cols = _get_cluster_cols(schema_df)
+    base_schema_cols = [
+        col for col in all_schema_cols if col not in cluster_schema_cols
+    ]
+    if not cluster_schema_cols:
+        st.error(
+            "El archivo seleccionado no contiene variables de cluster. "
+            "La comparación controlada requiere Base, Cluster y Base + Cluster."
+        )
+        return
+    max_available_features = max(1, len(all_schema_cols))
+
     accidents_df_for_tramo = _load_accidents_for_event(selected_event_path)
     allowed_porticos = _load_porticos_from_feature_file(selected_features_path)
     tramo_tuple = _build_tramo_selector(
         accidents_df_for_tramo,
-        date_start=None,
-        date_end=None,
+        date_start=dataset_date_start,
+        date_end=dataset_date_end,
         allowed_porticos=allowed_porticos,
         key="exp_controlled_tramo_choice",
     )
@@ -12349,6 +14180,29 @@ def _render_controlled_comparison_experiment() -> None:
         "portico_fin": p_end,
         "segment_label": f"{eje} | {calzada} | {p_start} -> {p_end}",
     }
+    protocol_mode_label = st.radio(
+        "Protocolo experimental",
+        [
+            "Comparación controlada",
+            "Modelos por K",
+            "Ablación cruzada con tuning congelado",
+        ],
+        horizontal=True,
+        key="exp_controlled_protocol_mode",
+        help=(
+            "Comparación controlada calcula un ranking independiente por Base, "
+            "Cluster y Base + Cluster. Modelos por K calcula un único ranking "
+            "global como el tab Feature selection y barre K global. Ablación "
+            "cruzada con tuning congelado tunea Base y Base + Cluster, cruza "
+            "sus hiperparámetros modelo+SMOTE sobre ambos targets con el mismo K "
+            "y recalibra threshold por target; úselo para aislar tuning, no para "
+            "comparar Cluster-only."
+        ),
+    )
+    use_modelos_k_protocol = protocol_mode_label == "Modelos por K"
+    use_frozen_tuning_ablation = (
+        protocol_mode_label == "Ablación cruzada con tuning congelado"
+    )
     objective_options = {
         "PR-AUC": "pr_auc",
         "ROC-AUC": "roc_auc",
@@ -12398,15 +14252,16 @@ def _render_controlled_comparison_experiment() -> None:
             key="exp_controlled_timeout",
         )
     with col_cfg4:
+        objective_labels = list(objective_options.keys())
         objective_label = st.selectbox(
             "Métrica Optuna/ranking",
-            list(objective_options.keys()),
-            index=0,
+            objective_labels,
+            index=objective_labels.index("Balanced F1"),
             key="exp_controlled_objective_metric",
             help=(
                 "Define la métrica que Optuna maximiza para elegir hiperparámetros. "
                 "Valores permitidos: PR-AUC, ROC-AUC, Balanced F1, F1, MCC, "
-                "Recall@N alertas/día o Costo operacional. Default: PR-AUC. "
+                "Recall@N alertas/día o Costo operacional. Default: Balanced F1. "
                 "Usar F1 con eventos raros puede sobreajustar el threshold de validación."
             ),
         )
@@ -12444,6 +14299,51 @@ def _render_controlled_comparison_experiment() -> None:
         for label in selected_protocol_labels
         if label in protocol_options
     ] or ["conservative"]
+
+    feature_selection_n_estimators = 200
+    feature_selection_max_depth: Optional[int] = None
+    feature_selection_n_jobs = -1
+    if use_modelos_k_protocol:
+        st.markdown("**Ranking global estilo Feature selection**")
+        rank_col1, rank_col2, rank_col3 = st.columns(3)
+        with rank_col1:
+            feature_selection_n_estimators = int(
+                st.number_input(
+                    "FS n_estimators",
+                    min_value=50,
+                    value=200,
+                    step=50,
+                    key="exp_controlled_fs_n_estimators",
+                    help=(
+                        "Mismo control que Feature selection. Se calcula una sola "
+                        "vez por corrida y luego se barre K global."
+                    ),
+                )
+            )
+        with rank_col2:
+            feature_selection_max_depth_raw = int(
+                st.number_input(
+                    "FS max_depth (0 = sin limite)",
+                    min_value=0,
+                    value=0,
+                    step=1,
+                    key="exp_controlled_fs_max_depth",
+                    help="Mismo significado que en el tab Feature selection.",
+                )
+            )
+            feature_selection_max_depth = (
+                None
+                if feature_selection_max_depth_raw == 0
+                else int(feature_selection_max_depth_raw)
+            )
+        with rank_col3:
+            feature_selection_n_jobs = -1
+            st.metric("FS random_state", int(random_state))
+        st.caption(
+            "Este modo usa RandomForestClassifier con class_weight='balanced', "
+            "criterion='gini' y n_jobs=-1, igual que Feature selection. Optuna "
+            "se ejecuta para cada K global y cada combinación."
+        )
 
     st.markdown("**Threshold operacional**")
     col_thr1, col_thr2, col_thr3, col_thr4 = st.columns(4)
@@ -12579,13 +14479,11 @@ def _render_controlled_comparison_experiment() -> None:
             key="exp_controlled_parallel_jobs",
         )
     with col_split4:
-        xgb_parallel_jobs = st.number_input(
+        xgb_parallel_jobs = _render_model_n_jobs_input(
             "Jobs paralelos XGBoost",
-            min_value=1,
-            max_value=max_parallel_input_jobs,
-            value=1,
-            step=1,
             key="exp_controlled_xgb_parallel_jobs",
+            default=1,
+            shared_key="global_xgb_parallel_jobs",
         )
 
     optuna_n_jobs = _render_optuna_n_jobs_input(
@@ -12594,30 +14492,30 @@ def _render_controlled_comparison_experiment() -> None:
         default=5,
     )
     st.caption(
-        "SVM se paraleliza a través de Optuna. Random Forest usa `n_jobs`; "
-        "XGBoost usa su propio `n_jobs`, configurable en esta UI."
+        "La UI es la fuente de verdad: Random Forest usa `Jobs paralelos RF/ranking`, "
+        "XGBoost usa `Jobs paralelos XGBoost`, y Optuna usa sólo sus jobs de trials."
     )
-    cpu_overlap_caps: List[str] = []
-    if "Random Forest" in selected_models:
-        rf_optuna_cap = max(1, max_parallel_input_jobs // max(1, int(parallel_jobs)))
-        cpu_overlap_caps.append(
-            f"RF -> Optuna <= {int(rf_optuna_cap)} con RF jobs={int(parallel_jobs)}"
-        )
-    if "XGBoost" in selected_models:
-        xgb_optuna_cap = max(
-            1,
-            max_parallel_input_jobs // max(1, int(xgb_parallel_jobs)),
-        )
-        cpu_overlap_caps.append(
-            "XGBoost -> Optuna <= "
-            f"{int(xgb_optuna_cap)} con XGBoost jobs={int(xgb_parallel_jobs)}"
-        )
-    if cpu_overlap_caps:
-        st.caption(
-            "Guardia anti-solape CPU: "
-            + " | ".join(cpu_overlap_caps)
-            + ". En esos combos, Optuna se ajusta automáticamente si pides más."
-        )
+
+    k_state_file_key = "exp_controlled_k_feature_file"
+    if st.session_state.get(k_state_file_key) != str(selected_features_path):
+        st.session_state["exp_controlled_k_min"] = min(10, max_available_features)
+        st.session_state["exp_controlled_k_max"] = max_available_features
+        st.session_state["exp_controlled_k_step"] = min(5, max_available_features)
+        st.session_state[k_state_file_key] = str(selected_features_path)
+    else:
+        for state_key, fallback in [
+            ("exp_controlled_k_min", min(10, max_available_features)),
+            ("exp_controlled_k_max", max_available_features),
+            ("exp_controlled_k_step", min(5, max_available_features)),
+        ]:
+            try:
+                current_value = int(st.session_state.get(state_key, fallback))
+            except Exception:
+                current_value = fallback
+            st.session_state[state_key] = max(
+                1,
+                min(current_value, max_available_features),
+            )
 
     st.markdown("**Grilla de K**")
     col_k1, col_k2, col_k3 = st.columns(3)
@@ -12625,28 +14523,44 @@ def _render_controlled_comparison_experiment() -> None:
         k_min = st.number_input(
             "K mínimo",
             min_value=1,
-            max_value=500,
-            value=2,
+            max_value=max_available_features,
+            value=min(10, max_available_features),
             step=1,
             key="exp_controlled_k_min",
+            help=(
+                "Cantidad mínima de features a evaluar por conjunto. "
+                f"Default: {min(10, max_available_features)}; rango 1 a "
+                f"{max_available_features}. Si se elige demasiado bajo, los "
+                "modelos pueden quedar subespecificados."
+            ),
         )
     with col_k2:
         k_max = st.number_input(
             "K máximo",
             min_value=1,
-            max_value=500,
-            value=20,
+            max_value=max_available_features,
+            value=max_available_features,
             step=1,
             key="exp_controlled_k_max",
+            help=(
+                "Cantidad máxima de features disponibles en el archivo seleccionado. "
+                f"Default y máximo: {max_available_features}. El runner lo recorta "
+                "por Base, Cluster y Base + Cluster según las columnas reales."
+            ),
         )
     with col_k3:
         k_step = st.number_input(
             "Paso K",
             min_value=1,
-            max_value=100,
-            value=5,
+            max_value=max_available_features,
+            value=min(5, max_available_features),
             step=1,
             key="exp_controlled_k_step",
+            help=(
+                "Incremento entre valores consecutivos de K. Default: "
+                f"{min(5, max_available_features)}. Pasos muy grandes pueden saltar "
+                "el mejor tamaño de feature set."
+            ),
         )
 
     with st.expander("Rangos de optimización", expanded=False):
@@ -12680,30 +14594,45 @@ def _render_controlled_comparison_experiment() -> None:
         with col_smote2:
             smote_str_min = st.number_input(
                 "Sampling strategy min",
-                min_value=0.1,
+                min_value=0.001,
                 max_value=1.0,
-                value=0.1,
-                step=0.1,
-                format="%.2f",
+                value=0.001,
+                step=0.005,
+                format="%.3f",
                 key="exp_controlled_smote_str_min",
+                help=(
+                    "Razón mínima objetivo minoritaria/mayoritaria que SMOTE puede probar. "
+                    "Default: 0.001; rango 0.001 a 1.0. Valores bajo la razón actual "
+                    "se descartan internamente, y valores altos pueden crear demasiados sintéticos."
+                ),
             )
             smote_str_max = st.number_input(
                 "Sampling strategy max",
-                min_value=0.1,
+                min_value=0.001,
                 max_value=1.0,
-                value=1.0,
-                step=0.1,
-                format="%.2f",
+                value=0.1,
+                step=0.005,
+                format="%.3f",
                 key="exp_controlled_smote_str_max",
+                help=(
+                    "Razón máxima objetivo minoritaria/mayoritaria para SMOTE. "
+                    "Default: 0.100; rango 0.001 a 1.0. Subirlo aumenta recall potencial "
+                    "pero también riesgo de sobre-muestreo y falsas alarmas."
+                ),
             )
             smote_str_step = st.number_input(
                 "Sampling strategy step",
-                min_value=0.05,
+                min_value=0.001,
                 max_value=1.0,
-                value=0.1,
-                step=0.05,
-                format="%.2f",
+                value=0.005,
+                step=0.001,
+                format="%.3f",
                 key="exp_controlled_smote_str_step",
+                help=(
+                    "Incremento entre razones de SMOTE en la grilla. Default: 0.005. "
+                    "Un paso demasiado fino aumenta trials equivalentes; uno muy grueso puede "
+                    "omitir una zona estable de balance."
+                ),
             )
 
         st.markdown("**Random Forest**")
@@ -13287,158 +15216,223 @@ def _render_controlled_comparison_experiment() -> None:
         },
     }
 
-    schema_df = pd.DataFrame()
-    schema_error = None
-    try:
-        schema_df = _inspect_controlled_feature_schema(selected_features_path)
-    except Exception as exc:
-        schema_error = str(exc)
-
-    base_schema_cols: List[str] = []
-    cluster_schema_cols: List[str] = []
-    all_schema_cols: List[str] = []
     checkpoint_mode = "Start fresh"
     checkpoint_preview: Optional[Dict[str, object]] = None
     checkpoint_root = RESULTS_DIR / "controlled_comparison_runs"
 
-    if schema_error:
-        st.error(f"No se pudo inspeccionar el archivo de features: {schema_error}")
+    st.caption(
+        "Variables detectadas: "
+        f"Base={len(base_schema_cols)} | "
+        f"Cluster={len(cluster_schema_cols)} | "
+        f"Base + Cluster={len(all_schema_cols)}"
+    )
+    if use_frozen_tuning_ablation:
+        protocol_family = FROZEN_TUNING_ABLATION_PROTOCOL_FAMILY
+    elif use_modelos_k_protocol:
+        protocol_family = "modelos_por_k"
     else:
-        all_schema_cols = _get_feature_cols(schema_df)
-        cluster_schema_cols = _get_cluster_cols(schema_df)
-        base_schema_cols = [
-            col for col in all_schema_cols if col not in cluster_schema_cols
-        ]
-        if not cluster_schema_cols:
-            st.error(
-                "El archivo seleccionado no contiene variables de cluster. "
-                "La comparación controlada requiere Base, Cluster y Base + Cluster."
-            )
-        else:
-            st.caption(
-                "Variables detectadas: "
-                f"Base={len(base_schema_cols)} | "
-                f"Cluster={len(cluster_schema_cols)} | "
-                f"Base + Cluster={len(all_schema_cols)}"
-            )
-            k_grid_by_set = {
-                "Base": _k_grid_values(
-                    k_min=int(k_min),
-                    k_max=int(k_max),
-                    k_step=int(k_step),
-                    feature_count=len(base_schema_cols),
-                ),
-                "Cluster": _k_grid_values(
-                    k_min=int(k_min),
-                    k_max=int(k_max),
-                    k_step=int(k_step),
-                    feature_count=len(cluster_schema_cols),
-                ),
-                "Base + Cluster": _k_grid_values(
-                    k_min=int(k_min),
-                    k_max=int(k_max),
-                    k_step=int(k_step),
-                    feature_count=len(all_schema_cols),
-                ),
-            }
-            st.caption(
-                "Grilla efectiva de K: "
-                f"Base={k_grid_by_set['Base']} | "
-                f"Cluster={k_grid_by_set['Cluster']} | "
-                f"Base + Cluster={k_grid_by_set['Base + Cluster']}"
-            )
-            protocol_preview = {
-                "split_mode": "Temporal",
-                "metric": objective_metric,
-                "objective_metric": objective_metric,
-                "objective_label": objective_label,
-                "optuna_objective_metric": objective_metric,
-                "optuna_objective_label": objective_label,
-                "threshold_protocols": list(threshold_protocols),
-                "threshold_objective": threshold_objective,
-                "threshold_objective_label": threshold_objective_label,
-                "calibration_method": calibration_method,
-                "far_target": float(controlled_far_target),
-                "alerts_per_day": float(controlled_alerts_per_day),
-                "fn_cost": float(controlled_fn_cost),
-                "fp_cost": float(controlled_fp_cost),
-                "robust_folds": int(robust_folds),
-                "test_only_final": True,
-                "models": list(selected_models),
-                "feature_sets": ["Base", "Cluster", "Base + Cluster"],
-                "balance_modes": ["none", "smote"],
-                "test_size": float(test_size),
-                "val_size": float(val_size),
-                "k_min": int(k_min),
-                "k_max": int(k_max),
-                "k_step": int(k_step),
-                "k_grid_by_set": k_grid_by_set,
-                "n_trials": int(n_trials),
-                "timeout": int(timeout),
-                "optuna_n_jobs": int(optuna_n_jobs),
-                "parallel_jobs": int(parallel_jobs),
-                "xgb_parallel_jobs": int(xgb_parallel_jobs),
-                "search_space_config": search_space,
-                "segment_info": segment_info,
-                "event_path": str(selected_event_path),
-                "features_path": str(selected_features_path),
-            }
-            checkpoint_context = build_controlled_comparison_context(
-                event_path=selected_event_path,
-                features_path=selected_features_path,
-                segment_info=segment_info,
-                protocol=protocol_preview,
-            )
-            checkpoint_preview = preview_controlled_comparison_checkpoint(
-                checkpoint_context,
-                checkpoint_root=checkpoint_root,
-            )
-            if checkpoint_preview.get("checkpoint_available"):
-                if checkpoint_preview.get("can_resume"):
-                    st.info(
-                        "Se encontró un checkpoint compatible en progreso. "
-                        f"Run ID: {checkpoint_preview.get('run_id')} | "
-                        f"Paso actual: {checkpoint_preview.get('current_step_id') or '-'} | "
-                        f"Progreso: {checkpoint_preview.get('completed_steps')}/"
-                        f"{checkpoint_preview.get('total_steps')}"
-                    )
-                    checkpoint_mode = st.radio(
-                        "Checkpoint compatible",
-                        ["Resume checkpoint", "Start fresh"],
-                        horizontal=True,
-                        key="exp_controlled_checkpoint_mode",
-                    )
-                elif checkpoint_preview.get("can_load_completed"):
-                    st.info(
-                        "Ya existe una corrida compatible completada. "
-                        f"Run ID: {checkpoint_preview.get('run_id')} | "
-                        f"Actualizado: {checkpoint_preview.get('updated_at')}"
-                    )
-                    checkpoint_mode = st.radio(
-                        "Checkpoint compatible",
-                        ["Load checkpoint result", "Start fresh"],
-                        horizontal=True,
-                        key="exp_controlled_checkpoint_mode_completed",
-                    )
+        protocol_family = "controlled_comparison"
 
-            _render_controlled_comparison_memory_estimator(
-                accidents_df_for_tramo=accidents_df_for_tramo,
-                selected_event_path=selected_event_path,
-                selected_features_path=selected_features_path,
-                tramo_tuple=tramo_tuple,
-                segment_info=segment_info,
-                test_size=float(test_size),
-                val_size=float(val_size),
+    if use_modelos_k_protocol:
+        k_grid_global = _k_grid_values(
+            k_min=int(k_min),
+            k_max=int(k_max),
+            k_step=int(k_step),
+            feature_count=len(all_schema_cols),
+        )
+        k_grid_by_set = {
+            "Base": list(k_grid_global),
+            "Cluster": list(k_grid_global),
+            "Base + Cluster": list(k_grid_global),
+        }
+        st.caption(
+            "Grilla efectiva de K global: "
+            f"{k_grid_global}. Cada familia usa las variables de su grupo que "
+            "aparezcan dentro del Top-K global."
+        )
+    elif use_frozen_tuning_ablation:
+        k_grid_global = []
+        common_k_grid = _k_grid_values(
+            k_min=int(k_min),
+            k_max=int(k_max),
+            k_step=int(k_step),
+            feature_count=len(base_schema_cols),
+        )
+        k_grid_by_set = {
+            "Base": list(common_k_grid),
+            "Base + Cluster": list(common_k_grid),
+        }
+        st.caption(
+            "Grilla común de K para Base↔Base+Cluster: "
+            f"{common_k_grid}. El máximo se limita por Base para que "
+            "Base + Cluster no gane sólo por tener más columnas."
+        )
+        st.info(
+            "Ablación cruzada: tuning congelado = modelo+SMOTE; threshold "
+            "recalibrado por target. Cluster-only queda fuera de esta matriz."
+        )
+    else:
+        k_grid_global = []
+        k_grid_by_set = {
+            "Base": _k_grid_values(
                 k_min=int(k_min),
                 k_max=int(k_max),
                 k_step=int(k_step),
-                xgb_parallel_jobs=int(xgb_parallel_jobs),
-                selected_models=list(selected_models),
-                search_space=search_space,
+                feature_count=len(base_schema_cols),
+            ),
+            "Cluster": _k_grid_values(
+                k_min=int(k_min),
+                k_max=int(k_max),
+                k_step=int(k_step),
+                feature_count=len(cluster_schema_cols),
+            ),
+            "Base + Cluster": _k_grid_values(
+                k_min=int(k_min),
+                k_max=int(k_max),
+                k_step=int(k_step),
+                feature_count=len(all_schema_cols),
+            ),
+        }
+        st.caption(
+            "Grilla efectiva de K: "
+            f"Base={k_grid_by_set['Base']} | "
+            f"Cluster={k_grid_by_set['Cluster']} | "
+            f"Base + Cluster={k_grid_by_set['Base + Cluster']}"
+        )
+    protocol_preview = {
+        "protocol_family": protocol_family,
+        "split_mode": "Temporal",
+        "metric": objective_metric,
+        "objective_metric": objective_metric,
+        "objective_label": objective_label,
+        "optuna_objective_metric": objective_metric,
+        "optuna_objective_label": objective_label,
+        "threshold_protocols": list(threshold_protocols),
+        "threshold_objective": threshold_objective,
+        "threshold_objective_label": threshold_objective_label,
+        "calibration_method": calibration_method,
+        "far_target": float(controlled_far_target),
+        "alerts_per_day": float(controlled_alerts_per_day),
+        "fn_cost": float(controlled_fn_cost),
+        "fp_cost": float(controlled_fp_cost),
+        "robust_folds": int(robust_folds),
+        "test_only_final": True,
+        "models": list(selected_models),
+        "feature_sets": (
+            list(FROZEN_TUNING_ABLATION_FEATURE_SETS)
+            if use_frozen_tuning_ablation
+            else ["Base", "Cluster", "Base + Cluster"]
+        ),
+        "balance_modes": ["none", "smote"],
+        "test_size": float(test_size),
+        "val_size": float(val_size),
+        "k_min": int(k_min),
+        "k_max": int(k_max),
+        "k_step": int(k_step),
+        "k_grid_by_set": k_grid_by_set,
+        "k_grid_global": list(k_grid_global),
+        "feature_ranking_mode": (
+            "feature_selection_global"
+            if use_modelos_k_protocol
+            else "controlled"
+        ),
+        "ranking_protocol": (
+            "feature_selection_tab"
+            if use_modelos_k_protocol
+            else "controlled_train_only_per_feature_set"
+        ),
+        "feature_selection_params": {
+            "n_estimators": int(feature_selection_n_estimators),
+            "max_depth": feature_selection_max_depth,
+            "random_state": int(random_state),
+            "class_weight": "balanced",
+            "criterion": "gini",
+            "n_jobs": int(feature_selection_n_jobs),
+        },
+        "n_trials": int(n_trials),
+        "timeout": int(timeout),
+        "optuna_n_jobs": int(optuna_n_jobs),
+        "parallel_jobs": int(parallel_jobs),
+        "xgb_parallel_jobs": int(xgb_parallel_jobs),
+        "search_space_config": search_space,
+        "segment_info": segment_info,
+        "event_path": str(selected_event_path),
+        "features_path": str(selected_features_path),
+        "dataset_date_start": (
+            None if dataset_date_start is None else str(pd.Timestamp(dataset_date_start))
+        ),
+        "dataset_date_end": (
+            None if dataset_date_end is None else str(pd.Timestamp(dataset_date_end))
+        ),
+    }
+    if use_frozen_tuning_ablation:
+        protocol_preview["ablation_config"] = dict(FROZEN_TUNING_ABLATION_CONFIG)
+    checkpoint_context = build_controlled_comparison_context(
+        event_path=selected_event_path,
+        features_path=selected_features_path,
+        segment_info=segment_info,
+        protocol=protocol_preview,
+    )
+    checkpoint_preview = preview_controlled_comparison_checkpoint(
+        checkpoint_context,
+        checkpoint_root=checkpoint_root,
+    )
+    if checkpoint_preview.get("checkpoint_available"):
+        if checkpoint_preview.get("can_resume"):
+            st.info(
+                "Se encontró un checkpoint compatible en progreso. "
+                f"Run ID: {checkpoint_preview.get('run_id')} | "
+                f"Paso actual: {checkpoint_preview.get('current_step_id') or '-'} | "
+                f"Progreso: {checkpoint_preview.get('completed_steps')}/"
+                f"{checkpoint_preview.get('total_steps')}"
+            )
+            checkpoint_mode = st.radio(
+                "Checkpoint compatible",
+                ["Resume checkpoint", "Start fresh"],
+                horizontal=True,
+                key="exp_controlled_checkpoint_mode",
+            )
+        elif checkpoint_preview.get("can_load_completed"):
+            st.info(
+                "Ya existe una corrida compatible completada. "
+                f"Run ID: {checkpoint_preview.get('run_id')} | "
+                f"Actualizado: {checkpoint_preview.get('updated_at')}"
+            )
+            checkpoint_mode = st.radio(
+                "Checkpoint compatible",
+                ["Load checkpoint result", "Start fresh"],
+                horizontal=True,
+                key="exp_controlled_checkpoint_mode_completed",
             )
 
+    _render_controlled_comparison_memory_estimator(
+        accidents_df_for_tramo=accidents_df_for_tramo,
+        selected_event_path=selected_event_path,
+        selected_features_path=selected_features_path,
+        tramo_tuple=tramo_tuple,
+        segment_info=segment_info,
+        dataset_date_start=dataset_date_start,
+        dataset_date_end=dataset_date_end,
+        test_size=float(test_size),
+        val_size=float(val_size),
+        k_min=int(k_min),
+        k_max=int(k_max),
+        k_step=int(k_step),
+        xgb_parallel_jobs=int(xgb_parallel_jobs),
+        selected_models=list(selected_models),
+        search_space=search_space,
+    )
+
     if st.button(
-        "Ejecutar comparación controlada",
+        (
+            "Ejecutar Modelos por K"
+            if use_modelos_k_protocol
+            else (
+                "Ejecutar ablación cruzada"
+                if use_frozen_tuning_ablation
+                else "Ejecutar comparación controlada"
+            )
+        ),
         key="exp_controlled_run",
     ):
         if int(k_min) > int(k_max):
@@ -13471,6 +15465,8 @@ def _render_controlled_comparison_experiment() -> None:
                 accidents_df_for_tramo=accidents_df_for_tramo,
                 selected_features_path=selected_features_path,
                 tramo_tuple=tramo_tuple,
+                date_start=dataset_date_start,
+                date_end=dataset_date_end,
             )
         except Exception as exc:
             st.error(f"No se pudo preparar el dataset del tramo: {exc}")
@@ -13479,6 +15475,35 @@ def _render_controlled_comparison_experiment() -> None:
         exp_meta = {
             "dataset_name": selected_event,
             "features_name": selected_features,
+            "dataset_date_start": (
+                None
+                if dataset_date_start is None
+                else str(pd.Timestamp(dataset_date_start))
+            ),
+            "dataset_date_end": (
+                None
+                if dataset_date_end is None
+                else str(pd.Timestamp(dataset_date_end))
+            ),
+            "protocol_family": protocol_family,
+            "feature_ranking_mode": (
+                "feature_selection_global"
+                if use_modelos_k_protocol
+                else "controlled"
+            ),
+            "ranking_protocol": (
+                "feature_selection_tab"
+                if use_modelos_k_protocol
+                else "controlled_train_only_per_feature_set"
+            ),
+            "feature_selection_params": {
+                "n_estimators": int(feature_selection_n_estimators),
+                "max_depth": feature_selection_max_depth,
+                "random_state": int(random_state),
+                "class_weight": "balanced",
+                "criterion": "gini",
+                "n_jobs": int(feature_selection_n_jobs),
+            },
             "run_mode": checkpoint_mode,
             "random_state": int(random_state),
             "objective_metric": objective_metric,
@@ -13506,6 +15531,8 @@ def _render_controlled_comparison_experiment() -> None:
             "segment_info": segment_info,
             "search_space_config": search_space,
         }
+        if use_frozen_tuning_ablation:
+            exp_meta["ablation_config"] = dict(FROZEN_TUNING_ABLATION_CONFIG)
         if checkpoint_mode != "Start fresh" and checkpoint_preview:
             exp_meta["checkpoint_run_dir"] = checkpoint_preview.get("run_dir")
         exp_db_path = _init_experiment_db("Controlled comparison", exp_meta)
@@ -13537,6 +15564,12 @@ def _render_controlled_comparison_experiment() -> None:
             payload_out["experiment"] = "Controlled comparison"
             payload_out["dataset_name"] = selected_event
             payload_out["features_name"] = selected_features
+            payload_out["dataset_date_start"] = (
+                None if dataset_date_start is None else str(pd.Timestamp(dataset_date_start))
+            )
+            payload_out["dataset_date_end"] = (
+                None if dataset_date_end is None else str(pd.Timestamp(dataset_date_end))
+            )
             payload_out["segment_info"] = segment_info
             _append_experiment_result(exp_db_path, payload_out)
 
@@ -13547,6 +15580,8 @@ def _render_controlled_comparison_experiment() -> None:
                 event_path=selected_event_path,
                 features_path=selected_features_path,
                 segment_info=segment_info,
+                dataset_date_start=dataset_date_start,
+                dataset_date_end=dataset_date_end,
                 objective_metric=objective_metric,
                 threshold_protocols=list(threshold_protocols),
                 threshold_objective=threshold_objective,
@@ -13556,6 +15591,19 @@ def _render_controlled_comparison_experiment() -> None:
                 fn_cost=float(controlled_fn_cost),
                 fp_cost=float(controlled_fp_cost),
                 robust_folds=int(robust_folds),
+                feature_ranking_mode=(
+                    "feature_selection_global"
+                    if use_modelos_k_protocol
+                    else "controlled"
+                ),
+                experimental_protocol=(
+                    FROZEN_TUNING_ABLATION_PROTOCOL_FAMILY
+                    if use_frozen_tuning_ablation
+                    else None
+                ),
+                feature_selection_n_estimators=int(feature_selection_n_estimators),
+                feature_selection_max_depth=feature_selection_max_depth,
+                feature_selection_n_jobs=int(feature_selection_n_jobs),
                 test_size=float(test_size),
                 val_size=float(val_size),
                 k_min=int(k_min),
@@ -13586,17 +15634,26 @@ def _render_controlled_comparison_experiment() -> None:
         summary_df = payload.get("best_summary_df")
         curves_df = payload.get("curves_df")
         grid_results_df = payload.get("grid_results_df")
+        ablation_deltas_df = payload.get("ablation_deltas_df")
         if not isinstance(summary_df, pd.DataFrame):
             summary_df = pd.DataFrame()
         if not isinstance(curves_df, pd.DataFrame):
             curves_df = pd.DataFrame()
         if not isinstance(grid_results_df, pd.DataFrame):
             grid_results_df = pd.DataFrame()
+        if not isinstance(ablation_deltas_df, pd.DataFrame):
+            ablation_deltas_df = pd.DataFrame()
 
         for record in summary_df.to_dict(orient="records"):
             record_out = dict(record)
             record_out["dataset_name"] = selected_event
             record_out["features_name"] = selected_features
+            record_out["dataset_date_start"] = (
+                None if dataset_date_start is None else str(pd.Timestamp(dataset_date_start))
+            )
+            record_out["dataset_date_end"] = (
+                None if dataset_date_end is None else str(pd.Timestamp(dataset_date_end))
+            )
             record_out["segment_info"] = segment_info
             _append_experiment_best(exp_db_path, record_out)
 
@@ -13604,11 +15661,16 @@ def _render_controlled_comparison_experiment() -> None:
         summary_path = RESULTS_DIR / f"controlled_comparison_summary_{stamp}.csv"
         curves_path = RESULTS_DIR / f"controlled_comparison_curves_{stamp}.csv"
         detail_path = RESULTS_DIR / f"controlled_comparison_grid_{stamp}.csv"
+        ablation_deltas_path = (
+            RESULTS_DIR / f"controlled_comparison_ablation_deltas_{stamp}.csv"
+        )
         summary_df.to_csv(summary_path, index=False)
         curves_df.to_csv(curves_path, index=False)
         grid_results_df.to_csv(detail_path, index=False)
+        if not ablation_deltas_df.empty:
+            ablation_deltas_df.to_csv(ablation_deltas_path, index=False)
 
-        st.session_state["exp_controlled_last_results"] = {
+        last_results = {
             "run_id": payload.get("run_id"),
             "checkpoint_run_dir": payload.get("checkpoint_run_dir"),
             "loaded_from_checkpoint": bool(payload.get("loaded_from_checkpoint")),
@@ -13620,6 +15682,14 @@ def _render_controlled_comparison_experiment() -> None:
             "curves_path": str(curves_path),
             "detail_path": str(detail_path),
         }
+        if not ablation_deltas_df.empty:
+            last_results.update(
+                {
+                    "ablation_deltas_name": ablation_deltas_path.name,
+                    "ablation_deltas_path": str(ablation_deltas_path),
+                }
+            )
+        st.session_state["exp_controlled_last_results"] = last_results
 
     _render_controlled_comparison_current_result(
         checkpoint_root=checkpoint_root,
@@ -13685,7 +15755,7 @@ def _render_experiments_tab() -> None:
                 # Attempt to extract timestamp from filename: experiments_results_YYYYMMDD_HHMMSS.csv
                 # Pattern: experiments_results_{timestamp}.csv
                 match = re.search(
-                    r"(?:experiments_results|find_samples_sizes_results|best_highway_section_results|best_highway_section_k_results|controlled_comparison_summary)_(\d{8}_\d{6})\.csv",
+                    r"(?:experiments_results|find_samples_sizes_results|best_highway_section_results|best_highway_section_k_results|best_highway_section_controlled_summary|controlled_comparison_summary)_(\d{8}_\d{6})\.csv",
                     sel_past,
                 )
                 timestamp = match.group(1) if match else None
@@ -13744,6 +15814,14 @@ def _render_experiments_tab() -> None:
                         is_find_samples = past_df["type"].astype(str).str.contains(
                             "find samples", case=False, na=False
                         ).any()
+                    if not is_controlled_comparison and "protocol_family" in past_df.columns:
+                        is_controlled_comparison = past_df[
+                            "protocol_family"
+                        ].astype(str).str.contains(
+                            "controlled comparison",
+                            case=False,
+                            na=False,
+                        ).any()
                     if not is_best_section and "type" in past_df.columns:
                         is_best_section = past_df["type"].astype(str).str.contains(
                             "best highway section", case=False, na=False
@@ -13764,19 +15842,37 @@ def _render_experiments_tab() -> None:
                         "controlled_comparison_summary_"
                     ):
                         is_controlled_comparison = True
+                    if not is_controlled_comparison and path.name.startswith(
+                        "best_highway_section_controlled_summary_"
+                    ):
+                        is_controlled_comparison = True
 
                     if is_controlled_comparison:
-                        st.caption("Experimento detectado: Controlled comparison")
+                        controlled_prefix = "controlled_comparison"
+                        controlled_label = "Controlled comparison"
+                        if path.name.startswith(
+                            "best_highway_section_controlled_summary_"
+                        ):
+                            controlled_prefix = "best_highway_section_controlled"
+                            controlled_label = (
+                                "Best highway section · protocolo controlado"
+                            )
+                        st.caption(f"Experimento detectado: {controlled_label}")
                         curves_df = pd.DataFrame()
                         detail_df = pd.DataFrame()
+                        ablation_deltas_df = pd.DataFrame()
                         if timestamp:
                             curves_path = (
                                 RESULTS_DIR
-                                / f"controlled_comparison_curves_{timestamp}.csv"
+                                / f"{controlled_prefix}_curves_{timestamp}.csv"
                             )
                             detail_path = (
                                 RESULTS_DIR
-                                / f"controlled_comparison_grid_{timestamp}.csv"
+                                / f"{controlled_prefix}_grid_{timestamp}.csv"
+                            )
+                            ablation_deltas_path = (
+                                RESULTS_DIR
+                                / f"{controlled_prefix}_ablation_deltas_{timestamp}.csv"
                             )
                             if curves_path.exists():
                                 try:
@@ -13788,10 +15884,18 @@ def _render_experiments_tab() -> None:
                                     detail_df = pd.read_csv(detail_path)
                                 except Exception:
                                     detail_df = pd.DataFrame()
+                            if ablation_deltas_path.exists():
+                                try:
+                                    ablation_deltas_df = pd.read_csv(
+                                        ablation_deltas_path
+                                    )
+                                except Exception:
+                                    ablation_deltas_df = pd.DataFrame()
                         _render_controlled_comparison_results_panel(
                             past_df,
                             curves_df,
                             grid_results_df=detail_df,
+                            ablation_deltas_df=ablation_deltas_df,
                             key_prefix=f"history_controlled_{timestamp or 'na'}",
                         )
                     elif is_find_samples:
@@ -14545,7 +16649,7 @@ def _render_experiments_tab() -> None:
             _render_find_samples_sizes_experiment()
             return
         if exp_kind == "Best highway section":
-            _render_best_highway_section_experiment()
+            _render_best_highway_section_controlled_experiment()
             return
         if exp_kind == "Best mix Highway section & K":
             _render_best_highway_section_k_experiment()

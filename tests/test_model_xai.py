@@ -113,6 +113,87 @@ def test_compute_xai_report_returns_global_and_local_sections(tmp_path):
     assert isinstance(report["local_cases"], list)
 
 
+def test_compute_xai_report_marks_next_and_last_cluster_features_as_cluster(
+    tmp_path, monkeypatch
+):
+    feature_cols = [
+        "next_speed_heavy",
+        "next_cluster_speed_0",
+        "last_cluster_density_1",
+        "cluster_share_0",
+    ]
+    background_df = pd.DataFrame(
+        {
+            "next_speed_heavy": [85.0, 82.0],
+            "next_cluster_speed_0": [70.0, 65.0],
+            "last_cluster_density_1": [0.12, 0.18],
+            "cluster_share_0": [0.45, 0.35],
+        }
+    )
+    explain_rows_df = background_df.copy()
+    explain_rows_df["target"] = [0, 1]
+    explain_rows_df["score"] = [0.25, 0.82]
+    explain_rows_df["pred"] = [0, 1]
+    explain_rows_df["threshold"] = [0.5, 0.5]
+    explain_rows_df["case_hint"] = ["baseline", "true_positive"]
+
+    class _FakeTreeExplainer:
+        def __init__(self, model):
+            self.model = model
+
+        def shap_values(self, X):
+            return np.array(
+                [
+                    [0.40, 0.15, -0.10, 0.04],
+                    [0.30, 0.12, -0.18, 0.03],
+                ],
+                dtype=float,
+            )
+
+    class _FakeShap:
+        TreeExplainer = _FakeTreeExplainer
+
+    monkeypatch.setattr(
+        model_xai,
+        "load_xai_bundle",
+        lambda _bundle_dir: {
+            "bundle_dir": str(tmp_path / "bundle"),
+            "manifest": {
+                "feature_cols": feature_cols,
+                "model_name": "Random Forest",
+            },
+            "background_df": background_df,
+            "explain_rows_df": explain_rows_df,
+            "model": object(),
+        },
+    )
+    monkeypatch.setattr(model_xai, "_require_shap", lambda: _FakeShap())
+
+    report = model_xai.compute_xai_report(tmp_path / "bundle")
+
+    global_df = report["global_importance_full"].set_index("feature")
+    assert global_df.loc["next_speed_heavy", "feature_group"] == "Base"
+    assert global_df.loc["next_cluster_speed_0", "feature_group"] == "Cluster"
+    assert global_df.loc["last_cluster_density_1", "feature_group"] == "Cluster"
+    assert global_df.loc["cluster_share_0", "feature_group"] == "Cluster"
+
+    group_df = report["group_summary"].set_index("feature_group")
+    assert group_df.loc["Cluster", "total_mean_abs_shap"] > 0
+    assert group_df.loc["Base", "total_mean_abs_shap"] > 0
+
+    cluster_top_features = set(report["cluster_top"]["feature"].astype(str))
+    assert {
+        "next_cluster_speed_0",
+        "last_cluster_density_1",
+        "cluster_share_0",
+    }.issubset(cluster_top_features)
+
+    assert report["local_cases"]
+    local_detail = report["local_cases"][0]["all_contributions"].set_index("feature")
+    assert local_detail.loc["next_cluster_speed_0", "feature_group"] == "Cluster"
+    assert local_detail.loc["last_cluster_density_1", "feature_group"] == "Cluster"
+
+
 def test_compute_xai_report_prefers_external_xgboost_when_local_module_shadows(
     tmp_path, monkeypatch
 ):

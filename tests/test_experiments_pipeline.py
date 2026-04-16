@@ -147,6 +147,68 @@ def _controlled_search_space() -> dict:
     }
 
 
+def _fake_controlled_result(
+    *,
+    model_name: str,
+    feature_set: str,
+    balance_mode: str,
+    selected_features,
+    score: float,
+    best_params: dict,
+    smote_params: dict,
+    optuna_trials_completed: int,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> dict:
+    return {
+        "status": "completed",
+        "model_name": model_name,
+        "feature_set": feature_set,
+        "balance_mode": balance_mode,
+        "objective_metric": "roc_auc",
+        "objective_label": "ROC-AUC",
+        "k": int(len(selected_features)),
+        "selected_features": list(selected_features),
+        "selected_feature_count": int(len(selected_features)),
+        "decision_threshold": 0.5,
+        "val_objective_score": float(score),
+        "test_objective_score": float(score - 0.01),
+        "val_roc_auc": float(score),
+        "test_roc_auc": float(score - 0.01),
+        "val_pr_auc": float(score / 2.0),
+        "test_pr_auc": float((score - 0.01) / 2.0),
+        "val_f1": 0.5,
+        "test_f1": 0.49,
+        "val_mcc": 0.3,
+        "test_mcc": 0.29,
+        "val_recall": 0.4,
+        "test_recall": 0.39,
+        "val_false_positives": 10,
+        "test_false_positives": 12,
+        "val_false_alarms_per_day": 1.2,
+        "test_false_alarms_per_day": 1.3,
+        "val_cost_per_day": 2.4,
+        "test_cost_per_day": 2.6,
+        "best_params": dict(best_params),
+        "effective_model_params": dict(best_params),
+        "smote_params": dict(smote_params),
+        "optuna_trials_completed": int(optuna_trials_completed),
+        "optuna_n_jobs": 1,
+        "parallel_jobs": 1,
+        "xgb_parallel_jobs": 1,
+        "threshold_n_jobs": 1,
+        "train_rows": int(len(train_df)),
+        "val_rows": int(len(val_df)),
+        "test_rows": int(len(test_df)),
+        "trials_df": pd.DataFrame(
+            [{"value": score, "state": "COMPLETE"}]
+            if optuna_trials_completed
+            else []
+        ),
+    }
+
+
 def _expected_k_grid(k_min: int, k_max: int, k_step: int, feature_count: int) -> list[int]:
     if feature_count <= 0:
         return []
@@ -582,6 +644,534 @@ def test_run_controlled_comparison_ranking_uses_train_only(tmp_path, monkeypatch
         assert observed_times == expected_times
 
 
+def test_run_controlled_comparison_modelos_k_uses_single_global_feature_selection_ranking(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, feature_cols, base_cols, cluster_cols = build_synthetic_base_df(tmp_path)
+    runner = ExperimentsRunner(random_state=42)
+    ranking_calls = []
+    optimize_calls = []
+    global_order = [
+        cluster_cols[0],
+        base_cols[0],
+        cluster_cols[1],
+        base_cols[1],
+    ]
+    global_order.extend(
+        col for col in feature_cols if col not in set(global_order)
+    )
+
+    def _record_global_importance(self, df, feature_cols, **kwargs):
+        ranking_calls.append(
+            {
+                "rows": len(df),
+                "feature_cols": list(feature_cols),
+                "kwargs": dict(kwargs),
+            }
+        )
+        return pd.DataFrame(
+            {
+                "variable": list(global_order),
+                "importance": list(range(len(global_order), 0, -1)),
+            }
+        )
+
+    def _fake_optimize(
+        self,
+        *,
+        model_name,
+        feature_set,
+        balance_mode,
+        selected_features,
+        train_df,
+        val_df,
+        test_df,
+        **kwargs,
+    ):
+        optimize_calls.append(
+            {
+                "model_name": model_name,
+                "feature_set": feature_set,
+                "balance_mode": balance_mode,
+                "selected_features": list(selected_features),
+            }
+        )
+        score = 0.6 + (len(selected_features) * 0.01)
+        return {
+            "status": "completed",
+            "model_name": model_name,
+            "feature_set": feature_set,
+            "balance_mode": balance_mode,
+            "objective_metric": "roc_auc",
+            "objective_label": "ROC-AUC",
+            "k": int(len(selected_features)),
+            "selected_features": list(selected_features),
+            "selected_feature_count": int(len(selected_features)),
+            "decision_threshold": 0.5,
+            "val_objective_score": score,
+            "test_objective_score": score - 0.01,
+            "val_roc_auc": score,
+            "test_roc_auc": score - 0.01,
+            "val_f1": 0.5,
+            "test_f1": 0.49,
+            "val_mcc": 0.3,
+            "test_mcc": 0.29,
+            "best_params": {"model": model_name},
+            "smote_params": {},
+            "optuna_trials_completed": 1,
+            "optuna_n_jobs": int(kwargs["optuna_n_jobs"]),
+            "parallel_jobs": int(kwargs["parallel_jobs"]),
+            "train_rows": int(len(train_df)),
+            "val_rows": int(len(val_df)),
+            "test_rows": int(len(test_df)),
+            "trials_df": pd.DataFrame([{"value": score, "state": "COMPLETE"}]),
+        }
+
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "calculate_feature_importance",
+        _record_global_importance,
+    )
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "_optimize_controlled_combo",
+        _fake_optimize,
+    )
+
+    payload = runner.run_controlled_comparison(
+        base_df,
+        event_path=tmp_path / "events.csv",
+        features_path=tmp_path / "features.duckdb",
+        segment_info={"segment": "A"},
+        test_size=0.2,
+        val_size=0.25,
+        k_min=2,
+        k_max=3,
+        k_step=1,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=1,
+        parallel_jobs=1,
+        search_space_config=_controlled_search_space(),
+        checkpoint_root=tmp_path / "controlled_ckpt_modelos_k",
+        start_fresh=True,
+        selected_models=["XGBoost"],
+        threshold_protocols=["conservative"],
+        feature_ranking_mode="feature_selection_global",
+        feature_selection_n_estimators=123,
+        feature_selection_max_depth=4,
+        feature_selection_n_jobs=-1,
+    )
+
+    assert len(ranking_calls) == 1
+    assert ranking_calls[0]["rows"] == len(base_df)
+    assert ranking_calls[0]["feature_cols"] == feature_cols
+    assert ranking_calls[0]["kwargs"]["n_estimators"] == 123
+    assert ranking_calls[0]["kwargs"]["max_depth"] == 4
+    assert ranking_calls[0]["kwargs"]["n_jobs"] == -1
+
+    assert len(optimize_calls) == 2 * 3 * 2
+    grid_df = payload["grid_results_df"]
+    assert set(grid_df["protocol_family"].unique()) == {"modelos_por_k"}
+    assert set(grid_df["feature_ranking_mode"].unique()) == {
+        "feature_selection_global"
+    }
+    assert sorted(grid_df["k"].astype(int).unique().tolist()) == [2, 3]
+    assert sorted(grid_df["k_global"].astype(int).unique().tolist()) == [2, 3]
+
+    k2_base = grid_df[
+        (grid_df["k"].astype(int) == 2)
+        & (grid_df["feature_set"] == "Base")
+    ].iloc[0]
+    k2_cluster = grid_df[
+        (grid_df["k"].astype(int) == 2)
+        & (grid_df["feature_set"] == "Cluster")
+    ].iloc[0]
+    k2_combined = grid_df[
+        (grid_df["k"].astype(int) == 2)
+        & (grid_df["feature_set"] == "Base + Cluster")
+    ].iloc[0]
+
+    assert int(k2_base["effective_k"]) == 1
+    assert json.loads(k2_base["selected_features"]) == [base_cols[0]]
+    assert int(k2_cluster["effective_k"]) == 1
+    assert json.loads(k2_cluster["selected_features"]) == [cluster_cols[0]]
+    assert int(k2_combined["effective_k"]) == 2
+    assert json.loads(k2_combined["selected_features_global"]) == global_order[:2]
+
+
+def test_run_controlled_comparison_frozen_tuning_ablation_builds_cross_matrix(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, _feature_cols, base_cols, cluster_cols = build_synthetic_base_df(tmp_path)
+    runner = ExperimentsRunner(random_state=42)
+    optimize_calls = []
+    frozen_calls = []
+
+    def _fake_importance(self, df, feature_cols, **kwargs):
+        ordered = list(feature_cols)
+        return pd.DataFrame(
+            {
+                "variable": ordered,
+                "importance": list(range(len(ordered), 0, -1)),
+            }
+        )
+
+    def _fake_optimize(
+        self,
+        *,
+        model_name,
+        feature_set,
+        balance_mode,
+        selected_features,
+        train_df,
+        val_df,
+        test_df,
+        threshold_protocol,
+        **kwargs,
+    ):
+        optimize_calls.append(
+            {
+                "feature_set": feature_set,
+                "balance_mode": balance_mode,
+                "threshold_protocol": threshold_protocol,
+                "selected_features": list(selected_features),
+            }
+        )
+        best_params = {
+            "source": feature_set,
+            "feature_count": len(selected_features),
+        }
+        smote_params = (
+            {"k_neighbors": 1, "sampling_strategy": 0.5}
+            if balance_mode == "smote"
+            else {}
+        )
+        score = 0.70 + (0.02 if feature_set == "Base + Cluster" else 0.0)
+        score += len(selected_features) * 0.001
+        return _fake_controlled_result(
+            model_name=model_name,
+            feature_set=feature_set,
+            balance_mode=balance_mode,
+            selected_features=selected_features,
+            score=score,
+            best_params=best_params,
+            smote_params=smote_params,
+            optuna_trials_completed=3,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+        )
+
+    def _fake_frozen_eval(
+        self,
+        *,
+        model_name,
+        feature_set,
+        balance_mode,
+        selected_features,
+        train_df,
+        val_df,
+        test_df,
+        frozen_model_params,
+        frozen_smote_params,
+        threshold_protocol,
+        **kwargs,
+    ):
+        frozen_calls.append(
+            {
+                "target": feature_set,
+                "balance_mode": balance_mode,
+                "threshold_protocol": threshold_protocol,
+                "frozen_model_params": dict(frozen_model_params),
+                "frozen_smote_params": dict(frozen_smote_params),
+            }
+        )
+        score = 0.60
+        score += 0.03 if feature_set == "Base + Cluster" else 0.0
+        score += 0.02 if frozen_model_params.get("source") == "Base + Cluster" else 0.0
+        return _fake_controlled_result(
+            model_name=model_name,
+            feature_set=feature_set,
+            balance_mode=balance_mode,
+            selected_features=selected_features,
+            score=score,
+            best_params=dict(frozen_model_params),
+            smote_params=dict(frozen_smote_params),
+            optuna_trials_completed=0,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+        )
+
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "calculate_feature_importance",
+        _fake_importance,
+    )
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "_optimize_controlled_combo",
+        _fake_optimize,
+    )
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "_evaluate_controlled_combo_with_frozen_params",
+        _fake_frozen_eval,
+    )
+
+    payload = runner.run_controlled_comparison(
+        base_df,
+        event_path=tmp_path / "events.csv",
+        features_path=tmp_path / "features.duckdb",
+        segment_info={"segment": "A"},
+        test_size=0.2,
+        val_size=0.25,
+        k_min=1,
+        k_max=2,
+        k_step=1,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=1,
+        parallel_jobs=1,
+        search_space_config=_controlled_search_space(),
+        checkpoint_root=tmp_path / "controlled_ckpt_frozen",
+        start_fresh=True,
+        selected_models=["XGBoost"],
+        threshold_protocols=["conservative"],
+        experimental_protocol="frozen_tuning_ablation",
+    )
+
+    grid_df = payload["grid_results_df"]
+    summary_df = payload["best_summary_df"]
+    deltas_df = payload["ablation_deltas_df"]
+
+    assert set(grid_df["protocol_family"].astype(str)) == {"frozen_tuning_ablation"}
+    assert set(grid_df["feature_set"].astype(str)) == {"Base", "Base + Cluster"}
+    assert "Cluster" not in set(grid_df["target_feature_set"].astype(str))
+    assert set(grid_df["params_source_feature_set"].astype(str)) == {
+        "Base",
+        "Base + Cluster",
+    }
+    assert set(grid_df["k"].astype(int)) == {1, 2}
+
+    source_rows = grid_df[grid_df["ablation_phase"] == "source_tuning"]
+    cross_rows = grid_df[grid_df["ablation_phase"] == "cross_eval"]
+    assert len(source_rows) == 2 * 2 * 2
+    assert len(cross_rows) == 2 * 2 * 2
+    assert set(source_rows["optuna_trials_completed"].astype(int)) == {3}
+    assert set(cross_rows["optuna_trials_completed"].astype(int)) == {0}
+    assert cross_rows["frozen_tuning"].astype(bool).all()
+    assert set(cross_rows["threshold_freeze_policy"].astype(str)) == {
+        "recalibrate_per_target"
+    }
+
+    assert frozen_calls
+    for call in frozen_calls:
+        assert call["frozen_model_params"]["source"] != call["target"]
+        if call["balance_mode"] == "smote":
+            assert call["frozen_smote_params"]["sampling_strategy"] == pytest.approx(0.5)
+        else:
+            assert call["frozen_smote_params"] == {}
+
+    grouped_pairs = summary_df[
+        [
+            "params_source_feature_set",
+            "target_feature_set",
+            "balance_mode",
+            "threshold_protocol",
+        ]
+    ].drop_duplicates()
+    assert len(grouped_pairs) == 2 * 2 * 2
+    assert len(summary_df) == 2 * 2 * 2
+
+    assert not deltas_df.empty
+    assert set(deltas_df["effect_type"].astype(str)) == {
+        "feature_effect",
+        "tuning_effect",
+    }
+    assert {
+        "delta_val_objective_score",
+        "delta_test_roc_auc",
+        "delta_test_false_positives",
+        "delta_test_false_alarms_per_day",
+        "delta_test_cost_per_day",
+    }.issubset(deltas_df.columns)
+    assert set(payload["protocol"]["ablation_config"]["freeze_scope"]) == {
+        "model_params",
+        "smote_params",
+    }
+    assert max(grid_df["effective_k"].astype(int)) <= len(base_cols)
+    assert grid_df["selected_cluster_feature_count"].astype(int).max() <= len(cluster_cols)
+
+
+def test_run_controlled_comparison_frozen_ablation_resume_uses_saved_source_params(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, _feature_cols, _base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    event_path = tmp_path / "events.csv"
+    features_path = tmp_path / "features.duckdb"
+    event_path.write_text("events", encoding="utf-8")
+    features_path.write_text("features", encoding="utf-8")
+    checkpoint_root = tmp_path / "controlled_ckpt_frozen_resume"
+    runner = ExperimentsRunner(random_state=42)
+    call_counts = {"optimize": 0, "frozen": 0}
+
+    def _fake_importance(self, df, feature_cols, **kwargs):
+        return pd.DataFrame(
+            {
+                "variable": list(feature_cols),
+                "importance": list(range(len(feature_cols), 0, -1)),
+            }
+        )
+
+    def _fake_optimize(
+        self,
+        *,
+        model_name,
+        feature_set,
+        balance_mode,
+        selected_features,
+        train_df,
+        val_df,
+        test_df,
+        **kwargs,
+    ):
+        call_counts["optimize"] += 1
+        return _fake_controlled_result(
+            model_name=model_name,
+            feature_set=feature_set,
+            balance_mode=balance_mode,
+            selected_features=selected_features,
+            score=0.70,
+            best_params={"source": feature_set},
+            smote_params=(
+                {"k_neighbors": 1, "sampling_strategy": 0.5}
+                if balance_mode == "smote"
+                else {}
+            ),
+            optuna_trials_completed=1,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+        )
+
+    def _fake_frozen_eval(
+        self,
+        *,
+        model_name,
+        feature_set,
+        balance_mode,
+        selected_features,
+        train_df,
+        val_df,
+        test_df,
+        frozen_model_params,
+        frozen_smote_params,
+        **kwargs,
+    ):
+        call_counts["frozen"] += 1
+        assert frozen_model_params["source"] in {"Base", "Base + Cluster"}
+        return _fake_controlled_result(
+            model_name=model_name,
+            feature_set=feature_set,
+            balance_mode=balance_mode,
+            selected_features=selected_features,
+            score=0.65,
+            best_params=dict(frozen_model_params),
+            smote_params=dict(frozen_smote_params),
+            optuna_trials_completed=0,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+        )
+
+    monkeypatch.setattr(ExperimentsRunner, "calculate_feature_importance", _fake_importance)
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "_evaluate_controlled_combo_with_frozen_params",
+        _fake_frozen_eval,
+    )
+
+    first_payload = runner.run_controlled_comparison(
+        base_df,
+        event_path=event_path,
+        features_path=features_path,
+        segment_info={"segment": "A"},
+        test_size=0.2,
+        val_size=0.25,
+        k_min=1,
+        k_max=1,
+        k_step=1,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=1,
+        parallel_jobs=1,
+        search_space_config=_controlled_search_space(),
+        checkpoint_root=checkpoint_root,
+        start_fresh=True,
+        selected_models=["XGBoost"],
+        threshold_protocols=["conservative"],
+        experimental_protocol="frozen_tuning_ablation",
+    )
+    assert call_counts == {"optimize": 4, "frozen": 4}
+
+    run_dir = Path(str(first_payload["checkpoint_run_dir"]))
+    grid_path = run_dir / "results" / "grid_results.csv"
+    manifest_path = run_dir / "manifest.json"
+    grid_df = pd.read_csv(grid_path)
+    dropped_idx = grid_df.index[grid_df["ablation_phase"] == "cross_eval"][-1]
+    dropped_combo_id = str(grid_df.loc[dropped_idx, "combo_id"])
+    grid_df = grid_df.drop(index=dropped_idx).reset_index(drop=True)
+    grid_df.to_csv(grid_path, index=False)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "running"
+    manifest["result_status"] = "running"
+    steps_index = manifest.get("steps_index") or {}
+    if dropped_combo_id in steps_index:
+        steps_index[dropped_combo_id]["status"] = "pending"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    second_payload = runner.run_controlled_comparison(
+        base_df,
+        event_path=event_path,
+        features_path=features_path,
+        segment_info={"segment": "A"},
+        test_size=0.2,
+        val_size=0.25,
+        k_min=1,
+        k_max=1,
+        k_step=1,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=1,
+        parallel_jobs=1,
+        search_space_config=_controlled_search_space(),
+        checkpoint_root=checkpoint_root,
+        selected_models=["XGBoost"],
+        threshold_protocols=["conservative"],
+        experimental_protocol="frozen_tuning_ablation",
+    )
+
+    assert call_counts == {"optimize": 4, "frozen": 5}
+    assert second_payload["auto_resumed"] is True
+    assert len(second_payload["grid_results_df"]) == len(first_payload["grid_results_df"])
+
+
 def test_run_controlled_comparison_resume_skips_completed_combos(
     tmp_path, monkeypatch
 ):
@@ -912,6 +1502,9 @@ def test_controlled_combo_random_forest_forwards_parallel_jobs(
     assert captured_params
     assert all(params["n_jobs"] == 3 for params in captured_params)
     assert result["parallel_jobs"] == 3
+    assert "n_jobs" not in result["best_params"]
+    assert result["effective_model_params"]["n_jobs"] == 3
+    assert result["threshold_n_jobs"] == 3
 
 
 def test_controlled_combo_svm_forwards_optuna_n_jobs(tmp_path, monkeypatch):
@@ -1121,9 +1714,12 @@ def test_controlled_combo_xgboost_forwards_xgb_parallel_jobs(tmp_path, monkeypat
     assert captured_params
     assert all(params["n_jobs"] == 6 for params in captured_params)
     assert result["xgb_parallel_jobs"] == 6
+    assert "n_jobs" not in result["best_params"]
+    assert result["effective_model_params"]["n_jobs"] == 6
+    assert result["threshold_n_jobs"] == 6
 
 
-def test_controlled_combo_xgboost_caps_optuna_jobs_to_avoid_overlap(
+def test_controlled_combo_xgboost_keeps_ui_optuna_jobs(
     tmp_path, monkeypatch
 ):
     pytest.importorskip("sklearn")
@@ -1169,7 +1765,7 @@ def test_controlled_combo_xgboost_caps_optuna_jobs_to_avoid_overlap(
         xgb_parallel_jobs=3,
     )
 
-    assert captured["n_jobs"] == 2
-    assert result["optuna_n_jobs"] == 2
+    assert captured["n_jobs"] == 5
+    assert result["optuna_n_jobs"] == 5
     assert result["requested_optuna_n_jobs"] == 5
-    assert result["max_optuna_jobs_without_overlap"] == 2
+    assert result["optuna_jobs_cpu_cap"] == 8

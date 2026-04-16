@@ -57,6 +57,31 @@ def test_recall_at_alerts_per_day_threshold_respects_alert_budget():
     assert metrics["recall"] > 0.0
 
 
+def test_parallel_threshold_selection_matches_serial():
+    y_true = np.asarray(([0, 1, 0, 0, 1] * 20), dtype=int)
+    scores = np.linspace(0.01, 0.99, len(y_true))
+    eval_df = _toy_eval_frame(len(y_true), freq="5min")
+
+    serial = select_threshold_for_metric(
+        y_true,
+        scores,
+        objective="balanced_f1",
+        eval_df=eval_df,
+        n_jobs=1,
+    )
+    parallel = select_threshold_for_metric(
+        y_true,
+        scores,
+        objective="balanced_f1",
+        eval_df=eval_df,
+        n_jobs=2,
+    )
+
+    assert parallel["threshold_n_jobs"] == 2
+    assert parallel["threshold"] == pytest.approx(serial["threshold"])
+    assert parallel["objective_score"] == pytest.approx(serial["objective_score"])
+
+
 def test_operational_cost_threshold_prefers_false_positive_when_fn_cost_is_high():
     y_true = np.asarray([0, 1])
     scores = np.asarray([0.6, 0.5])

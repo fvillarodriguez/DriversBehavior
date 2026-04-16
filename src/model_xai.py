@@ -28,6 +28,17 @@ _META_COLUMNS = {
     "source_index",
 }
 
+_CLUSTER_FEATURE_PREFIXES = (
+    "cluster_share_",
+    "cluster_flow_",
+    "cluster_count_",
+    "cluster_speed_",
+    "cluster_density_",
+    "cluster_delta_speed_",
+    "cluster_delta_density_",
+    "cluster_entropy",
+)
+
 
 def _json_default(value: object) -> object:
     if isinstance(value, (np.integer, np.floating)):
@@ -63,6 +74,17 @@ def _require_shap():
             "No se pudo importar `shap`. Instale la dependencia para usar XAI."
         ) from exc
     return shap
+
+
+def _is_cluster_feature(feature_name: object) -> bool:
+    text = str(feature_name)
+    if text.startswith(_CLUSTER_FEATURE_PREFIXES):
+        return True
+    if text.startswith("last_") and text[5:].startswith(_CLUSTER_FEATURE_PREFIXES):
+        return True
+    if text.startswith("next_") and text[5:].startswith(_CLUSTER_FEATURE_PREFIXES):
+        return True
+    return False
 
 
 def _import_external_xgboost():
@@ -348,7 +370,7 @@ def _build_case_contributions(
     )
     detail_df["abs_shap"] = detail_df["shap_value"].abs()
     detail_df["feature_group"] = np.where(
-        detail_df["feature"].str.startswith("cluster_"), "Cluster", "Base"
+        detail_df["feature"].map(_is_cluster_feature), "Cluster", "Base"
     )
     top_positive = detail_df[detail_df["shap_value"] > 0].sort_values(
         "shap_value", ascending=False
@@ -519,7 +541,7 @@ def compute_xai_report(
         }
     )
     global_df["feature_group"] = np.where(
-        global_df["feature"].str.startswith("cluster_"), "Cluster", "Base"
+        global_df["feature"].map(_is_cluster_feature), "Cluster", "Base"
     )
     global_df = global_df.sort_values(
         "mean_abs_shap", ascending=False
