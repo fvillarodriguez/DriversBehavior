@@ -49,6 +49,7 @@ from src.model_training import (
     build_model as _build_model,
     get_model_scores as _get_model_scores,
     select_threshold_for_far as _select_threshold_for_far,
+    select_threshold_for_metric as _select_threshold_for_metric,
     far_and_sensitivity as _far_and_sensitivity,
     temporal_train_test_split as _temporal_train_test_split,
     split_train_val_for_threshold as _split_train_val_for_threshold,
@@ -160,6 +161,8 @@ def _init_state() -> None:
     st.session_state.setdefault("optuna_pruner_startup_trials", 5)
     st.session_state.setdefault("far_target", 0.2)
     st.session_state.setdefault("val_size", 0.2)
+    st.session_state.setdefault("model_feature_source", "feature_selection")
+    st.session_state.setdefault("model_feature_source_config_label", None)
     st.session_state.setdefault("balance_last_stats", None)
     st.session_state.setdefault("balance_last_params", None)
     st.session_state.setdefault("history_entries", [])
@@ -4310,6 +4313,47 @@ def _get_feature_cols(df: pd.DataFrame) -> List[str]:
     ]
 
 
+def _rank_features_for_optuna(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    method: str,
+    random_state: int,
+) -> List[str]:
+    """Devuelve las columnas de X ordenadas de mayor a menor importancia.
+
+    Usa train (sin SMOTE) para evitar leakage. method in {"rf", "mutual_info"}.
+    """
+    cols = list(X.columns)
+    if not cols:
+        return []
+    method_key = str(method or "rf").strip().lower()
+    y_arr = pd.Series(y).astype(int)
+    if y_arr.nunique() < 2:
+        return cols
+    X_arr = X.fillna(0).astype("float32")
+    if method_key in {"mutual_info", "mi", "mutual_info_classif"}:
+        from sklearn.feature_selection import mutual_info_classif
+
+        scores = mutual_info_classif(
+            X_arr, y_arr, random_state=int(random_state)
+        )
+    else:
+        from sklearn.ensemble import RandomForestClassifier
+
+        model = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=None,
+            random_state=int(random_state),
+            class_weight="balanced",
+            n_jobs=-1,
+        )
+        model.fit(X_arr, y_arr)
+        scores = model.feature_importances_
+    ranking_df = pd.DataFrame(
+        {"variable": cols, "importance": scores}
+    ).sort_values("importance", ascending=False, kind="mergesort")
+    return ranking_df["variable"].tolist()
 
 
 
@@ -4477,6 +4521,120 @@ def _render_selected_features_info() -> None:
     if len(selected_features) > max_items:
         preview = f"{preview} + {len(selected_features) - max_items} mas"
     st.caption(f"Variables seleccionadas ({len(selected_features)}): {preview}")
+
+
+def _collect_optuna_best_feature_options(
+    model_choice: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    """Devuelve las entradas del store de Optuna con best_feature_cols no vacio.
+
+    Cada item incluye etiqueta amigable, lista de features, model_choice y metadata
+    suficiente para mostrar en un selector.
+    """
+    store = st.session_state.get("optuna_results_store") or {}
+    options: List[Dict[str, object]] = []
+    for entry_key, entry in store.items():
+        if not isinstance(entry, dict):
+            continue
+        results = entry.get("results")
+        if not isinstance(results, dict):
+            continue
+        for choice, result in results.items():
+            if not isinstance(result, dict):
+                continue
+            settings = result.get("optuna_settings") or {}
+            best_cols = settings.get("best_feature_cols")
+            if not best_cols:
+                # Fallback: si no hay best_feature_cols, usa el conjunto del config.
+                best_cols = entry.get("feature_cols")
+            if not best_cols:
+                continue
+            if model_choice and str(choice) != str(model_choice):
+                continue
+            label_parts = []
+            if len(entry.get("feature_cols", [])) > 0:
+                label_parts.append(f"{len(entry['feature_cols'])} vars config")
+            if settings.get("best_top_k") is not None:
+                label_parts.append(f"top_k={int(settings['best_top_k'])}")
+            label_parts.append(f"{choice}")
+            label = " | ".join(label_parts)
+            options.append(
+                {
+                    "label": label,
+                    "key": str(entry_key),
+                    "model_choice": str(choice),
+                    "best_feature_cols": list(best_cols),
+                    "best_top_k": settings.get("best_top_k"),
+                    "ranking_method": settings.get("ranking_method"),
+                    "ranking_method_label": settings.get("ranking_method_label"),
+                    "best_score": result.get("best_score"),
+                    "objective_label": settings.get("objective_label"),
+                }
+            )
+    return options
+
+
+def _apply_feature_source_for_model_tab(*, model_choice: str) -> Optional[Dict[str, object]]:
+    """Radio para elegir origen de variables en la pestana Modelos.
+
+    Si el usuario elige Optuna, sobreescribe `selected_features` con el
+    `best_feature_cols` del optuna elegido. Retorna el payload elegido (o None).
+    """
+    source = st.session_state.get("model_feature_source", "feature_selection")
+    source_options = {
+        "Feature selection": "feature_selection",
+        "Optuna (best_feature_cols)": "optuna",
+    }
+    reverse_source = {v: k for k, v in source_options.items()}
+    current_label = reverse_source.get(source, "Feature selection")
+    chosen_label = st.radio(
+        "Origen de variables",
+        list(source_options.keys()),
+        index=list(source_options.keys()).index(current_label),
+        horizontal=True,
+        key="model_feature_source_radio",
+        help=(
+            "Feature selection: usa la seleccion manual de la pestana Feature "
+            "selection (ranking sobre train). Optuna: usa best_feature_cols "
+            "producido por Optuna con top_k optimo."
+        ),
+    )
+    st.session_state["model_feature_source"] = source_options[chosen_label]
+
+    if st.session_state["model_feature_source"] != "optuna":
+        return None
+
+    options = _collect_optuna_best_feature_options(model_choice=model_choice)
+    if not options:
+        st.warning(
+            "No hay resultados de Optuna con best_feature_cols para el modelo "
+            f"'{model_choice}'. Ejecute Optuna primero o cambie el modelo."
+        )
+        return None
+
+    labels = [opt["label"] for opt in options]
+    remembered = st.session_state.get("model_feature_source_config_label")
+    index = labels.index(remembered) if remembered in labels else 0
+    chosen_opt_label = st.selectbox(
+        "Resultado de Optuna a utilizar",
+        labels,
+        index=index,
+        key="model_feature_source_config_label",
+    )
+    chosen_opt = next(opt for opt in options if opt["label"] == chosen_opt_label)
+    best_cols = list(chosen_opt["best_feature_cols"])
+    st.session_state["selected_features"] = best_cols
+    info_parts = [f"{len(best_cols)} variables"]
+    if chosen_opt.get("best_top_k") is not None:
+        info_parts.append(f"top_k={int(chosen_opt['best_top_k'])}")
+    if chosen_opt.get("ranking_method_label"):
+        info_parts.append(f"ranking={chosen_opt['ranking_method_label']}")
+    if chosen_opt.get("best_score") is not None:
+        info_parts.append(
+            f"best {chosen_opt.get('objective_label') or 'score'}={float(chosen_opt['best_score']):.4f}"
+        )
+    st.caption("Origen: Optuna — " + " | ".join(info_parts))
+    return chosen_opt
 
 
 def _render_flow_features_preview(features_df: pd.DataFrame) -> None:
@@ -6235,6 +6393,41 @@ def _render_feature_selection_tab() -> None:
         key="fs_random_state",
     )
 
+    col_split_a, col_split_b = st.columns(2)
+    with col_split_a:
+        fs_test_size = st.slider(
+            "Test size (para excluir test del ranking)",
+            min_value=0.05,
+            max_value=0.4,
+            value=float(st.session_state.get("test_size", 0.2)),
+            step=0.05,
+            key="fs_test_size",
+            help=(
+                "Fraccion temporal reservada como test. El ranking se calcula "
+                "sobre train (o train + val) para evitar leakage."
+            ),
+        )
+    with col_split_b:
+        fs_use_val = st.checkbox(
+            "Excluir tambien validacion",
+            value=bool(st.session_state.get("fs_use_val", False)),
+            key="fs_use_val",
+            help=(
+                "Si se activa, el ranking se calcula solo sobre train "
+                "(train/val/test). Si se deja desactivado, se usa train + val."
+            ),
+        )
+    fs_val_size = float(st.session_state.get("val_size", 0.2))
+    if fs_use_val:
+        fs_val_size = st.slider(
+            "Validation size",
+            min_value=0.05,
+            max_value=0.4,
+            value=float(st.session_state.get("val_size", 0.2)),
+            step=0.05,
+            key="fs_val_size",
+        )
+
     if st.button("Calcular importancia"):
         try:
             from sklearn.ensemble import RandomForestClassifier
@@ -6246,13 +6439,38 @@ def _render_feature_selection_tab() -> None:
 
         progress = st.progress(0)
         try:
-            X = base_df[feature_cols].fillna(0)
+            # Split temporal: test siempre excluido; val excluido si el usuario lo pide.
+            try:
+                train_val_df, _test_df = _temporal_train_test_split(
+                    base_df,
+                    time_col="interval_start",
+                    test_size=float(fs_test_size),
+                )
+            except ValueError as exc:
+                st.warning(f"No se pudo hacer split temporal: {exc}")
+                return
+            if fs_use_val:
+                try:
+                    fit_df, _val_df = _temporal_train_test_split(
+                        train_val_df,
+                        time_col="interval_start",
+                        test_size=float(fs_val_size),
+                    )
+                except ValueError as exc:
+                    st.warning(f"No se pudo crear validacion temporal: {exc}")
+                    return
+            else:
+                fit_df = train_val_df
+
             progress.progress(10)
-            y = base_df["target"].astype(int)
+            X = fit_df[feature_cols].fillna(0)
             progress.progress(20)
+            y = fit_df["target"].astype(int)
+            progress.progress(25)
             if y.nunique() < 2:
                 st.warning(
-                    "No hay dos clases en el target para calcular importancia."
+                    "No hay dos clases en el target del split de entrenamiento. "
+                    "Ajuste test_size/val_size."
                 )
                 return
             with st.spinner("Calculando importancia..."):
@@ -6276,8 +6494,14 @@ def _render_feature_selection_tab() -> None:
             importance_df = importance_df.reset_index(drop=True)
             progress.progress(95)
             st.session_state["feature_importances_df"] = importance_df
+            fit_label = "train" if fs_use_val else "train + val"
+            st.session_state["feature_importances_fit_label"] = fit_label
+            st.session_state["feature_importances_fit_rows"] = int(len(fit_df))
             progress.progress(100)
-            st.success("Importancias calculadas.")
+            st.success(
+                f"Importancias calculadas sobre {fit_label} "
+                f"({len(fit_df):,} filas). Test excluido."
+            )
         finally:
             progress.empty()
 
@@ -6292,6 +6516,13 @@ def _render_feature_selection_tab() -> None:
             st.info("Calcule la importancia para ordenar las variables.")
         else:
             st.session_state["feature_importances_df"] = importance_df
+            fit_label = st.session_state.get("feature_importances_fit_label")
+            fit_rows = st.session_state.get("feature_importances_fit_rows")
+            if fit_label:
+                st.caption(
+                    f"Ranking calculado sobre **{fit_label}** "
+                    f"({int(fit_rows or 0):,} filas, test excluido)."
+                )
             st.dataframe(importance_df, width="stretch")
             ordered_vars = importance_df["variable"].tolist()
     else:
@@ -6378,6 +6609,11 @@ def _render_feature_selection_tab() -> None:
         "n_estimators": int(n_estimators),
         "max_depth": int(max_depth) if max_depth else None,
         "random_state": int(random_state),
+        "test_size": float(fs_test_size),
+        "use_val": bool(fs_use_val),
+        "val_size": float(fs_val_size) if fs_use_val else None,
+        "fit_rows": int(st.session_state.get("feature_importances_fit_rows") or 0),
+        "fit_label": st.session_state.get("feature_importances_fit_label"),
     }
     _persist_feature_selection(
         feature_key=feature_key,
@@ -6660,7 +6896,8 @@ def _render_optuna_tab() -> None:
     objective_direction = objective_options[objective_label]["direction"]
     objective_verb = "minimiza" if objective_direction == "minimize" else "optimiza"
     st.caption(
-        f"Optuna {objective_verb} {objective_label} en el set de test con umbral calibrado por FAR."
+        f"Optuna {objective_verb} {objective_label} en el set de validacion "
+        "usando el criterio de threshold seleccionado (test queda como hold-out final)."
     )
 
     model_choice = st.selectbox(
@@ -6761,6 +6998,31 @@ def _render_optuna_tab() -> None:
     st.session_state["test_size"] = float(optuna_test_size)
 
     st.markdown("**Calibracion de umbral**")
+    optuna_threshold_objective_options = {
+        "FAR": "far",
+        "F1": "f1",
+        "Balanced F1": "balanced_f1",
+        "MCC": "mcc",
+        "Recall@N alertas/dia": "recall_at_alerts_per_day",
+        "Costo operacional": "operational_cost",
+        "PR-AUC": "pr_auc",
+        "ROC-AUC": "roc_auc",
+    }
+    optuna_threshold_objective_label = st.selectbox(
+        "Criterio de threshold",
+        list(optuna_threshold_objective_options.keys()),
+        index=0,
+        key="optuna_threshold_objective",
+        help=(
+            "Metrica con la que se escoge el umbral operativo sobre val dentro "
+            "de cada trial. Se aplica el mismo criterio que en la pestana de "
+            "Modelos. Para PR-AUC/ROC-AUC el umbral queda en 0.5 (metricas de "
+            "ranking)."
+        ),
+    )
+    optuna_threshold_objective = optuna_threshold_objective_options[
+        optuna_threshold_objective_label
+    ]
     optuna_far_target = st.slider(
         "FAR (False alarm rate) target",
         min_value=0.0,
@@ -6769,6 +7031,37 @@ def _render_optuna_tab() -> None:
         step=0.01,
         key="optuna_far_target",
     )
+    optuna_alerts_per_day = st.number_input(
+        "Alertas maximas por dia",
+        min_value=0.1,
+        max_value=50.0,
+        value=float(st.session_state.get("optuna_alerts_per_day", 5.0)),
+        step=0.5,
+        key="optuna_alerts_per_day",
+        help=(
+            "Presupuesto diario de alertas para Recall@N y costo operacional. "
+            "Se ignora para criterios que no lo usen."
+        ),
+    )
+    col_cost_a, col_cost_b = st.columns(2)
+    with col_cost_a:
+        optuna_fn_cost = st.number_input(
+            "Costo FN",
+            min_value=0.0,
+            value=float(st.session_state.get("optuna_fn_cost", 10.0)),
+            step=1.0,
+            key="optuna_fn_cost",
+            help="Costo de no alertar un accidente real (usado por costo operacional).",
+        )
+    with col_cost_b:
+        optuna_fp_cost = st.number_input(
+            "Costo FP",
+            min_value=0.0,
+            value=float(st.session_state.get("optuna_fp_cost", 1.0)),
+            step=0.5,
+            key="optuna_fp_cost",
+            help="Costo de una falsa alarma (usado por costo operacional).",
+        )
     optuna_val_size = st.slider(
         "Validation size",
         min_value=0.05,
@@ -6782,6 +7075,68 @@ def _render_optuna_tab() -> None:
 
     st.markdown("**Rangos y pasos de optimizacion**")
     st.caption("Ajuste los rangos que Optuna puede explorar.")
+
+    st.markdown("**Numero de variables (top-K del ranking)**")
+    optuna_tune_topk = st.checkbox(
+        "Optimizar K (numero de variables)",
+        value=bool(st.session_state.get("optuna_tune_topk", False)),
+        key="optuna_tune_topk",
+        help=(
+            "Si se activa, Optuna elige cuantas variables usar (top-K segun un "
+            "ranking calculado sobre train real). Si se desactiva, se usan "
+            "todas las variables del config."
+        ),
+    )
+    optuna_ranking_method_label = st.selectbox(
+        "Metodo de ranking",
+        ["Random Forest (importancia)", "Mutual information"],
+        index=0,
+        key="optuna_ranking_method_label",
+        disabled=not optuna_tune_topk,
+        help=(
+            "Metodo para rankear variables una vez sobre train (sin SMOTE). "
+            "Random Forest usa importancia por impureza; Mutual information "
+            "usa dependencia no lineal con el target."
+        ),
+    )
+    optuna_ranking_method = (
+        "mutual_info"
+        if optuna_ranking_method_label.startswith("Mutual")
+        else "rf"
+    )
+    col_k1, col_k2, col_k3 = st.columns(3)
+    with col_k1:
+        optuna_k_min = st.number_input(
+            "k_min",
+            min_value=1,
+            value=int(st.session_state.get("optuna_k_min", 3)),
+            step=1,
+            key="optuna_k_min",
+            disabled=not optuna_tune_topk,
+        )
+    with col_k2:
+        optuna_k_max = st.number_input(
+            "k_max",
+            min_value=1,
+            value=int(st.session_state.get("optuna_k_max", 20)),
+            step=1,
+            key="optuna_k_max",
+            disabled=not optuna_tune_topk,
+        )
+    with col_k3:
+        optuna_k_step = st.number_input(
+            "k_step",
+            min_value=1,
+            value=int(st.session_state.get("optuna_k_step", 1)),
+            step=1,
+            key="optuna_k_step",
+            disabled=not optuna_tune_topk,
+        )
+    if optuna_tune_topk:
+        st.caption(
+            "k_max se ajusta automaticamente al tamano de cada config "
+            "(Base / Cluster / Base + Cluster)."
+        )
 
     st.markdown("**SMOTE**")
     col1, col2, col3 = st.columns(3)
@@ -7475,12 +7830,26 @@ def _render_optuna_tab() -> None:
                 "Ajuste el rango o el test_size."
             )
             return
+        if y_val.nunique() < 2:
+            st.warning(
+                "El split temporal dejo una sola clase en validacion. "
+                "Ajuste val_size o test_size."
+            )
+            return
         if y_test.nunique() < 2:
             st.warning(
                 "El split temporal dejo una sola clase en test. "
                 "Ajuste el rango o el test_size."
             )
             return
+
+        if optuna_tune_topk:
+            if optuna_k_min > optuna_k_max:
+                st.warning("k_min no puede ser mayor que k_max.")
+                return
+            if optuna_k_step <= 0:
+                st.warning("k_step debe ser mayor a 0.")
+                return
 
         if smote_k_min > smote_k_max:
             st.warning("smote_k_min no puede ser mayor que smote_k_max.")
@@ -7623,7 +7992,7 @@ def _render_optuna_tab() -> None:
                 )
             else:
                 pruner = optuna.pruners.NopPruner()
-            
+
             study = optuna.create_study(
                 direction=objective_direction,
                 sampler=sampler,
@@ -7632,9 +8001,56 @@ def _render_optuna_tab() -> None:
 
             X_train_run = X_train[cols].fillna(0).astype("float32")
             X_val_run = X_val[cols].fillna(0).astype("float32")
-            X_test_run = X_test[cols].fillna(0).astype("float32")
+
+            # Ranking una sola vez sobre train real (pre-SMOTE), si se optimiza K.
+            ranked_cols: List[str] = list(cols)
+            effective_k_low = 0
+            effective_k_high = 0
+            effective_k_step = max(1, int(optuna_k_step)) if optuna_tune_topk else 1
+            if optuna_tune_topk:
+                try:
+                    with st.spinner(
+                        f"Calculando ranking ({optuna_ranking_method_label}) sobre train para {label}..."
+                    ):
+                        ranked_cols = _rank_features_for_optuna(
+                            X_train_run,
+                            y_train,
+                            method=optuna_ranking_method,
+                            random_state=int(optuna_random_state),
+                        )
+                except Exception as exc:
+                    st.warning(
+                        f"No se pudo calcular el ranking para {label}: {exc}. "
+                        "Se usaran todas las variables del config."
+                    )
+                    ranked_cols = list(cols)
+                total_cols = len(ranked_cols)
+                effective_k_low = max(1, min(int(optuna_k_min), total_cols))
+                effective_k_high = max(1, min(int(optuna_k_max), total_cols))
+                if effective_k_high < effective_k_low:
+                    effective_k_high = effective_k_low
+                st.caption(
+                    f"[{label}] Ranking calculado sobre {total_cols} variables. "
+                    f"top_k explorado en [{effective_k_low}, {effective_k_high}] "
+                    f"paso {effective_k_step}."
+                )
 
             def objective(trial: "optuna.Trial") -> float:
+                if optuna_tune_topk and ranked_cols:
+                    top_k = trial.suggest_int(
+                        "top_k",
+                        int(effective_k_low),
+                        int(effective_k_high),
+                        step=int(effective_k_step),
+                    )
+                    trial_cols = ranked_cols[: int(top_k)]
+                else:
+                    trial_cols = list(cols)
+                if not trial_cols:
+                    raise optuna.TrialPruned("trial_cols vacio.")
+                X_train_trial = X_train_run[trial_cols]
+                X_val_trial = X_val_run[trial_cols]
+
                 smote_k = trial.suggest_int(
                     "smote_k_neighbors",
                     int(k_low),
@@ -7653,7 +8069,7 @@ def _render_optuna_tab() -> None:
                     random_state=int(optuna_random_state),
                 )
                 try:
-                    X_res, y_res = smote.fit_resample(X_train_run, y_train)
+                    X_res, y_res = smote.fit_resample(X_train_trial, y_train)
                 except ValueError as exc:
                     raise optuna.TrialPruned(str(exc)) from exc
 
@@ -7805,38 +8221,43 @@ def _render_optuna_tab() -> None:
                         model_choice, model_params, int(optuna_random_state)
                     )
                     model.fit(X_res, y_res)
-                    scores_val = _get_model_scores(model, X_val_run)
-                    thr_info = _select_threshold_for_far(
+                    scores_val = _get_model_scores(model, X_val_trial)
+                    thr_info = _select_threshold_for_metric(
                         y_val.to_numpy(),
                         scores_val,
+                        objective=str(optuna_threshold_objective),
+                        eval_df=val_df,
                         far_target=float(optuna_far_target),
+                        alerts_per_day=float(optuna_alerts_per_day),
+                        fn_cost=float(optuna_fn_cost),
+                        fp_cost=float(optuna_fp_cost),
                     )
                     threshold = float(thr_info["threshold"])
-                    scores_test = _get_model_scores(model, X_test_run)
-                    preds = (scores_test >= threshold).astype(int)
+                    preds = (scores_val >= threshold).astype(int)
                 except Exception as exc:
                     raise optuna.TrialPruned(str(exc)) from exc
 
+                y_val_arr = y_val.to_numpy()
                 if objective_key == "f1":
-                    score = float(f1_score(y_test, preds, zero_division=0))
+                    score = float(f1_score(y_val_arr, preds, zero_division=0))
                 elif objective_key == "roc_auc":
                     try:
-                        score = float(roc_auc_score(y_test, scores_test))
+                        score = float(roc_auc_score(y_val_arr, scores_val))
                     except ValueError:
                         score = 0.5
                 elif objective_key == "accuracy":
-                    score = float(accuracy_score(y_test, preds))
+                    score = float(accuracy_score(y_val_arr, preds))
                 elif objective_key == "recall":
-                    score = float(recall_score(y_test, preds, zero_division=0))
+                    score = float(recall_score(y_val_arr, preds, zero_division=0))
                 elif objective_key == "precision":
-                    score = float(precision_score(y_test, preds, zero_division=0))
+                    score = float(precision_score(y_val_arr, preds, zero_division=0))
                 elif objective_key == "fnr":
                     tn, fp, fn, tp = confusion_matrix(
-                        y_test, preds, labels=[0, 1]
+                        y_val_arr, preds, labels=[0, 1]
                     ).ravel()
                     score = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
                 else:
-                    score = float(f1_score(y_test, preds, zero_division=0))
+                    score = float(f1_score(y_val_arr, preds, zero_division=0))
                 trial.report(score, step=0)
                 if trial.should_prune():
                     raise optuna.TrialPruned("Pruned by MedianPruner")
@@ -7985,12 +8406,23 @@ def _render_optuna_tab() -> None:
             trials_df = trials_df.sort_values(
                 "value", ascending=objective_direction == "minimize"
             ).reset_index(drop=True)
-            
+
+            if optuna_tune_topk and "top_k" in best_params:
+                best_top_k = int(best_params["top_k"])
+                best_top_k = max(1, min(best_top_k, len(ranked_cols)))
+                best_feature_cols = list(ranked_cols[:best_top_k])
+            else:
+                best_top_k = len(cols)
+                best_feature_cols = list(cols)
+
             return {
                 "best_score": best_score,
                 "smote_params": smote_params,
                 "model_params": model_params,
-                "trials_df": trials_df
+                "trials_df": trials_df,
+                "best_top_k": int(best_top_k),
+                "best_feature_cols": best_feature_cols,
+                "ranked_cols": list(ranked_cols),
             }
 
         # Run for each config
@@ -8021,6 +8453,14 @@ def _render_optuna_tab() -> None:
                         },
                     }
                 }
+                if optuna_tune_topk:
+                    search_space["top_k"] = {
+                        "min": int(optuna_k_min),
+                        "max": int(optuna_k_max),
+                        "step": int(optuna_k_step),
+                        "ranking_method": str(optuna_ranking_method),
+                        "ranking_method_label": optuna_ranking_method_label,
+                    }
                 if model_choice == "Random Forest":
                     search_space["model"] = {
                         "n_estimators": {
@@ -8077,6 +8517,41 @@ def _render_optuna_tab() -> None:
                             "step": float(xgb_gamma_step),
                         },
                     }
+                elif model_choice == "Neural Network":
+                    search_space["model"] = {
+                        "hidden_dim": {
+                            "min": int(nn_hidden_min),
+                            "max": int(nn_hidden_max),
+                            "step": int(nn_hidden_step),
+                        },
+                        "num_layers": {
+                            "min": int(nn_layers_min),
+                            "max": int(nn_layers_max),
+                            "step": int(nn_layers_step),
+                        },
+                        "dropout": {
+                            "min": float(nn_dropout_min),
+                            "max": float(nn_dropout_max),
+                            "step": float(nn_dropout_step),
+                        },
+                        "learning_rate": {
+                            "min": float(nn_lr_min),
+                            "max": float(nn_lr_max),
+                            "step": float(nn_lr_step),
+                        },
+                        "weight_decay": {
+                            "min": float(nn_wd_min),
+                            "max": float(nn_wd_max),
+                            "step": float(nn_wd_step),
+                        },
+                        "pos_weight": {
+                            "min": float(nn_pw_min),
+                            "max": float(nn_pw_max),
+                            "step": float(nn_pw_step),
+                        },
+                        "batch_size": list(nn_batch_options),
+                        # epochs no se optimiza (fijado + early stopping en Modelos)
+                    }
                 else:
                     search_space["model"] = {
                         "kernel": list(svm_kernels),
@@ -8095,9 +8570,28 @@ def _render_optuna_tab() -> None:
                     "test_size": float(optuna_test_size),
                     "val_size": float(optuna_val_size),
                     "far_target": float(optuna_far_target),
+                    "threshold_objective": str(optuna_threshold_objective),
+                    "threshold_objective_label": optuna_threshold_objective_label,
+                    "alerts_per_day": float(optuna_alerts_per_day),
+                    "fn_cost": float(optuna_fn_cost),
+                    "fp_cost": float(optuna_fp_cost),
                     "objective_metric": objective_key,
                     "objective_label": objective_label,
                     "objective_direction": objective_direction,
+                    "objective_eval_set": "val",
+                    "tune_topk": bool(optuna_tune_topk),
+                    "ranking_method": str(optuna_ranking_method)
+                    if optuna_tune_topk
+                    else None,
+                    "ranking_method_label": optuna_ranking_method_label
+                    if optuna_tune_topk
+                    else None,
+                    "k_min": int(optuna_k_min) if optuna_tune_topk else None,
+                    "k_max": int(optuna_k_max) if optuna_tune_topk else None,
+                    "k_step": int(optuna_k_step) if optuna_tune_topk else None,
+                    "best_top_k": int(res["best_top_k"]),
+                    "best_feature_cols": list(res["best_feature_cols"]),
+                    "ranked_cols": list(res["ranked_cols"]),
                     "pruner": {
                         "enabled": bool(pruner_enabled),
                         "type": "MedianPruner" if pruner_enabled else "NopPruner",
@@ -8126,11 +8620,19 @@ def _render_optuna_tab() -> None:
                     optuna_settings=optuna_settings_payload,
                     search_space=search_space,
                 )
-                st.success(
-                    f"Optuna ({cfg['label']}) finalizado. "
-                    f"{'Menor' if objective_direction == 'minimize' else 'Mejor'} "
-                    f"{objective_label}: {res['best_score']:.4f}"
-                )
+                if optuna_tune_topk:
+                    st.success(
+                        f"Optuna ({cfg['label']}) finalizado. "
+                        f"{'Menor' if objective_direction == 'minimize' else 'Mejor'} "
+                        f"{objective_label}: {res['best_score']:.4f} | "
+                        f"best top_k = {res['best_top_k']} / {len(res['ranked_cols'])}"
+                    )
+                else:
+                    st.success(
+                        f"Optuna ({cfg['label']}) finalizado. "
+                        f"{'Menor' if objective_direction == 'minimize' else 'Mejor'} "
+                        f"{objective_label}: {res['best_score']:.4f}"
+                    )
         
         st.rerun()
 
@@ -9026,7 +9528,6 @@ def _apply_optuna_model_params_to_state(
 
 def _render_model_tab() -> None:
     st.subheader("Modelos de prediccion")
-    _render_selected_features_info()
 
     accidents_df = st.session_state.get("accidents_df")
     features_df = st.session_state.get("flow_features_df")
@@ -9242,6 +9743,9 @@ def _render_model_tab() -> None:
             "Neural Network usa un MLP con PyTorch (StandardScaler + early stopping)."
         ),
     )
+
+    _apply_feature_source_for_model_tab(model_choice=model_choice)
+    _render_selected_features_info()
 
     random_state = st.number_input(
         "random_state", min_value=0, value=42, step=1, key="model_random_state"
