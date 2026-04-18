@@ -2325,17 +2325,44 @@ def _char_pick_size_column(df: pd.DataFrame) -> str | None:
     return None
 
 
-def _char_normalize_profile(profile: pd.DataFrame, method: str) -> pd.DataFrame:
+def _char_normalize_profile(
+    profile: pd.DataFrame,
+    method: str,
+    reference: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if profile.empty:
         return profile
+    ref_profile = (
+        reference
+        if reference is not None and not reference.empty
+        else profile
+    )
     if method == "Z-score":
-        means = profile.mean()
-        stds = profile.std(ddof=0).replace(0, 1)
-        return (profile - means) / stds
+        means = ref_profile.mean()
+        stds = ref_profile.std(ddof=0)
+        normalized = profile - means
+        variable_cols = stds[stds != 0].index
+        constant_cols = stds[stds == 0].index
+        if len(variable_cols) > 0:
+            normalized.loc[:, variable_cols] = normalized.loc[
+                :, variable_cols
+            ].div(stds.loc[variable_cols], axis=1)
+        if len(constant_cols) > 0:
+            normalized.loc[:, constant_cols] = 0.0
+        return normalized
     if method == "Min-max":
-        mins = profile.min()
-        ranges = (profile.max() - mins).replace(0, 1)
-        return (profile - mins) / ranges
+        mins = ref_profile.min()
+        ranges = ref_profile.max() - mins
+        normalized = profile - mins
+        variable_cols = ranges[ranges != 0].index
+        constant_cols = ranges[ranges == 0].index
+        if len(variable_cols) > 0:
+            normalized.loc[:, variable_cols] = normalized.loc[
+                :, variable_cols
+            ].div(ranges.loc[variable_cols], axis=1)
+        if len(constant_cols) > 0:
+            normalized.loc[:, constant_cols] = 0.0
+        return normalized
     return profile
 
 
@@ -3460,13 +3487,19 @@ def _render_cluster_characterization_summary() -> None:
                     elif not radar_clusters:
                         st.info("Seleccione al menos un cluster.")
                     else:
+                        radar_reference = (
+                            plot_df.set_index(label_col)[radar_vars]
+                            .sort_index()
+                        )
                         radar_profile = (
                             plot_df[plot_df[label_col].isin(radar_clusters)]
                             .set_index(label_col)[radar_vars]
                             .sort_index()
                         )
                         radar_profile = _char_normalize_profile(
-                            radar_profile, "Min-max"
+                            radar_profile,
+                            "Min-max",
+                            reference=radar_reference,
                         )
                         theta = radar_vars + [radar_vars[0]]
                         radar_fig = go.Figure()

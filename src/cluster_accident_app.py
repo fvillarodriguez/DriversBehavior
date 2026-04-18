@@ -15,7 +15,7 @@ import time
 import unicodedata
 from datetime import datetime, time as dt_time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -44,13 +44,17 @@ from src.utils import (
 from src.model_training import (
     BALANCE_STRATEGY_LABELS,
     CALIBRATION_METHOD_LABELS,
+    OPTUNA_OBJECTIVE_LABELS,
     THRESHOLD_OBJECTIVE_LABELS,
     THRESHOLD_PROTOCOL_LABELS,
     build_model as _build_model,
+    fit_score_calibrator as _fit_score_calibrator,
     get_model_scores as _get_model_scores,
-    select_threshold_for_far as _select_threshold_for_far,
-    select_threshold_for_metric as _select_threshold_for_metric,
-    far_and_sensitivity as _far_and_sensitivity,
+    normalize_calibration_method as _normalize_calibration_method,
+    normalize_optuna_objective_metric as _normalize_optuna_objective_metric,
+    normalize_threshold_objective,
+    optuna_objective_direction as _optuna_objective_direction,
+    score_optuna_objective as _score_optuna_objective,
     temporal_train_test_split as _temporal_train_test_split,
     split_train_val_for_threshold as _split_train_val_for_threshold,
     train_model as _train_model,
@@ -90,6 +94,12 @@ CLUSTER_LABEL_PATTERN = re.compile(
 XAI_GROUP_COLOR_DOMAIN = ["Base", "Cluster"]
 XAI_GROUP_COLOR_RANGE = ["#2f6c7a", "#c66a10"]
 XAI_FEATURE_VALUE_RANGE = ["#2f6c7a", "#f4f1de", "#c66a10"]
+OPTUNA_BALANCE_MODE_ORDER = ("none", "smote")
+OPTUNA_BALANCE_MODE_LABELS = {
+    "none": "Sin SMOTE",
+    "smote": "Con SMOTE",
+}
+CALIBRATION_METHOD_ORDER = ("sigmoid", "isotonic", "none")
 
 
 class _StreamlitProgress:
@@ -109,6 +119,19 @@ class _StreamlitProgress:
 
     def close(self) -> None:
         self.text.empty()
+
+
+def _format_duration_compact(seconds: Optional[float]) -> str:
+    if seconds is None or not np.isfinite(float(seconds)):
+        return "-"
+    total_seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def _init_state() -> None:
@@ -153,6 +176,10 @@ def _init_state() -> None:
     st.session_state.setdefault("optuna_results_store", {})
     st.session_state.setdefault("optuna_active_key", None)
     st.session_state.setdefault("optuna_model_params_applied_signatures", {})
+    # Aceptar fallback de calibración de Optuna en la pestaña Modelos.
+    # Default False: el usuario debe marcar conscientemente el opt-in para
+    # que Modelos use un Optuna cuya calibración no coincide con la pedida.
+    st.session_state.setdefault("allow_optuna_calibration_fallback", False)
     st.session_state.setdefault("optuna_n_trials", 500)
     st.session_state.setdefault("optuna_timeout", 86400)
     st.session_state.setdefault("optuna_n_jobs", 1)
@@ -167,6 +194,7 @@ def _init_state() -> None:
     st.session_state.setdefault("balance_last_params", None)
     st.session_state.setdefault("history_entries", [])
     st.session_state.setdefault("xai_report_cache", {})
+    st.session_state.setdefault("calibration_sweep_last_payload", None)
 
 
 def _normalize_portico_code(value: object) -> Optional[str]:
@@ -209,6 +237,43 @@ def _normalize_portico_series(series: pd.Series) -> pd.Series:
 
 def _max_optuna_parallel_jobs() -> int:
     return max(1, int(os.cpu_count() or 1))
+
+
+def _build_optuna_int_grid(low: int, high: int, step: int = 1) -> List[int]:
+    low_i = int(low)
+    high_i = int(high)
+    step_i = max(1, int(step))
+    if high_i < low_i:
+        high_i = low_i
+    values = list(range(low_i, high_i + 1, step_i))
+    if not values:
+        return [low_i]
+    if values[-1] != high_i:
+        values.append(high_i)
+    return values
+
+
+def _suggest_optuna_discrete_int(
+    trial: "optuna.Trial",
+    name: str,
+    low: int,
+    high: int,
+    *,
+    step: int = 1,
+) -> int:
+    low_i = int(low)
+    high_i = int(high)
+    step_i = max(1, int(step))
+    if high_i < low_i:
+        high_i = low_i
+    if step_i == 1 or (high_i - low_i) % step_i == 0:
+        return int(trial.suggest_int(name, low_i, high_i, step=step_i))
+    return int(
+        trial.suggest_categorical(
+            name,
+            _build_optuna_int_grid(low_i, high_i, step_i),
+        )
+    )
 
 
 def _render_optuna_n_jobs_input(
@@ -1195,6 +1260,41 @@ def _save_cluster_features(
     return path
 
 
+def _dataset_content_fingerprint(features_df: pd.DataFrame) -> str:
+    """Fingerprint determinístico de un DataFrame de features.
+
+    Captura nombre+orden de columnas, dtypes y shape. Dos DataFrames con el
+    mismo fingerprint son prácticamente idénticos a nivel de schema. Los
+    valores no se incluyen por costo, pero los cambios que rompen la
+    coherencia Optuna ↔ Modelos (columnas añadidas/removidas, dtype distinto,
+    nº de filas distinto) sí quedan detectados.
+
+    Se usa como:
+      - desempate en `_feature_selection_key` cuando no hay `features_path`.
+      - firma auxiliar en el store Optuna (`dataset_fingerprint`) para
+        detectar drift aunque el path no cambie.
+    """
+    if not isinstance(features_df, pd.DataFrame):
+        return "empty"
+    if features_df.empty and len(features_df.columns) == 0:
+        return "empty"
+    try:
+        cols = [str(c) for c in features_df.columns]
+        sorted_cols = sorted(cols)
+        dtypes = [str(features_df[col].dtype) for col in sorted_cols]
+        payload = "|".join(
+            [
+                f"rows={int(len(features_df))}",
+                f"cols={len(sorted_cols)}",
+                "names=" + ",".join(sorted_cols),
+                "dtypes=" + ",".join(dtypes),
+            ]
+        )
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return "error"
+
+
 def _feature_selection_key(
     features_path: Optional[str],
     features_source: Optional[str],
@@ -1206,7 +1306,11 @@ def _feature_selection_key(
         except Exception:
             return str(features_path)
     source = features_source or "memory"
-    return f"{source}:{len(features_df)}:{len(features_df.columns)}"
+    # Sin un path que identifique unívocamente la fuente, dos datasets con
+    # mismo shape colisionaban silenciosamente. El fingerprint garantiza que
+    # cambios de schema/shape produzcan un key distinto.
+    fingerprint = _dataset_content_fingerprint(features_df)
+    return f"{source}:{len(features_df)}:{len(features_df.columns)}:{fingerprint}"
 
 
 def _feature_selection_id(
@@ -1251,9 +1355,686 @@ def _optuna_result_paths(optuna_id: str) -> Tuple[Path, Path]:
     return json_path, csv_path
 
 
-def _optuna_trials_path(optuna_id: str, model_choice: Optional[str] = None) -> Path:
+def _normalize_optuna_balance_mode(value: object) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "": "none",
+        "none": "none",
+        "sin smote": "none",
+        "sin balance": "none",
+        "no_smote": "none",
+        "no-smote": "none",
+        "class_weight": "none",
+        "class weight": "none",
+        "smote": "smote",
+        "con smote": "smote",
+        "with_smote": "smote",
+        "with-smote": "smote",
+    }
+    return aliases.get(text, "none")
+
+
+def _optuna_balance_mode_label(balance_mode: object) -> str:
+    mode = _normalize_optuna_balance_mode(balance_mode)
+    return OPTUNA_BALANCE_MODE_LABELS.get(mode, str(balance_mode))
+
+
+def _ordered_calibration_methods(methods: Optional[List[object]] = None) -> List[str]:
+    raw_methods = list(methods) if methods is not None else list(CALIBRATION_METHOD_ORDER)
+    normalized = [
+        _normalize_calibration_method(method)
+        for method in raw_methods
+    ]
+    extras = [
+        method
+        for method in normalized
+        if method not in CALIBRATION_METHOD_ORDER
+    ]
+    ordered = list(CALIBRATION_METHOD_ORDER) + sorted(set(extras))
+    result: List[str] = []
+    seen: set[str] = set()
+    for method in ordered:
+        if method not in normalized or method in seen:
+            continue
+        seen.add(method)
+        result.append(method)
+    return result
+
+
+def _calibration_method_label(calibration_method: object) -> str:
+    method = _normalize_calibration_method(calibration_method)
+    return CALIBRATION_METHOD_LABELS.get(method, str(calibration_method))
+
+
+def _calibration_method_options(
+    methods: Optional[List[object]] = None,
+) -> List[Tuple[str, str]]:
+    return [
+        (_calibration_method_label(method), method)
+        for method in _ordered_calibration_methods(methods)
+    ]
+
+
+def _optuna_objective_option_label(metric: object) -> str:
+    metric_key = _normalize_optuna_objective_metric(metric)
+    label = OPTUNA_OBJECTIVE_LABELS.get(metric_key, str(metric).upper())
+    if _optuna_objective_direction(metric_key) == "minimize":
+        return f"{label} (menor es mejor)"
+    return label
+
+
+def _optuna_objective_options(
+    metrics: Optional[List[object]] = None,
+) -> Dict[str, Dict[str, str]]:
+    metric_order = [
+        "f1",
+        "roc_auc",
+        "pr_auc",
+        "accuracy",
+        "recall",
+        "precision",
+        "fnr",
+        "far_sens",
+        "balanced_f1",
+        "mcc",
+        "brier_score",
+        "recall_at_alerts_per_day",
+        "operational_cost",
+        "net_balanced_rate",
+    ]
+    requested = [
+        _normalize_optuna_objective_metric(metric)
+        for metric in (metrics if metrics is not None else metric_order)
+    ]
+    ordered = [metric for metric in metric_order if metric in requested]
+    for metric in requested:
+        if metric not in ordered:
+            ordered.append(metric)
+    return {
+        _optuna_objective_option_label(metric): {
+            "key": metric,
+            "direction": _optuna_objective_direction(metric),
+        }
+        for metric in ordered
+    }
+
+
+def _controlled_objective_options() -> Dict[str, str]:
+    options = _optuna_objective_options(
+        [
+            "pr_auc",
+            "roc_auc",
+            "balanced_f1",
+            "f1",
+            "mcc",
+            "brier_score",
+            "recall_at_alerts_per_day",
+            "operational_cost",
+        ]
+    )
+    return {label: cfg["key"] for label, cfg in options.items()}
+
+
+def _calibration_sweep_optuna_objective_options(
+    *,
+    include_advanced: bool = False,
+) -> Dict[str, str]:
+    default_metrics = [
+        "pr_auc",
+        "mcc",
+        "brier_score",
+        "balanced_f1",
+        "recall_at_alerts_per_day",
+        "operational_cost",
+        "far_sens",
+    ]
+    advanced_metrics = default_metrics + [
+        "roc_auc",
+        "f1",
+        "accuracy",
+        "recall",
+        "precision",
+        "fnr",
+        "net_balanced_rate",
+    ]
+    options = _optuna_objective_options(
+        advanced_metrics if include_advanced else default_metrics
+    )
+    return {label: cfg["key"] for label, cfg in options.items()}
+
+
+def _calibration_sweep_threshold_objective_options() -> Dict[str, str]:
+    return {
+        "FAR": "far",
+        "F1": "f1",
+        "Balanced F1": "balanced_f1",
+        "MCC": "mcc",
+        "Recall@N alertas/día": "recall_at_alerts_per_day",
+        "Costo operacional": "operational_cost",
+    }
+
+
+def _combined_threshold_field_visibility(
+    objectives: Sequence[object],
+) -> Dict[str, bool]:
+    visible_fields = {
+        "far_target": False,
+        "alerts_per_day": False,
+        "fn_cost": False,
+        "fp_cost": False,
+    }
+    for objective in objectives:
+        objective_visibility = _threshold_field_visibility_for_objective(objective)
+        for field_name, is_visible in objective_visibility.items():
+            visible_fields[field_name] = (
+                visible_fields[field_name] or bool(is_visible)
+            )
+    return visible_fields
+
+
+_THRESHOLD_CONFIG_FIELD_NAMES = (
+    "far_target",
+    "alerts_per_day",
+    "fn_cost",
+    "fp_cost",
+)
+
+
+def _threshold_field_visibility_for_objective(
+    objective: object,
+) -> Dict[str, bool]:
+    objective_key = normalize_threshold_objective(objective)
+    visible_fields = {
+        "far": {"far_target"},
+        "recall_at_alerts_per_day": {"alerts_per_day"},
+        "operational_cost": {"alerts_per_day", "fn_cost", "fp_cost"},
+    }.get(objective_key, set())
+    return {
+        field_name: field_name in visible_fields
+        for field_name in _THRESHOLD_CONFIG_FIELD_NAMES
+    }
+
+
+def _threshold_field_visibility_for_strategy(
+    strategy: object,
+) -> Dict[str, bool]:
+    strategy_key = str(strategy or "").strip().lower()
+    aliases = {
+        "optuna": "optuna",
+        "optimizar threshold": "optuna",
+        "far": "far",
+        "calibrar por far": "far",
+    }
+    normalized_strategy = aliases.get(strategy_key, "optuna")
+    visible_fields = {"far_target"} if normalized_strategy == "far" else set()
+    return {
+        field_name: field_name in visible_fields
+        for field_name in _THRESHOLD_CONFIG_FIELD_NAMES
+    }
+
+
+def _option_value_from_state(
+    options: Dict[str, str],
+    state_key: str,
+    *,
+    default_label: Optional[str] = None,
+) -> str:
+    labels = list(options.keys())
+    fallback_label = (
+        default_label if default_label in options else (labels[0] if labels else "")
+    )
+    selected_label = str(st.session_state.get(state_key, fallback_label))
+    if selected_label not in options:
+        selected_label = fallback_label
+    return str(options[selected_label])
+
+
+def _persisted_widget_state_key(widget_key: str) -> str:
+    return f"_persisted_widget_value::{widget_key}"
+
+
+def _get_persisted_widget_value(widget_key: str, default: object) -> object:
+    persisted_key = _persisted_widget_state_key(widget_key)
+    if widget_key in st.session_state:
+        st.session_state[persisted_key] = st.session_state[widget_key]
+    elif persisted_key not in st.session_state:
+        st.session_state[persisted_key] = default
+    return st.session_state[persisted_key]
+
+
+def _set_persisted_widget_value(widget_key: str, value: object) -> object:
+    st.session_state[_persisted_widget_state_key(widget_key)] = value
+    return value
+
+
+def _render_conditional_slider(
+    label: str,
+    *,
+    visible: bool,
+    min_value: object,
+    max_value: object,
+    value: object,
+    step: object,
+    key: str,
+    help: Optional[str] = None,
+) -> object:
+    current_value = _get_persisted_widget_value(key, value)
+    if not visible:
+        return _set_persisted_widget_value(key, current_value)
+    rendered_value = st.slider(
+        label,
+        min_value=min_value,
+        max_value=max_value,
+        value=current_value,
+        step=step,
+        key=key,
+        help=help,
+    )
+    return _set_persisted_widget_value(key, rendered_value)
+
+
+def _render_conditional_number_input(
+    label: str,
+    *,
+    visible: bool,
+    min_value: object,
+    value: object,
+    step: object,
+    key: str,
+    max_value: Optional[object] = None,
+    help: Optional[str] = None,
+) -> object:
+    current_value = _get_persisted_widget_value(key, value)
+    if not visible:
+        return _set_persisted_widget_value(key, current_value)
+    kwargs = {
+        "min_value": min_value,
+        "value": current_value,
+        "step": step,
+        "key": key,
+        "help": help,
+    }
+    if max_value is not None:
+        kwargs["max_value"] = max_value
+    rendered_value = st.number_input(
+        label,
+        **kwargs,
+    )
+    return _set_persisted_widget_value(key, rendered_value)
+
+
+def _calibration_method_selectbox(
+    label: str,
+    *,
+    key: str,
+    default_method: str = "sigmoid",
+    methods: Optional[List[object]] = None,
+    help: Optional[str] = None,
+) -> str:
+    options = _calibration_method_options(methods)
+    labels = [option_label for option_label, _ in options]
+    mapping = {option_label: option_key for option_label, option_key in options}
+    default_label = _calibration_method_label(default_method)
+    index = labels.index(default_label) if default_label in labels else 0
+    selected_label = st.selectbox(
+        label,
+        labels,
+        index=index,
+        key=key,
+        help=help,
+    )
+    return mapping[selected_label]
+
+
+def _calibration_method_multiselect(
+    label: str,
+    *,
+    key: str,
+    default_methods: Optional[List[object]] = None,
+    methods: Optional[List[object]] = None,
+    help: Optional[str] = None,
+) -> List[str]:
+    options = _calibration_method_options(methods)
+    labels = [option_label for option_label, _ in options]
+    mapping = {option_label: option_key for option_label, option_key in options}
+    default_labels = [
+        _calibration_method_label(method)
+        for method in (
+            default_methods if default_methods is not None else ["sigmoid", "isotonic"]
+        )
+        if _calibration_method_label(method) in mapping
+    ]
+    selected_labels = st.multiselect(
+        label,
+        labels,
+        default=default_labels,
+        key=key,
+        help=help,
+    )
+    return [mapping[selected_label] for selected_label in selected_labels if selected_label in mapping]
+
+
+def _infer_optuna_result_calibration_method(
+    result: Optional[Dict[str, object]],
+) -> str:
+    if not isinstance(result, dict):
+        return "none"
+    settings = result.get("optuna_settings")
+    if isinstance(settings, dict) and settings.get("calibration_method") is not None:
+        return _normalize_calibration_method(settings.get("calibration_method"))
+    if result.get("calibration_method") is not None:
+        return _normalize_calibration_method(result.get("calibration_method"))
+    return "none"
+
+
+def _infer_optuna_result_balance_mode(result: Optional[Dict[str, object]]) -> str:
+    if not isinstance(result, dict):
+        return "none"
+    settings = result.get("optuna_settings")
+    if isinstance(settings, dict) and settings.get("balance_mode") is not None:
+        return _normalize_optuna_balance_mode(settings.get("balance_mode"))
+    best_smote_params = result.get("best_smote_params")
+    if isinstance(best_smote_params, dict) and best_smote_params:
+        return "smote"
+    return "none"
+
+
+def _normalize_optuna_variant_result(
+    *,
+    model_choice: str,
+    result: Dict[str, object],
+    balance_mode: Optional[str] = None,
+    calibration_method: Optional[str] = None,
+) -> Dict[str, object]:
+    normalized_balance_mode = _normalize_optuna_balance_mode(
+        balance_mode if balance_mode is not None else _infer_optuna_result_balance_mode(result)
+    )
+    normalized_calibration_method = _normalize_calibration_method(
+        (
+            calibration_method
+            if calibration_method is not None
+            else _infer_optuna_result_calibration_method(result)
+        )
+    )
+    item = dict(result)
+    settings = item.get("optuna_settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    else:
+        settings = dict(settings)
+    item["balance_mode"] = normalized_balance_mode
+    item["balance_mode_label"] = _optuna_balance_mode_label(normalized_balance_mode)
+    item["calibration_method"] = normalized_calibration_method
+    item["calibration_method_label"] = _calibration_method_label(
+        normalized_calibration_method
+    )
+    settings["balance_mode"] = normalized_balance_mode
+    settings.setdefault(
+        "balance_mode_label",
+        _optuna_balance_mode_label(normalized_balance_mode),
+    )
+    settings["calibration_method"] = normalized_calibration_method
+    settings.setdefault(
+        "calibration_method_label",
+        _calibration_method_label(normalized_calibration_method),
+    )
+    item["model_choice"] = str(item.get("model_choice") or model_choice)
+    item["optuna_settings"] = settings
+    item["search_space"] = dict(item.get("search_space") or {})
+    return item
+
+
+def _normalize_optuna_results_payload(
+    results: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    normalized: Dict[str, object] = {}
+    if not isinstance(results, dict):
+        return normalized
+
+    for key, raw_value in results.items():
+        if not isinstance(raw_value, dict):
+            continue
+        model_choice = str(raw_value.get("model_choice") or key)
+        container = normalized.setdefault(
+            model_choice,
+            {
+                "model_choice": model_choice,
+                "by_balance_mode": {},
+            },
+        )
+        by_balance_mode = container.setdefault("by_balance_mode", {})
+
+        raw_by_mode = raw_value.get("by_balance_mode")
+        if isinstance(raw_by_mode, dict):
+            for raw_mode, raw_mode_value in raw_by_mode.items():
+                if not isinstance(raw_mode_value, dict):
+                    continue
+                mode = _normalize_optuna_balance_mode(raw_mode)
+                mode_container = by_balance_mode.setdefault(
+                    mode,
+                    {
+                        "balance_mode": mode,
+                        "balance_mode_label": _optuna_balance_mode_label(mode),
+                        "by_calibration_method": {},
+                    },
+                )
+                by_calibration_method = mode_container.setdefault(
+                    "by_calibration_method",
+                    {},
+                )
+                raw_by_calibration: Dict[str, object]
+                if any(
+                    key in raw_mode_value
+                    for key in [
+                        "best_score",
+                        "best_smote_params",
+                        "best_model_params",
+                        "optuna_settings",
+                        "search_space",
+                        "trials_csv",
+                        "trials_df",
+                    ]
+                ):
+                    raw_by_calibration = {
+                        _infer_optuna_result_calibration_method(raw_mode_value): raw_mode_value
+                    }
+                elif isinstance(raw_mode_value.get("by_calibration_method"), dict):
+                    raw_by_calibration = dict(
+                        raw_mode_value.get("by_calibration_method") or {}
+                    )
+                else:
+                    raw_by_calibration = raw_mode_value
+                for raw_calibration_method, raw_variant in raw_by_calibration.items():
+                    if not isinstance(raw_variant, dict):
+                        continue
+                    calibration_key = _normalize_calibration_method(
+                        raw_calibration_method
+                    )
+                    by_calibration_method[calibration_key] = (
+                        _normalize_optuna_variant_result(
+                            model_choice=model_choice,
+                            result=raw_variant,
+                            balance_mode=mode,
+                            calibration_method=calibration_key,
+                        )
+                    )
+            continue
+
+        legacy_mode = _infer_optuna_result_balance_mode(raw_value)
+        legacy_calibration_method = _infer_optuna_result_calibration_method(
+            raw_value
+        )
+        mode_container = by_balance_mode.setdefault(
+            legacy_mode,
+            {
+                "balance_mode": legacy_mode,
+                "balance_mode_label": _optuna_balance_mode_label(legacy_mode),
+                "by_calibration_method": {},
+            },
+        )
+        by_calibration_method = mode_container.setdefault("by_calibration_method", {})
+        by_calibration_method[legacy_calibration_method] = (
+            _normalize_optuna_variant_result(
+                model_choice=model_choice,
+                result=raw_value,
+                balance_mode=legacy_mode,
+                calibration_method=legacy_calibration_method,
+            )
+        )
+
+    return normalized
+
+
+def _get_optuna_model_result_container(
+    results: Optional[Dict[str, object]],
+    model_choice: str,
+) -> Optional[Dict[str, object]]:
+    normalized = _normalize_optuna_results_payload(results)
+    container = normalized.get(str(model_choice))
+    return container if isinstance(container, dict) else None
+
+
+def _get_optuna_model_result_variant_match(
+    results: Optional[Dict[str, object]],
+    *,
+    model_choice: str,
+    balance_mode: str,
+    calibration_method: Optional[str] = None,
+    fallback_modes: Optional[List[str]] = None,
+    fallback_calibration_methods: Optional[List[str]] = None,
+    allow_any_calibration_within_mode: bool = False,
+) -> Optional[Dict[str, object]]:
+    container = _get_optuna_model_result_container(results, model_choice)
+    if not isinstance(container, dict):
+        return None
+    by_balance_mode = container.get("by_balance_mode")
+    if not isinstance(by_balance_mode, dict):
+        return None
+    requested_mode = _normalize_optuna_balance_mode(balance_mode)
+    requested_calibration = (
+        None
+        if calibration_method is None
+        else _normalize_calibration_method(calibration_method)
+    )
+    candidate_modes = [
+        requested_mode,
+        *[
+            _normalize_optuna_balance_mode(mode)
+            for mode in list(fallback_modes or [])
+        ],
+    ]
+    seen_modes: set[str] = set()
+    for candidate_mode in candidate_modes:
+        if candidate_mode in seen_modes:
+            continue
+        seen_modes.add(candidate_mode)
+        mode_container = by_balance_mode.get(candidate_mode)
+        if not isinstance(mode_container, dict):
+            continue
+        by_calibration_method = mode_container.get("by_calibration_method")
+        if not isinstance(by_calibration_method, dict):
+            continue
+        calibration_candidates: List[str] = []
+        if requested_calibration is not None:
+            calibration_candidates.append(requested_calibration)
+        # `fallback_calibration_methods` explícitos siempre se respetan (el
+        # caller los eligió intencionalmente). Si vienen como None, SOLO
+        # expandir al resto cuando `allow_any_calibration_within_mode` está
+        # activo. Antes se expandía incondicionalmente y el flag no tenía
+        # efecto práctico, dejando pasar fallbacks silenciosos.
+        if fallback_calibration_methods is not None:
+            calibration_candidates.extend(
+                _ordered_calibration_methods(fallback_calibration_methods)
+            )
+        if requested_calibration is None or allow_any_calibration_within_mode:
+            calibration_candidates.extend(
+                _ordered_calibration_methods(
+                    list(by_calibration_method.keys())
+                )
+            )
+        seen_calibration_methods: set[str] = set()
+        for candidate_calibration in calibration_candidates:
+            if candidate_calibration in seen_calibration_methods:
+                continue
+            seen_calibration_methods.add(candidate_calibration)
+            variant = by_calibration_method.get(candidate_calibration)
+            if isinstance(variant, dict):
+                return {
+                    "result": variant,
+                    "requested_balance_mode": requested_mode,
+                    "resolved_balance_mode": candidate_mode,
+                    "requested_calibration_method": requested_calibration,
+                    "resolved_calibration_method": candidate_calibration,
+                    "used_fallback": (
+                        candidate_mode != requested_mode
+                        or (
+                            requested_calibration is not None
+                            and candidate_calibration != requested_calibration
+                        )
+                    ),
+                }
+    return None
+
+
+def _get_optuna_model_result_variant(
+    results: Optional[Dict[str, object]],
+    *,
+    model_choice: str,
+    balance_mode: str,
+    calibration_method: Optional[str] = None,
+    fallback_modes: Optional[List[str]] = None,
+    fallback_calibration_methods: Optional[List[str]] = None,
+    allow_any_calibration_within_mode: bool = False,
+) -> Optional[Dict[str, object]]:
+    match = _get_optuna_model_result_variant_match(
+        results,
+        model_choice=model_choice,
+        balance_mode=balance_mode,
+        calibration_method=calibration_method,
+        fallback_modes=fallback_modes,
+        fallback_calibration_methods=fallback_calibration_methods,
+        allow_any_calibration_within_mode=allow_any_calibration_within_mode,
+    )
+    if not isinstance(match, dict):
+        return None
+    result = match.get("result")
+    return result if isinstance(result, dict) else None
+
+
+def _optuna_model_tab_balance_mode(
+    *,
+    balance_strategy: str,
+    use_balanced: bool,
+) -> str:
+    if bool(use_balanced):
+        return "smote"
+    if str(balance_strategy).strip().lower() == "smote":
+        return "smote"
+    return "none"
+
+
+def _optuna_trials_path(
+    optuna_id: str,
+    model_choice: Optional[str] = None,
+    balance_mode: Optional[str] = None,
+    calibration_method: Optional[str] = None,
+) -> Path:
     if model_choice:
         suffix = _slugify(model_choice)
+        if balance_mode is not None:
+            balance_suffix = _slugify(_normalize_optuna_balance_mode(balance_mode))
+            if calibration_method is not None:
+                calibration_suffix = _slugify(
+                    _normalize_calibration_method(calibration_method)
+                )
+                return (
+                    RESULTS_DIR
+                    / f"optuna_{optuna_id}_{suffix}_{balance_suffix}_{calibration_suffix}_trials.csv"
+                )
+            return (
+                RESULTS_DIR
+                / f"optuna_{optuna_id}_{suffix}_{balance_suffix}_trials.csv"
+            )
         return RESULTS_DIR / f"optuna_{optuna_id}_{suffix}_trials.csv"
     return RESULTS_DIR / f"optuna_{optuna_id}_trials.csv"
 
@@ -1292,6 +2073,8 @@ def _persist_optuna_results(
     selected_features: Optional[List[str]],
     feature_cols: List[str],
     model_choice: str,
+    balance_mode: str,
+    calibration_method: str,
     best_score: float,
     best_smote_params: Dict[str, object],
     best_model_params: Dict[str, object],
@@ -1303,48 +2086,112 @@ def _persist_optuna_results(
     entry = store.get(optuna_key, {})
     if not isinstance(optuna_settings, dict):
         optuna_settings = {}
-    results = entry.get("results")
-    if not isinstance(results, dict):
-        results = {}
+    normalized_balance_mode = _normalize_optuna_balance_mode(balance_mode)
+    normalized_calibration_method = _normalize_calibration_method(
+        calibration_method
+    )
+    results = _normalize_optuna_results_payload(entry.get("results"))
+    if not results:
         legacy_model = entry.get("model_choice")
         if legacy_model:
-            results[str(legacy_model)] = {
-                "model_choice": legacy_model,
-                "best_score": entry.get("best_score"),
-                "best_smote_params": entry.get("best_smote_params", {}),
-                "best_model_params": entry.get("best_model_params", {}),
-                "optuna_settings": entry.get("optuna_settings", {}),
-                "search_space": entry.get("search_space", {}),
-                "saved_at": entry.get("saved_at"),
-                "trials_df": entry.get("trials_df"),
-                "trials_csv": entry.get("trials_csv"),
-            }
+            results = _normalize_optuna_results_payload(
+                {
+                    str(legacy_model): {
+                        "model_choice": legacy_model,
+                        "best_score": entry.get("best_score"),
+                        "best_smote_params": entry.get("best_smote_params", {}),
+                        "best_model_params": entry.get("best_model_params", {}),
+                        "optuna_settings": entry.get("optuna_settings", {}),
+                        "search_space": entry.get("search_space", {}),
+                        "saved_at": entry.get("saved_at"),
+                        "trials_df": entry.get("trials_df"),
+                        "trials_csv": entry.get("trials_csv"),
+                    }
+                }
+            )
+
+    model_container = results.setdefault(
+        str(model_choice),
+        {
+            "model_choice": str(model_choice),
+            "by_balance_mode": {},
+        },
+    )
+    by_balance_mode = model_container.setdefault("by_balance_mode", {})
+    mode_container = by_balance_mode.setdefault(
+        normalized_balance_mode,
+        {
+            "balance_mode": normalized_balance_mode,
+            "balance_mode_label": _optuna_balance_mode_label(normalized_balance_mode),
+            "by_calibration_method": {},
+        },
+    )
+    by_calibration_method = mode_container.setdefault("by_calibration_method", {})
 
     trials_csv = None
     if trials_df is not None and not trials_df.empty:
         try:
             RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-            trials_path = _optuna_trials_path(optuna_id, model_choice)
+            trials_path = _optuna_trials_path(
+                optuna_id,
+                model_choice,
+                normalized_balance_mode,
+                normalized_calibration_method,
+            )
             trials_df.to_csv(trials_path, index=False)
             trials_csv = str(trials_path)
         except Exception:
             trials_csv = None
     else:
-        existing = results.get(model_choice, {})
+        existing = by_calibration_method.get(normalized_calibration_method, {})
         trials_csv = existing.get("trials_csv")
 
-    result_entry = {
-        "model_choice": model_choice,
-        "best_score": float(best_score),
-        "best_smote_params": dict(best_smote_params),
-        "best_model_params": dict(best_model_params),
-        "optuna_settings": dict(optuna_settings),
-        "search_space": dict(search_space),
-        "saved_at": datetime.now().isoformat(),
-        "trials_df": trials_df,
-        "trials_csv": trials_csv,
-    }
-    results[model_choice] = result_entry
+    variant_settings = dict(optuna_settings)
+    variant_settings["balance_mode"] = normalized_balance_mode
+    variant_settings.setdefault(
+        "balance_mode_label",
+        _optuna_balance_mode_label(normalized_balance_mode),
+    )
+    variant_settings["calibration_method"] = normalized_calibration_method
+    variant_settings.setdefault(
+        "calibration_method_label",
+        _calibration_method_label(normalized_calibration_method),
+    )
+
+    result_entry = _normalize_optuna_variant_result(
+        model_choice=str(model_choice),
+        balance_mode=normalized_balance_mode,
+        calibration_method=normalized_calibration_method,
+        result={
+            "model_choice": model_choice,
+            "balance_mode": normalized_balance_mode,
+            "balance_mode_label": _optuna_balance_mode_label(
+                normalized_balance_mode
+            ),
+            "calibration_method": normalized_calibration_method,
+            "calibration_method_label": _calibration_method_label(
+                normalized_calibration_method
+            ),
+            "best_score": float(best_score),
+            "best_smote_params": dict(best_smote_params),
+            "best_model_params": dict(best_model_params),
+            "optuna_settings": variant_settings,
+            "search_space": dict(search_space),
+            "saved_at": datetime.now().isoformat(),
+            "trials_df": trials_df,
+            "trials_csv": trials_csv,
+        },
+    )
+    by_calibration_method[normalized_calibration_method] = result_entry
+    mode_container["balance_mode"] = normalized_balance_mode
+    mode_container["balance_mode_label"] = _optuna_balance_mode_label(
+        normalized_balance_mode
+    )
+    mode_container["by_calibration_method"] = by_calibration_method
+    by_balance_mode[normalized_balance_mode] = mode_container
+    model_container["model_choice"] = str(model_choice)
+    model_container["by_balance_mode"] = by_balance_mode
+    results[str(model_choice)] = model_container
 
     entry = {
         "optuna_id": optuna_id,
@@ -1354,6 +2201,7 @@ def _persist_optuna_results(
         "features_source": features_source,
         "features_rows": int(len(features_df)),
         "features_cols": int(len(features_df.columns)),
+        "dataset_fingerprint": _dataset_content_fingerprint(features_df),
         "selection_mode": "all" if selected_features is None else "selected",
         "selected_features": list(selected_features) if selected_features else [],
         "feature_cols": list(feature_cols),
@@ -1369,7 +2217,26 @@ def _persist_optuna_results(
         if not isinstance(data, dict):
             continue
         result_payload = dict(data)
-        result_payload.pop("trials_df", None)
+        raw_by_mode = result_payload.get("by_balance_mode")
+        payload_by_mode: Dict[str, object] = {}
+        if isinstance(raw_by_mode, dict):
+            for mode_key, mode_data in raw_by_mode.items():
+                if not isinstance(mode_data, dict):
+                    continue
+                mode_payload = dict(mode_data)
+                raw_by_calibration = mode_payload.get("by_calibration_method")
+                payload_by_calibration: Dict[str, object] = {}
+                if isinstance(raw_by_calibration, dict):
+                    for calibration_key, calibration_data in raw_by_calibration.items():
+                        if not isinstance(calibration_data, dict):
+                            continue
+                        calibration_payload = dict(calibration_data)
+                        calibration_payload.pop("trials_df", None)
+                        payload_by_calibration[str(calibration_key)] = calibration_payload
+                mode_payload["by_calibration_method"] = payload_by_calibration
+                mode_payload.pop("trials_df", None)
+                payload_by_mode[str(mode_key)] = mode_payload
+        result_payload["by_balance_mode"] = payload_by_mode
         payload_results[str(choice)] = result_payload
     payload["results"] = payload_results
     try:
@@ -1720,18 +2587,45 @@ def _optuna_summary_from_results(
     feature_cols: List[str],
 ) -> Dict[str, object]:
     models: Dict[str, object] = {}
-    for choice, data in results.items():
+    normalized_results = _normalize_optuna_results_payload(results)
+    for choice, data in normalized_results.items():
         if not isinstance(data, dict):
             continue
-        models[str(choice)] = {
-            "best_score": data.get("best_score"),
-            "best_smote_params": data.get("best_smote_params", {}),
-            "best_model_params": data.get("best_model_params", {}),
-            "settings": data.get("optuna_settings", {}),
-            "search_space": data.get("search_space", {}),
-            "saved_at": data.get("saved_at"),
-            "trials_csv": data.get("trials_csv"),
-        }
+        by_mode = data.get("by_balance_mode")
+        if not isinstance(by_mode, dict):
+            continue
+        variants: Dict[str, object] = {}
+        for balance_mode, mode_data in by_mode.items():
+            if not isinstance(mode_data, dict):
+                continue
+            by_calibration_method = mode_data.get("by_calibration_method")
+            if not isinstance(by_calibration_method, dict):
+                continue
+            calibration_variants: Dict[str, object] = {}
+            for calibration_method, variant in by_calibration_method.items():
+                if not isinstance(variant, dict):
+                    continue
+                calibration_variants[str(calibration_method)] = {
+                    "balance_mode": str(balance_mode),
+                    "balance_mode_label": _optuna_balance_mode_label(balance_mode),
+                    "calibration_method": str(calibration_method),
+                    "calibration_method_label": _calibration_method_label(
+                        calibration_method
+                    ),
+                    "best_score": variant.get("best_score"),
+                    "best_smote_params": variant.get("best_smote_params", {}),
+                    "best_model_params": variant.get("best_model_params", {}),
+                    "settings": variant.get("optuna_settings", {}),
+                    "search_space": variant.get("search_space", {}),
+                    "saved_at": variant.get("saved_at"),
+                    "trials_csv": variant.get("trials_csv"),
+                }
+            variants[str(balance_mode)] = {
+                "balance_mode": str(balance_mode),
+                "balance_mode_label": _optuna_balance_mode_label(balance_mode),
+                "by_calibration_method": calibration_variants,
+            }
+        models[str(choice)] = {"by_balance_mode": variants}
     return {
         "optuna_key": optuna_key,
         "optuna_id": optuna_id,
@@ -2674,6 +3568,8 @@ def _controlled_comparison_metric_options(
         ("Test ROC-AUC", "test_roc_auc"),
         ("Validación PR-AUC", "val_pr_auc"),
         ("Test PR-AUC", "test_pr_auc"),
+        ("Validación Brier", "val_brier_score"),
+        ("Test Brier", "test_brier_score"),
         ("Validación F1", "val_f1"),
         ("Test F1", "test_f1"),
         ("Validación F1 Global", "val_f1_global"),
@@ -2771,6 +3667,7 @@ def _prepare_controlled_comparison_detail_display(detail_df: pd.DataFrame) -> pd
         "selected_cluster_feature_count",
         "status",
         "objective_label",
+        "objective_direction",
         "val_objective_score",
         "test_objective_score",
         "val_accuracy",
@@ -2783,6 +3680,8 @@ def _prepare_controlled_comparison_detail_display(detail_df: pd.DataFrame) -> pd
         "test_roc_auc",
         "val_pr_auc",
         "test_pr_auc",
+        "val_brier_score",
+        "test_brier_score",
         "val_f1",
         "test_f1",
         "val_f1_global",
@@ -2866,8 +3765,10 @@ def _render_controlled_comparison_results(
         "f1": "F1",
         "balanced_f1": "Balanced F1",
         "mcc": "MCC",
+        "brier_score": "Brier",
         "recall_at_alerts_per_day": "Recall@N alertas/día",
         "operational_cost": "Costo operacional",
+        "net_balanced_rate": "(TP-FP)/P + (TN-FN)/N",
     }
     objective_label = objective_label_map.get(objective_metric, objective_metric.upper())
 
@@ -2969,6 +3870,7 @@ def _render_controlled_comparison_results(
             "threshold_objective_label",
             "calibration_method",
             "objective_label",
+            "objective_direction",
             "val_objective_score",
             "test_objective_score",
             "best_test_accuracy",
@@ -2976,6 +3878,7 @@ def _render_controlled_comparison_results(
             "best_test_sensitivity",
             "best_test_roc_auc",
             "best_test_pr_auc",
+            "best_test_brier_score",
             "best_test_f1_global",
             "best_test_balanced_f1",
             "best_test_f1_class_0",
@@ -3039,6 +3942,8 @@ def _render_controlled_comparison_results(
             "delta_test_roc_auc",
             "delta_val_pr_auc",
             "delta_test_pr_auc",
+            "delta_val_brier_score",
+            "delta_test_brier_score",
             "delta_val_f1",
             "delta_test_f1",
             "delta_val_mcc",
@@ -3313,6 +4218,503 @@ def _render_controlled_comparison_current_result(
         ablation_deltas_df=ablation_deltas_df,
         key_prefix=f"controlled_current_{run_id}",
     )
+
+
+def _render_calibration_sweep_experiment() -> None:
+    st.subheader("Calibración score + threshold")
+    st.caption(
+        "Barre, sobre un solo modelo, la combinación entre métrica objetivo de "
+        "Optuna, calibración del score, threshold operacional y balance mode. "
+        "El protocolo queda fijo en Robusto y el ranking oficial se arma con "
+        "métricas de validación."
+    )
+
+    event_files = _list_event_files()
+    if not event_files:
+        st.warning("No hay archivos de eventos (accidents) en Datos.")
+        return
+    feature_files = _list_flow_feature_files()
+    if not feature_files:
+        st.warning("No hay archivos de features en Resultados.")
+        return
+
+    event_names = [p.name for p in event_files]
+    feature_names = [p.name for p in feature_files]
+    selected_event = st.selectbox(
+        "Archivo de Eventos",
+        event_names,
+        key="exp_calibration_sweep_event_file",
+    )
+    selected_features_name = st.selectbox(
+        "Archivo de Features",
+        feature_names,
+        key="exp_calibration_sweep_feature_file",
+    )
+
+    selected_event_path = next(
+        (p for p in event_files if p.name == selected_event),
+        None,
+    )
+    selected_features_path = next(
+        (p for p in feature_files if p.name == selected_features_name),
+        None,
+    )
+    if selected_event_path is None or selected_features_path is None:
+        st.error("No se pudieron resolver los archivos seleccionados.")
+        return
+
+    dataset_date_start, dataset_date_end, dataset_date_valid = (
+        _render_controlled_feature_date_range_inputs(
+            selected_features_path,
+            key_prefix="exp_calibration_sweep",
+        )
+    )
+    if not dataset_date_valid:
+        return
+
+    try:
+        schema_df = _inspect_controlled_feature_schema(selected_features_path)
+    except Exception as exc:
+        st.error(f"No se pudo inspeccionar el archivo de features: {exc}")
+        return
+
+    if not _get_cluster_cols(schema_df):
+        st.error(
+            "El archivo seleccionado no contiene variables de cluster. "
+            "Este experimento requiere el mismo dataset enriquecido que Comparación controlada."
+        )
+        return
+
+    accidents_df_for_tramo = _load_accidents_for_event(selected_event_path)
+    allowed_porticos = _load_porticos_from_feature_file(selected_features_path)
+    tramo_tuple = _build_tramo_selector(
+        accidents_df_for_tramo,
+        date_start=dataset_date_start,
+        date_end=dataset_date_end,
+        allowed_porticos=allowed_porticos,
+        key="exp_calibration_sweep_tramo_choice",
+    )
+    if not tramo_tuple:
+        st.info("Seleccione un tramo específico para ejecutar el experimento.")
+        current_payload = st.session_state.get("calibration_sweep_last_payload")
+        if isinstance(current_payload, dict):
+            _render_calibration_sweep_results(
+                current_payload,
+                key_prefix="calibration_sweep_current",
+            )
+        return
+
+    st.markdown("**Configuración general**")
+    cfg1, cfg2, cfg3, cfg4 = st.columns(4)
+    with cfg1:
+        random_state = st.number_input(
+            "Random state",
+            min_value=0,
+            value=42,
+            step=1,
+            key="exp_calibration_sweep_random_state",
+        )
+    with cfg2:
+        n_trials = st.number_input(
+            "Optuna trials",
+            min_value=1,
+            value=25,
+            step=1,
+            key="exp_calibration_sweep_n_trials",
+        )
+    with cfg3:
+        timeout = st.number_input(
+            "Optuna timeout (seg)",
+            min_value=1,
+            value=1800,
+            step=10,
+            key="exp_calibration_sweep_timeout",
+        )
+    with cfg4:
+        model_choice = st.selectbox(
+            "Modelo",
+            list(CONTROLLED_COMPARISON_MODELS),
+            key="exp_calibration_sweep_model_choice",
+        )
+
+    source_options = {
+        "Feature selection": "feature_selection",
+        "Optuna (best_feature_cols)": "optuna",
+    }
+    reverse_source = {value: label for label, value in source_options.items()}
+    current_source = str(
+        st.session_state.get("calibration_sweep_feature_source", "feature_selection")
+    )
+    chosen_source_label = st.radio(
+        "Origen de variables",
+        list(source_options.keys()),
+        index=list(source_options.keys()).index(
+            reverse_source.get(current_source, "Feature selection")
+        ),
+        horizontal=True,
+        key="exp_calibration_sweep_feature_source_radio",
+        help=(
+            "Feature selection usa la selección actual si existe; si no, toma "
+            "todas las variables numéricas del archivo. Optuna intenta recuperar "
+            "best_feature_cols para este modelo desde el store existente."
+        ),
+    )
+    st.session_state["calibration_sweep_feature_source"] = source_options[
+        chosen_source_label
+    ]
+
+    advanced_objectives = st.checkbox(
+        "Mostrar catálogo avanzado de métricas objetivo de Optuna",
+        value=bool(
+            st.session_state.get(
+                "exp_calibration_sweep_show_advanced_objectives",
+                False,
+            )
+        ),
+        key="exp_calibration_sweep_show_advanced_objectives",
+    )
+    objective_options = _calibration_sweep_optuna_objective_options(
+        include_advanced=bool(advanced_objectives)
+    )
+    default_objective_keys = {
+        "pr_auc",
+        "mcc",
+        "brier_score",
+        "balanced_f1",
+        "recall_at_alerts_per_day",
+        "operational_cost",
+        "far_sens",
+    }
+    default_objective_labels = [
+        label
+        for label, key in objective_options.items()
+        if key in default_objective_keys
+    ]
+    selected_objective_labels = st.multiselect(
+        "Métricas objetivo de Optuna",
+        list(objective_options.keys()),
+        default=default_objective_labels,
+        key="exp_calibration_sweep_objectives",
+        help=(
+            "Optuna sigue siendo escalar por trial. Luego el ranking multiobjetivo "
+            "se arma sobre las combinaciones finalistas usando métricas de validación."
+        ),
+    )
+
+    calibration_methods = _calibration_method_multiselect(
+        "Calibración del score",
+        key="exp_calibration_sweep_calibration_methods",
+        default_methods=["sigmoid", "isotonic", "none"],
+        methods=["sigmoid", "isotonic", "none"],
+    )
+
+    threshold_objective_options = _calibration_sweep_threshold_objective_options()
+    selected_threshold_labels = st.multiselect(
+        "Objetivos operacionales de threshold",
+        list(threshold_objective_options.keys()),
+        default=list(threshold_objective_options.keys()),
+        key="exp_calibration_sweep_threshold_objectives",
+        help=(
+            "Solo se incluyen objetivos operacionales. PR-AUC y ROC-AUC quedan "
+            "fuera porque hoy no calibran threshold operativo."
+        ),
+    )
+    selected_threshold_objectives = [
+        threshold_objective_options[label]
+        for label in selected_threshold_labels
+        if label in threshold_objective_options
+    ]
+
+    st.caption("Threshold protocol fijo: Robusto.")
+    threshold_visibility = _combined_threshold_field_visibility(
+        selected_threshold_objectives
+    )
+    thr1, thr2, thr3, thr4 = st.columns(4)
+    with thr1:
+        far_target = float(
+            _render_conditional_slider(
+                "FAR target",
+                visible=threshold_visibility["far_target"],
+                min_value=0.0,
+                max_value=0.5,
+                value=0.2,
+                step=0.01,
+                key="exp_calibration_sweep_far_target",
+            )
+        )
+    with thr2:
+        alerts_per_day = float(
+            _render_conditional_number_input(
+                "Alertas máximas por día",
+                visible=threshold_visibility["alerts_per_day"],
+                min_value=0.1,
+                value=5.0,
+                step=0.5,
+                key="exp_calibration_sweep_alerts_per_day",
+            )
+        )
+    with thr3:
+        fn_cost = float(
+            _render_conditional_number_input(
+                "Costo FN",
+                visible=threshold_visibility["fn_cost"],
+                min_value=0.0,
+                value=10.0,
+                step=1.0,
+                key="exp_calibration_sweep_fn_cost",
+            )
+        )
+    with thr4:
+        fp_cost = float(
+            _render_conditional_number_input(
+                "Costo FP",
+                visible=threshold_visibility["fp_cost"],
+                min_value=0.0,
+                value=1.0,
+                step=0.5,
+                key="exp_calibration_sweep_fp_cost",
+            )
+        )
+
+    st.markdown("**Split y paralelización**")
+    split1, split2, split3, split4 = st.columns(4)
+    with split1:
+        test_size = st.slider(
+            "Test size",
+            min_value=0.1,
+            max_value=0.5,
+            value=0.2,
+            step=0.05,
+            key="exp_calibration_sweep_test_size",
+        )
+    with split2:
+        val_size = st.slider(
+            "Validation size",
+            min_value=0.1,
+            max_value=0.5,
+            value=0.2,
+            step=0.05,
+            key="exp_calibration_sweep_val_size",
+        )
+    with split3:
+        robust_folds = st.number_input(
+            "Folds robustos",
+            min_value=2,
+            max_value=10,
+            value=3,
+            step=1,
+            key="exp_calibration_sweep_robust_folds",
+        )
+    with split4:
+        parallel_jobs = st.number_input(
+            "Jobs paralelos RF/ranking",
+            min_value=1,
+            max_value=_max_optuna_parallel_jobs(),
+            value=min(4, _max_optuna_parallel_jobs()),
+            step=1,
+            key="exp_calibration_sweep_parallel_jobs",
+        )
+    opt_col1, opt_col2 = st.columns(2)
+    with opt_col1:
+        optuna_n_jobs = _render_optuna_n_jobs_input(
+            "Optuna jobs paralelos",
+            key="exp_calibration_sweep_optuna_n_jobs",
+            default=1,
+        )
+    with opt_col2:
+        xgb_parallel_jobs = _render_model_n_jobs_input(
+            "Jobs paralelos XGBoost",
+            key="exp_calibration_sweep_xgb_parallel_jobs",
+            default=1,
+            shared_key="global_xgb_parallel_jobs",
+        )
+
+    search_space = _default_controlled_comparison_search_space()
+    with st.expander("Rangos del barrido", expanded=False):
+        st.json(search_space)
+
+    if st.button(
+        "Ejecutar experimento de calibración",
+        key="exp_calibration_sweep_run",
+    ):
+        if not selected_objective_labels:
+            st.error("Seleccione al menos una métrica objetivo de Optuna.")
+            return
+        if not calibration_methods:
+            st.error("Seleccione al menos un método de calibración.")
+            return
+        if not selected_threshold_objectives:
+            st.error("Seleccione al menos un objetivo operacional de threshold.")
+            return
+
+        try:
+            base_df = _prepare_controlled_comparison_base_df(
+                accidents_df_for_tramo=accidents_df_for_tramo,
+                selected_features_path=selected_features_path,
+                tramo_tuple=tramo_tuple,
+                date_start=dataset_date_start,
+                date_end=dataset_date_end,
+            )
+            features_df = _load_controlled_features_df(
+                selected_features_path,
+                tramo_tuple,
+                date_start=dataset_date_start,
+                date_end=dataset_date_end,
+            )
+        except Exception as exc:
+            st.error(f"No se pudo preparar el dataset base: {exc}")
+            return
+
+        feature_resolution = _resolve_calibration_sweep_feature_selection(
+            dataset_df=base_df,
+            model_choice=str(model_choice),
+            features_df=features_df,
+            features_path=selected_features_path,
+            features_source=selected_features_path.name,
+        )
+        feature_cols = list(feature_resolution.get("feature_cols") or [])
+        if not feature_cols:
+            st.error("No hay variables disponibles para ejecutar el experimento.")
+            return
+
+        selected_objective_metrics = [
+            objective_options[label]
+            for label in selected_objective_labels
+            if label in objective_options
+        ]
+        total_combinations = (
+            len(selected_objective_metrics)
+            * len(calibration_methods)
+            * len(selected_threshold_objectives)
+            * 2
+        )
+        progress_bar = st.progress(
+            0,
+            text=(
+                "Iniciando experimento de calibración... "
+                f"0/{total_combinations} combinaciones"
+            ),
+        )
+        progress_stats = st.empty()
+        progress_last_combo = st.empty()
+        progress_state = {
+            "started_at": time.monotonic(),
+            "processed": 0,
+            "completed": 0,
+            "failed": 0,
+        }
+
+        def _update_calibration_progress(
+            payload_item: Optional[Dict[str, object]] = None,
+        ) -> None:
+            processed = int(progress_state["processed"])
+            completed_ok = int(progress_state["completed"])
+            failed = int(progress_state["failed"])
+            elapsed = time.monotonic() - float(progress_state["started_at"])
+            avg_seconds = (
+                elapsed / processed
+                if processed > 0
+                else None
+            )
+            remaining = max(0, int(total_combinations) - processed)
+            eta_seconds = (
+                remaining * avg_seconds
+                if avg_seconds is not None
+                else None
+            )
+            progress_pct = (
+                int(round((processed / max(1, total_combinations)) * 100))
+                if total_combinations > 0
+                else 100
+            )
+            progress_bar.progress(
+                min(100, max(0, progress_pct)),
+                text=(
+                    "Experimento de calibración en progreso... "
+                    f"{processed}/{total_combinations} combinaciones"
+                ),
+            )
+            progress_stats.caption(
+                "Avance: "
+                f"{processed}/{total_combinations} | "
+                f"OK: {completed_ok} | "
+                f"Fallidas: {failed} | "
+                f"Tiempo transcurrido: {_format_duration_compact(elapsed)} | "
+                f"Promedio actual: {_format_duration_compact(avg_seconds)} por combinación | "
+                f"ETA: {_format_duration_compact(eta_seconds)}"
+            )
+            if isinstance(payload_item, dict):
+                combo_label = (
+                    f"{payload_item.get('optuna_objective_metric') or payload_item.get('objective_metric')} | "
+                    f"{payload_item.get('calibration_method')} | "
+                    f"{payload_item.get('threshold_objective')} | "
+                    f"{payload_item.get('balance_mode')}"
+                )
+                status_label = str(payload_item.get("status") or "").strip() or "-"
+                progress_last_combo.caption(
+                    f"Última combinación: {combo_label} | estado={status_label}"
+                )
+
+        def _progress_callback(payload_item: Dict[str, object]) -> None:
+            progress_state["processed"] = int(progress_state["processed"]) + 1
+            if str(payload_item.get("status") or "").strip().lower() == "completed":
+                progress_state["completed"] = int(progress_state["completed"]) + 1
+            else:
+                progress_state["failed"] = int(progress_state["failed"]) + 1
+            _update_calibration_progress(payload_item)
+
+        _update_calibration_progress()
+        runner = ExperimentsRunner(random_state=int(random_state))
+        with st.spinner("Ejecutando barrido de calibración..."):
+            try:
+                payload = runner.run_calibration_sweep(
+                    base_df,
+                    model_name=str(model_choice),
+                    selected_features=feature_cols,
+                    objective_metrics=selected_objective_metrics,
+                    calibration_methods=list(calibration_methods),
+                    threshold_objectives=list(selected_threshold_objectives),
+                    event_path=selected_event_path,
+                    features_path=selected_features_path,
+                    feature_source=str(feature_resolution.get("feature_source") or ""),
+                    test_size=float(test_size),
+                    val_size=float(val_size),
+                    n_trials=int(n_trials),
+                    timeout=int(timeout),
+                    optuna_n_jobs=int(optuna_n_jobs),
+                    parallel_jobs=int(parallel_jobs),
+                    xgb_parallel_jobs=int(xgb_parallel_jobs),
+                    search_space_config=search_space,
+                    far_target=float(far_target),
+                    alerts_per_day=float(alerts_per_day),
+                    fn_cost=float(fn_cost),
+                    fp_cost=float(fp_cost),
+                    robust_folds=int(robust_folds),
+                    checkpoint_root=RESULTS_DIR / "calibration_experiment_runs",
+                    result_callback=_progress_callback,
+                )
+            except Exception as exc:
+                _update_calibration_progress()
+                st.error(f"El experimento falló: {exc}")
+                return
+
+        progress_bar.progress(
+            100,
+            text=(
+                "Experimento de calibración finalizado. "
+                f"{int(progress_state['processed'])}/{total_combinations} combinaciones"
+            ),
+        )
+        _update_calibration_progress()
+        payload["feature_source_note"] = feature_resolution.get("source_note")
+        st.session_state["calibration_sweep_last_payload"] = payload
+
+    current_payload = st.session_state.get("calibration_sweep_last_payload")
+    if isinstance(current_payload, dict):
+        _render_calibration_sweep_results(
+            current_payload,
+            key_prefix="calibration_sweep_current",
+        )
 
 
 def _render_controlled_comparison_memory_estimator(
@@ -3686,7 +5088,7 @@ def _render_controlled_comparison_protocol_description(
     selected_models: List[str],
     threshold_protocols: List[str],
     threshold_objective_label: str,
-    calibration_method: str,
+    calibration_methods: List[str],
     alerts_per_day: float,
     fn_cost: float,
     fp_cost: float,
@@ -3704,6 +5106,11 @@ def _render_controlled_comparison_protocol_description(
 ) -> None:
     selected_models_text = ", ".join(selected_models) if selected_models else "(ninguno)"
     protocol_text = ", ".join(threshold_protocols) if threshold_protocols else "(ninguno)"
+    calibration_text = (
+        ", ".join(_calibration_method_label(method) for method in calibration_methods)
+        if calibration_methods
+        else "(ninguna)"
+    )
     with st.expander("Descripción detallada del experimento", expanded=True):
         st.markdown(
             "\n".join(
@@ -3716,7 +5123,7 @@ def _render_controlled_comparison_protocol_description(
                     "6. **Tres conjuntos de variables.** Se construyen y evalúan tres vistas distintas del mismo problema: `Base` (solo flujo), `Cluster` (solo variables de cluster) y `Base + Cluster` (todas las variables numéricas disponibles).",
                     "7. **Grilla efectiva de K.** La grilla configurada por el usuario (`min`, `max`, `step`) se recorta automáticamente al tamaño real de cada conjunto. Si el máximo real no cae justo en el paso, también se incluye para no perder el borde superior evaluable.",
                     "8. **Estimación opcional de memoria.** Antes de ejecutar, la UI puede calcular jobs seguros usando el dataset real del tramo, el mayor `K` evaluable y el peor caso estimado de SMOTE/modelo. Ese cálculo reporta máximos independientes y una frontera segura combinada para `RF/ranking jobs`, `Optuna jobs` y `XGBoost jobs` bajo un presupuesto explícito de RAM.",
-                    "9. **Combinaciones evaluadas.** Para cada corrida se recorren todas las combinaciones `modelo × conjunto × balance_mode × protocolo_threshold × K` usando sólo los modelos y protocolos seleccionados en la UI. Los modos de balance son `sin SMOTE` y `con SMOTE`.",
+                    "9. **Combinaciones evaluadas.** Para cada corrida se recorren todas las combinaciones `modelo × conjunto × balance_mode × calibración × protocolo_threshold × K` usando sólo los modelos, calibradores y protocolos seleccionados en la UI. Los modos de balance son `sin SMOTE` y `con SMOTE`.",
                     "10. **Optimización con Optuna.** Para cada combinación se ejecuta una búsqueda con Optuna usando exactamente el objetivo seleccionado en esta UI: "
                     f"`{objective_label}`. Se optimizan los hiperparámetros del modelo y, cuando corresponde, también los hiperparámetros de SMOTE.",
                     "11. **Separación objetivo/threshold.** Optuna optimiza la métrica de ranking o clasificación seleccionada. Después, el threshold operativo se escoge con el objetivo de threshold configurado, de modo que PR-AUC puede ordenar modelos sin imponer un umbral arbitrario.",
@@ -3734,7 +5141,7 @@ def _render_controlled_comparison_protocol_description(
             "Configuración actual: "
             f"modelos={selected_models_text} | "
             f"objetivo Optuna={objective_label} | protocolos={protocol_text} | "
-            f"threshold={threshold_objective_label} | calibración={calibration_method} | "
+            f"threshold={threshold_objective_label} | calibración={calibration_text} | "
             f"alertas/día={float(alerts_per_day):.1f} | costo FN/FP={float(fn_cost):.1f}/{float(fp_cost):.1f} | "
             f"folds robustos={int(robust_folds)} | test_size={float(test_size):.2f} | "
             f"val_size={float(val_size):.2f} | K=[{int(k_min)}, {int(k_max)}] paso {int(k_step)} | "
@@ -4536,41 +5943,57 @@ def _collect_optuna_best_feature_options(
     for entry_key, entry in store.items():
         if not isinstance(entry, dict):
             continue
-        results = entry.get("results")
-        if not isinstance(results, dict):
-            continue
-        for choice, result in results.items():
-            if not isinstance(result, dict):
-                continue
-            settings = result.get("optuna_settings") or {}
-            best_cols = settings.get("best_feature_cols")
-            if not best_cols:
-                # Fallback: si no hay best_feature_cols, usa el conjunto del config.
-                best_cols = entry.get("feature_cols")
-            if not best_cols:
+        results = _normalize_optuna_results_payload(entry.get("results"))
+        for choice, container in results.items():
+            if not isinstance(container, dict):
                 continue
             if model_choice and str(choice) != str(model_choice):
                 continue
-            label_parts = []
-            if len(entry.get("feature_cols", [])) > 0:
-                label_parts.append(f"{len(entry['feature_cols'])} vars config")
-            if settings.get("best_top_k") is not None:
-                label_parts.append(f"top_k={int(settings['best_top_k'])}")
-            label_parts.append(f"{choice}")
-            label = " | ".join(label_parts)
-            options.append(
-                {
-                    "label": label,
-                    "key": str(entry_key),
-                    "model_choice": str(choice),
-                    "best_feature_cols": list(best_cols),
-                    "best_top_k": settings.get("best_top_k"),
-                    "ranking_method": settings.get("ranking_method"),
-                    "ranking_method_label": settings.get("ranking_method_label"),
-                    "best_score": result.get("best_score"),
-                    "objective_label": settings.get("objective_label"),
-                }
-            )
+            by_balance_mode = container.get("by_balance_mode")
+            if not isinstance(by_balance_mode, dict):
+                continue
+            for balance_mode, mode_data in by_balance_mode.items():
+                if not isinstance(mode_data, dict):
+                    continue
+                by_calibration_method = mode_data.get("by_calibration_method")
+                if not isinstance(by_calibration_method, dict):
+                    continue
+                for calibration_method, result in by_calibration_method.items():
+                    if not isinstance(result, dict):
+                        continue
+                    settings = result.get("optuna_settings") or {}
+                    best_cols = settings.get("best_feature_cols")
+                    if not best_cols:
+                        # Fallback: si no hay best_feature_cols, usa el conjunto del config.
+                        best_cols = entry.get("feature_cols")
+                    if not best_cols:
+                        continue
+                    label_parts = []
+                    if len(entry.get("feature_cols", [])) > 0:
+                        label_parts.append(f"{len(entry['feature_cols'])} vars config")
+                    if settings.get("best_top_k") is not None:
+                        label_parts.append(f"top_k={int(settings['best_top_k'])}")
+                    label_parts.append(f"{choice}")
+                    label_parts.append(_optuna_balance_mode_label(balance_mode))
+                    label_parts.append(
+                        _calibration_method_label(calibration_method)
+                    )
+                    label = " | ".join(label_parts)
+                    options.append(
+                        {
+                            "label": label,
+                            "key": str(entry_key),
+                            "model_choice": str(choice),
+                            "balance_mode": str(balance_mode),
+                            "calibration_method": str(calibration_method),
+                            "best_feature_cols": list(best_cols),
+                            "best_top_k": settings.get("best_top_k"),
+                            "ranking_method": settings.get("ranking_method"),
+                            "ranking_method_label": settings.get("ranking_method_label"),
+                            "best_score": result.get("best_score"),
+                            "objective_label": settings.get("objective_label"),
+                        }
+                    )
     return options
 
 
@@ -4592,6 +6015,9 @@ def _lookup_optuna_best_feature_cols(
     feature_key: str,
     cols: List[str],
     model_choice: str,
+    balance_mode: str,
+    calibration_method: str,
+    allow_calibration_fallback: bool = False,
 ) -> Optional[Dict[str, object]]:
     if not cols:
         return None
@@ -4599,10 +6025,16 @@ def _lookup_optuna_best_feature_cols(
     entry = store.get(key)
     if not isinstance(entry, dict):
         return None
-    results = entry.get("results")
-    if not isinstance(results, dict):
+    match = _get_optuna_model_result_variant_match(
+        entry.get("results"),
+        model_choice=model_choice,
+        balance_mode=balance_mode,
+        calibration_method=calibration_method,
+        allow_any_calibration_within_mode=allow_calibration_fallback,
+    )
+    if not isinstance(match, dict):
         return None
-    result = results.get(model_choice)
+    result = match.get("result")
     if not isinstance(result, dict):
         return None
     settings = result.get("optuna_settings") or {}
@@ -4615,12 +6047,957 @@ def _lookup_optuna_best_feature_cols(
         "ranking_method_label": settings.get("ranking_method_label"),
         "best_score": result.get("best_score"),
         "objective_label": settings.get("objective_label"),
+        "balance_mode": settings.get("balance_mode"),
+        "balance_mode_label": settings.get("balance_mode_label"),
+        "calibration_method": settings.get("calibration_method"),
+        "calibration_method_label": settings.get("calibration_method_label"),
+        "requested_calibration_method": _normalize_calibration_method(
+            calibration_method
+        ),
+        "used_fallback": bool(match.get("used_fallback")),
+        # Fingerprint del dataset usado cuando se corrió Optuna. Permite al
+        # consumidor detectar drift comparando contra el dataset actual.
+        "dataset_fingerprint": entry.get("dataset_fingerprint"),
+        "features_rows": entry.get("features_rows"),
+        "features_cols": entry.get("features_cols"),
+        "saved_at": entry.get("saved_at"),
     }
+
+
+def _diagnose_optuna_key_mismatch(
+    *,
+    store: Dict[str, object],
+    expected_key: str,
+    active_key: Optional[str],
+    current_fingerprint: Optional[str],
+) -> Dict[str, object]:
+    """Diagnóstico legible de por qué un `optuna_key` no coincide.
+
+    Reutilizable en cualquier tab que consuma Optuna (Balance, Modelos, etc.)
+    para explicar *por qué* el Optuna guardado ya no aplica, en lugar del
+    clásico warning genérico "no coinciden".
+
+    Devuelve:
+      - ``has_match``: hay entry exacto para `expected_key`.
+      - ``reasons``: lista de razones en español (dataset distinto, features
+        distintas, drift de contenido, etc.).
+      - ``dataset_drift``: el entry existe pero el fingerprint del dataset
+        actual difiere del guardado.
+      - ``stored_fingerprint``: fingerprint guardado en el entry (si aplica).
+    """
+    store_dict = store if isinstance(store, dict) else {}
+    expected_entry = store_dict.get(expected_key)
+    has_exact_entry = isinstance(expected_entry, dict)
+    reasons: List[str] = []
+    dataset_drift = False
+    stored_fingerprint: Optional[str] = None
+
+    if has_exact_entry:
+        stored_fingerprint = expected_entry.get("dataset_fingerprint")
+        if (
+            stored_fingerprint
+            and current_fingerprint
+            and stored_fingerprint != current_fingerprint
+        ):
+            dataset_drift = True
+            reasons.append(
+                "el contenido del dataset cambió desde la última corrida "
+                "(schema o shape distinto)"
+            )
+        return {
+            "has_match": True,
+            "reasons": reasons,
+            "dataset_drift": dataset_drift,
+            "stored_fingerprint": stored_fingerprint,
+        }
+
+    # No hay entry exacto: comparamos expected_key vs active_key por sus
+    # dos partes (feature_key|feature_list_signature).
+    expected_parts = str(expected_key).rsplit("|", 1)
+    active_str = str(active_key or "").strip()
+    active_parts = active_str.rsplit("|", 1) if active_str else []
+    if len(expected_parts) == 2 and len(active_parts) == 2:
+        expected_feature_key, expected_sig = expected_parts
+        active_feature_key, active_sig = active_parts
+        if expected_feature_key != active_feature_key:
+            reasons.append(
+                "el dataset activo (path, fuente o schema) difiere del "
+                "que usó Optuna"
+            )
+        if expected_sig != active_sig:
+            reasons.append(
+                "las variables seleccionadas cambiaron respecto a las "
+                "optimizadas por Optuna"
+            )
+    elif not active_str:
+        reasons.append("no hay resultado de Optuna activo en esta sesión")
+    else:
+        reasons.append(
+            "el identificador de Optuna tiene un formato inesperado "
+            "(puede ser un resultado legacy)"
+        )
+
+    # Si existe un entry activo (no exacto), detectar drift de contenido
+    # usando su fingerprint — ayuda a distinguir "cambiaste las features"
+    # de "regeneraste el dataset con el mismo path".
+    active_entry = store_dict.get(active_str) if active_str else None
+    if isinstance(active_entry, dict):
+        active_stored_fp = active_entry.get("dataset_fingerprint")
+        if (
+            active_stored_fp
+            and current_fingerprint
+            and active_stored_fp != current_fingerprint
+        ):
+            reasons.append(
+                "el contenido del dataset activo cambió respecto al "
+                "guardado por Optuna"
+            )
+
+    # Deduplicar preservando orden.
+    seen = set()
+    deduped: List[str] = []
+    for reason in reasons:
+        if reason in seen:
+            continue
+        seen.add(reason)
+        deduped.append(reason)
+
+    return {
+        "has_match": False,
+        "reasons": deduped,
+        "dataset_drift": False,
+        "stored_fingerprint": stored_fingerprint,
+    }
+
+
+def _get_active_optuna_best(
+    *,
+    store: Optional[Dict[str, object]] = None,
+    active_key: Optional[str] = None,
+    model_choice: Optional[str] = None,
+    calibration_method: Optional[str] = None,
+) -> Optional[Dict[str, object]]:
+    """Lee del store Optuna la vista "primary" para ``(active_key, model_choice)``.
+
+    Sustituto canónico de los keys legacy ``optuna_best_*`` en session_state:
+    en lugar de replicar los parámetros ganadores en múltiples keys top-level,
+    esta función los lee directamente del store
+    (``optuna_results_store[active_key]``) y devuelve una vista unificada.
+
+    Política de selección (mirror del disk-reloader en ``_render_optuna_tab``,
+    L9095-9139):
+      - ``balance_mode=smote`` gana sobre ``balance_mode=none``.
+      - ``calibration_method`` es la seleccionada en UI
+        (``session_state["optuna_calibration_method"]``); no hace fallback a
+        otras calibraciones dentro del mismo modo.
+      - ``best_smote_params`` proviene *solo* del variante SMOTE estricto
+        (no se rellena con ``none``); es ``None`` si SMOTE no corrió para esta
+        calibración.
+
+    Parameters
+    ----------
+    store : dict, optional
+        Store de Optuna. Si es ``None`` lo lee de
+        ``session_state["optuna_results_store"]``.
+    active_key : str, optional
+        Key activo. Si es ``None`` lo lee de
+        ``session_state["optuna_active_key"]``.
+    model_choice : str, optional
+        Modelo. Si es ``None`` lo lee de
+        ``session_state["optuna_model_choice"]``.
+    calibration_method : str, optional
+        Calibración preferida. Si es ``None`` lo lee de
+        ``session_state["optuna_calibration_method"]``.
+
+    Returns
+    -------
+    dict or None
+        ``None`` si no hay resultado activo para ``(active_key, model_choice)``.
+        Caso contrario, un dict con ``best_smote_params``, ``best_model_params``,
+        ``best_score``, ``model_choice``, ``balance_mode``,
+        ``calibration_method``, ``optuna_settings``, ``search_space``,
+        ``trials_df``, ``active_key``, ``entry``.
+    """
+    if store is None:
+        store = st.session_state.get("optuna_results_store") or {}
+    if not isinstance(store, dict) or not store:
+        return None
+
+    if active_key is None:
+        active_key = st.session_state.get("optuna_active_key")
+    active_key_str = str(active_key or "").strip()
+    if not active_key_str:
+        return None
+
+    entry = store.get(active_key_str)
+    if not isinstance(entry, dict):
+        return None
+
+    if model_choice is None:
+        model_choice = st.session_state.get("optuna_model_choice")
+    model_choice_str = str(model_choice or "").strip()
+    if not model_choice_str:
+        return None
+
+    if calibration_method is None:
+        calibration_method = st.session_state.get("optuna_calibration_method")
+    calibration_method_str = _normalize_calibration_method(calibration_method)
+    if not calibration_method_str:
+        calibration_method_str = "sigmoid"
+
+    results = entry.get("results")
+
+    # Selección principal: prefiere SMOTE sobre `none`; respeta la calibración
+    # pedida sin fallback (mismo contrato que el disk-reloader original).
+    primary = _get_optuna_model_result_variant(
+        results,
+        model_choice=model_choice_str,
+        balance_mode="smote",
+        calibration_method=calibration_method_str,
+        fallback_modes=["none"],
+    )
+    if not isinstance(primary, dict):
+        return None
+
+    # SMOTE estricto: solo si el variante SMOTE *real* existe para esta
+    # calibración. Devuelve None cuando el primario vino de balance_mode=none.
+    smote_variant = _get_optuna_model_result_variant(
+        results,
+        model_choice=model_choice_str,
+        balance_mode="smote",
+        calibration_method=calibration_method_str,
+    )
+    if isinstance(smote_variant, dict):
+        smote_params = smote_variant.get("best_smote_params") or None
+    else:
+        smote_params = None
+
+    settings = primary.get("optuna_settings") if isinstance(primary, dict) else None
+    balance_mode_used: Optional[str] = None
+    calibration_used: Optional[str] = None
+    if isinstance(settings, dict):
+        bm = settings.get("balance_mode")
+        if bm:
+            balance_mode_used = str(bm)
+        cm = settings.get("calibration_method")
+        if cm:
+            calibration_used = str(cm)
+
+    # Hidrata ``trials_df`` desde CSV si no está en memoria — mirror del
+    # disk-reloader para mantener paridad con el key legacy ``optuna_trials_df``.
+    trials_df = primary.get("trials_df")
+    trials_csv = primary.get("trials_csv")
+    if trials_df is None and trials_csv:
+        try:
+            if Path(str(trials_csv)).exists():
+                trials_df = pd.read_csv(trials_csv)
+        except Exception:
+            trials_df = None
+
+    return {
+        "best_smote_params": smote_params,
+        "best_model_params": primary.get("best_model_params"),
+        "best_score": primary.get("best_score"),
+        "model_choice": model_choice_str,
+        "balance_mode": balance_mode_used,
+        "calibration_method": calibration_used or calibration_method_str,
+        "optuna_settings": primary.get("optuna_settings"),
+        "search_space": primary.get("search_space"),
+        "trials_df": trials_df,
+        "active_key": active_key_str,
+        "entry": entry,
+    }
+
+
+# =============================================================================
+# Contratos de estado por tab (punto 5 del hardening de session_state)
+# =============================================================================
+#
+# Declaración explícita de qué keys cada tab (Optuna / Balance / Modelos) lee
+# y escribe. Convierte las dependencias implícitas entre tabs en un contrato
+# testeable:
+#
+#   - ``required``: keys que DEBEN existir y no ser None para que la tab
+#     pueda operar (p.ej. ``accidents_df``, ``flow_features_df``).
+#   - ``optional``: keys que la tab lee pero tolera que falten.
+#   - ``produces``: keys que la tab ESCRIBE como output. Usados por el botón
+#     "Reset state" del diagnóstico para volver a correr la tab desde cero.
+#
+# Las funciones ``_validate_tab_state``, ``_reset_tab_state_keys`` y
+# ``_render_state_diagnostics`` consumen este dict para dar visibilidad al
+# usuario sobre por qué una tab puede estar fallando.
+_TAB_STATE_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
+    "optuna": {
+        "required": [
+            "accidents_df",
+            "flow_features_df",
+            "selected_features",
+        ],
+        "optional": [
+            "flow_features_path",
+            "flow_features_source",
+            "optuna_results_store",
+            "optuna_active_key",
+            "optuna_model_choice",
+            "optuna_calibration_method",
+        ],
+        "produces": [
+            "optuna_results_store",
+            "optuna_active_key",
+            # Keys legacy top-level — ver DEPRECATED comments en
+            # _render_optuna_tab. Los dejamos en ``produces`` para que el
+            # botón Reset los borre y el estado quede limpio.
+            "optuna_best_smote_params",
+            "optuna_best_model_params",
+            "optuna_best_score",
+            "optuna_best_model_choice",
+            "optuna_best_settings",
+            "optuna_best_search_space",
+            "optuna_trials_df",
+        ],
+    },
+    "balance": {
+        "required": [
+            "accidents_df",
+            "flow_features_df",
+        ],
+        "optional": [
+            "flow_features_path",
+            "flow_features_source",
+            "selected_features",
+            "optuna_results_store",
+            "optuna_active_key",
+            "balance_source",
+            "test_size",
+        ],
+        "produces": [
+            "balanced_base_df",
+            "balanced_cluster_df",
+            "balanced_cluster_only_df",
+            "balance_last_stats",
+            "balance_last_params",
+            "smote_k_neighbors",
+            "smote_sampling_strategy",
+            "smote_random_state",
+        ],
+    },
+    "modelos": {
+        "required": [
+            "accidents_df",
+            "flow_features_df",
+        ],
+        "optional": [
+            "cluster_features_df",
+            "balanced_base_df",
+            "balanced_cluster_df",
+            "balanced_cluster_only_df",
+            "selected_features",
+            "optuna_results_store",
+            "optuna_active_key",
+            "test_size",
+            "val_size",
+            "model_choice",
+            "allow_optuna_calibration_fallback",
+        ],
+        "produces": [
+            "history_entries",
+            "feature_importances_df",
+        ],
+    },
+}
+
+
+def _session_state_value(session_state: object, key: str) -> object:
+    """Accede a session_state tolerando dict o streamlit.SessionState."""
+    if session_state is None:
+        return None
+    if hasattr(session_state, "get"):
+        try:
+            return session_state.get(key)
+        except Exception:
+            pass
+    try:
+        return session_state[key]  # type: ignore[index]
+    except Exception:
+        return None
+
+
+def _validate_tab_state(
+    tab: str,
+    *,
+    session_state: Optional[object] = None,
+) -> List[Dict[str, object]]:
+    """Valida el estado de una tab. Retorna lista de issues.
+
+    Cada issue es un dict con:
+      - ``level``: ``"error"``, ``"warning"`` o ``"info"``.
+      - ``key``: el key de session_state implicado (o ``__contract__`` si
+        la tab es desconocida).
+      - ``message``: explicación legible en español.
+
+    Política:
+      - ``error``: falta un key obligatorio, DataFrame requerido vacío,
+        lista requerida vacía.
+      - ``warning``: inconsistencias entre keys que la tab lee (p.ej.
+        ``optuna_active_key`` apunta a un key inexistente en el store).
+
+    No muta ``session_state``; es una función pura.
+    """
+    if session_state is None:
+        session_state = st.session_state
+
+    contract = _TAB_STATE_CONTRACTS.get(tab)
+    if contract is None:
+        return [
+            {
+                "level": "error",
+                "key": "__contract__",
+                "message": f"tab desconocida: {tab!r}",
+            }
+        ]
+
+    issues: List[Dict[str, object]] = []
+
+    for key in contract.get("required", []):
+        value = _session_state_value(session_state, key)
+        if value is None:
+            issues.append(
+                {
+                    "level": "error",
+                    "key": key,
+                    "message": (
+                        f"falta el key obligatorio `{key}` — "
+                        "verifique tabs anteriores (Eventos, Feature "
+                        "engineering, Feature selection)"
+                    ),
+                }
+            )
+            continue
+        if isinstance(value, pd.DataFrame) and value.empty:
+            issues.append(
+                {
+                    "level": "error",
+                    "key": key,
+                    "message": f"`{key}` está vacío (DataFrame sin filas)",
+                }
+            )
+            continue
+        if key == "selected_features" and hasattr(value, "__len__") and not len(value):
+            issues.append(
+                {
+                    "level": "error",
+                    "key": key,
+                    "message": (
+                        "`selected_features` está vacío — seleccione al menos "
+                        "una variable en Feature selection"
+                    ),
+                }
+            )
+
+    # Coherencia Optuna: el active_key debe existir en el store.
+    store = _session_state_value(session_state, "optuna_results_store")
+    active_key = _session_state_value(session_state, "optuna_active_key")
+    if (
+        active_key
+        and isinstance(store, dict)
+        and str(active_key).strip()
+        and active_key not in store
+    ):
+        issues.append(
+            {
+                "level": "warning",
+                "key": "optuna_active_key",
+                "message": (
+                    f"`optuna_active_key` apunta a un key ausente del store "
+                    f"(`{active_key}`). Es probable que el store se haya "
+                    "reseteado sin limpiar el active key."
+                ),
+            }
+        )
+
+    # Coherencia Balance → Modelos: si la tab es Modelos, avisar cuando no
+    # hay dataset balanceado disponible.
+    if tab == "modelos":
+        balanced_base = _session_state_value(session_state, "balanced_base_df")
+        if balanced_base is None:
+            issues.append(
+                {
+                    "level": "warning",
+                    "key": "balanced_base_df",
+                    "message": (
+                        "no hay dataset balanceado en memoria — la tab Modelos "
+                        "funcionará solo con datos sin balancear. Ejecute la "
+                        "tab Balance para habilitar SMOTE."
+                    ),
+                }
+            )
+
+    return issues
+
+
+def _reset_tab_state_keys(
+    tab: str,
+    *,
+    session_state: Optional[object] = None,
+) -> List[str]:
+    """Borra los keys producidos por una tab. Retorna la lista de keys borrados.
+
+    Pensado para el botón "Reset state de esta tab" de
+    ``_render_state_diagnostics``. Útil cuando la UI cayó en un estado
+    inconsistente y el usuario quiere volver a correr la tab desde cero sin
+    reiniciar la sesión entera.
+
+    No borra keys ``required``; solo los listados en ``produces``.
+    """
+    if session_state is None:
+        session_state = st.session_state
+    contract = _TAB_STATE_CONTRACTS.get(tab)
+    if contract is None:
+        return []
+    removed: List[str] = []
+    for key in contract.get("produces", []):
+        try:
+            if key in session_state:  # type: ignore[operator]
+                del session_state[key]  # type: ignore[index]
+                removed.append(key)
+        except Exception:
+            continue
+    return removed
+
+
+def _render_state_diagnostics(tab: str) -> None:
+    """Renderiza un expander con el diagnóstico de estado de la tab.
+
+    Muestra:
+      - los ``issues`` de ``_validate_tab_state``.
+      - qué keys producidos por esta tab están presentes actualmente.
+      - un botón "Reset state de esta tab" que invoca
+        ``_reset_tab_state_keys`` y recarga la página.
+
+    Se auto-expande cuando hay errors o warnings para hacerlos visibles.
+    """
+    issues = _validate_tab_state(tab)
+    contract = _TAB_STATE_CONTRACTS.get(tab, {})
+    produces = contract.get("produces", [])
+
+    error_count = sum(1 for i in issues if i.get("level") == "error")
+    warning_count = sum(1 for i in issues if i.get("level") == "warning")
+
+    if error_count:
+        title = (
+            f"⚠️ Estado ({error_count} "
+            f"{'errores' if error_count != 1 else 'error'})"
+        )
+    elif warning_count:
+        title = (
+            f"ℹ️ Estado ({warning_count} "
+            f"{'avisos' if warning_count != 1 else 'aviso'})"
+        )
+    else:
+        title = "✅ Estado"
+
+    with st.expander(title, expanded=bool(error_count or warning_count)):
+        if issues:
+            for issue in issues:
+                level = issue.get("level", "info")
+                message = issue.get("message", "")
+                if level == "error":
+                    st.error(f"• {message}")
+                elif level == "warning":
+                    st.warning(f"• {message}")
+                else:
+                    st.info(f"• {message}")
+        else:
+            st.success("Todos los keys obligatorios están presentes.")
+
+        present_produced = [
+            k
+            for k in produces
+            if _session_state_value(st.session_state, k) is not None
+        ]
+        if produces:
+            st.caption(
+                f"Keys producidos por esta tab: "
+                f"{len(present_produced)}/{len(produces)} presentes."
+            )
+            if present_produced:
+                st.caption(", ".join(f"`{k}`" for k in present_produced))
+
+        if st.button(
+            "Reset state de esta tab",
+            key=f"_reset_state_btn_{tab}",
+            help=(
+                "Borra los keys producidos por esta tab, dejando intactos los "
+                "datasets cargados (accidentes, features, etc)."
+            ),
+        ):
+            removed = _reset_tab_state_keys(tab)
+            if removed:
+                st.success(
+                    f"Borrados {len(removed)} keys: {', '.join(removed)}"
+                )
+                try:
+                    st.rerun()
+                except Exception:
+                    # Algunos entornos de test no soportan rerun.
+                    pass
+            else:
+                st.info("No había keys producidos que borrar.")
+
+
+def _lookup_optuna_feature_source_for_experiment(
+    *,
+    store: Dict[str, object],
+    feature_key: str,
+    model_choice: str,
+) -> Optional[Dict[str, object]]:
+    active_key = str(st.session_state.get("optuna_active_key") or "").strip()
+    candidate_keys: List[str] = []
+    if active_key and active_key.startswith(f"{feature_key}|"):
+        candidate_keys.append(active_key)
+    candidate_keys.extend(
+        [
+            key
+            for key in sorted(store.keys())
+            if str(key).startswith(f"{feature_key}|") and str(key) != active_key
+        ]
+    )
+    calibration_order = _ordered_calibration_methods(["sigmoid", "isotonic", "none"])
+    for candidate_key in candidate_keys:
+        entry = store.get(candidate_key)
+        if not isinstance(entry, dict):
+            continue
+        container = _get_optuna_model_result_container(
+            entry.get("results"),
+            model_choice,
+        )
+        if not isinstance(container, dict):
+            continue
+        by_balance_mode = container.get("by_balance_mode")
+        if not isinstance(by_balance_mode, dict):
+            continue
+        for balance_mode in OPTUNA_BALANCE_MODE_ORDER:
+            mode_container = by_balance_mode.get(balance_mode)
+            if not isinstance(mode_container, dict):
+                continue
+            by_calibration_method = mode_container.get("by_calibration_method")
+            if not isinstance(by_calibration_method, dict):
+                continue
+            for calibration_method in calibration_order:
+                result = by_calibration_method.get(calibration_method)
+                if not isinstance(result, dict):
+                    continue
+                settings = result.get("optuna_settings") or {}
+                best_feature_cols = settings.get("best_feature_cols") or entry.get(
+                    "feature_cols"
+                )
+                if not best_feature_cols:
+                    continue
+                return {
+                    "best_feature_cols": list(best_feature_cols),
+                    "balance_mode": str(balance_mode),
+                    "balance_mode_label": _optuna_balance_mode_label(balance_mode),
+                    "calibration_method": str(calibration_method),
+                    "calibration_method_label": _calibration_method_label(
+                        calibration_method
+                    ),
+                    "objective_metric": str(
+                        result.get("objective_metric")
+                        or settings.get("objective_metric")
+                        or ""
+                    ),
+                    "objective_label": str(
+                        result.get("objective_label")
+                        or settings.get("objective_label")
+                        or ""
+                    ),
+                    "optuna_key": str(candidate_key),
+                }
+    return None
+
+
+def _resolve_calibration_sweep_feature_selection(
+    *,
+    dataset_df: pd.DataFrame,
+    model_choice: str,
+    features_df: pd.DataFrame,
+    features_path: Optional[Path] = None,
+    features_source: Optional[str] = None,
+) -> Dict[str, object]:
+    source = str(
+        st.session_state.get(
+            "calibration_sweep_feature_source",
+            "feature_selection",
+        )
+    )
+    numeric_cols = _get_feature_cols(dataset_df)
+    selected_features = st.session_state.get("selected_features")
+    if isinstance(selected_features, (list, tuple)) and len(selected_features) > 0:
+        feature_selection_cols = [
+            str(col) for col in selected_features if str(col) in numeric_cols
+        ]
+    else:
+        feature_selection_cols = list(numeric_cols)
+    if source != "optuna":
+        return {
+            "feature_source": "feature_selection",
+            "feature_source_label": "Feature selection",
+            "feature_cols": list(feature_selection_cols),
+            "source_note": (
+                f"{len(feature_selection_cols)} variables congeladas desde "
+                "Feature selection."
+            ),
+        }
+
+    store = st.session_state.get("optuna_results_store") or {}
+    feature_key = _feature_selection_key(
+        str(features_path) if features_path is not None else None,
+        features_source,
+        features_df,
+    )
+    match = _lookup_optuna_feature_source_for_experiment(
+        store=store,
+        feature_key=feature_key,
+        model_choice=model_choice,
+    )
+    if not isinstance(match, dict):
+        return {
+            "feature_source": "feature_selection",
+            "feature_source_label": "Feature selection",
+            "feature_cols": list(feature_selection_cols),
+            "source_note": (
+                "No se encontró un match usable de Optuna para este modelo; "
+                "se usan las variables actuales de Feature selection."
+            ),
+            "used_fallback": True,
+        }
+
+    resolved_cols = [
+        str(col)
+        for col in list(match.get("best_feature_cols") or [])
+        if str(col) in numeric_cols
+    ]
+    if not resolved_cols:
+        return {
+            "feature_source": "feature_selection",
+            "feature_source_label": "Feature selection",
+            "feature_cols": list(feature_selection_cols),
+            "source_note": (
+                "Optuna devolvió columnas que no están disponibles en el dataset "
+                "actual; se usan las variables actuales de Feature selection."
+            ),
+            "used_fallback": True,
+        }
+    return {
+        "feature_source": "optuna",
+        "feature_source_label": "Optuna (best_feature_cols)",
+        "feature_cols": list(resolved_cols),
+        "source_note": (
+            f"{len(resolved_cols)} variables congeladas desde Optuna "
+            f"({_optuna_balance_mode_label(match.get('balance_mode'))} | "
+            f"{match.get('calibration_method_label') or match.get('calibration_method')})"
+        ),
+        "optuna_match": dict(match),
+    }
+
+
+def _load_calibration_sweep_result_frames(
+    result_state: Dict[str, object],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    run_dir_text = str(result_state.get("checkpoint_run_dir") or "").strip()
+    run_dir = Path(run_dir_text) if run_dir_text else None
+
+    def _load_frame(filename: str, fallback: object) -> pd.DataFrame:
+        if run_dir is not None:
+            candidate = run_dir / "results" / filename
+            if candidate.exists():
+                try:
+                    return pd.read_csv(candidate)
+                except Exception:
+                    pass
+        if isinstance(fallback, pd.DataFrame):
+            return fallback
+        return pd.DataFrame()
+
+    best_summary_df = _load_frame(
+        "best_summary.csv",
+        result_state.get("best_summary_df"),
+    )
+    leaderboard_df = _load_frame(
+        "leaderboard.csv",
+        result_state.get("leaderboard_df"),
+    )
+    pareto_front_df = _load_frame(
+        "pareto_front.csv",
+        result_state.get("pareto_front_df"),
+    )
+    grid_results_df = _load_frame(
+        "grid_results.csv",
+        result_state.get("grid_results_df"),
+    )
+    return best_summary_df, leaderboard_df, pareto_front_df, grid_results_df
+
+
+def _render_calibration_sweep_results(
+    result_state: Dict[str, object],
+    *,
+    key_prefix: str,
+) -> None:
+    if not isinstance(result_state, dict) or not result_state:
+        return
+
+    (
+        best_summary_df,
+        leaderboard_df,
+        pareto_front_df,
+        grid_results_df,
+    ) = _load_calibration_sweep_result_frames(result_state)
+
+    run_id = str(result_state.get("run_id") or "").strip()
+    status = str(result_state.get("result_status") or "").strip().lower()
+    if run_id:
+        if status == "completed":
+            st.success(f"Experimento de calibración finalizado. Run ID: {run_id}.")
+        else:
+            st.info(f"Experimento de calibración disponible. Run ID: {run_id}.")
+
+    run_dir = result_state.get("checkpoint_run_dir")
+    manifest_path = result_state.get("checkpoint_manifest_path")
+    if run_dir:
+        st.caption(f"Checkpoint: {run_dir}")
+    if manifest_path:
+        st.caption(f"Manifest: {manifest_path}")
+    source_note = str(result_state.get("feature_source_note") or "").strip()
+    if source_note:
+        st.caption(source_note)
+
+    best_columns = [
+        "selection_scope",
+        "rank",
+        "balance_mode",
+        "optuna_objective_metric",
+        "calibration_method",
+        "threshold_objective",
+        "stability_score",
+        "pareto_front",
+        "val_mcc",
+        "val_brier_score",
+        "val_pr_auc",
+        "val_true_positives",
+        "val_false_negatives",
+        "val_far",
+        "test_mcc",
+        "test_brier_score",
+        "test_pr_auc",
+        "test_true_positives",
+        "test_false_negatives",
+        "test_far",
+    ]
+    if isinstance(best_summary_df, pd.DataFrame) and not best_summary_df.empty:
+        st.markdown("**Mejores combinaciones**")
+        st.dataframe(
+            best_summary_df[
+                [col for col in best_columns if col in best_summary_df.columns]
+            ],
+            width="stretch",
+        )
+
+    leaderboard_columns = [
+        "rank",
+        "pareto_front",
+        "stability_score",
+        "rankable",
+        "model_name",
+        "balance_mode",
+        "optuna_objective_metric",
+        "calibration_method",
+        "threshold_objective",
+        "threshold_protocol",
+        "decision_threshold",
+        "val_mcc",
+        "val_brier_score",
+        "val_pr_auc",
+        "val_true_positives",
+        "val_false_negatives",
+        "val_far",
+        "val_positive_support",
+        "val_tp_capture",
+        "val_fn_rate",
+        "test_mcc",
+        "test_brier_score",
+        "test_pr_auc",
+        "test_true_positives",
+        "test_false_negatives",
+        "test_far",
+        "test_positive_support",
+        "test_tp_capture",
+        "test_fn_rate",
+    ]
+    grid_columns = [
+        "status",
+        "error",
+        "model_name",
+        "balance_mode",
+        "optuna_objective_metric",
+        "calibration_method",
+        "threshold_objective",
+        "threshold_protocol",
+        "rankable",
+        "pareto_front",
+        "stability_score",
+        "val_mcc",
+        "val_brier_score",
+        "val_pr_auc",
+        "val_true_positives",
+        "val_false_negatives",
+        "val_far",
+        "test_mcc",
+        "test_brier_score",
+        "test_pr_auc",
+        "test_true_positives",
+        "test_false_negatives",
+        "test_far",
+    ]
+    tab_leaderboard, tab_pareto, tab_grid = st.tabs(
+        ["Leaderboard", "Pareto", "Grid completo"]
+    )
+    with tab_leaderboard:
+        if isinstance(leaderboard_df, pd.DataFrame) and not leaderboard_df.empty:
+            st.dataframe(
+                leaderboard_df[
+                    [col for col in leaderboard_columns if col in leaderboard_df.columns]
+                ],
+                width="stretch",
+            )
+        else:
+            st.info("No hay leaderboard disponible.")
+    with tab_pareto:
+        if isinstance(pareto_front_df, pd.DataFrame) and not pareto_front_df.empty:
+            st.dataframe(
+                pareto_front_df[
+                    [col for col in leaderboard_columns if col in pareto_front_df.columns]
+                ],
+                width="stretch",
+            )
+        else:
+            st.info("No hay combinaciones no dominadas disponibles.")
+    with tab_grid:
+        if isinstance(grid_results_df, pd.DataFrame) and not grid_results_df.empty:
+            st.dataframe(
+                grid_results_df[
+                    [col for col in grid_columns if col in grid_results_df.columns]
+                ],
+                width="stretch",
+            )
+        else:
+            st.info("No hay resultados completos disponibles.")
 
 
 def _apply_feature_source_for_model_tab(
     *,
     model_choice: str,
+    balance_mode: str,
+    calibration_method: str,
     base_df: Optional[pd.DataFrame] = None,
     features_df: Optional[pd.DataFrame] = None,
 ) -> Optional[Dict[str, object]]:
@@ -4628,7 +7005,7 @@ def _apply_feature_source_for_model_tab(
 
     Si el usuario elige Optuna, matchea automaticamente los best_feature_cols
     de cada corrida de Optuna (Base, Cluster, Base + Cluster) con el modelo
-    correspondiente que se entrena en Modelos.
+    correspondiente y la variante sin/con SMOTE que se entrena en Modelos.
     """
     source = st.session_state.get("model_feature_source", "feature_selection")
     source_options = {
@@ -4656,6 +7033,26 @@ def _apply_feature_source_for_model_tab(
         _clear_model_feature_group_overrides()
         return None
 
+    # Opt-in explícito para fallback de calibración. Por default Modelos
+    # exige que Optuna haya optimizado EXACTAMENTE la calibración elegida
+    # aquí; si el usuario quiere aceptar un match de otra calibración
+    # dentro del mismo balance_mode, debe marcarlo conscientemente.
+    allow_calibration_fallback = st.checkbox(
+        "Aceptar fallback de calibración de Optuna",
+        value=bool(
+            st.session_state.get("allow_optuna_calibration_fallback", False)
+        ),
+        key="allow_optuna_calibration_fallback",
+        help=(
+            "Cuando Optuna no optimizó exactamente la calibración elegida "
+            "aquí (p. ej. optimizó Platt pero aquí pediste Isotonic), "
+            "aceptar la mejor disponible dentro del mismo balance_mode. "
+            "Desactivado por default: entrenar con parámetros ajustados "
+            "a otra calibración cambia el tradeoff y puede degradar la "
+            "calidad del threshold."
+        ),
+    )
+
     dataset_df = base_df if isinstance(base_df, pd.DataFrame) else features_df
     if not isinstance(dataset_df, pd.DataFrame) or dataset_df.empty:
         _clear_model_feature_group_overrides()
@@ -4679,6 +7076,7 @@ def _apply_feature_source_for_model_tab(
 
     selected_features = st.session_state.get("selected_features")
     numeric_cols = _get_feature_cols(dataset_df)
+    numeric_cols_set = set(numeric_cols)
     cluster_cols_set = set(_get_cluster_cols(dataset_df))
     if selected_features is None:
         cols_all = list(numeric_cols)
@@ -4686,6 +7084,12 @@ def _apply_feature_source_for_model_tab(
         cols_all = [col for col in selected_features if col in numeric_cols]
     cols_base = [col for col in cols_all if col not in cluster_cols_set]
     cols_cluster_only = [col for col in cols_all if col in cluster_cols_set]
+
+    # Fingerprint del dataset actual para detectar drift respecto al dataset
+    # usado cuando se entrenó Optuna.
+    current_fingerprint = _dataset_content_fingerprint(
+        features_df_state if isinstance(features_df_state, pd.DataFrame) else dataset_df
+    )
 
     store = st.session_state.get("optuna_results_store") or {}
 
@@ -4697,6 +7101,10 @@ def _apply_feature_source_for_model_tab(
 
     summary_lines: List[str] = []
     any_match = False
+    fallback_groups: List[str] = []
+    missing_cols_by_group: Dict[str, List[str]] = {}
+    drift_groups: List[str] = []
+    empty_after_filter_groups: List[str] = []
     for group_key, group_label, cols in groups:
         state_key = _MODEL_FEATURE_GROUP_OVERRIDE_KEYS[group_key]
 
@@ -4718,30 +7126,150 @@ def _apply_feature_source_for_model_tab(
             feature_key=feature_key,
             cols=cols,
             model_choice=model_choice,
+            balance_mode=balance_mode,
+            calibration_method=calibration_method,
+            allow_calibration_fallback=allow_calibration_fallback,
         )
         if match is None:
             st.session_state.pop(state_key, None)
+            # Distinguir "no hay Optuna" vs "sólo hay con otra calibración
+            # y el usuario no aceptó fallback". Esto último es ahora el
+            # motivo más frecuente si el default queda en False.
+            if not allow_calibration_fallback:
+                alt_match = _lookup_optuna_best_feature_cols(
+                    store=store,
+                    feature_key=feature_key,
+                    cols=cols,
+                    model_choice=model_choice,
+                    balance_mode=balance_mode,
+                    calibration_method=calibration_method,
+                    allow_calibration_fallback=True,
+                )
+                if alt_match is not None:
+                    alt_label = (
+                        alt_match.get("calibration_method_label")
+                        or alt_match.get("calibration_method")
+                        or "otra calibración"
+                    )
+                    summary_lines.append(
+                        f"✗ {group_label}: Optuna optimizó {alt_label} "
+                        "(active fallback para usarlo)"
+                    )
+                    continue
             summary_lines.append(f"✗ {group_label}: sin Optuna")
             continue
 
-        st.session_state[state_key] = list(match["best_feature_cols"])
+        # Validar que best_feature_cols existan en el dataset actual. Si
+        # Optuna corrió con otro esquema (columnas renombradas, archivo
+        # recalculado, selección distinta) este filtro lo detecta en lugar
+        # de fallar al entrenar.
+        raw_best_cols = [str(col) for col in match.get("best_feature_cols") or []]
+        valid_cols = [col for col in raw_best_cols if col in numeric_cols_set]
+        missing_cols = [col for col in raw_best_cols if col not in numeric_cols_set]
+        if missing_cols:
+            missing_cols_by_group[group_label] = missing_cols
+
+        if not valid_cols:
+            # Todas las cols de Optuna están ausentes → no podemos aplicar
+            # el override, caemos a Feature selection para este grupo.
+            st.session_state.pop(state_key, None)
+            empty_after_filter_groups.append(group_label)
+            summary_lines.append(
+                f"✗ {group_label}: Optuna propone {len(raw_best_cols)} vars "
+                "ausentes del dataset"
+            )
+            continue
+
+        st.session_state[state_key] = list(valid_cols)
         any_match = True
-        parts = [f"{len(match['best_feature_cols'])} vars"]
+
+        # Detectar drift del dataset (mismo feature_key pero fingerprint distinto).
+        stored_fingerprint = match.get("dataset_fingerprint")
+        if (
+            stored_fingerprint
+            and current_fingerprint
+            and stored_fingerprint != current_fingerprint
+        ):
+            drift_groups.append(group_label)
+
+        parts = [f"{len(valid_cols)} vars"]
+        if missing_cols:
+            parts.append(f"{len(missing_cols)} ignoradas")
         if match.get("best_top_k") is not None:
             parts.append(f"top_k={int(match['best_top_k'])}")
         if match.get("best_score") is not None:
             label = match.get("objective_label") or "score"
             parts.append(f"best {label}={float(match['best_score']):.4f}")
+        resolved_calibration_label = match.get("calibration_method_label")
+        if resolved_calibration_label:
+            parts.append(f"calibración={resolved_calibration_label}")
+        if bool(match.get("used_fallback")):
+            fallback_groups.append(group_label)
+            parts.append("fallback")
+        if group_label in drift_groups:
+            parts.append("drift")
         summary_lines.append(f"✓ {group_label}: " + ", ".join(parts))
 
     if not any_match:
         st.warning(
             "No se encontraron resultados de Optuna para el modelo "
-            f"'{model_choice}' que coincidan con los grupos Base, Cluster o "
-            "Base + Cluster. Ejecute Optuna primero o cambie el modelo."
+            f"'{model_choice}' ({_optuna_balance_mode_label(balance_mode)} | "
+            f"{_calibration_method_label(calibration_method)}) que "
+            "coincidan con los grupos Base, Cluster o Base + Cluster. "
+            "Ejecute Optuna primero o cambie el modelo."
         )
+    else:
+        if empty_after_filter_groups:
+            st.error(
+                "Optuna tiene resultados para "
+                + ", ".join(empty_after_filter_groups)
+                + " pero sus `best_feature_cols` no existen en el dataset "
+                "actual. Ese/esos grupos volverán a usar Feature selection. "
+                "Ejecute Optuna nuevamente sobre este dataset o elija otro "
+                "origen de variables."
+            )
+        if missing_cols_by_group:
+            detail_lines = []
+            for group_label, missing in missing_cols_by_group.items():
+                preview = ", ".join(missing[:5])
+                if len(missing) > 5:
+                    preview = f"{preview}, … (+{len(missing) - 5})"
+                detail_lines.append(f"- **{group_label}**: {preview}")
+            st.warning(
+                "Algunas columnas que Optuna seleccionó no están en el "
+                "dataset actual y fueron ignoradas:\n"
+                + "\n".join(detail_lines)
+            )
+        if drift_groups:
+            st.warning(
+                "⚠️ Dataset drift detectado en: "
+                + ", ".join(drift_groups)
+                + ". El schema (columnas/dtypes/filas) actual difiere del "
+                "usado cuando se entrenó Optuna. Los resultados pueden no "
+                "ser representativos; considere re-ejecutar Optuna."
+            )
+        if fallback_groups:
+            # Si el usuario aceptó el fallback opt-in, el mensaje es
+            # informativo, no un warning.
+            fallback_message = (
+                "Fallback de calibración aceptado para: "
+                + ", ".join(fallback_groups)
+                + f". No existe match exacto para "
+                f"{_calibration_method_label(calibration_method)} dentro de "
+                f"{_optuna_balance_mode_label(balance_mode)}; se usó la "
+                "mejor calibración disponible dentro del mismo balance_mode."
+            )
+            if allow_calibration_fallback:
+                st.info(fallback_message)
+            else:
+                st.warning(fallback_message)
 
-    st.caption("Match Optuna por grupo — " + "   ".join(summary_lines))
+    st.caption(
+        "Match Optuna por grupo "
+        f"({_optuna_balance_mode_label(balance_mode)} | "
+        f"{_calibration_method_label(calibration_method)}) — "
+        + "   ".join(summary_lines)
+    )
     return None
 
 
@@ -6738,6 +9266,7 @@ def _render_feature_selection_tab() -> None:
 def _render_optuna_tab() -> None:
     st.subheader("Optuna")
     _render_selected_features_info()
+    _render_state_diagnostics("optuna")
 
     accidents_df = st.session_state.get("accidents_df")
     features_df = st.session_state.get("flow_features_df")
@@ -6843,17 +9372,10 @@ def _render_optuna_tab() -> None:
             if entry is None:
                 payload, trials_df = _load_optuna_result_from_disk(c_id)
                 if payload or trials_df is not None:
-                    results: Dict[str, object] = {}
-                    if payload and isinstance(payload.get("results"), dict):
-                        for choice, data in payload["results"].items():
-                            if not isinstance(data, dict):
-                                continue
-                            item = dict(data)
-                            item.setdefault("model_choice", choice)
-                            item.setdefault("optuna_settings", {})
-                            item.setdefault("search_space", {})
-                            results[str(choice)] = item
-                    elif payload:
+                    results: Dict[str, object] = _normalize_optuna_results_payload(
+                        payload.get("results") if payload else None
+                    )
+                    if not results and payload:
                         legacy_choice = payload.get("model_choice") or "legacy"
                         _, legacy_csv = _optuna_result_paths(c_id)
                         trials_csv = payload.get("trials_csv")
@@ -6871,7 +9393,9 @@ def _render_optuna_tab() -> None:
                         }
                         if trials_df is not None:
                             legacy_result["trials_df"] = trials_df
-                        results[str(legacy_choice)] = legacy_result
+                        results = _normalize_optuna_results_payload(
+                            {str(legacy_choice): legacy_result}
+                        )
 
                     entry = {
                         "optuna_id": payload.get("optuna_id", c_id)
@@ -6899,6 +9423,12 @@ def _render_optuna_tab() -> None:
                         )
                         if payload
                         else int(len(features_df.columns)),
+                        "dataset_fingerprint": payload.get(
+                            "dataset_fingerprint",
+                            _dataset_content_fingerprint(features_df),
+                        )
+                        if payload
+                        else _dataset_content_fingerprint(features_df),
                         "selection_mode": payload.get(
                             "selection_mode",
                             "all" if selected_features is None else "selected",
@@ -6955,6 +9485,7 @@ def _render_optuna_tab() -> None:
                     "trials_csv": trials_csv,
                 }
             }
+            normalized_results = _normalize_optuna_results_payload(results)
             entry = {
                 "optuna_id": entry.get("optuna_id", c_id),
                 "feature_key": entry.get("feature_key", feature_key),
@@ -6965,6 +9496,10 @@ def _render_optuna_tab() -> None:
                 "features_cols": entry.get(
                     "features_cols", int(len(features_df.columns))
                 ),
+                "dataset_fingerprint": entry.get(
+                    "dataset_fingerprint",
+                    _dataset_content_fingerprint(features_df),
+                ),
                 "selection_mode": entry.get(
                     "selection_mode",
                     "all" if selected_features is None else "selected",
@@ -6974,9 +9509,17 @@ def _render_optuna_tab() -> None:
                     list(selected_features) if selected_features else [],
                 ),
                 "feature_cols": entry.get("feature_cols", list(c_cols)),
-                "results": results,
+                "results": normalized_results,
                 "saved_at": entry.get("saved_at"),
             }
+            store[c_key] = entry
+            st.session_state["optuna_results_store"] = store
+        elif entry and isinstance(entry.get("results"), dict):
+            normalized_results = _normalize_optuna_results_payload(
+                entry.get("results")
+            )
+            entry = dict(entry)
+            entry["results"] = normalized_results
             store[c_key] = entry
             st.session_state["optuna_results_store"] = store
 
@@ -6987,14 +9530,7 @@ def _render_optuna_tab() -> None:
         st.caption(
             f"Variables de cluster seleccionadas: {len(selected_cluster_cols)} (se optimizara con y sin ellas)"
         )
-    objective_options = {
-        "F1": {"key": "f1", "direction": "maximize"},
-        "ROC-AUC": {"key": "roc_auc", "direction": "maximize"},
-        "Accuracy": {"key": "accuracy", "direction": "maximize"},
-        "Recall": {"key": "recall", "direction": "maximize"},
-        "Precision": {"key": "precision", "direction": "maximize"},
-        "FNR (menor es mejor)": {"key": "fnr", "direction": "minimize"},
-    }
+    objective_options = _optuna_objective_options()
     objective_label = st.selectbox(
         "Metrica objetivo",
         list(objective_options.keys()),
@@ -7007,15 +9543,46 @@ def _render_optuna_tab() -> None:
         f"Optuna {objective_verb} {objective_label} en el set de validacion "
         "usando el criterio de threshold seleccionado (test queda como hold-out final)."
     )
+    entry = store.get(primary_key)
 
     model_choice = st.selectbox(
         "Modelo",
         ["XGBoost", "Random Forest", "SVM", "Neural Network"],
         key="optuna_model_choice",
     )
+    optuna_calibration_options = _calibration_method_options()
+    optuna_calibration_labels = [
+        label for label, _ in optuna_calibration_options
+    ]
+    optuna_calibration_map = {
+        label: key for label, key in optuna_calibration_options
+    }
+    optuna_calibration_label = st.selectbox(
+        "Calibración",
+        optuna_calibration_labels,
+        index=0,
+        key="optuna_calibration_method",
+        help=(
+            "Transforma scores antes de seleccionar el threshold operativo en "
+            "validación. Default: Platt scaling (sigmoid)."
+        ),
+    )
+    optuna_calibration_method = optuna_calibration_map[optuna_calibration_label]
     model_result: Optional[Dict[str, object]] = None
     if entry and isinstance(entry.get("results"), dict):
-        model_result = entry["results"].get(model_choice)
+        model_result = _get_optuna_model_result_variant(
+            entry.get("results"),
+            model_choice=model_choice,
+            balance_mode="smote",
+            calibration_method=optuna_calibration_method,
+            fallback_modes=["none"],
+        )
+        smote_result = _get_optuna_model_result_variant(
+            entry.get("results"),
+            model_choice=model_choice,
+            balance_mode="smote",
+            calibration_method=optuna_calibration_method,
+        )
         if isinstance(model_result, dict):
             trials_df = model_result.get("trials_df")
             trials_csv = model_result.get("trials_csv")
@@ -7029,8 +9596,16 @@ def _render_optuna_tab() -> None:
                     model_result["trials_df"] = trials_df
                 except Exception:
                     trials_df = None
-            st.session_state["optuna_best_smote_params"] = model_result.get(
-                "best_smote_params"
+            # DEPRECATED: replicación de valores del store en keys top-level
+            # ``optuna_best_*``. Consumidores nuevos deben usar
+            # ``_get_active_optuna_best()`` que lee directamente del
+            # ``optuna_results_store``. Se mantiene por compatibilidad con
+            # flujos legacy que aún leen estos keys (disk reloaders, tests
+            # viejos).
+            st.session_state["optuna_best_smote_params"] = (
+                smote_result.get("best_smote_params")
+                if isinstance(smote_result, dict)
+                else None
             )
             st.session_state["optuna_best_model_params"] = model_result.get(
                 "best_model_params"
@@ -7045,6 +9620,7 @@ def _render_optuna_tab() -> None:
                 "search_space"
             )
         else:
+            # DEPRECATED: reset de keys top-level ``optuna_best_*`` (legacy).
             st.session_state["optuna_best_smote_params"] = None
             st.session_state["optuna_best_model_params"] = None
             st.session_state["optuna_best_score"] = None
@@ -7153,44 +9729,87 @@ def _render_optuna_tab() -> None:
     optuna_threshold_objective = optuna_threshold_objective_options[
         optuna_threshold_objective_label
     ]
-    optuna_far_target = st.slider(
-        "FAR (False alarm rate) target",
-        min_value=0.0,
-        max_value=0.5,
-        value=float(st.session_state.get("far_target", 0.2)),
-        step=0.01,
-        key="optuna_far_target",
+    optuna_threshold_visibility = _threshold_field_visibility_for_objective(
+        optuna_threshold_objective
     )
-    optuna_alerts_per_day = st.number_input(
-        "Alertas maximas por dia",
-        min_value=0.1,
-        max_value=50.0,
-        value=float(st.session_state.get("optuna_alerts_per_day", 5.0)),
-        step=0.5,
-        key="optuna_alerts_per_day",
-        help=(
-            "Presupuesto diario de alertas para Recall@N y costo operacional. "
-            "Se ignora para criterios que no lo usen."
-        ),
-    )
-    col_cost_a, col_cost_b = st.columns(2)
-    with col_cost_a:
-        optuna_fn_cost = st.number_input(
-            "Costo FN",
+    optuna_far_target = float(
+        _render_conditional_slider(
+            "FAR (False alarm rate) target",
+            visible=optuna_threshold_visibility["far_target"],
             min_value=0.0,
-            value=float(st.session_state.get("optuna_fn_cost", 10.0)),
-            step=1.0,
-            key="optuna_fn_cost",
-            help="Costo de no alertar un accidente real (usado por costo operacional).",
+            max_value=0.5,
+            value=float(st.session_state.get("far_target", 0.2)),
+            step=0.01,
+            key="optuna_far_target",
         )
-    with col_cost_b:
-        optuna_fp_cost = st.number_input(
-            "Costo FP",
-            min_value=0.0,
-            value=float(st.session_state.get("optuna_fp_cost", 1.0)),
+    )
+    optuna_alerts_per_day = float(
+        _render_conditional_number_input(
+            "Alertas maximas por dia",
+            visible=optuna_threshold_visibility["alerts_per_day"],
+            min_value=0.1,
+            max_value=50.0,
+            value=float(st.session_state.get("optuna_alerts_per_day", 5.0)),
             step=0.5,
-            key="optuna_fp_cost",
-            help="Costo de una falsa alarma (usado por costo operacional).",
+            key="optuna_alerts_per_day",
+            help=(
+                "Presupuesto diario de alertas para Recall@N y costo operacional. "
+                "Se ignora para criterios que no lo usen."
+            ),
+        )
+    )
+    if (
+        optuna_threshold_visibility["fn_cost"]
+        or optuna_threshold_visibility["fp_cost"]
+    ):
+        col_cost_a, col_cost_b = st.columns(2)
+        with col_cost_a:
+            optuna_fn_cost = float(
+                _render_conditional_number_input(
+                    "Costo FN",
+                    visible=optuna_threshold_visibility["fn_cost"],
+                    min_value=0.0,
+                    value=float(st.session_state.get("optuna_fn_cost", 10.0)),
+                    step=1.0,
+                    key="optuna_fn_cost",
+                    help=(
+                        "Costo de no alertar un accidente real "
+                        "(usado por costo operacional)."
+                    ),
+                )
+            )
+        with col_cost_b:
+            optuna_fp_cost = float(
+                _render_conditional_number_input(
+                    "Costo FP",
+                    visible=optuna_threshold_visibility["fp_cost"],
+                    min_value=0.0,
+                    value=float(st.session_state.get("optuna_fp_cost", 1.0)),
+                    step=0.5,
+                    key="optuna_fp_cost",
+                    help="Costo de una falsa alarma (usado por costo operacional).",
+                )
+            )
+    else:
+        optuna_fn_cost = float(
+            _render_conditional_number_input(
+                "Costo FN",
+                visible=False,
+                min_value=0.0,
+                value=float(st.session_state.get("optuna_fn_cost", 10.0)),
+                step=1.0,
+                key="optuna_fn_cost",
+            )
+        )
+        optuna_fp_cost = float(
+            _render_conditional_number_input(
+                "Costo FP",
+                visible=False,
+                min_value=0.0,
+                value=float(st.session_state.get("optuna_fp_cost", 1.0)),
+                step=0.5,
+                key="optuna_fp_cost",
+            )
         )
     optuna_val_size = st.slider(
         "Validation size",
@@ -7902,12 +10521,12 @@ def _render_optuna_tab() -> None:
             return
         try:
             from imblearn.over_sampling import SMOTE  # type: ignore
+            smote_import_error = None
         except ImportError:
-            st.error(
-                "imbalanced-learn no esta instalado. "
-                "Ejecute `pip install imbalanced-learn`."
+            SMOTE = None  # type: ignore[assignment]
+            smote_import_error = (
+                "imbalanced-learn no esta instalado. La variante Con SMOTE se omitirá."
             )
-            return
         if model_choice == "XGBoost":
             try:
                 import xgboost as xgb  # noqa: F401
@@ -7917,14 +10536,6 @@ def _render_optuna_tab() -> None:
                 )
                 return
 
-        from sklearn.metrics import (
-            accuracy_score,
-            confusion_matrix,
-            f1_score,
-            precision_score,
-            recall_score,
-            roc_auc_score,
-        )
         y = base_df["target"].astype("int8")
         if y.nunique() < 2:
             st.warning("No hay dos clases en el target para Optuna.")
@@ -7994,17 +10605,20 @@ def _render_optuna_tab() -> None:
             return
 
         min_count = int(pd.Series(y_train).value_counts().min())
-        if min_count < 2:
-            st.warning("No hay suficientes ejemplos minoritarios para SMOTE.")
-            return
-        max_k = max(1, min_count - 1)
+        smote_skip_reason: Optional[str] = None
         k_low = max(1, int(smote_k_min))
-        k_high = min(int(smote_k_max), max_k)
-        if k_high < k_low:
-            st.warning(
-                "El rango de smote_k no es valido para este dataset."
-            )
-            return
+        k_high = int(smote_k_max)
+        if SMOTE is None:
+            smote_skip_reason = smote_import_error
+        elif min_count < 2:
+            smote_skip_reason = "No hay suficientes ejemplos minoritarios para SMOTE."
+        else:
+            max_k = max(1, min_count - 1)
+            k_high = min(int(smote_k_max), max_k)
+            if k_high < k_low:
+                smote_skip_reason = (
+                    "El rango de smote_k no es valido para este dataset."
+                )
 
         if model_choice == "Random Forest":
             if rf_n_min > rf_n_max:
@@ -8107,8 +10721,24 @@ def _render_optuna_tab() -> None:
                 st.warning("svm_C_step debe ser mayor a 0.")
                 return
 
-        def _run_optimization(cols: List[str], label: str):
-            st.markdown(f"**Optimizando: {label}**")
+        balance_modes_to_run = ["none"]
+        if smote_skip_reason is None:
+            balance_modes_to_run.append("smote")
+        else:
+            st.warning(
+                "No se pudo ejecutar la variante Con SMOTE. "
+                f"Motivo: {smote_skip_reason}"
+            )
+
+        def _run_optimization(
+            cols: List[str],
+            label: str,
+            *,
+            balance_mode: str,
+        ):
+            balance_mode = _normalize_optuna_balance_mode(balance_mode)
+            balance_label = _optuna_balance_mode_label(balance_mode)
+            st.markdown(f"**Optimizando: {label} | {balance_label}**")
             optuna.logging.set_verbosity(optuna.logging.WARNING)
             effective_optuna_n_jobs = max(1, int(optuna_n_jobs))
             sampler = optuna.samplers.TPESampler(
@@ -8132,7 +10762,6 @@ def _render_optuna_tab() -> None:
             X_train_run = X_train[cols].fillna(0).astype("float32")
             X_val_run = X_val[cols].fillna(0).astype("float32")
 
-            # Ranking una sola vez sobre train real (pre-SMOTE), si se optimiza K.
             ranked_cols: List[str] = list(cols)
             effective_k_low = 0
             effective_k_high = 0
@@ -8140,7 +10769,7 @@ def _render_optuna_tab() -> None:
             if optuna_tune_topk:
                 try:
                     with st.spinner(
-                        f"Calculando ranking ({optuna_ranking_method_label}) sobre train para {label}..."
+                        f"Calculando ranking ({optuna_ranking_method_label}) sobre train para {label} | {balance_label}..."
                     ):
                         ranked_cols = _rank_features_for_optuna(
                             X_train_run,
@@ -8150,7 +10779,7 @@ def _render_optuna_tab() -> None:
                         )
                 except Exception as exc:
                     st.warning(
-                        f"No se pudo calcular el ranking para {label}: {exc}. "
+                        f"No se pudo calcular el ranking para {label} | {balance_label}: {exc}. "
                         "Se usaran todas las variables del config."
                     )
                     ranked_cols = list(cols)
@@ -8160,14 +10789,15 @@ def _render_optuna_tab() -> None:
                 if effective_k_high < effective_k_low:
                     effective_k_high = effective_k_low
                 st.caption(
-                    f"[{label}] Ranking calculado sobre {total_cols} variables. "
+                    f"[{label} | {balance_label}] Ranking calculado sobre {total_cols} variables. "
                     f"top_k explorado en [{effective_k_low}, {effective_k_high}] "
                     f"paso {effective_k_step}."
                 )
 
             def objective(trial: "optuna.Trial") -> float:
                 if optuna_tune_topk and ranked_cols:
-                    top_k = trial.suggest_int(
+                    top_k = _suggest_optuna_discrete_int(
+                        trial,
                         "top_k",
                         int(effective_k_low),
                         int(effective_k_high),
@@ -8181,37 +10811,43 @@ def _render_optuna_tab() -> None:
                 X_train_trial = X_train_run[trial_cols]
                 X_val_trial = X_val_run[trial_cols]
 
-                smote_k = trial.suggest_int(
-                    "smote_k_neighbors",
-                    int(k_low),
-                    int(k_high),
-                    step=int(smote_k_step),
-                )
-                smote_sampling = trial.suggest_float(
-                    "smote_sampling_strategy",
-                    float(smote_sampling_min),
-                    float(smote_sampling_max),
-                    step=float(smote_sampling_step),
-                )
-                smote = SMOTE(
-                    k_neighbors=int(smote_k),
-                    sampling_strategy=float(smote_sampling),
-                    random_state=int(optuna_random_state),
-                )
-                try:
-                    X_res, y_res = smote.fit_resample(X_train_trial, y_train)
-                except ValueError as exc:
-                    raise optuna.TrialPruned(str(exc)) from exc
+                if balance_mode == "smote":
+                    smote_k = _suggest_optuna_discrete_int(
+                        trial,
+                        "smote_k_neighbors",
+                        int(k_low),
+                        int(k_high),
+                        step=int(smote_k_step),
+                    )
+                    smote_sampling = trial.suggest_float(
+                        "smote_sampling_strategy",
+                        float(smote_sampling_min),
+                        float(smote_sampling_max),
+                        step=float(smote_sampling_step),
+                    )
+                    smote = SMOTE(
+                        k_neighbors=int(smote_k),
+                        sampling_strategy=float(smote_sampling),
+                        random_state=int(optuna_random_state),
+                    )
+                    try:
+                        X_res, y_res = smote.fit_resample(X_train_trial, y_train)
+                    except ValueError as exc:
+                        raise optuna.TrialPruned(str(exc)) from exc
+                else:
+                    X_res, y_res = X_train_trial, y_train
 
                 model_params: Dict[str, object]
                 if model_choice == "Random Forest":
-                    n_estimators = trial.suggest_int(
+                    n_estimators = _suggest_optuna_discrete_int(
+                        trial,
                         "rf_n_estimators",
                         int(rf_n_min),
                         int(rf_n_max),
                         step=int(rf_n_step),
                     )
-                    max_depth = trial.suggest_int(
+                    max_depth = _suggest_optuna_discrete_int(
+                        trial,
                         "rf_max_depth",
                         int(rf_depth_min),
                         int(rf_depth_max),
@@ -8224,13 +10860,15 @@ def _render_optuna_tab() -> None:
                     if optuna_rf_n_jobs is not None:
                         model_params["n_jobs"] = int(optuna_rf_n_jobs)
                 elif model_choice == "XGBoost":
-                    n_estimators = trial.suggest_int(
+                    n_estimators = _suggest_optuna_discrete_int(
+                        trial,
                         "xgb_n_estimators",
                         int(xgb_n_min),
                         int(xgb_n_max),
                         step=int(xgb_n_step),
                     )
-                    max_depth = trial.suggest_int(
+                    max_depth = _suggest_optuna_discrete_int(
+                        trial,
                         "xgb_max_depth",
                         int(xgb_depth_min),
                         int(xgb_depth_max),
@@ -8285,13 +10923,15 @@ def _render_optuna_tab() -> None:
                     if optuna_xgb_n_jobs is not None:
                         model_params["n_jobs"] = int(optuna_xgb_n_jobs)
                 elif model_choice == "Neural Network":
-                    hidden_dim = trial.suggest_int(
+                    hidden_dim = _suggest_optuna_discrete_int(
+                        trial,
                         "nn_hidden_dim",
                         int(nn_hidden_min),
                         int(nn_hidden_max),
                         step=int(nn_hidden_step),
                     )
-                    num_layers = trial.suggest_int(
+                    num_layers = _suggest_optuna_discrete_int(
+                        trial,
                         "nn_num_layers",
                         int(nn_layers_min),
                         int(nn_layers_max),
@@ -8324,9 +10964,6 @@ def _render_optuna_tab() -> None:
                     batch_size = trial.suggest_categorical(
                         "nn_batch_size", list(nn_batch_options)
                     )
-                    # epochs fijo interno alto: el early stopping (patience=5)
-                    # cortara antes cuando la metrica de validacion deje de mejorar.
-                    # El maximo real se configura en la pestana Modelos.
                     model_params = {
                         "hidden_dim": int(hidden_dim),
                         "num_layers": int(num_layers),
@@ -8355,43 +10992,32 @@ def _render_optuna_tab() -> None:
                         model_choice, model_params, int(optuna_random_state)
                     )
                     model.fit(X_res, y_res)
-                    scores_val = _get_model_scores(model, X_val_trial)
-                    thr_info = _select_threshold_for_metric(
+                    raw_scores_val = _get_model_scores(model, X_val_trial)
+                    calibrator = _fit_score_calibrator(
+                        y_val.to_numpy(),
+                        raw_scores_val,
+                        method=optuna_calibration_method,
+                    )
+                    scores_val = calibrator.transform(raw_scores_val)
+                    scored = _score_optuna_objective(
                         y_val.to_numpy(),
                         scores_val,
-                        objective=str(optuna_threshold_objective),
+                        objective_metric=objective_key,
+                        threshold_objective=str(optuna_threshold_objective),
                         eval_df=val_df,
                         far_target=float(optuna_far_target),
                         alerts_per_day=float(optuna_alerts_per_day),
                         fn_cost=float(optuna_fn_cost),
                         fp_cost=float(optuna_fp_cost),
                     )
-                    threshold = float(thr_info["threshold"])
-                    preds = (scores_val >= threshold).astype(int)
+                    score = float(scored.get("score", float("nan")))
                 except Exception as exc:
                     raise optuna.TrialPruned(str(exc)) from exc
 
-                y_val_arr = y_val.to_numpy()
-                if objective_key == "f1":
-                    score = float(f1_score(y_val_arr, preds, zero_division=0))
-                elif objective_key == "roc_auc":
-                    try:
-                        score = float(roc_auc_score(y_val_arr, scores_val))
-                    except ValueError:
-                        score = 0.5
-                elif objective_key == "accuracy":
-                    score = float(accuracy_score(y_val_arr, preds))
-                elif objective_key == "recall":
-                    score = float(recall_score(y_val_arr, preds, zero_division=0))
-                elif objective_key == "precision":
-                    score = float(precision_score(y_val_arr, preds, zero_division=0))
-                elif objective_key == "fnr":
-                    tn, fp, fn, tp = confusion_matrix(
-                        y_val_arr, preds, labels=[0, 1]
-                    ).ravel()
-                    score = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
-                else:
-                    score = float(f1_score(y_val_arr, preds, zero_division=0))
+                if pd.isna(score):
+                    raise optuna.TrialPruned(
+                        f"{objective_key} invalido en validacion."
+                    )
                 trial.report(score, step=0)
                 if trial.should_prune():
                     raise optuna.TrialPruned("Pruned by MedianPruner")
@@ -8441,6 +11067,7 @@ def _render_optuna_tab() -> None:
                     "Menor" if objective_direction == "minimize" else "Mejor"
                 )
                 lines = [
+                    f"Modo balanceo: {balance_label}",
                     f"Tiempo transcurrido: {elapsed:.1f}s",
                     f"Trials: {completed} completados | {pruned} podados | {total} total",
                     f"Optuna n_jobs: {effective_optuna_n_jobs}",
@@ -8463,7 +11090,7 @@ def _render_optuna_tab() -> None:
             optuna_callbacks = None
             if effective_optuna_n_jobs == 1:
                 optuna_callbacks = [_render_optuna_progress]
-            with st.spinner(f"Optuna ({label}) en ejecucion..."):
+            with st.spinner(f"Optuna ({label} | {balance_label}) en ejecucion..."):
                 study.optimize(
                     objective,
                     n_trials=int(n_trials),
@@ -8474,7 +11101,9 @@ def _render_optuna_tab() -> None:
             _render_optuna_progress(study, None)
 
             if not study.trials:
-                st.warning(f"Optuna ({label}) no genero resultados.")
+                st.warning(
+                    f"Optuna ({label} | {balance_label}) no genero resultados."
+                )
                 return None
 
             completed_trials = [
@@ -8484,7 +11113,9 @@ def _render_optuna_tab() -> None:
                 and t.value is not None
             ]
             if not completed_trials:
-                st.warning(f"Optuna ({label}) no genero trials completos.")
+                st.warning(
+                    f"Optuna ({label} | {balance_label}) no genero trials completos."
+                )
                 return None
 
             if objective_direction == "minimize":
@@ -8493,12 +11124,14 @@ def _render_optuna_tab() -> None:
                 best_trial = max(completed_trials, key=lambda t: float(t.value))
             best_params = dict(best_trial.params)
             best_score = float(best_trial.value)
-            smote_params = {
-                "smote_k_neighbors": int(best_params["smote_k_neighbors"]),
-                "smote_sampling_strategy": float(
-                    best_params["smote_sampling_strategy"]
-                ),
-            }
+            smote_params: Dict[str, object] = {}
+            if balance_mode == "smote":
+                smote_params = {
+                    "smote_k_neighbors": int(best_params["smote_k_neighbors"]),
+                    "smote_sampling_strategy": float(
+                        best_params["smote_sampling_strategy"]
+                    ),
+                }
             if model_choice == "Random Forest":
                 max_depth = int(best_params["rf_max_depth"])
                 model_params = {
@@ -8517,8 +11150,6 @@ def _render_optuna_tab() -> None:
                     "gamma": float(best_params["xgb_gamma"]),
                 }
             elif model_choice == "Neural Network":
-                # epochs no se optimiza: se fija al maximo configurado en Modelos.
-                # early_stopping_patience=5 asegura convergencia sin overfitting.
                 model_params = {
                     "hidden_dim": int(best_params["nn_hidden_dim"]),
                     "num_layers": int(best_params["nn_num_layers"]),
@@ -8533,7 +11164,7 @@ def _render_optuna_tab() -> None:
                     "kernel": best_params["svm_kernel"],
                     "C": float(best_params["svm_C"]),
                 }
-            
+
             trials_df = study.trials_dataframe(
                 attrs=("number", "value", "params", "state")
             )
@@ -8550,6 +11181,12 @@ def _render_optuna_tab() -> None:
                 best_feature_cols = list(cols)
 
             return {
+                "balance_mode": balance_mode,
+                "balance_mode_label": balance_label,
+                "calibration_method": optuna_calibration_method,
+                "calibration_method_label": _calibration_method_label(
+                    optuna_calibration_method
+                ),
                 "best_score": best_score,
                 "smote_params": smote_params,
                 "model_params": model_params,
@@ -8559,22 +11196,52 @@ def _render_optuna_tab() -> None:
                 "ranked_cols": list(ranked_cols),
             }
 
-        # Run for each config
+        # Flag local para "ya promovimos un primary en esta corrida". Sustituye
+        # la lectura de ``session_state["optuna_best_model_params"]`` (legacy)
+        # que podía contaminarse con resultados de corridas previas de Optuna.
+        primary_promoted_this_run = False
+
         for cfg in configs:
-            res = _run_optimization(cfg["cols"], cfg["label"])
-            if res:
-                # Update session state if this is the primary config (Model tab compatibility)
-                if cfg["key"] == primary_key:
-                    st.session_state["optuna_best_smote_params"] = res["smote_params"]
+            for balance_mode in balance_modes_to_run:
+                res = _run_optimization(
+                    cfg["cols"],
+                    cfg["label"],
+                    balance_mode=balance_mode,
+                )
+                if not res:
+                    continue
+
+                should_promote_primary = (
+                    cfg["key"] == primary_key
+                    and (
+                        res["balance_mode"] == "smote"
+                        or not primary_promoted_this_run
+                    )
+                )
+                if should_promote_primary:
+                    # DEPRECATED: escritura de keys top-level ``optuna_best_*``.
+                    # Mantenida por compatibilidad hacia atrás; los consumidores
+                    # nuevos deben usar ``_get_active_optuna_best()`` que lee
+                    # directamente del ``optuna_results_store``.
+                    st.session_state["optuna_best_smote_params"] = (
+                        res["smote_params"] if res["balance_mode"] == "smote" else None
+                    )
                     st.session_state["optuna_best_model_params"] = res["model_params"]
                     st.session_state["optuna_best_score"] = res["best_score"]
                     st.session_state["optuna_best_model_choice"] = model_choice
                     st.session_state["optuna_trials_df"] = res["trials_df"]
-                    st.session_state["smote_k_neighbors"] = res["smote_params"]["smote_k_neighbors"]
-                    st.session_state["smote_sampling_strategy"] = res["smote_params"]["smote_sampling_strategy"]
-                
-                search_space: Dict[str, object] = {
-                    "smote": {
+                    primary_promoted_this_run = True
+                    if res["balance_mode"] == "smote" and res["smote_params"]:
+                        st.session_state["smote_k_neighbors"] = res["smote_params"][
+                            "smote_k_neighbors"
+                        ]
+                        st.session_state["smote_sampling_strategy"] = res["smote_params"][
+                            "smote_sampling_strategy"
+                        ]
+
+                search_space: Dict[str, object] = {}
+                if res["balance_mode"] == "smote":
+                    search_space["smote"] = {
                         "k_neighbors": {
                             "min": int(smote_k_min),
                             "max": int(smote_k_max),
@@ -8586,7 +11253,6 @@ def _render_optuna_tab() -> None:
                             "step": float(smote_sampling_step),
                         },
                     }
-                }
                 if optuna_tune_topk:
                     search_space["top_k"] = {
                         "min": int(optuna_k_min),
@@ -8684,7 +11350,6 @@ def _render_optuna_tab() -> None:
                             "step": float(nn_pw_step),
                         },
                         "batch_size": list(nn_batch_options),
-                        # epochs no se optimiza (fijado + early stopping en Modelos)
                     }
                 else:
                     search_space["model"] = {
@@ -8695,7 +11360,7 @@ def _render_optuna_tab() -> None:
                             "step": float(svm_c_step),
                         },
                     }
-                
+
                 optuna_settings_payload = {
                     "n_trials": int(n_trials),
                     "timeout": int(timeout),
@@ -8706,6 +11371,10 @@ def _render_optuna_tab() -> None:
                     "far_target": float(optuna_far_target),
                     "threshold_objective": str(optuna_threshold_objective),
                     "threshold_objective_label": optuna_threshold_objective_label,
+                    "calibration_method": str(optuna_calibration_method),
+                    "calibration_method_label": _calibration_method_label(
+                        optuna_calibration_method
+                    ),
                     "alerts_per_day": float(optuna_alerts_per_day),
                     "fn_cost": float(optuna_fn_cost),
                     "fp_cost": float(optuna_fp_cost),
@@ -8713,6 +11382,8 @@ def _render_optuna_tab() -> None:
                     "objective_label": objective_label,
                     "objective_direction": objective_direction,
                     "objective_eval_set": "val",
+                    "balance_mode": str(res["balance_mode"]),
+                    "balance_mode_label": str(res["balance_mode_label"]),
                     "tune_topk": bool(optuna_tune_topk),
                     "ranking_method": str(optuna_ranking_method)
                     if optuna_tune_topk
@@ -8732,7 +11403,10 @@ def _render_optuna_tab() -> None:
                         "startup_trials": int(pruner_startup_trials),
                     },
                 }
-                if cfg["key"] == primary_key:
+                if should_promote_primary:
+                    # DEPRECATED: escrituras top-level ``optuna_best_settings`` /
+                    # ``optuna_best_search_space``; preferir lectura vía
+                    # ``_get_active_optuna_best()``.
                     st.session_state["optuna_best_settings"] = optuna_settings_payload
                     st.session_state["optuna_best_search_space"] = search_space
 
@@ -8747,6 +11421,8 @@ def _render_optuna_tab() -> None:
                     selected_features=selected_features,
                     feature_cols=cfg["cols"],
                     model_choice=model_choice,
+                    balance_mode=str(res["balance_mode"]),
+                    calibration_method=str(res["calibration_method"]),
                     best_score=res["best_score"],
                     best_smote_params=res["smote_params"],
                     best_model_params=res["model_params"],
@@ -8756,18 +11432,18 @@ def _render_optuna_tab() -> None:
                 )
                 if optuna_tune_topk:
                     st.success(
-                        f"Optuna ({cfg['label']}) finalizado. "
+                        f"Optuna ({cfg['label']} | {res['balance_mode_label']}) finalizado. "
                         f"{'Menor' if objective_direction == 'minimize' else 'Mejor'} "
                         f"{objective_label}: {res['best_score']:.4f} | "
                         f"best top_k = {res['best_top_k']} / {len(res['ranked_cols'])}"
                     )
                 else:
                     st.success(
-                        f"Optuna ({cfg['label']}) finalizado. "
+                        f"Optuna ({cfg['label']} | {res['balance_mode_label']}) finalizado. "
                         f"{'Menor' if objective_direction == 'minimize' else 'Mejor'} "
                         f"{objective_label}: {res['best_score']:.4f}"
                     )
-        
+
         st.rerun()
 
     st.subheader("Resultados guardados")
@@ -8775,50 +11451,109 @@ def _render_optuna_tab() -> None:
     for idx, cfg in enumerate(configs):
         with res_tabs[idx]:
             entry_cfg = store.get(cfg["key"])
-            res_cfg = None
-            if entry_cfg and isinstance(entry_cfg.get("results"), dict):
-                res_cfg = entry_cfg["results"].get(model_choice)
-            
-            if isinstance(res_cfg, dict):
-                trials_df_cfg = res_cfg.get("trials_df")
-                trials_csv_cfg = res_cfg.get("trials_csv")
-                if trials_df_cfg is None and trials_csv_cfg and Path(str(trials_csv_cfg)).exists():
-                    try:
-                        trials_df_cfg = pd.read_csv(trials_csv_cfg)
-                        res_cfg["trials_df"] = trials_df_cfg
-                    except Exception:
-                        pass
-                
-                saved_score = res_cfg.get("best_score")
-                saved_settings = res_cfg.get("optuna_settings")
-                metric_label = "F1"
-                if isinstance(saved_settings, dict) and saved_settings:
-                    metric_label = saved_settings.get(
-                        "objective_label", metric_label
+            results_cfg = (
+                entry_cfg.get("results")
+                if entry_cfg and isinstance(entry_cfg.get("results"), dict)
+                else None
+            )
+            variants_present = [
+                mode
+                for mode in OPTUNA_BALANCE_MODE_ORDER
+                if isinstance(
+                    (
+                        (_get_optuna_model_result_container(results_cfg, model_choice) or {})
+                        .get("by_balance_mode", {})
+                        .get(mode, {})
+                    ).get("by_calibration_method"),
+                    dict,
+                )
+            ]
+            if not variants_present:
+                st.info(
+                    f"No hay resultados guardados para {cfg['label']} con {model_choice}."
+                )
+                continue
+
+            variant_tabs = st.tabs(
+                [_optuna_balance_mode_label(mode) for mode in variants_present]
+            )
+            for variant_idx, balance_mode in enumerate(variants_present):
+                with variant_tabs[variant_idx]:
+                    model_container = _get_optuna_model_result_container(
+                        results_cfg,
+                        model_choice,
                     )
-                if saved_score is not None:
-                    st.metric(metric_label, f"{float(saved_score):.4f}")
-                if isinstance(saved_settings, dict) and saved_settings:
-                    st.caption("Configuracion Optuna")
-                    st.json(saved_settings)
-                saved_space = res_cfg.get("search_space")
-                if isinstance(saved_space, dict) and saved_space:
-                    st.caption("Rangos y pasos usados")
-                    st.json(saved_space)
-                saved_smote = res_cfg.get("best_smote_params")
-                if isinstance(saved_smote, dict) and saved_smote:
-                    st.caption("Mejor SMOTE")
-                    st.json(saved_smote)
-                saved_model = res_cfg.get("best_model_params")
-                if isinstance(saved_model, dict) and saved_model:
-                    st.caption("Mejor modelo")
-                    st.json(saved_model)
-                saved_trials = res_cfg.get("trials_df")
-                if isinstance(saved_trials, pd.DataFrame) and not saved_trials.empty:
-                    st.caption("Top trials")
-                    st.dataframe(saved_trials.head(20), width="stretch")
-            else:
-                st.info(f"No hay resultados guardados para {cfg['label']} con {model_choice}.")
+                    mode_container = (
+                        dict(model_container or {}).get("by_balance_mode", {}).get(
+                            balance_mode
+                        )
+                    )
+                    by_calibration_method = (
+                        mode_container.get("by_calibration_method")
+                        if isinstance(mode_container, dict)
+                        else None
+                    )
+                    if not isinstance(by_calibration_method, dict) or not by_calibration_method:
+                        st.info("Sin resultados para esta variante.")
+                        continue
+                    calibration_methods = _ordered_calibration_methods(
+                        list(by_calibration_method.keys())
+                    )
+                    calibration_tabs = st.tabs(
+                        [
+                            _calibration_method_label(method)
+                            for method in calibration_methods
+                        ]
+                    )
+                    for calibration_idx, calibration_method in enumerate(
+                        calibration_methods
+                    ):
+                        with calibration_tabs[calibration_idx]:
+                            res_cfg = by_calibration_method.get(calibration_method)
+                            if not isinstance(res_cfg, dict):
+                                st.info("Sin resultados para este calibrador.")
+                                continue
+                            trials_df_cfg = res_cfg.get("trials_df")
+                            trials_csv_cfg = res_cfg.get("trials_csv")
+                            if (
+                                trials_df_cfg is None
+                                and trials_csv_cfg
+                                and Path(str(trials_csv_cfg)).exists()
+                            ):
+                                try:
+                                    trials_df_cfg = pd.read_csv(trials_csv_cfg)
+                                    res_cfg["trials_df"] = trials_df_cfg
+                                except Exception:
+                                    pass
+
+                            saved_score = res_cfg.get("best_score")
+                            saved_settings = res_cfg.get("optuna_settings")
+                            metric_label = "F1"
+                            if isinstance(saved_settings, dict) and saved_settings:
+                                metric_label = saved_settings.get(
+                                    "objective_label", metric_label
+                                )
+                            if saved_score is not None:
+                                st.metric(metric_label, f"{float(saved_score):.4f}")
+                            if isinstance(saved_settings, dict) and saved_settings:
+                                st.caption("Configuración Optuna")
+                                st.json(saved_settings)
+                            saved_space = res_cfg.get("search_space")
+                            if isinstance(saved_space, dict) and saved_space:
+                                st.caption("Rangos y pasos usados")
+                                st.json(saved_space)
+                            saved_smote = res_cfg.get("best_smote_params")
+                            if isinstance(saved_smote, dict) and saved_smote:
+                                st.caption("Mejor SMOTE")
+                                st.json(saved_smote)
+                            saved_model = res_cfg.get("best_model_params")
+                            if isinstance(saved_model, dict) and saved_model:
+                                st.caption("Mejor modelo")
+                                st.json(saved_model)
+                            saved_trials = res_cfg.get("trials_df")
+                            if isinstance(saved_trials, pd.DataFrame) and not saved_trials.empty:
+                                st.caption("Top trials")
+                                st.dataframe(saved_trials.head(20), width="stretch")
 
 
 
@@ -8830,6 +11565,7 @@ def _render_optuna_tab() -> None:
 def _render_balance_tab() -> None:
     st.subheader("Balance con SMOTE")
     _render_selected_features_info()
+    _render_state_diagnostics("balance")
 
     accidents_df = st.session_state.get("accidents_df")
     features_df = st.session_state.get("flow_features_df")
@@ -8937,7 +11673,17 @@ def _render_balance_tab() -> None:
         )
         st.session_state["test_size"] = float(test_size)
 
-        optuna_smote = st.session_state.get("optuna_best_smote_params")
+        # Lee ``best_smote_params`` directamente del store vía el helper
+        # canónico ``_get_active_optuna_best`` en lugar del key legacy
+        # ``optuna_best_smote_params``. Esto protege al Balance tab de leer
+        # un valor stale si alguien mutó el top-level key sin actualizar el
+        # store (p.ej. legacy disk reloader).
+        _active_optuna_best = _get_active_optuna_best()
+        optuna_smote = (
+            _active_optuna_best.get("best_smote_params")
+            if isinstance(_active_optuna_best, dict)
+            else None
+        )
         optuna_active_key = st.session_state.get("optuna_active_key")
         features_path = st.session_state.get("flow_features_path")
         features_source = st.session_state.get("flow_features_source")
@@ -8963,9 +11709,24 @@ def _render_balance_tab() -> None:
                     key="use_optuna_smote",
                 )
             else:
+                diagnosis = _diagnose_optuna_key_mismatch(
+                    store=st.session_state.get("optuna_results_store") or {},
+                    expected_key=optuna_key,
+                    active_key=optuna_active_key,
+                    current_fingerprint=_dataset_content_fingerprint(features_df),
+                )
+                reasons = diagnosis.get("reasons") or []
+                if reasons:
+                    reasons_text = "; ".join(reasons)
+                else:
+                    reasons_text = (
+                        "no se pudo determinar la causa exacta del desajuste"
+                    )
                 st.warning(
-                    "⚠️ Los resultados de Optuna no coinciden con el dataset "
-                    "o las variables seleccionadas actualmente."
+                    "⚠️ Los parámetros de Optuna no aplican al dataset / "
+                    f"selección actual: {reasons_text}. "
+                    "Re-ejecute Optuna sobre este dataset y selección para "
+                    "actualizar los parámetros SMOTE sugeridos."
                 )
         else:
             st.info(
@@ -9592,15 +12353,18 @@ def _apply_model_params_to_prefix(
 def _apply_optuna_model_params_to_state(
     *,
     model_choice: str,
+    balance_mode: str,
+    calibration_method: str,
     base_df: pd.DataFrame,
     features_df: pd.DataFrame,
 ) -> Optional[str]:
     """Aplica los best_model_params de Optuna a los selectores de params por grupo.
 
     Para cada grupo (Base, Cluster, Base + Cluster), busca la corrida de Optuna
-    que coincide con las columnas del grupo y el model_choice. Si la encuentra,
-    sobreescribe los widgets del prefijo correspondiente (base_/cluster_only_/
-    cluster_). El match y la aplicacion ocurren por grupo de forma independiente.
+    que coincide con las columnas del grupo, el model_choice y la variante
+    sin/con SMOTE. Si la encuentra, sobreescribe los widgets del prefijo
+    correspondiente (base_/cluster_only_/cluster_). El match y la aplicacion
+    ocurren por grupo de forma independiente.
     """
     features_path = st.session_state.get("flow_features_path")
     features_source = st.session_state.get("flow_features_source")
@@ -9653,12 +12417,20 @@ def _apply_optuna_model_params_to_state(
             missing_labels.append(group_label)
             signatures_map.pop(prefix, None)
             continue
-        results = entry.get("results")
-        if not isinstance(results, dict):
-            missing_labels.append(group_label)
-            signatures_map.pop(prefix, None)
-            continue
-        result = results.get(model_choice)
+        # Respeta el opt-in del usuario: si no aceptó fallback de
+        # calibración, sólo aplicar params de Optuna cuando la corrida
+        # optimizó exactamente la calibración elegida en Modelos.
+        allow_calibration_fallback = bool(
+            st.session_state.get("allow_optuna_calibration_fallback", False)
+        )
+        match = _get_optuna_model_result_variant_match(
+            entry.get("results"),
+            model_choice=model_choice,
+            balance_mode=balance_mode,
+            calibration_method=calibration_method,
+            allow_any_calibration_within_mode=allow_calibration_fallback,
+        )
+        result = match.get("result") if isinstance(match, dict) else None
         if not isinstance(result, dict):
             missing_labels.append(group_label)
             signatures_map.pop(prefix, None)
@@ -9673,7 +12445,15 @@ def _apply_optuna_model_params_to_state(
             params_sig = json.dumps(best_model_params, sort_keys=True)
         except TypeError:
             params_sig = str(best_model_params)
-        full_sig = f"{key}|{model_choice}|{params_sig}"
+        resolved_calibration_method = (
+            str(match.get("resolved_calibration_method"))
+            if isinstance(match, dict) and match.get("resolved_calibration_method")
+            else _normalize_calibration_method(calibration_method)
+        )
+        full_sig = (
+            f"{key}|{model_choice}|{balance_mode}|"
+            f"{resolved_calibration_method}|{params_sig}"
+        )
         if signatures_map.get(prefix) == full_sig:
             already_labels.append(group_label)
             continue
@@ -9684,14 +12464,21 @@ def _apply_optuna_model_params_to_state(
             params=best_model_params,
         )
         signatures_map[prefix] = full_sig
-        applied_labels.append(group_label)
+        applied_label = group_label
+        if isinstance(match, dict) and bool(match.get("used_fallback")):
+            applied_label = (
+                f"{group_label} ({_calibration_method_label(resolved_calibration_method)})"
+            )
+        applied_labels.append(applied_label)
 
     st.session_state["optuna_model_params_applied_signatures"] = signatures_map
 
     if not applied_labels and not already_labels:
         if missing_labels:
             return (
-                f"Optuna sin resultados para {model_choice} en: "
+                f"Optuna sin resultados para {model_choice} "
+                f"({_optuna_balance_mode_label(balance_mode)} | "
+                f"{_calibration_method_label(calibration_method)}) en: "
                 + ", ".join(missing_labels)
                 + "."
             )
@@ -9704,11 +12491,17 @@ def _apply_optuna_model_params_to_state(
         parts.append("ya cargados: " + ", ".join(already_labels))
     if missing_labels:
         parts.append("sin match: " + ", ".join(missing_labels))
-    return "Parametros Optuna — " + " | ".join(parts)
+    return (
+        "Parametros Optuna "
+        f"({_optuna_balance_mode_label(balance_mode)} | "
+        f"{_calibration_method_label(calibration_method)}) — "
+        + " | ".join(parts)
+    )
 
 
 def _render_model_tab() -> None:
     st.subheader("Modelos de prediccion")
+    _render_state_diagnostics("modelos")
 
     accidents_df = st.session_state.get("accidents_df")
     features_df = st.session_state.get("flow_features_df")
@@ -9751,22 +12544,41 @@ def _render_model_tab() -> None:
     ) or cluster_cols_in_features
     has_cluster_available = has_cluster_features or cluster_cols_in_balanced
     
-    
+    threshold_objective_options = {
+        "Recall@N alertas/día": "recall_at_alerts_per_day",
+        "FAR": "far",
+        "Balanced F1": "balanced_f1",
+        "F1": "f1",
+        "MCC": "mcc",
+        "Costo operacional": "operational_cost",
+    }
+    current_threshold_objective = _option_value_from_state(
+        threshold_objective_options,
+        "model_threshold_objective",
+        default_label="Recall@N alertas/día",
+    )
+    model_threshold_visibility = _threshold_field_visibility_for_objective(
+        current_threshold_objective
+    )
+
     test_size = float(st.session_state.get("test_size", 0.2))
     st.caption(f"Test size: {test_size:.2f}")
 
-    far_target = st.slider(
-        "FAR target",
-        min_value=0.0,
-        max_value=0.5,
-        value=float(st.session_state.get("far_target", 0.2)),
-        step=0.01,
-        key="far_target",
-        help=(
-            "Falsa alarma máxima aceptada cuando el objetivo de threshold es FAR. "
-            "Rango: 0.00 a 0.50. Default: 0.20. No es una probabilidad calibrada; "
-            "controla tasa de falsos positivos en validación."
-        ),
+    far_target = float(
+        _render_conditional_slider(
+            "FAR target",
+            visible=model_threshold_visibility["far_target"],
+            min_value=0.0,
+            max_value=0.5,
+            value=float(st.session_state.get("far_target", 0.2)),
+            step=0.01,
+            key="far_target",
+            help=(
+                "Falsa alarma máxima aceptada cuando el objetivo de threshold es FAR. "
+                "Rango: 0.00 a 0.50. Default: 0.20. No es una probabilidad calibrada; "
+                "controla tasa de falsos positivos en validación."
+            ),
+        )
     )
     val_size = st.slider(
         "Validation size",
@@ -9804,14 +12616,6 @@ def _render_model_tab() -> None:
         if label in protocol_options
     ] or ["conservative"]
 
-    threshold_objective_options = {
-        "Recall@N alertas/día": "recall_at_alerts_per_day",
-        "FAR": "far",
-        "Balanced F1": "balanced_f1",
-        "F1": "f1",
-        "MCC": "mcc",
-        "Costo operacional": "operational_cost",
-    }
     col_thr_a, col_thr_b, col_thr_c = st.columns(3)
     with col_thr_a:
         threshold_objective_label = st.selectbox(
@@ -9827,55 +12631,71 @@ def _render_model_tab() -> None:
             ),
         )
     with col_thr_b:
-        alerts_per_day = st.number_input(
-            "Alertas máximas por día",
-            min_value=0.1,
-            max_value=50.0,
-            value=5.0,
-            step=0.5,
-            key="model_alerts_per_day",
-            help=(
-                "Presupuesto diario de alertas para Recall@N y métricas "
-                "operacionales. Rango práctico: 0.1 a 50. Default: 5.0. "
-                "Valores muy bajos pueden ocultar eventos detectables."
-            ),
+        alerts_per_day = float(
+            _render_conditional_number_input(
+                "Alertas máximas por día",
+                visible=model_threshold_visibility["alerts_per_day"],
+                min_value=0.1,
+                max_value=50.0,
+                value=5.0,
+                step=0.5,
+                key="model_alerts_per_day",
+                help=(
+                    "Presupuesto diario de alertas para Recall@N y métricas "
+                    "operacionales. Rango práctico: 0.1 a 50. Default: 5.0. "
+                    "Valores muy bajos pueden ocultar eventos detectables."
+                ),
+            )
         )
     with col_thr_c:
-        calibration_method = st.selectbox(
+        calibration_options = _calibration_method_options()
+        calibration_labels = [label for label, _ in calibration_options]
+        calibration_map = {
+            label: key for label, key in calibration_options
+        }
+        calibration_label = st.selectbox(
             "Calibración",
-            ["sigmoid", "none", "isotonic"],
+            calibration_labels,
             index=0,
             key="model_calibration_method",
             help=(
-                "Transforma scores antes de elegir threshold. Valores: sigmoid, "
-                "none, isotonic. Default: sigmoid. Isotonic puede sobreajustar "
-                "con pocos positivos."
+                "Transforma scores antes de elegir threshold. Valores: Platt "
+                "scaling (sigmoid), Isotonic o Sin calibración. Default: "
+                "Platt scaling (sigmoid). Isotonic puede sobreajustar con "
+                "pocos positivos."
             ),
         )
+        calibration_method = calibration_map[calibration_label]
     col_cost_a, col_cost_b, col_cost_c = st.columns(3)
     with col_cost_a:
-        fn_cost = st.number_input(
-            "Costo FN",
-            min_value=0.0,
-            value=10.0,
-            step=1.0,
-            key="model_fn_cost",
-            help=(
-                "Costo de no alertar un accidente real. Default: 10.0. Subirlo "
-                "favorece recall, pero puede aumentar falsas alarmas."
-            ),
+        fn_cost = float(
+            _render_conditional_number_input(
+                "Costo FN",
+                visible=model_threshold_visibility["fn_cost"],
+                min_value=0.0,
+                value=10.0,
+                step=1.0,
+                key="model_fn_cost",
+                help=(
+                    "Costo de no alertar un accidente real. Default: 10.0. Subirlo "
+                    "favorece recall, pero puede aumentar falsas alarmas."
+                ),
+            )
         )
     with col_cost_b:
-        fp_cost = st.number_input(
-            "Costo FP",
-            min_value=0.0,
-            value=1.0,
-            step=0.5,
-            key="model_fp_cost",
-            help=(
-                "Costo de una falsa alarma. Default: 1.0. Subirlo reduce alertas, "
-                "pero puede bajar recall."
-            ),
+        fp_cost = float(
+            _render_conditional_number_input(
+                "Costo FP",
+                visible=model_threshold_visibility["fp_cost"],
+                min_value=0.0,
+                value=1.0,
+                step=0.5,
+                key="model_fp_cost",
+                help=(
+                    "Costo de una falsa alarma. Default: 1.0. Subirlo reduce alertas, "
+                    "pero puede bajar recall."
+                ),
+            )
         )
     with col_cost_c:
         robust_folds = st.number_input(
@@ -9913,6 +12733,15 @@ def _render_model_tab() -> None:
         ),
     )
     balance_strategy = balance_strategy_options.get(balance_strategy_label, "class_weight")
+    use_balanced_current = bool(
+        st.session_state.get(
+            "use_balanced_base_toggle",
+            bool(
+                st.session_state.get("use_balanced_base", False)
+                or st.session_state.get("use_balanced_cluster", False)
+            ),
+        )
+    )
 
     model_choice = st.selectbox(
         "Modelo",
@@ -9924,9 +12753,15 @@ def _render_model_tab() -> None:
             "Neural Network usa un MLP con PyTorch (StandardScaler + early stopping)."
         ),
     )
+    optuna_balance_mode = _optuna_model_tab_balance_mode(
+        balance_strategy=balance_strategy,
+        use_balanced=use_balanced_current,
+    )
 
     _apply_feature_source_for_model_tab(
         model_choice=model_choice,
+        balance_mode=optuna_balance_mode,
+        calibration_method=calibration_method,
         base_df=base_df,
         features_df=features_df,
     )
@@ -9962,6 +12797,8 @@ def _render_model_tab() -> None:
 
     optuna_status = _apply_optuna_model_params_to_state(
         model_choice=model_choice,
+        balance_mode=optuna_balance_mode,
+        calibration_method=calibration_method,
         base_df=base_df,
         features_df=features_df,
     )
@@ -10964,25 +13801,26 @@ def _render_find_samples_sizes_experiment() -> None:
             key="exp_samples_eval_top_n",
         )
     with col_eval2:
-        objective_options = {
-            "F1": {"key": "best_f1", "direction": "maximize"},
-            "ROC-AUC": {"key": "roc_auc", "direction": "maximize"},
-            "Accuracy": {"key": "accuracy", "direction": "maximize"},
-            "Recall": {"key": "recall", "direction": "maximize"},
-            "Precision": {"key": "precision", "direction": "maximize"},
-            "FNR (menor es mejor)": {"key": "fnr", "direction": "minimize"},
-            "FAR - Sensibilidad (menor es mejor)": {
-                "key": "far_sens",
-                "direction": "minimize",
-            },
-        }
+        objective_options = _optuna_objective_options(
+            [
+                "f1",
+                "roc_auc",
+                "accuracy",
+                "recall",
+                "precision",
+                "fnr",
+                "far_sens",
+                "mcc",
+                "brier_score",
+            ]
+        )
         objective_label = st.selectbox(
             "Metrica objetivo (mejor mix)",
             list(objective_options.keys()),
             key="exp_samples_objective_metric",
         )
         objective_cfg = objective_options.get(
-            objective_label, {"key": "best_f1", "direction": "maximize"}
+            objective_label, {"key": "f1", "direction": "maximize"}
         )
         objective_key = objective_cfg["key"]
         objective_direction = objective_cfg["direction"]
@@ -11057,18 +13895,29 @@ def _render_find_samples_sizes_experiment() -> None:
                 key="exp_samples_test_size",
             )
         st.markdown("**Calibracion de umbral**")
-        far_target = st.slider(
-            "FAR target",
-            min_value=0.0,
-            max_value=0.5,
-            value=0.2,
-            step=0.01,
-            key="exp_samples_far_target",
-        )
         threshold_options = {
             "Optimizar threshold": "optuna",
             "Calibrar por FAR": "far",
         }
+        threshold_strategy = _option_value_from_state(
+            threshold_options,
+            "exp_samples_threshold_strategy",
+            default_label="Calibrar por FAR",
+        )
+        threshold_visibility = _threshold_field_visibility_for_strategy(
+            threshold_strategy
+        )
+        far_target = float(
+            _render_conditional_slider(
+                "FAR target",
+                visible=threshold_visibility["far_target"],
+                min_value=0.0,
+                max_value=0.5,
+                value=0.2,
+                step=0.01,
+                key="exp_samples_far_target",
+            )
+        )
         threshold_labels = list(threshold_options.keys())
         threshold_strategy_label = st.selectbox(
             "Estrategia de umbral",
@@ -11077,6 +13926,11 @@ def _render_find_samples_sizes_experiment() -> None:
             key="exp_samples_threshold_strategy",
         )
         threshold_strategy = threshold_options[threshold_strategy_label]
+        calibration_methods = _calibration_method_multiselect(
+            "Calibración",
+            key="exp_samples_calibration_methods",
+            default_methods=["sigmoid", "isotonic"],
+        )
 
         st.markdown("**Rango SMOTE**")
         c_smote1, c_smote2 = st.columns(2)
@@ -11268,6 +14122,9 @@ def _render_find_samples_sizes_experiment() -> None:
         if min_window_days > max_window_days:
             st.error("La ventana minima no puede ser mayor que la maxima.")
             return
+        if not calibration_methods:
+            st.error("Seleccione al menos un calibrador.")
+            return
         if int(min_k_val) > int(max_k_val):
             st.error("Min K no puede ser mayor que Max K.")
             return
@@ -11285,6 +14142,7 @@ def _render_find_samples_sizes_experiment() -> None:
                 "far_target": float(far_target),
                 "threshold_strategy": threshold_strategy,
                 "threshold_strategy_label": threshold_strategy_label,
+                "calibration_methods": list(calibration_methods),
                 "val_size": float(val_size),
                 "test_size": float(test_size),
                 "window_min_days": int(min_window_days),
@@ -11616,6 +14474,7 @@ def _render_find_samples_sizes_experiment() -> None:
                 "feature_max": row.get("feature_max"),
                 "model_choice": model_choice,
                 "threshold_strategy": threshold_strategy,
+                "calibration_methods": list(calibration_methods),
                 "n_trials": int(n_trials),
                 "timeout": int(timeout),
                 "optuna_n_jobs": int(optuna_n_jobs),
@@ -11743,43 +14602,45 @@ def _render_find_samples_sizes_experiment() -> None:
                 payload["error"] = "No hay valores de K validos para entrenar."
                 return [payload], [None]
 
-            for k_curr in k_values:
-                # Clone payload for this K
-                p_k = payload.copy()
-                p_k["k"] = int(k_curr)
-                p_k["k_features"] = int(k_curr)
-                
-                curr_features = ordered[:k_curr]
-                if not curr_features:
-                     continue
-                
-                try:
-                    result = runner.run_optimization_loop(
-                        train_df=train_df,
-                        val_df=val_df,
-                        test_df=test_df,
-                        feature_cols=curr_features,
-                        model_choice=model_choice,
-                        n_trials=int(n_trials),
-                        timeout=int(timeout),
-                        optuna_n_jobs=int(optuna_n_jobs),
-                        far_target=float(far_target),
-                        search_space_config=search_space,
-                        objective_key=objective_key,
-                        objective_direction=objective_direction,
-                        threshold_strategy=threshold_strategy,
-                        return_model=True,
-                    )
-                except Exception as exc:
-                    p_k["error"] = f"Error en entrenamiento K={k_curr}: {exc}"
-                    k_results.append(p_k)
-                    k_models.append(None)
-                    continue
+            for calibration_method in calibration_methods:
+                for k_curr in k_values:
+                    p_k = payload.copy()
+                    p_k["k"] = int(k_curr)
+                    p_k["k_features"] = int(k_curr)
+                    p_k["calibration_method"] = str(calibration_method)
 
-                model_obj = result.pop("model", None)
-                p_k.update(result)
-                k_results.append(p_k)
-                k_models.append(model_obj)
+                    curr_features = ordered[:k_curr]
+                    if not curr_features:
+                        continue
+
+                    try:
+                        result = runner.run_optimization_loop(
+                            train_df=train_df,
+                            val_df=val_df,
+                            test_df=test_df,
+                            feature_cols=curr_features,
+                            model_choice=model_choice,
+                            n_trials=int(n_trials),
+                            timeout=int(timeout),
+                            optuna_n_jobs=int(optuna_n_jobs),
+                            far_target=float(far_target),
+                            search_space_config=search_space,
+                            objective_key=objective_key,
+                            objective_direction=objective_direction,
+                            threshold_strategy=threshold_strategy,
+                            calibration_method=str(calibration_method),
+                            return_model=True,
+                        )
+                    except Exception as exc:
+                        p_k["error"] = f"Error en entrenamiento K={k_curr}: {exc}"
+                        k_results.append(p_k)
+                        k_models.append(None)
+                        continue
+
+                    model_obj = result.pop("model", None)
+                    p_k.update(result)
+                    k_results.append(p_k)
+                    k_models.append(model_obj)
 
             if not k_results:
                  payload["error"] = "No se generaron resultados para ningun K."
@@ -11943,25 +14804,26 @@ def _render_best_highway_section_experiment() -> None:
         key="exp_best_section_feature_file",
     )
 
-    objective_options = {
-        "F1": {"key": "best_f1", "direction": "maximize"},
-        "ROC-AUC": {"key": "roc_auc", "direction": "maximize"},
-        "Accuracy": {"key": "accuracy", "direction": "maximize"},
-        "Recall": {"key": "recall", "direction": "maximize"},
-        "Precision": {"key": "precision", "direction": "maximize"},
-        "FNR (menor es mejor)": {"key": "fnr", "direction": "minimize"},
-        "FAR - Sensibilidad (menor es mejor)": {
-            "key": "far_sens",
-            "direction": "minimize",
-        },
-    }
+    objective_options = _optuna_objective_options(
+        [
+            "f1",
+            "roc_auc",
+            "accuracy",
+            "recall",
+            "precision",
+            "fnr",
+            "far_sens",
+            "mcc",
+            "brier_score",
+        ]
+    )
     objective_label = st.selectbox(
         "Metrica objetivo (mejor mix)",
         list(objective_options.keys()),
         key="exp_best_section_objective_metric",
     )
     objective_cfg = objective_options.get(
-        objective_label, {"key": "best_f1", "direction": "maximize"}
+        objective_label, {"key": "f1", "direction": "maximize"}
     )
     objective_key = objective_cfg["key"]
     objective_direction = objective_cfg["direction"]
@@ -12031,24 +14893,40 @@ def _render_best_highway_section_experiment() -> None:
                 key="exp_best_section_test_size",
             )
         st.markdown("**Calibracion de umbral**")
-        far_target = st.slider(
-            "FAR target",
-            min_value=0.0,
-            max_value=0.5,
-            value=0.2,
-            step=0.01,
-            key="exp_best_section_far_target",
-        )
         threshold_options = {
             "Optimizar threshold": "optuna",
             "Calibrar por FAR": "far",
         }
+        threshold_strategy = _option_value_from_state(
+            threshold_options,
+            "exp_best_section_threshold_strategy",
+            default_label="Optimizar threshold",
+        )
+        threshold_visibility = _threshold_field_visibility_for_strategy(
+            threshold_strategy
+        )
+        far_target = float(
+            _render_conditional_slider(
+                "FAR target",
+                visible=threshold_visibility["far_target"],
+                min_value=0.0,
+                max_value=0.5,
+                value=0.2,
+                step=0.01,
+                key="exp_best_section_far_target",
+            )
+        )
         threshold_strategy_label = st.selectbox(
             "Estrategia de umbral",
             list(threshold_options.keys()),
             key="exp_best_section_threshold_strategy",
         )
         threshold_strategy = threshold_options[threshold_strategy_label]
+        calibration_methods = _calibration_method_multiselect(
+            "Calibración",
+            key="exp_best_section_calibration_methods",
+            default_methods=["sigmoid", "isotonic"],
+        )
 
         st.markdown("**Rango SMOTE**")
         c_smote1, c_smote2 = st.columns(2)
@@ -12237,6 +15115,9 @@ def _render_best_highway_section_experiment() -> None:
             model_ranges = {"C": {"min": svm_c_min, "max": svm_c_max}}
 
     if st.button("Iniciar experimento", key="exp_best_section_run"):
+        if not calibration_methods:
+            st.error("Seleccione al menos un calibrador.")
+            return
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         exp_db_path = _init_experiment_db(
             "Best highway section",
@@ -12252,6 +15133,7 @@ def _render_best_highway_section_experiment() -> None:
                 "far_target": float(far_target),
                 "threshold_strategy": threshold_strategy,
                 "threshold_strategy_label": threshold_strategy_label,
+                "calibration_methods": list(calibration_methods),
                 "val_size": float(val_size),
                 "test_size": float(test_size),
             },
@@ -12445,6 +15327,7 @@ def _render_best_highway_section_experiment() -> None:
                     "far_target": float(far_target),
                     "threshold_strategy": threshold_strategy,
                     "threshold_strategy_label": threshold_strategy_label,
+                    "calibration_methods": list(calibration_methods),
                     "val_size": float(val_size),
                     "test_size": float(test_size),
                     "search_space_config": json.dumps(search_space),
@@ -12661,52 +15544,60 @@ def _render_best_highway_section_experiment() -> None:
                     dataset_type: str,
                     candidate_cols: List[str],
                     selected_cols_override: Optional[List[str]] = None,
-                ) -> Dict[str, object]:
-                    payload = dict(payload_common)
-                    payload["type"] = dataset_type
-                    payload["feature_selection_total"] = int(len(candidate_cols))
-                    if not candidate_cols:
-                        payload["error"] = "No hay variables numericas para entrenar."
-                        return payload
-                    if not selected_cols_override:
-                        payload["error"] = (
-                            "No hay ranking de importancia para seleccionar "
-                            "variables."
-                        )
-                        return payload
-                    selected_cols = [
-                        col
-                        for col in selected_cols_override
-                        if col in candidate_cols
-                    ]
-                    if not selected_cols:
-                        payload["error"] = (
-                            "No hay variables numericas para entrenar."
-                        )
-                        return payload
+                ) -> List[Dict[str, object]]:
+                    payloads: List[Dict[str, object]] = []
+                    for calibration_method in calibration_methods:
+                        payload = dict(payload_common)
+                        payload["type"] = dataset_type
+                        payload["feature_selection_total"] = int(len(candidate_cols))
+                        payload["calibration_method"] = str(calibration_method)
+                        if not candidate_cols:
+                            payload["error"] = "No hay variables numericas para entrenar."
+                            payloads.append(payload)
+                            continue
+                        if not selected_cols_override:
+                            payload["error"] = (
+                                "No hay ranking de importancia para seleccionar "
+                                "variables."
+                            )
+                            payloads.append(payload)
+                            continue
+                        selected_cols = [
+                            col
+                            for col in selected_cols_override
+                            if col in candidate_cols
+                        ]
+                        if not selected_cols:
+                            payload["error"] = (
+                                "No hay variables numericas para entrenar."
+                            )
+                            payloads.append(payload)
+                            continue
 
-                    payload["feature_selection_selected"] = int(len(selected_cols))
+                        payload["feature_selection_selected"] = int(len(selected_cols))
 
-                    try:
-                        result = runner.run_optimization_loop(
-                            train_df=train_opt_df,
-                            val_df=val_df,
-                            test_df=test_df,
-                            feature_cols=selected_cols,
-                            model_choice=model_choice,
-                            n_trials=int(n_trials),
-                            timeout=int(timeout),
-                            optuna_n_jobs=int(optuna_n_jobs),
-                            far_target=float(far_target),
-                            search_space_config=search_space,
-                            objective_key=objective_key,
-                            objective_direction=objective_direction,
-                            threshold_strategy=threshold_strategy,
-                        )
-                        payload.update(result)
-                    except Exception as exc:
-                        payload["error"] = f"Error en Optuna: {exc}"
-                    return payload
+                        try:
+                            result = runner.run_optimization_loop(
+                                train_df=train_opt_df,
+                                val_df=val_df,
+                                test_df=test_df,
+                                feature_cols=selected_cols,
+                                model_choice=model_choice,
+                                n_trials=int(n_trials),
+                                timeout=int(timeout),
+                                optuna_n_jobs=int(optuna_n_jobs),
+                                far_target=float(far_target),
+                                search_space_config=search_space,
+                                objective_key=objective_key,
+                                objective_direction=objective_direction,
+                                threshold_strategy=threshold_strategy,
+                                calibration_method=str(calibration_method),
+                            )
+                            payload.update(result)
+                        except Exception as exc:
+                            payload["error"] = f"Error en Optuna: {exc}"
+                        payloads.append(payload)
+                    return payloads
 
                 if importance_error:
                     payload_base = dict(payload_common)
@@ -12738,22 +15629,29 @@ def _render_best_highway_section_experiment() -> None:
                     )
                 else:
                     base_selected_cols = base_ordered_from_combined[:base_target_n]
-                    payload_base = _run_dataset(
+                    payload_base_list = _run_dataset(
                         dataset_type="Base",
                         candidate_cols=base_cols,
                         selected_cols_override=base_selected_cols,
                     )
-                results.append(payload_base)
-                _append_experiment_result(exp_db_path, payload_base)
+                    payload_base = None
+                if payload_base is not None:
+                    results.append(payload_base)
+                    _append_experiment_result(exp_db_path, payload_base)
+                else:
+                    for payload_item in payload_base_list:
+                        results.append(payload_item)
+                        _append_experiment_result(exp_db_path, payload_item)
 
                 if cluster_cols:
-                    payload_cluster = _run_dataset(
+                    payload_cluster_list = _run_dataset(
                         dataset_type="Base + Cluster",
                         candidate_cols=all_feature_cols,
                         selected_cols_override=combined_selected_cols,
                     )
-                    results.append(payload_cluster)
-                    _append_experiment_result(exp_db_path, payload_cluster)
+                    for payload_item in payload_cluster_list:
+                        results.append(payload_item)
+                        _append_experiment_result(exp_db_path, payload_item)
                 elif has_cluster_available:
                     payload_cluster = dict(payload_common)
                     payload_cluster["type"] = "Base + Cluster"
@@ -13017,15 +15915,7 @@ def _render_best_highway_section_controlled_experiment() -> None:
         return
     max_available_features = max(1, len(all_schema_cols))
 
-    objective_options = {
-        "PR-AUC": "pr_auc",
-        "ROC-AUC": "roc_auc",
-        "Balanced F1": "balanced_f1",
-        "F1": "f1",
-        "MCC": "mcc",
-        "Recall@N alertas/día": "recall_at_alerts_per_day",
-        "Costo operacional": "operational_cost",
-    }
+    objective_options = _controlled_objective_options()
     threshold_objective_options = {
         "Recall@N alertas/día": "recall_at_alerts_per_day",
         "FAR": "far",
@@ -13102,52 +15992,66 @@ def _render_best_highway_section_controlled_experiment() -> None:
             index=0,
             key="exp_best_section_controlled_threshold_objective",
         )
-    with thr2:
-        alerts_per_day = st.number_input(
-            "Alertas máximas por día",
-            min_value=0.1,
-            max_value=50.0,
-            value=5.0,
-            step=0.5,
-            key="exp_best_section_controlled_alerts_per_day",
-        )
-    with thr3:
-        far_target = st.slider(
-            "FAR target",
-            min_value=0.0,
-            max_value=0.5,
-            value=0.2,
-            step=0.01,
-            key="exp_best_section_controlled_far_target",
-        )
-    with thr4:
-        calibration_method = st.selectbox(
-            "Calibración",
-            ["sigmoid", "none", "isotonic"],
-            index=0,
-            key="exp_best_section_controlled_calibration_method",
-        )
     threshold_objective = threshold_objective_options.get(
         threshold_objective_label,
         "recall_at_alerts_per_day",
     )
+    threshold_visibility = _threshold_field_visibility_for_objective(
+        threshold_objective
+    )
+    with thr2:
+        alerts_per_day = float(
+            _render_conditional_number_input(
+                "Alertas máximas por día",
+                visible=threshold_visibility["alerts_per_day"],
+                min_value=0.1,
+                max_value=50.0,
+                value=5.0,
+                step=0.5,
+                key="exp_best_section_controlled_alerts_per_day",
+            )
+        )
+    with thr3:
+        far_target = float(
+            _render_conditional_slider(
+                "FAR target",
+                visible=threshold_visibility["far_target"],
+                min_value=0.0,
+                max_value=0.5,
+                value=0.2,
+                step=0.01,
+                key="exp_best_section_controlled_far_target",
+            )
+        )
+    with thr4:
+        calibration_methods = _calibration_method_multiselect(
+            "Calibración",
+            key="exp_best_section_controlled_calibration_method",
+            default_methods=["sigmoid", "isotonic"],
+        )
 
     cost1, cost2, cost3 = st.columns(3)
     with cost1:
-        fn_cost = st.number_input(
-            "Costo FN",
-            min_value=0.0,
-            value=10.0,
-            step=1.0,
-            key="exp_best_section_controlled_fn_cost",
+        fn_cost = float(
+            _render_conditional_number_input(
+                "Costo FN",
+                visible=threshold_visibility["fn_cost"],
+                min_value=0.0,
+                value=10.0,
+                step=1.0,
+                key="exp_best_section_controlled_fn_cost",
+            )
         )
     with cost2:
-        fp_cost = st.number_input(
-            "Costo FP",
-            min_value=0.0,
-            value=1.0,
-            step=0.5,
-            key="exp_best_section_controlled_fp_cost",
+        fp_cost = float(
+            _render_conditional_number_input(
+                "Costo FP",
+                visible=threshold_visibility["fp_cost"],
+                min_value=0.0,
+                value=1.0,
+                step=0.5,
+                key="exp_best_section_controlled_fp_cost",
+            )
         )
     with cost3:
         robust_folds = st.number_input(
@@ -13296,6 +16200,9 @@ def _render_best_highway_section_controlled_experiment() -> None:
         if not threshold_protocols:
             st.error("Seleccione al menos un protocolo de evaluación.")
             return
+        if not calibration_methods:
+            st.error("Seleccione al menos un calibrador.")
+            return
         if int(k_min) > int(k_max):
             st.error("K mínimo no puede ser mayor que K máximo.")
             return
@@ -13440,7 +16347,7 @@ def _render_best_highway_section_controlled_experiment() -> None:
             "threshold_protocols": list(threshold_protocols),
             "threshold_objective": threshold_objective,
             "threshold_objective_label": threshold_objective_label,
-            "calibration_method": calibration_method,
+            "calibration_methods": list(calibration_methods),
             "far_target": float(far_target),
             "alerts_per_day": float(alerts_per_day),
             "fn_cost": float(fn_cost),
@@ -13558,98 +16465,101 @@ def _render_best_highway_section_controlled_experiment() -> None:
                         payload_df.iloc[0].to_dict(),
                     )
 
-            try:
-                payload = runner.run_controlled_comparison(
-                    base_df,
-                    event_path=selected_event_path,
-                    features_path=selected_features_path,
-                    segment_info=segment_info,
-                    dataset_date_start=dataset_date_start,
-                    dataset_date_end=dataset_date_end,
-                    objective_metric=objective_metric,
-                    threshold_protocols=list(threshold_protocols),
-                    threshold_objective=threshold_objective,
-                    calibration_method=str(calibration_method),
-                    far_target=float(far_target),
-                    alerts_per_day=float(alerts_per_day),
-                    fn_cost=float(fn_cost),
-                    fp_cost=float(fp_cost),
-                    robust_folds=int(robust_folds),
-                    test_size=float(test_size),
-                    val_size=float(val_size),
-                    k_min=int(k_min),
-                    k_max=int(k_max),
-                    k_step=int(k_step),
-                    n_trials=int(n_trials),
-                    timeout=int(timeout),
-                    optuna_n_jobs=int(optuna_n_jobs),
-                    parallel_jobs=int(parallel_jobs),
-                    xgb_parallel_jobs=int(xgb_parallel_jobs),
-                    selected_models=list(selected_models),
-                    search_space_config=search_space,
-                    progress_callback=_progress_callback,
-                    result_callback=_result_callback,
-                    checkpoint_root=checkpoint_root,
-                    auto_resume=bool(reuse_checkpoints),
-                    start_fresh=not bool(reuse_checkpoints),
-                )
-            except Exception as exc:
-                error_payload = {
-                    "experiment": "Best highway section",
-                    "protocol_family": "Controlled comparison",
-                    "sweep_run_id": run_id,
-                    "dataset_name": selected_event,
-                    "features_name": selected_features,
-                    "segment_index": int(idx),
-                    "segment_eje": segment_info["eje"],
-                    "segment_calzada": segment_info["calzada"],
-                    "segment_portico_last": seg_last_raw,
-                    "segment_portico_next": seg_next_raw,
-                    "segment_label": segment_label,
-                    "objective_metric": objective_metric,
-                    "objective_label": objective_label,
-                    "status": "failed",
-                    "error": str(exc),
-                }
-                error_records.append(error_payload)
-                grid_frames.append(pd.DataFrame([error_payload]))
-                _append_experiment_result(exp_db_path, error_payload)
-                continue
+            for calibration_method in calibration_methods:
+                try:
+                    payload = runner.run_controlled_comparison(
+                        base_df,
+                        event_path=selected_event_path,
+                        features_path=selected_features_path,
+                        segment_info=segment_info,
+                        dataset_date_start=dataset_date_start,
+                        dataset_date_end=dataset_date_end,
+                        objective_metric=objective_metric,
+                        threshold_protocols=list(threshold_protocols),
+                        threshold_objective=threshold_objective,
+                        calibration_method=str(calibration_method),
+                        far_target=float(far_target),
+                        alerts_per_day=float(alerts_per_day),
+                        fn_cost=float(fn_cost),
+                        fp_cost=float(fp_cost),
+                        robust_folds=int(robust_folds),
+                        test_size=float(test_size),
+                        val_size=float(val_size),
+                        k_min=int(k_min),
+                        k_max=int(k_max),
+                        k_step=int(k_step),
+                        n_trials=int(n_trials),
+                        timeout=int(timeout),
+                        optuna_n_jobs=int(optuna_n_jobs),
+                        parallel_jobs=int(parallel_jobs),
+                        xgb_parallel_jobs=int(xgb_parallel_jobs),
+                        selected_models=list(selected_models),
+                        search_space_config=search_space,
+                        progress_callback=_progress_callback,
+                        result_callback=_result_callback,
+                        checkpoint_root=checkpoint_root,
+                        auto_resume=bool(reuse_checkpoints)
+                        and len(calibration_methods) == 1,
+                        start_fresh=not bool(reuse_checkpoints),
+                    )
+                except Exception as exc:
+                    error_payload = {
+                        "experiment": "Best highway section",
+                        "protocol_family": "Controlled comparison",
+                        "sweep_run_id": run_id,
+                        "dataset_name": selected_event,
+                        "features_name": selected_features,
+                        "segment_index": int(idx),
+                        "segment_eje": segment_info["eje"],
+                        "segment_calzada": segment_info["calzada"],
+                        "segment_portico_last": seg_last_raw,
+                        "segment_portico_next": seg_next_raw,
+                        "segment_label": segment_label,
+                        "objective_metric": objective_metric,
+                        "objective_label": objective_label,
+                        "calibration_method": str(calibration_method),
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                    error_records.append(error_payload)
+                    grid_frames.append(pd.DataFrame([error_payload]))
+                    _append_experiment_result(exp_db_path, error_payload)
+                    continue
 
-            checkpoint_run_dir = payload.get("checkpoint_run_dir")
-            summary_frames.append(
-                _enrich_best_section_controlled_frame(
-                    payload.get("best_summary_df"),
-                    run_id=run_id,
-                    dataset_name=selected_event,
-                    features_name=selected_features,
-                    segment_index=idx,
-                    segment_info=segment_info,
-                    checkpoint_run_dir=checkpoint_run_dir,
+                checkpoint_run_dir = payload.get("checkpoint_run_dir")
+                summary_frames.append(
+                    _enrich_best_section_controlled_frame(
+                        payload.get("best_summary_df"),
+                        run_id=run_id,
+                        dataset_name=selected_event,
+                        features_name=selected_features,
+                        segment_index=idx,
+                        segment_info=segment_info,
+                        checkpoint_run_dir=checkpoint_run_dir,
+                    )
                 )
-            )
-            curve_frames.append(
-                _enrich_best_section_controlled_frame(
-                    payload.get("curves_df"),
-                    run_id=run_id,
-                    dataset_name=selected_event,
-                    features_name=selected_features,
-                    segment_index=idx,
-                    segment_info=segment_info,
-                    checkpoint_run_dir=checkpoint_run_dir,
+                curve_frames.append(
+                    _enrich_best_section_controlled_frame(
+                        payload.get("curves_df"),
+                        run_id=run_id,
+                        dataset_name=selected_event,
+                        features_name=selected_features,
+                        segment_index=idx,
+                        segment_info=segment_info,
+                        checkpoint_run_dir=checkpoint_run_dir,
+                    )
                 )
-            )
-            grid_frames.append(
-                _enrich_best_section_controlled_frame(
-                    payload.get("grid_results_df"),
-                    run_id=run_id,
-                    dataset_name=selected_event,
-                    features_name=selected_features,
-                    segment_index=idx,
-                    segment_info=segment_info,
-                    checkpoint_run_dir=checkpoint_run_dir,
+                grid_frames.append(
+                    _enrich_best_section_controlled_frame(
+                        payload.get("grid_results_df"),
+                        run_id=run_id,
+                        dataset_name=selected_event,
+                        features_name=selected_features,
+                        segment_index=idx,
+                        segment_info=segment_info,
+                        checkpoint_run_dir=checkpoint_run_dir,
+                    )
                 )
-            )
 
         progress_bar.empty()
 
@@ -13812,25 +16722,26 @@ def _render_best_highway_section_k_experiment() -> None:
         key="exp_best_section_k_feature_file",
     )
 
-    objective_options = {
-        "F1": {"key": "best_f1", "direction": "maximize"},
-        "ROC-AUC": {"key": "roc_auc", "direction": "maximize"},
-        "Accuracy": {"key": "accuracy", "direction": "maximize"},
-        "Recall": {"key": "recall", "direction": "maximize"},
-        "Precision": {"key": "precision", "direction": "maximize"},
-        "FNR (menor es mejor)": {"key": "fnr", "direction": "minimize"},
-        "FAR - Sensibilidad (menor es mejor)": {
-            "key": "far_sens",
-            "direction": "minimize",
-        },
-    }
+    objective_options = _optuna_objective_options(
+        [
+            "f1",
+            "roc_auc",
+            "accuracy",
+            "recall",
+            "precision",
+            "fnr",
+            "far_sens",
+            "mcc",
+            "brier_score",
+        ]
+    )
     objective_label = st.selectbox(
         "Metrica objetivo (mejor mix)",
         list(objective_options.keys()),
         key="exp_best_section_k_objective_metric",
     )
     objective_cfg = objective_options.get(
-        objective_label, {"key": "best_f1", "direction": "maximize"}
+        objective_label, {"key": "f1", "direction": "maximize"}
     )
     objective_key = objective_cfg["key"]
     objective_direction = objective_cfg["direction"]
@@ -13920,24 +16831,40 @@ def _render_best_highway_section_k_experiment() -> None:
                 key="exp_best_section_k_test_size",
             )
         st.markdown("**Calibracion de umbral**")
-        far_target = st.slider(
-            "FAR target",
-            min_value=0.0,
-            max_value=0.5,
-            value=0.2,
-            step=0.01,
-            key="exp_best_section_k_far_target",
-        )
         threshold_options = {
             "Optimizar threshold": "optuna",
             "Calibrar por FAR": "far",
         }
+        threshold_strategy = _option_value_from_state(
+            threshold_options,
+            "exp_best_section_k_threshold_strategy",
+            default_label="Optimizar threshold",
+        )
+        threshold_visibility = _threshold_field_visibility_for_strategy(
+            threshold_strategy
+        )
+        far_target = float(
+            _render_conditional_slider(
+                "FAR target",
+                visible=threshold_visibility["far_target"],
+                min_value=0.0,
+                max_value=0.5,
+                value=0.2,
+                step=0.01,
+                key="exp_best_section_k_far_target",
+            )
+        )
         threshold_strategy_label = st.selectbox(
             "Estrategia de umbral",
             list(threshold_options.keys()),
             key="exp_best_section_k_threshold_strategy",
         )
         threshold_strategy = threshold_options[threshold_strategy_label]
+        calibration_methods = _calibration_method_multiselect(
+            "Calibración",
+            key="exp_best_section_k_calibration_methods",
+            default_methods=["sigmoid", "isotonic"],
+        )
 
         st.markdown("**Rango SMOTE**")
         c_smote1, c_smote2 = st.columns(2)
@@ -14126,6 +17053,9 @@ def _render_best_highway_section_k_experiment() -> None:
             model_ranges = {"C": {"min": svm_c_min, "max": svm_c_max}}
 
     if st.button("Iniciar experimento", key="exp_best_section_k_run"):
+        if not calibration_methods:
+            st.error("Seleccione al menos un calibrador.")
+            return
         if int(k_min) > int(k_max):
             st.error("K Min no puede ser mayor que K Max.")
             return
@@ -14150,6 +17080,7 @@ def _render_best_highway_section_k_experiment() -> None:
                 "far_target": float(far_target),
                 "threshold_strategy": threshold_strategy,
                 "threshold_strategy_label": threshold_strategy_label,
+                "calibration_methods": list(calibration_methods),
                 "val_size": float(val_size),
                 "test_size": float(test_size),
             },
@@ -14343,6 +17274,7 @@ def _render_best_highway_section_k_experiment() -> None:
                     "far_target": float(far_target),
                     "threshold_strategy": threshold_strategy,
                     "threshold_strategy_label": threshold_strategy_label,
+                    "calibration_methods": list(calibration_methods),
                     "val_size": float(val_size),
                     "test_size": float(test_size),
                     "search_space_config": json.dumps(search_space),
@@ -14549,52 +17481,60 @@ def _render_best_highway_section_k_experiment() -> None:
                     dataset_type: str,
                     candidate_cols: List[str],
                     selected_cols_override: Optional[List[str]] = None,
-                ) -> Dict[str, object]:
-                    payload = dict(payload_seed)
-                    payload["type"] = dataset_type
-                    payload["feature_selection_total"] = int(len(candidate_cols))
-                    if not candidate_cols:
-                        payload["error"] = "No hay variables numericas para entrenar."
-                        return payload
-                    if not selected_cols_override:
-                        payload["error"] = (
-                            "No hay ranking de importancia para seleccionar "
-                            "variables."
-                        )
-                        return payload
-                    selected_cols = [
-                        col
-                        for col in selected_cols_override
-                        if col in candidate_cols
-                    ]
-                    if not selected_cols:
-                        payload["error"] = (
-                            "No hay variables numericas para entrenar."
-                        )
-                        return payload
+                ) -> List[Dict[str, object]]:
+                    payloads: List[Dict[str, object]] = []
+                    for calibration_method in calibration_methods:
+                        payload = dict(payload_seed)
+                        payload["type"] = dataset_type
+                        payload["feature_selection_total"] = int(len(candidate_cols))
+                        payload["calibration_method"] = str(calibration_method)
+                        if not candidate_cols:
+                            payload["error"] = "No hay variables numericas para entrenar."
+                            payloads.append(payload)
+                            continue
+                        if not selected_cols_override:
+                            payload["error"] = (
+                                "No hay ranking de importancia para seleccionar "
+                                "variables."
+                            )
+                            payloads.append(payload)
+                            continue
+                        selected_cols = [
+                            col
+                            for col in selected_cols_override
+                            if col in candidate_cols
+                        ]
+                        if not selected_cols:
+                            payload["error"] = (
+                                "No hay variables numericas para entrenar."
+                            )
+                            payloads.append(payload)
+                            continue
 
-                    payload["feature_selection_selected"] = int(len(selected_cols))
+                        payload["feature_selection_selected"] = int(len(selected_cols))
 
-                    try:
-                        result = runner.run_optimization_loop(
-                            train_df=train_opt_df,
-                            val_df=val_df,
-                            test_df=test_df,
-                            feature_cols=selected_cols,
-                            model_choice=model_choice,
-                            n_trials=int(n_trials),
-                            timeout=int(timeout),
-                            optuna_n_jobs=int(optuna_n_jobs),
-                            far_target=float(far_target),
-                            search_space_config=search_space,
-                            objective_key=objective_key,
-                            objective_direction=objective_direction,
-                            threshold_strategy=threshold_strategy,
-                        )
-                        payload.update(result)
-                    except Exception as exc:
-                        payload["error"] = f"Error en Optuna: {exc}"
-                    return payload
+                        try:
+                            result = runner.run_optimization_loop(
+                                train_df=train_opt_df,
+                                val_df=val_df,
+                                test_df=test_df,
+                                feature_cols=selected_cols,
+                                model_choice=model_choice,
+                                n_trials=int(n_trials),
+                                timeout=int(timeout),
+                                optuna_n_jobs=int(optuna_n_jobs),
+                                far_target=float(far_target),
+                                search_space_config=search_space,
+                                objective_key=objective_key,
+                                objective_direction=objective_direction,
+                                threshold_strategy=threshold_strategy,
+                                calibration_method=str(calibration_method),
+                            )
+                            payload.update(result)
+                        except Exception as exc:
+                            payload["error"] = f"Error en Optuna: {exc}"
+                        payloads.append(payload)
+                    return payloads
 
                 if importance_error:
                     payload_base = dict(payload_common)
@@ -14666,24 +17606,31 @@ def _render_best_highway_section_k_experiment() -> None:
                         )
                     else:
                         base_selected_cols = base_ordered_from_combined[:base_target_n]
-                        payload_base = _run_dataset(
+                        payload_base_list = _run_dataset(
                             payload_common_k,
                             dataset_type="Base",
                             candidate_cols=base_cols,
                             selected_cols_override=base_selected_cols,
                         )
-                    results.append(payload_base)
-                    _append_experiment_result(exp_db_path, payload_base)
+                        payload_base = None
+                    if payload_base is not None:
+                        results.append(payload_base)
+                        _append_experiment_result(exp_db_path, payload_base)
+                    else:
+                        for payload_item in payload_base_list:
+                            results.append(payload_item)
+                            _append_experiment_result(exp_db_path, payload_item)
 
                     if cluster_cols:
-                        payload_cluster = _run_dataset(
+                        payload_cluster_list = _run_dataset(
                             payload_common_k,
                             dataset_type="Base + Cluster",
                             candidate_cols=all_feature_cols,
                             selected_cols_override=combined_selected_cols,
                         )
-                        results.append(payload_cluster)
-                        _append_experiment_result(exp_db_path, payload_cluster)
+                        for payload_item in payload_cluster_list:
+                            results.append(payload_item)
+                            _append_experiment_result(exp_db_path, payload_item)
                     elif has_cluster_available:
                         payload_cluster = dict(payload_common_k)
                         payload_cluster["type"] = "Base + Cluster"
@@ -14899,15 +17846,7 @@ def _render_controlled_comparison_experiment() -> None:
     use_frozen_tuning_ablation = (
         protocol_mode_label == "Ablación cruzada con tuning congelado"
     )
-    objective_options = {
-        "PR-AUC": "pr_auc",
-        "ROC-AUC": "roc_auc",
-        "Balanced F1": "balanced_f1",
-        "F1": "f1",
-        "MCC": "mcc",
-        "Recall@N alertas/día": "recall_at_alerts_per_day",
-        "Costo operacional": "operational_cost",
-    }
+    objective_options = _controlled_objective_options()
     threshold_objective_options = {
         "Recall@N alertas/día": "recall_at_alerts_per_day",
         "FAR": "far",
@@ -14957,7 +17896,7 @@ def _render_controlled_comparison_experiment() -> None:
             help=(
                 "Define la métrica que Optuna maximiza para elegir hiperparámetros. "
                 "Valores permitidos: PR-AUC, ROC-AUC, Balanced F1, F1, MCC, "
-                "Recall@N alertas/día o Costo operacional. Default: Balanced F1. "
+                "Brier, Recall@N alertas/día o Costo operacional. Default: Balanced F1. "
                 "Usar F1 con eventos raros puede sobreajustar el threshold de validación."
             ),
         )
@@ -15057,73 +17996,91 @@ def _render_controlled_comparison_experiment() -> None:
                 "alertas diarias."
             ),
         )
+    threshold_objective = threshold_objective_options.get(
+        threshold_objective_label,
+        "recall_at_alerts_per_day",
+    )
+    threshold_visibility = _threshold_field_visibility_for_objective(
+        threshold_objective
+    )
     with col_thr2:
-        controlled_alerts_per_day = st.number_input(
-            "Alertas máximas por día",
-            min_value=0.1,
-            max_value=50.0,
-            value=5.0,
-            step=0.5,
-            key="exp_controlled_alerts_per_day",
-            help=(
-                "Presupuesto diario de alertas para Recall@N. Rango práctico: "
-                "0.1 a 50. Default: 5.0. Baja este valor si necesitas menos "
-                "revisiones humanas; un valor demasiado bajo puede esconder "
-                "accidentes detectables."
-            ),
+        controlled_alerts_per_day = float(
+            _render_conditional_number_input(
+                "Alertas máximas por día",
+                visible=threshold_visibility["alerts_per_day"],
+                min_value=0.1,
+                max_value=50.0,
+                value=5.0,
+                step=0.5,
+                key="exp_controlled_alerts_per_day",
+                help=(
+                    "Presupuesto diario de alertas para Recall@N. Rango práctico: "
+                    "0.1 a 50. Default: 5.0. Baja este valor si necesitas menos "
+                    "revisiones humanas; un valor demasiado bajo puede esconder "
+                    "accidentes detectables."
+                ),
+            )
         )
     with col_thr3:
-        controlled_far_target = st.slider(
-            "FAR target",
-            min_value=0.0,
-            max_value=0.5,
-            value=0.2,
-            step=0.01,
-            key="exp_controlled_far_target",
-            help=(
-                "Falsa alarma máxima aceptada cuando el objetivo de threshold es "
-                "FAR. Rango: 0.00 a 0.50. Default: 0.20. No lo interpretes como "
-                "probabilidad calibrada; controla tasa de falsos positivos en "
-                "validación."
-            ),
+        controlled_far_target = float(
+            _render_conditional_slider(
+                "FAR target",
+                visible=threshold_visibility["far_target"],
+                min_value=0.0,
+                max_value=0.5,
+                value=0.2,
+                step=0.01,
+                key="exp_controlled_far_target",
+                help=(
+                    "Falsa alarma máxima aceptada cuando el objetivo de threshold es "
+                    "FAR. Rango: 0.00 a 0.50. Default: 0.20. No lo interpretes como "
+                    "probabilidad calibrada; controla tasa de falsos positivos en "
+                    "validación."
+                ),
+            )
         )
     with col_thr4:
-        calibration_label = st.selectbox(
+        calibration_methods = _calibration_method_multiselect(
             "Calibración",
-            ["sigmoid", "none", "isotonic"],
-            index=0,
             key="exp_controlled_calibration_method",
+            default_methods=["sigmoid", "isotonic"],
             help=(
-                "Transforma scores antes de elegir threshold. Valores: sigmoid, "
-                "none, isotonic. Default: sigmoid. Isotonic puede sobreajustar "
-                "cuando hay pocos accidentes positivos en validación."
+                "Transforma scores antes de elegir threshold. Default: comparar "
+                "Platt scaling (sigmoid) e Isotonic. Sin calibración queda "
+                "disponible para comparación directa."
             ),
         )
     col_cost1, col_cost2, col_cost3 = st.columns(3)
     with col_cost1:
-        controlled_fn_cost = st.number_input(
-            "Costo FN",
-            min_value=0.0,
-            value=10.0,
-            step=1.0,
-            key="exp_controlled_fn_cost",
-            help=(
-                "Costo unitario de no alertar un accidente real. Default: 10.0. "
-                "Aumentarlo empuja thresholds más sensibles; valores extremos "
-                "pueden producir demasiadas falsas alarmas."
-            ),
+        controlled_fn_cost = float(
+            _render_conditional_number_input(
+                "Costo FN",
+                visible=threshold_visibility["fn_cost"],
+                min_value=0.0,
+                value=10.0,
+                step=1.0,
+                key="exp_controlled_fn_cost",
+                help=(
+                    "Costo unitario de no alertar un accidente real. Default: 10.0. "
+                    "Aumentarlo empuja thresholds más sensibles; valores extremos "
+                    "pueden producir demasiadas falsas alarmas."
+                ),
+            )
         )
     with col_cost2:
-        controlled_fp_cost = st.number_input(
-            "Costo FP",
-            min_value=0.0,
-            value=1.0,
-            step=0.5,
-            key="exp_controlled_fp_cost",
-            help=(
-                "Costo unitario de una falsa alarma. Default: 1.0. Aumentarlo "
-                "endurece el threshold; valores altos pueden bajar mucho el recall."
-            ),
+        controlled_fp_cost = float(
+            _render_conditional_number_input(
+                "Costo FP",
+                visible=threshold_visibility["fp_cost"],
+                min_value=0.0,
+                value=1.0,
+                step=0.5,
+                key="exp_controlled_fp_cost",
+                help=(
+                    "Costo unitario de una falsa alarma. Default: 1.0. Aumentarlo "
+                    "endurece el threshold; valores altos pueden bajar mucho el recall."
+                ),
+            )
         )
     with col_cost3:
         robust_folds = st.number_input(
@@ -15143,7 +18100,6 @@ def _render_controlled_comparison_experiment() -> None:
         threshold_objective_label,
         "recall_at_alerts_per_day",
     )
-    calibration_method = str(calibration_label)
 
     col_split1, col_split2, col_split3, col_split4 = st.columns(4)
     with col_split1:
@@ -16006,7 +18962,7 @@ def _render_controlled_comparison_experiment() -> None:
         "threshold_protocols": list(threshold_protocols),
         "threshold_objective": threshold_objective,
         "threshold_objective_label": threshold_objective_label,
-        "calibration_method": calibration_method,
+        "calibration_methods": list(calibration_methods),
         "far_target": float(controlled_far_target),
         "alerts_per_day": float(controlled_alerts_per_day),
         "fn_cost": float(controlled_fn_cost),
@@ -16063,16 +19019,24 @@ def _render_controlled_comparison_experiment() -> None:
     }
     if use_frozen_tuning_ablation:
         protocol_preview["ablation_config"] = dict(FROZEN_TUNING_ABLATION_CONFIG)
-    checkpoint_context = build_controlled_comparison_context(
-        event_path=selected_event_path,
-        features_path=selected_features_path,
-        segment_info=segment_info,
-        protocol=protocol_preview,
-    )
-    checkpoint_preview = preview_controlled_comparison_checkpoint(
-        checkpoint_context,
-        checkpoint_root=checkpoint_root,
-    )
+    if len(calibration_methods) == 1:
+        protocol_preview["calibration_method"] = calibration_methods[0]
+        checkpoint_context = build_controlled_comparison_context(
+            event_path=selected_event_path,
+            features_path=selected_features_path,
+            segment_info=segment_info,
+            protocol=protocol_preview,
+        )
+        checkpoint_preview = preview_controlled_comparison_checkpoint(
+            checkpoint_context,
+            checkpoint_root=checkpoint_root,
+        )
+    else:
+        checkpoint_preview = {}
+        st.caption(
+            "El preview/reuso de checkpoint se resolverá por calibrador al ejecutar "
+            "la corrida múltiple."
+        )
     if checkpoint_preview.get("checkpoint_available"):
         if checkpoint_preview.get("can_resume"):
             st.info(
@@ -16149,6 +19113,9 @@ def _render_controlled_comparison_experiment() -> None:
         if not threshold_protocols:
             st.error("Seleccione al menos un protocolo de evaluación.")
             return
+        if not calibration_methods:
+            st.error("Seleccione al menos un calibrador.")
+            return
         if int(rf_depth_min) > int(rf_depth_max):
             st.error("RF max_depth min no puede ser mayor que RF max_depth max.")
             return
@@ -16207,7 +19174,7 @@ def _render_controlled_comparison_experiment() -> None:
             "threshold_protocols": list(threshold_protocols),
             "threshold_objective": threshold_objective,
             "threshold_objective_label": threshold_objective_label,
-            "calibration_method": calibration_method,
+            "calibration_methods": list(calibration_methods),
             "far_target": float(controlled_far_target),
             "alerts_per_day": float(controlled_alerts_per_day),
             "fn_cost": float(controlled_fn_cost),
@@ -16271,66 +19238,117 @@ def _render_controlled_comparison_experiment() -> None:
 
         runner = ExperimentsRunner(random_state=int(random_state))
         try:
-            payload = runner.run_controlled_comparison(
-                base_df,
-                event_path=selected_event_path,
-                features_path=selected_features_path,
-                segment_info=segment_info,
-                dataset_date_start=dataset_date_start,
-                dataset_date_end=dataset_date_end,
-                objective_metric=objective_metric,
-                threshold_protocols=list(threshold_protocols),
-                threshold_objective=threshold_objective,
-                calibration_method=calibration_method,
-                far_target=float(controlled_far_target),
-                alerts_per_day=float(controlled_alerts_per_day),
-                fn_cost=float(controlled_fn_cost),
-                fp_cost=float(controlled_fp_cost),
-                robust_folds=int(robust_folds),
-                feature_ranking_mode=(
-                    "feature_selection_global"
-                    if use_modelos_k_protocol
-                    else "controlled"
-                ),
-                experimental_protocol=(
-                    FROZEN_TUNING_ABLATION_PROTOCOL_FAMILY
-                    if use_frozen_tuning_ablation
-                    else None
-                ),
-                feature_selection_n_estimators=int(feature_selection_n_estimators),
-                feature_selection_max_depth=feature_selection_max_depth,
-                feature_selection_n_jobs=int(feature_selection_n_jobs),
-                test_size=float(test_size),
-                val_size=float(val_size),
-                k_min=int(k_min),
-                k_max=int(k_max),
-                k_step=int(k_step),
-                n_trials=int(n_trials),
-                timeout=int(timeout),
-                optuna_n_jobs=int(optuna_n_jobs),
-                parallel_jobs=int(parallel_jobs),
-                xgb_parallel_jobs=int(xgb_parallel_jobs),
-                selected_models=list(selected_models),
-                search_space_config=search_space,
-                progress_callback=_progress_callback,
-                result_callback=_result_callback,
-                checkpoint_root=checkpoint_root,
-                auto_resume=checkpoint_mode in {
-                    "Resume checkpoint",
-                    "Load checkpoint result",
-                },
-                start_fresh=checkpoint_mode == "Start fresh",
-            )
+            payloads: List[Dict[str, object]] = []
+            for calibration_method in calibration_methods:
+                payload = runner.run_controlled_comparison(
+                    base_df,
+                    event_path=selected_event_path,
+                    features_path=selected_features_path,
+                    segment_info=segment_info,
+                    dataset_date_start=dataset_date_start,
+                    dataset_date_end=dataset_date_end,
+                    objective_metric=objective_metric,
+                    threshold_protocols=list(threshold_protocols),
+                    threshold_objective=threshold_objective,
+                    calibration_method=calibration_method,
+                    far_target=float(controlled_far_target),
+                    alerts_per_day=float(controlled_alerts_per_day),
+                    fn_cost=float(controlled_fn_cost),
+                    fp_cost=float(controlled_fp_cost),
+                    robust_folds=int(robust_folds),
+                    feature_ranking_mode=(
+                        "feature_selection_global"
+                        if use_modelos_k_protocol
+                        else "controlled"
+                    ),
+                    experimental_protocol=(
+                        FROZEN_TUNING_ABLATION_PROTOCOL_FAMILY
+                        if use_frozen_tuning_ablation
+                        else None
+                    ),
+                    feature_selection_n_estimators=int(feature_selection_n_estimators),
+                    feature_selection_max_depth=feature_selection_max_depth,
+                    feature_selection_n_jobs=int(feature_selection_n_jobs),
+                    test_size=float(test_size),
+                    val_size=float(val_size),
+                    k_min=int(k_min),
+                    k_max=int(k_max),
+                    k_step=int(k_step),
+                    n_trials=int(n_trials),
+                    timeout=int(timeout),
+                    optuna_n_jobs=int(optuna_n_jobs),
+                    parallel_jobs=int(parallel_jobs),
+                    xgb_parallel_jobs=int(xgb_parallel_jobs),
+                    selected_models=list(selected_models),
+                    search_space_config=search_space,
+                    progress_callback=_progress_callback,
+                    result_callback=_result_callback,
+                    checkpoint_root=checkpoint_root,
+                    auto_resume=(
+                        len(calibration_methods) == 1
+                        and checkpoint_mode in {
+                            "Resume checkpoint",
+                            "Load checkpoint result",
+                        }
+                    ),
+                    start_fresh=checkpoint_mode == "Start fresh",
+                )
+                payloads.append(payload)
         except Exception as exc:
             progress_bar.empty()
             st.error(f"No se pudo ejecutar la comparación controlada: {exc}")
             return
 
         progress_bar.empty()
-        summary_df = payload.get("best_summary_df")
-        curves_df = payload.get("curves_df")
-        grid_results_df = payload.get("grid_results_df")
-        ablation_deltas_df = payload.get("ablation_deltas_df")
+        payload = payloads[-1] if payloads else {}
+        summary_df = pd.concat(
+            [
+                frame
+                for frame in [
+                    item.get("best_summary_df")
+                    for item in payloads
+                    if isinstance(item, dict)
+                ]
+                if isinstance(frame, pd.DataFrame) and not frame.empty
+            ],
+            ignore_index=True,
+        ) if payloads else pd.DataFrame()
+        curves_df = pd.concat(
+            [
+                frame
+                for frame in [
+                    item.get("curves_df")
+                    for item in payloads
+                    if isinstance(item, dict)
+                ]
+                if isinstance(frame, pd.DataFrame) and not frame.empty
+            ],
+            ignore_index=True,
+        ) if payloads else pd.DataFrame()
+        grid_results_df = pd.concat(
+            [
+                frame
+                for frame in [
+                    item.get("grid_results_df")
+                    for item in payloads
+                    if isinstance(item, dict)
+                ]
+                if isinstance(frame, pd.DataFrame) and not frame.empty
+            ],
+            ignore_index=True,
+        ) if payloads else pd.DataFrame()
+        ablation_deltas_df = pd.concat(
+            [
+                frame
+                for frame in [
+                    item.get("ablation_deltas_df")
+                    for item in payloads
+                    if isinstance(item, dict)
+                ]
+                if isinstance(frame, pd.DataFrame) and not frame.empty
+            ],
+            ignore_index=True,
+        ) if payloads else pd.DataFrame()
         if not isinstance(summary_df, pd.DataFrame):
             summary_df = pd.DataFrame()
         if not isinstance(curves_df, pd.DataFrame):
@@ -16396,7 +19414,7 @@ def _render_controlled_comparison_experiment() -> None:
         selected_models=list(selected_models),
         threshold_protocols=list(threshold_protocols),
         threshold_objective_label=threshold_objective_label,
-        calibration_method=calibration_method,
+        calibration_methods=list(calibration_methods),
         alerts_per_day=float(controlled_alerts_per_day),
         fn_cost=float(controlled_fn_cost),
         fp_cost=float(controlled_fp_cost),
@@ -16611,6 +19629,8 @@ def _render_experiments_tab() -> None:
                             "recall": "Recall",
                             "precision": "Precision",
                             "roc_auc": "ROC-AUC",
+                            "mcc": "MCC",
+                            "brier_score": "Brier (menor es mejor)",
                             "fnr": "FNR (menor es mejor)",
                             "far_sens": "FAR - Sensibilidad (menor es mejor)",
                         }
@@ -16654,7 +19674,7 @@ def _render_experiments_tab() -> None:
                                     best_mask
                                 ].iloc[0]
                             elif not plot_df.empty and metric_key in plot_df.columns:
-                                if metric_key in {"fnr", "far_sens"}:
+                                if metric_key in {"fnr", "far_sens", "brier_score"}:
                                     best_row = plot_df.loc[plot_df[metric_key].idxmin()]
                                 else:
                                     best_row = plot_df.loc[plot_df[metric_key].idxmax()]
@@ -16794,6 +19814,8 @@ def _render_experiments_tab() -> None:
                             "recall": "Recall",
                             "precision": "Precision",
                             "roc_auc": "ROC-AUC",
+                            "mcc": "MCC",
+                            "brier_score": "Brier (menor es mejor)",
                             "fnr": "FNR (menor es mejor)",
                             "far_sens": "FAR - Sensibilidad (menor es mejor)",
                         }
@@ -16860,7 +19882,7 @@ def _render_experiments_tab() -> None:
 
                             best_row = None
                             if not plot_df.empty and metric_key in plot_df.columns:
-                                if metric_key in {"fnr", "far_sens"}:
+                                if metric_key in {"fnr", "far_sens", "brier_score"}:
                                     best_row = plot_df.loc[plot_df[metric_key].idxmin()]
                                 else:
                                     best_row = plot_df.loc[plot_df[metric_key].idxmax()]
@@ -16931,7 +19953,7 @@ def _render_experiments_tab() -> None:
                                         "segment_portico_last",
                                         "segment_portico_next",
                                     ]
-                                    if metric_key in {"fnr", "far_sens"}:
+                                    if metric_key in {"fnr", "far_sens", "brier_score"}:
                                         best_idx = plot_df.groupby(group_cols)[metric_key].idxmin()
                                     else:
                                         best_idx = plot_df.groupby(group_cols)[metric_key].idxmax()
@@ -17048,6 +20070,8 @@ def _render_experiments_tab() -> None:
                             "recall": "Recall",
                             "precision": "Precision",
                             "roc_auc": "ROC-AUC",
+                            "mcc": "MCC",
+                            "brier_score": "Brier (menor es mejor)",
                             "fnr": "FNR (menor es mejor)",
                             "far_sens": "FAR - Sensibilidad (menor es mejor)",
                         }
@@ -17100,7 +20124,7 @@ def _render_experiments_tab() -> None:
 
                             best_row = None
                             if not plot_df.empty and metric_key in plot_df.columns:
-                                if metric_key in {"fnr", "far_sens"}:
+                                if metric_key in {"fnr", "far_sens", "brier_score"}:
                                     best_row = plot_df.loc[plot_df[metric_key].idxmin()]
                                 else:
                                     best_row = plot_df.loc[plot_df[metric_key].idxmax()]
@@ -17181,7 +20205,9 @@ def _render_experiments_tab() -> None:
                                     "recall": "Recall (Sens)",
                                     "precision": "Precision",
                                     "roc_auc": "ROC-AUC",
-                                    "fnr": "FNR"
+                                    "mcc": "MCC",
+                                    "brier_score": "Brier",
+                                    "fnr": "FNR",
                                 }
                                 # Filter only available columns
                                 available_metrics = {k: v for k, v in metric_options.items() if k in past_df.columns}
@@ -17337,6 +20363,7 @@ def _render_experiments_tab() -> None:
                 "Find samples sizes",
                 "Best highway section",
                 "Best mix Highway section & K",
+                "Calibración score + threshold",
                 "Comparación controlada",
             ],
             key="exp_kind_choice",
@@ -17349,6 +20376,9 @@ def _render_experiments_tab() -> None:
             return
         if exp_kind == "Best mix Highway section & K":
             _render_best_highway_section_k_experiment()
+            return
+        if exp_kind == "Calibración score + threshold":
+            _render_calibration_sweep_experiment()
             return
         if exp_kind == "Comparación controlada":
             _render_controlled_comparison_experiment()
@@ -17410,25 +20440,26 @@ def _render_experiments_tab() -> None:
             key="exp_model_choice"
         )
 
-        objective_options = {
-            "F1": {"key": "best_f1", "direction": "maximize"},
-            "ROC-AUC": {"key": "roc_auc", "direction": "maximize"},
-            "Accuracy": {"key": "accuracy", "direction": "maximize"},
-            "Recall": {"key": "recall", "direction": "maximize"},
-            "Precision": {"key": "precision", "direction": "maximize"},
-            "FNR (menor es mejor)": {"key": "fnr", "direction": "minimize"},
-            "FAR - Sensibilidad (menor es mejor)": {
-                "key": "far_sens",
-                "direction": "minimize",
-            },
-        }
+        objective_options = _optuna_objective_options(
+            [
+                "f1",
+                "roc_auc",
+                "accuracy",
+                "recall",
+                "precision",
+                "fnr",
+                "far_sens",
+                "mcc",
+                "brier_score",
+            ]
+        )
         objective_label = st.selectbox(
             "Metrica objetivo (Optuna/SMOTE)",
             list(objective_options.keys()),
             key="exp_features_objective_metric",
         )
         objective_cfg = objective_options.get(
-            objective_label, {"key": "best_f1", "direction": "maximize"}
+            objective_label, {"key": "f1", "direction": "maximize"}
         )
         objective_key = objective_cfg["key"]
         objective_direction = objective_cfg["direction"]
@@ -17481,24 +20512,40 @@ def _render_experiments_tab() -> None:
             with c_split2:
                 test_size = st.slider("Test Size (Global)", 0.1, 0.5, 0.2, 0.05, key="exp_test_size")
             st.markdown("**Calibración de umbral**")
-            far_target = st.slider(
-                "FAR target",
-                min_value=0.0,
-                max_value=0.5,
-                value=0.2,
-                step=0.01,
-                key="exp_far_target",
-            )
             threshold_options = {
                 "Optimizar threshold": "optuna",
                 "Calibrar por FAR": "far",
             }
+            threshold_strategy = _option_value_from_state(
+                threshold_options,
+                "exp_features_threshold_strategy",
+                default_label="Optimizar threshold",
+            )
+            threshold_visibility = _threshold_field_visibility_for_strategy(
+                threshold_strategy
+            )
+            far_target = float(
+                _render_conditional_slider(
+                    "FAR target",
+                    visible=threshold_visibility["far_target"],
+                    min_value=0.0,
+                    max_value=0.5,
+                    value=0.2,
+                    step=0.01,
+                    key="exp_far_target",
+                )
+            )
             threshold_strategy_label = st.selectbox(
                 "Estrategia de umbral",
                 list(threshold_options.keys()),
                 key="exp_features_threshold_strategy",
             )
             threshold_strategy = threshold_options[threshold_strategy_label]
+            calibration_methods = _calibration_method_multiselect(
+                "Calibración",
+                key="exp_features_calibration_methods",
+                default_methods=["sigmoid", "isotonic"],
+            )
 
                 
             st.markdown("**Rango SMOTE**")
@@ -17563,6 +20610,9 @@ def _render_experiments_tab() -> None:
                 }
 
         if st.button("Iniciar Experimento"):
+            if not calibration_methods:
+                st.error("Seleccione al menos un calibrador.")
+                return
             # Load Data
             try:
                 accidents_path = next(p for p in event_files if p.name == selected_event)
@@ -17698,6 +20748,7 @@ def _render_experiments_tab() -> None:
                     "far_target": float(far_target),
                     "threshold_strategy": threshold_strategy,
                     "threshold_strategy_label": threshold_strategy_label,
+                    "calibration_methods": list(calibration_methods),
                     "test_size": float(test_size),
                     "val_size": float(val_size),
                     "optuna_n_jobs": int(optuna_n_jobs),
@@ -17748,30 +20799,35 @@ def _render_experiments_tab() -> None:
                     f"(K={start_k}..{k_limit}, paso={int(step_size)})..."
                 )
 
-                results = runner.run_iterative_experiment(
-                    base_df=base_df,
-                    base_features_ordered=base_ordered,
-                    cluster_features=combined_ordered_for_run,
-                    model_choice=model_choice,
-                    n_trials=int(n_trials),
-                    timeout=int(timeout),
-                    optuna_n_jobs=int(optuna_n_jobs),
-                    far_target=float(far_target),
-                    search_space_config=search_space,
-                    step_size=int(step_size),
-                    test_size=float(test_size),
-                    val_size=float(val_size),
-                    objective_key=objective_key,
-                    objective_direction=objective_direction,
-                    objective_label=objective_label,
-                    cluster_feature_names=cluster_cols,
-                    threshold_strategy=threshold_strategy,
-                    progress_bar=progress_bar,
-                    dataset_name=selected_event,
-                    features_name=selected_features,
-                    max_k_limit=int(max_k_limit),
-                    result_callback=_db_callback,
-                )
+                results: List[Dict[str, object]] = []
+                for calibration_method in calibration_methods:
+                    results.extend(
+                        runner.run_iterative_experiment(
+                            base_df=base_df,
+                            base_features_ordered=base_ordered,
+                            cluster_features=combined_ordered_for_run,
+                            model_choice=model_choice,
+                            n_trials=int(n_trials),
+                            timeout=int(timeout),
+                            optuna_n_jobs=int(optuna_n_jobs),
+                            far_target=float(far_target),
+                            search_space_config=search_space,
+                            step_size=int(step_size),
+                            test_size=float(test_size),
+                            val_size=float(val_size),
+                            objective_key=objective_key,
+                            objective_direction=objective_direction,
+                            objective_label=objective_label,
+                            cluster_feature_names=cluster_cols,
+                            threshold_strategy=threshold_strategy,
+                            calibration_method=str(calibration_method),
+                            progress_bar=progress_bar,
+                            dataset_name=selected_event,
+                            features_name=selected_features,
+                            max_k_limit=int(max_k_limit),
+                            result_callback=_db_callback,
+                        )
+                    )
                 
                 # Results
                 if results:

@@ -18,12 +18,10 @@ import pandas as pd
 from imblearn.over_sampling import SMOTE
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
-    accuracy_score,
     average_precision_score,
     confusion_matrix,
     f1_score,
     matthews_corrcoef,
-    precision_score,
     recall_score,
     roc_auc_score,
 )
@@ -33,13 +31,14 @@ from src.model_training import (
     THRESHOLD_PROTOCOL_LABELS,
     build_model,
     compute_extended_metrics,
-    far_and_sensitivity,
+    fit_score_calibrator,
     get_model_scores,
     normalize_calibration_method,
+    normalize_optuna_objective_metric,
     normalize_threshold_objective,
     normalize_threshold_protocol,
-    select_threshold_for_metric,
-    select_threshold_for_far,
+    optuna_objective_direction,
+    score_optuna_objective,
     temporal_train_test_split,
     train_model_with_protocol,
 )
@@ -60,6 +59,17 @@ CONTROLLED_COMPARISON_MODELS = (
 )
 CONTROLLED_COMPARISON_FEATURE_SETS = ("Base", "Cluster", "Base + Cluster")
 CONTROLLED_COMPARISON_BALANCE_MODES = ("none", "smote")
+CALIBRATION_SWEEP_PROTOCOL_VERSION = "calibration_sweep_v1"
+CALIBRATION_SWEEP_PROTOCOL_FAMILY = "calibration_score_threshold"
+CALIBRATION_SWEEP_BALANCE_MODES = CONTROLLED_COMPARISON_BALANCE_MODES
+CALIBRATION_SWEEP_THRESHOLD_OBJECTIVES = (
+    "far",
+    "f1",
+    "balanced_f1",
+    "mcc",
+    "recall_at_alerts_per_day",
+    "operational_cost",
+)
 FROZEN_TUNING_ABLATION_PROTOCOL_FAMILY = "frozen_tuning_ablation"
 FROZEN_TUNING_ABLATION_FEATURE_SETS = ("Base", "Base + Cluster")
 FROZEN_TUNING_ABLATION_CONFIG = {
@@ -75,6 +85,8 @@ CONTROLLED_COMPARISON_OBJECTIVE_LABELS = {
     "f1": "F1",
     "balanced_f1": "Balanced F1",
     "mcc": "MCC",
+    "brier_score": "Brier",
+    "far_sens": "FAR - Sensibilidad",
     "recall_at_alerts_per_day": "Recall@N alertas/dia",
     "operational_cost": "Costo operacional",
 }
@@ -278,6 +290,10 @@ def _controlled_payload_updates_from_result(
         "status": result["status"],
         "objective_metric": result["objective_metric"],
         "objective_label": result["objective_label"],
+        "objective_direction": result.get(
+            "objective_direction",
+            optuna_objective_direction(result["objective_metric"]),
+        ),
         "optuna_objective_metric": result["objective_metric"],
         "optuna_objective_label": result["objective_label"],
         "threshold_protocol": result.get("threshold_protocol", threshold_protocol),
@@ -306,6 +322,8 @@ def _controlled_payload_updates_from_result(
         "test_roc_auc": result["test_roc_auc"],
         "val_pr_auc": result.get("val_pr_auc"),
         "test_pr_auc": result.get("test_pr_auc"),
+        "val_brier_score": result.get("val_brier_score"),
+        "test_brier_score": result.get("test_brier_score"),
         "val_f1": result["val_f1"],
         "test_f1": result["test_f1"],
         "val_f1_global": result.get("val_f1_global"),
@@ -339,6 +357,12 @@ def _controlled_payload_updates_from_result(
         "test_true_negatives": result.get("test_true_negatives"),
         "val_true_positives": result.get("val_true_positives"),
         "test_true_positives": result.get("test_true_positives"),
+        "val_positive_support": result.get("val_positive_support"),
+        "test_positive_support": result.get("test_positive_support"),
+        "val_tp_capture": result.get("val_tp_capture"),
+        "test_tp_capture": result.get("test_tp_capture"),
+        "val_fn_rate": result.get("val_fn_rate"),
+        "test_fn_rate": result.get("test_fn_rate"),
         "val_confusion_matrix": json.dumps(
             result.get("val_confusion_matrix"),
             ensure_ascii=True,
@@ -416,6 +440,8 @@ def _build_frozen_tuning_ablation_deltas(
         "test_roc_auc",
         "val_pr_auc",
         "test_pr_auc",
+        "val_brier_score",
+        "test_brier_score",
         "val_f1",
         "test_f1",
         "val_mcc",
@@ -556,6 +582,9 @@ def _normalize_controlled_objective_metric(value: object) -> str:
         "macro_f1": "balanced_f1",
         "f1_global": "balanced_f1",
         "mcc": "mcc",
+        "brier": "brier_score",
+        "brier_score": "brier_score",
+        "brier score": "brier_score",
         "recall_at_alerts_per_day": "recall_at_alerts_per_day",
         "recall@n": "recall_at_alerts_per_day",
         "operational_cost": "operational_cost",
@@ -583,7 +612,9 @@ def _controlled_objective_score_from_metrics(
 ) -> float:
     metric_key = _normalize_controlled_objective_metric(objective_metric)
     if metric_key == "operational_cost":
-        return -float(metrics.get("operational_cost", float("inf")))
+        return float(metrics.get("operational_cost", float("inf")))
+    if metric_key == "brier_score":
+        return float(metrics.get("brier_score", float("nan")))
     if metric_key == "balanced_f1":
         return float(
             metrics.get(
@@ -1119,6 +1150,14 @@ def _metric_at_threshold(
             return float(f1_score(y_arr, preds, average="macro", zero_division=0))
         if metric_name == "mcc":
             return float(matthews_corrcoef(y_arr, preds))
+        if metric_name == "brier_score":
+            scored = score_optuna_objective(
+                y_arr.to_numpy(),
+                scores_arr,
+                objective_metric="brier_score",
+                threshold=float(threshold),
+            )
+            return -float(scored.get("score", float("nan")))
         if metric_name == "recall_at_alerts_per_day":
             return float(recall_score(y_arr, preds, zero_division=0))
         if metric_name == "operational_cost":
@@ -1140,6 +1179,14 @@ def _best_threshold_for_metric(
         return _maybe_roc_auc(y_true, scores), 0.5
     if metric_name == "pr_auc":
         return _maybe_pr_auc(y_true, scores), 0.5
+    if metric_name == "brier_score":
+        scored = score_optuna_objective(
+            np.asarray(y_true).astype(int),
+            np.asarray(scores, dtype=float),
+            objective_metric="brier_score",
+            threshold=0.5,
+        )
+        return -float(scored.get("score", float("nan"))), 0.5
 
     best_score = float("-inf")
     best_threshold = 0.5
@@ -1300,8 +1347,24 @@ def controlled_comparison_checkpoint_root(
     )
 
 
+def calibration_experiment_checkpoint_root(
+    checkpoint_root: Optional[Path] = None,
+) -> Path:
+    return Path(checkpoint_root) if checkpoint_root is not None else Path(
+        "Resultados/calibration_experiment_runs"
+    )
+
+
 def _controlled_comparison_run_dir(run_id: str, *, checkpoint_root: Optional[Path] = None) -> Path:
     return controlled_comparison_checkpoint_root(checkpoint_root=checkpoint_root) / str(run_id)
+
+
+def _calibration_experiment_run_dir(
+    run_id: str,
+    *,
+    checkpoint_root: Optional[Path] = None,
+) -> Path:
+    return calibration_experiment_checkpoint_root(checkpoint_root=checkpoint_root) / str(run_id)
 
 
 def _controlled_comparison_paths(run_dir: Path) -> Dict[str, Path]:
@@ -1324,6 +1387,26 @@ def _controlled_comparison_paths(run_dir: Path) -> Dict[str, Path]:
         "best_summary": run_dir / "results" / "best_summary.csv",
         "curves": run_dir / "results" / "curves.csv",
         "ablation_deltas": run_dir / "results" / "ablation_deltas.csv",
+    }
+
+
+def _calibration_experiment_paths(run_dir: Path) -> Dict[str, Path]:
+    return {
+        "run_dir": run_dir,
+        "manifest": run_dir / "manifest.json",
+        "live_status": run_dir / "live_status.json",
+        "live_events": run_dir / "live_events.jsonl",
+        "protocol": run_dir / "protocol.json",
+        "splits_duckdb": run_dir / "dataset" / "splits.duckdb",
+        "splits_train_csv": run_dir / "dataset" / "train.csv",
+        "splits_val_csv": run_dir / "dataset" / "val.csv",
+        "splits_test_csv": run_dir / "dataset" / "test.csv",
+        "trials_dir": run_dir / "trials",
+        "grid_results": run_dir / "results" / "grid_results.csv",
+        "leaderboard": run_dir / "results" / "leaderboard.csv",
+        "pareto_front": run_dir / "results" / "pareto_front.csv",
+        "best_summary": run_dir / "results" / "best_summary.csv",
+        "best_summary_json": run_dir / "results" / "best_summary.json",
     }
 
 
@@ -1474,6 +1557,408 @@ def _read_checkpoint_frame(path: Path, *, table_name: Optional[str] = None) -> p
     return pd.read_csv(path)
 
 
+def _quality_from_metric_series(
+    series: pd.Series,
+    *,
+    direction: str,
+) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce")
+    quality = pd.Series(np.nan, index=series.index, dtype=float)
+    valid_mask = values.notna()
+    if not valid_mask.any():
+        return quality
+    valid_values = values.loc[valid_mask]
+    min_value = float(valid_values.min())
+    max_value = float(valid_values.max())
+    if math.isclose(min_value, max_value, rel_tol=0.0, abs_tol=1e-12):
+        quality.loc[valid_mask] = 1.0
+        return quality
+    span = max_value - min_value
+    if str(direction) == "minimize":
+        quality.loc[valid_mask] = (max_value - valid_values) / span
+    else:
+        quality.loc[valid_mask] = (valid_values - min_value) / span
+    return quality.clip(lower=0.0, upper=1.0)
+
+
+def _geometric_mean_quality(components: pd.DataFrame) -> pd.Series:
+    if not isinstance(components, pd.DataFrame) or components.empty:
+        return pd.Series(dtype=float)
+    result = pd.Series(np.nan, index=components.index, dtype=float)
+    for idx, row in components.iterrows():
+        values = pd.to_numeric(row, errors="coerce").to_numpy(dtype=float)
+        if values.size == 0 or not np.all(np.isfinite(values)):
+            continue
+        clipped = np.clip(values, 0.0, 1.0)
+        if np.any(clipped <= 0.0):
+            result.loc[idx] = 0.0
+            continue
+        result.loc[idx] = float(np.exp(np.mean(np.log(clipped))))
+    return result
+
+
+def _row_dominates(
+    frame: pd.DataFrame,
+    left_idx: object,
+    right_idx: object,
+    *,
+    objective_directions: Dict[str, str],
+) -> bool:
+    better_or_equal = True
+    strictly_better = False
+    for column_name, direction in objective_directions.items():
+        left_value = float(frame.at[left_idx, column_name])
+        right_value = float(frame.at[right_idx, column_name])
+        if str(direction) == "minimize":
+            if left_value > right_value + 1e-12:
+                better_or_equal = False
+                break
+            if left_value < right_value - 1e-12:
+                strictly_better = True
+        else:
+            if left_value < right_value - 1e-12:
+                better_or_equal = False
+                break
+            if left_value > right_value + 1e-12:
+                strictly_better = True
+    return bool(better_or_equal and strictly_better)
+
+
+def _pareto_front_numbers(
+    frame: pd.DataFrame,
+    *,
+    objective_directions: Dict[str, str],
+    eligible_mask: pd.Series,
+) -> pd.Series:
+    fronts = pd.Series(pd.NA, index=frame.index, dtype="Int64")
+    remaining = list(frame.index[eligible_mask.fillna(False)])
+    front_number = 1
+    while remaining:
+        current_front: List[object] = []
+        current_front_set: set[object] = set()
+        for candidate_idx in remaining:
+            dominated = False
+            for other_idx in remaining:
+                if other_idx == candidate_idx:
+                    continue
+                if _row_dominates(
+                    frame,
+                    other_idx,
+                    candidate_idx,
+                    objective_directions=objective_directions,
+                ):
+                    dominated = True
+                    break
+            if not dominated:
+                current_front.append(candidate_idx)
+                current_front_set.add(candidate_idx)
+        if not current_front:
+            break
+        fronts.loc[current_front] = int(front_number)
+        remaining = [idx for idx in remaining if idx not in current_front_set]
+        front_number += 1
+    return fronts
+
+
+def _build_calibration_sweep_leaderboard(
+    grid_results_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not isinstance(grid_results_df, pd.DataFrame) or grid_results_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    leaderboard_df = grid_results_df.copy()
+    if "status" in leaderboard_df.columns:
+        leaderboard_df = leaderboard_df[
+            leaderboard_df["status"].astype(str).str.lower() == "completed"
+        ].copy()
+    if leaderboard_df.empty:
+        return leaderboard_df, pd.DataFrame()
+
+    numeric_columns = [
+        "val_mcc",
+        "val_brier_score",
+        "val_pr_auc",
+        "val_true_positives",
+        "val_false_negatives",
+        "val_far",
+        "test_mcc",
+        "test_brier_score",
+        "test_pr_auc",
+        "test_true_positives",
+        "test_false_negatives",
+        "test_far",
+        "val_positive_support",
+        "test_positive_support",
+        "val_tp_capture",
+        "test_tp_capture",
+        "val_fn_rate",
+        "test_fn_rate",
+    ]
+    for column_name in numeric_columns:
+        if column_name not in leaderboard_df.columns:
+            leaderboard_df[column_name] = np.nan
+    for column_name in numeric_columns:
+        if column_name in leaderboard_df.columns:
+            leaderboard_df[column_name] = pd.to_numeric(
+                leaderboard_df[column_name],
+                errors="coerce",
+            )
+
+    if "val_positive_support" not in leaderboard_df.columns:
+        leaderboard_df["val_positive_support"] = (
+            pd.to_numeric(leaderboard_df.get("val_true_positives"), errors="coerce")
+            + pd.to_numeric(leaderboard_df.get("val_false_negatives"), errors="coerce")
+        )
+    if "test_positive_support" not in leaderboard_df.columns:
+        leaderboard_df["test_positive_support"] = (
+            pd.to_numeric(leaderboard_df.get("test_true_positives"), errors="coerce")
+            + pd.to_numeric(leaderboard_df.get("test_false_negatives"), errors="coerce")
+        )
+    if "val_tp_capture" not in leaderboard_df.columns:
+        leaderboard_df["val_tp_capture"] = np.where(
+            leaderboard_df["val_positive_support"] > 0,
+            pd.to_numeric(leaderboard_df.get("val_true_positives"), errors="coerce")
+            / leaderboard_df["val_positive_support"],
+            np.nan,
+        )
+    if "test_tp_capture" not in leaderboard_df.columns:
+        leaderboard_df["test_tp_capture"] = np.where(
+            leaderboard_df["test_positive_support"] > 0,
+            pd.to_numeric(leaderboard_df.get("test_true_positives"), errors="coerce")
+            / leaderboard_df["test_positive_support"],
+            np.nan,
+        )
+    if "val_fn_rate" not in leaderboard_df.columns:
+        leaderboard_df["val_fn_rate"] = np.where(
+            leaderboard_df["val_positive_support"] > 0,
+            pd.to_numeric(leaderboard_df.get("val_false_negatives"), errors="coerce")
+            / leaderboard_df["val_positive_support"],
+            np.nan,
+        )
+    if "test_fn_rate" not in leaderboard_df.columns:
+        leaderboard_df["test_fn_rate"] = np.where(
+            leaderboard_df["test_positive_support"] > 0,
+            pd.to_numeric(leaderboard_df.get("test_false_negatives"), errors="coerce")
+            / leaderboard_df["test_positive_support"],
+            np.nan,
+        )
+
+    objective_columns = {
+        "val_mcc": "maximize",
+        "val_brier_score": "minimize",
+        "val_pr_auc": "maximize",
+        "val_true_positives": "maximize",
+        "val_false_negatives": "minimize",
+        "val_far": "minimize",
+    }
+    required_columns = list(objective_columns.keys())
+    leaderboard_df["rankable"] = (
+        leaderboard_df[required_columns]
+        .apply(pd.to_numeric, errors="coerce")
+        .notna()
+        .all(axis=1)
+        & pd.to_numeric(
+            leaderboard_df["val_positive_support"],
+            errors="coerce",
+        ).gt(0)
+        & pd.to_numeric(
+            leaderboard_df["val_true_positives"],
+            errors="coerce",
+        ).gt(0)
+    )
+
+    leaderboard_df["capture_quality"] = np.clip(
+        pd.to_numeric(leaderboard_df["val_tp_capture"], errors="coerce"),
+        0.0,
+        1.0,
+    )
+    leaderboard_df["decision_quality"] = _quality_from_metric_series(
+        leaderboard_df["val_mcc"],
+        direction="maximize",
+    )
+    leaderboard_df["ranking_quality"] = _quality_from_metric_series(
+        leaderboard_df["val_pr_auc"],
+        direction="maximize",
+    )
+    leaderboard_df["calibration_quality"] = _quality_from_metric_series(
+        leaderboard_df["val_brier_score"],
+        direction="minimize",
+    )
+    leaderboard_df["false_alarm_quality"] = _quality_from_metric_series(
+        leaderboard_df["val_far"],
+        direction="minimize",
+    )
+    leaderboard_df["stability_score"] = _geometric_mean_quality(
+        leaderboard_df[
+            [
+                "capture_quality",
+                "calibration_quality",
+                "ranking_quality",
+                "decision_quality",
+                "false_alarm_quality",
+            ]
+        ]
+    )
+
+    leaderboard_df["pareto_front"] = _pareto_front_numbers(
+        leaderboard_df,
+        objective_directions=objective_columns,
+        eligible_mask=leaderboard_df["rankable"].astype(bool),
+    )
+    max_front = int(
+        pd.to_numeric(leaderboard_df["pareto_front"], errors="coerce").max()
+        if leaderboard_df["pareto_front"].notna().any()
+        else 0
+    )
+    leaderboard_df["__rankable_sort"] = leaderboard_df["rankable"].astype(int)
+    leaderboard_df["__pareto_sort"] = (
+        pd.to_numeric(leaderboard_df["pareto_front"], errors="coerce")
+        .fillna(max_front + 1)
+        .astype(int)
+    )
+    leaderboard_df = leaderboard_df.sort_values(
+        [
+            "__rankable_sort",
+            "__pareto_sort",
+            "stability_score",
+            "val_mcc",
+            "val_pr_auc",
+            "val_brier_score",
+            "val_far",
+            "balance_mode",
+            "optuna_objective_metric",
+            "calibration_method",
+            "threshold_objective",
+        ],
+        ascending=[
+            False,
+            True,
+            False,
+            False,
+            False,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+        ],
+    ).reset_index(drop=True)
+    leaderboard_df["rank"] = pd.Series(
+        pd.NA, index=leaderboard_df.index, dtype="Int64"
+    )
+    rankable_idx = leaderboard_df.index[
+        leaderboard_df["rankable"].astype(bool)
+    ]
+    leaderboard_df.loc[rankable_idx, "rank"] = pd.Series(
+        range(1, len(rankable_idx) + 1),
+        index=rankable_idx,
+        dtype="Int64",
+    )
+    leaderboard_df = leaderboard_df.drop(
+        columns=["__rankable_sort", "__pareto_sort"],
+        errors="ignore",
+    )
+
+    pareto_front_df = leaderboard_df[
+        leaderboard_df["rankable"].astype(bool)
+        & pd.to_numeric(leaderboard_df["pareto_front"], errors="coerce").eq(1)
+    ].copy()
+    return leaderboard_df, pareto_front_df
+
+
+def _build_calibration_sweep_best_summary(
+    leaderboard_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    summary_rows: List[Dict[str, object]] = []
+    summary_payload: Dict[str, object] = {
+        "global_best": None,
+        "by_balance_mode": {},
+    }
+    if not isinstance(leaderboard_df, pd.DataFrame) or leaderboard_df.empty:
+        return pd.DataFrame(), summary_payload
+
+    rankable_df = leaderboard_df[
+        leaderboard_df["rankable"].astype(bool)
+    ].copy()
+    candidate_df = rankable_df if not rankable_df.empty else leaderboard_df.copy()
+    if candidate_df.empty:
+        return pd.DataFrame(), summary_payload
+
+    summary_columns = [
+        "rank",
+        "model_name",
+        "balance_mode",
+        "optuna_objective_metric",
+        "objective_label",
+        "objective_direction",
+        "calibration_method",
+        "threshold_objective",
+        "threshold_objective_label",
+        "threshold_protocol",
+        "stability_score",
+        "pareto_front",
+        "rankable",
+        "decision_threshold",
+        "val_objective_score",
+        "test_objective_score",
+        "val_mcc",
+        "test_mcc",
+        "val_brier_score",
+        "test_brier_score",
+        "val_pr_auc",
+        "test_pr_auc",
+        "val_true_positives",
+        "test_true_positives",
+        "val_false_negatives",
+        "test_false_negatives",
+        "val_far",
+        "test_far",
+        "val_positive_support",
+        "test_positive_support",
+        "val_tp_capture",
+        "test_tp_capture",
+        "val_fn_rate",
+        "test_fn_rate",
+        "best_params",
+        "effective_model_params",
+        "smote_params",
+        "selected_feature_count",
+        "selected_features",
+        "trials_csv",
+    ]
+
+    def _row_payload(scope: str, row: pd.Series) -> Dict[str, object]:
+        payload = {
+            "scope": str(scope),
+            "rank_source": "validation",
+        }
+        for column_name in summary_columns:
+            if column_name in row.index:
+                payload[column_name] = row.get(column_name)
+        return payload
+
+    global_best = candidate_df.iloc[0]
+    global_payload = _row_payload("global", global_best)
+    summary_rows.append(global_payload)
+    summary_payload["global_best"] = dict(global_payload)
+
+    if "balance_mode" in candidate_df.columns:
+        for balance_mode, mode_df in candidate_df.groupby(
+            "balance_mode",
+            dropna=False,
+        ):
+            if mode_df.empty:
+                continue
+            best_row = mode_df.iloc[0]
+            scope = f"balance_mode:{balance_mode}"
+            payload = _row_payload(scope, best_row)
+            summary_rows.append(payload)
+            summary_payload["by_balance_mode"][str(balance_mode)] = dict(payload)
+
+    return pd.DataFrame(summary_rows), summary_payload
+
+
 def build_controlled_comparison_context(
     *,
     event_path: Optional[object],
@@ -1617,6 +2102,7 @@ class ExperimentsRunner:
         objective_key: str = "far_sens",
         objective_direction: str = "minimize",
         threshold_strategy: str = "optuna",
+        calibration_method: str = "none",
         progress_callback: Optional[Callable[[str], None]] = None,
         optuna_callbacks: Optional[List[Callable]] = None,
         return_model: bool = False,
@@ -1635,45 +2121,20 @@ class ExperimentsRunner:
         smote_cfg = search_space_config.get("smote", {})
         model_cfg = search_space_config.get("model", {})
 
+        objective_metric_key = normalize_optuna_objective_metric(objective_key)
         objective_direction = str(objective_direction).lower()
+        expected_direction = optuna_objective_direction(objective_metric_key)
         if objective_direction not in {"minimize", "maximize"}:
-            objective_direction = "minimize"
+            objective_direction = expected_direction
+        elif objective_direction != expected_direction:
+            objective_direction = expected_direction
         optuna_n_jobs = max(1, int(optuna_n_jobs))
         threshold_strategy = str(threshold_strategy).lower()
+        calibration_method = normalize_calibration_method(calibration_method)
         if threshold_strategy in {"far", "calibrate", "calibrar"}:
             threshold_strategy = "far"
         elif threshold_strategy not in {"optuna", "optimize", "optimizar"}:
             threshold_strategy = "optuna"
-
-        def _objective_value(
-            y_true: np.ndarray,
-            preds: np.ndarray,
-            scores: np.ndarray,
-        ) -> float:
-            key = str(objective_key).lower()
-            if key in {"best_f1", "f1"}:
-                return float(f1_score(y_true, preds, zero_division=0))
-            if key == "roc_auc":
-                try:
-                    return float(roc_auc_score(y_true, scores))
-                except ValueError:
-                    return 0.5
-            if key == "accuracy":
-                return float(accuracy_score(y_true, preds))
-            if key == "recall":
-                return float(recall_score(y_true, preds, zero_division=0))
-            if key == "precision":
-                return float(precision_score(y_true, preds, zero_division=0))
-            if key == "fnr":
-                tn, fp, fn, tp = confusion_matrix(
-                    y_true, preds, labels=[0, 1]
-                ).ravel()
-                return float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
-            if key in {"far_sens", "far_sensitivity", "far_minus_sens"}:
-                far_val, sens_val = far_and_sensitivity(y_true, preds)
-                return float(far_val) - (float(sens_val) * 1e-3)
-            far_val, sens_val = far_and_sensitivity(y_true, preds)
-            return float(far_val) - (float(sens_val) * 1e-3)
 
         def objective(trial: optuna.Trial) -> float:
             k_neighbors = trial.suggest_int(
@@ -1746,19 +2207,39 @@ class ExperimentsRunner:
             try:
                 model = build_model(model_choice, params, self.random_state)
                 model.fit(X_res, y_res)
-                scores_val = get_model_scores(model, X_val)
+                raw_scores_val = get_model_scores(model, X_val)
+                calibrator = fit_score_calibrator(
+                    y_val.to_numpy(),
+                    raw_scores_val,
+                    method=calibration_method,
+                )
+                scores_val = calibrator.transform(raw_scores_val)
                 if threshold_strategy == "far":
-                    thr_info = select_threshold_for_far(
-                        y_val, scores_val, far_target=far_target
+                    scored = score_optuna_objective(
+                        y_val.to_numpy(),
+                        scores_val,
+                        objective_metric=objective_metric_key,
+                        threshold_objective="far",
+                        eval_df=val_df,
+                        far_target=float(far_target),
                     )
-                    threshold = float(thr_info["threshold"])
                 else:
                     threshold = trial.suggest_float("threshold", 0.0, 1.0)
-                preds_val = (scores_val >= threshold).astype(int)
-                score = _objective_value(y_val, preds_val, scores_val)
+                    scored = score_optuna_objective(
+                        y_val.to_numpy(),
+                        scores_val,
+                        objective_metric=objective_metric_key,
+                        threshold=threshold,
+                        threshold_objective="far",
+                        eval_df=val_df,
+                        far_target=float(far_target),
+                    )
+                score = float(scored.get("score", float("nan")))
             except Exception as exc:
                 raise optuna.TrialPruned(f"Training failed: {exc}")
 
+            if pd.isna(score):
+                raise optuna.TrialPruned(f"{objective_metric_key} invalido en validacion.")
             return float(score)
 
         sampler = optuna.samplers.TPESampler(seed=self.random_state)
@@ -1798,46 +2279,67 @@ class ExperimentsRunner:
         final_model = build_model(model_choice, model_params_final, self.random_state)
         final_model.fit(X_train_res, y_train_res)
 
-        scores_val = get_model_scores(final_model, X_val)
+        raw_scores_val = get_model_scores(final_model, X_val)
+        calibrator = fit_score_calibrator(
+            y_val.to_numpy(),
+            raw_scores_val,
+            method=calibration_method,
+        )
+        scores_val = calibrator.transform(raw_scores_val)
         final_threshold = float(best_params.get("threshold", 0.5))
         if "threshold" not in best_params:
-            thr_info = select_threshold_for_far(
-                y_val, scores_val, far_target=far_target
+            final_scored = score_optuna_objective(
+                y_val.to_numpy(),
+                scores_val,
+                objective_metric=objective_metric_key,
+                threshold_objective="far",
+                eval_df=val_df,
+                far_target=float(far_target),
             )
-            final_threshold = float(thr_info["threshold"])
+            final_threshold = float(final_scored.get("threshold", 0.5))
 
-        scores_test = get_model_scores(final_model, X_test)
-        preds_test = (scores_test >= final_threshold).astype(int)
-
-        final_f1 = f1_score(y_test, preds_test, zero_division=0)
-        final_acc = accuracy_score(y_test, preds_test)
-        final_rec = recall_score(y_test, preds_test, zero_division=0)
-        final_prec = precision_score(y_test, preds_test, zero_division=0)
-        tn, fp, fn, tp = confusion_matrix(y_test, preds_test, labels=[0, 1]).ravel()
-
-        try:
-            final_roc_auc = roc_auc_score(y_test, scores_test)
-        except ValueError:
-            final_roc_auc = 0.5
-
-        final_fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
-        final_far, final_sens = far_and_sensitivity(y_test, preds_test)
+        scores_test = calibrator.transform(get_model_scores(final_model, X_test))
+        test_scored = score_optuna_objective(
+            y_test.to_numpy(),
+            scores_test,
+            objective_metric=objective_metric_key,
+            threshold=float(final_threshold),
+            threshold_objective="far",
+            eval_df=test_df,
+            far_target=float(far_target),
+        )
+        test_metrics = dict(test_scored.get("metrics") or {})
+        tn = int(test_metrics.get("true_negatives", 0))
+        fp = int(test_metrics.get("false_positives", 0))
+        fn = int(test_metrics.get("false_negatives", 0))
+        tp = int(test_metrics.get("true_positives", 0))
+        final_fnr = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
 
         result = {
             "n_features": len(feature_cols),
-            "best_f1": final_f1,
+            "best_f1": float(test_metrics.get("f1", float("nan"))),
+            "f1": float(test_metrics.get("f1", float("nan"))),
             "best_params": best_params,
             "feature_cols": feature_cols,
-            "accuracy": final_acc,
-            "recall": final_rec,
-            "precision": final_prec,
-            "roc_auc": final_roc_auc,
+            "accuracy": float(test_metrics.get("accuracy", float("nan"))),
+            "recall": float(test_metrics.get("recall", float("nan"))),
+            "precision": float(test_metrics.get("precision", float("nan"))),
+            "roc_auc": float(test_metrics.get("roc_auc", float("nan"))),
+            "pr_auc": float(test_metrics.get("pr_auc", float("nan"))),
+            "balanced_f1": float(test_metrics.get("balanced_f1", float("nan"))),
+            "mcc": float(test_metrics.get("mcc", float("nan"))),
+            "brier_score": float(test_metrics.get("brier_score", float("nan"))),
             "fnr": final_fnr,
-            "far": final_far,
-            "sensitivity": final_sens,
+            "far": float(test_metrics.get("far", float("nan"))),
+            "sensitivity": float(test_metrics.get("sensitivity", float("nan"))),
             "confusion_matrix": [int(tn), int(fp), int(fn), int(tp)],
             "threshold": float(final_threshold),
             "threshold_strategy": threshold_strategy,
+            "calibration_method": calibration_method,
+            "objective_metric": objective_metric_key,
+            "objective_label": test_scored.get("objective_label"),
+            "objective_direction": objective_direction,
+            "objective_score": float(test_scored.get("score", float("nan"))),
             "optuna_n_jobs": int(optuna_n_jobs),
             "dataset_rows": {
                 "train": len(train_df),
@@ -1868,6 +2370,7 @@ class ExperimentsRunner:
         objective_label: Optional[str] = None,
         cluster_feature_names: Optional[List[str]] = None,
         threshold_strategy: str = "optuna",
+        calibration_method: str = "none",
         progress_bar: Any = None,
         dataset_name: str = "unknown",
         features_name: str = "unknown",
@@ -1938,6 +2441,7 @@ class ExperimentsRunner:
                         objective_key=objective_key,
                         objective_direction=objective_direction,
                         threshold_strategy=threshold_strategy,
+                        calibration_method=calibration_method,
                     )
                     res["type"] = "Base"
                     res["k"] = k
@@ -1946,6 +2450,7 @@ class ExperimentsRunner:
                     res["objective_metric"] = objective_key
                     res["objective_direction"] = objective_direction
                     res["threshold_strategy"] = threshold_strategy
+                    res["calibration_method"] = calibration_method
                     if objective_label:
                         res["objective_label"] = objective_label
                     results.append(res)
@@ -1961,6 +2466,8 @@ class ExperimentsRunner:
                     "features_name": features_name,
                     "objective_metric": objective_key,
                     "objective_direction": objective_direction,
+                    "threshold_strategy": threshold_strategy,
+                    "calibration_method": calibration_method,
                     "optuna_n_jobs": int(optuna_n_jobs),
                     "error": "K total sin variables base disponibles.",
                 }
@@ -1987,6 +2494,7 @@ class ExperimentsRunner:
                         objective_key=objective_key,
                         objective_direction=objective_direction,
                         threshold_strategy=threshold_strategy,
+                        calibration_method=calibration_method,
                     )
                     res_c["type"] = "Base+Cluster"
                     res_c["k"] = k
@@ -1995,6 +2503,7 @@ class ExperimentsRunner:
                     res_c["objective_metric"] = objective_key
                     res_c["objective_direction"] = objective_direction
                     res_c["threshold_strategy"] = threshold_strategy
+                    res_c["calibration_method"] = calibration_method
                     if objective_label:
                         res_c["objective_label"] = objective_label
                     results.append(res_c)
@@ -2477,6 +2986,7 @@ class ExperimentsRunner:
         objective_label = CONTROLLED_COMPARISON_OBJECTIVE_LABELS.get(
             objective_metric, str(objective_metric).upper()
         )
+        objective_direction = optuna_objective_direction(objective_metric)
         threshold_objective_label = THRESHOLD_OBJECTIVE_LABELS.get(
             threshold_objective, str(threshold_objective).upper()
         )
@@ -2514,7 +3024,7 @@ class ExperimentsRunner:
         except TypeError:
             sampler = optuna.samplers.TPESampler(seed=self.random_state)
         study = optuna.create_study(
-            direction="maximize",
+            direction=objective_direction,
             sampler=sampler,
         )
 
@@ -2543,25 +3053,25 @@ class ExperimentsRunner:
                     objective_metric=objective_metric,
                     y_ref=y_val,
                 )
-                if objective_metric in {"roc_auc", "pr_auc"}:
-                    score, _threshold = _best_threshold_for_metric(
-                        y_val,
-                        scores_val,
-                        metric=objective_metric,
-                    )
-                else:
-                    threshold_info = select_threshold_for_metric(
-                        y_val.to_numpy(),
-                        scores_val,
-                        objective=objective_metric,
-                        eval_df=val_df,
-                        far_target=float(far_target),
-                        alerts_per_day=float(alerts_per_day),
-                        fn_cost=float(fn_cost),
-                        fp_cost=float(fp_cost),
-                        n_jobs=int(threshold_parallel_jobs),
-                    )
-                    score = float(threshold_info.get("objective_score", float("nan")))
+                calibrator = fit_score_calibrator(
+                    y_val.to_numpy(),
+                    scores_val,
+                    method=calibration_method,
+                )
+                scores_val = calibrator.transform(scores_val)
+                scored = score_optuna_objective(
+                    y_val.to_numpy(),
+                    scores_val,
+                    objective_metric=objective_metric,
+                    threshold_objective=threshold_objective,
+                    eval_df=val_df,
+                    far_target=float(far_target),
+                    alerts_per_day=float(alerts_per_day),
+                    fn_cost=float(fn_cost),
+                    fp_cost=float(fp_cost),
+                    threshold_n_jobs=int(threshold_parallel_jobs),
+                )
+                score = float(scored.get("score", float("nan")))
             except Exception as exc:
                 raise optuna.TrialPruned(str(exc)) from exc
             if pd.isna(score):
@@ -2584,7 +3094,10 @@ class ExperimentsRunner:
         ]
         if not completed_trials:
             raise ValueError("Optuna no genero trials completos.")
-        best_trial = max(completed_trials, key=lambda trial: float(trial.value))
+        if objective_direction == "minimize":
+            best_trial = min(completed_trials, key=lambda trial: float(trial.value))
+        else:
+            best_trial = max(completed_trials, key=lambda trial: float(trial.value))
         best_raw_params = dict(best_trial.params)
         best_model_params = {
             key: value
@@ -2643,7 +3156,10 @@ class ExperimentsRunner:
 
         trials_df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
         if not trials_df.empty:
-            trials_df = trials_df.sort_values("value", ascending=False).reset_index(drop=True)
+            trials_df = trials_df.sort_values(
+                "value",
+                ascending=objective_direction == "minimize",
+            ).reset_index(drop=True)
 
         return {
             "status": "completed",
@@ -2659,6 +3175,7 @@ class ExperimentsRunner:
             "calibration_method": calibration_method,
             "objective_metric": objective_metric,
             "objective_label": objective_label,
+            "objective_direction": objective_direction,
             "k": int(len(selected_features)),
             "selected_features": list(selected_features),
             "selected_feature_count": int(len(selected_features)),
@@ -2675,6 +3192,8 @@ class ExperimentsRunner:
             "test_roc_auc": float(test_metrics.get("roc_auc", float("nan"))),
             "val_pr_auc": float(val_metrics.get("pr_auc", float("nan"))),
             "test_pr_auc": float(test_metrics.get("pr_auc", float("nan"))),
+            "val_brier_score": float(val_metrics.get("brier_score", float("nan"))),
+            "test_brier_score": float(test_metrics.get("brier_score", float("nan"))),
             "val_f1": float(val_metrics.get("f1", float("nan"))),
             "test_f1": float(test_metrics.get("f1", float("nan"))),
             "val_f1_global": float(val_metrics.get("f1_global", float("nan"))),
@@ -2718,6 +3237,12 @@ class ExperimentsRunner:
             "test_true_negatives": int(test_metrics.get("true_negatives", 0)),
             "val_true_positives": int(val_metrics.get("true_positives", 0)),
             "test_true_positives": int(test_metrics.get("true_positives", 0)),
+            "val_positive_support": int(val_metrics.get("positive_support", 0)),
+            "test_positive_support": int(test_metrics.get("positive_support", 0)),
+            "val_tp_capture": float(val_metrics.get("tp_capture", float("nan"))),
+            "test_tp_capture": float(test_metrics.get("tp_capture", float("nan"))),
+            "val_fn_rate": float(val_metrics.get("fn_rate", float("nan"))),
+            "test_fn_rate": float(test_metrics.get("fn_rate", float("nan"))),
             "val_confusion_matrix": val_metrics.get("confusion_matrix"),
             "test_confusion_matrix": test_metrics.get("confusion_matrix"),
             "best_params": best_model_params,
@@ -2780,6 +3305,7 @@ class ExperimentsRunner:
         objective_label = CONTROLLED_COMPARISON_OBJECTIVE_LABELS.get(
             objective_metric, str(objective_metric).upper()
         )
+        objective_direction = optuna_objective_direction(objective_metric)
         threshold_objective_label = THRESHOLD_OBJECTIVE_LABELS.get(
             threshold_objective, str(threshold_objective).upper()
         )
@@ -2858,6 +3384,7 @@ class ExperimentsRunner:
             "calibration_method": calibration_method,
             "objective_metric": objective_metric,
             "objective_label": objective_label,
+            "objective_direction": objective_direction,
             "k": int(len(selected_features)),
             "selected_features": list(selected_features),
             "selected_feature_count": int(len(selected_features)),
@@ -2874,6 +3401,8 @@ class ExperimentsRunner:
             "test_roc_auc": float(test_metrics.get("roc_auc", float("nan"))),
             "val_pr_auc": float(val_metrics.get("pr_auc", float("nan"))),
             "test_pr_auc": float(test_metrics.get("pr_auc", float("nan"))),
+            "val_brier_score": float(val_metrics.get("brier_score", float("nan"))),
+            "test_brier_score": float(test_metrics.get("brier_score", float("nan"))),
             "val_f1": float(val_metrics.get("f1", float("nan"))),
             "test_f1": float(test_metrics.get("f1", float("nan"))),
             "val_f1_global": float(val_metrics.get("f1_global", float("nan"))),
@@ -2917,6 +3446,12 @@ class ExperimentsRunner:
             "test_true_negatives": int(test_metrics.get("true_negatives", 0)),
             "val_true_positives": int(val_metrics.get("true_positives", 0)),
             "test_true_positives": int(test_metrics.get("true_positives", 0)),
+            "val_positive_support": int(val_metrics.get("positive_support", 0)),
+            "test_positive_support": int(test_metrics.get("positive_support", 0)),
+            "val_tp_capture": float(val_metrics.get("tp_capture", float("nan"))),
+            "test_tp_capture": float(test_metrics.get("tp_capture", float("nan"))),
+            "val_fn_rate": float(val_metrics.get("fn_rate", float("nan"))),
+            "test_fn_rate": float(test_metrics.get("fn_rate", float("nan"))),
             "val_confusion_matrix": val_metrics.get("confusion_matrix"),
             "test_confusion_matrix": test_metrics.get("confusion_matrix"),
             "best_params": best_model_params,
@@ -2936,6 +3471,478 @@ class ExperimentsRunner:
             "val_rows": int(len(val_df)),
             "test_rows": int(len(test_df)),
             "trials_df": pd.DataFrame(),
+        }
+
+    def run_calibration_sweep(
+        self,
+        base_df: pd.DataFrame,
+        *,
+        model_name: str,
+        selected_features: Optional[Sequence[object]] = None,
+        objective_metrics: Optional[Sequence[object]] = None,
+        calibration_methods: Optional[Sequence[object]] = None,
+        threshold_objectives: Optional[Sequence[object]] = None,
+        event_path: Optional[object] = None,
+        features_path: Optional[object] = None,
+        feature_source: str = "feature_selection",
+        test_size: float = 0.2,
+        val_size: float = 0.2,
+        n_trials: int = 25,
+        timeout: int = 1800,
+        optuna_n_jobs: int = 1,
+        parallel_jobs: int = 1,
+        xgb_parallel_jobs: int = 1,
+        search_space_config: Optional[Dict[str, object]] = None,
+        far_target: float = 0.20,
+        alerts_per_day: float = 5.0,
+        fn_cost: float = 10.0,
+        fp_cost: float = 1.0,
+        robust_folds: int = 3,
+        checkpoint_root: Optional[Path] = None,
+        result_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    ) -> Dict[str, object]:
+        if base_df is None or base_df.empty:
+            raise ValueError("El dataset base no puede estar vacío.")
+        if "interval_start" not in base_df.columns:
+            raise ValueError("El dataset debe incluir interval_start para split temporal.")
+        if pd.Series(base_df["target"]).astype(int).nunique() < 2:
+            raise ValueError("El target debe contener ambas clases.")
+
+        resolved_model_name = _resolve_controlled_models([model_name])[0]
+        numeric_feature_cols = _numeric_feature_cols(base_df)
+        if not numeric_feature_cols:
+            raise ValueError("No hay variables numéricas disponibles para el experimento.")
+
+        if selected_features is None:
+            feature_cols = list(numeric_feature_cols)
+        else:
+            feature_cols = [
+                str(feature)
+                for feature in selected_features
+                if str(feature) in numeric_feature_cols
+            ]
+        if not feature_cols:
+            raise ValueError("No hay variables efectivas para ejecutar el experimento.")
+
+        resolved_objective_metrics: List[str] = []
+        for metric in list(
+            objective_metrics
+            or [
+                "pr_auc",
+                "mcc",
+                "brier_score",
+                "balanced_f1",
+                "recall_at_alerts_per_day",
+                "operational_cost",
+                "far_sens",
+            ]
+        ):
+            normalized_metric = _normalize_controlled_objective_metric(metric)
+            if normalized_metric not in resolved_objective_metrics:
+                resolved_objective_metrics.append(normalized_metric)
+        resolved_calibration_methods: List[str] = []
+        for method in list(calibration_methods or ["sigmoid", "isotonic", "none"]):
+            normalized_method = normalize_calibration_method(method)
+            if normalized_method not in resolved_calibration_methods:
+                resolved_calibration_methods.append(normalized_method)
+        resolved_threshold_objectives: List[str] = []
+        for objective in list(
+            threshold_objectives or list(CALIBRATION_SWEEP_THRESHOLD_OBJECTIVES)
+        ):
+            normalized_objective = normalize_threshold_objective(objective)
+            if (
+                normalized_objective in CALIBRATION_SWEEP_THRESHOLD_OBJECTIVES
+                and normalized_objective not in resolved_threshold_objectives
+            ):
+                resolved_threshold_objectives.append(normalized_objective)
+        if not resolved_objective_metrics:
+            raise ValueError("Debe seleccionar al menos una métrica objetivo de Optuna.")
+        if not resolved_calibration_methods:
+            raise ValueError("Debe seleccionar al menos un método de calibración.")
+        if not resolved_threshold_objectives:
+            raise ValueError("Debe seleccionar al menos un objetivo de threshold.")
+
+        search_space = dict(search_space_config or {})
+
+        train_val_df, test_df = temporal_train_test_split(
+            base_df,
+            test_size=float(test_size),
+        )
+        train_df, val_df = temporal_train_test_split(
+            train_val_df,
+            test_size=float(val_size),
+        )
+        if train_df["target"].astype(int).nunique() < 2:
+            raise ValueError("El split temporal dejó una sola clase en train.")
+        if val_df["target"].astype(int).nunique() < 2:
+            raise ValueError("El split temporal dejó una sola clase en validación.")
+        if test_df["target"].astype(int).nunique() < 2:
+            raise ValueError("El split temporal dejó una sola clase en test.")
+
+        protocol = {
+            "protocol_family": CALIBRATION_SWEEP_PROTOCOL_FAMILY,
+            "protocol_version": CALIBRATION_SWEEP_PROTOCOL_VERSION,
+            "model_name": resolved_model_name,
+            "threshold_protocol": "robust",
+            "feature_source": str(feature_source),
+            "selected_features": list(feature_cols),
+            "selected_feature_count": int(len(feature_cols)),
+            "objective_metrics": list(resolved_objective_metrics),
+            "calibration_methods": list(resolved_calibration_methods),
+            "threshold_objectives": list(resolved_threshold_objectives),
+            "balance_modes": list(CALIBRATION_SWEEP_BALANCE_MODES),
+            "test_size": float(test_size),
+            "val_size": float(val_size),
+            "n_trials": int(n_trials),
+            "timeout": int(timeout),
+            "optuna_n_jobs": int(optuna_n_jobs),
+            "parallel_jobs": int(parallel_jobs),
+            "xgb_parallel_jobs": int(xgb_parallel_jobs),
+            "far_target": float(far_target),
+            "alerts_per_day": float(alerts_per_day),
+            "fn_cost": float(fn_cost),
+            "fp_cost": float(fp_cost),
+            "robust_folds": int(robust_folds),
+            "search_space": dict(search_space),
+        }
+        context = {
+            "protocol_version": CALIBRATION_SWEEP_PROTOCOL_VERSION,
+            "protocol": dict(protocol),
+            "event_fingerprint": _file_fingerprint(event_path),
+            "features_fingerprint": _file_fingerprint(features_path),
+        }
+        serialized_context = json.dumps(
+            context,
+            sort_keys=True,
+            ensure_ascii=True,
+            default=_json_default,
+        )
+        computed_run_id = hashlib.md5(
+            serialized_context.encode("utf-8")
+        ).hexdigest()
+        run_id = (
+            "calibration_sweep_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{computed_run_id[:8]}"
+        )
+        paths = _calibration_experiment_paths(
+            _calibration_experiment_run_dir(
+                run_id,
+                checkpoint_root=checkpoint_root,
+            )
+        )
+
+        combos = list(
+            itertools.product(
+                resolved_objective_metrics,
+                resolved_calibration_methods,
+                resolved_threshold_objectives,
+                CALIBRATION_SWEEP_BALANCE_MODES,
+            )
+        )
+
+        manifest: Dict[str, object] = {
+            "run_id": run_id,
+            "computed_run_id": computed_run_id,
+            "protocol_version": CALIBRATION_SWEEP_PROTOCOL_VERSION,
+            "protocol_family": CALIBRATION_SWEEP_PROTOCOL_FAMILY,
+            "protocol": dict(protocol),
+            "status": "running",
+            "result_status": "running",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "artifacts": {},
+            "steps_index": {},
+            "step_sequence": [],
+            "last_error": None,
+        }
+        _register_step(
+            manifest,
+            step_id="split_freeze",
+            status="pending",
+            message="Congelar split temporal.",
+        )
+        for objective_metric, calibration_method, threshold_objective, balance_mode in combos:
+            combo_step_id = (
+                "combo__"
+                f"{_slugify(objective_metric)}__{_slugify(calibration_method)}__"
+                f"{_slugify(threshold_objective)}__{_slugify(balance_mode)}"
+            )
+            _register_step(
+                manifest,
+                step_id=combo_step_id,
+                status="pending",
+                message=(
+                    f"{objective_metric} | {calibration_method} | "
+                    f"{threshold_objective} | {balance_mode}"
+                ),
+            )
+        _register_step(
+            manifest,
+            step_id="leaderboard",
+            status="pending",
+            message="Construir leaderboard y resúmenes.",
+        )
+        _refresh_manifest_progress(manifest)
+        _atomic_write_json(paths["manifest"], manifest)
+        _atomic_write_json(paths["protocol"], protocol)
+        _persist_live_event(
+            paths,
+            manifest,
+            step_id="init",
+            status="running",
+            message="Experimento de calibración iniciado.",
+        )
+
+        split_artifacts = self._persist_controlled_splits(
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            paths=paths,
+        )
+        _mark_step(
+            paths,
+            manifest,
+            step_id="split_freeze",
+            status="completed",
+            message="Split temporal congelado.",
+            artifact_paths=split_artifacts,
+            metadata={
+                "train_rows": int(len(train_df)),
+                "val_rows": int(len(val_df)),
+                "test_rows": int(len(test_df)),
+            },
+        )
+
+        grid_records: List[Dict[str, object]] = []
+        for combo_index, (
+            objective_metric,
+            calibration_method,
+            threshold_objective,
+            balance_mode,
+        ) in enumerate(combos, start=1):
+            combo_step_id = (
+                "combo__"
+                f"{_slugify(objective_metric)}__{_slugify(calibration_method)}__"
+                f"{_slugify(threshold_objective)}__{_slugify(balance_mode)}"
+            )
+            payload: Dict[str, object] = {
+                "experiment": "Calibration sweep",
+                "protocol_family": CALIBRATION_SWEEP_PROTOCOL_FAMILY,
+                "run_id": run_id,
+                "computed_run_id": computed_run_id,
+                "combo_id": combo_step_id,
+                "model_name": resolved_model_name,
+                "feature_source": str(feature_source),
+                "selected_feature_count": int(len(feature_cols)),
+                "selected_features": json.dumps(
+                    list(feature_cols),
+                    ensure_ascii=True,
+                ),
+                "balance_mode": str(balance_mode),
+                "threshold_protocol": "robust",
+                "threshold_protocol_label": THRESHOLD_PROTOCOL_LABELS.get(
+                    "robust",
+                    "robust",
+                ),
+                "threshold_objective": str(threshold_objective),
+                "threshold_objective_label": THRESHOLD_OBJECTIVE_LABELS.get(
+                    threshold_objective,
+                    str(threshold_objective).upper(),
+                ),
+                "calibration_method": str(calibration_method),
+                "objective_metric": str(objective_metric),
+                "optuna_objective_metric": str(objective_metric),
+                "objective_label": CONTROLLED_COMPARISON_OBJECTIVE_LABELS.get(
+                    objective_metric,
+                    str(objective_metric).upper(),
+                ),
+                "objective_direction": optuna_objective_direction(objective_metric),
+                "status": "pending",
+                "error": None,
+                "event_path": str(event_path or ""),
+                "features_path": str(features_path or ""),
+            }
+            _mark_step(
+                paths,
+                manifest,
+                step_id=combo_step_id,
+                status="running",
+                message=(
+                    f"Evaluando {combo_index}/{len(combos)}: "
+                    f"{objective_metric} | {calibration_method} | "
+                    f"{threshold_objective} | {balance_mode}"
+                ),
+                metadata={
+                    "model_name": resolved_model_name,
+                    "objective_metric": objective_metric,
+                    "calibration_method": calibration_method,
+                    "threshold_objective": threshold_objective,
+                    "balance_mode": balance_mode,
+                },
+            )
+            try:
+                result = self._optimize_controlled_combo(
+                    model_name=resolved_model_name,
+                    feature_set="Frozen selection",
+                    balance_mode=str(balance_mode),
+                    objective_metric=str(objective_metric),
+                    threshold_protocol="robust",
+                    threshold_objective=str(threshold_objective),
+                    calibration_method=str(calibration_method),
+                    far_target=float(far_target),
+                    alerts_per_day=float(alerts_per_day),
+                    fn_cost=float(fn_cost),
+                    fp_cost=float(fp_cost),
+                    robust_folds=int(robust_folds),
+                    selected_features=list(feature_cols),
+                    train_df=train_df,
+                    val_df=val_df,
+                    test_df=test_df,
+                    n_trials=int(n_trials),
+                    timeout=int(timeout),
+                    optuna_n_jobs=int(optuna_n_jobs),
+                    search_space_config=dict(search_space),
+                    parallel_jobs=int(parallel_jobs),
+                    xgb_parallel_jobs=int(xgb_parallel_jobs),
+                )
+                payload.update(
+                    _controlled_payload_updates_from_result(
+                        result,
+                        threshold_protocol="robust",
+                        threshold_objective=str(threshold_objective),
+                        threshold_objective_label=THRESHOLD_OBJECTIVE_LABELS.get(
+                            threshold_objective,
+                            str(threshold_objective).upper(),
+                        ),
+                        calibration_method=str(calibration_method),
+                        k_global=None,
+                        effective_k=int(len(feature_cols)),
+                        balance_mode=str(balance_mode),
+                        optuna_n_jobs=int(optuna_n_jobs),
+                        parallel_jobs=int(parallel_jobs),
+                        xgb_parallel_jobs=int(xgb_parallel_jobs),
+                    )
+                )
+                trials_path = paths["trials_dir"] / f"{combo_step_id}.csv"
+                if (
+                    isinstance(result.get("trials_df"), pd.DataFrame)
+                    and not result["trials_df"].empty
+                ):
+                    _write_checkpoint_frame(result["trials_df"], trials_path)
+                    payload["trials_csv"] = str(trials_path)
+                else:
+                    payload["trials_csv"] = None
+                _mark_step(
+                    paths,
+                    manifest,
+                    step_id=combo_step_id,
+                    status="completed",
+                    message="Combinación evaluada.",
+                    artifact_paths={
+                        "trials_csv": str(trials_path),
+                    }
+                    if payload.get("trials_csv")
+                    else {},
+                    metadata={
+                        "objective_metric": objective_metric,
+                        "calibration_method": calibration_method,
+                        "threshold_objective": threshold_objective,
+                        "balance_mode": balance_mode,
+                        "val_objective_score": payload.get("val_objective_score"),
+                    },
+                )
+            except Exception as exc:
+                payload["status"] = "failed"
+                payload["error"] = str(exc)
+                _mark_step(
+                    paths,
+                    manifest,
+                    step_id=combo_step_id,
+                    status="failed",
+                    message=f"Combinación falló: {exc}",
+                    metadata={
+                        "objective_metric": objective_metric,
+                        "calibration_method": calibration_method,
+                        "threshold_objective": threshold_objective,
+                        "balance_mode": balance_mode,
+                    },
+                )
+            grid_records.append(dict(payload))
+            grid_results_df = pd.DataFrame(grid_records)
+            _write_checkpoint_frame(grid_results_df, paths["grid_results"])
+            if result_callback:
+                result_callback(dict(payload))
+
+        _mark_step(
+            paths,
+            manifest,
+            step_id="leaderboard",
+            status="running",
+            message="Construyendo leaderboard robusto.",
+        )
+        grid_results_df = _read_checkpoint_frame(paths["grid_results"])
+        leaderboard_df, pareto_front_df = _build_calibration_sweep_leaderboard(
+            grid_results_df
+        )
+        best_summary_df, best_summary_payload = _build_calibration_sweep_best_summary(
+            leaderboard_df
+        )
+        _write_checkpoint_frame(leaderboard_df, paths["leaderboard"])
+        _write_checkpoint_frame(pareto_front_df, paths["pareto_front"])
+        _write_checkpoint_frame(best_summary_df, paths["best_summary"])
+        _atomic_write_json(paths["best_summary_json"], best_summary_payload)
+        _mark_step(
+            paths,
+            manifest,
+            step_id="leaderboard",
+            status="completed",
+            message="Leaderboard persistido.",
+            artifact_paths={
+                "leaderboard": str(paths["leaderboard"]),
+                "pareto_front": str(paths["pareto_front"]),
+                "best_summary": str(paths["best_summary"]),
+                "best_summary_json": str(paths["best_summary_json"]),
+            },
+            metadata={
+                "completed_rows": int(len(leaderboard_df)),
+                "pareto_rows": int(len(pareto_front_df)),
+            },
+        )
+        manifest["status"] = "completed"
+        manifest["result_status"] = "completed"
+        manifest["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        manifest["completed_at"] = datetime.now().isoformat(timespec="seconds")
+        manifest["artifacts"] = {
+            "protocol": str(paths["protocol"]),
+            "grid_results": str(paths["grid_results"]),
+            "leaderboard": str(paths["leaderboard"]),
+            "pareto_front": str(paths["pareto_front"]),
+            "best_summary": str(paths["best_summary"]),
+            "best_summary_json": str(paths["best_summary_json"]),
+        }
+        _refresh_manifest_progress(manifest)
+        _atomic_write_json(paths["manifest"], manifest)
+        _persist_live_event(
+            paths,
+            manifest,
+            step_id="complete",
+            status="completed",
+            message="Experimento de calibración finalizado.",
+            extra={"artifact_paths": manifest.get("artifacts") or {}},
+        )
+        return {
+            "run_id": run_id,
+            "computed_run_id": computed_run_id,
+            "protocol": protocol,
+            "grid_results_df": grid_results_df,
+            "leaderboard_df": leaderboard_df,
+            "pareto_front_df": pareto_front_df,
+            "best_summary_df": best_summary_df,
+            "best_summary_payload": best_summary_payload,
+            "checkpoint_manifest": manifest,
+            "checkpoint_manifest_path": str(paths["manifest"]),
+            "checkpoint_run_dir": str(paths["run_dir"]),
+            "result_status": str(manifest.get("result_status") or ""),
         }
 
     def _load_controlled_splits(
@@ -3079,6 +4086,7 @@ class ExperimentsRunner:
         objective_label = CONTROLLED_COMPARISON_OBJECTIVE_LABELS.get(
             objective_metric, str(objective_metric).upper()
         )
+        objective_direction = optuna_objective_direction(objective_metric)
         threshold_objective_label = THRESHOLD_OBJECTIVE_LABELS.get(
             threshold_objective,
             str(threshold_objective).upper(),
@@ -3184,6 +4192,7 @@ class ExperimentsRunner:
             "metric": objective_metric,
             "objective_metric": objective_metric,
             "objective_label": objective_label,
+            "objective_direction": objective_direction,
             "optuna_objective_metric": objective_metric,
             "optuna_objective_label": objective_label,
             "threshold_protocols": list(resolved_threshold_protocols),
@@ -3664,6 +4673,7 @@ class ExperimentsRunner:
                     "calibration_method": calibration_method,
                     "objective_metric": objective_metric,
                     "objective_label": objective_label,
+                    "objective_direction": objective_direction,
                     "optuna_objective_metric": objective_metric,
                     "optuna_objective_label": objective_label,
                     "k": int(k_value),
@@ -4145,6 +5155,7 @@ class ExperimentsRunner:
                 "calibration_method": calibration_method,
                 "objective_metric": objective_metric,
                 "objective_label": objective_label,
+                "objective_direction": objective_direction,
                 "optuna_objective_metric": objective_metric,
                 "optuna_objective_label": objective_label,
                 "k": int(k_value),
@@ -4312,6 +5323,8 @@ class ExperimentsRunner:
                 "test_roc_auc",
                 "val_pr_auc",
                 "test_pr_auc",
+                "val_brier_score",
+                "test_brier_score",
                 "val_f1",
                 "test_f1",
                 "val_f1_global",
@@ -4353,6 +5366,7 @@ class ExperimentsRunner:
 
         best_summary_rows: List[Dict[str, object]] = []
         if not completed_grid_df.empty:
+            objective_sort_ascending = objective_direction == "minimize"
             if use_frozen_tuning_ablation:
                 grouping_cols = [
                     "model_name",
@@ -4362,7 +5376,10 @@ class ExperimentsRunner:
                     "threshold_protocol",
                 ]
                 sort_cols = grouping_cols + ["val_objective_score", "k"]
-                sort_ascending = [True] * len(grouping_cols) + [False, True]
+                sort_ascending = [True] * len(grouping_cols) + [
+                    objective_sort_ascending,
+                    True,
+                ]
             else:
                 grouping_cols = [
                     "model_name",
@@ -4371,7 +5388,10 @@ class ExperimentsRunner:
                     "threshold_protocol",
                 ]
                 sort_cols = grouping_cols + ["val_objective_score", "k"]
-                sort_ascending = [True] * len(grouping_cols) + [False, True]
+                sort_ascending = [True] * len(grouping_cols) + [
+                    objective_sort_ascending,
+                    True,
+                ]
             sort_df = completed_grid_df.sort_values(
                 sort_cols,
                 ascending=sort_ascending,
@@ -4413,6 +5433,7 @@ class ExperimentsRunner:
                         "calibration_method": best_row.get("calibration_method"),
                         "objective_metric": best_row.get("objective_metric"),
                         "objective_label": best_row.get("objective_label"),
+                        "objective_direction": best_row.get("objective_direction"),
                         "optuna_objective_metric": best_row.get(
                             "optuna_objective_metric",
                             best_row.get("objective_metric"),
@@ -4429,7 +5450,9 @@ class ExperimentsRunner:
                         "best_test_sensitivity": best_row.get("test_sensitivity"),
                         "best_test_roc_auc": best_row.get("test_roc_auc"),
                         "best_test_pr_auc": best_row.get("test_pr_auc"),
+                        "best_test_brier_score": best_row.get("test_brier_score"),
                         "val_roc_auc": best_row.get("val_roc_auc"),
+                        "val_brier_score": best_row.get("val_brier_score"),
                         "best_test_f1": best_row.get("test_f1"),
                         "best_test_f1_global": best_row.get("test_f1_global"),
                         "best_test_balanced_f1": best_row.get(
@@ -4544,6 +5567,7 @@ class ExperimentsRunner:
                     "ranking_protocol",
                     "val_objective_score",
                     "val_roc_auc",
+                    "val_brier_score",
                     "val_f1",
                     "val_pr_auc",
                     "val_f1_global",

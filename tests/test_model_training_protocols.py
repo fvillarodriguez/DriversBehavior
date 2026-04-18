@@ -6,6 +6,7 @@ from src import model_training
 from src.model_training import (
     compute_extended_metrics,
     select_threshold_for_metric,
+    score_optuna_objective,
     train_model,
 )
 
@@ -105,6 +106,45 @@ def test_operational_cost_threshold_prefers_false_positive_when_fn_cost_is_high(
     assert high_fp["threshold"] > 0.6
 
 
+def test_extended_metrics_include_brier_score():
+    y_true = np.asarray([0, 1, 1, 0])
+    scores = np.asarray([0.1, 0.8, 0.6, 0.3])
+
+    metrics = compute_extended_metrics(y_true, scores, threshold=0.5)
+
+    expected = np.mean((scores - y_true) ** 2)
+    assert metrics["brier_score"] == pytest.approx(expected)
+    assert metrics["brier"] == pytest.approx(expected)
+    assert metrics["positive_support"] == 2
+    assert metrics["tp_capture"] == pytest.approx(1.0)
+    assert metrics["fn_rate"] == pytest.approx(0.0)
+
+
+def test_score_optuna_objective_supports_brier_and_mcc():
+    y_true = np.asarray([0, 1, 1, 0])
+    scores = np.asarray([0.1, 0.8, 0.6, 0.3])
+
+    brier = score_optuna_objective(
+        y_true,
+        scores,
+        objective_metric="brier",
+        threshold=0.5,
+    )
+    mcc = score_optuna_objective(
+        y_true,
+        scores,
+        objective_metric="mcc",
+        threshold=0.5,
+    )
+
+    assert brier["objective_metric"] == "brier_score"
+    assert brier["objective_direction"] == "minimize"
+    assert brier["score"] == pytest.approx(np.mean((scores - y_true) ** 2))
+    assert mcc["objective_metric"] == "mcc"
+    assert mcc["objective_direction"] == "maximize"
+    assert mcc["score"] == pytest.approx(1.0)
+
+
 class _ScoreModel:
     def fit(self, X, y):
         return self
@@ -201,3 +241,69 @@ def test_internal_smote_is_called_only_on_training_partitions(monkeypatch):
     assert result["threshold_protocol"] == "robust"
     assert observed_rows
     assert max(observed_rows) < len(df)
+
+
+@pytest.mark.parametrize(
+    ("calibration_method", "shift"),
+    [("sigmoid", 0.05), ("isotonic", 0.10)],
+)
+def test_threshold_selection_uses_calibrated_scores(monkeypatch, calibration_method, shift):
+    monkeypatch.setattr(
+        model_training,
+        "build_model",
+        lambda model_name, params, random_state: _ScoreModel(),
+    )
+    observed = {"scores": None, "methods": []}
+
+    class _FakeCalibrator:
+        def __init__(self, method: str, delta: float) -> None:
+            self.method = method
+            self.delta = float(delta)
+
+        def transform(self, scores):
+            return np.asarray(scores, dtype=float) + self.delta
+
+    def _fake_fit_score_calibrator(y_true, scores, *, method="none"):
+        observed["methods"].append(str(method))
+        return _FakeCalibrator(str(method), shift)
+
+    def _fake_select_threshold_for_metric(y_true, scores, **kwargs):
+        observed["scores"] = np.asarray(scores, dtype=float)
+        return {
+            "threshold": 0.5,
+            "objective_score": 1.0,
+            "objective": kwargs.get("objective", "balanced_f1"),
+            "threshold_n_jobs": 1,
+        }
+
+    monkeypatch.setattr(
+        model_training,
+        "fit_score_calibrator",
+        _fake_fit_score_calibrator,
+    )
+    monkeypatch.setattr(
+        model_training,
+        "select_threshold_for_metric",
+        _fake_select_threshold_for_metric,
+    )
+
+    df = _protocol_df()
+    result = train_model(
+        df,
+        ["signal"],
+        "Random Forest",
+        {"n_estimators": 10, "max_depth": None},
+        test_size=0.2,
+        val_size=0.25,
+        far_target=0.2,
+        random_state=42,
+        threshold_protocol="conservative",
+        threshold_objective="balanced_f1",
+        calibration_method=calibration_method,
+    )
+
+    assert observed["methods"] == [calibration_method]
+    assert observed["scores"] is not None
+    assert observed["scores"].max() == pytest.approx(0.8 + shift)
+    assert result["calibration_method"] == calibration_method
+    assert result["metrics"]["calibration_method"] == calibration_method

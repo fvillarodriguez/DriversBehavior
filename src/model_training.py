@@ -13,6 +13,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
+    brier_score_loss,
     confusion_matrix,
     f1_score,
     matthews_corrcoef,
@@ -38,9 +39,41 @@ THRESHOLD_OBJECTIVE_LABELS = {
     "pr_auc": "PR-AUC",
     "roc_auc": "ROC-AUC",
 }
+OPTUNA_OBJECTIVE_LABELS = {
+    "f1": "F1",
+    "roc_auc": "ROC-AUC",
+    "pr_auc": "PR-AUC",
+    "accuracy": "Accuracy",
+    "recall": "Recall",
+    "precision": "Precision",
+    "fnr": "FNR",
+    "far_sens": "FAR - Sensibilidad",
+    "balanced_f1": "Balanced F1",
+    "mcc": "MCC",
+    "brier_score": "Brier",
+    "recall_at_alerts_per_day": "Recall@N alertas/dia",
+    "operational_cost": "Costo operacional",
+    "net_balanced_rate": "(TP-FP)/P + (TN-FN)/N",
+}
+OPTUNA_OBJECTIVE_DIRECTIONS = {
+    "f1": "maximize",
+    "roc_auc": "maximize",
+    "pr_auc": "maximize",
+    "accuracy": "maximize",
+    "recall": "maximize",
+    "precision": "maximize",
+    "fnr": "minimize",
+    "far_sens": "minimize",
+    "balanced_f1": "maximize",
+    "mcc": "maximize",
+    "brier_score": "minimize",
+    "recall_at_alerts_per_day": "maximize",
+    "operational_cost": "minimize",
+    "net_balanced_rate": "maximize",
+}
 CALIBRATION_METHOD_LABELS = {
-    "none": "Sin calibracion",
-    "sigmoid": "Sigmoid",
+    "none": "Sin calibración",
+    "sigmoid": "Platt scaling (sigmoid)",
     "isotonic": "Isotonic",
 }
 BALANCE_STRATEGY_LABELS = {
@@ -98,15 +131,68 @@ def normalize_threshold_objective(value: object) -> str:
     return aliases.get(text, "far")
 
 
+def normalize_optuna_objective_metric(value: object) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "": "f1",
+        "best_f1": "f1",
+        "f1": "f1",
+        "auc": "roc_auc",
+        "rocauc": "roc_auc",
+        "roc_auc": "roc_auc",
+        "roc-auc": "roc_auc",
+        "pr_auc": "pr_auc",
+        "pr-auc": "pr_auc",
+        "average_precision": "pr_auc",
+        "accuracy": "accuracy",
+        "acc": "accuracy",
+        "recall": "recall",
+        "sensitivity": "recall",
+        "precision": "precision",
+        "fnr": "fnr",
+        "false_negative_rate": "fnr",
+        "far_sens": "far_sens",
+        "far_sensitivity": "far_sens",
+        "far_minus_sens": "far_sens",
+        "balanced_f1": "balanced_f1",
+        "balanced f1": "balanced_f1",
+        "macro_f1": "balanced_f1",
+        "f1_global": "balanced_f1",
+        "mcc": "mcc",
+        "brier": "brier_score",
+        "brier_score": "brier_score",
+        "brier score": "brier_score",
+        "brier_loss": "brier_score",
+        "recall@n": "recall_at_alerts_per_day",
+        "recall_at_n": "recall_at_alerts_per_day",
+        "recall_at_alerts_per_day": "recall_at_alerts_per_day",
+        "recall_alerts": "recall_at_alerts_per_day",
+        "operational_cost": "operational_cost",
+        "cost": "operational_cost",
+        "costo operacional": "operational_cost",
+        "net_balanced_rate": "net_balanced_rate",
+        "(tp-fp)/p + (tn-fn)/n": "net_balanced_rate",
+    }
+    return aliases.get(text, "f1")
+
+
+def optuna_objective_direction(metric: object) -> str:
+    metric_key = normalize_optuna_objective_metric(metric)
+    return OPTUNA_OBJECTIVE_DIRECTIONS.get(metric_key, "maximize")
+
+
 def normalize_calibration_method(value: object) -> str:
     text = str(value or "").strip().lower()
     aliases = {
         "": "none",
         "none": "none",
         "sin calibracion": "none",
+        "sin calibración": "none",
         "no": "none",
         "sigmoid": "sigmoid",
         "platt": "sigmoid",
+        "platt scaling": "sigmoid",
+        "platt scaling (sigmoid)": "sigmoid",
         "isotonic": "isotonic",
         "isotonic_regression": "isotonic",
     }
@@ -688,6 +774,19 @@ def _maybe_pr_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
         return float("nan")
 
 
+def _maybe_brier_score(y_true: np.ndarray, scores: np.ndarray) -> float:
+    y_arr = np.asarray(y_true).astype(int)
+    scores_arr = np.asarray(scores, dtype=float)
+    valid_mask = np.isfinite(scores_arr)
+    if y_arr.size == 0 or not np.any(valid_mask):
+        return float("nan")
+    try:
+        clipped_scores = np.clip(scores_arr[valid_mask], 0.0, 1.0)
+        return float(brier_score_loss(y_arr[valid_mask], clipped_scores))
+    except Exception:
+        return float("nan")
+
+
 def threshold_candidates(scores: np.ndarray) -> np.ndarray:
     arr = np.asarray(scores, dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -857,6 +956,14 @@ def compute_extended_metrics(
     alert_count = int(tp + fp)
     false_alarm_count = int(fp)
     operational_cost = float(fn_cost) * float(fn) + float(fp_cost) * float(fp)
+    brier = _maybe_brier_score(y_arr, scores_arr)
+    positive_support = int(tp + fn)
+    tp_capture = (
+        float(tp / positive_support) if positive_support > 0 else float("nan")
+    )
+    fn_rate = (
+        float(fn / positive_support) if positive_support > 0 else float("nan")
+    )
     if recall_at_info is None:
         recall_at_info = recall_at_alerts_per_day(
             y_arr,
@@ -873,6 +980,8 @@ def compute_extended_metrics(
         "far": float(far_val),
         "roc_auc": _maybe_roc_auc(y_arr, scores_arr),
         "pr_auc": _maybe_pr_auc(y_arr, scores_arr),
+        "brier_score": brier,
+        "brier": brier,
         "f1": float(f1_score(y_arr, preds, zero_division=0)),
         "balanced_f1": float(f1_score(y_arr, preds, average="macro", zero_division=0)),
         "f1_global": float(f1_score(y_arr, preds, average="macro", zero_division=0)),
@@ -883,6 +992,9 @@ def compute_extended_metrics(
         "false_positives": int(fp),
         "true_negatives": int(tn),
         "true_positives": int(tp),
+        "positive_support": int(positive_support),
+        "tp_capture": float(tp_capture),
+        "fn_rate": float(fn_rate),
         "alerts": int(alert_count),
         "alerts_per_day": float(alert_count / days),
         "false_alarms_per_day": float(false_alarm_count / days),
@@ -1245,6 +1357,110 @@ def select_threshold_for_metric(
         "alerts_per_day": float(metrics.get("alerts_per_day", np.nan)),
         "operational_cost": float(metrics.get("operational_cost", np.nan)),
         "note": "",
+    }
+
+
+def score_optuna_objective(
+    y_true: np.ndarray,
+    scores: np.ndarray,
+    *,
+    objective_metric: str = "f1",
+    threshold: Optional[float] = None,
+    threshold_objective: str = "far",
+    eval_df: Optional[pd.DataFrame] = None,
+    far_target: float = 0.20,
+    alerts_per_day: float = 5.0,
+    fn_cost: float = 10.0,
+    fp_cost: float = 1.0,
+    threshold_n_jobs: Optional[int] = None,
+) -> Dict[str, object]:
+    """Score a validation fold for Optuna with the Crash Prediction metric catalog."""
+    y_arr = np.asarray(y_true).astype(int)
+    scores_arr = np.asarray(scores, dtype=float)
+    metric_key = normalize_optuna_objective_metric(objective_metric)
+    direction = optuna_objective_direction(metric_key)
+    threshold_objective_key = normalize_threshold_objective(threshold_objective)
+    effective_threshold_n_jobs = _coerce_threshold_n_jobs(threshold_n_jobs)
+
+    if threshold is None:
+        threshold_info = select_threshold_for_metric(
+            y_arr,
+            scores_arr,
+            objective=threshold_objective_key,
+            eval_df=eval_df,
+            far_target=float(far_target),
+            alerts_per_day=float(alerts_per_day),
+            fn_cost=float(fn_cost),
+            fp_cost=float(fp_cost),
+            n_jobs=int(effective_threshold_n_jobs),
+        )
+        threshold_value = float(threshold_info["threshold"])
+    else:
+        threshold_value = float(threshold)
+        threshold_info = {
+            "threshold": threshold_value,
+            "objective": threshold_objective_key,
+            "objective_score": float("nan"),
+            "threshold_n_jobs": int(effective_threshold_n_jobs),
+            "note": "Threshold provisto por el trial.",
+        }
+
+    metrics = compute_extended_metrics(
+        y_arr,
+        scores_arr,
+        threshold=threshold_value,
+        eval_df=eval_df,
+        alerts_per_day=float(alerts_per_day),
+        fn_cost=float(fn_cost),
+        fp_cost=float(fp_cost),
+    )
+    preds = (scores_arr >= threshold_value).astype(int)
+
+    if metric_key == "fnr":
+        fn = float(metrics.get("false_negatives", 0.0))
+        tp = float(metrics.get("true_positives", 0.0))
+        score = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
+    elif metric_key == "far_sens":
+        score = float(metrics.get("far", 0.0)) - (
+            float(metrics.get("sensitivity", 0.0)) * 1e-3
+        )
+    elif metric_key == "brier_score":
+        score = float(metrics.get("brier_score", float("nan")))
+    elif metric_key == "net_balanced_rate":
+        tp = float(metrics.get("true_positives", 0.0))
+        fp = float(metrics.get("false_positives", 0.0))
+        tn = float(metrics.get("true_negatives", 0.0))
+        fn = float(metrics.get("false_negatives", 0.0))
+        total_pos = tp + fn
+        total_neg = tn + fp
+        pos_term = (tp - fp) / total_pos if total_pos > 0 else 0.0
+        neg_term = (tn - fn) / total_neg if total_neg > 0 else 0.0
+        score = float(pos_term + neg_term)
+    else:
+        metric_lookup = {
+            "f1": "f1",
+            "roc_auc": "roc_auc",
+            "pr_auc": "pr_auc",
+            "accuracy": "accuracy",
+            "recall": "recall",
+            "precision": "precision",
+            "balanced_f1": "balanced_f1",
+            "mcc": "mcc",
+            "recall_at_alerts_per_day": "recall_at_alerts_per_day",
+            "operational_cost": "operational_cost",
+        }
+        score = float(metrics.get(metric_lookup.get(metric_key, "f1"), float("nan")))
+
+    return {
+        "score": float(score),
+        "objective_metric": metric_key,
+        "objective_label": OPTUNA_OBJECTIVE_LABELS.get(metric_key, metric_key.upper()),
+        "objective_direction": direction,
+        "threshold": float(threshold_value),
+        "threshold_objective": threshold_objective_key,
+        "threshold_info": threshold_info,
+        "metrics": metrics,
+        "preds": preds,
     }
 
 

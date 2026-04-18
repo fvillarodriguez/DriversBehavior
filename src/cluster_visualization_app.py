@@ -29,15 +29,42 @@ def list_cluster_files() -> list[Path]:
     return [path for path in candidates if CLUSTER_LABEL_PATTERN.match(path.name)]
 
 
-def normalize_profile(profile: pd.DataFrame, method: str) -> pd.DataFrame:
+def normalize_profile(
+    profile: pd.DataFrame,
+    method: str,
+    reference: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    ref_profile = (
+        reference
+        if reference is not None and not reference.empty
+        else profile
+    )
     if method == "Z-score":
-        means = profile.mean()
-        stds = profile.std(ddof=0).replace(0, 1)
-        return (profile - means) / stds
+        means = ref_profile.mean()
+        stds = ref_profile.std(ddof=0)
+        normalized = profile - means
+        variable_cols = stds[stds != 0].index
+        constant_cols = stds[stds == 0].index
+        if len(variable_cols) > 0:
+            normalized.loc[:, variable_cols] = normalized.loc[
+                :, variable_cols
+            ].div(stds.loc[variable_cols], axis=1)
+        if len(constant_cols) > 0:
+            normalized.loc[:, constant_cols] = 0.0
+        return normalized
     if method == "Min-max":
-        mins = profile.min()
-        ranges = (profile.max() - mins).replace(0, 1)
-        return (profile - mins) / ranges
+        mins = ref_profile.min()
+        ranges = ref_profile.max() - mins
+        normalized = profile - mins
+        variable_cols = ranges[ranges != 0].index
+        constant_cols = ranges[ranges == 0].index
+        if len(variable_cols) > 0:
+            normalized.loc[:, variable_cols] = normalized.loc[
+                :, variable_cols
+            ].div(ranges.loc[variable_cols], axis=1)
+        if len(constant_cols) > 0:
+            normalized.loc[:, constant_cols] = 0.0
+        return normalized
     return profile
 
 
@@ -267,13 +294,22 @@ def main() -> None:
         elif not radar_clusters:
             st.info("Seleccione al menos un cluster.")
         else:
+            radar_reference = (
+                df.groupby("cluster_label")[radar_vars]
+                .mean()
+                .sort_index()
+            )
             radar_profile = (
                 df[df["cluster_label"].isin(radar_clusters)]
                 .groupby("cluster_label")[radar_vars]
                 .mean()
                 .sort_index()
             )
-            radar_profile = normalize_profile(radar_profile, "Min-max")
+            radar_profile = normalize_profile(
+                radar_profile,
+                "Min-max",
+                reference=radar_reference,
+            )
             theta = radar_vars + [radar_vars[0]]
             fill_mode = "toself" if len(radar_clusters) <= 6 else None
             radar_fig = go.Figure()

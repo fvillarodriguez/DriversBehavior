@@ -113,6 +113,95 @@ def test_run_optimization_loop_forwards_optuna_n_jobs(tmp_path, monkeypatch):
     assert result["optuna_n_jobs"] == 2
 
 
+def test_run_optimization_loop_applies_requested_calibration(tmp_path, monkeypatch):
+    base_df, feature_cols, _base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    runner = ExperimentsRunner(random_state=42)
+    train_val_df, test_df = temporal_train_test_split(base_df, test_size=0.2)
+    train_df, val_df = temporal_train_test_split(train_val_df, test_size=0.25)
+    search_space = {
+        "smote": {
+            "k_neighbors": {"min": 1, "max": 1},
+            "sampling_strategy": {"min": 1.0, "max": 1.0},
+        },
+        "model": {
+            "n_estimators": {"min": 10, "max": 10},
+            "max_depth": {"min": 0, "max": 0},
+        },
+    }
+
+    observed = {"methods": [], "scores": []}
+
+    class _FakeCalibrator:
+        def __init__(self, method: str) -> None:
+            self.method = method
+
+        def transform(self, scores):
+            scores_arr = np.asarray(scores, dtype=float)
+            observed["scores"].append(scores_arr + 0.1)
+            return scores_arr + 0.1
+
+    def _fake_fit_score_calibrator(y_true, scores, *, method="none"):
+        observed["methods"].append(str(method))
+        return _FakeCalibrator(str(method))
+
+    def _fake_score_optuna_objective(y_true, scores, **kwargs):
+        observed["scores"].append(np.asarray(scores, dtype=float))
+        return {
+            "score": 1.0,
+            "threshold": 0.5,
+            "objective_metric": kwargs.get("objective_metric", "f1"),
+            "objective_label": "F1",
+            "objective_direction": "maximize",
+            "metrics": {
+                "f1": 1.0,
+                "accuracy": 1.0,
+                "recall": 1.0,
+                "precision": 1.0,
+                "roc_auc": 1.0,
+                "pr_auc": 1.0,
+                "balanced_f1": 1.0,
+                "mcc": 1.0,
+                "brier_score": 0.0,
+                "far": 0.0,
+                "sensitivity": 1.0,
+                "true_negatives": 1,
+                "false_positives": 0,
+                "false_negatives": 0,
+                "true_positives": 1,
+            },
+        }
+
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "fit_score_calibrator",
+        _fake_fit_score_calibrator,
+    )
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "score_optuna_objective",
+        _fake_score_optuna_objective,
+    )
+
+    result = runner.run_optimization_loop(
+        train_df=train_df,
+        val_df=val_df,
+        test_df=test_df,
+        feature_cols=feature_cols,
+        model_choice="Random Forest",
+        n_trials=1,
+        timeout=30,
+        far_target=0.2,
+        search_space_config=search_space,
+        threshold_strategy="far",
+        calibration_method="sigmoid",
+    )
+
+    assert observed["methods"]
+    assert set(observed["methods"]) == {"sigmoid"}
+    assert observed["scores"]
+    assert result["calibration_method"] == "sigmoid"
+
+
 def _controlled_search_space() -> dict:
     return {
         "smote": {
@@ -223,6 +312,380 @@ def _expected_k_grid(k_min: int, k_max: int, k_step: int, feature_count: int) ->
     if values[-1] != resolved_max:
         values.append(resolved_max)
     return sorted({int(value) for value in values if value > 0})
+
+
+def _synthetic_calibration_base_df(rows: int = 120) -> pd.DataFrame:
+    idx = np.arange(rows)
+    target = (((idx % 11) == 0) | ((idx % 17) == 0)).astype(int)
+    return pd.DataFrame(
+        {
+            "interval_start": pd.date_range("2024-01-01", periods=rows, freq="h"),
+            "signal": np.where(target == 1, 0.9, 0.2),
+            "aux_signal": np.where(target == 1, 0.7, 0.3) + (idx % 5) * 0.01,
+            "target": target,
+        }
+    )
+
+
+def test_calibration_sweep_leaderboard_applies_pareto_and_rankable_rules():
+    grid_results_df = pd.DataFrame(
+        [
+            {
+                "combo_id": "best",
+                "status": "completed",
+                "balance_mode": "none",
+                "optuna_objective_metric": "mcc",
+                "calibration_method": "sigmoid",
+                "threshold_objective": "far",
+                "val_mcc": 0.70,
+                "val_brier_score": 0.10,
+                "val_pr_auc": 0.80,
+                "val_true_positives": 4,
+                "val_false_negatives": 1,
+                "val_far": 0.10,
+            },
+            {
+                "combo_id": "dominated",
+                "status": "completed",
+                "balance_mode": "smote",
+                "optuna_objective_metric": "mcc",
+                "calibration_method": "isotonic",
+                "threshold_objective": "far",
+                "val_mcc": 0.50,
+                "val_brier_score": 0.20,
+                "val_pr_auc": 0.60,
+                "val_true_positives": 3,
+                "val_false_negatives": 2,
+                "val_far": 0.20,
+            },
+            {
+                "combo_id": "not_rankable",
+                "status": "completed",
+                "balance_mode": "none",
+                "optuna_objective_metric": "brier_score",
+                "calibration_method": "none",
+                "threshold_objective": "f1",
+                "val_mcc": 0.40,
+                "val_brier_score": 0.15,
+                "val_pr_auc": 0.55,
+                "val_true_positives": 0,
+                "val_false_negatives": 5,
+                "val_far": 0.05,
+            },
+        ]
+    )
+
+    leaderboard_df, pareto_front_df = (
+        experiments_logic_module._build_calibration_sweep_leaderboard(
+            grid_results_df
+        )
+    )
+
+    best_row = leaderboard_df.loc[leaderboard_df["combo_id"] == "best"].iloc[0]
+    dominated_row = leaderboard_df.loc[
+        leaderboard_df["combo_id"] == "dominated"
+    ].iloc[0]
+    not_rankable_row = leaderboard_df.loc[
+        leaderboard_df["combo_id"] == "not_rankable"
+    ].iloc[0]
+
+    assert bool(best_row["rankable"]) is True
+    assert int(best_row["pareto_front"]) == 1
+    assert int(best_row["rank"]) == 1
+    assert bool(dominated_row["rankable"]) is True
+    assert int(dominated_row["pareto_front"]) > int(best_row["pareto_front"])
+    assert pd.isna(not_rankable_row["pareto_front"])
+    assert bool(not_rankable_row["rankable"]) is False
+    assert pd.isna(not_rankable_row["rank"])
+    assert pareto_front_df["combo_id"].tolist() == ["best"]
+
+
+def test_calibration_sweep_leaderboard_breaks_ties_with_stability_score():
+    grid_results_df = pd.DataFrame(
+        [
+            {
+                "combo_id": "stable",
+                "status": "completed",
+                "balance_mode": "none",
+                "optuna_objective_metric": "mcc",
+                "calibration_method": "sigmoid",
+                "threshold_objective": "far",
+                "val_mcc": 0.70,
+                "val_brier_score": 0.12,
+                "val_pr_auc": 0.70,
+                "val_true_positives": 4,
+                "val_false_negatives": 1,
+                "val_far": 0.12,
+            },
+            {
+                "combo_id": "unstable",
+                "status": "completed",
+                "balance_mode": "smote",
+                "optuna_objective_metric": "mcc",
+                "calibration_method": "isotonic",
+                "threshold_objective": "far",
+                "val_mcc": 0.90,
+                "val_brier_score": 0.27,
+                "val_pr_auc": 0.90,
+                "val_true_positives": 4,
+                "val_false_negatives": 1,
+                "val_far": 0.27,
+            },
+            {
+                "combo_id": "anchor",
+                "status": "completed",
+                "balance_mode": "none",
+                "optuna_objective_metric": "pr_auc",
+                "calibration_method": "none",
+                "threshold_objective": "mcc",
+                "val_mcc": 0.50,
+                "val_brier_score": 0.30,
+                "val_pr_auc": 0.50,
+                "val_true_positives": 2,
+                "val_false_negatives": 3,
+                "val_far": 0.30,
+            },
+        ]
+    )
+
+    leaderboard_df, _pareto_front_df = (
+        experiments_logic_module._build_calibration_sweep_leaderboard(
+            grid_results_df
+        )
+    )
+    ordered_ids = leaderboard_df.loc[
+        leaderboard_df["rankable"].astype(bool),
+        "combo_id",
+    ].tolist()
+    stable_row = leaderboard_df.loc[leaderboard_df["combo_id"] == "stable"].iloc[0]
+    unstable_row = leaderboard_df.loc[
+        leaderboard_df["combo_id"] == "unstable"
+    ].iloc[0]
+
+    assert int(stable_row["pareto_front"]) == 1
+    assert int(unstable_row["pareto_front"]) == 1
+    assert float(stable_row["stability_score"]) > float(
+        unstable_row["stability_score"]
+    )
+    assert ordered_ids[:2] == ["stable", "unstable"]
+
+
+def test_calibration_sweep_search_space_preserves_none_imbalance_knobs():
+    runner = ExperimentsRunner(random_state=42)
+    y_train = pd.Series(([0] * 24) + ([1] * 6))
+
+    rf_space = runner._controlled_comparison_search_space(
+        model_name="Random Forest",
+        balance_mode="none",
+        search_space_config={},
+        y_train=y_train,
+    )
+    svm_space = runner._controlled_comparison_search_space(
+        model_name="SVM",
+        balance_mode="none",
+        search_space_config={},
+        y_train=y_train,
+    )
+    xgb_space = runner._controlled_comparison_search_space(
+        model_name="XGBoost",
+        balance_mode="none",
+        search_space_config={},
+        y_train=y_train,
+    )
+    nn_space = runner._controlled_comparison_search_space(
+        model_name="Neural Network",
+        balance_mode="none",
+        search_space_config={},
+        y_train=y_train,
+    )
+    balanced_rf_space = runner._controlled_comparison_search_space(
+        model_name="Balanced Random Forest",
+        balance_mode="none",
+        search_space_config={},
+        y_train=y_train,
+    )
+
+    assert "class_weight" in rf_space["model"]
+    assert "class_weight" in svm_space["model"]
+    assert "scale_pos_weight" in xgb_space["model"]
+    assert "max_delta_step" in xgb_space["model"]
+    assert "pos_weight" in nn_space["model"]
+    assert "replacement" in balanced_rf_space["model"]
+
+
+def test_run_calibration_sweep_persists_artifacts_and_ranks_on_validation(
+    tmp_path, monkeypatch
+):
+    base_df = _synthetic_calibration_base_df()
+    runner = ExperimentsRunner(random_state=42)
+    captured_calls = []
+
+    def _fake_optimize(self, **kwargs):
+        balance_mode = str(kwargs["balance_mode"])
+        captured_calls.append(dict(kwargs))
+        if balance_mode == "none":
+            val_metrics = {
+                "mcc": 0.82,
+                "brier_score": 0.08,
+                "pr_auc": 0.84,
+                "true_positives": 6,
+                "false_negatives": 1,
+                "far": 0.08,
+            }
+            test_metrics = {
+                "mcc": 0.40,
+                "brier_score": 0.20,
+                "pr_auc": 0.55,
+                "true_positives": 4,
+                "false_negatives": 3,
+                "far": 0.20,
+            }
+        else:
+            val_metrics = {
+                "mcc": 0.60,
+                "brier_score": 0.14,
+                "pr_auc": 0.70,
+                "true_positives": 5,
+                "false_negatives": 2,
+                "far": 0.12,
+            }
+            test_metrics = {
+                "mcc": 0.88,
+                "brier_score": 0.06,
+                "pr_auc": 0.90,
+                "true_positives": 7,
+                "false_negatives": 0,
+                "far": 0.05,
+            }
+        val_positive_support = (
+            val_metrics["true_positives"] + val_metrics["false_negatives"]
+        )
+        test_positive_support = (
+            test_metrics["true_positives"] + test_metrics["false_negatives"]
+        )
+        return {
+            "status": "completed",
+            "model_name": str(kwargs["model_name"]),
+            "feature_set": str(kwargs["feature_set"]),
+            "balance_mode": balance_mode,
+            "objective_metric": str(kwargs["objective_metric"]),
+            "objective_label": str(kwargs["objective_metric"]).upper(),
+            "objective_direction": "maximize",
+            "k": int(len(kwargs["selected_features"])),
+            "selected_features": list(kwargs["selected_features"]),
+            "selected_feature_count": int(len(kwargs["selected_features"])),
+            "decision_threshold": 0.42 if balance_mode == "none" else 0.55,
+            "val_objective_score": float(val_metrics["mcc"]),
+            "test_objective_score": float(test_metrics["mcc"]),
+            "val_roc_auc": 0.80 if balance_mode == "none" else 0.72,
+            "test_roc_auc": 0.61 if balance_mode == "none" else 0.91,
+            "val_pr_auc": float(val_metrics["pr_auc"]),
+            "test_pr_auc": float(test_metrics["pr_auc"]),
+            "val_brier_score": float(val_metrics["brier_score"]),
+            "test_brier_score": float(test_metrics["brier_score"]),
+            "val_f1": 0.70,
+            "test_f1": 0.55,
+            "val_f1_global": 0.70,
+            "test_f1_global": 0.55,
+            "val_balanced_f1": 0.71,
+            "test_balanced_f1": 0.56,
+            "val_f1_class_0": 0.90,
+            "test_f1_class_0": 0.80,
+            "val_f1_class_1": 0.52,
+            "test_f1_class_1": 0.40,
+            "val_mcc": float(val_metrics["mcc"]),
+            "test_mcc": float(test_metrics["mcc"]),
+            "val_recall": float(
+                val_metrics["true_positives"] / max(1, val_positive_support)
+            ),
+            "test_recall": float(
+                test_metrics["true_positives"] / max(1, test_positive_support)
+            ),
+            "val_alerts_per_day": 3.0,
+            "test_alerts_per_day": 3.5,
+            "val_false_alarms_per_day": 0.6,
+            "test_false_alarms_per_day": 0.4,
+            "val_event_recall_approx": 0.70,
+            "test_event_recall_approx": 0.80,
+            "val_operational_cost": 8.0,
+            "test_operational_cost": 6.0,
+            "val_cost_per_day": 1.0,
+            "test_cost_per_day": 0.8,
+            "alerts_per_day_budget": 5.0,
+            "fn_cost": 10.0,
+            "fp_cost": 1.0,
+            "val_false_negatives": int(val_metrics["false_negatives"]),
+            "test_false_negatives": int(test_metrics["false_negatives"]),
+            "val_false_positives": 3,
+            "test_false_positives": 2,
+            "val_true_negatives": 50,
+            "test_true_negatives": 48,
+            "val_true_positives": int(val_metrics["true_positives"]),
+            "test_true_positives": int(test_metrics["true_positives"]),
+            "val_positive_support": int(val_positive_support),
+            "test_positive_support": int(test_positive_support),
+            "val_tp_capture": float(
+                val_metrics["true_positives"] / max(1, val_positive_support)
+            ),
+            "test_tp_capture": float(
+                test_metrics["true_positives"] / max(1, test_positive_support)
+            ),
+            "val_fn_rate": float(
+                val_metrics["false_negatives"] / max(1, val_positive_support)
+            ),
+            "test_fn_rate": float(
+                test_metrics["false_negatives"] / max(1, test_positive_support)
+            ),
+            "val_far": float(val_metrics["far"]),
+            "test_far": float(test_metrics["far"]),
+            "val_confusion_matrix": [[50, 3], [1, 6]],
+            "test_confusion_matrix": [[48, 2], [3, 4]],
+            "best_params": {"max_depth": 4},
+            "effective_model_params": {"max_depth": 4},
+            "smote_params": {} if balance_mode == "none" else {"k_neighbors": 3},
+            "optuna_trials_completed": 1,
+            "optuna_n_jobs": int(kwargs["optuna_n_jobs"]),
+            "parallel_jobs": int(kwargs["parallel_jobs"]),
+            "xgb_parallel_jobs": int(kwargs["xgb_parallel_jobs"]),
+            "threshold_n_jobs": 1,
+            "optuna_jobs_cpu_cap": int(kwargs["optuna_n_jobs"]),
+            "cpu_count": 4,
+            "train_rows": int(len(kwargs["train_df"])),
+            "val_rows": int(len(kwargs["val_df"])),
+            "test_rows": int(len(kwargs["test_df"])),
+            "trials_df": pd.DataFrame(
+                [{"number": 0, "value": float(val_metrics["mcc"]), "state": "COMPLETE"}]
+            ),
+        }
+
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "_optimize_controlled_combo",
+        _fake_optimize,
+    )
+
+    payload = runner.run_calibration_sweep(
+        base_df,
+        model_name="Random Forest",
+        selected_features=["signal", "aux_signal"],
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        checkpoint_root=tmp_path / "calibration_runs",
+    )
+
+    assert len(captured_calls) == 2
+    assert {call["balance_mode"] for call in captured_calls} == {"none", "smote"}
+    assert all(call["threshold_protocol"] == "robust" for call in captured_calls)
+    assert (tmp_path / "calibration_runs" / payload["run_id"] / "results" / "leaderboard.csv").exists()
+    assert (tmp_path / "calibration_runs" / payload["run_id"] / "results" / "pareto_front.csv").exists()
+    assert (tmp_path / "calibration_runs" / payload["run_id"] / "manifest.json").exists()
+    assert not payload["leaderboard_df"].empty
+    assert not payload["pareto_front_df"].empty
+    top_balance_mode = payload["leaderboard_df"].iloc[0]["balance_mode"]
+    assert top_balance_mode == "none"
 
 
 def test_estimate_controlled_comparison_parallelism_builds_safe_frontier(tmp_path):
