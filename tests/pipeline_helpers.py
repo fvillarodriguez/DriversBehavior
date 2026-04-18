@@ -126,6 +126,7 @@ def build_synthetic_base_df(
         flow_cols,
         include_counts=True,
         max_headway_s=600.0,
+        speed_limit_map={"1": 65},
         outlier_action="none",
     )
 

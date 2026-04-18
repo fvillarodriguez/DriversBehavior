@@ -206,6 +206,11 @@ def test_build_live_sources_includes_drift_manifests(tmp_path, monkeypatch):
     monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
     monkeypatch.setattr(
         live_app,
+        "CALIBRATION_EXPERIMENTS_DIR",
+        tmp_path / "calibration_experiment_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
         "DRIFT_RUNS_DIR",
         tmp_path / "drift_recalibration_runs",
     )
@@ -246,6 +251,11 @@ def test_build_live_sources_includes_drift_manifests(tmp_path, monkeypatch):
 
 def test_build_live_sources_includes_paper_replication_manifests(tmp_path, monkeypatch):
     monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(
+        live_app,
+        "CALIBRATION_EXPERIMENTS_DIR",
+        tmp_path / "calibration_experiment_runs",
+    )
     monkeypatch.setattr(
         live_app,
         "DRIFT_RUNS_DIR",
@@ -291,6 +301,11 @@ def test_build_live_sources_includes_neural_drift_experiment_manifests(tmp_path,
     monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
     monkeypatch.setattr(
         live_app,
+        "CALIBRATION_EXPERIMENTS_DIR",
+        tmp_path / "calibration_experiment_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
         "DRIFT_RUNS_DIR",
         tmp_path / "drift_recalibration_runs",
     )
@@ -334,6 +349,11 @@ def test_build_live_sources_includes_language_modeling_manifests(tmp_path, monke
     monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
     monkeypatch.setattr(
         live_app,
+        "CALIBRATION_EXPERIMENTS_DIR",
+        tmp_path / "calibration_experiment_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
         "DRIFT_RUNS_DIR",
         tmp_path / "drift_recalibration_runs",
     )
@@ -372,6 +392,56 @@ def test_build_live_sources_includes_language_modeling_manifests(tmp_path, monke
     assert len(sources) == 1
     assert sources[0]["type"] == "language_modeling"
     assert "transformers_search" in str(sources[0]["label"])
+
+
+def test_build_live_sources_includes_calibration_experiment_manifests(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(
+        live_app,
+        "CALIBRATION_EXPERIMENTS_DIR",
+        tmp_path / "calibration_experiment_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "DRIFT_RUNS_DIR",
+        tmp_path / "drift_recalibration_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NEURAL_DRIFT_EXPERIMENTS_DIR",
+        tmp_path / "neural_drift_experiments",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_PAPER_RUNS_DIR",
+        tmp_path / "nlp_in_severity" / "paper_replication",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_LANGUAGE_MODELING_LIVE_DIR",
+        tmp_path / "nlp_in_severity" / "language_modeling_live",
+    )
+
+    run_dir = live_app.CALIBRATION_EXPERIMENTS_DIR / "calibration_sweep_demo"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "calibration_sweep_demo",
+                "status": "running",
+                "updated_at": "2026-04-18T15:30:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sources = live_app._build_live_sources()
+
+    assert len(sources) == 1
+    assert sources[0]["type"] == "calibration_experiment"
+    assert "calibration_sweep_demo" in str(sources[0]["label"])
 
 
 def test_read_language_modeling_run_loads_live_artifacts(tmp_path):
@@ -451,6 +521,220 @@ def test_read_language_modeling_run_loads_live_artifacts(tmp_path):
     assert list(data["best_history_df"]["epoch"]) == [1.0]
     assert data["search_summary"]["objective_metric"] == "balanced_f1"
     assert data["best_result"]["model_name"] == "demo-model"
+
+
+def test_read_calibration_experiment_run_loads_partial_results_and_previous_runs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        live_app,
+        "CALIBRATION_EXPERIMENTS_DIR",
+        tmp_path / "calibration_experiment_runs",
+    )
+
+    shared_event_path = str(tmp_path / "events.csv")
+    shared_features_path = str(tmp_path / "features.duckdb")
+
+    current_run_dir = live_app.CALIBRATION_EXPERIMENTS_DIR / "run_current"
+    previous_run_dir = live_app.CALIBRATION_EXPERIMENTS_DIR / "run_previous"
+    (current_run_dir / "results").mkdir(parents=True)
+    (previous_run_dir / "results").mkdir(parents=True)
+
+    protocol = {
+        "protocol_family": "calibration_score_threshold",
+        "model_name": "XGBoost",
+        "objective_metrics": ["pr_auc"],
+        "calibration_methods": ["sigmoid"],
+        "threshold_objectives": ["far", "mcc"],
+        "balance_modes": ["none", "smote"],
+    }
+
+    current_manifest = {
+        "run_id": "run_current",
+        "status": "running",
+        "result_status": "running",
+        "created_at": "2026-04-18T15:00:00",
+        "updated_at": "2026-04-18T15:10:00",
+        "protocol": dict(protocol),
+        "progress": {
+            "completed_steps": 3,
+            "total_steps": 6,
+            "current_step_id": "combo__pr_auc__sigmoid__mcc__none",
+        },
+    }
+    (current_run_dir / "manifest.json").write_text(
+        json.dumps(current_manifest),
+        encoding="utf-8",
+    )
+    (current_run_dir / "protocol.json").write_text(
+        json.dumps(protocol),
+        encoding="utf-8",
+    )
+    (current_run_dir / "live_status.json").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-04-18T15:10:00",
+                "status": "running",
+                "result_status": "running",
+                "step_id": "combo__pr_auc__sigmoid__mcc__none",
+                "message": "Evaluando combinación actual.",
+                "progress": {
+                    "completed_steps": 3,
+                    "total_steps": 6,
+                    "current_step_id": "combo__pr_auc__sigmoid__mcc__none",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (current_run_dir / "live_events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-18T15:00:00",
+                        "status": "running",
+                        "result_status": "running",
+                        "step_id": "init",
+                        "step_status": "running",
+                        "message": "Inicio.",
+                        "progress": {"completed_steps": 0, "total_steps": 6},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-18T15:04:00",
+                        "status": "running",
+                        "result_status": "running",
+                        "step_id": "combo__pr_auc__sigmoid__far__none",
+                        "step_status": "completed",
+                        "message": "Primera combinación lista.",
+                        "progress": {"completed_steps": 2, "total_steps": 6},
+                        "metadata": {
+                            "objective_metric": "pr_auc",
+                            "calibration_method": "sigmoid",
+                            "threshold_objective": "far",
+                            "balance_mode": "none",
+                            "val_objective_score": 0.21,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-18T15:10:00",
+                        "status": "running",
+                        "result_status": "running",
+                        "step_id": "combo__pr_auc__sigmoid__mcc__none",
+                        "step_status": "running",
+                        "message": "Segunda combinación en curso.",
+                        "progress": {"completed_steps": 3, "total_steps": 6},
+                        "metadata": {
+                            "objective_metric": "pr_auc",
+                            "calibration_method": "sigmoid",
+                            "threshold_objective": "mcc",
+                            "balance_mode": "none",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        [
+            {
+                "status": "completed",
+                "model_name": "XGBoost",
+                "event_path": shared_event_path,
+                "features_path": shared_features_path,
+                "balance_mode": "none",
+                "optuna_objective_metric": "pr_auc",
+                "calibration_method": "sigmoid",
+                "threshold_objective": "far",
+                "decision_threshold": 0.42,
+                "val_mcc": 0.11,
+                "val_brier_score": 0.09,
+                "val_pr_auc": 0.21,
+                "test_mcc": 0.1,
+                "test_brier_score": 0.12,
+                "test_pr_auc": 0.2,
+            },
+            {
+                "status": "failed",
+                "model_name": "XGBoost",
+                "event_path": shared_event_path,
+                "features_path": shared_features_path,
+                "balance_mode": "smote",
+                "optuna_objective_metric": "pr_auc",
+                "calibration_method": "sigmoid",
+                "threshold_objective": "far",
+                "error": "boom",
+            },
+        ]
+    ).to_csv(current_run_dir / "results" / "grid_results.csv", index=False)
+
+    previous_manifest = {
+        "run_id": "run_previous",
+        "status": "completed",
+        "result_status": "completed",
+        "created_at": "2026-04-18T14:00:00",
+        "updated_at": "2026-04-18T14:20:00",
+        "protocol": dict(protocol),
+        "progress": {"completed_steps": 6, "total_steps": 6},
+    }
+    (previous_run_dir / "manifest.json").write_text(
+        json.dumps(previous_manifest),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        [
+            {
+                "status": "completed",
+                "model_name": "XGBoost",
+                "event_path": shared_event_path,
+                "features_path": shared_features_path,
+                "balance_mode": "smote",
+                "optuna_objective_metric": "pr_auc",
+                "calibration_method": "sigmoid",
+                "threshold_objective": "mcc",
+                "val_pr_auc": 0.31,
+                "test_pr_auc": 0.29,
+            }
+        ]
+    ).to_csv(previous_run_dir / "results" / "grid_results.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "rank": 1,
+                "balance_mode": "smote",
+                "optuna_objective_metric": "pr_auc",
+                "calibration_method": "sigmoid",
+                "threshold_objective": "mcc",
+                "stability_score": 0.73,
+                "val_mcc": 0.18,
+                "val_brier_score": 0.08,
+                "val_pr_auc": 0.31,
+                "test_mcc": 0.16,
+                "test_brier_score": 0.1,
+                "test_pr_auc": 0.29,
+            }
+        ]
+    ).to_csv(previous_run_dir / "results" / "best_summary.csv", index=False)
+
+    payload = live_app._read_calibration_experiment_run(
+        current_run_dir / "manifest.json"
+    )
+
+    assert payload["protocol"]["protocol_family"] == "calibration_score_threshold"
+    assert payload["live_events_df"]["progress_pct"].iloc[-1] == pytest.approx(50.0)
+    assert payload["grid_results_df"]["status"].tolist() == ["completed", "failed"]
+    assert not payload["previous_runs_df"].empty
+    assert payload["previous_runs_df"]["run_id"].tolist() == ["run_previous"]
+    assert bool(payload["previous_runs_df"]["same_context"].iloc[0]) is True
+    assert payload["previous_runs_df"]["best_test_pr_auc"].iloc[0] == pytest.approx(
+        0.29
+    )
 
 
 def test_read_drift_run_builds_partial_monitoring_frames(tmp_path):

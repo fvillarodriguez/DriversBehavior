@@ -22,6 +22,7 @@ from src.drift_bias_variance import (
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
+CALIBRATION_EXPERIMENTS_DIR = RESULTS_DIR / "calibration_experiment_runs"
 DRIFT_RUNS_DIR = RESULTS_DIR / "drift_recalibration_runs"
 NEURAL_DRIFT_EXPERIMENTS_DIR = RESULTS_DIR / "neural_drift_experiments"
 NLP_PAPER_RUNS_DIR = RESULTS_DIR / "nlp_in_severity" / "paper_replication"
@@ -340,6 +341,16 @@ def _list_drift_manifest_files() -> list[Path]:
     )
 
 
+def _list_calibration_experiment_manifest_files() -> list[Path]:
+    if not CALIBRATION_EXPERIMENTS_DIR.exists():
+        return []
+    return sorted(
+        CALIBRATION_EXPERIMENTS_DIR.glob("*/manifest.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def _list_paper_replication_manifest_files() -> list[Path]:
     if not NLP_PAPER_RUNS_DIR.exists():
         return []
@@ -372,6 +383,23 @@ def _list_language_modeling_manifest_files() -> list[Path]:
 
 def _build_live_sources() -> list[Dict[str, object]]:
     entries: list[Dict[str, object]] = []
+    for path in _list_calibration_experiment_manifest_files():
+        manifest = _load_json_file(path, default={})
+        run_id = str((manifest or {}).get("run_id") or path.parent.name)
+        status = str((manifest or {}).get("status") or "unknown")
+        updated_at = str(
+            (manifest or {}).get("updated_at")
+            or (manifest or {}).get("created_at")
+            or "-"
+        )
+        entries.append(
+            {
+                "type": "calibration_experiment",
+                "path": path,
+                "sort_key": float(path.stat().st_mtime),
+                "label": f"Calibration sweep | {run_id} | {status} | {updated_at}",
+            }
+        )
     for path in _list_drift_manifest_files():
         manifest = _load_json_file(path, default={})
         run_id = str((manifest or {}).get("run_id") or path.parent.name)
@@ -2557,6 +2585,371 @@ def _read_language_modeling_run(manifest_path: Path) -> Dict[str, object]:
         "finetune_result": finetune_result,
         "failure_summary": failure_summary,
         "current_context": current_context,
+    }
+
+
+def _calibration_metric_options() -> Dict[str, str]:
+    return {
+        "val_pr_auc": "Validación PR-AUC",
+        "val_mcc": "Validación MCC",
+        "val_brier_score": "Validación Brier",
+        "val_far": "Validación FAR",
+        "val_tp_capture": "Validación TP capture",
+        "val_fn_rate": "Validación FN rate",
+        "test_pr_auc": "Test PR-AUC",
+        "test_mcc": "Test MCC",
+        "test_brier_score": "Test Brier",
+        "test_far": "Test FAR",
+        "test_tp_capture": "Test TP capture",
+        "test_fn_rate": "Test FN rate",
+    }
+
+
+def _calibration_metric_lower_is_better(metric_col: str) -> bool:
+    return str(metric_col) in {
+        "val_brier_score",
+        "test_brier_score",
+        "val_far",
+        "test_far",
+        "val_fn_rate",
+        "test_fn_rate",
+    }
+
+
+def _calibration_total_combos(protocol: Dict[str, object]) -> int:
+    total = 1
+    for key in [
+        "objective_metrics",
+        "calibration_methods",
+        "threshold_objectives",
+        "balance_modes",
+    ]:
+        values = protocol.get(key)
+        if not isinstance(values, list) or not values:
+            return 0
+        total *= len(values)
+    return int(total)
+
+
+def _calibration_run_context(
+    protocol: Dict[str, object],
+    grid_results_df: pd.DataFrame,
+) -> Dict[str, str]:
+    context = {
+        "protocol_family": str(protocol.get("protocol_family") or ""),
+        "model_name": str(protocol.get("model_name") or ""),
+        "event_path": "",
+        "features_path": "",
+    }
+    if isinstance(grid_results_df, pd.DataFrame) and not grid_results_df.empty:
+        for col in ["event_path", "features_path"]:
+            if col in grid_results_df.columns:
+                values = (
+                    grid_results_df[col]
+                    .dropna()
+                    .astype(str)
+                    .loc[lambda s: s.str.strip() != ""]
+                )
+                if not values.empty:
+                    context[col] = str(values.iloc[0])
+    return context
+
+
+def _calibration_best_result_row(
+    best_summary_df: pd.DataFrame,
+    leaderboard_df: pd.DataFrame,
+    grid_results_df: pd.DataFrame,
+) -> Dict[str, object]:
+    if isinstance(best_summary_df, pd.DataFrame) and not best_summary_df.empty:
+        work = best_summary_df.copy()
+        if "rank" in work.columns:
+            work["rank"] = pd.to_numeric(work["rank"], errors="coerce")
+            ranked = work.dropna(subset=["rank"]).sort_values("rank", kind="stable")
+            if not ranked.empty:
+                return ranked.iloc[0].to_dict()
+        return work.iloc[0].to_dict()
+
+    if isinstance(leaderboard_df, pd.DataFrame) and not leaderboard_df.empty:
+        work = leaderboard_df.copy()
+        if "rank" in work.columns:
+            work["rank"] = pd.to_numeric(work["rank"], errors="coerce")
+            ranked = work.dropna(subset=["rank"]).sort_values("rank", kind="stable")
+            if not ranked.empty:
+                return ranked.iloc[0].to_dict()
+        return work.iloc[0].to_dict()
+
+    if not isinstance(grid_results_df, pd.DataFrame) or grid_results_df.empty:
+        return {}
+    work = grid_results_df.copy()
+    if "status" in work.columns:
+        work = work.loc[
+            work["status"].astype(str).str.lower().eq("completed")
+        ].copy()
+    if work.empty:
+        return {}
+    for metric_col in ["val_pr_auc", "val_mcc", "test_pr_auc", "test_mcc"]:
+        if metric_col not in work.columns:
+            continue
+        work[metric_col] = pd.to_numeric(work[metric_col], errors="coerce")
+        metric_df = work.dropna(subset=[metric_col]).copy()
+        if metric_df.empty:
+            continue
+        ascending = _calibration_metric_lower_is_better(metric_col)
+        return metric_df.sort_values(metric_col, ascending=ascending, kind="stable").iloc[0].to_dict()
+    return work.iloc[0].to_dict()
+
+
+def _build_calibration_history_rows(
+    *,
+    current_manifest_path: Path,
+    current_context: Dict[str, str],
+) -> pd.DataFrame:
+    rows: list[Dict[str, object]] = []
+    for manifest_path in _list_calibration_experiment_manifest_files():
+        if manifest_path == current_manifest_path:
+            continue
+        manifest = _load_json_file(manifest_path, default={}) or {}
+        if not isinstance(manifest, dict):
+            continue
+        run_dir = manifest_path.parent
+        protocol = dict(
+            manifest.get("protocol")
+            or _load_json_file(run_dir / "protocol.json", default={})
+            or {}
+        )
+        grid_results_df = _load_csv_file(run_dir / "results" / "grid_results.csv")
+        leaderboard_df = _load_csv_file(run_dir / "results" / "leaderboard.csv")
+        best_summary_df = _load_csv_file(run_dir / "results" / "best_summary.csv")
+        best_row = _calibration_best_result_row(
+            best_summary_df,
+            leaderboard_df,
+            grid_results_df,
+        )
+        run_context = _calibration_run_context(protocol, grid_results_df)
+
+        status_counts: Dict[str, int] = {}
+        if isinstance(grid_results_df, pd.DataFrame) and not grid_results_df.empty and "status" in grid_results_df.columns:
+            status_counts = (
+                grid_results_df["status"]
+                .astype(str)
+                .str.lower()
+                .value_counts()
+                .to_dict()
+            )
+        completed_combos = int(status_counts.get("completed", 0))
+        failed_combos = int(status_counts.get("failed", 0))
+        total_combos = _calibration_total_combos(protocol)
+        processed_combos = completed_combos + failed_combos
+        pending_combos = max(0, int(total_combos) - int(processed_combos))
+
+        progress = dict(manifest.get("progress") or {})
+        completed_steps = pd.to_numeric(progress.get("completed_steps"), errors="coerce")
+        total_steps = pd.to_numeric(progress.get("total_steps"), errors="coerce")
+        if total_combos > 0:
+            progress_ratio = processed_combos / float(max(1, total_combos))
+        elif not pd.isna(completed_steps) and not pd.isna(total_steps) and float(total_steps) > 0:
+            progress_ratio = float(completed_steps) / float(total_steps)
+        else:
+            progress_ratio = 0.0
+
+        same_context = (
+            bool(current_context.get("protocol_family"))
+            and run_context.get("protocol_family") == current_context.get("protocol_family")
+            and run_context.get("model_name") == current_context.get("model_name")
+            and run_context.get("event_path") == current_context.get("event_path")
+            and run_context.get("features_path") == current_context.get("features_path")
+        )
+        rows.append(
+            {
+                "run_id": str(manifest.get("run_id") or run_dir.name),
+                "status": str(manifest.get("status") or "unknown"),
+                "result_status": str(manifest.get("result_status") or manifest.get("status") or "unknown"),
+                "created_at": str(manifest.get("created_at") or ""),
+                "updated_at": str(manifest.get("updated_at") or manifest.get("created_at") or ""),
+                "model_name": str(run_context.get("model_name") or protocol.get("model_name") or ""),
+                "event_path": str(run_context.get("event_path") or ""),
+                "features_path": str(run_context.get("features_path") or ""),
+                "completed_combos": completed_combos,
+                "failed_combos": failed_combos,
+                "pending_combos": pending_combos,
+                "progress_pct": round(100.0 * float(progress_ratio), 2),
+                "best_rank": _display_cell(best_row.get("rank")),
+                "best_balance_mode": _display_cell(best_row.get("balance_mode")),
+                "best_optuna_objective_metric": _display_cell(
+                    best_row.get("optuna_objective_metric", best_row.get("objective_metric"))
+                ),
+                "best_calibration_method": _display_cell(best_row.get("calibration_method")),
+                "best_threshold_objective": _display_cell(best_row.get("threshold_objective")),
+                "best_stability_score": _display_cell(best_row.get("stability_score")),
+                "best_val_mcc": _display_cell(best_row.get("val_mcc")),
+                "best_val_brier_score": _display_cell(best_row.get("val_brier_score")),
+                "best_val_pr_auc": _display_cell(best_row.get("val_pr_auc")),
+                "best_test_mcc": _display_cell(best_row.get("test_mcc")),
+                "best_test_brier_score": _display_cell(best_row.get("test_brier_score")),
+                "best_test_pr_auc": _display_cell(best_row.get("test_pr_auc")),
+                "same_context": same_context,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+    history_df = pd.DataFrame(rows)
+    sort_cols = [
+        col
+        for col in ["same_context", "updated_at", "run_id"]
+        if col in history_df.columns
+    ]
+    ascending = [False, False, False][: len(sort_cols)]
+    return history_df.sort_values(sort_cols, ascending=ascending, kind="stable").reset_index(drop=True)
+
+
+def _calibration_progress_curve_df(
+    grid_results_df: pd.DataFrame,
+    *,
+    metric_col: str,
+) -> pd.DataFrame:
+    if not isinstance(grid_results_df, pd.DataFrame) or grid_results_df.empty:
+        return pd.DataFrame()
+    if metric_col not in grid_results_df.columns:
+        return pd.DataFrame()
+    work = grid_results_df.copy()
+    if "status" in work.columns:
+        work = work.loc[
+            work["status"].astype(str).str.lower().eq("completed")
+        ].copy()
+    work[metric_col] = pd.to_numeric(work[metric_col], errors="coerce")
+    work = work.dropna(subset=[metric_col]).reset_index(drop=True)
+    if work.empty:
+        return pd.DataFrame()
+    work["combo_index"] = range(1, len(work) + 1)
+    if _calibration_metric_lower_is_better(metric_col):
+        work["best_so_far"] = work[metric_col].cummin()
+    else:
+        work["best_so_far"] = work[metric_col].cummax()
+    return work[["combo_index", metric_col, "best_so_far"]].rename(
+        columns={metric_col: "current_value"}
+    )
+
+
+def _read_calibration_experiment_run(manifest_path: Path) -> Dict[str, object]:
+    manifest = _load_json_file(manifest_path, default={}) or {}
+    run_dir = manifest_path.parent
+    protocol = dict(
+        manifest.get("protocol")
+        or _load_json_file(run_dir / "protocol.json", default={})
+        or {}
+    )
+    live_status_path = run_dir / "live_status.json"
+    live_events_path = run_dir / "live_events.jsonl"
+    live_status = _load_json_file(live_status_path, default={}) or {}
+    live_event_rows = _read_jsonl_records(live_events_path)
+    if not live_event_rows and isinstance(live_status, dict) and live_status:
+        live_event_rows = [live_status]
+    if not live_event_rows and manifest:
+        live_event_rows = [
+            {
+                "timestamp": manifest.get("updated_at") or manifest.get("created_at") or "",
+                "status": manifest.get("status"),
+                "result_status": manifest.get("result_status"),
+                "step_id": (manifest.get("progress") or {}).get("current_step_id"),
+                "message": manifest.get("last_error") or "",
+                "progress": dict(manifest.get("progress") or {}),
+            }
+        ]
+
+    normalized_events: list[Dict[str, object]] = []
+    for row in live_event_rows:
+        if not isinstance(row, dict):
+            continue
+        payload = dict(row)
+        progress = dict(payload.get("progress") or {})
+        metadata = dict(payload.get("metadata") or {})
+        artifact_paths = dict(payload.get("artifact_paths") or {})
+        completed_steps = pd.to_numeric(
+            progress.get("completed_steps"),
+            errors="coerce",
+        )
+        total_steps = pd.to_numeric(
+            progress.get("total_steps"),
+            errors="coerce",
+        )
+        progress_ratio = pd.to_numeric(payload.get("progress_ratio"), errors="coerce")
+        if (
+            pd.isna(progress_ratio)
+            and not pd.isna(completed_steps)
+            and not pd.isna(total_steps)
+            and float(total_steps) > 0
+        ):
+            progress_ratio = float(completed_steps) / float(total_steps)
+        normalized_events.append(
+            {
+                "timestamp": str(
+                    payload.get("timestamp")
+                    or live_status.get("timestamp")
+                    or manifest.get("updated_at")
+                    or manifest.get("created_at")
+                    or ""
+                ),
+                "status": str(payload.get("status") or live_status.get("status") or manifest.get("status") or ""),
+                "result_status": str(
+                    payload.get("result_status")
+                    or live_status.get("result_status")
+                    or manifest.get("result_status")
+                    or ""
+                ),
+                "step_id": str(
+                    payload.get("step_id")
+                    or live_status.get("step_id")
+                    or progress.get("current_step_id")
+                    or ""
+                ),
+                "step_status": str(payload.get("step_status") or ""),
+                "message": str(payload.get("message") or ""),
+                "progress_completed_steps": None if pd.isna(completed_steps) else int(completed_steps),
+                "progress_total_steps": None if pd.isna(total_steps) else int(total_steps),
+                "progress_ratio": None if pd.isna(progress_ratio) else float(progress_ratio),
+                "progress_pct": None if pd.isna(progress_ratio) else 100.0 * float(progress_ratio),
+                "objective_metric": str(metadata.get("objective_metric") or ""),
+                "calibration_method": str(metadata.get("calibration_method") or ""),
+                "threshold_objective": str(metadata.get("threshold_objective") or ""),
+                "balance_mode": str(metadata.get("balance_mode") or ""),
+                "val_objective_score": _display_cell(metadata.get("val_objective_score")),
+                "artifact_paths": json.dumps(artifact_paths, ensure_ascii=False) if artifact_paths else "",
+            }
+        )
+    live_events_df = pd.DataFrame(normalized_events)
+    if not live_events_df.empty:
+        live_events_df["event_index"] = range(1, len(live_events_df) + 1)
+
+    grid_results_df = _load_csv_file(run_dir / "results" / "grid_results.csv")
+    leaderboard_df = _load_csv_file(run_dir / "results" / "leaderboard.csv")
+    pareto_front_df = _load_csv_file(run_dir / "results" / "pareto_front.csv")
+    best_summary_df = _load_csv_file(run_dir / "results" / "best_summary.csv")
+    best_summary_payload = _load_json_file(
+        run_dir / "results" / "best_summary.json",
+        default={},
+    ) or {}
+    current_context = _calibration_run_context(protocol, grid_results_df)
+    previous_runs_df = _build_calibration_history_rows(
+        current_manifest_path=manifest_path,
+        current_context=current_context,
+    )
+
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "run_dir": run_dir,
+        "protocol": protocol,
+        "live_status": live_status,
+        "live_events_df": live_events_df,
+        "live_status_path": live_status_path,
+        "live_events_path": live_events_path,
+        "grid_results_df": grid_results_df,
+        "leaderboard_df": leaderboard_df,
+        "pareto_front_df": pareto_front_df,
+        "best_summary_df": best_summary_df,
+        "best_summary_payload": best_summary_payload,
+        "previous_runs_df": previous_runs_df,
     }
 
 
@@ -4963,6 +5356,356 @@ def _render_language_modeling_live_view(data: Dict[str, object]) -> None:
             st.dataframe(_streamlit_arrow_safe_df(live_events_df), width="stretch")
 
 
+def _render_calibration_experiment_live_view(data: Dict[str, object]) -> None:
+    manifest = dict(data.get("manifest") or {})
+    protocol = dict(data.get("protocol") or {})
+    live_status = dict(data.get("live_status") or {})
+    live_events_df = data.get("live_events_df")
+    grid_results_df = data.get("grid_results_df")
+    leaderboard_df = data.get("leaderboard_df")
+    pareto_front_df = data.get("pareto_front_df")
+    best_summary_df = data.get("best_summary_df")
+    previous_runs_df = data.get("previous_runs_df")
+
+    manifest_progress = dict(manifest.get("progress") or {})
+    live_progress = dict(live_status.get("progress") or {})
+    completed_steps = pd.to_numeric(
+        live_progress.get("completed_steps", manifest_progress.get("completed_steps")),
+        errors="coerce",
+    )
+    total_steps = pd.to_numeric(
+        live_progress.get("total_steps", manifest_progress.get("total_steps")),
+        errors="coerce",
+    )
+    progress_ratio = pd.to_numeric(
+        live_status.get("progress_ratio"),
+        errors="coerce",
+    )
+    if (
+        pd.isna(progress_ratio)
+        and not pd.isna(completed_steps)
+        and not pd.isna(total_steps)
+        and float(total_steps) > 0
+    ):
+        progress_ratio = float(completed_steps) / float(total_steps)
+    if pd.isna(progress_ratio):
+        progress_ratio = 0.0
+    progress_ratio = max(0.0, min(float(progress_ratio), 1.0))
+
+    total_combos = _calibration_total_combos(protocol)
+    completed_combos = 0
+    failed_combos = 0
+    if isinstance(grid_results_df, pd.DataFrame) and not grid_results_df.empty and "status" in grid_results_df.columns:
+        status_counts = (
+            grid_results_df["status"]
+            .astype(str)
+            .str.lower()
+            .value_counts()
+            .to_dict()
+        )
+        completed_combos = int(status_counts.get("completed", 0))
+        failed_combos = int(status_counts.get("failed", 0))
+    pending_combos = max(0, int(total_combos) - int(completed_combos) - int(failed_combos))
+
+    status = str(live_status.get("status") or manifest.get("status") or "unknown")
+    result_status = str(
+        live_status.get("result_status")
+        or manifest.get("result_status")
+        or status
+    )
+    updated_at = str(
+        live_status.get("timestamp")
+        or manifest.get("updated_at")
+        or manifest.get("created_at")
+        or "-"
+    )
+    current_step = str(
+        live_status.get("step_id")
+        or live_progress.get("current_step_id")
+        or manifest_progress.get("current_step_id")
+        or "-"
+    )
+    current_message = str(live_status.get("message") or "")
+
+    current_best_row = _calibration_best_result_row(
+        best_summary_df if isinstance(best_summary_df, pd.DataFrame) else pd.DataFrame(),
+        leaderboard_df if isinstance(leaderboard_df, pd.DataFrame) else pd.DataFrame(),
+        grid_results_df if isinstance(grid_results_df, pd.DataFrame) else pd.DataFrame(),
+    )
+    current_best_payload = {
+        "rank": current_best_row.get("rank"),
+        "balance_mode": current_best_row.get("balance_mode"),
+        "optuna_objective_metric": current_best_row.get(
+            "optuna_objective_metric", current_best_row.get("objective_metric")
+        ),
+        "calibration_method": current_best_row.get("calibration_method"),
+        "threshold_objective": current_best_row.get("threshold_objective"),
+        "decision_threshold": current_best_row.get("decision_threshold"),
+        "stability_score": current_best_row.get("stability_score"),
+        "val_mcc": current_best_row.get("val_mcc"),
+        "val_brier_score": current_best_row.get("val_brier_score"),
+        "val_pr_auc": current_best_row.get("val_pr_auc"),
+        "test_mcc": current_best_row.get("test_mcc"),
+        "test_brier_score": current_best_row.get("test_brier_score"),
+        "test_pr_auc": current_best_row.get("test_pr_auc"),
+    }
+    current_best_payload = {
+        key: value for key, value in current_best_payload.items() if value not in [None, "", "-"]
+    }
+
+    st.caption("Experimento detectado: Crash prediction | Calibración score + threshold")
+    st.caption(f"Checkpoint: {data.get('manifest_path')}")
+    st.caption(f"Run dir: {data.get('run_dir')}")
+
+    if status == "failed":
+        st.error(
+            manifest.get("last_error")
+            or current_message
+            or "Corrida fallida sin detalle persistido."
+        )
+    elif status == "completed":
+        st.success("Corrida completada. Se muestran resultados finales y el histórico persistido.")
+    else:
+        st.info("Corrida en progreso. La vista usa el tracker y los resultados parciales persistidos.")
+
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6 = st.columns(6)
+    kpi_1.metric("Modelo", str(protocol.get("model_name") or "-"))
+    kpi_2.metric("Estado", status)
+    kpi_3.metric("Resultado", result_status)
+    kpi_4.metric("Progreso", f"{100.0 * progress_ratio:.1f}%")
+    kpi_5.metric("Combinaciones OK", f"{completed_combos}/{total_combos or '-'}")
+    kpi_6.metric("Fallidas", f"{failed_combos}")
+
+    st.progress(progress_ratio)
+    st.caption(f"Threshold protocol: {protocol.get('threshold_protocol') or '-'}")
+    st.caption(f"Step actual: {current_step}")
+    if current_message:
+        st.caption(current_message)
+    st.caption(f"Ultima actualizacion: {updated_at}")
+
+    live_tab, results_tab, data_tab = st.tabs(["Live", "Results", "Raw data"])
+
+    with live_tab:
+        st.markdown("**Avance temporal**")
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            plot_df = live_events_df[["event_index", "progress_pct"]].dropna(
+                subset=["progress_pct"]
+            )
+            if not plot_df.empty:
+                st.line_chart(
+                    plot_df.set_index("event_index")["progress_pct"],
+                    width="stretch",
+                )
+            visible_cols = [
+                col
+                for col in [
+                    "event_index",
+                    "timestamp",
+                    "step_id",
+                    "step_status",
+                    "objective_metric",
+                    "calibration_method",
+                    "threshold_objective",
+                    "balance_mode",
+                    "progress_pct",
+                    "message",
+                ]
+                if col in live_events_df.columns
+            ]
+            st.dataframe(
+                _streamlit_arrow_safe_df(live_events_df[visible_cols]),
+                width="stretch",
+            )
+        else:
+            st.info("No hay eventos live persistidos todavía.")
+
+        st.markdown("**Evolución del mejor resultado observado**")
+        metric_options = {
+            key: label
+            for key, label in _calibration_metric_options().items()
+            if isinstance(grid_results_df, pd.DataFrame)
+            and not grid_results_df.empty
+            and key in grid_results_df.columns
+        }
+        if metric_options:
+            selected_metric_label = st.selectbox(
+                "Métrica de avance",
+                options=list(metric_options.values()),
+                key=f"calibration_live_metric_{manifest.get('run_id') or 'current'}",
+            )
+            selected_metric = next(
+                key
+                for key, label in metric_options.items()
+                if label == selected_metric_label
+            )
+            metric_curve_df = _calibration_progress_curve_df(
+                grid_results_df,
+                metric_col=selected_metric,
+            )
+            if not metric_curve_df.empty:
+                st.line_chart(
+                    metric_curve_df.set_index("combo_index")[
+                        ["current_value", "best_so_far"]
+                    ],
+                    width="stretch",
+                )
+            else:
+                st.info("Todavía no hay combinaciones completadas con esa métrica.")
+        else:
+            st.info("No hay métricas parciales disponibles para graficar.")
+
+        if current_best_payload:
+            st.markdown("**Mejor combinación observada hasta ahora**")
+            st.json(current_best_payload, expanded=False)
+
+    with results_tab:
+        if isinstance(best_summary_df, pd.DataFrame) and not best_summary_df.empty:
+            st.markdown("**Mejores combinaciones**")
+            st.dataframe(_streamlit_arrow_safe_df(best_summary_df), width="stretch")
+        elif isinstance(grid_results_df, pd.DataFrame) and not grid_results_df.empty:
+            partial_df = grid_results_df.copy()
+            if "status" in partial_df.columns:
+                partial_df = partial_df.loc[
+                    partial_df["status"].astype(str).str.lower().eq("completed")
+                ].copy()
+            if not partial_df.empty:
+                metric_col = "val_pr_auc" if "val_pr_auc" in partial_df.columns else (
+                    "val_mcc" if "val_mcc" in partial_df.columns else None
+                )
+                if metric_col is not None:
+                    partial_df[metric_col] = pd.to_numeric(
+                        partial_df[metric_col],
+                        errors="coerce",
+                    )
+                    partial_df = partial_df.sort_values(
+                        metric_col,
+                        ascending=_calibration_metric_lower_is_better(metric_col),
+                        kind="stable",
+                    )
+                visible_cols = [
+                    col
+                    for col in [
+                        "status",
+                        "balance_mode",
+                        "optuna_objective_metric",
+                        "calibration_method",
+                        "threshold_objective",
+                        "decision_threshold",
+                        "val_mcc",
+                        "val_brier_score",
+                        "val_pr_auc",
+                        "test_mcc",
+                        "test_brier_score",
+                        "test_pr_auc",
+                    ]
+                    if col in partial_df.columns
+                ]
+                st.markdown("**Resultados parciales acumulados**")
+                st.dataframe(
+                    _streamlit_arrow_safe_df(partial_df[visible_cols]),
+                    width="stretch",
+                )
+            else:
+                st.info("No hay combinaciones completadas todavía.")
+        else:
+            st.info("No hay resultados parciales persistidos todavía.")
+
+        if isinstance(leaderboard_df, pd.DataFrame) and not leaderboard_df.empty:
+            st.markdown("**Leaderboard**")
+            st.dataframe(_streamlit_arrow_safe_df(leaderboard_df), width="stretch")
+
+        if isinstance(pareto_front_df, pd.DataFrame) and not pareto_front_df.empty:
+            st.markdown("**Pareto front**")
+            st.dataframe(_streamlit_arrow_safe_df(pareto_front_df), width="stretch")
+
+        if isinstance(grid_results_df, pd.DataFrame) and not grid_results_df.empty and "status" in grid_results_df.columns:
+            failed_df = grid_results_df.loc[
+                grid_results_df["status"].astype(str).str.lower().eq("failed")
+            ].copy()
+            if not failed_df.empty:
+                st.markdown("**Combinaciones fallidas**")
+                failed_cols = [
+                    col
+                    for col in [
+                        "optuna_objective_metric",
+                        "calibration_method",
+                        "threshold_objective",
+                        "balance_mode",
+                        "error",
+                    ]
+                    if col in failed_df.columns
+                ]
+                st.dataframe(
+                    _streamlit_arrow_safe_df(failed_df[failed_cols]),
+                    width="stretch",
+                )
+
+        st.markdown("**Resultados previos**")
+        if isinstance(previous_runs_df, pd.DataFrame) and not previous_runs_df.empty:
+            compatible_df = (
+                previous_runs_df.loc[
+                    previous_runs_df["same_context"].astype(bool)
+                ].copy()
+                if "same_context" in previous_runs_df.columns
+                else pd.DataFrame()
+            )
+            history_df = compatible_df if not compatible_df.empty else previous_runs_df
+            if not compatible_df.empty:
+                st.caption("Se muestran primero corridas compatibles con el mismo dataset/modelo.")
+            history_metric_options = {
+                col: label
+                for col, label in {
+                    "best_val_pr_auc": "Mejor validación PR-AUC",
+                    "best_val_mcc": "Mejor validación MCC",
+                    "best_test_pr_auc": "Mejor test PR-AUC",
+                    "best_test_mcc": "Mejor test MCC",
+                    "best_test_brier_score": "Mejor test Brier",
+                }.items()
+                if col in history_df.columns
+            }
+            if history_metric_options:
+                history_metric_label = st.selectbox(
+                    "Métrica histórica",
+                    options=list(history_metric_options.values()),
+                    key=f"calibration_history_metric_{manifest.get('run_id') or 'current'}",
+                )
+                history_metric_col = next(
+                    col
+                    for col, label in history_metric_options.items()
+                    if label == history_metric_label
+                )
+                chart_df = history_df[["run_id", history_metric_col]].copy()
+                chart_df[history_metric_col] = pd.to_numeric(
+                    chart_df[history_metric_col],
+                    errors="coerce",
+                )
+                chart_df = chart_df.dropna(subset=[history_metric_col])
+                if not chart_df.empty:
+                    st.bar_chart(
+                        chart_df.set_index("run_id")[history_metric_col],
+                        width="stretch",
+                    )
+            st.dataframe(_streamlit_arrow_safe_df(history_df), width="stretch")
+        else:
+            st.info("No hay corridas previas persistidas para este experimento.")
+
+    with data_tab:
+        st.markdown("**Manifest**")
+        st.json(manifest, expanded=False)
+        if protocol:
+            st.markdown("**Protocol**")
+            st.json(protocol, expanded=False)
+        if live_status:
+            st.markdown("**Live status**")
+            st.json(live_status, expanded=False)
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            st.markdown("**Live events**")
+            st.dataframe(_streamlit_arrow_safe_df(live_events_df), width="stretch")
+        if isinstance(grid_results_df, pd.DataFrame) and not grid_results_df.empty:
+            st.markdown("**Grid results**")
+            st.dataframe(_streamlit_arrow_safe_df(grid_results_df), width="stretch")
+
+
 def _render_neural_drift_experiment_live_view(data: Dict[str, object]) -> None:
     manifest = dict(data.get("manifest") or {})
     live_status = dict(data.get("live_status") or {})
@@ -5196,7 +5939,10 @@ def main(*, set_page_config: bool = True) -> None:
     source = sources[int(selected_idx)]
     source_type = str(source.get("type") or "")
     path = Path(str(source.get("path")))
-    if source_type == "drift_recalibration":
+    if source_type == "calibration_experiment":
+        run_data = _read_calibration_experiment_run(path)
+        _render_calibration_experiment_live_view(run_data)
+    elif source_type == "drift_recalibration":
         run_data = _read_drift_run(path)
         _render_drift_recalibration_view(run_data)
     elif source_type == "neural_drift_experiment":

@@ -23,19 +23,20 @@ try:
 except ImportError:
     duckdb = None  # type: ignore
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 from utils import (
     FlowColumns,
     ensure_flow_db_summary,
     load_flujos,
     load_flujos_range,
+    load_portico_maxspeed_map,
     normalize_plate_series,
     prompt_flow_sample_selection,
 )
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-SRC_DIR = ROOT_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 PLATE_CLEAN_COL = "plate_clean"
 LANE_CLEAN_COL = "lane_numeric"
@@ -43,8 +44,10 @@ LANE_CLEAN_COL = "lane_numeric"
 CLUSTER_DB_PATH = ROOT_DIR / "Resultados" / "cluster_features.duckdb"
 CLUSTER_TABLE_NAME = "cluster_features"
 CLUSTER_BATCH_TABLE_NAME = "cluster_features_batches"
+CLUSTER_META_TABLE_NAME = "cluster_features_meta"
 DEFAULT_CLUSTER_FEATURES = [
     "avg_speed_kmh",
+    "exceso_velocidad",
     "avg_relative_speed",
     "avg_headway_s",
     "conflict_rate",
@@ -91,6 +94,39 @@ TTC_MAX_BY_PORTICO = {
     31: 10,
     32: 8,
 }
+DEFAULT_FIXED_TTC_SECONDS = 1.5
+
+
+def build_ttc_feature_metadata(
+    ttc_mode: str = "dynamic",
+    fixed_ttc_s: Optional[float] = None,
+    ttc_max_map: Optional[Dict[int, float]] = None,
+) -> Dict[str, object]:
+    normalized_mode = str(ttc_mode or "dynamic").strip().lower()
+    if normalized_mode not in {"dynamic", "fixed"}:
+        normalized_mode = "dynamic"
+
+    metadata: Dict[str, object] = {
+        "ttc_mode": normalized_mode,
+        "ttc_mode_label": "Dinamico" if normalized_mode == "dynamic" else "Fijo",
+    }
+    if normalized_mode == "fixed":
+        threshold = (
+            float(fixed_ttc_s)
+            if fixed_ttc_s is not None
+            else float(DEFAULT_FIXED_TTC_SECONDS)
+        )
+        metadata["ttc_fixed_seconds"] = threshold
+        metadata["ttc_threshold_map"] = None
+        return metadata
+
+    threshold_map = ttc_max_map or TTC_MAX_BY_PORTICO
+    metadata["ttc_fixed_seconds"] = None
+    metadata["ttc_threshold_map"] = {
+        str(int(portico)): float(value)
+        for portico, value in sorted(threshold_map.items())
+    }
+    return metadata
 
 
 def list_cluster_feature_db_paths() -> List[Path]:
@@ -272,6 +308,9 @@ def Clusterization(
     overlap_col: Optional[str] = None,
     include_counts: bool = False,
     max_headway_s: Optional[float] = 60.0,
+    ttc_mode: str = "dynamic",
+    fixed_ttc_s: Optional[float] = None,
+    speed_limit_map: Optional[Dict[str, float]] = None,
 
     progress: Optional[object] = None,
     group_progress: Optional[object] = None,
@@ -285,6 +324,9 @@ def Clusterization(
     overlap_col: columna booleana para marcar filas de solape a excluir de agregados.
     include_counts: si True, agrega columnas de conteo para ponderacion posterior.
     max_headway_s: headways mayores a este umbral se tratan como NaN.
+    ttc_mode: "dynamic" usa umbral por portico; "fixed" usa un umbral unico.
+    fixed_ttc_s: umbral TTC fijo en segundos cuando ttc_mode == "fixed".
+    speed_limit_map: mapa portico -> maxspeed para calcular exceso_velocidad.
     progress: barra de progreso para pasos principales.
     group_progress: barra de progreso para el loop de headway/TTC por grupo.
     """
@@ -320,6 +362,15 @@ def Clusterization(
 
     if ttc_max_map is None:
         ttc_max_map = TTC_MAX_BY_PORTICO
+    ttc_mode = str(ttc_mode or "dynamic").strip().lower()
+    if ttc_mode not in {"dynamic", "fixed"}:
+        raise ValueError("ttc_mode must be 'dynamic' or 'fixed'.")
+    if ttc_mode == "fixed":
+        if fixed_ttc_s is None:
+            fixed_ttc_s = DEFAULT_FIXED_TTC_SECONDS
+        fixed_ttc_s = float(fixed_ttc_s)
+        if fixed_ttc_s <= 0:
+            raise ValueError("fixed_ttc_s must be > 0.")
 
     month_col = "month"
     if monthly_weighting:
@@ -353,6 +404,51 @@ def Clusterization(
     summary = pd.DataFrame(index=total_passes.index)
     summary["total_passes"] = total_passes
     summary["avg_speed_kmh"] = sum_speed / total_passes
+
+    if speed_limit_map is None:
+        speed_limit_map = load_portico_maxspeed_map()
+    speed_limit_lookup: Dict[str, float] = {}
+    for portico, maxspeed in (speed_limit_map or {}).items():
+        try:
+            value = float(maxspeed)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            key = _normalize_portico_series(pd.Series([portico])).iloc[0]
+            if pd.notna(key):
+                speed_limit_lookup[str(key).strip().upper()] = value
+
+    speed_limit = (
+        df_valid[flow_cols.portico]
+        .astype("string")
+        .str.strip()
+        .str.upper()
+        .map(speed_limit_lookup)
+    )
+    speed_limit_mask = speed_limit.notna()
+    if speed_limit_mask.any():
+        exceso = (
+            df_valid.loc[speed_limit_mask, flow_cols.speed_kmh].to_numpy(dtype=float)
+            > speed_limit.loc[speed_limit_mask].to_numpy(dtype=float)
+        ).astype(float)
+        speed_limit_stats = (
+            df_valid.loc[speed_limit_mask, group_cols]
+            .assign(exceso_velocidad=exceso)
+            .groupby(group_cols, sort=False)["exceso_velocidad"]
+            .agg(["sum", "count"])
+        )
+        speed_limit_sum_s = speed_limit_stats["sum"]
+        speed_limit_count_s = speed_limit_stats["count"]
+    else:
+        speed_limit_sum_s = pd.Series(dtype=float)
+        speed_limit_count_s = pd.Series(dtype=float)
+    speed_limit_den = speed_limit_count_s.reindex(summary.index).replace(0, np.nan)
+    summary["exceso_velocidad"] = (
+        speed_limit_sum_s.reindex(summary.index) / speed_limit_den
+    ).fillna(0.0)
+    summary["speed_limit_count"] = (
+        speed_limit_count_s.reindex(summary.index).fillna(0).astype(int)
+    )
 
     _tick("Agregando totales por matricula")
 
@@ -448,7 +544,9 @@ def Clusterization(
 
         conf_mask = hw_mask & prev_speed.notna()
         valid_conf_mask = conf_mask & group_valid
-        if ttc_max_map:
+        if ttc_mode == "fixed":
+            ttc_max = pd.Series(float(fixed_ttc_s), index=ordered_hw.index)
+        elif ttc_max_map:
             portico_key = pd.to_numeric(
                 ordered_hw[flow_cols.portico], errors="coerce"
             )
@@ -541,15 +639,27 @@ def Clusterization(
         weighted_sum = weighted_grouped[weighted_cols].sum()
         total_passes_sum = weighted_grouped["total_passes"].sum()
         lane_changes_sum = weighted_grouped["lane_changes"].sum()
+        speed_limit_count_sum = weighted_grouped["speed_limit_count"].sum()
+        speed_limit_excess_sum = (
+            weighted["exceso_velocidad"] * weighted["speed_limit_count"]
+        ).groupby(weighted[PLATE_CLEAN_COL], sort=False).sum()
         summary = weighted_sum.div(total_passes_sum, axis=0)
+        speed_limit_den = speed_limit_count_sum.replace(0, np.nan)
+        summary["exceso_velocidad"] = (
+            speed_limit_excess_sum / speed_limit_den
+        ).fillna(0.0)
         summary["total_passes"] = total_passes_sum
         summary["lane_changes"] = lane_changes_sum
         summary["lane_change_rate"] = lane_changes_sum.div(transitions_sum).fillna(0.0)
+        if include_counts:
+            summary["speed_limit_count"] = speed_limit_count_sum
         summary = summary.reset_index()
     else:
         summary = summary.reset_index()
 
     summary = summary.rename(columns={PLATE_CLEAN_COL: "plate"})
+    if not include_counts and "speed_limit_count" in summary.columns:
+        summary = summary.drop(columns=["speed_limit_count"])
     summary["n_days_active"] = summary["plate"].map(n_days_active).fillna(0).astype(int)
     summary["n_weeks_active"] = summary["plate"].map(n_weeks_active).fillna(0).astype(int)
     summary["n_months_active"] = (
@@ -961,8 +1071,48 @@ def _connect_cluster_duckdb(
     return duckdb.connect(str(target_path), read_only=ro_flag)
 
 
+def _feature_metadata_to_rows(metadata: Optional[Dict[str, object]]) -> pd.DataFrame:
+    rows = []
+    for key, value in (metadata or {}).items():
+        rows.append({"key": str(key), "value_json": json.dumps(value, ensure_ascii=True)})
+    return pd.DataFrame(rows, columns=["key", "value_json"])
+
+
+def _load_cluster_feature_metadata_from_conn(conn) -> Dict[str, object]:
+    try:
+        info = conn.execute(
+            f"PRAGMA table_info('{CLUSTER_META_TABLE_NAME}')"
+        ).fetchall()
+    except Exception:
+        return {}
+    if not info:
+        return {}
+    try:
+        meta_df = conn.execute(
+            f"SELECT key, value_json FROM {CLUSTER_META_TABLE_NAME}"
+        ).df()
+    except Exception:
+        return {}
+    metadata: Dict[str, object] = {}
+    for row in meta_df.itertuples(index=False):
+        key = str(getattr(row, "key", "") or "").strip()
+        if not key:
+            continue
+        raw_value = getattr(row, "value_json", None)
+        if raw_value is None or pd.isna(raw_value):
+            metadata[key] = None
+            continue
+        try:
+            metadata[key] = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError):
+            metadata[key] = raw_value
+    return metadata
+
+
 def save_cluster_features_duckdb(
-    features_df: pd.DataFrame, db_path: Optional[Path] = None
+    features_df: pd.DataFrame,
+    db_path: Optional[Path] = None,
+    metadata: Optional[Dict[str, object]] = None,
 ) -> Path:
     target_path = db_path or CLUSTER_DB_PATH
     conn = _connect_cluster_duckdb(read_only=False, db_path=target_path)
@@ -972,27 +1122,53 @@ def save_cluster_features_duckdb(
             f"CREATE OR REPLACE TABLE {CLUSTER_TABLE_NAME} AS "
             "SELECT * FROM cluster_features_df"
         )
+        conn.unregister("cluster_features_df")
+        conn.execute(f"DROP TABLE IF EXISTS {CLUSTER_META_TABLE_NAME}")
+        meta_rows = _feature_metadata_to_rows(metadata)
+        if not meta_rows.empty:
+            conn.register("cluster_features_meta_df", meta_rows)
+            conn.execute(
+                f"CREATE TABLE {CLUSTER_META_TABLE_NAME} AS "
+                "SELECT * FROM cluster_features_meta_df"
+            )
+            conn.unregister("cluster_features_meta_df")
     finally:
         conn.close()
     return target_path
 
 
-def load_cluster_features_duckdb(
+def load_cluster_feature_bundle_duckdb(
     db_path: Optional[Path] = None
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
     target_path = db_path or CLUSTER_DB_PATH
     if not target_path.exists():
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
     conn = _connect_cluster_duckdb(read_only=True, db_path=target_path)
     try:
         info = conn.execute(
             f"PRAGMA table_info('{CLUSTER_TABLE_NAME}')"
         ).fetchall()
         if not info:
-            return pd.DataFrame()
-        return conn.execute(f"SELECT * FROM {CLUSTER_TABLE_NAME}").df()
+            return pd.DataFrame(), {}
+        features_df = conn.execute(f"SELECT * FROM {CLUSTER_TABLE_NAME}").df()
+        metadata = _load_cluster_feature_metadata_from_conn(conn)
+        return features_df, metadata
     finally:
         conn.close()
+
+
+def load_cluster_feature_metadata_duckdb(
+    db_path: Optional[Path] = None
+) -> Dict[str, object]:
+    _features_df, metadata = load_cluster_feature_bundle_duckdb(db_path)
+    return metadata
+
+
+def load_cluster_features_duckdb(
+    db_path: Optional[Path] = None
+) -> pd.DataFrame:
+    features_df, _metadata = load_cluster_feature_bundle_duckdb(db_path)
+    return features_df
 
 
 def compute_kmeans_metrics(
@@ -1747,6 +1923,21 @@ def _aggregate_batch_features(
         weighted_grouped = weighted.groupby("plate", sort=False)
         weighted_sum = weighted_grouped[weighted_cols].sum()
         summary = weighted_sum.div(total_passes, axis=0)
+        if "exceso_velocidad" in batches_df.columns:
+            if "speed_limit_count" in batches_df.columns:
+                speed_limit_count = grouped["speed_limit_count"].sum()
+                speed_limit_sum = (
+                    batches_df["exceso_velocidad"] * batches_df["speed_limit_count"]
+                ).groupby(batches_df["plate"], sort=False).sum()
+                speed_limit_den = speed_limit_count.replace(0, np.nan)
+                summary["exceso_velocidad"] = (
+                    speed_limit_sum / speed_limit_den
+                ).fillna(0.0)
+                summary["speed_limit_count"] = speed_limit_count
+            else:
+                summary["exceso_velocidad"] = (
+                    batches_df["exceso_velocidad"] * batches_df["total_passes"]
+                ).groupby(batches_df["plate"], sort=False).sum() / total_passes
         summary["total_passes"] = total_passes
         if n_days_active is not None:
             summary["n_days_active"] = n_days_active
@@ -1811,6 +2002,23 @@ def _aggregate_batch_features(
             batches_df["conflict_rate"] * batches_df["total_passes"]
         ).groupby(batches_df["plate"], sort=False).sum() / total_passes
 
+    if "exceso_velocidad" in batches_df.columns:
+        if "speed_limit_count" in batches_df.columns:
+            speed_limit_count = grouped["speed_limit_count"].sum()
+            speed_limit_sum = (
+                batches_df["exceso_velocidad"] * batches_df["speed_limit_count"]
+            ).groupby(batches_df["plate"], sort=False).sum()
+            speed_limit_den = speed_limit_count.replace(0, np.nan)
+            exceso_velocidad = (speed_limit_sum / speed_limit_den).fillna(0.0)
+        else:
+            speed_limit_count = None
+            exceso_velocidad = (
+                batches_df["exceso_velocidad"] * batches_df["total_passes"]
+            ).groupby(batches_df["plate"], sort=False).sum() / total_passes
+    else:
+        speed_limit_count = None
+        exceso_velocidad = pd.Series(0.0, index=total_passes.index)
+
     lane_changes_sum = grouped["lane_changes"].sum()
     if lane_changes_extra:
         lane_changes_sum = lane_changes_sum.add(
@@ -1820,6 +2028,7 @@ def _aggregate_batch_features(
     summary = pd.DataFrame(index=total_passes.index)
     summary["total_passes"] = total_passes
     summary["avg_speed_kmh"] = speed_sum / total_passes
+    summary["exceso_velocidad"] = exceso_velocidad
     summary["avg_relative_speed"] = avg_relative_speed
     summary["avg_headway_s"] = avg_headway
     summary["conflict_rate"] = conflict_rate
@@ -1838,6 +2047,8 @@ def _aggregate_batch_features(
         summary["n_weeks_active"] = n_weeks_active
     if n_months_active is not None:
         summary["n_months_active"] = n_months_active
+    if speed_limit_count is not None:
+        summary["speed_limit_count"] = speed_limit_count
     return summary.reset_index()
 
 
@@ -1881,10 +2092,12 @@ def _aggregate_weekly_batches_by_month(
         "lane_prop_1",
         "lane_prop_2",
         "lane_prop_3",
+        "exceso_velocidad",
         "lane_changes",
         "rel_speed_count",
         "headway_count",
         "conflict_count",
+        "speed_limit_count",
         "n_days_active",
         "n_weeks_active",
     ]
@@ -1897,6 +2110,8 @@ def _aggregate_weekly_batches_by_month(
         for col in ["rel_speed_count", "headway_count", "conflict_count"]
         if col in df.columns
     ]
+    if "speed_limit_count" in df.columns:
+        count_cols.append("speed_limit_count")
     if count_cols:
         df[count_cols] = df[count_cols].fillna(0)
 
@@ -1948,6 +2163,23 @@ def _aggregate_weekly_batches_by_month(
             df["conflict_rate"] * df["total_passes"]
         ).groupby(group_keys, sort=False).sum() / total_passes
 
+    if "exceso_velocidad" in df.columns:
+        if "speed_limit_count" in df.columns:
+            speed_limit_count = grouped["speed_limit_count"].sum()
+            speed_limit_sum = (df["exceso_velocidad"] * df["speed_limit_count"]).groupby(
+                group_keys, sort=False
+            ).sum()
+            speed_limit_den = speed_limit_count.replace(0, np.nan)
+            exceso_velocidad = (speed_limit_sum / speed_limit_den).fillna(0.0)
+        else:
+            speed_limit_count = None
+            exceso_velocidad = (
+                df["exceso_velocidad"] * df["total_passes"]
+            ).groupby(group_keys, sort=False).sum() / total_passes
+    else:
+        speed_limit_count = None
+        exceso_velocidad = pd.Series(0.0, index=total_passes.index)
+
     lane_changes_sum = grouped["lane_changes"].sum()
     if lane_changes_extra_by_month:
         extras = []
@@ -1971,6 +2203,7 @@ def _aggregate_weekly_batches_by_month(
     summary = pd.DataFrame(index=total_passes.index)
     summary["total_passes"] = total_passes
     summary["avg_speed_kmh"] = speed_sum / total_passes
+    summary["exceso_velocidad"] = exceso_velocidad
     summary["avg_relative_speed"] = avg_relative_speed
     summary["avg_headway_s"] = avg_headway
     summary["conflict_rate"] = conflict_rate
@@ -1987,6 +2220,8 @@ def _aggregate_weekly_batches_by_month(
         summary["n_days_active"] = grouped["n_days_active"].sum()
     if "n_weeks_active" in df.columns:
         summary["n_weeks_active"] = grouped["n_weeks_active"].sum()
+    if speed_limit_count is not None:
+        summary["speed_limit_count"] = speed_limit_count
     summary["n_months_active"] = 1
     return summary.reset_index()
 
@@ -2000,6 +2235,9 @@ def _clusterize_in_batches(
     date_end: Optional[pd.Timestamp] = None,
     batch_db_path: Optional[Path] = None,
     progress: Optional[object] = None,
+    ttc_mode: str = "dynamic",
+    fixed_ttc_s: Optional[float] = None,
+    speed_limit_map: Optional[Dict[str, float]] = None,
     **clean_kwargs,
 ) -> Tuple[pd.DataFrame, List[Path]]:
     summary = ensure_flow_db_summary()
@@ -2111,6 +2349,9 @@ def _clusterize_in_batches(
                 monthly_weighting=False,
                 overlap_col=overlap_col,
                 include_counts=True,
+                ttc_mode=ttc_mode,
+                fixed_ttc_s=fixed_ttc_s,
+                speed_limit_map=speed_limit_map,
                 progress=None,
                 **clean_kwargs,
             )
@@ -2224,16 +2465,15 @@ def _clusterize_in_batches(
         by=["total_passes", "plate"], ascending=[False, True]
     ).reset_index(drop=True)
     if batch_db_path is not None:
-        _ensure_duckdb_available()
-        batch_conn = duckdb.connect(str(batch_db_path))
-        try:
-            batch_conn.register("cluster_features_df", consolidated)
-            batch_conn.execute(
-                f"CREATE OR REPLACE TABLE {CLUSTER_TABLE_NAME} AS "
-                "SELECT * FROM cluster_features_df"
-            )
-        finally:
-            batch_conn.close()
+        save_cluster_features_duckdb(
+            consolidated,
+            db_path=batch_db_path,
+            metadata=build_ttc_feature_metadata(
+                ttc_mode=ttc_mode,
+                fixed_ttc_s=fixed_ttc_s,
+                ttc_max_map=ttc_max_map,
+            ),
+        )
     return consolidated, batch_paths
 
 
@@ -2263,6 +2503,7 @@ def handle_clusterization(session) -> None:
                     "plate",
                     "total_passes",
                     "avg_speed_kmh",
+                    "exceso_velocidad",
                     "avg_relative_speed",
                     "avg_headway_s",
                     "conflict_rate",
@@ -2356,7 +2597,14 @@ def handle_clusterization(session) -> None:
         try:
             suffix = _prompt_cluster_feature_db_suffix()
             db_path = _build_cluster_feature_db_path(suffix)
-            db_path = save_cluster_features_duckdb(features_df, db_path=db_path)
+            db_path = save_cluster_features_duckdb(
+                features_df,
+                db_path=db_path,
+                metadata=build_ttc_feature_metadata(
+                    ttc_mode="dynamic",
+                    ttc_max_map=TTC_MAX_BY_PORTICO,
+                ),
+            )
             print(f"📦 Variables guardadas en DuckDB: {db_path}")
         except ImportError as exc:
             print(f"❌ {exc}")

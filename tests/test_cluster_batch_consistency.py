@@ -121,6 +121,7 @@ def test_clusterization_batch_vs_full(tmp_path, monkeypatch):
     compare_cols = [
         "total_passes",
         "avg_speed_kmh",
+        "exceso_velocidad",
         "avg_relative_speed",
         "avg_headway_s",
         "conflict_rate",
@@ -129,6 +130,7 @@ def test_clusterization_batch_vs_full(tmp_path, monkeypatch):
         "lane_prop_3",
         "lane_changes",
         "lane_change_rate",
+        "speed_limit_count",
     ]
     missing_full = set(compare_cols) - set(full_df.columns)
     missing_batch = set(compare_cols) - set(batch_df.columns)
@@ -144,7 +146,7 @@ def test_clusterization_batch_vs_full(tmp_path, monkeypatch):
     full = full.loc[batch.index, compare_cols]
     batch = batch.loc[full.index, compare_cols]
 
-    int_cols = ["total_passes"]
+    int_cols = ["total_passes", "speed_limit_count"]
     float_cols = [col for col in compare_cols if col not in int_cols]
 
     for col in int_cols:
@@ -202,6 +204,7 @@ def test_weekly_rollup_matches_monthly_batches(tmp_path, monkeypatch):
     compare_cols = [
         "total_passes",
         "avg_speed_kmh",
+        "exceso_velocidad",
         "avg_relative_speed",
         "avg_headway_s",
         "conflict_rate",
@@ -210,6 +213,7 @@ def test_weekly_rollup_matches_monthly_batches(tmp_path, monkeypatch):
         "lane_prop_3",
         "lane_changes",
         "lane_change_rate",
+        "speed_limit_count",
     ]
     missing_month = set(compare_cols) - set(month_df.columns)
     missing_week = set(compare_cols) - set(week_df.columns)
@@ -225,7 +229,7 @@ def test_weekly_rollup_matches_monthly_batches(tmp_path, monkeypatch):
     month = month.loc[week.index, compare_cols]
     week = week.loc[month.index, compare_cols]
 
-    int_cols = ["total_passes"]
+    int_cols = ["total_passes", "speed_limit_count"]
     float_cols = [col for col in compare_cols if col not in int_cols]
 
     for col in int_cols:

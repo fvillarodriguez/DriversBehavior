@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import fnmatch
 import io
+import json
 import os
 import re
 
@@ -37,6 +38,8 @@ FLOW_TABLE_SCHEMA = """
     CARRIL VARCHAR
 """
 DEFAULT_INTERVAL_MINUTES = 5
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PORTICO_MAXSPEED_CACHE: Optional[Dict[str, float]] = None
 
 
 @dataclass(frozen=True)
@@ -1629,6 +1632,168 @@ def load_porticos(path: Optional[str] = None) -> pd.DataFrame:
     porticos_df = load_porticos_from_df(df)
     _PORTICOS_DF_CACHE = porticos_df
     return porticos_df.copy()
+
+
+def _normalize_portico_id(value: object) -> Optional[str]:
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+    numeric = pd.to_numeric(text.replace(",", "."), errors="coerce")
+    if pd.notna(numeric) and np.isclose(float(numeric), np.floor(float(numeric))):
+        return str(int(numeric))
+    return text.upper()
+
+
+def _parse_maxspeed_value(value: object) -> Optional[float]:
+    if value is None or pd.isna(value):
+        return None
+    match = re.search(r"[-+]?\d+(?:[.,]\d+)?", str(value))
+    if match is None:
+        return None
+    speed = pd.to_numeric(match.group(0).replace(",", "."), errors="coerce")
+    if pd.isna(speed) or float(speed) <= 0:
+        return None
+    return float(speed)
+
+
+def _project_point_to_segment(
+    point: np.ndarray, start: np.ndarray, end: np.ndarray
+) -> np.ndarray:
+    segment = end - start
+    denom = float(np.dot(segment, segment))
+    if denom <= 0:
+        return start
+    ratio = float(np.dot(point - start, segment) / denom)
+    ratio = max(0.0, min(1.0, ratio))
+    return start + ratio * segment
+
+
+def _ensure_portico_coordinates(porticos_df: pd.DataFrame) -> pd.DataFrame:
+    porticos = porticos_df.copy()
+    if "lat" in porticos.columns and "lon" in porticos.columns:
+        porticos["lat"] = pd.to_numeric(porticos["lat"], errors="coerce")
+        porticos["lon"] = pd.to_numeric(porticos["lon"], errors="coerce")
+        return porticos
+
+    coord_col = None
+    for candidate in ("lat-lon", "lat_lon", "coordenadas"):
+        if candidate in porticos.columns:
+            coord_col = candidate
+            break
+    if coord_col is None:
+        return porticos
+
+    split_coords = porticos[coord_col].astype(str).str.split(",", expand=True)
+    if split_coords.shape[1] >= 2:
+        porticos["lat"] = pd.to_numeric(split_coords[0], errors="coerce")
+        porticos["lon"] = pd.to_numeric(split_coords[1], errors="coerce")
+    return porticos
+
+
+def load_portico_maxspeed_map(
+    porticos_path: Optional[Union[str, Path]] = None,
+    highway_json_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, float]:
+    """
+    Construye un mapa portico -> maxspeed usando Porticos.csv y nodos_autopista.json.
+
+    Solo retorna porticos auxiliares == 0 con una asignacion univoca de maxspeed.
+    Los porticos duplicados con limites distintos quedan fuera del mapa.
+    """
+    global _PORTICO_MAXSPEED_CACHE
+    use_cache = porticos_path is None and highway_json_path is None
+    if use_cache and _PORTICO_MAXSPEED_CACHE is not None:
+        return dict(_PORTICO_MAXSPEED_CACHE)
+
+    resolved_porticos_path = (
+        Path(porticos_path)
+        if porticos_path is not None
+        else PROJECT_ROOT / "Datos" / "Porticos.csv"
+    )
+    resolved_highway_path = (
+        Path(highway_json_path)
+        if highway_json_path is not None
+        else PROJECT_ROOT / "Datos" / "nodos_autopista.json"
+    )
+    if not resolved_porticos_path.exists() or not resolved_highway_path.exists():
+        return {}
+
+    try:
+        porticos = load_porticos(str(resolved_porticos_path))
+    except Exception:
+        return {}
+
+    porticos = _ensure_portico_coordinates(porticos)
+    if "aux" in porticos.columns:
+        aux_numeric = pd.to_numeric(porticos["aux"], errors="coerce").fillna(0)
+        porticos = porticos[aux_numeric.eq(0)].copy()
+    if not {"portico", "lat", "lon"}.issubset(porticos.columns):
+        return {}
+    porticos["portico_norm"] = porticos["portico"].apply(_normalize_portico_id)
+    porticos["lat"] = pd.to_numeric(porticos["lat"], errors="coerce")
+    porticos["lon"] = pd.to_numeric(porticos["lon"], errors="coerce")
+    porticos = porticos.dropna(subset=["portico_norm", "lat", "lon"])
+    if porticos.empty:
+        return {}
+
+    try:
+        with open(resolved_highway_path, "r", encoding="utf-8") as file:
+            highway_data = json.load(file)
+    except Exception:
+        return {}
+
+    segments: List[Tuple[np.ndarray, np.ndarray, float]] = []
+    for element in highway_data.get("elements", []):
+        if element.get("type") != "way":
+            continue
+        maxspeed = _parse_maxspeed_value((element.get("tags") or {}).get("maxspeed"))
+        geometry = element.get("geometry") or []
+        if maxspeed is None or len(geometry) < 2:
+            continue
+        try:
+            path = np.array(
+                [[point["lon"], point["lat"]] for point in geometry], dtype=float
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        for idx in range(len(path) - 1):
+            segments.append((path[idx], path[idx + 1], maxspeed))
+    if not segments:
+        return {}
+
+    rows: List[Dict[str, object]] = []
+    for row in porticos.itertuples(index=False):
+        point = np.array([float(row.lon), float(row.lat)], dtype=float)
+        best_speed: Optional[float] = None
+        best_dist_sq: Optional[float] = None
+        for start, end, maxspeed in segments:
+            projected = _project_point_to_segment(point, start, end)
+            dist_sq = float(np.sum((point - projected) ** 2))
+            if best_dist_sq is None or dist_sq < best_dist_sq:
+                best_dist_sq = dist_sq
+                best_speed = maxspeed
+        if best_speed is not None:
+            rows.append(
+                {
+                    "portico": row.portico_norm,
+                    "maxspeed": float(best_speed),
+                }
+            )
+    if not rows:
+        return {}
+
+    speed_df = pd.DataFrame(rows)
+    result: Dict[str, float] = {}
+    for portico, group in speed_df.groupby("portico", sort=False):
+        unique_speeds = group["maxspeed"].dropna().round(6).unique()
+        if len(unique_speeds) == 1:
+            result[str(portico)] = float(unique_speeds[0])
+
+    if use_cache:
+        _PORTICO_MAXSPEED_CACHE = dict(result)
+    return result
 
 
 def find_candidate_porticos(

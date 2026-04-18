@@ -32,6 +32,7 @@ from utils import (  # noqa: E402
 )
 from clustering import (  # noqa: E402
     Clusterization,
+    DEFAULT_FIXED_TTC_SECONDS,
     TTC_MAX_BY_PORTICO,
     _build_batch_ranges,
     _build_cluster_feature_db_path,
@@ -40,12 +41,13 @@ from clustering import (  # noqa: E402
     _order_feature_columns,
     _prepare_cluster_features,
     _scale_cluster_features,
+    build_ttc_feature_metadata,
     build_cluster_descriptive,
     build_cluster_summary,
     compute_gmm_metrics,
     compute_kmeans_metrics,
+    load_cluster_feature_bundle_duckdb,
     list_cluster_feature_db_paths,
-    load_cluster_features_duckdb,
     save_cluster_descriptive,
     save_cluster_features,
     save_cluster_features_duckdb,
@@ -61,6 +63,7 @@ REQUIRED_FEATURE_COLS = {
     "plate",
     "total_passes",
     "avg_speed_kmh",
+    "exceso_velocidad",
     "avg_relative_speed",
     "avg_headway_s",
     "conflict_rate",
@@ -76,6 +79,55 @@ CLUSTER_LABEL_PATTERN = re.compile(
 SUMMARY_PATTERN = re.compile(
     r"^cluster_summary(?:_(?P<method>kmeans|gmm|hdbscan))?(?:_k(?P<k>\d+))?(?:.*)?\.csv$"
 )
+FEATURE_DETAILS = {
+    "base": [
+        (
+            "avg_speed_kmh",
+            "Promedio de velocidad por patente sobre todas sus pasadas validas.",
+        ),
+        (
+            "exceso_velocidad",
+            "Media por patente de mediciones con exceso de velocidad: 1 si la velocidad de la pasada supera el `maxspeed` del portico y 0 si es menor o igual. El `maxspeed` se obtiene de `Datos/nodos_autopista.json` usando los porticos no auxiliares de `Datos/Porticos.csv`; si una patente no tiene pasadas con limite valido, se reporta 0.",
+        ),
+        (
+            "avg_relative_speed",
+            "Velocidad del vehiculo dividida por la velocidad promedio del portico en ventanas de 5 minutos; valores mayores a 1 indican que suele circular sobre el flujo medio.",
+        ),
+        (
+            "avg_headway_s",
+            "Promedio del headway temporal respecto al vehiculo previo en el mismo portico y carril; se descartan headways mayores a 60 segundos.",
+        ),
+        (
+            "conflict_rate",
+            "Proporcion de eventos con conflicto TTC. TTC = (headway * velocidad actual) / (velocidad actual - velocidad previa) cuando el vehiculo actual va mas rapido que el anterior.",
+        ),
+        (
+            "lane_prop_1",
+            "Proporcion de pasadas por el carril 1 respecto del total de la patente.",
+        ),
+        (
+            "lane_prop_2",
+            "Proporcion de pasadas por el carril 2 respecto del total de la patente.",
+        ),
+        (
+            "lane_prop_3",
+            "Proporcion de pasadas por el carril 3 respecto del total de la patente. Se calcula siempre, aunque normalmente no se usa para clustering por colinealidad.",
+        ),
+        (
+            "lane_change_rate",
+            "Cantidad de cambios de carril dividida por (total_passes - 1), ordenando los eventos por patente y tiempo.",
+        ),
+    ],
+    "meta": [
+        ("plate", "Patente normalizada y anonimizada que identifica al conductor."),
+        ("total_passes", "Cantidad total de pasadas validas usadas para construir el perfil."),
+        ("speed_limit_count", "Cantidad de pasadas de la patente que tuvieron un `maxspeed` valido para calcular `exceso_velocidad`."),
+        ("lane_changes", "Numero absoluto de cambios de carril detectados antes de normalizar."),
+        ("n_days_active", "Numero de dias distintos con actividad para la patente."),
+        ("n_weeks_active", "Numero de semanas ISO distintas con actividad para la patente."),
+        ("n_months_active", "Numero de meses distintos con actividad para la patente."),
+    ],
+}
 
 
 class StreamlitProgress:
@@ -116,6 +168,7 @@ def _init_state() -> None:
     st.session_state.setdefault("features_df", None)
     st.session_state.setdefault("features_source", None)
     st.session_state.setdefault("features_path", None)
+    st.session_state.setdefault("features_config", None)
     st.session_state.setdefault("metrics_df", None)
     st.session_state.setdefault("metrics_method", None)
     st.session_state.setdefault("metrics_feature_cols", None)
@@ -135,10 +188,82 @@ def _reset_metrics_state() -> None:
     st.session_state["metrics_params"] = None
 
 
-def _store_features(df: pd.DataFrame, source: str, path: Optional[Path]) -> None:
+def _normalize_feature_config(feature_config: Optional[dict]) -> dict:
+    if not isinstance(feature_config, dict):
+        return {}
+    ttc_mode = str(feature_config.get("ttc_mode") or "").strip().lower()
+    if ttc_mode not in {"dynamic", "fixed"}:
+        return {}
+    normalized = dict(feature_config)
+    normalized["ttc_mode"] = ttc_mode
+    normalized["ttc_mode_label"] = (
+        "Dinamico" if ttc_mode == "dynamic" else "Fijo"
+    )
+    if ttc_mode == "fixed":
+        try:
+            normalized["ttc_fixed_seconds"] = float(
+                feature_config.get("ttc_fixed_seconds", DEFAULT_FIXED_TTC_SECONDS)
+            )
+        except (TypeError, ValueError):
+            normalized["ttc_fixed_seconds"] = float(DEFAULT_FIXED_TTC_SECONDS)
+    return normalized
+
+
+def _current_feature_config() -> dict:
+    return _normalize_feature_config(st.session_state.get("features_config"))
+
+
+def _format_ttc_config(feature_config: Optional[dict]) -> Optional[str]:
+    normalized = _normalize_feature_config(feature_config)
+    if not normalized:
+        return None
+    if normalized["ttc_mode"] == "fixed":
+        return f"TTC: Fijo ({normalized['ttc_fixed_seconds']:.2f} s)"
+    threshold_map = normalized.get("ttc_threshold_map")
+    if isinstance(threshold_map, dict) and threshold_map:
+        values = []
+        for value in threshold_map.values():
+            try:
+                values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        if values:
+            return (
+                "TTC: Dinamico "
+                f"({len(values)} porticos, {min(values):.1f}-{max(values):.1f} s)"
+            )
+    return "TTC: Dinamico (umbral por portico)"
+
+
+def _render_feature_details() -> None:
+    current_ttc = _format_ttc_config(_current_feature_config())
+    with st.expander("Detalle de las features calculadas", expanded=False):
+        if current_ttc:
+            st.caption(current_ttc)
+        st.markdown("**Features base para clustering**")
+        for feature_name, detail in FEATURE_DETAILS["base"]:
+            st.markdown(f"`{feature_name}`: {detail}")
+        st.markdown("**Metadatos auxiliares**")
+        for feature_name, detail in FEATURE_DETAILS["meta"]:
+            st.markdown(f"`{feature_name}`: {detail}")
+        st.caption(
+            "En `conflict_rate`, el umbral TTC puede ser Dinamico (mapa por portico) o Fijo (valor unico definido en la UI)."
+        )
+        st.caption(
+            "`exceso_velocidad` usa `maxspeed` desde `Datos/nodos_autopista.json`; las pasadas sin limite valido no entran al denominador y una patente sin pasadas validas queda en 0."
+        )
+
+
+def _store_features(
+    df: pd.DataFrame,
+    source: str,
+    path: Optional[Path],
+    feature_config: Optional[dict] = None,
+) -> None:
     st.session_state["features_df"] = df
     st.session_state["features_source"] = source
     st.session_state["features_path"] = str(path) if path else None
+    st.session_state["features_config"] = _normalize_feature_config(feature_config)
     _reset_metrics_state()
 
 
@@ -146,6 +271,7 @@ def _clear_features() -> None:
     st.session_state["features_df"] = None
     st.session_state["features_source"] = None
     st.session_state["features_path"] = None
+    st.session_state["features_config"] = None
     _reset_metrics_state()
 
 
@@ -252,6 +378,9 @@ def _log_metrics_event(
         "feature_path": feature_path,
         "feature_file": feature_file,
     }
+    feature_config = _current_feature_config()
+    if feature_config:
+        entry["feature_config"] = feature_config
     _write_run_log(entry)
 
 
@@ -280,6 +409,9 @@ def _log_gmm_comparison_run(
         "feature_path": str(feature_path),
         "feature_file": feature_path.name,
     }
+    feature_config = _current_feature_config()
+    if feature_config:
+        entry["feature_config"] = feature_config
     if quality_path is not None:
         entry["quality_path"] = str(quality_path)
         entry["quality_file"] = quality_path.name
@@ -315,6 +447,9 @@ def _log_k_optimo_run(
         "feature_path": feature_path,
         "feature_file": feature_file,
     }
+    feature_config = _current_feature_config()
+    if feature_config:
+        entry["feature_config"] = feature_config
     if train_params:
         entry["train_params"] = train_params
     if train_distribution:
@@ -354,6 +489,9 @@ def _log_cluster_run(
         "feature_path": feature_path,
         "feature_file": feature_file,
     }
+    feature_config = _current_feature_config()
+    if feature_config:
+        entry["feature_config"] = feature_config
     if metrics_path is not None:
         entry["metrics_path"] = str(metrics_path)
         entry["metrics_file"] = metrics_path.name
@@ -401,6 +539,9 @@ def _log_frequent_definition(
             "rare_share": rare_share,
         },
     }
+    feature_config = _current_feature_config()
+    if feature_config:
+        entry["feature_config"] = feature_config
     _write_run_log(entry)
 
 
@@ -538,6 +679,7 @@ def _build_sample_inputs(
 
 def _render_feature_loader() -> Optional[pd.DataFrame]:
     #st.subheader("Variables para clustering")
+    _render_feature_details()
 
     features_df = _get_features()
     has_memory = features_df is not None and not features_df.empty
@@ -596,7 +738,7 @@ def _render_feature_loader() -> Optional[pd.DataFrame]:
         if st.button("Cargar variables"):
             path = RESULTS_DIR / selected
             try:
-                df = load_cluster_features_duckdb(path)
+                df, feature_config = load_cluster_feature_bundle_duckdb(path)
             except ImportError as exc:
                 st.error(str(exc))
                 return _get_features()
@@ -610,7 +752,7 @@ def _render_feature_loader() -> Optional[pd.DataFrame]:
                     + ", ".join(missing)
                 )
                 return _get_features()
-            _store_features(df, "duckdb", path)
+            _store_features(df, "duckdb", path, feature_config=feature_config)
             st.session_state["feature_source_request"] = "En memoria"
             st.session_state["features_notice"] = (
                 f"Variables cargadas: {len(df):,} filas."
@@ -652,11 +794,41 @@ def _render_feature_loader() -> Optional[pd.DataFrame]:
                 "Ponderar variables por mes antes de consolidar",
                 value=False,
             )
+        st.markdown("**Configuracion TTC**")
+        ttc_mode_label = st.radio(
+            "Umbral TTC para conflict_rate",
+            ["Dinamico", "Fijo"],
+            horizontal=True,
+            help=(
+                "Dinamico usa el umbral actual por portico. "
+                "Fijo aplica el mismo umbral TTC a todos los porticos."
+            ),
+        )
+        fixed_ttc_s = None
+        if ttc_mode_label == "Fijo":
+            fixed_ttc_s = st.number_input(
+                "TTC fijo (segundos)",
+                min_value=0.1,
+                value=float(DEFAULT_FIXED_TTC_SECONDS),
+                step=0.1,
+                format="%.2f",
+                help="Valor unico de TTC usado para marcar conflicto.",
+            )
+        else:
+            st.caption(
+                f"Modo Dinamico: {len(TTC_MAX_BY_PORTICO)} umbrales por portico."
+            )
 
         run_calculation = st.form_submit_button("Calcular variables", disabled=not range_valid)
 
     if run_calculation:
         fc = FlowColumns()
+        ttc_mode = "fixed" if ttc_mode_label == "Fijo" else "dynamic"
+        feature_config = build_ttc_feature_metadata(
+            ttc_mode=ttc_mode,
+            fixed_ttc_s=fixed_ttc_s,
+            ttc_max_map=TTC_MAX_BY_PORTICO,
+        )
         progress_container = st.container()
         batch_db_path = None
         if use_batches:
@@ -687,6 +859,8 @@ def _render_feature_loader() -> Optional[pd.DataFrame]:
                         date_end=sample.date_end,
                         batch_db_path=batch_db_path,
                         progress=batch_progress,
+                        ttc_mode=ttc_mode,
+                        fixed_ttc_s=fixed_ttc_s,
                     )
                 except ImportError as exc:
                     st.error(str(exc))
@@ -723,6 +897,8 @@ def _render_feature_loader() -> Optional[pd.DataFrame]:
                         flujos_df,
                         fc,
                         monthly_weighting=monthly_weighting,
+                        ttc_mode=ttc_mode,
+                        fixed_ttc_s=fixed_ttc_s,
                         progress=calc_progress,
                         group_progress=headway_progress,
                     )
@@ -733,7 +909,12 @@ def _render_feature_loader() -> Optional[pd.DataFrame]:
             st.warning("No se encontraron registros validos.")
             return _get_features()
         source_label = "computed (DB)" if batch_db_path else "computed"
-        _store_features(features_df, source_label, batch_db_path)
+        _store_features(
+            features_df,
+            source_label,
+            batch_db_path,
+            feature_config=feature_config,
+        )
         st.session_state["feature_source_request"] = "En memoria"
         st.session_state["features_notice"] = (
             f"Variables calculadas: {len(features_df):,} filas."
@@ -754,6 +935,9 @@ def _render_feature_preview(features_df: pd.DataFrame) -> None:
     )
     if st.session_state.get("features_path"):
         st.caption(f"Archivo: {st.session_state.get('features_path')}")
+    ttc_summary = _format_ttc_config(_current_feature_config())
+    if ttc_summary:
+        st.caption(ttc_summary)
     preview_rows = st.slider("Filas de vista previa", 5, 100, 20, step=5)
     st.dataframe(features_df.head(preview_rows), width="stretch")
 
@@ -765,7 +949,11 @@ def _render_feature_preview(features_df: pd.DataFrame) -> None:
     if st.button("Guardar en DuckDB"):
         try:
             db_path = _build_cluster_feature_db_path(suffix)
-            saved = save_cluster_features_duckdb(features_df, db_path=db_path)
+            saved = save_cluster_features_duckdb(
+                features_df,
+                db_path=db_path,
+                metadata=_current_feature_config(),
+            )
         except ImportError as exc:
             st.error(str(exc))
             return
@@ -3674,12 +3862,19 @@ def _render_history_tab() -> None:
             feature_source = entry.get("feature_source")
             feature_file = entry.get("feature_file")
             feature_path = entry.get("feature_path")
+            feature_config = entry.get("feature_config")
             if feature_source:
                 st.caption(f"source: {feature_source}")
             if feature_file:
                 st.caption(f"archivo: {feature_file}")
             if feature_path:
                 st.caption(f"path: {feature_path}")
+            if isinstance(feature_config, dict) and feature_config:
+                ttc_summary = _format_ttc_config(feature_config)
+                if ttc_summary:
+                    st.caption(ttc_summary)
+                with st.expander("Configuracion TTC", expanded=False):
+                    st.json(feature_config)
 
             feature_cols = entry.get("feature_cols")
             if isinstance(feature_cols, list) and feature_cols:
