@@ -101,11 +101,37 @@ def _render_public_key_tools(config: ray_cluster.RayClusterConfig) -> None:
         "Exporte la llave publica de este Mac para copiarla al otro nodo o importe una llave publica "
         "en el archivo local authorized_keys."
     )
+    st.info(
+        "Importar aqui solo agrega una llave al archivo local authorized_keys para aceptar conexiones entrantes. "
+        "El aviso superior depende de la ruta configurada en 'Llave SSH privada'."
+    )
 
     col_export, col_import = st.columns(2)
     with col_export:
         st.markdown("**Exportar llave publica**")
         st.caption("Usa la llave SSH configurada arriba y busca el archivo .pub correspondiente.")
+        try:
+            private_key = ray_cluster.ssh_private_key_path(config.ssh_key_path)
+        except ValueError as exc:
+            st.warning(str(exc))
+            private_key = None
+        else:
+            if private_key.exists():
+                st.success(f"Llave privada configurada lista: {private_key}")
+            else:
+                st.warning(f"No existe la llave privada configurada: {private_key}")
+
+        detected_private_keys = ray_cluster.detect_private_keys()
+        if detected_private_keys and (
+            private_key is None or not private_key.exists() or private_key not in detected_private_keys
+        ):
+            st.caption("Llaves privadas detectadas en este Mac:")
+            for candidate in detected_private_keys:
+                label = f"Usar {candidate}"
+                if st.button(label, key=f"ray_use_detected_key_{candidate}", width="stretch"):
+                    st.session_state["ray_ssh_key"] = str(candidate)
+                    st.rerun()
+
         if st.button("Cargar llave publica local", key="ray_export_public_key", width="stretch"):
             try:
                 st.session_state["ray_exported_public_key"] = ray_cluster.read_public_key(config)

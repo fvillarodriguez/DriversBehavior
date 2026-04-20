@@ -12106,26 +12106,42 @@ def _render_optuna_tab() -> None:
             st.markdown(f"**Optimizando: {label} | {balance_label}**")
             optuna.logging.set_verbosity(optuna.logging.WARNING)
             effective_optuna_n_jobs = max(1, int(optuna_n_jobs))
-            sampler = optuna.samplers.TPESampler(
-                seed=int(optuna_random_state)
-            )
-            if pruner_enabled:
-                pruner = optuna.pruners.MedianPruner(
-                    n_startup_trials=int(pruner_startup_trials),
-                    n_warmup_steps=0,
-                    interval_steps=1,
+            sampler_kwargs: Dict[str, object] = {
+                "seed": int(optuna_random_state)
+            }
+            if is_multiobjective_optuna and effective_optuna_n_jobs > 1:
+                sampler_kwargs["constant_liar"] = True
+            try:
+                sampler = optuna.samplers.TPESampler(**sampler_kwargs)
+            except TypeError:
+                sampler = optuna.samplers.TPESampler(
+                    seed=int(optuna_random_state)
+                )
+            if is_multiobjective_optuna:
+                pruner = optuna.pruners.NopPruner()
+                study = optuna.create_study(
+                    directions=list(CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS),
+                    sampler=sampler,
+                    pruner=pruner,
                 )
             else:
-                pruner = optuna.pruners.NopPruner()
-
-            study = optuna.create_study(
-                direction=objective_direction,
-                sampler=sampler,
-                pruner=pruner,
-            )
+                if pruner_enabled:
+                    pruner = optuna.pruners.MedianPruner(
+                        n_startup_trials=int(pruner_startup_trials),
+                        n_warmup_steps=0,
+                        interval_steps=1,
+                    )
+                else:
+                    pruner = optuna.pruners.NopPruner()
+                study = optuna.create_study(
+                    direction=objective_direction,
+                    sampler=sampler,
+                    pruner=pruner,
+                )
 
             X_train_run = X_train[cols].fillna(0).astype("float32")
             X_val_run = X_val[cols].fillna(0).astype("float32")
+            y_val_np = y_val.to_numpy()
 
             ranked_cols: List[str] = list(cols)
             effective_k_low = 0
@@ -12159,7 +12175,9 @@ def _render_optuna_tab() -> None:
                     f"paso {effective_k_step}."
                 )
 
-            def objective(trial: "optuna.Trial") -> float:
+            def _prepare_trial_inputs(
+                trial: "optuna.Trial",
+            ) -> Dict[str, object]:
                 if optuna_tune_topk and ranked_cols:
                     top_k = _suggest_optuna_discrete_int(
                         trial,
@@ -12352,32 +12370,49 @@ def _render_optuna_tab() -> None:
                     )
                     model_params = {"kernel": kernel, "C": float(c_value)}
 
+                return {
+                    "trial_cols": list(trial_cols),
+                    "X_res": X_res,
+                    "y_res": y_res,
+                    "X_val_trial": X_val_trial,
+                    "model_params": model_params,
+                }
+
+            def _fit_trial_scores(trial_payload: Dict[str, object]) -> np.ndarray:
                 try:
                     model = _build_model(
-                        model_choice, model_params, int(optuna_random_state)
+                        model_choice,
+                        dict(trial_payload["model_params"]),
+                        int(optuna_random_state),
                     )
-                    model.fit(X_res, y_res)
-                    raw_scores_val = _get_model_scores(model, X_val_trial)
+                    model.fit(trial_payload["X_res"], trial_payload["y_res"])
+                    raw_scores_val = _get_model_scores(
+                        model, trial_payload["X_val_trial"]
+                    )
                     calibrator = _fit_score_calibrator(
-                        y_val.to_numpy(),
+                        y_val_np,
                         raw_scores_val,
                         method=optuna_calibration_method,
                     )
-                    scores_val = calibrator.transform(raw_scores_val)
-                    scored = _score_optuna_objective(
-                        y_val.to_numpy(),
-                        scores_val,
-                        objective_metric=objective_key,
-                        threshold_objective=str(optuna_threshold_objective),
-                        eval_df=val_df,
-                        far_target=float(optuna_far_target),
-                        alerts_per_day=float(optuna_alerts_per_day),
-                        fn_cost=float(optuna_fn_cost),
-                        fp_cost=float(optuna_fp_cost),
-                    )
-                    score = float(scored.get("score", float("nan")))
+                    return calibrator.transform(raw_scores_val)
                 except Exception as exc:
                     raise optuna.TrialPruned(str(exc)) from exc
+
+            def objective(trial: "optuna.Trial") -> float:
+                trial_payload = _prepare_trial_inputs(trial)
+                scores_val = _fit_trial_scores(trial_payload)
+                scored = _score_optuna_objective(
+                    y_val_np,
+                    scores_val,
+                    objective_metric=objective_key,
+                    threshold_objective=str(optuna_threshold_objective),
+                    eval_df=val_df,
+                    far_target=float(optuna_far_target),
+                    alerts_per_day=float(optuna_alerts_per_day),
+                    fn_cost=float(optuna_fn_cost),
+                    fp_cost=float(optuna_fp_cost),
+                )
+                score = float(scored.get("score", float("nan")))
 
                 if pd.isna(score):
                     raise optuna.TrialPruned(
@@ -12387,6 +12422,68 @@ def _render_optuna_tab() -> None:
                 if trial.should_prune():
                     raise optuna.TrialPruned("Pruned by MedianPruner")
                 return score
+
+            def objective_multiobjective(
+                trial: "optuna.Trial",
+            ) -> Tuple[float, float, float, float]:
+                trial_payload = _prepare_trial_inputs(trial)
+                scores_val = _fit_trial_scores(trial_payload)
+                scored = _score_optuna_objective(
+                    y_val_np,
+                    scores_val,
+                    objective_metric="mcc",
+                    threshold_objective=str(optuna_threshold_objective),
+                    eval_df=val_df,
+                    far_target=float(optuna_far_target),
+                    alerts_per_day=float(optuna_alerts_per_day),
+                    fn_cost=float(optuna_fn_cost),
+                    fp_cost=float(optuna_fp_cost),
+                )
+                metrics = dict(scored.get("metrics") or {})
+                values = _calibration_multiobjective_values_from_metrics(metrics)
+                proxy_score = _calibration_multiobjective_pruning_proxy_from_metrics(
+                    metrics,
+                    far_target=float(optuna_far_target),
+                )
+                if any(pd.isna(value) for value in values) or pd.isna(proxy_score):
+                    raise optuna.TrialPruned(
+                        "Vector multiobjetivo invalido en validacion."
+                    )
+                objective_values = dict(
+                    zip(CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS, values)
+                )
+                for metric_name, value in objective_values.items():
+                    trial.set_user_attr(metric_name, float(value))
+                trial.set_user_attr(
+                    "val_far",
+                    float(metrics.get("far", float("nan"))),
+                )
+                trial.set_user_attr(
+                    "val_false_negatives",
+                    int(metrics.get("false_negatives", 0)),
+                )
+                trial.set_user_attr(
+                    "val_true_positives",
+                    int(metrics.get("true_positives", 0)),
+                )
+                trial.set_user_attr(
+                    "decision_threshold",
+                    float(scored.get("threshold", 0.5)),
+                )
+                trial.set_user_attr(
+                    "pruning_proxy_score",
+                    float(proxy_score),
+                )
+                trial.set_user_attr(
+                    "far_gate_pass",
+                    bool(
+                        _calibration_multiobjective_far_gate(
+                            metrics,
+                            far_target=float(optuna_far_target),
+                        )
+                    ),
+                )
+                return tuple(float(value) for value in values)
 
             start_time = time.monotonic()
             status_placeholder = st.empty()
@@ -12402,49 +12499,111 @@ def _render_optuna_tab() -> None:
 
             def _render_optuna_progress(study: "optuna.Study", trial) -> None:
                 elapsed = time.monotonic() - start_time
-                completed_trials = [
-                    t
-                    for t in study.trials
-                    if t.state == optuna.trial.TrialState.COMPLETE
-                    and t.value is not None
-                ]
-                completed = len(completed_trials)
                 best_score = None
                 best_params: Dict[str, object] = {}
-                if completed_trials:
-                    if objective_direction == "minimize":
-                        best_trial = min(
-                            completed_trials, key=lambda t: float(t.value)
+                selected_vector_text = "-"
+                pareto_count = 0
+                far_gate_status = "-"
+                if is_multiobjective_optuna:
+                    completed_trials = [
+                        t
+                        for t in study.trials
+                        if t.state == optuna.trial.TrialState.COMPLETE
+                        and t.values is not None
+                    ]
+                    completed = len(completed_trials)
+                    if completed_trials:
+                        pareto_trials = list(study.best_trials or completed_trials)
+                        pareto_count = len(pareto_trials)
+                        selected_trial, far_gate_fallback = (
+                            _select_calibration_multiobjective_trial(
+                                pareto_trials,
+                                far_target=float(optuna_far_target),
+                            )
                         )
-                    else:
-                        best_trial = max(
-                            completed_trials, key=lambda t: float(t.value)
+                        best_score = float(
+                            (selected_trial.user_attrs or {}).get(
+                                "pruning_proxy_score",
+                                float("nan"),
+                            )
                         )
-                    best_score = float(best_trial.value)
-                    best_params = dict(best_trial.params)
+                        best_params = dict(selected_trial.params)
+                        selected_vector_text = _format_optuna_multiobjective_values(
+                            dict(
+                                zip(
+                                    CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS,
+                                    list(selected_trial.values or []),
+                                )
+                            )
+                        )
+                        far_gate_status = (
+                            "Fallback por proxy"
+                            if far_gate_fallback
+                            else "Cumple FAR gate"
+                        )
+                else:
+                    completed_trials = [
+                        t
+                        for t in study.trials
+                        if t.state == optuna.trial.TrialState.COMPLETE
+                        and t.value is not None
+                    ]
+                    completed = len(completed_trials)
+                    if completed_trials:
+                        if objective_direction == "minimize":
+                            best_trial = min(
+                                completed_trials, key=lambda t: float(t.value)
+                            )
+                        else:
+                            best_trial = max(
+                                completed_trials, key=lambda t: float(t.value)
+                            )
+                        best_score = float(best_trial.value)
+                        best_params = dict(best_trial.params)
                 pruned = sum(
                     1
                     for t in study.trials
                     if t.state == optuna.trial.TrialState.PRUNED
                 )
                 total = len(study.trials)
-                best_prefix = (
-                    "Menor" if objective_direction == "minimize" else "Mejor"
-                )
                 lines = [
                     f"Modo balanceo: {balance_label}",
                     f"Tiempo transcurrido: {elapsed:.1f}s",
                     f"Trials: {completed} completados | {pruned} podados | {total} total",
                     f"Optuna n_jobs: {effective_optuna_n_jobs}",
-                    (
-                        f"{best_prefix} "
-                        f"{objective_label}: {best_score:.4f}"
-                        if best_score is not None
-                        else f"{best_prefix} {objective_label}: -"
-                    ),
-                    "Mejores parametros:",
-                    _format_best_params(best_params),
                 ]
+                if is_multiobjective_optuna:
+                    lines.extend(
+                        [
+                            f"Modo objetivo: {objective_mode_label}",
+                            f"Pareto actual: {pareto_count}",
+                            (
+                                f"Proxy Pareto: {best_score:.4f}"
+                                if best_score is not None and pd.notna(best_score)
+                                else "Proxy Pareto: -"
+                            ),
+                            f"Vector seleccionado: {selected_vector_text}",
+                            f"FAR gate: {far_gate_status}",
+                            "Mejores parametros:",
+                            _format_best_params(best_params),
+                        ]
+                    )
+                else:
+                    best_prefix = (
+                        "Menor" if objective_direction == "minimize" else "Mejor"
+                    )
+                    lines.extend(
+                        [
+                            (
+                                f"{best_prefix} "
+                                f"{objective_label}: {best_score:.4f}"
+                                if best_score is not None
+                                else f"{best_prefix} {objective_label}: -"
+                            ),
+                            "Mejores parametros:",
+                            _format_best_params(best_params),
+                        ]
+                    )
                 if effective_optuna_n_jobs > 1:
                     lines.append(
                         "Modo paralelo: el progreso por trial se refresca al finalizar."
@@ -12457,7 +12616,7 @@ def _render_optuna_tab() -> None:
                 optuna_callbacks = [_render_optuna_progress]
             with st.spinner(f"Optuna ({label} | {balance_label}) en ejecucion..."):
                 study.optimize(
-                    objective,
+                    objective_multiobjective if is_multiobjective_optuna else objective,
                     n_trials=int(n_trials),
                     timeout=int(timeout),
                     n_jobs=effective_optuna_n_jobs,
@@ -12471,24 +12630,102 @@ def _render_optuna_tab() -> None:
                 )
                 return None
 
-            completed_trials = [
-                t
-                for t in study.trials
-                if t.state == optuna.trial.TrialState.COMPLETE
-                and t.value is not None
-            ]
+            if is_multiobjective_optuna:
+                completed_trials = [
+                    t
+                    for t in study.trials
+                    if t.state == optuna.trial.TrialState.COMPLETE
+                    and t.values is not None
+                ]
+            else:
+                completed_trials = [
+                    t
+                    for t in study.trials
+                    if t.state == optuna.trial.TrialState.COMPLETE
+                    and t.value is not None
+                ]
             if not completed_trials:
                 st.warning(
                     f"Optuna ({label} | {balance_label}) no genero trials completos."
                 )
                 return None
 
-            if objective_direction == "minimize":
-                best_trial = min(completed_trials, key=lambda t: float(t.value))
+            if is_multiobjective_optuna:
+                pareto_trials = list(study.best_trials or completed_trials)
+                best_trial, far_gate_fallback = (
+                    _select_calibration_multiobjective_trial(
+                        pareto_trials,
+                        far_target=float(optuna_far_target),
+                    )
+                )
+                best_score = float(
+                    (best_trial.user_attrs or {}).get(
+                        "pruning_proxy_score",
+                        float("nan"),
+                    )
+                )
+                decision_threshold = float(
+                    (best_trial.user_attrs or {}).get(
+                        "decision_threshold",
+                        float("nan"),
+                    )
+                )
+                objective_values = {
+                    "validation": dict(
+                        zip(
+                            CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS,
+                            list(best_trial.values or []),
+                        )
+                    ),
+                    "selected_trial": dict(
+                        zip(
+                            CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS,
+                            list(best_trial.values or []),
+                        )
+                    ),
+                }
+                trials_df = _calibration_multiobjective_trials_dataframe(
+                    study.trials
+                )
+                pareto_front_df = _calibration_multiobjective_trials_dataframe(
+                    pareto_trials
+                )
+                pareto_numbers = {
+                    int(trial.number) for trial in pareto_trials
+                }
+                if not trials_df.empty and "number" in trials_df.columns:
+                    trials_df["pareto_front"] = trials_df["number"].isin(
+                        pareto_numbers
+                    )
+                    trials_df["selected_trial"] = trials_df["number"].eq(
+                        int(best_trial.number)
+                    )
+                if (
+                    not pareto_front_df.empty
+                    and "number" in pareto_front_df.columns
+                ):
+                    pareto_front_df["selected_trial"] = (
+                        pareto_front_df["number"].eq(int(best_trial.number))
+                    )
             else:
-                best_trial = max(completed_trials, key=lambda t: float(t.value))
+                if objective_direction == "minimize":
+                    best_trial = min(completed_trials, key=lambda t: float(t.value))
+                else:
+                    best_trial = max(completed_trials, key=lambda t: float(t.value))
+                best_score = float(best_trial.value)
+                decision_threshold = float("nan")
+                objective_values = {
+                    "validation": {str(objective_key): float(best_score)}
+                }
+                trials_df = study.trials_dataframe(
+                    attrs=("number", "value", "params", "state")
+                )
+                trials_df = trials_df.sort_values(
+                    "value", ascending=objective_direction == "minimize"
+                ).reset_index(drop=True)
+                pareto_front_df = None
+                far_gate_fallback = False
             best_params = dict(best_trial.params)
-            best_score = float(best_trial.value)
             smote_params: Dict[str, object] = {}
             if balance_mode == "smote":
                 smote_params = {
@@ -12530,13 +12767,6 @@ def _render_optuna_tab() -> None:
                     "C": float(best_params["svm_C"]),
                 }
 
-            trials_df = study.trials_dataframe(
-                attrs=("number", "value", "params", "state")
-            )
-            trials_df = trials_df.sort_values(
-                "value", ascending=objective_direction == "minimize"
-            ).reset_index(drop=True)
-
             if optuna_tune_topk and "top_k" in best_params:
                 best_top_k = int(best_params["top_k"])
                 best_top_k = max(1, min(best_top_k, len(ranked_cols)))
@@ -12559,6 +12789,39 @@ def _render_optuna_tab() -> None:
                 "best_top_k": int(best_top_k),
                 "best_feature_cols": best_feature_cols,
                 "ranked_cols": list(ranked_cols),
+                "objective_mode": str(optuna_objective_mode),
+                "objective_metric": str(objective_key),
+                "objective_label": str(objective_label),
+                "objective_direction": str(objective_direction),
+                "objective_values": objective_values,
+                "multiobjective_metrics": list(
+                    CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS
+                )
+                if is_multiobjective_optuna
+                else [],
+                "multiobjective_directions": list(
+                    CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS
+                )
+                if is_multiobjective_optuna
+                else [],
+                "pruning_proxy_score": float(best_score)
+                if is_multiobjective_optuna
+                else None,
+                "far_gate_pass": bool(
+                    (best_trial.user_attrs or {}).get("far_gate_pass", False)
+                )
+                if is_multiobjective_optuna
+                else None,
+                "far_gate_fallback": bool(far_gate_fallback)
+                if is_multiobjective_optuna
+                else None,
+                "decision_threshold": (
+                    float(decision_threshold)
+                    if pd.notna(decision_threshold)
+                    else None
+                ),
+                "best_trial_number": int(best_trial.number),
+                "pareto_front_df": pareto_front_df,
             }
 
         # Flag local para "ya promovimos un primary en esta corrida". Sustituye
@@ -12743,9 +13006,18 @@ def _render_optuna_tab() -> None:
                     "alerts_per_day": float(optuna_alerts_per_day),
                     "fn_cost": float(optuna_fn_cost),
                     "fp_cost": float(optuna_fp_cost),
-                    "objective_metric": objective_key,
-                    "objective_label": objective_label,
-                    "objective_direction": objective_direction,
+                    "objective_mode": str(optuna_objective_mode),
+                    "objective_mode_label": objective_mode_label,
+                    "objective_metric": str(res["objective_metric"]),
+                    "objective_label": str(res["objective_label"]),
+                    "objective_direction": str(res["objective_direction"]),
+                    "optuna_objective_mode": str(optuna_objective_mode),
+                    "multiobjective_metrics": list(
+                        res.get("multiobjective_metrics") or []
+                    ),
+                    "multiobjective_directions": list(
+                        res.get("multiobjective_directions") or []
+                    ),
                     "objective_eval_set": "val",
                     "balance_mode": str(res["balance_mode"]),
                     "balance_mode_label": str(res["balance_mode_label"]),
@@ -12762,9 +13034,18 @@ def _render_optuna_tab() -> None:
                     "best_top_k": int(res["best_top_k"]),
                     "best_feature_cols": list(res["best_feature_cols"]),
                     "ranked_cols": list(res["ranked_cols"]),
+                    "pruning_proxy_score": res.get("pruning_proxy_score"),
+                    "far_gate_pass": res.get("far_gate_pass"),
+                    "far_gate_fallback": res.get("far_gate_fallback"),
+                    "decision_threshold": res.get("decision_threshold"),
                     "pruner": {
-                        "enabled": bool(pruner_enabled),
-                        "type": "MedianPruner" if pruner_enabled else "NopPruner",
+                        "enabled": bool(pruner_enabled)
+                        and not is_multiobjective_optuna,
+                        "type": (
+                            "NopPruner"
+                            if is_multiobjective_optuna or not pruner_enabled
+                            else "MedianPruner"
+                        ),
                         "startup_trials": int(pruner_startup_trials),
                     },
                 }
@@ -12794,8 +13075,52 @@ def _render_optuna_tab() -> None:
                     trials_df=res["trials_df"],
                     optuna_settings=optuna_settings_payload,
                     search_space=search_space,
+                    extra_result_fields={
+                        "objective_metric": str(res["objective_metric"]),
+                        "objective_label": str(res["objective_label"]),
+                        "objective_direction": str(res["objective_direction"]),
+                        "objective_mode": str(optuna_objective_mode),
+                        "optuna_objective_mode": str(optuna_objective_mode),
+                        "multiobjective_metrics": list(
+                            res.get("multiobjective_metrics") or []
+                        ),
+                        "multiobjective_directions": list(
+                            res.get("multiobjective_directions") or []
+                        ),
+                        "objective_values": dict(
+                            res.get("objective_values") or {}
+                        ),
+                        "pruning_proxy_score": res.get("pruning_proxy_score"),
+                        "far_gate_pass": res.get("far_gate_pass"),
+                        "far_gate_fallback": res.get("far_gate_fallback"),
+                        "decision_threshold": res.get("decision_threshold"),
+                        "best_trial_number": res.get("best_trial_number"),
+                    },
+                    pareto_front_df=res.get("pareto_front_df"),
                 )
-                if optuna_tune_topk:
+                if is_multiobjective_optuna:
+                    success_metric = (
+                        f"Proxy Pareto: {float(res['best_score']):.4f}"
+                        if res.get("best_score") is not None
+                        else "Proxy Pareto: -"
+                    )
+                    pareto_rows = len(
+                        res.get("pareto_front_df")
+                        if isinstance(res.get("pareto_front_df"), pd.DataFrame)
+                        else []
+                    )
+                    if optuna_tune_topk:
+                        st.success(
+                            f"Optuna ({cfg['label']} | {res['balance_mode_label']}) finalizado. "
+                            f"{success_metric} | Pareto={pareto_rows} | "
+                            f"best top_k = {res['best_top_k']} / {len(res['ranked_cols'])}"
+                        )
+                    else:
+                        st.success(
+                            f"Optuna ({cfg['label']} | {res['balance_mode_label']}) finalizado. "
+                            f"{success_metric} | Pareto={pareto_rows}"
+                        )
+                elif optuna_tune_topk:
                     st.success(
                         f"Optuna ({cfg['label']} | {res['balance_mode_label']}) finalizado. "
                         f"{'Menor' if objective_direction == 'minimize' else 'Mejor'} "
@@ -12883,22 +13208,78 @@ def _render_optuna_tab() -> None:
                             if (
                                 trials_df_cfg is None
                                 and trials_csv_cfg
-                                and Path(str(trials_csv_cfg)).exists()
                             ):
-                                try:
-                                    trials_df_cfg = pd.read_csv(trials_csv_cfg)
+                                trials_df_cfg = _load_optuna_variant_frame(
+                                    res_cfg,
+                                    frame_key="trials_df",
+                                    csv_key="trials_csv",
+                                )
+                                if isinstance(trials_df_cfg, pd.DataFrame):
                                     res_cfg["trials_df"] = trials_df_cfg
-                                except Exception:
-                                    pass
 
                             saved_score = res_cfg.get("best_score")
                             saved_settings = res_cfg.get("optuna_settings")
+                            saved_objective_mode = str(
+                                (
+                                    saved_settings or {}
+                                ).get(
+                                    "objective_mode",
+                                    res_cfg.get(
+                                        "optuna_objective_mode",
+                                        CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
+                                    ),
+                                )
+                            ).strip().lower()
                             metric_label = "F1"
                             if isinstance(saved_settings, dict) and saved_settings:
                                 metric_label = saved_settings.get(
                                     "objective_label", metric_label
                                 )
-                            if saved_score is not None:
+                            if (
+                                saved_objective_mode
+                                == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+                            ):
+                                proxy_score = res_cfg.get(
+                                    "pruning_proxy_score", saved_score
+                                )
+                                if proxy_score is not None and pd.notna(proxy_score):
+                                    st.metric(
+                                        "Proxy multiobjetivo",
+                                        f"{float(proxy_score):.4f}",
+                                    )
+                                objective_values = res_cfg.get("objective_values")
+                                if isinstance(objective_values, dict) and objective_values:
+                                    st.caption("Vector multiobjetivo")
+                                    st.json(objective_values)
+                                decision_threshold = res_cfg.get(
+                                    "decision_threshold"
+                                )
+                                if (
+                                    decision_threshold is not None
+                                    and pd.notna(decision_threshold)
+                                ):
+                                    st.caption(
+                                        "Threshold seleccionado: "
+                                        f"{float(decision_threshold):.4f}"
+                                    )
+                                far_gate_pass = res_cfg.get("far_gate_pass")
+                                far_gate_fallback = res_cfg.get(
+                                    "far_gate_fallback"
+                                )
+                                if far_gate_pass is not None:
+                                    st.caption(
+                                        "FAR gate: "
+                                        + (
+                                            "fallback por proxy"
+                                            if bool(far_gate_fallback)
+                                            else (
+                                                "cumple"
+                                                if bool(far_gate_pass)
+                                                else "no cumple"
+                                            )
+                                        )
+                                    )
+                            elif saved_score is not None:
                                 st.metric(metric_label, f"{float(saved_score):.4f}")
                             if isinstance(saved_settings, dict) and saved_settings:
                                 st.caption("Configuración Optuna")
@@ -12915,10 +13296,37 @@ def _render_optuna_tab() -> None:
                             if isinstance(saved_model, dict) and saved_model:
                                 st.caption("Mejor modelo")
                                 st.json(saved_model)
-                            saved_trials = res_cfg.get("trials_df")
+                            pareto_front_df_cfg = _load_optuna_variant_frame(
+                                res_cfg,
+                                frame_key="pareto_front_df",
+                                csv_key="pareto_front_csv",
+                            )
+                            if isinstance(pareto_front_df_cfg, pd.DataFrame):
+                                res_cfg["pareto_front_df"] = pareto_front_df_cfg
+                            if (
+                                isinstance(pareto_front_df_cfg, pd.DataFrame)
+                                and not pareto_front_df_cfg.empty
+                            ):
+                                st.caption("Pareto front")
+                                st.dataframe(
+                                    pareto_front_df_cfg.head(25),
+                                    width="stretch",
+                                )
+                            saved_trials = (
+                                trials_df_cfg
+                                if isinstance(trials_df_cfg, pd.DataFrame)
+                                else res_cfg.get("trials_df")
+                            )
                             if isinstance(saved_trials, pd.DataFrame) and not saved_trials.empty:
-                                st.caption("Top trials")
-                                st.dataframe(saved_trials.head(20), width="stretch")
+                                st.caption(
+                                    "Trials multiobjetivo"
+                                    if (
+                                        saved_objective_mode
+                                        == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+                                    )
+                                    else "Top trials"
+                                )
+                                st.dataframe(saved_trials.head(25), width="stretch")
 
 
 

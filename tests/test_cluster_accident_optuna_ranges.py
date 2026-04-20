@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import warnings
+from pathlib import Path
 
+import pandas as pd
 import pytest
 
 pytest.importorskip("optuna")
@@ -196,6 +198,147 @@ def test_calibration_sweep_protocol_preview_uses_multiobjective_version():
     assert protocol["protocol_version"] == app.CALIBRATION_SWEEP_MULTIOBJECTIVE_PROTOCOL_VERSION
     assert protocol["optuna_objective_mode"] == app.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
     assert protocol["multiobjective_metrics"] == list(app.CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS)
+
+
+def test_optuna_objective_mode_options_include_scalar_and_multiobjective():
+    options = app._optuna_objective_mode_options()
+
+    assert options["Escalar legacy"] == app.CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR
+    assert (
+        options["Multiobjetivo Pareto"]
+        == app.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+    )
+
+
+def test_persist_optuna_results_keeps_multiobjective_metadata_and_pareto_csv(
+    tmp_path,
+    monkeypatch,
+):
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "RESULTS_DIR", tmp_path)
+
+    features_df = pd.DataFrame(
+        {
+            "signal": [0.1, 0.9],
+            "interval_start": pd.date_range("2024-01-01", periods=2, freq="D"),
+        }
+    )
+    trials_df = pd.DataFrame(
+        [
+            {
+                "number": 0,
+                "pruning_proxy_score": 0.61,
+                "pareto_front": True,
+                "selected_trial": True,
+            }
+        ]
+    )
+    pareto_front_df = pd.DataFrame(
+        [
+            {
+                "number": 0,
+                "value_mcc": 0.40,
+                "value_pr_auc": 0.52,
+                "value_brier_score": 0.18,
+                "value_recall_at_alerts_per_day": 0.60,
+                "selected_trial": True,
+            }
+        ]
+    )
+
+    app._persist_optuna_results(
+        optuna_key="optuna_test_key",
+        optuna_id="optuna_test_id",
+        feature_key="feature_key",
+        feature_id="feature_id",
+        features_path="features.duckdb",
+        features_source="duckdb",
+        features_df=features_df,
+        selected_features=["signal"],
+        feature_cols=["signal"],
+        model_choice="XGBoost",
+        balance_mode="none",
+        calibration_method="sigmoid",
+        best_score=0.61,
+        best_smote_params={},
+        best_model_params={"n_estimators": 120, "max_depth": 4},
+        trials_df=trials_df,
+        optuna_settings={
+            "objective_mode": app.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+            "objective_label": app.CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL,
+        },
+        search_space={"model": {"n_estimators": {"min": 100, "max": 200}}},
+        extra_result_fields={
+            "objective_metric": app.CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY,
+            "objective_label": app.CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL,
+            "objective_direction": "multiobjective",
+            "objective_mode": app.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+            "optuna_objective_mode": app.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+            "multiobjective_metrics": list(app.CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS),
+            "multiobjective_directions": list(app.CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS),
+            "objective_values": {
+                "validation": {
+                    "mcc": 0.40,
+                    "pr_auc": 0.52,
+                    "brier_score": 0.18,
+                    "recall_at_alerts_per_day": 0.60,
+                }
+            },
+            "pruning_proxy_score": 0.61,
+            "far_gate_pass": True,
+            "far_gate_fallback": False,
+            "decision_threshold": 0.37,
+            "best_trial_number": 0,
+        },
+        pareto_front_df=pareto_front_df,
+    )
+
+    store = fake_st.session_state["optuna_results_store"]
+    entry = store["optuna_test_key"]
+    variant = app._get_optuna_model_result_variant(
+        entry["results"],
+        model_choice="XGBoost",
+        balance_mode="none",
+        calibration_method="sigmoid",
+    )
+
+    assert variant is not None
+    assert (
+        variant["optuna_objective_mode"]
+        == app.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+    )
+    assert variant["objective_values"]["validation"]["mcc"] == pytest.approx(0.40)
+    assert variant["pruning_proxy_score"] == pytest.approx(0.61)
+    assert variant["decision_threshold"] == pytest.approx(0.37)
+    assert variant["pareto_front_csv"]
+    assert (tmp_path / Path(str(variant["pareto_front_csv"])).name).exists()
+
+    payload, _ = app._load_optuna_result_from_disk("optuna_test_id")
+    assert payload is not None
+    disk_variant = app._get_optuna_model_result_variant(
+        payload["results"],
+        model_choice="XGBoost",
+        balance_mode="none",
+        calibration_method="sigmoid",
+    )
+    assert disk_variant is not None
+    assert disk_variant["objective_values"]["validation"]["pr_auc"] == pytest.approx(0.52)
+    assert disk_variant["pareto_front_csv"]
+    loaded_trials_df = app._load_optuna_variant_frame(
+        disk_variant,
+        frame_key="trials_df",
+        csv_key="trials_csv",
+    )
+    loaded_pareto_df = app._load_optuna_variant_frame(
+        disk_variant,
+        frame_key="pareto_front_df",
+        csv_key="pareto_front_csv",
+    )
+    assert isinstance(loaded_trials_df, pd.DataFrame)
+    assert not loaded_trials_df.empty
+    assert isinstance(loaded_pareto_df, pd.DataFrame)
+    assert not loaded_pareto_df.empty
 
 
 def test_list_experiment_result_files_includes_calibration_sweep_runs(

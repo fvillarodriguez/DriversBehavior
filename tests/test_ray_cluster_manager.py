@@ -74,7 +74,23 @@ def test_build_worker_start_script_uses_repo_and_calculated_cpus():
 
 def test_ssh_public_key_path_derives_pub_file():
     assert manager.ssh_public_key_path("~/.ssh/id_ed25519").name == "id_ed25519.pub"
-    assert manager.ssh_public_key_path("~/.ssh/id_ed25519.pub").name == "id_ed25519.pub"
+
+
+def test_ssh_private_key_path_rejects_pub_file():
+    with pytest.raises(ValueError):
+        manager.ssh_private_key_path("~/.ssh/id_ed25519.pub")
+
+
+def test_detect_private_keys_finds_standard_keys(tmp_path: Path):
+    ssh_dir = tmp_path / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "id_ed25519").write_text("PRIVATE", encoding="utf-8")
+    (ssh_dir / "id_ed25519.pub").write_text("PUBLIC", encoding="utf-8")
+    (ssh_dir / "id_rsa").write_text("PRIVATE", encoding="utf-8")
+
+    found = manager.detect_private_keys(ssh_dir)
+
+    assert found == [ssh_dir / "id_ed25519", ssh_dir / "id_rsa"]
 
 
 def test_read_public_key_prefers_existing_pub_file(tmp_path: Path):
@@ -131,6 +147,22 @@ def test_check_config_warnings_reports_blank_private_key_path():
     warnings = manager.check_config_warnings(manager.RayClusterConfig(ssh_key_path=""))
 
     assert "Ingrese la ruta de la llave SSH privada." in warnings
+
+
+def test_check_config_warnings_reports_pub_path_as_invalid_private_key():
+    warnings = manager.check_config_warnings(manager.RayClusterConfig(ssh_key_path="~/.ssh/id_ed25519.pub"))
+
+    assert "La ruta configurada debe apuntar a la llave SSH privada, no al archivo .pub." in warnings
+
+
+def test_run_remote_script_reports_invalid_private_key_path():
+    config = manager.RayClusterConfig(ssh_key_path="~/.ssh/id_ed25519.pub")
+
+    result = manager.run_remote_script(config, "echo ok")
+
+    assert not result.ok
+    assert result.returncode == 2
+    assert ".pub" in result.stderr
 
 
 def test_command_runner_reports_missing_executable():

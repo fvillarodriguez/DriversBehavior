@@ -24,6 +24,13 @@ DEFAULT_NETMASK = "255.255.255.252"
 DEFAULT_RAY_VERSION = "2.53.0"
 DEFAULT_WORKER_PORT_MIN = 10002
 DEFAULT_WORKER_PORT_MAX = 10100
+COMMON_SSH_PRIVATE_KEY_NAMES = (
+    "id_ed25519",
+    "id_rsa",
+    "id_ecdsa",
+    "id_ed25519_sk",
+    "id_ecdsa_sk",
+)
 SSH_PUBLIC_KEY_PREFIXES = (
     "ssh-ed25519",
     "ssh-rsa",
@@ -172,20 +179,35 @@ def python_bin(root_dir: Path = ROOT_DIR) -> Path:
     return root_dir / ".venv" / "bin" / "python"
 
 
-def ssh_public_key_path(ssh_key_path: str) -> Path:
+def ssh_private_key_path(ssh_key_path: str) -> Path:
     raw_value = ssh_key_path.strip()
     if not raw_value:
         raise ValueError("Ingrese la ruta de la llave SSH privada.")
-    private_key = Path(raw_value).expanduser()
-    if not private_key.name:
+    key_path = Path(raw_value).expanduser()
+    if not key_path.name:
         raise ValueError("La ruta de la llave SSH privada no es valida.")
-    if private_key.name.endswith(".pub"):
-        return private_key
+    if key_path.name.endswith(".pub"):
+        raise ValueError("La ruta configurada debe apuntar a la llave SSH privada, no al archivo .pub.")
+    return key_path
+
+
+def ssh_public_key_path(ssh_key_path: str) -> Path:
+    private_key = ssh_private_key_path(ssh_key_path)
     return private_key.with_name(f"{private_key.name}.pub")
 
 
 def authorized_keys_path() -> Path:
     return Path.home() / ".ssh" / "authorized_keys"
+
+
+def detect_private_keys(ssh_dir: Optional[Path] = None) -> list[Path]:
+    root = (ssh_dir or (Path.home() / ".ssh")).expanduser()
+    matches: list[Path] = []
+    for name in COMMON_SSH_PRIVATE_KEY_NAMES:
+        candidate = root / name
+        if candidate.exists() and candidate.is_file():
+            matches.append(candidate)
+    return matches
 
 
 def normalize_public_key(public_key: str) -> str:
@@ -210,7 +232,7 @@ def read_public_key(config: RayClusterConfig, *, runner: Optional[CommandRunner]
         if payload:
             return normalize_public_key(payload)
 
-    private_key_file = Path(config.ssh_key_path).expanduser()
+    private_key_file = ssh_private_key_path(config.ssh_key_path)
     if not private_key_file.exists():
         raise FileNotFoundError(f"No existe la llave SSH configurada: {private_key_file}")
 
@@ -310,10 +332,11 @@ def build_worker_start_script(config: RayClusterConfig) -> str:
 
 
 def ssh_base_args(config: RayClusterConfig) -> list[str]:
+    private_key = ssh_private_key_path(config.ssh_key_path)
     return [
         "ssh",
         "-i",
-        str(Path(config.ssh_key_path).expanduser()),
+        str(private_key),
         "-o",
         "BatchMode=yes",
         "-o",
@@ -332,9 +355,18 @@ def run_remote_script(
     timeout: Optional[int] = None,
 ) -> CommandResult:
     active_runner = runner or CommandRunner()
+    try:
+        ssh_args = ssh_base_args(config)
+    except ValueError as exc:
+        return CommandResult(
+            ok=False,
+            returncode=2,
+            stderr=str(exc),
+            command="ssh",
+        )
     remote_command = f"bash -lc {shlex.quote(script)}"
     return active_runner.run(
-        [*ssh_base_args(config), remote_command],
+        [*ssh_args, remote_command],
         timeout=timeout or config.command_timeout_s,
     )
 
@@ -739,11 +771,13 @@ def check_config_warnings(config: RayClusterConfig) -> list[str]:
         warnings.append("Ingrese el usuario SSH del worker.")
     if not config.remote_repo_path.strip():
         warnings.append("Ingrese la ruta del repo en el worker.")
-    ssh_key_raw = config.ssh_key_path.strip()
-    if not ssh_key_raw:
-        warnings.append("Ingrese la ruta de la llave SSH privada.")
-    elif not Path(ssh_key_raw).expanduser().exists():
-        warnings.append("La llave SSH indicada no existe en este Mac.")
+    try:
+        private_key = ssh_private_key_path(config.ssh_key_path)
+    except ValueError as exc:
+        warnings.append(str(exc))
+    else:
+        if not private_key.exists():
+            warnings.append(f"No existe la llave SSH privada configurada: {private_key}")
     if config.head_ip == config.worker_ip:
         warnings.append("Head y worker no pueden usar la misma IP.")
     return warnings
