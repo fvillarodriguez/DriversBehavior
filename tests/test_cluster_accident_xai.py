@@ -1077,6 +1077,54 @@ def test_prepare_controlled_comparison_detail_display_keeps_ablation_columns():
     assert "sampling_strategy" in row["smote_params"]
 
 
+def test_calibration_sweep_best_feature_cols_prefers_effective_variables():
+    best_summary_df = pd.DataFrame(
+        [
+            {
+                "rank": 1,
+                "selected_features": json.dumps(["pool_a", "pool_b", "pool_c"]),
+                "best_feature_cols": json.dumps(["pool_b", "pool_c"]),
+            }
+        ]
+    )
+    leaderboard_df = pd.DataFrame()
+    grid_results_df = pd.DataFrame()
+
+    result_state = {"protocol": {"selected_features": ["pool_a", "pool_b", "pool_c"]}}
+    assert app._calibration_sweep_selected_features(
+        result_state,
+        pd.DataFrame({"selected_features": [json.dumps(["other"])]}),
+    ) == ["pool_a", "pool_b", "pool_c"]
+
+    assert app._calibration_sweep_best_feature_cols(
+        best_summary_df=best_summary_df,
+        leaderboard_df=leaderboard_df,
+        grid_results_df=grid_results_df,
+    ) == ["pool_b", "pool_c"]
+
+    fallback_df = best_summary_df.drop(columns=["best_feature_cols"])
+    assert app._calibration_sweep_best_feature_cols(
+        best_summary_df=fallback_df,
+        leaderboard_df=leaderboard_df,
+        grid_results_df=grid_results_df,
+    ) == ["pool_a", "pool_b", "pool_c"]
+
+
+def test_prepare_dataframe_for_streamlit_stringifies_mixed_metadata_value_column():
+    df = pd.DataFrame(
+        [
+            {"grupo": "Corrida", "campo": "run_id", "valor": "calibration_001"},
+            {"grupo": "Progreso", "campo": "completed_steps", "valor": 7},
+            {"grupo": "Protocolo", "campo": "far_target", "valor": 0.2},
+            {"grupo": "Corrida", "campo": "last_error", "valor": None},
+        ]
+    )
+
+    safe_df = app._prepare_dataframe_for_streamlit(df)
+
+    assert safe_df["valor"].tolist() == ["calibration_001", "7", "0.2", None]
+
+
 def test_seed_controlled_comparison_live_db_backfills_checkpoint_results(
     tmp_path, monkeypatch
 ):

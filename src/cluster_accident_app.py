@@ -62,6 +62,16 @@ from src.model_training import (
 )
 from src.model_xai import compute_xai_report, save_xai_bundle
 from src.experiments_logic import (
+    CALIBRATION_SWEEP_BALANCE_MODES,
+    CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS,
+    CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY,
+    CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL,
+    CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS,
+    CALIBRATION_SWEEP_MULTIOBJECTIVE_PROTOCOL_VERSION,
+    CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+    CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
+    CALIBRATION_SWEEP_PROTOCOL_FAMILY,
+    CALIBRATION_SWEEP_PROTOCOL_VERSION,
     CONTROLLED_COMPARISON_MODELS,
     FROZEN_TUNING_ABLATION_CONFIG,
     FROZEN_TUNING_ABLATION_FEATURE_SETS,
@@ -1378,6 +1388,99 @@ def _calibration_sweep_result_state_from_path(
     return state
 
 
+def _calibration_sweep_result_state_from_run_dir(
+    run_dir: Path,
+    *,
+    loaded_from_selection: bool = False,
+) -> Dict[str, object]:
+    manifest_path = run_dir / "manifest.json"
+    manifest = _read_json_file(manifest_path)
+    state = {
+        "run_id": str(manifest.get("run_id") or run_dir.name),
+        "checkpoint_run_dir": str(run_dir),
+        "checkpoint_manifest_path": str(manifest_path) if manifest_path.exists() else None,
+        "checkpoint_manifest": manifest,
+        "result_status": str(manifest.get("result_status") or manifest.get("status") or ""),
+    }
+    if loaded_from_selection:
+        state["loaded_from_selection"] = True
+    return state
+
+
+def _calibration_sweep_checkpoint_status_label(status: object) -> str:
+    text = str(status or "disponible").strip()
+    return {
+        "completed": "completado",
+        "running": "en progreso",
+        "failed": "fallido",
+    }.get(text.lower(), text or "disponible")
+
+
+def _list_calibration_sweep_checkpoints(
+    checkpoint_root: Optional[Path] = None,
+) -> List[Dict[str, object]]:
+    root = (
+        Path(checkpoint_root)
+        if checkpoint_root is not None
+        else RESULTS_DIR / "calibration_experiment_runs"
+    )
+    if not root.exists():
+        return []
+
+    items: List[Dict[str, object]] = []
+    for run_dir in root.glob("calibration_sweep_*"):
+        if not run_dir.is_dir():
+            continue
+        manifest_path = run_dir / "manifest.json"
+        manifest = _read_json_file(manifest_path)
+        run_id = str(manifest.get("run_id") or run_dir.name)
+        status = str(manifest.get("result_status") or manifest.get("status") or "missing")
+        updated_at = str(
+            manifest.get("completed_at")
+            or manifest.get("updated_at")
+            or manifest.get("created_at")
+            or ""
+        )
+        history_file = _calibration_sweep_history_file_for_run(run_dir)
+        label = (
+            _experiment_result_option_label(history_file)
+            if history_file is not None
+            else " | ".join(
+                part
+                for part in [
+                    "Calibración score + threshold",
+                    updated_at.replace("T", " ") if updated_at else "",
+                    _calibration_sweep_checkpoint_status_label(status),
+                    run_id,
+                ]
+                if str(part).strip()
+            )
+        )
+        progress = dict(manifest.get("progress") or {})
+        items.append(
+            {
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "manifest_path": str(manifest_path) if manifest_path.exists() else None,
+                "status": status,
+                "status_label": _calibration_sweep_checkpoint_status_label(status),
+                "updated_at": updated_at,
+                "label": label,
+                "history_file": str(history_file) if history_file is not None else None,
+                "completed_steps": int(progress.get("completed_steps") or 0),
+                "total_steps": int(progress.get("total_steps") or 0),
+                "current_step_id": progress.get("current_step_id"),
+            }
+        )
+
+    def _sort_key(item: Dict[str, object]) -> Tuple[str, str]:
+        updated_at = str(item.get("updated_at") or "")
+        run_id = str(item.get("run_id") or "")
+        return updated_at, run_id
+
+    return sorted(items, key=_sort_key, reverse=True)
+
+
 def _experiment_result_related_files(path: Path, timestamp: Optional[str]) -> List[Path]:
     run_dir = _calibration_sweep_run_dir_from_result_path(path)
     if run_dir is not None:
@@ -2463,6 +2566,59 @@ def _json_default(value: object) -> object:
     if isinstance(value, pd.Series):
         return value.tolist()
     return str(value)
+
+
+def _is_null_like(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _stringify_streamlit_cell(value: object) -> object:
+    if _is_null_like(value):
+        return None
+    if isinstance(value, set):
+        value = sorted(value, key=str)
+    if isinstance(value, (dict, list, tuple, set, Path)):
+        return json.dumps(value, default=_json_default, ensure_ascii=True, sort_keys=True)
+    return value
+
+
+def _prepare_dataframe_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize mixed object columns so Streamlit Arrow serialization stays stable."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    safe_df = df.copy()
+    for column in safe_df.columns:
+        series = safe_df[column]
+        if not pd.api.types.is_object_dtype(series.dtype):
+            continue
+        non_null_values = [value for value in series.tolist() if not _is_null_like(value)]
+        if not non_null_values:
+            continue
+        if any(isinstance(value, (dict, list, tuple, set, Path)) for value in non_null_values):
+            safe_df[column] = series.map(_stringify_streamlit_cell)
+            continue
+        normalized_types = {
+            str
+            if isinstance(value, str)
+            else bool
+            if isinstance(value, (bool, np.bool_))
+            else int
+            if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
+            else float
+            if isinstance(value, (float, np.floating))
+            else type(value)
+            for value in non_null_values[:50]
+        }
+        if len(normalized_types) > 1:
+            safe_df[column] = series.map(
+                lambda value: None if _is_null_like(value) else str(value)
+            )
+    return safe_df
 
 
 def _init_experiment_db(
@@ -4507,6 +4663,15 @@ def _render_calibration_sweep_experiment() -> None:
             )
         return
 
+    eje, calzada, p_start, p_end = tramo_tuple
+    segment_info = {
+        "eje": eje,
+        "calzada": calzada,
+        "portico_inicio": p_start,
+        "portico_fin": p_end,
+        "segment_label": f"{eje} | {calzada} | {p_start} -> {p_end}",
+    }
+
     st.markdown("**Configuración general**")
     cfg1, cfg2, cfg3, cfg4 = st.columns(4)
     with cfg1:
@@ -4557,52 +4722,157 @@ def _render_calibration_sweep_experiment() -> None:
         horizontal=True,
         key="exp_calibration_sweep_feature_source_radio",
         help=(
-            "Feature selection usa la selección actual si existe; si no, toma "
-            "todas las variables numéricas del archivo. Optuna intenta recuperar "
-            "best_feature_cols para este modelo desde el store existente."
+            "Feature selection rankea las variables numéricas y toma un K fijo. "
+            "Optuna optimiza top_k en cada trial y guarda best_feature_cols."
         ),
     )
     st.session_state["calibration_sweep_feature_source"] = source_options[
         chosen_source_label
     ]
-
-    advanced_objectives = st.checkbox(
-        "Mostrar catálogo avanzado de métricas objetivo de Optuna",
-        value=bool(
-            st.session_state.get(
-                "exp_calibration_sweep_show_advanced_objectives",
-                False,
+    calibration_feature_source = source_options[chosen_source_label]
+    calibration_candidate_feature_count = len(_get_feature_cols(schema_df))
+    if calibration_feature_source == "optuna":
+        topk_col1, topk_col2, topk_col3 = st.columns(3)
+        with topk_col1:
+            calibration_k_min = st.number_input(
+                "k_min",
+                min_value=1,
+                value=int(st.session_state.get("exp_calibration_sweep_k_min", 10)),
+                step=1,
+                key="exp_calibration_sweep_k_min",
             )
-        ),
-        key="exp_calibration_sweep_show_advanced_objectives",
-    )
-    objective_options = _calibration_sweep_optuna_objective_options(
-        include_advanced=bool(advanced_objectives)
-    )
-    default_objective_keys = {
-        "pr_auc",
-        "mcc",
-        "brier_score",
-        "balanced_f1",
-        "recall_at_alerts_per_day",
-        "operational_cost",
-        "far_sens",
+        with topk_col2:
+            calibration_k_max = st.number_input(
+                "k_max",
+                min_value=1,
+                value=int(st.session_state.get("exp_calibration_sweep_k_max", 100)),
+                step=1,
+                key="exp_calibration_sweep_k_max",
+            )
+        with topk_col3:
+            calibration_k_step = st.number_input(
+                "k_step",
+                min_value=1,
+                value=int(st.session_state.get("exp_calibration_sweep_k_step", 10)),
+                step=1,
+                key="exp_calibration_sweep_k_step",
+            )
+        calibration_top_k_grid = _k_grid_values(
+            k_min=int(calibration_k_min),
+            k_max=int(calibration_k_max),
+            k_step=int(calibration_k_step),
+            feature_count=int(calibration_candidate_feature_count),
+        )
+        if calibration_top_k_grid:
+            st.caption(
+                "Optuna explorará top_k="
+                f"{calibration_top_k_grid} "
+                f"(recortado a {calibration_candidate_feature_count} variables disponibles)."
+            )
+        calibration_feature_k_config = {
+            "mode": "optuna_top_k",
+            "k_min": int(calibration_k_min),
+            "k_max": int(calibration_k_max),
+            "k_step": int(calibration_k_step),
+            "ranking_method": "rf",
+        }
+    else:
+        calibration_fixed_k = st.number_input(
+            "K features",
+            min_value=1,
+            value=int(st.session_state.get("exp_calibration_sweep_fixed_k", 20)),
+            step=1,
+            key="exp_calibration_sweep_fixed_k",
+        )
+        effective_fixed_k = (
+            max(1, min(int(calibration_fixed_k), int(calibration_candidate_feature_count)))
+            if calibration_candidate_feature_count > 0
+            else int(calibration_fixed_k)
+        )
+        st.caption(
+            f"Feature selection rankeará una vez y usará las top {effective_fixed_k} "
+            f"de {calibration_candidate_feature_count} variables disponibles."
+        )
+        calibration_feature_k_config = {
+            "mode": "fixed_top_k",
+            "k": int(calibration_fixed_k),
+            "ranking_method": "rf",
+        }
+
+    objective_mode_options = {
+        "Multiobjetivo Pareto": CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+        "Escalar legacy": CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
     }
-    default_objective_labels = [
-        label
-        for label, key in objective_options.items()
-        if key in default_objective_keys
-    ]
-    selected_objective_labels = st.multiselect(
-        "Métricas objetivo de Optuna",
-        list(objective_options.keys()),
-        default=default_objective_labels,
-        key="exp_calibration_sweep_objectives",
+    current_objective_mode = str(
+        st.session_state.get(
+            "exp_calibration_sweep_objective_mode",
+            CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+        )
+    )
+    reverse_objective_mode = {
+        value: label for label, value in objective_mode_options.items()
+    }
+    objective_mode_label = st.selectbox(
+        "Modo objetivo Optuna",
+        list(objective_mode_options.keys()),
+        index=list(objective_mode_options.keys()).index(
+            reverse_objective_mode.get(current_objective_mode, "Multiobjetivo Pareto")
+        ),
+        key="exp_calibration_sweep_objective_mode_label",
         help=(
-            "Optuna sigue siendo escalar por trial. Luego el ranking multiobjetivo "
-            "se arma sobre las combinaciones finalistas usando métricas de validación."
+            "Multiobjetivo Pareto optimiza MCC, PR-AUC, Brier y Recall@N alertas/día "
+            "en un único estudio Optuna. Escalar legacy mantiene una métrica por estudio."
         ),
     )
+    optuna_objective_mode = objective_mode_options[objective_mode_label]
+    st.session_state["exp_calibration_sweep_objective_mode"] = optuna_objective_mode
+    if optuna_objective_mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE:
+        objective_options = {
+            CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL: CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY
+        }
+        selected_objective_labels = [CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL]
+        st.caption(
+            "Objetivos fijos: MCC ↑, PR-AUC ↑, Brier ↓ y Recall@N alertas/día ↑. "
+            "FAR se usa como gate operacional y penalización del proxy de pruning."
+        )
+    else:
+        advanced_objectives = st.checkbox(
+            "Mostrar catálogo avanzado de métricas objetivo de Optuna",
+            value=bool(
+                st.session_state.get(
+                    "exp_calibration_sweep_show_advanced_objectives",
+                    False,
+                )
+            ),
+            key="exp_calibration_sweep_show_advanced_objectives",
+        )
+        objective_options = _calibration_sweep_optuna_objective_options(
+            include_advanced=bool(advanced_objectives)
+        )
+        default_objective_keys = {
+            "pr_auc",
+            "mcc",
+            "brier_score",
+            "balanced_f1",
+            "recall_at_alerts_per_day",
+            "operational_cost",
+            "far_sens",
+        }
+        default_objective_labels = [
+            label
+            for label, key in objective_options.items()
+            if key in default_objective_keys
+        ]
+        selected_objective_labels = st.multiselect(
+            "Métricas objetivo de Optuna",
+            list(objective_options.keys()),
+            default=default_objective_labels,
+            key="exp_calibration_sweep_objectives",
+            help=(
+                "Optuna sigue siendo escalar por trial. Luego el ranking multiobjetivo "
+                "se arma sobre las combinaciones finalistas usando métricas de validación."
+            ),
+        )
 
     calibration_methods = _calibration_method_multiselect(
         "Calibración del score",
@@ -4809,6 +5079,92 @@ def _render_calibration_sweep_experiment() -> None:
     with st.expander("Rangos del barrido", expanded=False):
         st.json(search_space)
 
+    selected_objective_metrics = [
+        objective_options[label]
+        for label in selected_objective_labels
+        if label in objective_options
+    ]
+    checkpoint_root = RESULTS_DIR / "calibration_experiment_runs"
+    checkpoint_entries = _list_calibration_sweep_checkpoints(
+        checkpoint_root=checkpoint_root
+    )
+    checkpoint_entries_by_label = {
+        str(entry.get("label") or entry.get("run_id") or ""): entry
+        for entry in checkpoint_entries
+    }
+    selected_checkpoint_entry: Optional[Dict[str, object]] = None
+    checkpoint_execution_mode = "Nuevo run"
+    if checkpoint_entries_by_label:
+        st.markdown("**Checkpoints guardados**")
+        st.caption(
+            "La selección es explícita: modificar los parámetros del formulario no "
+            "busca checkpoints compatibles automáticamente."
+        )
+        checkpoint_selector_key = "exp_calibration_sweep_checkpoint_selector"
+        checkpoint_selector_options = ["(sin checkpoint)"] + list(
+            checkpoint_entries_by_label.keys()
+        )
+        selected_checkpoint_label = st.selectbox(
+            "Checkpoint disponible",
+            checkpoint_selector_options,
+            key=checkpoint_selector_key,
+            help=(
+                "Permite cargar resultados previos para analizarlos y, si el "
+                "formulario coincide con la corrida, reanudar o reiniciar ese checkpoint."
+            ),
+        )
+        if selected_checkpoint_label != "(sin checkpoint)":
+            selected_checkpoint_entry = checkpoint_entries_by_label.get(
+                selected_checkpoint_label
+            )
+        if selected_checkpoint_entry is not None:
+            progress_text = (
+                f"{int(selected_checkpoint_entry.get('completed_steps') or 0)}/"
+                f"{int(selected_checkpoint_entry.get('total_steps') or 0)}"
+            )
+            st.caption(
+                f"Run ID: {selected_checkpoint_entry.get('run_id')} | "
+                f"Estado: {selected_checkpoint_entry.get('status_label')} | "
+                f"Actualizado: {selected_checkpoint_entry.get('updated_at') or '-'} | "
+                f"Progreso: {progress_text}"
+            )
+            if st.button(
+                "Cargar checkpoint seleccionado",
+                key="exp_calibration_sweep_load_selected_checkpoint",
+            ):
+                st.session_state["calibration_sweep_last_payload"] = (
+                    _calibration_sweep_result_state_from_run_dir(
+                        Path(str(selected_checkpoint_entry.get("run_dir") or "")),
+                        loaded_from_selection=True,
+                    )
+                )
+
+            if str(selected_checkpoint_entry.get("status") or "").lower() == "completed":
+                checkpoint_mode_options = [
+                    "Nuevo run",
+                    "Reiniciar checkpoint seleccionado",
+                ]
+            else:
+                checkpoint_mode_options = [
+                    "Nuevo run",
+                    "Reanudar checkpoint seleccionado",
+                    "Reiniciar checkpoint seleccionado",
+                ]
+            checkpoint_execution_key = (
+                "exp_calibration_sweep_checkpoint_execution_mode"
+            )
+            if (
+                st.session_state.get(checkpoint_execution_key)
+                not in checkpoint_mode_options
+            ):
+                st.session_state[checkpoint_execution_key] = checkpoint_mode_options[0]
+            checkpoint_execution_mode = st.radio(
+                "Uso al ejecutar",
+                checkpoint_mode_options,
+                horizontal=True,
+                key=checkpoint_execution_key,
+            )
+
     if st.button(
         "Ejecutar experimento de calibración",
         key="exp_calibration_sweep_run",
@@ -4822,6 +5178,17 @@ def _render_calibration_sweep_experiment() -> None:
         if not selected_threshold_objectives:
             st.error("Seleccione al menos un objetivo operacional de threshold.")
             return
+        if calibration_feature_source == "optuna":
+            if int(calibration_k_min) > int(calibration_k_max):
+                st.error("k_min no puede ser mayor que k_max.")
+                return
+            if int(calibration_k_step) < 1:
+                st.error("k_step debe ser mayor o igual a 1.")
+                return
+        else:
+            if int(calibration_fixed_k) < 1:
+                st.error("K features debe ser mayor o igual a 1.")
+                return
 
         try:
             base_df = _prepare_controlled_comparison_base_df(
@@ -4966,6 +5333,24 @@ def _render_calibration_sweep_experiment() -> None:
 
         _update_calibration_progress()
         runner = ExperimentsRunner(random_state=int(random_state))
+        selected_checkpoint_run_id = None
+        restart_selected_checkpoint = False
+        if selected_checkpoint_entry is not None:
+            if checkpoint_execution_mode == "Reanudar checkpoint seleccionado":
+                selected_checkpoint_run_id_text = str(
+                    selected_checkpoint_entry.get("run_id") or ""
+                ).strip()
+                selected_checkpoint_run_id = (
+                    selected_checkpoint_run_id_text or None
+                )
+            elif checkpoint_execution_mode == "Reiniciar checkpoint seleccionado":
+                selected_checkpoint_run_id_text = str(
+                    selected_checkpoint_entry.get("run_id") or ""
+                ).strip()
+                selected_checkpoint_run_id = (
+                    selected_checkpoint_run_id_text or None
+                )
+                restart_selected_checkpoint = selected_checkpoint_run_id is not None
         with st.spinner("Ejecutando barrido de calibración..."):
             try:
                 payload = runner.run_calibration_sweep(
@@ -4977,6 +5362,9 @@ def _render_calibration_sweep_experiment() -> None:
                     threshold_objectives=list(selected_threshold_objectives),
                     event_path=selected_event_path,
                     features_path=selected_features_path,
+                    segment_info=segment_info,
+                    dataset_date_start=dataset_date_start,
+                    dataset_date_end=dataset_date_end,
                     feature_source=str(feature_resolution.get("feature_source") or ""),
                     test_size=float(test_size),
                     val_size=float(val_size),
@@ -4992,13 +5380,39 @@ def _render_calibration_sweep_experiment() -> None:
                     fp_cost=float(fp_cost),
                     robust_folds=int(robust_folds),
                     optuna_pruning_config=optuna_pruning_config,
-                    checkpoint_root=RESULTS_DIR / "calibration_experiment_runs",
+                    feature_k_config=dict(calibration_feature_k_config),
+                    optuna_objective_mode=str(optuna_objective_mode),
+                    checkpoint_root=checkpoint_root,
+                    auto_resume=False,
+                    start_fresh=bool(restart_selected_checkpoint),
+                    checkpoint_run_id_override=selected_checkpoint_run_id,
                     result_callback=_progress_callback,
                 )
             except Exception as exc:
                 _update_calibration_progress()
                 st.error(f"El experimento falló: {exc}")
                 return
+
+        if bool(payload.get("loaded_from_checkpoint")):
+            checkpoint_grid = payload.get("grid_results_df")
+            if isinstance(checkpoint_grid, pd.DataFrame):
+                completed_rows = int(
+                    checkpoint_grid.get("status", pd.Series(dtype=str))
+                    .astype(str)
+                    .str.lower()
+                    .eq("completed")
+                    .sum()
+                )
+                failed_rows = int(
+                    checkpoint_grid.get("status", pd.Series(dtype=str))
+                    .astype(str)
+                    .str.lower()
+                    .eq("failed")
+                    .sum()
+                )
+                progress_state["processed"] = int(len(checkpoint_grid))
+                progress_state["completed"] = completed_rows
+                progress_state["failed"] = failed_rows
 
         progress_bar.progress(
             100,
@@ -6947,77 +7361,6 @@ def _render_state_diagnostics(tab: str) -> None:
                 st.info("No había keys producidos que borrar.")
 
 
-def _lookup_optuna_feature_source_for_experiment(
-    *,
-    store: Dict[str, object],
-    feature_key: str,
-    model_choice: str,
-) -> Optional[Dict[str, object]]:
-    active_key = str(st.session_state.get("optuna_active_key") or "").strip()
-    candidate_keys: List[str] = []
-    if active_key and active_key.startswith(f"{feature_key}|"):
-        candidate_keys.append(active_key)
-    candidate_keys.extend(
-        [
-            key
-            for key in sorted(store.keys())
-            if str(key).startswith(f"{feature_key}|") and str(key) != active_key
-        ]
-    )
-    calibration_order = _ordered_calibration_methods(["sigmoid", "isotonic", "none"])
-    for candidate_key in candidate_keys:
-        entry = store.get(candidate_key)
-        if not isinstance(entry, dict):
-            continue
-        container = _get_optuna_model_result_container(
-            entry.get("results"),
-            model_choice,
-        )
-        if not isinstance(container, dict):
-            continue
-        by_balance_mode = container.get("by_balance_mode")
-        if not isinstance(by_balance_mode, dict):
-            continue
-        for balance_mode in OPTUNA_BALANCE_MODE_ORDER:
-            mode_container = by_balance_mode.get(balance_mode)
-            if not isinstance(mode_container, dict):
-                continue
-            by_calibration_method = mode_container.get("by_calibration_method")
-            if not isinstance(by_calibration_method, dict):
-                continue
-            for calibration_method in calibration_order:
-                result = by_calibration_method.get(calibration_method)
-                if not isinstance(result, dict):
-                    continue
-                settings = result.get("optuna_settings") or {}
-                best_feature_cols = settings.get("best_feature_cols") or entry.get(
-                    "feature_cols"
-                )
-                if not best_feature_cols:
-                    continue
-                return {
-                    "best_feature_cols": list(best_feature_cols),
-                    "balance_mode": str(balance_mode),
-                    "balance_mode_label": _optuna_balance_mode_label(balance_mode),
-                    "calibration_method": str(calibration_method),
-                    "calibration_method_label": _calibration_method_label(
-                        calibration_method
-                    ),
-                    "objective_metric": str(
-                        result.get("objective_metric")
-                        or settings.get("objective_metric")
-                        or ""
-                    ),
-                    "objective_label": str(
-                        result.get("objective_label")
-                        or settings.get("objective_label")
-                        or ""
-                    ),
-                    "optuna_key": str(candidate_key),
-                }
-    return None
-
-
 def _resolve_calibration_sweep_feature_selection(
     *,
     dataset_df: pd.DataFrame,
@@ -7033,73 +7376,149 @@ def _resolve_calibration_sweep_feature_selection(
         )
     )
     numeric_cols = _get_feature_cols(dataset_df)
-    selected_features = st.session_state.get("selected_features")
-    if isinstance(selected_features, (list, tuple)) and len(selected_features) > 0:
-        feature_selection_cols = [
-            str(col) for col in selected_features if str(col) in numeric_cols
-        ]
-    else:
-        feature_selection_cols = list(numeric_cols)
+    feature_selection_cols = list(numeric_cols)
     if source != "optuna":
         return {
             "feature_source": "feature_selection",
             "feature_source_label": "Feature selection",
             "feature_cols": list(feature_selection_cols),
             "source_note": (
-                f"{len(feature_selection_cols)} variables congeladas desde "
-                "Feature selection."
+                f"{len(feature_selection_cols)} variables candidatas; se rankean "
+                "en train y se toma el K fijo configurado."
             ),
-        }
-
-    store = st.session_state.get("optuna_results_store") or {}
-    feature_key = _feature_selection_key(
-        str(features_path) if features_path is not None else None,
-        features_source,
-        features_df,
-    )
-    match = _lookup_optuna_feature_source_for_experiment(
-        store=store,
-        feature_key=feature_key,
-        model_choice=model_choice,
-    )
-    if not isinstance(match, dict):
-        return {
-            "feature_source": "feature_selection",
-            "feature_source_label": "Feature selection",
-            "feature_cols": list(feature_selection_cols),
-            "source_note": (
-                "No se encontró un match usable de Optuna para este modelo; "
-                "se usan las variables actuales de Feature selection."
-            ),
-            "used_fallback": True,
-        }
-
-    resolved_cols = [
-        str(col)
-        for col in list(match.get("best_feature_cols") or [])
-        if str(col) in numeric_cols
-    ]
-    if not resolved_cols:
-        return {
-            "feature_source": "feature_selection",
-            "feature_source_label": "Feature selection",
-            "feature_cols": list(feature_selection_cols),
-            "source_note": (
-                "Optuna devolvió columnas que no están disponibles en el dataset "
-                "actual; se usan las variables actuales de Feature selection."
-            ),
-            "used_fallback": True,
         }
     return {
         "feature_source": "optuna",
         "feature_source_label": "Optuna (best_feature_cols)",
-        "feature_cols": list(resolved_cols),
+        "feature_cols": list(feature_selection_cols),
         "source_note": (
-            f"{len(resolved_cols)} variables congeladas desde Optuna "
-            f"({_optuna_balance_mode_label(match.get('balance_mode'))} | "
-            f"{match.get('calibration_method_label') or match.get('calibration_method')})"
+            f"{len(feature_selection_cols)} variables candidatas; Optuna optimiza "
+            "top_k y genera best_feature_cols en esta corrida."
         ),
-        "optuna_match": dict(match),
+    }
+
+
+def _calibration_sweep_protocol_preview(
+    *,
+    model_name: str,
+    feature_source: str,
+    optuna_objective_mode: str,
+    candidate_feature_cols: Sequence[str],
+    feature_k_config: Dict[str, object],
+    objective_metrics: Sequence[str],
+    calibration_methods: Sequence[str],
+    threshold_objectives: Sequence[str],
+    test_size: float,
+    val_size: float,
+    n_trials: int,
+    timeout: int,
+    optuna_n_jobs: int,
+    parallel_jobs: int,
+    xgb_parallel_jobs: int,
+    far_target: float,
+    alerts_per_day: float,
+    fn_cost: float,
+    fp_cost: float,
+    robust_folds: int,
+    search_space: Dict[str, object],
+    optuna_pruning_config: Dict[str, object],
+    random_state: int,
+    segment_info: Dict[str, object],
+    event_path: Path,
+    features_path: Path,
+    dataset_date_start: Optional[object],
+    dataset_date_end: Optional[object],
+) -> Dict[str, object]:
+    objective_mode = (
+        CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+        if str(optuna_objective_mode).strip().lower()
+        == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+        else CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR
+    )
+    protocol_version = (
+        CALIBRATION_SWEEP_MULTIOBJECTIVE_PROTOCOL_VERSION
+        if objective_mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+        else CALIBRATION_SWEEP_PROTOCOL_VERSION
+    )
+    feature_k_config_payload = dict(feature_k_config or {})
+    feature_k_mode = str(
+        feature_k_config_payload.get("mode") or "fixed_feature_list"
+    ).strip().lower()
+    ranking_method = str(
+        feature_k_config_payload.get("ranking_method") or "rf"
+    ).strip().lower()
+    candidate_cols = [str(col) for col in candidate_feature_cols]
+    top_k_min_value: Optional[int] = None
+    top_k_max_value: Optional[int] = None
+    top_k_step_value: Optional[int] = None
+    if feature_k_mode == "optuna_top_k":
+        top_k_grid = _k_grid_values(
+            k_min=int(feature_k_config_payload.get("k_min", 10)),
+            k_max=int(feature_k_config_payload.get("k_max", 100)),
+            k_step=int(feature_k_config_payload.get("k_step", 10)),
+            feature_count=len(candidate_cols),
+        )
+        if top_k_grid:
+            top_k_min_value = int(top_k_grid[0])
+            top_k_max_value = int(top_k_grid[-1])
+            top_k_step_value = int(feature_k_config_payload.get("k_step", 10))
+    elif feature_k_mode != "fixed_top_k":
+        feature_k_mode = "fixed_feature_list"
+
+    return {
+        "protocol_family": CALIBRATION_SWEEP_PROTOCOL_FAMILY,
+        "protocol_version": protocol_version,
+        "model_name": str(model_name),
+        "threshold_protocol": "robust",
+        "optuna_objective_mode": objective_mode,
+        "feature_source": str(feature_source),
+        "selected_features": list(candidate_cols),
+        "selected_feature_count": int(len(candidate_cols)),
+        "candidate_feature_count": int(len(candidate_cols)),
+        "feature_k_mode": str(feature_k_mode),
+        "feature_k_config": dict(feature_k_config_payload),
+        "ranking_method": ranking_method
+        if feature_k_mode in {"fixed_top_k", "optuna_top_k"}
+        else None,
+        "top_k_min": top_k_min_value,
+        "top_k_max": top_k_max_value,
+        "top_k_step": top_k_step_value,
+        "objective_metrics": list(objective_metrics),
+        "multiobjective_metrics": list(CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS)
+        if objective_mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+        else [],
+        "multiobjective_directions": list(CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS)
+        if objective_mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+        else [],
+        "calibration_methods": list(calibration_methods),
+        "threshold_objectives": list(threshold_objectives),
+        "balance_modes": list(CALIBRATION_SWEEP_BALANCE_MODES),
+        "test_size": float(test_size),
+        "val_size": float(val_size),
+        "n_trials": int(n_trials),
+        "timeout": int(timeout),
+        "optuna_n_jobs": int(optuna_n_jobs),
+        "parallel_jobs": int(parallel_jobs),
+        "xgb_parallel_jobs": int(xgb_parallel_jobs),
+        "far_target": float(far_target),
+        "alerts_per_day": float(alerts_per_day),
+        "fn_cost": float(fn_cost),
+        "fp_cost": float(fp_cost),
+        "robust_folds": int(robust_folds),
+        "search_space": dict(search_space),
+        "optuna_pruning": dict(optuna_pruning_config),
+        "random_state": int(random_state),
+        "segment_info": dict(segment_info or {}),
+        "event_path": str(event_path or ""),
+        "features_path": str(features_path or ""),
+        "dataset_date_start": (
+            None
+            if dataset_date_start is None
+            else str(pd.Timestamp(dataset_date_start))
+        ),
+        "dataset_date_end": (
+            None if dataset_date_end is None else str(pd.Timestamp(dataset_date_end))
+        ),
     }
 
 
@@ -7258,6 +7677,9 @@ def _calibration_sweep_metadata_rows(
         protocol.get("selected_feature_count"),
         _first_frame_value(grid_results_df, "selected_feature_count"),
     )
+    _add("Insumos", "segment_info", protocol.get("segment_info"))
+    _add("Insumos", "dataset_date_start", protocol.get("dataset_date_start"))
+    _add("Insumos", "dataset_date_end", protocol.get("dataset_date_end"))
 
     for key in ("train_rows", "val_rows", "test_rows"):
         _add("Split", key, _first_frame_value(grid_results_df, key))
@@ -7312,6 +7734,51 @@ def _calibration_sweep_selected_features(
         if isinstance(parsed, list):
             return [str(feature) for feature in parsed]
         return [raw_features]
+    return []
+
+
+def _feature_list_from_jsonish(value: object) -> List[str]:
+    parsed = _parse_jsonish(value)
+    if isinstance(parsed, (list, tuple)):
+        return [str(item) for item in parsed if str(item).strip()]
+    if isinstance(parsed, str):
+        text = parsed.strip()
+        if not text:
+            return []
+        if "," in text:
+            return [part.strip() for part in text.split(",") if part.strip()]
+        return [text]
+    return []
+
+
+def _calibration_sweep_best_feature_cols(
+    *,
+    best_summary_df: pd.DataFrame,
+    leaderboard_df: pd.DataFrame,
+    grid_results_df: pd.DataFrame,
+) -> List[str]:
+    for frame in (best_summary_df, leaderboard_df, grid_results_df):
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            continue
+        work = frame.copy()
+        if "status" in work.columns:
+            completed = work[
+                work["status"].astype(str).str.lower().eq("completed")
+            ]
+            if not completed.empty:
+                work = completed
+        if "rank" in work.columns:
+            work["_rank_sort"] = pd.to_numeric(work["rank"], errors="coerce")
+            work = work.sort_values("_rank_sort", na_position="last")
+        if work.empty:
+            continue
+        row = work.iloc[0]
+        for column in ("best_feature_cols", "selected_features"):
+            if column not in work.columns:
+                continue
+            features = _feature_list_from_jsonish(row.get(column))
+            if features:
+                return features
     return []
 
 
@@ -7470,13 +7937,19 @@ def _calibration_sweep_artifact_rows(
 def _render_calibration_sweep_metadata(
     result_state: Dict[str, object],
     *,
+    best_summary_df: pd.DataFrame,
+    leaderboard_df: pd.DataFrame,
     grid_results_df: pd.DataFrame,
 ) -> None:
     with st.expander("Metadata disponible", expanded=False):
         metadata_rows = _calibration_sweep_metadata_rows(result_state, grid_results_df)
         if metadata_rows:
             st.markdown("**Manifest, protocolo e insumos**")
-            st.dataframe(pd.DataFrame(metadata_rows), width="stretch", hide_index=True)
+            st.dataframe(
+                _prepare_dataframe_for_streamlit(pd.DataFrame(metadata_rows)),
+                width="stretch",
+                hide_index=True,
+            )
         else:
             st.info("No hay metadata general disponible.")
 
@@ -7485,10 +7958,24 @@ def _render_calibration_sweep_metadata(
             grid_results_df,
         )
         if selected_features:
-            st.markdown("**Variables seleccionadas**")
+            st.markdown("**Pool candidato**")
             st.caption(f"Total: {len(selected_features):,}")
             st.dataframe(
                 pd.DataFrame({"feature": selected_features}),
+                width="stretch",
+                hide_index=True,
+            )
+
+        best_feature_cols = _calibration_sweep_best_feature_cols(
+            best_summary_df=best_summary_df,
+            leaderboard_df=leaderboard_df,
+            grid_results_df=grid_results_df,
+        )
+        if best_feature_cols:
+            st.markdown("**Variables efectivas del mejor resultado**")
+            st.caption(f"Total: {len(best_feature_cols):,}")
+            st.dataframe(
+                pd.DataFrame({"feature": best_feature_cols}),
                 width="stretch",
                 hide_index=True,
             )
@@ -7501,9 +7988,9 @@ def _render_calibration_sweep_metadata(
         if split_db_path is not None:
             st.caption(f"Split congelado: {split_db_path}")
         st.caption(
-            "El manifest actual no guarda `segment_info` ni `tramo` explícitos "
-            "para esta familia; los porticos se infieren desde `splits.duckdb` "
-            "cuando existen columnas `portico_last` y `portico_next`."
+            "`segment_info` y el rango temporal quedan en el protocolo del checkpoint; "
+            "los porticos también se pueden auditar desde `splits.duckdb` cuando "
+            "existen columnas `portico_last` y `portico_next`."
         )
         if isinstance(split_df, pd.DataFrame) and not split_df.empty:
             st.dataframe(split_df, width="stretch", hide_index=True)
@@ -7552,12 +8039,20 @@ def _render_calibration_sweep_results(
         st.caption(f"Checkpoint: {run_dir}")
     if manifest_path:
         st.caption(f"Manifest: {manifest_path}")
+    if bool(result_state.get("loaded_from_selection")):
+        st.caption("Resultado cargado desde el selector de checkpoints.")
+    elif bool(result_state.get("loaded_from_checkpoint")):
+        st.caption("Resultado cargado desde un checkpoint compatible completado.")
+    elif bool(result_state.get("auto_resumed")):
+        st.caption("Corrida reanudada desde un checkpoint compatible incompleto.")
     source_note = str(result_state.get("feature_source_note") or "").strip()
     if source_note:
         st.caption(source_note)
 
     _render_calibration_sweep_metadata(
         result_state,
+        best_summary_df=best_summary_df,
+        leaderboard_df=leaderboard_df,
         grid_results_df=grid_results_df,
     )
 
@@ -7566,19 +8061,29 @@ def _render_calibration_sweep_results(
         "rank",
         "balance_mode",
         "optuna_objective_metric",
+        "optuna_objective_mode",
         "calibration_method",
         "threshold_objective",
+        "feature_k_mode",
+        "best_top_k",
+        "selected_feature_count",
+        "best_feature_cols",
         "stability_score",
         "pareto_front",
+        "far_gate_pass",
+        "far_gate_fallback",
+        "pruning_proxy_score",
         "val_mcc",
         "val_brier_score",
         "val_pr_auc",
+        "val_recall_at_alerts_per_day",
         "val_true_positives",
         "val_false_negatives",
         "val_far",
         "test_mcc",
         "test_brier_score",
         "test_pr_auc",
+        "test_recall_at_alerts_per_day",
         "test_true_positives",
         "test_false_negatives",
         "test_far",
@@ -7600,13 +8105,22 @@ def _render_calibration_sweep_results(
         "model_name",
         "balance_mode",
         "optuna_objective_metric",
+        "optuna_objective_mode",
         "calibration_method",
         "threshold_objective",
         "threshold_protocol",
+        "feature_k_mode",
+        "best_top_k",
+        "selected_feature_count",
+        "best_feature_cols",
         "decision_threshold",
+        "far_gate_pass",
+        "far_gate_fallback",
+        "pruning_proxy_score",
         "val_mcc",
         "val_brier_score",
         "val_pr_auc",
+        "val_recall_at_alerts_per_day",
         "val_true_positives",
         "val_false_negatives",
         "val_far",
@@ -7616,6 +8130,7 @@ def _render_calibration_sweep_results(
         "test_mcc",
         "test_brier_score",
         "test_pr_auc",
+        "test_recall_at_alerts_per_day",
         "test_true_positives",
         "test_false_negatives",
         "test_far",
@@ -7629,21 +8144,31 @@ def _render_calibration_sweep_results(
         "model_name",
         "balance_mode",
         "optuna_objective_metric",
+        "optuna_objective_mode",
         "calibration_method",
         "threshold_objective",
         "threshold_protocol",
+        "feature_k_mode",
+        "best_top_k",
+        "selected_feature_count",
+        "best_feature_cols",
         "rankable",
         "pareto_front",
         "stability_score",
+        "far_gate_pass",
+        "far_gate_fallback",
+        "pruning_proxy_score",
         "val_mcc",
         "val_brier_score",
         "val_pr_auc",
+        "val_recall_at_alerts_per_day",
         "val_true_positives",
         "val_false_negatives",
         "val_far",
         "test_mcc",
         "test_brier_score",
         "test_pr_auc",
+        "test_recall_at_alerts_per_day",
         "test_true_positives",
         "test_false_negatives",
         "test_far",

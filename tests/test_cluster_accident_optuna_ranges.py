@@ -161,6 +161,43 @@ def test_calibration_sweep_optuna_objectives_shortlist_and_advanced_catalog():
     assert "fnr" in advanced_values
 
 
+def test_calibration_sweep_protocol_preview_uses_multiobjective_version():
+    protocol = app._calibration_sweep_protocol_preview(
+        model_name="Random Forest",
+        feature_source="feature_selection",
+        optuna_objective_mode="multiobjective",
+        candidate_feature_cols=["signal", "aux_signal"],
+        feature_k_config={"mode": "fixed_top_k", "k": 2, "ranking_method": "rf"},
+        objective_metrics=["multiobjective_pareto"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        test_size=0.2,
+        val_size=0.2,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=1,
+        parallel_jobs=1,
+        xgb_parallel_jobs=1,
+        far_target=0.2,
+        alerts_per_day=5.0,
+        fn_cost=10.0,
+        fp_cost=1.0,
+        robust_folds=3,
+        search_space={},
+        optuna_pruning_config={},
+        random_state=42,
+        segment_info={},
+        event_path="events.csv",
+        features_path="features.duckdb",
+        dataset_date_start=None,
+        dataset_date_end=None,
+    )
+
+    assert protocol["protocol_version"] == app.CALIBRATION_SWEEP_MULTIOBJECTIVE_PROTOCOL_VERSION
+    assert protocol["optuna_objective_mode"] == app.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+    assert protocol["multiobjective_metrics"] == list(app.CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS)
+
+
 def test_list_experiment_result_files_includes_calibration_sweep_runs(
     tmp_path,
     monkeypatch,
@@ -259,6 +296,76 @@ def test_calibration_sweep_history_helpers_build_labels_and_exports(
     assert trial_path in related_files
     assert state["checkpoint_run_dir"] == str(run_dir)
     assert state["run_id"] == run_dir.name
+
+
+def test_list_calibration_sweep_checkpoints_exposes_sorted_selector_entries(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app, "RESULTS_DIR", tmp_path)
+    newer_run = (
+        tmp_path
+        / "calibration_experiment_runs"
+        / "calibration_sweep_20260420_101500_newer"
+    )
+    older_run = (
+        tmp_path
+        / "calibration_experiment_runs"
+        / "calibration_sweep_20260418_151657_older"
+    )
+    (newer_run / "results").mkdir(parents=True)
+    (older_run / "results").mkdir(parents=True)
+    (newer_run / "results" / "grid_results.csv").write_text(
+        "status,model_name\nrunning,XGBoost\n",
+        encoding="utf-8",
+    )
+    (older_run / "results" / "best_summary.csv").write_text(
+        "rank,model_name\n1,Random Forest\n",
+        encoding="utf-8",
+    )
+    (newer_run / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": newer_run.name,
+                "status": "running",
+                "result_status": "running",
+                "updated_at": "2026-04-20T10:15:00",
+                "progress": {
+                    "completed_steps": 1,
+                    "total_steps": 4,
+                    "current_step_id": "combo__demo",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (older_run / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": older_run.name,
+                "status": "completed",
+                "result_status": "completed",
+                "completed_at": "2026-04-18T23:21:25",
+                "progress": {
+                    "completed_steps": 4,
+                    "total_steps": 4,
+                    "current_step_id": None,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    checkpoints = app._list_calibration_sweep_checkpoints()
+
+    assert [item["run_id"] for item in checkpoints[:2]] == [
+        newer_run.name,
+        older_run.name,
+    ]
+    assert checkpoints[0]["status_label"] == "en progreso"
+    assert checkpoints[0]["completed_steps"] == 1
+    assert checkpoints[1]["status_label"] == "completado"
+    assert "Calibración score + threshold" in checkpoints[0]["label"]
 
 
 def test_render_conditional_number_input_preserves_hidden_value(monkeypatch):

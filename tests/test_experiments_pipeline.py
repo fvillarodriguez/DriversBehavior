@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -13,8 +14,10 @@ import src.experiments_logic as experiments_logic_module
 from src.experiments_logic import (
     CONTROLLED_COMPARISON_MODELS,
     ExperimentsRunner,
+    build_calibration_sweep_context,
     build_controlled_comparison_context,
     estimate_controlled_comparison_parallelism,
+    preview_calibration_sweep_checkpoint,
     preview_controlled_comparison_checkpoint,
 )
 from src.model_training import temporal_train_test_split
@@ -324,6 +327,218 @@ def _synthetic_calibration_base_df(rows: int = 120) -> pd.DataFrame:
             "aux_signal": np.where(target == 1, 0.7, 0.3) + (idx % 5) * 0.01,
             "target": target,
         }
+    )
+
+
+def _fake_calibration_optimize_result(kwargs: dict, *, score: float = 0.72) -> dict:
+    selected_features = list(kwargs["selected_features"])
+    balance_mode = str(kwargs.get("balance_mode") or "none")
+    val_mcc = float(score if balance_mode == "none" else score - 0.05)
+    val_brier = float(0.08 if balance_mode == "none" else 0.12)
+    metadata = dict(kwargs.get("feature_k_metadata") or {})
+    return {
+        "status": "completed",
+        "model_name": str(kwargs["model_name"]),
+        "feature_set": str(kwargs.get("feature_set") or "Frozen selection"),
+        "balance_mode": balance_mode,
+        "objective_metric": str(kwargs["objective_metric"]),
+        "objective_label": str(kwargs["objective_metric"]).upper(),
+        "objective_direction": "maximize",
+        "k": int(len(selected_features)),
+        "selected_features": list(selected_features),
+        "selected_feature_count": int(len(selected_features)),
+        "feature_k_mode": metadata.get("feature_k_mode", "fixed_feature_list"),
+        "candidate_feature_count": metadata.get(
+            "candidate_feature_count",
+            len(selected_features),
+        ),
+        "ranking_method": metadata.get("ranking_method"),
+        "top_k_min": metadata.get("top_k_min"),
+        "top_k_max": metadata.get("top_k_max"),
+        "top_k_step": metadata.get("top_k_step"),
+        "best_top_k": int(len(selected_features)),
+        "best_feature_cols": list(selected_features),
+        "ranked_cols": list(metadata.get("ranked_cols") or selected_features),
+        "decision_threshold": 0.42,
+        "val_objective_score": val_mcc,
+        "test_objective_score": val_mcc - 0.10,
+        "val_roc_auc": 0.81,
+        "test_roc_auc": 0.71,
+        "val_pr_auc": 0.83,
+        "test_pr_auc": 0.73,
+        "val_brier_score": val_brier,
+        "test_brier_score": val_brier + 0.05,
+        "val_f1": 0.70,
+        "test_f1": 0.60,
+        "val_mcc": val_mcc,
+        "test_mcc": val_mcc - 0.10,
+        "val_recall": 0.75,
+        "test_recall": 0.65,
+        "val_alerts_per_day": 3.0,
+        "test_alerts_per_day": 3.5,
+        "val_false_alarms_per_day": 0.5,
+        "test_false_alarms_per_day": 0.7,
+        "val_event_recall_approx": 0.75,
+        "test_event_recall_approx": 0.65,
+        "val_operational_cost": 5.0,
+        "test_operational_cost": 6.0,
+        "val_cost_per_day": 1.0,
+        "test_cost_per_day": 1.2,
+        "alerts_per_day_budget": 5.0,
+        "fn_cost": 10.0,
+        "fp_cost": 1.0,
+        "val_false_negatives": 1,
+        "test_false_negatives": 2,
+        "val_false_positives": 2,
+        "test_false_positives": 3,
+        "val_true_negatives": 30,
+        "test_true_negatives": 28,
+        "val_true_positives": 5,
+        "test_true_positives": 4,
+        "val_positive_support": 6,
+        "test_positive_support": 6,
+        "val_tp_capture": 5 / 6,
+        "test_tp_capture": 4 / 6,
+        "val_fn_rate": 1 / 6,
+        "test_fn_rate": 2 / 6,
+        "val_far": 0.08 if balance_mode == "none" else 0.12,
+        "test_far": 0.10 if balance_mode == "none" else 0.14,
+        "val_confusion_matrix": [[30, 2], [1, 5]],
+        "test_confusion_matrix": [[28, 3], [2, 4]],
+        "best_params": {"max_depth": 4},
+        "effective_model_params": {"max_depth": 4},
+        "smote_params": {} if balance_mode == "none" else {"k_neighbors": 3},
+        "optuna_trials_completed": 1,
+        "optuna_trials_pruned": 0,
+        "optuna_trials_failed": 0,
+        "optuna_trials_total": 1,
+        "train_rows": int(len(kwargs["train_df"])),
+        "val_rows": int(len(kwargs["val_df"])),
+        "test_rows": int(len(kwargs["test_df"])),
+        "trials_df": pd.DataFrame(
+            [{"number": 0, "value": val_mcc, "state": "COMPLETE"}]
+        ),
+    }
+
+
+def test_calibration_multiobjective_helpers_compute_vector_proxy_and_far_gate():
+    metrics = {
+        "mcc": 0.20,
+        "pr_auc": 0.40,
+        "brier_score": 0.10,
+        "recall_at_alerts_per_day": 0.50,
+        "far": 0.15,
+    }
+
+    values = experiments_logic_module._calibration_multiobjective_values_from_metrics(
+        metrics
+    )
+    proxy = experiments_logic_module._calibration_multiobjective_pruning_proxy_from_metrics(
+        metrics,
+        far_target=0.20,
+    )
+
+    assert values == pytest.approx((0.20, 0.40, 0.10, 0.50))
+    assert proxy == pytest.approx(np.mean([0.40, 0.60, 0.90, 0.50]))
+    assert (
+        experiments_logic_module._calibration_multiobjective_far_gate(
+            metrics,
+            far_target=0.20,
+        )
+        is True
+    )
+
+    penalized = dict(metrics, far=0.30)
+    penalized_proxy = (
+        experiments_logic_module._calibration_multiobjective_pruning_proxy_from_metrics(
+            penalized,
+            far_target=0.20,
+        )
+    )
+    assert penalized_proxy == pytest.approx(proxy - 0.50)
+
+
+def test_controlled_objective_normalization_keeps_advanced_metrics():
+    assert experiments_logic_module._normalize_controlled_objective_metric("accuracy") == "accuracy"
+    assert experiments_logic_module._normalize_controlled_objective_metric("recall") == "recall"
+    assert experiments_logic_module._normalize_controlled_objective_metric("precision") == "precision"
+    assert experiments_logic_module._normalize_controlled_objective_metric("fnr") == "fnr"
+    assert experiments_logic_module._normalize_controlled_objective_metric("far_sens") == "far_sens"
+    assert (
+        experiments_logic_module._normalize_controlled_objective_metric("net_balanced_rate")
+        == "net_balanced_rate"
+    )
+
+
+def test_select_calibration_multiobjective_trial_prefers_far_gate_then_proxy():
+    infeasible = SimpleNamespace(
+        number=0,
+        user_attrs={
+            "far_gate_pass": False,
+            "pruning_proxy_score": 0.95,
+            "recall_at_alerts_per_day": 0.90,
+            "mcc": 0.80,
+            "pr_auc": 0.85,
+            "brier_score": 0.08,
+            "val_far": 0.30,
+        },
+    )
+    feasible = SimpleNamespace(
+        number=1,
+        user_attrs={
+            "far_gate_pass": True,
+            "pruning_proxy_score": 0.70,
+            "recall_at_alerts_per_day": 0.60,
+            "mcc": 0.50,
+            "pr_auc": 0.65,
+            "brier_score": 0.12,
+            "val_far": 0.12,
+        },
+    )
+
+    selected, fallback = experiments_logic_module._select_calibration_multiobjective_trial(
+        [infeasible, feasible],
+        far_target=0.20,
+    )
+
+    assert selected is feasible
+    assert fallback is False
+
+    selected_fallback, fallback_used = (
+        experiments_logic_module._select_calibration_multiobjective_trial(
+            [infeasible],
+            far_target=0.20,
+        )
+    )
+    assert selected_fallback is infeasible
+    assert fallback_used is True
+
+
+def test_multiobjective_proxy_pruning_uses_manual_median_without_trial_report():
+    pruning_config = {
+        "enabled": True,
+        "n_startup_trials": 2,
+        "n_warmup_steps": 1,
+        "interval_steps": 1,
+    }
+
+    assert (
+        experiments_logic_module._should_prune_calibration_multiobjective_proxy(
+            0.60,
+            [0.70, 0.80, 0.75],
+            pruning_config,
+            step=1,
+        )
+        is False
+    )
+    assert (
+        experiments_logic_module._should_prune_calibration_multiobjective_proxy(
+            0.60,
+            [0.70, 0.80, 0.75],
+            pruning_config,
+            step=2,
+        )
+        is True
     )
 
 
@@ -723,6 +938,599 @@ def test_run_calibration_sweep_persists_artifacts_and_ranks_on_validation(
     assert not payload["pareto_front_df"].empty
     top_balance_mode = payload["leaderboard_df"].iloc[0]["balance_mode"]
     assert top_balance_mode == "none"
+
+
+def test_run_calibration_sweep_multiobjective_persists_contract_columns(
+    tmp_path,
+    monkeypatch,
+):
+    base_df = _synthetic_calibration_base_df()
+    runner = ExperimentsRunner(random_state=42)
+    captured_calls = []
+
+    def _fake_optimize(self, **kwargs):
+        captured_calls.append(dict(kwargs))
+        result = _fake_calibration_optimize_result(kwargs, score=0.74)
+        result.update(
+            {
+                "objective_metric": experiments_logic_module.CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY,
+                "objective_label": experiments_logic_module.CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL,
+                "objective_direction": "multiobjective",
+                "optuna_objective_mode": experiments_logic_module.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+                "multiobjective_metrics": list(
+                    experiments_logic_module.CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS
+                ),
+                "multiobjective_directions": list(
+                    experiments_logic_module.CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS
+                ),
+                "objective_values": {
+                    "validation": {
+                        "mcc": result["val_mcc"],
+                        "pr_auc": result["val_pr_auc"],
+                        "brier_score": result["val_brier_score"],
+                        "recall_at_alerts_per_day": 0.67,
+                    }
+                },
+                "val_recall_at_alerts_per_day": 0.67,
+                "test_recall_at_alerts_per_day": 0.58,
+                "far_gate_pass": bool(result["val_far"] <= 0.20),
+                "far_gate_fallback": False,
+                "pruning_proxy_score": 0.71,
+                "far_target": 0.20,
+            }
+        )
+        return result
+
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+
+    payload = runner.run_calibration_sweep(
+        base_df,
+        model_name="Random Forest",
+        selected_features=["signal", "aux_signal"],
+        optuna_objective_mode=experiments_logic_module.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        checkpoint_root=tmp_path / "calibration_runs",
+    )
+
+    assert len(captured_calls) == 2
+    assert {
+        call["objective_metric"] for call in captured_calls
+    } == {experiments_logic_module.CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY}
+    assert all(
+        call["optuna_objective_mode"]
+        == experiments_logic_module.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+        for call in captured_calls
+    )
+    assert (
+        payload["protocol"]["protocol_version"]
+        == experiments_logic_module.CALIBRATION_SWEEP_MULTIOBJECTIVE_PROTOCOL_VERSION
+    )
+    leaderboard_df = payload["leaderboard_df"]
+    for column_name in [
+        "optuna_objective_mode",
+        "multiobjective_metrics",
+        "multiobjective_directions",
+        "objective_values_json",
+        "val_recall_at_alerts_per_day",
+        "test_recall_at_alerts_per_day",
+        "far_gate_pass",
+        "far_gate_fallback",
+        "pruning_proxy_score",
+    ]:
+        assert column_name in leaderboard_df.columns
+    assert not payload["pareto_front_df"].empty
+
+
+def test_calibration_sweep_checkpoint_context_strictly_matches(tmp_path):
+    event_path = tmp_path / "events.csv"
+    features_path = tmp_path / "features.duckdb"
+    event_path.write_text("accidente_time\n2024-01-01\n", encoding="utf-8")
+    features_path.write_text("feature-bytes-v1", encoding="utf-8")
+    protocol = {
+        "protocol_family": experiments_logic_module.CALIBRATION_SWEEP_PROTOCOL_FAMILY,
+        "protocol_version": experiments_logic_module.CALIBRATION_SWEEP_PROTOCOL_VERSION,
+        "model_name": "Random Forest",
+        "selected_features": ["signal", "aux_signal"],
+        "objective_metrics": ["mcc"],
+        "calibration_methods": ["sigmoid"],
+        "threshold_objectives": ["far"],
+        "balance_modes": ["none", "smote"],
+        "n_trials": 1,
+    }
+    segment_info = {
+        "eje": "E1",
+        "calzada": "N",
+        "portico_inicio": "P1",
+        "portico_fin": "P2",
+    }
+    context = build_calibration_sweep_context(
+        event_path=event_path,
+        features_path=features_path,
+        segment_info=segment_info,
+        dataset_date_start=pd.Timestamp("2024-01-01"),
+        dataset_date_end=pd.Timestamp("2024-01-31 23:59:59"),
+        protocol=protocol,
+    )
+    run_dir = tmp_path / "calibration_runs" / "calibration_sweep_demo"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "calibration_sweep_demo",
+                "computed_run_id": context["computed_run_id"],
+                "protocol_version": experiments_logic_module.CALIBRATION_SWEEP_PROTOCOL_VERSION,
+                "protocol_family": experiments_logic_module.CALIBRATION_SWEEP_PROTOCOL_FAMILY,
+                "protocol": protocol,
+                "status": "running",
+                "updated_at": "2026-04-20T10:00:00",
+                "progress": {"completed_steps": 1, "total_steps": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    preview = preview_calibration_sweep_checkpoint(
+        context,
+        checkpoint_root=tmp_path / "calibration_runs",
+    )
+    assert preview["compatible"] is True
+    assert preview["can_resume"] is True
+    assert preview["run_id"] == "calibration_sweep_demo"
+
+    changed_protocol = dict(protocol)
+    changed_protocol["n_trials"] = 2
+    changed_contexts = [
+        build_calibration_sweep_context(
+            event_path=event_path,
+            features_path=features_path,
+            segment_info=segment_info,
+            dataset_date_start=pd.Timestamp("2024-01-01"),
+            dataset_date_end=pd.Timestamp("2024-01-31 23:59:59"),
+            protocol=changed_protocol,
+        ),
+        build_calibration_sweep_context(
+            event_path=event_path,
+            features_path=features_path,
+            segment_info={**segment_info, "portico_fin": "P3"},
+            dataset_date_start=pd.Timestamp("2024-01-01"),
+            dataset_date_end=pd.Timestamp("2024-01-31 23:59:59"),
+            protocol=protocol,
+        ),
+        build_calibration_sweep_context(
+            event_path=event_path,
+            features_path=features_path,
+            segment_info=segment_info,
+            dataset_date_start=pd.Timestamp("2024-01-02"),
+            dataset_date_end=pd.Timestamp("2024-01-31 23:59:59"),
+            protocol=protocol,
+        ),
+    ]
+    features_path.write_text("feature-bytes-v2-extra", encoding="utf-8")
+    changed_contexts.append(
+        build_calibration_sweep_context(
+            event_path=event_path,
+            features_path=features_path,
+            segment_info=segment_info,
+            dataset_date_start=pd.Timestamp("2024-01-01"),
+            dataset_date_end=pd.Timestamp("2024-01-31 23:59:59"),
+            protocol=protocol,
+        )
+    )
+    for changed_context in changed_contexts:
+        incompatible = preview_calibration_sweep_checkpoint(
+            changed_context,
+            checkpoint_root=tmp_path / "calibration_runs",
+        )
+        assert incompatible["compatible"] is False
+
+
+def test_run_calibration_sweep_loads_completed_checkpoint(tmp_path, monkeypatch):
+    base_df = _synthetic_calibration_base_df()
+    event_path = tmp_path / "events.csv"
+    features_path = tmp_path / "features.duckdb"
+    event_path.write_text("events", encoding="utf-8")
+    features_path.write_text("features", encoding="utf-8")
+    calls = []
+
+    def _fake_optimize(self, **kwargs):
+        calls.append(dict(kwargs))
+        return _fake_calibration_optimize_result(kwargs)
+
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+    runner = ExperimentsRunner(random_state=42)
+    args = dict(
+        model_name="Random Forest",
+        selected_features=["signal", "aux_signal"],
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        event_path=event_path,
+        features_path=features_path,
+        segment_info={"segment_label": "E1 | N | P1 -> P2"},
+        dataset_date_start=pd.Timestamp("2024-01-01"),
+        dataset_date_end=pd.Timestamp("2024-01-31 23:59:59"),
+        checkpoint_root=tmp_path / "calibration_runs",
+    )
+
+    first_payload = runner.run_calibration_sweep(base_df, **args)
+    assert first_payload["loaded_from_checkpoint"] is False
+    assert len(calls) == 2
+
+    second_payload = runner.run_calibration_sweep(base_df, **args)
+    assert second_payload["loaded_from_checkpoint"] is True
+    assert second_payload["auto_resumed"] is False
+    assert second_payload["run_id"] == first_payload["run_id"]
+    assert len(calls) == 2
+    assert len(second_payload["grid_results_df"]) == 2
+
+
+def test_run_calibration_sweep_without_auto_resume_skips_checkpoint_lookup(
+    tmp_path,
+    monkeypatch,
+):
+    base_df = _synthetic_calibration_base_df()
+    calls = []
+
+    def _fake_optimize(self, **kwargs):
+        calls.append(dict(kwargs))
+        return _fake_calibration_optimize_result(kwargs)
+
+    def _unexpected_preview(*args, **kwargs):
+        raise AssertionError("preview_calibration_sweep_checkpoint no deberia ejecutarse")
+
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "preview_calibration_sweep_checkpoint",
+        _unexpected_preview,
+    )
+
+    runner = ExperimentsRunner(random_state=42)
+    payload = runner.run_calibration_sweep(
+        base_df,
+        model_name="Random Forest",
+        selected_features=["signal", "aux_signal"],
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        checkpoint_root=tmp_path / "calibration_runs",
+        auto_resume=False,
+    )
+
+    assert payload["loaded_from_checkpoint"] is False
+    assert payload["auto_resumed"] is False
+    assert len(calls) == 2
+
+
+def test_run_calibration_sweep_resumes_only_missing_combo(tmp_path, monkeypatch):
+    base_df = _synthetic_calibration_base_df()
+    event_path = tmp_path / "events.csv"
+    features_path = tmp_path / "features.duckdb"
+    event_path.write_text("events", encoding="utf-8")
+    features_path.write_text("features", encoding="utf-8")
+    calls = []
+
+    def _fake_optimize(self, **kwargs):
+        calls.append(dict(kwargs))
+        return _fake_calibration_optimize_result(kwargs)
+
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+    runner = ExperimentsRunner(random_state=42)
+    args = dict(
+        model_name="Random Forest",
+        selected_features=["signal", "aux_signal"],
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        event_path=event_path,
+        features_path=features_path,
+        segment_info={"segment_label": "E1 | N | P1 -> P2"},
+        dataset_date_start=pd.Timestamp("2024-01-01"),
+        dataset_date_end=pd.Timestamp("2024-01-31 23:59:59"),
+        checkpoint_root=tmp_path / "calibration_runs",
+    )
+
+    first_payload = runner.run_calibration_sweep(base_df, **args)
+    assert len(calls) == 2
+    grid_path = Path(first_payload["checkpoint_run_dir"]) / "results" / "grid_results.csv"
+    grid_df = pd.read_csv(grid_path)
+    removed_combo_id = str(grid_df.iloc[-1]["combo_id"])
+    removed_balance_mode = str(grid_df.iloc[-1]["balance_mode"])
+    grid_df.iloc[:-1].to_csv(grid_path, index=False)
+
+    manifest_path = Path(first_payload["checkpoint_manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "running"
+    manifest["result_status"] = "running"
+    manifest["updated_at"] = "2026-04-20T11:00:00"
+    manifest.pop("completed_at", None)
+    manifest["steps_index"][removed_combo_id]["status"] = "pending"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    resumed_payload = runner.run_calibration_sweep(base_df, **args)
+    assert resumed_payload["auto_resumed"] is True
+    assert resumed_payload["loaded_from_checkpoint"] is False
+    assert len(calls) == 3
+    assert calls[-1]["balance_mode"] == removed_balance_mode
+    assert len(resumed_payload["grid_results_df"]) == 2
+    assert removed_combo_id in set(resumed_payload["grid_results_df"]["combo_id"])
+
+
+def test_run_calibration_sweep_can_restart_selected_checkpoint_override(
+    tmp_path,
+    monkeypatch,
+):
+    base_df = _synthetic_calibration_base_df()
+    event_path = tmp_path / "events.csv"
+    features_path = tmp_path / "features.duckdb"
+    event_path.write_text("events", encoding="utf-8")
+    features_path.write_text("features", encoding="utf-8")
+    calls = []
+
+    def _fake_optimize(self, **kwargs):
+        calls.append(dict(kwargs))
+        return _fake_calibration_optimize_result(kwargs)
+
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+    runner = ExperimentsRunner(random_state=42)
+    args = dict(
+        model_name="Random Forest",
+        selected_features=["signal", "aux_signal"],
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        event_path=event_path,
+        features_path=features_path,
+        segment_info={"segment_label": "E1 | N | P1 -> P2"},
+        dataset_date_start=pd.Timestamp("2024-01-01"),
+        dataset_date_end=pd.Timestamp("2024-01-31 23:59:59"),
+        checkpoint_root=tmp_path / "calibration_runs",
+    )
+
+    first_payload = runner.run_calibration_sweep(base_df, **args)
+    assert len(calls) == 2
+
+    second_payload = runner.run_calibration_sweep(
+        base_df,
+        **args,
+        auto_resume=False,
+        checkpoint_run_id_override=str(first_payload["run_id"]),
+        start_fresh=True,
+    )
+
+    assert second_payload["run_id"] == first_payload["run_id"]
+    assert second_payload["checkpoint_run_dir"] == first_payload["checkpoint_run_dir"]
+    assert second_payload["loaded_from_checkpoint"] is False
+    assert second_payload["auto_resumed"] is False
+    assert len(calls) == 4
+    assert len(second_payload["grid_results_df"]) == 2
+
+
+def test_run_calibration_sweep_start_fresh_ignores_compatible_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    base_df = _synthetic_calibration_base_df()
+    calls = []
+
+    def _fake_optimize(self, **kwargs):
+        calls.append(dict(kwargs))
+        return _fake_calibration_optimize_result(kwargs)
+
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+    runner = ExperimentsRunner(random_state=42)
+    args = dict(
+        model_name="Random Forest",
+        selected_features=["signal", "aux_signal"],
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        checkpoint_root=tmp_path / "calibration_runs",
+    )
+
+    first_payload = runner.run_calibration_sweep(base_df, **args)
+    second_payload = runner.run_calibration_sweep(
+        base_df,
+        **args,
+        start_fresh=True,
+    )
+    assert first_payload["run_id"] != second_payload["run_id"]
+    assert second_payload["loaded_from_checkpoint"] is False
+    assert second_payload["auto_resumed"] is False
+    assert len(calls) == 4
+
+
+def test_calibration_top_k_grid_includes_effective_upper_bound():
+    assert experiments_logic_module._calibration_top_k_grid(
+        k_min=10,
+        k_max=100,
+        k_step=10,
+        feature_count=37,
+    ) == [10, 20, 30, 37]
+    assert experiments_logic_module._calibration_top_k_grid(
+        k_min=10,
+        k_max=100,
+        k_step=10,
+        feature_count=8,
+    ) == [8]
+
+
+def test_calibration_sweep_fixed_top_k_uses_ranked_prefix(tmp_path, monkeypatch):
+    base_df = _synthetic_calibration_base_df()
+    for idx in range(25):
+        base_df[f"extra_rank_{idx:02d}"] = np.linspace(0.0, 1.0, len(base_df)) + idx
+    candidate_cols = [
+        col
+        for col in base_df.columns
+        if col != "target" and pd.api.types.is_numeric_dtype(base_df[col])
+    ]
+    ranked_cols = [f"extra_rank_{idx:02d}" for idx in range(24, -1, -1)] + [
+        col for col in candidate_cols if not col.startswith("extra_rank_")
+    ]
+    captured_calls = []
+
+    def _fake_importance(self, df, feature_cols, **kwargs):
+        ordered = [col for col in ranked_cols if col in feature_cols]
+        return pd.DataFrame(
+            {"variable": ordered, "importance": np.arange(len(ordered), 0, -1)}
+        )
+
+    def _fake_optimize(self, **kwargs):
+        captured_calls.append(kwargs)
+        return {
+            "status": "completed",
+            "objective_metric": kwargs["objective_metric"],
+            "objective_label": "MCC",
+            "objective_direction": "maximize",
+            "decision_threshold": 0.5,
+            "val_objective_score": 0.5,
+            "test_objective_score": 0.4,
+            "val_roc_auc": 0.5,
+            "test_roc_auc": 0.5,
+            "val_f1": 0.5,
+            "test_f1": 0.4,
+            "val_mcc": 0.5,
+            "test_mcc": 0.4,
+            "best_params": {},
+            "effective_model_params": {},
+            "smote_params": {},
+            "selected_features": list(kwargs["selected_features"]),
+            "selected_feature_count": len(kwargs["selected_features"]),
+            "best_top_k": len(kwargs["selected_features"]),
+            "best_feature_cols": list(kwargs["selected_features"]),
+            "ranked_cols": list(ranked_cols),
+            "candidate_feature_count": len(candidate_cols),
+            "feature_k_mode": kwargs["feature_k_metadata"]["feature_k_mode"],
+            "ranking_method": kwargs["feature_k_metadata"]["ranking_method"],
+            "optuna_trials_completed": 1,
+            "optuna_trials_pruned": 0,
+            "optuna_trials_failed": 0,
+            "optuna_trials_total": 1,
+            "train_rows": len(kwargs["train_df"]),
+            "val_rows": len(kwargs["val_df"]),
+            "test_rows": len(kwargs["test_df"]),
+            "trials_df": pd.DataFrame(
+                [{"number": 0, "value": 0.5, "state": "COMPLETE"}]
+            ),
+        }
+
+    monkeypatch.setattr(ExperimentsRunner, "calculate_feature_importance", _fake_importance)
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+
+    runner = ExperimentsRunner(random_state=42)
+    runner.run_calibration_sweep(
+        base_df,
+        model_name="Random Forest",
+        selected_features=candidate_cols,
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        feature_k_config={"mode": "fixed_top_k", "k": 20, "ranking_method": "rf"},
+        checkpoint_root=tmp_path / "calibration_fixed_topk",
+    )
+
+    assert captured_calls
+    assert all(call["selected_features"] == ranked_cols[:20] for call in captured_calls)
+
+
+def test_calibration_sweep_optuna_top_k_passes_effective_grid(tmp_path, monkeypatch):
+    base_df = _synthetic_calibration_base_df()
+    for idx in range(37):
+        base_df[f"extra_topk_{idx:02d}"] = np.linspace(0.0, 1.0, len(base_df)) + idx
+    candidate_cols = [f"extra_topk_{idx:02d}" for idx in range(37)]
+    ranked_cols = [f"extra_topk_{idx:02d}" for idx in range(36, -1, -1)]
+    captured_calls = []
+
+    def _fake_importance(self, df, feature_cols, **kwargs):
+        ordered = [col for col in ranked_cols if col in feature_cols]
+        return pd.DataFrame(
+            {"variable": ordered, "importance": np.arange(len(ordered), 0, -1)}
+        )
+
+    def _fake_optimize(self, **kwargs):
+        captured_calls.append(kwargs)
+        best_cols = list(kwargs["ranked_features"][:10])
+        return {
+            "status": "completed",
+            "objective_metric": kwargs["objective_metric"],
+            "objective_label": "MCC",
+            "objective_direction": "maximize",
+            "decision_threshold": 0.5,
+            "val_objective_score": 0.5,
+            "test_objective_score": 0.4,
+            "val_roc_auc": 0.5,
+            "test_roc_auc": 0.5,
+            "val_f1": 0.5,
+            "test_f1": 0.4,
+            "val_mcc": 0.5,
+            "test_mcc": 0.4,
+            "best_params": {},
+            "effective_model_params": {},
+            "smote_params": {},
+            "selected_features": best_cols,
+            "selected_feature_count": len(best_cols),
+            "best_top_k": 10,
+            "best_feature_cols": best_cols,
+            "ranked_cols": list(kwargs["ranked_features"]),
+            "candidate_feature_count": len(kwargs["ranked_features"]),
+            "feature_k_mode": kwargs["feature_k_metadata"]["feature_k_mode"],
+            "ranking_method": kwargs["feature_k_metadata"]["ranking_method"],
+            "top_k_min": kwargs["feature_k_metadata"]["top_k_min"],
+            "top_k_max": kwargs["feature_k_metadata"]["top_k_max"],
+            "top_k_step": kwargs["feature_k_metadata"]["top_k_step"],
+            "optuna_trials_completed": 1,
+            "optuna_trials_pruned": 0,
+            "optuna_trials_failed": 0,
+            "optuna_trials_total": 1,
+            "train_rows": len(kwargs["train_df"]),
+            "val_rows": len(kwargs["val_df"]),
+            "test_rows": len(kwargs["test_df"]),
+            "trials_df": pd.DataFrame(
+                [{"number": 0, "value": 0.5, "state": "COMPLETE"}]
+            ),
+        }
+
+    monkeypatch.setattr(ExperimentsRunner, "calculate_feature_importance", _fake_importance)
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+
+    runner = ExperimentsRunner(random_state=42)
+    runner.run_calibration_sweep(
+        base_df,
+        model_name="Random Forest",
+        selected_features=candidate_cols,
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        feature_k_config={
+            "mode": "optuna_top_k",
+            "k_min": 10,
+            "k_max": 100,
+            "k_step": 10,
+            "ranking_method": "rf",
+        },
+        checkpoint_root=tmp_path / "calibration_optuna_topk",
+    )
+
+    assert captured_calls
+    assert all(call["top_k_values"] == [10, 20, 30, 37] for call in captured_calls)
+    assert all(call["ranked_features"] == ranked_cols for call in captured_calls)
 
 
 def test_estimate_controlled_comparison_parallelism_builds_safe_frontier(tmp_path):
@@ -2005,6 +2813,70 @@ def test_controlled_combo_random_forest_forwards_parallel_jobs(
     assert "n_jobs" not in result["best_params"]
     assert result["effective_model_params"]["n_jobs"] == 3
     assert result["threshold_n_jobs"] == 3
+
+
+def test_controlled_combo_optuna_top_k_uses_trial_feature_prefix(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, _feature_cols, base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    runner = ExperimentsRunner(random_state=42)
+    train_val_df, test_df = temporal_train_test_split(base_df, test_size=0.2)
+    train_df, val_df = temporal_train_test_split(train_val_df, test_size=0.25)
+    ranked_features = list(reversed(base_cols[:2]))
+    fit_columns = []
+
+    class _CapturingModel(_DummyModel):
+        def fit(self, X, y):
+            fit_columns.append(list(X.columns))
+            return self
+
+    def _fake_build_model(model_name, params, random_state):
+        return _CapturingModel()
+
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "build_model",
+        _fake_build_model,
+    )
+
+    result = runner._optimize_controlled_combo(
+        model_name="Random Forest",
+        feature_set="Base",
+        balance_mode="none",
+        objective_metric="roc_auc",
+        selected_features=base_cols[:2],
+        train_df=train_df,
+        val_df=val_df,
+        test_df=test_df,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=1,
+        search_space_config=_controlled_search_space(),
+        parallel_jobs=1,
+        xgb_parallel_jobs=1,
+        ranked_features=ranked_features,
+        top_k_values=[1],
+        feature_k_metadata={
+            "feature_k_mode": "optuna_top_k",
+            "ranking_method": "rf",
+            "top_k_min": 1,
+            "top_k_max": 1,
+            "top_k_step": 1,
+            "ranked_cols": ranked_features,
+        },
+    )
+
+    assert "params_top_k" in result["trials_df"].columns
+    assert result["best_top_k"] == 1
+    assert result["best_feature_cols"] == ranked_features[:1]
+    assert result["selected_features"] == ranked_features[:1]
+    assert "top_k" not in result["best_params"]
+    assert fit_columns
+    assert all(columns == ranked_features[:1] for columns in fit_columns)
 
 
 def test_controlled_combo_svm_forwards_optuna_n_jobs(tmp_path, monkeypatch):
