@@ -94,6 +94,79 @@ def _config_from_widgets(current: ray_cluster.RayClusterConfig) -> ray_cluster.R
     )
 
 
+def _render_public_key_tools(config: ray_cluster.RayClusterConfig) -> None:
+    st.divider()
+    st.subheader("Llaves publicas SSH")
+    st.caption(
+        "Exporte la llave publica de este Mac para copiarla al otro nodo o importe una llave publica "
+        "en el archivo local authorized_keys."
+    )
+
+    col_export, col_import = st.columns(2)
+    with col_export:
+        st.markdown("**Exportar llave publica**")
+        st.caption("Usa la llave SSH configurada arriba y busca el archivo .pub correspondiente.")
+        if st.button("Cargar llave publica local", key="ray_export_public_key", width="stretch"):
+            try:
+                st.session_state["ray_exported_public_key"] = ray_cluster.read_public_key(config)
+                st.session_state.pop("ray_exported_public_key_error", None)
+            except Exception as exc:
+                st.session_state["ray_exported_public_key"] = None
+                st.session_state["ray_exported_public_key_error"] = str(exc)
+
+        export_error = st.session_state.get("ray_exported_public_key_error")
+        if export_error:
+            st.error(export_error)
+
+        exported_key = st.session_state.get("ray_exported_public_key")
+        if exported_key:
+            export_path = ray_cluster.ssh_public_key_path(config.ssh_key_path)
+            st.caption(f"Archivo sugerido: {export_path.name}")
+            st.code(exported_key, language="text")
+            st.download_button(
+                label="Descargar llave publica",
+                data=f"{exported_key}\n",
+                file_name=export_path.name,
+                mime="text/plain",
+                key="ray_download_public_key",
+            )
+
+    with col_import:
+        st.markdown("**Importar llave publica**")
+        st.caption(f"Destino local: {ray_cluster.authorized_keys_path()}")
+        uploaded_key = st.file_uploader(
+            "Archivo .pub",
+            type=["pub", "txt"],
+            key="ray_public_key_upload",
+        )
+        manual_key = st.text_area(
+            "O pegue la llave publica",
+            key="ray_public_key_import_text",
+            height=120,
+            placeholder="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...",
+        )
+        if st.button("Importar llave publica", type="primary", key="ray_import_public_key", width="stretch"):
+            candidate = ""
+            if uploaded_key is not None:
+                try:
+                    candidate = uploaded_key.getvalue().decode("utf-8")
+                except UnicodeDecodeError:
+                    st.error("El archivo cargado no es texto UTF-8 valido.")
+                    candidate = ""
+            if not candidate:
+                candidate = manual_key
+
+            if not candidate.strip():
+                st.error("Pegue o cargue una llave publica antes de importar.")
+            else:
+                try:
+                    message = ray_cluster.import_public_key(candidate)
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(message)
+
+
 def _render_config_tab(config: ray_cluster.RayClusterConfig) -> ray_cluster.RayClusterConfig:
     st.subheader("Configuracion del cluster")
     updated = _config_from_widgets(config)
@@ -111,6 +184,8 @@ def _render_config_tab(config: ray_cluster.RayClusterConfig) -> ray_cluster.RayC
             st.rerun()
     with col_reload:
         st.caption(f"Archivo: {ray_cluster.CONFIG_FILE}")
+
+    _render_public_key_tools(updated)
 
     st.divider()
     st.subheader("Comandos para configurar Thunderbolt Bridge")

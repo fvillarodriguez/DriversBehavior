@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from src import ray_cluster_manager as manager
 
 
@@ -68,6 +70,67 @@ def test_build_worker_start_script_uses_repo_and_calculated_cpus():
     assert "--node-ip-address=10.10.10.2" in script
     assert '--num-cpus="$CPUS"' in script
     assert "--disable-usage-stats" in script
+
+
+def test_ssh_public_key_path_derives_pub_file():
+    assert manager.ssh_public_key_path("~/.ssh/id_ed25519").name == "id_ed25519.pub"
+    assert manager.ssh_public_key_path("~/.ssh/id_ed25519.pub").name == "id_ed25519.pub"
+
+
+def test_read_public_key_prefers_existing_pub_file(tmp_path: Path):
+    private_key = tmp_path / "id_ed25519"
+    public_key = tmp_path / "id_ed25519.pub"
+    private_key.write_text("PRIVATE", encoding="utf-8")
+    public_key.write_text("ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGZha2U= test@sumo\n", encoding="utf-8")
+    config = manager.RayClusterConfig(ssh_key_path=str(private_key))
+
+    exported = manager.read_public_key(config)
+
+    assert exported == "ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGZha2U= test@sumo"
+
+
+def test_read_public_key_falls_back_to_ssh_keygen(tmp_path: Path):
+    private_key = tmp_path / "id_ed25519"
+    private_key.write_text("PRIVATE", encoding="utf-8")
+    config = manager.RayClusterConfig(ssh_key_path=str(private_key))
+    fake = FakeRunner(
+        [
+            manager.CommandResult(
+                ok=True,
+                returncode=0,
+                stdout="ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGZha2U= worker@mac\n",
+                command="ssh-keygen",
+            )
+        ]
+    )
+
+    exported = manager.read_public_key(config, runner=fake)
+
+    assert exported == "ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGZha2U= worker@mac"
+    assert fake.calls[0][:3] == ["ssh-keygen", "-y", "-f"]
+
+
+def test_import_public_key_appends_once(tmp_path: Path):
+    target = tmp_path / ".ssh" / "authorized_keys"
+    public_key = "ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGZha2U= test@sumo"
+
+    first = manager.import_public_key(public_key, target_path=target)
+    second = manager.import_public_key(public_key, target_path=target)
+
+    assert "importada" in first
+    assert "ya estaba presente" in second
+    assert target.read_text(encoding="utf-8") == f"{public_key}\n"
+
+
+def test_import_public_key_rejects_invalid_payload(tmp_path: Path):
+    with pytest.raises(ValueError):
+        manager.import_public_key("esto no es una llave valida", target_path=tmp_path / "authorized_keys")
+
+
+def test_check_config_warnings_reports_blank_private_key_path():
+    warnings = manager.check_config_warnings(manager.RayClusterConfig(ssh_key_path=""))
+
+    assert "Ingrese la ruta de la llave SSH privada." in warnings
 
 
 def test_command_runner_reports_missing_executable():

@@ -24,6 +24,16 @@ DEFAULT_NETMASK = "255.255.255.252"
 DEFAULT_RAY_VERSION = "2.53.0"
 DEFAULT_WORKER_PORT_MIN = 10002
 DEFAULT_WORKER_PORT_MAX = 10100
+SSH_PUBLIC_KEY_PREFIXES = (
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+    "sk-ssh-ed25519@openssh.com",
+)
+SSH_PUBLIC_KEY_BODY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 
 
 @dataclass(frozen=True)
@@ -160,6 +170,98 @@ def ray_bin(root_dir: Path = ROOT_DIR) -> Path:
 
 def python_bin(root_dir: Path = ROOT_DIR) -> Path:
     return root_dir / ".venv" / "bin" / "python"
+
+
+def ssh_public_key_path(ssh_key_path: str) -> Path:
+    raw_value = ssh_key_path.strip()
+    if not raw_value:
+        raise ValueError("Ingrese la ruta de la llave SSH privada.")
+    private_key = Path(raw_value).expanduser()
+    if not private_key.name:
+        raise ValueError("La ruta de la llave SSH privada no es valida.")
+    if private_key.name.endswith(".pub"):
+        return private_key
+    return private_key.with_name(f"{private_key.name}.pub")
+
+
+def authorized_keys_path() -> Path:
+    return Path.home() / ".ssh" / "authorized_keys"
+
+
+def normalize_public_key(public_key: str) -> str:
+    normalized = " ".join(segment.strip() for segment in public_key.splitlines() if segment.strip())
+    if not normalized:
+        raise ValueError("Ingrese una llave publica SSH.")
+    parts = normalized.split(None, 2)
+    if len(parts) < 2:
+        raise ValueError("Formato de llave publica SSH no reconocido.")
+    key_type, key_body = parts[0], parts[1]
+    if key_type not in SSH_PUBLIC_KEY_PREFIXES:
+        raise ValueError("Tipo de llave publica SSH no soportado.")
+    if any(char not in SSH_PUBLIC_KEY_BODY_CHARS for char in key_body):
+        raise ValueError("La llave publica SSH contiene caracteres invalidos.")
+    return normalized
+
+
+def read_public_key(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> str:
+    public_key_file = ssh_public_key_path(config.ssh_key_path)
+    if public_key_file.exists():
+        payload = public_key_file.read_text(encoding="utf-8").strip()
+        if payload:
+            return normalize_public_key(payload)
+
+    private_key_file = Path(config.ssh_key_path).expanduser()
+    if not private_key_file.exists():
+        raise FileNotFoundError(f"No existe la llave SSH configurada: {private_key_file}")
+
+    active_runner = runner or CommandRunner()
+    result = active_runner.run(
+        ["ssh-keygen", "-y", "-f", str(private_key_file)],
+        timeout=min(10, config.command_timeout_s),
+    )
+    if not result.ok or not result.stdout.strip():
+        raise RuntimeError(result.combined_output or "No se pudo exportar la llave publica SSH.")
+    return normalize_public_key(result.stdout)
+
+
+def import_public_key(
+    public_key: str,
+    *,
+    target_path: Optional[Path] = None,
+) -> str:
+    normalized = normalize_public_key(public_key)
+    authorized_keys = (target_path or authorized_keys_path()).expanduser()
+    ssh_dir = authorized_keys.parent
+    ssh_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        ssh_dir.chmod(0o700)
+    except OSError:
+        pass
+
+    existing_text = authorized_keys.read_text(encoding="utf-8") if authorized_keys.exists() else ""
+    existing_keys: set[str] = set()
+    for line in existing_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            existing_keys.add(normalize_public_key(stripped))
+        except ValueError:
+            continue
+    if normalized in existing_keys:
+        try:
+            authorized_keys.chmod(0o600)
+        except OSError:
+            pass
+        return f"La llave publica ya estaba presente en {authorized_keys}."
+
+    separator = "" if not existing_text or existing_text.endswith("\n") else "\n"
+    authorized_keys.write_text(f"{existing_text}{separator}{normalized}\n", encoding="utf-8")
+    try:
+        authorized_keys.chmod(0o600)
+    except OSError:
+        pass
+    return f"Llave publica importada en {authorized_keys}."
 
 
 def bridge_manual_command(ip: str, netmask: str = DEFAULT_NETMASK) -> str:
@@ -637,7 +739,10 @@ def check_config_warnings(config: RayClusterConfig) -> list[str]:
         warnings.append("Ingrese el usuario SSH del worker.")
     if not config.remote_repo_path.strip():
         warnings.append("Ingrese la ruta del repo en el worker.")
-    if not Path(config.ssh_key_path).expanduser().exists():
+    ssh_key_raw = config.ssh_key_path.strip()
+    if not ssh_key_raw:
+        warnings.append("Ingrese la ruta de la llave SSH privada.")
+    elif not Path(ssh_key_raw).expanduser().exists():
         warnings.append("La llave SSH indicada no existe en este Mac.")
     if config.head_ip == config.worker_ip:
         warnings.append("Head y worker no pueden usar la misma IP.")

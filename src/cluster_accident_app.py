@@ -77,6 +77,11 @@ from src.experiments_logic import (
     FROZEN_TUNING_ABLATION_FEATURE_SETS,
     FROZEN_TUNING_ABLATION_PROTOCOL_FAMILY,
     ExperimentsRunner,
+    _calibration_multiobjective_far_gate,
+    _calibration_multiobjective_pruning_proxy_from_metrics,
+    _calibration_multiobjective_trials_dataframe,
+    _calibration_multiobjective_values_from_metrics,
+    _select_calibration_multiobjective_trial,
     _controlled_comparison_paths,
     _k_grid_values,
     build_controlled_comparison_context,
@@ -1765,6 +1770,40 @@ def _optuna_objective_options(
     }
 
 
+def _optuna_objective_mode_options() -> Dict[str, str]:
+    return {
+        "Escalar legacy": CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
+        "Multiobjetivo Pareto": CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+    }
+
+
+def _optuna_objective_mode_label(value: object) -> str:
+    mode = str(value or "").strip().lower()
+    if mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE:
+        return "Multiobjetivo Pareto"
+    return "Escalar legacy"
+
+
+def _format_optuna_multiobjective_values(
+    values: Optional[Dict[str, object]],
+) -> str:
+    if not isinstance(values, dict) or not values:
+        return "-"
+    labels = {
+        "mcc": "MCC",
+        "pr_auc": "PR-AUC",
+        "brier_score": "Brier",
+        "recall_at_alerts_per_day": "Recall@N",
+    }
+    parts: List[str] = []
+    for metric in CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS:
+        value = values.get(metric)
+        if value is None or pd.isna(value):
+            continue
+        parts.append(f"{labels.get(metric, metric)}={float(value):.4f}")
+    return " | ".join(parts) if parts else "-"
+
+
 def _controlled_objective_options() -> Dict[str, str]:
     options = _optuna_objective_options(
         [
@@ -2325,6 +2364,24 @@ def _optuna_trials_path(
     balance_mode: Optional[str] = None,
     calibration_method: Optional[str] = None,
 ) -> Path:
+    return _optuna_variant_frame_path(
+        optuna_id,
+        model_choice=model_choice,
+        balance_mode=balance_mode,
+        calibration_method=calibration_method,
+        frame_kind="trials",
+    )
+
+
+def _optuna_variant_frame_path(
+    optuna_id: str,
+    *,
+    model_choice: Optional[str] = None,
+    balance_mode: Optional[str] = None,
+    calibration_method: Optional[str] = None,
+    frame_kind: str = "trials",
+) -> Path:
+    frame_suffix = _slugify(frame_kind) or "artifact"
     if model_choice:
         suffix = _slugify(model_choice)
         if balance_mode is not None:
@@ -2335,14 +2392,42 @@ def _optuna_trials_path(
                 )
                 return (
                     RESULTS_DIR
-                    / f"optuna_{optuna_id}_{suffix}_{balance_suffix}_{calibration_suffix}_trials.csv"
+                    / f"optuna_{optuna_id}_{suffix}_{balance_suffix}_{calibration_suffix}_{frame_suffix}.csv"
                 )
             return (
                 RESULTS_DIR
-                / f"optuna_{optuna_id}_{suffix}_{balance_suffix}_trials.csv"
+                / f"optuna_{optuna_id}_{suffix}_{balance_suffix}_{frame_suffix}.csv"
             )
-        return RESULTS_DIR / f"optuna_{optuna_id}_{suffix}_trials.csv"
-    return RESULTS_DIR / f"optuna_{optuna_id}_trials.csv"
+        return RESULTS_DIR / f"optuna_{optuna_id}_{suffix}_{frame_suffix}.csv"
+    return RESULTS_DIR / f"optuna_{optuna_id}_{frame_suffix}.csv"
+
+
+def _load_optuna_variant_frame(
+    result: Optional[Dict[str, object]],
+    *,
+    frame_key: str,
+    csv_key: str,
+) -> Optional[pd.DataFrame]:
+    if not isinstance(result, dict):
+        return None
+    frame = result.get(frame_key)
+    if isinstance(frame, pd.DataFrame):
+        return frame
+    csv_path = result.get(csv_key)
+    if not csv_path:
+        return None
+    try:
+        candidate = Path(str(csv_path))
+    except Exception:
+        return None
+    if not candidate.exists():
+        return None
+    try:
+        frame = pd.read_csv(candidate)
+    except Exception:
+        return None
+    result[frame_key] = frame
+    return frame
 
 
 def _load_optuna_result_from_disk(
@@ -2387,6 +2472,8 @@ def _persist_optuna_results(
     trials_df: Optional[pd.DataFrame],
     optuna_settings: Optional[Dict[str, object]],
     search_space: Dict[str, object],
+    extra_result_fields: Optional[Dict[str, object]] = None,
+    pareto_front_df: Optional[pd.DataFrame] = None,
 ) -> None:
     store = st.session_state.setdefault("optuna_results_store", {})
     entry = store.get(optuna_key, {})
@@ -2452,6 +2539,25 @@ def _persist_optuna_results(
         existing = by_calibration_method.get(normalized_calibration_method, {})
         trials_csv = existing.get("trials_csv")
 
+    pareto_front_csv = None
+    if pareto_front_df is not None and not pareto_front_df.empty:
+        try:
+            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            pareto_path = _optuna_variant_frame_path(
+                optuna_id,
+                model_choice=model_choice,
+                balance_mode=normalized_balance_mode,
+                calibration_method=normalized_calibration_method,
+                frame_kind="pareto_front",
+            )
+            pareto_front_df.to_csv(pareto_path, index=False)
+            pareto_front_csv = str(pareto_path)
+        except Exception:
+            pareto_front_csv = None
+    else:
+        existing = by_calibration_method.get(normalized_calibration_method, {})
+        pareto_front_csv = existing.get("pareto_front_csv")
+
     variant_settings = dict(optuna_settings)
     variant_settings["balance_mode"] = normalized_balance_mode
     variant_settings.setdefault(
@@ -2486,8 +2592,12 @@ def _persist_optuna_results(
             "saved_at": datetime.now().isoformat(),
             "trials_df": trials_df,
             "trials_csv": trials_csv,
+            "pareto_front_df": pareto_front_df,
+            "pareto_front_csv": pareto_front_csv,
         },
     )
+    if isinstance(extra_result_fields, dict):
+        result_entry.update(dict(extra_result_fields))
     by_calibration_method[normalized_calibration_method] = result_entry
     mode_container["balance_mode"] = normalized_balance_mode
     mode_container["balance_mode_label"] = _optuna_balance_mode_label(
@@ -2538,6 +2648,7 @@ def _persist_optuna_results(
                             continue
                         calibration_payload = dict(calibration_data)
                         calibration_payload.pop("trials_df", None)
+                        calibration_payload.pop("pareto_front_df", None)
                         payload_by_calibration[str(calibration_key)] = calibration_payload
                 mode_payload["by_calibration_method"] = payload_by_calibration
                 mode_payload.pop("trials_df", None)
@@ -2547,7 +2658,13 @@ def _persist_optuna_results(
     payload["results"] = payload_results
     try:
         with json_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=True, indent=2)
+            json.dump(
+                payload,
+                handle,
+                ensure_ascii=True,
+                indent=2,
+                default=_json_default,
+            )
     except Exception:
         return
 
@@ -10745,19 +10862,47 @@ def _render_optuna_tab() -> None:
         st.caption(
             f"Variables de cluster seleccionadas: {len(selected_cluster_cols)} (se optimizara con y sin ellas)"
         )
-    objective_options = _optuna_objective_options()
-    objective_label = st.selectbox(
-        "Metrica objetivo",
-        list(objective_options.keys()),
-        key="optuna_objective_metric",
+    objective_mode_options = _optuna_objective_mode_options()
+    objective_mode_label = st.selectbox(
+        "Modo objetivo Optuna",
+        list(objective_mode_options.keys()),
+        key="optuna_objective_mode_label",
+        help=(
+            "Escalar legacy optimiza una sola métrica por estudio. "
+            "Multiobjetivo Pareto usa MCC, PR-AUC, Brier y Recall@N alertas/día "
+            "en el mismo study, replicando el criterio del experimento "
+            "`Calibración score + threshold`."
+        ),
     )
-    objective_key = objective_options[objective_label]["key"]
-    objective_direction = objective_options[objective_label]["direction"]
-    objective_verb = "minimiza" if objective_direction == "minimize" else "optimiza"
-    st.caption(
-        f"Optuna {objective_verb} {objective_label} en el set de validacion "
-        "usando el criterio de threshold seleccionado (test queda como hold-out final)."
+    optuna_objective_mode = objective_mode_options[objective_mode_label]
+    is_multiobjective_optuna = (
+        optuna_objective_mode
+        == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
     )
+    if is_multiobjective_optuna:
+        objective_label = CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL
+        objective_key = CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY
+        objective_direction = "multiobjective"
+        st.caption(
+            "Objetivos fijos: MCC ↑, PR-AUC ↑, Brier ↓ y Recall@N alertas/día ↑. "
+            "FAR actúa como gate operacional para elegir el trial dentro del frente Pareto."
+        )
+    else:
+        objective_options = _optuna_objective_options()
+        objective_label = st.selectbox(
+            "Metrica objetivo",
+            list(objective_options.keys()),
+            key="optuna_objective_metric",
+        )
+        objective_key = objective_options[objective_label]["key"]
+        objective_direction = objective_options[objective_label]["direction"]
+        objective_verb = (
+            "minimiza" if objective_direction == "minimize" else "optimiza"
+        )
+        st.caption(
+            f"Optuna {objective_verb} {objective_label} en el set de validacion "
+            "usando el criterio de threshold seleccionado (test queda como hold-out final)."
+        )
     entry = store.get(primary_key)
 
     model_choice = st.selectbox(
@@ -10908,6 +11053,11 @@ def _render_optuna_tab() -> None:
         key="optuna_pruner_startup_trials",
         disabled=not pruner_enabled,
     )
+    if is_multiobjective_optuna and pruner_enabled:
+        st.info(
+            "En multiobjetivo el study corre sin `MedianPruner`; se guarda el "
+            "proxy Pareto para ranking y selección del trial."
+        )
     optuna_test_size = st.slider(
         "Test size",
         min_value=0.1,
