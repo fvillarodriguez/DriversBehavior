@@ -250,6 +250,28 @@ def _import_external_xgboost():
     return xgb
 
 
+def _coerce_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "si", "sí", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "none", ""}:
+        return False
+    return bool(default)
+
+
+def _coerce_optional_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"", "none", "null", "false"}:
+        return None
+    return float(value)
+
+
 class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
     """Sklearn-compatible wrapper around MLPNet for the crash prediction pipeline."""
 
@@ -266,6 +288,16 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         pos_weight: float = 1.0,
         val_fraction: float = 0.15,
         random_state: int = 42,
+        use_batch_norm: bool = False,
+        loss_function: str = "cross_entropy",
+        focal_gamma: float = 2.0,
+        focal_alpha: Optional[float] = None,
+        max_grad_norm: Optional[float] = None,
+        lr_scheduler: str = "none",
+        scheduler_factor: float = 0.5,
+        scheduler_patience: int = 2,
+        min_lr: float = 1e-6,
+        temperature_scaling: bool = False,
     ):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -278,10 +310,96 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         self.pos_weight = pos_weight
         self.val_fraction = val_fraction
         self.random_state = random_state
+        self.use_batch_norm = use_batch_norm
+        self.loss_function = loss_function
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
+        self.max_grad_norm = max_grad_norm
+        self.lr_scheduler = lr_scheduler
+        self.scheduler_factor = scheduler_factor
+        self.scheduler_patience = scheduler_patience
+        self.min_lr = min_lr
+        self.temperature_scaling = temperature_scaling
         self.model_ = None
         self.in_dim_ = None
         self.device_ = None
         self.classes_ = np.array([0, 1])
+        self.temperature_ = 1.0
+        self.lr_history_: List[float] = []
+        self.val_loss_history_: List[float] = []
+
+    @staticmethod
+    def _normalize_loss_function(value: object) -> str:
+        text = str(value or "").strip().lower().replace("-", "_")
+        aliases = {
+            "": "cross_entropy",
+            "ce": "cross_entropy",
+            "crossentropy": "cross_entropy",
+            "cross_entropy": "cross_entropy",
+            "focal": "focal",
+            "focal_loss": "focal",
+        }
+        return aliases.get(text, "cross_entropy")
+
+    @staticmethod
+    def _normalize_lr_scheduler(value: object) -> str:
+        text = str(value or "").strip().lower().replace("-", "_")
+        aliases = {
+            "": "none",
+            "none": "none",
+            "off": "none",
+            "false": "none",
+            "reduce_lr_on_plateau": "reduce_on_plateau",
+            "reduce_on_plateau": "reduce_on_plateau",
+            "plateau": "reduce_on_plateau",
+        }
+        return aliases.get(text, "none")
+
+    def _compute_loss(self, logits, targets, class_weight):
+        import torch
+        import torch.nn.functional as F
+
+        loss_key = self._normalize_loss_function(self.loss_function)
+        if loss_key != "focal":
+            return F.cross_entropy(logits, targets, weight=class_weight)
+
+        ce = F.cross_entropy(logits, targets, weight=class_weight, reduction="none")
+        base_ce = F.cross_entropy(logits, targets, reduction="none")
+        pt = torch.exp(-base_ce)
+        loss = ((1.0 - pt) ** float(self.focal_gamma)) * ce
+        if self.focal_alpha is not None:
+            alpha_pos = float(self.focal_alpha)
+            if not 0.0 <= alpha_pos <= 1.0:
+                raise ValueError("focal_alpha debe estar entre 0 y 1.")
+            alpha = torch.tensor(
+                alpha_pos,
+                dtype=loss.dtype,
+                device=loss.device,
+            )
+            alpha_t = torch.where(targets == 1, alpha, 1.0 - alpha)
+            loss = alpha_t * loss
+        return loss.mean()
+
+    @staticmethod
+    def _fit_temperature_from_logits(logits, labels) -> float:
+        import torch
+        import torch.nn.functional as F
+
+        logits_cpu = logits.detach().cpu().clone()
+        labels_cpu = labels.detach().cpu().long().clone()
+        log_temperature = torch.zeros((), dtype=torch.float32, requires_grad=True)
+        optimizer = torch.optim.LBFGS([log_temperature], lr=0.05, max_iter=50)
+
+        def _closure():
+            optimizer.zero_grad(set_to_none=True)
+            temperature = torch.exp(log_temperature).clamp(0.05, 10.0)
+            loss = F.cross_entropy(logits_cpu / temperature, labels_cpu)
+            loss.backward()
+            return loss
+
+        optimizer.step(_closure)
+        with torch.no_grad():
+            return float(torch.exp(log_temperature).clamp(0.05, 10.0).item())
 
     @staticmethod
     def _resolve_device():
@@ -316,6 +434,9 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         y_np = np.asarray(y, dtype=np.int64)
         self.in_dim_ = X_np.shape[1]
         self.device_ = self._resolve_device()
+        self.temperature_ = 1.0
+        self.lr_history_ = []
+        self.val_loss_history_ = []
 
         torch.manual_seed(self.random_state)
 
@@ -349,7 +470,11 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         )
 
         model = MLPNet(
-            self.in_dim_, self.hidden_dim, self.num_layers, self.dropout,
+            self.in_dim_,
+            self.hidden_dim,
+            self.num_layers,
+            self.dropout,
+            use_batch_norm=_coerce_bool(self.use_batch_norm),
         ).to(self.device_)
 
         # AdamW fused solo en CUDA (no soportado en MPS).
@@ -366,6 +491,17 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                 optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
         else:
             optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+
+        scheduler_key = self._normalize_lr_scheduler(self.lr_scheduler)
+        scheduler = None
+        if scheduler_key == "reduce_on_plateau" and use_early_stopping:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=float(self.scheduler_factor),
+                patience=max(0, int(self.scheduler_patience)),
+                min_lr=float(self.min_lr),
+            )
 
         preload_to_device = self._fits_on_device(
             X_tr.shape[0], X_tr.shape[1], self.device_
@@ -418,6 +554,7 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
 
         for _epoch in range(self.epochs):
             model.train()
+            epoch_seen = 0
             if preload_to_device:
                 # Permutacion en CPU (randperm en MPS no es siempre estable)
                 # y la subimos al device una sola vez por epoca.
@@ -427,19 +564,36 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                     idx = perm_dev[start : start + batch_size]
                     xb = X_tr_t.index_select(0, idx)
                     yb = y_tr_t.index_select(0, idx)
+                    if _coerce_bool(self.use_batch_norm) and yb.size(0) < 2:
+                        continue
                     optimizer.zero_grad(set_to_none=True)
-                    loss = F.cross_entropy(model(xb), yb, weight=class_weight)
+                    loss = self._compute_loss(model(xb), yb, class_weight)
                     loss.backward()
+                    if self.max_grad_norm is not None and float(self.max_grad_norm) > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), float(self.max_grad_norm)
+                        )
                     optimizer.step()
+                    epoch_seen += int(yb.size(0))
             else:
                 non_block = self.device_.type == "cuda"
                 for xb, yb in train_loader:
                     xb = xb.to(self.device_, non_blocking=non_block)
                     yb = yb.to(self.device_, non_blocking=non_block)
+                    if _coerce_bool(self.use_batch_norm) and yb.size(0) < 2:
+                        continue
                     optimizer.zero_grad(set_to_none=True)
-                    loss = F.cross_entropy(model(xb), yb, weight=class_weight)
+                    loss = self._compute_loss(model(xb), yb, class_weight)
                     loss.backward()
+                    if self.max_grad_norm is not None and float(self.max_grad_norm) > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), float(self.max_grad_norm)
+                        )
                     optimizer.step()
+                    epoch_seen += int(yb.size(0))
+
+            if epoch_seen > 0:
+                self.lr_history_.append(float(optimizer.param_groups[0]["lr"]))
 
             if use_early_stopping and X_es is not None:
                 model.eval()
@@ -451,10 +605,23 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                             self.device_, non_blocking=True
                         )
                     es_out = model(es_tensor)
+                    es_targets = torch.from_numpy(y_es).to(
+                        self.device_, non_blocking=True
+                    )
+                    val_loss = float(
+                        self._compute_loss(es_out, es_targets, class_weight)
+                        .detach()
+                        .cpu()
+                        .item()
+                    )
                     es_probs = (
                         F.softmax(es_out, dim=1)[:, 1].detach().cpu().numpy()
                     )
                 from sklearn.metrics import average_precision_score
+
+                self.val_loss_history_.append(val_loss)
+                if scheduler is not None:
+                    scheduler.step(val_loss)
 
                 if len(np.unique(y_es)) > 1:
                     val_score = average_precision_score(y_es, es_probs)
@@ -476,6 +643,24 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         if best_state is not None:
             model.load_state_dict(best_state)
         model.to(self.device_)
+        if (
+            _coerce_bool(self.temperature_scaling)
+            and X_es is not None
+            and len(np.unique(y_es)) > 1
+        ):
+            model.eval()
+            with torch.inference_mode():
+                if preload_to_device and X_es_t is not None:
+                    es_tensor = X_es_t
+                else:
+                    es_tensor = torch.from_numpy(X_es).to(
+                        self.device_, non_blocking=True
+                    )
+                logits = model(es_tensor)
+                labels = torch.from_numpy(y_es).long()
+            self.temperature_ = self._fit_temperature_from_logits(logits, labels)
+        else:
+            self.temperature_ = 1.0
         self.model_ = model
         return self
 
@@ -497,6 +682,8 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                     self.device_, non_blocking=True
                 )
                 logits = self.model_(tensor)
+                temperature = max(float(getattr(self, "temperature_", 1.0)), 1e-6)
+                logits = logits / temperature
                 probs_chunk = F.softmax(logits, dim=1).detach().cpu().numpy()
                 out_parts.append(probs_chunk)
         if not out_parts:
@@ -636,7 +823,32 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
                             params.get("early_stopping_patience", 5)
                         ),
                         pos_weight=float(params.get("pos_weight", 1.0)),
+                        val_fraction=float(params.get("val_fraction", 0.15)),
                         random_state=random_state,
+                        use_batch_norm=_coerce_bool(
+                            params.get("use_batch_norm", False)
+                        ),
+                        loss_function=str(
+                            params.get("loss_function", "cross_entropy")
+                        ),
+                        focal_gamma=float(params.get("focal_gamma", 2.0)),
+                        focal_alpha=_coerce_optional_float(
+                            params.get("focal_alpha")
+                        ),
+                        max_grad_norm=_coerce_optional_float(
+                            params.get("max_grad_norm")
+                        ),
+                        lr_scheduler=str(params.get("lr_scheduler", "none")),
+                        scheduler_factor=float(
+                            params.get("scheduler_factor", 0.5)
+                        ),
+                        scheduler_patience=int(
+                            params.get("scheduler_patience", 2)
+                        ),
+                        min_lr=float(params.get("min_lr", 1e-6)),
+                        temperature_scaling=_coerce_bool(
+                            params.get("temperature_scaling", False)
+                        ),
                     ),
                 ),
             ]
@@ -1582,15 +1794,23 @@ def _build_xai_explain_rows(
     preds: np.ndarray,
     threshold: float,
 ) -> pd.DataFrame:
-    work = test_df.copy().reset_index(drop=False).rename(
+    base = test_df.reset_index(drop=False).rename(
         columns={"index": "source_index"}
     )
-    work[feature_cols] = work[feature_cols].fillna(0)
-    work["target"] = work["target"].astype(int)
-    work["score"] = np.asarray(scores_test, dtype=float)
-    work["pred"] = np.asarray(preds, dtype=int)
-    work["threshold"] = float(threshold)
-    work["case_hint"] = ""
+    feature_col_set = set(feature_cols)
+    work_data: Dict[str, object] = {}
+    for col in base.columns:
+        if col in feature_col_set:
+            work_data[col] = base[col].fillna(0)
+        elif col == "target":
+            work_data[col] = base[col].astype(int)
+        else:
+            work_data[col] = base[col]
+    work_data["score"] = np.asarray(scores_test, dtype=float)
+    work_data["pred"] = np.asarray(preds, dtype=int)
+    work_data["threshold"] = np.full(len(base), float(threshold), dtype=float)
+    work_data["case_hint"] = np.full(len(base), "", dtype=object)
+    work = pd.DataFrame(work_data, index=base.index).copy()
 
     selected_idx: List[int] = []
 

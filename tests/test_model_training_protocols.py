@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -167,6 +169,44 @@ def _protocol_df(rows: int = 60) -> pd.DataFrame:
     )
 
 
+def test_build_xai_explain_rows_batches_metadata_columns_without_fragmentation_warning():
+    rows = 8
+    feature_cols = [f"feature_{idx}" for idx in range(130)]
+    test_df = pd.DataFrame(
+        {
+            "interval_start": pd.date_range("2024-01-01", periods=rows, freq="D"),
+            "target": np.asarray([0, 1] * 4, dtype=int),
+        }
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", pd.errors.PerformanceWarning)
+        for idx, feature_col in enumerate(feature_cols):
+            test_df[feature_col] = np.linspace(0.0, 1.0, rows) + idx
+
+    scores = np.linspace(0.1, 0.8, rows)
+    preds = (scores >= 0.5).astype(int)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", pd.errors.PerformanceWarning)
+        explain_rows = model_training._build_xai_explain_rows(
+            test_df,
+            feature_cols=feature_cols,
+            scores_test=scores,
+            preds=preds,
+            threshold=0.5,
+        )
+
+    performance_warnings = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, pd.errors.PerformanceWarning)
+    ]
+    assert performance_warnings == []
+    assert {"target", "score", "pred", "threshold", "case_hint"}.issubset(
+        explain_rows.columns
+    )
+
+
 def test_conservative_and_robust_protocols_report_distinct_split_metadata(monkeypatch):
     monkeypatch.setattr(
         model_training,
@@ -307,3 +347,146 @@ def test_threshold_selection_uses_calibrated_scores(monkeypatch, calibration_met
     assert observed["scores"].max() == pytest.approx(0.8 + shift)
     assert result["calibration_method"] == calibration_method
     assert result["metrics"]["calibration_method"] == calibration_method
+
+
+def test_neural_network_build_model_passes_phase1_options():
+    model = model_training.build_model(
+        "Neural Network",
+        {
+            "hidden_dim": 32,
+            "num_layers": 3,
+            "dropout": 0.15,
+            "learning_rate": 0.003,
+            "weight_decay": 0.0001,
+            "batch_size": 64,
+            "epochs": 7,
+            "early_stopping_patience": 2,
+            "pos_weight": 4.0,
+            "val_fraction": 0.25,
+            "use_batch_norm": True,
+            "loss_function": "focal",
+            "focal_gamma": 1.5,
+            "focal_alpha": 0.7,
+            "max_grad_norm": 0.75,
+            "lr_scheduler": "reduce_on_plateau",
+            "scheduler_factor": 0.25,
+            "scheduler_patience": 1,
+            "min_lr": 1e-5,
+            "temperature_scaling": True,
+        },
+        random_state=123,
+    )
+
+    wrapper = model.named_steps["model"]
+    assert wrapper.hidden_dim == 32
+    assert wrapper.num_layers == 3
+    assert wrapper.use_batch_norm is True
+    assert wrapper.loss_function == "focal"
+    assert wrapper.focal_gamma == pytest.approx(1.5)
+    assert wrapper.focal_alpha == pytest.approx(0.7)
+    assert wrapper.max_grad_norm == pytest.approx(0.75)
+    assert wrapper.lr_scheduler == "reduce_on_plateau"
+    assert wrapper.temperature_scaling is True
+
+
+def test_mlp_net_inserts_batch_norm_only_when_requested():
+    torch = pytest.importorskip("torch")
+    from src.mlp_tabular import MLPNet
+
+    with_bn = MLPNet(4, hidden_dim=8, num_layers=2, dropout=0.1, use_batch_norm=True)
+    without_bn = MLPNet(4, hidden_dim=8, num_layers=2, dropout=0.1)
+
+    assert sum(isinstance(layer, torch.nn.BatchNorm1d) for layer in with_bn.net) == 2
+    assert sum(isinstance(layer, torch.nn.BatchNorm1d) for layer in without_bn.net) == 0
+
+
+def test_mlp_focal_loss_matches_manual_formula():
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+
+    wrapper = model_training.MLPClassifierWrapper(
+        loss_function="focal",
+        focal_gamma=2.0,
+        focal_alpha=0.75,
+    )
+    logits = torch.tensor([[2.0, -0.5], [-0.25, 1.25], [0.0, 0.0]])
+    targets = torch.tensor([0, 1, 1])
+    class_weight = torch.tensor([1.0, 3.0])
+
+    observed = wrapper._compute_loss(logits, targets, class_weight)
+
+    weighted_ce = F.cross_entropy(
+        logits,
+        targets,
+        weight=class_weight,
+        reduction="none",
+    )
+    base_ce = F.cross_entropy(logits, targets, reduction="none")
+    pt = torch.exp(-base_ce)
+    alpha_t = torch.where(targets == 1, torch.tensor(0.75), torch.tensor(0.25))
+    expected = (alpha_t * ((1.0 - pt) ** 2.0) * weighted_ce).mean()
+    assert observed.item() == pytest.approx(expected.item())
+
+
+def test_mlp_classifier_trains_with_phase1_options(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    scheduler_steps = []
+
+    class _FakePlateauScheduler:
+        def __init__(self, optimizer, **kwargs):
+            self.optimizer = optimizer
+            self.kwargs = kwargs
+
+        def step(self, metric):
+            scheduler_steps.append(float(metric))
+
+    clip_calls = []
+
+    def _fake_clip_grad_norm_(parameters, max_norm):
+        clip_calls.append(float(max_norm))
+        return torch.tensor(0.0)
+
+    monkeypatch.setattr(
+        torch.optim.lr_scheduler,
+        "ReduceLROnPlateau",
+        _FakePlateauScheduler,
+    )
+    monkeypatch.setattr(
+        torch.nn.utils,
+        "clip_grad_norm_",
+        _fake_clip_grad_norm_,
+    )
+
+    rng = np.random.default_rng(7)
+    X = rng.normal(size=(48, 5)).astype(np.float32)
+    y = (X[:, 0] + 0.5 * X[:, 1] > 0.0).astype(int)
+
+    clf = model_training.MLPClassifierWrapper(
+        hidden_dim=8,
+        num_layers=1,
+        dropout=0.0,
+        learning_rate=0.01,
+        batch_size=8,
+        epochs=3,
+        early_stopping_patience=3,
+        val_fraction=0.25,
+        use_batch_norm=True,
+        loss_function="focal",
+        focal_gamma=1.0,
+        focal_alpha=0.65,
+        max_grad_norm=0.5,
+        lr_scheduler="reduce_on_plateau",
+        scheduler_patience=0,
+        temperature_scaling=True,
+        random_state=11,
+    ).fit(X, y)
+
+    proba = clf.predict_proba(X[:6])
+    assert proba.shape == (6, 2)
+    assert np.allclose(proba.sum(axis=1), 1.0, atol=1e-6)
+    assert clip_calls
+    assert set(clip_calls) == {0.5}
+    assert scheduler_steps == pytest.approx(clf.val_loss_history_)
+    assert clf.lr_history_
+    assert clf.temperature_ > 0.0

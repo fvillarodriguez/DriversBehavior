@@ -103,6 +103,63 @@ def test_display_cell_handles_infinite_thresholds():
     assert live_app._display_cell(float("-inf")) == "-inf"
 
 
+def test_format_decimal_es_uses_decimal_comma_and_thin_space():
+    assert live_app._format_decimal_es(14238.024) == "14\u202f238,024"
+    assert live_app._format_decimal_es(0.5) == "0,5"
+
+
+def test_calibration_progress_curve_preserves_context_and_best_direction():
+    df = pd.DataFrame(
+        [
+            {
+                "status": "completed",
+                "val_balanced_f1": 0.40,
+                "calibration_method": "sigmoid",
+                "threshold_objective": "far",
+                "balance_mode": "none",
+            },
+            {
+                "status": "failed",
+                "val_balanced_f1": 0.99,
+                "calibration_method": "sigmoid",
+                "threshold_objective": "far",
+                "balance_mode": "smote",
+            },
+            {
+                "status": "completed",
+                "val_balanced_f1": 0.45,
+                "calibration_method": "isotonic",
+                "threshold_objective": "f1",
+                "balance_mode": "none",
+            },
+        ]
+    )
+
+    curve_df = live_app._calibration_progress_curve_df(
+        df,
+        metric_col="val_balanced_f1",
+    )
+
+    assert curve_df["combo_index"].tolist() == [1, 2]
+    assert curve_df["current_value"].tolist() == pytest.approx([0.40, 0.45])
+    assert curve_df["best_so_far"].tolist() == pytest.approx([0.40, 0.45])
+    assert curve_df["calibration_method"].tolist() == ["sigmoid", "isotonic"]
+
+
+def test_calibration_default_progress_metric_prefers_protocol_objective():
+    metric_options = {
+        "val_pr_auc": "Validación PR-AUC",
+        "val_balanced_f1": "Validación Balanced F1",
+    }
+
+    selected = live_app._calibration_default_progress_metric(
+        {"objective_metrics": ["balanced_f1"]},
+        metric_options,
+    )
+
+    assert selected == "val_balanced_f1"
+
+
 def test_controlled_live_best_payload_uses_best_test_fallbacks():
     row = {
         "model_name": "XGBoost",

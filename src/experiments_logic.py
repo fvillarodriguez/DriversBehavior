@@ -61,6 +61,15 @@ CONTROLLED_COMPARISON_FEATURE_SETS = ("Base", "Cluster", "Base + Cluster")
 CONTROLLED_COMPARISON_BALANCE_MODES = ("none", "smote")
 CALIBRATION_SWEEP_PROTOCOL_VERSION = "calibration_sweep_v1"
 CALIBRATION_SWEEP_PROTOCOL_FAMILY = "calibration_score_threshold"
+CALIBRATION_SWEEP_DEFAULT_PRUNING_CONFIG = {
+    "enabled": True,
+    "type": "median",
+    "n_startup_trials": 5,
+    "n_warmup_steps": 1,
+    "interval_steps": 1,
+    "intermediate_steps": 2,
+    "warm_start": True,
+}
 CALIBRATION_SWEEP_BALANCE_MODES = CONTROLLED_COMPARISON_BALANCE_MODES
 CALIBRATION_SWEEP_THRESHOLD_OBJECTIVES = (
     "far",
@@ -340,6 +349,8 @@ def _controlled_payload_updates_from_result(
         "test_alerts_per_day": result.get("test_alerts_per_day"),
         "val_false_alarms_per_day": result.get("val_false_alarms_per_day"),
         "test_false_alarms_per_day": result.get("test_false_alarms_per_day"),
+        "val_far": result.get("val_far"),
+        "test_far": result.get("test_far"),
         "val_event_recall_approx": result.get("val_event_recall_approx"),
         "test_event_recall_approx": result.get("test_event_recall_approx"),
         "val_operational_cost": result.get("val_operational_cost"),
@@ -393,6 +404,21 @@ def _controlled_payload_updates_from_result(
         "val_rows": int(result["val_rows"]),
         "test_rows": int(result["test_rows"]),
         "optuna_trials_completed": int(result["optuna_trials_completed"]),
+        "optuna_trials_pruned": int(result.get("optuna_trials_pruned", 0)),
+        "optuna_trials_failed": int(result.get("optuna_trials_failed", 0)),
+        "optuna_trials_total": int(
+            result.get(
+                "optuna_trials_total",
+                result.get("optuna_trials_completed", 0),
+            )
+        ),
+        "optuna_pruning_rate": float(result.get("optuna_pruning_rate", 0.0)),
+        "optuna_pruner": result.get("optuna_pruner"),
+        "optuna_pruning_config": json.dumps(
+            result.get("optuna_pruning_config", {}),
+            ensure_ascii=True,
+            default=_json_default,
+        ),
         "effective_optuna_n_jobs": int(result.get("optuna_n_jobs", optuna_n_jobs)),
         "effective_parallel_jobs": int(result.get("parallel_jobs", parallel_jobs)),
         "effective_xgb_parallel_jobs": int(
@@ -1317,6 +1343,14 @@ def _discrete_range_values(
     return list(deduped)
 
 
+def _choice_values(value: object) -> List[object]:
+    if isinstance(value, dict) and isinstance(value.get("choices"), (list, tuple)):
+        return list(value.get("choices") or [])
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
 def _k_grid_values(
     *,
     k_min: int,
@@ -1337,6 +1371,96 @@ def _k_grid_values(
     if values[-1] != resolved_max:
         values.append(resolved_max)
     return sorted({int(value) for value in values if value > 0})
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "si", "sí", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _resolve_calibration_pruning_config(
+    config: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    resolved = dict(CALIBRATION_SWEEP_DEFAULT_PRUNING_CONFIG)
+    if isinstance(config, dict):
+        resolved.update(config)
+    resolved["enabled"] = _as_bool(resolved.get("enabled"), True)
+    resolved["type"] = str(resolved.get("type") or "median").strip().lower()
+    resolved["n_startup_trials"] = max(0, int(resolved.get("n_startup_trials") or 0))
+    resolved["n_warmup_steps"] = max(0, int(resolved.get("n_warmup_steps") or 0))
+    resolved["interval_steps"] = max(1, int(resolved.get("interval_steps") or 1))
+    resolved["intermediate_steps"] = max(0, int(resolved.get("intermediate_steps") or 0))
+    resolved["warm_start"] = _as_bool(resolved.get("warm_start"), True)
+    return resolved
+
+
+def _build_optuna_pruner(config: Dict[str, object]) -> optuna.pruners.BasePruner:
+    if not _as_bool(config.get("enabled"), True):
+        return optuna.pruners.NopPruner()
+    pruner_type = str(config.get("type") or "median").strip().lower()
+    if pruner_type == "hyperband":
+        return optuna.pruners.HyperbandPruner(
+            min_resource=max(1, int(config.get("min_resource") or 1)),
+            max_resource=max(1, int(config.get("max_resource") or 3)),
+            reduction_factor=max(2, int(config.get("reduction_factor") or 3)),
+        )
+    return optuna.pruners.MedianPruner(
+        n_startup_trials=max(0, int(config.get("n_startup_trials") or 0)),
+        n_warmup_steps=max(0, int(config.get("n_warmup_steps") or 0)),
+        interval_steps=max(1, int(config.get("interval_steps") or 1)),
+    )
+
+
+def _optuna_trial_state_counts(study: optuna.Study) -> Dict[str, int]:
+    counts = {
+        "complete": 0,
+        "pruned": 0,
+        "failed": 0,
+        "running": 0,
+        "waiting": 0,
+        "total": 0,
+    }
+    for trial in study.trials:
+        counts["total"] += 1
+        if trial.state == optuna.trial.TrialState.COMPLETE:
+            counts["complete"] += 1
+        elif trial.state == optuna.trial.TrialState.PRUNED:
+            counts["pruned"] += 1
+        elif trial.state == optuna.trial.TrialState.FAIL:
+            counts["failed"] += 1
+        elif trial.state == optuna.trial.TrialState.RUNNING:
+            counts["running"] += 1
+        elif trial.state == optuna.trial.TrialState.WAITING:
+            counts["waiting"] += 1
+    return counts
+
+
+def _nearest_choice(values: Sequence[object], target: object) -> Optional[object]:
+    choices = list(values or [])
+    if not choices:
+        return None
+    if target in choices:
+        return target
+    try:
+        target_float = float(target)
+        numeric_choices = [
+            (abs(float(value) - target_float), index, value)
+            for index, value in enumerate(choices)
+            if value is not None
+        ]
+        if numeric_choices:
+            return min(numeric_choices, key=lambda item: (item[0], item[1]))[2]
+    except Exception:
+        pass
+    return choices[0]
 
 
 def controlled_comparison_checkpoint_root(
@@ -1704,38 +1828,68 @@ def _build_calibration_sweep_leaderboard(
                 errors="coerce",
             )
 
-    if "val_positive_support" not in leaderboard_df.columns:
+    if (
+        "val_positive_support" not in leaderboard_df.columns
+        or pd.to_numeric(leaderboard_df["val_positive_support"], errors="coerce")
+        .isna()
+        .all()
+    ):
         leaderboard_df["val_positive_support"] = (
             pd.to_numeric(leaderboard_df.get("val_true_positives"), errors="coerce")
             + pd.to_numeric(leaderboard_df.get("val_false_negatives"), errors="coerce")
         )
-    if "test_positive_support" not in leaderboard_df.columns:
+    if (
+        "test_positive_support" not in leaderboard_df.columns
+        or pd.to_numeric(leaderboard_df["test_positive_support"], errors="coerce")
+        .isna()
+        .all()
+    ):
         leaderboard_df["test_positive_support"] = (
             pd.to_numeric(leaderboard_df.get("test_true_positives"), errors="coerce")
             + pd.to_numeric(leaderboard_df.get("test_false_negatives"), errors="coerce")
         )
-    if "val_tp_capture" not in leaderboard_df.columns:
+    if (
+        "val_tp_capture" not in leaderboard_df.columns
+        or pd.to_numeric(leaderboard_df["val_tp_capture"], errors="coerce")
+        .isna()
+        .all()
+    ):
         leaderboard_df["val_tp_capture"] = np.where(
             leaderboard_df["val_positive_support"] > 0,
             pd.to_numeric(leaderboard_df.get("val_true_positives"), errors="coerce")
             / leaderboard_df["val_positive_support"],
             np.nan,
         )
-    if "test_tp_capture" not in leaderboard_df.columns:
+    if (
+        "test_tp_capture" not in leaderboard_df.columns
+        or pd.to_numeric(leaderboard_df["test_tp_capture"], errors="coerce")
+        .isna()
+        .all()
+    ):
         leaderboard_df["test_tp_capture"] = np.where(
             leaderboard_df["test_positive_support"] > 0,
             pd.to_numeric(leaderboard_df.get("test_true_positives"), errors="coerce")
             / leaderboard_df["test_positive_support"],
             np.nan,
         )
-    if "val_fn_rate" not in leaderboard_df.columns:
+    if (
+        "val_fn_rate" not in leaderboard_df.columns
+        or pd.to_numeric(leaderboard_df["val_fn_rate"], errors="coerce")
+        .isna()
+        .all()
+    ):
         leaderboard_df["val_fn_rate"] = np.where(
             leaderboard_df["val_positive_support"] > 0,
             pd.to_numeric(leaderboard_df.get("val_false_negatives"), errors="coerce")
             / leaderboard_df["val_positive_support"],
             np.nan,
         )
-    if "test_fn_rate" not in leaderboard_df.columns:
+    if (
+        "test_fn_rate" not in leaderboard_df.columns
+        or pd.to_numeric(leaderboard_df["test_fn_rate"], errors="coerce")
+        .isna()
+        .all()
+    ):
         leaderboard_df["test_fn_rate"] = np.where(
             leaderboard_df["test_positive_support"] > 0,
             pd.to_numeric(leaderboard_df.get("test_false_negatives"), errors="coerce")
@@ -1925,6 +2079,11 @@ def _build_calibration_sweep_best_summary(
         "smote_params",
         "selected_feature_count",
         "selected_features",
+        "optuna_trials_completed",
+        "optuna_trials_pruned",
+        "optuna_trials_total",
+        "optuna_pruning_rate",
+        "optuna_pruner",
         "trials_csv",
     ]
 
@@ -2719,52 +2878,44 @@ class ExperimentsRunner:
                 ),
             }
         elif model_name == "Neural Network":
+            nn_cfg = search_space_config.get("nn", {})
             class_counts = pd.Series(y_train).astype(int).value_counts()
             pos = int(class_counts.get(1, 0))
             neg = int(class_counts.get(0, 0))
             base_pw = float(neg / pos) if pos > 0 else 1.0
             pw_multipliers = list(
-                search_space_config.get("nn", {}).get(
-                    "pos_weight_multipliers", [0.5, 1.0, 2.0, 5.0, 10.0]
-                )
+                nn_cfg.get("pos_weight_multipliers", [0.5, 1.0, 2.0, 5.0, 10.0])
             )
             model_space = {
                 "hidden_dim": _discrete_range_values(
-                    search_space_config.get("nn", {}).get("hidden_dim"),
+                    nn_cfg.get("hidden_dim"),
                     default_min=64,
                     default_max=512,
                     default_step=64,
                     caster=int,
                 ),
                 "num_layers": _discrete_range_values(
-                    search_space_config.get("nn", {}).get("num_layers"),
+                    nn_cfg.get("num_layers"),
                     default_min=1,
                     default_max=4,
                     default_step=1,
                     caster=int,
                 ),
                 "dropout": _discrete_range_values(
-                    search_space_config.get("nn", {}).get("dropout"),
+                    nn_cfg.get("dropout"),
                     default_min=0.0,
                     default_max=0.5,
                     default_step=0.1,
                     caster=float,
                 ),
                 "learning_rate": list(
-                    search_space_config.get("nn", {}).get(
-                        "learning_rate",
-                        [0.0001, 0.0003, 0.001, 0.003, 0.01],
-                    )
+                    nn_cfg.get("learning_rate", [0.0001, 0.0003, 0.001, 0.003, 0.01])
                 ),
                 "weight_decay": list(
-                    search_space_config.get("nn", {}).get(
-                        "weight_decay", [1e-6, 1e-5, 1e-4, 1e-3]
-                    )
+                    nn_cfg.get("weight_decay", [1e-6, 1e-5, 1e-4, 1e-3])
                 ),
                 "batch_size": list(
-                    search_space_config.get("nn", {}).get(
-                        "batch_size", [256, 512, 1024, 2048]
-                    )
+                    nn_cfg.get("batch_size", [256, 512, 1024, 2048])
                 ),
                 # epochs no se optimiza: se fija a un maximo + early stopping
                 # (patience=5) para que cada trial entrene hasta convergencia
@@ -2774,6 +2925,35 @@ class ExperimentsRunner:
                     for m in pw_multipliers
                 ],
             }
+            for key in (
+                "use_batch_norm",
+                "loss_function",
+                "lr_scheduler",
+                "temperature_scaling",
+            ):
+                if key in nn_cfg:
+                    model_space[key] = _choice_values(nn_cfg.get(key))
+            numeric_optional = {
+                "focal_gamma": (2.0, 2.0, 0.1),
+                "focal_alpha": (0.25, 0.75, 0.05),
+                "max_grad_norm": (0.5, 5.0, 0.5),
+                "scheduler_factor": (0.1, 0.9, 0.1),
+                "scheduler_patience": (1, 5, 1),
+                "min_lr": (1e-6, 1e-5, 1e-6),
+            }
+            for key, (default_min, default_max, default_step) in numeric_optional.items():
+                if key in nn_cfg:
+                    cfg = nn_cfg.get(key)
+                    if isinstance(cfg, dict) and "choices" in cfg:
+                        model_space[key] = _choice_values(cfg)
+                    else:
+                        model_space[key] = _discrete_range_values(
+                            cfg,
+                            default_min=default_min,
+                            default_max=default_max,
+                            default_step=default_step,
+                            caster=int if key == "scheduler_patience" else float,
+                        )
         else:
             raise ValueError(f"Modelo no soportado: {model_name}")
 
@@ -2937,6 +3117,293 @@ class ExperimentsRunner:
             pd.Series(y_res, name=y_train.name),
         )
 
+    def _fractional_training_sample(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        *,
+        fraction: float,
+        step: int,
+    ) -> Tuple[pd.DataFrame, pd.Series]:
+        fraction = max(0.0, min(1.0, float(fraction)))
+        if fraction >= 0.999 or len(y_train) < 4:
+            return X_train, y_train
+        y_arr = pd.Series(y_train).astype(int).to_numpy()
+        rng = np.random.default_rng(int(self.random_state) + int(step) * 7919)
+        selected: List[int] = []
+        for cls in np.unique(y_arr):
+            cls_idx = np.flatnonzero(y_arr == cls)
+            if cls_idx.size == 0:
+                continue
+            sample_size = max(1, int(math.ceil(cls_idx.size * fraction)))
+            sample_size = min(sample_size, int(cls_idx.size))
+            selected.extend(
+                rng.choice(cls_idx, size=sample_size, replace=False).astype(int).tolist()
+            )
+        if not selected:
+            return X_train, y_train
+        selected_idx = np.asarray(sorted(set(selected)), dtype=int)
+        sampled_y = y_train.iloc[selected_idx]
+        if sampled_y.astype(int).nunique() < 2:
+            return X_train, y_train
+        return X_train.iloc[selected_idx], sampled_y
+
+    def _controlled_proxy_model_params(
+        self,
+        model_name: str,
+        model_params: Dict[str, object],
+        *,
+        fraction: float,
+    ) -> Dict[str, object]:
+        proxy_params = dict(model_params)
+        if model_name in {"Random Forest", "Balanced Random Forest", "XGBoost"}:
+            if "n_estimators" in proxy_params:
+                full_estimators = max(1, int(proxy_params["n_estimators"]))
+                min_estimators = min(full_estimators, 20)
+                proxy_params["n_estimators"] = max(
+                    min_estimators,
+                    int(math.ceil(full_estimators * float(fraction))),
+                )
+        elif model_name == "Neural Network":
+            full_epochs = max(1, int(proxy_params.get("epochs", 100)))
+            proxy_epochs = max(5, int(math.ceil(full_epochs * float(fraction))))
+            proxy_params["epochs"] = min(full_epochs, proxy_epochs)
+            proxy_params["early_stopping_patience"] = min(
+                max(1, int(proxy_params.get("early_stopping_patience", 5))),
+                3,
+            )
+        return proxy_params
+
+    def _score_controlled_trial_params(
+        self,
+        *,
+        model_name: str,
+        model_params: Dict[str, object],
+        X_fit: pd.DataFrame,
+        y_fit: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        val_df: pd.DataFrame,
+        objective_metric: str,
+        threshold_objective: str,
+        calibration_method: str,
+        far_target: float,
+        alerts_per_day: float,
+        fn_cost: float,
+        fp_cost: float,
+        threshold_parallel_jobs: int,
+    ) -> float:
+        model = build_model(model_name, model_params, self.random_state)
+        model.fit(X_fit, y_fit)
+        scores_val, _ = self._controlled_model_scores(
+            model,
+            X_val,
+            model_name=model_name,
+            objective_metric=objective_metric,
+            y_ref=y_val,
+        )
+        calibrator = fit_score_calibrator(
+            y_val.to_numpy(),
+            scores_val,
+            method=calibration_method,
+        )
+        scores_val = calibrator.transform(scores_val)
+        scored = score_optuna_objective(
+            y_val.to_numpy(),
+            scores_val,
+            objective_metric=objective_metric,
+            threshold_objective=threshold_objective,
+            eval_df=val_df,
+            far_target=float(far_target),
+            alerts_per_day=float(alerts_per_day),
+            fn_cost=float(fn_cost),
+            fp_cost=float(fp_cost),
+            threshold_n_jobs=int(threshold_parallel_jobs),
+        )
+        return float(scored.get("score", float("nan")))
+
+    def _report_controlled_intermediate_scores(
+        self,
+        trial: optuna.Trial,
+        *,
+        model_name: str,
+        model_params: Dict[str, object],
+        X_fit: pd.DataFrame,
+        y_fit: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        val_df: pd.DataFrame,
+        objective_metric: str,
+        threshold_objective: str,
+        calibration_method: str,
+        far_target: float,
+        alerts_per_day: float,
+        fn_cost: float,
+        fp_cost: float,
+        threshold_parallel_jobs: int,
+        pruning_config: Dict[str, object],
+    ) -> int:
+        if not _as_bool(pruning_config.get("enabled"), True):
+            return 0
+        step_count = max(0, int(pruning_config.get("intermediate_steps") or 0))
+        if step_count <= 0:
+            return 0
+        fractions = np.linspace(0.35, 0.85, step_count)
+        reports = 0
+        for step, fraction in enumerate(fractions, start=1):
+            X_proxy, y_proxy = self._fractional_training_sample(
+                X_fit,
+                y_fit,
+                fraction=float(fraction),
+                step=step,
+            )
+            proxy_params = self._controlled_proxy_model_params(
+                model_name,
+                model_params,
+                fraction=float(fraction),
+            )
+            score = self._score_controlled_trial_params(
+                model_name=model_name,
+                model_params=proxy_params,
+                X_fit=X_proxy,
+                y_fit=y_proxy,
+                X_val=X_val,
+                y_val=y_val,
+                val_df=val_df,
+                objective_metric=objective_metric,
+                threshold_objective=threshold_objective,
+                calibration_method=calibration_method,
+                far_target=float(far_target),
+                alerts_per_day=float(alerts_per_day),
+                fn_cost=float(fn_cost),
+                fp_cost=float(fp_cost),
+                threshold_parallel_jobs=int(threshold_parallel_jobs),
+            )
+            if pd.isna(score):
+                continue
+            trial.report(float(score), step=step)
+            reports += 1
+            if trial.should_prune():
+                raise optuna.TrialPruned("Pruned by Optuna intermediate score.")
+        return reports
+
+    def _controlled_warm_start_trials(
+        self,
+        *,
+        model_name: str,
+        model_space: Dict[str, List[object]],
+        smote_space: Dict[str, List[object]],
+        balance_mode: str,
+    ) -> List[Dict[str, object]]:
+        templates: List[Dict[str, object]]
+        if model_name == "XGBoost":
+            templates = [
+                {
+                    "n_estimators": 150,
+                    "max_depth": 6,
+                    "learning_rate": 0.1,
+                    "subsample": 0.8,
+                    "colsample_bytree": 0.8,
+                    "min_child_weight": 1.0,
+                    "reg_alpha": 0.0,
+                    "reg_lambda": 1.0,
+                    "gamma": 0.0,
+                    "max_delta_step": 1.0,
+                },
+                {
+                    "n_estimators": 200,
+                    "max_depth": 8,
+                    "learning_rate": 0.05,
+                    "subsample": 0.9,
+                    "colsample_bytree": 0.9,
+                    "min_child_weight": 3.0,
+                    "reg_alpha": 0.1,
+                    "reg_lambda": 2.0,
+                    "gamma": 0.1,
+                    "max_delta_step": 1.0,
+                },
+            ]
+        elif model_name in {"Random Forest", "Balanced Random Forest"}:
+            templates = [
+                {
+                    "n_estimators": 150,
+                    "max_depth": 8,
+                    "min_samples_split": 2,
+                    "min_samples_leaf": 1,
+                    "max_features": "sqrt",
+                    "class_weight": "balanced",
+                    "replacement": False,
+                },
+                {
+                    "n_estimators": 250,
+                    "max_depth": 12,
+                    "min_samples_split": 4,
+                    "min_samples_leaf": 2,
+                    "max_features": "sqrt",
+                    "class_weight": "balanced",
+                    "replacement": False,
+                },
+            ]
+        elif model_name == "SVM":
+            templates = [
+                {"kernel": "rbf", "C": 1.0, "gamma": "scale", "class_weight": "balanced"},
+                {"kernel": "linear", "C": 1.0, "class_weight": "balanced"},
+            ]
+        elif model_name == "Neural Network":
+            templates = [
+                {
+                    "hidden_dim": 256,
+                    "num_layers": 2,
+                    "dropout": 0.2,
+                    "learning_rate": 0.001,
+                    "weight_decay": 1e-5,
+                    "batch_size": 1024,
+                },
+                {
+                    "hidden_dim": 128,
+                    "num_layers": 2,
+                    "dropout": 0.1,
+                    "learning_rate": 0.0003,
+                    "weight_decay": 1e-4,
+                    "batch_size": 512,
+                },
+            ]
+        else:
+            templates = []
+
+        warm_trials: List[Dict[str, object]] = []
+        for template in templates:
+            params: Dict[str, object] = {}
+            for key, values in model_space.items():
+                if not values:
+                    continue
+                if model_name == "SVM":
+                    kernel_name = str(template.get("kernel", "rbf"))
+                    if key == "gamma" and kernel_name not in {"rbf", "poly", "sigmoid"}:
+                        continue
+                    if key == "degree" and kernel_name != "poly":
+                        continue
+                    if key == "coef0" and kernel_name not in {"poly", "sigmoid"}:
+                        continue
+                    if key == "class_weight" and len(values) <= 1:
+                        continue
+                target = template.get(key, values[0])
+                choice = _nearest_choice(values, target)
+                if choice is not None:
+                    params[str(key)] = choice
+            if balance_mode == "smote":
+                for source_key, target in (
+                    ("k_neighbors", 3),
+                    ("sampling_strategy", 0.5),
+                ):
+                    values = list(smote_space.get(source_key) or [])
+                    choice = _nearest_choice(values, target)
+                    if choice is not None:
+                        params[f"smote_{source_key}"] = choice
+            if params and params not in warm_trials:
+                warm_trials.append(params)
+        return warm_trials
+
     def _optimize_controlled_combo(
         self,
         *,
@@ -2962,6 +3429,7 @@ class ExperimentsRunner:
         search_space_config: Dict[str, object],
         parallel_jobs: int,
         xgb_parallel_jobs: int = 1,
+        optuna_pruning_config: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         X_train = train_df[selected_features].fillna(0).astype("float32")
         y_train = train_df["target"].astype(int)
@@ -3011,6 +3479,15 @@ class ExperimentsRunner:
         )
         model_space = dict(search_space.get("model") or {})
         smote_space = dict(search_space.get("smote") or {})
+        pruning_config = _resolve_calibration_pruning_config(
+            optuna_pruning_config
+            if optuna_pruning_config is not None
+            else {
+                "enabled": False,
+                "intermediate_steps": 0,
+                "warm_start": False,
+            }
+        )
         if balance_mode == "smote" and (
             not smote_space.get("k_neighbors") or not smote_space.get("sampling_strategy")
         ):
@@ -3026,7 +3503,16 @@ class ExperimentsRunner:
         study = optuna.create_study(
             direction=objective_direction,
             sampler=sampler,
+            pruner=_build_optuna_pruner(pruning_config),
         )
+        if _as_bool(pruning_config.get("warm_start"), True):
+            for warm_params in self._controlled_warm_start_trials(
+                model_name=model_name,
+                model_space=model_space,
+                smote_space=smote_space,
+                balance_mode=balance_mode,
+            ):
+                study.enqueue_trial(warm_params)
 
         def objective(trial: optuna.Trial) -> float:
             model_params, smote_params = self._controlled_comparison_trial_params(
@@ -3044,35 +3530,49 @@ class ExperimentsRunner:
                     y_train,
                     smote_params=smote_params,
                 )
-                model = build_model(model_name, model_params, self.random_state)
-                model.fit(X_fit, y_fit)
-                scores_val, _ = self._controlled_model_scores(
-                    model,
-                    X_val,
+                reports = self._report_controlled_intermediate_scores(
+                    trial,
                     model_name=model_name,
-                    objective_metric=objective_metric,
-                    y_ref=y_val,
-                )
-                calibrator = fit_score_calibrator(
-                    y_val.to_numpy(),
-                    scores_val,
-                    method=calibration_method,
-                )
-                scores_val = calibrator.transform(scores_val)
-                scored = score_optuna_objective(
-                    y_val.to_numpy(),
-                    scores_val,
+                    model_params=model_params,
+                    X_fit=X_fit,
+                    y_fit=y_fit,
+                    X_val=X_val,
+                    y_val=y_val,
+                    val_df=val_df,
                     objective_metric=objective_metric,
                     threshold_objective=threshold_objective,
-                    eval_df=val_df,
+                    calibration_method=calibration_method,
                     far_target=float(far_target),
                     alerts_per_day=float(alerts_per_day),
                     fn_cost=float(fn_cost),
                     fp_cost=float(fp_cost),
-                    threshold_n_jobs=int(threshold_parallel_jobs),
+                    threshold_parallel_jobs=int(threshold_parallel_jobs),
+                    pruning_config=pruning_config,
                 )
-                score = float(scored.get("score", float("nan")))
+                score = self._score_controlled_trial_params(
+                    model_name=model_name,
+                    model_params=model_params,
+                    X_fit=X_fit,
+                    y_fit=y_fit,
+                    X_val=X_val,
+                    y_val=y_val,
+                    val_df=val_df,
+                    objective_metric=objective_metric,
+                    threshold_objective=threshold_objective,
+                    calibration_method=calibration_method,
+                    far_target=float(far_target),
+                    alerts_per_day=float(alerts_per_day),
+                    fn_cost=float(fn_cost),
+                    fp_cost=float(fp_cost),
+                    threshold_parallel_jobs=int(threshold_parallel_jobs),
+                )
+                if not pd.isna(score):
+                    trial.report(float(score), step=int(reports) + 1)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned("Pruned by final validation score.")
             except Exception as exc:
+                if isinstance(exc, optuna.TrialPruned):
+                    raise
                 raise optuna.TrialPruned(str(exc)) from exc
             if pd.isna(score):
                 raise optuna.TrialPruned(
@@ -3092,6 +3592,7 @@ class ExperimentsRunner:
             for trial in study.trials
             if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None
         ]
+        state_counts = _optuna_trial_state_counts(study)
         if not completed_trials:
             raise ValueError("Optuna no genero trials completos.")
         if objective_direction == "minimize":
@@ -3160,6 +3661,10 @@ class ExperimentsRunner:
                 "value",
                 ascending=objective_direction == "minimize",
             ).reset_index(drop=True)
+            trials_df["pruner"] = type(study.pruner).__name__
+            trials_df["intermediate_report_steps"] = int(
+                pruning_config.get("intermediate_steps") or 0
+            )
 
         return {
             "status": "completed",
@@ -3220,6 +3725,8 @@ class ExperimentsRunner:
             "test_alerts_per_day": float(test_metrics.get("alerts_per_day", float("nan"))),
             "val_false_alarms_per_day": float(val_metrics.get("false_alarms_per_day", float("nan"))),
             "test_false_alarms_per_day": float(test_metrics.get("false_alarms_per_day", float("nan"))),
+            "val_far": float(val_metrics.get("far", float("nan"))),
+            "test_far": float(test_metrics.get("far", float("nan"))),
             "val_event_recall_approx": float(val_metrics.get("event_recall_approx", float("nan"))),
             "test_event_recall_approx": float(test_metrics.get("event_recall_approx", float("nan"))),
             "val_operational_cost": float(val_metrics.get("operational_cost", float("nan"))),
@@ -3249,6 +3756,14 @@ class ExperimentsRunner:
             "effective_model_params": effective_model_params,
             "smote_params": best_smote_params,
             "optuna_trials_completed": int(len(completed_trials)),
+            "optuna_trials_pruned": int(state_counts["pruned"]),
+            "optuna_trials_failed": int(state_counts["failed"]),
+            "optuna_trials_total": int(state_counts["total"]),
+            "optuna_pruning_rate": float(
+                state_counts["pruned"] / max(1, state_counts["total"])
+            ),
+            "optuna_pruner": type(study.pruner).__name__,
+            "optuna_pruning_config": dict(pruning_config),
             "optuna_n_jobs": int(effective_optuna_n_jobs),
             "parallel_jobs": int(resolved_parallel_jobs),
             "xgb_parallel_jobs": int(resolved_xgb_parallel_jobs),
@@ -3429,6 +3944,8 @@ class ExperimentsRunner:
             "test_alerts_per_day": float(test_metrics.get("alerts_per_day", float("nan"))),
             "val_false_alarms_per_day": float(val_metrics.get("false_alarms_per_day", float("nan"))),
             "test_false_alarms_per_day": float(test_metrics.get("false_alarms_per_day", float("nan"))),
+            "val_far": float(val_metrics.get("far", float("nan"))),
+            "test_far": float(test_metrics.get("far", float("nan"))),
             "val_event_recall_approx": float(val_metrics.get("event_recall_approx", float("nan"))),
             "test_event_recall_approx": float(test_metrics.get("event_recall_approx", float("nan"))),
             "val_operational_cost": float(val_metrics.get("operational_cost", float("nan"))),
@@ -3498,6 +4015,7 @@ class ExperimentsRunner:
         fn_cost: float = 10.0,
         fp_cost: float = 1.0,
         robust_folds: int = 3,
+        optuna_pruning_config: Optional[Dict[str, object]] = None,
         checkpoint_root: Optional[Path] = None,
         result_callback: Optional[Callable[[Dict[str, object]], None]] = None,
     ) -> Dict[str, object]:
@@ -3563,6 +4081,7 @@ class ExperimentsRunner:
             raise ValueError("Debe seleccionar al menos un objetivo de threshold.")
 
         search_space = dict(search_space_config or {})
+        pruning_config = _resolve_calibration_pruning_config(optuna_pruning_config)
 
         train_val_df, test_df = temporal_train_test_split(
             base_df,
@@ -3604,6 +4123,7 @@ class ExperimentsRunner:
             "fp_cost": float(fp_cost),
             "robust_folds": int(robust_folds),
             "search_space": dict(search_space),
+            "optuna_pruning": dict(pruning_config),
         }
         context = {
             "protocol_version": CALIBRATION_SWEEP_PROTOCOL_VERSION,
@@ -3804,6 +4324,7 @@ class ExperimentsRunner:
                     search_space_config=dict(search_space),
                     parallel_jobs=int(parallel_jobs),
                     xgb_parallel_jobs=int(xgb_parallel_jobs),
+                    optuna_pruning_config=dict(pruning_config),
                 )
                 payload.update(
                     _controlled_payload_updates_from_result(
@@ -3849,6 +4370,13 @@ class ExperimentsRunner:
                         "threshold_objective": threshold_objective,
                         "balance_mode": balance_mode,
                         "val_objective_score": payload.get("val_objective_score"),
+                        "optuna_trials_completed": payload.get(
+                            "optuna_trials_completed"
+                        ),
+                        "optuna_trials_pruned": payload.get(
+                            "optuna_trials_pruned"
+                        ),
+                        "optuna_pruning_rate": payload.get("optuna_pruning_rate"),
                     },
                 )
             except Exception as exc:

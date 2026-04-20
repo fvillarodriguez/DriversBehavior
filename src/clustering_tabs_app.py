@@ -79,6 +79,38 @@ CLUSTER_LABEL_PATTERN = re.compile(
 SUMMARY_PATTERN = re.compile(
     r"^cluster_summary(?:_(?P<method>kmeans|gmm|hdbscan))?(?:_k(?P<k>\d+))?(?:.*)?\.csv$"
 )
+FIXED_TTC_OPTIONS = [
+    {
+        "threshold_s": 1.0,
+        "threshold_label": "TTC < 1.0 s",
+        "interpretation": "Conflicto muy severo / casi colision",
+        "recommended_use": "Analisis conservador de eventos criticos",
+    },
+    {
+        "threshold_s": 1.5,
+        "threshold_label": "TTC < 1.5 s",
+        "interpretation": "Conflicto severo tradicional",
+        "recommended_use": "Valor estandar para surrogate safety / SSAM",
+    },
+    {
+        "threshold_s": 2.0,
+        "threshold_label": "TTC < 2.0 s",
+        "interpretation": "Conflicto moderado-severo",
+        "recommended_use": "Sensibilidad menos estricta",
+    },
+    {
+        "threshold_s": 3.0,
+        "threshold_label": "TTC < 3.0 s",
+        "interpretation": "Riesgo ampliado / conflicto potencial",
+        "recommended_use": "Estudios exploratorios, videoanalisis, escenarios urbanos",
+    },
+    {
+        "threshold_s": 4.0,
+        "threshold_label": "TTC < 4.0 s",
+        "interpretation": "Advertencia temprana / collision avoidance systems",
+        "recommended_use": "Sistemas ADAS, alertas preventivas, no necesariamente conflicto severo",
+    },
+]
 FEATURE_DETAILS = {
     "base": [
         (
@@ -233,6 +265,26 @@ def _format_ttc_config(feature_config: Optional[dict]) -> Optional[str]:
                 f"({len(values)} porticos, {min(values):.1f}-{max(values):.1f} s)"
             )
     return "TTC: Dinamico (umbral por portico)"
+
+
+def _fixed_ttc_reference_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Umbral TTC": option["threshold_label"],
+                "Interpretacion tipica": option["interpretation"],
+                "Uso recomendado": option["recommended_use"],
+            }
+            for option in FIXED_TTC_OPTIONS
+        ]
+    )
+
+
+def _format_fixed_ttc_option(threshold_s: float) -> str:
+    for option in FIXED_TTC_OPTIONS:
+        if float(option["threshold_s"]) == float(threshold_s):
+            return f"{threshold_s:.1f} s - {option['interpretation']}"
+    return f"{threshold_s:.1f} s"
 
 
 def _render_feature_details() -> None:
@@ -806,13 +858,28 @@ def _render_feature_loader() -> Optional[pd.DataFrame]:
         )
         fixed_ttc_s = None
         if ttc_mode_label == "Fijo":
-            fixed_ttc_s = st.number_input(
-                "TTC fijo (segundos)",
-                min_value=0.1,
-                value=float(DEFAULT_FIXED_TTC_SECONDS),
-                step=0.1,
-                format="%.2f",
-                help="Valor unico de TTC usado para marcar conflicto.",
+            fixed_ttc_values = [
+                float(option["threshold_s"]) for option in FIXED_TTC_OPTIONS
+            ]
+            default_fixed_ttc_index = (
+                fixed_ttc_values.index(float(DEFAULT_FIXED_TTC_SECONDS))
+                if float(DEFAULT_FIXED_TTC_SECONDS) in fixed_ttc_values
+                else 0
+            )
+            fixed_ttc_s = st.selectbox(
+                "TTC fijo para marcar conflicto",
+                fixed_ttc_values,
+                index=default_fixed_ttc_index,
+                format_func=_format_fixed_ttc_option,
+                help=(
+                    "Valor unico aplicado a todos los porticos. "
+                    "Un evento cuenta como conflicto cuando TTC es menor que este umbral."
+                ),
+            )
+            st.dataframe(
+                _fixed_ttc_reference_df(),
+                hide_index=True,
+                width="stretch",
             )
         else:
             st.caption(

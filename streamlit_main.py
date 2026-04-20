@@ -89,6 +89,7 @@ import src.notification_system as notification_system
 import src.multi_agent_rl_app as multi_agent_rl_app
 import src.latex_viewer_app as latex_viewer_app
 import src.nlp_severity_app as nlp_severity_app
+import src.documentation_app as documentation_app
 
 
 def _render_home() -> None:
@@ -167,6 +168,9 @@ def main() -> None:
     def p_latex():
         latex_viewer_app.Latex(set_page_config=False, show_exit_button=False)
 
+    def p_documentacion():
+        documentation_app.main(set_page_config=False, show_exit_button=False)
+
     ps_databases = st.Page(p_flow_database, title="Flow database", icon=":material/database:")
     ps_files = st.Page(p_files, title="Files", icon=":material/folder:")
     ps_github = st.Page(p_github, title="GitHub Sync", icon=":material/sync:")
@@ -185,12 +189,13 @@ def main() -> None:
     ps_notify = st.Page(notification_system.render_notification_config, title="Notification system", icon=":material/notifications:")
     ps_test = st.Page(p_test, title="Test", icon=":material/bug_report:")
     ps_latex = st.Page(p_latex, title="LaTeX", icon=":material/picture_as_pdf:")
+    ps_docs = st.Page(p_documentacion, title="Documentación", icon=":material/description:")
     ps_home = st.Page(_render_home, title="Inicio", icon=":material/home:", default=True)
 
     # --- NAVIGATION SETUP ---
     pg = st.navigation(
         {
-            "Navegación": [ps_home],
+            "Navegación": [ps_home, ps_docs],
             "Data & Gestión": [ps_databases, ps_files, ps_github],
             "Análisis & Modelos": [ps_clustering, ps_crash, ps_nlp_sev, ps_drift, ps_gnn, ps_marl],
             "Simulación & Vizualización": [ps_events, ps_exp, ps_sumo],

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import warnings
 
 import pytest
@@ -158,6 +159,106 @@ def test_calibration_sweep_optuna_objectives_shortlist_and_advanced_catalog():
     assert "roc_auc" not in default_values
     assert "roc_auc" in advanced_values
     assert "fnr" in advanced_values
+
+
+def test_list_experiment_result_files_includes_calibration_sweep_runs(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app, "RESULTS_DIR", tmp_path)
+    legacy_path = tmp_path / "experiments_results_20260101_010203.csv"
+    legacy_path.write_text("type,best_f1\nbase,0.1\n", encoding="utf-8")
+
+    completed_run = (
+        tmp_path
+        / "calibration_experiment_runs"
+        / "calibration_sweep_20260418_151657_5f2b8a6f"
+    )
+    completed_results = completed_run / "results"
+    completed_results.mkdir(parents=True)
+    completed_best = completed_results / "best_summary.csv"
+    completed_best.write_text("rank,model_name\n1,XGBoost\n", encoding="utf-8")
+    (completed_run / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": completed_run.name,
+                "status": "completed",
+                "result_status": "completed",
+                "completed_at": "2026-04-18T23:21:25",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    partial_run = (
+        tmp_path
+        / "calibration_experiment_runs"
+        / "calibration_sweep_20260418_151446_55cc815f"
+    )
+    partial_results = partial_run / "results"
+    partial_results.mkdir(parents=True)
+    partial_grid = partial_results / "grid_results.csv"
+    partial_grid.write_text("status,model_name\ncompleted,XGBoost\n", encoding="utf-8")
+
+    files = app._list_experiment_result_files()
+    relative_files = {str(path.relative_to(tmp_path)) for path in files}
+
+    assert (
+        "calibration_experiment_runs/"
+        "calibration_sweep_20260418_151657_5f2b8a6f/results/best_summary.csv"
+    ) in relative_files
+    assert (
+        "calibration_experiment_runs/"
+        "calibration_sweep_20260418_151446_55cc815f/results/grid_results.csv"
+    ) in relative_files
+    assert files[0] == completed_best
+
+
+def test_calibration_sweep_history_helpers_build_labels_and_exports(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app, "RESULTS_DIR", tmp_path)
+    run_dir = (
+        tmp_path
+        / "calibration_experiment_runs"
+        / "calibration_sweep_20260418_151657_5f2b8a6f"
+    )
+    results_dir = run_dir / "results"
+    trials_dir = run_dir / "trials"
+    results_dir.mkdir(parents=True)
+    trials_dir.mkdir()
+    best_path = results_dir / "best_summary.csv"
+    trial_path = trials_dir / "combo.csv"
+    best_path.write_text("rank,model_name\n1,XGBoost\n", encoding="utf-8")
+    trial_path.write_text("number,value\n0,0.5\n", encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "status": "completed",
+                "result_status": "completed",
+                "completed_at": "2026-04-18T23:21:25",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    label = app._experiment_result_option_label(best_path)
+    related_files = app._experiment_result_related_files(
+        best_path,
+        app._experiment_result_timestamp(best_path),
+    )
+    state = app._calibration_sweep_result_state_from_path(best_path)
+
+    assert "Calibración score + threshold" in label
+    assert "2026-04-18 23:21:25" in label
+    assert "completado" in label
+    assert app._experiment_result_timestamp(best_path) == "20260418_151657"
+    assert best_path in related_files
+    assert trial_path in related_files
+    assert state["checkpoint_run_dir"] == str(run_dir)
+    assert state["run_id"] == run_dir.name
 
 
 def test_render_conditional_number_input_preserves_hidden_value(monkeypatch):

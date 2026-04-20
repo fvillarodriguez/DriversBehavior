@@ -100,6 +100,17 @@ OPTUNA_BALANCE_MODE_LABELS = {
     "smote": "Con SMOTE",
 }
 CALIBRATION_METHOD_ORDER = ("sigmoid", "isotonic", "none")
+EXPERIMENT_RESULT_TIMESTAMP_RE = re.compile(
+    r"(?:experiments_results|find_samples_sizes_results|best_highway_section_results|"
+    r"best_highway_section_k_results|best_highway_section_controlled_summary|"
+    r"controlled_comparison_summary)_(\d{8}_\d{6})\.csv$"
+)
+CALIBRATION_SWEEP_RUN_RE = re.compile(r"^calibration_sweep_(\d{8}_\d{6})_.+")
+CALIBRATION_SWEEP_HISTORY_FILENAMES = (
+    "best_summary.csv",
+    "leaderboard.csv",
+    "grid_results.csv",
+)
 
 
 class _StreamlitProgress:
@@ -1197,9 +1208,201 @@ def _list_experiment_result_files() -> List[Path]:
     files: List[Path] = []
     for pattern in patterns:
         files.extend(RESULTS_DIR.glob(pattern))
-    unique = {path.name: path for path in files}
-    # Sort by name (which has timestamp) descending to show newest first
-    return sorted(unique.values(), key=lambda p: p.name, reverse=True)
+
+    calibration_root = RESULTS_DIR / "calibration_experiment_runs"
+    if calibration_root.exists():
+        for run_dir in calibration_root.glob("calibration_sweep_*"):
+            if not run_dir.is_dir():
+                continue
+            history_file = _calibration_sweep_history_file_for_run(run_dir)
+            if history_file is not None:
+                files.append(history_file)
+
+    unique = {str(path): path for path in files}
+    return sorted(
+        unique.values(),
+        key=_experiment_result_sort_key,
+        reverse=True,
+    )
+
+
+def _calibration_sweep_history_file_for_run(run_dir: Path) -> Optional[Path]:
+    for filename in CALIBRATION_SWEEP_HISTORY_FILENAMES:
+        candidate = run_dir / "results" / filename
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _calibration_sweep_run_dir_from_result_path(path: Path) -> Optional[Path]:
+    path = Path(path)
+    if path.name not in CALIBRATION_SWEEP_HISTORY_FILENAMES:
+        return None
+    if path.parent.name != "results":
+        return None
+    run_dir = path.parent.parent
+    if not CALIBRATION_SWEEP_RUN_RE.match(run_dir.name):
+        return None
+    try:
+        run_dir.resolve().relative_to(
+            (RESULTS_DIR / "calibration_experiment_runs").resolve()
+        )
+    except ValueError:
+        return None
+    return run_dir
+
+
+def _experiment_result_timestamp(path: Path) -> Optional[str]:
+    match = EXPERIMENT_RESULT_TIMESTAMP_RE.search(Path(path).name)
+    if match:
+        return match.group(1)
+    run_dir = _calibration_sweep_run_dir_from_result_path(path)
+    if run_dir is not None:
+        run_match = CALIBRATION_SWEEP_RUN_RE.match(run_dir.name)
+        if run_match:
+            return run_match.group(1)
+    return None
+
+
+def _experiment_result_sort_key(path: Path) -> str:
+    timestamp = _experiment_result_timestamp(path)
+    if timestamp:
+        return timestamp
+    try:
+        return datetime.fromtimestamp(Path(path).stat().st_mtime).strftime(
+            "%Y%m%d_%H%M%S"
+        )
+    except OSError:
+        return ""
+
+
+def _read_json_file(path: Path) -> Dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _calibration_sweep_manifest_for_result(path: Path) -> Dict[str, object]:
+    run_dir = _calibration_sweep_run_dir_from_result_path(path)
+    if run_dir is None:
+        return {}
+    return _read_json_file(run_dir / "manifest.json")
+
+
+def _experiment_result_option_label(path: Path) -> str:
+    run_dir = _calibration_sweep_run_dir_from_result_path(path)
+    if run_dir is None:
+        return Path(path).name
+
+    manifest = _calibration_sweep_manifest_for_result(path)
+    status = str(
+        manifest.get("result_status") or manifest.get("status") or "disponible"
+    ).strip()
+    status_label = {
+        "completed": "completado",
+        "running": "en progreso",
+        "failed": "fallido",
+    }.get(status.lower(), status or "disponible")
+    time_label = str(
+        manifest.get("completed_at")
+        or manifest.get("updated_at")
+        or manifest.get("created_at")
+        or _experiment_result_timestamp(path)
+        or ""
+    ).replace("T", " ")
+    parts = ["Calibración score + threshold"]
+    if time_label:
+        parts.append(time_label)
+    parts.extend([status_label, run_dir.name])
+    return " | ".join(parts)
+
+
+def _is_calibration_sweep_result_file(
+    path: Path,
+    result_df: Optional[pd.DataFrame] = None,
+) -> bool:
+    if _calibration_sweep_run_dir_from_result_path(path) is not None:
+        return True
+    if isinstance(result_df, pd.DataFrame):
+        if "protocol_family" in result_df.columns and result_df[
+            "protocol_family"
+        ].astype(str).str.contains(
+            "calibration_score_threshold",
+            case=False,
+            na=False,
+        ).any():
+            return True
+        if "experiment" in result_df.columns and result_df["experiment"].astype(
+            str
+        ).str.contains(
+            "calibration sweep",
+            case=False,
+            na=False,
+        ).any():
+            return True
+    return False
+
+
+def _calibration_sweep_result_state_from_path(
+    path: Path,
+    fallback_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, object]:
+    run_dir = _calibration_sweep_run_dir_from_result_path(path)
+    if run_dir is not None:
+        manifest = _calibration_sweep_manifest_for_result(path)
+        manifest_path = run_dir / "manifest.json"
+        return {
+            "run_id": str(manifest.get("run_id") or run_dir.name),
+            "checkpoint_run_dir": str(run_dir),
+            "checkpoint_manifest_path": str(manifest_path)
+            if manifest_path.exists()
+            else None,
+            "checkpoint_manifest": manifest,
+            "result_status": str(
+                manifest.get("result_status") or manifest.get("status") or ""
+            ),
+        }
+
+    state: Dict[str, object] = {"run_id": Path(path).stem}
+    if isinstance(fallback_df, pd.DataFrame):
+        if Path(path).name == "best_summary.csv":
+            state["best_summary_df"] = fallback_df
+        elif Path(path).name == "leaderboard.csv":
+            state["leaderboard_df"] = fallback_df
+        elif Path(path).name == "pareto_front.csv":
+            state["pareto_front_df"] = fallback_df
+        elif Path(path).name == "grid_results.csv":
+            state["grid_results_df"] = fallback_df
+    return state
+
+
+def _experiment_result_related_files(path: Path, timestamp: Optional[str]) -> List[Path]:
+    run_dir = _calibration_sweep_run_dir_from_result_path(path)
+    if run_dir is not None:
+        return sorted(
+            file_path for file_path in run_dir.rglob("*") if file_path.is_file()
+        )
+    if timestamp:
+        return sorted(RESULTS_DIR.glob(f"*{timestamp}*"))
+    return []
+
+
+def _experiment_export_arcname(path: Path) -> str:
+    try:
+        return str(path.relative_to(RESULTS_DIR))
+    except ValueError:
+        return path.name
+
+
+def _experiment_export_zip_name(path: Path, timestamp: Optional[str]) -> str:
+    run_dir = _calibration_sweep_run_dir_from_result_path(path)
+    if run_dir is not None:
+        return f"{run_dir.name}.zip"
+    if timestamp:
+        return f"experiment_{timestamp}.zip"
+    return f"experiment_{Path(path).stem}.zip"
 
 
 
@@ -4529,6 +4732,79 @@ def _render_calibration_sweep_experiment() -> None:
             shared_key="global_xgb_parallel_jobs",
         )
 
+    with st.expander("Configuración avanzada de Optuna", expanded=False):
+        pr_col1, pr_col2, pr_col3 = st.columns(3)
+        with pr_col1:
+            pruning_enabled = st.checkbox(
+                "Activar pruning",
+                value=True,
+                key="exp_calibration_sweep_pruning_enabled",
+                help=(
+                    "Usa MedianPruner con reportes intermedios por trial para cortar "
+                    "configuraciones claramente inferiores."
+                ),
+            )
+        with pr_col2:
+            pruning_startup_trials = st.number_input(
+                "Pruning: startup trials",
+                min_value=0,
+                value=5,
+                step=1,
+                key="exp_calibration_sweep_pruning_startup_trials",
+                disabled=not pruning_enabled,
+                help="Cantidad de trials completos antes de permitir podado.",
+            )
+        with pr_col3:
+            pruning_warmup_steps = st.number_input(
+                "Pruning: warmup steps",
+                min_value=0,
+                value=1,
+                step=1,
+                key="exp_calibration_sweep_pruning_warmup_steps",
+                disabled=not pruning_enabled,
+                help="Cantidad de reportes intermedios antes de evaluar podado.",
+            )
+        pr_col4, pr_col5, pr_col6 = st.columns(3)
+        with pr_col4:
+            pruning_interval_steps = st.number_input(
+                "Pruning: interval steps",
+                min_value=1,
+                value=1,
+                step=1,
+                key="exp_calibration_sweep_pruning_interval_steps",
+                disabled=not pruning_enabled,
+            )
+        with pr_col5:
+            pruning_intermediate_steps = st.number_input(
+                "Reportes proxy por trial",
+                min_value=0,
+                max_value=4,
+                value=2,
+                step=1,
+                key="exp_calibration_sweep_pruning_intermediate_steps",
+                disabled=not pruning_enabled,
+                help=(
+                    "Entrena modelos proxy con menos filas/estimadores antes del fit "
+                    "completo. Valores altos podan antes, pero agregan overhead."
+                ),
+            )
+        with pr_col6:
+            warm_start_enabled = st.checkbox(
+                "Warm starts TPE",
+                value=True,
+                key="exp_calibration_sweep_warm_start_enabled",
+                help="Encola 2 configuraciones base compatibles antes del muestreo TPE.",
+            )
+    optuna_pruning_config = {
+        "enabled": bool(pruning_enabled),
+        "type": "median",
+        "n_startup_trials": int(pruning_startup_trials),
+        "n_warmup_steps": int(pruning_warmup_steps),
+        "interval_steps": int(pruning_interval_steps),
+        "intermediate_steps": int(pruning_intermediate_steps),
+        "warm_start": bool(warm_start_enabled),
+    }
+
     search_space = _default_controlled_comparison_search_space()
     with st.expander("Rangos del barrido", expanded=False):
         st.json(search_space)
@@ -4602,6 +4878,10 @@ def _render_calibration_sweep_experiment() -> None:
             "processed": 0,
             "completed": 0,
             "failed": 0,
+            "trial_completed": 0,
+            "trial_pruned": 0,
+            "trial_failed": 0,
+            "trial_total": 0,
         }
 
         def _update_calibration_progress(
@@ -4610,6 +4890,11 @@ def _render_calibration_sweep_experiment() -> None:
             processed = int(progress_state["processed"])
             completed_ok = int(progress_state["completed"])
             failed = int(progress_state["failed"])
+            trial_completed = int(progress_state["trial_completed"])
+            trial_pruned = int(progress_state["trial_pruned"])
+            trial_failed = int(progress_state["trial_failed"])
+            trial_total = int(progress_state["trial_total"])
+            pruning_rate = trial_pruned / max(1, trial_total)
             elapsed = time.monotonic() - float(progress_state["started_at"])
             avg_seconds = (
                 elapsed / processed
@@ -4639,6 +4924,10 @@ def _render_calibration_sweep_experiment() -> None:
                 f"{processed}/{total_combinations} | "
                 f"OK: {completed_ok} | "
                 f"Fallidas: {failed} | "
+                f"Trials OK: {trial_completed} | "
+                f"Podados: {trial_pruned} | "
+                f"Trials fallidos: {trial_failed} | "
+                f"Tasa podado: {pruning_rate:.1%} | "
                 f"Tiempo transcurrido: {_format_duration_compact(elapsed)} | "
                 f"Promedio actual: {_format_duration_compact(avg_seconds)} por combinación | "
                 f"ETA: {_format_duration_compact(eta_seconds)}"
@@ -4661,6 +4950,18 @@ def _render_calibration_sweep_experiment() -> None:
                 progress_state["completed"] = int(progress_state["completed"]) + 1
             else:
                 progress_state["failed"] = int(progress_state["failed"]) + 1
+            progress_state["trial_completed"] = int(
+                progress_state["trial_completed"]
+            ) + int(payload_item.get("optuna_trials_completed") or 0)
+            progress_state["trial_pruned"] = int(
+                progress_state["trial_pruned"]
+            ) + int(payload_item.get("optuna_trials_pruned") or 0)
+            progress_state["trial_failed"] = int(
+                progress_state["trial_failed"]
+            ) + int(payload_item.get("optuna_trials_failed") or 0)
+            progress_state["trial_total"] = int(
+                progress_state["trial_total"]
+            ) + int(payload_item.get("optuna_trials_total") or 0)
             _update_calibration_progress(payload_item)
 
         _update_calibration_progress()
@@ -4690,6 +4991,7 @@ def _render_calibration_sweep_experiment() -> None:
                     fn_cost=float(fn_cost),
                     fp_cost=float(fp_cost),
                     robust_folds=int(robust_folds),
+                    optuna_pruning_config=optuna_pruning_config,
                     checkpoint_root=RESULTS_DIR / "calibration_experiment_runs",
                     result_callback=_progress_callback,
                 )
@@ -6838,6 +7140,389 @@ def _load_calibration_sweep_result_frames(
     return best_summary_df, leaderboard_df, pareto_front_df, grid_results_df
 
 
+def _calibration_sweep_manifest_from_state(
+    result_state: Dict[str, object],
+) -> Dict[str, object]:
+    manifest = result_state.get("checkpoint_manifest")
+    if isinstance(manifest, dict):
+        return manifest
+
+    manifest_path_text = str(result_state.get("checkpoint_manifest_path") or "").strip()
+    if manifest_path_text:
+        manifest_path = Path(manifest_path_text)
+        if manifest_path.exists():
+            manifest = _read_json_file(manifest_path)
+            if manifest:
+                return manifest
+
+    run_dir_text = str(result_state.get("checkpoint_run_dir") or "").strip()
+    if run_dir_text:
+        manifest_path = Path(run_dir_text) / "manifest.json"
+        if manifest_path.exists():
+            manifest = _read_json_file(manifest_path)
+            if manifest:
+                return manifest
+    return {}
+
+
+def _first_frame_value(df: pd.DataFrame, column: str) -> Optional[object]:
+    if not isinstance(df, pd.DataFrame) or df.empty or column not in df.columns:
+        return None
+    values = df[column].dropna()
+    if values.empty:
+        return None
+    value = values.iloc[0]
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _metadata_value(value: object) -> object:
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(item) for item in value)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return value
+
+
+def _calibration_sweep_metadata_rows(
+    result_state: Dict[str, object],
+    grid_results_df: pd.DataFrame,
+) -> List[Dict[str, object]]:
+    manifest = _calibration_sweep_manifest_from_state(result_state)
+    protocol = result_state.get("protocol")
+    if not isinstance(protocol, dict):
+        protocol = manifest.get("protocol")
+    if not isinstance(protocol, dict):
+        protocol = {}
+
+    def _first(*values: object) -> Optional[object]:
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, float) and pd.isna(value):
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return value
+        return None
+
+    rows: List[Dict[str, object]] = []
+
+    def _add(group: str, field: str, *values: object) -> None:
+        value = _first(*values)
+        if value is None:
+            return
+        rows.append(
+            {
+                "grupo": group,
+                "campo": field,
+                "valor": _metadata_value(value),
+            }
+        )
+
+    _add("Corrida", "run_id", manifest.get("run_id"), result_state.get("run_id"))
+    _add("Corrida", "computed_run_id", manifest.get("computed_run_id"))
+    _add("Corrida", "status", manifest.get("status"))
+    _add("Corrida", "result_status", manifest.get("result_status"))
+    _add("Corrida", "created_at", manifest.get("created_at"))
+    _add("Corrida", "updated_at", manifest.get("updated_at"))
+    _add("Corrida", "completed_at", manifest.get("completed_at"))
+    _add("Corrida", "last_error", manifest.get("last_error"))
+
+    progress = manifest.get("progress")
+    if isinstance(progress, dict):
+        _add("Progreso", "completed_steps", progress.get("completed_steps"))
+        _add("Progreso", "total_steps", progress.get("total_steps"))
+        _add("Progreso", "current_step_id", progress.get("current_step_id"))
+
+    _add(
+        "Insumos",
+        "event_path",
+        _first_frame_value(grid_results_df, "event_path"),
+    )
+    _add(
+        "Insumos",
+        "features_path",
+        _first_frame_value(grid_results_df, "features_path"),
+    )
+    _add(
+        "Insumos",
+        "feature_source",
+        protocol.get("feature_source"),
+        _first_frame_value(grid_results_df, "feature_source"),
+    )
+    _add(
+        "Insumos",
+        "selected_feature_count",
+        protocol.get("selected_feature_count"),
+        _first_frame_value(grid_results_df, "selected_feature_count"),
+    )
+
+    for key in ("train_rows", "val_rows", "test_rows"):
+        _add("Split", key, _first_frame_value(grid_results_df, key))
+
+    _add("Protocolo", "protocol_family", manifest.get("protocol_family"), protocol.get("protocol_family"))
+    _add("Protocolo", "protocol_version", manifest.get("protocol_version"), protocol.get("protocol_version"))
+    _add("Protocolo", "model_name", protocol.get("model_name"), _first_frame_value(grid_results_df, "model_name"))
+    _add("Protocolo", "threshold_protocol", protocol.get("threshold_protocol"))
+    _add("Protocolo", "objective_metrics", protocol.get("objective_metrics"))
+    _add("Protocolo", "calibration_methods", protocol.get("calibration_methods"))
+    _add("Protocolo", "threshold_objectives", protocol.get("threshold_objectives"))
+    _add("Protocolo", "balance_modes", protocol.get("balance_modes"))
+    _add("Protocolo", "test_size", protocol.get("test_size"))
+    _add("Protocolo", "val_size", protocol.get("val_size"))
+    _add("Protocolo", "n_trials", protocol.get("n_trials"))
+    _add("Protocolo", "timeout", protocol.get("timeout"))
+    _add("Protocolo", "optuna_n_jobs", protocol.get("optuna_n_jobs"))
+    _add("Protocolo", "parallel_jobs", protocol.get("parallel_jobs"))
+    _add("Protocolo", "xgb_parallel_jobs", protocol.get("xgb_parallel_jobs"))
+    _add("Protocolo", "far_target", protocol.get("far_target"))
+    _add("Protocolo", "alerts_per_day", protocol.get("alerts_per_day"))
+    _add("Protocolo", "fn_cost", protocol.get("fn_cost"))
+    _add("Protocolo", "fp_cost", protocol.get("fp_cost"))
+    _add("Protocolo", "robust_folds", protocol.get("robust_folds"))
+
+    return rows
+
+
+def _calibration_sweep_selected_features(
+    result_state: Dict[str, object],
+    grid_results_df: pd.DataFrame,
+) -> List[str]:
+    manifest = _calibration_sweep_manifest_from_state(result_state)
+    protocol = result_state.get("protocol")
+    if not isinstance(protocol, dict):
+        protocol = manifest.get("protocol")
+    if isinstance(protocol, dict):
+        selected_features = protocol.get("selected_features")
+        if isinstance(selected_features, list):
+            return [str(feature) for feature in selected_features]
+
+    raw_features = _first_frame_value(grid_results_df, "selected_features")
+    if raw_features is None:
+        return []
+    if isinstance(raw_features, list):
+        return [str(feature) for feature in raw_features]
+    if isinstance(raw_features, str):
+        try:
+            parsed = json.loads(raw_features)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(feature) for feature in parsed]
+        return [raw_features]
+    return []
+
+
+def _calibration_sweep_split_db_path(
+    result_state: Dict[str, object],
+) -> Optional[Path]:
+    manifest = _calibration_sweep_manifest_from_state(result_state)
+    steps_index = manifest.get("steps_index")
+    if isinstance(steps_index, dict):
+        split_step = steps_index.get("split_freeze")
+        if isinstance(split_step, dict):
+            artifact_paths = split_step.get("artifact_paths")
+            if isinstance(artifact_paths, dict):
+                path_text = str(artifact_paths.get("splits_duckdb") or "").strip()
+                if path_text:
+                    path = Path(path_text)
+                    if path.exists():
+                        return path
+
+    run_dir_text = str(result_state.get("checkpoint_run_dir") or "").strip()
+    if run_dir_text:
+        candidate = Path(run_dir_text) / "dataset" / "splits.duckdb"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_calibration_sweep_split_metadata(
+    split_db_path: Optional[Path],
+) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
+    if split_db_path is None:
+        return pd.DataFrame(), pd.DataFrame(), "No hay splits.duckdb registrado."
+    if duckdb is None:
+        return pd.DataFrame(), pd.DataFrame(), "duckdb no está disponible."
+    if not split_db_path.exists():
+        return pd.DataFrame(), pd.DataFrame(), f"No existe {split_db_path}."
+
+    try:
+        con = duckdb.connect(str(split_db_path), read_only=True)
+        try:
+            table_names = [str(row[0]) for row in con.execute("SHOW TABLES").fetchall()]
+            split_tables = [
+                table_name
+                for table_name in ("train", "val", "test")
+                if table_name in table_names
+            ]
+            split_rows: List[Dict[str, object]] = []
+            table_columns: Dict[str, List[str]] = {}
+            for table_name in split_tables:
+                table_ref = _duckdb_quote_identifier(table_name)
+                columns = con.execute(f"DESCRIBE {table_ref}").fetchdf()[
+                    "column_name"
+                ].tolist()
+                table_columns[table_name] = [str(column) for column in columns]
+                row: Dict[str, object] = {
+                    "split": table_name,
+                    "rows": int(
+                        con.execute(f"SELECT COUNT(*) FROM {table_ref}").fetchone()[0]
+                    ),
+                    "columns": int(len(columns)),
+                }
+                if "interval_start" in columns:
+                    min_ts, max_ts = con.execute(
+                        f"SELECT MIN(interval_start), MAX(interval_start) FROM {table_ref}"
+                    ).fetchone()
+                    row["interval_start_min"] = min_ts
+                    row["interval_start_max"] = max_ts
+                if {"portico_last", "portico_next"}.issubset(columns):
+                    row["segments"] = int(
+                        con.execute(
+                            "SELECT COUNT(DISTINCT "
+                            "CAST(portico_last AS VARCHAR) || ' -> ' || "
+                            f"CAST(portico_next AS VARCHAR)) FROM {table_ref}"
+                        ).fetchone()[0]
+                    )
+                if "km_last" in columns:
+                    row["km_last_min"], row["km_last_max"] = con.execute(
+                        f"SELECT MIN(km_last), MAX(km_last) FROM {table_ref}"
+                    ).fetchone()
+                if "km_next" in columns:
+                    row["km_next_min"], row["km_next_max"] = con.execute(
+                        f"SELECT MIN(km_next), MAX(km_next) FROM {table_ref}"
+                    ).fetchone()
+                split_rows.append(row)
+
+            segment_selects: List[str] = []
+            for table_name in split_tables:
+                columns = table_columns.get(table_name, [])
+                if not {"portico_last", "portico_next"}.issubset(columns):
+                    continue
+                table_ref = _duckdb_quote_identifier(table_name)
+                km_last_expr = "km_last" if "km_last" in columns else "NULL"
+                km_next_expr = "km_next" if "km_next" in columns else "NULL"
+                segment_selects.append(
+                    "SELECT "
+                    "CAST(portico_last AS VARCHAR) AS portico_last, "
+                    "CAST(portico_next AS VARCHAR) AS portico_next, "
+                    f"{km_last_expr} AS km_last, "
+                    f"{km_next_expr} AS km_next "
+                    f"FROM {table_ref}"
+                )
+
+            segment_df = pd.DataFrame()
+            if segment_selects:
+                union_sql = " UNION ALL ".join(segment_selects)
+                segment_df = con.execute(
+                    "SELECT portico_last, portico_next, "
+                    "MIN(km_last) AS km_last, MIN(km_next) AS km_next, "
+                    "COUNT(*) AS rows "
+                    f"FROM ({union_sql}) "
+                    "GROUP BY portico_last, portico_next "
+                    "ORDER BY rows DESC "
+                    "LIMIT 50"
+                ).fetchdf()
+
+            return pd.DataFrame(split_rows), segment_df, None
+        finally:
+            con.close()
+    except Exception as exc:
+        return pd.DataFrame(), pd.DataFrame(), str(exc)
+
+
+def _calibration_sweep_artifact_rows(
+    result_state: Dict[str, object],
+) -> List[Dict[str, object]]:
+    manifest = _calibration_sweep_manifest_from_state(result_state)
+    artifact_rows: List[Dict[str, object]] = []
+
+    def _add(source: str, name: str, value: object) -> None:
+        if value is None:
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        artifact_rows.append({"origen": source, "artefacto": name, "path": text})
+
+    artifacts = manifest.get("artifacts")
+    if isinstance(artifacts, dict):
+        for name, value in artifacts.items():
+            _add("manifest.artifacts", str(name), value)
+
+    steps_index = manifest.get("steps_index")
+    if isinstance(steps_index, dict):
+        for step_name, step_payload in steps_index.items():
+            if not isinstance(step_payload, dict):
+                continue
+            artifact_paths = step_payload.get("artifact_paths")
+            if not isinstance(artifact_paths, dict):
+                continue
+            for name, value in artifact_paths.items():
+                _add(f"steps_index.{step_name}", str(name), value)
+
+    return artifact_rows
+
+
+def _render_calibration_sweep_metadata(
+    result_state: Dict[str, object],
+    *,
+    grid_results_df: pd.DataFrame,
+) -> None:
+    with st.expander("Metadata disponible", expanded=False):
+        metadata_rows = _calibration_sweep_metadata_rows(result_state, grid_results_df)
+        if metadata_rows:
+            st.markdown("**Manifest, protocolo e insumos**")
+            st.dataframe(pd.DataFrame(metadata_rows), width="stretch", hide_index=True)
+        else:
+            st.info("No hay metadata general disponible.")
+
+        selected_features = _calibration_sweep_selected_features(
+            result_state,
+            grid_results_df,
+        )
+        if selected_features:
+            st.markdown("**Variables seleccionadas**")
+            st.caption(f"Total: {len(selected_features):,}")
+            st.dataframe(
+                pd.DataFrame({"feature": selected_features}),
+                width="stretch",
+                hide_index=True,
+            )
+
+        split_db_path = _calibration_sweep_split_db_path(result_state)
+        split_df, segment_df, split_error = _load_calibration_sweep_split_metadata(
+            split_db_path
+        )
+        st.markdown("**Porticos, tramo y splits**")
+        if split_db_path is not None:
+            st.caption(f"Split congelado: {split_db_path}")
+        st.caption(
+            "El manifest actual no guarda `segment_info` ni `tramo` explícitos "
+            "para esta familia; los porticos se infieren desde `splits.duckdb` "
+            "cuando existen columnas `portico_last` y `portico_next`."
+        )
+        if isinstance(split_df, pd.DataFrame) and not split_df.empty:
+            st.dataframe(split_df, width="stretch", hide_index=True)
+        elif split_error:
+            st.info(split_error)
+        if isinstance(segment_df, pd.DataFrame) and not segment_df.empty:
+            st.markdown("**Tramos inferidos desde splits**")
+            st.dataframe(segment_df, width="stretch", hide_index=True)
+
+        artifact_rows = _calibration_sweep_artifact_rows(result_state)
+        if artifact_rows:
+            st.markdown("**Artefactos registrados**")
+            st.dataframe(
+                pd.DataFrame(artifact_rows),
+                width="stretch",
+                hide_index=True,
+            )
+
+
 def _render_calibration_sweep_results(
     result_state: Dict[str, object],
     *,
@@ -6870,6 +7555,11 @@ def _render_calibration_sweep_results(
     source_note = str(result_state.get("feature_source_note") or "").strip()
     if source_note:
         st.caption(source_note)
+
+    _render_calibration_sweep_metadata(
+        result_state,
+        grid_results_df=grid_results_df,
+    )
 
     best_columns = [
         "selection_scope",
@@ -15791,14 +16481,16 @@ def _default_controlled_comparison_search_space() -> Dict[str, object]:
         },
         "xgb": {
             "n_estimators": {"min": 50, "max": 300, "step": 25},
-            "max_depth": {"min": 3, "max": 15, "step": 1},
-            "learning_rate": {"min": 0.01, "max": 0.30, "step": 0.01},
-            "subsample": {"min": 0.5, "max": 1.0, "step": 0.1},
-            "colsample_bytree": {"min": 0.5, "max": 1.0, "step": 0.1},
-            "min_child_weight": {"min": 1.0, "max": 10.0, "step": 1.0},
-            "reg_alpha": {"min": 0.0, "max": 5.0, "step": 0.1},
-            "reg_lambda": {"min": 1.0, "max": 10.0, "step": 0.1},
-            "gamma": {"min": 0.0, "max": 5.0, "step": 0.1},
+            "max_depth": {"min": 3, "max": 10, "step": 1},
+            "learning_rate": {
+                "choices": [0.01, 0.02, 0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3],
+            },
+            "subsample": {"min": 0.6, "max": 1.0, "step": 0.1},
+            "colsample_bytree": {"min": 0.6, "max": 1.0, "step": 0.1},
+            "min_child_weight": {"choices": [0.1, 0.3, 1.0, 3.0, 10.0]},
+            "reg_alpha": {"choices": [0.0, 0.01, 0.1, 1.0, 5.0]},
+            "reg_lambda": {"choices": [0.5, 1.0, 2.0, 5.0, 10.0]},
+            "gamma": {"choices": [0.0, 0.1, 0.5, 1.0, 2.0, 5.0]},
             "scale_pos_weight_multipliers": [0.5, 1.0, 2.0, 5.0, 10.0],
             "max_delta_step": [0.0, 1.0],
         },
@@ -19459,26 +20151,28 @@ def _render_experiments_tab() -> None:
         st.subheader("Visualización y Exportación")
         past_files = _list_experiment_result_files()
         if past_files:
-            past_names = [p.name for p in past_files]
-            sel_past = st.selectbox("Seleccionar archivo de resultados previos", past_names, key="history_exp_select")
+            past_options = {
+                _experiment_result_option_label(path): path for path in past_files
+            }
+            sel_past = st.selectbox(
+                "Seleccionar archivo de resultados previos",
+                list(past_options.keys()),
+                key="history_exp_select",
+            )
             
             if sel_past:
-                path = next(p for p in past_files if p.name == sel_past)
+                path = past_options[sel_past]
                 
                 # --- Export Logic ---
-                # Attempt to extract timestamp from filename: experiments_results_YYYYMMDD_HHMMSS.csv
-                # Pattern: experiments_results_{timestamp}.csv
-                match = re.search(
-                    r"(?:experiments_results|find_samples_sizes_results|best_highway_section_results|best_highway_section_k_results|best_highway_section_controlled_summary|controlled_comparison_summary)_(\d{8}_\d{6})\.csv",
-                    sel_past,
-                )
-                timestamp = match.group(1) if match else None
+                timestamp = _experiment_result_timestamp(path)
                 
                 col_view, col_export = st.columns([0.8, 0.2])
                 with col_export:
                     if timestamp:
-                        # Find all files with this timestamp
-                        related_files = sorted(RESULTS_DIR.glob(f"*{timestamp}*"))
+                        related_files = _experiment_result_related_files(
+                            path,
+                            timestamp,
+                        )
                         if related_files:
                             try:
                                 import zipfile
@@ -19486,12 +20180,18 @@ def _render_experiments_tab() -> None:
                                 zip_buffer = io.BytesIO()
                                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                                     for f in related_files:
-                                        zf.write(f, arcname=f.name)
+                                        zf.write(
+                                            f,
+                                            arcname=_experiment_export_arcname(f),
+                                        )
                                 zip_buffer.seek(0)
                                 st.download_button(
                                     label="Exportar Experimento (ZIP)",
                                     data=zip_buffer,
-                                    file_name=f"experiment_{timestamp}.zip",
+                                    file_name=_experiment_export_zip_name(
+                                        path,
+                                        timestamp,
+                                    ),
                                     mime="application/zip"
                                 )
                             except Exception as e:
@@ -19503,6 +20203,10 @@ def _render_experiments_tab() -> None:
 
                 try:
                     past_df = pd.read_csv(path)
+                    is_calibration_sweep = _is_calibration_sweep_result_file(
+                        path,
+                        past_df,
+                    )
                     is_controlled_comparison = False
                     is_find_samples = False
                     is_best_section = False
@@ -19561,7 +20265,20 @@ def _render_experiments_tab() -> None:
                     ):
                         is_controlled_comparison = True
 
-                    if is_controlled_comparison:
+                    if is_calibration_sweep:
+                        st.caption(
+                            "Experimento detectado: Calibración score + threshold"
+                        )
+                        _render_calibration_sweep_results(
+                            _calibration_sweep_result_state_from_path(
+                                path,
+                                past_df,
+                            ),
+                            key_prefix=(
+                                f"history_calibration_{timestamp or path.stem}"
+                            ),
+                        )
+                    elif is_controlled_comparison:
                         controlled_prefix = "controlled_comparison"
                         controlled_label = "Controlled comparison"
                         if path.name.startswith(

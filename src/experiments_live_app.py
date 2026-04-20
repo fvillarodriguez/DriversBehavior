@@ -28,6 +28,16 @@ NEURAL_DRIFT_EXPERIMENTS_DIR = RESULTS_DIR / "neural_drift_experiments"
 NLP_PAPER_RUNS_DIR = RESULTS_DIR / "nlp_in_severity" / "paper_replication"
 NLP_LANGUAGE_MODELING_LIVE_DIR = RESULTS_DIR / "nlp_in_severity" / "language_modeling_live"
 PAPER_MODEL_CODES = ("M1", "M2", "M3")
+THESIS_CHART_COLORS = {
+    "paper": "#fdfcfa",
+    "rule": "#d8d5cd",
+    "rule_soft": "#e6e3dc",
+    "ink": "#1a1a1a",
+    "ink_2": "#3d3d3d",
+    "ink_3": "#6b6b6b",
+    "accent": "#1b3a6b",
+    "sage": "#3b7a57",
+}
 
 
 def _list_live_db_files() -> list[Path]:
@@ -1051,6 +1061,20 @@ def _display_cell(value: object, *, pending: bool = False) -> object:
         return int(round(numeric_value))
     return round(numeric_value, 4)
     return value
+
+
+def _format_decimal_es(value: object, *, digits: int = 4) -> str:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return "-"
+    numeric_value = float(numeric)
+    if not math.isfinite(numeric_value):
+        return str(numeric_value)
+    text = f"{numeric_value:,.{digits}f}"
+    text = text.replace(",", "\u202f").replace(".", ",")
+    if "," in text:
+        text = text.rstrip("0").rstrip(",")
+    return text
 
 
 def _yearly_training_label(strategy: str, *, base_year: Optional[int], prediction_year: int) -> str:
@@ -2590,15 +2614,19 @@ def _read_language_modeling_run(manifest_path: Path) -> Dict[str, object]:
 
 def _calibration_metric_options() -> Dict[str, str]:
     return {
+        "val_balanced_f1": "Validación Balanced F1",
         "val_pr_auc": "Validación PR-AUC",
         "val_mcc": "Validación MCC",
         "val_brier_score": "Validación Brier",
+        "val_event_recall_approx": "Validación event recall",
         "val_far": "Validación FAR",
         "val_tp_capture": "Validación TP capture",
         "val_fn_rate": "Validación FN rate",
+        "test_balanced_f1": "Test Balanced F1",
         "test_pr_auc": "Test PR-AUC",
         "test_mcc": "Test MCC",
         "test_brier_score": "Test Brier",
+        "test_event_recall_approx": "Test event recall",
         "test_far": "Test FAR",
         "test_tp_capture": "Test TP capture",
         "test_fn_rate": "Test FN rate",
@@ -2614,6 +2642,51 @@ def _calibration_metric_lower_is_better(metric_col: str) -> bool:
         "val_fn_rate",
         "test_fn_rate",
     }
+
+
+def _calibration_default_progress_metric(
+    protocol: Dict[str, object],
+    metric_options: Dict[str, str],
+) -> Optional[str]:
+    if not metric_options:
+        return None
+    objective_metrics = protocol.get("objective_metrics")
+    objective_metric = None
+    if isinstance(objective_metrics, list) and objective_metrics:
+        objective_metric = str(objective_metrics[0])
+    elif protocol.get("objective_metric") is not None:
+        objective_metric = str(protocol.get("objective_metric"))
+
+    objective_candidates = {
+        "balanced_f1": ["val_balanced_f1"],
+        "brier_score": ["val_brier_score"],
+        "far": ["val_far"],
+        "fn_rate": ["val_fn_rate"],
+        "mcc": ["val_mcc"],
+        "pr_auc": ["val_pr_auc"],
+        "recall_at_alerts_per_day": ["val_tp_capture", "val_event_recall_approx"],
+        "roc_auc": ["val_roc_auc"],
+        "tp_capture": ["val_tp_capture"],
+    }
+    candidates = []
+    if objective_metric:
+        candidates.extend(
+            objective_candidates.get(objective_metric, [f"val_{objective_metric}"])
+        )
+    candidates.extend(
+        [
+            "val_balanced_f1",
+            "val_pr_auc",
+            "val_mcc",
+            "val_brier_score",
+            "val_tp_capture",
+            "val_fn_rate",
+        ]
+    )
+    for candidate in candidates:
+        if candidate in metric_options:
+            return candidate
+    return next(iter(metric_options))
 
 
 def _calibration_total_combos(protocol: Dict[str, object]) -> int:
@@ -2826,8 +2899,270 @@ def _calibration_progress_curve_df(
         work["best_so_far"] = work[metric_col].cummin()
     else:
         work["best_so_far"] = work[metric_col].cummax()
-    return work[["combo_index", metric_col, "best_so_far"]].rename(
+    context_cols = [
+        col
+        for col in [
+            "combo_id",
+            "optuna_objective_metric",
+            "objective_metric",
+            "objective_label",
+            "calibration_method",
+            "threshold_objective",
+            "threshold_objective_label",
+            "balance_mode",
+            "decision_threshold",
+        ]
+        if col in work.columns
+    ]
+    return work[["combo_index", metric_col, "best_so_far"] + context_cols].rename(
         columns={metric_col: "current_value"}
+    )
+
+
+def _calibration_progress_summary(
+    metric_curve_df: pd.DataFrame,
+    *,
+    metric_col: str,
+) -> Dict[str, object]:
+    if not isinstance(metric_curve_df, pd.DataFrame) or metric_curve_df.empty:
+        return {}
+    required_cols = {"combo_index", "current_value", "best_so_far"}
+    if not required_cols.issubset(metric_curve_df.columns):
+        return {}
+    work = metric_curve_df.copy()
+    for col in required_cols:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=list(required_cols))
+    if work.empty:
+        return {}
+    final_best_value = float(work["best_so_far"].iloc[-1])
+    if _calibration_metric_lower_is_better(metric_col):
+        best_rows = work[work["current_value"] <= final_best_value + 1e-12]
+    else:
+        best_rows = work[work["current_value"] >= final_best_value - 1e-12]
+    best_row = best_rows.iloc[0] if not best_rows.empty else work.iloc[-1]
+    return {
+        "best_value": final_best_value,
+        "best_combo_index": int(best_row["combo_index"]),
+        "observations": int(len(work)),
+        "direction_label": (
+            "menor es mejor"
+            if _calibration_metric_lower_is_better(metric_col)
+            else "mayor es mejor"
+        ),
+        "calibration_method": best_row.get("calibration_method"),
+        "threshold_objective": best_row.get(
+            "threshold_objective_label", best_row.get("threshold_objective")
+        ),
+        "balance_mode": best_row.get("balance_mode"),
+    }
+
+
+def _build_calibration_progress_chart(
+    metric_curve_df: pd.DataFrame,
+    *,
+    metric_col: str,
+    metric_label: str,
+):
+    import altair as alt
+
+    work = metric_curve_df.copy()
+    for col in ["combo_index", "current_value", "best_so_far"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=["combo_index", "current_value", "best_so_far"]).copy()
+    if work.empty:
+        return None
+
+    lower_is_better = _calibration_metric_lower_is_better(metric_col)
+    previous_best = work["best_so_far"].shift(1)
+    if lower_is_better:
+        work["is_improvement"] = previous_best.isna() | (
+            work["current_value"] < previous_best - 1e-12
+        )
+    else:
+        work["is_improvement"] = previous_best.isna() | (
+            work["current_value"] > previous_best + 1e-12
+        )
+    work["combo_index"] = work["combo_index"].astype(int)
+    work["current_value_label"] = work["current_value"].map(_format_decimal_es)
+    work["best_so_far_label"] = work["best_so_far"].map(_format_decimal_es)
+    work["combo_label"] = "Combinación " + work["combo_index"].astype(str)
+    context_cols = [
+        col
+        for col in [
+            "combo_label",
+            "calibration_method",
+            "threshold_objective",
+            "threshold_objective_label",
+            "balance_mode",
+            "decision_threshold",
+        ]
+        if col in work.columns
+    ]
+
+    observed_df = work[
+        ["combo_index", "current_value", "current_value_label"] + context_cols
+    ].rename(columns={"current_value": "value", "current_value_label": "value_label"})
+    observed_df["series_label"] = "Resultado observado"
+    best_df = work[
+        ["combo_index", "best_so_far", "best_so_far_label"] + context_cols
+    ].rename(columns={"best_so_far": "value", "best_so_far_label": "value_label"})
+    best_df["series_label"] = "Mejor acumulado"
+    improvement_df = work.loc[work["is_improvement"]].copy()
+    final_df = work.iloc[[-1]].copy()
+    final_df["annotation"] = "mejor: " + final_df["best_so_far_label"].astype(str)
+
+    min_value = float(min(work["current_value"].min(), work["best_so_far"].min()))
+    max_value = float(max(work["current_value"].max(), work["best_so_far"].max()))
+    value_span = max_value - min_value
+    if value_span <= 0:
+        value_span = max(abs(max_value) * 0.05, 0.01)
+    y_domain = [min_value - value_span * 0.10, max_value + value_span * 0.16]
+    if min_value >= 0 and y_domain[0] < 0:
+        y_domain[0] = 0.0
+    x_domain = [0.75, float(work["combo_index"].max()) + 1.25]
+
+    tooltip_base = [
+        alt.Tooltip("combo_label:N", title="Combinación"),
+        alt.Tooltip("series_label:N", title="Serie"),
+        alt.Tooltip("value_label:N", title=metric_label),
+    ]
+    tooltip_context = [("calibration_method", "Calibración")]
+    if "threshold_objective_label" in observed_df.columns:
+        tooltip_context.append(("threshold_objective_label", "Objetivo threshold"))
+    elif "threshold_objective" in observed_df.columns:
+        tooltip_context.append(("threshold_objective", "Objetivo threshold"))
+    tooltip_context.extend(
+        [
+            ("balance_mode", "Balanceo"),
+            ("decision_threshold", "Threshold"),
+        ]
+    )
+    for col, title in tooltip_context:
+        if col in observed_df.columns:
+            tooltip_base.append(alt.Tooltip(f"{col}:N", title=title))
+
+    colors = THESIS_CHART_COLORS
+    axis_label_expr = "replace(format(datum.value, '.4f'), '.', ',')"
+    base_x = alt.X(
+        "combo_index:Q",
+        axis=alt.Axis(
+            title="Combinaciones evaluadas",
+            format="d",
+            labelFlush=False,
+            grid=False,
+        ),
+        scale=alt.Scale(domain=x_domain, nice=False),
+    )
+    base_y = alt.Y(
+        "value:Q",
+        axis=alt.Axis(
+            title=metric_label,
+            labelExpr=axis_label_expr,
+            grid=True,
+        ),
+        scale=alt.Scale(domain=y_domain, nice=False, zero=False),
+    )
+    observed_line = (
+        alt.Chart(observed_df)
+        .mark_line(color=colors["ink_3"], strokeWidth=1.3, opacity=0.45)
+        .encode(x=base_x, y=base_y, tooltip=tooltip_base)
+    )
+    observed_points = (
+        alt.Chart(observed_df)
+        .mark_circle(
+            color=colors["paper"],
+            opacity=0.95,
+            size=54,
+            stroke=colors["ink_3"],
+            strokeWidth=1.2,
+        )
+        .encode(x=base_x, y=base_y, tooltip=tooltip_base)
+    )
+    best_line = (
+        alt.Chart(best_df)
+        .mark_line(
+            color=colors["accent"],
+            interpolate="step-after",
+            strokeWidth=3,
+        )
+        .encode(x=base_x, y=base_y, tooltip=tooltip_base)
+    )
+    improvement_points = (
+        alt.Chart(improvement_df)
+        .mark_circle(
+            color=colors["sage"],
+            size=92,
+            stroke=colors["paper"],
+            strokeWidth=1.5,
+        )
+        .encode(
+            x=alt.X("combo_index:Q", scale=alt.Scale(domain=x_domain, nice=False)),
+            y=alt.Y(
+                "current_value:Q",
+                scale=alt.Scale(domain=y_domain, nice=False, zero=False),
+            ),
+            tooltip=[
+                alt.Tooltip("combo_label:N", title="Nueva mejora"),
+                alt.Tooltip("current_value_label:N", title=metric_label),
+                *[
+                    alt.Tooltip(f"{col}:N", title=title)
+                    for col, title in tooltip_context
+                    if col in improvement_df.columns
+                ],
+            ],
+        )
+    )
+    best_rule = (
+        alt.Chart(final_df)
+        .mark_rule(color=colors["rule"], strokeDash=[5, 4], strokeWidth=1)
+        .encode(y=alt.Y("best_so_far:Q", scale=alt.Scale(domain=y_domain, nice=False)))
+    )
+    best_label = (
+        alt.Chart(final_df)
+        .mark_text(
+            align="left",
+            baseline="middle",
+            dx=9,
+            dy=-11,
+            color=colors["accent"],
+            font="Inter",
+            fontSize=13,
+            fontWeight=600,
+        )
+        .encode(
+            x=alt.X("combo_index:Q", scale=alt.Scale(domain=x_domain, nice=False)),
+            y=alt.Y(
+                "best_so_far:Q",
+                scale=alt.Scale(domain=y_domain, nice=False, zero=False),
+            ),
+            text="annotation:N",
+        )
+    )
+    return (
+        alt.layer(
+            observed_line,
+            observed_points,
+            best_rule,
+            best_line,
+            improvement_points,
+            best_label,
+        )
+        .properties(height=320, background=colors["paper"])
+        .configure_axis(
+            domainColor=colors["rule"],
+            gridColor=colors["rule_soft"],
+            labelColor=colors["ink_2"],
+            labelFont="Inter",
+            labelFontSize=12,
+            tickColor=colors["rule"],
+            titleColor=colors["ink"],
+            titleFont="Inter",
+            titleFontSize=13,
+            titleFontWeight=600,
+        )
+        .configure_view(stroke=colors["rule"], strokeWidth=1)
+        .interactive()
     )
 
 
@@ -5528,9 +5863,20 @@ def _render_calibration_experiment_live_view(data: Dict[str, object]) -> None:
             and key in grid_results_df.columns
         }
         if metric_options:
+            metric_keys = list(metric_options.keys())
+            default_metric = _calibration_default_progress_metric(
+                protocol,
+                metric_options,
+            )
+            default_metric_index = (
+                metric_keys.index(default_metric)
+                if default_metric in metric_keys
+                else 0
+            )
             selected_metric_label = st.selectbox(
                 "Métrica de avance",
                 options=list(metric_options.values()),
+                index=default_metric_index,
                 key=f"calibration_live_metric_{manifest.get('run_id') or 'current'}",
             )
             selected_metric = next(
@@ -5543,12 +5889,44 @@ def _render_calibration_experiment_live_view(data: Dict[str, object]) -> None:
                 metric_col=selected_metric,
             )
             if not metric_curve_df.empty:
-                st.line_chart(
-                    metric_curve_df.set_index("combo_index")[
-                        ["current_value", "best_so_far"]
-                    ],
-                    width="stretch",
+                progress_summary = _calibration_progress_summary(
+                    metric_curve_df,
+                    metric_col=selected_metric,
                 )
+                if progress_summary:
+                    st.caption(
+                        "Lectura: la línea principal muestra el mejor valor acumulado; "
+                        "los puntos destacados marcan nuevas mejoras; la línea tenue muestra "
+                        "cada combinación evaluada."
+                    )
+                    summary_text = (
+                        f"Mejor acumulado: "
+                        f"{_format_decimal_es(progress_summary.get('best_value'))} "
+                        f"en combinación {progress_summary.get('best_combo_index')} "
+                        f"de {progress_summary.get('observations')} "
+                        f"({progress_summary.get('direction_label')})."
+                    )
+                    st.caption(summary_text)
+                try:
+                    progress_chart = _build_calibration_progress_chart(
+                        metric_curve_df,
+                        metric_col=selected_metric,
+                        metric_label=selected_metric_label,
+                    )
+                    if progress_chart is not None:
+                        st.altair_chart(progress_chart, width="stretch")
+                    else:
+                        st.info("No hay datos numéricos suficientes para graficar.")
+                except ImportError:
+                    st.line_chart(
+                        metric_curve_df.set_index("combo_index")[
+                            ["current_value", "best_so_far"]
+                        ],
+                        width="stretch",
+                    )
+                    st.warning(
+                        "Altair no está instalado; se muestra el gráfico básico de Streamlit."
+                    )
             else:
                 st.info("Todavía no hay combinaciones completadas con esa métrica.")
         else:

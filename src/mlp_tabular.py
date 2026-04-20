@@ -144,12 +144,22 @@ class MLPConfig:
 
 
 class MLPNet(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, num_layers: int, dropout: float, num_classes: int = 2):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        dropout: float,
+        num_classes: int = 2,
+        use_batch_norm: bool = False,
+    ):
         super().__init__()
         layers: List[nn.Module] = []
         dim_in = in_dim
         for i in range(max(0, num_layers)):
             layers.append(nn.Linear(dim_in, hidden_dim))
+            if use_batch_norm:
+                layers.append(nn.BatchNorm1d(hidden_dim))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
             dim_in = hidden_dim

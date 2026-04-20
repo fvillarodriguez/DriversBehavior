@@ -513,6 +513,43 @@ def test_calibration_sweep_search_space_preserves_none_imbalance_knobs():
     assert "replacement" in balanced_rf_space["model"]
 
 
+def test_neural_network_search_space_accepts_phase1_opt_in_knobs():
+    runner = ExperimentsRunner(random_state=42)
+    y_train = pd.Series(([0] * 24) + ([1] * 6))
+
+    nn_space = runner._controlled_comparison_search_space(
+        model_name="Neural Network",
+        balance_mode="none",
+        search_space_config={
+            "nn": {
+                "use_batch_norm": [False, True],
+                "loss_function": ["cross_entropy", "focal"],
+                "focal_gamma": {"min": 1.0, "max": 2.0, "step": 1.0},
+                "focal_alpha": {"choices": [0.25, 0.75]},
+                "max_grad_norm": {"choices": [None, 1.0]},
+                "lr_scheduler": ["none", "reduce_on_plateau"],
+                "scheduler_factor": {"choices": [0.25]},
+                "scheduler_patience": {"choices": [1, 2]},
+                "min_lr": {"choices": [1e-6]},
+                "temperature_scaling": [False, True],
+            }
+        },
+        y_train=y_train,
+    )
+
+    model_space = nn_space["model"]
+    assert model_space["use_batch_norm"] == [False, True]
+    assert model_space["loss_function"] == ["cross_entropy", "focal"]
+    assert model_space["focal_gamma"] == [1.0, 2.0]
+    assert model_space["focal_alpha"] == [0.25, 0.75]
+    assert model_space["max_grad_norm"] == [None, 1.0]
+    assert model_space["lr_scheduler"] == ["none", "reduce_on_plateau"]
+    assert model_space["scheduler_factor"] == [0.25]
+    assert model_space["scheduler_patience"] == [1, 2]
+    assert model_space["min_lr"] == [1e-06]
+    assert model_space["temperature_scaling"] == [False, True]
+
+
 def test_run_calibration_sweep_persists_artifacts_and_ranks_on_validation(
     tmp_path, monkeypatch
 ):
