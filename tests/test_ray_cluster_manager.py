@@ -10,9 +10,11 @@ class FakeRunner:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
+        self.envs = []
 
     def run(self, args, *, cwd=manager.ROOT_DIR, timeout=30, env=None):
         self.calls.append(list(args))
+        self.envs.append(dict(env or {}))
         if self.responses:
             return self.responses.pop(0)
         return manager.CommandResult(ok=True, returncode=0, command=" ".join(args))
@@ -51,6 +53,22 @@ def test_build_head_start_args_uses_fixed_ray_ports():
     assert "--max-worker-port=10100" in args
     assert "--num-cpus=8" in args
     assert "--disable-usage-stats" in args
+
+
+def test_automatic_bridge_config_forces_default_bridge_profile():
+    config = manager.RayClusterConfig(
+        head_ip="192.168.1.10",
+        worker_ip="192.168.1.11",
+        netmask="255.255.255.0",
+        ssh_user="felipe",
+    )
+
+    normalized = manager.automatic_bridge_config(config)
+
+    assert normalized.head_ip == manager.DEFAULT_HEAD_IP
+    assert normalized.worker_ip == manager.DEFAULT_WORKER_IP
+    assert normalized.netmask == manager.DEFAULT_NETMASK
+    assert normalized.ssh_user == "felipe"
 
 
 def test_build_worker_start_script_uses_repo_and_calculated_cpus():
@@ -143,26 +161,29 @@ def test_import_public_key_rejects_invalid_payload(tmp_path: Path):
         manager.import_public_key("esto no es una llave valida", target_path=tmp_path / "authorized_keys")
 
 
-def test_check_config_warnings_reports_blank_private_key_path():
+def test_check_config_warnings_ignores_blank_private_key_path():
     warnings = manager.check_config_warnings(manager.RayClusterConfig(ssh_key_path=""))
 
-    assert "Ingrese la ruta de la llave SSH privada." in warnings
+    assert warnings == []
 
 
-def test_check_config_warnings_reports_pub_path_as_invalid_private_key():
+def test_check_config_warnings_ignores_pub_path_and_keeps_ssh_automatic():
     warnings = manager.check_config_warnings(manager.RayClusterConfig(ssh_key_path="~/.ssh/id_ed25519.pub"))
 
-    assert "La ruta configurada debe apuntar a la llave SSH privada, no al archivo .pub." in warnings
+    assert warnings == []
 
 
-def test_run_remote_script_reports_invalid_private_key_path():
+def test_run_remote_script_falls_back_to_automatic_private_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    private_key = tmp_path / "id_ed25519"
+    private_key.write_text("PRIVATE", encoding="utf-8")
+    monkeypatch.setattr(manager, "default_ssh_private_key_path", lambda: private_key)
     config = manager.RayClusterConfig(ssh_key_path="~/.ssh/id_ed25519.pub")
+    fake = FakeRunner([manager.CommandResult(ok=True, returncode=0, command="ssh")])
 
-    result = manager.run_remote_script(config, "echo ok")
+    result = manager.run_remote_script(config, "echo ok", runner=fake)
 
-    assert not result.ok
-    assert result.returncode == 2
-    assert ".pub" in result.stderr
+    assert result.ok
+    assert str(private_key) in fake.calls[0]
 
 
 def test_command_runner_reports_missing_executable():
@@ -189,6 +210,71 @@ def test_run_remote_script_uses_ssh_key_and_batch_mode():
     assert "BatchMode=yes" in call
     assert "felipe@10.10.10.2" in call
     assert call[-1].startswith("bash -lc ")
+
+
+def test_prepare_ssh_access_requests_password_when_ssh_is_not_ready(tmp_path: Path):
+    private_key = tmp_path / "id_ed25519"
+    private_key.write_text("PRIVATE", encoding="utf-8")
+    config = manager.RayClusterConfig(ssh_key_path=str(private_key))
+    fake = FakeRunner([manager.CommandResult(ok=False, returncode=255, stderr="Permission denied", command="ssh true")])
+
+    results = manager.prepare_ssh_access(config, password="", runner=fake)
+
+    assert len(results) == 2
+    assert results[0].ok
+    assert not results[1].ok
+    assert "password del worker" in results[1].stderr.lower()
+
+
+def test_bootstrap_ssh_access_uses_expect_and_ssh_copy_id(tmp_path: Path):
+    private_key = tmp_path / "id_ed25519"
+    public_key = tmp_path / "id_ed25519.pub"
+    private_key.write_text("PRIVATE", encoding="utf-8")
+    public_key.write_text("ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGZha2U= test@sumo\n", encoding="utf-8")
+    config = manager.RayClusterConfig(ssh_user="felipe", ssh_key_path=str(private_key))
+    fake = FakeRunner([manager.CommandResult(ok=True, returncode=0, command="expect")])
+
+    result = manager.bootstrap_ssh_access(config, "secret", runner=fake)
+
+    assert result.ok
+    call = fake.calls[0]
+    assert call[:2] == ["expect", "-c"]
+    assert call[4:7] == ["ssh-copy-id", "-i", str(public_key)]
+    assert call[-1] == "felipe@10.10.10.2"
+    assert fake.envs[0][manager.SSH_BOOTSTRAP_PASSWORD_ENV] == "secret"
+
+
+def test_configure_local_bridge_uses_macos_admin_prompt():
+    config = manager.RayClusterConfig()
+    fake = FakeRunner([manager.CommandResult(ok=True, returncode=0, command="osascript")])
+
+    result = manager.configure_local_bridge(config, runner=fake)
+
+    assert result.ok
+    call = fake.calls[0]
+    assert call[:2] == ["osascript", "-e"]
+    assert "networksetup -setmanual 'Thunderbolt Bridge' 10.10.10.1 255.255.255.252 0.0.0.0" in call[2]
+    assert "administrator privileges" in call[2]
+
+
+def test_configure_remote_bridge_uses_ssh_to_apply_worker_profile():
+    config = manager.RayClusterConfig(
+        ssh_user="felipe",
+        ssh_key_path="~/.ssh/id_ed25519",
+        remote_repo_path="/Users/felipe/Desktop/SUMO",
+    )
+    fake = FakeRunner([manager.CommandResult(ok=True, returncode=0, command="ssh")])
+
+    result = manager.configure_remote_bridge(config, runner=fake)
+
+    assert result.ok
+    call = fake.calls[0]
+    assert call[:2] == ["ssh", "-i"]
+    assert "felipe@10.10.10.2" in call
+    assert "networksetup -setmanual" in call[-1]
+    assert "Thunderbolt Bridge" in call[-1]
+    assert "10.10.10.2" in call[-1]
+    assert "255.255.255.252" in call[-1]
 
 
 def test_check_ports_available_reports_busy_port():

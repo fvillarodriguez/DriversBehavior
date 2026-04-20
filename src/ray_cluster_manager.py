@@ -9,7 +9,7 @@ import os
 import shlex
 import socket
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -17,6 +17,9 @@ from typing import Any, Iterable, Optional, Sequence
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT_DIR / "Resultados" / "ray_cluster"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+THUNDERBOLT_BRIDGE_NAME = "Thunderbolt Bridge"
+DEFAULT_SSH_PRIVATE_KEY_FILENAME = "id_ed25519"
+SSH_BOOTSTRAP_PASSWORD_ENV = "SUMO_RAY_SSH_PASSWORD"
 
 DEFAULT_HEAD_IP = "10.10.10.1"
 DEFAULT_WORKER_IP = "10.10.10.2"
@@ -179,6 +182,10 @@ def python_bin(root_dir: Path = ROOT_DIR) -> Path:
     return root_dir / ".venv" / "bin" / "python"
 
 
+def default_ssh_private_key_path() -> Path:
+    return Path.home() / ".ssh" / DEFAULT_SSH_PRIVATE_KEY_FILENAME
+
+
 def ssh_private_key_path(ssh_key_path: str) -> Path:
     raw_value = ssh_key_path.strip()
     if not raw_value:
@@ -194,6 +201,13 @@ def ssh_private_key_path(ssh_key_path: str) -> Path:
 def ssh_public_key_path(ssh_key_path: str) -> Path:
     private_key = ssh_private_key_path(ssh_key_path)
     return private_key.with_name(f"{private_key.name}.pub")
+
+
+def _resolved_ssh_private_key_target(config: RayClusterConfig) -> Path:
+    try:
+        return ssh_private_key_path(config.ssh_key_path)
+    except ValueError:
+        return default_ssh_private_key_path()
 
 
 def authorized_keys_path() -> Path:
@@ -226,15 +240,12 @@ def normalize_public_key(public_key: str) -> str:
 
 
 def read_public_key(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> str:
-    public_key_file = ssh_public_key_path(config.ssh_key_path)
+    private_key_file = resolved_ssh_private_key_path(config, runner=runner)
+    public_key_file = private_key_file.with_name(f"{private_key_file.name}.pub")
     if public_key_file.exists():
         payload = public_key_file.read_text(encoding="utf-8").strip()
         if payload:
             return normalize_public_key(payload)
-
-    private_key_file = ssh_private_key_path(config.ssh_key_path)
-    if not private_key_file.exists():
-        raise FileNotFoundError(f"No existe la llave SSH configurada: {private_key_file}")
 
     active_runner = runner or CommandRunner()
     result = active_runner.run(
@@ -287,7 +298,283 @@ def import_public_key(
 
 
 def bridge_manual_command(ip: str, netmask: str = DEFAULT_NETMASK) -> str:
-    return f"sudo networksetup -setmanual 'Thunderbolt Bridge' {shlex.quote(ip)} {shlex.quote(netmask)} 0.0.0.0"
+    return (
+        f"sudo networksetup -setmanual {shlex.quote(THUNDERBOLT_BRIDGE_NAME)} "
+        f"{shlex.quote(ip)} {shlex.quote(netmask)} 0.0.0.0"
+    )
+
+
+def automatic_bridge_config(config: RayClusterConfig) -> RayClusterConfig:
+    return replace(
+        config,
+        head_ip=DEFAULT_HEAD_IP,
+        worker_ip=DEFAULT_WORKER_IP,
+        netmask=DEFAULT_NETMASK,
+    )
+
+
+def _bridge_set_command(ip: str, netmask: str = DEFAULT_NETMASK) -> list[str]:
+    return [
+        "networksetup",
+        "-setmanual",
+        THUNDERBOLT_BRIDGE_NAME,
+        ip,
+        netmask,
+        "0.0.0.0",
+    ]
+
+
+def _macos_admin_command(args: Sequence[str]) -> list[str]:
+    shell_command = " ".join(shlex.quote(str(part)) for part in args)
+    applescript = f"do shell script {json.dumps(shell_command)} with administrator privileges"
+    return ["osascript", "-e", applescript]
+
+
+def configure_local_bridge(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> CommandResult:
+    active_runner = runner or CommandRunner()
+    effective = automatic_bridge_config(config)
+    return active_runner.run(
+        _macos_admin_command(_bridge_set_command(effective.head_ip, effective.netmask)),
+        timeout=max(20, effective.command_timeout_s),
+    )
+
+
+def _remote_bridge_apply_script(ip: str, netmask: str) -> str:
+    bridge_cmd = " ".join(shlex.quote(part) for part in _bridge_set_command(ip, netmask))
+    applescript = f"do shell script {json.dumps(bridge_cmd)} with administrator privileges"
+    return " || ".join(
+        [
+            f"osascript -e {shlex.quote(applescript)}",
+            f"sudo -n {bridge_cmd}",
+            bridge_cmd,
+        ]
+    )
+
+
+def configure_remote_bridge(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> CommandResult:
+    effective = automatic_bridge_config(config)
+    return run_remote_script(
+        effective,
+        _remote_bridge_apply_script(effective.worker_ip, effective.netmask),
+        runner=runner,
+        timeout=max(20, effective.command_timeout_s),
+    )
+
+
+def apply_automatic_bridge(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> list[CommandResult]:
+    active_runner = runner or CommandRunner()
+    effective = automatic_bridge_config(config)
+    return [
+        configure_local_bridge(effective, runner=active_runner),
+        configure_remote_bridge(effective, runner=active_runner),
+    ]
+
+
+def ensure_local_ssh_identity(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> tuple[CommandResult, Path]:
+    key_path = _resolved_ssh_private_key_target(config)
+    if key_path.exists() and key_path.is_file():
+        return (
+            CommandResult(
+                ok=True,
+                returncode=0,
+                stdout=f"Llave SSH local lista: {key_path}",
+                command="ssh key auto-detect",
+            ),
+            key_path,
+        )
+
+    ssh_dir = key_path.parent
+    ssh_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        ssh_dir.chmod(0o700)
+    except OSError:
+        pass
+
+    active_runner = runner or CommandRunner()
+    comment = f"{os.environ.get('USER', 'sumo')}@ray-cluster"
+    result = active_runner.run(
+        [
+            "ssh-keygen",
+            "-q",
+            "-t",
+            "ed25519",
+            "-f",
+            str(key_path),
+            "-N",
+            "",
+            "-C",
+            comment,
+        ],
+        timeout=min(20, max(10, int(config.command_timeout_s))),
+    )
+    if result.ok and key_path.exists():
+        return (
+            CommandResult(
+                ok=True,
+                returncode=0,
+                stdout=f"Llave SSH local generada: {key_path}",
+                command=result.command,
+            ),
+            key_path,
+        )
+    return (
+        CommandResult(
+            ok=False,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr or f"No se pudo generar la llave SSH local en {key_path}.",
+            command=result.command,
+            timed_out=result.timed_out,
+        ),
+        key_path,
+    )
+
+
+def resolved_ssh_private_key_path(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> Path:
+    result, key_path = ensure_local_ssh_identity(config, runner=runner)
+    if result.ok and key_path.exists():
+        return key_path
+    raise RuntimeError(result.combined_output or f"No se pudo preparar la llave SSH local en {key_path}.")
+
+
+def ssh_target(config: RayClusterConfig) -> str:
+    return f"{config.ssh_user}@{config.worker_ip}"
+
+
+def ssh_check(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 8,
+) -> CommandResult:
+    active_runner = runner or CommandRunner()
+    try:
+        args = [*ssh_base_args(config, runner=active_runner), "true"]
+    except (ValueError, RuntimeError) as exc:
+        return CommandResult(
+            ok=False,
+            returncode=2,
+            stderr=str(exc),
+            command="ssh true",
+        )
+    return active_runner.run(args, timeout=timeout)
+
+
+def _ssh_copy_id_expect_script() -> str:
+    return r"""
+set timeout 30
+set password $env(SUMO_RAY_SSH_PASSWORD)
+eval spawn $argv
+expect {
+    -re "(?i)continue connecting.*" {
+        send -- "yes\r"
+        exp_continue
+    }
+    -re "(?i)(password|contrasena|contraseña).*:" {
+        send -- "$password\r"
+        exp_continue
+    }
+    eof {
+        catch wait result
+        set rc [lindex $result 3]
+        exit $rc
+    }
+}
+"""
+
+
+def bootstrap_ssh_access(
+    config: RayClusterConfig,
+    password: str,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> CommandResult:
+    effective = automatic_bridge_config(config)
+    active_runner = runner or CommandRunner()
+    if not password.strip():
+        return CommandResult(
+            ok=False,
+            returncode=2,
+            stderr="Ingrese la password del worker para autorizar la llave SSH automaticamente.",
+            command="ssh-copy-id",
+        )
+    key_result, private_key = ensure_local_ssh_identity(effective, runner=active_runner)
+    if not key_result.ok:
+        return key_result
+    public_key = private_key.with_name(f"{private_key.name}.pub")
+    env = dict(os.environ)
+    env[SSH_BOOTSTRAP_PASSWORD_ENV] = password
+    return active_runner.run(
+        [
+            "expect",
+            "-c",
+            _ssh_copy_id_expect_script(),
+            "--",
+            "ssh-copy-id",
+            "-i",
+            str(public_key),
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            ssh_target(effective),
+        ],
+        timeout=min(45, max(15, int(effective.command_timeout_s) * 2)),
+        env=env,
+    )
+
+
+def prepare_ssh_access(
+    config: RayClusterConfig,
+    password: str = "",
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> list[CommandResult]:
+    effective = automatic_bridge_config(config)
+    active_runner = runner or CommandRunner()
+    key_result, _ = ensure_local_ssh_identity(effective, runner=active_runner)
+    if not key_result.ok:
+        return [key_result]
+
+    precheck = ssh_check(effective, runner=active_runner, timeout=8)
+    if precheck.ok:
+        return [key_result, precheck]
+
+    if not password.strip():
+        return [
+            key_result,
+            CommandResult(
+                ok=False,
+                returncode=2,
+                stderr=(
+                    "SSH aun no conecta. Ingrese la password del worker una sola vez para "
+                    "autorizar la llave automaticamente."
+                ),
+                command="ssh bootstrap required",
+            ),
+        ]
+
+    bootstrap = bootstrap_ssh_access(effective, password, runner=active_runner)
+    postcheck = ssh_check(effective, runner=active_runner, timeout=8)
+    return [key_result, bootstrap, postcheck]
 
 
 def build_head_start_args(config: RayClusterConfig, *, root_dir: Path = ROOT_DIR) -> list[str]:
@@ -331,8 +618,8 @@ def build_worker_start_script(config: RayClusterConfig) -> str:
     )
 
 
-def ssh_base_args(config: RayClusterConfig) -> list[str]:
-    private_key = ssh_private_key_path(config.ssh_key_path)
+def ssh_base_args(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> list[str]:
+    private_key = resolved_ssh_private_key_path(config, runner=runner)
     return [
         "ssh",
         "-i",
@@ -343,7 +630,7 @@ def ssh_base_args(config: RayClusterConfig) -> list[str]:
         "ConnectTimeout=5",
         "-o",
         "StrictHostKeyChecking=accept-new",
-        f"{config.ssh_user}@{config.worker_ip}",
+        ssh_target(config),
     ]
 
 
@@ -356,8 +643,8 @@ def run_remote_script(
 ) -> CommandResult:
     active_runner = runner or CommandRunner()
     try:
-        ssh_args = ssh_base_args(config)
-    except ValueError as exc:
+        ssh_args = ssh_base_args(config, runner=active_runner)
+    except (ValueError, RuntimeError) as exc:
         return CommandResult(
             ok=False,
             returncode=2,
@@ -502,40 +789,45 @@ def _result_detail(result: CommandResult, ok_message: str) -> str:
     return result.combined_output or f"Comando fallo con codigo {result.returncode}."
 
 
+def _bridge_expected_detail(ip: str, netmask: str) -> str:
+    return f"{THUNDERBOLT_BRIDGE_NAME} debe quedar en {ip}/{netmask}."
+
+
 def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> list[CheckResult]:
     active_runner = runner or CommandRunner()
+    effective = automatic_bridge_config(config)
     checks: list[CheckResult] = []
 
     local_bridge = active_runner.run(["ifconfig", "bridge0"], timeout=5)
     checks.append(
         CheckResult(
             "Thunderbolt local",
-            local_bridge.ok and _bridge_has_ip(local_bridge.stdout, config.head_ip) and _bridge_active(local_bridge.stdout),
+            local_bridge.ok and _bridge_has_ip(local_bridge.stdout, effective.head_ip) and _bridge_active(local_bridge.stdout),
             (
-                f"bridge0 activo con {config.head_ip}."
-                if local_bridge.ok and _bridge_has_ip(local_bridge.stdout, config.head_ip) and _bridge_active(local_bridge.stdout)
-                else f"Configure: {bridge_manual_command(config.head_ip, config.netmask)}"
+                f"bridge0 activo con {effective.head_ip}."
+                if local_bridge.ok and _bridge_has_ip(local_bridge.stdout, effective.head_ip) and _bridge_active(local_bridge.stdout)
+                else _bridge_expected_detail(effective.head_ip, effective.netmask)
             ),
             local_bridge.command,
         )
     )
 
-    ssh_check = active_runner.run([*ssh_base_args(config), "true"], timeout=8)
+    ssh_check = active_runner.run([*ssh_base_args(effective), "true"], timeout=8)
     checks.append(
         CheckResult(
             "SSH worker",
             ssh_check.ok,
-            _result_detail(ssh_check, f"SSH OK hacia {config.ssh_user}@{config.worker_ip}."),
+            _result_detail(ssh_check, f"SSH OK hacia {effective.ssh_user}@{effective.worker_ip}."),
             ssh_check.command,
         )
     )
 
-    ping_worker = active_runner.run(["ping", "-c", "2", "-W", "1000", config.worker_ip], timeout=6)
+    ping_worker = active_runner.run(["ping", "-c", "2", "-W", "1000", effective.worker_ip], timeout=6)
     checks.append(
         CheckResult(
             "Ping worker",
             ping_worker.ok,
-            _result_detail(ping_worker, f"{config.worker_ip} responde por Thunderbolt."),
+            _result_detail(ping_worker, f"{effective.worker_ip} responde por Thunderbolt."),
             ping_worker.command,
         )
     )
@@ -554,30 +846,30 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
     checks.append(
         CheckResult(
             "Ray local",
-            local_ray.ok and _version_ok(local_ray.combined_output, config.ray_version),
+            local_ray.ok and _version_ok(local_ray.combined_output, effective.ray_version),
             _result_detail(local_ray, local_ray.combined_output.strip()),
             local_ray.command,
         )
     )
 
     if ssh_check.ok:
-        remote_bridge = run_remote_script(config, "ifconfig bridge0", runner=active_runner, timeout=8)
+        remote_bridge = run_remote_script(effective, "ifconfig bridge0", runner=active_runner, timeout=8)
         checks.append(
             CheckResult(
                 "Thunderbolt worker",
-                remote_bridge.ok and _bridge_has_ip(remote_bridge.stdout, config.worker_ip) and _bridge_active(remote_bridge.stdout),
+                remote_bridge.ok and _bridge_has_ip(remote_bridge.stdout, effective.worker_ip) and _bridge_active(remote_bridge.stdout),
                 (
-                    f"bridge0 activo con {config.worker_ip}."
-                    if remote_bridge.ok and _bridge_has_ip(remote_bridge.stdout, config.worker_ip) and _bridge_active(remote_bridge.stdout)
-                    else f"Configure en worker: {bridge_manual_command(config.worker_ip, config.netmask)}"
+                    f"bridge0 activo con {effective.worker_ip}."
+                    if remote_bridge.ok and _bridge_has_ip(remote_bridge.stdout, effective.worker_ip) and _bridge_active(remote_bridge.stdout)
+                    else _bridge_expected_detail(effective.worker_ip, effective.netmask)
                 ),
                 remote_bridge.command,
             )
         )
 
         remote_python = run_remote_script(
-            config,
-            f"cd {shlex.quote(config.remote_repo_path)} && .venv/bin/python --version",
+            effective,
+            f"cd {shlex.quote(effective.remote_repo_path)} && .venv/bin/python --version",
             runner=active_runner,
             timeout=8,
         )
@@ -598,11 +890,11 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
         )
         checks.append(
             CheckResult(
-                "Ray worker",
-                remote_ray.ok and _version_ok(remote_ray.combined_output, config.ray_version),
-                _result_detail(remote_ray, remote_ray.combined_output.strip()),
-                remote_ray.command,
-            )
+            "Ray worker",
+            remote_ray.ok and _version_ok(remote_ray.combined_output, effective.ray_version),
+            _result_detail(remote_ray, remote_ray.combined_output.strip()),
+            remote_ray.command,
+        )
         )
     else:
         checks.extend(
@@ -613,7 +905,7 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
             ]
         )
 
-    stop_probe = stop_head(config, runner=active_runner)
+    stop_probe = stop_head(effective, runner=active_runner)
     checks.append(
         CheckResult(
             "ray stop local",
@@ -622,9 +914,9 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
             stop_probe.command,
         )
     )
-    checks.append(check_ports_available(config, runner=active_runner))
+    checks.append(check_ports_available(effective, runner=active_runner))
     if ssh_check.ok:
-        remote_stop = stop_worker(config, runner=active_runner)
+        remote_stop = stop_worker(effective, runner=active_runner)
         checks.append(
             CheckResult(
                 "ray stop worker",
@@ -633,7 +925,7 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
                 remote_stop.command,
             )
         )
-        checks.append(check_ports_available(config, remote=True, runner=active_runner))
+        checks.append(check_ports_available(effective, remote=True, runner=active_runner))
     else:
         checks.append(CheckResult("ray stop worker", False, "Omitido porque SSH no conecta."))
         checks.append(CheckResult("Puertos worker", False, "Omitido porque SSH no conecta."))
@@ -771,13 +1063,6 @@ def check_config_warnings(config: RayClusterConfig) -> list[str]:
         warnings.append("Ingrese el usuario SSH del worker.")
     if not config.remote_repo_path.strip():
         warnings.append("Ingrese la ruta del repo en el worker.")
-    try:
-        private_key = ssh_private_key_path(config.ssh_key_path)
-    except ValueError as exc:
-        warnings.append(str(exc))
-    else:
-        if not private_key.exists():
-            warnings.append(f"No existe la llave SSH privada configurada: {private_key}")
     if config.head_ip == config.worker_ip:
         warnings.append("Head y worker no pueden usar la misma IP.")
     return warnings

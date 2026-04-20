@@ -30,24 +30,33 @@ def _render_results(results: Iterable[ray_cluster.CommandResult]) -> None:
 
 
 def _config_from_widgets(current: ray_cluster.RayClusterConfig) -> ray_cluster.RayClusterConfig:
+    automatic = ray_cluster.automatic_bridge_config(current)
+    st.caption(
+        "Head y worker usan un perfil automatico de Thunderbolt Bridge. "
+        "Solo debes ajustar el usuario SSH, la ruta del repo y los recursos; la red queda fija y simple."
+    )
+
+    col_bridge_head, col_bridge_worker, col_bridge_mask = st.columns(3)
+    col_bridge_head.metric("Head (este Mac)", automatic.head_ip)
+    col_bridge_worker.metric("Worker (Mac remoto)", automatic.worker_ip)
+    col_bridge_mask.metric("Mascara", automatic.netmask)
+
     col_head, col_worker = st.columns(2)
     with col_head:
-        head_ip = st.text_input("IP head", value=current.head_ip, key="ray_head_ip")
         head_cpus = st.number_input(
             "CPUs Ray en head",
             min_value=1,
             max_value=128,
-            value=max(1, int(current.head_cpus)),
+            value=max(1, int(automatic.head_cpus)),
             step=1,
             key="ray_head_cpus",
         )
     with col_worker:
-        worker_ip = st.text_input("IP worker", value=current.worker_ip, key="ray_worker_ip")
         worker_reserved = st.number_input(
             "CPUs reservadas en worker",
             min_value=0,
             max_value=32,
-            value=max(0, int(current.worker_reserved_cpus)),
+            value=max(0, int(automatic.worker_reserved_cpus)),
             step=1,
             key="ray_worker_reserved_cpus",
         )
@@ -55,19 +64,19 @@ def _config_from_widgets(current: ray_cluster.RayClusterConfig) -> ray_cluster.R
     st.divider()
     col_ssh, col_repo = st.columns(2)
     with col_ssh:
-        ssh_user = st.text_input("Usuario SSH worker", value=current.ssh_user, key="ray_ssh_user")
-        ssh_key_path = st.text_input("Llave SSH privada", value=current.ssh_key_path, key="ray_ssh_key")
+        ssh_user = st.text_input("Usuario SSH worker", value=automatic.ssh_user, key="ray_ssh_user")
+        st.caption("La llave SSH se detecta o genera automaticamente en este Mac.")
     with col_repo:
         remote_repo_path = st.text_input(
             "Ruta repo en worker",
-            value=current.remote_repo_path,
+            value=automatic.remote_repo_path,
             key="ray_remote_repo_path",
         )
         command_timeout = st.number_input(
             "Timeout comandos (s)",
             min_value=5,
             max_value=300,
-            value=max(5, int(current.command_timeout_s)),
+            value=max(5, int(automatic.command_timeout_s)),
             step=5,
             key="ray_timeout",
         )
@@ -75,122 +84,48 @@ def _config_from_widgets(current: ray_cluster.RayClusterConfig) -> ray_cluster.R
     with st.expander("Puertos Ray fijos", expanded=False):
         st.caption("Estos puertos se mantienen fijos para facilitar firewall y diagnostico.")
         cols = st.columns(4)
-        cols[0].metric("Head", current.head_port)
-        cols[1].metric("Dashboard", current.dashboard_port)
-        cols[2].metric("Object manager", current.object_manager_port)
-        cols[3].metric("Ray Client", current.ray_client_port)
-        st.caption(f"Workers: {current.worker_port_min}-{current.worker_port_max}")
+        cols[0].metric("Head", automatic.head_port)
+        cols[1].metric("Dashboard", automatic.dashboard_port)
+        cols[2].metric("Object manager", automatic.object_manager_port)
+        cols[3].metric("Ray Client", automatic.ray_client_port)
+        st.caption(f"Workers: {automatic.worker_port_min}-{automatic.worker_port_max}")
 
-    return replace(
-        current,
-        head_ip=head_ip.strip(),
-        worker_ip=worker_ip.strip(),
-        ssh_user=ssh_user.strip(),
-        ssh_key_path=ssh_key_path.strip(),
-        remote_repo_path=remote_repo_path.strip(),
-        head_cpus=int(head_cpus),
-        worker_reserved_cpus=int(worker_reserved),
-        command_timeout_s=int(command_timeout),
+    return ray_cluster.automatic_bridge_config(
+        replace(
+            automatic,
+            ssh_user=ssh_user.strip(),
+            remote_repo_path=remote_repo_path.strip(),
+            head_cpus=int(head_cpus),
+            worker_reserved_cpus=int(worker_reserved),
+            command_timeout_s=int(command_timeout),
+        )
     )
 
 
-def _render_public_key_tools(config: ray_cluster.RayClusterConfig) -> None:
+def _render_ssh_auto_tools(config: ray_cluster.RayClusterConfig) -> None:
     st.divider()
-    st.subheader("Llaves publicas SSH")
+    st.subheader("SSH automatica")
     st.caption(
-        "Exporte la llave publica de este Mac para copiarla al otro nodo o importe una llave publica "
-        "en el archivo local authorized_keys."
-    )
-    st.info(
-        "Importar aqui solo agrega una llave al archivo local authorized_keys para aceptar conexiones entrantes. "
-        "El aviso superior depende de la ruta configurada en 'Llave SSH privada'."
+        "La app detecta o genera una llave local y puede autorizarla automaticamente en el worker. "
+        "La password solo se usa en el primer enlace."
     )
 
-    col_export, col_import = st.columns(2)
-    with col_export:
-        st.markdown("**Exportar llave publica**")
-        st.caption("Usa la llave SSH configurada arriba y busca el archivo .pub correspondiente.")
-        try:
-            private_key = ray_cluster.ssh_private_key_path(config.ssh_key_path)
-        except ValueError as exc:
-            st.warning(str(exc))
-            private_key = None
-        else:
-            if private_key.exists():
-                st.success(f"Llave privada configurada lista: {private_key}")
-            else:
-                st.warning(f"No existe la llave privada configurada: {private_key}")
-
-        detected_private_keys = ray_cluster.detect_private_keys()
-        if detected_private_keys and (
-            private_key is None or not private_key.exists() or private_key not in detected_private_keys
-        ):
-            st.caption("Llaves privadas detectadas en este Mac:")
-            for candidate in detected_private_keys:
-                label = f"Usar {candidate}"
-                if st.button(label, key=f"ray_use_detected_key_{candidate}", width="stretch"):
-                    st.session_state["ray_ssh_key"] = str(candidate)
-                    st.rerun()
-
-        if st.button("Cargar llave publica local", key="ray_export_public_key", width="stretch"):
-            try:
-                st.session_state["ray_exported_public_key"] = ray_cluster.read_public_key(config)
-                st.session_state.pop("ray_exported_public_key_error", None)
-            except Exception as exc:
-                st.session_state["ray_exported_public_key"] = None
-                st.session_state["ray_exported_public_key_error"] = str(exc)
-
-        export_error = st.session_state.get("ray_exported_public_key_error")
-        if export_error:
-            st.error(export_error)
-
-        exported_key = st.session_state.get("ray_exported_public_key")
-        if exported_key:
-            export_path = ray_cluster.ssh_public_key_path(config.ssh_key_path)
-            st.caption(f"Archivo sugerido: {export_path.name}")
-            st.code(exported_key, language="text")
-            st.download_button(
-                label="Descargar llave publica",
-                data=f"{exported_key}\n",
-                file_name=export_path.name,
-                mime="text/plain",
-                key="ray_download_public_key",
-            )
-
-    with col_import:
-        st.markdown("**Importar llave publica**")
-        st.caption(f"Destino local: {ray_cluster.authorized_keys_path()}")
-        uploaded_key = st.file_uploader(
-            "Archivo .pub",
-            type=["pub", "txt"],
-            key="ray_public_key_upload",
+    col_password, col_button = st.columns([2, 1])
+    with col_password:
+        password = st.text_input(
+            "Password del worker (solo si es la primera vez)",
+            type="password",
+            key="ray_worker_ssh_password",
         )
-        manual_key = st.text_area(
-            "O pegue la llave publica",
-            key="ray_public_key_import_text",
-            height=120,
-            placeholder="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...",
-        )
-        if st.button("Importar llave publica", type="primary", key="ray_import_public_key", width="stretch"):
-            candidate = ""
-            if uploaded_key is not None:
-                try:
-                    candidate = uploaded_key.getvalue().decode("utf-8")
-                except UnicodeDecodeError:
-                    st.error("El archivo cargado no es texto UTF-8 valido.")
-                    candidate = ""
-            if not candidate:
-                candidate = manual_key
+    with col_button:
+        st.write("")
+        if st.button("Preparar SSH", type="primary", key="ray_prepare_ssh", width="stretch"):
+            with st.spinner("Preparando SSH automatica..."):
+                st.session_state["ray_prepare_ssh_results"] = ray_cluster.prepare_ssh_access(config, password=password)
 
-            if not candidate.strip():
-                st.error("Pegue o cargue una llave publica antes de importar.")
-            else:
-                try:
-                    message = ray_cluster.import_public_key(candidate)
-                except Exception as exc:
-                    st.error(str(exc))
-                else:
-                    st.success(message)
+    prepare_results = st.session_state.get("ray_prepare_ssh_results")
+    if prepare_results:
+        _render_results(prepare_results)
 
 
 def _render_config_tab(config: ray_cluster.RayClusterConfig) -> ray_cluster.RayClusterConfig:
@@ -202,32 +137,52 @@ def _render_config_tab(config: ray_cluster.RayClusterConfig) -> ray_cluster.RayC
         for warning in warnings:
             st.warning(warning)
 
-    col_save, col_reload = st.columns([1, 5])
+    _render_ssh_auto_tools(updated)
+
+    col_auto, col_save, col_reload = st.columns([1, 1, 4])
+    with col_auto:
+        if st.button("Aplicar conexion automatica", type="primary", width="stretch"):
+            with st.spinner("Configurando Thunderbolt Bridge en head y worker..."):
+                st.session_state["ray_bridge_apply_results"] = ray_cluster.apply_automatic_bridge(updated)
+            results = st.session_state.get("ray_bridge_apply_results") or []
+            if results and all(result.ok for result in results):
+                ray_cluster.save_config(updated)
+                st.success("Thunderbolt Bridge configurado y perfil guardado.")
+            else:
+                st.warning("La configuracion automatica quedo incompleta. Revise la salida y, si hace falta, use el diagnostico manual.")
     with col_save:
-        if st.button("Guardar configuracion", type="primary", width="stretch"):
+        if st.button("Guardar configuracion", width="stretch"):
             ray_cluster.save_config(updated)
             st.success("Configuracion guardada.")
-            st.rerun()
     with col_reload:
         st.caption(f"Archivo: {ray_cluster.CONFIG_FILE}")
 
-    _render_public_key_tools(updated)
+    bridge_results = st.session_state.get("ray_bridge_apply_results")
+    if bridge_results:
+        st.divider()
+        st.subheader("Resultado de conexion automatica")
+        _render_results(bridge_results)
 
     st.divider()
-    st.subheader("Comandos para configurar Thunderbolt Bridge")
-    st.caption("Ejecutelos manualmente si macOS pide permisos de administrador.")
-    st.code(
-        "\n".join(
-            [
-                f"# Head ({ray_cluster.local_hostname()})",
-                ray_cluster.bridge_manual_command(updated.head_ip, updated.netmask),
-                "",
-                "# Worker",
-                ray_cluster.bridge_manual_command(updated.worker_ip, updated.netmask),
-            ]
-        ),
-        language="bash",
+    st.subheader("Sincronizacion head/worker")
+    st.caption(
+        "La conexion usa siempre el mismo perfil Thunderbolt Bridge. "
+        "Primero puedes preparar SSH automaticamente y luego aplicar la conexion Thunderbolt para dejar ambos Macs sincronizados."
     )
+    with st.expander("Diagnostico manual", expanded=False):
+        st.caption("Usa estos comandos solo si macOS o el worker no permiten la configuracion automatica.")
+        st.code(
+            "\n".join(
+                [
+                    f"# Head ({ray_cluster.local_hostname()})",
+                    ray_cluster.bridge_manual_command(updated.head_ip, updated.netmask),
+                    "",
+                    "# Worker",
+                    ray_cluster.bridge_manual_command(updated.worker_ip, updated.netmask),
+                ]
+            ),
+            language="bash",
+        )
     return updated
 
 
@@ -247,7 +202,7 @@ def _checks_to_dataframe(checks: list[ray_cluster.CheckResult]) -> pd.DataFrame:
 
 def _render_preflight_tab(config: ray_cluster.RayClusterConfig) -> None:
     st.subheader("Preflight")
-    st.caption("Valida red Thunderbolt, SSH, Python, Ray y deja procesos Ray detenidos antes de iniciar.")
+    st.caption("Valida el perfil automatico de Thunderbolt Bridge, SSH, Python, Ray y deja procesos Ray detenidos antes de iniciar.")
     if st.button("Ejecutar preflight", type="primary"):
         with st.spinner("Ejecutando validaciones..."):
             st.session_state["ray_preflight_checks"] = ray_cluster.run_preflight(config)
@@ -268,7 +223,7 @@ def _render_preflight_tab(config: ray_cluster.RayClusterConfig) -> None:
 
 def _render_control_tab(config: ray_cluster.RayClusterConfig) -> None:
     st.subheader("Control del cluster")
-    st.caption("La app corre en el head y administra el worker por SSH.")
+    st.caption("Este Mac opera como head y administra el worker por SSH sobre Thunderbolt Bridge.")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -389,11 +344,11 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
 
     st.title("Ray Cluster")
     st.markdown(
-        "Administra el cluster Ray por Thunderbolt Bridge desde Streamlit. "
-        "La app corre en el head y controla el worker por SSH con llave."
+        "Administra el cluster Ray con una conexion head/worker simple y fija sobre Thunderbolt Bridge. "
+        "La red se maneja con un perfil automatico y el head controla el worker por SSH con llave."
     )
 
-    config = ray_cluster.load_config()
+    config = ray_cluster.automatic_bridge_config(ray_cluster.load_config())
     tabs = st.tabs(["Configuracion", "Preflight", "Control", "Monitor", "Prueba distribuida"])
     with tabs[0]:
         config = _render_config_tab(config)
