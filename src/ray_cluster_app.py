@@ -4,6 +4,7 @@ Streamlit page for managing the local two-node Ray cluster.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import Iterable
 
@@ -27,6 +28,85 @@ def _render_results(results: Iterable[ray_cluster.CommandResult]) -> None:
         st.success("Operacion completada.")
     else:
         st.error("Una o mas operaciones fallaron.")
+
+
+def _check_state(check: ray_cluster.CheckResult) -> str:
+    if check.ok:
+        return "OK"
+    if check.blocking:
+        return "Bloqueante"
+    return "Advertencia"
+
+
+def _config_signature(config: ray_cluster.RayClusterConfig) -> str:
+    return json.dumps(ray_cluster.config_to_json_dict(config), sort_keys=True)
+
+
+def _action_blockers(
+    snapshot: ray_cluster.RayHealthSnapshot | None,
+    *,
+    stale: bool,
+    action: str,
+) -> list[ray_cluster.CheckResult]:
+    if stale or snapshot is None:
+        return [
+            ray_cluster.CheckResult(
+                name="Salud Ray",
+                ok=False,
+                detail="Actualice la salud del cluster para validar esta accion con la configuracion actual.",
+                blocking=True,
+            )
+        ]
+    action_checks = {
+        "head": snapshot.head_start_checks,
+        "worker": snapshot.worker_start_checks,
+        "cluster": snapshot.worker_start_checks,
+        "benchmark": snapshot.benchmark_checks,
+    }
+    return ray_cluster.blocking_checks(action_checks[action])
+
+
+def _render_blocker_notice(title: str, checks: list[ray_cluster.CheckResult]) -> None:
+    if not checks:
+        return
+    st.error(f"{title}\n{ray_cluster.checks_to_text(checks)}")
+
+
+def _render_health_console(config: ray_cluster.RayClusterConfig) -> tuple[ray_cluster.RayHealthSnapshot | None, bool]:
+    st.subheader("Salud del cluster")
+    st.caption(
+        "Resume entorno local, espacio en /tmp, GCS, dashboard y validacion de la ruta remota del worker."
+    )
+
+    signature = _config_signature(config)
+    refresh = st.button("Actualizar salud Ray", type="primary", key="ray_health_refresh")
+    if refresh or "ray_health_snapshot" not in st.session_state:
+        with st.spinner("Auditando salud de Ray..."):
+            st.session_state["ray_health_snapshot"] = ray_cluster.collect_health_snapshot(config)
+            st.session_state["ray_health_signature"] = signature
+
+    snapshot = st.session_state.get("ray_health_snapshot")
+    stale = st.session_state.get("ray_health_signature") != signature
+    if stale:
+        st.warning(
+            "La configuracion actual cambio desde el ultimo audit. Actualice la salud antes de iniciar, reiniciar o ejecutar benchmark."
+        )
+
+    if snapshot is None:
+        st.info("Actualice la salud del cluster para ver el estado actual.")
+        return None, True
+
+    cols = st.columns(len(snapshot.summary_checks))
+    for col, check in zip(cols, snapshot.summary_checks):
+        with col:
+            st.metric(check.name, _check_state(check))
+            st.caption(check.detail)
+
+    with st.expander("Checks detallados del entorno local", expanded=False):
+        df = _checks_to_dataframe(list(snapshot.local_environment_checks))
+        st.dataframe(df, width="stretch", hide_index=True)
+
+    return snapshot, stale
 
 
 def _config_from_widgets(current: ray_cluster.RayClusterConfig) -> ray_cluster.RayClusterConfig:
@@ -201,7 +281,7 @@ def _checks_to_dataframe(checks: list[ray_cluster.CheckResult]) -> pd.DataFrame:
         [
             {
                 "check": check.name,
-                "estado": "OK" if check.ok else "Pendiente",
+                "estado": _check_state(check),
                 "detalle": check.detail,
                 "comando": check.command,
             }
@@ -210,9 +290,15 @@ def _checks_to_dataframe(checks: list[ray_cluster.CheckResult]) -> pd.DataFrame:
     )
 
 
-def _render_preflight_tab(config: ray_cluster.RayClusterConfig) -> None:
+def _render_preflight_tab(
+    config: ray_cluster.RayClusterConfig,
+    snapshot: ray_cluster.RayHealthSnapshot | None,
+    stale: bool,
+) -> None:
     st.subheader("Preflight")
     st.caption("Usa el preflight que corresponde al rol de este Mac. En el worker local no se requiere SSH.")
+    if stale:
+        st.warning("El snapshot de salud esta desactualizado; el preflight ejecutara checks frescos con la configuracion actual.")
 
     preflight_head, preflight_worker = st.tabs(["Head / controlador", "Worker local"])
     with preflight_head:
@@ -250,49 +336,67 @@ def _render_checks(checks: list[ray_cluster.CheckResult], *, success_text: str) 
     df = _checks_to_dataframe(checks)
     st.dataframe(df, width="stretch", hide_index=True)
     ok_count = sum(1 for check in checks if check.ok)
-    st.metric("Checks OK", f"{ok_count}/{len(checks)}")
-    if ok_count == len(checks):
+    warning_count = sum(1 for check in checks if (not check.ok and not check.blocking))
+    blocking_count = sum(1 for check in checks if (not check.ok and check.blocking))
+    col_ok, col_warn, col_block = st.columns(3)
+    col_ok.metric("Checks OK", ok_count)
+    col_warn.metric("Advertencias", warning_count)
+    col_block.metric("Bloqueantes", blocking_count)
+    if warning_count == 0 and blocking_count == 0:
         st.success(success_text)
     else:
-        st.warning("Resuelva los checks pendientes antes de usar el cluster para trabajos reales.")
+        if blocking_count:
+            st.error("Resuelva los checks bloqueantes antes de usar el cluster para trabajos reales.")
+        if warning_count:
+            st.warning("Hay advertencias que conviene atender para evitar degradacion de Ray.")
 
 
-def _render_control_tab(config: ray_cluster.RayClusterConfig) -> None:
+def _render_control_tab(
+    config: ray_cluster.RayClusterConfig,
+    snapshot: ray_cluster.RayHealthSnapshot | None,
+    stale: bool,
+) -> None:
     st.subheader("Control del cluster")
     st.caption("El head se administra en el Mac 10.10.10.1. El worker local se administra en el Mac 10.10.10.2, sin SSH.")
+    head_blockers = _action_blockers(snapshot, stale=stale, action="head")
+    worker_blockers = _action_blockers(snapshot, stale=stale, action="worker")
+    cluster_blockers = _action_blockers(snapshot, stale=stale, action="cluster")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        if st.button("Iniciar head", type="primary", width="stretch"):
+        if st.button("Iniciar head", type="primary", width="stretch", disabled=bool(head_blockers)):
             with st.spinner("Iniciando head..."):
                 _render_result(ray_cluster.start_head(config))
         if st.button("Detener head", width="stretch"):
             with st.spinner("Deteniendo head..."):
                 _render_result(ray_cluster.stop_head(config))
     with col2:
-        if st.button("Iniciar worker remoto", width="stretch"):
+        if st.button("Iniciar worker remoto", width="stretch", disabled=bool(worker_blockers)):
             with st.spinner("Iniciando worker por SSH..."):
                 _render_result(ray_cluster.start_worker(config))
         if st.button("Detener worker remoto", width="stretch"):
             with st.spinner("Deteniendo worker por SSH..."):
                 _render_result(ray_cluster.stop_worker(config))
     with col3:
-        if st.button("Iniciar worker local", type="primary", width="stretch"):
+        if st.button("Iniciar worker local", type="primary", width="stretch", disabled=bool(head_blockers)):
             with st.spinner("Iniciando worker local..."):
                 _render_result(ray_cluster.start_local_worker(config))
         if st.button("Detener worker local", width="stretch"):
             with st.spinner("Deteniendo worker local..."):
                 _render_result(ray_cluster.stop_local_worker(config))
     with col4:
-        if st.button("Iniciar cluster", type="primary", width="stretch"):
+        if st.button("Iniciar cluster", type="primary", width="stretch", disabled=bool(cluster_blockers)):
             with st.spinner("Iniciando cluster completo..."):
                 _render_results(ray_cluster.start_cluster(config))
         if st.button("Detener cluster", width="stretch"):
             with st.spinner("Deteniendo cluster completo..."):
                 _render_results(ray_cluster.stop_cluster(config))
-        if st.button("Reiniciar cluster", width="stretch"):
+        if st.button("Reiniciar cluster", width="stretch", disabled=bool(cluster_blockers)):
             with st.spinner("Reiniciando cluster completo..."):
                 _render_results(ray_cluster.restart_cluster(config))
+
+    _render_blocker_notice("Head local bloqueado:", head_blockers)
+    _render_blocker_notice("Worker remoto / cluster bloqueado:", worker_blockers)
 
     st.divider()
     st.subheader("Comandos equivalentes")
@@ -302,7 +406,11 @@ def _render_control_tab(config: ray_cluster.RayClusterConfig) -> None:
     st.code(ray_cluster.build_worker_start_script(config), language="bash")
 
 
-def _render_monitor_tab(config: ray_cluster.RayClusterConfig) -> None:
+def _render_monitor_tab(
+    config: ray_cluster.RayClusterConfig,
+    snapshot: ray_cluster.RayHealthSnapshot | None,
+    stale: bool,
+) -> None:
     st.subheader("Monitor")
     col_status, col_dashboard = st.columns([1, 1])
     with col_status:
@@ -310,8 +418,24 @@ def _render_monitor_tab(config: ray_cluster.RayClusterConfig) -> None:
             with st.spinner("Consultando Ray..."):
                 st.session_state["ray_status_result"] = ray_cluster.ray_status(config)
     with col_dashboard:
-        st.link_button("Abrir dashboard Ray", config.dashboard_url, width="stretch")
-        st.caption(config.dashboard_url)
+        dashboard_ok = bool(snapshot and not stale and snapshot.dashboard_check.ok)
+        if dashboard_ok:
+            st.link_button("Abrir dashboard Ray", config.dashboard_url, width="stretch")
+            st.caption(config.dashboard_url)
+        else:
+            st.button("Dashboard no disponible", width="stretch", disabled=True, key="ray_dashboard_disabled")
+            if snapshot is not None:
+                st.caption(snapshot.dashboard_check.detail)
+            else:
+                st.caption(config.dashboard_url)
+
+    if stale:
+        st.warning("El snapshot de salud esta desactualizado; actualicelo para validar dashboard y GCS.")
+    elif snapshot is not None:
+        if not snapshot.gcs_check.ok:
+            st.error(snapshot.gcs_check.detail)
+        elif not snapshot.dashboard_check.ok:
+            st.warning(snapshot.dashboard_check.detail)
 
     status_result = st.session_state.get("ray_status_result")
     if status_result:
@@ -346,8 +470,13 @@ def _render_monitor_tab(config: ray_cluster.RayClusterConfig) -> None:
             st.code(logs.combined_output or "(sin logs)", language="text")
 
 
-def _render_benchmark_tab(config: ray_cluster.RayClusterConfig) -> None:
+def _render_benchmark_tab(
+    config: ray_cluster.RayClusterConfig,
+    snapshot: ray_cluster.RayHealthSnapshot | None,
+    stale: bool,
+) -> None:
     st.subheader("Prueba distribuida")
+    benchmark_blockers = _action_blockers(snapshot, stale=stale, action="benchmark")
     tasks = st.number_input(
         "Numero de tareas Ray",
         min_value=1,
@@ -356,11 +485,13 @@ def _render_benchmark_tab(config: ray_cluster.RayClusterConfig) -> None:
         step=10,
         key="ray_benchmark_tasks",
     )
-    if st.button("Ejecutar prueba distribuida", type="primary"):
+    if st.button("Ejecutar prueba distribuida", type="primary", disabled=bool(benchmark_blockers)):
         with st.spinner("Ejecutando benchmark Ray..."):
             result, payload = ray_cluster.run_distributed_benchmark(config, tasks=int(tasks))
             st.session_state["ray_benchmark_result"] = result
             st.session_state["ray_benchmark_payload"] = payload
+
+    _render_blocker_notice("Benchmark bloqueado:", benchmark_blockers)
 
     result = st.session_state.get("ray_benchmark_result")
     payload = st.session_state.get("ray_benchmark_payload")
@@ -393,17 +524,20 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
     )
 
     config = ray_cluster.automatic_bridge_config(ray_cluster.load_config())
+    health_placeholder = st.container()
     tabs = st.tabs(["Configuracion", "Preflight", "Control", "Monitor", "Prueba distribuida"])
     with tabs[0]:
         config = _render_config_tab(config)
+    with health_placeholder:
+        snapshot, stale = _render_health_console(config)
     with tabs[1]:
-        _render_preflight_tab(config)
+        _render_preflight_tab(config, snapshot, stale)
     with tabs[2]:
-        _render_control_tab(config)
+        _render_control_tab(config, snapshot, stale)
     with tabs[3]:
-        _render_monitor_tab(config)
+        _render_monitor_tab(config, snapshot, stale)
     with tabs[4]:
-        _render_benchmark_tab(config)
+        _render_benchmark_tab(config, snapshot, stale)
 
     if show_exit_button and st.button("Cerrar"):
         raise SystemExit(0)

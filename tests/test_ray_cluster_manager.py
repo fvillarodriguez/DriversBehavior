@@ -1,4 +1,6 @@
+from collections import namedtuple
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -232,6 +234,193 @@ def test_command_runner_timeout_normalizes_bytes_output(monkeypatch: pytest.Monk
     assert result.combined_output == "partial stdout\npartial stderr"
 
 
+def test_check_local_venv_sync_detects_stale_venv(tmp_path: Path):
+    venv_path = tmp_path / ".venv"
+    (venv_path / "bin").mkdir(parents=True)
+    (venv_path / "bin" / "python").write_text("", encoding="utf-8")
+    (venv_path / "bin" / "ray").write_text("", encoding="utf-8")
+    requirements_path = tmp_path / "requirements.txt"
+    requirements_path.write_text("ray[default]==2.53.0\n", encoding="utf-8")
+    os.utime(venv_path, (1, 1))
+    os.utime(requirements_path, (2, 2))
+
+    check = manager.check_local_venv_sync(
+        root_dir=tmp_path,
+        venv_path=venv_path,
+        requirements_path=requirements_path,
+    )
+
+    assert not check.ok
+    assert check.blocking
+    assert "mas antigua" in check.detail
+
+
+def test_check_local_ray_dependencies_reports_missing_modules():
+    fake = FakeRunner(
+        [
+            manager.CommandResult(
+                ok=False,
+                returncode=1,
+                stdout=json.dumps(
+                    {
+                        "missing": [
+                            {"module": "aiohttp_cors", "error": "ModuleNotFoundError: missing"},
+                            {"module": "opencensus", "error": "ModuleNotFoundError: missing"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                command="python -c",
+            )
+        ]
+    )
+
+    check = manager.check_local_ray_dependencies(runner=fake)
+
+    assert not check.ok
+    assert check.blocking
+    assert "aiohttp_cors" in check.detail
+    assert "opencensus" in check.detail
+
+
+def test_check_tmp_disk_headroom_warns_and_blocks(monkeypatch: pytest.MonkeyPatch):
+    disk_usage = namedtuple("disk_usage", ["total", "used", "free"])
+    gib = 1024**3
+
+    monkeypatch.setattr(
+        manager.shutil,
+        "disk_usage",
+        lambda path: disk_usage(total=400 * gib, used=365 * gib, free=35 * gib),
+    )
+    warning = manager.check_tmp_disk_headroom(Path("/tmp"))
+    assert not warning.ok
+    assert not warning.blocking
+    assert "poco margen" in warning.detail
+
+    monkeypatch.setattr(
+        manager.shutil,
+        "disk_usage",
+        lambda path: disk_usage(total=460 * gib, used=432 * gib, free=28 * gib),
+    )
+    near_limit = manager.check_tmp_disk_headroom(Path("/tmp"))
+    assert not near_limit.ok
+    assert not near_limit.blocking
+    assert "poco margen" in near_limit.detail
+
+    monkeypatch.setattr(
+        manager.shutil,
+        "disk_usage",
+        lambda path: disk_usage(total=100 * gib, used=96 * gib, free=4 * gib),
+    )
+    blocking = manager.check_tmp_disk_headroom(Path("/tmp"))
+    assert not blocking.ok
+    assert blocking.blocking
+    assert "Libere espacio" in blocking.detail
+
+
+def test_cleanup_local_ray_tmp_removes_all_sessions_when_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ray_tmp_root = tmp_path / "ray"
+    session_old = ray_tmp_root / "session_old"
+    session_latest_target = ray_tmp_root / "session_current"
+    session_old.mkdir(parents=True)
+    session_latest_target.mkdir(parents=True)
+    (session_old / "old.log").write_text("a" * 64, encoding="utf-8")
+    (session_latest_target / "latest.log").write_text("b" * 128, encoding="utf-8")
+    (ray_tmp_root / "session_latest").symlink_to(session_latest_target, target_is_directory=True)
+
+    monkeypatch.setattr(manager, "local_ray_processes_running", lambda **kwargs: False)
+
+    result = manager.cleanup_local_ray_tmp(ray_tmp_root)
+
+    assert result.attempted
+    assert result.bytes_freed >= 192
+    assert len(result.removed_paths) == 2
+    assert not session_old.exists()
+    assert not session_latest_target.exists()
+    assert not (ray_tmp_root / "session_latest").exists()
+
+
+def test_cleanup_local_ray_tmp_keeps_latest_session_when_ray_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ray_tmp_root = tmp_path / "ray"
+    session_old = ray_tmp_root / "session_old"
+    session_latest_target = ray_tmp_root / "session_current"
+    session_old.mkdir(parents=True)
+    session_latest_target.mkdir(parents=True)
+    (session_old / "old.log").write_text("a" * 64, encoding="utf-8")
+    (session_latest_target / "latest.log").write_text("b" * 128, encoding="utf-8")
+    (ray_tmp_root / "session_latest").symlink_to(session_latest_target, target_is_directory=True)
+
+    monkeypatch.setattr(manager, "local_ray_processes_running", lambda **kwargs: True)
+
+    result = manager.cleanup_local_ray_tmp(ray_tmp_root)
+
+    assert result.attempted
+    assert str(session_old) in result.removed_paths
+    assert str(session_latest_target) not in result.removed_paths
+    assert not session_old.exists()
+    assert session_latest_target.exists()
+    assert (ray_tmp_root / "session_latest").exists()
+
+
+def test_check_tmp_disk_headroom_attempts_cleanup_before_blocking(monkeypatch: pytest.MonkeyPatch):
+    disk_usage = namedtuple("disk_usage", ["total", "used", "free"])
+    gib = 1024**3
+    calls = iter(
+        [
+            disk_usage(total=100 * gib, used=72 * gib, free=28 * gib),
+            disk_usage(total=100 * gib, used=60 * gib, free=40 * gib),
+        ]
+    )
+
+    monkeypatch.setattr(manager.shutil, "disk_usage", lambda path: next(calls))
+    monkeypatch.setattr(
+        manager,
+        "cleanup_local_ray_tmp",
+        lambda ray_tmp_root, runner=None, timeout=5: manager.TmpRayCleanupResult(
+            attempted=True,
+            bytes_freed=12 * gib,
+            removed_paths=(str(ray_tmp_root / "session_old"),),
+        ),
+    )
+
+    check = manager.check_tmp_disk_headroom(Path("/tmp"), attempt_cleanup=True)
+
+    assert check.ok
+    assert not check.blocking
+    assert "Limpieza automatica de Ray libero" in check.detail
+    assert "Hay margen suficiente" in check.detail
+
+
+def test_check_remote_repo_path_reports_invalid_repo():
+    config = manager.RayClusterConfig(
+        ssh_user="felipe",
+        worker_ip="10.10.10.2",
+        remote_repo_path="/Users/felipe/Desktop/Tesis",
+    )
+    fake = FakeRunner(
+        [
+            manager.CommandResult(
+                ok=False,
+                returncode=1,
+                stdout="Ruta remota invalida: faltan .venv/bin/ray en /Users/felipe/Desktop/Tesis",
+                command="ssh",
+            )
+        ]
+    )
+
+    check = manager.check_remote_repo_path(config, runner=fake)
+
+    assert not check.ok
+    assert check.blocking
+    assert "Ruta remota invalida" in check.detail
+
+
 def test_run_remote_script_uses_ssh_key_and_batch_mode(tmp_path: Path):
     private_key = tmp_path / "id_ed25519"
     private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
@@ -376,7 +565,10 @@ Demands:
     assert summary["usage"] == {"CPU": "2.0/16.0", "memory": "0.0/32.0"}
 
 
-def test_run_preflight_skips_remote_checks_when_ssh_fails(tmp_path: Path):
+def test_run_preflight_skips_remote_checks_when_ssh_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     private_key = tmp_path / "id_ed25519"
     private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
     config = manager.RayClusterConfig(ssh_key_path=str(private_key))
@@ -391,6 +583,7 @@ def test_run_preflight_skips_remote_checks_when_ssh_fails(tmp_path: Path):
             manager.CommandResult(ok=True, returncode=0, stdout="Puertos libres\n", command="ports"),
         ]
     )
+    monkeypatch.setattr(manager, "head_start_health_checks", lambda config, runner=None: [])
 
     checks = manager.run_preflight(config, runner=fake)
     by_name = {check.name: check for check in checks}
@@ -401,3 +594,49 @@ def test_run_preflight_skips_remote_checks_when_ssh_fails(tmp_path: Path):
     assert by_name["Python worker"].detail == "Omitido porque SSH no conecta."
     assert by_name["Puertos head"].ok
     assert by_name["Puertos worker"].detail == "Omitido porque SSH no conecta."
+
+
+def test_start_cluster_returns_health_failure_when_blocked(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        manager,
+        "worker_start_health_checks",
+        lambda config, runner=None: [
+            manager.CheckResult(
+                name="Disco /tmp",
+                ok=False,
+                detail="sin margen para Ray",
+                blocking=True,
+            )
+        ],
+    )
+
+    results = manager.start_cluster(manager.RayClusterConfig(), runner=FakeRunner([]))
+
+    assert len(results) == 1
+    assert not results[0].ok
+    assert "sin margen para Ray" in results[0].stderr
+
+
+def test_run_distributed_benchmark_refuses_when_health_blocked(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        manager,
+        "runtime_connection_health_checks",
+        lambda config, runner=None: [
+            manager.CheckResult(
+                name="GCS head",
+                ok=False,
+                detail="Ray no responde",
+                blocking=True,
+            )
+        ],
+    )
+    fake = FakeRunner([])
+
+    result, payload = manager.run_distributed_benchmark(
+        manager.RayClusterConfig(),
+        runner=fake,
+    )
+
+    assert not result.ok
+    assert payload is None
+    assert fake.calls == []

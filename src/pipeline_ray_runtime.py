@@ -53,6 +53,14 @@ def connect_ray_cluster(*, ray_module: Any | None = None) -> RayClusterRuntime:
     config = ray_cluster_manager.automatic_bridge_config(
         ray_cluster_manager.load_config()
     )
+    blockers = ray_cluster_manager.blocking_checks(
+        ray_cluster_manager.runtime_connection_health_checks(config)
+    )
+    if blockers:
+        raise RuntimeError(
+            "No se puede conectar al Ray Cluster hasta corregir estos checks:\n"
+            + ray_cluster_manager.checks_to_text(blockers)
+        )
     status = ray_cluster_manager.ray_status(config)
     if not status.ok:
         detail = status.combined_output or "Ray Cluster no responde."

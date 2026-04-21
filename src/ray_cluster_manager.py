@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import time
@@ -28,6 +29,18 @@ DEFAULT_NETMASK = "255.255.255.252"
 DEFAULT_RAY_VERSION = "2.53.0"
 DEFAULT_WORKER_PORT_MIN = 10002
 DEFAULT_WORKER_PORT_MAX = 10100
+DISK_WARNING_USED_RATIO = 0.90
+DISK_WARNING_FREE_BYTES = 30 * 1024**3
+DISK_BLOCK_USED_RATIO = 0.95
+DISK_BLOCK_FREE_BYTES = 20 * 1024**3
+RAY_TMP_ROOT = Path("/tmp/ray")
+REQUIRED_RAY_PYTHON_MODULES = (
+    "ray",
+    "aiohttp_cors",
+    "opencensus",
+    "opentelemetry",
+    "prometheus_client",
+)
 RAY_MACOS_CLUSTER_ENV = {
     "RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER": "1",
     "RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL": "minor",
@@ -115,6 +128,37 @@ class CheckResult:
     ok: bool
     detail: str
     command: str = ""
+    blocking: bool = False
+
+
+@dataclass(frozen=True)
+class RayHealthSnapshot:
+    local_environment_checks: tuple[CheckResult, ...]
+    local_environment_summary: CheckResult
+    disk_check: CheckResult
+    gcs_check: CheckResult
+    dashboard_check: CheckResult
+    remote_repo_check: CheckResult
+    head_start_checks: tuple[CheckResult, ...]
+    worker_start_checks: tuple[CheckResult, ...]
+    benchmark_checks: tuple[CheckResult, ...]
+
+    @property
+    def summary_checks(self) -> tuple[CheckResult, ...]:
+        return (
+            self.local_environment_summary,
+            self.disk_check,
+            self.gcs_check,
+            self.dashboard_check,
+            self.remote_repo_check,
+        )
+
+
+@dataclass(frozen=True)
+class TmpRayCleanupResult:
+    attempted: bool
+    bytes_freed: int = 0
+    removed_paths: tuple[str, ...] = ()
 
 
 class CommandRunner:
@@ -199,6 +243,163 @@ def ray_bin(root_dir: Path = ROOT_DIR) -> Path:
 
 def python_bin(root_dir: Path = ROOT_DIR) -> Path:
     return root_dir / ".venv" / "bin" / "python"
+
+
+def requirements_file(root_dir: Path = ROOT_DIR) -> Path:
+    return root_dir / "requirements.txt"
+
+
+def format_gib(num_bytes: int) -> str:
+    return f"{num_bytes / (1024**3):.1f} GiB"
+
+
+def _disk_headroom_stats(path: Path) -> tuple[int, int, float, float]:
+    usage = shutil.disk_usage(path)
+    total = max(1, int(usage.total))
+    free = int(usage.free)
+    used_ratio = 1.0 - (free / total)
+    used_pct = used_ratio * 100.0
+    return total, free, used_ratio, used_pct
+
+
+def _path_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_symlink():
+        return 0
+    if path.is_file():
+        try:
+            return int(path.stat().st_size)
+        except OSError:
+            return 0
+
+    total = 0
+    for root, _, files in os.walk(path, topdown=True):
+        for filename in files:
+            candidate = Path(root) / filename
+            try:
+                if candidate.is_symlink():
+                    continue
+                total += int(candidate.stat().st_size)
+            except OSError:
+                continue
+    return total
+
+
+def local_ray_processes_running(
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 5,
+) -> bool:
+    active_runner = runner or CommandRunner()
+    result = active_runner.run(
+        [
+            "bash",
+            "-lc",
+            "pgrep -f 'raylet|gcs_server|dashboard.py|log_monitor.py|runtime_env_agent|ray::' >/dev/null",
+        ],
+        cwd=ROOT_DIR,
+        timeout=timeout,
+    )
+    return result.returncode == 0
+
+
+def cleanup_local_ray_tmp(
+    ray_tmp_root: Path = RAY_TMP_ROOT,
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 5,
+) -> TmpRayCleanupResult:
+    if not ray_tmp_root.exists():
+        return TmpRayCleanupResult(attempted=False)
+
+    active_runner = runner or CommandRunner()
+    ray_active = local_ray_processes_running(runner=active_runner, timeout=timeout)
+    latest_link = ray_tmp_root / "session_latest"
+    latest_target: Optional[Path] = None
+    if latest_link.exists() or latest_link.is_symlink():
+        try:
+            latest_target = latest_link.resolve(strict=False)
+        except OSError:
+            latest_target = None
+
+    attempted = False
+    freed_bytes = 0
+    removed_paths: list[str] = []
+    for entry in sorted(ray_tmp_root.iterdir()):
+        if entry.name == "session_latest" or not entry.name.startswith("session_"):
+            continue
+        attempted = True
+        try:
+            resolved_entry = entry.resolve(strict=False)
+        except OSError:
+            resolved_entry = entry
+        if ray_active and latest_target is not None and resolved_entry == latest_target:
+            continue
+        freed_bytes += _path_size_bytes(entry)
+        try:
+            if entry.is_symlink() or entry.is_file():
+                entry.unlink()
+            else:
+                shutil.rmtree(entry)
+            removed_paths.append(str(entry))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+
+    if latest_link.is_symlink():
+        remove_latest_link = False
+        if not ray_active:
+            remove_latest_link = True
+        elif latest_target is not None and not latest_target.exists():
+            remove_latest_link = True
+        if remove_latest_link:
+            attempted = True
+            try:
+                latest_link.unlink()
+            except OSError:
+                pass
+
+    return TmpRayCleanupResult(
+        attempted=attempted,
+        bytes_freed=freed_bytes,
+        removed_paths=tuple(removed_paths),
+    )
+
+
+def blocking_checks(checks: Iterable[CheckResult]) -> list[CheckResult]:
+    return [check for check in checks if not check.ok and check.blocking]
+
+
+def warning_checks(checks: Iterable[CheckResult]) -> list[CheckResult]:
+    return [check for check in checks if not check.ok and not check.blocking]
+
+
+def checks_to_text(checks: Iterable[CheckResult]) -> str:
+    lines = []
+    for check in checks:
+        level = "BLOQUEANTE" if check.blocking else "ADVERTENCIA"
+        lines.append(f"- [{level}] {check.name}: {check.detail}")
+    return "\n".join(lines)
+
+
+def _summary_detail(checks: Iterable[CheckResult], success_detail: str) -> str:
+    failed = [check.detail for check in checks if not check.ok and check.detail.strip()]
+    if failed:
+        return " | ".join(failed[:3])
+    return success_detail
+
+
+def summarize_checks(name: str, checks: Iterable[CheckResult], *, success_detail: str) -> CheckResult:
+    materialized = list(checks)
+    failed = [check for check in materialized if not check.ok]
+    return CheckResult(
+        name=name,
+        ok=not failed,
+        detail=_summary_detail(materialized, success_detail),
+        blocking=any(check.blocking for check in failed),
+    )
 
 
 def ray_process_env() -> dict[str, str]:
@@ -870,6 +1071,13 @@ def stop_local_worker(config: RayClusterConfig, *, runner: Optional[CommandRunne
 
 def start_local_worker(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> CommandResult:
     active_runner = runner or CommandRunner()
+    blockers = blocking_checks(head_start_health_checks(config, runner=active_runner))
+    if blockers:
+        return health_failure_result(
+            blockers,
+            command="ray start worker local",
+            prefix="No se puede iniciar el worker local mientras existan checks bloqueantes.",
+        )
     stop_local_worker(config, runner=active_runner)
     return run_background_command(
         build_worker_start_args(config, block=True),
@@ -883,6 +1091,13 @@ def start_local_worker(config: RayClusterConfig, *, runner: Optional[CommandRunn
 
 def start_head(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> CommandResult:
     active_runner = runner or CommandRunner()
+    blockers = blocking_checks(head_start_health_checks(config, runner=active_runner))
+    if blockers:
+        return health_failure_result(
+            blockers,
+            command="ray start --head",
+            prefix="No se puede iniciar el head mientras existan checks bloqueantes.",
+        )
     stop_head(config, runner=active_runner)
     return active_runner.run(
         build_head_start_args(config),
@@ -902,6 +1117,13 @@ def stop_worker(config: RayClusterConfig, *, runner: Optional[CommandRunner] = N
 
 
 def start_worker(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> CommandResult:
+    blockers = blocking_checks(worker_start_health_checks(config, runner=runner))
+    if blockers:
+        return health_failure_result(
+            blockers,
+            command="ray start worker remoto",
+            prefix="No se puede iniciar el worker remoto mientras existan checks bloqueantes.",
+        )
     return run_remote_script(
         config,
         build_worker_start_script(config),
@@ -920,6 +1142,15 @@ def stop_cluster(config: RayClusterConfig, *, runner: Optional[CommandRunner] = 
 
 def start_cluster(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> list[CommandResult]:
     active_runner = runner or CommandRunner()
+    blockers = blocking_checks(worker_start_health_checks(config, runner=active_runner))
+    if blockers:
+        return [
+            health_failure_result(
+                blockers,
+                command="ray start cluster",
+                prefix="No se puede iniciar el cluster mientras existan checks bloqueantes.",
+            )
+        ]
     head = start_head(config, runner=active_runner)
     worker = start_worker(config, runner=active_runner) if head.ok else CommandResult(
         ok=False,
@@ -996,6 +1227,7 @@ def check_ports_available(
         result.ok,
         result.combined_output or ("Puertos libres" if result.ok else "No se pudo verificar puertos."),
         result.command,
+        blocking=not result.ok,
     )
 
 
@@ -1011,6 +1243,7 @@ def check_worker_ports_available(
         result.ok,
         result.combined_output or ("Puertos worker libres" if result.ok else "No se pudo verificar puertos worker."),
         result.command,
+        blocking=not result.ok,
     )
 
 
@@ -1055,10 +1288,386 @@ def _tcp_check(
     return active_runner.run(["python3", "-c", script, host, str(port)], timeout=timeout)
 
 
+def check_local_venv_sync(
+    *,
+    root_dir: Path = ROOT_DIR,
+    venv_path: Optional[Path] = None,
+    requirements_path: Optional[Path] = None,
+) -> CheckResult:
+    effective_venv = (venv_path or (root_dir / ".venv")).expanduser()
+    effective_requirements = (requirements_path or requirements_file(root_dir)).expanduser()
+    if not effective_requirements.exists():
+        return CheckResult(
+            "Venv local",
+            False,
+            f"No existe {effective_requirements}.",
+            blocking=True,
+        )
+    if not effective_venv.exists():
+        return CheckResult(
+            "Venv local",
+            False,
+            f"No existe {effective_venv}.",
+            blocking=True,
+        )
+    python_path = effective_venv / "bin" / "python"
+    ray_path = effective_venv / "bin" / "ray"
+    missing = [str(path.relative_to(effective_venv)) for path in (python_path, ray_path) if not path.exists()]
+    if missing:
+        return CheckResult(
+            "Venv local",
+            False,
+            f"La venv local no esta completa; faltan {', '.join(missing)}.",
+            blocking=True,
+        )
+    if effective_venv.stat().st_mtime < effective_requirements.stat().st_mtime:
+        return CheckResult(
+            "Venv local",
+            False,
+            (
+                f"La venv local ({effective_venv}) es mas antigua que {effective_requirements.name}. "
+                "Resincronice dependencias antes de usar Ray."
+            ),
+            blocking=True,
+        )
+    return CheckResult(
+        "Venv local",
+        True,
+        f"Venv local sincronizada con {effective_requirements.name}.",
+    )
+
+
+def check_local_python_version(
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 5,
+) -> CheckResult:
+    active_runner = runner or CommandRunner()
+    result = active_runner.run([str(python_bin()), "--version"], timeout=timeout)
+    return CheckResult(
+        "Python local",
+        result.ok and "Python 3.12" in result.combined_output,
+        _result_detail(result, result.combined_output.strip() or "Python 3.12 detectado."),
+        result.command,
+        blocking=not (result.ok and "Python 3.12" in result.combined_output),
+    )
+
+
+def check_local_ray_version(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 5,
+) -> CheckResult:
+    active_runner = runner or CommandRunner()
+    result = active_runner.run([str(ray_bin()), "--version"], timeout=timeout)
+    ok = result.ok and _version_ok(result.combined_output, config.ray_version)
+    return CheckResult(
+        "Ray local",
+        ok,
+        _result_detail(result, result.combined_output.strip() or f"Ray {config.ray_version} detectado."),
+        result.command,
+        blocking=not ok,
+    )
+
+
+def check_local_ray_dependencies(
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 10,
+) -> CheckResult:
+    active_runner = runner or CommandRunner()
+    script = (
+        "import importlib, json, sys\n"
+        "missing = []\n"
+        "for name in sys.argv[1:]:\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except Exception as exc:\n"
+        "        missing.append({'module': name, 'error': f'{type(exc).__name__}: {exc}'})\n"
+        "if missing:\n"
+        "    print(json.dumps({'missing': missing}, ensure_ascii=False))\n"
+        "    raise SystemExit(1)\n"
+        "print('OK')\n"
+    )
+    result = active_runner.run(
+        [str(python_bin()), "-c", script, *REQUIRED_RAY_PYTHON_MODULES],
+        timeout=timeout,
+    )
+    if result.ok:
+        return CheckResult(
+            "Extras Ray local",
+            True,
+            "Extras de dashboard y metrics presentes en la venv local.",
+            result.command,
+        )
+
+    missing_modules = []
+    payload = result.stdout.strip()
+    if payload.startswith("{"):
+        try:
+            data = json.loads(payload)
+            missing_modules = [entry.get("module", "") for entry in data.get("missing", []) if entry.get("module")]
+        except Exception:
+            missing_modules = []
+    if missing_modules:
+        detail = (
+            "Faltan modulos de Ray en la venv local: "
+            + ", ".join(missing_modules)
+            + ". Reinstale requirements.txt para recuperar dashboard y metrics."
+        )
+    else:
+        detail = _result_detail(
+            result,
+            "No se pudo validar los extras de Ray en la venv local.",
+        )
+    return CheckResult(
+        "Extras Ray local",
+        False,
+        detail,
+        result.command,
+        blocking=True,
+    )
+
+
+def check_tmp_disk_headroom(
+    path: Path = Path("/tmp"),
+    *,
+    attempt_cleanup: bool = False,
+    runner: Optional[CommandRunner] = None,
+    ray_tmp_root: Optional[Path] = None,
+) -> CheckResult:
+    _, free, used_ratio, used_pct = _disk_headroom_stats(path)
+    cleanup_result: Optional[TmpRayCleanupResult] = None
+    needs_attention = used_ratio >= DISK_WARNING_USED_RATIO or free < DISK_WARNING_FREE_BYTES
+    if attempt_cleanup and needs_attention:
+        cleanup_result = cleanup_local_ray_tmp(
+            ray_tmp_root=(ray_tmp_root or (path / "ray")),
+            runner=runner,
+        )
+        if cleanup_result.attempted and cleanup_result.bytes_freed > 0:
+            _, free, used_ratio, used_pct = _disk_headroom_stats(path)
+
+    detail_parts = [f"{path} usa {used_pct:.1f}% del volumen y deja {format_gib(free)} libres."]
+    if cleanup_result and cleanup_result.attempted:
+        if cleanup_result.bytes_freed > 0:
+            detail_parts.append(
+                "Limpieza automatica de Ray libero "
+                f"{format_gib(cleanup_result.bytes_freed)} en {len(cleanup_result.removed_paths)} sesiones."
+            )
+        else:
+            detail_parts.append(
+                "La limpieza automatica de Ray no encontro temporales ociosos suficientes para liberar espacio."
+            )
+    detail = " ".join(detail_parts)
+    if used_ratio >= DISK_BLOCK_USED_RATIO or free < DISK_BLOCK_FREE_BYTES:
+        suffix = (
+            " La limpieza automatica no alcanzo el margen minimo requerido por Ray."
+            if cleanup_result and cleanup_result.attempted
+            else " Libere espacio antes de iniciar Ray."
+        )
+        return CheckResult(
+            "Disco /tmp",
+            False,
+            detail + suffix,
+            blocking=True,
+        )
+    if used_ratio >= DISK_WARNING_USED_RATIO or free < DISK_WARNING_FREE_BYTES:
+        return CheckResult(
+            "Disco /tmp",
+            False,
+            detail + " Hay poco margen para spill y logs de Ray.",
+            blocking=False,
+        )
+    return CheckResult(
+        "Disco /tmp",
+        True,
+        detail + " Hay margen suficiente para Ray.",
+    )
+
+
+def check_gcs_health(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 10,
+) -> CheckResult:
+    result = ray_status(config, runner=runner, timeout=timeout)
+    return CheckResult(
+        "GCS head",
+        result.ok,
+        _result_detail(result, f"Ray responde en {config.ray_address}."),
+        result.command,
+        blocking=not result.ok,
+    )
+
+
+def check_dashboard_available(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 5,
+) -> CheckResult:
+    active_runner = runner or CommandRunner()
+    result = active_runner.run(
+        ["bash", "-lc", f"lsof -nP -iTCP:{config.dashboard_port} -sTCP:LISTEN"],
+        cwd=ROOT_DIR,
+        timeout=timeout,
+    )
+    if result.ok:
+        return CheckResult(
+            "Dashboard Ray",
+            True,
+            f"Dashboard disponible en {config.dashboard_url}.",
+            result.command,
+        )
+    return CheckResult(
+        "Dashboard Ray",
+        False,
+        (
+            f"Dashboard no disponible en {config.dashboard_url}. "
+            "Si el head esta iniciado, revise la instalacion de ray[default] y dashboard.log."
+        ),
+        result.command,
+        blocking=False,
+    )
+
+
+def check_remote_repo_path(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 10,
+) -> CheckResult:
+    repo_path = config.remote_repo_path.strip()
+    if not config.ssh_user.strip():
+        return CheckResult(
+            "Repo worker",
+            False,
+            "Falta el usuario SSH del worker.",
+            blocking=True,
+        )
+    if not repo_path:
+        return CheckResult(
+            "Repo worker",
+            False,
+            "Falta la ruta del repo en el worker.",
+            blocking=True,
+        )
+    script = (
+        f"repo={shlex.quote(repo_path)}; "
+        "[ -d \"$repo\" ] || { echo \"Ruta remota inexistente: $repo\"; exit 1; }; "
+        "missing=''; "
+        "for rel in .venv/bin/python .venv/bin/ray requirements.txt; do "
+        "[ -e \"$repo/$rel\" ] || missing=\"$missing $rel\"; "
+        "done; "
+        "if [ -n \"$missing\" ]; then "
+        "echo \"Ruta remota invalida: faltan$missing en $repo\"; exit 1; "
+        "fi; "
+        "echo \"Ruta remota valida: $repo\""
+    )
+    result = run_remote_script(config, script, runner=runner, timeout=timeout)
+    return CheckResult(
+        "Repo worker",
+        result.ok,
+        _result_detail(result, f"Ruta remota valida: {repo_path}."),
+        result.command,
+        blocking=not result.ok,
+    )
+
+
+def local_ray_environment_checks(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> list[CheckResult]:
+    return [
+        check_local_venv_sync(),
+        check_local_python_version(runner=runner),
+        check_local_ray_version(config, runner=runner),
+        check_local_ray_dependencies(runner=runner),
+    ]
+
+
+def head_start_health_checks(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> list[CheckResult]:
+    return [
+        *local_ray_environment_checks(config, runner=runner),
+        check_tmp_disk_headroom(attempt_cleanup=True, runner=runner),
+    ]
+
+
+def worker_start_health_checks(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> list[CheckResult]:
+    return [
+        *head_start_health_checks(config, runner=runner),
+        check_remote_repo_path(config, runner=runner),
+    ]
+
+
+def runtime_connection_health_checks(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> list[CheckResult]:
+    return [
+        *head_start_health_checks(config, runner=runner),
+        check_gcs_health(config, runner=runner),
+    ]
+
+
+def collect_health_snapshot(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> RayHealthSnapshot:
+    active_runner = runner or CommandRunner()
+    local_env_checks = tuple(local_ray_environment_checks(config, runner=active_runner))
+    disk_check = check_tmp_disk_headroom(attempt_cleanup=True, runner=active_runner)
+    gcs_check = check_gcs_health(config, runner=active_runner)
+    dashboard_check = check_dashboard_available(config, runner=active_runner)
+    remote_repo_check = check_remote_repo_path(config, runner=active_runner)
+    head_checks = tuple([*local_env_checks, disk_check])
+    worker_checks = tuple([*head_checks, remote_repo_check])
+    benchmark_checks = tuple([*head_checks, gcs_check])
+    return RayHealthSnapshot(
+        local_environment_checks=local_env_checks,
+        local_environment_summary=summarize_checks(
+            "Entorno local Ray",
+            local_env_checks,
+            success_detail="Entorno local Ray listo para head, worker y dashboard.",
+        ),
+        disk_check=disk_check,
+        gcs_check=gcs_check,
+        dashboard_check=dashboard_check,
+        remote_repo_check=remote_repo_check,
+        head_start_checks=head_checks,
+        worker_start_checks=worker_checks,
+        benchmark_checks=benchmark_checks,
+    )
+
+
+def health_failure_result(checks: Iterable[CheckResult], *, command: str, prefix: str) -> CommandResult:
+    return CommandResult(
+        ok=False,
+        returncode=2,
+        stderr=f"{prefix}\n{checks_to_text(checks)}",
+        command=command,
+    )
+
+
 def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> list[CheckResult]:
     active_runner = runner or CommandRunner()
     effective = automatic_bridge_config(config)
     checks: list[CheckResult] = []
+
+    checks.extend(head_start_health_checks(effective, runner=active_runner))
 
     local_bridge = active_runner.run(["ifconfig", "bridge0"], timeout=5)
     checks.append(
@@ -1071,16 +1680,18 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
                 else _bridge_expected_detail(effective.head_ip, effective.netmask)
             ),
             local_bridge.command,
+            blocking=True,
         )
     )
 
-    ssh_check = active_runner.run([*ssh_base_args(effective), "true"], timeout=8)
+    ssh_result = ssh_check(effective, runner=active_runner, timeout=8)
     checks.append(
         CheckResult(
             "SSH worker",
-            ssh_check.ok,
-            _result_detail(ssh_check, f"SSH OK hacia {effective.ssh_user}@{effective.worker_ip}."),
-            ssh_check.command,
+            ssh_result.ok,
+            _result_detail(ssh_result, f"SSH OK hacia {effective.ssh_user}@{effective.worker_ip}."),
+            ssh_result.command,
+            blocking=True,
         )
     )
 
@@ -1091,30 +1702,11 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
             ping_worker.ok,
             _result_detail(ping_worker, f"{effective.worker_ip} responde por Thunderbolt."),
             ping_worker.command,
+            blocking=False,
         )
     )
 
-    local_python = active_runner.run([str(python_bin()), "--version"], timeout=5)
-    checks.append(
-        CheckResult(
-            "Python local",
-            local_python.ok and "Python 3.12" in local_python.combined_output,
-            _result_detail(local_python, local_python.combined_output.strip()),
-            local_python.command,
-        )
-    )
-
-    local_ray = active_runner.run([str(ray_bin()), "--version"], timeout=5)
-    checks.append(
-        CheckResult(
-            "Ray local",
-            local_ray.ok and _version_ok(local_ray.combined_output, effective.ray_version),
-            _result_detail(local_ray, local_ray.combined_output.strip()),
-            local_ray.command,
-        )
-    )
-
-    if ssh_check.ok:
+    if ssh_result.ok:
         remote_bridge = run_remote_script(effective, "ifconfig bridge0", runner=active_runner, timeout=8)
         checks.append(
             CheckResult(
@@ -1126,46 +1718,58 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
                     else _bridge_expected_detail(effective.worker_ip, effective.netmask)
                 ),
                 remote_bridge.command,
+                blocking=True,
             )
         )
 
-        remote_python = run_remote_script(
-            effective,
-            f"cd {shlex.quote(effective.remote_repo_path)} && .venv/bin/python --version",
-            runner=active_runner,
-            timeout=8,
-        )
-        checks.append(
-            CheckResult(
-                "Python worker",
-                remote_python.ok and "Python 3.12" in remote_python.combined_output,
-                _result_detail(remote_python, remote_python.combined_output.strip()),
-                remote_python.command,
+        repo_worker = check_remote_repo_path(effective, runner=active_runner, timeout=8)
+        checks.append(repo_worker)
+        if repo_worker.ok:
+            remote_python = run_remote_script(
+                effective,
+                f"cd {shlex.quote(effective.remote_repo_path)} && .venv/bin/python --version",
+                runner=active_runner,
+                timeout=8,
             )
-        )
+            checks.append(
+                CheckResult(
+                    "Python worker",
+                    remote_python.ok and "Python 3.12" in remote_python.combined_output,
+                    _result_detail(remote_python, remote_python.combined_output.strip()),
+                    remote_python.command,
+                    blocking=not (remote_python.ok and "Python 3.12" in remote_python.combined_output),
+                )
+            )
 
-        remote_ray = run_remote_script(
-            config,
-            f"cd {shlex.quote(config.remote_repo_path)} && .venv/bin/ray --version",
-            runner=active_runner,
-            timeout=8,
-        )
-        checks.append(
-            CheckResult(
-            "Ray worker",
-            remote_ray.ok and _version_ok(remote_ray.combined_output, effective.ray_version),
-            _result_detail(remote_ray, remote_ray.combined_output.strip()),
-            remote_ray.command,
-        )
-        )
+            remote_ray = run_remote_script(
+                effective,
+                f"cd {shlex.quote(effective.remote_repo_path)} && .venv/bin/ray --version",
+                runner=active_runner,
+                timeout=8,
+            )
+            checks.append(
+                CheckResult(
+                    "Ray worker",
+                    remote_ray.ok and _version_ok(remote_ray.combined_output, effective.ray_version),
+                    _result_detail(remote_ray, remote_ray.combined_output.strip()),
+                    remote_ray.command,
+                    blocking=not (remote_ray.ok and _version_ok(remote_ray.combined_output, effective.ray_version)),
+                )
+            )
+        else:
+            checks.extend(
+                [
+                    CheckResult("Python worker", False, "Omitido porque la ruta remota del repo es invalida."),
+                    CheckResult("Ray worker", False, "Omitido porque la ruta remota del repo es invalida."),
+                ]
+            )
     else:
-        checks.extend(
-            [
-                CheckResult("Thunderbolt worker", False, "Omitido porque SSH no conecta."),
-                CheckResult("Python worker", False, "Omitido porque SSH no conecta."),
-                CheckResult("Ray worker", False, "Omitido porque SSH no conecta."),
-            ]
+        checks.append(
+            CheckResult("Thunderbolt worker", False, "Omitido porque SSH no conecta.")
         )
+        checks.append(CheckResult("Repo worker", False, "Omitido porque SSH no conecta.", blocking=True))
+        checks.append(CheckResult("Python worker", False, "Omitido porque SSH no conecta."))
+        checks.append(CheckResult("Ray worker", False, "Omitido porque SSH no conecta."))
 
     stop_probe = stop_head(effective, runner=active_runner)
     checks.append(
@@ -1177,7 +1781,7 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
         )
     )
     checks.append(check_ports_available(effective, runner=active_runner))
-    if ssh_check.ok:
+    if ssh_result.ok:
         remote_stop = stop_worker(effective, runner=active_runner)
         checks.append(
             CheckResult(
@@ -1198,7 +1802,7 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
 def run_worker_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> list[CheckResult]:
     active_runner = runner or CommandRunner()
     effective = automatic_bridge_config(config)
-    checks: list[CheckResult] = []
+    checks: list[CheckResult] = head_start_health_checks(effective, runner=active_runner)
 
     local_bridge = active_runner.run(["ifconfig", "bridge0"], timeout=5)
     bridge_ok = (
@@ -1216,6 +1820,7 @@ def run_worker_preflight(config: RayClusterConfig, *, runner: Optional[CommandRu
                 else _bridge_expected_detail(effective.worker_ip, effective.netmask)
             ),
             local_bridge.command,
+            blocking=True,
         )
     )
 
@@ -1226,6 +1831,7 @@ def run_worker_preflight(config: RayClusterConfig, *, runner: Optional[CommandRu
             ping_head.ok,
             _result_detail(ping_head, f"{effective.head_ip} responde por Thunderbolt."),
             ping_head.command,
+            blocking=False,
         )
     )
 
@@ -1236,26 +1842,7 @@ def run_worker_preflight(config: RayClusterConfig, *, runner: Optional[CommandRu
             head_gcs.ok,
             _result_detail(head_gcs, f"Head Ray escucha en {effective.ray_address}."),
             head_gcs.command,
-        )
-    )
-
-    local_python = active_runner.run([str(python_bin()), "--version"], timeout=5)
-    checks.append(
-        CheckResult(
-            "Python worker local",
-            local_python.ok and "Python 3.12" in local_python.combined_output,
-            _result_detail(local_python, local_python.combined_output.strip()),
-            local_python.command,
-        )
-    )
-
-    local_ray = active_runner.run([str(ray_bin()), "--version"], timeout=5)
-    checks.append(
-        CheckResult(
-            "Ray worker local",
-            local_ray.ok and _version_ok(local_ray.combined_output, effective.ray_version),
-            _result_detail(local_ray, local_ray.combined_output.strip()),
-            local_ray.command,
+            blocking=True,
         )
     )
 
@@ -1266,6 +1853,7 @@ def run_worker_preflight(config: RayClusterConfig, *, runner: Optional[CommandRu
             status.ok,
             _result_detail(status, f"Ray responde desde {effective.ray_address}."),
             status.command,
+            blocking=not status.ok,
         )
     )
 
@@ -1381,6 +1969,16 @@ def run_distributed_benchmark(
     timeout: int = 60,
 ) -> tuple[CommandResult, Optional[dict[str, Any]]]:
     active_runner = runner or CommandRunner()
+    blockers = blocking_checks(runtime_connection_health_checks(config, runner=active_runner))
+    if blockers:
+        return (
+            health_failure_result(
+                blockers,
+                command="ray distributed benchmark",
+                prefix="No se puede ejecutar el benchmark mientras existan checks bloqueantes.",
+            ),
+            None,
+        )
     result = active_runner.run(
         [str(python_bin()), "-c", build_benchmark_script(config, tasks=tasks)],
         cwd=ROOT_DIR,

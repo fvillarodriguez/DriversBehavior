@@ -29,15 +29,97 @@ create_env() {
   fi
 }
 
+venv_is_stale() {
+  if [ ! -d ".venv" ] || [ ! -f "requirements.txt" ]; then
+    return 0
+  fi
+
+  .venv/bin/python - <<'PY'
+from pathlib import Path
+
+venv = Path(".venv")
+requirements = Path("requirements.txt")
+raise SystemExit(0 if venv.stat().st_mtime < requirements.stat().st_mtime else 1)
+PY
+}
+
+ray_runtime_audit() {
+  local output=""
+  if output="$(
+    .venv/bin/python - <<'PY' 2>&1
+import importlib
+import json
+from src import ray_cluster_manager as manager
+
+missing = []
+for module_name in manager.REQUIRED_RAY_PYTHON_MODULES:
+    try:
+        importlib.import_module(module_name)
+    except Exception as exc:
+        missing.append({"module": module_name, "error": f"{type(exc).__name__}: {exc}"})
+
+if missing:
+    print(json.dumps({"missing": missing}, ensure_ascii=False))
+    raise SystemExit(1)
+
+print("ray_runtime_ok")
+PY
+  )"; then
+    RAY_RUNTIME_AUDIT_OUTPUT="$output"
+    return 0
+  fi
+
+  RAY_RUNTIME_AUDIT_OUTPUT="$output"
+  return 1
+}
+
+repair_ray_runtime_if_needed() {
+  local needs_repair=0
+
+  if venv_is_stale; then
+    echo "Detected outdated .venv relative to requirements.txt. Reinstalling dependencies..."
+    needs_repair=1
+  fi
+
+  if ! ray_runtime_audit; then
+    echo "Detected incomplete Ray runtime in .venv."
+    if [ -n "${RAY_RUNTIME_AUDIT_OUTPUT:-}" ]; then
+      echo "$RAY_RUNTIME_AUDIT_OUTPUT"
+    fi
+    needs_repair=1
+  fi
+
+  if [ "$needs_repair" -eq 0 ]; then
+    return
+  fi
+
+  if [ ! -f "requirements.txt" ]; then
+    echo "requirements.txt not found. Cannot repair Ray runtime."
+    exit 1
+  fi
+
+  echo "Repairing local Python environment from requirements.txt..."
+  pip install -r "requirements.txt"
+  touch ".venv"
+
+  if ! ray_runtime_audit; then
+    echo "Ray runtime audit failed after reinstall. Streamlit will not start."
+    if [ -n "${RAY_RUNTIME_AUDIT_OUTPUT:-}" ]; then
+      echo "$RAY_RUNTIME_AUDIT_OUTPUT"
+    fi
+    echo "Run 'pip install -r requirements.txt' manually and verify the missing Ray extras."
+    exit 1
+  fi
+}
+
 if [ -f ".venv/bin/activate" ]; then
   # shellcheck disable=SC1091
   source ".venv/bin/activate"
-elif [ -f "venv/bin/activate" ]; then
-  # shellcheck disable=SC1091
-  source "venv/bin/activate"
 else
   create_env
 fi
+
+repair_ray_runtime_if_needed
 
 load_env_file() {
   local env_file="$1"

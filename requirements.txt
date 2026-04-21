@@ -37,3 +37,14 @@ shap
 latexmk
 psutil
 ray[default]==2.53.0
+aiohttp-cors
+colorful
+opencensus
+opentelemetry-exporter-prometheus
+opentelemetry-proto
+opentelemetry-sdk>=1.30.0
+prometheus-client>=0.7.1
+py-spy>=0.2.0; python_version < '3.12'
+py-spy>=0.4.0; python_version >= '3.12'
+smart-open
+virtualenv!=20.21.1,>=20.0.24

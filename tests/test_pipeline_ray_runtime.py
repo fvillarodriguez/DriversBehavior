@@ -48,6 +48,11 @@ def test_connect_ray_cluster_uses_saved_address_and_alive_nodes(monkeypatch):
         "ray_status",
         lambda config: fake_status,
     )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "runtime_connection_health_checks",
+        lambda config: [],
+    )
 
     runtime = runtime_module.connect_ray_cluster(ray_module=fake_ray)
 
@@ -80,8 +85,43 @@ def test_connect_ray_cluster_raises_when_status_is_not_ok(monkeypatch):
         "ray_status",
         lambda config: fake_status,
     )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "runtime_connection_health_checks",
+        lambda config: [],
+    )
 
     with pytest.raises(RuntimeError, match="cluster down"):
+        runtime_module.connect_ray_cluster(ray_module=_FakeRayModule())
+
+
+def test_connect_ray_cluster_raises_when_health_checks_block(monkeypatch):
+    fake_config = SimpleNamespace(ray_address="ray://cluster")
+
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "load_config",
+        lambda: fake_config,
+    )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "automatic_bridge_config",
+        lambda config: config,
+    )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "runtime_connection_health_checks",
+        lambda config: [
+            runtime_module.ray_cluster_manager.CheckResult(
+                name="Disco /tmp",
+                ok=False,
+                detail="sin margen para Ray",
+                blocking=True,
+            )
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="sin margen para Ray"):
         runtime_module.connect_ray_cluster(ray_module=_FakeRayModule())
 
 
