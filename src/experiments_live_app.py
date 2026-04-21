@@ -19,6 +19,7 @@ from src.drift_bias_variance import (
     build_bias_variance_noise_lookup,
     drift_row_group_key,
 )
+from src.pipeline_ray_runtime import EXECUTION_BACKEND_LOCAL
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
@@ -3602,6 +3603,30 @@ def _render_controlled_comparison_live_view(
     if not objective_label:
         objective_label = objective_metric.upper()
 
+    def _meta_or_df_value(column_name: str, default: object = None) -> object:
+        if column_name in meta and meta.get(column_name) not in [None, "", []]:
+            return meta.get(column_name)
+        if column_name in plot_df.columns:
+            values = plot_df[column_name].dropna()
+            if not values.empty:
+                return values.iloc[0]
+        return default
+
+    execution_backend = str(
+        _meta_or_df_value("execution_backend", EXECUTION_BACKEND_LOCAL)
+    ).strip() or EXECUTION_BACKEND_LOCAL
+    ray_requested = _meta_or_df_value("ray_requested_trial_concurrency")
+    ray_effective = _meta_or_df_value("ray_effective_trial_concurrency")
+    ray_trial_cpus = _meta_or_df_value("ray_trial_cpus")
+    ray_active_nodes = _meta_or_df_value("ray_active_nodes")
+    ray_hosts_used = _meta_or_df_value("ray_hosts_used", [])
+    if isinstance(ray_hosts_used, str):
+        try:
+            parsed_hosts = json.loads(ray_hosts_used)
+        except Exception:
+            parsed_hosts = [ray_hosts_used]
+        ray_hosts_used = parsed_hosts if isinstance(parsed_hosts, list) else []
+
     metric_col = (
         "val_objective_score"
         if "val_objective_score" in plot_df.columns
@@ -3672,16 +3697,27 @@ def _render_controlled_comparison_live_view(
     st.caption(
         f"Objetivo: {objective_label} | "
         f"Eventos: {meta.get('dataset_name') or '-'} | "
-        f"Features: {meta.get('features_name') or '-'}"
+        f"Features: {meta.get('features_name') or '-'} | "
+        f"Backend: {execution_backend}"
     )
 
-    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6 = st.columns(6)
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6, kpi_7 = st.columns(7)
     kpi_1.metric("Estado", str(meta.get("run_mode") or "live"))
     kpi_2.metric("Completadas", f"{completed_count}")
     kpi_3.metric("Fallidas", f"{failed_count}")
     kpi_4.metric("Pendientes", f"{pending_count}")
     kpi_5.metric("Objetivo", objective_label)
     kpi_6.metric("Optuna jobs", str(meta.get("optuna_n_jobs") or "-"))
+    kpi_7.metric("Backend", execution_backend)
+    if execution_backend == "ray_cluster":
+        st.caption(
+            "Ray: "
+            f"requested={ray_requested or '-'} | "
+            f"effective={ray_effective or '-'} | "
+            f"trial_cpus={ray_trial_cpus or '-'} | "
+            f"active_nodes={ray_active_nodes or '-'} | "
+            f"hosts={len(ray_hosts_used) if isinstance(ray_hosts_used, list) else 0}"
+        )
 
     if completed_df.empty:
         st.info("Aún no hay combinaciones completadas.")
@@ -5787,6 +5823,22 @@ def _render_calibration_experiment_live_view(data: Dict[str, object]) -> None:
     current_best_payload = {
         key: value for key, value in current_best_payload.items() if value not in [None, "", "-"]
     }
+    execution_backend = str(
+        protocol.get("execution_backend")
+        or manifest.get("execution_backend")
+        or EXECUTION_BACKEND_LOCAL
+    ).strip() or EXECUTION_BACKEND_LOCAL
+    ray_hosts_used = (
+        protocol.get("ray_hosts_used")
+        or manifest.get("ray_hosts_used")
+        or []
+    )
+    if isinstance(ray_hosts_used, str):
+        try:
+            parsed_hosts = json.loads(ray_hosts_used)
+        except Exception:
+            parsed_hosts = [ray_hosts_used]
+        ray_hosts_used = parsed_hosts if isinstance(parsed_hosts, list) else []
 
     st.caption("Experimento detectado: Crash prediction | Calibración score + threshold")
     st.caption(f"Checkpoint: {data.get('manifest_path')}")
@@ -5803,16 +5855,29 @@ def _render_calibration_experiment_live_view(data: Dict[str, object]) -> None:
     else:
         st.info("Corrida en progreso. La vista usa el tracker y los resultados parciales persistidos.")
 
-    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6 = st.columns(6)
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6, kpi_7 = st.columns(7)
     kpi_1.metric("Modelo", str(protocol.get("model_name") or "-"))
     kpi_2.metric("Estado", status)
     kpi_3.metric("Resultado", result_status)
     kpi_4.metric("Progreso", f"{100.0 * progress_ratio:.1f}%")
     kpi_5.metric("Combinaciones OK", f"{completed_combos}/{total_combos or '-'}")
     kpi_6.metric("Fallidas", f"{failed_combos}")
+    kpi_7.metric("Backend", execution_backend)
 
     st.progress(progress_ratio)
-    st.caption(f"Threshold protocol: {protocol.get('threshold_protocol') or '-'}")
+    st.caption(
+        f"Threshold protocol: {protocol.get('threshold_protocol') or '-'} | "
+        f"Backend: {execution_backend}"
+    )
+    if execution_backend == "ray_cluster":
+        st.caption(
+            "Ray: "
+            f"requested={protocol.get('ray_requested_trial_concurrency') or '-'} | "
+            f"effective={protocol.get('ray_effective_trial_concurrency') or '-'} | "
+            f"trial_cpus={protocol.get('ray_trial_cpus') or '-'} | "
+            f"active_nodes={protocol.get('ray_active_nodes') or '-'} | "
+            f"hosts={len(ray_hosts_used) if isinstance(ray_hosts_used, list) else 0}"
+        )
     st.caption(f"Step actual: {current_step}")
     if current_message:
         st.caption(current_message)

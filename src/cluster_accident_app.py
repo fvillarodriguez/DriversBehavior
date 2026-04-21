@@ -88,6 +88,12 @@ from src.experiments_logic import (
     estimate_controlled_comparison_parallelism,
     preview_controlled_comparison_checkpoint,
 )
+from src.pipeline_ray_runtime import (
+    EXECUTION_BACKEND_LOCAL,
+    EXECUTION_BACKEND_RAY_CLUSTER,
+    EXECUTION_BACKEND_VALUES,
+    connect_ray_cluster,
+)
 
 try:
     import duckdb
@@ -367,6 +373,34 @@ def _render_model_n_jobs_input(
     if shared_key:
         st.session_state[shared_key] = int(value)
     return value
+
+
+def _render_execution_backend_input(
+    label: str,
+    *,
+    key: str,
+    default: str = EXECUTION_BACKEND_LOCAL,
+) -> str:
+    current_value = str(st.session_state.get(key, default) or default).strip().lower()
+    if current_value not in EXECUTION_BACKEND_VALUES:
+        current_value = default
+    return str(
+        st.selectbox(
+            label,
+            options=list(EXECUTION_BACKEND_VALUES),
+            index=list(EXECUTION_BACKEND_VALUES).index(current_value),
+            key=key,
+            format_func=lambda value: (
+                "Local"
+                if value == EXECUTION_BACKEND_LOCAL
+                else "Ray Cluster"
+            ),
+            help=(
+                "`local` ejecuta Optuna en este proceso. `ray_cluster` distribuye "
+                "los trials de Optuna usando el cluster configurado en la UI Ray Cluster."
+            ),
+        )
+    )
 
 
 def _queue_controlled_job_config_apply(
@@ -5104,7 +5138,7 @@ def _render_calibration_sweep_experiment() -> None:
             step=1,
             key="exp_calibration_sweep_parallel_jobs",
         )
-    opt_col1, opt_col2 = st.columns(2)
+    opt_col1, opt_col2, opt_col3 = st.columns(3)
     with opt_col1:
         optuna_n_jobs = _render_optuna_n_jobs_input(
             "Optuna jobs paralelos",
@@ -5118,6 +5152,16 @@ def _render_calibration_sweep_experiment() -> None:
             default=1,
             shared_key="global_xgb_parallel_jobs",
         )
+    with opt_col3:
+        execution_backend = _render_execution_backend_input(
+            "Execution backend",
+            key="exp_calibration_sweep_execution_backend",
+            default=EXECUTION_BACKEND_LOCAL,
+        )
+    st.caption(
+        "Si eliges `ray_cluster`, `Optuna jobs paralelos` pasa a ser la "
+        "concurrencia máxima de trials remotos."
+    )
 
     with st.expander("Configuración avanzada de Optuna", expanded=False):
         pr_col1, pr_col2, pr_col3 = st.columns(3)
@@ -5336,6 +5380,12 @@ def _render_calibration_sweep_experiment() -> None:
         if not feature_cols:
             st.error("No hay variables disponibles para ejecutar el experimento.")
             return
+        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+            try:
+                connect_ray_cluster()
+            except Exception as exc:
+                st.error(f"Ray Cluster no disponible: {exc}")
+                return
 
         selected_objective_metrics = [
             objective_options[label]
@@ -5488,6 +5538,7 @@ def _render_calibration_sweep_experiment() -> None:
                     n_trials=int(n_trials),
                     timeout=int(timeout),
                     optuna_n_jobs=int(optuna_n_jobs),
+                    execution_backend=str(execution_backend),
                     parallel_jobs=int(parallel_jobs),
                     xgb_parallel_jobs=int(xgb_parallel_jobs),
                     search_space_config=search_space,
@@ -19913,14 +19964,23 @@ def _render_controlled_comparison_experiment() -> None:
             shared_key="global_xgb_parallel_jobs",
         )
 
-    optuna_n_jobs = _render_optuna_n_jobs_input(
-        "Optuna jobs paralelos",
-        key="exp_controlled_optuna_n_jobs",
-        default=5,
-    )
+    optuna_col1, optuna_col2 = st.columns(2)
+    with optuna_col1:
+        optuna_n_jobs = _render_optuna_n_jobs_input(
+            "Optuna jobs paralelos",
+            key="exp_controlled_optuna_n_jobs",
+            default=5,
+        )
+    with optuna_col2:
+        execution_backend = _render_execution_backend_input(
+            "Execution backend",
+            key="exp_controlled_execution_backend",
+            default=EXECUTION_BACKEND_LOCAL,
+        )
     st.caption(
         "La UI es la fuente de verdad: Random Forest usa `Jobs paralelos RF/ranking`, "
-        "XGBoost usa `Jobs paralelos XGBoost`, y Optuna usa sólo sus jobs de trials."
+        "XGBoost usa `Jobs paralelos XGBoost`, y Optuna usa sólo sus jobs de trials. "
+        "Si eliges `ray_cluster`, esos jobs pasan a ser concurrencia máxima de trials remotos."
     )
 
     k_state_file_key = "exp_controlled_k_feature_file"
@@ -20726,6 +20786,16 @@ def _render_controlled_comparison_experiment() -> None:
             f"Cluster={k_grid_by_set['Cluster']} | "
             f"Base + Cluster={k_grid_by_set['Base + Cluster']}"
         )
+    preview_ray_address = None
+    preview_ray_active_nodes = None
+    if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+        try:
+            preview_ray_runtime = connect_ray_cluster()
+            preview_ray_address = str(preview_ray_runtime.config.ray_address or "")
+            preview_ray_active_nodes = int(preview_ray_runtime.active_nodes)
+        except Exception:
+            preview_ray_address = None
+            preview_ray_active_nodes = None
     protocol_preview = {
         "protocol_family": protocol_family,
         "split_mode": "Temporal",
@@ -20779,8 +20849,19 @@ def _render_controlled_comparison_experiment() -> None:
         "n_trials": int(n_trials),
         "timeout": int(timeout),
         "optuna_n_jobs": int(optuna_n_jobs),
+        "execution_backend": str(execution_backend),
         "parallel_jobs": int(parallel_jobs),
         "xgb_parallel_jobs": int(xgb_parallel_jobs),
+        "ray_address": preview_ray_address,
+        "ray_requested_trial_concurrency": (
+            int(optuna_n_jobs)
+            if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
+            else None
+        ),
+        "ray_effective_trial_concurrency": None,
+        "ray_trial_cpus": None,
+        "ray_active_nodes": preview_ray_active_nodes,
+        "ray_hosts_used": [],
         "search_space_config": search_space,
         "segment_info": segment_info,
         "event_path": str(selected_event_path),
@@ -20909,6 +20990,12 @@ def _render_controlled_comparison_experiment() -> None:
         except Exception as exc:
             st.error(f"No se pudo preparar el dataset del tramo: {exc}")
             return
+        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+            try:
+                connect_ray_cluster()
+            except Exception as exc:
+                st.error(f"Ray Cluster no disponible: {exc}")
+                return
 
         exp_meta = {
             "dataset_name": selected_event,
@@ -20958,6 +21045,7 @@ def _render_controlled_comparison_experiment() -> None:
             "n_trials": int(n_trials),
             "timeout": int(timeout),
             "optuna_n_jobs": int(optuna_n_jobs),
+            "execution_backend": str(execution_backend),
             "parallel_jobs": int(parallel_jobs),
             "xgb_parallel_jobs": int(xgb_parallel_jobs),
             "selected_models": list(selected_models),
@@ -21052,6 +21140,7 @@ def _render_controlled_comparison_experiment() -> None:
                     n_trials=int(n_trials),
                     timeout=int(timeout),
                     optuna_n_jobs=int(optuna_n_jobs),
+                    execution_backend=str(execution_backend),
                     parallel_jobs=int(parallel_jobs),
                     xgb_parallel_jobs=int(xgb_parallel_jobs),
                     selected_models=list(selected_models),

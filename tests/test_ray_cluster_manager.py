@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -114,7 +115,7 @@ def test_detect_private_keys_finds_standard_keys(tmp_path: Path):
 def test_read_public_key_prefers_existing_pub_file(tmp_path: Path):
     private_key = tmp_path / "id_ed25519"
     public_key = tmp_path / "id_ed25519.pub"
-    private_key.write_text("PRIVATE", encoding="utf-8")
+    private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
     public_key.write_text("ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGZha2U= test@sumo\n", encoding="utf-8")
     config = manager.RayClusterConfig(ssh_key_path=str(private_key))
 
@@ -125,7 +126,7 @@ def test_read_public_key_prefers_existing_pub_file(tmp_path: Path):
 
 def test_read_public_key_falls_back_to_ssh_keygen(tmp_path: Path):
     private_key = tmp_path / "id_ed25519"
-    private_key.write_text("PRIVATE", encoding="utf-8")
+    private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
     config = manager.RayClusterConfig(ssh_key_path=str(private_key))
     fake = FakeRunner(
         [
@@ -175,7 +176,7 @@ def test_check_config_warnings_ignores_pub_path_and_keeps_ssh_automatic():
 
 def test_run_remote_script_falls_back_to_automatic_private_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     private_key = tmp_path / "id_ed25519"
-    private_key.write_text("PRIVATE", encoding="utf-8")
+    private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
     monkeypatch.setattr(manager, "default_ssh_private_key_path", lambda: private_key)
     config = manager.RayClusterConfig(ssh_key_path="~/.ssh/id_ed25519.pub")
     fake = FakeRunner([manager.CommandResult(ok=True, returncode=0, command="ssh")])
@@ -186,6 +187,23 @@ def test_run_remote_script_falls_back_to_automatic_private_key(tmp_path: Path, m
     assert str(private_key) in fake.calls[0]
 
 
+def test_ensure_local_ssh_identity_ignores_authorized_keys_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    authorized_keys = tmp_path / "authorized_keys"
+    authorized_keys.write_text("ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGZha2U= test@sumo\n", encoding="utf-8")
+    private_key = tmp_path / "id_ed25519"
+    private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
+    monkeypatch.setattr(manager, "default_ssh_private_key_path", lambda: private_key)
+    monkeypatch.setattr(manager, "detect_private_keys", lambda ssh_dir=None: [])
+
+    result, resolved = manager.ensure_local_ssh_identity(
+        manager.RayClusterConfig(ssh_key_path=str(authorized_keys))
+    )
+
+    assert result.ok
+    assert resolved == private_key
+    assert str(resolved) in result.stdout
+
+
 def test_command_runner_reports_missing_executable():
     result = manager.CommandRunner().run(["/definitely/not/a/command"], timeout=1)
 
@@ -194,11 +212,33 @@ def test_command_runner_reports_missing_executable():
     assert "/definitely/not/a/command" in result.command
 
 
-def test_run_remote_script_uses_ssh_key_and_batch_mode():
+def test_command_runner_timeout_normalizes_bytes_output(monkeypatch: pytest.MonkeyPatch):
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=["ray", "status"],
+            timeout=10,
+            output=b"partial stdout\n",
+            stderr=b"partial stderr\n",
+        )
+
+    monkeypatch.setattr(manager.subprocess, "run", fake_run)
+
+    result = manager.CommandRunner().run(["ray", "status"], timeout=10)
+
+    assert not result.ok
+    assert result.timed_out
+    assert result.stdout == "partial stdout\n"
+    assert result.stderr == "partial stderr\n"
+    assert result.combined_output == "partial stdout\npartial stderr"
+
+
+def test_run_remote_script_uses_ssh_key_and_batch_mode(tmp_path: Path):
+    private_key = tmp_path / "id_ed25519"
+    private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
     config = manager.RayClusterConfig(
         ssh_user="felipe",
         worker_ip="10.10.10.2",
-        ssh_key_path="~/.ssh/id_ed25519",
+        ssh_key_path=str(private_key),
     )
     fake = FakeRunner([manager.CommandResult(ok=True, returncode=0, command="ssh")])
 
@@ -214,7 +254,7 @@ def test_run_remote_script_uses_ssh_key_and_batch_mode():
 
 def test_prepare_ssh_access_requests_password_when_ssh_is_not_ready(tmp_path: Path):
     private_key = tmp_path / "id_ed25519"
-    private_key.write_text("PRIVATE", encoding="utf-8")
+    private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
     config = manager.RayClusterConfig(ssh_key_path=str(private_key))
     fake = FakeRunner([manager.CommandResult(ok=False, returncode=255, stderr="Permission denied", command="ssh true")])
 
@@ -229,7 +269,7 @@ def test_prepare_ssh_access_requests_password_when_ssh_is_not_ready(tmp_path: Pa
 def test_bootstrap_ssh_access_uses_expect_and_ssh_copy_id(tmp_path: Path):
     private_key = tmp_path / "id_ed25519"
     public_key = tmp_path / "id_ed25519.pub"
-    private_key.write_text("PRIVATE", encoding="utf-8")
+    private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
     public_key.write_text("ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGZha2U= test@sumo\n", encoding="utf-8")
     config = manager.RayClusterConfig(ssh_user="felipe", ssh_key_path=str(private_key))
     fake = FakeRunner([manager.CommandResult(ok=True, returncode=0, command="expect")])
@@ -239,8 +279,10 @@ def test_bootstrap_ssh_access_uses_expect_and_ssh_copy_id(tmp_path: Path):
     assert result.ok
     call = fake.calls[0]
     assert call[:2] == ["expect", "-c"]
-    assert call[4:7] == ["ssh-copy-id", "-i", str(public_key)]
-    assert call[-1] == "felipe@10.10.10.2"
+    assert "set cmd [list {ssh-copy-id}" in call[2]
+    assert str(public_key) in call[2]
+    assert "spawn {*}$cmd" in call[2]
+    assert "felipe@10.10.10.2" in call[2]
     assert fake.envs[0][manager.SSH_BOOTSTRAP_PASSWORD_ENV] == "secret"
 
 
@@ -257,10 +299,12 @@ def test_configure_local_bridge_uses_macos_admin_prompt():
     assert "administrator privileges" in call[2]
 
 
-def test_configure_remote_bridge_uses_ssh_to_apply_worker_profile():
+def test_configure_remote_bridge_uses_ssh_to_apply_worker_profile(tmp_path: Path):
+    private_key = tmp_path / "id_ed25519"
+    private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
     config = manager.RayClusterConfig(
         ssh_user="felipe",
-        ssh_key_path="~/.ssh/id_ed25519",
+        ssh_key_path=str(private_key),
         remote_repo_path="/Users/felipe/Desktop/SUMO",
     )
     fake = FakeRunner([manager.CommandResult(ok=True, returncode=0, command="ssh")])
@@ -332,8 +376,10 @@ Demands:
     assert summary["usage"] == {"CPU": "2.0/16.0", "memory": "0.0/32.0"}
 
 
-def test_run_preflight_skips_remote_checks_when_ssh_fails():
-    config = manager.RayClusterConfig()
+def test_run_preflight_skips_remote_checks_when_ssh_fails(tmp_path: Path):
+    private_key = tmp_path / "id_ed25519"
+    private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")
+    config = manager.RayClusterConfig(ssh_key_path=str(private_key))
     fake = FakeRunner(
         [
             manager.CommandResult(ok=True, returncode=0, stdout="inet 10.10.10.1 netmask 0xfffffffc\nstatus: active\n", command="ifconfig"),

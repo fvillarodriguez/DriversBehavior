@@ -9,6 +9,7 @@ import os
 import shlex
 import socket
 import subprocess
+import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
@@ -27,6 +28,11 @@ DEFAULT_NETMASK = "255.255.255.252"
 DEFAULT_RAY_VERSION = "2.53.0"
 DEFAULT_WORKER_PORT_MIN = 10002
 DEFAULT_WORKER_PORT_MAX = 10100
+RAY_MACOS_CLUSTER_ENV = {
+    "RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER": "1",
+    "RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL": "minor",
+}
+INVALID_SSH_KEY_FILENAMES = frozenset({"authorized_keys", "known_hosts", "config"})
 COMMON_SSH_PRIVATE_KEY_NAMES = (
     "id_ed25519",
     "id_rsa",
@@ -44,6 +50,14 @@ SSH_PUBLIC_KEY_PREFIXES = (
     "sk-ssh-ed25519@openssh.com",
 )
 SSH_PUBLIC_KEY_BODY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+
+
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 @dataclass(frozen=True)
@@ -83,6 +97,11 @@ class CommandResult:
     stderr: str = ""
     command: str = ""
     timed_out: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stdout", _coerce_text(self.stdout))
+        object.__setattr__(self, "stderr", _coerce_text(self.stderr))
+        object.__setattr__(self, "command", _coerce_text(self.command))
 
     @property
     def combined_output(self) -> str:
@@ -182,6 +201,103 @@ def python_bin(root_dir: Path = ROOT_DIR) -> Path:
     return root_dir / ".venv" / "bin" / "python"
 
 
+def ray_process_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.update(RAY_MACOS_CLUSTER_ENV)
+    return env
+
+
+def ray_env_export_script() -> str:
+    return "\n".join(
+        f"export {key}={shlex.quote(value)}"
+        for key, value in RAY_MACOS_CLUSTER_ENV.items()
+    )
+
+
+def local_worker_cpus(config: RayClusterConfig) -> int:
+    cpus = os.cpu_count() or 1
+    return max(1, cpus - max(0, int(config.worker_reserved_cpus)))
+
+
+def build_worker_start_args(
+    config: RayClusterConfig,
+    *,
+    root_dir: Path = ROOT_DIR,
+    block: bool = False,
+) -> list[str]:
+    args = [
+        str(ray_bin(root_dir)),
+        "start",
+        f"--address={config.ray_address}",
+        f"--node-ip-address={config.worker_ip}",
+        f"--object-manager-port={config.object_manager_port}",
+        f"--node-manager-port={config.node_manager_port}",
+        f"--min-worker-port={config.worker_port_min}",
+        f"--max-worker-port={config.worker_port_max}",
+        f"--num-cpus={local_worker_cpus(config)}",
+        "--disable-usage-stats",
+    ]
+    if block:
+        args.append("--block")
+    return args
+
+
+def _tail_file(path: Path, *, max_chars: int = 6000) -> str:
+    if not path.exists():
+        return ""
+    payload = path.read_text(encoding="utf-8", errors="replace")
+    return payload[-max_chars:]
+
+
+def run_background_command(
+    args: Sequence[str],
+    *,
+    cwd: Path = ROOT_DIR,
+    env: Optional[dict[str, str]] = None,
+    stdout_path: Path,
+    stderr_path: Path,
+    startup_wait_s: float = 2.0,
+) -> CommandResult:
+    display = " ".join(shlex.quote(str(part)) for part in args)
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with stdout_path.open("ab") as stdout_file, stderr_path.open("ab") as stderr_file:
+            process = subprocess.Popen(
+                [str(part) for part in args],
+                cwd=cwd,
+                env=env,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+    except FileNotFoundError as exc:
+        return CommandResult(ok=False, returncode=127, stderr=str(exc), command=display)
+    except OSError as exc:
+        return CommandResult(ok=False, returncode=1, stderr=str(exc), command=display)
+
+    time.sleep(max(0.0, startup_wait_s))
+    returncode = process.poll()
+    if returncode is None:
+        return CommandResult(
+            ok=True,
+            returncode=0,
+            stdout=(
+                f"Worker local iniciado en segundo plano. PID launcher: {process.pid}\n"
+                f"stdout: {stdout_path}\nstderr: {stderr_path}"
+            ),
+            command=display,
+        )
+
+    return CommandResult(
+        ok=False,
+        returncode=returncode,
+        stdout=_tail_file(stdout_path),
+        stderr=_tail_file(stderr_path) or f"El proceso termino al iniciar con codigo {returncode}.",
+        command=display,
+    )
+
+
 def default_ssh_private_key_path() -> Path:
     return Path.home() / ".ssh" / DEFAULT_SSH_PRIVATE_KEY_FILENAME
 
@@ -208,6 +324,38 @@ def _resolved_ssh_private_key_target(config: RayClusterConfig) -> Path:
         return ssh_private_key_path(config.ssh_key_path)
     except ValueError:
         return default_ssh_private_key_path()
+
+
+def _is_reserved_ssh_filename(path: Path) -> bool:
+    return path.name in INVALID_SSH_KEY_FILENAMES
+
+
+def _looks_like_public_key_text(payload: str) -> bool:
+    stripped = payload.strip()
+    return any(stripped.startswith(prefix) for prefix in SSH_PUBLIC_KEY_PREFIXES)
+
+
+def _looks_like_private_key_file(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    if path.suffix == ".pub" or _is_reserved_ssh_filename(path):
+        return False
+    try:
+        sample = path.read_text(encoding="utf-8", errors="ignore")[:4096]
+    except OSError:
+        return False
+    if "PRIVATE KEY" in sample:
+        return True
+    if _looks_like_public_key_text(sample):
+        return False
+    return False
+
+
+def _preferred_generation_key_path(config: RayClusterConfig) -> Path:
+    configured = _resolved_ssh_private_key_target(config)
+    if configured.suffix != ".pub" and not _is_reserved_ssh_filename(configured):
+        return configured
+    return default_ssh_private_key_path()
 
 
 def authorized_keys_path() -> Path:
@@ -388,7 +536,31 @@ def ensure_local_ssh_identity(
     runner: Optional[CommandRunner] = None,
 ) -> tuple[CommandResult, Path]:
     key_path = _resolved_ssh_private_key_target(config)
-    if key_path.exists() and key_path.is_file():
+    if _looks_like_private_key_file(key_path):
+        return (
+            CommandResult(
+                ok=True,
+                returncode=0,
+                stdout=f"Llave SSH local lista: {key_path}",
+                command="ssh key auto-detect",
+            ),
+            key_path,
+        )
+
+    for candidate in detect_private_keys():
+        if _looks_like_private_key_file(candidate):
+            return (
+                CommandResult(
+                    ok=True,
+                    returncode=0,
+                    stdout=f"Llave SSH local lista: {candidate}",
+                    command="ssh key auto-detect",
+                ),
+                candidate,
+            )
+
+    key_path = _preferred_generation_key_path(config)
+    if _looks_like_private_key_file(key_path):
         return (
             CommandResult(
                 ok=True,
@@ -480,27 +652,33 @@ def ssh_check(
     return active_runner.run(args, timeout=timeout)
 
 
-def _ssh_copy_id_expect_script() -> str:
-    return r"""
+def _tcl_quote(value: str) -> str:
+    return "{" + value.replace("\\", "\\\\").replace("}", "\\}") + "}"
+
+
+def _ssh_copy_id_expect_script(copy_id_args: Sequence[str]) -> str:
+    command_list = " ".join(_tcl_quote(str(part)) for part in copy_id_args)
+    return """
 set timeout 30
 set password $env(SUMO_RAY_SSH_PASSWORD)
-eval spawn $argv
-expect {
-    -re "(?i)continue connecting.*" {
+set cmd [list {command_list}]
+spawn {{*}}$cmd
+expect {{
+    -re "(?i)continue connecting.*" {{
         send -- "yes\r"
         exp_continue
-    }
-    -re "(?i)(password|contrasena|contraseña).*:" {
+    }}
+    -re "(?i)(password|contrasena|contraseña).*:" {{
         send -- "$password\r"
         exp_continue
-    }
-    eof {
+    }}
+    eof {{
         catch wait result
         set rc [lindex $result 3]
         exit $rc
-    }
-}
-"""
+    }}
+}}
+""".format(command_list=command_list)
 
 
 def bootstrap_ssh_access(
@@ -522,20 +700,32 @@ def bootstrap_ssh_access(
     if not key_result.ok:
         return key_result
     public_key = private_key.with_name(f"{private_key.name}.pub")
+    if not public_key.exists():
+        try:
+            public_payload = read_public_key(effective, runner=active_runner)
+        except Exception as exc:
+            return CommandResult(
+                ok=False,
+                returncode=2,
+                stderr=str(exc),
+                command="ssh-copy-id",
+            )
+        public_key.write_text(f"{public_payload}\n", encoding="utf-8")
     env = dict(os.environ)
     env[SSH_BOOTSTRAP_PASSWORD_ENV] = password
+    copy_id_args = [
+        "ssh-copy-id",
+        "-i",
+        str(public_key),
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        ssh_target(effective),
+    ]
     return active_runner.run(
         [
             "expect",
             "-c",
-            _ssh_copy_id_expect_script(),
-            "--",
-            "ssh-copy-id",
-            "-i",
-            str(public_key),
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            ssh_target(effective),
+            _ssh_copy_id_expect_script(copy_id_args),
         ],
         timeout=min(45, max(15, int(effective.command_timeout_s) * 2)),
         env=env,
@@ -601,6 +791,7 @@ def build_worker_start_script(config: RayClusterConfig) -> str:
     reserved = max(0, int(config.worker_reserved_cpus))
     return "\n".join(
         [
+            ray_env_export_script(),
             f"cd {repo}",
             "CPUS=$(($(sysctl -n hw.ncpu)-%d))" % reserved,
             '[ "$CPUS" -lt 1 ] && CPUS=1',
@@ -667,6 +858,29 @@ def stop_head(config: RayClusterConfig, *, runner: Optional[CommandRunner] = Non
     )
 
 
+def stop_local_worker(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> CommandResult:
+    active_runner = runner or CommandRunner()
+    return active_runner.run(
+        [str(ray_bin()), "stop"],
+        cwd=ROOT_DIR,
+        timeout=config.command_timeout_s,
+        env=ray_process_env(),
+    )
+
+
+def start_local_worker(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> CommandResult:
+    active_runner = runner or CommandRunner()
+    stop_local_worker(config, runner=active_runner)
+    return run_background_command(
+        build_worker_start_args(config, block=True),
+        cwd=ROOT_DIR,
+        env=ray_process_env(),
+        stdout_path=CONFIG_DIR / "worker_local.out.log",
+        stderr_path=CONFIG_DIR / "worker_local.err.log",
+        startup_wait_s=3.0,
+    )
+
+
 def start_head(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> CommandResult:
     active_runner = runner or CommandRunner()
     stop_head(config, runner=active_runner)
@@ -674,6 +888,7 @@ def start_head(config: RayClusterConfig, *, runner: Optional[CommandRunner] = No
         build_head_start_args(config),
         cwd=ROOT_DIR,
         timeout=config.command_timeout_s,
+        env=ray_process_env(),
     )
 
 
@@ -726,6 +941,7 @@ def ray_status(config: RayClusterConfig, *, runner: Optional[CommandRunner] = No
         [str(ray_bin()), "status", f"--address={config.ray_address}"],
         cwd=ROOT_DIR,
         timeout=timeout,
+        env=ray_process_env(),
     )
 
 
@@ -750,6 +966,18 @@ def _port_check_script(config: RayClusterConfig) -> str:
     )
 
 
+def _worker_port_check_script(config: RayClusterConfig) -> str:
+    ports = " ".join(str(port) for port in [config.object_manager_port, config.node_manager_port])
+    return (
+        "busy=''; "
+        f"for port in {ports}; do "
+        "if lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1; then busy=\"$busy $port\"; fi; "
+        "done; "
+        "if [ -z \"$busy\" ]; then echo 'Puertos worker libres'; "
+        "else echo \"Puertos worker ocupados:$busy\"; exit 1; fi"
+    )
+
+
 def check_ports_available(
     config: RayClusterConfig,
     *,
@@ -767,6 +995,21 @@ def check_ports_available(
         name,
         result.ok,
         result.combined_output or ("Puertos libres" if result.ok else "No se pudo verificar puertos."),
+        result.command,
+    )
+
+
+def check_worker_ports_available(
+    config: RayClusterConfig,
+    *,
+    runner: Optional[CommandRunner] = None,
+) -> CheckResult:
+    active_runner = runner or CommandRunner()
+    result = active_runner.run(["bash", "-lc", _worker_port_check_script(config)], cwd=ROOT_DIR, timeout=8)
+    return CheckResult(
+        "Puertos worker local",
+        result.ok,
+        result.combined_output or ("Puertos worker libres" if result.ok else "No se pudo verificar puertos worker."),
         result.command,
     )
 
@@ -791,6 +1034,25 @@ def _result_detail(result: CommandResult, ok_message: str) -> str:
 
 def _bridge_expected_detail(ip: str, netmask: str) -> str:
     return f"{THUNDERBOLT_BRIDGE_NAME} debe quedar en {ip}/{netmask}."
+
+
+def _tcp_check(
+    host: str,
+    port: int,
+    *,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 5,
+) -> CommandResult:
+    active_runner = runner or CommandRunner()
+    script = (
+        "import socket, sys\n"
+        "host = sys.argv[1]\n"
+        "port = int(sys.argv[2])\n"
+        "sock = socket.create_connection((host, port), timeout=3)\n"
+        "sock.close()\n"
+        "print(f'{host}:{port} abierto')\n"
+    )
+    return active_runner.run(["python3", "-c", script, host, str(port)], timeout=timeout)
 
 
 def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> list[CheckResult]:
@@ -933,6 +1195,94 @@ def run_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] =
     return checks
 
 
+def run_worker_preflight(config: RayClusterConfig, *, runner: Optional[CommandRunner] = None) -> list[CheckResult]:
+    active_runner = runner or CommandRunner()
+    effective = automatic_bridge_config(config)
+    checks: list[CheckResult] = []
+
+    local_bridge = active_runner.run(["ifconfig", "bridge0"], timeout=5)
+    bridge_ok = (
+        local_bridge.ok
+        and _bridge_has_ip(local_bridge.stdout, effective.worker_ip)
+        and _bridge_active(local_bridge.stdout)
+    )
+    checks.append(
+        CheckResult(
+            "Thunderbolt worker local",
+            bridge_ok,
+            (
+                f"bridge0 activo con {effective.worker_ip}."
+                if bridge_ok
+                else _bridge_expected_detail(effective.worker_ip, effective.netmask)
+            ),
+            local_bridge.command,
+        )
+    )
+
+    ping_head = active_runner.run(["ping", "-c", "2", "-W", "1000", effective.head_ip], timeout=6)
+    checks.append(
+        CheckResult(
+            "Ping head",
+            ping_head.ok,
+            _result_detail(ping_head, f"{effective.head_ip} responde por Thunderbolt."),
+            ping_head.command,
+        )
+    )
+
+    head_gcs = _tcp_check(effective.head_ip, effective.head_port, runner=active_runner, timeout=5)
+    checks.append(
+        CheckResult(
+            "Puerto head Ray",
+            head_gcs.ok,
+            _result_detail(head_gcs, f"Head Ray escucha en {effective.ray_address}."),
+            head_gcs.command,
+        )
+    )
+
+    local_python = active_runner.run([str(python_bin()), "--version"], timeout=5)
+    checks.append(
+        CheckResult(
+            "Python worker local",
+            local_python.ok and "Python 3.12" in local_python.combined_output,
+            _result_detail(local_python, local_python.combined_output.strip()),
+            local_python.command,
+        )
+    )
+
+    local_ray = active_runner.run([str(ray_bin()), "--version"], timeout=5)
+    checks.append(
+        CheckResult(
+            "Ray worker local",
+            local_ray.ok and _version_ok(local_ray.combined_output, effective.ray_version),
+            _result_detail(local_ray, local_ray.combined_output.strip()),
+            local_ray.command,
+        )
+    )
+
+    status = ray_status(effective, runner=active_runner, timeout=10)
+    checks.append(
+        CheckResult(
+            "ray status head",
+            status.ok,
+            _result_detail(status, f"Ray responde desde {effective.ray_address}."),
+            status.command,
+        )
+    )
+
+    stop_probe = stop_local_worker(effective, runner=active_runner)
+    checks.append(
+        CheckResult(
+            "ray stop worker local",
+            stop_probe.returncode in (0, 1),
+            "ray stop local ejecutado; el worker queda limpio para iniciar.",
+            stop_probe.command,
+        )
+    )
+    checks.append(check_worker_ports_available(effective, runner=active_runner))
+
+    return checks
+
+
 def tail_logs(config: RayClusterConfig, *, remote: bool = False, lines: int = 80, runner: Optional[CommandRunner] = None) -> CommandResult:
     safe_lines = max(10, min(int(lines), 300))
     script = (
@@ -971,7 +1321,7 @@ def parse_ray_status_summary(output: str) -> dict[str, Any]:
             continue
         if line in {"Pending:", "Recent failures:", "Resources", "Demands:"}:
             in_active = False
-        if line == "Usage:":
+        if line in {"Usage:", "Total Usage:"}:
             in_usage = True
             continue
         if line == "Demands:":
@@ -1035,6 +1385,7 @@ def run_distributed_benchmark(
         [str(python_bin()), "-c", build_benchmark_script(config, tasks=tasks)],
         cwd=ROOT_DIR,
         timeout=timeout,
+        env=ray_process_env(),
     )
     if not result.ok:
         return result, None

@@ -21,6 +21,10 @@ from src.experiments_logic import (
     preview_controlled_comparison_checkpoint,
 )
 from src.model_training import temporal_train_test_split
+from src.pipeline_ray_runtime import (
+    EXECUTION_BACKEND_RAY_CLUSTER,
+    RayClusterRuntime,
+)
 from tests.pipeline_helpers import build_synthetic_base_df
 
 
@@ -3141,3 +3145,337 @@ def test_controlled_combo_xgboost_keeps_ui_optuna_jobs(
     assert result["optuna_n_jobs"] == 5
     assert result["requested_optuna_n_jobs"] == 5
     assert result["optuna_jobs_cpu_cap"] == 8
+
+
+class _FakeObjectRef:
+    def __init__(self, value):
+        self.value = value
+
+
+class _FakeRemoteFunction:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def remote(self, *args, **kwargs):
+        return _FakeObjectRef(self.fn(*args, **kwargs))
+
+
+class _FakeRayModule:
+    def __init__(self, *, total_cpus: int = 8, max_node_cpus: int = 4):
+        self._total_cpus = int(total_cpus)
+        self._max_node_cpus = int(max_node_cpus)
+        self._initialized = True
+
+    def is_initialized(self):
+        return self._initialized
+
+    def init(self, **kwargs):
+        self._initialized = True
+        return kwargs
+
+    def nodes(self):
+        return [
+            {"Alive": True, "Resources": {"CPU": float(self._max_node_cpus)}},
+            {"Alive": True, "Resources": {"CPU": float(self._max_node_cpus)}},
+        ]
+
+    def cluster_resources(self):
+        return {"CPU": float(self._total_cpus)}
+
+    def put(self, value):
+        return value
+
+    def get(self, ref):
+        return ref.value
+
+    def wait(self, refs, num_returns=1, timeout=None):
+        resolved = list(refs)
+        return resolved[:num_returns], resolved[num_returns:]
+
+    def remote(self, *args, **kwargs):
+        if args and callable(args[0]) and len(args) == 1 and not kwargs:
+            return _FakeRemoteFunction(args[0])
+
+        def _wrapper(fn):
+            return _FakeRemoteFunction(fn)
+
+        return _wrapper
+
+
+def _fake_ray_runtime(
+    *,
+    total_cpus: int = 8,
+    max_node_cpus: int = 4,
+) -> RayClusterRuntime:
+    fake_ray = _FakeRayModule(
+        total_cpus=total_cpus,
+        max_node_cpus=max_node_cpus,
+    )
+    return RayClusterRuntime(
+        config=SimpleNamespace(ray_address="ray://cluster"),
+        status=SimpleNamespace(ok=True, combined_output="ok"),
+        ray_module=fake_ray,
+        nodes=fake_ray.nodes(),
+        cluster_resources=fake_ray.cluster_resources(),
+        total_cpus=int(total_cpus),
+        max_node_cpus=int(max_node_cpus),
+        active_nodes=2,
+    )
+
+
+def test_controlled_combo_ray_cluster_driver_manages_trials_and_trial_metadata(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, _feature_cols, base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    runner = ExperimentsRunner(random_state=42)
+    train_val_df, test_df = temporal_train_test_split(base_df, test_size=0.2)
+    train_df, val_df = temporal_train_test_split(train_val_df, test_size=0.25)
+    runtime = _fake_ray_runtime(total_cpus=8, max_node_cpus=4)
+
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "build_model",
+        lambda model_name, params, random_state: _DummyModel(),
+    )
+    monkeypatch.setattr(
+        experiments_logic_module.socket,
+        "gethostname",
+        lambda: "node-a",
+    )
+
+    result = runner._optimize_controlled_combo(
+        model_name="Random Forest",
+        feature_set="Base",
+        balance_mode="none",
+        objective_metric="roc_auc",
+        selected_features=base_cols[:2],
+        train_df=train_df,
+        val_df=val_df,
+        test_df=test_df,
+        n_trials=2,
+        timeout=30,
+        optuna_n_jobs=3,
+        execution_backend=EXECUTION_BACKEND_RAY_CLUSTER,
+        search_space_config=_controlled_search_space(),
+        parallel_jobs=2,
+        xgb_parallel_jobs=1,
+        ray_runtime=runtime,
+    )
+
+    assert result["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
+    assert result["ray_address"] == "ray://cluster"
+    assert result["ray_requested_trial_concurrency"] == 3
+    assert result["ray_effective_trial_concurrency"] == 3
+    assert result["ray_trial_cpus"] == 2
+    assert result["ray_active_nodes"] == 2
+    assert result["ray_hosts_used"] == ["node-a"]
+    assert not result["trials_df"].empty
+    assert "trial_host" in result["trials_df"].columns
+    assert "trial_elapsed_s" in result["trials_df"].columns
+    assert "execution_backend" in result["trials_df"].columns
+    assert set(result["trials_df"]["trial_host"].dropna().astype(str)) == {"node-a"}
+    assert set(result["trials_df"]["execution_backend"].dropna().astype(str)) == {
+        EXECUTION_BACKEND_RAY_CLUSTER
+    }
+
+
+def test_controlled_combo_ray_cluster_rejects_hyperband(
+    tmp_path,
+):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, _feature_cols, base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    runner = ExperimentsRunner(random_state=42)
+    train_val_df, test_df = temporal_train_test_split(base_df, test_size=0.2)
+    train_df, val_df = temporal_train_test_split(train_val_df, test_size=0.25)
+
+    with pytest.raises(ValueError, match="Hyperband"):
+        runner._optimize_controlled_combo(
+            model_name="Random Forest",
+            feature_set="Base",
+            balance_mode="none",
+            objective_metric="roc_auc",
+            selected_features=base_cols[:2],
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            n_trials=1,
+            timeout=30,
+            optuna_n_jobs=2,
+            execution_backend=EXECUTION_BACKEND_RAY_CLUSTER,
+            search_space_config=_controlled_search_space(),
+            parallel_jobs=2,
+            xgb_parallel_jobs=1,
+            optuna_pruning_config={"enabled": True, "type": "hyperband"},
+            ray_runtime=_fake_ray_runtime(),
+        )
+
+
+def test_run_calibration_sweep_propagates_ray_backend_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    base_df = _synthetic_calibration_base_df()
+    runner = ExperimentsRunner(random_state=42)
+    runtime = _fake_ray_runtime()
+    captured_calls = []
+
+    def _fake_optimize(self, **kwargs):
+        captured_calls.append(dict(kwargs))
+        result = _fake_calibration_optimize_result(kwargs, score=0.74)
+        result.update(
+            {
+                "execution_backend": EXECUTION_BACKEND_RAY_CLUSTER,
+                "ray_address": "ray://cluster",
+                "ray_requested_trial_concurrency": 3,
+                "ray_effective_trial_concurrency": 2,
+                "ray_trial_cpus": 2,
+                "ray_active_nodes": 2,
+                "ray_hosts_used": ["node-a"],
+            }
+        )
+        return result
+
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "connect_ray_cluster",
+        lambda: runtime,
+    )
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+
+    payload = runner.run_calibration_sweep(
+        base_df,
+        model_name="Random Forest",
+        selected_features=["signal", "aux_signal"],
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=3,
+        execution_backend=EXECUTION_BACKEND_RAY_CLUSTER,
+        parallel_jobs=2,
+        checkpoint_root=tmp_path / "calibration_runs",
+    )
+
+    assert len(captured_calls) == 2
+    assert all(
+        call["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
+        for call in captured_calls
+    )
+    assert payload["protocol"]["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
+    assert payload["protocol"]["ray_address"] == "ray://cluster"
+    assert "execution_backend" in payload["leaderboard_df"].columns
+    assert set(
+        payload["leaderboard_df"]["execution_backend"].dropna().astype(str)
+    ) == {EXECUTION_BACKEND_RAY_CLUSTER}
+
+
+def test_run_controlled_comparison_propagates_ray_backend_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    pytest.importorskip("sklearn")
+    pytest.importorskip("optuna")
+    pytest.importorskip("imblearn")
+
+    base_df, feature_cols, _base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    runner = ExperimentsRunner(random_state=42)
+    runtime = _fake_ray_runtime()
+    captured_calls = []
+
+    def _fake_importance(self, df, feature_cols, **kwargs):
+        return pd.DataFrame(
+            {"variable": list(feature_cols), "importance": list(range(len(feature_cols), 0, -1))}
+        )
+
+    def _fake_optimize(
+        self,
+        *,
+        model_name,
+        feature_set,
+        balance_mode,
+        selected_features,
+        train_df,
+        val_df,
+        test_df,
+        **kwargs,
+    ):
+        captured_calls.append(dict(kwargs))
+        result = _fake_controlled_result(
+            model_name=model_name,
+            feature_set=feature_set,
+            balance_mode=balance_mode,
+            selected_features=selected_features,
+            score=0.74,
+            best_params={"max_depth": 4},
+            smote_params={},
+            optuna_trials_completed=1,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+        )
+        result.update(
+            {
+                "execution_backend": EXECUTION_BACKEND_RAY_CLUSTER,
+                "ray_address": "ray://cluster",
+                "ray_requested_trial_concurrency": 3,
+                "ray_effective_trial_concurrency": 2,
+                "ray_trial_cpus": 2,
+                "ray_active_nodes": 2,
+                "ray_hosts_used": ["node-a"],
+            }
+        )
+        return result
+
+    monkeypatch.setattr(
+        experiments_logic_module,
+        "connect_ray_cluster",
+        lambda: runtime,
+    )
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "calculate_feature_importance",
+        _fake_importance,
+    )
+    monkeypatch.setattr(
+        ExperimentsRunner,
+        "_optimize_controlled_combo",
+        _fake_optimize,
+    )
+
+    payload = runner.run_controlled_comparison(
+        base_df,
+        test_size=0.2,
+        val_size=0.25,
+        k_min=2,
+        k_max=2,
+        k_step=1,
+        n_trials=1,
+        timeout=30,
+        optuna_n_jobs=3,
+        execution_backend=EXECUTION_BACKEND_RAY_CLUSTER,
+        parallel_jobs=2,
+        xgb_parallel_jobs=1,
+        selected_models=["Random Forest"],
+        search_space_config=_controlled_search_space(),
+        checkpoint_root=tmp_path / "controlled_runs",
+        start_fresh=True,
+    )
+
+    assert captured_calls
+    assert all(
+        call["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
+        for call in captured_calls
+    )
+    assert payload["protocol"]["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
+    assert "execution_backend" in payload["grid_results_df"].columns
+    assert EXECUTION_BACKEND_RAY_CLUSTER in set(
+        payload["grid_results_df"]["execution_backend"].dropna().astype(str)
+    )

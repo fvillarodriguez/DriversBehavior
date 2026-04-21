@@ -8,7 +8,9 @@ import itertools
 import json
 import math
 import os
+import socket
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -43,6 +45,13 @@ from src.model_training import (
     temporal_train_test_split,
     train_model_with_protocol,
 )
+from src.pipeline_ray_runtime import (
+    EXECUTION_BACKEND_LOCAL,
+    EXECUTION_BACKEND_RAY_CLUSTER,
+    RayClusterRuntime,
+    connect_ray_cluster,
+    normalize_execution_backend,
+)
 
 try:
     import duckdb
@@ -50,7 +59,7 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
     duckdb = None
 
 
-CONTROLLED_COMPARISON_PROTOCOL_VERSION = "controlled_comparison_v3"
+CONTROLLED_COMPARISON_PROTOCOL_VERSION = "controlled_comparison_v4"
 CONTROLLED_COMPARISON_MODELS = (
     "Random Forest",
     "Balanced Random Forest",
@@ -60,8 +69,8 @@ CONTROLLED_COMPARISON_MODELS = (
 )
 CONTROLLED_COMPARISON_FEATURE_SETS = ("Base", "Cluster", "Base + Cluster")
 CONTROLLED_COMPARISON_BALANCE_MODES = ("none", "smote")
-CALIBRATION_SWEEP_PROTOCOL_VERSION = "calibration_sweep_v2"
-CALIBRATION_SWEEP_MULTIOBJECTIVE_PROTOCOL_VERSION = "calibration_sweep_v3"
+CALIBRATION_SWEEP_PROTOCOL_VERSION = "calibration_sweep_v4"
+CALIBRATION_SWEEP_MULTIOBJECTIVE_PROTOCOL_VERSION = "calibration_sweep_v5"
 CALIBRATION_SWEEP_PROTOCOL_FAMILY = "calibration_score_threshold"
 CALIBRATION_SWEEP_DEFAULT_PRUNING_CONFIG = {
     "enabled": True,
@@ -522,6 +531,23 @@ def _controlled_payload_updates_from_result(
         "effective_threshold_n_jobs": int(result.get("threshold_n_jobs", 1)),
         "optuna_jobs_cpu_cap": int(result.get("optuna_jobs_cpu_cap", 0)),
         "cpu_count": int(result.get("cpu_count", os.cpu_count() or 1)),
+        "execution_backend": str(
+            result.get("execution_backend", EXECUTION_BACKEND_LOCAL)
+        ),
+        "ray_address": result.get("ray_address"),
+        "ray_requested_trial_concurrency": result.get(
+            "ray_requested_trial_concurrency"
+        ),
+        "ray_effective_trial_concurrency": result.get(
+            "ray_effective_trial_concurrency"
+        ),
+        "ray_trial_cpus": result.get("ray_trial_cpus"),
+        "ray_active_nodes": result.get("ray_active_nodes"),
+        "ray_hosts_used": json.dumps(
+            list(result.get("ray_hosts_used") or []),
+            ensure_ascii=True,
+            default=_json_default,
+        ),
     }
 
 
@@ -913,6 +939,17 @@ def _calibration_multiobjective_trials_dataframe(
             "val_far": attrs.get("val_far"),
             "far_gate_pass": attrs.get("far_gate_pass"),
             "decision_threshold": attrs.get("decision_threshold"),
+            "trial_state": getattr(
+                getattr(trial, "state", None),
+                "name",
+                str(getattr(trial, "state", "")),
+            ),
+            "trial_host": attrs.get("trial_host"),
+            "trial_elapsed_s": attrs.get("trial_elapsed_s"),
+            "execution_backend": attrs.get(
+                "execution_backend",
+                EXECUTION_BACKEND_LOCAL,
+            ),
         }
         values = list(getattr(trial, "values", None) or [])
         for metric_name, value in zip(metric_names, values):
@@ -952,6 +989,307 @@ def _calibration_multiobjective_trials_dataframe(
         ]
         frame = frame.sort_values(sort_columns, ascending=ascending).reset_index(drop=True)
     return frame
+
+
+def _trial_state_name(state: object) -> str:
+    return str(getattr(state, "name", state or "") or "")
+
+
+def _should_prune_controlled_scalar_proxy(
+    score: float,
+    completed_scores: Sequence[object],
+    pruning_config: Dict[str, object],
+    *,
+    step: int,
+    direction: str,
+) -> bool:
+    if not _as_bool(pruning_config.get("enabled"), True):
+        return False
+    if int(step) <= int(pruning_config.get("n_warmup_steps") or 0):
+        return False
+    interval = max(1, int(pruning_config.get("interval_steps") or 1))
+    warmup = max(0, int(pruning_config.get("n_warmup_steps") or 0))
+    if (int(step) - warmup) % interval != 0:
+        return False
+    clean_scores = [
+        float(value)
+        for value in completed_scores
+        if np.isfinite(_finite_metric_value(value, default=float("nan")))
+    ]
+    if len(clean_scores) < max(0, int(pruning_config.get("n_startup_trials") or 0)):
+        return False
+    if not clean_scores:
+        return False
+    median_score = float(np.median(clean_scores))
+    if str(direction).strip().lower() == "minimize":
+        return float(score) > median_score
+    return float(score) < median_score
+
+
+def _controlled_scalar_trials_dataframe(
+    trials: Sequence[object],
+    *,
+    objective_direction: str,
+    pruner_name: str,
+) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for trial in trials:
+        attrs = dict(getattr(trial, "user_attrs", {}) or {})
+        row: Dict[str, object] = {
+            "number": int(getattr(trial, "number", -1)),
+            "value": getattr(trial, "value", None),
+            "state": _trial_state_name(getattr(trial, "state", None)),
+            "trial_state": _trial_state_name(getattr(trial, "state", None)),
+            "pruner": str(pruner_name),
+            "trial_host": attrs.get("trial_host"),
+            "trial_elapsed_s": attrs.get("trial_elapsed_s"),
+            "execution_backend": attrs.get(
+                "execution_backend",
+                EXECUTION_BACKEND_LOCAL,
+            ),
+        }
+        for key, value in dict(getattr(trial, "params", {}) or {}).items():
+            row[f"params_{key}"] = value
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    if "value" in frame.columns:
+        frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
+        frame = frame.sort_values(
+            ["state", "value"],
+            ascending=[True, objective_direction == "minimize"],
+            kind="stable",
+        ).reset_index(drop=True)
+    return frame
+
+
+def _controlled_result_backend_metadata(
+    *,
+    execution_backend: str,
+    ray_runtime: Optional[RayClusterRuntime],
+    requested_trial_concurrency: int,
+    effective_trial_concurrency: int,
+    ray_trial_cpus: Optional[int],
+    ray_hosts_used: Optional[Sequence[object]] = None,
+) -> Dict[str, object]:
+    backend = normalize_execution_backend(execution_backend)
+    hosts = sorted(
+        {
+            str(host).strip()
+            for host in list(ray_hosts_used or [])
+            if str(host).strip()
+        }
+    )
+    if backend != EXECUTION_BACKEND_RAY_CLUSTER:
+        return {
+            "execution_backend": EXECUTION_BACKEND_LOCAL,
+            "ray_address": None,
+            "ray_requested_trial_concurrency": None,
+            "ray_effective_trial_concurrency": None,
+            "ray_trial_cpus": None,
+            "ray_active_nodes": None,
+            "ray_hosts_used": [],
+        }
+    runtime = ray_runtime
+    return {
+        "execution_backend": EXECUTION_BACKEND_RAY_CLUSTER,
+        "ray_address": (
+            None
+            if runtime is None
+            else str(runtime.config.ray_address or "")
+        ),
+        "ray_requested_trial_concurrency": int(requested_trial_concurrency),
+        "ray_effective_trial_concurrency": int(effective_trial_concurrency),
+        "ray_trial_cpus": (
+            None if ray_trial_cpus is None else int(ray_trial_cpus)
+        ),
+        "ray_active_nodes": (
+            None if runtime is None else int(runtime.active_nodes)
+        ),
+        "ray_hosts_used": hosts,
+    }
+
+
+def _ray_run_controlled_trial(
+    payload: Dict[str, object],
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+) -> Dict[str, object]:
+    started_at = time.monotonic()
+    hostname = socket.gethostname()
+    runner = ExperimentsRunner(random_state=int(payload.get("random_state") or 42))
+    try:
+        selected_features = [
+            str(feature)
+            for feature in list(payload.get("selected_features") or [])
+            if str(feature) in train_df.columns and str(feature) in val_df.columns
+        ]
+        if not selected_features:
+            raise ValueError("Sin variables para el trial Ray.")
+
+        X_train = train_df[selected_features].fillna(0).astype("float32")
+        y_train = train_df["target"].astype(int)
+        X_val = val_df[selected_features].fillna(0).astype("float32")
+        y_val = val_df["target"].astype(int)
+        model_name = str(payload.get("model_name") or "")
+        model_params = dict(payload.get("model_params") or {})
+        smote_params = dict(payload.get("smote_params") or {})
+        threshold_parallel_jobs = int(payload.get("threshold_parallel_jobs") or 1)
+        pruning_config = dict(payload.get("pruning_config") or {})
+        threshold_objective = str(payload.get("threshold_objective") or "f1")
+        calibration_method = str(payload.get("calibration_method") or "none")
+        far_target = float(payload.get("far_target") or 0.20)
+        alerts_per_day = float(payload.get("alerts_per_day") or 5.0)
+        fn_cost = float(payload.get("fn_cost") or 10.0)
+        fp_cost = float(payload.get("fp_cost") or 1.0)
+        objective_mode = _normalize_calibration_sweep_objective_mode(
+            payload.get("optuna_objective_mode")
+        )
+
+        X_fit, y_fit = runner._apply_smote(
+            X_train,
+            y_train,
+            smote_params=smote_params,
+        )
+
+        if (
+            objective_mode
+            == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+        ):
+            step_scores = runner._collect_controlled_multiobjective_proxy_scores(
+                model_name=model_name,
+                model_params=model_params,
+                X_fit=X_fit,
+                y_fit=y_fit,
+                X_val=X_val,
+                y_val=y_val,
+                val_df=val_df,
+                threshold_objective=threshold_objective,
+                calibration_method=calibration_method,
+                far_target=far_target,
+                alerts_per_day=alerts_per_day,
+                fn_cost=fn_cost,
+                fp_cost=fp_cost,
+                threshold_parallel_jobs=threshold_parallel_jobs,
+                pruning_config=pruning_config,
+            )
+            scored = runner._score_controlled_multiobjective_trial_params(
+                model_name=model_name,
+                model_params=model_params,
+                X_fit=X_fit,
+                y_fit=y_fit,
+                X_val=X_val,
+                y_val=y_val,
+                val_df=val_df,
+                threshold_objective=threshold_objective,
+                calibration_method=calibration_method,
+                far_target=far_target,
+                alerts_per_day=alerts_per_day,
+                fn_cost=fn_cost,
+                fp_cost=fp_cost,
+                threshold_parallel_jobs=threshold_parallel_jobs,
+            )
+            metrics = dict(scored.get("metrics") or {})
+            values = list(scored.get("values") or [])
+            return {
+                "status": "completed",
+                "objective_mode": CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+                "values": values,
+                "metrics": metrics,
+                "threshold": float(scored.get("threshold", 0.5)),
+                "threshold_info": dict(scored.get("threshold_info") or {}),
+                "step_scores": {int(k): float(v) for k, v in step_scores.items()},
+                "pruning_proxy_score": float(
+                    scored.get("pruning_proxy_score", float("nan"))
+                ),
+                "far_gate_pass": bool(scored.get("far_gate_pass", False)),
+                "user_attrs": {
+                    **{
+                        metric_name: float(value)
+                        for metric_name, value in zip(
+                            CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS,
+                            values,
+                        )
+                    },
+                    "val_far": float(metrics.get("far", float("nan"))),
+                    "val_false_negatives": int(
+                        metrics.get("false_negatives", 0)
+                    ),
+                    "val_true_positives": int(metrics.get("true_positives", 0)),
+                    "decision_threshold": float(scored.get("threshold", 0.5)),
+                    "pruning_proxy_score": float(
+                        scored.get("pruning_proxy_score", float("nan"))
+                    ),
+                    "far_gate_pass": bool(scored.get("far_gate_pass", False)),
+                },
+                "hostname": hostname,
+                "elapsed_s": float(time.monotonic() - started_at),
+            }
+
+        step_scores = runner._collect_controlled_intermediate_scores(
+            model_name=model_name,
+            model_params=model_params,
+            X_fit=X_fit,
+            y_fit=y_fit,
+            X_val=X_val,
+            y_val=y_val,
+            val_df=val_df,
+            objective_metric=str(payload.get("objective_metric") or "roc_auc"),
+            threshold_objective=threshold_objective,
+            calibration_method=calibration_method,
+            far_target=far_target,
+            alerts_per_day=alerts_per_day,
+            fn_cost=fn_cost,
+            fp_cost=fp_cost,
+            threshold_parallel_jobs=threshold_parallel_jobs,
+            pruning_config=pruning_config,
+        )
+        scored_scalar = runner._score_controlled_trial_payload(
+            model_name=model_name,
+            model_params=model_params,
+            X_fit=X_fit,
+            y_fit=y_fit,
+            X_val=X_val,
+            y_val=y_val,
+            val_df=val_df,
+            objective_metric=str(payload.get("objective_metric") or "roc_auc"),
+            threshold_objective=threshold_objective,
+            calibration_method=calibration_method,
+            far_target=far_target,
+            alerts_per_day=alerts_per_day,
+            fn_cost=fn_cost,
+            fp_cost=fp_cost,
+            threshold_parallel_jobs=threshold_parallel_jobs,
+        )
+        metrics = dict(scored_scalar.get("metrics") or {})
+        return {
+            "status": "completed",
+            "objective_mode": CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
+            "score": float(scored_scalar.get("score", float("nan"))),
+            "metrics": metrics,
+            "threshold": float(scored_scalar.get("threshold", 0.5)),
+            "threshold_info": dict(scored_scalar.get("threshold_info") or {}),
+            "step_scores": {int(k): float(v) for k, v in step_scores.items()},
+            "user_attrs": {
+                "decision_threshold": float(scored_scalar.get("threshold", 0.5)),
+                "val_far": float(metrics.get("far", float("nan"))),
+                "val_mcc": float(metrics.get("mcc", float("nan"))),
+                "val_pr_auc": float(metrics.get("pr_auc", float("nan"))),
+                "objective_score": float(
+                    scored_scalar.get("score", float("nan"))
+                ),
+            },
+            "hostname": hostname,
+            "elapsed_s": float(time.monotonic() - started_at),
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": str(exc),
+            "hostname": hostname,
+            "elapsed_s": float(time.monotonic() - started_at),
+        }
 
 
 def _resolve_controlled_models(
@@ -3766,7 +4104,7 @@ class ExperimentsRunner:
             )
         return proxy_params
 
-    def _score_controlled_trial_params(
+    def _score_controlled_trial_payload(
         self,
         *,
         model_name: str,
@@ -3784,7 +4122,7 @@ class ExperimentsRunner:
         fn_cost: float,
         fp_cost: float,
         threshold_parallel_jobs: int,
-    ) -> float:
+    ) -> Dict[str, object]:
         model = build_model(model_name, model_params, self.random_state)
         model.fit(X_fit, y_fit)
         scores_val, _ = self._controlled_model_scores(
@@ -3811,6 +4149,49 @@ class ExperimentsRunner:
             fn_cost=float(fn_cost),
             fp_cost=float(fp_cost),
             threshold_n_jobs=int(threshold_parallel_jobs),
+        )
+        return {
+            "score": float(scored.get("score", float("nan"))),
+            "threshold": float(scored.get("threshold", 0.5)),
+            "threshold_info": dict(scored.get("threshold_info") or {}),
+            "metrics": dict(scored.get("metrics") or {}),
+        }
+
+    def _score_controlled_trial_params(
+        self,
+        *,
+        model_name: str,
+        model_params: Dict[str, object],
+        X_fit: pd.DataFrame,
+        y_fit: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        val_df: pd.DataFrame,
+        objective_metric: str,
+        threshold_objective: str,
+        calibration_method: str,
+        far_target: float,
+        alerts_per_day: float,
+        fn_cost: float,
+        fp_cost: float,
+        threshold_parallel_jobs: int,
+    ) -> float:
+        scored = self._score_controlled_trial_payload(
+            model_name=model_name,
+            model_params=model_params,
+            X_fit=X_fit,
+            y_fit=y_fit,
+            X_val=X_val,
+            y_val=y_val,
+            val_df=val_df,
+            objective_metric=objective_metric,
+            threshold_objective=threshold_objective,
+            calibration_method=calibration_method,
+            far_target=far_target,
+            alerts_per_day=alerts_per_day,
+            fn_cost=fn_cost,
+            fp_cost=fp_cost,
+            threshold_parallel_jobs=threshold_parallel_jobs,
         )
         return float(scored.get("score", float("nan")))
 
@@ -3878,7 +4259,7 @@ class ExperimentsRunner:
             ),
         }
 
-    def _report_controlled_multiobjective_proxy_scores(
+    def _collect_controlled_multiobjective_proxy_scores(
         self,
         *,
         model_name: str,
@@ -3896,7 +4277,6 @@ class ExperimentsRunner:
         fp_cost: float,
         threshold_parallel_jobs: int,
         pruning_config: Dict[str, object],
-        completed_proxy_scores_by_step: Dict[int, List[float]],
     ) -> Dict[int, float]:
         if not _as_bool(pruning_config.get("enabled"), True):
             return {}
@@ -3937,6 +4317,46 @@ class ExperimentsRunner:
             if pd.isna(proxy_score):
                 continue
             step_scores[int(step)] = float(proxy_score)
+        return step_scores
+
+    def _report_controlled_multiobjective_proxy_scores(
+        self,
+        *,
+        model_name: str,
+        model_params: Dict[str, object],
+        X_fit: pd.DataFrame,
+        y_fit: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        val_df: pd.DataFrame,
+        threshold_objective: str,
+        calibration_method: str,
+        far_target: float,
+        alerts_per_day: float,
+        fn_cost: float,
+        fp_cost: float,
+        threshold_parallel_jobs: int,
+        pruning_config: Dict[str, object],
+        completed_proxy_scores_by_step: Dict[int, List[float]],
+    ) -> Dict[int, float]:
+        step_scores = self._collect_controlled_multiobjective_proxy_scores(
+            model_name=model_name,
+            model_params=model_params,
+            X_fit=X_fit,
+            y_fit=y_fit,
+            X_val=X_val,
+            y_val=y_val,
+            val_df=val_df,
+            threshold_objective=threshold_objective,
+            calibration_method=calibration_method,
+            far_target=far_target,
+            alerts_per_day=alerts_per_day,
+            fn_cost=fn_cost,
+            fp_cost=fp_cost,
+            threshold_parallel_jobs=threshold_parallel_jobs,
+            pruning_config=pruning_config,
+        )
+        for step, proxy_score in step_scores.items():
             if _should_prune_calibration_multiobjective_proxy(
                 proxy_score,
                 completed_proxy_scores_by_step.get(int(step), []),
@@ -3946,9 +4366,8 @@ class ExperimentsRunner:
                 raise optuna.TrialPruned("Pruned by manual multiobjective proxy.")
         return step_scores
 
-    def _report_controlled_intermediate_scores(
+    def _collect_controlled_intermediate_scores(
         self,
-        trial: optuna.Trial,
         *,
         model_name: str,
         model_params: Dict[str, object],
@@ -3966,14 +4385,14 @@ class ExperimentsRunner:
         fp_cost: float,
         threshold_parallel_jobs: int,
         pruning_config: Dict[str, object],
-    ) -> int:
+    ) -> Dict[int, float]:
         if not _as_bool(pruning_config.get("enabled"), True):
-            return 0
+            return {}
         step_count = max(0, int(pruning_config.get("intermediate_steps") or 0))
         if step_count <= 0:
-            return 0
+            return {}
         fractions = np.linspace(0.35, 0.85, step_count)
-        reports = 0
+        reports: Dict[int, float] = {}
         for step, fraction in enumerate(fractions, start=1):
             X_proxy, y_proxy = self._fractional_training_sample(
                 X_fit,
@@ -4000,12 +4419,56 @@ class ExperimentsRunner:
                 far_target=float(far_target),
                 alerts_per_day=float(alerts_per_day),
                 fn_cost=float(fn_cost),
-                fp_cost=float(fp_cost),
-                threshold_parallel_jobs=int(threshold_parallel_jobs),
-            )
+                    fp_cost=float(fp_cost),
+                    threshold_parallel_jobs=int(threshold_parallel_jobs),
+                )
             if pd.isna(score):
                 continue
-            trial.report(float(score), step=step)
+            reports[int(step)] = float(score)
+        return reports
+
+    def _report_controlled_intermediate_scores(
+        self,
+        trial: optuna.Trial,
+        *,
+        model_name: str,
+        model_params: Dict[str, object],
+        X_fit: pd.DataFrame,
+        y_fit: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        val_df: pd.DataFrame,
+        objective_metric: str,
+        threshold_objective: str,
+        calibration_method: str,
+        far_target: float,
+        alerts_per_day: float,
+        fn_cost: float,
+        fp_cost: float,
+        threshold_parallel_jobs: int,
+        pruning_config: Dict[str, object],
+    ) -> int:
+        step_scores = self._collect_controlled_intermediate_scores(
+            model_name=model_name,
+            model_params=model_params,
+            X_fit=X_fit,
+            y_fit=y_fit,
+            X_val=X_val,
+            y_val=y_val,
+            val_df=val_df,
+            objective_metric=objective_metric,
+            threshold_objective=threshold_objective,
+            calibration_method=calibration_method,
+            far_target=far_target,
+            alerts_per_day=alerts_per_day,
+            fn_cost=fn_cost,
+            fp_cost=fp_cost,
+            threshold_parallel_jobs=threshold_parallel_jobs,
+            pruning_config=pruning_config,
+        )
+        reports = 0
+        for step, score in step_scores.items():
+            trial.report(float(score), step=int(step))
             reports += 1
             if trial.should_prune():
                 raise optuna.TrialPruned("Pruned by Optuna intermediate score.")
@@ -4158,6 +4621,8 @@ class ExperimentsRunner:
         top_k_values: Optional[Sequence[int]] = None,
         feature_k_metadata: Optional[Dict[str, object]] = None,
         optuna_objective_mode: str = CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
+        execution_backend: str = EXECUTION_BACKEND_LOCAL,
+        ray_runtime: Optional[RayClusterRuntime] = None,
     ) -> Dict[str, object]:
         feature_k_metadata = dict(feature_k_metadata or {})
         candidate_features = (
@@ -4196,6 +4661,13 @@ class ExperimentsRunner:
         if y_test.nunique() < 2:
             raise ValueError("Solo existe una clase en test.")
 
+        execution_backend = normalize_execution_backend(execution_backend)
+        if (
+            execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
+            and ray_runtime is None
+        ):
+            ray_runtime = connect_ray_cluster()
+
         optuna_objective_mode = _normalize_calibration_sweep_objective_mode(
             optuna_objective_mode
         )
@@ -4212,18 +4684,46 @@ class ExperimentsRunner:
         threshold_objective_label = THRESHOLD_OBJECTIVE_LABELS.get(
             threshold_objective, str(threshold_objective).upper()
         )
-        effective_parallelism = _resolve_controlled_optimization_parallelism(
-            model_name=model_name,
-            requested_optuna_n_jobs=int(optuna_n_jobs),
-            parallel_jobs=int(parallel_jobs),
-            xgb_parallel_jobs=int(xgb_parallel_jobs),
-        )
+        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+            if ray_runtime is None:
+                raise RuntimeError("Ray Cluster no está disponible.")
+            effective_parallelism = _resolve_controlled_optimization_parallelism(
+                model_name=model_name,
+                requested_optuna_n_jobs=1,
+                parallel_jobs=int(parallel_jobs),
+                xgb_parallel_jobs=int(xgb_parallel_jobs),
+                max_cpu_count=max(1, int(ray_runtime.max_node_cpus)),
+            )
+        else:
+            effective_parallelism = _resolve_controlled_optimization_parallelism(
+                model_name=model_name,
+                requested_optuna_n_jobs=int(optuna_n_jobs),
+                parallel_jobs=int(parallel_jobs),
+                xgb_parallel_jobs=int(xgb_parallel_jobs),
+            )
         resolved_parallel_jobs = int(effective_parallelism["parallel_jobs"])
         resolved_xgb_parallel_jobs = int(effective_parallelism["xgb_parallel_jobs"])
-        effective_optuna_n_jobs = int(effective_parallelism["optuna_n_jobs"])
-        optuna_jobs_cpu_cap = int(effective_parallelism["cpu_limited_optuna_jobs"])
         threshold_parallel_jobs = int(effective_parallelism["trial_threads"])
-        cpu_count = int(effective_parallelism["cpu_count"])
+        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+            if ray_runtime is None:
+                raise RuntimeError("Ray Cluster no está disponible.")
+            ray_trial_cpus = max(1, int(threshold_parallel_jobs))
+            optuna_jobs_cpu_cap = max(
+                1,
+                int(ray_runtime.total_cpus) // max(1, int(ray_trial_cpus)),
+            )
+            effective_optuna_n_jobs = max(
+                1,
+                min(int(optuna_n_jobs), int(optuna_jobs_cpu_cap)),
+            )
+            cpu_count = int(ray_runtime.total_cpus)
+        else:
+            ray_trial_cpus = None
+            effective_optuna_n_jobs = int(effective_parallelism["optuna_n_jobs"])
+            optuna_jobs_cpu_cap = int(
+                effective_parallelism["cpu_limited_optuna_jobs"]
+            )
+            cpu_count = int(effective_parallelism["cpu_count"])
 
         search_space = self._controlled_comparison_search_space(
             model_name=model_name,
@@ -4246,183 +4746,59 @@ class ExperimentsRunner:
             not smote_space.get("k_neighbors") or not smote_space.get("sampling_strategy")
         ):
             raise ValueError("SMOTE no es valido para el split actual.")
+        pruning_type = str(pruning_config.get("type") or "median").strip().lower()
+        if (
+            execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
+            and _as_bool(pruning_config.get("enabled"), True)
+            and pruning_type == "hyperband"
+        ):
+            raise ValueError(
+                "Hyperband no está soportado con execution_backend=ray_cluster."
+            )
 
-        if optuna_objective_mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE:
-            multiobjective_metric = CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY
-            multiobjective_label = CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL
+        def _build_sampler() -> optuna.samplers.BaseSampler:
             sampler_kwargs: Dict[str, object] = {"seed": self.random_state}
             if int(effective_optuna_n_jobs) > 1:
                 sampler_kwargs["constant_liar"] = True
             try:
-                sampler = optuna.samplers.TPESampler(**sampler_kwargs)
+                return optuna.samplers.TPESampler(**sampler_kwargs)
             except TypeError:
-                sampler = optuna.samplers.TPESampler(seed=self.random_state)
-            study = optuna.create_study(
-                directions=list(CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS),
-                sampler=sampler,
-                pruner=optuna.pruners.NopPruner(),
-            )
-            if _as_bool(pruning_config.get("warm_start"), True):
-                for warm_params in self._controlled_warm_start_trials(
-                    model_name=model_name,
-                    model_space=model_space,
-                    smote_space=smote_space,
-                    balance_mode=balance_mode,
-                ):
-                    study.enqueue_trial(warm_params)
+                return optuna.samplers.TPESampler(seed=self.random_state)
 
-            completed_proxy_scores_by_step: Dict[int, List[float]] = {}
-            completed_final_proxy_scores: List[float] = []
+        def _enqueue_warm_trials(study: optuna.Study) -> None:
+            if not _as_bool(pruning_config.get("warm_start"), True):
+                return
+            for warm_params in self._controlled_warm_start_trials(
+                model_name=model_name,
+                model_space=model_space,
+                smote_space=smote_space,
+                balance_mode=balance_mode,
+            ):
+                study.enqueue_trial(warm_params)
 
-            def objective_multiobjective(trial: optuna.Trial) -> Tuple[float, float, float, float]:
-                if tune_top_k:
-                    trial_top_k = int(
-                        trial.suggest_categorical("top_k", list(resolved_top_k_values))
-                    )
-                    trial_features = candidate_features[:trial_top_k]
-                else:
-                    trial_features = list(candidate_features)
-                if not trial_features:
-                    raise optuna.TrialPruned("Sin variables para el trial.")
-                X_train = X_train_all[trial_features]
-                X_val = X_val_all[trial_features]
-                model_params, smote_params = self._controlled_comparison_trial_params(
-                    trial,
-                    model_name=model_name,
-                    model_space=model_space,
-                    smote_space=smote_space,
-                    balance_mode=balance_mode,
-                    parallel_jobs=resolved_parallel_jobs,
-                    xgb_parallel_jobs=resolved_xgb_parallel_jobs,
-                )
-                try:
-                    X_fit, y_fit = self._apply_smote(
-                        X_train,
-                        y_train,
-                        smote_params=smote_params,
-                    )
-                    step_scores = self._report_controlled_multiobjective_proxy_scores(
-                        model_name=model_name,
-                        model_params=model_params,
-                        X_fit=X_fit,
-                        y_fit=y_fit,
-                        X_val=X_val,
-                        y_val=y_val,
-                        val_df=val_df,
-                        threshold_objective=threshold_objective,
-                        calibration_method=calibration_method,
-                        far_target=float(far_target),
-                        alerts_per_day=float(alerts_per_day),
-                        fn_cost=float(fn_cost),
-                        fp_cost=float(fp_cost),
-                        threshold_parallel_jobs=int(threshold_parallel_jobs),
-                        pruning_config=pruning_config,
-                        completed_proxy_scores_by_step=completed_proxy_scores_by_step,
-                    )
-                    scored = self._score_controlled_multiobjective_trial_params(
-                        model_name=model_name,
-                        model_params=model_params,
-                        X_fit=X_fit,
-                        y_fit=y_fit,
-                        X_val=X_val,
-                        y_val=y_val,
-                        val_df=val_df,
-                        threshold_objective=threshold_objective,
-                        calibration_method=calibration_method,
-                        far_target=float(far_target),
-                        alerts_per_day=float(alerts_per_day),
-                        fn_cost=float(fn_cost),
-                        fp_cost=float(fp_cost),
-                        threshold_parallel_jobs=int(threshold_parallel_jobs),
-                    )
-                except Exception as exc:
-                    if isinstance(exc, optuna.TrialPruned):
-                        raise
-                    raise optuna.TrialPruned(str(exc)) from exc
-
-                values = tuple(scored.get("values") or ())
-                if len(values) != len(CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS) or any(
-                    pd.isna(value) for value in values
-                ):
-                    raise optuna.TrialPruned("Vector multiobjetivo invalido en validacion.")
-                metrics = dict(scored.get("metrics") or {})
-                proxy_score = float(scored.get("pruning_proxy_score", float("nan")))
-                if pd.isna(proxy_score):
-                    raise optuna.TrialPruned("Proxy multiobjetivo invalido en validacion.")
-
-                final_step = int(pruning_config.get("intermediate_steps") or 0) + 1
-                if _should_prune_calibration_multiobjective_proxy(
-                    proxy_score,
-                    completed_final_proxy_scores,
-                    pruning_config,
-                    step=final_step,
-                ):
-                    raise optuna.TrialPruned("Pruned by final manual multiobjective proxy.")
-
-                for step, step_score in step_scores.items():
-                    trial.set_user_attr(f"pruning_proxy_step_{step}", float(step_score))
-                    completed_proxy_scores_by_step.setdefault(int(step), []).append(
-                        float(step_score)
-                    )
-                completed_final_proxy_scores.append(float(proxy_score))
-
-                for metric_name, value in zip(
-                    CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS,
-                    values,
-                ):
-                    trial.set_user_attr(metric_name, float(value))
-                trial.set_user_attr("val_far", float(metrics.get("far", float("nan"))))
-                trial.set_user_attr(
-                    "val_false_negatives",
-                    int(metrics.get("false_negatives", 0)),
-                )
-                trial.set_user_attr(
-                    "val_true_positives",
-                    int(metrics.get("true_positives", 0)),
-                )
-                trial.set_user_attr(
-                    "decision_threshold",
-                    float(scored.get("threshold", 0.5)),
-                )
-                trial.set_user_attr("pruning_proxy_score", float(proxy_score))
-                trial.set_user_attr(
-                    "far_gate_pass",
-                    bool(scored.get("far_gate_pass", False)),
-                )
-                return tuple(float(value) for value in values)
-
-            study.optimize(
-                objective_multiobjective,
-                n_trials=max(1, int(n_trials)),
-                timeout=max(1, int(timeout)),
-                n_jobs=max(1, int(effective_optuna_n_jobs)),
-            )
-
-            completed_trials = [
-                trial
-                for trial in study.trials
-                if trial.state == optuna.trial.TrialState.COMPLETE
-                and trial.values is not None
-            ]
-            state_counts = _optuna_trial_state_counts(study)
-            if not completed_trials:
-                raise ValueError("Optuna no genero trials multiobjetivo completos.")
-            pareto_trials = list(study.best_trials or completed_trials)
-            best_trial, far_gate_fallback = _select_calibration_multiobjective_trial(
-                pareto_trials,
-                far_target=float(far_target),
-            )
-            best_raw_params = dict(best_trial.params)
+        def _resolve_best_trial_payload(
+            best_trial: object,
+        ) -> Tuple[
+            Dict[str, object],
+            Dict[str, object],
+            Dict[str, object],
+            Dict[str, object],
+            List[str],
+            int,
+        ]:
+            best_raw_params = dict(getattr(best_trial, "params", {}) or {})
             best_model_params = {
                 key: value
                 for key, value in best_raw_params.items()
                 if not str(key).startswith("smote_") and str(key) != "top_k"
             }
-            best_smote_params = {}
+            best_smote_params: Dict[str, object] = {}
             if balance_mode == "smote":
                 best_smote_params = {
                     "k_neighbors": int(best_raw_params["smote_k_neighbors"]),
-                    "sampling_strategy": float(best_raw_params["smote_sampling_strategy"]),
+                    "sampling_strategy": float(
+                        best_raw_params["smote_sampling_strategy"]
+                    ),
                 }
             effective_model_params = dict(best_model_params)
             if model_name in {"Random Forest", "Balanced Random Forest"}:
@@ -4448,6 +4824,470 @@ class ExperimentsRunner:
             else:
                 best_feature_cols = list(candidate_features)
                 best_top_k = int(len(best_feature_cols))
+            return (
+                best_raw_params,
+                best_model_params,
+                best_smote_params,
+                effective_model_params,
+                best_feature_cols,
+                best_top_k,
+            )
+
+        ray_hosts_used: List[str] = []
+
+        if optuna_objective_mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE:
+            multiobjective_metric = CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY
+            multiobjective_label = CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL
+            if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+                if ray_runtime is None:
+                    raise RuntimeError("Ray Cluster no está disponible.")
+                study = optuna.create_study(
+                    directions=list(CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS),
+                    sampler=_build_sampler(),
+                    pruner=optuna.pruners.NopPruner(),
+                )
+                _enqueue_warm_trials(study)
+                completed_proxy_scores_by_step: Dict[int, List[float]] = {}
+                completed_final_proxy_scores: List[float] = []
+                ray_module = ray_runtime.ray_module
+                remote_eval = ray_module.remote(
+                    num_cpus=max(1, int(ray_trial_cpus or 1))
+                )(_ray_run_controlled_trial)
+                train_ref = ray_module.put(train_df.copy())
+                val_ref = ray_module.put(val_df.copy())
+                pending: Dict[object, optuna.Trial] = {}
+                launched_trials = 0
+                max_trials = max(1, int(n_trials))
+                deadline = time.monotonic() + max(1, int(timeout))
+                stop_launching = False
+                final_step = int(pruning_config.get("intermediate_steps") or 0) + 1
+
+                while launched_trials < max_trials or pending:
+                    while (
+                        not stop_launching
+                        and launched_trials < max_trials
+                        and len(pending) < max(1, int(effective_optuna_n_jobs))
+                    ):
+                        if time.monotonic() >= deadline:
+                            stop_launching = True
+                            break
+                        trial = study.ask()
+                        if tune_top_k:
+                            trial_top_k = int(
+                                trial.suggest_categorical(
+                                    "top_k",
+                                    list(resolved_top_k_values),
+                                )
+                            )
+                            trial_features = candidate_features[:trial_top_k]
+                        else:
+                            trial_features = list(candidate_features)
+                        if not trial_features:
+                            study.tell(
+                                trial,
+                                state=optuna.trial.TrialState.PRUNED,
+                            )
+                            launched_trials += 1
+                            continue
+                        model_params, smote_params = (
+                            self._controlled_comparison_trial_params(
+                                trial,
+                                model_name=model_name,
+                                model_space=model_space,
+                                smote_space=smote_space,
+                                balance_mode=balance_mode,
+                                parallel_jobs=resolved_parallel_jobs,
+                                xgb_parallel_jobs=resolved_xgb_parallel_jobs,
+                            )
+                        )
+                        payload = {
+                            "random_state": int(self.random_state),
+                            "model_name": model_name,
+                            "objective_metric": multiobjective_metric,
+                            "threshold_objective": threshold_objective,
+                            "calibration_method": calibration_method,
+                            "far_target": float(far_target),
+                            "alerts_per_day": float(alerts_per_day),
+                            "fn_cost": float(fn_cost),
+                            "fp_cost": float(fp_cost),
+                            "threshold_parallel_jobs": int(threshold_parallel_jobs),
+                            "pruning_config": dict(pruning_config),
+                            "optuna_objective_mode": (
+                                CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+                            ),
+                            "selected_features": list(trial_features),
+                            "model_params": dict(model_params),
+                            "smote_params": dict(smote_params),
+                        }
+                        pending[
+                            remote_eval.remote(payload, train_ref, val_ref)
+                        ] = trial
+                        launched_trials += 1
+
+                    if not pending:
+                        if launched_trials >= max_trials or stop_launching:
+                            break
+                        continue
+
+                    wait_timeout = (
+                        None
+                        if stop_launching or launched_trials >= max_trials
+                        else max(0.0, deadline - time.monotonic())
+                    )
+                    done_refs, _ = ray_module.wait(
+                        list(pending.keys()),
+                        num_returns=1,
+                        timeout=wait_timeout,
+                    )
+                    if not done_refs:
+                        stop_launching = True
+                        done_refs, _ = ray_module.wait(
+                            list(pending.keys()),
+                            num_returns=1,
+                            timeout=None,
+                        )
+                    for done_ref in done_refs:
+                        trial = pending.pop(done_ref)
+                        remote_result = ray_module.get(done_ref)
+                        host = str(remote_result.get("hostname") or "").strip()
+                        if host:
+                            ray_hosts_used.append(host)
+                        elapsed_s = pd.to_numeric(
+                            remote_result.get("elapsed_s"),
+                            errors="coerce",
+                        )
+                        trial.set_user_attr("trial_host", host or None)
+                        if not pd.isna(elapsed_s):
+                            trial.set_user_attr(
+                                "trial_elapsed_s",
+                                float(elapsed_s),
+                            )
+                        trial.set_user_attr(
+                            "execution_backend",
+                            EXECUTION_BACKEND_RAY_CLUSTER,
+                        )
+                        if str(remote_result.get("status") or "") != "completed":
+                            if remote_result.get("error") is not None:
+                                trial.set_user_attr(
+                                    "trial_error",
+                                    str(remote_result.get("error")),
+                                )
+                            study.tell(
+                                trial,
+                                state=optuna.trial.TrialState.FAIL,
+                            )
+                            continue
+
+                        step_scores = {
+                            int(key): float(value)
+                            for key, value in dict(
+                                remote_result.get("step_scores") or {}
+                            ).items()
+                        }
+                        for step, score in sorted(step_scores.items()):
+                            trial.set_user_attr(
+                                f"pruning_proxy_step_{int(step)}",
+                                float(score),
+                            )
+                        for key, value in dict(
+                            remote_result.get("user_attrs") or {}
+                        ).items():
+                            trial.set_user_attr(str(key), value)
+
+                        values = tuple(
+                            float(value)
+                            for value in list(remote_result.get("values") or [])
+                        )
+                        proxy_score = float(
+                            remote_result.get(
+                                "pruning_proxy_score",
+                                float("nan"),
+                            )
+                        )
+                        invalid_values = (
+                            len(values)
+                            != len(CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS)
+                            or any(pd.isna(value) for value in values)
+                            or pd.isna(proxy_score)
+                        )
+                        pruned = False
+                        if not invalid_values:
+                            for step, step_score in sorted(step_scores.items()):
+                                if _should_prune_calibration_multiobjective_proxy(
+                                    step_score,
+                                    completed_proxy_scores_by_step.get(
+                                        int(step),
+                                        [],
+                                    ),
+                                    pruning_config,
+                                    step=int(step),
+                                ):
+                                    pruned = True
+                                    break
+                            if (
+                                not pruned
+                                and _should_prune_calibration_multiobjective_proxy(
+                                    proxy_score,
+                                    completed_final_proxy_scores,
+                                    pruning_config,
+                                    step=final_step,
+                                )
+                            ):
+                                pruned = True
+
+                        if invalid_values or pruned:
+                            study.tell(
+                                trial,
+                                state=optuna.trial.TrialState.PRUNED,
+                            )
+                            continue
+
+                        for step, step_score in sorted(step_scores.items()):
+                            completed_proxy_scores_by_step.setdefault(
+                                int(step),
+                                [],
+                            ).append(float(step_score))
+                        completed_final_proxy_scores.append(float(proxy_score))
+                        study.tell(trial, values)
+
+                completed_trials = [
+                    trial
+                    for trial in study.trials
+                    if trial.state == optuna.trial.TrialState.COMPLETE
+                    and trial.values is not None
+                ]
+                state_counts = _optuna_trial_state_counts(study)
+                if not completed_trials:
+                    raise ValueError(
+                        "Optuna no genero trials multiobjetivo completos."
+                    )
+                pareto_trials = list(study.best_trials or completed_trials)
+                best_trial, far_gate_fallback = (
+                    _select_calibration_multiobjective_trial(
+                        pareto_trials,
+                        far_target=float(far_target),
+                    )
+                )
+                trials_df = _calibration_multiobjective_trials_dataframe(
+                    study.trials
+                )
+                if not trials_df.empty:
+                    trials_df["pruner"] = "ManualMedianProxy"
+                    trials_df["intermediate_report_steps"] = int(
+                        pruning_config.get("intermediate_steps") or 0
+                    )
+            else:
+                study = optuna.create_study(
+                    directions=list(CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS),
+                    sampler=_build_sampler(),
+                    pruner=optuna.pruners.NopPruner(),
+                )
+                _enqueue_warm_trials(study)
+
+                completed_proxy_scores_by_step: Dict[int, List[float]] = {}
+                completed_final_proxy_scores: List[float] = []
+
+                def objective_multiobjective(
+                    trial: optuna.Trial,
+                ) -> Tuple[float, float, float, float]:
+                    if tune_top_k:
+                        trial_top_k = int(
+                            trial.suggest_categorical(
+                                "top_k",
+                                list(resolved_top_k_values),
+                            )
+                        )
+                        trial_features = candidate_features[:trial_top_k]
+                    else:
+                        trial_features = list(candidate_features)
+                    if not trial_features:
+                        raise optuna.TrialPruned("Sin variables para el trial.")
+                    X_train = X_train_all[trial_features]
+                    X_val = X_val_all[trial_features]
+                    model_params, smote_params = (
+                        self._controlled_comparison_trial_params(
+                            trial,
+                            model_name=model_name,
+                            model_space=model_space,
+                            smote_space=smote_space,
+                            balance_mode=balance_mode,
+                            parallel_jobs=resolved_parallel_jobs,
+                            xgb_parallel_jobs=resolved_xgb_parallel_jobs,
+                        )
+                    )
+                    try:
+                        X_fit, y_fit = self._apply_smote(
+                            X_train,
+                            y_train,
+                            smote_params=smote_params,
+                        )
+                        step_scores = (
+                            self._report_controlled_multiobjective_proxy_scores(
+                                model_name=model_name,
+                                model_params=model_params,
+                                X_fit=X_fit,
+                                y_fit=y_fit,
+                                X_val=X_val,
+                                y_val=y_val,
+                                val_df=val_df,
+                                threshold_objective=threshold_objective,
+                                calibration_method=calibration_method,
+                                far_target=float(far_target),
+                                alerts_per_day=float(alerts_per_day),
+                                fn_cost=float(fn_cost),
+                                fp_cost=float(fp_cost),
+                                threshold_parallel_jobs=int(
+                                    threshold_parallel_jobs
+                                ),
+                                pruning_config=pruning_config,
+                                completed_proxy_scores_by_step=(
+                                    completed_proxy_scores_by_step
+                                ),
+                            )
+                        )
+                        scored = self._score_controlled_multiobjective_trial_params(
+                            model_name=model_name,
+                            model_params=model_params,
+                            X_fit=X_fit,
+                            y_fit=y_fit,
+                            X_val=X_val,
+                            y_val=y_val,
+                            val_df=val_df,
+                            threshold_objective=threshold_objective,
+                            calibration_method=calibration_method,
+                            far_target=float(far_target),
+                            alerts_per_day=float(alerts_per_day),
+                            fn_cost=float(fn_cost),
+                            fp_cost=float(fp_cost),
+                            threshold_parallel_jobs=int(
+                                threshold_parallel_jobs
+                            ),
+                        )
+                    except Exception as exc:
+                        if isinstance(exc, optuna.TrialPruned):
+                            raise
+                        raise optuna.TrialPruned(str(exc)) from exc
+
+                    values = tuple(scored.get("values") or ())
+                    if len(values) != len(
+                        CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS
+                    ) or any(pd.isna(value) for value in values):
+                        raise optuna.TrialPruned(
+                            "Vector multiobjetivo invalido en validacion."
+                        )
+                    metrics = dict(scored.get("metrics") or {})
+                    proxy_score = float(
+                        scored.get("pruning_proxy_score", float("nan"))
+                    )
+                    if pd.isna(proxy_score):
+                        raise optuna.TrialPruned(
+                            "Proxy multiobjetivo invalido en validacion."
+                        )
+
+                    final_step = (
+                        int(pruning_config.get("intermediate_steps") or 0) + 1
+                    )
+                    if _should_prune_calibration_multiobjective_proxy(
+                        proxy_score,
+                        completed_final_proxy_scores,
+                        pruning_config,
+                        step=final_step,
+                    ):
+                        raise optuna.TrialPruned(
+                            "Pruned by final manual multiobjective proxy."
+                        )
+
+                    for step, step_score in step_scores.items():
+                        trial.set_user_attr(
+                            f"pruning_proxy_step_{step}",
+                            float(step_score),
+                        )
+                        completed_proxy_scores_by_step.setdefault(
+                            int(step),
+                            [],
+                        ).append(float(step_score))
+                    completed_final_proxy_scores.append(float(proxy_score))
+
+                    for metric_name, value in zip(
+                        CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS,
+                        values,
+                    ):
+                        trial.set_user_attr(metric_name, float(value))
+                    trial.set_user_attr(
+                        "val_far",
+                        float(metrics.get("far", float("nan"))),
+                    )
+                    trial.set_user_attr(
+                        "val_false_negatives",
+                        int(metrics.get("false_negatives", 0)),
+                    )
+                    trial.set_user_attr(
+                        "val_true_positives",
+                        int(metrics.get("true_positives", 0)),
+                    )
+                    trial.set_user_attr(
+                        "decision_threshold",
+                        float(scored.get("threshold", 0.5)),
+                    )
+                    trial.set_user_attr(
+                        "pruning_proxy_score",
+                        float(proxy_score),
+                    )
+                    trial.set_user_attr(
+                        "far_gate_pass",
+                        bool(scored.get("far_gate_pass", False)),
+                    )
+                    return tuple(float(value) for value in values)
+
+                study.optimize(
+                    objective_multiobjective,
+                    n_trials=max(1, int(n_trials)),
+                    timeout=max(1, int(timeout)),
+                    n_jobs=max(1, int(effective_optuna_n_jobs)),
+                )
+
+                completed_trials = [
+                    trial
+                    for trial in study.trials
+                    if trial.state == optuna.trial.TrialState.COMPLETE
+                    and trial.values is not None
+                ]
+                state_counts = _optuna_trial_state_counts(study)
+                if not completed_trials:
+                    raise ValueError(
+                        "Optuna no genero trials multiobjetivo completos."
+                    )
+                pareto_trials = list(study.best_trials or completed_trials)
+                best_trial, far_gate_fallback = (
+                    _select_calibration_multiobjective_trial(
+                        pareto_trials,
+                        far_target=float(far_target),
+                    )
+                )
+                trials_df = _calibration_multiobjective_trials_dataframe(
+                    study.trials
+                )
+                if not trials_df.empty:
+                    trials_df["intermediate_report_steps"] = int(
+                        pruning_config.get("intermediate_steps") or 0
+                    )
+
+            (
+                _best_raw_params,
+                best_model_params,
+                best_smote_params,
+                effective_model_params,
+                best_feature_cols,
+                best_top_k,
+            ) = _resolve_best_trial_payload(best_trial)
+            backend_metadata = _controlled_result_backend_metadata(
+                execution_backend=execution_backend,
+                ray_runtime=ray_runtime,
+                requested_trial_concurrency=int(optuna_n_jobs),
+                effective_trial_concurrency=int(effective_optuna_n_jobs),
+                ray_trial_cpus=ray_trial_cpus,
+                ray_hosts_used=ray_hosts_used,
+            )
 
             protocol_result = train_model_with_protocol(
                 train_df,
@@ -4493,11 +5333,6 @@ class ExperimentsRunner:
                 val_metrics,
                 far_target=float(far_target),
             )
-            trials_df = _calibration_multiobjective_trials_dataframe(study.trials)
-            if not trials_df.empty:
-                trials_df["intermediate_report_steps"] = int(
-                    pruning_config.get("intermediate_steps") or 0
-                )
 
             return {
                 "status": "completed",
@@ -4514,9 +5349,15 @@ class ExperimentsRunner:
                 "objective_metric": multiobjective_metric,
                 "objective_label": multiobjective_label,
                 "objective_direction": "multiobjective",
-                "optuna_objective_mode": CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
-                "multiobjective_metrics": list(CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS),
-                "multiobjective_directions": list(CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS),
+                "optuna_objective_mode": (
+                    CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+                ),
+                "multiobjective_metrics": list(
+                    CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS
+                ),
+                "multiobjective_directions": list(
+                    CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS
+                ),
                 "objective_values": {
                     "validation": val_objective_values,
                     "test": test_objective_values,
@@ -4539,7 +5380,10 @@ class ExperimentsRunner:
                     feature_k_metadata.get("ranked_cols") or candidate_features
                 ),
                 "candidate_feature_count": int(
-                    feature_k_metadata.get("candidate_feature_count", len(candidate_features))
+                    feature_k_metadata.get(
+                        "candidate_feature_count",
+                        len(candidate_features),
+                    )
                 ),
                 "feature_k_mode": str(
                     feature_k_metadata.get(
@@ -4564,14 +5408,22 @@ class ExperimentsRunner:
                 "test_accuracy": float(test_metrics.get("accuracy", float("nan"))),
                 "val_recall": float(val_metrics.get("recall", float("nan"))),
                 "test_recall": float(test_metrics.get("recall", float("nan"))),
-                "val_sensitivity": float(val_metrics.get("sensitivity", float("nan"))),
-                "test_sensitivity": float(test_metrics.get("sensitivity", float("nan"))),
+                "val_sensitivity": float(
+                    val_metrics.get("sensitivity", float("nan"))
+                ),
+                "test_sensitivity": float(
+                    test_metrics.get("sensitivity", float("nan"))
+                ),
                 "val_roc_auc": float(val_metrics.get("roc_auc", float("nan"))),
                 "test_roc_auc": float(test_metrics.get("roc_auc", float("nan"))),
                 "val_pr_auc": float(val_metrics.get("pr_auc", float("nan"))),
                 "test_pr_auc": float(test_metrics.get("pr_auc", float("nan"))),
-                "val_brier_score": float(val_metrics.get("brier_score", float("nan"))),
-                "test_brier_score": float(test_metrics.get("brier_score", float("nan"))),
+                "val_brier_score": float(
+                    val_metrics.get("brier_score", float("nan"))
+                ),
+                "test_brier_score": float(
+                    test_metrics.get("brier_score", float("nan"))
+                ),
                 "val_recall_at_alerts_per_day": float(
                     val_metrics.get("recall_at_alerts_per_day", float("nan"))
                 ),
@@ -4580,50 +5432,114 @@ class ExperimentsRunner:
                 ),
                 "val_f1": float(val_metrics.get("f1", float("nan"))),
                 "test_f1": float(test_metrics.get("f1", float("nan"))),
-                "val_f1_global": float(val_metrics.get("f1_global", float("nan"))),
-                "test_f1_global": float(test_metrics.get("f1_global", float("nan"))),
+                "val_f1_global": float(
+                    val_metrics.get("f1_global", float("nan"))
+                ),
+                "test_f1_global": float(
+                    test_metrics.get("f1_global", float("nan"))
+                ),
                 "val_balanced_f1": float(
-                    val_metrics.get("balanced_f1", val_metrics.get("f1_global", float("nan")))
+                    val_metrics.get(
+                        "balanced_f1",
+                        val_metrics.get("f1_global", float("nan")),
+                    )
                 ),
                 "test_balanced_f1": float(
-                    test_metrics.get("balanced_f1", test_metrics.get("f1_global", float("nan")))
+                    test_metrics.get(
+                        "balanced_f1",
+                        test_metrics.get("f1_global", float("nan")),
+                    )
                 ),
-                "val_f1_class_0": float(val_metrics.get("f1_class_0", float("nan"))),
-                "test_f1_class_0": float(test_metrics.get("f1_class_0", float("nan"))),
-                "val_f1_class_1": float(val_metrics.get("f1_class_1", float("nan"))),
-                "test_f1_class_1": float(test_metrics.get("f1_class_1", float("nan"))),
+                "val_f1_class_0": float(
+                    val_metrics.get("f1_class_0", float("nan"))
+                ),
+                "test_f1_class_0": float(
+                    test_metrics.get("f1_class_0", float("nan"))
+                ),
+                "val_f1_class_1": float(
+                    val_metrics.get("f1_class_1", float("nan"))
+                ),
+                "test_f1_class_1": float(
+                    test_metrics.get("f1_class_1", float("nan"))
+                ),
                 "val_mcc": float(val_metrics.get("mcc", float("nan"))),
                 "test_mcc": float(test_metrics.get("mcc", float("nan"))),
-                "val_alerts_per_day": float(val_metrics.get("alerts_per_day", float("nan"))),
-                "test_alerts_per_day": float(test_metrics.get("alerts_per_day", float("nan"))),
-                "val_false_alarms_per_day": float(val_metrics.get("false_alarms_per_day", float("nan"))),
-                "test_false_alarms_per_day": float(test_metrics.get("false_alarms_per_day", float("nan"))),
+                "val_alerts_per_day": float(
+                    val_metrics.get("alerts_per_day", float("nan"))
+                ),
+                "test_alerts_per_day": float(
+                    test_metrics.get("alerts_per_day", float("nan"))
+                ),
+                "val_false_alarms_per_day": float(
+                    val_metrics.get("false_alarms_per_day", float("nan"))
+                ),
+                "test_false_alarms_per_day": float(
+                    test_metrics.get("false_alarms_per_day", float("nan"))
+                ),
                 "val_far": float(val_metrics.get("far", float("nan"))),
                 "test_far": float(test_metrics.get("far", float("nan"))),
-                "val_event_recall_approx": float(val_metrics.get("event_recall_approx", float("nan"))),
-                "test_event_recall_approx": float(test_metrics.get("event_recall_approx", float("nan"))),
-                "val_operational_cost": float(val_metrics.get("operational_cost", float("nan"))),
-                "test_operational_cost": float(test_metrics.get("operational_cost", float("nan"))),
-                "val_cost_per_day": float(val_metrics.get("cost_per_day", float("nan"))),
-                "test_cost_per_day": float(test_metrics.get("cost_per_day", float("nan"))),
+                "val_event_recall_approx": float(
+                    val_metrics.get("event_recall_approx", float("nan"))
+                ),
+                "test_event_recall_approx": float(
+                    test_metrics.get("event_recall_approx", float("nan"))
+                ),
+                "val_operational_cost": float(
+                    val_metrics.get("operational_cost", float("nan"))
+                ),
+                "test_operational_cost": float(
+                    test_metrics.get("operational_cost", float("nan"))
+                ),
+                "val_cost_per_day": float(
+                    val_metrics.get("cost_per_day", float("nan"))
+                ),
+                "test_cost_per_day": float(
+                    test_metrics.get("cost_per_day", float("nan"))
+                ),
                 "alerts_per_day_budget": float(alerts_per_day),
                 "far_target": float(far_target),
                 "fn_cost": float(fn_cost),
                 "fp_cost": float(fp_cost),
-                "val_false_negatives": int(val_metrics.get("false_negatives", 0)),
-                "test_false_negatives": int(test_metrics.get("false_negatives", 0)),
-                "val_false_positives": int(val_metrics.get("false_positives", 0)),
-                "test_false_positives": int(test_metrics.get("false_positives", 0)),
-                "val_true_negatives": int(val_metrics.get("true_negatives", 0)),
-                "test_true_negatives": int(test_metrics.get("true_negatives", 0)),
-                "val_true_positives": int(val_metrics.get("true_positives", 0)),
-                "test_true_positives": int(test_metrics.get("true_positives", 0)),
-                "val_positive_support": int(val_metrics.get("positive_support", 0)),
-                "test_positive_support": int(test_metrics.get("positive_support", 0)),
-                "val_tp_capture": float(val_metrics.get("tp_capture", float("nan"))),
-                "test_tp_capture": float(test_metrics.get("tp_capture", float("nan"))),
+                "val_false_negatives": int(
+                    val_metrics.get("false_negatives", 0)
+                ),
+                "test_false_negatives": int(
+                    test_metrics.get("false_negatives", 0)
+                ),
+                "val_false_positives": int(
+                    val_metrics.get("false_positives", 0)
+                ),
+                "test_false_positives": int(
+                    test_metrics.get("false_positives", 0)
+                ),
+                "val_true_negatives": int(
+                    val_metrics.get("true_negatives", 0)
+                ),
+                "test_true_negatives": int(
+                    test_metrics.get("true_negatives", 0)
+                ),
+                "val_true_positives": int(
+                    val_metrics.get("true_positives", 0)
+                ),
+                "test_true_positives": int(
+                    test_metrics.get("true_positives", 0)
+                ),
+                "val_positive_support": int(
+                    val_metrics.get("positive_support", 0)
+                ),
+                "test_positive_support": int(
+                    test_metrics.get("positive_support", 0)
+                ),
+                "val_tp_capture": float(
+                    val_metrics.get("tp_capture", float("nan"))
+                ),
+                "test_tp_capture": float(
+                    test_metrics.get("tp_capture", float("nan"))
+                ),
                 "val_fn_rate": float(val_metrics.get("fn_rate", float("nan"))),
-                "test_fn_rate": float(test_metrics.get("fn_rate", float("nan"))),
+                "test_fn_rate": float(
+                    test_metrics.get("fn_rate", float("nan"))
+                ),
                 "val_confusion_matrix": val_metrics.get("confusion_matrix"),
                 "test_confusion_matrix": test_metrics.get("confusion_matrix"),
                 "best_params": best_model_params,
@@ -4651,161 +5567,372 @@ class ExperimentsRunner:
                 "val_rows": int(len(val_df)),
                 "test_rows": int(len(test_df)),
                 "trials_df": trials_df,
+                **backend_metadata,
             }
 
-        sampler_kwargs: Dict[str, object] = {"seed": self.random_state}
-        if int(effective_optuna_n_jobs) > 1:
-            sampler_kwargs["constant_liar"] = True
-        try:
-            sampler = optuna.samplers.TPESampler(**sampler_kwargs)
-        except TypeError:
-            sampler = optuna.samplers.TPESampler(seed=self.random_state)
-        study = optuna.create_study(
-            direction=objective_direction,
-            sampler=sampler,
-            pruner=_build_optuna_pruner(pruning_config),
-        )
-        if _as_bool(pruning_config.get("warm_start"), True):
-            for warm_params in self._controlled_warm_start_trials(
-                model_name=model_name,
-                model_space=model_space,
-                smote_space=smote_space,
-                balance_mode=balance_mode,
-            ):
-                study.enqueue_trial(warm_params)
+        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+            if ray_runtime is None:
+                raise RuntimeError("Ray Cluster no está disponible.")
+            study = optuna.create_study(
+                direction=objective_direction,
+                sampler=_build_sampler(),
+                pruner=optuna.pruners.NopPruner(),
+            )
+            _enqueue_warm_trials(study)
+            completed_scores_by_step: Dict[int, List[float]] = {}
+            completed_final_scores: List[float] = []
+            ray_module = ray_runtime.ray_module
+            remote_eval = ray_module.remote(
+                num_cpus=max(1, int(ray_trial_cpus or 1))
+            )(_ray_run_controlled_trial)
+            train_ref = ray_module.put(train_df.copy())
+            val_ref = ray_module.put(val_df.copy())
+            pending: Dict[object, optuna.Trial] = {}
+            launched_trials = 0
+            max_trials = max(1, int(n_trials))
+            deadline = time.monotonic() + max(1, int(timeout))
+            stop_launching = False
+            final_step = int(pruning_config.get("intermediate_steps") or 0) + 1
 
-        def objective(trial: optuna.Trial) -> float:
-            if tune_top_k:
-                trial_top_k = int(
-                    trial.suggest_categorical("top_k", list(resolved_top_k_values))
+            while launched_trials < max_trials or pending:
+                while (
+                    not stop_launching
+                    and launched_trials < max_trials
+                    and len(pending) < max(1, int(effective_optuna_n_jobs))
+                ):
+                    if time.monotonic() >= deadline:
+                        stop_launching = True
+                        break
+                    trial = study.ask()
+                    if tune_top_k:
+                        trial_top_k = int(
+                            trial.suggest_categorical(
+                                "top_k",
+                                list(resolved_top_k_values),
+                            )
+                        )
+                        trial_features = candidate_features[:trial_top_k]
+                    else:
+                        trial_features = list(candidate_features)
+                    if not trial_features:
+                        study.tell(
+                            trial,
+                            state=optuna.trial.TrialState.PRUNED,
+                        )
+                        launched_trials += 1
+                        continue
+                    model_params, smote_params = (
+                        self._controlled_comparison_trial_params(
+                            trial,
+                            model_name=model_name,
+                            model_space=model_space,
+                            smote_space=smote_space,
+                            balance_mode=balance_mode,
+                            parallel_jobs=resolved_parallel_jobs,
+                            xgb_parallel_jobs=resolved_xgb_parallel_jobs,
+                        )
+                    )
+                    payload = {
+                        "random_state": int(self.random_state),
+                        "model_name": model_name,
+                        "objective_metric": objective_metric,
+                        "threshold_objective": threshold_objective,
+                        "calibration_method": calibration_method,
+                        "far_target": float(far_target),
+                        "alerts_per_day": float(alerts_per_day),
+                        "fn_cost": float(fn_cost),
+                        "fp_cost": float(fp_cost),
+                        "threshold_parallel_jobs": int(threshold_parallel_jobs),
+                        "pruning_config": dict(pruning_config),
+                        "optuna_objective_mode": (
+                            CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR
+                        ),
+                        "selected_features": list(trial_features),
+                        "model_params": dict(model_params),
+                        "smote_params": dict(smote_params),
+                    }
+                    pending[remote_eval.remote(payload, train_ref, val_ref)] = trial
+                    launched_trials += 1
+
+                if not pending:
+                    if launched_trials >= max_trials or stop_launching:
+                        break
+                    continue
+
+                wait_timeout = (
+                    None
+                    if stop_launching or launched_trials >= max_trials
+                    else max(0.0, deadline - time.monotonic())
                 )
-                trial_features = candidate_features[:trial_top_k]
+                done_refs, _ = ray_module.wait(
+                    list(pending.keys()),
+                    num_returns=1,
+                    timeout=wait_timeout,
+                )
+                if not done_refs:
+                    stop_launching = True
+                    done_refs, _ = ray_module.wait(
+                        list(pending.keys()),
+                        num_returns=1,
+                        timeout=None,
+                    )
+                for done_ref in done_refs:
+                    trial = pending.pop(done_ref)
+                    remote_result = ray_module.get(done_ref)
+                    host = str(remote_result.get("hostname") or "").strip()
+                    if host:
+                        ray_hosts_used.append(host)
+                    elapsed_s = pd.to_numeric(
+                        remote_result.get("elapsed_s"),
+                        errors="coerce",
+                    )
+                    trial.set_user_attr("trial_host", host or None)
+                    if not pd.isna(elapsed_s):
+                        trial.set_user_attr(
+                            "trial_elapsed_s",
+                            float(elapsed_s),
+                        )
+                    trial.set_user_attr(
+                        "execution_backend",
+                        EXECUTION_BACKEND_RAY_CLUSTER,
+                    )
+                    for key, value in dict(
+                        remote_result.get("user_attrs") or {}
+                    ).items():
+                        trial.set_user_attr(str(key), value)
+
+                    if str(remote_result.get("status") or "") != "completed":
+                        if remote_result.get("error") is not None:
+                            trial.set_user_attr(
+                                "trial_error",
+                                str(remote_result.get("error")),
+                            )
+                        study.tell(
+                            trial,
+                            state=optuna.trial.TrialState.FAIL,
+                        )
+                        continue
+
+                    step_scores = {
+                        int(key): float(value)
+                        for key, value in dict(
+                            remote_result.get("step_scores") or {}
+                        ).items()
+                    }
+                    pruned = False
+                    for step, step_score in sorted(step_scores.items()):
+                        trial.report(float(step_score), step=int(step))
+                        if _should_prune_controlled_scalar_proxy(
+                            step_score,
+                            completed_scores_by_step.get(int(step), []),
+                            pruning_config,
+                            step=int(step),
+                            direction=objective_direction,
+                        ):
+                            pruned = True
+                            break
+
+                    score = float(remote_result.get("score", float("nan")))
+                    if not pruned and not pd.isna(score):
+                        trial.report(float(score), step=final_step)
+                        if _should_prune_controlled_scalar_proxy(
+                            score,
+                            completed_final_scores,
+                            pruning_config,
+                            step=final_step,
+                            direction=objective_direction,
+                        ):
+                            pruned = True
+
+                    if pruned or pd.isna(score):
+                        study.tell(
+                            trial,
+                            state=optuna.trial.TrialState.PRUNED,
+                        )
+                        continue
+
+                    for step, step_score in sorted(step_scores.items()):
+                        completed_scores_by_step.setdefault(
+                            int(step),
+                            [],
+                        ).append(float(step_score))
+                    completed_final_scores.append(float(score))
+                    study.tell(trial, float(score))
+
+            completed_trials = [
+                trial
+                for trial in study.trials
+                if trial.state == optuna.trial.TrialState.COMPLETE
+                and trial.value is not None
+            ]
+            state_counts = _optuna_trial_state_counts(study)
+            if not completed_trials:
+                raise ValueError("Optuna no genero trials completos.")
+            if objective_direction == "minimize":
+                best_trial = min(
+                    completed_trials,
+                    key=lambda trial: float(trial.value),
+                )
             else:
-                trial_features = list(candidate_features)
-            if not trial_features:
-                raise optuna.TrialPruned("Sin variables para el trial.")
-            X_train = X_train_all[trial_features]
-            X_val = X_val_all[trial_features]
-            model_params, smote_params = self._controlled_comparison_trial_params(
-                trial,
-                model_name=model_name,
-                model_space=model_space,
-                smote_space=smote_space,
-                balance_mode=balance_mode,
-                parallel_jobs=resolved_parallel_jobs,
-                xgb_parallel_jobs=resolved_xgb_parallel_jobs,
+                best_trial = max(
+                    completed_trials,
+                    key=lambda trial: float(trial.value),
+                )
+            optuna_pruner_name = "DriverMedianProxy"
+            trials_df = _controlled_scalar_trials_dataframe(
+                study.trials,
+                objective_direction=objective_direction,
+                pruner_name=optuna_pruner_name,
             )
-            try:
-                X_fit, y_fit = self._apply_smote(
-                    X_train,
-                    y_train,
-                    smote_params=smote_params,
+            if not trials_df.empty:
+                trials_df["intermediate_report_steps"] = int(
+                    pruning_config.get("intermediate_steps") or 0
                 )
-                reports = self._report_controlled_intermediate_scores(
-                    trial,
-                    model_name=model_name,
-                    model_params=model_params,
-                    X_fit=X_fit,
-                    y_fit=y_fit,
-                    X_val=X_val,
-                    y_val=y_val,
-                    val_df=val_df,
-                    objective_metric=objective_metric,
-                    threshold_objective=threshold_objective,
-                    calibration_method=calibration_method,
-                    far_target=float(far_target),
-                    alerts_per_day=float(alerts_per_day),
-                    fn_cost=float(fn_cost),
-                    fp_cost=float(fp_cost),
-                    threshold_parallel_jobs=int(threshold_parallel_jobs),
-                    pruning_config=pruning_config,
-                )
-                score = self._score_controlled_trial_params(
-                    model_name=model_name,
-                    model_params=model_params,
-                    X_fit=X_fit,
-                    y_fit=y_fit,
-                    X_val=X_val,
-                    y_val=y_val,
-                    val_df=val_df,
-                    objective_metric=objective_metric,
-                    threshold_objective=threshold_objective,
-                    calibration_method=calibration_method,
-                    far_target=float(far_target),
-                    alerts_per_day=float(alerts_per_day),
-                    fn_cost=float(fn_cost),
-                    fp_cost=float(fp_cost),
-                    threshold_parallel_jobs=int(threshold_parallel_jobs),
-                )
-                if not pd.isna(score):
-                    trial.report(float(score), step=int(reports) + 1)
-                    if trial.should_prune():
-                        raise optuna.TrialPruned("Pruned by final validation score.")
-            except Exception as exc:
-                if isinstance(exc, optuna.TrialPruned):
-                    raise
-                raise optuna.TrialPruned(str(exc)) from exc
-            if pd.isna(score):
-                raise optuna.TrialPruned(
-                    f"{objective_label} invalido en validacion."
-                )
-            return float(score)
+        else:
+            study = optuna.create_study(
+                direction=objective_direction,
+                sampler=_build_sampler(),
+                pruner=_build_optuna_pruner(pruning_config),
+            )
+            _enqueue_warm_trials(study)
 
-        study.optimize(
-            objective,
-            n_trials=max(1, int(n_trials)),
-            timeout=max(1, int(timeout)),
-            n_jobs=max(1, int(effective_optuna_n_jobs)),
+            def objective(trial: optuna.Trial) -> float:
+                if tune_top_k:
+                    trial_top_k = int(
+                        trial.suggest_categorical(
+                            "top_k",
+                            list(resolved_top_k_values),
+                        )
+                    )
+                    trial_features = candidate_features[:trial_top_k]
+                else:
+                    trial_features = list(candidate_features)
+                if not trial_features:
+                    raise optuna.TrialPruned("Sin variables para el trial.")
+                X_train = X_train_all[trial_features]
+                X_val = X_val_all[trial_features]
+                model_params, smote_params = (
+                    self._controlled_comparison_trial_params(
+                        trial,
+                        model_name=model_name,
+                        model_space=model_space,
+                        smote_space=smote_space,
+                        balance_mode=balance_mode,
+                        parallel_jobs=resolved_parallel_jobs,
+                        xgb_parallel_jobs=resolved_xgb_parallel_jobs,
+                    )
+                )
+                try:
+                    X_fit, y_fit = self._apply_smote(
+                        X_train,
+                        y_train,
+                        smote_params=smote_params,
+                    )
+                    reports = self._report_controlled_intermediate_scores(
+                        trial,
+                        model_name=model_name,
+                        model_params=model_params,
+                        X_fit=X_fit,
+                        y_fit=y_fit,
+                        X_val=X_val,
+                        y_val=y_val,
+                        val_df=val_df,
+                        objective_metric=objective_metric,
+                        threshold_objective=threshold_objective,
+                        calibration_method=calibration_method,
+                        far_target=float(far_target),
+                        alerts_per_day=float(alerts_per_day),
+                        fn_cost=float(fn_cost),
+                        fp_cost=float(fp_cost),
+                        threshold_parallel_jobs=int(threshold_parallel_jobs),
+                        pruning_config=pruning_config,
+                    )
+                    score = self._score_controlled_trial_params(
+                        model_name=model_name,
+                        model_params=model_params,
+                        X_fit=X_fit,
+                        y_fit=y_fit,
+                        X_val=X_val,
+                        y_val=y_val,
+                        val_df=val_df,
+                        objective_metric=objective_metric,
+                        threshold_objective=threshold_objective,
+                        calibration_method=calibration_method,
+                        far_target=float(far_target),
+                        alerts_per_day=float(alerts_per_day),
+                        fn_cost=float(fn_cost),
+                        fp_cost=float(fp_cost),
+                        threshold_parallel_jobs=int(threshold_parallel_jobs),
+                    )
+                    if not pd.isna(score):
+                        trial.report(float(score), step=int(reports) + 1)
+                        if trial.should_prune():
+                            raise optuna.TrialPruned(
+                                "Pruned by final validation score."
+                            )
+                except Exception as exc:
+                    if isinstance(exc, optuna.TrialPruned):
+                        raise
+                    raise optuna.TrialPruned(str(exc)) from exc
+                if pd.isna(score):
+                    raise optuna.TrialPruned(
+                        f"{objective_label} invalido en validacion."
+                    )
+                return float(score)
+
+            study.optimize(
+                objective,
+                n_trials=max(1, int(n_trials)),
+                timeout=max(1, int(timeout)),
+                n_jobs=max(1, int(effective_optuna_n_jobs)),
+            )
+
+            completed_trials = [
+                trial
+                for trial in study.trials
+                if trial.state == optuna.trial.TrialState.COMPLETE
+                and trial.value is not None
+            ]
+            state_counts = _optuna_trial_state_counts(study)
+            if not completed_trials:
+                raise ValueError("Optuna no genero trials completos.")
+            if objective_direction == "minimize":
+                best_trial = min(
+                    completed_trials,
+                    key=lambda trial: float(trial.value),
+                )
+            else:
+                best_trial = max(
+                    completed_trials,
+                    key=lambda trial: float(trial.value),
+                )
+            optuna_pruner_name = type(study.pruner).__name__
+            trials_df = _controlled_scalar_trials_dataframe(
+                study.trials,
+                objective_direction=objective_direction,
+                pruner_name=optuna_pruner_name,
+            )
+            if not trials_df.empty:
+                trials_df["intermediate_report_steps"] = int(
+                    pruning_config.get("intermediate_steps") or 0
+                )
+
+        (
+            _best_raw_params,
+            best_model_params,
+            best_smote_params,
+            effective_model_params,
+            best_feature_cols,
+            best_top_k,
+        ) = _resolve_best_trial_payload(best_trial)
+        backend_metadata = _controlled_result_backend_metadata(
+            execution_backend=execution_backend,
+            ray_runtime=ray_runtime,
+            requested_trial_concurrency=int(optuna_n_jobs),
+            effective_trial_concurrency=int(effective_optuna_n_jobs),
+            ray_trial_cpus=ray_trial_cpus,
+            ray_hosts_used=ray_hosts_used,
         )
-
-        completed_trials = [
-            trial
-            for trial in study.trials
-            if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None
-        ]
-        state_counts = _optuna_trial_state_counts(study)
-        if not completed_trials:
-            raise ValueError("Optuna no genero trials completos.")
-        if objective_direction == "minimize":
-            best_trial = min(completed_trials, key=lambda trial: float(trial.value))
-        else:
-            best_trial = max(completed_trials, key=lambda trial: float(trial.value))
-        best_raw_params = dict(best_trial.params)
-        best_model_params = {
-            key: value
-            for key, value in best_raw_params.items()
-            if not str(key).startswith("smote_") and str(key) != "top_k"
-        }
-        best_smote_params = {}
-        if balance_mode == "smote":
-            best_smote_params = {
-                "k_neighbors": int(best_raw_params["smote_k_neighbors"]),
-                "sampling_strategy": float(best_raw_params["smote_sampling_strategy"]),
-            }
-        effective_model_params = dict(best_model_params)
-        if model_name in {"Random Forest", "Balanced Random Forest"}:
-            if effective_model_params.get("max_depth") in {0, "0"}:
-                effective_model_params["max_depth"] = None
-            if best_model_params.get("max_depth") in {0, "0"}:
-                best_model_params["max_depth"] = None
-            effective_model_params["n_jobs"] = int(resolved_parallel_jobs)
-        elif model_name == "XGBoost":
-            effective_model_params["n_jobs"] = int(resolved_xgb_parallel_jobs)
-        elif model_name == "SVM":
-            effective_model_params["probability"] = False
-
-        if tune_top_k:
-            best_top_k = max(
-                1,
-                min(
-                    int(best_raw_params.get("top_k", resolved_top_k_values[-1])),
-                    len(candidate_features),
-                ),
-            )
-            best_feature_cols = list(candidate_features[:best_top_k])
-        else:
-            best_feature_cols = list(candidate_features)
-            best_top_k = int(len(best_feature_cols))
 
         protocol_result = train_model_with_protocol(
             train_df,
@@ -4838,17 +5965,6 @@ class ExperimentsRunner:
             test_metrics,
             objective_metric,
         )
-
-        trials_df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
-        if not trials_df.empty:
-            trials_df = trials_df.sort_values(
-                "value",
-                ascending=objective_direction == "minimize",
-            ).reset_index(drop=True)
-            trials_df["pruner"] = type(study.pruner).__name__
-            trials_df["intermediate_report_steps"] = int(
-                pruning_config.get("intermediate_steps") or 0
-            )
 
         return {
             "status": "completed",
@@ -4950,16 +6066,30 @@ class ExperimentsRunner:
             "test_mcc": float(test_metrics.get("mcc", float("nan"))),
             "val_alerts_per_day": float(val_metrics.get("alerts_per_day", float("nan"))),
             "test_alerts_per_day": float(test_metrics.get("alerts_per_day", float("nan"))),
-            "val_false_alarms_per_day": float(val_metrics.get("false_alarms_per_day", float("nan"))),
-            "test_false_alarms_per_day": float(test_metrics.get("false_alarms_per_day", float("nan"))),
+            "val_false_alarms_per_day": float(
+                val_metrics.get("false_alarms_per_day", float("nan"))
+            ),
+            "test_false_alarms_per_day": float(
+                test_metrics.get("false_alarms_per_day", float("nan"))
+            ),
             "val_far": float(val_metrics.get("far", float("nan"))),
             "test_far": float(test_metrics.get("far", float("nan"))),
-            "val_event_recall_approx": float(val_metrics.get("event_recall_approx", float("nan"))),
-            "test_event_recall_approx": float(test_metrics.get("event_recall_approx", float("nan"))),
-            "val_operational_cost": float(val_metrics.get("operational_cost", float("nan"))),
-            "test_operational_cost": float(test_metrics.get("operational_cost", float("nan"))),
+            "val_event_recall_approx": float(
+                val_metrics.get("event_recall_approx", float("nan"))
+            ),
+            "test_event_recall_approx": float(
+                test_metrics.get("event_recall_approx", float("nan"))
+            ),
+            "val_operational_cost": float(
+                val_metrics.get("operational_cost", float("nan"))
+            ),
+            "test_operational_cost": float(
+                test_metrics.get("operational_cost", float("nan"))
+            ),
             "val_cost_per_day": float(val_metrics.get("cost_per_day", float("nan"))),
-            "test_cost_per_day": float(test_metrics.get("cost_per_day", float("nan"))),
+            "test_cost_per_day": float(
+                test_metrics.get("cost_per_day", float("nan"))
+            ),
             "alerts_per_day_budget": float(alerts_per_day),
             "far_target": float(far_target),
             "fn_cost": float(fn_cost),
@@ -4990,7 +6120,7 @@ class ExperimentsRunner:
             "optuna_pruning_rate": float(
                 state_counts["pruned"] / max(1, state_counts["total"])
             ),
-            "optuna_pruner": type(study.pruner).__name__,
+            "optuna_pruner": optuna_pruner_name,
             "optuna_pruning_config": dict(pruning_config),
             "optuna_n_jobs": int(effective_optuna_n_jobs),
             "parallel_jobs": int(resolved_parallel_jobs),
@@ -5005,6 +6135,7 @@ class ExperimentsRunner:
             "val_rows": int(len(val_df)),
             "test_rows": int(len(test_df)),
             "trials_df": trials_df,
+            **backend_metadata,
         }
 
     def _evaluate_controlled_combo_with_frozen_params(
@@ -5270,6 +6401,7 @@ class ExperimentsRunner:
         n_trials: int = 25,
         timeout: int = 1800,
         optuna_n_jobs: int = 1,
+        execution_backend: str = EXECUTION_BACKEND_LOCAL,
         parallel_jobs: int = 1,
         xgb_parallel_jobs: int = 1,
         search_space_config: Optional[Dict[str, object]] = None,
@@ -5309,6 +6441,28 @@ class ExperimentsRunner:
             ]
         if not feature_cols:
             raise ValueError("No hay variables efectivas para ejecutar el experimento.")
+        execution_backend = normalize_execution_backend(execution_backend)
+        ray_runtime: Optional[RayClusterRuntime] = None
+        ray_protocol_trial_cpus: Optional[int] = None
+        ray_protocol_effective_concurrency: Optional[int] = None
+        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+            ray_runtime = connect_ray_cluster()
+            preview_parallelism = _resolve_controlled_optimization_parallelism(
+                model_name=resolved_model_name,
+                requested_optuna_n_jobs=1,
+                parallel_jobs=int(parallel_jobs),
+                xgb_parallel_jobs=int(xgb_parallel_jobs),
+                max_cpu_count=max(1, int(ray_runtime.max_node_cpus)),
+            )
+            ray_protocol_trial_cpus = int(preview_parallelism["trial_threads"])
+            ray_protocol_effective_concurrency = max(
+                1,
+                min(
+                    int(optuna_n_jobs),
+                    int(ray_runtime.total_cpus)
+                    // max(1, int(ray_protocol_trial_cpus)),
+                ),
+            )
 
         optuna_objective_mode = _normalize_calibration_sweep_objective_mode(
             optuna_objective_mode
@@ -5467,8 +6621,25 @@ class ExperimentsRunner:
             "n_trials": int(n_trials),
             "timeout": int(timeout),
             "optuna_n_jobs": int(optuna_n_jobs),
+            "execution_backend": str(execution_backend),
             "parallel_jobs": int(parallel_jobs),
             "xgb_parallel_jobs": int(xgb_parallel_jobs),
+            "ray_address": (
+                None
+                if ray_runtime is None
+                else str(ray_runtime.config.ray_address or "")
+            ),
+            "ray_requested_trial_concurrency": (
+                int(optuna_n_jobs)
+                if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
+                else None
+            ),
+            "ray_effective_trial_concurrency": ray_protocol_effective_concurrency,
+            "ray_trial_cpus": ray_protocol_trial_cpus,
+            "ray_active_nodes": (
+                None if ray_runtime is None else int(ray_runtime.active_nodes)
+            ),
+            "ray_hosts_used": [],
             "far_target": float(far_target),
             "alerts_per_day": float(alerts_per_day),
             "fn_cost": float(fn_cost),
@@ -5587,6 +6758,17 @@ class ExperimentsRunner:
                 "protocol_version": protocol_version,
                 "protocol_family": CALIBRATION_SWEEP_PROTOCOL_FAMILY,
                 "protocol": dict(protocol),
+                "execution_backend": str(execution_backend),
+                "ray_address": protocol.get("ray_address"),
+                "ray_requested_trial_concurrency": protocol.get(
+                    "ray_requested_trial_concurrency"
+                ),
+                "ray_effective_trial_concurrency": protocol.get(
+                    "ray_effective_trial_concurrency"
+                ),
+                "ray_trial_cpus": protocol.get("ray_trial_cpus"),
+                "ray_active_nodes": protocol.get("ray_active_nodes"),
+                "ray_hosts_used": list(protocol.get("ray_hosts_used") or []),
                 "status": "running",
                 "result_status": "running",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -5803,6 +6985,7 @@ class ExperimentsRunner:
                     search_space_config=dict(search_space),
                     parallel_jobs=int(parallel_jobs),
                     xgb_parallel_jobs=int(xgb_parallel_jobs),
+                    execution_backend=str(execution_backend),
                     optuna_pruning_config=dict(pruning_config),
                     optuna_objective_mode=str(optuna_objective_mode),
                     ranked_features=list(ranked_feature_cols)
@@ -5822,6 +7005,7 @@ class ExperimentsRunner:
                         "candidate_feature_count": int(len(candidate_feature_cols)),
                         "ranked_cols": list(ranked_feature_cols),
                     },
+                    ray_runtime=ray_runtime,
                 )
                 payload.update(
                     _controlled_payload_updates_from_result(
@@ -6068,6 +7252,7 @@ class ExperimentsRunner:
         n_trials: int,
         timeout: int,
         optuna_n_jobs: int,
+        execution_backend: str = EXECUTION_BACKEND_LOCAL,
         parallel_jobs: int,
         search_space_config: Dict[str, object],
         xgb_parallel_jobs: int = 1,
@@ -6106,6 +7291,10 @@ class ExperimentsRunner:
             raise ValueError("El dataset debe incluir interval_start para split temporal.")
         if pd.Series(base_df["target"]).astype(int).nunique() < 2:
             raise ValueError("El target debe tener al menos dos clases.")
+        execution_backend = normalize_execution_backend(execution_backend)
+        ray_runtime: Optional[RayClusterRuntime] = None
+        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+            ray_runtime = connect_ray_cluster()
         objective_metric = _normalize_controlled_objective_metric(objective_metric)
         resolved_models = _resolve_controlled_models(selected_models)
         resolved_threshold_protocols = _normalize_controlled_threshold_protocols(
@@ -6270,8 +7459,25 @@ class ExperimentsRunner:
             "n_trials": int(n_trials),
             "timeout": int(timeout),
             "optuna_n_jobs": int(optuna_n_jobs),
+            "execution_backend": str(execution_backend),
             "parallel_jobs": int(parallel_jobs),
             "xgb_parallel_jobs": int(xgb_parallel_jobs),
+            "ray_address": (
+                None
+                if ray_runtime is None
+                else str(ray_runtime.config.ray_address or "")
+            ),
+            "ray_requested_trial_concurrency": (
+                int(optuna_n_jobs)
+                if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
+                else None
+            ),
+            "ray_effective_trial_concurrency": None,
+            "ray_trial_cpus": None,
+            "ray_active_nodes": (
+                None if ray_runtime is None else int(ray_runtime.active_nodes)
+            ),
+            "ray_hosts_used": [],
             "search_space_config": search_space_config,
             "segment_info": dict(segment_info or {}),
             "event_path": str(event_path or ""),
@@ -6435,6 +7641,17 @@ class ExperimentsRunner:
                 "result_status": "running",
                 "last_error": None,
                 "protocol": protocol,
+                "execution_backend": str(execution_backend),
+                "ray_address": protocol.get("ray_address"),
+                "ray_requested_trial_concurrency": protocol.get(
+                    "ray_requested_trial_concurrency"
+                ),
+                "ray_effective_trial_concurrency": protocol.get(
+                    "ray_effective_trial_concurrency"
+                ),
+                "ray_trial_cpus": protocol.get("ray_trial_cpus"),
+                "ray_active_nodes": protocol.get("ray_active_nodes"),
+                "ray_hosts_used": list(protocol.get("ray_hosts_used") or []),
                 "input_fingerprints": {
                     "event": context["event_fingerprint"],
                     "features": context["features_fingerprint"],
@@ -6857,9 +8074,11 @@ class ExperimentsRunner:
                         n_trials=int(n_trials),
                         timeout=int(timeout),
                         optuna_n_jobs=int(optuna_n_jobs),
+                        execution_backend=str(execution_backend),
                         search_space_config=search_space_config,
                         parallel_jobs=int(parallel_jobs),
                         xgb_parallel_jobs=int(xgb_parallel_jobs),
+                        ray_runtime=ray_runtime,
                     )
                     payload.update(
                         _controlled_payload_updates_from_result(
@@ -7264,13 +8483,15 @@ class ExperimentsRunner:
                     train_df=train_df,
                     val_df=val_df,
                     test_df=test_df,
-                    n_trials=int(n_trials),
-                    timeout=int(timeout),
-                    optuna_n_jobs=int(optuna_n_jobs),
-                    search_space_config=search_space_config,
-                    parallel_jobs=int(parallel_jobs),
-                    xgb_parallel_jobs=int(xgb_parallel_jobs),
-                )
+                        n_trials=int(n_trials),
+                        timeout=int(timeout),
+                        optuna_n_jobs=int(optuna_n_jobs),
+                        execution_backend=str(execution_backend),
+                        search_space_config=search_space_config,
+                        parallel_jobs=int(parallel_jobs),
+                        xgb_parallel_jobs=int(xgb_parallel_jobs),
+                        ray_runtime=ray_runtime,
+                    )
                 payload.update(
                     _controlled_payload_updates_from_result(
                         result,

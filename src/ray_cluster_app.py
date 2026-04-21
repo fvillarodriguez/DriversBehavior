@@ -37,8 +37,8 @@ def _config_from_widgets(current: ray_cluster.RayClusterConfig) -> ray_cluster.R
     )
 
     col_bridge_head, col_bridge_worker, col_bridge_mask = st.columns(3)
-    col_bridge_head.metric("Head (este Mac)", automatic.head_ip)
-    col_bridge_worker.metric("Worker (Mac remoto)", automatic.worker_ip)
+    col_bridge_head.metric("Head", automatic.head_ip)
+    col_bridge_worker.metric("Worker", automatic.worker_ip)
     col_bridge_mask.metric("Mascara", automatic.netmask)
 
     col_head, col_worker = st.columns(2)
@@ -139,7 +139,7 @@ def _render_config_tab(config: ray_cluster.RayClusterConfig) -> ray_cluster.RayC
 
     _render_ssh_auto_tools(updated)
 
-    col_auto, col_save, col_reload = st.columns([1, 1, 4])
+    col_auto, col_worker, col_save, col_reload = st.columns([1, 1, 1, 3])
     with col_auto:
         if st.button("Aplicar conexion automatica", type="primary", width="stretch"):
             with st.spinner("Configurando Thunderbolt Bridge en head y worker..."):
@@ -150,6 +150,10 @@ def _render_config_tab(config: ray_cluster.RayClusterConfig) -> ray_cluster.RayC
                 st.success("Thunderbolt Bridge configurado y perfil guardado.")
             else:
                 st.warning("La configuracion automatica quedo incompleta. Revise la salida y, si hace falta, use el diagnostico manual.")
+    with col_worker:
+        if st.button("Arrancar este Mac como Worker", width="stretch"):
+            with st.spinner("Iniciando worker local..."):
+                st.session_state["ray_config_worker_start_result"] = ray_cluster.start_local_worker(updated)
     with col_save:
         if st.button("Guardar configuracion", width="stretch"):
             ray_cluster.save_config(updated)
@@ -162,6 +166,12 @@ def _render_config_tab(config: ray_cluster.RayClusterConfig) -> ray_cluster.RayC
         st.divider()
         st.subheader("Resultado de conexion automatica")
         _render_results(bridge_results)
+
+    worker_start_result = st.session_state.get("ray_config_worker_start_result")
+    if worker_start_result:
+        st.divider()
+        st.subheader("Resultado de arranque Worker")
+        _render_result(worker_start_result)
 
     st.divider()
     st.subheader("Sincronizacion head/worker")
@@ -202,30 +212,56 @@ def _checks_to_dataframe(checks: list[ray_cluster.CheckResult]) -> pd.DataFrame:
 
 def _render_preflight_tab(config: ray_cluster.RayClusterConfig) -> None:
     st.subheader("Preflight")
-    st.caption("Valida el perfil automatico de Thunderbolt Bridge, SSH, Python, Ray y deja procesos Ray detenidos antes de iniciar.")
-    if st.button("Ejecutar preflight", type="primary"):
-        with st.spinner("Ejecutando validaciones..."):
-            st.session_state["ray_preflight_checks"] = ray_cluster.run_preflight(config)
+    st.caption("Usa el preflight que corresponde al rol de este Mac. En el worker local no se requiere SSH.")
 
-    checks = st.session_state.get("ray_preflight_checks")
-    if checks:
-        df = _checks_to_dataframe(checks)
-        st.dataframe(df, width="stretch", hide_index=True)
-        ok_count = sum(1 for check in checks if check.ok)
-        st.metric("Checks OK", f"{ok_count}/{len(checks)}")
-        if ok_count == len(checks):
-            st.success("Preflight listo para iniciar cluster.")
+    preflight_head, preflight_worker = st.tabs(["Head / controlador", "Worker local"])
+    with preflight_head:
+        st.caption(
+            "Para ejecutar en el Mac head: valida Thunderbolt en 10.10.10.1, SSH hacia el worker, "
+            "Python, Ray y puertos del cluster."
+        )
+        if st.button("Ejecutar preflight head", type="primary"):
+            with st.spinner("Ejecutando validaciones de head..."):
+                st.session_state["ray_preflight_head_checks"] = ray_cluster.run_preflight(config)
+
+        checks = st.session_state.get("ray_preflight_head_checks")
+        if checks:
+            _render_checks(checks, success_text="Preflight head listo.")
         else:
-            st.warning("Resuelva los checks pendientes antes de usar el cluster para trabajos reales.")
+            st.info("Ejecute este preflight solo desde el Mac head.")
+
+    with preflight_worker:
+        st.caption(
+            "Para ejecutar en este Mac cuando es worker: valida Thunderbolt en 10.10.10.2, "
+            "conectividad al head 10.10.10.1, Python, Ray y puertos locales del worker."
+        )
+        if st.button("Ejecutar preflight worker", type="primary"):
+            with st.spinner("Ejecutando validaciones de worker..."):
+                st.session_state["ray_preflight_worker_checks"] = ray_cluster.run_worker_preflight(config)
+
+        checks = st.session_state.get("ray_preflight_worker_checks")
+        if checks:
+            _render_checks(checks, success_text="Preflight worker listo.")
+        else:
+            st.info("Ejecute este preflight desde el Mac con IP Thunderbolt 10.10.10.2.")
+
+
+def _render_checks(checks: list[ray_cluster.CheckResult], *, success_text: str) -> None:
+    df = _checks_to_dataframe(checks)
+    st.dataframe(df, width="stretch", hide_index=True)
+    ok_count = sum(1 for check in checks if check.ok)
+    st.metric("Checks OK", f"{ok_count}/{len(checks)}")
+    if ok_count == len(checks):
+        st.success(success_text)
     else:
-        st.info("Ejecute preflight antes de iniciar el cluster por primera vez.")
+        st.warning("Resuelva los checks pendientes antes de usar el cluster para trabajos reales.")
 
 
 def _render_control_tab(config: ray_cluster.RayClusterConfig) -> None:
     st.subheader("Control del cluster")
-    st.caption("Este Mac opera como head y administra el worker por SSH sobre Thunderbolt Bridge.")
+    st.caption("El head se administra en el Mac 10.10.10.1. El worker local se administra en el Mac 10.10.10.2, sin SSH.")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         if st.button("Iniciar head", type="primary", width="stretch"):
             with st.spinner("Iniciando head..."):
@@ -234,13 +270,20 @@ def _render_control_tab(config: ray_cluster.RayClusterConfig) -> None:
             with st.spinner("Deteniendo head..."):
                 _render_result(ray_cluster.stop_head(config))
     with col2:
-        if st.button("Iniciar worker", type="primary", width="stretch"):
+        if st.button("Iniciar worker remoto", width="stretch"):
             with st.spinner("Iniciando worker por SSH..."):
                 _render_result(ray_cluster.start_worker(config))
-        if st.button("Detener worker", width="stretch"):
+        if st.button("Detener worker remoto", width="stretch"):
             with st.spinner("Deteniendo worker por SSH..."):
                 _render_result(ray_cluster.stop_worker(config))
     with col3:
+        if st.button("Iniciar worker local", type="primary", width="stretch"):
+            with st.spinner("Iniciando worker local..."):
+                _render_result(ray_cluster.start_local_worker(config))
+        if st.button("Detener worker local", width="stretch"):
+            with st.spinner("Deteniendo worker local..."):
+                _render_result(ray_cluster.stop_local_worker(config))
+    with col4:
         if st.button("Iniciar cluster", type="primary", width="stretch"):
             with st.spinner("Iniciando cluster completo..."):
                 _render_results(ray_cluster.start_cluster(config))
@@ -255,6 +298,7 @@ def _render_control_tab(config: ray_cluster.RayClusterConfig) -> None:
     st.subheader("Comandos equivalentes")
     st.caption("Referencia de auditoria; la UI ejecuta estos comandos con parametros fijos.")
     st.code(" ".join(ray_cluster.build_head_start_args(config)), language="bash")
+    st.code(" ".join(ray_cluster.build_worker_start_args(config, block=True)), language="bash")
     st.code(ray_cluster.build_worker_start_script(config), language="bash")
 
 
@@ -345,7 +389,7 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
     st.title("Ray Cluster")
     st.markdown(
         "Administra el cluster Ray con una conexion head/worker simple y fija sobre Thunderbolt Bridge. "
-        "La red se maneja con un perfil automatico y el head controla el worker por SSH con llave."
+        "El head y el worker tienen preflights separados porque validan responsabilidades distintas."
     )
 
     config = ray_cluster.automatic_bridge_config(ray_cluster.load_config())
