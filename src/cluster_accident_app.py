@@ -120,6 +120,13 @@ OPTUNA_BALANCE_MODE_LABELS = {
     "none": "Sin SMOTE",
     "smote": "Con SMOTE",
 }
+OPTUNA_MODEL_ORDER = (
+    "XGBoost",
+    "Random Forest",
+    "Balanced Random Forest",
+    "SVM",
+    "Neural Network",
+)
 CALIBRATION_METHOD_ORDER = ("sigmoid", "isotonic", "none")
 EXPERIMENT_RESULT_TIMESTAMP_RE = re.compile(
     r"(?:experiments_results|find_samples_sizes_results|best_highway_section_results|"
@@ -207,6 +214,8 @@ def _init_state() -> None:
     st.session_state.setdefault("optuna_trials_df", None)
     st.session_state.setdefault("optuna_results_store", {})
     st.session_state.setdefault("optuna_active_key", None)
+    st.session_state.setdefault("optuna_previous_result_selection", None)
+    st.session_state.setdefault("optuna_loaded_result_state", None)
     st.session_state.setdefault("optuna_model_params_applied_signatures", {})
     # Aceptar fallback de calibración de Optuna en la pestaña Modelos.
     # Default False: el usuario debe marcar conscientemente el opt-in para
@@ -2484,6 +2493,616 @@ def _load_optuna_result_from_disk(
         except Exception:
             trials_df = None
     return payload, trials_df
+
+
+def _empty_optuna_widget_state() -> None:
+    st.session_state["optuna_best_smote_params"] = None
+    st.session_state["optuna_best_model_params"] = None
+    st.session_state["optuna_best_score"] = None
+    st.session_state["optuna_best_model_choice"] = None
+    st.session_state["optuna_trials_df"] = None
+    st.session_state["optuna_best_settings"] = None
+    st.session_state["optuna_best_search_space"] = None
+
+
+def _sync_optuna_legacy_top_level_state(
+    entry: Optional[Dict[str, object]],
+    *,
+    model_choice: str,
+    calibration_method: str,
+) -> Optional[Dict[str, object]]:
+    if not isinstance(entry, dict) or not isinstance(entry.get("results"), dict):
+        _empty_optuna_widget_state()
+        return None
+
+    model_result = _get_optuna_model_result_variant(
+        entry.get("results"),
+        model_choice=model_choice,
+        balance_mode="smote",
+        calibration_method=calibration_method,
+        fallback_modes=["none"],
+    )
+    smote_result = _get_optuna_model_result_variant(
+        entry.get("results"),
+        model_choice=model_choice,
+        balance_mode="smote",
+        calibration_method=calibration_method,
+    )
+    if not isinstance(model_result, dict):
+        _empty_optuna_widget_state()
+        return None
+
+    trials_df = _load_optuna_variant_frame(
+        model_result,
+        frame_key="trials_df",
+        csv_key="trials_csv",
+    )
+    st.session_state["optuna_best_smote_params"] = (
+        smote_result.get("best_smote_params")
+        if isinstance(smote_result, dict)
+        else None
+    )
+    st.session_state["optuna_best_model_params"] = model_result.get(
+        "best_model_params"
+    )
+    st.session_state["optuna_best_score"] = model_result.get("best_score")
+    st.session_state["optuna_best_model_choice"] = model_choice
+    st.session_state["optuna_trials_df"] = trials_df
+    st.session_state["optuna_best_settings"] = model_result.get(
+        "optuna_settings"
+    )
+    st.session_state["optuna_best_search_space"] = model_result.get(
+        "search_space"
+    )
+    return model_result
+
+
+def _build_optuna_store_entry(
+    *,
+    payload: Optional[Dict[str, object]],
+    trials_df: Optional[pd.DataFrame],
+    optuna_id: str,
+    feature_key_fallback: Optional[str] = None,
+    feature_id_fallback: Optional[str] = None,
+    features_path_fallback: Optional[str] = None,
+    features_source_fallback: Optional[str] = None,
+    features_rows_fallback: Optional[int] = None,
+    features_cols_fallback: Optional[int] = None,
+    dataset_fingerprint_fallback: Optional[str] = None,
+    selection_mode_fallback: Optional[str] = None,
+    selected_features_fallback: Optional[List[str]] = None,
+    feature_cols_fallback: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    results: Dict[str, object] = {}
+    payload_dict = payload if isinstance(payload, dict) else {}
+    payload_results = payload_dict.get("results")
+    if isinstance(payload_results, dict):
+        results = _normalize_optuna_results_payload(payload_results)
+    elif payload_dict:
+        legacy_choice = payload_dict.get("model_choice") or "legacy"
+        _, legacy_csv = _optuna_result_paths(optuna_id)
+        trials_csv = payload_dict.get("trials_csv")
+        if not trials_csv and legacy_csv.exists():
+            trials_csv = str(legacy_csv)
+        legacy_result = {
+            "model_choice": legacy_choice,
+            "best_score": payload_dict.get("best_score"),
+            "best_smote_params": payload_dict.get("best_smote_params", {}),
+            "best_model_params": payload_dict.get("best_model_params", {}),
+            "optuna_settings": payload_dict.get("optuna_settings", {}),
+            "search_space": payload_dict.get("search_space", {}),
+            "saved_at": payload_dict.get("saved_at"),
+            "trials_csv": trials_csv,
+            "calibration_method": payload_dict.get("calibration_method"),
+            "balance_mode": payload_dict.get("balance_mode"),
+            "objective_metric": payload_dict.get("objective_metric"),
+            "objective_label": payload_dict.get("objective_label"),
+            "threshold_objective": payload_dict.get("threshold_objective"),
+            "pareto_front_csv": payload_dict.get("pareto_front_csv"),
+        }
+        if trials_df is not None:
+            legacy_result["trials_df"] = trials_df
+        results = _normalize_optuna_results_payload(
+            {str(legacy_choice): legacy_result}
+        )
+
+    return {
+        "optuna_id": payload_dict.get("optuna_id", optuna_id),
+        "feature_key": payload_dict.get("feature_key", feature_key_fallback),
+        "feature_id": payload_dict.get("feature_id", feature_id_fallback),
+        "features_path": payload_dict.get("features_path", features_path_fallback),
+        "features_source": payload_dict.get(
+            "features_source", features_source_fallback
+        ),
+        "features_rows": payload_dict.get("features_rows", features_rows_fallback),
+        "features_cols": payload_dict.get("features_cols", features_cols_fallback),
+        "dataset_fingerprint": payload_dict.get(
+            "dataset_fingerprint",
+            dataset_fingerprint_fallback,
+        ),
+        "selection_mode": payload_dict.get(
+            "selection_mode",
+            selection_mode_fallback,
+        ),
+        "selected_features": payload_dict.get(
+            "selected_features",
+            list(selected_features_fallback or []),
+        ),
+        "feature_cols": payload_dict.get(
+            "feature_cols",
+            list(feature_cols_fallback or []),
+        ),
+        "results": results,
+        "saved_at": payload_dict.get("saved_at"),
+    }
+
+
+def _load_optuna_store_entry_from_disk(
+    optuna_id: str,
+    *,
+    feature_key_fallback: Optional[str] = None,
+    feature_id_fallback: Optional[str] = None,
+    features_path_fallback: Optional[str] = None,
+    features_source_fallback: Optional[str] = None,
+    features_rows_fallback: Optional[int] = None,
+    features_cols_fallback: Optional[int] = None,
+    dataset_fingerprint_fallback: Optional[str] = None,
+    selection_mode_fallback: Optional[str] = None,
+    selected_features_fallback: Optional[List[str]] = None,
+    feature_cols_fallback: Optional[List[str]] = None,
+) -> Tuple[Dict[str, object], Optional[pd.DataFrame]]:
+    payload, trials_df = _load_optuna_result_from_disk(optuna_id)
+    if payload is None and trials_df is None:
+        return {}, None
+    entry = _build_optuna_store_entry(
+        payload=payload,
+        trials_df=trials_df,
+        optuna_id=optuna_id,
+        feature_key_fallback=feature_key_fallback,
+        feature_id_fallback=feature_id_fallback,
+        features_path_fallback=features_path_fallback,
+        features_source_fallback=features_source_fallback,
+        features_rows_fallback=features_rows_fallback,
+        features_cols_fallback=features_cols_fallback,
+        dataset_fingerprint_fallback=dataset_fingerprint_fallback,
+        selection_mode_fallback=selection_mode_fallback,
+        selected_features_fallback=selected_features_fallback,
+        feature_cols_fallback=feature_cols_fallback,
+    )
+    return entry, trials_df
+
+
+def _optuna_threshold_objective_options_for_tab() -> Dict[str, str]:
+    return {
+        "FAR": "far",
+        "F1": "f1",
+        "Balanced F1": "balanced_f1",
+        "MCC": "mcc",
+        "Recall@N alertas/dia": "recall_at_alerts_per_day",
+        "Costo operacional": "operational_cost",
+        "PR-AUC": "pr_auc",
+        "ROC-AUC": "roc_auc",
+    }
+
+
+def _optuna_threshold_objective_label(value: object) -> str:
+    normalized = normalize_threshold_objective(value)
+    reverse_options = {
+        option_value: option_label
+        for option_label, option_value in _optuna_threshold_objective_options_for_tab().items()
+    }
+    return reverse_options.get(normalized, "FAR")
+
+
+def _optuna_display_threshold_objective(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    return normalize_threshold_objective(text)
+
+
+def _optuna_variant_objective_fields(
+    variant: Optional[Dict[str, object]],
+) -> Tuple[str, str]:
+    if not isinstance(variant, dict):
+        return "-", "-"
+    settings = variant.get("optuna_settings")
+    settings_dict = settings if isinstance(settings, dict) else {}
+    objective_metric = (
+        variant.get("objective_metric")
+        or settings_dict.get("objective_metric")
+        or "-"
+    )
+    objective_metric_text = str(objective_metric or "-")
+    objective_label = (
+        variant.get("objective_label")
+        or settings_dict.get("objective_label")
+        or (
+            OPTUNA_OBJECTIVE_LABELS.get(
+                _normalize_optuna_objective_metric(objective_metric_text),
+                objective_metric_text.upper(),
+            )
+            if objective_metric_text != "-"
+            else "-"
+        )
+    )
+    return str(objective_label or "-"), objective_metric_text
+
+
+def _build_optuna_previous_result_label(
+    *,
+    objective_label: object,
+    objective_metric: object,
+    calibration_method: object,
+    threshold_objective: object,
+    optuna_id: object,
+) -> str:
+    objective_text = str(objective_label or objective_metric or "-").strip() or "-"
+    calibration_text = _normalize_calibration_method(calibration_method)
+    threshold_text = _optuna_display_threshold_objective(threshold_objective)
+    optuna_id_text = str(optuna_id or "-").strip() or "-"
+    return (
+        f"{objective_text}-{calibration_text}-{threshold_text}-{optuna_id_text}"
+    )
+
+
+def _optuna_model_rank(model_choice: object) -> int:
+    model_text = str(model_choice or "").strip()
+    try:
+        return OPTUNA_MODEL_ORDER.index(model_text)
+    except ValueError:
+        return len(OPTUNA_MODEL_ORDER)
+
+
+def _optuna_previous_result_preference_key(option: Dict[str, object]) -> Tuple[int, int, str]:
+    balance_mode = _normalize_optuna_balance_mode(option.get("balance_mode"))
+    balance_rank = 0 if balance_mode == "smote" else 1
+    return (
+        _optuna_model_rank(option.get("model_choice")),
+        balance_rank,
+        str(option.get("saved_at") or ""),
+    )
+
+
+def _optuna_previous_result_options_from_entry(
+    entry: Optional[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    if not isinstance(entry, dict):
+        return []
+    results = _normalize_optuna_results_payload(entry.get("results"))
+    if not results:
+        return []
+
+    grouped: Dict[str, Dict[str, object]] = {}
+    optuna_id = str(entry.get("optuna_id") or "")
+    for model_choice, container in results.items():
+        if not isinstance(container, dict):
+            continue
+        by_balance_mode = container.get("by_balance_mode")
+        if not isinstance(by_balance_mode, dict):
+            continue
+        for balance_mode, mode_container in by_balance_mode.items():
+            if not isinstance(mode_container, dict):
+                continue
+            by_calibration_method = mode_container.get("by_calibration_method")
+            if not isinstance(by_calibration_method, dict):
+                continue
+            for calibration_method, variant in by_calibration_method.items():
+                if not isinstance(variant, dict):
+                    continue
+                settings = variant.get("optuna_settings")
+                settings_dict = settings if isinstance(settings, dict) else {}
+                objective_label, objective_metric = _optuna_variant_objective_fields(
+                    variant
+                )
+                threshold_objective = settings_dict.get(
+                    "threshold_objective",
+                    variant.get("threshold_objective"),
+                )
+                label = _build_optuna_previous_result_label(
+                    objective_label=objective_label,
+                    objective_metric=objective_metric,
+                    calibration_method=calibration_method,
+                    threshold_objective=threshold_objective,
+                    optuna_id=optuna_id,
+                )
+                candidate = {
+                    "token": _slugify(
+                        f"{optuna_id}_{objective_metric}_{calibration_method}_{balance_mode}_{model_choice}"
+                    ),
+                    "label": label,
+                    "optuna_id": optuna_id,
+                    "model_choice": str(model_choice),
+                    "balance_mode": _normalize_optuna_balance_mode(balance_mode),
+                    "balance_mode_label": _optuna_balance_mode_label(balance_mode),
+                    "calibration_method": _normalize_calibration_method(
+                        calibration_method
+                    ),
+                    "threshold_objective": _optuna_display_threshold_objective(
+                        threshold_objective
+                    ),
+                    "objective_label": objective_label,
+                    "objective_metric": objective_metric,
+                    "saved_at": variant.get("saved_at") or entry.get("saved_at"),
+                    "entry": entry,
+                    "variant": variant,
+                }
+                current = grouped.get(label)
+                if current is None or _optuna_previous_result_preference_key(
+                    candidate
+                ) < _optuna_previous_result_preference_key(current):
+                    grouped[label] = candidate
+
+    options = list(grouped.values())
+    options.sort(
+        key=lambda item: (
+            str(item.get("saved_at") or ""),
+            str(item.get("label") or ""),
+        ),
+        reverse=True,
+    )
+    return options
+
+
+def _list_optuna_previous_result_options() -> List[Dict[str, object]]:
+    options: List[Dict[str, object]] = []
+    try:
+        candidates = sorted(RESULTS_DIR.glob("optuna_*.json"), reverse=True)
+    except Exception:
+        return options
+
+    for path in candidates:
+        optuna_id = path.stem.replace("optuna_", "", 1)
+        entry, _ = _load_optuna_store_entry_from_disk(optuna_id)
+        if not isinstance(entry.get("results"), dict) or not entry.get("results"):
+            continue
+        options.extend(_optuna_previous_result_options_from_entry(entry))
+    options.sort(
+        key=lambda item: (
+            str(item.get("saved_at") or ""),
+            str(item.get("label") or ""),
+        ),
+        reverse=True,
+    )
+    return options
+
+
+def _diagnose_optuna_loaded_result_compatibility(
+    entry: Optional[Dict[str, object]],
+    *,
+    current_feature_key: str,
+    current_primary_key: str,
+    current_dataset_fingerprint: Optional[str],
+) -> Dict[str, object]:
+    if not isinstance(entry, dict):
+        return {
+            "compatible": False,
+            "matched_key": None,
+            "loaded_key": None,
+            "dataset_drift": False,
+            "reasons": ["el resultado cargado no contiene metadata suficiente"],
+        }
+
+    stored_feature_key = str(entry.get("feature_key") or "").strip()
+    stored_feature_cols = list(entry.get("feature_cols") or [])
+    stored_fingerprint = str(entry.get("dataset_fingerprint") or "").strip()
+    loaded_key = None
+    if stored_feature_key and stored_feature_cols:
+        loaded_key = _optuna_result_key(stored_feature_key, stored_feature_cols)
+
+    reasons: List[str] = []
+    if stored_feature_key and stored_feature_key != current_feature_key:
+        reasons.append("el dataset/base de features difiere del contexto actual")
+    if loaded_key and loaded_key != current_primary_key:
+        reasons.append("las variables seleccionadas no coinciden con la corrida activa")
+    elif not loaded_key:
+        reasons.append("faltan columnas guardadas para verificar compatibilidad")
+
+    dataset_drift = False
+    if stored_fingerprint and current_dataset_fingerprint:
+        dataset_drift = stored_fingerprint != str(current_dataset_fingerprint)
+        if dataset_drift:
+            reasons.append("el fingerprint del dataset cambió desde esa corrida")
+
+    compatible = bool(
+        loaded_key
+        and loaded_key == current_primary_key
+        and not dataset_drift
+    )
+    return {
+        "compatible": compatible,
+        "matched_key": current_primary_key if compatible else None,
+        "loaded_key": loaded_key,
+        "dataset_drift": dataset_drift,
+        "reasons": reasons,
+    }
+
+
+def _hydrate_optuna_widget_state_from_selection(
+    option: Dict[str, object],
+) -> None:
+    variant = option.get("variant")
+    if not isinstance(variant, dict):
+        return
+
+    settings = variant.get("optuna_settings")
+    settings_dict = settings if isinstance(settings, dict) else {}
+    objective_mode = (
+        settings_dict.get("objective_mode")
+        or variant.get("optuna_objective_mode")
+        or variant.get("objective_mode")
+        or CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR
+    )
+    objective_metric = (
+        variant.get("objective_metric")
+        or settings_dict.get("objective_metric")
+    )
+    calibration_method = option.get("calibration_method") or settings_dict.get(
+        "calibration_method"
+    )
+    threshold_objective = settings_dict.get(
+        "threshold_objective",
+        option.get("threshold_objective"),
+    )
+    ranking_method_label = settings_dict.get("ranking_method_label")
+    if not ranking_method_label:
+        ranking_method_label = (
+            "Mutual information"
+            if str(settings_dict.get("ranking_method") or "").strip().lower()
+            == "mutual_info"
+            else "Random Forest (importancia)"
+        )
+
+    st.session_state["optuna_model_choice"] = str(
+        option.get("model_choice") or "XGBoost"
+    )
+    st.session_state["optuna_objective_mode_label"] = _optuna_objective_mode_label(
+        objective_mode
+    )
+    if (
+        str(objective_mode).strip().lower()
+        != CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+        and objective_metric
+    ):
+        st.session_state["optuna_objective_metric"] = _optuna_objective_option_label(
+            objective_metric
+        )
+    st.session_state["optuna_calibration_method"] = _calibration_method_label(
+        calibration_method
+    )
+    st.session_state["optuna_threshold_objective"] = _optuna_threshold_objective_label(
+        threshold_objective
+    )
+
+    int_settings = {
+        "optuna_n_trials": "n_trials",
+        "optuna_timeout": "timeout",
+        "optuna_n_jobs": "n_jobs",
+        "optuna_random_state": "random_state",
+        "optuna_k_min": "k_min",
+        "optuna_k_max": "k_max",
+        "optuna_k_step": "k_step",
+    }
+    for state_key, source_key in int_settings.items():
+        if settings_dict.get(source_key) is not None:
+            st.session_state[state_key] = int(settings_dict.get(source_key))
+
+    float_settings = {
+        "optuna_alerts_per_day": "alerts_per_day",
+        "optuna_fn_cost": "fn_cost",
+        "optuna_fp_cost": "fp_cost",
+    }
+    for state_key, source_key in float_settings.items():
+        if settings_dict.get(source_key) is not None:
+            st.session_state[state_key] = float(settings_dict.get(source_key))
+
+    if settings_dict.get("test_size") is not None:
+        test_size = float(settings_dict.get("test_size"))
+        st.session_state["test_size"] = test_size
+        st.session_state["optuna_test_size"] = test_size
+    if settings_dict.get("val_size") is not None:
+        val_size = float(settings_dict.get("val_size"))
+        st.session_state["val_size"] = val_size
+        st.session_state["optuna_val_size"] = val_size
+    if settings_dict.get("far_target") is not None:
+        far_target = float(settings_dict.get("far_target"))
+        st.session_state["far_target"] = far_target
+        st.session_state["optuna_far_target"] = far_target
+    if settings_dict.get("tune_topk") is not None:
+        st.session_state["optuna_tune_topk"] = bool(settings_dict.get("tune_topk"))
+    if ranking_method_label:
+        st.session_state["optuna_ranking_method_label"] = str(
+            ranking_method_label
+        )
+
+    pruner = settings_dict.get("pruner")
+    if isinstance(pruner, dict):
+        if pruner.get("enabled") is not None:
+            st.session_state["optuna_pruner_enabled"] = bool(pruner.get("enabled"))
+        if pruner.get("startup_trials") is not None:
+            st.session_state["optuna_pruner_startup_trials"] = int(
+                pruner.get("startup_trials")
+            )
+
+    best_smote_params = variant.get("best_smote_params")
+    if isinstance(best_smote_params, dict) and best_smote_params:
+        if best_smote_params.get("smote_k_neighbors") is not None:
+            st.session_state["smote_k_neighbors"] = int(
+                best_smote_params.get("smote_k_neighbors")
+            )
+        if best_smote_params.get("smote_sampling_strategy") is not None:
+            st.session_state["smote_sampling_strategy"] = float(
+                best_smote_params.get("smote_sampling_strategy")
+            )
+
+    _load_optuna_variant_frame(
+        variant,
+        frame_key="trials_df",
+        csv_key="trials_csv",
+    )
+    _load_optuna_variant_frame(
+        variant,
+        frame_key="pareto_front_df",
+        csv_key="pareto_front_csv",
+    )
+
+
+def _load_optuna_previous_result_selection(
+    option: Dict[str, object],
+    *,
+    current_feature_key: str,
+    current_primary_key: str,
+    current_dataset_fingerprint: Optional[str],
+) -> Dict[str, object]:
+    entry = option.get("entry")
+    if not isinstance(entry, dict):
+        return {
+            "loaded": False,
+            "label": option.get("label"),
+            "reasons": ["no se pudo resolver el resultado seleccionado"],
+        }
+
+    compatibility = _diagnose_optuna_loaded_result_compatibility(
+        entry,
+        current_feature_key=current_feature_key,
+        current_primary_key=current_primary_key,
+        current_dataset_fingerprint=current_dataset_fingerprint,
+    )
+    _hydrate_optuna_widget_state_from_selection(option)
+    _sync_optuna_legacy_top_level_state(
+        entry,
+        model_choice=str(option.get("model_choice") or "XGBoost"),
+        calibration_method=str(option.get("calibration_method") or "sigmoid"),
+    )
+
+    if compatibility.get("compatible"):
+        store = dict(st.session_state.get("optuna_results_store") or {})
+        matched_key = str(compatibility.get("matched_key") or current_primary_key)
+        store[matched_key] = entry
+        st.session_state["optuna_results_store"] = store
+        st.session_state["optuna_active_key"] = matched_key
+
+    loaded_state = {
+        "loaded": True,
+        "label": option.get("label"),
+        "token": option.get("token"),
+        "optuna_id": option.get("optuna_id"),
+        "model_choice": option.get("model_choice"),
+        "balance_mode": option.get("balance_mode"),
+        "balance_mode_label": option.get("balance_mode_label"),
+        "calibration_method": option.get("calibration_method"),
+        "threshold_objective": option.get("threshold_objective"),
+        "objective_metric": option.get("objective_metric"),
+        "objective_label": option.get("objective_label"),
+        "compatible": bool(compatibility.get("compatible")),
+        "matched_key": compatibility.get("matched_key"),
+        "loaded_key": compatibility.get("loaded_key"),
+        "reasons": list(compatibility.get("reasons") or []),
+        "dataset_drift": bool(compatibility.get("dataset_drift")),
+        "entry": entry,
+    }
+    st.session_state["optuna_loaded_result_state"] = loaded_state
+    return loaded_state
 
 
 def _persist_optuna_results(
@@ -7222,12 +7841,16 @@ _TAB_STATE_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
             "flow_features_source",
             "optuna_results_store",
             "optuna_active_key",
+            "optuna_previous_result_selection",
+            "optuna_loaded_result_state",
             "optuna_model_choice",
             "optuna_calibration_method",
         ],
         "produces": [
             "optuna_results_store",
             "optuna_active_key",
+            "optuna_previous_result_selection",
+            "optuna_loaded_result_state",
             # Keys legacy top-level — ver DEPRECATED comments en
             # _render_optuna_tab. Los dejamos en ``produces`` para que el
             # botón Reset los borre y el estado quede limpio.
@@ -10737,101 +11360,138 @@ def _render_optuna_tab() -> None:
         st.warning("No hay variables numericas para Optuna.")
         return
 
+    current_dataset_fingerprint = _dataset_content_fingerprint(features_df)
+
     store = st.session_state.get("optuna_results_store", {})
     active_optuna_key = st.session_state.get("optuna_active_key")
     
     primary_config = configs[-1]
     primary_key = primary_config["key"]
-    
+
+    previous_result_options = _list_optuna_previous_result_options()
+    if previous_result_options:
+        previous_option_map = {
+            str(option.get("token") or option.get("label")): option
+            for option in previous_result_options
+        }
+        previous_tokens = list(previous_option_map.keys())
+        current_previous_token = st.session_state.get(
+            "optuna_previous_result_selection"
+        )
+        if current_previous_token not in previous_option_map:
+            current_previous_token = previous_tokens[0]
+            st.session_state["optuna_previous_result_selection"] = current_previous_token
+        st.markdown("**Resultados previos**")
+        selected_previous_token = st.selectbox(
+            "Seleccionar resultado previo",
+            previous_tokens,
+            key="optuna_previous_result_selection",
+            format_func=lambda token: previous_option_map.get(token, {}).get(
+                "label", str(token)
+            ),
+        )
+        selected_previous_option = previous_option_map.get(selected_previous_token)
+        if isinstance(selected_previous_option, dict):
+            col_prev1, col_prev2, col_prev3 = st.columns(3)
+            with col_prev1:
+                st.caption(
+                    "Modelo inicial: "
+                    f"{selected_previous_option.get('model_choice') or '-'}"
+                )
+            with col_prev2:
+                st.caption(
+                    "Balance preferido: "
+                    f"{selected_previous_option.get('balance_mode_label') or '-'}"
+                )
+            with col_prev3:
+                st.caption(
+                    "Guardado: "
+                    f"{selected_previous_option.get('saved_at') or '-'}"
+                )
+            if st.button(
+                "Cargar resultado seleccionado",
+                key="optuna_load_selected_previous_result",
+            ):
+                _load_optuna_previous_result_selection(
+                    selected_previous_option,
+                    current_feature_key=feature_key,
+                    current_primary_key=primary_key,
+                    current_dataset_fingerprint=current_dataset_fingerprint,
+                )
+                st.rerun()
+    else:
+        st.caption("No se encontraron resultados previos de Optuna en disco.")
+
+    loaded_result_state = st.session_state.get("optuna_loaded_result_state")
+    incompatible_loaded_entry: Optional[Dict[str, object]] = None
+    if isinstance(loaded_result_state, dict) and isinstance(
+        loaded_result_state.get("entry"), dict
+    ):
+        loaded_entry = loaded_result_state.get("entry")
+        loaded_compatibility = _diagnose_optuna_loaded_result_compatibility(
+            loaded_entry,
+            current_feature_key=feature_key,
+            current_primary_key=primary_key,
+            current_dataset_fingerprint=current_dataset_fingerprint,
+        )
+        loaded_result_state["compatible"] = bool(
+            loaded_compatibility.get("compatible")
+        )
+        loaded_result_state["matched_key"] = loaded_compatibility.get("matched_key")
+        loaded_result_state["loaded_key"] = loaded_compatibility.get("loaded_key")
+        loaded_result_state["reasons"] = list(
+            loaded_compatibility.get("reasons") or []
+        )
+        loaded_result_state["dataset_drift"] = bool(
+            loaded_compatibility.get("dataset_drift")
+        )
+        st.session_state["optuna_loaded_result_state"] = loaded_result_state
+
+        loaded_label = str(loaded_result_state.get("label") or "resultado previo")
+        if bool(loaded_result_state.get("compatible")):
+            st.success(
+                f"Resultado previo cargado y activado para la sesión: {loaded_label}"
+            )
+        else:
+            reasons_text = "; ".join(loaded_result_state.get("reasons") or [])
+            warning_text = (
+                f"Resultado previo cargado solo para inspección: {loaded_label}."
+            )
+            if reasons_text:
+                warning_text += f" {reasons_text}."
+            st.warning(warning_text)
+            incompatible_loaded_entry = loaded_entry
+
     if active_optuna_key != primary_key:
         st.session_state["optuna_active_key"] = primary_key
         
         for cfg in configs:
             c_key = cfg["key"]
             c_id = cfg["id"]
-            c_cols = cfg["cols"]
             
             entry = store.get(c_key)
             if entry is None:
-                payload, trials_df = _load_optuna_result_from_disk(c_id)
-                if payload or trials_df is not None:
-                    results: Dict[str, object] = _normalize_optuna_results_payload(
-                        payload.get("results") if payload else None
-                    )
-                    if not results and payload:
-                        legacy_choice = payload.get("model_choice") or "legacy"
-                        _, legacy_csv = _optuna_result_paths(c_id)
-                        trials_csv = payload.get("trials_csv")
-                        if not trials_csv and legacy_csv.exists():
-                            trials_csv = str(legacy_csv)
-                        legacy_result = {
-                            "model_choice": legacy_choice,
-                            "best_score": payload.get("best_score"),
-                            "best_smote_params": payload.get("best_smote_params", {}),
-                            "best_model_params": payload.get("best_model_params", {}),
-                            "optuna_settings": payload.get("optuna_settings", {}),
-                            "search_space": payload.get("search_space", {}),
-                            "saved_at": payload.get("saved_at"),
-                            "trials_csv": trials_csv,
-                        }
-                        if trials_df is not None:
-                            legacy_result["trials_df"] = trials_df
-                        results = _normalize_optuna_results_payload(
-                            {str(legacy_choice): legacy_result}
-                        )
-
-                    entry = {
-                        "optuna_id": payload.get("optuna_id", c_id)
-                        if payload
-                        else c_id,
-                        "feature_key": payload.get("feature_key", feature_key)
-                        if payload
-                        else feature_key,
-                        "feature_id": payload.get("feature_id", feature_id)
-                        if payload
-                        else feature_id,
-                        "features_path": payload.get("features_path", features_path)
-                        if payload
-                        else features_path,
-                        "features_source": payload.get(
-                            "features_source", features_source
-                        )
-                        if payload
-                        else features_source,
-                        "features_rows": payload.get("features_rows", len(features_df))
-                        if payload
-                        else int(len(features_df)),
-                        "features_cols": payload.get(
-                            "features_cols", len(features_df.columns)
-                        )
-                        if payload
-                        else int(len(features_df.columns)),
-                        "dataset_fingerprint": payload.get(
-                            "dataset_fingerprint",
-                            _dataset_content_fingerprint(features_df),
-                        )
-                        if payload
-                        else _dataset_content_fingerprint(features_df),
-                        "selection_mode": payload.get(
-                            "selection_mode",
-                            "all" if selected_features is None else "selected",
-                        )
-                        if payload
-                        else ("all" if selected_features is None else "selected"),
-                        "selected_features": payload.get(
-                            "selected_features",
-                            list(selected_features) if selected_features else [],
-                        )
-                        if payload
-                        else list(selected_features) if selected_features else [],
-                        "feature_cols": payload.get(
-                            "feature_cols", list(c_cols)
-                        )
-                        if payload
-                        else list(c_cols),
-                        "results": results,
-                        "saved_at": payload.get("saved_at") if payload else None,
-                    }
+                entry, _ = _load_optuna_store_entry_from_disk(
+                    c_id,
+                    feature_key_fallback=feature_key,
+                    feature_id_fallback=feature_id,
+                    features_path_fallback=features_path,
+                    features_source_fallback=features_source,
+                    features_rows_fallback=int(len(features_df)),
+                    features_cols_fallback=int(len(features_df.columns)),
+                    dataset_fingerprint_fallback=current_dataset_fingerprint,
+                    selection_mode_fallback=(
+                        "all" if selected_features is None else "selected"
+                    ),
+                    selected_features_fallback=(
+                        list(selected_features) if selected_features else []
+                    ),
+                    feature_cols_fallback=list(cfg["cols"]),
+                )
+                if isinstance(entry, dict) and (
+                    isinstance(entry.get("results"), dict)
+                    or entry.get("feature_key")
+                ):
                     store[c_key] = entry
         
         st.session_state["optuna_results_store"] = store
@@ -10954,7 +11614,11 @@ def _render_optuna_tab() -> None:
             f"Optuna {objective_verb} {objective_label} en el set de validacion "
             "usando el criterio de threshold seleccionado (test queda como hold-out final)."
         )
-    entry = store.get(primary_key)
+    entry = (
+        incompatible_loaded_entry
+        if isinstance(incompatible_loaded_entry, dict)
+        else store.get(primary_key)
+    )
 
     model_choice = st.selectbox(
         "Modelo",
@@ -10981,64 +11645,13 @@ def _render_optuna_tab() -> None:
     optuna_calibration_method = optuna_calibration_map[optuna_calibration_label]
     model_result: Optional[Dict[str, object]] = None
     if entry and isinstance(entry.get("results"), dict):
-        model_result = _get_optuna_model_result_variant(
-            entry.get("results"),
+        model_result = _sync_optuna_legacy_top_level_state(
+            entry,
             model_choice=model_choice,
-            balance_mode="smote",
-            calibration_method=optuna_calibration_method,
-            fallback_modes=["none"],
-        )
-        smote_result = _get_optuna_model_result_variant(
-            entry.get("results"),
-            model_choice=model_choice,
-            balance_mode="smote",
             calibration_method=optuna_calibration_method,
         )
-        if isinstance(model_result, dict):
-            trials_df = model_result.get("trials_df")
-            trials_csv = model_result.get("trials_csv")
-            if (
-                trials_df is None
-                and trials_csv
-                and Path(str(trials_csv)).exists()
-            ):
-                try:
-                    trials_df = pd.read_csv(trials_csv)
-                    model_result["trials_df"] = trials_df
-                except Exception:
-                    trials_df = None
-            # DEPRECATED: replicación de valores del store en keys top-level
-            # ``optuna_best_*``. Consumidores nuevos deben usar
-            # ``_get_active_optuna_best()`` que lee directamente del
-            # ``optuna_results_store``. Se mantiene por compatibilidad con
-            # flujos legacy que aún leen estos keys (disk reloaders, tests
-            # viejos).
-            st.session_state["optuna_best_smote_params"] = (
-                smote_result.get("best_smote_params")
-                if isinstance(smote_result, dict)
-                else None
-            )
-            st.session_state["optuna_best_model_params"] = model_result.get(
-                "best_model_params"
-            )
-            st.session_state["optuna_best_score"] = model_result.get("best_score")
-            st.session_state["optuna_best_model_choice"] = model_choice
-            st.session_state["optuna_trials_df"] = trials_df
-            st.session_state["optuna_best_settings"] = model_result.get(
-                "optuna_settings"
-            )
-            st.session_state["optuna_best_search_space"] = model_result.get(
-                "search_space"
-            )
-        else:
-            # DEPRECATED: reset de keys top-level ``optuna_best_*`` (legacy).
-            st.session_state["optuna_best_smote_params"] = None
-            st.session_state["optuna_best_model_params"] = None
-            st.session_state["optuna_best_score"] = None
-            st.session_state["optuna_best_model_choice"] = None
-            st.session_state["optuna_trials_df"] = None
-            st.session_state["optuna_best_settings"] = None
-            st.session_state["optuna_best_search_space"] = None
+    else:
+        _empty_optuna_widget_state()
 
     n_trials = st.number_input(
         "n_trials",
@@ -11120,16 +11733,7 @@ def _render_optuna_tab() -> None:
     st.session_state["test_size"] = float(optuna_test_size)
 
     st.markdown("**Calibracion de umbral**")
-    optuna_threshold_objective_options = {
-        "FAR": "far",
-        "F1": "f1",
-        "Balanced F1": "balanced_f1",
-        "MCC": "mcc",
-        "Recall@N alertas/dia": "recall_at_alerts_per_day",
-        "Costo operacional": "operational_cost",
-        "PR-AUC": "pr_auc",
-        "ROC-AUC": "roc_auc",
-    }
+    optuna_threshold_objective_options = _optuna_threshold_objective_options_for_tab()
     optuna_threshold_objective_label = st.selectbox(
         "Criterio de threshold",
         list(optuna_threshold_objective_options.keys()),
@@ -11928,6 +12532,7 @@ def _render_optuna_tab() -> None:
             )
 
     if st.button("Ejecutar Optuna"):
+        st.session_state["optuna_loaded_result_state"] = None
         try:
             import optuna  # type: ignore
         except ImportError:

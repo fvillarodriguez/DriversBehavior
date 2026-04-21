@@ -421,6 +421,33 @@ def test_check_remote_repo_path_reports_invalid_repo():
     assert "Ruta remota invalida" in check.detail
 
 
+def test_check_remote_repo_path_reports_src_import_failure():
+    config = manager.RayClusterConfig(
+        ssh_user="felipe",
+        worker_ip="10.10.10.2",
+        remote_repo_path="/Users/felipe/Desktop/Tesis",
+    )
+    fake = FakeRunner(
+        [
+            manager.CommandResult(
+                ok=False,
+                returncode=1,
+                stdout=(
+                    "Ruta remota invalida: no se pudo importar src "
+                    "desde /Users/felipe/Desktop/Tesis"
+                ),
+                command="ssh",
+            )
+        ]
+    )
+
+    check = manager.check_remote_repo_path(config, runner=fake)
+
+    assert not check.ok
+    assert check.blocking
+    assert "no se pudo importar src" in check.detail
+
+
 def test_run_remote_script_uses_ssh_key_and_batch_mode(tmp_path: Path):
     private_key = tmp_path / "id_ed25519"
     private_key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE\n-----END OPENSSH PRIVATE KEY-----\n", encoding="utf-8")

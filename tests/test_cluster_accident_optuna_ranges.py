@@ -38,6 +38,138 @@ class _FakeStreamlit:
         return self.session_state.get(key, value)
 
 
+def _make_optuna_variant(
+    *,
+    model_choice: str = "XGBoost",
+    balance_mode: str = "smote",
+    calibration_method: str = "sigmoid",
+    objective_metric: str = "balanced_f1",
+    objective_label: str = "Balanced F1",
+    threshold_objective: str = "far",
+    best_score: float = 0.42,
+    saved_at: str = "2026-04-21T10:00:00",
+    include_trials_df: bool = False,
+) -> dict:
+    variant = {
+        "model_choice": model_choice,
+        "balance_mode": balance_mode,
+        "calibration_method": calibration_method,
+        "best_score": best_score,
+        "best_smote_params": (
+            {
+                "smote_k_neighbors": 5,
+                "smote_sampling_strategy": 0.2,
+            }
+            if balance_mode == "smote"
+            else {}
+        ),
+        "best_model_params": {
+            "n_estimators": 120,
+            "max_depth": 4,
+        },
+        "optuna_settings": {
+            "objective_mode": app.CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
+            "objective_metric": objective_metric,
+            "objective_label": objective_label,
+            "threshold_objective": threshold_objective,
+            "calibration_method": calibration_method,
+            "n_trials": 20,
+            "timeout": 120,
+            "n_jobs": 2,
+            "random_state": 7,
+            "test_size": 0.25,
+            "val_size": 0.15,
+            "far_target": 0.15,
+            "alerts_per_day": 5.0,
+            "fn_cost": 11.0,
+            "fp_cost": 2.0,
+            "tune_topk": True,
+            "ranking_method": "rf",
+            "ranking_method_label": "Random Forest (importancia)",
+            "k_min": 2,
+            "k_max": 5,
+            "k_step": 1,
+            "pruner": {
+                "enabled": True,
+                "startup_trials": 3,
+            },
+        },
+        "objective_metric": objective_metric,
+        "objective_label": objective_label,
+        "search_space": {
+            "model": {
+                "n_estimators": {"min": 100, "max": 200, "step": 10},
+            }
+        },
+        "saved_at": saved_at,
+    }
+    if include_trials_df:
+        variant["trials_df"] = pd.DataFrame(
+            [{"number": 0, "value": best_score, "state": "COMPLETE"}]
+        )
+    return variant
+
+
+def _make_optuna_entry(
+    *,
+    optuna_id: str = "optuna_selector_test",
+    feature_key: str = "features.duckdb",
+    feature_cols: list[str] | None = None,
+    dataset_fingerprint: str = "fp-1",
+    variants: list[dict] | None = None,
+) -> dict:
+    feature_cols = feature_cols or ["signal"]
+    raw_results: dict[str, dict] = {}
+    for variant in variants or []:
+        model_choice = str(variant.get("model_choice") or "XGBoost")
+        balance_mode = str(variant.get("balance_mode") or "none")
+        calibration_method = str(variant.get("calibration_method") or "none")
+        model_container = raw_results.setdefault(
+            model_choice,
+            {
+                "model_choice": model_choice,
+                "by_balance_mode": {},
+            },
+        )
+        by_balance_mode = model_container.setdefault("by_balance_mode", {})
+        mode_container = by_balance_mode.setdefault(
+            balance_mode,
+            {
+                "balance_mode": balance_mode,
+                "by_calibration_method": {},
+            },
+        )
+        by_calibration = mode_container.setdefault("by_calibration_method", {})
+        by_calibration[calibration_method] = dict(variant)
+    return {
+        "optuna_id": optuna_id,
+        "feature_key": feature_key,
+        "feature_id": "feature_id",
+        "features_path": feature_key,
+        "features_source": "duckdb",
+        "feature_cols": list(feature_cols),
+        "selected_features": list(feature_cols),
+        "dataset_fingerprint": dataset_fingerprint,
+        "results": app._normalize_optuna_results_payload(raw_results),
+        "saved_at": "2026-04-21T10:00:00",
+    }
+
+
+def _write_optuna_payload(tmp_path: Path, optuna_id: str, payload: dict) -> Path:
+    path = tmp_path / f"optuna_{optuna_id}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+    def slider(self, label, **kwargs):
+        call = {"label": label, **kwargs}
+        self.slider_calls.append(call)
+        key = kwargs.get("key")
+        value = kwargs.get("value")
+        if key is not None and key not in self.session_state:
+            self.session_state[key] = value
+        return self.session_state.get(key, value)
+
+
 def test_suggest_optuna_discrete_int_preserves_non_divisible_upper_bound():
     optuna = pytest.importorskip("optuna")
     trial = optuna.trial.FixedTrial({"top_k": 41})
@@ -208,6 +340,154 @@ def test_optuna_objective_mode_options_include_scalar_and_multiobjective():
         options["Multiobjetivo Pareto"]
         == app.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
     )
+
+
+def test_build_optuna_previous_result_label_uses_expected_format_and_fallbacks():
+    assert (
+        app._build_optuna_previous_result_label(
+            objective_label="Balanced F1",
+            objective_metric="balanced_f1",
+            calibration_method="Platt scaling (sigmoid)",
+            threshold_objective="recall@n",
+            optuna_id="optuna_123",
+        )
+        == "Balanced F1-sigmoid-recall_at_alerts_per_day-optuna_123"
+    )
+    assert (
+        app._build_optuna_previous_result_label(
+            objective_label=None,
+            objective_metric="f1",
+            calibration_method=None,
+            threshold_objective=None,
+            optuna_id="legacy_id",
+        )
+        == "f1-none---legacy_id"
+    )
+
+
+def test_list_optuna_previous_result_options_supports_normalized_and_legacy_payloads(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app, "RESULTS_DIR", tmp_path)
+
+    normalized_entry = _make_optuna_entry(
+        optuna_id="normalized_id",
+        variants=[
+            _make_optuna_variant(balance_mode="none", saved_at="2026-04-21T09:00:00"),
+            _make_optuna_variant(balance_mode="smote", saved_at="2026-04-21T10:00:00"),
+        ],
+    )
+    legacy_payload = {
+        "optuna_id": "legacy_id",
+        "feature_key": "legacy_features.duckdb",
+        "feature_cols": ["signal"],
+        "dataset_fingerprint": "fp-legacy",
+        "model_choice": "Random Forest",
+        "best_score": 0.31,
+        "best_smote_params": {},
+        "best_model_params": {"n_estimators": 100},
+        "optuna_settings": {
+            "objective_metric": "f1",
+            "objective_label": "F1",
+        },
+        "search_space": {},
+        "saved_at": "2026-04-20T08:00:00",
+    }
+
+    _write_optuna_payload(tmp_path, "normalized_id", normalized_entry)
+    _write_optuna_payload(tmp_path, "legacy_id", legacy_payload)
+
+    options = app._list_optuna_previous_result_options()
+    labels = {option["label"]: option for option in options}
+
+    normalized_label = "Balanced F1-sigmoid-far-normalized_id"
+    assert normalized_label in labels
+    assert labels[normalized_label]["balance_mode"] == "smote"
+    assert labels[normalized_label]["model_choice"] == "XGBoost"
+
+    legacy_label = "F1-none---legacy_id"
+    assert legacy_label in labels
+    assert labels[legacy_label]["model_choice"] == "Random Forest"
+
+
+def test_load_optuna_previous_result_selection_promotes_compatible_entry(
+    monkeypatch,
+):
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    entry = _make_optuna_entry(
+        feature_key="features.duckdb",
+        feature_cols=["signal"],
+        dataset_fingerprint="fp-1",
+        variants=[_make_optuna_variant(include_trials_df=True)],
+    )
+    option = app._optuna_previous_result_options_from_entry(entry)[0]
+    current_primary_key = app._optuna_result_key("features.duckdb", ["signal"])
+
+    loaded = app._load_optuna_previous_result_selection(
+        option,
+        current_feature_key="features.duckdb",
+        current_primary_key=current_primary_key,
+        current_dataset_fingerprint="fp-1",
+    )
+
+    assert loaded["compatible"] is True
+    assert fake_st.session_state["optuna_active_key"] == current_primary_key
+    assert current_primary_key in fake_st.session_state["optuna_results_store"]
+    assert fake_st.session_state["optuna_model_choice"] == "XGBoost"
+    assert (
+        fake_st.session_state["optuna_objective_mode_label"]
+        == "Escalar legacy"
+    )
+    assert (
+        fake_st.session_state["optuna_calibration_method"]
+        == "Platt scaling (sigmoid)"
+    )
+    assert fake_st.session_state["optuna_threshold_objective"] == "FAR"
+    assert fake_st.session_state["optuna_best_model_params"] == {
+        "n_estimators": 120,
+        "max_depth": 4,
+    }
+    assert isinstance(fake_st.session_state["optuna_trials_df"], pd.DataFrame)
+    assert not fake_st.session_state["optuna_trials_df"].empty
+
+
+def test_load_optuna_previous_result_selection_keeps_incompatible_entry_local(
+    monkeypatch,
+):
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    entry = _make_optuna_entry(
+        feature_key="features.duckdb",
+        feature_cols=["signal"],
+        dataset_fingerprint="fp-1",
+        variants=[_make_optuna_variant(include_trials_df=True)],
+    )
+    option = app._optuna_previous_result_options_from_entry(entry)[0]
+    incompatible_primary_key = app._optuna_result_key(
+        "features.duckdb",
+        ["signal", "aux_signal"],
+    )
+
+    loaded = app._load_optuna_previous_result_selection(
+        option,
+        current_feature_key="features.duckdb",
+        current_primary_key=incompatible_primary_key,
+        current_dataset_fingerprint="fp-2",
+    )
+
+    assert loaded["compatible"] is False
+    assert fake_st.session_state.get("optuna_active_key") is None
+    assert "optuna_results_store" not in fake_st.session_state
+    assert loaded["reasons"]
+    assert fake_st.session_state["optuna_loaded_result_state"]["compatible"] is False
+    assert fake_st.session_state["optuna_best_model_params"] == {
+        "n_estimators": 120,
+        "max_depth": 4,
+    }
 
 
 def test_persist_optuna_results_keeps_multiobjective_metadata_and_pareto_csv(

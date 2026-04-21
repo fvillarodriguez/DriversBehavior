@@ -54,7 +54,10 @@ def connect_ray_cluster(*, ray_module: Any | None = None) -> RayClusterRuntime:
         ray_cluster_manager.load_config()
     )
     blockers = ray_cluster_manager.blocking_checks(
-        ray_cluster_manager.runtime_connection_health_checks(config)
+        [
+            *ray_cluster_manager.runtime_connection_health_checks(config),
+            ray_cluster_manager.check_remote_repo_path(config),
+        ]
     )
     if blockers:
         raise RuntimeError(

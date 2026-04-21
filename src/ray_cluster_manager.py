@@ -1554,16 +1554,23 @@ def check_remote_repo_path(
             "Falta la ruta del repo en el worker.",
             blocking=True,
         )
+    import_probe = (
+        "import sys; "
+        f"sys.path.insert(0, {repo_path!r}); "
+        "import src"
+    )
     script = (
         f"repo={shlex.quote(repo_path)}; "
         "[ -d \"$repo\" ] || { echo \"Ruta remota inexistente: $repo\"; exit 1; }; "
         "missing=''; "
-        "for rel in .venv/bin/python .venv/bin/ray requirements.txt; do "
+        "for rel in .venv/bin/python .venv/bin/ray requirements.txt src; do "
         "[ -e \"$repo/$rel\" ] || missing=\"$missing $rel\"; "
         "done; "
         "if [ -n \"$missing\" ]; then "
         "echo \"Ruta remota invalida: faltan$missing en $repo\"; exit 1; "
         "fi; "
+        f"\"$repo/.venv/bin/python\" -c {shlex.quote(import_probe)} >/dev/null 2>&1 "
+        "|| { echo \"Ruta remota invalida: no se pudo importar src desde $repo\"; exit 1; }; "
         "echo \"Ruta remota valida: $repo\""
     )
     result = run_remote_script(config, script, runner=runner, timeout=timeout)

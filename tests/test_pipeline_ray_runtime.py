@@ -30,7 +30,10 @@ class _FakeRayModule:
 
 def test_connect_ray_cluster_uses_saved_address_and_alive_nodes(monkeypatch):
     fake_ray = _FakeRayModule()
-    fake_config = SimpleNamespace(ray_address="ray://cluster")
+    fake_config = SimpleNamespace(
+        ray_address="ray://cluster",
+        remote_repo_path="/Users/felipe/Desktop/SUMO",
+    )
     fake_status = SimpleNamespace(ok=True, combined_output="ok")
 
     monkeypatch.setattr(
@@ -53,6 +56,16 @@ def test_connect_ray_cluster_uses_saved_address_and_alive_nodes(monkeypatch):
         "runtime_connection_health_checks",
         lambda config: [],
     )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "check_remote_repo_path",
+        lambda config: runtime_module.ray_cluster_manager.CheckResult(
+            name="Repo worker",
+            ok=True,
+            detail="Ruta remota valida",
+            blocking=False,
+        ),
+    )
 
     runtime = runtime_module.connect_ray_cluster(ray_module=fake_ray)
 
@@ -67,7 +80,10 @@ def test_connect_ray_cluster_uses_saved_address_and_alive_nodes(monkeypatch):
 
 
 def test_connect_ray_cluster_raises_when_status_is_not_ok(monkeypatch):
-    fake_config = SimpleNamespace(ray_address="ray://cluster")
+    fake_config = SimpleNamespace(
+        ray_address="ray://cluster",
+        remote_repo_path="/Users/felipe/Desktop/SUMO",
+    )
     fake_status = SimpleNamespace(ok=False, combined_output="cluster down")
 
     monkeypatch.setattr(
@@ -90,13 +106,26 @@ def test_connect_ray_cluster_raises_when_status_is_not_ok(monkeypatch):
         "runtime_connection_health_checks",
         lambda config: [],
     )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "check_remote_repo_path",
+        lambda config: runtime_module.ray_cluster_manager.CheckResult(
+            name="Repo worker",
+            ok=True,
+            detail="Ruta remota valida",
+            blocking=False,
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="cluster down"):
         runtime_module.connect_ray_cluster(ray_module=_FakeRayModule())
 
 
 def test_connect_ray_cluster_raises_when_health_checks_block(monkeypatch):
-    fake_config = SimpleNamespace(ray_address="ray://cluster")
+    fake_config = SimpleNamespace(
+        ray_address="ray://cluster",
+        remote_repo_path="/Users/felipe/Desktop/SUMO",
+    )
 
     monkeypatch.setattr(
         runtime_module.ray_cluster_manager,
@@ -120,8 +149,54 @@ def test_connect_ray_cluster_raises_when_health_checks_block(monkeypatch):
             )
         ],
     )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "check_remote_repo_path",
+        lambda config: runtime_module.ray_cluster_manager.CheckResult(
+            name="Repo worker",
+            ok=True,
+            detail="Ruta remota valida",
+            blocking=False,
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="sin margen para Ray"):
+        runtime_module.connect_ray_cluster(ray_module=_FakeRayModule())
+
+
+def test_connect_ray_cluster_raises_when_remote_repo_check_blocks(monkeypatch):
+    fake_config = SimpleNamespace(
+        ray_address="ray://cluster",
+        remote_repo_path="/Users/felipe/Desktop/Tesis",
+    )
+
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "load_config",
+        lambda: fake_config,
+    )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "automatic_bridge_config",
+        lambda config: config,
+    )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "runtime_connection_health_checks",
+        lambda config: [],
+    )
+    monkeypatch.setattr(
+        runtime_module.ray_cluster_manager,
+        "check_remote_repo_path",
+        lambda config: runtime_module.ray_cluster_manager.CheckResult(
+            name="Repo worker",
+            ok=False,
+            detail="no se pudo importar src desde /Users/felipe/Desktop/Tesis",
+            blocking=True,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="no se pudo importar src"):
         runtime_module.connect_ray_cluster(ray_module=_FakeRayModule())
 
 
