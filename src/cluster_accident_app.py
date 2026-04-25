@@ -9,13 +9,14 @@ import inspect
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
 import unicodedata
 from datetime import datetime, time as dt_time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -61,6 +62,7 @@ from src.model_training import (
     train_model_on_split as _train_model_on_split,
 )
 from src.model_xai import compute_xai_report, save_xai_bundle
+from src import crash_prediction_history_store as history_store
 from src.experiments_logic import (
     CALIBRATION_SWEEP_BALANCE_MODES,
     CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS,
@@ -72,7 +74,6 @@ from src.experiments_logic import (
     CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
     CALIBRATION_SWEEP_PROTOCOL_FAMILY,
     CALIBRATION_SWEEP_PROTOCOL_VERSION,
-    CONTROLLED_COMPARISON_MODELS,
     FROZEN_TUNING_ABLATION_CONFIG,
     FROZEN_TUNING_ABLATION_FEATURE_SETS,
     FROZEN_TUNING_ABLATION_PROTOCOL_FAMILY,
@@ -120,13 +121,38 @@ OPTUNA_BALANCE_MODE_LABELS = {
     "none": "Sin SMOTE",
     "smote": "Con SMOTE",
 }
+OPTUNA_PARAMETER_PROFILE_WIDE = "Búsqueda amplia"
+OPTUNA_PARAMETER_PROFILE_LOCAL = "Refinamiento local"
+OPTUNA_PARAMETER_PROFILE_OPTIONS = (
+    OPTUNA_PARAMETER_PROFILE_WIDE,
+    OPTUNA_PARAMETER_PROFILE_LOCAL,
+)
 OPTUNA_MODEL_ORDER = (
     "XGBoost",
     "Random Forest",
-    "Balanced Random Forest",
     "SVM",
     "Neural Network",
 )
+CRASH_PREDICTION_MODEL_OPTIONS = (
+    "Random Forest",
+    "XGBoost",
+    "SVM",
+    "Neural Network",
+)
+CRASH_OPTUNA_MODEL_OPTIONS = (
+    "XGBoost",
+    "Random Forest",
+    "SVM",
+    "Neural Network",
+)
+CRASH_CONTROLLED_COMPARISON_MODELS = (
+    "Random Forest",
+    "SVM",
+    "XGBoost",
+    "Neural Network",
+)
+MODEL_FEATURE_SET_ORDER = ("Base", "Cluster", "Base + Cluster")
+OPTUNA_DEFAULT_FEATURE_SET_SELECTION = ("Base", "Base + Cluster")
 CALIBRATION_METHOD_ORDER = ("sigmoid", "isotonic", "none")
 EXPERIMENT_RESULT_TIMESTAMP_RE = re.compile(
     r"(?:experiments_results|find_samples_sizes_results|best_highway_section_results|"
@@ -139,6 +165,18 @@ CALIBRATION_SWEEP_HISTORY_FILENAMES = (
     "leaderboard.csv",
     "grid_results.csv",
 )
+COMBINED_TRAMO_PORTICOS = ("15", "14", "12", "11")
+COMBINED_TRAMO_PAIRS = tuple(
+    zip(COMBINED_TRAMO_PORTICOS[:-1], COMBINED_TRAMO_PORTICOS[1:])
+)
+COMBINED_TRAMO_SENTINEL = "__combined_tramo_15_14_12_11__"
+COMBINED_TRAMO_SELECTION = (
+    COMBINED_TRAMO_SENTINEL,
+    "",
+    COMBINED_TRAMO_PORTICOS[0],
+    COMBINED_TRAMO_PORTICOS[-1],
+)
+COMBINED_TRAMO_LABEL = "15 -> 14 -> 12 -> 11 (3 tramos)"
 
 
 class _StreamlitProgress:
@@ -158,6 +196,68 @@ class _StreamlitProgress:
 
     def close(self) -> None:
         self.text.empty()
+
+
+class _LiveTrainingCurvesBoard:
+    def __init__(self, labels: Sequence[str]) -> None:
+        self.labels = [str(label) for label in labels]
+        self._meta_slots: Dict[str, object] = {}
+        self._chart_slots: Dict[str, object] = {}
+        if not self.labels:
+            return
+
+        container = st.container()
+        with container:
+            st.caption("Curvas en vivo")
+            columns = st.columns(len(self.labels))
+            for column, label in zip(columns, self.labels):
+                with column:
+                    st.markdown(f"**{label}**")
+                    self._meta_slots[label] = st.empty()
+                    self._chart_slots[label] = st.empty()
+                    self._meta_slots[label].caption("Esperando entrenamiento")
+
+    def update(
+        self,
+        label: str,
+        curves_value: object,
+        *,
+        protocol_label: Optional[str] = None,
+    ) -> None:
+        if label not in self._chart_slots:
+            return
+        curves = _coerce_training_curves(curves_value)
+        frame = _training_curves_frame(curves_value)
+        if not curves or frame is None or frame.empty:
+            return
+
+        meta_parts: List[str] = []
+        if protocol_label:
+            meta_parts.append(str(protocol_label))
+        meta_parts.append(
+            f"epoch {int(curves.get('epochs_ran', 0))}/{int(curves.get('max_epochs', 0))}"
+        )
+        if bool(curves.get("early_stopping_triggered")):
+            meta_parts.append("early stop")
+        self._meta_slots[label].caption(" | ".join(meta_parts))
+
+        alt = _import_altair()
+        chart_slot = self._chart_slots[label]
+        if alt is not None:
+            chart = (
+                alt.Chart(frame)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("epoch:Q", title="Epoch"),
+                    y=alt.Y("loss:Q", title="Loss"),
+                    color=alt.Color("serie:N", title="Curva"),
+                )
+                .properties(height=220)
+            )
+            chart_slot.altair_chart(chart, width="stretch")
+        else:
+            pivot_df = frame.pivot(index="epoch", columns="serie", values="loss")
+            chart_slot.line_chart(pivot_df, height=220)
 
 
 def _format_duration_compact(seconds: Optional[float]) -> str:
@@ -216,7 +316,13 @@ def _init_state() -> None:
     st.session_state.setdefault("optuna_active_key", None)
     st.session_state.setdefault("optuna_previous_result_selection", None)
     st.session_state.setdefault("optuna_loaded_result_state", None)
+    st.session_state.setdefault("optuna_loaded_feature_sets_sync_pending", False)
+    st.session_state.setdefault("optuna_loaded_feature_sets_sync_token", None)
     st.session_state.setdefault("optuna_model_params_applied_signatures", {})
+    st.session_state.setdefault("optuna_feature_sets_selected", [])
+    st.session_state.setdefault("optuna_last_optimized_feature_sets", [])
+    st.session_state.setdefault("optuna_last_optimized_feature_key", None)
+    st.session_state.setdefault("optuna_last_optimized_dataset_fingerprint", None)
     # Aceptar fallback de calibración de Optuna en la pestaña Modelos.
     # Default False: el usuario debe marcar conscientemente el opt-in para
     # que Modelos use un Optuna cuya calibración no coincide con la pedida.
@@ -227,10 +333,18 @@ def _init_state() -> None:
     st.session_state.setdefault("optuna_random_state", 42)
     st.session_state.setdefault("optuna_pruner_enabled", True)
     st.session_state.setdefault("optuna_pruner_startup_trials", 5)
+    st.session_state.setdefault(
+        "optuna_param_profile",
+        OPTUNA_PARAMETER_PROFILE_WIDE,
+    )
+    st.session_state.setdefault("optuna_param_profile_last_selection", None)
     st.session_state.setdefault("far_target", 0.2)
     st.session_state.setdefault("val_size", 0.2)
     st.session_state.setdefault("model_feature_source", "feature_selection")
     st.session_state.setdefault("model_feature_source_config_label", None)
+    st.session_state.setdefault("model_optuna_batch_token", None)
+    st.session_state.setdefault("model_optuna_batch_contract", None)
+    st.session_state.setdefault("model_optuna_batch_compatibility", None)
     st.session_state.setdefault("balance_last_stats", None)
     st.session_state.setdefault("balance_last_params", None)
     st.session_state.setdefault("history_entries", [])
@@ -274,6 +388,182 @@ def _normalize_portico_series(series: pd.Series) -> pd.Series:
             result.loc[float_mask] = nums.loc[float_mask].astype("string")
     result.loc[invalid] = pd.NA
     return result
+
+
+def _is_combined_tramo(
+    tramo_tuple: Optional[Tuple[str, str, str, str]],
+) -> bool:
+    if not tramo_tuple:
+        return False
+    return str(tramo_tuple[0]) == COMBINED_TRAMO_SENTINEL
+
+
+def _combined_tramo_allowed(allowed_porticos: Optional[set[str]]) -> bool:
+    if allowed_porticos is None:
+        return True
+    allowed_clean = {
+        normalized
+        for normalized in (
+            _normalize_portico_code(value) for value in allowed_porticos
+        )
+        if normalized
+    }
+    if not allowed_clean:
+        return False
+    required_starts = {
+        _normalize_portico_code(start) for start, _ in COMBINED_TRAMO_PAIRS
+    }
+    return all(start in allowed_clean for start in required_starts if start)
+
+
+def _tramo_segment_pairs(
+    tramo_tuple: Optional[Tuple[str, str, str, str]],
+) -> Tuple[Tuple[str, str], ...]:
+    if not tramo_tuple:
+        return tuple()
+    if _is_combined_tramo(tramo_tuple):
+        return COMBINED_TRAMO_PAIRS
+    _, _, p_start, p_end = tramo_tuple
+    start_norm = _normalize_portico_code(p_start)
+    end_norm = _normalize_portico_code(p_end)
+    if not start_norm or not end_norm:
+        return tuple()
+    return ((start_norm, end_norm),)
+
+
+def _tramo_portico_codes(
+    tramo_tuple: Optional[Tuple[str, str, str, str]],
+) -> Tuple[str, ...]:
+    codes: List[str] = []
+    for start, end in _tramo_segment_pairs(tramo_tuple):
+        for code in (start, end):
+            if code and code not in codes:
+                codes.append(code)
+    return tuple(codes)
+
+
+def _tramo_display_label(
+    tramo_tuple: Optional[Tuple[str, str, str, str]],
+) -> str:
+    if not tramo_tuple:
+        return "Toda la autopista"
+    if _is_combined_tramo(tramo_tuple):
+        return COMBINED_TRAMO_LABEL
+    eje, calzada, p_start, p_end = tramo_tuple
+    parts = [
+        str(part).strip()
+        for part in [eje, calzada, f"{p_start} -> {p_end}"]
+        if str(part or "").strip()
+    ]
+    return " | ".join(parts)
+
+
+def _tramo_segment_info(
+    tramo_tuple: Tuple[str, str, str, str],
+) -> Dict[str, object]:
+    if _is_combined_tramo(tramo_tuple):
+        return {
+            "eje": None,
+            "calzada": None,
+            "portico_inicio": COMBINED_TRAMO_PORTICOS[0],
+            "portico_fin": COMBINED_TRAMO_PORTICOS[-1],
+            "segment_label": COMBINED_TRAMO_LABEL,
+            "segments": [
+                {"portico_inicio": start, "portico_fin": end}
+                for start, end in COMBINED_TRAMO_PAIRS
+            ],
+        }
+    eje, calzada, p_start, p_end = tramo_tuple
+    return {
+        "eje": eje or None,
+        "calzada": calzada or None,
+        "portico_inicio": p_start,
+        "portico_fin": p_end,
+        "segment_label": _tramo_display_label(tramo_tuple),
+    }
+
+
+def _segments_contain_combined_tramo(
+    segments_df: pd.DataFrame,
+    *,
+    start_col: str,
+    end_col: str,
+) -> bool:
+    if (
+        segments_df.empty
+        or start_col not in segments_df.columns
+        or end_col not in segments_df.columns
+    ):
+        return False
+    starts = _normalize_portico_series(segments_df[start_col])
+    ends = _normalize_portico_series(segments_df[end_col])
+    available = {
+        (str(start), str(end))
+        for start, end in zip(starts, ends)
+        if pd.notna(start) and pd.notna(end)
+    }
+    return all(pair in available for pair in COMBINED_TRAMO_PAIRS)
+
+
+def _pair_mask(
+    df: pd.DataFrame,
+    *,
+    start_col: str,
+    end_col: str,
+    pairs: Sequence[Tuple[str, str]],
+) -> pd.Series:
+    start_values = _normalize_portico_series(df[start_col])
+    end_values = _normalize_portico_series(df[end_col])
+    mask = pd.Series(False, index=df.index)
+    for start, end in pairs:
+        mask |= start_values.eq(start) & end_values.eq(end)
+    return mask
+
+
+def _filter_segments_for_tramo(
+    segments_df: pd.DataFrame,
+    tramo_tuple: Tuple[str, str, str, str],
+) -> pd.DataFrame:
+    pairs = _tramo_segment_pairs(tramo_tuple)
+    if not pairs or not {"portico_last", "portico_next"}.issubset(
+        segments_df.columns
+    ):
+        return segments_df.iloc[0:0].copy()
+
+    result = segments_df.copy()
+    mask = _pair_mask(
+        result,
+        start_col="portico_last",
+        end_col="portico_next",
+        pairs=pairs,
+    )
+    if not _is_combined_tramo(tramo_tuple):
+        eje_sel, calzada_sel, _, _ = tramo_tuple
+        if "eje" in result.columns and str(eje_sel or "").strip():
+            mask &= result["eje"].astype(str).str.strip().eq(str(eje_sel).strip())
+        if "calzada" in result.columns and str(calzada_sel or "").strip():
+            mask &= (
+                result["calzada"].astype(str).str.strip().eq(str(calzada_sel).strip())
+            )
+    result = result.loc[mask].copy()
+    if result.empty:
+        return result
+
+    pair_order = {pair: idx for idx, pair in enumerate(pairs)}
+    result["_tramo_pair"] = list(
+        zip(
+            _normalize_portico_series(result["portico_last"]),
+            _normalize_portico_series(result["portico_next"]),
+        )
+    )
+    if _is_combined_tramo(tramo_tuple):
+        result = result.drop_duplicates(subset=["_tramo_pair"], keep="last")
+    result["_tramo_order"] = result["_tramo_pair"].map(pair_order)
+    result = result.sort_values("_tramo_order").drop(
+        columns=["_tramo_pair", "_tramo_order"],
+        errors="ignore",
+    )
+    return result.reset_index(drop=True)
 
 
 def _max_optuna_parallel_jobs() -> int:
@@ -638,10 +928,11 @@ def _build_tramo_selector(
     date_end: Optional[pd.Timestamp],
     allowed_porticos: Optional[set[str]] = None,
     key: str,
+    include_combined_tramo: bool = False,
 ) -> Optional[Tuple[str, str, str, str]]:
     tramo_tuple: Optional[Tuple[str, str, str, str]] = None
     tramo_options = ["Toda la autopista"]
-    tramo_lookup: Dict[str, Tuple[str, str]] = {}
+    tramo_lookup: Dict[str, Tuple[str, str, str, str]] = {}
     if accidents_df is None or accidents_df.empty:
         st.info("Cargue accidentes en la pestana Eventos para usar tramos.")
     elif not {"accidente_time", "ultimo_portico"}.issubset(accidents_df.columns):
@@ -810,6 +1101,10 @@ def _build_tramo_selector(
                     "No hay tramos con datos en el archivo seleccionado."
                 )
 
+    if include_combined_tramo and _combined_tramo_allowed(allowed_porticos):
+        tramo_options.append(COMBINED_TRAMO_LABEL)
+        tramo_lookup[COMBINED_TRAMO_LABEL] = COMBINED_TRAMO_SELECTION
+
     tramo_choice = st.selectbox(
         "Tramo",
         options=tramo_options,
@@ -818,10 +1113,7 @@ def _build_tramo_selector(
     if tramo_choice != "Toda la autopista":
         tramo_tuple = tramo_lookup.get(tramo_choice)
         if tramo_tuple:
-            eje, calzada, p_start, p_end = tramo_tuple
-            st.caption(
-                f"Filtro activo: {eje} | {calzada} | {p_start} -> {p_end}"
-            )
+            st.caption(f"Filtro activo: {_tramo_display_label(tramo_tuple)}")
     return tramo_tuple
 
 
@@ -830,9 +1122,8 @@ def _set_flow_tramo_selection(
 ) -> None:
     st.session_state["flow_features_tramo"] = tramo_tuple
     if tramo_tuple:
-        eje, calzada, p_start, p_end = tramo_tuple
         st.session_state["flow_features_tramo_label"] = (
-            f"{eje} | {calzada} | {p_start} -> {p_end}"
+            _tramo_display_label(tramo_tuple)
         )
     else:
         st.session_state["flow_features_tramo_label"] = "Toda la autopista"
@@ -856,25 +1147,49 @@ def _build_tramo_duckdb_filters(
 ) -> Tuple[List[str], List[object], bool]:
     if not tramo_tuple:
         return [], [], True
-    eje_sel, calzada_sel, p_start, p_end = tramo_tuple
+    eje_sel, calzada_sel, p_start, _ = tramo_tuple
+    if _is_combined_tramo(tramo_tuple):
+        eje_sel = ""
+        calzada_sel = ""
+    pairs = _tramo_segment_pairs(tramo_tuple)
+    if not pairs:
+        return [], [], False
     clauses: List[str] = []
     params: List[object] = []
     has_segment_filter = False
     if {"portico_last", "portico_next"}.issubset(columns):
-        clauses.extend(["portico_last = ?", "portico_next = ?"])
-        params.extend([p_start, p_end])
+        pair_clauses = ["(portico_last = ? AND portico_next = ?)" for _ in pairs]
+        clauses.append("(" + " OR ".join(pair_clauses) + ")")
+        for start, end in pairs:
+            params.extend([start, end])
         has_segment_filter = True
     elif {"portico_inicio", "portico_fin"}.issubset(columns):
-        clauses.extend(["portico_inicio = ?", "portico_fin = ?"])
-        params.extend([p_start, p_end])
+        pair_clauses = [
+            "(portico_inicio = ? AND portico_fin = ?)" for _ in pairs
+        ]
+        clauses.append("(" + " OR ".join(pair_clauses) + ")")
+        for start, end in pairs:
+            params.extend([start, end])
+        has_segment_filter = True
+    elif {"ultimo_portico", "proximo_portico"}.issubset(columns):
+        pair_clauses = [
+            "(ultimo_portico = ? AND proximo_portico = ?)" for _ in pairs
+        ]
+        clauses.append("(" + " OR ".join(pair_clauses) + ")")
+        for start, end in pairs:
+            params.extend([start, end])
         has_segment_filter = True
     elif "portico" in columns:
-        clauses.append("portico = ?")
-        params.append(p_start)
+        starts = [start for start, _ in pairs] or [p_start]
+        placeholders = ", ".join("?" for _ in starts)
+        clauses.append(f"portico IN ({placeholders})")
+        params.extend(starts)
         has_segment_filter = True
     elif "ultimo_portico" in columns:
-        clauses.append("ultimo_portico = ?")
-        params.append(p_start)
+        starts = [start for start, _ in pairs] or [p_start]
+        placeholders = ", ".join("?" for _ in starts)
+        clauses.append(f"ultimo_portico IN ({placeholders})")
+        params.extend(starts)
         has_segment_filter = True
 
     if not has_segment_filter:
@@ -900,35 +1215,47 @@ def _apply_tramo_filter_df(
 ) -> Tuple[pd.DataFrame, bool]:
     if not tramo_tuple:
         return df, True
-    eje_sel, calzada_sel, p_start, p_end = tramo_tuple
-    start_norm = _normalize_portico_code(p_start)
-    end_norm = _normalize_portico_code(p_end)
+    eje_sel, calzada_sel, _, _ = tramo_tuple
+    if _is_combined_tramo(tramo_tuple):
+        eje_sel = ""
+        calzada_sel = ""
+    pairs = _tramo_segment_pairs(tramo_tuple)
+    if not pairs:
+        return df, False
     mask = pd.Series(True, index=df.index)
     filter_ok = False
 
     if {"portico_last", "portico_next"}.issubset(df.columns):
-        df = df.copy()
-        df["portico_last"] = _normalize_portico_series(df["portico_last"])
-        df["portico_next"] = _normalize_portico_series(df["portico_next"])
-        mask &= df["portico_last"] == start_norm
-        mask &= df["portico_next"] == end_norm
+        mask &= _pair_mask(
+            df,
+            start_col="portico_last",
+            end_col="portico_next",
+            pairs=pairs,
+        )
         filter_ok = True
     elif {"portico_inicio", "portico_fin"}.issubset(df.columns):
-        df = df.copy()
-        df["portico_inicio"] = _normalize_portico_series(df["portico_inicio"])
-        df["portico_fin"] = _normalize_portico_series(df["portico_fin"])
-        mask &= df["portico_inicio"] == start_norm
-        mask &= df["portico_fin"] == end_norm
+        mask &= _pair_mask(
+            df,
+            start_col="portico_inicio",
+            end_col="portico_fin",
+            pairs=pairs,
+        )
+        filter_ok = True
+    elif {"ultimo_portico", "proximo_portico"}.issubset(df.columns):
+        mask &= _pair_mask(
+            df,
+            start_col="ultimo_portico",
+            end_col="proximo_portico",
+            pairs=pairs,
+        )
         filter_ok = True
     elif "portico" in df.columns:
-        df = df.copy()
-        df["portico"] = _normalize_portico_series(df["portico"])
-        mask &= df["portico"] == start_norm
+        portico_values = _normalize_portico_series(df["portico"])
+        mask &= portico_values.isin([start for start, _ in pairs])
         filter_ok = True
     elif "ultimo_portico" in df.columns:
-        df = df.copy()
-        df["ultimo_portico"] = _normalize_portico_series(df["ultimo_portico"])
-        mask &= df["ultimo_portico"] == start_norm
+        portico_values = _normalize_portico_series(df["ultimo_portico"])
+        mask &= portico_values.isin([start for start, _ in pairs])
         filter_ok = True
 
     if not filter_ok:
@@ -1135,24 +1462,31 @@ def _get_feature_max_window_days(path: Path) -> Optional[int]:
     return max(1, int(delta_days))
 
 
-def _load_accidents_for_event(path: Path) -> Optional[pd.DataFrame]:
+def _load_accidents_for_event(
+    path: Path,
+    *,
+    cache_in_session: bool = True,
+) -> Optional[pd.DataFrame]:
     cache = st.session_state.setdefault("accidents_by_event_cache", {})
     key = str(path)
-    if key in cache:
+    if cache_in_session and key in cache:
         return cache.get(key)
     try:
         raw_df = read_csv_with_progress(str(path))
         porticos_df = load_porticos()
         if porticos_df is None or porticos_df.empty:
-            cache[key] = None
+            if cache_in_session:
+                cache[key] = None
             return None
         acc_df, _ = process_accidentes_df(
             raw_df, porticos_df, return_excluded=True
         )
     except Exception:
-        cache[key] = None
+        if cache_in_session:
+            cache[key] = None
         return None
-    cache[key] = acc_df
+    if cache_in_session:
+        cache[key] = acc_df
     return acc_df
 
 
@@ -1827,6 +2161,111 @@ def _optuna_objective_mode_label(value: object) -> str:
     return "Escalar legacy"
 
 
+def _optuna_parameter_profile_defaults(
+    profile_label: object,
+    *,
+    model_choice: Optional[str] = None,
+) -> Dict[str, object]:
+    profile = str(profile_label or OPTUNA_PARAMETER_PROFILE_WIDE)
+    defaults: Dict[str, object] = {}
+
+    if profile == OPTUNA_PARAMETER_PROFILE_LOCAL:
+        defaults.update(
+            {
+                "optuna_pruner_startup_trials": 20,
+                "optuna_tune_topk": True,
+                "optuna_k_min": 16,
+                "optuna_k_max": 20,
+                "optuna_k_step": 1,
+                "optuna_ranking_method_label": "Random Forest (importancia)",
+            }
+        )
+        if str(model_choice or "") == "XGBoost":
+            defaults.update(
+                {
+                    "optuna_xgb_n_min": 80,
+                    "optuna_xgb_n_max": 400,
+                    "optuna_xgb_n_step": 20,
+                    "optuna_xgb_depth_min": 5,
+                    "optuna_xgb_depth_max": 7,
+                    "optuna_xgb_depth_step": 1,
+                    "optuna_xgb_lr_min": 0.18,
+                    "optuna_xgb_lr_max": 0.23,
+                    "optuna_xgb_lr_step": 0.01,
+                    "optuna_xgb_sub_min": 0.60,
+                    "optuna_xgb_sub_max": 0.70,
+                    "optuna_xgb_sub_step": 0.05,
+                    "optuna_xgb_col_min": 0.75,
+                    "optuna_xgb_col_max": 0.85,
+                    "optuna_xgb_col_step": 0.05,
+                    "optuna_xgb_reg_alpha_min": 0.7,
+                    "optuna_xgb_reg_alpha_max": 3.0,
+                    "optuna_xgb_reg_alpha_step": 0.1,
+                    "optuna_xgb_reg_lambda_min": 4.5,
+                    "optuna_xgb_reg_lambda_max": 12.0,
+                    "optuna_xgb_reg_lambda_step": 0.5,
+                    "optuna_xgb_gamma_min": 3.8,
+                    "optuna_xgb_gamma_max": 4.8,
+                    "optuna_xgb_gamma_step": 0.1,
+                }
+            )
+        return defaults
+
+    defaults.update(
+        {
+            "optuna_pruner_startup_trials": 5,
+            "optuna_tune_topk": False,
+            "optuna_k_min": 3,
+            "optuna_k_max": 20,
+            "optuna_k_step": 1,
+            "optuna_ranking_method_label": "Random Forest (importancia)",
+        }
+    )
+    if str(model_choice or "") == "XGBoost":
+        defaults.update(
+            {
+                "optuna_xgb_n_min": 100,
+                "optuna_xgb_n_max": 500,
+                "optuna_xgb_n_step": 50,
+                "optuna_xgb_depth_min": 2,
+                "optuna_xgb_depth_max": 10,
+                "optuna_xgb_depth_step": 1,
+                "optuna_xgb_lr_min": 0.01,
+                "optuna_xgb_lr_max": 0.30,
+                "optuna_xgb_lr_step": 0.01,
+                "optuna_xgb_sub_min": 0.60,
+                "optuna_xgb_sub_max": 1.00,
+                "optuna_xgb_sub_step": 0.05,
+                "optuna_xgb_col_min": 0.60,
+                "optuna_xgb_col_max": 1.00,
+                "optuna_xgb_col_step": 0.05,
+                "optuna_xgb_reg_alpha_min": 0.0,
+                "optuna_xgb_reg_alpha_max": 5.0,
+                "optuna_xgb_reg_alpha_step": 0.1,
+                "optuna_xgb_reg_lambda_min": 0.0,
+                "optuna_xgb_reg_lambda_max": 10.0,
+                "optuna_xgb_reg_lambda_step": 0.1,
+                "optuna_xgb_gamma_min": 0.0,
+                "optuna_xgb_gamma_max": 5.0,
+                "optuna_xgb_gamma_step": 0.1,
+            }
+        )
+    return defaults
+
+
+def _apply_optuna_parameter_profile(
+    session_state: Dict[str, object],
+    *,
+    profile_label: object,
+    model_choice: Optional[str] = None,
+) -> None:
+    for key, value in _optuna_parameter_profile_defaults(
+        profile_label,
+        model_choice=model_choice,
+    ).items():
+        session_state[key] = value
+
+
 def _format_optuna_multiobjective_values(
     values: Optional[Dict[str, object]],
 ) -> str:
@@ -1975,6 +2414,34 @@ def _option_value_from_state(
     if selected_label not in options:
         selected_label = fallback_label
     return str(options[selected_label])
+
+
+def _sanitize_selectbox_state(
+    state_key: str,
+    options: Sequence[str],
+    *,
+    default: Optional[str] = None,
+) -> None:
+    if not options:
+        return
+    allowed = [str(option) for option in options]
+    fallback = str(default) if default in allowed else allowed[0]
+    if str(st.session_state.get(state_key, fallback)) not in allowed:
+        st.session_state[state_key] = fallback
+
+
+def _sanitize_multiselect_state(state_key: str, options: Sequence[str]) -> None:
+    allowed = [str(option) for option in options]
+    current = st.session_state.get(state_key)
+    if current is None:
+        return
+    if isinstance(current, (list, tuple, set)):
+        filtered = [str(item) for item in current if str(item) in allowed]
+        if filtered != list(current):
+            st.session_state[state_key] = filtered
+        return
+    if str(current) not in allowed:
+        st.session_state[state_key] = []
 
 
 def _persisted_widget_state_key(widget_key: str) -> str:
@@ -2554,6 +3021,11 @@ def _sync_optuna_legacy_top_level_state(
     st.session_state["optuna_best_search_space"] = model_result.get(
         "search_space"
     )
+    _sync_optuna_last_optimized_context_from_variant(
+        model_result,
+        feature_key=entry.get("feature_key"),
+        dataset_fingerprint=entry.get("dataset_fingerprint"),
+    )
     return model_result
 
 
@@ -2918,9 +3390,182 @@ def _diagnose_optuna_loaded_result_compatibility(
     }
 
 
+def _optuna_entry_loaded_key(entry: Optional[Dict[str, object]]) -> Optional[str]:
+    if not isinstance(entry, dict):
+        return None
+    stored_feature_key = str(entry.get("feature_key") or "").strip()
+    stored_feature_cols = list(entry.get("feature_cols") or [])
+    if not stored_feature_key or not stored_feature_cols:
+        return None
+    return _optuna_result_key(stored_feature_key, stored_feature_cols)
+
+
+def _dedupe_optuna_batch_entries(
+    entries: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    unique_entries: List[Dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for entry in list(entries):
+        if not isinstance(entry, dict):
+            continue
+        entry_key = _optuna_entry_loaded_key(entry) or str(
+            entry.get("optuna_id") or ""
+        ).strip()
+        if entry_key:
+            if entry_key in seen_keys:
+                continue
+            seen_keys.add(entry_key)
+        unique_entries.append(entry)
+    return unique_entries
+
+
+def _optuna_history_option_feature_sets(
+    option: Optional[Dict[str, object]],
+) -> List[str]:
+    """Resolve feature-set labels carried by a history option or batch."""
+    if not isinstance(option, dict):
+        return []
+
+    raw_labels: List[object] = []
+
+    def add_labels(values: object) -> None:
+        if values is None:
+            return
+        if isinstance(values, (str, bytes)):
+            raw_labels.append(values)
+            return
+        try:
+            for value in list(values):  # type: ignore[arg-type]
+                if value is not None:
+                    raw_labels.append(value)
+        except TypeError:
+            raw_labels.append(values)
+
+    def add_inferred(feature_cols: object) -> None:
+        if feature_cols is None or isinstance(feature_cols, (str, bytes)):
+            cols = None
+        else:
+            try:
+                cols = list(feature_cols)  # type: ignore[arg-type]
+            except TypeError:
+                cols = None
+        label = _history_infer_optuna_feature_set_label(cols)
+        if label and label != "-":
+            raw_labels.append(label)
+
+    add_labels(option.get("feature_set_labels"))
+
+    for record_key in ("history_record",):
+        record = option.get(record_key)
+        if not isinstance(record, dict):
+            continue
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        add_labels(metadata.get("optuna_batch_feature_sets"))
+        add_labels(metadata.get("feature_set_labels"))
+        add_inferred(metadata.get("feature_cols"))
+        variant = metadata.get("variant") if isinstance(metadata.get("variant"), dict) else {}
+        settings = (
+            variant.get("optuna_settings")
+            if isinstance(variant.get("optuna_settings"), dict)
+            else {}
+        )
+        add_labels(settings.get("selected_feature_sets_in_run"))
+        add_labels([settings.get("feature_set_label")])
+
+    for record in list(option.get("history_records") or []):
+        if not isinstance(record, dict):
+            continue
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        add_labels(metadata.get("optuna_batch_feature_sets"))
+        add_labels(metadata.get("feature_set_labels"))
+        add_inferred(metadata.get("feature_cols"))
+        variant = metadata.get("variant") if isinstance(metadata.get("variant"), dict) else {}
+        settings = (
+            variant.get("optuna_settings")
+            if isinstance(variant.get("optuna_settings"), dict)
+            else {}
+        )
+        add_labels(settings.get("selected_feature_sets_in_run"))
+        add_labels([settings.get("feature_set_label")])
+
+    for entry_key in ("entry",):
+        entry = option.get(entry_key)
+        if isinstance(entry, dict):
+            add_inferred(entry.get("feature_cols"))
+
+    for entry in list(option.get("entries") or []):
+        if isinstance(entry, dict):
+            add_inferred(entry.get("feature_cols"))
+
+    variant = option.get("variant")
+    if isinstance(variant, dict):
+        settings = (
+            variant.get("optuna_settings")
+            if isinstance(variant.get("optuna_settings"), dict)
+            else {}
+        )
+        add_labels(settings.get("selected_feature_sets_in_run"))
+        add_labels([settings.get("feature_set_label")])
+
+    return _normalize_model_feature_set_labels(raw_labels)
+
+
+def _optuna_history_option_balance_modes(
+    option: Optional[Dict[str, object]],
+) -> List[str]:
+    if not isinstance(option, dict):
+        return []
+    raw_modes: List[object] = []
+
+    def add_mode(value: object) -> None:
+        mode = _normalize_optuna_balance_mode(value)
+        if mode and mode not in raw_modes:
+            raw_modes.append(mode)
+
+    for value in list(option.get("balance_modes") or []):
+        add_mode(value)
+    add_mode(option.get("balance_mode"))
+    for record in list(option.get("history_records") or []):
+        if isinstance(record, dict):
+            add_mode(record.get("balance_strategy"))
+    record = option.get("history_record")
+    if isinstance(record, dict):
+        add_mode(record.get("balance_strategy"))
+    variant = option.get("variant")
+    if isinstance(variant, dict):
+        add_mode(variant.get("balance_mode"))
+    for entry in list(option.get("entries") or []):
+        if not isinstance(entry, dict):
+            continue
+        results = entry.get("results")
+        if not isinstance(results, dict):
+            continue
+        for model_container in results.values():
+            if not isinstance(model_container, dict):
+                continue
+            by_balance = model_container.get("by_balance_mode")
+            if not isinstance(by_balance, dict):
+                continue
+            for mode in by_balance.keys():
+                add_mode(mode)
+    canonical_order = ["none", "smote"]
+    ordered = [mode for mode in canonical_order if mode in raw_modes]
+    ordered.extend(
+        str(mode)
+        for mode in raw_modes
+        if str(mode).strip() and str(mode) not in set(ordered)
+    )
+    return ordered
+
+
 def _hydrate_optuna_widget_state_from_selection(
     option: Dict[str, object],
 ) -> None:
+    selected_feature_sets = _optuna_history_option_feature_sets(option)
+    if selected_feature_sets:
+        st.session_state["optuna_feature_sets_selected"] = list(selected_feature_sets)
+        st.session_state["optuna_loaded_feature_sets_sync_pending"] = True
+
     variant = option.get("variant")
     if not isinstance(variant, dict):
         return
@@ -3014,6 +3659,9 @@ def _hydrate_optuna_widget_state_from_selection(
         st.session_state["optuna_ranking_method_label"] = str(
             ranking_method_label
         )
+    if selected_feature_sets:
+        st.session_state["optuna_feature_sets_selected"] = list(selected_feature_sets)
+        st.session_state["optuna_loaded_feature_sets_sync_pending"] = True
 
     pruner = settings_dict.get("pruner")
     if isinstance(pruner, dict):
@@ -3047,6 +3695,184 @@ def _hydrate_optuna_widget_state_from_selection(
     )
 
 
+def _diagnose_optuna_batch_entry_compatibility(
+    entry: Optional[Dict[str, object]],
+    *,
+    current_feature_key: str,
+    current_dataset_fingerprint: Optional[str],
+) -> Dict[str, object]:
+    if not isinstance(entry, dict):
+        return {
+            "compatible": False,
+            "loaded_key": None,
+            "dataset_drift": False,
+            "reasons": ["el entry del batch no contiene metadata suficiente"],
+        }
+
+    stored_feature_key = str(entry.get("feature_key") or "").strip()
+    stored_fingerprint = str(entry.get("dataset_fingerprint") or "").strip()
+    loaded_key = _optuna_entry_loaded_key(entry)
+
+    reasons: List[str] = []
+    if stored_feature_key and stored_feature_key != current_feature_key:
+        reasons.append("el dataset/base de features difiere del contexto actual")
+    elif not stored_feature_key:
+        reasons.append("falta `feature_key` para verificar compatibilidad")
+
+    if not loaded_key:
+        reasons.append("faltan columnas guardadas para reconstruir el key")
+
+    dataset_drift = False
+    if stored_fingerprint and current_dataset_fingerprint:
+        dataset_drift = stored_fingerprint != str(current_dataset_fingerprint)
+        if dataset_drift:
+            reasons.append("el fingerprint del dataset cambió desde esa corrida")
+
+    compatible = bool(
+        loaded_key
+        and stored_feature_key == current_feature_key
+        and not dataset_drift
+    )
+    return {
+        "compatible": compatible,
+        "loaded_key": loaded_key,
+        "dataset_drift": dataset_drift,
+        "reasons": reasons,
+    }
+
+
+def _load_optuna_previous_batch_selection(
+    option: Dict[str, object],
+    *,
+    current_feature_key: str,
+    current_primary_key: str,
+    current_dataset_fingerprint: Optional[str],
+) -> Dict[str, object]:
+    entries = _dedupe_optuna_batch_entries(
+        [
+            entry
+            for entry in list(option.get("entries") or [])
+            if isinstance(entry, dict)
+        ]
+    )
+    if not entries:
+        return {
+            "loaded": False,
+            "label": option.get("label"),
+            "reasons": ["el batch seleccionado no contiene entries cargables"],
+        }
+
+    _hydrate_optuna_widget_state_from_selection(option)
+    store = dict(st.session_state.get("optuna_results_store") or {})
+    compatibility_rows: List[Dict[str, object]] = []
+    loaded_keys: List[str] = []
+    active_entry: Optional[Dict[str, object]] = None
+
+    for entry in entries:
+        compatibility = _diagnose_optuna_batch_entry_compatibility(
+            entry,
+            current_feature_key=current_feature_key,
+            current_dataset_fingerprint=current_dataset_fingerprint,
+        )
+        compatibility_rows.append(compatibility)
+        loaded_key = str(compatibility.get("loaded_key") or "").strip()
+        if not compatibility.get("compatible") or not loaded_key:
+            continue
+        store[loaded_key] = entry
+        if loaded_key not in loaded_keys:
+            loaded_keys.append(loaded_key)
+        if loaded_key == current_primary_key:
+            active_entry = entry
+
+    if loaded_keys:
+        st.session_state["optuna_results_store"] = store
+
+    active_key: Optional[str] = None
+    if active_entry is not None:
+        active_key = current_primary_key
+    elif loaded_keys:
+        active_key = loaded_keys[0]
+        active_entry = store.get(active_key)
+
+    if active_key:
+        st.session_state["optuna_active_key"] = active_key
+
+    representative_entry = (
+        active_entry
+        if isinstance(active_entry, dict)
+        else option.get("entry")
+        if isinstance(option.get("entry"), dict)
+        else entries[0]
+    )
+    batch_feature_sets = _optuna_history_option_feature_sets(option)
+    if batch_feature_sets:
+        st.session_state["optuna_feature_sets_selected"] = list(batch_feature_sets)
+        st.session_state["optuna_loaded_feature_sets_sync_pending"] = True
+        _store_optuna_last_optimized_context(
+            selected_feature_sets=batch_feature_sets,
+            feature_key=representative_entry.get("feature_key"),
+            dataset_fingerprint=representative_entry.get("dataset_fingerprint"),
+        )
+    synced_variant = _sync_optuna_legacy_top_level_state(
+        representative_entry,
+        model_choice=str(option.get("model_choice") or "XGBoost"),
+        calibration_method=str(option.get("calibration_method") or "sigmoid"),
+    )
+    if not isinstance(synced_variant, dict):
+        _sync_optuna_last_optimized_context_from_variant(
+            option.get("variant"),
+            feature_key=representative_entry.get("feature_key"),
+            dataset_fingerprint=representative_entry.get("dataset_fingerprint"),
+        )
+
+    compatible = current_primary_key in set(loaded_keys)
+    reasons: List[str] = []
+    if not compatible and loaded_keys:
+        reasons.append(
+            "se cargó parcialmente el batch, pero el grupo principal activo no "
+            "está presente en los resultados restaurados"
+        )
+    if not loaded_keys:
+        reasons.append(
+            "ninguna subcorrida del batch es compatible con el dataset actual"
+        )
+    for compatibility in compatibility_rows:
+        if compatibility.get("compatible"):
+            continue
+        for reason in list(compatibility.get("reasons") or []):
+            if reason not in reasons:
+                reasons.append(str(reason))
+
+    loaded_state = {
+        "loaded": True,
+        "label": option.get("label"),
+        "token": option.get("token"),
+        "optuna_id": option.get("optuna_id"),
+        "batch_key": option.get("batch_key"),
+        "subrun_count": int(option.get("subrun_count") or len(entries)),
+        "loaded_keys": list(loaded_keys),
+        "model_choice": option.get("model_choice"),
+        "balance_mode": option.get("balance_mode"),
+        "balance_mode_label": option.get("balance_mode_label"),
+        "calibration_method": option.get("calibration_method"),
+        "threshold_objective": option.get("threshold_objective"),
+        "objective_metric": option.get("objective_metric"),
+        "objective_label": option.get("objective_label"),
+        "feature_set_labels": list(batch_feature_sets),
+        "balance_modes": _optuna_history_option_balance_modes(option),
+        "compatible": compatible,
+        "matched_key": current_primary_key if compatible else active_key,
+        "loaded_key": active_key,
+        "reasons": reasons,
+        "dataset_drift": any(
+            bool(item.get("dataset_drift")) for item in compatibility_rows
+        ),
+        "entry": representative_entry,
+    }
+    st.session_state["optuna_loaded_result_state"] = loaded_state
+    return loaded_state
+
+
 def _load_optuna_previous_result_selection(
     option: Dict[str, object],
     *,
@@ -3054,6 +3880,17 @@ def _load_optuna_previous_result_selection(
     current_primary_key: str,
     current_dataset_fingerprint: Optional[str],
 ) -> Dict[str, object]:
+    entries = [
+        entry for entry in list(option.get("entries") or []) if isinstance(entry, dict)
+    ]
+    if len(entries) > 1:
+        return _load_optuna_previous_batch_selection(
+            option,
+            current_feature_key=current_feature_key,
+            current_primary_key=current_primary_key,
+            current_dataset_fingerprint=current_dataset_fingerprint,
+        )
+
     entry = option.get("entry")
     if not isinstance(entry, dict):
         return {
@@ -3069,11 +3906,27 @@ def _load_optuna_previous_result_selection(
         current_dataset_fingerprint=current_dataset_fingerprint,
     )
     _hydrate_optuna_widget_state_from_selection(option)
-    _sync_optuna_legacy_top_level_state(
+    synced_variant = _sync_optuna_legacy_top_level_state(
         entry,
         model_choice=str(option.get("model_choice") or "XGBoost"),
         calibration_method=str(option.get("calibration_method") or "sigmoid"),
     )
+    if not isinstance(synced_variant, dict):
+        _sync_optuna_last_optimized_context_from_variant(
+            option.get("variant"),
+            feature_key=entry.get("feature_key"),
+            dataset_fingerprint=entry.get("dataset_fingerprint"),
+        )
+
+    feature_set_labels = _optuna_history_option_feature_sets(option)
+    if feature_set_labels:
+        st.session_state["optuna_feature_sets_selected"] = list(feature_set_labels)
+        st.session_state["optuna_loaded_feature_sets_sync_pending"] = True
+        _store_optuna_last_optimized_context(
+            selected_feature_sets=feature_set_labels,
+            feature_key=entry.get("feature_key"),
+            dataset_fingerprint=entry.get("dataset_fingerprint"),
+        )
 
     if compatibility.get("compatible"):
         store = dict(st.session_state.get("optuna_results_store") or {})
@@ -3094,6 +3947,8 @@ def _load_optuna_previous_result_selection(
         "threshold_objective": option.get("threshold_objective"),
         "objective_metric": option.get("objective_metric"),
         "objective_label": option.get("objective_label"),
+        "feature_set_labels": list(feature_set_labels),
+        "balance_modes": _optuna_history_option_balance_modes(option),
         "compatible": bool(compatibility.get("compatible")),
         "matched_key": compatibility.get("matched_key"),
         "loaded_key": compatibility.get("loaded_key"),
@@ -3109,6 +3964,12 @@ def _persist_optuna_results(
     *,
     optuna_key: str,
     optuna_id: str,
+    optuna_batch_key: Optional[str] = None,
+    optuna_batch_started_at: Optional[str] = None,
+    optuna_batch_feature_sets: Optional[Sequence[object]] = None,
+    optuna_batch_balance_modes: Optional[Sequence[object]] = None,
+    optuna_batch_total_runs: Optional[int] = None,
+    optuna_batch_run_index: Optional[int] = None,
     feature_key: str,
     feature_id: str,
     features_path: Optional[str],
@@ -3320,6 +4181,30 @@ def _persist_optuna_results(
             )
     except Exception:
         return
+    try:
+        _register_optuna_history(
+            entry=entry,
+            payload=payload,
+            optuna_key=optuna_key,
+            optuna_id=optuna_id,
+            optuna_batch_key=optuna_batch_key,
+            optuna_batch_started_at=optuna_batch_started_at,
+            optuna_batch_feature_sets=optuna_batch_feature_sets,
+            optuna_batch_balance_modes=optuna_batch_balance_modes,
+            optuna_batch_total_runs=optuna_batch_total_runs,
+            optuna_batch_run_index=optuna_batch_run_index,
+            features_df=features_df,
+            feature_cols=feature_cols,
+            model_choice=model_choice,
+            balance_mode=normalized_balance_mode,
+            calibration_method=normalized_calibration_method,
+            result_entry=result_entry,
+            trials_csv=trials_csv,
+            pareto_front_csv=pareto_front_csv,
+            json_path=json_path,
+        )
+    except Exception:
+        return
 
 
 def _json_default(value: object) -> object:
@@ -3336,6 +4221,1628 @@ def _json_default(value: object) -> object:
     if isinstance(value, pd.Series):
         return value.tolist()
     return str(value)
+
+
+def _history_db_path() -> Path:
+    return RESULTS_DIR / "crash_prediction_history.sqlite"
+
+
+def _history_stage_artifacts_dir(stage: str) -> Path:
+    path = RESULTS_DIR / "history_artifacts" / (_slugify(stage) or "record")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _history_context_details(
+    features_df: Optional[pd.DataFrame],
+    *,
+    selected_features: Optional[Sequence[object]] = None,
+) -> Dict[str, object]:
+    features_path = st.session_state.get("flow_features_path")
+    features_source = st.session_state.get("flow_features_source")
+    event_files = list(st.session_state.get("accident_files") or [])
+    tramo_label = st.session_state.get("flow_features_tramo_label") or "Toda la autopista"
+    rows = int(len(features_df)) if isinstance(features_df, pd.DataFrame) else 0
+    cols = int(len(features_df.columns)) if isinstance(features_df, pd.DataFrame) else 0
+    dataset_fingerprint = (
+        _dataset_content_fingerprint(features_df)
+        if isinstance(features_df, pd.DataFrame)
+        else "empty"
+    )
+    date_min = None
+    date_max = None
+    if isinstance(features_df, pd.DataFrame) and "interval_start" in features_df.columns:
+        times = pd.to_datetime(features_df["interval_start"], errors="coerce").dropna()
+        if not times.empty:
+            date_min = times.min().isoformat()
+            date_max = times.max().isoformat()
+
+    feature_context_key = history_store.build_context_key(
+        event_files=event_files,
+        features_path=features_path,
+        features_source=features_source,
+        features_date_min=date_min,
+        features_date_max=date_max,
+        tramo_label=tramo_label,
+        features_rows=rows,
+        features_cols=cols,
+        dataset_fingerprint=dataset_fingerprint,
+        selected_features=None,
+    )
+    context_key = history_store.build_context_key(
+        event_files=event_files,
+        features_path=features_path,
+        features_source=features_source,
+        features_date_min=date_min,
+        features_date_max=date_max,
+        tramo_label=tramo_label,
+        features_rows=rows,
+        features_cols=cols,
+        dataset_fingerprint=dataset_fingerprint,
+        selected_features=selected_features,
+    )
+    return {
+        "context_key": context_key,
+        "feature_context_key": feature_context_key,
+        "event_files": event_files,
+        "features_path": features_path,
+        "features_source": features_source,
+        "features_date_min": date_min,
+        "features_date_max": date_max,
+        "features_rows": rows,
+        "features_cols": cols,
+        "dataset_fingerprint": dataset_fingerprint,
+        "tramo_label": tramo_label,
+        "feature_signature": history_store.feature_signature(selected_features),
+    }
+
+
+def _history_input_artifacts(
+    *,
+    include_features: bool = True,
+    extra_inputs: Optional[Sequence[object]] = None,
+) -> List[Dict[str, object]]:
+    artifacts: List[Dict[str, object]] = []
+    for name in list(st.session_state.get("accident_files") or []):
+        artifacts.append(
+            {
+                "path": str(DATA_DIR / str(name)),
+                "role": "eventos",
+                "generated": False,
+                "delete_on_record_delete": False,
+            }
+        )
+    porticos_source = st.session_state.get("porticos_source")
+    if porticos_source:
+        artifacts.append(
+            {
+                "path": str(ROOT_DIR / str(porticos_source)),
+                "role": "porticos",
+                "generated": False,
+                "delete_on_record_delete": False,
+            }
+        )
+    if include_features and st.session_state.get("flow_features_path"):
+        artifacts.append(
+            {
+                "path": str(st.session_state.get("flow_features_path")),
+                "role": "features_input",
+                "generated": False,
+                "delete_on_record_delete": False,
+            }
+        )
+    for path in list(extra_inputs or []):
+        if not path:
+            continue
+        artifacts.append(
+            {
+                "path": str(path),
+                "role": "input",
+                "generated": False,
+                "delete_on_record_delete": False,
+            }
+        )
+    return artifacts
+
+
+def _history_write_json_snapshot(
+    *,
+    stage: str,
+    stem: str,
+    payload: Dict[str, object],
+) -> Optional[str]:
+    try:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        out_path = _history_stage_artifacts_dir(stage) / f"{_slugify(stem) or 'record'}_{stamp}.json"
+        with out_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=True, indent=2, default=_json_default)
+        return str(out_path)
+    except Exception:
+        return None
+
+
+def _history_copy_snapshot(
+    source_path: Optional[object],
+    *,
+    stage: str,
+    role: str,
+    stem: str,
+) -> Optional[str]:
+    if not source_path:
+        return None
+    try:
+        src = Path(str(source_path))
+    except Exception:
+        return None
+    if not src.exists() or not src.is_file():
+        return None
+    try:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        suffix = src.suffix or ".artifact"
+        out_path = _history_stage_artifacts_dir(stage) / (
+            f"{_slugify(stem) or role}_{stamp}{suffix}"
+        )
+        shutil.copy2(src, out_path)
+        return str(out_path)
+    except Exception:
+        return None
+
+
+def _history_sanitize_payload(value: object) -> object:
+    if isinstance(value, pd.DataFrame):
+        return None
+    if isinstance(value, pd.Series):
+        return value.tolist()
+    if isinstance(value, dict):
+        sanitized: Dict[str, object] = {}
+        for key, item in value.items():
+            if str(key) in {"trials_df", "pareto_front_df"}:
+                continue
+            sanitized[str(key)] = _history_sanitize_payload(item)
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_history_sanitize_payload(item) for item in value]
+    return value
+
+
+def _history_insert_record(**kwargs: object) -> Optional[int]:
+    try:
+        return history_store.insert_record(_history_db_path(), **kwargs)
+    except Exception:
+        return None
+
+
+def _history_optuna_context_key(
+    *,
+    feature_context_key: object,
+    optuna_key: object,
+    model_name: object,
+    balance_mode: object,
+    calibration_method: object,
+    optuna_objective: object,
+    threshold_objective: object,
+) -> str:
+    payload = {
+        "feature_context_key": str(feature_context_key or ""),
+        "optuna_key": str(optuna_key or ""),
+        "model_name": str(model_name or ""),
+        "balance_mode": str(balance_mode or ""),
+        "calibration_method": str(calibration_method or ""),
+        "optuna_objective": str(optuna_objective or ""),
+        "threshold_objective": str(threshold_objective or ""),
+    }
+    return hashlib.md5(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _history_make_optuna_record_uid(
+    *,
+    optuna_id: object,
+    model_name: object,
+    balance_mode: object,
+    calibration_method: object,
+    created_at: Optional[str] = None,
+    legacy: bool = False,
+) -> str:
+    prefix = "legacy-optuna" if legacy else "optuna"
+    stamp = created_at or datetime.now().isoformat()
+    raw = f"{prefix}|{optuna_id}|{model_name}|{balance_mode}|{calibration_method}|{stamp}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _history_make_optuna_batch_key(
+    *,
+    feature_key: object,
+    model_name: object,
+    calibration_method: object,
+    optuna_objective: object,
+    threshold_objective: object,
+    selected_feature_sets: Optional[Sequence[object]] = None,
+    balance_modes: Optional[Sequence[object]] = None,
+    started_at: Optional[str] = None,
+) -> str:
+    payload = {
+        "feature_key": str(feature_key or ""),
+        "model_name": str(model_name or ""),
+        "calibration_method": str(calibration_method or ""),
+        "optuna_objective": str(optuna_objective or ""),
+        "threshold_objective": str(threshold_objective or ""),
+        "selected_feature_sets": [
+            str(item)
+            for item in list(selected_feature_sets or [])
+            if str(item).strip()
+        ],
+        "balance_modes": [
+            str(item) for item in list(balance_modes or []) if str(item).strip()
+        ],
+        "started_at": str(started_at or datetime.now().isoformat()),
+    }
+    return "optuna-batch-" + hashlib.md5(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _register_feature_engineering_history(
+    *,
+    features_df: pd.DataFrame,
+    features_db_path: Path,
+    params: Dict[str, object],
+    metrics: Dict[str, object],
+    cluster_label_path: Optional[object] = None,
+) -> Optional[int]:
+    context = _history_context_details(features_df, selected_features=None)
+    artifacts = _history_input_artifacts(include_features=False)
+    if cluster_label_path:
+        artifacts.append(
+            {
+                "path": str(cluster_label_path),
+                "role": "cluster_labels_input",
+                "generated": False,
+                "delete_on_record_delete": False,
+            }
+        )
+    artifacts.append(
+        {
+            "path": str(features_db_path),
+            "role": "features_duckdb",
+            "generated": True,
+            "delete_on_record_delete": True,
+        }
+    )
+    record_uid = hashlib.md5(
+        f"feature-engineering|{features_db_path}|{datetime.now().isoformat()}".encode("utf-8")
+    ).hexdigest()
+    return _history_insert_record(
+        stage="Feature engineering",
+        record_uid=record_uid,
+        context_key=context["context_key"],
+        feature_context_key=context["feature_context_key"],
+        event_files=context["event_files"],
+        features_path=str(features_db_path),
+        features_source="calculadas (DB)",
+        features_date_min=context["features_date_min"],
+        features_date_max=context["features_date_max"],
+        tramo_label=context["tramo_label"],
+        feature_signature_value=context["feature_signature"],
+        params=params,
+        metrics=metrics,
+        metadata={
+            "features_rows": context["features_rows"],
+            "features_cols": context["features_cols"],
+            "dataset_fingerprint": context["dataset_fingerprint"],
+        },
+        artifacts=artifacts,
+        legacy_ref=str(features_db_path),
+    )
+
+
+def _register_feature_selection_history(
+    *,
+    features_df: pd.DataFrame,
+    payload: Dict[str, object],
+    importance_csv: Optional[object],
+    importance_df: Optional[pd.DataFrame],
+) -> Optional[int]:
+    selected_features = list(payload.get("selected_features") or [])
+    context = _history_context_details(features_df, selected_features=selected_features)
+    feature_id = str(payload.get("feature_id") or "feature_selection")
+    stage = "Feature selection"
+    json_snapshot = _history_write_json_snapshot(
+        stage=stage,
+        stem=f"{feature_id}_selection",
+        payload=payload,
+    )
+    csv_snapshot = _history_copy_snapshot(
+        importance_csv,
+        stage=stage,
+        role="importance_csv",
+        stem=f"{feature_id}_importance",
+    )
+    if csv_snapshot is None and isinstance(importance_df, pd.DataFrame) and not importance_df.empty:
+        try:
+            csv_path = _history_stage_artifacts_dir(stage) / (
+                f"{_slugify(feature_id) or 'feature_selection'}_importance_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv"
+            )
+            importance_df.to_csv(csv_path, index=False)
+            csv_snapshot = str(csv_path)
+        except Exception:
+            csv_snapshot = None
+
+    artifacts = _history_input_artifacts(include_features=True)
+    if json_snapshot:
+        artifacts.append(
+            {
+                "path": json_snapshot,
+                "role": "feature_selection_json_snapshot",
+                "generated": True,
+                "delete_on_record_delete": True,
+            }
+        )
+    if csv_snapshot:
+        artifacts.append(
+            {
+                "path": csv_snapshot,
+                "role": "importance_csv_snapshot",
+                "generated": True,
+                "delete_on_record_delete": True,
+            }
+        )
+    record_uid = hashlib.md5(
+        (
+            "feature-selection|"
+            f"{feature_id}|{payload.get('saved_at')}|"
+            f"{context['feature_signature']}"
+        ).encode("utf-8")
+    ).hexdigest()
+    return _history_insert_record(
+        stage=stage,
+        record_uid=record_uid,
+        context_key=context["context_key"],
+        feature_context_key=context["feature_context_key"],
+        event_files=context["event_files"],
+        features_path=context["features_path"],
+        features_source=context["features_source"],
+        features_date_min=context["features_date_min"],
+        features_date_max=context["features_date_max"],
+        tramo_label=context["tramo_label"],
+        feature_signature_value=context["feature_signature"],
+        params=dict(payload.get("params") or {}),
+        metrics={
+            "selected_count": len(selected_features),
+            "importance_rows": int(len(importance_df))
+            if isinstance(importance_df, pd.DataFrame)
+            else 0,
+        },
+        metadata={
+            "feature_id": feature_id,
+            "selected_features": selected_features,
+            "importance_csv": str(importance_csv) if importance_csv else None,
+            "json_snapshot": json_snapshot,
+            "csv_snapshot": csv_snapshot,
+            "features_rows": context["features_rows"],
+            "features_cols": context["features_cols"],
+            "dataset_fingerprint": context["dataset_fingerprint"],
+        },
+        artifacts=artifacts,
+        legacy_ref=feature_id,
+    )
+
+
+def _register_optuna_history(
+    *,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+    optuna_key: str,
+    optuna_id: str,
+    optuna_batch_key: Optional[str],
+    optuna_batch_started_at: Optional[str],
+    optuna_batch_feature_sets: Optional[Sequence[object]],
+    optuna_batch_balance_modes: Optional[Sequence[object]],
+    optuna_batch_total_runs: Optional[int],
+    optuna_batch_run_index: Optional[int],
+    features_df: pd.DataFrame,
+    feature_cols: List[str],
+    model_choice: str,
+    balance_mode: str,
+    calibration_method: str,
+    result_entry: Dict[str, object],
+    trials_csv: Optional[object],
+    pareto_front_csv: Optional[object],
+    json_path: Optional[object],
+) -> Optional[int]:
+    stage = "Optuna"
+    context = _history_context_details(features_df, selected_features=feature_cols)
+    settings = result_entry.get("optuna_settings")
+    settings_dict = settings if isinstance(settings, dict) else {}
+    objective_label = (
+        result_entry.get("objective_label")
+        or settings_dict.get("objective_label")
+        or result_entry.get("objective_metric")
+    )
+    threshold_objective = (
+        settings_dict.get("threshold_objective")
+        or result_entry.get("threshold_objective")
+    )
+    optuna_context_key = _history_optuna_context_key(
+        feature_context_key=context["feature_context_key"],
+        optuna_key=optuna_key,
+        model_name=model_choice,
+        balance_mode=balance_mode,
+        calibration_method=calibration_method,
+        optuna_objective=objective_label,
+        threshold_objective=threshold_objective,
+    )
+    variant_payload = dict(result_entry)
+    variant_payload.pop("trials_df", None)
+    variant_payload.pop("pareto_front_df", None)
+    snapshot_payload = {
+        "optuna_key": optuna_key,
+        "optuna_id": optuna_id,
+        "feature_cols": list(feature_cols),
+        "store_entry": _history_sanitize_payload(payload),
+        "variant": variant_payload,
+    }
+    json_snapshot = _history_write_json_snapshot(
+        stage=stage,
+        stem=f"{optuna_id}_{model_choice}_{balance_mode}_{calibration_method}",
+        payload=snapshot_payload,
+    )
+    trials_snapshot = _history_copy_snapshot(
+        trials_csv,
+        stage=stage,
+        role="trials_csv",
+        stem=f"{optuna_id}_{model_choice}_{balance_mode}_{calibration_method}_trials",
+    )
+    pareto_snapshot = _history_copy_snapshot(
+        pareto_front_csv,
+        stage=stage,
+        role="pareto_front_csv",
+        stem=f"{optuna_id}_{model_choice}_{balance_mode}_{calibration_method}_pareto",
+    )
+    artifacts = _history_input_artifacts(include_features=True)
+    for path, role in [
+        (json_snapshot, "optuna_json_snapshot"),
+        (trials_snapshot, "trials_csv_snapshot"),
+        (pareto_snapshot, "pareto_front_csv_snapshot"),
+    ]:
+        if path:
+            artifacts.append(
+                {
+                    "path": path,
+                    "role": role,
+                    "generated": True,
+                    "delete_on_record_delete": True,
+                }
+            )
+    if json_path:
+        artifacts.append(
+            {
+                "path": str(json_path),
+                "role": "optuna_latest_json",
+                "generated": True,
+                "delete_on_record_delete": False,
+            }
+        )
+
+    created_at = str(result_entry.get("saved_at") or datetime.now().isoformat())
+    metadata = {
+        "optuna_key": optuna_key,
+        "optuna_id": optuna_id,
+        "optuna_batch_key": optuna_batch_key,
+        "optuna_batch_started_at": optuna_batch_started_at,
+        "optuna_batch_feature_sets": [
+            str(item)
+            for item in list(optuna_batch_feature_sets or [])
+            if str(item).strip()
+        ],
+        "optuna_batch_balance_modes": [
+            str(item)
+            for item in list(optuna_batch_balance_modes or [])
+            if str(item).strip()
+        ],
+        "optuna_batch_total_runs": (
+            int(optuna_batch_total_runs)
+            if optuna_batch_total_runs is not None
+            else None
+        ),
+        "optuna_batch_run_index": (
+            int(optuna_batch_run_index)
+            if optuna_batch_run_index is not None
+            else None
+        ),
+        "feature_cols": list(feature_cols),
+        "selected_features": list(entry.get("selected_features") or []),
+        "store_entry": _history_sanitize_payload(payload),
+        "variant": variant_payload,
+        "json_snapshot": json_snapshot,
+        "trials_snapshot": trials_snapshot,
+        "pareto_snapshot": pareto_snapshot,
+        "features_rows": context["features_rows"],
+        "features_cols": context["features_cols"],
+        "dataset_fingerprint": context["dataset_fingerprint"],
+    }
+    return _history_insert_record(
+        stage=stage,
+        record_uid=_history_make_optuna_record_uid(
+            optuna_id=optuna_id,
+            model_name=model_choice,
+            balance_mode=balance_mode,
+            calibration_method=calibration_method,
+            created_at=created_at,
+        ),
+        created_at=created_at,
+        context_key=context["context_key"],
+        feature_context_key=context["feature_context_key"],
+        optuna_context_key=optuna_context_key,
+        batch_key=optuna_batch_key,
+        event_files=context["event_files"],
+        features_path=context["features_path"],
+        features_source=context["features_source"],
+        features_date_min=context["features_date_min"],
+        features_date_max=context["features_date_max"],
+        tramo_label=context["tramo_label"],
+        feature_signature_value=context["feature_signature"],
+        model_name=model_choice,
+        optuna_objective=objective_label,
+        threshold_objective=threshold_objective,
+        calibration_method=calibration_method,
+        balance_strategy=balance_mode,
+        params={
+            "settings": settings_dict,
+            "search_space": result_entry.get("search_space", {}),
+            "best_model_params": result_entry.get("best_model_params", {}),
+            "best_smote_params": result_entry.get("best_smote_params", {}),
+        },
+        metrics={
+            "best_score": result_entry.get("best_score"),
+            "objective_values": result_entry.get("objective_values"),
+            "decision_threshold": result_entry.get("decision_threshold"),
+            "best_trial_number": result_entry.get("best_trial_number"),
+        },
+        metadata=metadata,
+        artifacts=artifacts,
+        legacy_ref=optuna_id,
+    )
+
+
+def _register_balance_history(
+    *,
+    features_df: pd.DataFrame,
+    params: Dict[str, object],
+    stats: Dict[str, object],
+    snapshots: Dict[str, str],
+) -> Optional[int]:
+    selected_features = st.session_state.get("selected_features")
+    context = _history_context_details(features_df, selected_features=selected_features)
+    artifacts = _history_input_artifacts(include_features=True)
+    for role, path in snapshots.items():
+        artifacts.append(
+            {
+                "path": path,
+                "role": f"balanced_{role}",
+                "generated": True,
+                "delete_on_record_delete": True,
+            }
+        )
+    created_at = datetime.now().isoformat()
+    return _history_insert_record(
+        stage="Balance",
+        record_uid=hashlib.md5(
+            f"balance|{created_at}|{context['context_key']}".encode("utf-8")
+        ).hexdigest(),
+        created_at=created_at,
+        context_key=context["context_key"],
+        feature_context_key=context["feature_context_key"],
+        event_files=context["event_files"],
+        features_path=context["features_path"],
+        features_source=context["features_source"],
+        features_date_min=context["features_date_min"],
+        features_date_max=context["features_date_max"],
+        tramo_label=context["tramo_label"],
+        feature_signature_value=context["feature_signature"],
+        balance_strategy="smote",
+        params=params,
+        metrics=stats,
+        metadata={
+            "snapshots": snapshots,
+            "selected_features": list(selected_features or []),
+            "features_rows": context["features_rows"],
+            "features_cols": context["features_cols"],
+            "dataset_fingerprint": context["dataset_fingerprint"],
+        },
+        artifacts=artifacts,
+    )
+
+
+def _register_model_history_record(
+    entry: Dict[str, object],
+    *,
+    features_df: pd.DataFrame,
+    model_choice: str,
+) -> Optional[int]:
+    feature_selection = entry.get("feature_selection")
+    selected_features = (
+        feature_selection.get("selected_features")
+        if isinstance(feature_selection, dict)
+        else st.session_state.get("selected_features")
+    )
+    context = _history_context_details(features_df, selected_features=selected_features)
+    training = entry.get("training") if isinstance(entry.get("training"), dict) else {}
+    source_mode = str(training.get("source_mode") or "").strip().lower()
+    batch_payload = (
+        training.get("optuna_batch")
+        if isinstance(training.get("optuna_batch"), dict)
+        else entry.get("optuna_batch")
+        if isinstance(entry.get("optuna_batch"), dict)
+        else None
+    )
+    active_best = None
+    optuna_context_key = None
+    active_best_metadata = None
+    batch_key = None
+    if source_mode == "optuna_batch" and isinstance(batch_payload, dict):
+        batch_ref = (
+            batch_payload.get("batch_ref")
+            if isinstance(batch_payload.get("batch_ref"), dict)
+            else batch_payload
+        )
+        if isinstance(batch_ref, dict):
+            batch_key = str(batch_ref.get("batch_key") or batch_ref.get("token") or "").strip() or None
+            optuna_context_key = _model_optuna_batch_context_key(batch_ref)
+        active_best_metadata = _history_sanitize_payload(batch_payload)
+    else:
+        active_best = _get_active_optuna_best(
+            model_choice=model_choice,
+            calibration_method=str(training.get("calibration_method") or "sigmoid"),
+        )
+    if isinstance(active_best, dict):
+        active_best_metadata = dict(active_best)
+        active_best_metadata.pop("trials_df", None)
+        if isinstance(active_best_metadata.get("entry"), dict):
+            entry_copy = dict(active_best_metadata["entry"])
+            entry_copy.pop("results", None)
+            active_best_metadata["entry"] = entry_copy
+        optuna_settings = active_best.get("optuna_settings")
+        optuna_settings_dict = optuna_settings if isinstance(optuna_settings, dict) else {}
+        optuna_context_key = _history_optuna_context_key(
+            feature_context_key=context["feature_context_key"],
+            optuna_key=active_best.get("active_key"),
+            model_name=model_choice,
+            balance_mode=active_best.get("balance_mode"),
+            calibration_method=active_best.get("calibration_method"),
+            optuna_objective=(
+                optuna_settings_dict.get("objective_label")
+                or optuna_settings_dict.get("objective_metric")
+            ),
+            threshold_objective=(
+                optuna_settings_dict.get("threshold_objective")
+                or training.get("threshold_objective")
+            ),
+        )
+    run_id = str(entry.get("run_id") or "")
+    run_dir = str(MODELS_DIR / run_id) if run_id else None
+    artifacts = _history_input_artifacts(include_features=True)
+    if run_dir:
+        artifacts.append(
+            {
+                "path": run_dir,
+                "role": "model_history_run_dir",
+                "generated": True,
+                "delete_on_record_delete": True,
+            }
+        )
+    metrics = {}
+    models = entry.get("models")
+    if isinstance(models, dict):
+        metrics = {
+            label: model_entry.get("metrics", {})
+            for label, model_entry in models.items()
+            if isinstance(model_entry, dict)
+        }
+    elif isinstance(entry.get("subruns"), list):
+        metrics = {}
+        for subrun in list(entry.get("subruns") or []):
+            if not isinstance(subrun, dict):
+                continue
+            subrun_key = str(subrun.get("subrun_id") or subrun.get("feature_set_label") or "subrun")
+            candidate_metrics: Dict[str, object] = {}
+            for candidate in list(subrun.get("candidates") or []):
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_key = str(candidate.get("candidate_id") or candidate.get("candidate_label") or "candidate")
+                candidate_metrics[candidate_key] = {
+                    protocol: (
+                        result.get("metrics", {})
+                        if isinstance(result, dict)
+                        else {}
+                    )
+                    for protocol, result in dict(candidate.get("protocol_results") or {}).items()
+                }
+            metrics[subrun_key] = candidate_metrics
+    return _history_insert_record(
+        stage="Modelos",
+        record_uid=f"modelos:{run_id}" if run_id else None,
+        created_at=str(entry.get("timestamp") or datetime.now().isoformat()),
+        context_key=context["context_key"],
+        feature_context_key=context["feature_context_key"],
+        optuna_context_key=optuna_context_key,
+        batch_key=batch_key,
+        event_files=context["event_files"],
+        features_path=context["features_path"],
+        features_source=context["features_source"],
+        features_date_min=context["features_date_min"],
+        features_date_max=context["features_date_max"],
+        tramo_label=context["tramo_label"],
+        feature_signature_value=context["feature_signature"],
+        model_name=model_choice,
+        threshold_objective=training.get("threshold_objective"),
+        calibration_method=training.get("calibration_method"),
+        balance_strategy=training.get("balance_strategy"),
+        protocols=training.get("threshold_protocols") or [],
+        params=training,
+        metrics=metrics,
+        metadata={
+            "run_id": run_id,
+            "history_entry": _history_sanitize_payload(entry),
+            "optuna_active": _history_sanitize_payload(active_best_metadata),
+            "optuna_batch": _history_sanitize_payload(batch_payload),
+            "selected_features": list(selected_features or []),
+            "features_rows": context["features_rows"],
+            "features_cols": context["features_cols"],
+            "dataset_fingerprint": context["dataset_fingerprint"],
+        },
+        artifacts=artifacts,
+        legacy_ref=run_id,
+    )
+
+
+def _seed_history_db_from_legacy_once() -> None:
+    db_path = _history_db_path()
+    try:
+        if history_store.get_meta(db_path, "legacy_seed_v1") == "done":
+            return
+    except Exception:
+        return
+
+    try:
+        if HISTORY_PATH.exists():
+            for entry in _load_history_entries():
+                if not isinstance(entry, dict):
+                    continue
+                run_id = str(entry.get("run_id") or "")
+                dataset = entry.get("dataset") if isinstance(entry.get("dataset"), dict) else {}
+                training = entry.get("training") if isinstance(entry.get("training"), dict) else {}
+                features = entry.get("features") if isinstance(entry.get("features"), dict) else {}
+                models = entry.get("models") if isinstance(entry.get("models"), dict) else {}
+                model_name = None
+                if isinstance(models, dict):
+                    base_model = models.get("Base")
+                    if isinstance(base_model, dict):
+                        model_name = base_model.get("model_name")
+                artifacts: List[Dict[str, object]] = []
+                if run_id:
+                    run_dir = MODELS_DIR / run_id
+                    if run_dir.exists():
+                        artifacts.append(
+                            {
+                                "path": str(run_dir),
+                                "role": "model_history_run_dir",
+                                "generated": True,
+                                "delete_on_record_delete": True,
+                            }
+                        )
+                _history_insert_record(
+                    stage="Modelos",
+                    record_uid=f"modelos:{run_id}" if run_id else None,
+                    created_at=str(entry.get("timestamp") or datetime.now().isoformat()),
+                    context_key=str(entry.get("run_id") or ""),
+                    feature_context_key=str(features.get("features_path") or ""),
+                    event_files=[],
+                    features_path=features.get("features_path"),
+                    features_source=features.get("features_source"),
+                    features_date_min=dataset.get("fecha_min"),
+                    features_date_max=dataset.get("fecha_max"),
+                    tramo_label=(dataset.get("tramo") or {}).get("label")
+                    if isinstance(dataset.get("tramo"), dict)
+                    else None,
+                    model_name=model_name,
+                    threshold_objective=training.get("threshold_objective"),
+                    calibration_method=training.get("calibration_method"),
+                    balance_strategy=training.get("balance_strategy"),
+                    protocols=training.get("threshold_protocols") or [],
+                    params=training,
+                    metrics={
+                        label: model_entry.get("metrics", {})
+                        for label, model_entry in models.items()
+                        if isinstance(model_entry, dict)
+                    }
+                    if isinstance(models, dict)
+                    else {},
+                    metadata={"history_entry": _history_sanitize_payload(entry)},
+                    artifacts=artifacts,
+                    legacy_ref=run_id,
+                )
+
+        for json_path in sorted(RESULTS_DIR.glob("feature_selection_*.json")):
+            if json_path.name.endswith("_importance.json"):
+                continue
+            try:
+                payload = json.loads(json_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            feature_id = str(payload.get("feature_id") or json_path.stem)
+            importance_csv = payload.get("importance_csv")
+            artifacts = [
+                {
+                    "path": str(json_path),
+                    "role": "feature_selection_json",
+                    "generated": True,
+                    "delete_on_record_delete": True,
+                }
+            ]
+            if importance_csv:
+                artifacts.append(
+                    {
+                        "path": str(importance_csv),
+                        "role": "importance_csv",
+                        "generated": True,
+                        "delete_on_record_delete": True,
+                    }
+                )
+            selected = list(payload.get("selected_features") or [])
+            _history_insert_record(
+                stage="Feature selection",
+                record_uid=f"legacy-feature-selection:{feature_id}",
+                created_at=str(payload.get("saved_at") or datetime.now().isoformat()),
+                context_key=str(payload.get("feature_key") or feature_id),
+                feature_context_key=str(payload.get("feature_key") or feature_id),
+                features_path=payload.get("features_path"),
+                features_source=payload.get("features_source"),
+                feature_signature_value=history_store.feature_signature(selected),
+                params=dict(payload.get("params") or {}),
+                metrics={"selected_count": len(selected)},
+                metadata={"payload": payload},
+                artifacts=artifacts,
+                legacy_ref=feature_id,
+            )
+
+        for optuna_json_path in sorted(RESULTS_DIR.glob("optuna_*.json")):
+            optuna_id = optuna_json_path.stem.replace("optuna_", "", 1)
+            entry, _trials_df = _load_optuna_store_entry_from_disk(optuna_id)
+            if not isinstance(entry, dict) or not isinstance(entry.get("results"), dict):
+                continue
+            options = _optuna_previous_result_options_from_entry(entry)
+            for option in options:
+                variant = option.get("variant")
+                if not isinstance(variant, dict):
+                    continue
+                model_choice = option.get("model_choice")
+                balance_mode = option.get("balance_mode")
+                calibration_method = option.get("calibration_method")
+                threshold_objective = option.get("threshold_objective")
+                objective_label = option.get("objective_label") or option.get("objective_metric")
+                feature_cols = list(entry.get("feature_cols") or [])
+                feature_context_key = str(entry.get("feature_key") or "")
+                optuna_context_key = _history_optuna_context_key(
+                    feature_context_key=feature_context_key,
+                    optuna_key=_optuna_result_key(feature_context_key, feature_cols)
+                    if feature_context_key and feature_cols
+                    else optuna_id,
+                    model_name=model_choice,
+                    balance_mode=balance_mode,
+                    calibration_method=calibration_method,
+                    optuna_objective=objective_label,
+                    threshold_objective=threshold_objective,
+                )
+                artifacts = [
+                    {
+                        "path": str(optuna_json_path),
+                        "role": "optuna_json",
+                        "generated": True,
+                        "delete_on_record_delete": True,
+                    }
+                ]
+                if variant.get("trials_csv"):
+                    artifacts.append(
+                        {
+                            "path": str(variant.get("trials_csv")),
+                            "role": "trials_csv",
+                            "generated": True,
+                            "delete_on_record_delete": True,
+                        }
+                    )
+                if variant.get("pareto_front_csv"):
+                    artifacts.append(
+                        {
+                            "path": str(variant.get("pareto_front_csv")),
+                            "role": "pareto_front_csv",
+                            "generated": True,
+                            "delete_on_record_delete": True,
+                        }
+                    )
+                _history_insert_record(
+                    stage="Optuna",
+                    record_uid=f"legacy-optuna:{optuna_id}:{model_choice}:{balance_mode}:{calibration_method}",
+                    created_at=str(option.get("saved_at") or entry.get("saved_at") or datetime.now().isoformat()),
+                    context_key=_optuna_result_key(feature_context_key, feature_cols)
+                    if feature_context_key and feature_cols
+                    else optuna_id,
+                    feature_context_key=feature_context_key,
+                    optuna_context_key=optuna_context_key,
+                    features_path=entry.get("features_path"),
+                    features_source=entry.get("features_source"),
+                    feature_signature_value=history_store.feature_signature(feature_cols),
+                    model_name=model_choice,
+                    optuna_objective=objective_label,
+                    threshold_objective=threshold_objective,
+                    calibration_method=calibration_method,
+                    balance_strategy=balance_mode,
+                    params={
+                        "settings": variant.get("optuna_settings", {}),
+                        "search_space": variant.get("search_space", {}),
+                        "best_model_params": variant.get("best_model_params", {}),
+                        "best_smote_params": variant.get("best_smote_params", {}),
+                    },
+                    metrics={"best_score": variant.get("best_score")},
+                    metadata={
+                        "optuna_id": optuna_id,
+                        "store_entry": _history_sanitize_payload(entry),
+                        "variant": _history_sanitize_payload(variant),
+                    },
+                    artifacts=artifacts,
+                    legacy_ref=optuna_id,
+                )
+
+        for manifest_path in sorted(MODELS_DIR.glob("*/**/manifest.json")):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(manifest, dict):
+                continue
+            run_id = str(manifest.get("run_id") or manifest_path.parents[1].name)
+            strategy_label = str(manifest.get("strategy_label") or manifest_path.parent.name)
+            dataset = manifest.get("dataset") if isinstance(manifest.get("dataset"), dict) else {}
+            metrics = manifest.get("metrics") if isinstance(manifest.get("metrics"), dict) else {}
+            _history_insert_record(
+                stage="Modelos",
+                record_uid=f"legacy-model-manifest:{run_id}:{strategy_label}",
+                created_at=str(manifest.get("saved_at") or datetime.now().isoformat()),
+                context_key=run_id,
+                feature_context_key=str(manifest.get("features_path") or ""),
+                features_path=manifest.get("features_path"),
+                features_source=manifest.get("features_source"),
+                features_date_min=dataset.get("fecha_min"),
+                features_date_max=dataset.get("fecha_max"),
+                tramo_label=(dataset.get("tramo") or {}).get("label")
+                if isinstance(dataset.get("tramo"), dict)
+                else None,
+                feature_signature_value=history_store.feature_signature(
+                    manifest.get("selected_features") or []
+                ),
+                model_name=manifest.get("model_name"),
+                threshold_objective=metrics.get("threshold_objective"),
+                calibration_method=metrics.get("calibration_method"),
+                balance_strategy=metrics.get("balance_strategy"),
+                protocols=[metrics.get("threshold_protocol")]
+                if metrics.get("threshold_protocol")
+                else [],
+                params=manifest.get("model_params") or {},
+                metrics=metrics,
+                metadata={"manifest": manifest, "manifest_path": str(manifest_path)},
+                artifacts=[
+                    {
+                        "path": str(manifest_path.parent),
+                        "role": "model_variant_bundle",
+                        "generated": True,
+                        "delete_on_record_delete": True,
+                    }
+                ],
+                legacy_ref=run_id,
+            )
+        history_store.set_meta(db_path, "legacy_seed_v1", "done")
+    except Exception:
+        return
+
+
+def _history_optuna_previous_options(
+    *,
+    feature_context_key: str,
+    feature_signature_value: str,
+) -> List[Dict[str, object]]:
+    _seed_history_db_from_legacy_once()
+    try:
+        records = history_store.query_previous_optuna(
+            _history_db_path(),
+            feature_context_key=feature_context_key,
+            feature_signature_value=None,
+        )
+    except Exception:
+        return []
+    return _history_optuna_previous_options_from_records(
+        records,
+        feature_signature_value=feature_signature_value,
+    )
+
+
+def _history_optuna_previous_options_from_records(
+    records: Sequence[Dict[str, object]],
+    *,
+    feature_signature_value: Optional[str],
+) -> List[Dict[str, object]]:
+    options: List[Dict[str, object]] = []
+    requested_signature = str(feature_signature_value or "").strip()
+    grouped_records = _group_optuna_history_records(list(records))
+    for group in grouped_records:
+        group_records = list(group.get("records") or [])
+        if not group_records:
+            continue
+        if requested_signature and not any(
+            str(record.get("feature_signature") or "") == requested_signature
+            for record in group_records
+        ):
+            continue
+
+        candidates: List[Dict[str, object]] = []
+        for record in group_records:
+            metadata = (
+                record.get("metadata")
+                if isinstance(record.get("metadata"), dict)
+                else {}
+            )
+            entry = metadata.get("store_entry") if isinstance(metadata, dict) else None
+            variant = metadata.get("variant") if isinstance(metadata, dict) else None
+            if not isinstance(entry, dict) or not isinstance(variant, dict):
+                continue
+            candidates.append(
+                {
+                    "record": record,
+                    "metadata": metadata,
+                    "entry": entry,
+                    "variant": variant,
+                    "preference": _optuna_previous_result_preference_key(
+                        {
+                            "model_choice": record.get("model_name"),
+                            "balance_mode": record.get("balance_strategy"),
+                            "saved_at": record.get("created_at"),
+                        }
+                    ),
+                }
+            )
+        if not candidates:
+            continue
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda item: (
+                _history_parse_created_at(
+                    (item.get("record") or {}).get("created_at")
+                )
+                or pd.Timestamp.min,
+                int((item.get("record") or {}).get("id") or 0),
+            ),
+            reverse=True,
+        )
+        deduped_entry_candidates: List[Dict[str, object]] = []
+        seen_entry_keys: set[str] = set()
+        for candidate in sorted_candidates:
+            entry_key = _optuna_entry_loaded_key(candidate.get("entry")) or str(
+                (candidate.get("entry") or {}).get("optuna_id") or ""
+            ).strip()
+            if entry_key:
+                if entry_key in seen_entry_keys:
+                    continue
+                seen_entry_keys.add(entry_key)
+            deduped_entry_candidates.append(candidate)
+
+        preferred_candidates = [
+            candidate
+            for candidate in candidates
+            if str(
+                (candidate.get("record") or {}).get("feature_signature") or ""
+            )
+            == requested_signature
+        ]
+        representative_candidates = (
+            preferred_candidates if preferred_candidates else candidates
+        )
+        representative = min(
+            representative_candidates,
+            key=lambda item: item.get("preference") or (10**6, 10**6, ""),
+        )
+        representative_record = representative["record"]
+        representative_metadata = representative["metadata"]
+        representative_entry = representative["entry"]
+        representative_variant = representative["variant"]
+
+        objective_label = representative_record.get("optuna_objective")
+        calibration_method = representative_record.get("calibration_method")
+        threshold_objective = representative_record.get("threshold_objective")
+        optuna_id = (
+            representative_metadata.get("optuna_batch_key")
+            or representative_metadata.get("optuna_id")
+            or representative_metadata.get("optuna_key")
+            or representative_record.get("id")
+        )
+        label = _build_optuna_previous_result_label(
+            objective_label=objective_label,
+            objective_metric=objective_label,
+            calibration_method=calibration_method,
+            threshold_objective=threshold_objective,
+            optuna_id=optuna_id,
+        )
+        ids = sorted(
+            [
+                int((candidate.get("record") or {}).get("id") or 0)
+                for candidate in candidates
+            ]
+        )
+        if len(candidates) > 1 and ids:
+            label = (
+                f"{label} | batch {max(ids)}-{min(ids)} | "
+                f"{len(candidates)} subcorridas"
+            )
+
+        option_batch_key = str(
+            representative_record.get("batch_key")
+            or representative_metadata.get("optuna_batch_key")
+            or ""
+        ).strip()
+        option_feature_sets = []
+        for candidate in candidates:
+            record = candidate["record"]
+            metadata = candidate["metadata"]
+            variant = candidate["variant"]
+            settings = (
+                variant.get("optuna_settings")
+                if isinstance(variant.get("optuna_settings"), dict)
+                else {}
+            )
+            feature_set_label = (
+                settings.get("feature_set_label")
+                or metadata.get("feature_set_label")
+                or _history_infer_optuna_feature_set_label(
+                    metadata.get("feature_cols")
+                    or metadata.get("selected_features")
+                    or []
+                )
+            )
+            if feature_set_label and feature_set_label not in option_feature_sets:
+                option_feature_sets.append(str(feature_set_label))
+        option_balance_modes = []
+        for candidate in candidates:
+            mode = _normalize_optuna_balance_mode(
+                (candidate.get("record") or {}).get("balance_strategy")
+            )
+            if mode and mode not in option_balance_modes:
+                option_balance_modes.append(mode)
+
+        token_suffix = option_batch_key or (
+            "_".join(str(record_id) for record_id in ids) if ids else "empty"
+        )
+        options.append(
+            {
+                "token": f"history_batch_{_slugify(token_suffix) or token_suffix}",
+                "label": label,
+                "record_id": representative_record.get("id"),
+                "record_ids": ids,
+                "batch_key": option_batch_key or None,
+                "subrun_count": len(candidates),
+                "optuna_id": representative_metadata.get("optuna_id")
+                or representative_metadata.get("optuna_key"),
+                "model_choice": representative_record.get("model_name"),
+                "balance_mode": representative_record.get("balance_strategy"),
+                "balance_mode_label": _optuna_balance_mode_label(
+                    representative_record.get("balance_strategy")
+                ),
+                "balance_modes": list(option_balance_modes),
+                "calibration_method": _normalize_calibration_method(
+                    representative_record.get("calibration_method")
+                ),
+                "threshold_objective": representative_record.get(
+                    "threshold_objective"
+                ),
+                "objective_label": objective_label,
+                "objective_metric": objective_label,
+                "saved_at": representative_record.get("created_at"),
+                "entry": representative_entry,
+                "entries": [
+                    candidate["entry"] for candidate in deduped_entry_candidates
+                ],
+                "variant": representative_variant,
+                "history_record": representative_record,
+                "history_records": [
+                    candidate["record"] for candidate in candidates
+                ],
+                "feature_set_labels": list(option_feature_sets),
+            }
+        )
+    options.sort(
+        key=lambda item: (
+            str(item.get("saved_at") or ""),
+            str(item.get("label") or ""),
+        ),
+        reverse=True,
+    )
+    return options
+
+
+def _render_optuna_history_loader(
+    *,
+    feature_context_key: str,
+    feature_signature_value: str,
+    current_feature_key: str,
+    current_primary_key: str,
+    current_dataset_fingerprint: Optional[str],
+) -> None:
+    previous_result_options = _history_optuna_previous_options(
+        feature_context_key=feature_context_key,
+        feature_signature_value=feature_signature_value,
+    )
+    if not previous_result_options:
+        return
+    with st.expander("Resultados previos compatibles", expanded=False):
+        model_values = sorted(
+            {str(option.get("model_choice")) for option in previous_result_options if option.get("model_choice")}
+        )
+        objective_values = sorted(
+            {str(option.get("objective_label")) for option in previous_result_options if option.get("objective_label")}
+        )
+        calibration_values = sorted(
+            {str(option.get("calibration_method")) for option in previous_result_options if option.get("calibration_method")}
+        )
+        threshold_values = sorted(
+            {str(option.get("threshold_objective")) for option in previous_result_options if option.get("threshold_objective")}
+        )
+        col_a, col_b, col_c, col_d = st.columns(4)
+        with col_a:
+            model_filter = st.selectbox(
+                "Modelo",
+                ["Todos"] + model_values,
+                key="optuna_history_model_filter",
+            )
+        with col_b:
+            objective_filter = st.selectbox(
+                "Objetivo Optuna",
+                ["Todos"] + objective_values,
+                key="optuna_history_objective_filter",
+            )
+        with col_c:
+            calibration_filter = st.selectbox(
+                "Calibración",
+                ["Todos"] + calibration_values,
+                key="optuna_history_calibration_filter",
+            )
+        with col_d:
+            threshold_filter = st.selectbox(
+                "Criterio threshold",
+                ["Todos"] + threshold_values,
+                key="optuna_history_threshold_filter",
+            )
+        filtered_options = []
+        for option in previous_result_options:
+            if model_filter != "Todos" and option.get("model_choice") != model_filter:
+                continue
+            if objective_filter != "Todos" and option.get("objective_label") != objective_filter:
+                continue
+            if calibration_filter != "Todos" and option.get("calibration_method") != calibration_filter:
+                continue
+            if threshold_filter != "Todos" and option.get("threshold_objective") != threshold_filter:
+                continue
+            filtered_options.append(option)
+        if not filtered_options:
+            st.info("No hay resultados para los filtros seleccionados.")
+            return
+        option_map = {str(option.get("token")): option for option in filtered_options}
+        token = st.selectbox(
+            "Resultado",
+            list(option_map.keys()),
+            key="optuna_history_result_selection",
+            format_func=lambda value: option_map.get(value, {}).get("label", str(value)),
+        )
+        selected = option_map.get(str(token))
+        if not isinstance(selected, dict):
+            return
+        col_load, col_repeat = st.columns(2)
+        with col_load:
+            if st.button("Cargar en sesión", key="optuna_history_load_result"):
+                _load_optuna_previous_result_selection(
+                    selected,
+                    current_feature_key=current_feature_key,
+                    current_primary_key=current_primary_key,
+                    current_dataset_fingerprint=current_dataset_fingerprint,
+                )
+                st.rerun()
+        with col_repeat:
+            if st.button("Cargar configuración para repetir", key="optuna_history_load_config"):
+                _hydrate_optuna_widget_state_from_selection(selected)
+                st.session_state["optuna_loaded_result_state"] = {
+                    "loaded": True,
+                    "label": selected.get("label"),
+                    "token": selected.get("token"),
+                    "batch_key": selected.get("batch_key"),
+                    "feature_set_labels": _optuna_history_option_feature_sets(
+                        selected
+                    ),
+                    "balance_modes": _optuna_history_option_balance_modes(
+                        selected
+                    ),
+                    "compatible": False,
+                    "reasons": ["configuración cargada para repetir experimento"],
+                    "entry": selected.get("entry"),
+                }
+                st.rerun()
+        with st.expander("Detalle del resultado seleccionado", expanded=False):
+            history_records = [
+                record
+                for record in list(selected.get("history_records") or [])
+                if isinstance(record, dict)
+            ]
+            if len(history_records) > 1:
+                st.json(
+                    {
+                        "batch_key": selected.get("batch_key"),
+                        "subrun_count": selected.get("subrun_count"),
+                        "record_ids": selected.get("record_ids"),
+                        "feature_sets": selected.get("feature_set_labels"),
+                        "balance_modes": selected.get("balance_modes"),
+                    }
+                )
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "id": record.get("id"),
+                                "created_at": record.get("created_at"),
+                                "feature_signature": record.get(
+                                    "feature_signature"
+                                ),
+                                "balance_strategy": record.get(
+                                    "balance_strategy"
+                                ),
+                                "calibration_method": record.get(
+                                    "calibration_method"
+                                ),
+                            }
+                            for record in history_records
+                        ]
+                    ),
+                    width="stretch",
+                )
+            record = selected.get("history_record")
+            if isinstance(record, dict):
+                st.json(
+                    {
+                        "id": record.get("id"),
+                        "created_at": record.get("created_at"),
+                        "params": record.get("params"),
+                        "metrics": record.get("metrics"),
+                        "artifacts": record.get("artifacts"),
+                    }
+                )
+
+
+def _render_model_history_loader(
+    *,
+    feature_context_key: str,
+    optuna_context_key: Optional[str],
+    model_name: str,
+    threshold_objective: str,
+    calibration_method: str,
+    balance_strategy: str,
+    protocols: Sequence[str],
+) -> None:
+    _seed_history_db_from_legacy_once()
+    try:
+        records = history_store.query_previous_models(
+            _history_db_path(),
+            feature_context_key=feature_context_key,
+            optuna_context_key=optuna_context_key,
+            model_name=model_name,
+            threshold_objective=threshold_objective,
+            calibration_method=calibration_method,
+            balance_strategy=balance_strategy,
+            protocols=list(protocols),
+        )
+    except Exception:
+        records = []
+    if not records:
+        return
+    with st.expander("Resultados previos compatibles", expanded=False):
+        protocol_values = sorted(
+            {
+                str(protocol)
+                for record in records
+                for protocol in list(record.get("protocols") or [])
+                if protocol
+            }
+        )
+        threshold_values = sorted(
+            {str(record.get("threshold_objective")) for record in records if record.get("threshold_objective")}
+        )
+        balance_values = sorted(
+            {str(record.get("balance_strategy")) for record in records if record.get("balance_strategy")}
+        )
+        model_values = sorted(
+            {str(record.get("model_name")) for record in records if record.get("model_name")}
+        )
+        calibration_values = sorted(
+            {str(record.get("calibration_method")) for record in records if record.get("calibration_method")}
+        )
+        col_a, col_b, col_c, col_d, col_e = st.columns(5)
+        with col_a:
+            protocol_filter = st.selectbox(
+                "Protocolos",
+                ["Todos"] + protocol_values,
+                key="model_history_protocol_filter",
+            )
+        with col_b:
+            threshold_filter = st.selectbox(
+                "Objetivo threshold",
+                ["Todos"] + threshold_values,
+                key="model_history_threshold_filter",
+            )
+        with col_c:
+            balance_filter = st.selectbox(
+                "Desbalance",
+                ["Todos"] + balance_values,
+                key="model_history_balance_filter",
+            )
+        with col_d:
+            model_filter = st.selectbox(
+                "Modelo",
+                ["Todos"] + model_values,
+                key="model_history_model_filter",
+            )
+        with col_e:
+            calibration_filter = st.selectbox(
+                "Calibración",
+                ["Todos"] + calibration_values,
+                key="model_history_calibration_filter",
+            )
+        filtered = []
+        for record in records:
+            if protocol_filter != "Todos" and protocol_filter not in list(record.get("protocols") or []):
+                continue
+            if threshold_filter != "Todos" and record.get("threshold_objective") != threshold_filter:
+                continue
+            if balance_filter != "Todos" and record.get("balance_strategy") != balance_filter:
+                continue
+            if model_filter != "Todos" and record.get("model_name") != model_filter:
+                continue
+            if calibration_filter != "Todos" and record.get("calibration_method") != calibration_filter:
+                continue
+            filtered.append(record)
+        if not filtered:
+            st.info("No hay resultados para los filtros seleccionados.")
+            return
+        option_map = {
+            str(record.get("id")): record
+            for record in filtered
+        }
+        selected_id = st.selectbox(
+            "Resultado",
+            list(option_map.keys()),
+            key="model_history_result_selection",
+            format_func=lambda value: (
+                f"{option_map[value].get('created_at')} | "
+                f"{option_map[value].get('model_name')} | "
+                f"{option_map[value].get('balance_strategy')}"
+            ),
+        )
+        selected = option_map.get(str(selected_id))
+        if not isinstance(selected, dict):
+            return
+        col_view, col_repeat = st.columns(2)
+        with col_view:
+            st.caption("Use el detalle para visualizar resultados y artefactos.")
+        with col_repeat:
+            if st.button("Cargar configuración para repetir", key="model_history_load_config"):
+                _apply_model_history_record_to_state(selected)
+                st.rerun()
+        with st.expander("Detalle del resultado seleccionado", expanded=False):
+            st.json(
+                {
+                    "id": selected.get("id"),
+                    "created_at": selected.get("created_at"),
+                    "params": selected.get("params"),
+                    "metrics": selected.get("metrics"),
+                    "artifacts": selected.get("artifacts"),
+                }
+            )
+
+
+def _apply_model_history_record_to_state(record: Dict[str, object]) -> None:
+    params = record.get("params") if isinstance(record.get("params"), dict) else {}
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    source_mode = str(
+        params.get("source_mode")
+        or params.get("feature_source")
+        or metadata.get("source_mode")
+        or ""
+    ).strip().lower()
+    if source_mode == "optuna_batch":
+        st.session_state["model_feature_source"] = "optuna"
+        st.session_state["model_feature_source_radio"] = "Optuna (batch explícito)"
+        batch_payload = (
+            params.get("optuna_batch")
+            if isinstance(params.get("optuna_batch"), dict)
+            else metadata.get("optuna_batch")
+            if isinstance(metadata.get("optuna_batch"), dict)
+            else {}
+        )
+        batch_ref = (
+            batch_payload.get("batch_ref")
+            if isinstance(batch_payload.get("batch_ref"), dict)
+            else batch_payload
+            if isinstance(batch_payload, dict)
+            else {}
+        )
+        batch_token = str(batch_ref.get("token") or "").strip()
+        if batch_token:
+            st.session_state["model_optuna_batch_token"] = batch_token
+    else:
+        st.session_state["model_feature_source"] = "feature_selection"
+        st.session_state["model_feature_source_radio"] = "Feature selection"
+
+    model_name = record.get("model_name")
+    if model_name:
+        st.session_state["model_choice"] = str(model_name)
+    threshold_objective = record.get("threshold_objective")
+    if threshold_objective:
+        reverse_threshold = {
+            "recall_at_alerts_per_day": "Recall@N alertas/día",
+            "far": "FAR",
+            "balanced_f1": "Balanced F1",
+            "f1": "F1",
+            "mcc": "MCC",
+            "operational_cost": "Costo operacional",
+        }
+        st.session_state["model_threshold_objective"] = reverse_threshold.get(
+            normalize_threshold_objective(threshold_objective),
+            str(threshold_objective),
+        )
+    calibration_method = record.get("calibration_method")
+    if calibration_method:
+        st.session_state["model_calibration_method"] = _calibration_method_label(
+            calibration_method
+        )
+    balance_strategy = record.get("balance_strategy")
+    if balance_strategy and source_mode != "optuna_batch":
+        reverse_balance = {
+            "none": "Sin balance interno",
+            "class_weight": "Class weight / scale_pos_weight",
+            "smote": "SMOTE interno",
+        }
+        st.session_state["model_balance_strategy"] = reverse_balance.get(
+            str(balance_strategy),
+            str(balance_strategy),
+        )
+    protocols = list(record.get("protocols") or [])
+    if protocols:
+        reverse_protocols = {
+            "conservative": "Conservador",
+            "robust": "Robusto",
+        }
+        st.session_state["model_threshold_protocols"] = [
+            reverse_protocols.get(str(protocol), str(protocol))
+            for protocol in protocols
+        ]
+    for state_key, param_key in [
+        ("test_size", "test_size"),
+        ("val_size", "val_size"),
+        ("far_target", "far_target"),
+        ("model_alerts_per_day", "alerts_per_day"),
+        ("model_fn_cost", "fn_cost"),
+        ("model_fp_cost", "fp_cost"),
+        ("model_robust_folds", "robust_folds"),
+        ("model_random_state", "random_state"),
+    ]:
+        if params.get(param_key) is not None:
+            st.session_state[state_key] = params.get(param_key)
 
 
 def _is_null_like(value: object) -> bool:
@@ -3623,13 +6130,7 @@ def _summarize_dataset(df: pd.DataFrame) -> Dict[str, object]:
     tramo_tuple = st.session_state.get("flow_features_tramo")
     tramo_label = st.session_state.get("flow_features_tramo_label")
     if tramo_tuple:
-        eje, calzada, p_start, p_end = tramo_tuple
-        tramo_info: Dict[str, object] = {
-            "eje": str(eje),
-            "calzada": str(calzada),
-            "portico_inicio": str(p_start),
-            "portico_fin": str(p_end),
-        }
+        tramo_info = _tramo_segment_info(tramo_tuple)
         if tramo_label:
             tramo_info["label"] = tramo_label
         summary["tramo"] = tramo_info
@@ -3964,6 +6465,7 @@ def _save_model_bundle_artifact(
         "model_name": model_name,
         "model_params": dict(model_params),
         "metrics": result.get("metrics", {}),
+        "training_curves": result.get("training_curves", {}),
         "threshold": result.get("metrics", {}).get("threshold"),
         "split_info": result.get("split_info", {}),
         "features_path": feature_summary.get("features_path"),
@@ -4015,6 +6517,7 @@ def _history_protocol_results_summary(
                 "metrics": result.get("metrics", {}),
                 "validation_metrics": result.get("validation_metrics", {}),
                 "confusion_matrix": result.get("confusion_matrix"),
+                "training_curves": result.get("training_curves", {}),
                 "split_info": result.get("split_info", {}),
                 "threshold_info": result.get("threshold_info", {}),
                 "note": result.get("note"),
@@ -4110,6 +6613,7 @@ def _record_experiment_history(
         "model_params": dict(model_params_base),
         "metrics": base_result.get("metrics", {}),
         "confusion_matrix": base_result.get("confusion_matrix"),
+        "training_curves": base_result.get("training_curves", {}),
         "model_path": base_bundle.get("model_path"),
         "bundle_path": base_bundle.get("bundle_path"),
         "manifest_path": base_bundle.get("manifest_path"),
@@ -4141,6 +6645,7 @@ def _record_experiment_history(
             ),
             "metrics": cluster_only_result.get("metrics", {}),
             "confusion_matrix": cluster_only_result.get("confusion_matrix"),
+            "training_curves": cluster_only_result.get("training_curves", {}),
             "model_path": cluster_only_bundle.get("model_path"),
             "bundle_path": cluster_only_bundle.get("bundle_path"),
             "manifest_path": cluster_only_bundle.get("manifest_path"),
@@ -4174,6 +6679,7 @@ def _record_experiment_history(
             "model_params": dict(model_params_cluster) if model_params_cluster else {},
             "metrics": cluster_result.get("metrics", {}),
             "confusion_matrix": cluster_result.get("confusion_matrix"),
+            "training_curves": cluster_result.get("training_curves", {}),
             "model_path": cluster_bundle.get("model_path"),
             "bundle_path": cluster_bundle.get("bundle_path"),
             "manifest_path": cluster_bundle.get("manifest_path"),
@@ -4234,6 +6740,206 @@ def _record_experiment_history(
         ),
     }
     _append_history_entry(entry)
+    try:
+        _register_model_history_record(
+            entry,
+            features_df=features_df,
+            model_choice=model_choice,
+        )
+    except Exception:
+        pass
+    return entry
+
+
+def _record_optuna_batch_experiment_history(
+    *,
+    base_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+    batch_contract: Dict[str, object],
+    inherited_training_config: Dict[str, object],
+    subrun_results: Sequence[Dict[str, object]],
+    threshold_protocols: Sequence[str],
+    robust_folds: int,
+    model_n_jobs: Optional[int],
+) -> Dict[str, object]:
+    batch_ref = (
+        batch_contract.get("batch_ref")
+        if isinstance(batch_contract.get("batch_ref"), dict)
+        else {}
+    )
+    signature_payload = {
+        "batch_ref": batch_ref,
+        "threshold_protocols": list(threshold_protocols),
+        "robust_folds": int(robust_folds),
+        "model_n_jobs": model_n_jobs,
+        "time": time.time(),
+    }
+    signature = hashlib.md5(
+        json.dumps(signature_payload, sort_keys=True, default=_json_default).encode("utf-8")
+    ).hexdigest()[:8]
+    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{signature}"
+
+    feature_summary = _summarize_flow_settings(features_df)
+    dataset_summary = _summarize_dataset(base_df)
+    union_feature_cols = sorted(
+        {
+            str(col)
+            for subrun in list(subrun_results or [])
+            if isinstance(subrun, dict)
+            for candidate in list(subrun.get("candidates") or [])
+            if isinstance(candidate, dict)
+            for col in list(candidate.get("feature_cols") or [])
+            if str(col).strip()
+        }
+    )
+    feature_selection_summary = {
+        "source": "optuna_batch",
+        "selected_features": list(union_feature_cols),
+    }
+    entry_subruns: List[Dict[str, object]] = []
+    protocol_results_summary: Dict[str, object] = {}
+
+    for subrun in list(subrun_results or []):
+        if not isinstance(subrun, dict):
+            continue
+        subrun_protocol_summary: Dict[str, object] = {}
+        candidate_entries: List[Dict[str, object]] = []
+        for candidate_index, candidate in enumerate(list(subrun.get("candidates") or []), start=1):
+            if not isinstance(candidate, dict):
+                continue
+            protocol_entries: Dict[str, object] = {}
+            protocol_results = (
+                candidate.get("protocol_results")
+                if isinstance(candidate.get("protocol_results"), dict)
+                else {}
+            )
+            for protocol, result in protocol_results.items():
+                if not isinstance(result, dict):
+                    continue
+                bundle_label = (
+                    f"{subrun.get('subrun_id')}_{subrun.get('feature_set_label')}_"
+                    f"{subrun.get('balance_mode')}_cand_{candidate_index}_{protocol}"
+                )
+                bundle = _save_model_bundle_artifact(
+                    model=result.get("model"),
+                    run_id=run_id,
+                    label=bundle_label,
+                    model_name=str(inherited_training_config.get("model_name") or ""),
+                    model_params=dict(candidate.get("model_params") or {}),
+                    feature_cols=list(candidate.get("feature_cols") or []),
+                    result=result,
+                    feature_summary=feature_summary,
+                    feature_selection_summary={
+                        "source": "optuna_batch",
+                        "selected_features": list(candidate.get("feature_cols") or []),
+                    },
+                    dataset_summary=dataset_summary,
+                    use_balanced=False,
+                )
+                protocol_entries[str(protocol)] = {
+                    "metrics": result.get("metrics", {}),
+                    "validation_metrics": result.get("validation_metrics", {}),
+                    "confusion_matrix": result.get("confusion_matrix"),
+                    "training_curves": result.get("training_curves", {}),
+                    "split_info": result.get("split_info", {}),
+                    "threshold_info": result.get("threshold_info", {}),
+                    "model_path": bundle.get("model_path"),
+                    "bundle_path": bundle.get("bundle_path"),
+                    "manifest_path": bundle.get("manifest_path"),
+                    "xai_error": bundle.get("error"),
+                }
+            candidate_entry = {
+                "candidate_id": candidate.get("candidate_id"),
+                "candidate_label": candidate.get("candidate_label"),
+                "candidate_kind": candidate.get("candidate_kind"),
+                "trial_number": candidate.get("trial_number"),
+                "top_k": candidate.get("top_k"),
+                "selected_trial": bool(candidate.get("selected_trial")),
+                "feature_cols": list(candidate.get("feature_cols") or []),
+                "model_params": dict(candidate.get("model_params") or {}),
+                "smote_params": (
+                    dict(candidate.get("smote_params"))
+                    if isinstance(candidate.get("smote_params"), dict)
+                    else None
+                ),
+                "objective_values": dict(candidate.get("objective_values") or {}),
+                "pruning_proxy_score": candidate.get("pruning_proxy_score"),
+                "far_gate_pass": candidate.get("far_gate_pass"),
+                "far_gate_fallback": candidate.get("far_gate_fallback"),
+                "decision_threshold": candidate.get("decision_threshold"),
+                "protocol_results": protocol_entries,
+            }
+            candidate_entries.append(candidate_entry)
+            subrun_protocol_summary[str(candidate.get("candidate_id") or f"candidate_{candidate_index}")] = {
+                protocol: result.get("metrics", {})
+                for protocol, result in protocol_entries.items()
+                if isinstance(result, dict)
+            }
+
+        entry_subruns.append(
+            {
+                "subrun_id": subrun.get("subrun_id"),
+                "record_id": subrun.get("record_id"),
+                "feature_set_label": subrun.get("feature_set_label"),
+                "dataset_kind": subrun.get("dataset_kind"),
+                "balance_mode": subrun.get("balance_mode"),
+                "balance_mode_label": subrun.get("balance_mode_label"),
+                "calibration_method": subrun.get("calibration_method"),
+                "calibration_method_label": subrun.get("calibration_method_label"),
+                "objective_mode": subrun.get("objective_mode"),
+                "candidate_count": len(candidate_entries),
+                "candidates": candidate_entries,
+            }
+        )
+        protocol_results_summary[str(subrun.get("subrun_id") or f"subrun_{len(entry_subruns)}")] = subrun_protocol_summary
+
+    training_payload = {
+        "source_mode": "optuna_batch",
+        "feature_source": "optuna_batch",
+        "use_balanced": False,
+        "test_size": inherited_training_config.get("test_size"),
+        "val_size": inherited_training_config.get("val_size"),
+        "far_target": inherited_training_config.get("far_target"),
+        "random_state": inherited_training_config.get("random_state"),
+        "threshold_protocols": list(threshold_protocols),
+        "threshold_objective": inherited_training_config.get("threshold_objective"),
+        "calibration_method": inherited_training_config.get("calibration_method"),
+        "alerts_per_day": inherited_training_config.get("alerts_per_day"),
+        "fn_cost": inherited_training_config.get("fn_cost"),
+        "fp_cost": inherited_training_config.get("fp_cost"),
+        "robust_folds": int(robust_folds),
+        "balance_strategy": "optuna_batch",
+        "model_n_jobs": model_n_jobs,
+        "optuna_batch": {
+            "batch_ref": batch_ref,
+            "inherited_training_config": dict(inherited_training_config),
+            "compatibility": {
+                "compatible": bool(batch_contract.get("compatible")),
+                "reasons": list(batch_contract.get("reasons") or []),
+            },
+            "subrun_ids": [subrun.get("subrun_id") for subrun in entry_subruns],
+        },
+    }
+    entry = {
+        "run_id": run_id,
+        "timestamp": datetime.now().isoformat(),
+        "dataset": dataset_summary,
+        "training": training_payload,
+        "feature_selection": feature_selection_summary,
+        "optuna_batch": training_payload.get("optuna_batch"),
+        "subruns": entry_subruns,
+        "models": {},
+        "protocol_results": protocol_results_summary,
+    }
+    _append_history_entry(entry)
+    try:
+        _register_model_history_record(
+            entry,
+            features_df=features_df,
+            model_choice=str(inherited_training_config.get("model_name") or ""),
+        )
+    except Exception:
+        pass
     return entry
 
 
@@ -4329,7 +7035,817 @@ def _confusion_matrix_to_text(value: object) -> str:
     return json.dumps(matrix, ensure_ascii=False)
 
 
+def _coerce_training_curves(value: object) -> Optional[Dict[str, object]]:
+    parsed = _parse_jsonish(value)
+    if not isinstance(parsed, dict):
+        return None
+
+    def _to_float_list(raw: object) -> List[float]:
+        if not isinstance(raw, list):
+            return []
+        values: List[float] = []
+        for item in raw:
+            try:
+                values.append(float(item))
+            except (TypeError, ValueError):
+                values.append(float("nan"))
+        return values
+
+    train_loss = _to_float_list(parsed.get("train_loss"))
+    val_loss = _to_float_list(parsed.get("val_loss"))
+    max_len = max(len(train_loss), len(val_loss))
+    if max_len <= 0:
+        return None
+
+    epochs_raw = parsed.get("epochs")
+    if isinstance(epochs_raw, list) and len(epochs_raw) >= max_len:
+        epochs: List[int] = []
+        for index, item in enumerate(epochs_raw[:max_len], start=1):
+            try:
+                epochs.append(int(item))
+            except (TypeError, ValueError):
+                epochs.append(index)
+    else:
+        epochs = list(range(1, max_len + 1))
+
+    curves: Dict[str, object] = {
+        "epochs": epochs,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "epochs_ran": int(parsed.get("epochs_ran") or max_len),
+        "max_epochs": int(parsed.get("max_epochs") or max_len),
+        "early_stopping_used": bool(parsed.get("early_stopping_used", False)),
+        "early_stopping_triggered": bool(
+            parsed.get("early_stopping_triggered", False)
+        ),
+        "early_stopping_patience": int(
+            parsed.get("early_stopping_patience") or 0
+        ),
+        "early_stopping_min_delta": float(
+            parsed.get("early_stopping_min_delta") or 0.0
+        ),
+    }
+    if parsed.get("best_epoch") is not None:
+        try:
+            curves["best_epoch"] = int(parsed.get("best_epoch"))
+        except (TypeError, ValueError):
+            pass
+    return curves
+
+
+def _training_curves_frame(value: object) -> Optional[pd.DataFrame]:
+    curves = _coerce_training_curves(value)
+    if not curves:
+        return None
+
+    rows: List[Dict[str, object]] = []
+    epochs = list(curves.get("epochs", []))
+    for column_name, label in (
+        ("train_loss", "Train"),
+        ("val_loss", "Validación"),
+    ):
+        series = curves.get(column_name, [])
+        if not isinstance(series, list):
+            continue
+        for index, loss_value in enumerate(series):
+            epoch_value = epochs[index] if index < len(epochs) else index + 1
+            rows.append(
+                {
+                    "epoch": int(epoch_value),
+                    "loss": float(loss_value),
+                    "serie": label,
+                }
+            )
+
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
+def _render_training_curves_section(
+    items: Sequence[Tuple[str, object, Optional[str]]],
+    *,
+    title: str,
+) -> None:
+    valid_items: List[Tuple[str, Dict[str, object], pd.DataFrame, Optional[str]]] = []
+    for label, curves_value, context in items:
+        curves = _coerce_training_curves(curves_value)
+        frame = _training_curves_frame(curves_value)
+        if not curves or frame is None or frame.empty:
+            continue
+        valid_items.append((label, curves, frame, context))
+    if not valid_items:
+        return
+
+    st.subheader(title)
+    alt = _import_altair()
+    columns = st.columns(len(valid_items))
+    for column, (label, curves, frame, context) in zip(columns, valid_items):
+        with column:
+            heading = label if not context else f"{label} | {context}"
+            st.caption(heading)
+            meta = [
+                f"epochs: {int(curves.get('epochs_ran', 0))}/{int(curves.get('max_epochs', 0))}",
+                f"patience: {int(curves.get('early_stopping_patience', 0))}",
+                f"min_delta: {float(curves.get('early_stopping_min_delta', 0.0)):.4f}",
+            ]
+            best_epoch = curves.get("best_epoch")
+            if best_epoch is not None:
+                meta.append(f"best_epoch: {int(best_epoch)}")
+            if bool(curves.get("early_stopping_triggered")):
+                meta.append("early stop: sí")
+            st.caption(" | ".join(meta))
+
+            if alt is not None:
+                chart = (
+                    alt.Chart(frame)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("epoch:Q", title="Epoch"),
+                        y=alt.Y("loss:Q", title="Loss"),
+                        color=alt.Color("serie:N", title="Curva"),
+                    )
+                    .properties(height=260)
+                )
+                st.altair_chart(chart, width="stretch")
+            else:
+                pivot_df = frame.pivot(index="epoch", columns="serie", values="loss")
+                st.line_chart(pivot_df, height=260)
+
+
+def _model_optuna_batch_total_steps(
+    subruns: Sequence[Dict[str, object]],
+    threshold_protocols: Sequence[str],
+) -> int:
+    total_candidates = 0
+    for subrun in list(subruns or []):
+        if not isinstance(subrun, dict):
+            continue
+        candidates = [
+            candidate
+            for candidate in list(subrun.get("candidates") or [])
+            if isinstance(candidate, dict)
+        ]
+        total_candidates += len(candidates)
+    return max(1, int(total_candidates) * max(1, len(list(threshold_protocols or []))))
+
+
+def _clamp_model_optuna_batch_progress_ratio(value: object) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(ratio):
+        return 0.0
+    return max(0.0, min(1.0, ratio))
+
+
+def _model_optuna_batch_progress_ratio(
+    *,
+    live_status: Optional[Dict[str, object]] = None,
+    manifest_progress: Optional[Dict[str, object]] = None,
+) -> float:
+    live_status = live_status if isinstance(live_status, dict) else {}
+    manifest_progress = (
+        manifest_progress if isinstance(manifest_progress, dict) else {}
+    )
+    if live_status.get("progress_ratio") is not None:
+        return _clamp_model_optuna_batch_progress_ratio(
+            live_status.get("progress_ratio")
+        )
+
+    progress = (
+        live_status.get("progress")
+        if isinstance(live_status.get("progress"), dict)
+        else manifest_progress
+    )
+    try:
+        completed_steps = float(progress.get("completed_steps") or 0)
+        total_steps = float(progress.get("total_steps") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+    if total_steps <= 0:
+        return 0.0
+    return _clamp_model_optuna_batch_progress_ratio(completed_steps / total_steps)
+
+
+MODEL_OPTUNA_BATCH_METRIC_OPTIONS: Tuple[Tuple[str, str], ...] = (
+    ("test_roc_auc", "Test ROC-AUC"),
+    ("test_pr_auc", "Test PR-AUC"),
+    ("test_mcc", "Test MCC"),
+    ("test_balanced_f1", "Test Balanced F1"),
+    ("test_brier_score", "Test Brier score"),
+    ("test_far", "Test FAR"),
+    ("test_fn_rate", "Test FN rate"),
+    ("test_tp_capture", "Test captura TP"),
+    ("test_event_recall_approx", "Test recall eventos"),
+    ("val_roc_auc", "Validación ROC-AUC"),
+    ("val_pr_auc", "Validación PR-AUC"),
+    ("val_mcc", "Validación MCC"),
+    ("val_balanced_f1", "Validación Balanced F1"),
+    ("val_brier_score", "Validación Brier score"),
+    ("val_far", "Validación FAR"),
+    ("val_fn_rate", "Validación FN rate"),
+    ("val_tp_capture", "Validación captura TP"),
+    ("val_event_recall_approx", "Validación recall eventos"),
+)
+
+
+def _model_optuna_batch_metric_label(metric_col: object) -> str:
+    metric_text = str(metric_col or "").strip()
+    labels = dict(MODEL_OPTUNA_BATCH_METRIC_OPTIONS)
+    return labels.get(metric_text, metric_text.replace("_", " "))
+
+
+def _model_optuna_batch_metric_options(
+    rows: Sequence[Dict[str, object]] | pd.DataFrame,
+) -> List[Tuple[str, str]]:
+    df = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(list(rows or []))
+    if df.empty:
+        return []
+    if "status" in df.columns:
+        df = df[df["status"].astype(str).str.lower() == "completed"].copy()
+    if df.empty:
+        return []
+
+    options: List[Tuple[str, str]] = []
+    for metric_col, label in MODEL_OPTUNA_BATCH_METRIC_OPTIONS:
+        if metric_col not in df.columns:
+            continue
+        values = pd.to_numeric(df[metric_col], errors="coerce")
+        if values.notna().any():
+            options.append((metric_col, label))
+    return options
+
+
+def _model_optuna_batch_default_metric_column(
+    options: Sequence[Tuple[str, str]],
+) -> Optional[str]:
+    metric_cols = [str(metric_col) for metric_col, _label in options]
+    if "test_roc_auc" in metric_cols:
+        return "test_roc_auc"
+    return metric_cols[0] if metric_cols else None
+
+
+def _model_optuna_batch_metric_column(
+    objective_metric: object,
+    columns: Sequence[object],
+) -> Optional[str]:
+    available = {str(column) for column in list(columns) if str(column)}
+    metric_key = _normalize_optuna_objective_metric(objective_metric)
+    metric_map = {
+        "balanced_f1": ["val_balanced_f1"],
+        "brier_score": ["val_brier_score"],
+        "far": ["val_far"],
+        "fn_rate": ["val_fn_rate"],
+        "mcc": ["val_mcc"],
+        "pr_auc": ["val_pr_auc"],
+        "roc_auc": ["val_roc_auc"],
+        "tp_capture": ["val_tp_capture", "val_event_recall_approx"],
+        "recall_at_alerts_per_day": ["val_tp_capture", "val_event_recall_approx"],
+    }
+    for column in metric_map.get(metric_key, []):
+        if column in available:
+            return column
+    for column in (
+        "val_balanced_f1",
+        "val_pr_auc",
+        "val_mcc",
+        "val_brier_score",
+        "val_tp_capture",
+        "val_fn_rate",
+    ):
+        if column in available:
+            return column
+    return None
+
+
+def _model_optuna_batch_lower_is_better_metric(metric_name: object) -> bool:
+    text = str(metric_name or "").strip().lower()
+    return any(
+        token in text
+        for token in (
+            "brier",
+            "far",
+            "fn_rate",
+            "false_negative",
+            "operational_cost",
+            "costo",
+        )
+    )
+
+
+def _model_optuna_batch_best_so_far_frame(
+    rows: Sequence[Dict[str, object]] | pd.DataFrame,
+    *,
+    objective_metric: object = None,
+    metric_col: object = None,
+) -> Tuple[pd.DataFrame, Optional[str], bool]:
+    df = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(list(rows or []))
+    if df.empty:
+        return pd.DataFrame(), None, False
+    if "status" in df.columns:
+        df = df[df["status"].astype(str).str.lower() == "completed"].copy()
+    if df.empty:
+        return pd.DataFrame(), None, False
+
+    selected_metric_col = str(metric_col or "").strip()
+    if selected_metric_col and selected_metric_col in df.columns:
+        metric_col = selected_metric_col
+    else:
+        metric_col = _model_optuna_batch_metric_column(objective_metric, df.columns)
+    if metric_col is None:
+        return pd.DataFrame(), None, False
+    df[metric_col] = pd.to_numeric(df[metric_col], errors="coerce")
+    df = df.dropna(subset=[metric_col]).reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(), metric_col, False
+
+    # Direction must follow the metric that is actually plotted. If the
+    # protocol objective is unavailable, the chart falls back to another metric
+    # such as val_balanced_f1, whose direction can differ from the objective.
+    lower_is_better = _model_optuna_batch_lower_is_better_metric(metric_col)
+    df["combo_index"] = list(range(1, len(df) + 1))
+    df["current_value"] = df[metric_col].astype(float)
+    if lower_is_better:
+        df["best_so_far"] = df["current_value"].cummin()
+    else:
+        df["best_so_far"] = df["current_value"].cummax()
+    previous_best = df["best_so_far"].shift(1)
+    df["new_best"] = previous_best.isna() | (
+        df["best_so_far"].astype(float) != previous_best.astype(float)
+    )
+    keep_cols = [
+        "combo_index",
+        "combo_id",
+        "candidate_label",
+        "objective_metric",
+        "calibration_method",
+        "threshold_objective",
+        "threshold_objective_label",
+        "balance_mode",
+        "decision_threshold",
+        "threshold_protocol",
+        "current_value",
+        "best_so_far",
+        "new_best",
+    ]
+    keep_cols = [column for column in keep_cols if column in df.columns]
+    return df[keep_cols].copy(), metric_col, lower_is_better
+
+
+def _model_optuna_batch_status_counts(
+    rows: Sequence[Dict[str, object]],
+    *,
+    total_steps: int,
+) -> Dict[str, int]:
+    completed = 0
+    failed = 0
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "").lower()
+        if status == "completed":
+            completed += 1
+        elif status == "failed":
+            failed += 1
+    total = max(0, int(total_steps))
+    return {
+        "completed": completed,
+        "failed": failed,
+        "total": total,
+        "pending": max(0, total - completed - failed),
+    }
+
+
+def _model_optuna_batch_live_dir(run_id: str) -> Path:
+    return MODELS_DIR / "optuna_batch_live" / (_slugify(run_id) or "run")
+
+
+def _model_optuna_batch_persist_live_state(
+    state: Dict[str, object],
+    partial_rows: Sequence[Dict[str, object]],
+) -> None:
+    run_id = str(state.get("run_id") or "").strip()
+    if not run_id:
+        return
+    run_dir = _model_optuna_batch_live_dir(run_id)
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        manifest = state.get("manifest") if isinstance(state.get("manifest"), dict) else {}
+        live_status = (
+            state.get("live_status")
+            if isinstance(state.get("live_status"), dict)
+            else {}
+        )
+        events = [
+            event
+            for event in list(state.get("live_events") or [])
+            if isinstance(event, dict)
+        ]
+        (run_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, default=_json_default),
+            encoding="utf-8",
+        )
+        (run_dir / "live_status.json").write_text(
+            json.dumps(live_status, ensure_ascii=False, indent=2, default=_json_default),
+            encoding="utf-8",
+        )
+        (run_dir / "live_events.jsonl").write_text(
+            "\n".join(
+                json.dumps(event, ensure_ascii=False, default=_json_default)
+                for event in events
+            )
+            + ("\n" if events else ""),
+            encoding="utf-8",
+        )
+        if partial_rows:
+            pd.DataFrame(list(partial_rows)).to_csv(
+                run_dir / "partial_results.csv",
+                index=False,
+            )
+    except Exception:
+        pass
+
+
+def _model_optuna_batch_append_event(
+    state: Dict[str, object],
+    *,
+    step_id: str,
+    step_status: str,
+    message: str,
+    completed_steps: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    progress_ratio: Optional[float] = None,
+    context: Optional[Dict[str, object]] = None,
+    partial_rows: Optional[Sequence[Dict[str, object]]] = None,
+) -> Dict[str, object]:
+    manifest = state.setdefault("manifest", {})
+    if not isinstance(manifest, dict):
+        manifest = {}
+        state["manifest"] = manifest
+    progress = manifest.setdefault("progress", {})
+    if not isinstance(progress, dict):
+        progress = {}
+        manifest["progress"] = progress
+    if completed_steps is not None:
+        progress["completed_steps"] = int(completed_steps)
+    if total_steps is not None:
+        progress["total_steps"] = int(total_steps)
+    progress["current_step_id"] = str(step_id)
+    progress["message"] = str(message)
+    if progress_ratio is None:
+        progress_ratio = _model_optuna_batch_progress_ratio(
+            manifest_progress=progress
+        )
+    progress["progress_ratio"] = _clamp_model_optuna_batch_progress_ratio(
+        progress_ratio
+    )
+
+    status = str(step_status or "")
+    if status == "failed":
+        manifest["status"] = "failed"
+        manifest["result_status"] = "failed"
+        manifest["error"] = str(message)
+    elif status == "completed":
+        manifest["status"] = "completed"
+        manifest["result_status"] = "completed"
+        manifest["completed_at"] = datetime.now().isoformat(timespec="seconds")
+    else:
+        manifest["status"] = "running"
+        manifest["result_status"] = "running"
+    manifest["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    live_status = {
+        "timestamp": manifest["updated_at"],
+        "step_id": str(step_id),
+        "message": str(message),
+        "progress_ratio": progress["progress_ratio"],
+        "progress": dict(progress),
+    }
+    if isinstance(context, dict):
+        live_status.update(context)
+    state["live_status"] = live_status
+
+    events = state.setdefault("live_events", [])
+    if not isinstance(events, list):
+        events = []
+        state["live_events"] = events
+    event = {
+        "event_index": len(events) + 1,
+        "timestamp": manifest["updated_at"],
+        "run_id": manifest.get("run_id") or state.get("run_id"),
+        "status": str(manifest.get("status") or ""),
+        "result_status": str(manifest.get("result_status") or ""),
+        "step_id": str(step_id),
+        "step_status": status,
+        "message": str(message),
+        "progress": dict(progress),
+    }
+    if isinstance(context, dict):
+        event.update(context)
+    events.append(event)
+    state["run_dir"] = str(_model_optuna_batch_live_dir(str(state.get("run_id") or "")))
+    st.session_state["model_optuna_batch_live_state"] = state
+    _model_optuna_batch_persist_live_state(state, partial_rows or [])
+    return event
+
+
+def _model_optuna_batch_result_progress_row(
+    *,
+    combo_index: int,
+    total_combinations: int,
+    subrun: Dict[str, object],
+    candidate: Dict[str, object],
+    candidate_label: str,
+    protocol: str,
+    protocol_label: str,
+    model_name: str,
+    model_n_jobs: Optional[int],
+    threshold_objective: str,
+    threshold_objective_label: str,
+    calibration_method: str,
+    result: Dict[str, object],
+    status: str = "completed",
+    error: Optional[str] = None,
+) -> Dict[str, object]:
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    validation_metrics = (
+        result.get("validation_metrics")
+        if isinstance(result.get("validation_metrics"), dict)
+        else {}
+    )
+    objective_metric = (
+        subrun.get("objective_metric")
+        or subrun.get("objective_label")
+        or candidate.get("objective_metric")
+        or candidate.get("objective_label")
+        or threshold_objective
+    )
+
+    def _metric(prefix: str, key: str) -> object:
+        source = validation_metrics if prefix == "val" else metrics
+        return source.get(key)
+
+    return {
+        "status": status,
+        "error": error,
+        "combo_index": int(combo_index),
+        "total_combinations": int(total_combinations),
+        "combo_id": (
+            f"{subrun.get('subrun_id')}|{candidate_label}|{protocol}"
+        ),
+        "subrun_id": subrun.get("subrun_id"),
+        "feature_set_label": subrun.get("feature_set_label"),
+        "candidate_label": candidate_label,
+        "candidate_kind": candidate.get("candidate_kind"),
+        "trial_number": candidate.get("trial_number"),
+        "model_name": model_name,
+        "objective_metric": objective_metric,
+        "calibration_method": calibration_method,
+        "threshold_objective": threshold_objective,
+        "threshold_objective_label": threshold_objective_label,
+        "balance_mode": subrun.get("balance_mode"),
+        "balance_mode_label": subrun.get("balance_mode_label"),
+        "decision_threshold": metrics.get("threshold")
+        if metrics.get("threshold") is not None
+        else candidate.get("decision_threshold"),
+        "threshold_protocol": protocol,
+        "threshold_protocol_label": protocol_label,
+        "backend": "local",
+        "model_n_jobs": model_n_jobs,
+        "val_roc_auc": _metric("val", "roc_auc"),
+        "val_balanced_f1": _metric("val", "balanced_f1"),
+        "val_pr_auc": _metric("val", "pr_auc"),
+        "val_mcc": _metric("val", "mcc"),
+        "val_brier_score": _metric("val", "brier_score"),
+        "val_far": _metric("val", "far"),
+        "val_fn_rate": _metric("val", "fn_rate"),
+        "val_tp_capture": _metric("val", "recall_at_alerts_per_day"),
+        "val_event_recall_approx": _metric("val", "event_recall_approx"),
+        "test_roc_auc": _metric("test", "roc_auc"),
+        "test_balanced_f1": _metric("test", "balanced_f1"),
+        "test_pr_auc": _metric("test", "pr_auc"),
+        "test_mcc": _metric("test", "mcc"),
+        "test_brier_score": _metric("test", "brier_score"),
+        "test_far": _metric("test", "far"),
+        "test_fn_rate": _metric("test", "fn_rate"),
+        "test_tp_capture": _metric("test", "recall_at_alerts_per_day"),
+        "test_event_recall_approx": _metric("test", "event_recall_approx"),
+    }
+
+
+def _render_model_optuna_batch_best_so_far_chart(
+    rows: Sequence[Dict[str, object]],
+    *,
+    objective_metric: object = None,
+    metric_col: object = None,
+    metric_label: object = None,
+) -> None:
+    curve_df, metric_col, lower_is_better = _model_optuna_batch_best_so_far_frame(
+        rows,
+        objective_metric=objective_metric,
+        metric_col=metric_col,
+    )
+    if curve_df.empty or not metric_col:
+        st.info("Aún no hay combinaciones completadas con la métrica seleccionada.")
+        return
+    metric_label = str(metric_label or _model_optuna_batch_metric_label(metric_col))
+    alt = _import_altair()
+    if alt is None:
+        st.warning("Altair no está disponible; usando gráfico básico de Streamlit.")
+        st.line_chart(
+            curve_df.set_index("combo_index")[["current_value", "best_so_far"]],
+            height=260,
+        )
+        return
+
+    observed_df = curve_df.assign(series="Observado", metric_value=curve_df["current_value"])
+    best_df = curve_df.assign(series="Best so far", metric_value=curve_df["best_so_far"])
+    plot_df = pd.concat([observed_df, best_df], ignore_index=True)
+    tooltip = [
+        alt.Tooltip("combo_index:Q", title="Combo"),
+        alt.Tooltip("series:N", title="Serie"),
+        alt.Tooltip("metric_value:Q", title=metric_label, format=".4f"),
+        alt.Tooltip("candidate_label:N", title="Candidato"),
+        alt.Tooltip("calibration_method:N", title="Calibración"),
+        alt.Tooltip("threshold_objective:N", title="Threshold objetivo"),
+        alt.Tooltip("balance_mode:N", title="Balance"),
+        alt.Tooltip("decision_threshold:Q", title="Threshold", format=".4f"),
+    ]
+    observed = (
+        alt.Chart(observed_df)
+        .mark_line(point=True, opacity=0.45)
+        .encode(
+            x=alt.X("combo_index:Q", title="Combinación"),
+            y=alt.Y("metric_value:Q", title=metric_label),
+            tooltip=tooltip,
+        )
+    )
+    best = (
+        alt.Chart(best_df)
+        .mark_line(point=False, interpolate="step-after", strokeWidth=3)
+        .encode(
+            x=alt.X("combo_index:Q", title="Combinación"),
+            y=alt.Y("metric_value:Q", title=metric_label),
+            color=alt.value("#2f6c7a"),
+            tooltip=tooltip,
+        )
+    )
+    new_best_df = curve_df[curve_df["new_best"]].assign(
+        series="Nuevo best",
+        metric_value=curve_df.loc[curve_df["new_best"], "best_so_far"],
+    )
+    new_best = (
+        alt.Chart(new_best_df)
+        .mark_point(size=95, filled=True, color="#c66a10")
+        .encode(
+            x="combo_index:Q",
+            y=alt.Y("best_so_far:Q", title=metric_label),
+            tooltip=tooltip,
+        )
+    )
+    final_best = float(curve_df["best_so_far"].iloc[-1])
+    rule_df = pd.DataFrame(
+        [{"best_so_far": final_best, "label": f"Final best: {final_best:.4f}"}]
+    )
+    rule = (
+        alt.Chart(rule_df)
+        .mark_rule(strokeDash=[4, 3], color="#555555")
+        .encode(y="best_so_far:Q")
+    )
+    label = (
+        alt.Chart(rule_df)
+        .mark_text(align="left", dx=6, dy=-6, color="#555555")
+        .encode(
+            x=alt.value(8),
+            y="best_so_far:Q",
+            text="label:N",
+        )
+    )
+    caption = "menor es mejor" if lower_is_better else "mayor es mejor"
+    st.caption(f"Métrica: {metric_label} ({caption}).")
+    st.altair_chart((observed + best + new_best + rule + label).properties(height=280), width="stretch")
+
+
+class _ModelOptunaBatchProgressBoard:
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        total_steps: int,
+        batch_ref: Dict[str, object],
+        run_dir: str,
+    ) -> None:
+        self.model_name = str(model_name or "-")
+        self.total_steps = max(1, int(total_steps))
+        self.batch_ref = dict(batch_ref or {})
+        self.run_dir = str(run_dir or "")
+        with st.container():
+            st.caption("Experimento detectado: Crash prediction | Modelos <- batch Optuna")
+            st.caption(
+                "Checkpoint path: "
+                + (self.run_dir if self.run_dir else "-")
+                + " | Run directory: "
+                + (self.run_dir if self.run_dir else "-")
+            )
+            self.status_slot = st.empty()
+            metric_cols = st.columns(7)
+            self.metric_slots = [col.empty() for col in metric_cols]
+            self.progress_slot = st.empty()
+            self.detail_slot = st.empty()
+            self.best_slot = st.empty()
+
+    def update(
+        self,
+        state: Dict[str, object],
+        partial_rows: Sequence[Dict[str, object]],
+        *,
+        objective_metric: object,
+    ) -> None:
+        manifest = state.get("manifest") if isinstance(state.get("manifest"), dict) else {}
+        live_status = (
+            state.get("live_status")
+            if isinstance(state.get("live_status"), dict)
+            else {}
+        )
+        progress = manifest.get("progress") if isinstance(manifest.get("progress"), dict) else {}
+        ratio = _model_optuna_batch_progress_ratio(
+            live_status=live_status,
+            manifest_progress=progress,
+        )
+        counts = _model_optuna_batch_status_counts(
+            partial_rows,
+            total_steps=int(progress.get("total_steps") or self.total_steps),
+        )
+        message = str(live_status.get("message") or progress.get("message") or "")
+        status = str(manifest.get("status") or "running")
+        if status == "failed":
+            self.status_slot.error(message or "Batch Optuna falló.")
+        elif status == "completed":
+            self.status_slot.success(message or "Batch Optuna completado.")
+        else:
+            self.status_slot.info(message or "Entrenando batch Optuna...")
+
+        kpis = [
+            ("Modelo", self.model_name),
+            ("Estado", status),
+            ("Resultado", str(manifest.get("result_status") or status)),
+            ("Progreso", f"{ratio * 100:.1f}%"),
+            ("Combinaciones OK", f"{counts['completed']}/{counts['total']}"),
+            ("Fallidas", str(counts["failed"])),
+            ("Backend", "local"),
+        ]
+        for slot, (label, value) in zip(self.metric_slots, kpis):
+            slot.metric(label, value)
+        self.progress_slot.progress(ratio)
+        self.detail_slot.caption(
+            "Threshold protocol: "
+            + str(live_status.get("threshold_protocol") or "-")
+            + " | Backend: local"
+            + " | Current step: "
+            + str(live_status.get("step_id") or progress.get("current_step_id") or "-")
+            + " | Current message: "
+            + (message or "-")
+            + " | Last update: "
+            + str(live_status.get("timestamp") or manifest.get("updated_at") or "-")
+        )
+
+        with self.best_slot.container():
+            metric_options = _model_optuna_batch_metric_options(partial_rows)
+            if not metric_options:
+                st.info("Aún no hay métricas completadas para visualizar.")
+                return
+            metric_cols = [metric_col for metric_col, _label in metric_options]
+            metric_labels = dict(metric_options)
+            default_metric_col = _model_optuna_batch_default_metric_column(metric_options)
+            default_index = (
+                metric_cols.index(default_metric_col)
+                if default_metric_col in metric_cols
+                else 0
+            )
+            run_key = str(manifest.get("run_id") or state.get("run_id") or "current")
+            selected_metric_col = st.selectbox(
+                "Métrica",
+                metric_cols,
+                index=default_index,
+                format_func=lambda value: metric_labels.get(value, value),
+                key=f"model_optuna_batch_metric_selector_{run_key}",
+            )
+            _render_model_optuna_batch_best_so_far_chart(
+                partial_rows,
+                objective_metric=objective_metric,
+                metric_col=selected_metric_col,
+                metric_label=metric_labels.get(selected_metric_col),
+            )
+
+
 def _inspect_controlled_feature_schema(path: Path) -> pd.DataFrame:
+    cache = st.session_state.setdefault("controlled_feature_schema_cache", {})
+    key = str(path)
+    cached = cache.get(key)
+    if isinstance(cached, pd.DataFrame):
+        return cached.copy()
     if path.suffix.lower() != ".duckdb":
         raise ValueError("El archivo de features debe ser .duckdb.")
     if duckdb is None:
@@ -4345,15 +7861,25 @@ def _inspect_controlled_feature_schema(path: Path) -> pd.DataFrame:
         if not table_name:
             raise ValueError("La base de datos de features esta vacia.")
         table_ref = _duckdb_quote_identifier(table_name)
-        return con.execute(f"SELECT * FROM {table_ref} LIMIT 0").df()
+        schema_df = con.execute(f"SELECT * FROM {table_ref} LIMIT 0").df()
     finally:
         con.close()
+    cache[key] = schema_df.copy()
+    return schema_df.copy()
 
 
 def _controlled_feature_timestamp_bounds(
     path: Path,
 ) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    cache = st.session_state.setdefault(
+        "controlled_feature_timestamp_bounds_cache",
+        {},
+    )
+    key = str(path)
+    if key in cache:
+        return cache.get(key)
     if path.suffix.lower() != ".duckdb" or duckdb is None:
+        cache[key] = None
         return None
     con = duckdb.connect(str(path), read_only=True)
     try:
@@ -4364,11 +7890,13 @@ def _controlled_feature_timestamp_bounds(
             ["flow_features", "features", "cluster_features"],
         )
         if not table_name:
+            cache[key] = None
             return None
         table_ref = _duckdb_quote_identifier(table_name)
         cols_info = con.execute(f"DESCRIBE {table_ref}").fetchall()
         columns = {row[0] for row in cols_info}
         if "interval_start" not in columns:
+            cache[key] = None
             return None
         interval_ref = _duckdb_quote_identifier("interval_start")
         bounds = con.execute(
@@ -4380,8 +7908,11 @@ def _controlled_feature_timestamp_bounds(
     finally:
         con.close()
     if not bounds or bounds[0] is None or bounds[1] is None:
+        cache[key] = None
         return None
-    return pd.Timestamp(bounds[0]), pd.Timestamp(bounds[1])
+    result = (pd.Timestamp(bounds[0]), pd.Timestamp(bounds[1]))
+    cache[key] = result
+    return result
 
 
 def _sync_controlled_feature_date_defaults(
@@ -4470,6 +8001,280 @@ def _render_controlled_feature_date_range_inputs(
     return date_start, date_end, True
 
 
+def _load_portico_segment_catalog() -> pd.DataFrame:
+    cached = st.session_state.get("portico_segment_catalog_cache")
+    if isinstance(cached, pd.DataFrame):
+        return cached.copy()
+
+    porticos_df = load_porticos()
+    segment_df = get_portico_segments(porticos_df)
+    if segment_df is None or segment_df.empty:
+        segment_df = pd.DataFrame(
+            columns=[
+                "eje",
+                "calzada",
+                "portico_last",
+                "km_last",
+                "portico_next",
+                "km_next",
+            ]
+        )
+    else:
+        segment_df = segment_df.copy()
+        segment_df["portico_last"] = _normalize_portico_series(
+            segment_df["portico_last"]
+        )
+        segment_df["portico_next"] = _normalize_portico_series(
+            segment_df["portico_next"]
+        )
+        segment_df["km_last"] = pd.to_numeric(
+            segment_df.get("km_last"),
+            errors="coerce",
+        )
+        segment_df["km_next"] = pd.to_numeric(
+            segment_df.get("km_next"),
+            errors="coerce",
+        )
+        segment_df = segment_df.dropna(
+            subset=["portico_last", "portico_next"]
+        ).drop_duplicates(
+            subset=["portico_last", "portico_next"]
+        )
+        sort_cols = [
+            column_name
+            for column_name in [
+                "eje",
+                "calzada",
+                "km_last",
+                "km_next",
+                "portico_last",
+                "portico_next",
+            ]
+            if column_name in segment_df.columns
+        ]
+        if sort_cols:
+            segment_df = segment_df.sort_values(sort_cols).reset_index(drop=True)
+
+    st.session_state["portico_segment_catalog_cache"] = segment_df.copy()
+    return segment_df.copy()
+
+
+def _load_feature_segment_catalog(
+    path: Path,
+    *,
+    date_start: Optional[pd.Timestamp] = None,
+    date_end: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    cache = st.session_state.setdefault("feature_segment_catalog_cache", {})
+    cache_key = json.dumps(
+        {
+            "path": str(path),
+            "date_start": (
+                None if date_start is None else str(pd.Timestamp(date_start))
+            ),
+            "date_end": None if date_end is None else str(pd.Timestamp(date_end)),
+        },
+        sort_keys=True,
+    )
+    cached = cache.get(cache_key)
+    if isinstance(cached, pd.DataFrame):
+        return cached.copy()
+
+    if path.suffix.lower() != ".duckdb":
+        raise ValueError("El archivo de features debe ser .duckdb.")
+    if duckdb is None:
+        raise RuntimeError("duckdb no esta instalado.")
+
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        table_rows = con.execute("SHOW TABLES").fetchall()
+        tables = [row[0] for row in table_rows]
+        table_name = _pick_duckdb_table(
+            tables,
+            ["flow_features", "features", "cluster_features"],
+        )
+        if not table_name:
+            raise ValueError("La base de datos de features esta vacia.")
+        table_ref = _duckdb_quote_identifier(table_name)
+        cols_info = con.execute(f"DESCRIBE {table_ref}").fetchall()
+        columns = {row[0] for row in cols_info}
+        if {"portico_last", "portico_next"}.issubset(columns):
+            segment_cols = ("portico_last", "portico_next")
+        elif {"portico_inicio", "portico_fin"}.issubset(columns):
+            segment_cols = ("portico_inicio", "portico_fin")
+        else:
+            raise ValueError(
+                "El archivo de features no contiene columnas de tramo "
+                "(portico_last/portico_next o portico_inicio/portico_fin)."
+            )
+
+        last_ref = _duckdb_quote_identifier(segment_cols[0])
+        next_ref = _duckdb_quote_identifier(segment_cols[1])
+        clauses = [
+            f"{last_ref} IS NOT NULL",
+            f"{next_ref} IS NOT NULL",
+        ]
+        params: List[object] = []
+        if "interval_start" in columns:
+            interval_ref = _duckdb_quote_identifier("interval_start")
+            if date_start is not None:
+                clauses.append(f"TRY_CAST({interval_ref} AS TIMESTAMP) >= ?")
+                params.append(pd.Timestamp(date_start))
+            if date_end is not None:
+                clauses.append(f"TRY_CAST({interval_ref} AS TIMESTAMP) <= ?")
+                params.append(pd.Timestamp(date_end))
+
+        segment_df = con.execute(
+            "SELECT DISTINCT "
+            f"CAST({last_ref} AS VARCHAR) AS portico_last, "
+            f"CAST({next_ref} AS VARCHAR) AS portico_next "
+            f"FROM {table_ref} "
+            f"WHERE {' AND '.join(clauses)}",
+            params,
+        ).df()
+    finally:
+        con.close()
+
+    if segment_df.empty:
+        empty_df = pd.DataFrame(
+            columns=[
+                "eje",
+                "calzada",
+                "portico_last",
+                "km_last",
+                "portico_next",
+                "km_next",
+            ]
+        )
+        cache[cache_key] = empty_df.copy()
+        return empty_df.copy()
+
+    segment_df = segment_df.copy()
+    segment_df["portico_last"] = _normalize_portico_series(
+        segment_df["portico_last"]
+    )
+    segment_df["portico_next"] = _normalize_portico_series(
+        segment_df["portico_next"]
+    )
+    segment_df = segment_df.dropna(
+        subset=["portico_last", "portico_next"]
+    ).drop_duplicates(
+        subset=["portico_last", "portico_next"]
+    )
+
+    try:
+        portico_segment_df = _load_portico_segment_catalog()
+    except Exception:
+        portico_segment_df = pd.DataFrame()
+
+    if not portico_segment_df.empty:
+        segment_df = segment_df.merge(
+            portico_segment_df,
+            on=["portico_last", "portico_next"],
+            how="left",
+        )
+    else:
+        segment_df["eje"] = None
+        segment_df["calzada"] = None
+        segment_df["km_last"] = np.nan
+        segment_df["km_next"] = np.nan
+
+    for column_name, fallback in [
+        ("eje", None),
+        ("calzada", None),
+        ("km_last", np.nan),
+        ("km_next", np.nan),
+    ]:
+        if column_name not in segment_df.columns:
+            segment_df[column_name] = fallback
+
+    sort_cols = [
+        column_name
+        for column_name in [
+            "eje",
+            "calzada",
+            "km_last",
+            "km_next",
+            "portico_last",
+            "portico_next",
+        ]
+        if column_name in segment_df.columns
+    ]
+    if sort_cols:
+        segment_df = segment_df.sort_values(
+            sort_cols,
+            na_position="last",
+        ).reset_index(drop=True)
+
+    cache[cache_key] = segment_df.copy()
+    return segment_df.copy()
+
+
+def _render_feature_segment_selector(
+    path: Path,
+    *,
+    date_start: Optional[pd.Timestamp],
+    date_end: Optional[pd.Timestamp],
+    key: str,
+) -> Optional[Tuple[str, str, str, str]]:
+    segments_df = _load_feature_segment_catalog(
+        path,
+        date_start=date_start,
+        date_end=date_end,
+    )
+    if segments_df.empty:
+        st.warning("No se encontraron tramos con datos en el rango seleccionado.")
+        return None
+
+    st.caption(
+        "Selector de tramo construido desde metadata del DuckDB. "
+        "El archivo de eventos se carga solo al ejecutar."
+    )
+    st.caption(f"Tramos disponibles en features: {len(segments_df):,}")
+
+    segment_options = ["(seleccione un tramo)"]
+    segment_lookup: Dict[str, Tuple[str, str, str, str]] = {}
+    if _segments_contain_combined_tramo(
+        segments_df,
+        start_col="portico_last",
+        end_col="portico_next",
+    ):
+        segment_options.append(COMBINED_TRAMO_LABEL)
+        segment_lookup[COMBINED_TRAMO_LABEL] = COMBINED_TRAMO_SELECTION
+    for row in segments_df.itertuples(index=False):
+        eje = getattr(row, "eje", None)
+        calzada = getattr(row, "calzada", None)
+        portico_last = str(getattr(row, "portico_last"))
+        portico_next = str(getattr(row, "portico_next"))
+        parts = []
+        if not pd.isna(eje) and str(eje).strip():
+            parts.append(str(eje).strip())
+        if not pd.isna(calzada) and str(calzada).strip():
+            parts.append(str(calzada).strip())
+        parts.append(f"{portico_last} -> {portico_next}")
+        label = " | ".join(parts)
+        segment_options.append(label)
+        segment_lookup[label] = (
+            "" if pd.isna(eje) else str(eje).strip(),
+            "" if pd.isna(calzada) else str(calzada).strip(),
+            portico_last,
+            portico_next,
+        )
+
+    selected_label = st.selectbox(
+        "Tramo",
+        segment_options,
+        key=key,
+    )
+    if selected_label == "(seleccione un tramo)":
+        return None
+
+    tramo_tuple = segment_lookup.get(selected_label)
+    if tramo_tuple is not None:
+        st.caption(f"Filtro activo: {_tramo_display_label(tramo_tuple)}")
+    return tramo_tuple
+
+
 def _load_controlled_features_df(
     path: Path,
     tramo_tuple: Optional[Tuple[str, str, str, str]],
@@ -4540,6 +8345,7 @@ def _prepare_controlled_comparison_base_df(
     tramo_tuple: Tuple[str, str, str, str],
     date_start: Optional[pd.Timestamp] = None,
     date_end: Optional[pd.Timestamp] = None,
+    features_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     accidents_segment, filter_ok = _apply_tramo_filter_df(
         accidents_df_for_tramo
@@ -4571,12 +8377,30 @@ def _prepare_controlled_comparison_base_df(
                 "No hay accidentes para el tramo en el rango de fechas seleccionado."
             )
 
-    features_df = _load_controlled_features_df(
-        selected_features_path,
-        tramo_tuple,
-        date_start=date_start,
-        date_end=date_end,
-    )
+    if features_df is None:
+        features_df = _load_controlled_features_df(
+            selected_features_path,
+            tramo_tuple,
+            date_start=date_start,
+            date_end=date_end,
+        )
+    else:
+        features_df = features_df.copy()
+        if {"portico_inicio", "portico_fin"}.issubset(features_df.columns) and not {
+            "portico_last",
+            "portico_next",
+        }.issubset(features_df.columns):
+            features_df = features_df.rename(
+                columns={
+                    "portico_inicio": "portico_last",
+                    "portico_fin": "portico_next",
+                }
+            )
+        if "interval_start" in features_df.columns:
+            features_df["interval_start"] = pd.to_datetime(
+                features_df["interval_start"],
+                errors="coerce",
+            )
     if features_df.empty:
         raise ValueError("No hay features para el tramo seleccionado.")
     if "interval_start" not in features_df.columns:
@@ -5414,15 +9238,16 @@ def _render_calibration_sweep_experiment() -> None:
         )
         return
 
-    accidents_df_for_tramo = _load_accidents_for_event(selected_event_path)
-    allowed_porticos = _load_porticos_from_feature_file(selected_features_path)
-    tramo_tuple = _build_tramo_selector(
-        accidents_df_for_tramo,
-        date_start=dataset_date_start,
-        date_end=dataset_date_end,
-        allowed_porticos=allowed_porticos,
-        key="exp_calibration_sweep_tramo_choice",
-    )
+    try:
+        tramo_tuple = _render_feature_segment_selector(
+            selected_features_path,
+            date_start=dataset_date_start,
+            date_end=dataset_date_end,
+            key="exp_calibration_sweep_tramo_choice",
+        )
+    except Exception as exc:
+        st.error(f"No se pudieron leer los tramos del archivo de features: {exc}")
+        return
     if not tramo_tuple:
         st.info("Seleccione un tramo específico para ejecutar el experimento.")
         current_payload = st.session_state.get("calibration_sweep_last_payload")
@@ -5433,14 +9258,7 @@ def _render_calibration_sweep_experiment() -> None:
             )
         return
 
-    eje, calzada, p_start, p_end = tramo_tuple
-    segment_info = {
-        "eje": eje,
-        "calzada": calzada,
-        "portico_inicio": p_start,
-        "portico_fin": p_end,
-        "segment_label": f"{eje} | {calzada} | {p_start} -> {p_end}",
-    }
+    segment_info = _tramo_segment_info(tramo_tuple)
 
     st.markdown("**Configuración general**")
     cfg1, cfg2, cfg3, cfg4 = st.columns(4)
@@ -5469,9 +9287,14 @@ def _render_calibration_sweep_experiment() -> None:
             key="exp_calibration_sweep_timeout",
         )
     with cfg4:
+        _sanitize_selectbox_state(
+            "exp_calibration_sweep_model_choice",
+            CRASH_CONTROLLED_COMPARISON_MODELS,
+            default="XGBoost",
+        )
         model_choice = st.selectbox(
             "Modelo",
-            list(CONTROLLED_COMPARISON_MODELS),
+            list(CRASH_CONTROLLED_COMPARISON_MODELS),
             key="exp_calibration_sweep_model_choice",
         )
 
@@ -5970,19 +9793,30 @@ def _render_calibration_sweep_experiment() -> None:
                 st.error("K features debe ser mayor o igual a 1.")
                 return
 
+        accidents_df_for_tramo = _load_accidents_for_event(
+            selected_event_path,
+            cache_in_session=False,
+        )
+        if accidents_df_for_tramo is None or accidents_df_for_tramo.empty:
+            st.error(
+                "No se pudieron cargar accidentes procesados para el evento seleccionado."
+            )
+            return
+
         try:
+            features_df = _load_controlled_features_df(
+                selected_features_path,
+                tramo_tuple,
+                date_start=dataset_date_start,
+                date_end=dataset_date_end,
+            )
             base_df = _prepare_controlled_comparison_base_df(
                 accidents_df_for_tramo=accidents_df_for_tramo,
                 selected_features_path=selected_features_path,
                 tramo_tuple=tramo_tuple,
                 date_start=dataset_date_start,
                 date_end=dataset_date_end,
-            )
-            features_df = _load_controlled_features_df(
-                selected_features_path,
-                tramo_tuple,
-                date_start=dataset_date_start,
-                date_end=dataset_date_end,
+                features_df=features_df,
             )
         except Exception as exc:
             st.error(f"No se pudo preparar el dataset base: {exc}")
@@ -6024,8 +9858,14 @@ def _render_calibration_sweep_experiment() -> None:
                 f"0/{total_combinations} combinaciones"
             ),
         )
+        combo_progress_bar = st.progress(
+            0,
+            text="Esperando detalle de la primera combinación...",
+        )
         progress_stats = st.empty()
         progress_last_combo = st.empty()
+        progress_detail = st.empty()
+        progress_recent_events = st.empty()
         progress_state = {
             "started_at": time.monotonic(),
             "processed": 0,
@@ -6035,6 +9875,19 @@ def _render_calibration_sweep_experiment() -> None:
             "trial_pruned": 0,
             "trial_failed": 0,
             "trial_total": 0,
+            "current_combo_fraction": 0.0,
+            "current_combo_index": None,
+            "current_combo_total": total_combinations,
+            "current_message": "",
+            "current_stage": "",
+            "current_combo_label": "",
+            "current_trial_done": 0,
+            "current_trial_target": int(n_trials),
+            "current_trial_completed": 0,
+            "current_trial_pruned": 0,
+            "current_trial_failed": 0,
+            "current_trial_running": 0,
+            "recent_events": [],
         }
 
         def _update_calibration_progress(
@@ -6060,18 +9913,40 @@ def _render_calibration_sweep_experiment() -> None:
                 if avg_seconds is not None
                 else None
             )
+            combo_fraction = float(progress_state.get("current_combo_fraction") or 0.0)
+            partial_processed = min(
+                float(total_combinations),
+                float(processed) + min(0.999, max(0.0, combo_fraction)),
+            )
             progress_pct = (
-                int(round((processed / max(1, total_combinations)) * 100))
+                int(round((partial_processed / max(1, total_combinations)) * 100))
                 if total_combinations > 0
                 else 100
             )
+            current_message = str(progress_state.get("current_message") or "").strip()
+            bar_text = (
+                "Experimento de calibración en progreso... "
+                f"{processed}/{total_combinations} combinaciones"
+            )
+            if current_message:
+                bar_text += f" | {current_message[:90]}"
             progress_bar.progress(
                 min(100, max(0, progress_pct)),
-                text=(
-                    "Experimento de calibración en progreso... "
-                    f"{processed}/{total_combinations} combinaciones"
-                ),
+                text=bar_text,
             )
+            combo_pct = int(round(min(1.0, max(0.0, combo_fraction)) * 100))
+            combo_index = progress_state.get("current_combo_index")
+            combo_total = progress_state.get("current_combo_total") or total_combinations
+            combo_label = str(progress_state.get("current_combo_label") or "").strip()
+            combo_text = (
+                f"Combinación actual {combo_index}/{combo_total}: {combo_label}"
+                if combo_index
+                else "Preparando combinación..."
+            )
+            stage = str(progress_state.get("current_stage") or "").strip()
+            if stage:
+                combo_text += f" | {stage}"
+            combo_progress_bar.progress(combo_pct, text=combo_text[:180])
             progress_stats.caption(
                 "Avance: "
                 f"{processed}/{total_combinations} | "
@@ -6085,6 +9960,22 @@ def _render_calibration_sweep_experiment() -> None:
                 f"Promedio actual: {_format_duration_compact(avg_seconds)} por combinación | "
                 f"ETA: {_format_duration_compact(eta_seconds)}"
             )
+            trial_done = int(progress_state.get("current_trial_done") or 0)
+            trial_target = int(progress_state.get("current_trial_target") or 0)
+            if trial_target > 0 or current_message:
+                progress_detail.caption(
+                    "Etapa actual: "
+                    f"{stage or '-'} | "
+                    f"{current_message or '-'} | "
+                    f"Trials actuales: {trial_done}/{trial_target or '-'} "
+                    f"(OK: {int(progress_state.get('current_trial_completed') or 0)}, "
+                    f"podados: {int(progress_state.get('current_trial_pruned') or 0)}, "
+                    f"fallidos: {int(progress_state.get('current_trial_failed') or 0)}, "
+                    f"en ejecución: {int(progress_state.get('current_trial_running') or 0)})"
+                )
+            recent_events = list(progress_state.get("recent_events") or [])
+            if recent_events:
+                progress_recent_events.caption(" | ".join(recent_events[-5:]))
             if isinstance(payload_item, dict):
                 combo_label = (
                     f"{payload_item.get('optuna_objective_metric') or payload_item.get('objective_metric')} | "
@@ -6115,7 +10006,104 @@ def _render_calibration_sweep_experiment() -> None:
             progress_state["trial_total"] = int(
                 progress_state["trial_total"]
             ) + int(payload_item.get("optuna_trials_total") or 0)
+            progress_state["current_combo_fraction"] = 0.0
             _update_calibration_progress(payload_item)
+
+        def _detail_progress_callback(event: Dict[str, object]) -> None:
+            event_name = str(event.get("event") or "")
+            progress_state["current_message"] = str(event.get("message") or "")
+            progress_state["current_stage"] = str(event.get("stage") or "")
+            progress_state["current_combo_index"] = event.get(
+                "combo_index",
+                progress_state.get("current_combo_index"),
+            )
+            progress_state["current_combo_total"] = event.get(
+                "total_combinations",
+                progress_state.get("current_combo_total") or total_combinations,
+            )
+            progress_state["current_combo_label"] = str(
+                event.get("combo_label")
+                or (
+                    f"{event.get('objective_metric')} | "
+                    f"{event.get('calibration_method')} | "
+                    f"{event.get('threshold_objective')} | "
+                    f"{event.get('balance_mode')}"
+                    if event.get("objective_metric")
+                    else progress_state.get("current_combo_label") or ""
+                )
+            )
+            if event.get("combo_fraction") is not None:
+                progress_state["current_combo_fraction"] = float(
+                    event.get("combo_fraction") or 0.0
+                )
+            elif event.get("optuna_trial_fraction") is not None:
+                progress_state["current_combo_fraction"] = 0.10 + 0.75 * float(
+                    event.get("optuna_trial_fraction") or 0.0
+                )
+            elif event_name == "combo_start":
+                progress_state["current_combo_fraction"] = 0.0
+            elif event_name == "combo_done":
+                progress_state["current_combo_fraction"] = 1.0
+
+            if event_name in {"combo_start", "optuna_start"}:
+                progress_state["current_trial_done"] = 0
+                progress_state["current_trial_completed"] = 0
+                progress_state["current_trial_pruned"] = 0
+                progress_state["current_trial_failed"] = 0
+                progress_state["current_trial_running"] = 0
+                progress_state["current_trial_target"] = int(
+                    event.get("optuna_trials_target") or int(n_trials)
+                )
+
+            progress_state["current_trial_done"] = int(
+                event.get(
+                    "optuna_trials_done",
+                    progress_state.get("current_trial_done") or 0,
+                )
+                or 0
+            )
+            progress_state["current_trial_target"] = int(
+                event.get(
+                    "optuna_trials_target",
+                    progress_state.get("current_trial_target") or int(n_trials),
+                )
+                or 0
+            )
+            progress_state["current_trial_completed"] = int(
+                event.get(
+                    "optuna_trials_completed",
+                    progress_state.get("current_trial_completed") or 0,
+                )
+                or 0
+            )
+            progress_state["current_trial_pruned"] = int(
+                event.get(
+                    "optuna_trials_pruned",
+                    progress_state.get("current_trial_pruned") or 0,
+                )
+                or 0
+            )
+            progress_state["current_trial_failed"] = int(
+                event.get(
+                    "optuna_trials_failed",
+                    progress_state.get("current_trial_failed") or 0,
+                )
+                or 0
+            )
+            progress_state["current_trial_running"] = int(
+                event.get(
+                    "optuna_trials_running",
+                    progress_state.get("current_trial_running") or 0,
+                )
+                or 0
+            )
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            short_message = str(event.get("message") or event.get("event") or "").strip()
+            if short_message:
+                recent_events = list(progress_state.get("recent_events") or [])
+                recent_events.append(f"{timestamp} {short_message[:90]}")
+                progress_state["recent_events"] = recent_events[-5:]
+            _update_calibration_progress()
 
         _update_calibration_progress()
         runner = ExperimentsRunner(random_state=int(random_state))
@@ -6173,6 +10161,7 @@ def _render_calibration_sweep_experiment() -> None:
                     auto_resume=False,
                     start_fresh=bool(restart_selected_checkpoint),
                     checkpoint_run_id_override=selected_checkpoint_run_id,
+                    progress_callback=_detail_progress_callback,
                     result_callback=_progress_callback,
                 )
             except Exception as exc:
@@ -7057,7 +11046,7 @@ def _persist_feature_selection(
     selected_features: List[str],
     importance_df: Optional[pd.DataFrame],
     params: Dict[str, object],
-) -> None:
+) -> Optional[int]:
     store = st.session_state.setdefault("feature_selection_store", {})
     prev = store.get(feature_key, {})
     prev_selected = prev.get("selected_features")
@@ -7094,10 +11083,11 @@ def _persist_feature_selection(
         importance_df is not None and importance_hash != prev_hash
     )
     if not (selected_changed or importance_changed or prev == {}):
-        return
+        return None
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     json_path, csv_path = _feature_selection_paths(feature_id)
+    saved_at = datetime.now().isoformat()
     payload = {
         "feature_key": feature_key,
         "feature_id": feature_id,
@@ -7107,7 +11097,7 @@ def _persist_feature_selection(
         "features_cols": int(len(features_df.columns)),
         "selected_features": list(selected_features),
         "params": dict(params),
-        "saved_at": datetime.now().isoformat(),
+        "saved_at": saved_at,
         "importance_csv": None,
     }
     if importance_df is not None and not importance_df.empty:
@@ -7123,7 +11113,16 @@ def _persist_feature_selection(
         with json_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=True, indent=2)
     except Exception:
-        return
+        return None
+    try:
+        return _register_feature_selection_history(
+            features_df=features_df,
+            payload=payload,
+            importance_csv=payload.get("importance_csv"),
+            importance_df=importance_df,
+        )
+    except Exception:
+        return None
 
 
 def _apply_smote_dataset(
@@ -7496,8 +11495,553 @@ def _collect_optuna_best_feature_options(
                             "best_score": result.get("best_score"),
                             "objective_label": settings.get("objective_label"),
                         }
-                    )
+    )
     return options
+
+
+def _model_optuna_batch_context_key(batch_ref: Optional[Dict[str, object]]) -> Optional[str]:
+    if not isinstance(batch_ref, dict):
+        return None
+    token = str(batch_ref.get("token") or "").strip()
+    batch_key = str(batch_ref.get("batch_key") or "").strip()
+    identity = batch_key or token
+    if not identity:
+        return None
+    return f"optuna_batch::{identity}"
+
+
+def _history_optuna_batch_options_for_model_tab(
+    *,
+    feature_context_key: str,
+) -> List[Dict[str, object]]:
+    _seed_history_db_from_legacy_once()
+    try:
+        records = history_store.query_previous_optuna(
+            _history_db_path(),
+            feature_context_key=feature_context_key,
+            feature_signature_value=None,
+        )
+    except Exception:
+        return []
+
+    options: List[Dict[str, object]] = []
+    grouped_records = _group_optuna_history_records(list(records))
+    for group in grouped_records:
+        group_records = [
+            record for record in list(group.get("records") or []) if isinstance(record, dict)
+        ]
+        if not group_records:
+            continue
+        sorted_records = sorted(
+            group_records,
+            key=lambda record: (
+                _history_parse_created_at(record.get("created_at")) or pd.Timestamp.min,
+                int(record.get("id") or 0),
+            ),
+            reverse=True,
+        )
+        representative = sorted_records[0]
+        ids = [int(record.get("id") or 0) for record in sorted_records]
+        feature_set_labels: List[str] = []
+        balance_modes: List[str] = []
+        threshold_values: List[str] = []
+        model_names: List[str] = []
+        calibration_values: List[str] = []
+        for record in sorted_records:
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            variant = metadata.get("variant") if isinstance(metadata, dict) else None
+            settings = (
+                variant.get("optuna_settings")
+                if isinstance(variant, dict) and isinstance(variant.get("optuna_settings"), dict)
+                else {}
+            )
+            feature_set_label = (
+                settings.get("feature_set_label")
+                or metadata.get("feature_set_label")
+                or _history_infer_optuna_feature_set_label(
+                    metadata.get("feature_cols")
+                    or metadata.get("selected_features")
+                    or []
+                )
+            )
+            if feature_set_label and feature_set_label not in feature_set_labels:
+                feature_set_labels.append(str(feature_set_label))
+            balance_mode = _normalize_optuna_balance_mode(record.get("balance_strategy"))
+            if balance_mode and balance_mode not in balance_modes:
+                balance_modes.append(balance_mode)
+            threshold_value = str(
+                settings.get("threshold_objective")
+                or record.get("threshold_objective")
+                or ""
+            ).strip()
+            if threshold_value and threshold_value not in threshold_values:
+                threshold_values.append(threshold_value)
+            model_name = str(record.get("model_name") or "").strip()
+            if model_name and model_name not in model_names:
+                model_names.append(model_name)
+            calibration_value = _normalize_calibration_method(
+                record.get("calibration_method")
+            )
+            if calibration_value and calibration_value not in calibration_values:
+                calibration_values.append(calibration_value)
+
+        created_at = representative.get("created_at")
+        created_label = str(created_at or "").replace("T", " ")[:19]
+        model_label = ", ".join(model_names) if model_names else "-"
+        calibration_label = ", ".join(
+            _calibration_method_label(value) for value in calibration_values
+        ) if calibration_values else "-"
+        feature_sets_label = ", ".join(feature_set_labels) if feature_set_labels else "-"
+        label = (
+            f"{created_label} | {model_label} | {calibration_label} | "
+            f"{len(sorted_records)} subcorridas | {feature_sets_label}"
+        )
+        options.append(
+            {
+                "token": str(group.get("token") or ""),
+                "batch_key": str(group.get("explicit_batch_key") or "").strip() or None,
+                "label": label,
+                "created_at": created_at,
+                "record_ids": ids,
+                "subrun_count": len(sorted_records),
+                "feature_set_labels": list(feature_set_labels),
+                "balance_modes": list(balance_modes),
+                "threshold_objectives": list(threshold_values),
+                "model_names": list(model_names),
+                "calibration_methods": list(calibration_values),
+                "records": list(sorted_records),
+                "representative_record": representative,
+            }
+        )
+
+    options.sort(
+        key=lambda item: (
+            str(item.get("created_at") or ""),
+            str(item.get("label") or ""),
+        ),
+        reverse=True,
+    )
+    return options
+
+
+def _optuna_batch_shared_value_signature(value: object) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=True, default=_json_default)
+    except Exception:
+        return str(value)
+
+
+def _optuna_subrun_candidates_from_variant(
+    *,
+    entry: Dict[str, object],
+    variant: Dict[str, object],
+    model_choice: str,
+    feature_cols_fallback: Sequence[object],
+    best_model_params: Dict[str, object],
+    best_smote_params: Optional[Dict[str, object]],
+) -> Tuple[List[Dict[str, object]], Optional[str]]:
+    fallback_feature_cols = [
+        str(col) for col in list(feature_cols_fallback or []) if str(col).strip()
+    ]
+    objective_mode = _optuna_variant_objective_mode(variant)
+    if objective_mode != CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE:
+        return (
+            [
+                {
+                    "candidate_id": "best_trial",
+                    "candidate_label": "Best trial",
+                    "candidate_kind": "scalar_best",
+                    "trial_number": variant.get("best_trial_number"),
+                    "feature_cols": list(fallback_feature_cols),
+                    "model_params": dict(best_model_params),
+                    "smote_params": (
+                        dict(best_smote_params)
+                        if isinstance(best_smote_params, dict) and best_smote_params
+                        else None
+                    ),
+                    "objective_values": dict(variant.get("objective_values") or {}),
+                    "pruning_proxy_score": variant.get("pruning_proxy_score"),
+                    "far_gate_pass": variant.get("far_gate_pass"),
+                    "far_gate_fallback": variant.get("far_gate_fallback"),
+                    "decision_threshold": variant.get("decision_threshold"),
+                    "selected_trial": True,
+                    "top_k": (
+                        (variant.get("optuna_settings") or {}).get("best_top_k")
+                        if isinstance(variant.get("optuna_settings"), dict)
+                        else None
+                    ),
+                }
+            ],
+            None,
+        )
+
+    pareto_front_df = _load_optuna_variant_frame(
+        variant,
+        frame_key="pareto_front_df",
+        csv_key="pareto_front_csv",
+    )
+    if not isinstance(pareto_front_df, pd.DataFrame) or pareto_front_df.empty:
+        return [], "subcorrida multiobjetivo sin `pareto_front` utilizable"
+
+    candidates: List[Dict[str, object]] = []
+    for row_idx, row in pareto_front_df.reset_index(drop=True).iterrows():
+        trial_params = _optuna_trial_params_from_frame_row(row)
+        feature_cols, top_k = _feature_cols_for_optuna_trial(
+            entry=entry,
+            variant=variant,
+            trial_params=trial_params,
+        )
+        resolved_feature_cols = [
+            str(col) for col in list(feature_cols or fallback_feature_cols) if str(col).strip()
+        ]
+        candidate_model_params = _build_model_params_from_optuna_trial(
+            model_choice=model_choice,
+            trial_params=trial_params,
+            base_model_params=best_model_params,
+        )
+        candidate_smote_params = _build_smote_params_from_optuna_trial(
+            trial_params=trial_params,
+            base_smote_params=best_smote_params or {},
+        )
+        candidates.append(
+            {
+                "candidate_id": f"pareto_{row_idx + 1}",
+                "candidate_label": f"Pareto {row_idx + 1}",
+                "candidate_kind": "pareto",
+                "trial_number": row.get("trial_number"),
+                "feature_cols": list(resolved_feature_cols),
+                "model_params": candidate_model_params,
+                "smote_params": (
+                    candidate_smote_params if candidate_smote_params else None
+                ),
+                "objective_values": {
+                    column: row.get(column)
+                    for column in pareto_front_df.columns
+                    if str(column).startswith("values_")
+                },
+                "pruning_proxy_score": row.get("pruning_proxy_score"),
+                "far_gate_pass": row.get("far_gate_pass"),
+                "far_gate_fallback": row.get("far_gate_fallback"),
+                "decision_threshold": row.get("decision_threshold"),
+                "selected_trial": bool(row.get("selected_trial")),
+                "top_k": top_k,
+            }
+        )
+
+    if not candidates:
+        return [], "subcorrida multiobjetivo sin candidatos Pareto"
+    return candidates, None
+
+
+def _build_model_optuna_batch_contract(
+    option: Dict[str, object],
+    *,
+    current_feature_key: str,
+    current_dataset_fingerprint: Optional[str],
+    base_df: pd.DataFrame,
+    cluster_df: Optional[pd.DataFrame],
+) -> Dict[str, object]:
+    records = [
+        record for record in list(option.get("records") or []) if isinstance(record, dict)
+    ]
+    reasons: List[str] = []
+    subruns: List[Dict[str, object]] = []
+    if not records:
+        return {
+            "batch_ref": {
+                "token": option.get("token"),
+                "batch_key": option.get("batch_key"),
+                "label": option.get("label"),
+            },
+            "compatible": False,
+            "reasons": ["el batch seleccionado no contiene subcorridas utilizables"],
+            "subruns": [],
+            "inherited_training_config": {},
+        }
+
+    base_numeric_cols = set(_get_feature_cols(base_df))
+    cluster_numeric_cols = set(_get_feature_cols(cluster_df)) if isinstance(cluster_df, pd.DataFrame) else set()
+    current_fingerprint = str(current_dataset_fingerprint or "").strip()
+
+    shared_field_resolvers = {
+        "model_name": lambda record, settings, variant: (
+            str(record.get("model_name") or variant.get("model_choice") or "").strip()
+        ),
+        "calibration_method": lambda record, settings, variant: (
+            _normalize_calibration_method(
+                variant.get("calibration_method") or record.get("calibration_method")
+            )
+        ),
+        "threshold_objective": lambda record, settings, _variant: (
+            normalize_threshold_objective(
+                settings.get("threshold_objective") or record.get("threshold_objective")
+            )
+        ),
+        "test_size": lambda _record, settings, _variant: settings.get("test_size"),
+        "val_size": lambda _record, settings, _variant: settings.get("val_size"),
+        "far_target": lambda _record, settings, _variant: settings.get("far_target"),
+        "alerts_per_day": lambda _record, settings, _variant: settings.get("alerts_per_day"),
+        "fn_cost": lambda _record, settings, _variant: settings.get("fn_cost"),
+        "fp_cost": lambda _record, settings, _variant: settings.get("fp_cost"),
+        "robust_folds": lambda _record, settings, _variant: settings.get("robust_folds"),
+        "random_state": lambda _record, settings, _variant: settings.get("random_state"),
+        "objective_label": lambda record, settings, variant: (
+            settings.get("objective_label")
+            or variant.get("objective_label")
+            or record.get("optuna_objective")
+        ),
+    }
+    shared_samples: Dict[str, object] = {}
+
+    for index, record in enumerate(records, start=1):
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        entry = metadata.get("store_entry") if isinstance(metadata.get("store_entry"), dict) else None
+        variant = metadata.get("variant") if isinstance(metadata.get("variant"), dict) else None
+        if entry is None or variant is None:
+            reasons.append(
+                f"subcorrida #{index}: metadata incompleta (`store_entry`/`variant` ausente)"
+            )
+            continue
+
+        settings = (
+            variant.get("optuna_settings")
+            if isinstance(variant.get("optuna_settings"), dict)
+            else {}
+        )
+        for field_name, resolver in shared_field_resolvers.items():
+            value = resolver(record, settings, variant)
+            if field_name not in shared_samples:
+                shared_samples[field_name] = value
+                continue
+            if _optuna_batch_shared_value_signature(shared_samples[field_name]) != _optuna_batch_shared_value_signature(value):
+                reasons.append(
+                    f"batch heterogéneo: `{field_name}` difiere entre subcorridas"
+                )
+
+        feature_set_label = str(
+            settings.get("feature_set_label")
+            or metadata.get("feature_set_label")
+            or _history_infer_optuna_feature_set_label(
+                metadata.get("feature_cols")
+                or metadata.get("selected_features")
+                or entry.get("feature_cols")
+                or []
+            )
+        ).strip() or "-"
+        balance_mode = _normalize_optuna_balance_mode(
+            variant.get("balance_mode") or record.get("balance_strategy")
+        )
+        calibration_method = _normalize_calibration_method(
+            variant.get("calibration_method") or record.get("calibration_method")
+        )
+        best_feature_cols = [
+            str(col)
+            for col in list(
+                settings.get("best_feature_cols")
+                or metadata.get("feature_cols")
+                or entry.get("feature_cols")
+                or []
+            )
+            if str(col).strip()
+        ]
+        best_model_params = (
+            dict(variant.get("best_model_params"))
+            if isinstance(variant.get("best_model_params"), dict)
+            else {}
+        )
+        best_smote_params = (
+            dict(variant.get("best_smote_params"))
+            if isinstance(variant.get("best_smote_params"), dict)
+            else {}
+        )
+        record_reasons: List[str] = []
+        entry_feature_key = str(entry.get("feature_key") or "").strip()
+        if entry_feature_key and entry_feature_key != str(current_feature_key or "").strip():
+            record_reasons.append("corresponde a otro `feature_key`")
+        stored_fingerprint = str(entry.get("dataset_fingerprint") or "").strip()
+        if stored_fingerprint and current_fingerprint and stored_fingerprint != current_fingerprint:
+            record_reasons.append("el fingerprint del dataset no coincide")
+
+        dataset_kind = "base"
+        available_numeric_cols = set(base_numeric_cols)
+        if feature_set_label in {"Cluster", "Base + Cluster"}:
+            dataset_kind = "cluster"
+            if not isinstance(cluster_df, pd.DataFrame) or cluster_df.empty:
+                record_reasons.append("faltan variables de cluster en el dataset actual")
+                available_numeric_cols = set()
+            else:
+                available_numeric_cols = set(cluster_numeric_cols)
+        missing_cols = [
+            col for col in best_feature_cols if col not in set(available_numeric_cols)
+        ]
+        if missing_cols:
+            preview = ", ".join(missing_cols[:5])
+            if len(missing_cols) > 5:
+                preview = f"{preview}, … (+{len(missing_cols) - 5})"
+            record_reasons.append(
+                f"faltan columnas requeridas en el dataset actual: {preview}"
+            )
+
+        candidates, candidate_error = _optuna_subrun_candidates_from_variant(
+            entry=entry,
+            variant=variant,
+            model_choice=str(shared_samples.get("model_name") or record.get("model_name") or ""),
+            feature_cols_fallback=best_feature_cols,
+            best_model_params=best_model_params,
+            best_smote_params=best_smote_params,
+        )
+        if candidate_error:
+            record_reasons.append(candidate_error)
+
+        compatible = not record_reasons
+        if not compatible:
+            reasons.extend(
+                [
+                    f"subcorrida #{index} ({feature_set_label} | {record.get('balance_strategy')}): {reason}"
+                    for reason in record_reasons
+                ]
+            )
+        subruns.append(
+            {
+                "subrun_id": f"optuna_record_{int(record.get('id') or index)}",
+                "record_id": int(record.get("id") or 0),
+                "record_uid": record.get("record_uid"),
+                "created_at": record.get("created_at"),
+                "feature_set_label": feature_set_label,
+                "dataset_kind": dataset_kind,
+                "balance_mode": balance_mode,
+                "balance_mode_label": _optuna_balance_mode_label(balance_mode),
+                "calibration_method": calibration_method,
+                "calibration_method_label": _calibration_method_label(calibration_method),
+                "objective_mode": _optuna_variant_objective_mode(variant),
+                "objective_label": (
+                    settings.get("objective_label")
+                    or variant.get("objective_label")
+                    or record.get("optuna_objective")
+                ),
+                "threshold_objective": normalize_threshold_objective(
+                    settings.get("threshold_objective") or record.get("threshold_objective")
+                ),
+                "best_feature_cols": list(best_feature_cols),
+                "best_model_params": dict(best_model_params),
+                "best_smote_params": dict(best_smote_params),
+                "compatible": compatible,
+                "reasons": list(record_reasons),
+                "candidate_count": len(candidates),
+                "candidates": list(candidates),
+                "trials_csv": variant.get("trials_csv"),
+                "pareto_front_csv": variant.get("pareto_front_csv"),
+                "optuna_record": record,
+                "optuna_entry": entry,
+                "optuna_variant": variant,
+                "settings": dict(settings),
+            }
+        )
+
+    compatible = not reasons and all(bool(item.get("compatible")) for item in subruns)
+    inherited_training_config = {
+        "model_name": shared_samples.get("model_name"),
+        "calibration_method": shared_samples.get("calibration_method"),
+        "calibration_method_label": _calibration_method_label(
+            shared_samples.get("calibration_method")
+        )
+        if shared_samples.get("calibration_method")
+        else None,
+        "threshold_objective": shared_samples.get("threshold_objective"),
+        "threshold_objective_label": THRESHOLD_OBJECTIVE_LABELS.get(
+            normalize_threshold_objective(shared_samples.get("threshold_objective")),
+            shared_samples.get("threshold_objective"),
+        )
+        if shared_samples.get("threshold_objective") is not None
+        else None,
+        "test_size": shared_samples.get("test_size"),
+        "val_size": shared_samples.get("val_size"),
+        "far_target": shared_samples.get("far_target"),
+        "alerts_per_day": shared_samples.get("alerts_per_day"),
+        "fn_cost": shared_samples.get("fn_cost"),
+        "fp_cost": shared_samples.get("fp_cost"),
+        "robust_folds": shared_samples.get("robust_folds"),
+        "random_state": shared_samples.get("random_state"),
+        "objective_label": shared_samples.get("objective_label"),
+    }
+    return {
+        "batch_ref": {
+            "token": option.get("token"),
+            "batch_key": option.get("batch_key"),
+            "label": option.get("label"),
+            "record_ids": list(option.get("record_ids") or []),
+            "subrun_count": int(option.get("subrun_count") or len(subruns)),
+            "feature_set_labels": list(option.get("feature_set_labels") or []),
+        },
+        "compatible": compatible,
+        "reasons": list(dict.fromkeys(str(reason) for reason in reasons if str(reason).strip())),
+        "subruns": subruns,
+        "inherited_training_config": inherited_training_config,
+    }
+
+
+def _render_model_optuna_batch_contract_summary(
+    contract: Dict[str, object],
+) -> None:
+    batch_ref = contract.get("batch_ref") if isinstance(contract.get("batch_ref"), dict) else {}
+    inherited = (
+        contract.get("inherited_training_config")
+        if isinstance(contract.get("inherited_training_config"), dict)
+        else {}
+    )
+    st.caption(
+        "Lote Optuna seleccionado: "
+        + str(batch_ref.get("label") or batch_ref.get("token") or "sin etiqueta")
+    )
+    summary_df = pd.DataFrame(
+        [
+            {
+                "Modelo": inherited.get("model_name"),
+                "Calibración": inherited.get("calibration_method_label"),
+                "Objetivo threshold": inherited.get("threshold_objective_label"),
+                "Test size": inherited.get("test_size"),
+                "Val size": inherited.get("val_size"),
+                "FAR target": inherited.get("far_target"),
+                "Alertas/día": inherited.get("alerts_per_day"),
+                "Costo FN": inherited.get("fn_cost"),
+                "Costo FP": inherited.get("fp_cost"),
+                "Folds robustos": inherited.get("robust_folds"),
+                "random_state": inherited.get("random_state"),
+                "Protocolos": "Conservador + Robusto",
+            }
+        ]
+    )
+    st.dataframe(_prepare_dataframe_for_streamlit(summary_df), width="stretch")
+    subrun_rows = []
+    for subrun in list(contract.get("subruns") or []):
+        if not isinstance(subrun, dict):
+            continue
+        subrun_rows.append(
+            {
+                "Subcorrida": subrun.get("subrun_id"),
+                "Feature set": subrun.get("feature_set_label"),
+                "Balance": subrun.get("balance_mode_label"),
+                "Calibración": subrun.get("calibration_method_label"),
+                "Modo objetivo": subrun.get("objective_mode"),
+                "Features": len(list(subrun.get("best_feature_cols") or [])),
+                "Candidatos": int(subrun.get("candidate_count") or 0),
+                "Compatible": bool(subrun.get("compatible")),
+            }
+        )
+    if subrun_rows:
+        st.dataframe(_prepare_dataframe_for_streamlit(pd.DataFrame(subrun_rows)), width="stretch")
+    if contract.get("compatible"):
+        st.info(
+            "Modo `Optuna <- batch` activo: se entrenarán todas las subcorridas "
+            "y todos sus candidatos con protocolos Conservador y Robusto."
+        )
+    else:
+        st.error(
+            "El batch seleccionado no es entrenable en el dataset actual. "
+            "Corrija las incompatibilidades antes de ejecutar Modelos."
+        )
+        for reason in list(contract.get("reasons") or []):
+            st.caption(f"- {reason}")
 
 
 _MODEL_FEATURE_GROUP_OVERRIDE_KEYS: Dict[str, str] = {
@@ -7510,6 +12054,246 @@ _MODEL_FEATURE_GROUP_OVERRIDE_KEYS: Dict[str, str] = {
 def _clear_model_feature_group_overrides() -> None:
     for state_key in _MODEL_FEATURE_GROUP_OVERRIDE_KEYS.values():
         st.session_state.pop(state_key, None)
+
+
+def _normalize_model_feature_set_labels(
+    labels: Optional[Sequence[object]],
+) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    raw_values = [labels] if isinstance(labels, (str, bytes)) else list(labels or [])
+    raw_labels = []
+    for label in raw_values:
+        if label is None:
+            continue
+        text = str(label).strip()
+        if not text or text.lower() in {"none", "null", "nan", "-"}:
+            continue
+        raw_labels.append(text)
+    for label in MODEL_FEATURE_SET_ORDER:
+        if label in raw_labels and label not in seen:
+            normalized.append(label)
+            seen.add(label)
+    for label in raw_labels:
+        if label not in seen:
+            normalized.append(label)
+            seen.add(label)
+    return normalized
+
+
+def _sanitize_optuna_feature_set_selection(
+    available_labels: Sequence[object],
+    selected_labels: Optional[Sequence[object]] = None,
+) -> List[str]:
+    available = _normalize_model_feature_set_labels(available_labels)
+    if not available:
+        return []
+    selected = [
+        label
+        for label in _normalize_model_feature_set_labels(selected_labels)
+        if label in available
+    ]
+    if selected:
+        return selected
+    defaults = [
+        label for label in OPTUNA_DEFAULT_FEATURE_SET_SELECTION if label in available
+    ]
+    if defaults:
+        return defaults
+    return [available[0]]
+
+
+def _sync_loaded_optuna_feature_sets_to_form(
+    available_labels: Sequence[object],
+) -> List[str]:
+    """Apply a just-loaded Optuna batch selection to the feature-set widget."""
+    available = _normalize_model_feature_set_labels(available_labels)
+    loaded_state = st.session_state.get("optuna_loaded_result_state")
+    loaded_labels = (
+        _normalize_model_feature_set_labels(loaded_state.get("feature_set_labels"))
+        if isinstance(loaded_state, dict)
+        else []
+    )
+    desired = [label for label in loaded_labels if label in set(available)]
+    pending = bool(st.session_state.get("optuna_loaded_feature_sets_sync_pending"))
+    current = _normalize_model_feature_set_labels(
+        st.session_state.get("optuna_feature_sets_selected")
+    )
+    current_available = [label for label in current if label in set(available)]
+
+    if desired and (pending or not current_available):
+        st.session_state["optuna_feature_sets_selected"] = list(desired)
+        st.session_state["optuna_loaded_feature_sets_sync_token"] = "|".join(
+            [
+                str((loaded_state or {}).get("token") or ""),
+                str((loaded_state or {}).get("batch_key") or ""),
+                ",".join(desired),
+            ]
+        )
+        current = list(desired)
+    st.session_state["optuna_loaded_feature_sets_sync_pending"] = False
+    return _sanitize_optuna_feature_set_selection(available, current)
+
+
+def _store_optuna_last_optimized_context(
+    *,
+    selected_feature_sets: Sequence[object],
+    feature_key: Optional[object],
+    dataset_fingerprint: Optional[object],
+) -> None:
+    st.session_state["optuna_last_optimized_feature_sets"] = (
+        _normalize_model_feature_set_labels(selected_feature_sets)
+    )
+    feature_key_text = str(feature_key or "").strip()
+    dataset_fingerprint_text = str(dataset_fingerprint or "").strip()
+    st.session_state["optuna_last_optimized_feature_key"] = (
+        feature_key_text or None
+    )
+    st.session_state["optuna_last_optimized_dataset_fingerprint"] = (
+        dataset_fingerprint_text or None
+    )
+
+
+def _sync_optuna_last_optimized_context_from_variant(
+    variant: Optional[Dict[str, object]],
+    *,
+    feature_key: Optional[object],
+    dataset_fingerprint: Optional[object],
+) -> None:
+    if not isinstance(variant, dict):
+        return
+    settings = variant.get("optuna_settings")
+    settings_dict = settings if isinstance(settings, dict) else {}
+    selected_feature_sets = _normalize_model_feature_set_labels(
+        settings_dict.get("selected_feature_sets_in_run")
+    )
+    if not selected_feature_sets:
+        selected_feature_sets = _normalize_model_feature_set_labels(
+            [settings_dict.get("feature_set_label")]
+        )
+    if not selected_feature_sets:
+        return
+    _store_optuna_last_optimized_context(
+        selected_feature_sets=selected_feature_sets,
+        feature_key=feature_key,
+        dataset_fingerprint=dataset_fingerprint,
+    )
+    st.session_state["optuna_feature_sets_selected"] = list(selected_feature_sets)
+
+
+def _resolve_model_optuna_feature_set_filter(
+    *,
+    current_feature_key: str,
+    current_dataset_fingerprint: Optional[str],
+    available_feature_sets: Sequence[object],
+) -> Dict[str, object]:
+    available = _normalize_model_feature_set_labels(available_feature_sets)
+    source = str(st.session_state.get("model_feature_source") or "").strip().lower()
+    if source != "optuna":
+        return {
+            "applies": False,
+            "allowed_feature_sets": list(available),
+            "configured_feature_sets": [],
+            "message": None,
+            "reason": "source_not_optuna",
+        }
+
+    configured_feature_sets = _normalize_model_feature_set_labels(
+        st.session_state.get("optuna_last_optimized_feature_sets")
+    )
+    if not configured_feature_sets:
+        return {
+            "applies": False,
+            "allowed_feature_sets": list(available),
+            "configured_feature_sets": [],
+            "message": (
+                "No hay contexto de grupos optimizados en la última corrida de "
+                "Optuna; Modelos mantendrá el comportamiento actual."
+            ),
+            "reason": "missing_context",
+        }
+
+    last_feature_key = str(
+        st.session_state.get("optuna_last_optimized_feature_key") or ""
+    ).strip()
+    if last_feature_key and current_feature_key and last_feature_key != current_feature_key:
+        return {
+            "applies": False,
+            "allowed_feature_sets": list(available),
+            "configured_feature_sets": configured_feature_sets,
+            "message": (
+                "El filtro de grupos de la última corrida de Optuna corresponde "
+                "a otro dataset/base de features; se ignorará para esta sesión."
+            ),
+            "reason": "feature_key_mismatch",
+        }
+
+    last_dataset_fingerprint = str(
+        st.session_state.get("optuna_last_optimized_dataset_fingerprint") or ""
+    ).strip()
+    current_fingerprint = str(current_dataset_fingerprint or "").strip()
+    if (
+        last_dataset_fingerprint
+        and current_fingerprint
+        and last_dataset_fingerprint != current_fingerprint
+    ):
+        return {
+            "applies": False,
+            "allowed_feature_sets": list(available),
+            "configured_feature_sets": configured_feature_sets,
+            "message": (
+                "El filtro de grupos de la última corrida de Optuna fue creado "
+                "sobre otro fingerprint del dataset; se ignorará para esta sesión."
+            ),
+            "reason": "dataset_drift",
+        }
+
+    allowed = [
+        label for label in available if label in set(configured_feature_sets)
+    ]
+    if not allowed:
+        return {
+            "applies": True,
+            "allowed_feature_sets": [],
+            "configured_feature_sets": configured_feature_sets,
+            "message": (
+                "La última corrida de Optuna no incluyó grupos entrenables en el "
+                "dataset actual."
+            ),
+            "reason": "no_overlap",
+        }
+    return {
+        "applies": True,
+        "allowed_feature_sets": allowed,
+        "configured_feature_sets": configured_feature_sets,
+        "message": None,
+        "reason": None,
+    }
+
+
+def _optuna_feature_group_has_matching_result(
+    *,
+    store: Dict[str, object],
+    feature_key: str,
+    cols: Sequence[str],
+    model_choice: str,
+    balance_mode: str,
+    calibration_method: str,
+    allow_calibration_fallback: bool = False,
+) -> bool:
+    if not cols:
+        return False
+    entry = store.get(_optuna_result_key(feature_key, list(cols)))
+    if not isinstance(entry, dict):
+        return False
+    match = _get_optuna_model_result_variant_match(
+        entry.get("results"),
+        model_choice=model_choice,
+        balance_mode=balance_mode,
+        calibration_method=calibration_method,
+        allow_any_calibration_within_mode=allow_calibration_fallback,
+    )
+    return isinstance((match or {}).get("result"), dict)
 
 
 def _lookup_optuna_best_feature_cols(
@@ -7564,6 +12348,292 @@ def _lookup_optuna_best_feature_cols(
         "features_rows": entry.get("features_rows"),
         "features_cols": entry.get("features_cols"),
         "saved_at": entry.get("saved_at"),
+    }
+
+
+def _optuna_variant_objective_mode(
+    variant: Optional[Dict[str, object]],
+) -> str:
+    if not isinstance(variant, dict):
+        return CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR
+    settings = variant.get("optuna_settings")
+    settings_dict = settings if isinstance(settings, dict) else {}
+    objective_mode = (
+        settings_dict.get("objective_mode")
+        or variant.get("optuna_objective_mode")
+        or variant.get("objective_mode")
+        or CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR
+    )
+    mode = str(objective_mode or "").strip().lower()
+    if mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE:
+        return CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+    return CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR
+
+
+def _default_model_pareto_feature_sets(
+    available_labels: Sequence[str],
+) -> List[str]:
+    available = [str(label) for label in available_labels if str(label).strip()]
+    defaults = [
+        label for label in ("Base", "Base + Cluster") if label in available
+    ]
+    if defaults:
+        return defaults
+    return available[:2]
+
+
+def _optuna_trial_params_from_frame_row(row: pd.Series) -> Dict[str, object]:
+    params: Dict[str, object] = {}
+    for column, value in row.items():
+        if not str(column).startswith("params_"):
+            continue
+        if pd.isna(value):
+            continue
+        if isinstance(value, np.generic):
+            value = value.item()
+        params[str(column).replace("params_", "", 1)] = value
+    return params
+
+
+def _build_model_params_from_optuna_trial(
+    *,
+    model_choice: str,
+    trial_params: Dict[str, object],
+    base_model_params: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    params = dict(base_model_params or {})
+    if model_choice == "Random Forest":
+        if trial_params.get("rf_n_estimators") is not None:
+            params["n_estimators"] = int(trial_params["rf_n_estimators"])
+        if trial_params.get("rf_max_depth") is not None:
+            max_depth = int(trial_params["rf_max_depth"])
+            params["max_depth"] = None if max_depth == 0 else max_depth
+    elif model_choice == "XGBoost":
+        field_map = {
+            "xgb_n_estimators": ("n_estimators", int),
+            "xgb_max_depth": ("max_depth", int),
+            "xgb_learning_rate": ("learning_rate", float),
+            "xgb_subsample": ("subsample", float),
+            "xgb_colsample_bytree": ("colsample_bytree", float),
+            "xgb_reg_alpha": ("reg_alpha", float),
+            "xgb_reg_lambda": ("reg_lambda", float),
+            "xgb_gamma": ("gamma", float),
+        }
+        for trial_key, (target_key, caster) in field_map.items():
+            if trial_params.get(trial_key) is not None:
+                params[target_key] = caster(trial_params[trial_key])
+    elif model_choice == "Neural Network":
+        field_map = {
+            "nn_hidden_dim": ("hidden_dim", int),
+            "nn_num_layers": ("num_layers", int),
+            "nn_dropout": ("dropout", float),
+            "nn_learning_rate": ("learning_rate", float),
+            "nn_weight_decay": ("weight_decay", float),
+            "nn_pos_weight": ("pos_weight", float),
+            "nn_batch_size": ("batch_size", int),
+        }
+        for trial_key, (target_key, caster) in field_map.items():
+            if trial_params.get(trial_key) is not None:
+                params[target_key] = caster(trial_params[trial_key])
+        params.setdefault("epochs", 100)
+        params.setdefault("early_stopping_patience", 5)
+    elif model_choice == "SVM":
+        if trial_params.get("svm_kernel") is not None:
+            params["kernel"] = str(trial_params["svm_kernel"])
+        if trial_params.get("svm_C") is not None:
+            params["C"] = float(trial_params["svm_C"])
+    return params
+
+
+def _build_smote_params_from_optuna_trial(
+    *,
+    trial_params: Dict[str, object],
+    base_smote_params: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    params = dict(base_smote_params or {})
+    if trial_params.get("smote_k_neighbors") is not None:
+        params["smote_k_neighbors"] = int(trial_params["smote_k_neighbors"])
+    if trial_params.get("smote_sampling_strategy") is not None:
+        params["smote_sampling_strategy"] = float(
+            trial_params["smote_sampling_strategy"]
+        )
+    return params
+
+
+def _feature_cols_for_optuna_trial(
+    *,
+    entry: Dict[str, object],
+    variant: Dict[str, object],
+    trial_params: Dict[str, object],
+) -> Tuple[List[str], Optional[int]]:
+    settings = variant.get("optuna_settings")
+    settings_dict = settings if isinstance(settings, dict) else {}
+    ranked_cols = [
+        str(column)
+        for column in list(settings_dict.get("ranked_cols") or [])
+        if str(column).strip()
+    ]
+    default_feature_cols = [
+        str(column)
+        for column in list(
+            settings_dict.get("best_feature_cols") or entry.get("feature_cols") or []
+        )
+        if str(column).strip()
+    ]
+    top_k_raw = trial_params.get("top_k")
+    if top_k_raw is None:
+        if default_feature_cols:
+            return default_feature_cols, settings_dict.get("best_top_k")
+        return ranked_cols, settings_dict.get("best_top_k")
+    try:
+        requested_top_k = int(top_k_raw)
+    except (TypeError, ValueError):
+        requested_top_k = len(ranked_cols) if ranked_cols else len(default_feature_cols)
+    if ranked_cols:
+        top_k = max(1, min(requested_top_k, len(ranked_cols)))
+        return list(ranked_cols[:top_k]), int(top_k)
+    if default_feature_cols:
+        top_k = max(1, min(requested_top_k, len(default_feature_cols)))
+        return list(default_feature_cols[:top_k]), int(top_k)
+    return [], None
+
+
+def _lookup_optuna_pareto_candidates(
+    *,
+    store: Dict[str, object],
+    feature_key: str,
+    cols: List[str],
+    model_choice: str,
+    balance_mode: str,
+    calibration_method: str,
+    allow_calibration_fallback: bool = False,
+) -> Optional[Dict[str, object]]:
+    if not cols:
+        return None
+    key = _optuna_result_key(feature_key, cols)
+    entry = store.get(key)
+    if not isinstance(entry, dict):
+        return None
+    match = _get_optuna_model_result_variant_match(
+        entry.get("results"),
+        model_choice=model_choice,
+        balance_mode=balance_mode,
+        calibration_method=calibration_method,
+        allow_any_calibration_within_mode=allow_calibration_fallback,
+    )
+    if not isinstance(match, dict):
+        return None
+    variant = match.get("result")
+    if not isinstance(variant, dict):
+        return None
+    objective_mode = _optuna_variant_objective_mode(variant)
+    if objective_mode != CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE:
+        return None
+
+    pareto_front_df = _load_optuna_variant_frame(
+        variant,
+        frame_key="pareto_front_df",
+        csv_key="pareto_front_csv",
+    )
+    if not isinstance(pareto_front_df, pd.DataFrame) or pareto_front_df.empty:
+        return {
+            "entry": entry,
+            "variant": variant,
+            "objective_mode": objective_mode,
+            "used_fallback": bool(match.get("used_fallback")),
+            "requested_calibration_method": match.get(
+                "requested_calibration_method"
+            ),
+            "resolved_calibration_method": match.get(
+                "resolved_calibration_method"
+            ),
+            "calibration_method_label": (
+                (variant.get("optuna_settings") or {}).get("calibration_method_label")
+                if isinstance(variant.get("optuna_settings"), dict)
+                else None
+            )
+            or variant.get("calibration_method_label"),
+            "candidates": [],
+        }
+
+    base_model_params = (
+        variant.get("best_model_params")
+        if isinstance(variant.get("best_model_params"), dict)
+        else {}
+    )
+    base_smote_params = (
+        variant.get("best_smote_params")
+        if isinstance(variant.get("best_smote_params"), dict)
+        else {}
+    )
+    candidates: List[Dict[str, object]] = []
+    for row_idx, row in pareto_front_df.reset_index(drop=True).iterrows():
+        trial_params = _optuna_trial_params_from_frame_row(row)
+        feature_cols, top_k = _feature_cols_for_optuna_trial(
+            entry=entry,
+            variant=variant,
+            trial_params=trial_params,
+        )
+        objective_values: Dict[str, object] = {}
+        for metric_name in CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS:
+            value = row.get(f"value_{metric_name}")
+            if value is None or pd.isna(value):
+                continue
+            objective_values[metric_name] = float(value)
+        trial_number = row.get("number")
+        if trial_number is not None and not pd.isna(trial_number):
+            trial_number = int(trial_number)
+        else:
+            trial_number = int(row_idx)
+        candidates.append(
+            {
+                "candidate_index": int(row_idx + 1),
+                "trial_number": trial_number,
+                "model_params": _build_model_params_from_optuna_trial(
+                    model_choice=model_choice,
+                    trial_params=trial_params,
+                    base_model_params=base_model_params,
+                ),
+                "smote_params": _build_smote_params_from_optuna_trial(
+                    trial_params=trial_params,
+                    base_smote_params=base_smote_params,
+                ),
+                "feature_cols": list(feature_cols),
+                "top_k": top_k,
+                "objective_values": objective_values,
+                "pruning_proxy_score": (
+                    None
+                    if pd.isna(row.get("pruning_proxy_score"))
+                    else float(row.get("pruning_proxy_score"))
+                ),
+                "far_gate_pass": (
+                    None
+                    if pd.isna(row.get("far_gate_pass"))
+                    else bool(row.get("far_gate_pass"))
+                ),
+                "decision_threshold": (
+                    None
+                    if pd.isna(row.get("decision_threshold"))
+                    else float(row.get("decision_threshold"))
+                ),
+                "selected_trial": bool(row.get("selected_trial", False)),
+            }
+        )
+
+    settings = variant.get("optuna_settings")
+    settings_dict = settings if isinstance(settings, dict) else {}
+    return {
+        "entry": entry,
+        "variant": variant,
+        "objective_mode": objective_mode,
+        "used_fallback": bool(match.get("used_fallback")),
+        "requested_calibration_method": match.get("requested_calibration_method"),
+        "resolved_calibration_method": match.get("resolved_calibration_method"),
+        "calibration_method_label": (
+            settings_dict.get("calibration_method_label")
+            or variant.get("calibration_method_label")
+        ),
+        "candidates": candidates,
     }
 
 
@@ -7843,6 +12913,8 @@ _TAB_STATE_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
             "optuna_active_key",
             "optuna_previous_result_selection",
             "optuna_loaded_result_state",
+            "optuna_loaded_feature_sets_sync_pending",
+            "optuna_loaded_feature_sets_sync_token",
             "optuna_model_choice",
             "optuna_calibration_method",
         ],
@@ -7851,6 +12923,8 @@ _TAB_STATE_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
             "optuna_active_key",
             "optuna_previous_result_selection",
             "optuna_loaded_result_state",
+            "optuna_loaded_feature_sets_sync_pending",
+            "optuna_loaded_feature_sets_sync_token",
             # Keys legacy top-level — ver DEPRECATED comments en
             # _render_optuna_tab. Los dejamos en ``produces`` para que el
             # botón Reset los borre y el estado quede limpio.
@@ -7905,10 +12979,15 @@ _TAB_STATE_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
             "val_size",
             "model_choice",
             "allow_optuna_calibration_fallback",
+            "model_optuna_batch_token",
+            "model_optuna_batch_contract",
+            "model_optuna_batch_compatibility",
         ],
         "produces": [
             "history_entries",
             "feature_importances_df",
+            "model_optuna_batch_contract",
+            "model_optuna_batch_compatibility",
         ],
     },
 }
@@ -9009,14 +14088,13 @@ def _apply_feature_source_for_model_tab(
 ) -> Optional[Dict[str, object]]:
     """Radio para elegir origen de variables en la pestana Modelos.
 
-    Si el usuario elige Optuna, matchea automaticamente los best_feature_cols
-    de cada corrida de Optuna (Base, Cluster, Base + Cluster) con el modelo
-    correspondiente y la variante sin/con SMOTE que se entrena en Modelos.
+    Si el usuario elige Optuna, exige seleccionar explícitamente un batch del
+    historial y construye un contrato estricto con todas sus subcorridas.
     """
     source = st.session_state.get("model_feature_source", "feature_selection")
     source_options = {
         "Feature selection": "feature_selection",
-        "Optuna (best_feature_cols)": "optuna",
+        "Optuna (batch explícito)": "optuna",
     }
     reverse_source = {v: k for k, v in source_options.items()}
     current_label = reverse_source.get(source, "Feature selection")
@@ -9028,42 +14106,27 @@ def _apply_feature_source_for_model_tab(
         key="model_feature_source_radio",
         help=(
             "Feature selection: usa la seleccion manual de la pestana Feature "
-            "selection (ranking sobre train). Optuna: matchea automaticamente "
-            "los best_feature_cols de Optuna con los modelos Base, Cluster y "
-            "Base + Cluster."
+            "selection (ranking sobre train). Optuna: exige seleccionar un "
+            "batch explícito del historial y hereda sus subcorridas, "
+            "variables y parámetros sin fallback implícito."
         ),
     )
     st.session_state["model_feature_source"] = source_options[chosen_label]
 
     if st.session_state["model_feature_source"] != "optuna":
         _clear_model_feature_group_overrides()
+        st.session_state["model_optuna_batch_contract"] = None
+        st.session_state["model_optuna_batch_compatibility"] = None
         return None
 
-    # Opt-in explícito para fallback de calibración. Por default Modelos
-    # exige que Optuna haya optimizado EXACTAMENTE la calibración elegida
-    # aquí; si el usuario quiere aceptar un match de otra calibración
-    # dentro del mismo balance_mode, debe marcarlo conscientemente.
-    allow_calibration_fallback = st.checkbox(
-        "Aceptar fallback de calibración de Optuna",
-        value=bool(
-            st.session_state.get("allow_optuna_calibration_fallback", False)
-        ),
-        key="allow_optuna_calibration_fallback",
-        help=(
-            "Cuando Optuna no optimizó exactamente la calibración elegida "
-            "aquí (p. ej. optimizó Platt pero aquí pediste Isotonic), "
-            "aceptar la mejor disponible dentro del mismo balance_mode. "
-            "Desactivado por default: entrenar con parámetros ajustados "
-            "a otra calibración cambia el tradeoff y puede degradar la "
-            "calidad del threshold."
-        ),
-    )
+    _clear_model_feature_group_overrides()
 
     dataset_df = base_df if isinstance(base_df, pd.DataFrame) else features_df
     if not isinstance(dataset_df, pd.DataFrame) or dataset_df.empty:
-        _clear_model_feature_group_overrides()
+        st.session_state["model_optuna_batch_contract"] = None
+        st.session_state["model_optuna_batch_compatibility"] = None
         st.warning(
-            "No hay dataset cargado para calcular el match automatico con Optuna."
+            "No hay dataset cargado para resolver el batch de Optuna."
         )
         return None
 
@@ -9079,204 +14142,84 @@ def _apply_feature_source_for_model_tab(
         features_source,
         features_df_state if isinstance(features_df_state, pd.DataFrame) else dataset_df,
     )
+    feature_context = _history_context_details(
+        features_df_state if isinstance(features_df_state, pd.DataFrame) else dataset_df,
+        selected_features=None,
+    )
+    batch_options = _history_optuna_batch_options_for_model_tab(
+        feature_context_key=str(feature_context.get("feature_context_key") or ""),
+    )
+    if not batch_options:
+        st.session_state["model_optuna_batch_contract"] = None
+        st.session_state["model_optuna_batch_compatibility"] = {
+            "compatible": False,
+            "reasons": ["no hay batches Optuna disponibles para este dataset"],
+        }
+        st.warning(
+            "No hay lotes/corridas de Optuna disponibles para este dataset. "
+            "Ejecute Optuna primero."
+        )
+        return None
 
-    selected_features = st.session_state.get("selected_features")
-    numeric_cols = _get_feature_cols(dataset_df)
-    numeric_cols_set = set(numeric_cols)
-    cluster_cols_set = set(_get_cluster_cols(dataset_df))
-    if selected_features is None:
-        cols_all = list(numeric_cols)
-    else:
-        cols_all = [col for col in selected_features if col in numeric_cols]
-    cols_base = [col for col in cols_all if col not in cluster_cols_set]
-    cols_cluster_only = [col for col in cols_all if col in cluster_cols_set]
+    placeholder = "(seleccione un lote Optuna)"
+    option_map = {str(option.get("token")): option for option in batch_options}
+    current_token = str(st.session_state.get("model_optuna_batch_token") or "").strip()
+    default_index = 0
+    if current_token and current_token in option_map:
+        default_index = 1 + list(option_map.keys()).index(current_token)
+    selected_token = st.selectbox(
+        "Lote/corrida Optuna",
+        [placeholder] + list(option_map.keys()),
+        index=default_index,
+        key="model_optuna_batch_token",
+        format_func=lambda value: (
+            placeholder if value == placeholder else option_map.get(value, {}).get("label", str(value))
+        ),
+        help=(
+            "Modelos entrenará todas las subcorridas reales del batch "
+            "seleccionado y bloqueará el entrenamiento si alguna es "
+            "incompatible con el dataset actual."
+        ),
+    )
+    if selected_token == placeholder or selected_token not in option_map:
+        st.session_state["model_optuna_batch_contract"] = None
+        st.session_state["model_optuna_batch_compatibility"] = {
+            "compatible": False,
+            "reasons": ["seleccione explícitamente un lote/corrida de Optuna"],
+        }
+        st.warning("Seleccione un lote/corrida de Optuna para habilitar el entrenamiento.")
+        return None
 
-    # Fingerprint del dataset actual para detectar drift respecto al dataset
-    # usado cuando se entrenó Optuna.
-    current_fingerprint = _dataset_content_fingerprint(
+    selected_option = option_map[selected_token]
+    requires_cluster_dataset = any(
+        str(label) in {"Cluster", "Base + Cluster"}
+        for label in list(selected_option.get("feature_set_labels") or [])
+    )
+    cluster_df = (
+        _build_cluster_dataset(
+            base_df,
+            cluster_features_df=st.session_state.get("cluster_features_df"),
+        )
+        if requires_cluster_dataset
+        else None
+    )
+    current_dataset_fingerprint = _dataset_content_fingerprint(
         features_df_state if isinstance(features_df_state, pd.DataFrame) else dataset_df
     )
-
-    store = st.session_state.get("optuna_results_store") or {}
-
-    groups = [
-        ("base", "Base", cols_base),
-        ("cluster", "Cluster", cols_cluster_only),
-        ("base_cluster", "Base + Cluster", cols_all),
-    ]
-
-    summary_lines: List[str] = []
-    any_match = False
-    fallback_groups: List[str] = []
-    missing_cols_by_group: Dict[str, List[str]] = {}
-    drift_groups: List[str] = []
-    empty_after_filter_groups: List[str] = []
-    for group_key, group_label, cols in groups:
-        state_key = _MODEL_FEATURE_GROUP_OVERRIDE_KEYS[group_key]
-
-        if group_key == "cluster" and not cols_cluster_only:
-            st.session_state.pop(state_key, None)
-            summary_lines.append(f"{group_label}: sin variables de cluster")
-            continue
-        if (
-            group_key == "base_cluster"
-            and cols_cluster_only == []
-            and set(cols_all) == set(cols_base)
-        ):
-            st.session_state.pop(state_key, None)
-            summary_lines.append(f"{group_label}: igual a Base")
-            continue
-
-        match = _lookup_optuna_best_feature_cols(
-            store=store,
-            feature_key=feature_key,
-            cols=cols,
-            model_choice=model_choice,
-            balance_mode=balance_mode,
-            calibration_method=calibration_method,
-            allow_calibration_fallback=allow_calibration_fallback,
-        )
-        if match is None:
-            st.session_state.pop(state_key, None)
-            # Distinguir "no hay Optuna" vs "sólo hay con otra calibración
-            # y el usuario no aceptó fallback". Esto último es ahora el
-            # motivo más frecuente si el default queda en False.
-            if not allow_calibration_fallback:
-                alt_match = _lookup_optuna_best_feature_cols(
-                    store=store,
-                    feature_key=feature_key,
-                    cols=cols,
-                    model_choice=model_choice,
-                    balance_mode=balance_mode,
-                    calibration_method=calibration_method,
-                    allow_calibration_fallback=True,
-                )
-                if alt_match is not None:
-                    alt_label = (
-                        alt_match.get("calibration_method_label")
-                        or alt_match.get("calibration_method")
-                        or "otra calibración"
-                    )
-                    summary_lines.append(
-                        f"✗ {group_label}: Optuna optimizó {alt_label} "
-                        "(active fallback para usarlo)"
-                    )
-                    continue
-            summary_lines.append(f"✗ {group_label}: sin Optuna")
-            continue
-
-        # Validar que best_feature_cols existan en el dataset actual. Si
-        # Optuna corrió con otro esquema (columnas renombradas, archivo
-        # recalculado, selección distinta) este filtro lo detecta en lugar
-        # de fallar al entrenar.
-        raw_best_cols = [str(col) for col in match.get("best_feature_cols") or []]
-        valid_cols = [col for col in raw_best_cols if col in numeric_cols_set]
-        missing_cols = [col for col in raw_best_cols if col not in numeric_cols_set]
-        if missing_cols:
-            missing_cols_by_group[group_label] = missing_cols
-
-        if not valid_cols:
-            # Todas las cols de Optuna están ausentes → no podemos aplicar
-            # el override, caemos a Feature selection para este grupo.
-            st.session_state.pop(state_key, None)
-            empty_after_filter_groups.append(group_label)
-            summary_lines.append(
-                f"✗ {group_label}: Optuna propone {len(raw_best_cols)} vars "
-                "ausentes del dataset"
-            )
-            continue
-
-        st.session_state[state_key] = list(valid_cols)
-        any_match = True
-
-        # Detectar drift del dataset (mismo feature_key pero fingerprint distinto).
-        stored_fingerprint = match.get("dataset_fingerprint")
-        if (
-            stored_fingerprint
-            and current_fingerprint
-            and stored_fingerprint != current_fingerprint
-        ):
-            drift_groups.append(group_label)
-
-        parts = [f"{len(valid_cols)} vars"]
-        if missing_cols:
-            parts.append(f"{len(missing_cols)} ignoradas")
-        if match.get("best_top_k") is not None:
-            parts.append(f"top_k={int(match['best_top_k'])}")
-        if match.get("best_score") is not None:
-            label = match.get("objective_label") or "score"
-            parts.append(f"best {label}={float(match['best_score']):.4f}")
-        resolved_calibration_label = match.get("calibration_method_label")
-        if resolved_calibration_label:
-            parts.append(f"calibración={resolved_calibration_label}")
-        if bool(match.get("used_fallback")):
-            fallback_groups.append(group_label)
-            parts.append("fallback")
-        if group_label in drift_groups:
-            parts.append("drift")
-        summary_lines.append(f"✓ {group_label}: " + ", ".join(parts))
-
-    if not any_match:
-        st.warning(
-            "No se encontraron resultados de Optuna para el modelo "
-            f"'{model_choice}' ({_optuna_balance_mode_label(balance_mode)} | "
-            f"{_calibration_method_label(calibration_method)}) que "
-            "coincidan con los grupos Base, Cluster o Base + Cluster. "
-            "Ejecute Optuna primero o cambie el modelo."
-        )
-    else:
-        if empty_after_filter_groups:
-            st.error(
-                "Optuna tiene resultados para "
-                + ", ".join(empty_after_filter_groups)
-                + " pero sus `best_feature_cols` no existen en el dataset "
-                "actual. Ese/esos grupos volverán a usar Feature selection. "
-                "Ejecute Optuna nuevamente sobre este dataset o elija otro "
-                "origen de variables."
-            )
-        if missing_cols_by_group:
-            detail_lines = []
-            for group_label, missing in missing_cols_by_group.items():
-                preview = ", ".join(missing[:5])
-                if len(missing) > 5:
-                    preview = f"{preview}, … (+{len(missing) - 5})"
-                detail_lines.append(f"- **{group_label}**: {preview}")
-            st.warning(
-                "Algunas columnas que Optuna seleccionó no están en el "
-                "dataset actual y fueron ignoradas:\n"
-                + "\n".join(detail_lines)
-            )
-        if drift_groups:
-            st.warning(
-                "⚠️ Dataset drift detectado en: "
-                + ", ".join(drift_groups)
-                + ". El schema (columnas/dtypes/filas) actual difiere del "
-                "usado cuando se entrenó Optuna. Los resultados pueden no "
-                "ser representativos; considere re-ejecutar Optuna."
-            )
-        if fallback_groups:
-            # Si el usuario aceptó el fallback opt-in, el mensaje es
-            # informativo, no un warning.
-            fallback_message = (
-                "Fallback de calibración aceptado para: "
-                + ", ".join(fallback_groups)
-                + f". No existe match exacto para "
-                f"{_calibration_method_label(calibration_method)} dentro de "
-                f"{_optuna_balance_mode_label(balance_mode)}; se usó la "
-                "mejor calibración disponible dentro del mismo balance_mode."
-            )
-            if allow_calibration_fallback:
-                st.info(fallback_message)
-            else:
-                st.warning(fallback_message)
-
-    st.caption(
-        "Match Optuna por grupo "
-        f"({_optuna_balance_mode_label(balance_mode)} | "
-        f"{_calibration_method_label(calibration_method)}) — "
-        + "   ".join(summary_lines)
+    contract = _build_model_optuna_batch_contract(
+        selected_option,
+        current_feature_key=feature_key,
+        current_dataset_fingerprint=current_dataset_fingerprint,
+        base_df=base_df if isinstance(base_df, pd.DataFrame) else dataset_df,
+        cluster_df=cluster_df,
     )
-    return None
+    st.session_state["model_optuna_batch_contract"] = contract
+    st.session_state["model_optuna_batch_compatibility"] = {
+        "compatible": bool(contract.get("compatible")),
+        "reasons": list(contract.get("reasons") or []),
+    }
+    _render_model_optuna_batch_contract_summary(contract)
+    return contract
 
 
 def _render_flow_features_preview(features_df: pd.DataFrame) -> None:
@@ -9540,10 +14483,32 @@ def _cluster_selector(key_prefix: str) -> Tuple[str, bool]:
 
 
 def _load_cluster_labels(cluster_path: Path) -> pd.DataFrame:
-    try:
-        return pd.read_csv(cluster_path, usecols=["plate", "cluster_label"])
-    except ValueError:
+    header = pd.read_csv(cluster_path, nrows=0)
+    columns = list(header.columns)
+
+    def _prob_sort_key(column: str) -> tuple[int, object]:
+        suffix = column[len("cluster_prob_") :]
+        try:
+            return (0, int(suffix))
+        except ValueError:
+            return (1, suffix)
+
+    probability_cols = sorted(
+        [col for col in columns if str(col).startswith("cluster_prob_")],
+        key=_prob_sort_key,
+    )
+    usecols = []
+    if "plate" in columns:
+        usecols.append("plate")
+    if "cluster_label" in columns:
+        usecols.append("cluster_label")
+    usecols.extend(probability_cols)
+    if "plate" not in usecols or (
+        "cluster_label" not in usecols and not probability_cols
+    ):
         return pd.read_csv(cluster_path)
+    loaded = pd.read_csv(cluster_path, usecols=usecols)
+    return loaded[usecols]
 
 
 def _call_compute_cluster_features(
@@ -10253,9 +15218,7 @@ def _render_variables_tab() -> None:
     ]
     source_key = "variables_source"
     if source_key not in st.session_state or st.session_state[source_key] not in source_options:
-        st.session_state[source_key] = (
-            "En memoria" if has_memory else "Calcular nuevas"
-        )
+        st.session_state[source_key] = "Cargar existentes"
     source = st.radio(
         "Fuente",
         source_options,
@@ -10294,78 +15257,95 @@ def _render_variables_tab() -> None:
             )
         else:
             names = [path.name for path in feature_files]
+            file_options = ["(ninguno)"] + names
+            _sanitize_selectbox_state(
+                "flow_features_file",
+                file_options,
+                default="(ninguno)",
+            )
             selected = st.selectbox(
                 "Archivo de variables",
-                options=["(ninguno)"] + names,
+                options=file_options,
                 key="flow_features_file",
             )
-            allowed_porticos: Optional[set[str]] = None
-            if selected != "(ninguno)":
-                selected_path = RESULTS_DIR / selected
-                allowed_porticos = _load_porticos_from_feature_file(
-                    selected_path
-                )
-                if allowed_porticos is None:
-                    st.warning(
-                        "No se pudo leer porticos del archivo para filtrar tramos."
-                    )
-                    allowed_porticos = set()
-            accidents_df_existing = st.session_state.get("accidents_df")
             date_start_ts = None
-            date_end_inclusive = None
             date_end_exclusive = None
-            if (
-                isinstance(accidents_df_existing, pd.DataFrame)
-                and not accidents_df_existing.empty
-                and "accidente_time" in accidents_df_existing.columns
-            ):
-                acc_times = pd.to_datetime(
-                    accidents_df_existing["accidente_time"], errors="coerce"
-                ).dropna()
-                if not acc_times.empty:
-                    min_date = acc_times.min().date()
-                    max_date = acc_times.max().date()
-                    c_date1, c_date2 = st.columns(2)
-                    with c_date1:
-                        date_start_input = st.date_input(
-                            "Fecha inicio",
-                            value=min_date,
-                            key="acc_flow_existing_date_start",
-                        )
-                    with c_date2:
-                        date_end_input = st.date_input(
-                            "Fecha fin",
-                            value=max_date,
-                            key="acc_flow_existing_date_end",
-                        )
-                    if date_start_input and date_end_input:
-                        if date_start_input > date_end_input:
-                            st.error(
-                                "La fecha de inicio no puede ser mayor que la fecha final."
-                            )
-                        else:
-                            date_start_ts = pd.Timestamp(date_start_input)
-                            date_end_exclusive = (
-                                pd.Timestamp(date_end_input) + pd.Timedelta(days=1)
-                            )
-                            date_end_inclusive = date_end_exclusive - pd.Timedelta(
-                                nanoseconds=1
-                            )
-            else:
-                st.info(
-                    "Cargue accidentes en la pestana Eventos para habilitar "
-                    "el filtro de fechas."
-                )
-            tramo_tuple = _build_tramo_selector(
-                accidents_df_existing,
-                date_start=date_start_ts,
-                date_end=date_end_inclusive,
-                allowed_porticos=allowed_porticos,
+            use_date_filter = st.checkbox(
+                "Filtrar por fecha",
+                value=False,
+                key="acc_flow_existing_use_date_filter",
+            )
+            date_range_valid = True
+            if use_date_filter:
+                default_date = datetime.today().date()
+                c_date1, c_date2 = st.columns(2)
+                with c_date1:
+                    date_start_input = st.date_input(
+                        "Fecha inicio",
+                        value=default_date,
+                        key="acc_flow_existing_date_start",
+                    )
+                with c_date2:
+                    date_end_input = st.date_input(
+                        "Fecha fin",
+                        value=default_date,
+                        key="acc_flow_existing_date_end",
+                    )
+                if date_start_input > date_end_input:
+                    st.error("La fecha de inicio no puede ser mayor que la fecha final.")
+                    date_range_valid = False
+                else:
+                    date_start_ts = pd.Timestamp(date_start_input)
+                    date_end_exclusive = pd.Timestamp(date_end_input) + pd.Timedelta(
+                        days=1
+                    )
+
+            tramo_options = [
+                "Toda la autopista",
+                COMBINED_TRAMO_LABEL,
+                "Tramo manual",
+            ]
+            _sanitize_selectbox_state(
+                "acc_flow_tramo_choice_existing",
+                tramo_options,
+                default="Toda la autopista",
+            )
+            tramo_choice = st.selectbox(
+                "Tramo",
+                options=tramo_options,
                 key="acc_flow_tramo_choice_existing",
             )
+            tramo_tuple: Optional[Tuple[str, str, str, str]] = None
+            if tramo_choice == COMBINED_TRAMO_LABEL:
+                tramo_tuple = COMBINED_TRAMO_SELECTION
+            elif tramo_choice == "Tramo manual":
+                c_start, c_end = st.columns(2)
+                with c_start:
+                    manual_start = st.text_input(
+                        "Portico inicio",
+                        key="acc_flow_existing_manual_start",
+                    )
+                with c_end:
+                    manual_end = st.text_input(
+                        "Portico fin",
+                        key="acc_flow_existing_manual_end",
+                    )
+                start_norm = _normalize_portico_code(manual_start)
+                end_norm = _normalize_portico_code(manual_end)
+                if start_norm and end_norm:
+                    tramo_tuple = ("", "", start_norm, end_norm)
+            if tramo_tuple:
+                st.caption(f"Filtro activo: {_tramo_display_label(tramo_tuple)}")
+
             if st.button("Cargar variables"):
                 if selected == "(ninguno)":
                     st.warning("Seleccione un archivo de Resultados.")
+                elif not date_range_valid:
+                    st.warning("Corrija el rango de fechas antes de cargar.")
+                elif tramo_choice == "Tramo manual" and tramo_tuple is None:
+                    st.warning(
+                        "Ingrese portico inicio y portico fin para el tramo manual."
+                    )
                 else:
                     progress = st.progress(0)
                     try:
@@ -10533,6 +15513,7 @@ def _render_variables_tab() -> None:
             date_end=sample.date_end,
             allowed_porticos=None,
             key="acc_flow_tramo_choice",
+            include_combined_tramo=True,
         )
 
         batch_mode = "month"
@@ -10676,7 +15657,10 @@ def _render_variables_tab() -> None:
             flow_db_path = flow_summary.db_path
             con_temp.execute(f"ATTACH '{flow_db_path}' AS flow_db (READ_ONLY)")
             
-            query = "CREATE TABLE work_flujos AS SELECT * FROM flow_db.flujos_duckdb WHERE 1=1"
+            query = (
+                "CREATE TABLE work_flujos AS "
+                "SELECT * FROM flow_db.flujos_duckdb WHERE 1=1"
+            )
             params = []
             if sample.date_start:
                 query += " AND FECHA >= ?"
@@ -10684,6 +15668,13 @@ def _render_variables_tab() -> None:
             if sample.date_end:
                 query += " AND FECHA <= ?"
                 params.append(sample.date_end)
+            selected_porticos = _tramo_portico_codes(tramo_tuple)
+            if selected_porticos:
+                placeholders = ", ".join("?" for _ in selected_porticos)
+                query += f" AND CAST(PORTICO AS VARCHAR) IN ({placeholders})"
+                params.extend(selected_porticos)
+            if sample.row_limit is not None:
+                query += f" LIMIT {max(1, int(sample.row_limit))}"
             
             with st.spinner("Creando base de trabajo temporal..."):
                 con_temp.execute(query, params)
@@ -10734,13 +15725,10 @@ def _render_variables_tab() -> None:
 
         target_segments = all_segments
         if tramo_tuple:
-            eje_sel, calzada_sel, p_start, p_end = tramo_tuple
-            target_segments = all_segments[
-                (all_segments["eje"] == eje_sel)
-                & (all_segments["calzada"] == calzada_sel)
-                & (all_segments["portico_last"] == p_start)
-                & (all_segments["portico_next"] == p_end)
-            ].copy()
+            target_segments = _filter_segments_for_tramo(
+                all_segments,
+                tramo_tuple,
+            )
             if target_segments.empty:
                 st.warning("El tramo seleccionado no es valido en la configuracion actual de porticos.")
                 con_temp.close()
@@ -10782,7 +15770,7 @@ def _render_variables_tab() -> None:
         for idx, (start, end, label) in enumerate(ranges, start=1):
             progress.set_description(f"Procesando lote {idx}/{len(ranges)}")
             
-            # Load batch (all porticos to ensure we have neighbors)
+            # work_flujos is already limited to the selected segment porticos.
             df_batch = con_temp.execute(
                 "SELECT * FROM work_flujos WHERE FECHA >= ? AND FECHA < ?",
                 [start, end]
@@ -10919,6 +15907,42 @@ def _render_variables_tab() -> None:
             st.session_state["cluster_choice"] = cluster_choice if include_cluster_vars else "(sin clusters)"
 
             st.success(f"Variables calculadas y guardadas en {features_db_name}: {total_rows:,} filas")
+            try:
+                _register_feature_engineering_history(
+                    features_df=final_df,
+                    features_db_path=features_db_path,
+                    params={
+                        "sample_mode": mode,
+                        "date_start": sample.date_start,
+                        "date_end": sample.date_end,
+                        "row_limit": sample.row_limit,
+                        "use_batches": bool(use_batches),
+                        "batch_mode": batch_mode if use_batches else None,
+                        "include_cluster_vars": bool(include_cluster_vars),
+                        "cluster_choice": cluster_choice
+                        if include_cluster_vars
+                        else "(sin clusters)",
+                        "cluster_vars": list(cluster_vars),
+                        "metrics": list(metrics),
+                        "categories": list(categories),
+                        "lanes": int(lanes),
+                    },
+                    metrics={
+                        "total_rows": int(total_rows),
+                        "input_rows": int(diagnostics.get("input_rows", 0)),
+                        "feature_rows": int(diagnostics.get("feature_rows", 0)),
+                        "final_rows": int(diagnostics.get("final_rows", 0)),
+                    },
+                    cluster_label_path=(
+                        RESULTS_DIR / cluster_choice
+                        if include_cluster_vars
+                        and cluster_choice not in {"(sin clusters)", "(ninguno)"}
+                        else None
+                    ),
+                )
+                st.caption("History SQLite actualizado: Feature engineering.")
+            except Exception as exc:
+                st.warning(f"No se pudo registrar Feature engineering en History: {exc}")
         else:
             con_feat.close()
             if features_db_path.exists():
@@ -10972,14 +15996,25 @@ def _render_feature_selection_tab() -> None:
         if entry is None:
             payload, importance_df = _load_feature_selection_from_disk(feature_id)
             if payload or importance_df is not None:
+                importance_hash = None
+                if isinstance(importance_df, pd.DataFrame) and not importance_df.empty:
+                    try:
+                        importance_hash = int(
+                            pd.util.hash_pandas_object(
+                                importance_df, index=True
+                            ).sum()
+                        )
+                    except Exception:
+                        importance_hash = None
                 entry = {
                     "feature_id": feature_id,
                     "selected_features": payload.get("selected_features")
                     if payload
                     else None,
                     "importance_df": importance_df,
-                    "importance_hash": None,
+                    "importance_hash": importance_hash,
                     "params": payload.get("params") if payload else {},
+                    "loaded_from_disk": True,
                 }
                 store[feature_key] = entry
                 st.session_state["feature_selection_store"] = store
@@ -11350,6 +16385,18 @@ def _render_optuna_tab() -> None:
             "key": _optuna_result_key(feature_key, feature_cols_cluster),
             "id": _optuna_result_id(feature_id, feature_cols_cluster)
         })
+    available_optuna_feature_sets = [str(cfg["label"]) for cfg in configs]
+    selected_optuna_feature_sets = _sync_loaded_optuna_feature_sets_to_form(
+        available_optuna_feature_sets
+    )
+    st.session_state["optuna_feature_sets_selected"] = list(
+        selected_optuna_feature_sets
+    )
+    selected_configs = [
+        cfg
+        for cfg in configs
+        if str(cfg["label"]) in set(selected_optuna_feature_sets)
+    ]
 
     if missing:
         st.warning(
@@ -11365,62 +16412,19 @@ def _render_optuna_tab() -> None:
     store = st.session_state.get("optuna_results_store", {})
     active_optuna_key = st.session_state.get("optuna_active_key")
     
-    primary_config = configs[-1]
+    primary_config = selected_configs[-1] if selected_configs else configs[-1]
     primary_key = primary_config["key"]
-
-    previous_result_options = _list_optuna_previous_result_options()
-    if previous_result_options:
-        previous_option_map = {
-            str(option.get("token") or option.get("label")): option
-            for option in previous_result_options
-        }
-        previous_tokens = list(previous_option_map.keys())
-        current_previous_token = st.session_state.get(
-            "optuna_previous_result_selection"
-        )
-        if current_previous_token not in previous_option_map:
-            current_previous_token = previous_tokens[0]
-            st.session_state["optuna_previous_result_selection"] = current_previous_token
-        st.markdown("**Resultados previos**")
-        selected_previous_token = st.selectbox(
-            "Seleccionar resultado previo",
-            previous_tokens,
-            key="optuna_previous_result_selection",
-            format_func=lambda token: previous_option_map.get(token, {}).get(
-                "label", str(token)
-            ),
-        )
-        selected_previous_option = previous_option_map.get(selected_previous_token)
-        if isinstance(selected_previous_option, dict):
-            col_prev1, col_prev2, col_prev3 = st.columns(3)
-            with col_prev1:
-                st.caption(
-                    "Modelo inicial: "
-                    f"{selected_previous_option.get('model_choice') or '-'}"
-                )
-            with col_prev2:
-                st.caption(
-                    "Balance preferido: "
-                    f"{selected_previous_option.get('balance_mode_label') or '-'}"
-                )
-            with col_prev3:
-                st.caption(
-                    "Guardado: "
-                    f"{selected_previous_option.get('saved_at') or '-'}"
-                )
-            if st.button(
-                "Cargar resultado seleccionado",
-                key="optuna_load_selected_previous_result",
-            ):
-                _load_optuna_previous_result_selection(
-                    selected_previous_option,
-                    current_feature_key=feature_key,
-                    current_primary_key=primary_key,
-                    current_dataset_fingerprint=current_dataset_fingerprint,
-                )
-                st.rerun()
-    else:
-        st.caption("No se encontraron resultados previos de Optuna en disco.")
+    history_context = _history_context_details(
+        features_df,
+        selected_features=primary_config["cols"],
+    )
+    _render_optuna_history_loader(
+        feature_context_key=str(history_context["feature_context_key"]),
+        feature_signature_value=str(history_context["feature_signature"]),
+        current_feature_key=feature_key,
+        current_primary_key=primary_key,
+        current_dataset_fingerprint=current_dataset_fingerprint,
+    )
 
     loaded_result_state = st.session_state.get("optuna_loaded_result_state")
     incompatible_loaded_entry: Optional[Dict[str, object]] = None
@@ -11620,11 +16624,49 @@ def _render_optuna_tab() -> None:
         else store.get(primary_key)
     )
 
+    _sanitize_selectbox_state(
+        "optuna_model_choice",
+        CRASH_OPTUNA_MODEL_OPTIONS,
+        default="XGBoost",
+    )
     model_choice = st.selectbox(
         "Modelo",
-        ["XGBoost", "Random Forest", "SVM", "Neural Network"],
+        list(CRASH_OPTUNA_MODEL_OPTIONS),
         key="optuna_model_choice",
     )
+    previous_parameter_profile = st.session_state.get(
+        "optuna_param_profile_last_selection"
+    )
+    optuna_parameter_profile = st.selectbox(
+        "Perfil de parámetros",
+        list(OPTUNA_PARAMETER_PROFILE_OPTIONS),
+        key="optuna_param_profile",
+        help=(
+            "`Búsqueda amplia` conserva los rangos actuales del tab. "
+            "`Refinamiento local` aplica el ajuste recomendado para top-K y, "
+            "si el modelo es XGBoost, estrecha el espacio a la zona con mejor "
+            "señal observada en los últimos resultados."
+        ),
+    )
+    if previous_parameter_profile is None:
+        st.session_state["optuna_param_profile_last_selection"] = (
+            optuna_parameter_profile
+        )
+    elif str(previous_parameter_profile) != str(optuna_parameter_profile):
+        _apply_optuna_parameter_profile(
+            st.session_state,
+            profile_label=optuna_parameter_profile,
+            model_choice=model_choice,
+        )
+        st.session_state["optuna_param_profile_last_selection"] = (
+            optuna_parameter_profile
+        )
+    if optuna_parameter_profile == OPTUNA_PARAMETER_PROFILE_LOCAL:
+        st.caption(
+            "Refinamiento local: reaplica top-K=16..20, sube `startup_trials` "
+            "y, con XGBoost, concentra la búsqueda en la zona local del frente "
+            "de Pareto reciente."
+        )
     optuna_calibration_options = _calibration_method_options()
     optuna_calibration_labels = [
         label for label, _ in optuna_calibration_options
@@ -11677,7 +16719,7 @@ def _render_optuna_tab() -> None:
     optuna_rf_n_jobs: Optional[int] = None
     optuna_xgb_n_jobs: Optional[int] = None
     max_internal_jobs = _max_optuna_parallel_jobs()
-    if model_choice in {"Random Forest", "Balanced Random Forest"}:
+    if model_choice == "Random Forest":
         optuna_rf_n_jobs = _render_model_n_jobs_input(
             "Random Forest n_jobs (trials)",
             key="optuna_rf_n_jobs",
@@ -12531,8 +17573,27 @@ def _render_optuna_tab() -> None:
                 key="optuna_svm_c_step",
             )
 
+    selected_optuna_feature_sets = st.multiselect(
+        "Grupos de features a optimizar",
+        available_optuna_feature_sets,
+        default=selected_optuna_feature_sets,
+        key="optuna_feature_sets_selected",
+        help=(
+            "Controla qué grupos se optimizan en esta corrida. Modelos respetará "
+            "este filtro cuando uses `Optuna (best_feature_cols)` como origen."
+        ),
+    )
+    selected_configs = [
+        cfg
+        for cfg in configs
+        if str(cfg["label"]) in set(selected_optuna_feature_sets)
+    ]
+
     if st.button("Ejecutar Optuna"):
         st.session_state["optuna_loaded_result_state"] = None
+        if not selected_optuna_feature_sets:
+            st.error("Seleccione al menos un grupo de features para Optuna.")
+            return
         try:
             import optuna  # type: ignore
         except ImportError:
@@ -13484,8 +18545,24 @@ def _render_optuna_tab() -> None:
         # la lectura de ``session_state["optuna_best_model_params"]`` (legacy)
         # que podía contaminarse con resultados de corridas previas de Optuna.
         primary_promoted_this_run = False
+        any_optuna_result_persisted = False
+        optuna_batch_started_at = datetime.now().isoformat()
+        optuna_batch_key = _history_make_optuna_batch_key(
+            feature_key=feature_key,
+            model_name=model_choice,
+            calibration_method=optuna_calibration_method,
+            optuna_objective=objective_label,
+            threshold_objective=optuna_threshold_objective,
+            selected_feature_sets=selected_optuna_feature_sets,
+            balance_modes=balance_modes_to_run,
+            started_at=optuna_batch_started_at,
+        )
+        optuna_batch_total_runs = int(
+            len(selected_configs) * len(balance_modes_to_run)
+        )
+        optuna_batch_run_index = 0
 
-        for cfg in configs:
+        for cfg in selected_configs:
             for balance_mode in balance_modes_to_run:
                 res = _run_optimization(
                     cfg["cols"],
@@ -13494,6 +18571,8 @@ def _render_optuna_tab() -> None:
                 )
                 if not res:
                     continue
+                any_optuna_result_persisted = True
+                optuna_batch_run_index += 1
 
                 should_promote_primary = (
                     cfg["key"] == primary_key
@@ -13646,6 +18725,7 @@ def _render_optuna_tab() -> None:
                     }
 
                 optuna_settings_payload = {
+                    "parameter_profile": str(optuna_parameter_profile),
                     "n_trials": int(n_trials),
                     "timeout": int(timeout),
                     "n_jobs": int(optuna_n_jobs),
@@ -13677,6 +18757,8 @@ def _render_optuna_tab() -> None:
                     "objective_eval_set": "val",
                     "balance_mode": str(res["balance_mode"]),
                     "balance_mode_label": str(res["balance_mode_label"]),
+                    "feature_set_label": str(cfg["label"]),
+                    "selected_feature_sets_in_run": list(selected_optuna_feature_sets),
                     "tune_topk": bool(optuna_tune_topk),
                     "ranking_method": str(optuna_ranking_method)
                     if optuna_tune_topk
@@ -13715,6 +18797,12 @@ def _render_optuna_tab() -> None:
                 _persist_optuna_results(
                     optuna_key=cfg["key"],
                     optuna_id=cfg["id"],
+                    optuna_batch_key=optuna_batch_key,
+                    optuna_batch_started_at=optuna_batch_started_at,
+                    optuna_batch_feature_sets=selected_optuna_feature_sets,
+                    optuna_batch_balance_modes=balance_modes_to_run,
+                    optuna_batch_total_runs=optuna_batch_total_runs,
+                    optuna_batch_run_index=optuna_batch_run_index,
                     feature_key=feature_key,
                     feature_id=feature_id,
                     features_path=features_path,
@@ -13790,6 +18878,20 @@ def _render_optuna_tab() -> None:
                         f"{objective_label}: {res['best_score']:.4f}"
                     )
 
+        if any_optuna_result_persisted:
+            _store_optuna_last_optimized_context(
+                selected_feature_sets=selected_optuna_feature_sets,
+                feature_key=feature_key,
+                dataset_fingerprint=current_dataset_fingerprint,
+            )
+            # Auto-activar el primary_key recién optimizado para que el tab
+            # "Modelos" consuma sus best_model_params sin requerir que el
+            # usuario cargue el run manualmente desde el history loader.
+            st.session_state["optuna_active_key"] = primary_key
+            # Invalidar firmas aplicadas previamente: obliga a
+            # _apply_optuna_model_params_to_state a reinyectar los params
+            # nuevos sobre los widgets del tab Modelos en el próximo render.
+            st.session_state["optuna_model_params_applied_signatures"] = {}
         st.rerun()
 
     st.subheader("Resultados guardados")
@@ -14323,6 +19425,32 @@ def _render_balance_tab() -> None:
                         "k_neighbors": int(k_used_base) if k_used_base else 0,
                         "sampling_strategy": smote_sampling_strategy,
                     }
+                    balance_snapshots: Dict[str, str] = {}
+                    try:
+                        snapshot_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        snapshot_dir = _history_stage_artifacts_dir("Balance")
+                        for snapshot_label, snapshot_df in [
+                            ("base", balanced_base_df),
+                            ("cluster", balanced_cluster_only_df),
+                            ("base_cluster", balanced_cluster_df),
+                        ]:
+                            if isinstance(snapshot_df, pd.DataFrame) and not snapshot_df.empty:
+                                snapshot_path = (
+                                    snapshot_dir
+                                    / f"balanced_{snapshot_label}_{snapshot_stamp}.csv"
+                                )
+                                snapshot_df.to_csv(snapshot_path, index=False)
+                                balance_snapshots[snapshot_label] = str(snapshot_path)
+                        _register_balance_history(
+                            features_df=features_df,
+                            params=dict(st.session_state["balance_last_params"]),
+                            stats=dict(st.session_state["balance_last_stats"]),
+                            snapshots=balance_snapshots,
+                        )
+                        if balance_snapshots:
+                            st.caption("History SQLite actualizado: Balance.")
+                    except Exception as exc:
+                        st.warning(f"No se pudo registrar Balance en History: {exc}")
 
                     msg = []
                     if balanced_base_df is not None:
@@ -14480,7 +19608,7 @@ def _render_balance_tab() -> None:
 
 def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]:
     params = {}
-    if model_choice in {"Random Forest", "Balanced Random Forest"}:
+    if model_choice == "Random Forest":
         n_estimators = st.number_input(
             "n_estimators",
             min_value=50,
@@ -14606,6 +19734,12 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
         else:
             params["scale_pos_weight"] = "auto"
     elif model_choice == "Neural Network":
+        hidden_activation = st.selectbox(
+            "hidden_activation",
+            ["relu", "gelu", "leaky_relu", "elu", "tanh"],
+            key=f"{prefix}model_nn_hidden_activation",
+            help="Función de activación entre capas ocultas.",
+        )
         hidden_dim = st.number_input(
             "hidden_dim",
             min_value=32,
@@ -14619,6 +19753,15 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
             value=2,
             step=1,
             key=f"{prefix}model_nn_num_layers",
+        )
+        output_activation = st.selectbox(
+            "output_activation",
+            ["softmax", "sigmoid"],
+            key=f"{prefix}model_nn_output_activation",
+            help=(
+                "Activación usada para convertir logits en probabilidades "
+                "durante inferencia/evaluación."
+            ),
         )
         dropout = st.number_input(
             "dropout",
@@ -14651,8 +19794,23 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
             key=f"{prefix}model_nn_batch_size",
             help=(
                 "Batch mayor = mejor ocupacion de GPU (MPS/CUDA). "
-                "El wrapper precarga train/val en device y evita copias H2D "
-                "por batch; elige >=1024 si tienes GPU disponible."
+            "El wrapper precarga train/val en device y evita copias H2D "
+            "por batch; elige >=1024 si tienes GPU disponible."
+            ),
+        )
+        optimizer_name = st.selectbox(
+            "optimizer",
+            ["adamw", "adam", "rmsprop"],
+            key=f"{prefix}model_nn_optimizer_name",
+            help="Optimizador del entrenamiento del MLP.",
+        )
+        loss_function = st.selectbox(
+            "loss_function",
+            ["cross_entropy", "binary_cross_entropy", "focal"],
+            key=f"{prefix}model_nn_loss_function",
+            help=(
+                "Pérdida de entrenamiento. `binary_cross_entropy` usa BCE "
+                "sobre el margen binario; `focal` enfatiza ejemplos difíciles."
             ),
         )
         epochs = st.number_input(
@@ -14663,14 +19821,32 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
             key=f"{prefix}model_nn_epochs",
             help=(
                 "Maximo de epocas de entrenamiento. El early stopping "
-                "(paciencia 5) cortara antes si la metrica de validacion "
-                "deja de mejorar."
+                "cortara antes si la metrica de validacion deja de mejorar."
             ),
         )
         early_stopping_patience = 5
+        early_stopping_min_delta = st.number_input(
+            "Early stopping (umbral / min_delta)",
+            min_value=0.0,
+            value=0.0,
+            step=0.0001,
+            format="%.4f",
+            key=f"{prefix}model_nn_early_stopping_min_delta",
+            help=(
+                "Mejora minima requerida en la metrica de validacion "
+                "(average precision) para resetear la paciencia. Use 0 "
+                "para aceptar cualquier mejora."
+            ),
+        )
         st.caption(
             f"Early stopping activo | paciencia = {early_stopping_patience} "
+            f"| min_delta = {float(early_stopping_min_delta):.4f} "
             "| val_fraction = 0.15"
+        )
+        use_batch_norm = st.checkbox(
+            "use_batch_norm",
+            value=False,
+            key=f"{prefix}model_nn_use_batch_norm",
         )
         pos_weight = st.number_input(
             "pos_weight (0 = auto)",
@@ -14685,16 +19861,102 @@ def _render_model_params_ui(model_choice: str, prefix: str) -> Dict[str, object]
                 "cuando la estrategia de desbalance lo requiera."
             ),
         )
+        max_grad_norm = st.number_input(
+            "max_grad_norm (0 = desactivado)",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+            format="%.2f",
+            key=f"{prefix}model_nn_max_grad_norm",
+        )
+        lr_scheduler = st.selectbox(
+            "lr_scheduler",
+            ["none", "reduce_on_plateau"],
+            key=f"{prefix}model_nn_lr_scheduler",
+        )
+        scheduler_factor = 0.5
+        scheduler_patience = 2
+        min_lr = 1e-6
+        if lr_scheduler == "reduce_on_plateau":
+            scheduler_factor = st.number_input(
+                "scheduler_factor",
+                min_value=0.1,
+                max_value=0.9,
+                value=0.5,
+                step=0.1,
+                format="%.2f",
+                key=f"{prefix}model_nn_scheduler_factor",
+            )
+            scheduler_patience = int(
+                st.number_input(
+                    "scheduler_patience",
+                    min_value=1,
+                    value=2,
+                    step=1,
+                    key=f"{prefix}model_nn_scheduler_patience",
+                )
+            )
+            min_lr = st.number_input(
+                "min_lr",
+                min_value=0.000001,
+                value=0.000001,
+                step=0.000001,
+                format="%.6f",
+                key=f"{prefix}model_nn_min_lr",
+            )
+        temperature_scaling = st.checkbox(
+            "temperature_scaling",
+            value=False,
+            key=f"{prefix}model_nn_temperature_scaling",
+            help="Ajusta temperatura en validación antes de predecir probabilidades.",
+        )
+        focal_gamma = 2.0
+        focal_alpha = 0.25
+        if loss_function == "focal":
+            focal_gamma = st.number_input(
+                "focal_gamma",
+                min_value=0.5,
+                value=2.0,
+                step=0.5,
+                format="%.2f",
+                key=f"{prefix}model_nn_focal_gamma",
+            )
+            focal_alpha = st.number_input(
+                "focal_alpha",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.25,
+                step=0.05,
+                format="%.2f",
+                key=f"{prefix}model_nn_focal_alpha",
+            )
         params = {
+            "hidden_activation": str(hidden_activation),
             "hidden_dim": int(hidden_dim),
             "num_layers": int(num_layers),
+            "output_activation": str(output_activation),
             "dropout": float(dropout),
             "learning_rate": float(learning_rate),
             "weight_decay": float(weight_decay),
             "batch_size": int(batch_size),
+            "optimizer_name": str(optimizer_name),
+            "loss_function": str(loss_function),
             "epochs": int(epochs),
             "early_stopping_patience": int(early_stopping_patience),
+            "early_stopping_min_delta": float(early_stopping_min_delta),
+            "use_batch_norm": bool(use_batch_norm),
+            "lr_scheduler": str(lr_scheduler),
+            "temperature_scaling": bool(temperature_scaling),
         }
+        if float(max_grad_norm) > 0:
+            params["max_grad_norm"] = float(max_grad_norm)
+        if loss_function == "focal":
+            params["focal_gamma"] = float(focal_gamma)
+            params["focal_alpha"] = float(focal_alpha)
+        if lr_scheduler == "reduce_on_plateau":
+            params["scheduler_factor"] = float(scheduler_factor)
+            params["scheduler_patience"] = int(scheduler_patience)
+            params["min_lr"] = float(min_lr)
         if float(pos_weight) > 0:
             params["pos_weight"] = float(pos_weight)
         else:
@@ -14733,7 +19995,7 @@ def _apply_model_params_to_prefix(
     prefix: str,
     params: Dict[str, object],
 ) -> None:
-    if model_choice in {"Random Forest", "Balanced Random Forest"}:
+    if model_choice == "Random Forest":
         n_estimators = int(params.get("n_estimators", 200))
         max_depth = params.get("max_depth")
         st.session_state[f"{prefix}model_rf_n_estimators"] = max(50, n_estimators)
@@ -14756,20 +20018,138 @@ def _apply_model_params_to_prefix(
         st.session_state[f"{prefix}model_xgb_reg_lambda"] = max(0.0, reg_lambda)
         st.session_state[f"{prefix}model_xgb_gamma"] = max(0.0, gamma)
     elif model_choice == "Neural Network":
+        def _normalize_nn_choice(
+            value: object,
+            aliases: Dict[str, str],
+            default: str,
+        ) -> str:
+            key = (
+                str(value or "")
+                .strip()
+                .lower()
+                .replace("-", "_")
+                .replace(" ", "_")
+            )
+            return aliases.get(key, default)
+
+        def _normalize_nn_bool(value: object) -> bool:
+            if isinstance(value, bool):
+                return value
+            key = str(value or "").strip().lower()
+            if key in {"1", "true", "yes", "y", "on"}:
+                return True
+            if key in {"", "0", "false", "no", "n", "off"}:
+                return False
+            return bool(value)
+
+        hidden_activation = _normalize_nn_choice(
+            params.get("hidden_activation", "relu"),
+            {
+                "relu": "relu",
+                "gelu": "gelu",
+                "elu": "elu",
+                "leakyrelu": "leaky_relu",
+                "leaky_relu": "leaky_relu",
+                "tanh": "tanh",
+            },
+            "relu",
+        )
         hidden_dim = int(params.get("hidden_dim", 256))
         num_layers = int(params.get("num_layers", 2))
+        output_activation = _normalize_nn_choice(
+            params.get("output_activation", "softmax"),
+            {
+                "softmax": "softmax",
+                "sigmoid": "sigmoid",
+            },
+            "softmax",
+        )
         dropout = float(params.get("dropout", 0.2))
         learning_rate = float(params.get("learning_rate", 0.001))
         weight_decay = float(params.get("weight_decay", 1e-5))
         batch_size = int(params.get("batch_size", 1024))
+        optimizer_name = _normalize_nn_choice(
+            params.get("optimizer_name", params.get("optimizer", "adamw")),
+            {
+                "adamw": "adamw",
+                "adam": "adam",
+                "rmsprop": "rmsprop",
+            },
+            "adamw",
+        )
+        loss_function = _normalize_nn_choice(
+            params.get("loss_function", "cross_entropy"),
+            {
+                "ce": "cross_entropy",
+                "mce": "cross_entropy",
+                "crossentropy": "cross_entropy",
+                "cross_entropy": "cross_entropy",
+                "categorical_cross_entropy": "cross_entropy",
+                "bce": "binary_cross_entropy",
+                "binary_cross_entropy": "binary_cross_entropy",
+                "binarycrossentropy": "binary_cross_entropy",
+                "bce_with_logits": "binary_cross_entropy",
+                "focal": "focal",
+                "focal_loss": "focal",
+            },
+            "cross_entropy",
+        )
+        use_batch_norm = _normalize_nn_bool(params.get("use_batch_norm", False))
+        max_grad_norm = params.get("max_grad_norm")
+        lr_scheduler = _normalize_nn_choice(
+            params.get("lr_scheduler", "none"),
+            {
+                "none": "none",
+                "off": "none",
+                "false": "none",
+                "reduce_lr_on_plateau": "reduce_on_plateau",
+                "reduce_on_plateau": "reduce_on_plateau",
+                "plateau": "reduce_on_plateau",
+            },
+            "none",
+        )
+        scheduler_factor = float(params.get("scheduler_factor", 0.5))
+        scheduler_patience = int(params.get("scheduler_patience", 2))
+        min_lr = float(params.get("min_lr", 1e-6))
+        temperature_scaling = _normalize_nn_bool(
+            params.get("temperature_scaling", False)
+        )
+        focal_gamma = float(params.get("focal_gamma", 2.0))
+        focal_alpha = float(params.get("focal_alpha", 0.25))
         # epochs no se optimiza en Optuna: se conserva el valor maximo fijado
         # en los widgets de Modelos (early stopping decide cuando cortar).
+        st.session_state[f"{prefix}model_nn_hidden_activation"] = hidden_activation
         st.session_state[f"{prefix}model_nn_hidden_dim"] = max(32, hidden_dim)
         st.session_state[f"{prefix}model_nn_num_layers"] = max(1, num_layers)
+        st.session_state[f"{prefix}model_nn_output_activation"] = output_activation
         st.session_state[f"{prefix}model_nn_dropout"] = max(0.0, min(0.5, dropout))
         st.session_state[f"{prefix}model_nn_learning_rate"] = max(0.0001, learning_rate)
         st.session_state[f"{prefix}model_nn_weight_decay"] = max(0.0, weight_decay)
         st.session_state[f"{prefix}model_nn_batch_size"] = batch_size
+        st.session_state[f"{prefix}model_nn_optimizer_name"] = optimizer_name
+        st.session_state[f"{prefix}model_nn_loss_function"] = loss_function
+        st.session_state[f"{prefix}model_nn_use_batch_norm"] = use_batch_norm
+        st.session_state[f"{prefix}model_nn_max_grad_norm"] = (
+            0.0 if max_grad_norm in {None, "", False} else max(0.0, float(max_grad_norm))
+        )
+        st.session_state[f"{prefix}model_nn_lr_scheduler"] = lr_scheduler
+        st.session_state[f"{prefix}model_nn_scheduler_factor"] = max(
+            0.1,
+            min(0.9, scheduler_factor),
+        )
+        st.session_state[f"{prefix}model_nn_scheduler_patience"] = max(
+            1,
+            scheduler_patience,
+        )
+        st.session_state[f"{prefix}model_nn_min_lr"] = max(0.000001, min_lr)
+        st.session_state[f"{prefix}model_nn_temperature_scaling"] = (
+            temperature_scaling
+        )
+        st.session_state[f"{prefix}model_nn_focal_gamma"] = max(0.5, focal_gamma)
+        st.session_state[f"{prefix}model_nn_focal_alpha"] = max(
+            0.0,
+            min(1.0, focal_alpha),
+        )
     elif model_choice == "SVM":
         kernel_value = params.get("kernel", "rbf")
         if kernel_value not in {"rbf", "linear", "poly", "sigmoid"}:
@@ -14812,6 +20192,7 @@ def _apply_optuna_model_params_to_state(
         cols_all = [col for col in selected_features if col in numeric_cols]
     cols_base = [col for col in cols_all if col not in cluster_cols_set]
     cols_cluster_only = [col for col in cols_all if col in cluster_cols_set]
+    current_dataset_fingerprint = _dataset_content_fingerprint(features_df)
 
     store = st.session_state.get("optuna_results_store") or {}
 
@@ -14820,6 +20201,12 @@ def _apply_optuna_model_params_to_state(
         ("cluster_only", "Cluster", "cluster_only_", cols_cluster_only),
         ("base_cluster", "Base + Cluster", "cluster_", cols_all),
     ]
+    feature_set_filter = _resolve_model_optuna_feature_set_filter(
+        current_feature_key=feature_key,
+        current_dataset_fingerprint=current_dataset_fingerprint,
+        available_feature_sets=[label for _, label, _, cols in group_defs if cols],
+    )
+    filtered_feature_sets = set(feature_set_filter.get("allowed_feature_sets") or [])
 
     signatures_map: Dict[str, str] = dict(
         st.session_state.get("optuna_model_params_applied_signatures") or {}
@@ -14828,6 +20215,7 @@ def _apply_optuna_model_params_to_state(
     applied_labels: List[str] = []
     already_labels: List[str] = []
     missing_labels: List[str] = []
+    skipped_labels: List[str] = []
 
     for group_key, group_label, prefix, cols in group_defs:
         if group_key == "cluster_only" and not cols_cluster_only:
@@ -14838,6 +20226,10 @@ def _apply_optuna_model_params_to_state(
             continue
         if not cols:
             signatures_map.pop(prefix, None)
+            continue
+        if feature_set_filter.get("applies") and group_label not in filtered_feature_sets:
+            signatures_map.pop(prefix, None)
+            skipped_labels.append(group_label)
             continue
 
         key = _optuna_result_key(feature_key, cols)
@@ -14918,6 +20310,8 @@ def _apply_optuna_model_params_to_state(
         parts.append("aplicados: " + ", ".join(applied_labels))
     if already_labels:
         parts.append("ya cargados: " + ", ".join(already_labels))
+    if skipped_labels:
+        parts.append("filtrados: " + ", ".join(skipped_labels))
     if missing_labels:
         parts.append("sin match: " + ", ".join(missing_labels))
     return (
@@ -14926,6 +20320,826 @@ def _apply_optuna_model_params_to_state(
         f"{_calibration_method_label(calibration_method)}) — "
         + " | ".join(parts)
     )
+
+
+def _model_selection_metric_from_result(
+    result: Optional[Dict[str, object]],
+    *,
+    threshold_objective: str,
+) -> Dict[str, object]:
+    metrics = result.get("metrics") if isinstance(result, dict) else {}
+    metrics_dict = metrics if isinstance(metrics, dict) else {}
+    objective_key = normalize_threshold_objective(threshold_objective)
+    if objective_key == "far":
+        metric_key = "sensitivity"
+        metric_label = "Sensibilidad (FAR)"
+        direction = "maximize"
+    elif objective_key == "operational_cost":
+        metric_key = "operational_cost"
+        metric_label = "Costo operacional"
+        direction = "minimize"
+    elif objective_key == "recall_at_alerts_per_day":
+        metric_key = "recall_at_alerts_per_day"
+        metric_label = "Recall@N alertas/día"
+        direction = "maximize"
+    elif objective_key == "balanced_f1":
+        metric_key = "balanced_f1"
+        metric_label = "Balanced F1"
+        direction = "maximize"
+    elif objective_key == "pr_auc":
+        metric_key = "pr_auc"
+        metric_label = "PR-AUC"
+        direction = "maximize"
+    elif objective_key == "roc_auc":
+        metric_key = "roc_auc"
+        metric_label = "ROC-AUC"
+        direction = "maximize"
+    else:
+        metric_key = objective_key
+        metric_label = THRESHOLD_OBJECTIVE_LABELS.get(objective_key, objective_key)
+        direction = "maximize"
+
+    raw_value = metrics_dict.get(metric_key)
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        value = float("nan")
+    if not np.isfinite(value):
+        score = float("-inf")
+    elif direction == "minimize":
+        score = -float(value)
+    else:
+        score = float(value)
+    return {
+        "objective_key": objective_key,
+        "metric_key": metric_key,
+        "metric_label": metric_label,
+        "direction": direction,
+        "value": value,
+        "score": score,
+    }
+
+
+def _build_model_tab_training_kwargs(
+    *,
+    val_size: float,
+    far_target: float,
+    random_state: int,
+    threshold_protocol: str,
+    threshold_objective: str,
+    calibration_method: str,
+    alerts_per_day: float,
+    fn_cost: float,
+    fp_cost: float,
+    robust_folds: int,
+    balance_strategy: str,
+    use_balanced: bool,
+    use_split: bool,
+    epoch_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    smote_params: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    effective_balance_strategy = (
+        "none" if (bool(use_balanced) and bool(use_split)) else str(balance_strategy)
+    )
+    return {
+        "val_size": float(val_size),
+        "far_target": float(far_target),
+        "random_state": int(random_state),
+        "threshold_protocol": threshold_protocol,
+        "threshold_objective": threshold_objective,
+        "calibration_method": str(calibration_method),
+        "alerts_per_day": float(alerts_per_day),
+        "fn_cost": float(fn_cost),
+        "fp_cost": float(fp_cost),
+        "robust_folds": int(robust_folds),
+        "balance_strategy": effective_balance_strategy,
+        "smote_params": (
+            dict(smote_params) if isinstance(smote_params, dict) else None
+        ),
+        "epoch_callback": epoch_callback,
+    }
+
+
+def _render_model_tab_optuna_batch_mode(
+    *,
+    base_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+    cluster_features_df: Optional[pd.DataFrame],
+    contract: Optional[Dict[str, object]],
+) -> None:
+    batch_contract = (
+        contract
+        if isinstance(contract, dict)
+        else st.session_state.get("model_optuna_batch_contract")
+    )
+    if not isinstance(batch_contract, dict):
+        st.info("Seleccione un batch de Optuna para habilitar este modo.")
+        return
+
+    inherited = (
+        batch_contract.get("inherited_training_config")
+        if isinstance(batch_contract.get("inherited_training_config"), dict)
+        else {}
+    )
+    batch_ref = (
+        batch_contract.get("batch_ref")
+        if isinstance(batch_contract.get("batch_ref"), dict)
+        else {}
+    )
+    subruns = [
+        subrun
+        for subrun in list(batch_contract.get("subruns") or [])
+        if isinstance(subrun, dict)
+    ]
+    model_name = str(inherited.get("model_name") or "").strip()
+    if not model_name:
+        st.error("El batch seleccionado no define un modelo heredado válido.")
+        return
+
+    calibration_method = _normalize_calibration_method(
+        inherited.get("calibration_method")
+    )
+    threshold_objective = normalize_threshold_objective(
+        inherited.get("threshold_objective")
+    )
+    test_size = float(inherited.get("test_size") or 0.2)
+    val_size = float(inherited.get("val_size") or 0.2)
+    far_target = float(inherited.get("far_target") or 0.2)
+    alerts_per_day = float(inherited.get("alerts_per_day") or 5.0)
+    fn_cost = float(inherited.get("fn_cost") or 10.0)
+    fp_cost = float(inherited.get("fp_cost") or 1.0)
+    robust_folds = int(inherited.get("robust_folds") or 3)
+    random_state = int(inherited.get("random_state") or 42)
+    threshold_protocols = ["conservative", "robust"]
+
+    st.session_state["model_threshold_protocols"] = [
+        THRESHOLD_PROTOCOL_LABELS[protocol] for protocol in threshold_protocols
+    ]
+    st.caption(
+        "Modo `Optuna <- batch`: configuración de entrenamiento heredada en "
+        "solo lectura. Se ejecutarán siempre los protocolos Conservador y "
+        "Robusto; no se usa dataset balanceado legacy."
+    )
+
+    model_history_context = _history_context_details(
+        features_df,
+        selected_features=None,
+    )
+    _render_model_history_loader(
+        feature_context_key=str(model_history_context["feature_context_key"]),
+        optuna_context_key=_model_optuna_batch_context_key(batch_ref),
+        model_name=model_name,
+        threshold_objective=threshold_objective,
+        calibration_method=calibration_method,
+        balance_strategy="optuna_batch",
+        protocols=threshold_protocols,
+    )
+
+    model_n_jobs: Optional[int] = None
+    if model_name == "Random Forest":
+        model_n_jobs = _render_model_n_jobs_input(
+            "Jobs paralelos RF/ranking",
+            key="model_optuna_batch_rf_parallel_jobs",
+            default=min(10, _max_optuna_parallel_jobs()),
+        )
+    elif model_name == "XGBoost":
+        model_n_jobs = _render_model_n_jobs_input(
+            "Jobs paralelos XGBoost",
+            key="model_optuna_batch_xgb_parallel_jobs",
+            default=1,
+            shared_key="global_xgb_parallel_jobs",
+        )
+    elif model_name == "Neural Network":
+        st.caption(
+            "Neural Network entrena en dispositivo (MPS/CUDA/CPU); "
+            "no requiere n_jobs."
+        )
+    elif model_name == "SVM":
+        st.caption("SVM no expone `n_jobs` configurables en Modelos.")
+
+    preview_rows: List[Dict[str, object]] = []
+    total_candidates = 0
+    for subrun in subruns:
+        candidates = [
+            candidate
+            for candidate in list(subrun.get("candidates") or [])
+            if isinstance(candidate, dict)
+        ]
+        total_candidates += len(candidates)
+        for candidate in candidates:
+            preview_rows.append(
+                {
+                    "Subcorrida": subrun.get("subrun_id"),
+                    "Feature set": subrun.get("feature_set_label"),
+                    "Balance": subrun.get("balance_mode_label"),
+                    "Candidato": candidate.get("candidate_label"),
+                    "Tipo": candidate.get("candidate_kind"),
+                    "Trial": candidate.get("trial_number"),
+                    "top_k": candidate.get("top_k"),
+                    "Features": len(list(candidate.get("feature_cols") or [])),
+                }
+            )
+    if preview_rows:
+        with st.expander("Detalle de subcorridas y candidatos", expanded=False):
+            st.dataframe(
+                _prepare_dataframe_for_streamlit(pd.DataFrame(preview_rows)),
+                width="stretch",
+            )
+    st.info(
+        f"Batch seleccionado: {len(subruns)} subcorridas | "
+        f"{total_candidates} candidatos | "
+        f"{total_candidates * len(threshold_protocols)} entrenamientos."
+    )
+
+    can_train = bool(batch_contract.get("compatible")) and bool(subruns) and bool(total_candidates)
+    if not can_train:
+        st.warning(
+            "El batch seleccionado no está listo para entrenamiento. Revise las "
+            "incompatibilidades listadas arriba."
+        )
+
+    if not st.button(
+        "Entrenar batch Optuna",
+        key="train_optuna_batch_models",
+        disabled=not can_train,
+    ):
+        return
+
+    requires_cluster_dataset = any(
+        str(subrun.get("dataset_kind")) == "cluster" for subrun in subruns
+    )
+    cluster_df = None
+    if requires_cluster_dataset:
+        cluster_df = _build_cluster_dataset(
+            base_df,
+            cluster_features_df=cluster_features_df,
+        )
+        if cluster_df is None or cluster_df.empty:
+            st.error(
+                "No se pudo reconstruir el dataset con variables de cluster "
+                "para entrenar este batch."
+            )
+            return
+
+    summary_rows: List[Dict[str, object]] = []
+    confusion_rows: List[Dict[str, object]] = []
+    curve_items: List[Tuple[str, object, Optional[str]]] = []
+    subrun_results: List[Dict[str, object]] = []
+    progress_rows: List[Dict[str, object]] = []
+    total_training_steps = _model_optuna_batch_total_steps(
+        subruns,
+        threshold_protocols,
+    )
+    progress_run_id = (
+        "model_optuna_batch_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+        f"{hashlib.md5(json.dumps(batch_ref, sort_keys=True, default=_json_default).encode('utf-8')).hexdigest()[:8]}"
+    )
+    progress_run_dir = str(_model_optuna_batch_live_dir(progress_run_id))
+    progress_state: Dict[str, object] = {
+        "run_id": progress_run_id,
+        "run_dir": progress_run_dir,
+        "manifest": {
+            "run_id": progress_run_id,
+            "status": "running",
+            "result_status": "running",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "progress": {
+                "completed_steps": 0,
+                "total_steps": int(total_training_steps),
+                "current_step_id": "run_start",
+                "progress_ratio": 0.0,
+            },
+        },
+        "live_status": {},
+        "live_events": [],
+    }
+    progress_board = _ModelOptunaBatchProgressBoard(
+        model_name=model_name,
+        total_steps=total_training_steps,
+        batch_ref=batch_ref,
+        run_dir=progress_run_dir,
+    )
+    completed_steps = 0
+    combo_counter = 0
+    progress_objective_metric = (
+        inherited.get("objective_metric")
+        or inherited.get("objective_label")
+        or threshold_objective
+    )
+    _model_optuna_batch_append_event(
+        progress_state,
+        step_id="run_start",
+        step_status="running",
+        message="Entrenando batch Optuna...",
+        completed_steps=completed_steps,
+        total_steps=total_training_steps,
+        context={
+            "model_name": model_name,
+            "backend": "local",
+            "threshold_objective": threshold_objective,
+            "calibration_method": calibration_method,
+        },
+        partial_rows=progress_rows,
+    )
+    progress_board.update(
+        progress_state,
+        progress_rows,
+        objective_metric=progress_objective_metric,
+    )
+
+    try:
+        with st.spinner("Entrenando batch Optuna..."):
+            for subrun in subruns:
+                dataset_kind = str(subrun.get("dataset_kind") or "base")
+                dataset_df = base_df if dataset_kind == "base" else cluster_df
+                if dataset_df is None or not isinstance(dataset_df, pd.DataFrame):
+                    raise ValueError(
+                        f"No hay dataset disponible para {subrun.get('subrun_id')}."
+                    )
+                numeric_cols_set = set(_get_feature_cols(dataset_df))
+                balance_mode = _normalize_optuna_balance_mode(
+                    subrun.get("balance_mode")
+                )
+                if balance_mode != "smote":
+                    balance_mode = "none"
+                _model_optuna_batch_append_event(
+                    progress_state,
+                    step_id="subrun_start",
+                    step_status="running",
+                    message=(
+                        f"Subcorrida {subrun.get('subrun_id')} | "
+                        f"{subrun.get('feature_set_label')} | "
+                        f"{subrun.get('balance_mode_label')}"
+                    ),
+                    completed_steps=completed_steps,
+                    total_steps=total_training_steps,
+                    context={
+                        "subrun_id": subrun.get("subrun_id"),
+                        "feature_set_label": subrun.get("feature_set_label"),
+                        "balance_mode": balance_mode,
+                        "balance_mode_label": subrun.get("balance_mode_label"),
+                        "model_name": model_name,
+                        "backend": "local",
+                        "threshold_objective": threshold_objective,
+                        "calibration_method": calibration_method,
+                    },
+                    partial_rows=progress_rows,
+                )
+                progress_board.update(
+                    progress_state,
+                    progress_rows,
+                    objective_metric=progress_objective_metric,
+                )
+
+                subrun_result = {
+                    "subrun_id": subrun.get("subrun_id"),
+                    "record_id": subrun.get("record_id"),
+                    "feature_set_label": subrun.get("feature_set_label"),
+                    "dataset_kind": dataset_kind,
+                    "balance_mode": balance_mode,
+                    "balance_mode_label": subrun.get("balance_mode_label"),
+                    "calibration_method": calibration_method,
+                    "calibration_method_label": _calibration_method_label(
+                        calibration_method
+                    ),
+                    "objective_mode": subrun.get("objective_mode"),
+                    "candidates": [],
+                }
+                candidates = [
+                    candidate
+                    for candidate in list(subrun.get("candidates") or [])
+                    if isinstance(candidate, dict)
+                ]
+                if not candidates:
+                    raise ValueError(
+                        f"{subrun.get('subrun_id')}: no hay candidatos utilizables."
+                    )
+                for candidate_index, candidate in enumerate(candidates, start=1):
+                    candidate_label = str(
+                        candidate.get("candidate_label")
+                        or candidate.get("candidate_id")
+                        or f"candidate_{candidate_index}"
+                    )
+                    feature_cols = [
+                        str(col)
+                        for col in list(
+                            candidate.get("feature_cols")
+                            or subrun.get("best_feature_cols")
+                            or []
+                        )
+                        if str(col).strip()
+                    ]
+                    missing_cols = [
+                        col for col in feature_cols if col not in numeric_cols_set
+                    ]
+                    if missing_cols:
+                        preview = ", ".join(missing_cols[:5])
+                        if len(missing_cols) > 5:
+                            preview = f"{preview}, … (+{len(missing_cols) - 5})"
+                        raise ValueError(
+                            f"{subrun.get('subrun_id')} | {candidate_label}: "
+                            f"faltan columnas en el dataset actual: {preview}"
+                        )
+                    if not feature_cols:
+                        raise ValueError(
+                            f"{subrun.get('subrun_id')} | {candidate_label}: "
+                            "no hay variables efectivas para entrenar."
+                        )
+
+                    model_params = dict(
+                        candidate.get("model_params")
+                        or subrun.get("best_model_params")
+                        or {}
+                    )
+                    if model_n_jobs is not None and model_name in {
+                        "Random Forest",
+                        "XGBoost",
+                    }:
+                        model_params["n_jobs"] = int(model_n_jobs)
+                    smote_params = (
+                        dict(
+                            candidate.get("smote_params")
+                            or subrun.get("best_smote_params")
+                            or {}
+                        )
+                        if balance_mode == "smote"
+                        else None
+                    )
+
+                    protocol_results: Dict[str, Dict[str, object]] = {}
+                    for protocol in threshold_protocols:
+                        combo_counter += 1
+                        protocol_label = THRESHOLD_PROTOCOL_LABELS.get(
+                            str(protocol), str(protocol)
+                        )
+                        combo_label = (
+                            f"{subrun.get('feature_set_label')} | "
+                            f"{subrun.get('balance_mode_label')} | "
+                            f"{candidate_label} | {protocol_label}"
+                        )
+                        event_context = {
+                            "combo_index": int(combo_counter),
+                            "total_combinations": int(total_training_steps),
+                            "combo_label": combo_label,
+                            "model_name": model_name,
+                            "objective_metric": progress_objective_metric,
+                            "calibration_method": calibration_method,
+                            "threshold_objective": threshold_objective,
+                            "threshold_objective_label": THRESHOLD_OBJECTIVE_LABELS.get(
+                                threshold_objective, threshold_objective
+                            ),
+                            "balance_mode": balance_mode,
+                            "balance_mode_label": subrun.get("balance_mode_label"),
+                            "threshold_protocol": protocol,
+                            "backend": "local",
+                            "model_n_jobs": model_n_jobs,
+                        }
+                        _model_optuna_batch_append_event(
+                            progress_state,
+                            step_id="combo_start",
+                            step_status="running",
+                            message=f"Entrenando {combo_label}",
+                            completed_steps=completed_steps,
+                            total_steps=total_training_steps,
+                            context=event_context,
+                            partial_rows=progress_rows,
+                        )
+                        progress_board.update(
+                            progress_state,
+                            progress_rows,
+                            objective_metric=progress_objective_metric,
+                        )
+
+                        def _epoch_callback(payload: Dict[str, object]) -> None:
+                            epoch = (
+                                payload.get("epoch")
+                                if isinstance(payload, dict)
+                                else None
+                            )
+                            max_epochs = (
+                                payload.get("max_epochs")
+                                if isinstance(payload, dict)
+                                else None
+                            )
+                            epoch_message = (
+                                f"{combo_label} | epoch {epoch}/{max_epochs}"
+                                if epoch is not None and max_epochs is not None
+                                else f"{combo_label} | epoch en progreso"
+                            )
+                            _model_optuna_batch_append_event(
+                                progress_state,
+                                step_id="epoch_update",
+                                step_status="running",
+                                message=epoch_message,
+                                completed_steps=completed_steps,
+                                total_steps=total_training_steps,
+                                progress_ratio=(
+                                    completed_steps
+                                    + min(
+                                        0.9,
+                                        max(
+                                            0.0,
+                                            float(epoch or 0)
+                                            / float(max_epochs or 1),
+                                        ),
+                                    )
+                                )
+                                / float(total_training_steps),
+                                context=event_context,
+                                partial_rows=progress_rows,
+                            )
+                            progress_board.update(
+                                progress_state,
+                                progress_rows,
+                                objective_metric=progress_objective_metric,
+                            )
+
+                        common_kwargs = _build_model_tab_training_kwargs(
+                            val_size=val_size,
+                            far_target=far_target,
+                            random_state=random_state,
+                            threshold_protocol=protocol,
+                            threshold_objective=threshold_objective,
+                            calibration_method=calibration_method,
+                            alerts_per_day=alerts_per_day,
+                            fn_cost=fn_cost,
+                            fp_cost=fp_cost,
+                            robust_folds=robust_folds,
+                            balance_strategy=balance_mode,
+                            use_balanced=False,
+                            use_split=False,
+                            smote_params=smote_params,
+                            epoch_callback=(
+                                _epoch_callback
+                                if model_name == "Neural Network"
+                                else None
+                            ),
+                        )
+                        try:
+                            result = _train_model(
+                                dataset_df,
+                                feature_cols,
+                                model_name,
+                                model_params,
+                                test_size=test_size,
+                                **common_kwargs,
+                            )
+                        except Exception as protocol_exc:
+                            progress_rows.append(
+                                _model_optuna_batch_result_progress_row(
+                                    combo_index=combo_counter,
+                                    total_combinations=total_training_steps,
+                                    subrun=subrun,
+                                    candidate=candidate,
+                                    candidate_label=candidate_label,
+                                    protocol=str(protocol),
+                                    protocol_label=protocol_label,
+                                    model_name=model_name,
+                                    model_n_jobs=model_n_jobs,
+                                    threshold_objective=threshold_objective,
+                                    threshold_objective_label=THRESHOLD_OBJECTIVE_LABELS.get(
+                                        threshold_objective, threshold_objective
+                                    ),
+                                    calibration_method=calibration_method,
+                                    result={},
+                                    status="failed",
+                                    error=str(protocol_exc),
+                                )
+                            )
+                            _model_optuna_batch_append_event(
+                                progress_state,
+                                step_id="combo_failed",
+                                step_status="failed",
+                                message=f"{combo_label} falló: {protocol_exc}",
+                                completed_steps=completed_steps,
+                                total_steps=total_training_steps,
+                                context=event_context,
+                                partial_rows=progress_rows,
+                            )
+                            progress_board.update(
+                                progress_state,
+                                progress_rows,
+                                objective_metric=progress_objective_metric,
+                            )
+                            raise
+                        protocol_results[str(protocol)] = result
+                        metrics = (
+                            result.get("metrics")
+                            if isinstance(result.get("metrics"), dict)
+                            else {}
+                        )
+                        summary_rows.append(
+                            {
+                                "Subcorrida": subrun.get("subrun_id"),
+                                "Feature set": subrun.get("feature_set_label"),
+                                "Balance": subrun.get("balance_mode_label"),
+                                "Candidato": candidate_label,
+                                "Trial": candidate.get("trial_number"),
+                                "Protocolo": THRESHOLD_PROTOCOL_LABELS.get(
+                                    str(protocol), str(protocol)
+                                ),
+                                "Features": len(feature_cols),
+                                "Threshold": metrics.get("threshold"),
+                                "MCC": metrics.get("mcc"),
+                                "PR-AUC": metrics.get("pr_auc"),
+                                "Brier": metrics.get("brier_score"),
+                                "Balanced F1": metrics.get("balanced_f1"),
+                                "F1": metrics.get("f1"),
+                                "FAR": metrics.get("far"),
+                                "Recall@N": metrics.get(
+                                    "recall_at_alerts_per_day"
+                                ),
+                                "Costo operacional": metrics.get(
+                                    "operational_cost"
+                                ),
+                            }
+                        )
+                        progress_rows.append(
+                            _model_optuna_batch_result_progress_row(
+                                combo_index=combo_counter,
+                                total_combinations=total_training_steps,
+                                subrun=subrun,
+                                candidate=candidate,
+                                candidate_label=candidate_label,
+                                protocol=str(protocol),
+                                protocol_label=protocol_label,
+                                model_name=model_name,
+                                model_n_jobs=model_n_jobs,
+                                threshold_objective=threshold_objective,
+                                threshold_objective_label=THRESHOLD_OBJECTIVE_LABELS.get(
+                                    threshold_objective, threshold_objective
+                                ),
+                                calibration_method=calibration_method,
+                                result=result,
+                                status="completed",
+                            )
+                        )
+                        confusion_rows.append(
+                            {
+                                "subrun_id": subrun.get("subrun_id"),
+                                "candidate_label": candidate_label,
+                                "protocol": THRESHOLD_PROTOCOL_LABELS.get(
+                                    str(protocol), str(protocol)
+                                ),
+                                "confusion_matrix": result.get("confusion_matrix"),
+                            }
+                        )
+                        if model_name == "Neural Network":
+                            curve_items.append(
+                                (
+                                    f"{subrun.get('feature_set_label')} | {candidate_label}",
+                                    result.get("training_curves"),
+                                    THRESHOLD_PROTOCOL_LABELS.get(
+                                        str(protocol), str(protocol)
+                                    ),
+                                )
+                            )
+                        completed_steps += 1
+                        _model_optuna_batch_append_event(
+                            progress_state,
+                            step_id="combo_done",
+                            step_status="completed",
+                            message=f"{combo_label} completado.",
+                            completed_steps=completed_steps,
+                            total_steps=total_training_steps,
+                            context=event_context,
+                            partial_rows=progress_rows,
+                        )
+                        progress_board.update(
+                            progress_state,
+                            progress_rows,
+                            objective_metric=progress_objective_metric,
+                        )
+
+                    subrun_result["candidates"].append(
+                        {
+                            "candidate_id": candidate.get("candidate_id"),
+                            "candidate_label": candidate_label,
+                            "candidate_kind": candidate.get("candidate_kind"),
+                            "trial_number": candidate.get("trial_number"),
+                            "top_k": candidate.get("top_k"),
+                            "selected_trial": bool(candidate.get("selected_trial")),
+                            "feature_cols": list(feature_cols),
+                            "model_params": dict(model_params),
+                            "smote_params": dict(smote_params)
+                            if isinstance(smote_params, dict)
+                            else None,
+                            "objective_values": dict(
+                                candidate.get("objective_values") or {}
+                            ),
+                            "pruning_proxy_score": candidate.get(
+                                "pruning_proxy_score"
+                            ),
+                            "far_gate_pass": candidate.get("far_gate_pass"),
+                            "far_gate_fallback": candidate.get("far_gate_fallback"),
+                            "decision_threshold": candidate.get(
+                                "decision_threshold"
+                            ),
+                            "protocol_results": protocol_results,
+                        }
+                    )
+                subrun_results.append(subrun_result)
+    except Exception as exc:
+        _model_optuna_batch_append_event(
+            progress_state,
+            step_id="run_failed",
+            step_status="failed",
+            message=f"Batch Optuna falló: {exc}",
+            completed_steps=completed_steps,
+            total_steps=total_training_steps,
+            context={
+                "model_name": model_name,
+                "backend": "local",
+                "threshold_objective": threshold_objective,
+                "calibration_method": calibration_method,
+            },
+            partial_rows=progress_rows,
+        )
+        progress_board.update(
+            progress_state,
+            progress_rows,
+            objective_metric=progress_objective_metric,
+        )
+        st.error(
+            "No se pudo entrenar el batch Optuna completo. "
+            f"Se persistieron los eventos y resultados parciales disponibles: {exc}"
+        )
+        return
+
+    _model_optuna_batch_append_event(
+        progress_state,
+        step_id="run_completed",
+        step_status="completed",
+        message="Batch Optuna completado.",
+        completed_steps=total_training_steps,
+        total_steps=total_training_steps,
+        progress_ratio=1.0,
+        context={
+            "model_name": model_name,
+            "backend": "local",
+            "threshold_objective": threshold_objective,
+            "calibration_method": calibration_method,
+        },
+        partial_rows=progress_rows,
+    )
+    progress_board.update(
+        progress_state,
+        progress_rows,
+        objective_metric=progress_objective_metric,
+    )
+
+    results_df = pd.DataFrame(summary_rows)
+    st.subheader("Resultados batch Optuna")
+    st.dataframe(
+        _prepare_dataframe_for_streamlit(results_df),
+        width="stretch",
+    )
+
+    if curve_items:
+        _render_training_curves_section(
+            curve_items,
+            title="Curvas de pérdida",
+        )
+
+    if confusion_rows:
+        with st.expander("Matrices de confusión", expanded=False):
+            for item in confusion_rows:
+                st.caption(
+                    f"{item['subrun_id']} | {item['candidate_label']} | "
+                    f"{item['protocol']}"
+                )
+                matrix = item.get("confusion_matrix")
+                if matrix is None:
+                    st.info("Sin matriz disponible.")
+                    continue
+                st.dataframe(
+                    pd.DataFrame(
+                        matrix,
+                        index=["Actual 0", "Actual 1"],
+                        columns=["Pred 0", "Pred 1"],
+                    ),
+                    width="stretch",
+                )
+
+    history_entry: Optional[Dict[str, object]] = None
+    try:
+        inherited_training_config = dict(inherited)
+        inherited_training_config["robust_folds"] = int(robust_folds)
+        history_entry = _record_optuna_batch_experiment_history(
+            base_df=base_df,
+            features_df=features_df,
+            batch_contract=batch_contract,
+            inherited_training_config=inherited_training_config,
+            subrun_results=subrun_results,
+            threshold_protocols=threshold_protocols,
+            robust_folds=int(robust_folds),
+            model_n_jobs=model_n_jobs,
+        )
+        if history_entry is not None:
+            st.caption("Historial actualizado y modelos guardados.")
+    except Exception as exc:
+        st.warning(f"No se pudo guardar en History: {exc}")
 
 
 def _render_model_tab() -> None:
@@ -14946,6 +21160,22 @@ def _render_model_tab() -> None:
     base_df = add_accident_target(features_df, accidents_df)
     if base_df.empty:
         st.warning("No se pudo preparar el dataset base.")
+        return
+
+    optuna_batch_contract = _apply_feature_source_for_model_tab(
+        model_choice=str(st.session_state.get("model_choice") or "Random Forest"),
+        balance_mode="none",
+        calibration_method="sigmoid",
+        base_df=base_df,
+        features_df=features_df,
+    )
+    if str(st.session_state.get("model_feature_source") or "").strip().lower() == "optuna":
+        _render_model_tab_optuna_batch_mode(
+            base_df=base_df,
+            features_df=features_df,
+            cluster_features_df=cluster_features_df,
+            contract=optuna_batch_contract,
+        )
         return
 
     balanced_df = st.session_state.get("balanced_base_df")
@@ -15172,14 +21402,18 @@ def _render_model_tab() -> None:
         )
     )
 
+    _sanitize_selectbox_state(
+        "model_choice",
+        CRASH_PREDICTION_MODEL_OPTIONS,
+        default="Random Forest",
+    )
     model_choice = st.selectbox(
         "Modelo",
-        ["Random Forest", "Balanced Random Forest", "XGBoost", "SVM", "Neural Network"],
+        list(CRASH_PREDICTION_MODEL_OPTIONS),
         key="model_choice",
         help=(
-            "Modelo a entrenar en la pestaña Modelos. Balanced Random Forest "
-            "requiere imbalanced-learn y compara submuestreo balanceado frente a RF. "
-            "Neural Network usa un MLP con PyTorch (StandardScaler + early stopping)."
+            "Modelo a entrenar en la pestaña Modelos. Neural Network usa un MLP "
+            "con PyTorch (StandardScaler + early stopping)."
         ),
     )
     optuna_balance_mode = _optuna_model_tab_balance_mode(
@@ -15187,20 +21421,13 @@ def _render_model_tab() -> None:
         use_balanced=use_balanced_current,
     )
 
-    _apply_feature_source_for_model_tab(
-        model_choice=model_choice,
-        balance_mode=optuna_balance_mode,
-        calibration_method=calibration_method,
-        base_df=base_df,
-        features_df=features_df,
-    )
     _render_selected_features_info()
 
     random_state = st.number_input(
         "random_state", min_value=0, value=42, step=1, key="model_random_state"
     )
     model_n_jobs: Optional[int] = None
-    if model_choice in {"Random Forest", "Balanced Random Forest"}:
+    if model_choice == "Random Forest":
         model_n_jobs = _render_model_n_jobs_input(
             "Jobs paralelos RF/ranking",
             key="model_rf_parallel_jobs",
@@ -15233,6 +21460,207 @@ def _render_model_tab() -> None:
     )
     if optuna_status:
         st.caption(optuna_status)
+
+    features_path = st.session_state.get("flow_features_path")
+    features_source = st.session_state.get("flow_features_source")
+    feature_key = _feature_selection_key(
+        features_path,
+        features_source,
+        features_df,
+    )
+    selected_features = st.session_state.get("selected_features")
+    numeric_cols = _get_feature_cols(base_df)
+    cluster_cols_set = set(_get_cluster_cols(base_df))
+    if selected_features is None:
+        cols_all = list(numeric_cols)
+    else:
+        cols_all = [col for col in selected_features if col in numeric_cols]
+    cols_base = [col for col in cols_all if col not in cluster_cols_set]
+    cols_cluster_only = [col for col in cols_all if col in cluster_cols_set]
+    current_dataset_fingerprint = _dataset_content_fingerprint(features_df)
+    group_cols_by_feature_set: Dict[str, List[str]] = {}
+    for feature_set_label, group_cols in (
+        ("Base", cols_base),
+        ("Cluster", cols_cluster_only),
+        ("Base + Cluster", cols_all),
+    ):
+        if feature_set_label == "Cluster" and not cols_cluster_only:
+            continue
+        if feature_set_label == "Base + Cluster" and set(cols_all) == set(cols_base):
+            continue
+        group_cols_by_feature_set[feature_set_label] = list(group_cols)
+    feature_set_filter = _resolve_model_optuna_feature_set_filter(
+        current_feature_key=feature_key,
+        current_dataset_fingerprint=current_dataset_fingerprint,
+        available_feature_sets=list(group_cols_by_feature_set.keys()),
+    )
+    # Muestra explícitamente el diagnóstico de drift/mismatch entre la última
+    # corrida de Optuna y el dataset actual. Sin este aviso los params de
+    # Optuna se descartan silenciosamente y el usuario entrenaría con
+    # defaults creyendo que reutiliza la optimización.
+    filter_reason = str(feature_set_filter.get("reason") or "")
+    filter_message = feature_set_filter.get("message")
+    if filter_message:
+        if filter_reason in {"dataset_drift", "feature_key_mismatch", "no_overlap"}:
+            st.warning(str(filter_message))
+        elif filter_reason == "missing_context":
+            st.info(str(filter_message))
+    filtered_feature_sets = set(
+        feature_set_filter.get("allowed_feature_sets") or group_cols_by_feature_set.keys()
+    )
+    model_history_context = _history_context_details(
+        features_df,
+        selected_features=cols_all,
+    )
+    active_best_for_history = _get_active_optuna_best(
+        model_choice=model_choice,
+        calibration_method=calibration_method,
+    )
+    active_optuna_context_key = None
+    if isinstance(active_best_for_history, dict):
+        active_settings = active_best_for_history.get("optuna_settings")
+        active_settings_dict = (
+            active_settings if isinstance(active_settings, dict) else {}
+        )
+        active_optuna_context_key = _history_optuna_context_key(
+            feature_context_key=model_history_context["feature_context_key"],
+            optuna_key=active_best_for_history.get("active_key"),
+            model_name=model_choice,
+            balance_mode=active_best_for_history.get("balance_mode"),
+            calibration_method=active_best_for_history.get("calibration_method"),
+            optuna_objective=(
+                active_settings_dict.get("objective_label")
+                or active_settings_dict.get("objective_metric")
+            ),
+            threshold_objective=(
+                active_settings_dict.get("threshold_objective")
+                or threshold_objective
+            ),
+        )
+    _render_model_history_loader(
+        feature_context_key=str(model_history_context["feature_context_key"]),
+        optuna_context_key=active_optuna_context_key,
+        model_name=model_choice,
+        threshold_objective=threshold_objective,
+        calibration_method=calibration_method,
+        balance_strategy=balance_strategy,
+        protocols=threshold_protocols,
+    )
+    allow_calibration_fallback = bool(
+        st.session_state.get("allow_optuna_calibration_fallback", False)
+    )
+    store = st.session_state.get("optuna_results_store") or {}
+    optuna_matched_feature_sets: List[str] = []
+    if feature_set_filter.get("applies"):
+        for feature_set_label in MODEL_FEATURE_SET_ORDER:
+            group_cols = group_cols_by_feature_set.get(feature_set_label)
+            if not group_cols or feature_set_label not in filtered_feature_sets:
+                continue
+            if _optuna_feature_group_has_matching_result(
+                store=store,
+                feature_key=feature_key,
+                cols=group_cols,
+                model_choice=model_choice,
+                balance_mode=optuna_balance_mode,
+                calibration_method=calibration_method,
+                allow_calibration_fallback=allow_calibration_fallback,
+            ):
+                optuna_matched_feature_sets.append(feature_set_label)
+    pareto_candidates_by_feature_set: Dict[str, Dict[str, object]] = {}
+    for feature_set_label, group_cols in group_cols_by_feature_set.items():
+        if feature_set_filter.get("applies") and feature_set_label not in filtered_feature_sets:
+            continue
+        pareto_info = _lookup_optuna_pareto_candidates(
+            store=store,
+            feature_key=feature_key,
+            cols=group_cols,
+            model_choice=model_choice,
+            balance_mode=optuna_balance_mode,
+            calibration_method=calibration_method,
+            allow_calibration_fallback=allow_calibration_fallback,
+        )
+        if pareto_info is not None:
+            pareto_candidates_by_feature_set[feature_set_label] = pareto_info
+
+    multiobjective_without_front = [
+        feature_set_label
+        for feature_set_label, pareto_info in pareto_candidates_by_feature_set.items()
+        if (
+            pareto_info.get("objective_mode")
+            == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE
+            and not pareto_info.get("candidates")
+        )
+    ]
+    if multiobjective_without_front:
+        st.warning(
+            "Optuna multiobjetivo activo sin `pareto_front` utilizable en: "
+            + ", ".join(multiobjective_without_front)
+            + ". Modelos usará el mejor trial guardado como fallback."
+        )
+
+    available_pareto_feature_sets = [
+        label
+        for label in MODEL_FEATURE_SET_ORDER
+        if label in pareto_candidates_by_feature_set
+        and pareto_candidates_by_feature_set[label].get("candidates")
+    ]
+    selected_pareto_feature_sets: List[str] = []
+    if available_pareto_feature_sets:
+        current_pareto_selection = _normalize_model_feature_set_labels(
+            st.session_state.get("model_pareto_feature_sets")
+        )
+        sanitized_pareto_selection = [
+            label
+            for label in current_pareto_selection
+            if label in available_pareto_feature_sets
+        ]
+        if current_pareto_selection != sanitized_pareto_selection:
+            st.session_state["model_pareto_feature_sets"] = (
+                sanitized_pareto_selection
+            )
+        selected_pareto_feature_sets = st.multiselect(
+            "Conjuntos de features a evaluar desde Pareto",
+            available_pareto_feature_sets,
+            default=_default_model_pareto_feature_sets(
+                available_pareto_feature_sets
+            ),
+            key="model_pareto_feature_sets",
+            help=(
+                "Cuando Optuna fue multiobjetivo, Modelos reentrena todos los "
+                "trials no dominados del frente Pareto para estos conjuntos y "
+                "elige el mejor según el objetivo de threshold actual."
+            ),
+        )
+        selected_pareto_count = sum(
+            len(
+                pareto_candidates_by_feature_set.get(feature_set_label, {}).get(
+                    "candidates", []
+                )
+            )
+            for feature_set_label in selected_pareto_feature_sets
+        )
+        count_parts = [
+            (
+                f"{feature_set_label}="
+                f"{len(pareto_candidates_by_feature_set[feature_set_label]['candidates'])}"
+            )
+            for feature_set_label in selected_pareto_feature_sets
+        ]
+        total_candidate_runs = int(selected_pareto_count * len(threshold_protocols))
+        if selected_pareto_feature_sets:
+            st.info(
+                "Pareto disponible en Modelos. "
+                f"Selección actual: {', '.join(selected_pareto_feature_sets)}. "
+                f"Paretos a evaluar: {selected_pareto_count} "
+                f"({', '.join(count_parts)}). "
+                f"Entrenamientos estimados con {len(threshold_protocols)} protocolo(s): "
+                f"{total_candidate_runs}."
+            )
+            st.caption(
+                "En los grupos seleccionados, los tabs de parámetros quedan como "
+                "referencia: al entrenar se usan todos los candidatos Pareto "
+                "guardados por Optuna."
+            )
 
     param_tabs = st.tabs(
         ["Parámetros Base", "Parámetros Cluster", "Parámetros Base + Cluster"]
@@ -15279,6 +21707,9 @@ def _render_model_tab() -> None:
             "sobre ese split prebalanceado."
         )
 
+    progress: Optional[_StreamlitProgress] = None
+    live_board: Optional[_LiveTrainingCurvesBoard] = None
+
     def _primary_protocol_result(
         results_by_protocol: Dict[str, Dict[str, object]]
     ) -> Dict[str, object]:
@@ -15288,6 +21719,37 @@ def _render_model_tab() -> None:
             return results_by_protocol["conservative"]
         return next(iter(results_by_protocol.values()))
 
+    def _build_live_epoch_callback(
+        *,
+        feature_group_label: str,
+        protocol: str,
+    ) -> Optional[Callable[[Dict[str, object]], None]]:
+        if model_choice != "Neural Network":
+            return None
+        protocol_label = THRESHOLD_PROTOCOL_LABELS.get(
+            str(protocol),
+            str(protocol),
+        )
+
+        def _callback(payload: Dict[str, object]) -> None:
+            if live_board is not None:
+                live_board.update(
+                    feature_group_label,
+                    payload,
+                    protocol_label=protocol_label,
+                )
+            if progress is not None:
+                current_epoch = int(
+                    payload.get("epochs_ran") or payload.get("epoch") or 0
+                )
+                max_epochs = int(payload.get("max_epochs") or 0)
+                progress.set_description(
+                    f"Entrenando modelo {feature_group_label} | "
+                    f"{protocol_label} | epoch {current_epoch}/{max_epochs}"
+                )
+
+        return _callback
+
     def _train_selected_protocols(
         *,
         use_split: bool,
@@ -15296,25 +21758,32 @@ def _render_model_tab() -> None:
         test_df: Optional[pd.DataFrame] = None,
         feature_cols: List[str],
         model_params: Dict[str, object],
+        feature_group_label: str,
+        smote_params: Optional[Dict[str, object]] = None,
     ) -> Dict[str, Dict[str, object]]:
         by_protocol: Dict[str, Dict[str, object]] = {}
-        effective_balance_strategy = (
-            "none" if (use_balanced and use_split) else balance_strategy
-        )
         for protocol in threshold_protocols:
-            common_kwargs = {
-                "val_size": float(val_size),
-                "far_target": float(far_target),
-                "random_state": int(random_state),
-                "threshold_protocol": protocol,
-                "threshold_objective": threshold_objective,
-                "calibration_method": str(calibration_method),
-                "alerts_per_day": float(alerts_per_day),
-                "fn_cost": float(fn_cost),
-                "fp_cost": float(fp_cost),
-                "robust_folds": int(robust_folds),
-                "balance_strategy": effective_balance_strategy,
-            }
+            epoch_callback = _build_live_epoch_callback(
+                feature_group_label=feature_group_label,
+                protocol=str(protocol),
+            )
+            common_kwargs = _build_model_tab_training_kwargs(
+                val_size=float(val_size),
+                far_target=float(far_target),
+                random_state=int(random_state),
+                threshold_protocol=protocol,
+                threshold_objective=threshold_objective,
+                calibration_method=str(calibration_method),
+                alerts_per_day=float(alerts_per_day),
+                fn_cost=float(fn_cost),
+                fp_cost=float(fp_cost),
+                robust_folds=int(robust_folds),
+                balance_strategy=balance_strategy,
+                use_balanced=use_balanced,
+                use_split=use_split,
+                epoch_callback=epoch_callback,
+                smote_params=smote_params,
+            )
             if use_split:
                 if train_df is None or test_df is None:
                     raise ValueError("Split train/test requerido.")
@@ -15376,6 +21845,7 @@ def _render_model_tab() -> None:
         label: str,
         feature_group: str,
         model_params: Dict[str, object],
+        smote_params: Optional[Dict[str, object]] = None,
         use_split: bool,
         df: Optional[pd.DataFrame] = None,
         train_df: Optional[pd.DataFrame] = None,
@@ -15396,12 +21866,183 @@ def _render_model_tab() -> None:
             test_df=test_df,
             feature_cols=feature_cols,
             model_params=model_params,
+            feature_group_label=label,
+            smote_params=smote_params,
         )
         return (
             results_by_protocol,
             _primary_protocol_result(results_by_protocol),
             feature_cols,
         )
+
+    def _resolve_explicit_feature_cols(
+        df: pd.DataFrame,
+        *,
+        feature_cols: List[str],
+        label: str,
+        candidate_label: Optional[str] = None,
+    ) -> List[str]:
+        numeric_cols_set = set(_get_feature_cols(df))
+        valid_cols = [col for col in feature_cols if col in numeric_cols_set]
+        missing_cols = [col for col in feature_cols if col not in numeric_cols_set]
+        if missing_cols:
+            prefix = (
+                f"{label} | {candidate_label}"
+                if candidate_label
+                else str(label)
+            )
+            preview = ", ".join(missing_cols[:5])
+            if len(missing_cols) > 5:
+                preview = f"{preview}, … (+{len(missing_cols) - 5})"
+            st.warning(
+                f"{prefix}: se ignoraron variables ausentes del dataset actual: "
+                f"{preview}"
+            )
+        if not valid_cols:
+            raise ValueError(
+                f"No hay variables válidas para {label}"
+                + (
+                    f" ({candidate_label})"
+                    if candidate_label
+                    else ""
+                )
+                + "."
+            )
+        return list(valid_cols)
+
+    def _train_explicit_feature_cols_protocols(
+        *,
+        label: str,
+        feature_cols: List[str],
+        model_params: Dict[str, object],
+        smote_params: Optional[Dict[str, object]] = None,
+        use_split: bool,
+        df: Optional[pd.DataFrame] = None,
+        train_df: Optional[pd.DataFrame] = None,
+        test_df: Optional[pd.DataFrame] = None,
+        candidate_label: Optional[str] = None,
+    ) -> Tuple[Dict[str, Dict[str, object]], Dict[str, object], List[str]]:
+        feature_source_df = train_df if use_split else df
+        if feature_source_df is None:
+            raise ValueError(f"Dataset requerido para {label}.")
+        resolved_feature_cols = _resolve_explicit_feature_cols(
+            feature_source_df,
+            feature_cols=feature_cols,
+            label=label,
+            candidate_label=candidate_label,
+        )
+        feature_group_label = (
+            f"{label} | {candidate_label}"
+            if candidate_label
+            else label
+        )
+        results_by_protocol = _train_selected_protocols(
+            use_split=use_split,
+            df=df,
+            train_df=train_df,
+            test_df=test_df,
+            feature_cols=resolved_feature_cols,
+            model_params=model_params,
+            feature_group_label=feature_group_label,
+            smote_params=smote_params,
+        )
+        return (
+            results_by_protocol,
+            _primary_protocol_result(results_by_protocol),
+            resolved_feature_cols,
+        )
+
+    def _evaluate_pareto_feature_group(
+        *,
+        label: str,
+        pareto_candidates: List[Dict[str, object]],
+        use_split: bool,
+        df: Optional[pd.DataFrame] = None,
+        train_df: Optional[pd.DataFrame] = None,
+        test_df: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, object]:
+        if not pareto_candidates:
+            raise ValueError(f"No hay candidatos Pareto para {label}.")
+        evaluations: List[Dict[str, object]] = []
+        best_item: Optional[Dict[str, object]] = None
+        best_sort_key = (float("-inf"), float("-inf"), -1)
+        total_candidates = len(pareto_candidates)
+        for candidate_index, candidate in enumerate(pareto_candidates, start=1):
+            candidate_label = (
+                f"Pareto {candidate_index}/{total_candidates}"
+            )
+            candidate_model_params = dict(candidate.get("model_params") or {})
+            if model_n_jobs is not None and model_choice in {
+                "Random Forest",
+                "XGBoost",
+            }:
+                candidate_model_params["n_jobs"] = int(model_n_jobs)
+            (
+                candidate_results_by_protocol,
+                candidate_primary_result,
+                candidate_feature_cols,
+            ) = _train_explicit_feature_cols_protocols(
+                label=label,
+                feature_cols=list(candidate.get("feature_cols") or []),
+                model_params=candidate_model_params,
+                smote_params=candidate.get("smote_params")
+                if isinstance(candidate.get("smote_params"), dict)
+                else None,
+                use_split=use_split,
+                df=df,
+                train_df=train_df,
+                test_df=test_df,
+                candidate_label=candidate_label,
+            )
+            selection_metric = _model_selection_metric_from_result(
+                candidate_primary_result,
+                threshold_objective=threshold_objective,
+            )
+            sort_key = (
+                float(selection_metric.get("score", float("-inf"))),
+                float(candidate.get("pruning_proxy_score") or float("-inf")),
+                1 if bool(candidate.get("selected_trial")) else 0,
+            )
+            evaluation = {
+                "feature_set": label,
+                "candidate_index": int(candidate_index),
+                "trial_number": candidate.get("trial_number"),
+                "candidate_label": candidate_label,
+                "results_by_protocol": candidate_results_by_protocol,
+                "primary_result": candidate_primary_result,
+                "feature_cols": candidate_feature_cols,
+                "model_params": candidate_model_params,
+                "smote_params": (
+                    dict(candidate.get("smote_params"))
+                    if isinstance(candidate.get("smote_params"), dict)
+                    else None
+                ),
+                "selection_metric": selection_metric,
+                "objective_values": dict(candidate.get("objective_values") or {}),
+                "pruning_proxy_score": candidate.get("pruning_proxy_score"),
+                "far_gate_pass": candidate.get("far_gate_pass"),
+                "decision_threshold": candidate.get("decision_threshold"),
+                "selected_trial": bool(candidate.get("selected_trial")),
+                "top_k": candidate.get("top_k"),
+            }
+            evaluations.append(evaluation)
+            if best_item is None or sort_key > best_sort_key:
+                best_item = evaluation
+                best_sort_key = sort_key
+        if best_item is None:
+            raise ValueError(f"No se pudo evaluar el Pareto para {label}.")
+        for evaluation in evaluations:
+            evaluation["selected_for_feature_set"] = (
+                evaluation is best_item
+            )
+        return {
+            "evaluations": evaluations,
+            "results_by_protocol": best_item["results_by_protocol"],
+            "primary_result": best_item["primary_result"],
+            "feature_cols": best_item["feature_cols"],
+            "model_params": best_item["model_params"],
+            "smote_params": best_item.get("smote_params"),
+        }
 
     if st.button("Entrenar modelos"):
         use_balanced = bool(st.session_state.get("use_balanced_base", False))
@@ -15416,21 +22057,91 @@ def _render_model_tab() -> None:
             _get_cluster_cols(st.session_state.get("balanced_cluster_df") if st.session_state.get("balanced_cluster_df") is not None else pd.DataFrame())
         )
         has_cluster = has_cluster_features or cluster_cols_in_balanced
+        default_feature_sets_to_train = ["Base"]
+        if has_cluster:
+            if cols_cluster_only:
+                default_feature_sets_to_train.append("Cluster")
+            if set(cols_all) != set(cols_base):
+                default_feature_sets_to_train.append("Base + Cluster")
+        if feature_set_filter.get("applies"):
+            default_feature_sets_to_train = list(optuna_matched_feature_sets)
+        if available_pareto_feature_sets:
+            feature_sets_to_train = list(selected_pareto_feature_sets)
+            if not feature_sets_to_train:
+                st.warning(
+                    "Seleccione al menos un conjunto de features del Pareto para entrenar."
+                )
+                return
+        else:
+            feature_sets_to_train = list(default_feature_sets_to_train)
+        if feature_set_filter.get("applies") and not feature_sets_to_train:
+            st.warning(
+                "La última corrida de Optuna no dejó grupos entrenables para la "
+                "configuración actual de Modelos."
+            )
+            return
+        should_train_base = "Base" in feature_sets_to_train
+        should_train_cluster_only = "Cluster" in feature_sets_to_train
+        should_train_base_cluster = "Base + Cluster" in feature_sets_to_train
         base_feature_cols_used: List[str] = []
         cluster_only_feature_cols_used: Optional[List[str]] = None
         cluster_feature_cols_used: Optional[List[str]] = None
-        total_steps = 2 + (2 if has_cluster else 0)
+        total_steps = 1
+        if should_train_base:
+            total_steps += max(
+                1,
+                len(
+                    pareto_candidates_by_feature_set.get("Base", {}).get(
+                        "candidates", []
+                    )
+                )
+                if "Base" in selected_pareto_feature_sets
+                else 1,
+            )
+        if has_cluster and should_train_cluster_only:
+            total_steps += max(
+                1,
+                len(
+                    pareto_candidates_by_feature_set.get("Cluster", {}).get(
+                        "candidates", []
+                    )
+                )
+                if "Cluster" in selected_pareto_feature_sets
+                else 1,
+            )
+        if has_cluster and should_train_base_cluster:
+            total_steps += max(
+                1,
+                len(
+                    pareto_candidates_by_feature_set.get("Base + Cluster", {}).get(
+                        "candidates", []
+                    )
+                )
+                if "Base + Cluster" in selected_pareto_feature_sets
+                else 1,
+            )
         progress = _StreamlitProgress(total=total_steps)
+        if model_choice == "Neural Network":
+            live_labels = list(feature_sets_to_train)
+            live_board = _LiveTrainingCurvesBoard(live_labels)
+        else:
+            live_board = None
         with st.spinner("Entrenando modelos..."):
             progress.set_description("Preparando datasets")
             progress.update(1)
 
+            pareto_evaluations_by_feature_set: Dict[str, List[Dict[str, object]]] = {}
             base_result: Optional[Dict[str, object]] = None
             base_results_by_protocol: Dict[str, Dict[str, object]] = {}
+            base_model_params_used: Dict[str, object] = dict(model_params_base)
             if use_balanced and balanced_df is None:
                 st.warning("No hay dataset balanceado. Usando original.")
 
-            if use_balanced and st.session_state.get("balanced_base_df") is not None:
+            if (
+                should_train_base
+                and use_balanced
+                and st.session_state.get("balanced_base_df") is not None
+            ):
                 split = _split_balanced_dataset(st.session_state["balanced_base_df"])
                 if split is None:
                     st.warning(
@@ -15443,25 +22154,54 @@ def _render_model_tab() -> None:
                         f"Base (train/test): {len(train_df):,} / {len(test_df):,}"
                     )
                     try:
-                        progress.set_description("Entrenando modelo Base")
-                        (
-                            base_results_by_protocol,
-                            base_result,
-                            base_feature_cols_used,
-                        ) = _train_feature_group_protocols(
-                            label="Base",
-                            feature_group="base",
-                            model_params=model_params_base,
-                            use_split=True,
-                            train_df=train_df,
-                            test_df=test_df,
-                        )
+                        if "Base" in selected_pareto_feature_sets:
+                            progress.set_description(
+                                "Evaluando Pareto | Base"
+                            )
+                            base_pareto = _evaluate_pareto_feature_group(
+                                label="Base",
+                                pareto_candidates=list(
+                                    pareto_candidates_by_feature_set.get(
+                                        "Base", {}
+                                    ).get("candidates", [])
+                                ),
+                                use_split=True,
+                                train_df=train_df,
+                                test_df=test_df,
+                            )
+                            base_results_by_protocol = base_pareto[
+                                "results_by_protocol"
+                            ]
+                            base_result = base_pareto["primary_result"]
+                            base_feature_cols_used = list(
+                                base_pareto["feature_cols"]
+                            )
+                            base_model_params_used = dict(
+                                base_pareto["model_params"]
+                            )
+                            pareto_evaluations_by_feature_set["Base"] = list(
+                                base_pareto["evaluations"]
+                            )
+                        else:
+                            progress.set_description("Entrenando modelo Base")
+                            (
+                                base_results_by_protocol,
+                                base_result,
+                                base_feature_cols_used,
+                            ) = _train_feature_group_protocols(
+                                label="Base",
+                                feature_group="base",
+                                model_params=model_params_base,
+                                use_split=True,
+                                train_df=train_df,
+                                test_df=test_df,
+                            )
                     except Exception as exc:
                         progress.close()
                         st.error(f"No se pudo entrenar el modelo base: {exc}")
                         return
 
-            if base_result is None:
+            if should_train_base and base_result is None:
                 pos_count = int(base_df["target"].sum())
                 st.caption(
                     f"Filas: {len(base_df):,} | Accidentes: {pos_count:,}"
@@ -15471,34 +22211,81 @@ def _render_model_tab() -> None:
                     st.warning("No se encontraron accidentes alineados con las variables.")
                     return
                 try:
-                    progress.set_description("Entrenando modelo Base")
-                    (
-                        base_results_by_protocol,
-                        base_result,
-                        base_feature_cols_used,
-                    ) = _train_feature_group_protocols(
-                        label="Base",
-                        feature_group="base",
-                        model_params=model_params_base,
-                        use_split=False,
-                        df=base_df,
-                    )
+                    if "Base" in selected_pareto_feature_sets:
+                        progress.set_description("Evaluando Pareto | Base")
+                        base_pareto = _evaluate_pareto_feature_group(
+                            label="Base",
+                            pareto_candidates=list(
+                                pareto_candidates_by_feature_set.get(
+                                    "Base", {}
+                                ).get("candidates", [])
+                            ),
+                            use_split=False,
+                            df=base_df,
+                        )
+                        base_results_by_protocol = base_pareto[
+                            "results_by_protocol"
+                        ]
+                        base_result = base_pareto["primary_result"]
+                        base_feature_cols_used = list(base_pareto["feature_cols"])
+                        base_model_params_used = dict(
+                            base_pareto["model_params"]
+                        )
+                        pareto_evaluations_by_feature_set["Base"] = list(
+                            base_pareto["evaluations"]
+                        )
+                    else:
+                        progress.set_description("Entrenando modelo Base")
+                        (
+                            base_results_by_protocol,
+                            base_result,
+                            base_feature_cols_used,
+                        ) = _train_feature_group_protocols(
+                            label="Base",
+                            feature_group="base",
+                            model_params=model_params_base,
+                            use_split=False,
+                            df=base_df,
+                        )
                 except Exception as exc:
                     progress.close()
                     st.error(f"No se pudo entrenar el modelo base: {exc}")
                     return
 
-            progress.update(1)
-            results = {
-                ("Base", protocol): result["metrics"]
-                for protocol, result in base_results_by_protocol.items()
-            }
+            if should_train_base:
+                progress.update(
+                    max(
+                        1,
+                        len(
+                            pareto_candidates_by_feature_set.get("Base", {}).get(
+                                "candidates", []
+                            )
+                        )
+                        if "Base" in selected_pareto_feature_sets
+                        else 1,
+                    )
+                )
+            results = {}
+            if base_result is not None:
+                results.update(
+                    {
+                        ("Base", protocol): result["metrics"]
+                        for protocol, result in base_results_by_protocol.items()
+                    }
+                )
 
             cluster_only_result: Optional[Dict[str, object]] = None
             cluster_only_results_by_protocol: Dict[str, Dict[str, object]] = {}
+            cluster_only_model_params_used: Dict[str, object] = dict(
+                model_params_cluster_only
+            )
             cluster_result: Optional[Dict[str, object]] = None
             cluster_results_by_protocol: Dict[str, Dict[str, object]] = {}
-            if has_cluster:
+            cluster_model_params_used: Dict[str, object] = dict(
+                model_params_cluster
+            )
+            pareto_summary_rows: List[Dict[str, object]] = []
+            if has_cluster and (should_train_cluster_only or should_train_base_cluster):
                 balanced_cluster_only_df = st.session_state.get(
                     "balanced_cluster_only_df"
                 )
@@ -15557,98 +22344,260 @@ def _render_model_tab() -> None:
                     )
 
                 # Entrenamiento modelo Cluster-only
-                if cluster_only_split is not None:
+                if should_train_cluster_only and cluster_only_split is not None:
                     train_co, test_co = cluster_only_split
                     st.caption(
                         f"Cluster (train/test): {len(train_co):,} / {len(test_co):,}"
                     )
                     try:
-                        progress.set_description("Entrenando modelo Cluster")
-                        (
-                            cluster_only_results_by_protocol,
-                            cluster_only_result,
-                            cluster_only_feature_cols_used,
-                        ) = _train_feature_group_protocols(
-                            label="Cluster",
-                            feature_group="cluster",
-                            model_params=model_params_cluster_only,
-                            use_split=True,
-                            train_df=train_co,
-                            test_df=test_co,
-                        )
+                        if "Cluster" in selected_pareto_feature_sets:
+                            progress.set_description(
+                                "Evaluando Pareto | Cluster"
+                            )
+                            cluster_only_pareto = _evaluate_pareto_feature_group(
+                                label="Cluster",
+                                pareto_candidates=list(
+                                    pareto_candidates_by_feature_set.get(
+                                        "Cluster", {}
+                                    ).get("candidates", [])
+                                ),
+                                use_split=True,
+                                train_df=train_co,
+                                test_df=test_co,
+                            )
+                            cluster_only_results_by_protocol = cluster_only_pareto[
+                                "results_by_protocol"
+                            ]
+                            cluster_only_result = cluster_only_pareto[
+                                "primary_result"
+                            ]
+                            cluster_only_feature_cols_used = list(
+                                cluster_only_pareto["feature_cols"]
+                            )
+                            cluster_only_model_params_used = dict(
+                                cluster_only_pareto["model_params"]
+                            )
+                            pareto_evaluations_by_feature_set["Cluster"] = list(
+                                cluster_only_pareto["evaluations"]
+                            )
+                        else:
+                            progress.set_description("Entrenando modelo Cluster")
+                            (
+                                cluster_only_results_by_protocol,
+                                cluster_only_result,
+                                cluster_only_feature_cols_used,
+                            ) = _train_feature_group_protocols(
+                                label="Cluster",
+                                feature_group="cluster",
+                                model_params=model_params_cluster_only,
+                                use_split=True,
+                                train_df=train_co,
+                                test_df=test_co,
+                            )
                     except Exception as exc:
                         progress.close()
                         st.error(f"No se pudo entrenar el modelo Cluster: {exc}")
                         return
-                    progress.update(1)
-                elif cluster_train_df is not None:
+                    progress.update(
+                        max(
+                            1,
+                            len(
+                                pareto_candidates_by_feature_set.get(
+                                    "Cluster", {}
+                                ).get("candidates", [])
+                            )
+                            if "Cluster" in selected_pareto_feature_sets
+                            else 1,
+                        )
+                    )
+                elif should_train_cluster_only and cluster_train_df is not None:
                     try:
-                        progress.set_description("Entrenando modelo Cluster")
-                        (
-                            cluster_only_results_by_protocol,
-                            cluster_only_result,
-                            cluster_only_feature_cols_used,
-                        ) = _train_feature_group_protocols(
-                            label="Cluster",
-                            feature_group="cluster",
-                            model_params=model_params_cluster_only,
-                            use_split=False,
-                            df=cluster_train_df,
-                        )
+                        if "Cluster" in selected_pareto_feature_sets:
+                            progress.set_description(
+                                "Evaluando Pareto | Cluster"
+                            )
+                            cluster_only_pareto = _evaluate_pareto_feature_group(
+                                label="Cluster",
+                                pareto_candidates=list(
+                                    pareto_candidates_by_feature_set.get(
+                                        "Cluster", {}
+                                    ).get("candidates", [])
+                                ),
+                                use_split=False,
+                                df=cluster_train_df,
+                            )
+                            cluster_only_results_by_protocol = cluster_only_pareto[
+                                "results_by_protocol"
+                            ]
+                            cluster_only_result = cluster_only_pareto[
+                                "primary_result"
+                            ]
+                            cluster_only_feature_cols_used = list(
+                                cluster_only_pareto["feature_cols"]
+                            )
+                            cluster_only_model_params_used = dict(
+                                cluster_only_pareto["model_params"]
+                            )
+                            pareto_evaluations_by_feature_set["Cluster"] = list(
+                                cluster_only_pareto["evaluations"]
+                            )
+                        else:
+                            progress.set_description("Entrenando modelo Cluster")
+                            (
+                                cluster_only_results_by_protocol,
+                                cluster_only_result,
+                                cluster_only_feature_cols_used,
+                            ) = _train_feature_group_protocols(
+                                label="Cluster",
+                                feature_group="cluster",
+                                model_params=model_params_cluster_only,
+                                use_split=False,
+                                df=cluster_train_df,
+                            )
                     except Exception as exc:
                         progress.close()
                         st.error(f"No se pudo entrenar el modelo Cluster: {exc}")
                         return
-                    progress.update(1)
+                    progress.update(
+                        max(
+                            1,
+                            len(
+                                pareto_candidates_by_feature_set.get(
+                                    "Cluster", {}
+                                ).get("candidates", [])
+                            )
+                            if "Cluster" in selected_pareto_feature_sets
+                            else 1,
+                        )
+                    )
 
                 # Entrenamiento modelo Base + Cluster
-                if cluster_split is not None:
+                if should_train_base_cluster and cluster_split is not None:
                     train_df, test_df = cluster_split
                     st.caption(
                         f"Base + Cluster (train/test): {len(train_df):,} / {len(test_df):,}"
                     )
                     try:
-                        progress.set_description("Entrenando modelo Base + Cluster")
-                        (
-                            cluster_results_by_protocol,
-                            cluster_result,
-                            cluster_feature_cols_used,
-                        ) = _train_feature_group_protocols(
-                            label="Base + Cluster",
-                            feature_group="base_cluster",
-                            model_params=model_params_cluster,
-                            use_split=True,
-                            train_df=train_df,
-                            test_df=test_df,
-                        )
+                        if "Base + Cluster" in selected_pareto_feature_sets:
+                            progress.set_description(
+                                "Evaluando Pareto | Base + Cluster"
+                            )
+                            cluster_pareto = _evaluate_pareto_feature_group(
+                                label="Base + Cluster",
+                                pareto_candidates=list(
+                                    pareto_candidates_by_feature_set.get(
+                                        "Base + Cluster", {}
+                                    ).get("candidates", [])
+                                ),
+                                use_split=True,
+                                train_df=train_df,
+                                test_df=test_df,
+                            )
+                            cluster_results_by_protocol = cluster_pareto[
+                                "results_by_protocol"
+                            ]
+                            cluster_result = cluster_pareto["primary_result"]
+                            cluster_feature_cols_used = list(
+                                cluster_pareto["feature_cols"]
+                            )
+                            cluster_model_params_used = dict(
+                                cluster_pareto["model_params"]
+                            )
+                            pareto_evaluations_by_feature_set[
+                                "Base + Cluster"
+                            ] = list(cluster_pareto["evaluations"])
+                        else:
+                            progress.set_description("Entrenando modelo Base + Cluster")
+                            (
+                                cluster_results_by_protocol,
+                                cluster_result,
+                                cluster_feature_cols_used,
+                            ) = _train_feature_group_protocols(
+                                label="Base + Cluster",
+                                feature_group="base_cluster",
+                                model_params=model_params_cluster,
+                                use_split=True,
+                                train_df=train_df,
+                                test_df=test_df,
+                            )
                     except Exception as exc:
                         progress.close()
                         st.error(
                             f"No se pudo entrenar el modelo Base + Cluster: {exc}"
                         )
                         return
-                    progress.update(1)
-                elif cluster_train_df is not None:
+                    progress.update(
+                        max(
+                            1,
+                            len(
+                                pareto_candidates_by_feature_set.get(
+                                    "Base + Cluster", {}
+                                ).get("candidates", [])
+                            )
+                            if "Base + Cluster" in selected_pareto_feature_sets
+                            else 1,
+                        )
+                    )
+                elif should_train_base_cluster and cluster_train_df is not None:
                     try:
-                        progress.set_description("Entrenando modelo Base + Cluster")
-                        (
-                            cluster_results_by_protocol,
-                            cluster_result,
-                            cluster_feature_cols_used,
-                        ) = _train_feature_group_protocols(
-                            label="Base + Cluster",
-                            feature_group="base_cluster",
-                            model_params=model_params_cluster,
-                            use_split=False,
-                            df=cluster_train_df,
-                        )
+                        if "Base + Cluster" in selected_pareto_feature_sets:
+                            progress.set_description(
+                                "Evaluando Pareto | Base + Cluster"
+                            )
+                            cluster_pareto = _evaluate_pareto_feature_group(
+                                label="Base + Cluster",
+                                pareto_candidates=list(
+                                    pareto_candidates_by_feature_set.get(
+                                        "Base + Cluster", {}
+                                    ).get("candidates", [])
+                                ),
+                                use_split=False,
+                                df=cluster_train_df,
+                            )
+                            cluster_results_by_protocol = cluster_pareto[
+                                "results_by_protocol"
+                            ]
+                            cluster_result = cluster_pareto["primary_result"]
+                            cluster_feature_cols_used = list(
+                                cluster_pareto["feature_cols"]
+                            )
+                            cluster_model_params_used = dict(
+                                cluster_pareto["model_params"]
+                            )
+                            pareto_evaluations_by_feature_set[
+                                "Base + Cluster"
+                            ] = list(cluster_pareto["evaluations"])
+                        else:
+                            progress.set_description("Entrenando modelo Base + Cluster")
+                            (
+                                cluster_results_by_protocol,
+                                cluster_result,
+                                cluster_feature_cols_used,
+                            ) = _train_feature_group_protocols(
+                                label="Base + Cluster",
+                                feature_group="base_cluster",
+                                model_params=model_params_cluster,
+                                use_split=False,
+                                df=cluster_train_df,
+                            )
                     except Exception as exc:
                         progress.close()
                         st.error(
                             f"No se pudo entrenar el modelo Base + Cluster: {exc}"
                         )
                         return
-                    progress.update(1)
+                    progress.update(
+                        max(
+                            1,
+                            len(
+                                pareto_candidates_by_feature_set.get(
+                                    "Base + Cluster", {}
+                                ).get("candidates", [])
+                            )
+                            if "Base + Cluster" in selected_pareto_feature_sets
+                            else 1,
+                        )
+                    )
 
                 if cluster_only_result is not None:
                     for protocol, result in cluster_only_results_by_protocol.items():
@@ -15661,10 +22610,59 @@ def _render_model_tab() -> None:
             if isinstance(metrics_df.index, pd.MultiIndex):
                 metrics_df.index = metrics_df.index.set_names(
                     ["feature_set", "threshold_protocol"]
-            )
+                )
+            if selected_pareto_feature_sets:
+                pareto_rows: List[Dict[str, object]] = []
+                for feature_set_label in selected_pareto_feature_sets:
+                    evaluations = list(
+                        pareto_evaluations_by_feature_set.get(feature_set_label) or []
+                    )
+                    if not evaluations:
+                        continue
+                    candidate_count = len(evaluations)
+                    for evaluation in evaluations:
+                        metrics = evaluation.get("primary_result", {}).get("metrics")
+                        metrics_dict = metrics if isinstance(metrics, dict) else {}
+                        selection_metric = evaluation.get("selection_metric") or {}
+                        row = {
+                            "feature_set": feature_set_label,
+                            "pareto_total": int(candidate_count),
+                            "pareto_idx": int(evaluation.get("candidate_index") or 0),
+                            "trial_number": evaluation.get("trial_number"),
+                            "selected_modelos": bool(
+                                evaluation.get("selected_for_feature_set")
+                            ),
+                            "selected_optuna": bool(evaluation.get("selected_trial")),
+                            "top_k": evaluation.get("top_k"),
+                            "n_features": len(evaluation.get("feature_cols") or []),
+                            "vector_pareto": _format_optuna_multiobjective_values(
+                                dict(evaluation.get("objective_values") or {})
+                            ),
+                            "proxy_pareto": evaluation.get("pruning_proxy_score"),
+                            "far_gate_pass": evaluation.get("far_gate_pass"),
+                            "metrica_seleccion": selection_metric.get("metric_label"),
+                            "valor_seleccion": selection_metric.get("value"),
+                            "mcc": metrics_dict.get("mcc"),
+                            "pr_auc": metrics_dict.get("pr_auc"),
+                            "brier_score": metrics_dict.get("brier_score"),
+                            "balanced_f1": metrics_dict.get("balanced_f1"),
+                            "f1": metrics_dict.get("f1"),
+                            "far": metrics_dict.get("far"),
+                            "recall_at_alerts_per_day": metrics_dict.get(
+                                "recall_at_alerts_per_day"
+                            ),
+                            "operational_cost": metrics_dict.get("operational_cost"),
+                        }
+                        pareto_rows.append(row)
+                if pareto_rows:
+                    st.subheader("Evaluación Pareto")
+                    st.dataframe(pd.DataFrame(pareto_rows), width="stretch")
             st.subheader("Resultados")
             st.dataframe(metrics_df, width="stretch")
-            if cluster_only_results_by_protocol or cluster_results_by_protocol:
+            if (
+                base_result is not None
+                and (cluster_only_results_by_protocol or cluster_results_by_protocol)
+            ):
                 delta_rows: Dict[Tuple[str, str], pd.Series] = {}
                 for protocol in threshold_protocols:
                     base_key = ("Base", protocol)
@@ -15692,40 +22690,72 @@ def _render_model_tab() -> None:
                     )
                 st.subheader("Delta vs Base")
                 st.dataframe(delta_df, width="stretch")
-            st.subheader("Matriz de confusion")
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                st.caption("Base (protocolo principal)")
-                base_cm = base_result.get("confusion_matrix")
-                if base_cm is not None:
-                    base_cm_df = pd.DataFrame(
-                        base_cm,
-                        index=["Actual 0", "Actual 1"],
-                        columns=["Pred 0", "Pred 1"],
+            if model_choice == "Neural Network":
+                curve_items: List[Tuple[str, object, Optional[str]]] = []
+                if base_result is not None:
+                    curve_items.append(
+                        (
+                            "Base",
+                            base_result.get("training_curves"),
+                            THRESHOLD_PROTOCOL_LABELS.get(
+                                str(base_result.get("threshold_protocol") or ""),
+                                str(base_result.get("threshold_protocol") or ""),
+                            ),
+                        )
                     )
-                    st.dataframe(base_cm_df, width="stretch")
-            with col_b:
                 if cluster_only_result is not None:
-                    st.caption("Cluster (protocolo principal)")
-                    cluster_only_cm = cluster_only_result.get("confusion_matrix")
-                    if cluster_only_cm is not None:
-                        cluster_only_cm_df = pd.DataFrame(
-                            cluster_only_cm,
-                            index=["Actual 0", "Actual 1"],
-                            columns=["Pred 0", "Pred 1"],
+                    curve_items.append(
+                        (
+                            "Cluster",
+                            cluster_only_result.get("training_curves"),
+                            THRESHOLD_PROTOCOL_LABELS.get(
+                                str(cluster_only_result.get("threshold_protocol") or ""),
+                                str(cluster_only_result.get("threshold_protocol") or ""),
+                            ),
                         )
-                        st.dataframe(cluster_only_cm_df, width="stretch")
-            with col_c:
+                    )
                 if cluster_result is not None:
-                    st.caption("Base + Cluster (protocolo principal)")
-                    cluster_cm = cluster_result.get("confusion_matrix")
-                    if cluster_cm is not None:
-                        cluster_cm_df = pd.DataFrame(
-                            cluster_cm,
-                            index=["Actual 0", "Actual 1"],
-                            columns=["Pred 0", "Pred 1"],
+                    curve_items.append(
+                        (
+                            "Base + Cluster",
+                            cluster_result.get("training_curves"),
+                            THRESHOLD_PROTOCOL_LABELS.get(
+                                str(cluster_result.get("threshold_protocol") or ""),
+                                str(cluster_result.get("threshold_protocol") or ""),
+                            ),
                         )
-                        st.dataframe(cluster_cm_df, width="stretch")
+                    )
+                if curve_items:
+                    _render_training_curves_section(
+                        curve_items,
+                        title="Curvas de pérdida",
+                    )
+            st.subheader("Matriz de confusion")
+            confusion_items = [
+                ("Base", base_result),
+                ("Cluster", cluster_only_result),
+                ("Base + Cluster", cluster_result),
+            ]
+            confusion_items = [
+                (label, result)
+                for label, result in confusion_items
+                if result is not None
+            ]
+            if confusion_items:
+                columns = st.columns(len(confusion_items))
+                for column, (label, result) in zip(columns, confusion_items):
+                    with column:
+                        st.caption(f"{label} (protocolo principal)")
+                        matrix = result.get("confusion_matrix")
+                        if matrix is not None:
+                            st.dataframe(
+                                pd.DataFrame(
+                                    matrix,
+                                    index=["Actual 0", "Actual 1"],
+                                    columns=["Pred 0", "Pred 1"],
+                                ),
+                                width="stretch",
+                            )
             if len(threshold_protocols) > 1:
                 with st.expander("Matrices por protocolo", expanded=False):
                     for label, protocol_results in [
@@ -15746,43 +22776,48 @@ def _render_model_tab() -> None:
                                     width="stretch",
                                 )
             history_entry: Optional[Dict[str, object]] = None
-            try:
-                history_entry = _record_experiment_history(
-                    base_df=base_df,
-                    features_df=features_df,
-                    balanced_df=balanced_df,
-                    base_feature_cols=base_feature_cols_used,
-                    base_result=base_result,
-                    cluster_only_feature_cols=cluster_only_feature_cols_used,
-                    cluster_only_result=cluster_only_result,
-                    cluster_feature_cols=cluster_feature_cols_used,
-                    cluster_result=cluster_result,
-                    model_choice=model_choice,
-                    model_params_base=model_params_base,
-                    model_params_cluster_only=model_params_cluster_only,
-                    model_params_cluster=model_params_cluster,
-                    random_state=int(random_state),
-                    test_size=float(test_size),
-                    val_size=float(val_size),
-                    far_target=float(far_target),
-                    use_balanced=bool(use_balanced),
-                    protocol_results={
-                        "Base": base_results_by_protocol,
-                        "Cluster": cluster_only_results_by_protocol,
-                        "Base + Cluster": cluster_results_by_protocol,
-                    },
-                    threshold_protocols=list(threshold_protocols),
-                    threshold_objective=threshold_objective,
-                    calibration_method=str(calibration_method),
-                    alerts_per_day=float(alerts_per_day),
-                    fn_cost=float(fn_cost),
-                    fp_cost=float(fp_cost),
-                    robust_folds=int(robust_folds),
-                    balance_strategy=balance_strategy,
+            if base_result is not None:
+                try:
+                    history_entry = _record_experiment_history(
+                        base_df=base_df,
+                        features_df=features_df,
+                        balanced_df=balanced_df,
+                        base_feature_cols=base_feature_cols_used,
+                        base_result=base_result,
+                        cluster_only_feature_cols=cluster_only_feature_cols_used,
+                        cluster_only_result=cluster_only_result,
+                        cluster_feature_cols=cluster_feature_cols_used,
+                        cluster_result=cluster_result,
+                        model_choice=model_choice,
+                        model_params_base=base_model_params_used,
+                        model_params_cluster_only=cluster_only_model_params_used,
+                        model_params_cluster=cluster_model_params_used,
+                        random_state=int(random_state),
+                        test_size=float(test_size),
+                        val_size=float(val_size),
+                        far_target=float(far_target),
+                        use_balanced=bool(use_balanced),
+                        protocol_results={
+                            "Base": base_results_by_protocol,
+                            "Cluster": cluster_only_results_by_protocol,
+                            "Base + Cluster": cluster_results_by_protocol,
+                        },
+                        threshold_protocols=list(threshold_protocols),
+                        threshold_objective=threshold_objective,
+                        calibration_method=str(calibration_method),
+                        alerts_per_day=float(alerts_per_day),
+                        fn_cost=float(fn_cost),
+                        fp_cost=float(fp_cost),
+                        robust_folds=int(robust_folds),
+                        balance_strategy=balance_strategy,
+                    )
+                    st.caption("Historial actualizado y modelos guardados.")
+                except Exception as exc:
+                    st.warning(f"No se pudo guardar en History: {exc}")
+            else:
+                st.info(
+                    "No se guardó en History porque no se entrenó el conjunto Base."
                 )
-                st.caption("Historial actualizado y modelos guardados.")
-            except Exception as exc:
-                st.warning(f"No se pudo guardar en History: {exc}")
             if history_entry is not None and cluster_result is not None:
                 _render_base_cluster_xai_block(
                     history_entry,
@@ -15792,245 +22827,1229 @@ def _render_model_tab() -> None:
             progress.close()
 
 
+def _history_parse_created_at(value: object) -> Optional[pd.Timestamp]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, errors="coerce")
+    if parsed is None or pd.isna(parsed):
+        return None
+    return parsed if isinstance(parsed, pd.Timestamp) else None
+
+
+def _history_format_duration(
+    start: Optional[pd.Timestamp],
+    end: Optional[pd.Timestamp],
+) -> str:
+    if start is None or end is None:
+        return "-"
+    delta = end - start if end >= start else start - end
+    total_seconds = max(int(delta.total_seconds()), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+def _history_is_cluster_feature_name(value: object) -> bool:
+    name = str(value or "").strip()
+    if not name:
+        return False
+    cluster_prefixes = (
+        "cluster_share_",
+        "cluster_flow_",
+        "cluster_count_",
+        "cluster_speed_",
+        "cluster_density_",
+        "cluster_delta_speed_",
+        "cluster_delta_density_",
+        "cluster_entropy",
+    )
+    if name.startswith(cluster_prefixes):
+        return True
+    if name.startswith("last_") and name[5:].startswith(cluster_prefixes):
+        return True
+    if name.startswith("next_") and name[5:].startswith(cluster_prefixes):
+        return True
+    return False
+
+
+def _history_infer_optuna_feature_set_label(
+    feature_cols: Optional[Sequence[object]],
+) -> str:
+    columns = [str(col) for col in list(feature_cols or []) if str(col).strip()]
+    if not columns:
+        return "-"
+    cluster_count = sum(
+        1 for column in columns if _history_is_cluster_feature_name(column)
+    )
+    if cluster_count == 0:
+        return "Base"
+    if cluster_count == len(columns):
+        return "Cluster"
+    return "Base + Cluster"
+
+
+def _history_optuna_legacy_batch_identity(
+    record: Dict[str, object],
+) -> Tuple[str, ...]:
+    return (
+        str(record.get("stage") or ""),
+        str(record.get("features_path") or ""),
+        str(record.get("tramo_label") or ""),
+        str(record.get("model_name") or ""),
+        str(record.get("optuna_objective") or ""),
+        str(record.get("threshold_objective") or ""),
+        str(record.get("calibration_method") or ""),
+    )
+
+
+def _group_optuna_history_records(
+    records: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    groups: List[Dict[str, object]] = []
+    current_group: Optional[Dict[str, object]] = None
+    legacy_gap = pd.Timedelta(minutes=90)
+
+    for record in list(records):
+        batch_key = str(record.get("batch_key") or "").strip()
+        created_at = _history_parse_created_at(record.get("created_at"))
+        legacy_identity = _history_optuna_legacy_batch_identity(record)
+
+        can_append = False
+        if current_group is not None:
+            explicit_key = str(current_group.get("explicit_batch_key") or "").strip()
+            if batch_key and explicit_key and batch_key == explicit_key:
+                can_append = True
+            elif (
+                not batch_key
+                and not explicit_key
+                and tuple(current_group.get("legacy_identity") or ()) == legacy_identity
+            ):
+                previous_created_at = current_group.get("tail_created_at")
+                if (
+                    isinstance(previous_created_at, pd.Timestamp)
+                    and created_at is not None
+                    and previous_created_at >= created_at
+                    and (previous_created_at - created_at) <= legacy_gap
+                ):
+                    can_append = True
+
+        if not can_append:
+            current_group = {
+                "token": batch_key
+                or f"legacy-optuna-batch-{int(record.get('id') or 0)}",
+                "explicit_batch_key": batch_key or None,
+                "legacy_identity": legacy_identity,
+                "records": [],
+                "tail_created_at": created_at,
+            }
+            groups.append(current_group)
+
+        current_group["records"].append(record)
+        if created_at is not None:
+            current_group["tail_created_at"] = created_at
+
+    return groups
+
+
+def _history_optuna_batch_overview_rows(
+    grouped_records: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for group in grouped_records:
+        records = list(group.get("records") or [])
+        if not records:
+            continue
+        ids = [int(record.get("id") or 0) for record in records]
+        timestamps = [
+            parsed
+            for parsed in (
+                _history_parse_created_at(record.get("created_at"))
+                for record in records
+            )
+            if parsed is not None
+        ]
+        started_at = min(timestamps) if timestamps else None
+        finished_at = max(timestamps) if timestamps else None
+        balance_labels = [
+            _optuna_balance_mode_label(record.get("balance_strategy"))
+            for record in records
+            if str(record.get("balance_strategy") or "").strip()
+        ]
+        rows.append(
+            {
+                "batch": (
+                    f"{max(ids)}"
+                    if len(records) == 1
+                    else f"{max(ids)} -> {min(ids)}"
+                ),
+                "subcorridas": len(records),
+                "inicio": (
+                    started_at.isoformat(sep=" ", timespec="seconds")
+                    if started_at is not None
+                    else "-"
+                ),
+                "fin": (
+                    finished_at.isoformat(sep=" ", timespec="seconds")
+                    if finished_at is not None
+                    else "-"
+                ),
+                "duracion": _history_format_duration(started_at, finished_at),
+                "features": Path(str(records[0].get("features_path") or "")).name,
+                "tramo": records[0].get("tramo_label"),
+                "model": records[0].get("model_name"),
+                "objective": records[0].get("threshold_objective")
+                or records[0].get("optuna_objective"),
+                "calibration": records[0].get("calibration_method"),
+                "balances": ", ".join(sorted(set(balance_labels))),
+            }
+        )
+    return rows
+
+
+def _history_optuna_subrun_rows(
+    db_path: Path,
+    records: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for record in list(records):
+        detail = history_store.get_record(db_path, int(record.get("id") or 0))
+        if not isinstance(detail, dict):
+            detail = record
+        metadata = detail.get("metadata") if isinstance(detail.get("metadata"), dict) else {}
+        variant = metadata.get("variant") if isinstance(metadata.get("variant"), dict) else {}
+        settings = (
+            variant.get("optuna_settings")
+            if isinstance(variant.get("optuna_settings"), dict)
+            else {}
+        )
+        feature_cols = list(
+            metadata.get("feature_cols")
+            or metadata.get("selected_features")
+            or []
+        )
+        feature_set_label = (
+            settings.get("feature_set_label")
+            or metadata.get("feature_set_label")
+            or _history_infer_optuna_feature_set_label(feature_cols)
+        )
+        rows.append(
+            {
+                "id": int(record.get("id") or 0),
+                "orden": metadata.get("optuna_batch_run_index"),
+                "created_at": record.get("created_at"),
+                "feature_set": feature_set_label,
+                "variables": len(feature_cols),
+                "balance": _optuna_balance_mode_label(
+                    detail.get("balance_strategy")
+                ),
+                "calibration": detail.get("calibration_method"),
+                "objective": detail.get("threshold_objective")
+                or detail.get("optuna_objective"),
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            int(row["orden"]) if row.get("orden") is not None else 10**9,
+            str(row.get("created_at") or ""),
+        ),
+    )
+
+
+HISTORY_MODEL_FEATURE_SET_ORDER = ("Base", "Cluster", "Base+Cluster")
+HISTORY_MODEL_ID_COLUMNS = [
+    "record_id",
+    "created_at",
+    "feature_set",
+    "model",
+    "protocol",
+    "threshold_objective",
+    "calibration",
+    "balance",
+    "tramo",
+    "features",
+    "run_id",
+    "subrun",
+    "candidate",
+]
+HISTORY_MODEL_DEFAULT_CHART_METRICS = ("mcc", "pr_auc", "recall", "far")
+HISTORY_MODEL_METRIC_LABELS = {
+    "accuracy": "Accuracy",
+    "alerts": "Alertas",
+    "alerts_per_day": "Alertas/día",
+    "balanced_f1": "Balanced F1",
+    "brier": "Brier",
+    "brier_score": "Brier",
+    "cost_per_day": "Costo/día",
+    "event_recall_approx": "Recall eventos",
+    "f1": "F1",
+    "f1_global": "F1 global",
+    "false_alarms_per_day": "Falsas alarmas/día",
+    "false_negatives": "FN",
+    "false_positives": "FP",
+    "far": "FAR",
+    "fn_rate": "FNR",
+    "mcc": "MCC",
+    "operational_cost": "Costo operacional",
+    "positive_support": "Soporte positivo",
+    "pr_auc": "PR-AUC",
+    "precision": "Precision",
+    "recall": "Recall",
+    "recall_at_alerts_per_day": "Recall@N alertas/día",
+    "roc_auc": "ROC-AUC",
+    "sensitivity": "Sensibilidad",
+    "specificity": "Especificidad",
+    "threshold": "Threshold",
+    "true_negatives": "TN",
+    "true_positives": "TP",
+}
+
+
+def _history_normalize_model_feature_set_label(value: object) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = (
+        unicodedata.normalize("NFKD", text)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+    )
+    compact = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    if compact in {"base", "flow", "flujo"}:
+        return "Base"
+    if compact in {"cluster", "clusters", "cluster_only", "solo_cluster"}:
+        return "Cluster"
+    if compact in {
+        "base_cluster",
+        "base_clusters",
+        "base_plus_cluster",
+        "base_clusteres",
+        "base_mas_cluster",
+        "base_con_cluster",
+    }:
+        return "Base+Cluster"
+    if "base" in compact and "cluster" in compact:
+        return "Base+Cluster"
+    if compact.startswith("cluster"):
+        return "Cluster"
+    return None
+
+
+def _history_model_metric_label(metric_key: object) -> str:
+    key = str(metric_key or "")
+    return HISTORY_MODEL_METRIC_LABELS.get(key, key.replace("_", " ").title())
+
+
+def _history_model_is_metric_payload(value: object) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    return any(
+        isinstance(metric_value, (int, float, np.integer, np.floating, bool, np.bool_))
+        and not _is_null_like(metric_value)
+        for metric_value in value.values()
+    )
+
+
+def _history_metric_cell_value(value: object) -> object:
+    if _is_null_like(value):
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(
+        value, (bool, np.bool_)
+    ):
+        return float(value)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list, tuple, set, Path)):
+        return _stringify_streamlit_cell(value)
+    return str(value)
+
+
+def _history_record_run_id(record: Dict[str, object]) -> str:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    for value in (
+        metadata.get("run_id"),
+        record.get("legacy_ref"),
+        record.get("record_uid"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text.removeprefix("modelos:")
+    return ""
+
+
+def _history_record_manifest(record: Dict[str, object]) -> Dict[str, object]:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    manifest = metadata.get("manifest") if isinstance(metadata.get("manifest"), dict) else {}
+    if manifest:
+        return manifest
+    history_entry = (
+        metadata.get("history_entry")
+        if isinstance(metadata.get("history_entry"), dict)
+        else {}
+    )
+    return (
+        history_entry.get("manifest")
+        if isinstance(history_entry.get("manifest"), dict)
+        else {}
+    )
+
+
+def _history_infer_model_feature_set_label(
+    record: Dict[str, object],
+    *,
+    label_hint: object = None,
+    metric_payload: Optional[Dict[str, object]] = None,
+    subrun_id: object = None,
+    candidate_id: object = None,
+) -> Optional[str]:
+    normalized = _history_normalize_model_feature_set_label(label_hint)
+    if normalized:
+        return normalized
+
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    history_entry = (
+        metadata.get("history_entry")
+        if isinstance(metadata.get("history_entry"), dict)
+        else {}
+    )
+    subruns = list(history_entry.get("subruns") or [])
+    subrun_text = str(subrun_id or "").strip()
+    candidate_text = str(candidate_id or "").strip()
+    for subrun in subruns:
+        if not isinstance(subrun, dict):
+            continue
+        subrun_matches = not subrun_text or subrun_text in {
+            str(subrun.get("subrun_id") or ""),
+            str(subrun.get("feature_set_label") or ""),
+        }
+        if not subrun_matches:
+            continue
+        normalized = _history_normalize_model_feature_set_label(
+            subrun.get("feature_set_label")
+        )
+        if normalized:
+            return normalized
+        for candidate in list(subrun.get("candidates") or []):
+            if not isinstance(candidate, dict):
+                continue
+            candidate_matches = not candidate_text or candidate_text in {
+                str(candidate.get("candidate_id") or ""),
+                str(candidate.get("candidate_label") or ""),
+            }
+            if candidate_matches:
+                inferred = _history_infer_optuna_feature_set_label(
+                    candidate.get("feature_cols") or subrun.get("best_feature_cols")
+                )
+                return _history_normalize_model_feature_set_label(inferred)
+
+    manifest = _history_record_manifest(record)
+    for key in ("strategy_label", "feature_set_label", "label"):
+        normalized = _history_normalize_model_feature_set_label(manifest.get(key))
+        if normalized:
+            return normalized
+
+    for path_key in ("bundle_dir", "manifest_path", "model_path"):
+        path_text = str(manifest.get(path_key) or "").replace("\\", "/")
+        for part in reversed([part for part in path_text.split("/") if part]):
+            normalized = _history_normalize_model_feature_set_label(part)
+            if normalized:
+                return normalized
+
+    feature_cols = (
+        (metric_payload or {}).get("feature_cols") if isinstance(metric_payload, dict) else None
+    )
+    if not feature_cols:
+        feature_cols = (
+            manifest.get("feature_cols")
+            or metadata.get("selected_features")
+            or metadata.get("feature_cols")
+        )
+    inferred = _history_infer_optuna_feature_set_label(feature_cols)
+    normalized = _history_normalize_model_feature_set_label(inferred)
+    return normalized if normalized in HISTORY_MODEL_FEATURE_SET_ORDER else None
+
+
+def _history_model_subrun_lookup(record: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    history_entry = (
+        metadata.get("history_entry")
+        if isinstance(metadata.get("history_entry"), dict)
+        else {}
+    )
+    lookup: Dict[str, Dict[str, object]] = {}
+    for subrun in list(history_entry.get("subruns") or []):
+        if not isinstance(subrun, dict):
+            continue
+        keys = {
+            str(subrun.get("subrun_id") or "").strip(),
+            str(subrun.get("feature_set_label") or "").strip(),
+        }
+        for key in keys:
+            if key:
+                lookup[key] = subrun
+    return lookup
+
+
+def _history_model_candidate_lookup(
+    subrun: Optional[Dict[str, object]],
+) -> Dict[str, Dict[str, object]]:
+    lookup: Dict[str, Dict[str, object]] = {}
+    if not isinstance(subrun, dict):
+        return lookup
+    for candidate in list(subrun.get("candidates") or []):
+        if not isinstance(candidate, dict):
+            continue
+        keys = {
+            str(candidate.get("candidate_id") or "").strip(),
+            str(candidate.get("candidate_label") or "").strip(),
+        }
+        for key in keys:
+            if key:
+                lookup[key] = candidate
+    return lookup
+
+
+def _history_model_metrics_payload(record: Dict[str, object]) -> Dict[str, object]:
+    metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+    if metrics:
+        return metrics
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    history_entry = (
+        metadata.get("history_entry")
+        if isinstance(metadata.get("history_entry"), dict)
+        else {}
+    )
+    models = history_entry.get("models") if isinstance(history_entry.get("models"), dict) else {}
+    if models:
+        model_metrics = {
+            label: model_entry.get("metrics", {})
+            for label, model_entry in models.items()
+            if isinstance(model_entry, dict)
+            and isinstance(model_entry.get("metrics"), dict)
+            and model_entry.get("metrics")
+        }
+        if model_metrics:
+            return model_metrics
+    protocol_results = (
+        history_entry.get("protocol_results")
+        if isinstance(history_entry.get("protocol_results"), dict)
+        else {}
+    )
+    return protocol_results if protocol_results else {}
+
+
+def _history_base_model_metric_row(
+    record: Dict[str, object],
+    *,
+    feature_set: Optional[str],
+    metrics: Dict[str, object],
+    subrun: object = "",
+    candidate: object = "",
+    protocol: object = None,
+) -> Dict[str, object]:
+    metric_protocol = (
+        metrics.get("threshold_protocol") if isinstance(metrics, dict) else None
+    )
+    row: Dict[str, object] = {
+        "record_id": int(record.get("id") or 0),
+        "created_at": record.get("created_at"),
+        "feature_set": feature_set or "Sin clasificar",
+        "model": record.get("model_name") or "",
+        "protocol": protocol or metric_protocol or "",
+        "threshold_objective": (
+            metrics.get("threshold_objective")
+            if isinstance(metrics, dict) and metrics.get("threshold_objective") is not None
+            else record.get("threshold_objective") or record.get("optuna_objective") or ""
+        ),
+        "calibration": (
+            metrics.get("calibration_method")
+            if isinstance(metrics, dict) and metrics.get("calibration_method") is not None
+            else record.get("calibration_method") or ""
+        ),
+        "balance": (
+            metrics.get("balance_strategy")
+            if isinstance(metrics, dict) and metrics.get("balance_strategy") is not None
+            else record.get("balance_strategy") or ""
+        ),
+        "tramo": record.get("tramo_label") or "",
+        "features": Path(str(record.get("features_path") or "")).name,
+        "run_id": _history_record_run_id(record),
+        "subrun": subrun or "",
+        "candidate": candidate or "",
+    }
+    for key, value in dict(metrics or {}).items():
+        if key == "feature_cols":
+            continue
+        row[str(key)] = _history_metric_cell_value(value)
+    return row
+
+
+def _history_model_metric_rows(records: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for record in list(records):
+        if str(record.get("stage") or "") != "Modelos":
+            continue
+        metrics = _history_model_metrics_payload(record)
+        if not metrics:
+            continue
+
+        if _history_model_is_metric_payload(metrics):
+            feature_set = _history_infer_model_feature_set_label(
+                record,
+                metric_payload=metrics,
+            )
+            rows.append(
+                _history_base_model_metric_row(
+                    record,
+                    feature_set=feature_set,
+                    metrics=metrics,
+                )
+            )
+            continue
+
+        for feature_key, feature_value in metrics.items():
+            if _history_model_is_metric_payload(feature_value):
+                feature_set = _history_infer_model_feature_set_label(
+                    record,
+                    label_hint=feature_key,
+                    metric_payload=feature_value,
+                )
+                rows.append(
+                    _history_base_model_metric_row(
+                        record,
+                        feature_set=feature_set,
+                        metrics=feature_value,
+                    )
+                )
+                continue
+
+            if not isinstance(feature_value, dict):
+                continue
+            subrun_lookup = _history_model_subrun_lookup(record)
+            subrun_meta = subrun_lookup.get(str(feature_key))
+            candidate_lookup = _history_model_candidate_lookup(subrun_meta)
+            for candidate_key, candidate_value in feature_value.items():
+                if _history_model_is_metric_payload(candidate_value):
+                    feature_set = _history_infer_model_feature_set_label(
+                        record,
+                        label_hint=feature_key,
+                        metric_payload=candidate_value,
+                        subrun_id=feature_key,
+                        candidate_id=candidate_key,
+                    )
+                    rows.append(
+                        _history_base_model_metric_row(
+                            record,
+                            feature_set=feature_set,
+                            metrics=candidate_value,
+                            subrun=feature_key,
+                            candidate=candidate_key,
+                        )
+                    )
+                    continue
+
+                if not isinstance(candidate_value, dict):
+                    continue
+                candidate_meta = candidate_lookup.get(str(candidate_key))
+                for protocol_key, protocol_value in candidate_value.items():
+                    if not _history_model_is_metric_payload(protocol_value):
+                        continue
+                    feature_set = _history_infer_model_feature_set_label(
+                        record,
+                        label_hint=feature_key,
+                        metric_payload=protocol_value,
+                        subrun_id=feature_key,
+                        candidate_id=candidate_key,
+                    )
+                    if feature_set is None and isinstance(candidate_meta, dict):
+                        feature_set = _history_infer_model_feature_set_label(
+                            record,
+                            label_hint=feature_key,
+                            metric_payload={
+                                **dict(protocol_value),
+                                "feature_cols": candidate_meta.get("feature_cols"),
+                            },
+                        )
+                    rows.append(
+                        _history_base_model_metric_row(
+                            record,
+                            feature_set=feature_set,
+                            metrics=protocol_value,
+                            subrun=feature_key,
+                            candidate=candidate_key,
+                            protocol=protocol_key,
+                        )
+                    )
+    return rows
+
+
+def _history_model_metrics_dataframe(
+    records: Sequence[Dict[str, object]],
+) -> pd.DataFrame:
+    rows = _history_model_metric_rows(records)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    id_columns = [column for column in HISTORY_MODEL_ID_COLUMNS if column in df.columns]
+    metric_columns = sorted(
+        column
+        for column in df.columns
+        if column not in set(id_columns)
+    )
+    return df[id_columns + metric_columns]
+
+
+def _history_numeric_metric_columns(df: pd.DataFrame) -> List[str]:
+    reserved = set(HISTORY_MODEL_ID_COLUMNS)
+    metric_columns: List[str] = []
+    for column in df.columns:
+        if column in reserved:
+            continue
+        numeric = pd.to_numeric(df[column], errors="coerce")
+        if numeric.notna().any():
+            metric_columns.append(str(column))
+    return metric_columns
+
+
+def _history_chart_row_label(row: pd.Series) -> str:
+    pieces = [
+        f"#{row.get('record_id')}",
+        str(row.get("model") or "").strip(),
+        str(row.get("protocol") or "").strip(),
+        str(row.get("balance") or "").strip(),
+    ]
+    label = " | ".join(piece for piece in pieces if piece and piece != "#")
+    candidate = str(row.get("candidate") or "").strip()
+    if candidate:
+        label = f"{label} | {candidate}"
+    return label
+
+
+def _history_model_heatmap_frame(
+    df: pd.DataFrame,
+    metrics: Sequence[str],
+) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    if df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    work["_row_label"] = work.apply(_history_chart_row_label, axis=1)
+    for metric in metrics:
+        if metric not in work.columns:
+            continue
+        values = pd.to_numeric(work[metric], errors="coerce")
+        finite_values = values.replace([np.inf, -np.inf], np.nan)
+        min_value = finite_values.min(skipna=True)
+        max_value = finite_values.max(skipna=True)
+        span = float(max_value - min_value) if pd.notna(min_value) and pd.notna(max_value) else 0.0
+        if span <= 0:
+            normalized = pd.Series(1.0, index=work.index)
+        else:
+            normalized = (finite_values - min_value) / span
+        for idx, row in work.iterrows():
+            actual = finite_values.loc[idx]
+            if pd.isna(actual):
+                continue
+            rows.append(
+                {
+                    "config": row["_row_label"],
+                    "metric": metric,
+                    "metric_label": _history_model_metric_label(metric),
+                    "value": float(actual),
+                    "normalized": float(normalized.loc[idx]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _render_history_model_metric_charts(
+    df: pd.DataFrame,
+    *,
+    selected_metrics: Sequence[str],
+    key_prefix: str,
+) -> None:
+    if df.empty or not selected_metrics:
+        return
+    alt = _import_altair()
+    work = df.copy()
+    work["_row_label"] = work.apply(_history_chart_row_label, axis=1)
+    if alt is None:
+        chart_df = work.set_index("_row_label")[
+            [metric for metric in selected_metrics if metric in work.columns]
+        ].apply(pd.to_numeric, errors="coerce")
+        st.bar_chart(chart_df)
+    else:
+        for metric in selected_metrics:
+            if metric not in work.columns:
+                continue
+            metric_df = work.copy()
+            metric_df["_metric_value"] = pd.to_numeric(
+                metric_df[metric], errors="coerce"
+            )
+            metric_df = metric_df.dropna(subset=["_metric_value"])
+            if metric_df.empty:
+                continue
+            chart = (
+                alt.Chart(metric_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X(
+                        "_row_label:N",
+                        sort=None,
+                        axis=alt.Axis(title=None, labelAngle=-35),
+                    ),
+                    y=alt.Y(
+                        "_metric_value:Q",
+                        axis=alt.Axis(title=_history_model_metric_label(metric)),
+                    ),
+                    color=alt.Color(
+                        "model:N",
+                        scale=alt.Scale(
+                            range=["#1b3a6b", "#d4541a", "#3b7a57", "#2a6a8a"]
+                        ),
+                        legend=alt.Legend(title="Modelo"),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("_row_label:N", title="Configuración"),
+                        alt.Tooltip("model:N", title="Modelo"),
+                        alt.Tooltip("protocol:N", title="Protocolo"),
+                        alt.Tooltip("_metric_value:Q", title=_history_model_metric_label(metric), format=".6f"),
+                    ],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart, width="stretch")
+
+    heatmap_df = _history_model_heatmap_frame(work, selected_metrics)
+    if heatmap_df.empty:
+        return
+    if alt is None:
+        pivot = heatmap_df.pivot(index="config", columns="metric_label", values="value")
+        st.dataframe(_prepare_dataframe_for_streamlit(pivot.reset_index()), width="stretch")
+        return
+    heatmap = (
+        alt.Chart(heatmap_df)
+        .mark_rect()
+        .encode(
+            x=alt.X("metric_label:N", title=None),
+            y=alt.Y("config:N", title=None, sort=None),
+            color=alt.Color(
+                "normalized:Q",
+                title="Posición rel.",
+                scale=alt.Scale(range=["#ecebe6", "#8fa4c7", "#1b3a6b"]),
+            ),
+            tooltip=[
+                alt.Tooltip("config:N", title="Configuración"),
+                alt.Tooltip("metric_label:N", title="Métrica"),
+                alt.Tooltip("value:Q", title="Valor test", format=".6f"),
+            ],
+        )
+        .properties(height=max(220, min(720, 26 * int(heatmap_df["config"].nunique()))))
+    )
+    st.altair_chart(heatmap, width="stretch")
+
+
+def _render_history_model_metrics_comparison(
+    records: Sequence[Dict[str, object]],
+    *,
+    key_prefix: str,
+) -> None:
+    df = _history_model_metrics_dataframe(records)
+    if df.empty:
+        st.info("No hay métricas comparables de Modelos para los filtros actuales.")
+        return
+
+    grouped_count = int(df["feature_set"].isin(HISTORY_MODEL_FEATURE_SET_ORDER).sum())
+    unclassified_count = int((~df["feature_set"].isin(HISTORY_MODEL_FEATURE_SET_ORDER)).sum())
+    st.markdown("**Comparación de métricas test — Modelos**")
+    caption = f"Filas comparables: {grouped_count}"
+    if unclassified_count:
+        caption += f" | sin clasificar: {unclassified_count}"
+    st.caption(caption)
+
+    tabs = st.tabs(list(HISTORY_MODEL_FEATURE_SET_ORDER))
+    for feature_set, tab in zip(HISTORY_MODEL_FEATURE_SET_ORDER, tabs):
+        with tab:
+            group_df = df.loc[df["feature_set"].eq(feature_set)].copy()
+            if group_df.empty:
+                st.info(f"Sin resultados para {feature_set}.")
+                continue
+            metric_columns = _history_numeric_metric_columns(group_df)
+            default_metrics = [
+                metric
+                for metric in HISTORY_MODEL_DEFAULT_CHART_METRICS
+                if metric in metric_columns
+            ]
+            if not default_metrics:
+                default_metrics = metric_columns[: min(4, len(metric_columns))]
+            selected_metrics = st.multiselect(
+                "Métricas para visualizar",
+                options=metric_columns,
+                default=default_metrics,
+                key=f"{key_prefix}_{_slugify(feature_set)}_metrics",
+                format_func=_history_model_metric_label,
+            )
+            st.dataframe(
+                _prepare_dataframe_for_streamlit(group_df),
+                width="stretch",
+            )
+            _render_history_model_metric_charts(
+                group_df,
+                selected_metrics=selected_metrics,
+                key_prefix=f"{key_prefix}_{_slugify(feature_set)}",
+            )
+
+    if unclassified_count:
+        with st.expander("Resultados de Modelos sin grupo de features inferible", expanded=False):
+            st.dataframe(
+                _prepare_dataframe_for_streamlit(
+                    df.loc[
+                        ~df["feature_set"].isin(HISTORY_MODEL_FEATURE_SET_ORDER)
+                    ].copy()
+                ),
+                width="stretch",
+            )
+
+
 def _render_history_tab() -> None:
     st.subheader("History")
-    entries = _load_history_entries()
-    if not entries:
+    db_path = _history_db_path()
+    try:
+        legacy_seed_done = history_store.get_meta(db_path, "legacy_seed_v1") == "done"
+    except Exception:
+        legacy_seed_done = False
+    if not legacy_seed_done:
+        st.info(
+            "La importación del historial legacy está pendiente. Ejecútela solo "
+            "si necesita ver resultados antiguos en SQLite."
+        )
+        if st.button("Importar historial legacy", key="history_seed_legacy"):
+            with st.spinner("Importando historial legacy..."):
+                _seed_history_db_from_legacy_once()
+            st.rerun()
+
+    try:
+        stage_options = history_store.distinct_values(db_path, "stage")
+        features_options = history_store.distinct_values(db_path, "features_path")
+        tramo_options = history_store.distinct_values(db_path, "tramo_label")
+        model_options = history_store.distinct_values(db_path, "model_name")
+        calibration_options = history_store.distinct_values(db_path, "calibration_method")
+        threshold_options = history_store.distinct_values(db_path, "threshold_objective")
+    except Exception:
         st.info("No hay historial disponible.")
         return
-    entries_sorted = sorted(
-        entries, key=lambda item: str(item.get("timestamp", ""))
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        stage_filter = st.selectbox(
+            "Etapa",
+            ["Todos"] + stage_options,
+            key="history_stage_filter",
+        )
+    with col_b:
+        starred_filter = st.selectbox(
+            "Estrella",
+            ["Todos", "Solo destacados", "Sin destacar"],
+            key="history_star_filter",
+        )
+    with col_c:
+        features_filter = st.selectbox(
+            "Archivo features",
+            ["Todos"] + features_options,
+            key="history_features_filter_sqlite",
+            format_func=lambda value: (
+                Path(value).name if value not in {"Todos", ""} else value
+            ),
+        )
+    with col_d:
+        tramo_filter = st.selectbox(
+            "Tramo",
+            ["Todos"] + tramo_options,
+            key="history_tramo_filter_sqlite",
+        )
+
+    col_e, col_f, col_g = st.columns(3)
+    with col_e:
+        model_filter = st.selectbox(
+            "Modelo",
+            ["Todos"] + model_options,
+            key="history_model_filter",
+        )
+    with col_f:
+        calibration_filter = st.selectbox(
+            "Calibración",
+            ["Todos"] + calibration_options,
+            key="history_calibration_filter",
+        )
+    with col_g:
+        threshold_filter = st.selectbox(
+            "Objetivo",
+            ["Todos"] + threshold_options,
+            key="history_threshold_filter",
+        )
+    max_records = int(
+        st.selectbox(
+            "Registros a listar",
+            [25, 50, 100, 200, 300],
+            index=2,
+            key="history_records_limit",
+        )
     )
-    def _feature_file_label(entry: Dict[str, object]) -> str:
-        features = entry.get("features", {})
-        if not isinstance(features, dict):
-            return "(sin archivo)"
-        features_path = features.get("features_path")
-        if features_path:
-            try:
-                return Path(str(features_path)).name
-            except Exception:
-                return str(features_path)
-        features_source = features.get("features_source")
-        if features_source:
-            return f"(sin archivo) {features_source}"
-        return "(sin archivo)"
 
-    feature_labels = sorted({_feature_file_label(entry) for entry in entries_sorted})
-    
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        filter_choice = st.selectbox(
-            "Filtrar por archivo de features",
-            options=["Todos"] + feature_labels,
-            key="history_features_filter",
+    starred_value: Optional[bool]
+    if starred_filter == "Solo destacados":
+        starred_value = True
+    elif starred_filter == "Sin destacar":
+        starred_value = False
+    else:
+        starred_value = None
+
+    try:
+        records = history_store.list_record_summaries(
+            db_path,
+            stage=None if stage_filter == "Todos" else stage_filter,
+            starred=starred_value,
+            features_path=None if features_filter == "Todos" else features_filter,
+            tramo_label=None if tramo_filter == "Todos" else tramo_filter,
+            model_name=None if model_filter == "Todos" else model_filter,
+            calibration_method=None
+            if calibration_filter == "Todos"
+            else calibration_filter,
+            threshold_objective=None
+            if threshold_filter == "Todos"
+            else threshold_filter,
+            limit=max_records,
         )
-    
-    # --- TRAMO FILTER LOGIC ---
-    def _get_tramo_label(entry: Dict[str, object]) -> str:
-        tramo = entry.get("dataset", {}).get("tramo", {})
-        if not isinstance(tramo, dict):
-            return "Toda la autopista"
-        label = tramo.get("label")
-        if label:
-            return str(label)
-        # Fallback if label is missing but parts exist
-        eje = tramo.get("eje")
-        calzada = tramo.get("calzada")
-        p_start = tramo.get("portico_inicio")
-        p_end = tramo.get("portico_fin")
-        if eje and calzada and p_start and p_end:
-             return f"{eje} | {calzada} | {p_start} -> {p_end}"
-        return "Toda la autopista"
-
-    tramo_labels = sorted({_get_tramo_label(entry) for entry in entries_sorted})
-    with col_f2:
-        tramo_choice = st.selectbox(
-            "Filtrar por tramo",
-            options=["Todos"] + tramo_labels,
-            key="history_tramo_filter",
-        )
-    # --------------------------
-
-    if filter_choice != "Todos":
-        entries_sorted = [
-            entry
-            for entry in entries_sorted
-            if _feature_file_label(entry) == filter_choice
-        ]
-    
-    if tramo_choice != "Todos":
-        entries_sorted = [
-            entry
-            for entry in entries_sorted
-            if _get_tramo_label(entry) == tramo_choice
-        ]
-
-    if not entries_sorted:
-        st.info("No hay historial para el filtro seleccionado.")
+    except Exception as exc:
+        st.warning(f"No se pudo leer History SQLite: {exc}")
         return
-    st.caption(f"Entradas: {len(entries_sorted)}")
-    for idx, entry in enumerate(entries_sorted, start=1):
-        timestamp = entry.get("timestamp", "-")
-        models = entry.get("models", {})
-        model_name = "-"
-        if isinstance(models, dict):
-            base = models.get("Base")
-            if isinstance(base, dict):
-                model_name = base.get("model_name", "-")
-        title = f"{idx}. {timestamp} | {model_name}"
-        with st.expander(title, expanded=False):
-            st.caption(f"run_id: {entry.get('run_id', '-')}")
-            run_id = entry.get("run_id")
-            if st.button(
-                "Eliminar registro",
-                key=f"history_delete_acc_{run_id or idx}",
-            ):
-                if _delete_history_entry(run_id):
-                    st.success("Registro eliminado.")
-                    st.rerun()
-                else:
-                    st.warning("No se pudo eliminar el registro.")
 
-            dataset = entry.get("dataset", {})
-            st.markdown("**Dataset**")
-            if dataset:
-                st.json(dataset)
+    if not records:
+        st.info("No hay historial para los filtros seleccionados.")
+        return
 
-            training = entry.get("training", {})
-            st.markdown("**Entrenamiento**")
-            if training:
-                st.json(training)
-
-            features = entry.get("features", {})
-            st.markdown("**Features calculadas**")
-            if features:
-                st.json(features)
-
-            feature_sel = entry.get("feature_selection", {})
-            st.markdown("**Feature selection**")
-            if feature_sel:
-                selected = feature_sel.get("selected_features", [])
-                st.caption(
-                    f"Seleccionadas: {len(selected) if isinstance(selected, list) else 0}"
-                )
-                if isinstance(selected, list) and selected:
-                    st.dataframe(
-                        pd.DataFrame({"variable": selected}),
-                        width="stretch",
-                    )
-                importance_top = feature_sel.get("importance_top", [])
-                if isinstance(importance_top, list) and importance_top:
-                    st.caption("Importancia (top 25)")
-                    st.dataframe(
-                        pd.DataFrame(importance_top), width="stretch"
-                    )
-                importance_csv = feature_sel.get("importance_csv")
-                if importance_csv:
-                    st.caption(f"CSV importancia: {importance_csv}")
-
-            optuna = entry.get("optuna", {})
-            st.markdown("**Optuna**")
-            if optuna:
-                if isinstance(optuna, dict) and (
-                    "base" in optuna or "base_cluster" in optuna
-                ):
-                    base_optuna = optuna.get("base")
-                    if isinstance(base_optuna, dict) and base_optuna:
-                        st.caption("Base")
-                        st.json(base_optuna)
-                    cluster_optuna = optuna.get("base_cluster")
-                    if isinstance(cluster_optuna, dict) and cluster_optuna:
-                        st.caption("Base + Cluster")
-                        st.json(cluster_optuna)
-                else:
-                    st.json(optuna)
-
-            balance = entry.get("balance", {})
-            st.markdown("**Balance**")
-            if balance:
-                if isinstance(balance, dict) and (
-                    "base" in balance or "base_cluster" in balance
-                ):
-                    for label, key in (
-                        ("Base", "base"),
-                        ("Base + Cluster", "base_cluster"),
-                    ):
-                        item = balance.get(key)
-                        if not isinstance(item, dict):
-                            continue
-                        params = item.get("params")
-                        stats = item.get("stats", {})
-                        if params or stats:
-                            st.caption(label)
-                        if params:
-                            st.json(params)
-                        if isinstance(stats, dict):
-                            for split_label, records in stats.items():
-                                st.caption(f"{label} | Distribucion: {split_label}")
-                                if isinstance(records, list) and records:
-                                    st.dataframe(
-                                        pd.DataFrame(records), width="stretch"
-                                    )
-                else:
-                    balance_params = balance.get("params")
-                    if balance_params:
-                        st.json(balance_params)
-                    stats = balance.get("stats", {})
-                    if isinstance(stats, dict):
-                        for label, records in stats.items():
-                            st.caption(f"Distribucion: {label}")
-                            if isinstance(records, list) and records:
-                                st.dataframe(
-                                    pd.DataFrame(records), width="stretch"
-                                )
-
-            if isinstance(models, dict) and models:
-                st.markdown("**Modelos y resultados**")
-                metrics_table = {}
-                for name, model_entry in models.items():
-                    if isinstance(model_entry, dict):
-                        metrics_table[name] = model_entry.get("metrics", {})
-                if metrics_table:
-                    st.dataframe(
-                        pd.DataFrame(metrics_table).T, width="stretch"
-                    )
-                for name, model_entry in models.items():
-                    if not isinstance(model_entry, dict):
-                        continue
-                    st.caption(f"{name} | modelo: {model_entry.get('model_name')}")
-                    model_path = model_entry.get("model_path")
-                    if model_path:
-                        st.caption(f"Archivo modelo: {model_path}")
-                    model_params = model_entry.get("model_params")
-                    if model_params:
-                        st.json(model_params)
-                    split_info = model_entry.get("split_info")
-                    if split_info:
-                        st.json(split_info)
-                    feature_cols = model_entry.get("feature_cols")
-                    if isinstance(feature_cols, list) and feature_cols:
-                        st.caption(
-                            f"Variables usadas: {len(feature_cols)}"
-                        )
-                        st.dataframe(
-                            pd.DataFrame({"variable": feature_cols}),
-                            width="stretch",
-                        )
-                    cm = model_entry.get("confusion_matrix")
-                    if isinstance(cm, list) and cm:
-                        cm_df = pd.DataFrame(
-                            cm,
-                            index=["Actual 0", "Actual 1"],
-                            columns=["Pred 0", "Pred 1"],
-                        )
-                        st.caption("Matriz de confusion")
-                        st.dataframe(cm_df, width="stretch")
-            _render_base_cluster_xai_block(
-                entry,
-                key_prefix=f"history_xai_{run_id or idx}",
-                default_visible=False,
+    optuna_only_records = bool(records) and all(
+        str(record.get("stage") or "") == "Optuna" for record in records
+    )
+    selected_summary: Optional[Dict[str, object]] = None
+    model_detail_records: List[Dict[str, object]] = []
+    if optuna_only_records:
+        grouped_records = _group_optuna_history_records(records)
+        st.caption(
+            f"Lotes Optuna listados: {len(grouped_records)} | "
+            f"Subcorridas: {len(records)} | Base: {db_path}"
+        )
+        st.dataframe(
+            pd.DataFrame(_history_optuna_batch_overview_rows(grouped_records)),
+            width="stretch",
+        )
+        batch_lookup = {
+            str(group.get("token")): group for group in grouped_records
+        }
+        batch_token = st.selectbox(
+            "Lote Optuna",
+            list(batch_lookup.keys()),
+            key="history_selected_optuna_batch",
+            format_func=lambda value: (
+                f"{len(batch_lookup[value].get('records') or [])} subcorridas | "
+                f"ids "
+                f"{max(int(record.get('id') or 0) for record in batch_lookup[value].get('records') or [{}])}"
+                f" -> "
+                f"{min(int(record.get('id') or 0) for record in batch_lookup[value].get('records') or [{}])}"
+            ),
+        )
+        selected_batch = batch_lookup.get(str(batch_token), {})
+        batch_records = list(selected_batch.get("records") or [])
+        if batch_records:
+            st.caption(
+                f"Subcorridas del lote seleccionado: {len(batch_records)}"
             )
+            st.dataframe(
+                pd.DataFrame(
+                    _history_optuna_subrun_rows(db_path, batch_records)
+                ),
+                width="stretch",
+            )
+        record_lookup = {
+            int(record["id"]): record for record in batch_records
+        }
+        record_id = st.selectbox(
+            "Detalle de subcorrida",
+            list(record_lookup.keys()),
+            key="history_selected_optuna_record_id",
+            format_func=lambda value: (
+                f"{'* ' if record_lookup[int(value)].get('starred') else ''}"
+                f"{value} | {record_lookup[int(value)].get('created_at')} | "
+                f"{record_lookup[int(value)].get('balance_strategy') or '-'}"
+            ),
+        )
+        selected_summary = record_lookup.get(int(record_id))
+    else:
+        st.caption(f"Registros listados: {len(records)} | Base: {db_path}")
+        overview_rows = []
+        for record in records:
+            overview_rows.append(
+                {
+                    "id": record.get("id"),
+                    "star": "*" if record.get("starred") else "",
+                    "stage": record.get("stage"),
+                    "created_at": record.get("created_at"),
+                    "features": Path(str(record.get("features_path") or "")).name,
+                    "tramo": record.get("tramo_label"),
+                    "model": record.get("model_name"),
+                    "objective": record.get("threshold_objective")
+                    or record.get("optuna_objective"),
+                    "calibration": record.get("calibration_method"),
+                }
+            )
+        st.dataframe(pd.DataFrame(overview_rows), width="stretch")
+
+        record_lookup = {int(record["id"]): record for record in records}
+        record_id = st.selectbox(
+            "Detalle",
+            list(record_lookup.keys()),
+            key="history_selected_record_id",
+            format_func=lambda value: (
+                f"{'* ' if record_lookup[int(value)].get('starred') else ''}"
+                f"{value} | {record_lookup[int(value)].get('stage')} | "
+                f"{record_lookup[int(value)].get('created_at')} | "
+                f"{record_lookup[int(value)].get('model_name') or '-'}"
+            ),
+        )
+        selected_summary = record_lookup.get(int(record_id))
+
+        model_summaries = [
+            record
+            for record in records
+            if str(record.get("stage") or "") == "Modelos"
+        ]
+        for record in model_summaries:
+            try:
+                detail = history_store.get_record(db_path, int(record.get("id") or 0))
+            except Exception:
+                detail = None
+            model_detail_records.append(detail if isinstance(detail, dict) else record)
+        if model_summaries:
+            _render_history_model_metrics_comparison(
+                model_detail_records,
+                key_prefix="history_modelos_comparison",
+            )
+
+    selected_record = history_store.get_record(db_path, int(record_id))
+    if not isinstance(selected_record, dict):
+        st.warning("No se pudo cargar el registro seleccionado.")
+        return
+
+    col_star, col_delete = st.columns([1, 2])
+    with col_star:
+        star_label = (
+            "Quitar estrella"
+            if selected_summary and selected_summary.get("starred")
+            else "Marcar estrella"
+        )
+        if st.button(star_label, key=f"history_star_{record_id}"):
+            history_store.set_starred(
+                db_path,
+                int(record_id),
+                not bool(selected_summary and selected_summary.get("starred")),
+            )
+            st.rerun()
+    with col_delete:
+        confirm_key = f"history_delete_confirm_{record_id}"
+        confirm_delete = st.checkbox(
+            "Confirmar eliminación",
+            key=confirm_key,
+        )
+        if st.button(
+            "Eliminar registro y artefactos generados",
+            key=f"history_delete_{record_id}",
+            disabled=not confirm_delete,
+        ):
+            result = history_store.delete_record(db_path, int(record_id))
+            if result.get("deleted"):
+                deleted_count = len(result.get("deleted_paths") or [])
+                skipped_count = len(result.get("skipped_paths") or [])
+                st.success(
+                    f"Registro eliminado. Archivos borrados: {deleted_count}. "
+                    f"Omitidos: {skipped_count}."
+                )
+                st.rerun()
+            st.warning("No se pudo eliminar el registro.")
+
+    st.markdown("**Resumen**")
+    st.json(
+        {
+            "id": selected_record.get("id"),
+            "stage": selected_record.get("stage"),
+            "created_at": selected_record.get("created_at"),
+            "context_key": selected_record.get("context_key"),
+            "feature_context_key": selected_record.get("feature_context_key"),
+            "optuna_context_key": selected_record.get("optuna_context_key"),
+            "batch_key": selected_record.get("batch_key"),
+            "features_path": selected_record.get("features_path"),
+            "features_source": selected_record.get("features_source"),
+            "features_date_min": selected_record.get("features_date_min"),
+            "features_date_max": selected_record.get("features_date_max"),
+            "tramo_label": selected_record.get("tramo_label"),
+            "feature_signature": selected_record.get("feature_signature"),
+            "model_name": selected_record.get("model_name"),
+            "optuna_objective": selected_record.get("optuna_objective"),
+            "threshold_objective": selected_record.get("threshold_objective"),
+            "calibration_method": selected_record.get("calibration_method"),
+            "balance_strategy": selected_record.get("balance_strategy"),
+            "protocols": selected_record.get("protocols"),
+        }
+    )
+    st.markdown("**Parámetros**")
+    st.json(selected_record.get("params") or {})
+    st.markdown("**Métricas**")
+    metrics = selected_record.get("metrics") or {}
+    if isinstance(metrics, dict) and metrics:
+        if all(isinstance(value, dict) for value in metrics.values()):
+            try:
+                st.dataframe(pd.DataFrame(metrics).T, width="stretch")
+            except Exception:
+                st.json(metrics)
+        else:
+            st.json(metrics)
+    else:
+        st.info("Sin métricas registradas.")
+    st.markdown("**Artefactos**")
+    artifacts = selected_record.get("artifacts") or []
+    if artifacts:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "role": item.get("role"),
+                        "path": item.get("path"),
+                        "generated": item.get("generated"),
+                        "delete_on_record_delete": item.get(
+                            "delete_on_record_delete"
+                        ),
+                        "exists": Path(str(item.get("path"))).exists(),
+                    }
+                    for item in artifacts
+                    if isinstance(item, dict)
+                ]
+            ),
+            width="stretch",
+        )
+    else:
+        st.info("Sin artefactos registrados.")
+    if st.checkbox(
+        "Mostrar metadata completa",
+        key=f"history_show_metadata_{record_id}",
+    ):
+        st.json(selected_record.get("metadata") or {})
 
 
 
@@ -18233,8 +26252,24 @@ def _default_controlled_comparison_search_space() -> Dict[str, object]:
             "scale_pos_weight_multipliers": [0.5, 1.0, 2.0, 5.0, 10.0],
             "max_delta_step": [0.0, 1.0],
         },
-        "balanced_rf": {
-            "replacement": [False],
+        "nn": {
+            "hidden_dim": {"min": 64, "max": 512, "step": 64},
+            "num_layers": {"min": 1, "max": 4, "step": 1},
+            "dropout": {"min": 0.0, "max": 0.5, "step": 0.1},
+            "learning_rate": {
+                "choices": [0.0001, 0.0003, 0.001, 0.003, 0.01],
+            },
+            "weight_decay": {"choices": [1e-6, 1e-5, 1e-4, 1e-3]},
+            "batch_size": [256, 512, 1024, 2048],
+            "hidden_activation": ["relu", "gelu", "leaky_relu", "elu", "tanh"],
+            "output_activation": ["softmax", "sigmoid"],
+            "loss_function": [
+                "cross_entropy",
+                "binary_cross_entropy",
+                "focal",
+            ],
+            "optimizer_name": ["adamw", "adam", "rmsprop"],
+            "pos_weight_multipliers": [0.5, 1.0, 2.0, 5.0, 10.0],
         },
     }
 
@@ -18396,10 +26431,14 @@ def _render_best_highway_section_controlled_experiment() -> None:
         )
     objective_metric = objective_options.get(objective_label, "balanced_f1")
 
+    _sanitize_multiselect_state(
+        "exp_best_section_controlled_selected_models",
+        CRASH_CONTROLLED_COMPARISON_MODELS,
+    )
     selected_models = st.multiselect(
         "Modelos a comparar",
-        list(CONTROLLED_COMPARISON_MODELS),
-        default=list(CONTROLLED_COMPARISON_MODELS),
+        list(CRASH_CONTROLLED_COMPARISON_MODELS),
+        default=list(CRASH_CONTROLLED_COMPARISON_MODELS),
         key="exp_best_section_controlled_selected_models",
     )
     selected_protocol_labels = st.multiselect(
@@ -20332,16 +28371,18 @@ def _render_controlled_comparison_experiment() -> None:
             ),
         )
     objective_metric = objective_options.get(objective_label, "pr_auc")
+    _sanitize_multiselect_state(
+        "exp_controlled_selected_models",
+        CRASH_CONTROLLED_COMPARISON_MODELS,
+    )
     selected_models = st.multiselect(
         "Modelos a comparar",
-        list(CONTROLLED_COMPARISON_MODELS),
-        default=list(CONTROLLED_COMPARISON_MODELS),
+        list(CRASH_CONTROLLED_COMPARISON_MODELS),
+        default=list(CRASH_CONTROLLED_COMPARISON_MODELS),
         key="exp_controlled_selected_models",
         help=(
             "Selecciona el subconjunto de modelos que quieres ejecutar en la "
-            "comparación controlada. Incluye Balanced Random Forest si quieres "
-            "comparar submuestreo balanceado; si falta imbalanced-learn, esa "
-            "combinación fallará y quedará registrada."
+            "comparación controlada."
         ),
     )
     if not selected_models:
@@ -21303,8 +29344,24 @@ def _render_controlled_comparison_experiment() -> None:
             "scale_pos_weight_multipliers": [0.5, 1.0, 2.0, 5.0, 10.0],
             "max_delta_step": [0.0, 1.0],
         },
-        "balanced_rf": {
-            "replacement": [False],
+        "nn": {
+            "hidden_dim": {"min": 64, "max": 512, "step": 64},
+            "num_layers": {"min": 1, "max": 4, "step": 1},
+            "dropout": {"min": 0.0, "max": 0.5, "step": 0.1},
+            "learning_rate": {
+                "choices": [0.0001, 0.0003, 0.001, 0.003, 0.01],
+            },
+            "weight_decay": {"choices": [1e-6, 1e-5, 1e-4, 1e-3]},
+            "batch_size": [256, 512, 1024, 2048],
+            "hidden_activation": ["relu", "gelu", "leaky_relu", "elu", "tanh"],
+            "output_activation": ["softmax", "sigmoid"],
+            "loss_function": [
+                "cross_entropy",
+                "binary_cross_entropy",
+                "focal",
+            ],
+            "optimizer_name": ["adamw", "adam", "rmsprop"],
+            "pos_weight_multipliers": [0.5, 1.0, 2.0, 5.0, 10.0],
         },
     }
 
@@ -22853,524 +30910,21 @@ def _render_experiments_tab() -> None:
         exp_kind = st.radio(
             "Tipo de experimento",
             [
-                "Features sampler",
-                "Find samples sizes",
                 "Best highway section",
-                "Best mix Highway section & K",
                 "Calibración score + threshold",
                 "Comparación controlada",
             ],
             key="exp_kind_choice",
         )
-        if exp_kind == "Find samples sizes":
-            _render_find_samples_sizes_experiment()
-            return
         if exp_kind == "Best highway section":
             _render_best_highway_section_controlled_experiment()
-            return
-        if exp_kind == "Best mix Highway section & K":
-            _render_best_highway_section_k_experiment()
             return
         if exp_kind == "Calibración score + threshold":
             _render_calibration_sweep_experiment()
             return
-        if exp_kind == "Comparación controlada":
-            _render_controlled_comparison_experiment()
-            return
+        _render_controlled_comparison_experiment()
 
-        st.subheader("Features sampler")
-        
-        # 1. Select Event File
-        event_files = _list_event_files()
-        if not event_files:
-            st.warning("No hay archivos de eventos (accidents) en Datos.")
-            return
-        event_names = [p.name for p in event_files]
-        selected_event = st.selectbox("Archivo de Eventos", event_names, key="exp_event_file")
-        
-        # 2. Select Features File (Includes both Flow and Cluster variables)
-        feature_files = _list_flow_feature_files()
-        if not feature_files:
-            st.warning("No hay archivos de features en Resultados.")
-            return
-        feature_names = [p.name for p in feature_files]
-        selected_features = st.selectbox("Archivo de Features (Flow + Cluster)", feature_names, key="exp_feature_file")
 
-        selected_features_path = next(
-            (p for p in feature_files if p.name == selected_features),
-            None,
-        )
-        allowed_porticos: Optional[set[str]] = None
-        if selected_features_path is not None:
-            allowed_porticos = _load_porticos_from_feature_file(
-                selected_features_path
-            )
-            if allowed_porticos is None:
-                st.warning(
-                    "No se pudo leer porticos del archivo para filtrar tramos."
-                )
-        accidents_df_for_tramo = st.session_state.get("accidents_df")
-        tramo_tuple = _build_tramo_selector(
-            accidents_df_for_tramo,
-            date_start=None,
-            date_end=None,
-            allowed_porticos=allowed_porticos,
-            key="exp_features_sampler_tramo_choice",
-        )
-        tramo_info = None
-        if tramo_tuple:
-            eje, calzada, p_start, p_end = tramo_tuple
-            tramo_info = {
-                "eje": eje,
-                "calzada": calzada,
-                "portico_inicio": p_start,
-                "portico_fin": p_end,
-            }
-        
-        # Model Selection
-        model_choice = st.selectbox(
-            "Modelo para Experimento",
-            ["Random Forest", "XGBoost", "SVM"],
-            key="exp_model_choice"
-        )
-
-        objective_options = _optuna_objective_options(
-            [
-                "f1",
-                "roc_auc",
-                "accuracy",
-                "recall",
-                "precision",
-                "fnr",
-                "far_sens",
-                "mcc",
-                "brier_score",
-            ]
-        )
-        objective_label = st.selectbox(
-            "Metrica objetivo (Optuna/SMOTE)",
-            list(objective_options.keys()),
-            key="exp_features_objective_metric",
-        )
-        objective_cfg = objective_options.get(
-            objective_label, {"key": "f1", "direction": "maximize"}
-        )
-        objective_key = objective_cfg["key"]
-        objective_direction = objective_cfg["direction"]
-        objective_verb = (
-            "minimiza" if objective_direction == "minimize" else "optimiza"
-        )
-        st.caption(
-            f"Optuna {objective_verb} {objective_label} en el set de validacion."
-        )
-        
-        # Settings
-        col1, col2 = st.columns(2)
-        with col1:
-            n_trials = st.number_input("Optuna Trials por paso", min_value=5, value=30, step=5, key="exp_n_trials")
-        with col2:
-            timeout = st.number_input("Optuna Timeout (seg) por paso", min_value=10, value=3600, step=10, key="exp_timeout")
-        optuna_n_jobs = _render_optuna_n_jobs_input(
-            "Optuna jobs paralelos",
-            key="exp_optuna_n_jobs",
-            default=1,
-        )
-        
-        col_k1, col_k2 = st.columns(2)
-        with col_k1:
-            max_k_limit = st.number_input(
-                "Max K Features Limit",
-                min_value=5,
-                value=50,
-                step=5,
-                key="exp_max_k_limit",
-            )
-        with col_k2:
-            step_size = st.number_input(
-                "Paso K",
-                min_value=1,
-                value=5,
-                step=1,
-                key="exp_step_size",
-            )
-
-        # Advanced Configuration
-        far_target = 0.2
-        threshold_strategy = "optuna"
-        threshold_strategy_label = "Optimizar threshold"
-        with st.expander("Configuración Avanzada (Parámetros y Rangos)"):
-            st.markdown("**Split de Datos**")
-            c_split1, c_split2 = st.columns(2)
-            with c_split1:
-                val_size = st.slider("Validation Size (vs Train)", 0.1, 0.5, 0.2, 0.05, key="exp_val_size")
-            with c_split2:
-                test_size = st.slider("Test Size (Global)", 0.1, 0.5, 0.2, 0.05, key="exp_test_size")
-            st.markdown("**Calibración de umbral**")
-            threshold_options = {
-                "Optimizar threshold": "optuna",
-                "Calibrar por FAR": "far",
-            }
-            threshold_strategy = _option_value_from_state(
-                threshold_options,
-                "exp_features_threshold_strategy",
-                default_label="Optimizar threshold",
-            )
-            threshold_visibility = _threshold_field_visibility_for_strategy(
-                threshold_strategy
-            )
-            far_target = float(
-                _render_conditional_slider(
-                    "FAR target",
-                    visible=threshold_visibility["far_target"],
-                    min_value=0.0,
-                    max_value=0.5,
-                    value=0.2,
-                    step=0.01,
-                    key="exp_far_target",
-                )
-            )
-            threshold_strategy_label = st.selectbox(
-                "Estrategia de umbral",
-                list(threshold_options.keys()),
-                key="exp_features_threshold_strategy",
-            )
-            threshold_strategy = threshold_options[threshold_strategy_label]
-            calibration_methods = _calibration_method_multiselect(
-                "Calibración",
-                key="exp_features_calibration_methods",
-                default_methods=["sigmoid", "isotonic"],
-            )
-
-                
-            st.markdown("**Rango SMOTE**")
-            c_smote1, c_smote2 = st.columns(2)
-            with c_smote1:
-                smote_k_min = st.number_input("K Neighbors Min", 1, 20, 1, key="exp_smote_k_min")
-                smote_k_max = st.number_input("K Neighbors Max", 1, 20, 10, key="exp_smote_k_max")
-            with c_smote2:
-                smote_str_min = st.slider("Sampling Strategy Min", 0.1, 1.0, 0.1, 0.1, key="exp_smote_str_min")
-                smote_str_max = st.slider("Sampling Strategy Max", 0.1, 1.0, 1.0, 0.1, key="exp_smote_str_max")
-            
-            # Model Specific Params
-            st.markdown(f"**Rangos para {model_choice}**")
-            model_ranges = {}
-            
-            if model_choice == "Random Forest":
-                c_rf1, c_rf2 = st.columns(2)
-                with c_rf1:
-                    rf_ne_min = st.number_input("N Estimators Min", 10, 1000, 50, step=10, key="exp_rf_ne_min")
-                    rf_ne_max = st.number_input("N Estimators Max", 10, 1000, 300, step=10, key="exp_rf_ne_max")
-                with c_rf2:
-                    rf_md_min = st.number_input("Max Depth Min", 1, 50, 3, key="exp_rf_md_min")
-                    rf_md_max = st.number_input("Max Depth Max", 1, 50, 15, key="exp_rf_md_max")
-                
-                model_ranges = {
-                    "n_estimators": {"min": rf_ne_min, "max": rf_ne_max},
-                    "max_depth": {"min": rf_md_min, "max": rf_md_max}
-                }
-
-            elif model_choice == "XGBoost":
-                c_xgb1, c_xgb2 = st.columns(2)
-                with c_xgb1:
-                    xgb_ne_min = st.number_input("N Estimators Min", 10, 1000, 50, step=10, key="exp_xgb_ne_min")
-                    xgb_ne_max = st.number_input("N Estimators Max", 10, 1000, 300, step=10, key="exp_xgb_ne_max")
-                    xgb_lr_min = st.number_input("Learning Rate Min", 0.001, 1.0, 0.01, format="%.3f", key="exp_xgb_lr_min")
-                    xgb_lr_max = st.number_input("Learning Rate Max", 0.001, 1.0, 0.3, format="%.3f", key="exp_xgb_lr_max")
-                with c_xgb2:
-                    xgb_md_min = st.number_input("Max Depth Min", 1, 50, 3, key="exp_xgb_md_min")
-                    xgb_md_max = st.number_input("Max Depth Max", 1, 50, 15, key="exp_xgb_md_max")
-                    xgb_sub_min = st.slider("Subsample Min", 0.1, 1.0, 0.5, 0.1, key="exp_xgb_sub_min")
-                    xgb_sub_max = st.slider("Subsample Max", 0.1, 1.0, 1.0, 0.1, key="exp_xgb_sub_max")
-                    xgb_col_min = st.slider("Colsample ByTree Min", 0.1, 1.0, 0.5, 0.1, key="exp_xgb_col_min")
-                    xgb_col_max = st.slider("Colsample ByTree Max", 0.1, 1.0, 1.0, 0.1, key="exp_xgb_col_max")
-                    
-                model_ranges = {
-                    "n_estimators": {"min": xgb_ne_min, "max": xgb_ne_max},
-                    "max_depth": {"min": xgb_md_min, "max": xgb_md_max},
-                    "learning_rate": {"min": xgb_lr_min, "max": xgb_lr_max},
-                    "subsample": {"min": xgb_sub_min, "max": xgb_sub_max},
-                    "colsample_bytree": {"min": xgb_col_min, "max": xgb_col_max},
-                }
-
-            elif model_choice == "SVM":
-                c_svm1, c_svm2 = st.columns(2)
-                with c_svm1:
-                     svm_c_min = st.number_input("C Min", 0.01, 1000.0, 0.1, format="%.2f", key="exp_svm_c_min")
-                with c_svm2:
-                     svm_c_max = st.number_input("C Max", 0.01, 1000.0, 50.0, format="%.2f", key="exp_svm_c_max")
-                
-                model_ranges = {
-                     "C": {"min": svm_c_min, "max": svm_c_max}
-                }
-
-        if st.button("Iniciar Experimento"):
-            if not calibration_methods:
-                st.error("Seleccione al menos un calibrador.")
-                return
-            # Load Data
-            try:
-                accidents_path = next(p for p in event_files if p.name == selected_event)
-                features_path = selected_features_path or next(
-                    p for p in feature_files if p.name == selected_features
-                )
-                
-                # Load using robust reader (handles sep and encoding)
-                raw_accidents_df = read_csv_with_progress(str(accidents_path))
-                
-                # Load Porticos for processing
-                try:
-                    porticos_df = load_porticos()
-                    if porticos_df is None or porticos_df.empty:
-                        st.error("No se pudieron cargar los porticos (Porticos.csv).")
-                        return
-                except Exception as e:
-                    st.error(f"Error cargando porticos: {e}")
-                    return
-
-                # Process Accidents (calculate ultimo_portico, accidente_time, etc.)
-                try:
-                    accidents_df, excluded = process_accidentes_df(
-                        raw_accidents_df, porticos_df, return_excluded=True
-                    )
-                    if accidents_df.empty:
-                        st.warning("No quedaron accidentes validos tras el procesamiento (verificar porticos/nombres).")
-                        return
-                    st.success(f"Accidentes procesados: {len(accidents_df)} (Excluidos: {len(excluded)})")
-                except Exception as e:
-                    st.error(f"Error procesando accidentes: {e}")
-                    return
-                
-                # Handle DuckDB or CSV for features
-                if str(features_path).endswith(".duckdb"):
-                     if duckdb:
-                        con = duckdb.connect(str(features_path), read_only=True)
-                        # Assuming table name is first table
-                        tables = con.execute("SHOW TABLES").fetchall()
-                        if tables:
-                            table_name = tables[0][0]
-                            table_ref = _duckdb_quote_identifier(table_name)
-                            query = f"SELECT * FROM {table_ref}"
-                            params: List[object] = []
-                            if tramo_tuple:
-                                cols_info = con.execute(
-                                    f"DESCRIBE {table_ref}"
-                                ).fetchall()
-                                columns = {row[0] for row in cols_info}
-                                clauses, params, filter_ok = _build_tramo_duckdb_filters(
-                                    tramo_tuple, columns
-                                )
-                                if not filter_ok:
-                                    st.warning(
-                                        "El archivo no contiene columnas para filtrar por tramo "
-                                        "(se buscaron: portico, portico_last/portico_next, "
-                                        "portico_inicio/portico_fin, ultimo_portico)."
-                                    )
-                                    con.close()
-                                    return
-                                if clauses:
-                                    query += " WHERE " + " AND ".join(clauses)
-                            features_df = con.execute(query, params).df()
-                        else:
-                            st.error("Empty DuckDB")
-                            con.close()
-                            return
-                        con.close()
-                     else:
-                        st.error("DuckDB not installed")
-                        return
-                else:
-                    features_df = read_csv_with_progress(str(features_path))
-                    if tramo_tuple:
-                        features_df, filter_ok = _apply_tramo_filter_df(
-                            features_df, tramo_tuple
-                        )
-                        if not filter_ok:
-                            st.warning(
-                                "El archivo no contiene columnas para filtrar por tramo "
-                                "(se buscaron: portico, portico_last/portico_next, "
-                                "portico_inicio/portico_fin, ultimo_portico)."
-                            )
-                            return
-
-                if features_df is None or features_df.empty:
-                    if tramo_tuple:
-                        st.warning(
-                            "No se encontraron variables para el tramo seleccionado."
-                        )
-                    else:
-                        st.error("El archivo de features esta vacio.")
-                    return
-                    
-                # Merge to create Base DF
-                # Note: add_accident_target handles merging features with accidents
-                base_df = add_accident_target(features_df, accidents_df)
-                if base_df.empty:
-                    st.error("Dataset vacio tras merge.")
-                    return
-
-                # Identify Column Groups
-                # 1. Cluster Columns
-                cluster_cols = _get_cluster_cols(base_df)
-                # 2. All Numeric Columns (Feature Candidates)
-                all_feature_cols = _get_feature_cols(base_df)
-                # 3. Base (Flow) Columns = All - Cluster
-                base_cols = [c for c in all_feature_cols if c not in cluster_cols]
-                
-                if not cluster_cols:
-                    st.warning("No se detectaron columnas de cluster en el archivo.")
-                
-                # Define search space from inputs
-                search_space = {
-                    "smote": {
-                        "k_neighbors": {"min": smote_k_min, "max": smote_k_max},
-                        "sampling_strategy": {"min": smote_str_min, "max": smote_str_max}
-                    },
-                    "model": model_ranges
-                }
-                
-                # Prepare Runner
-                runner = ExperimentsRunner()
-                run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-                exp_meta = {
-                    "run_id": run_id,
-                    "dataset_name": selected_event,
-                    "features_name": selected_features,
-                    "model_choice": model_choice,
-                    "objective_label": objective_label,
-                    "objective_metric": objective_key,
-                    "objective_direction": objective_direction,
-                    "far_target": float(far_target),
-                    "threshold_strategy": threshold_strategy,
-                    "threshold_strategy_label": threshold_strategy_label,
-                    "calibration_methods": list(calibration_methods),
-                    "test_size": float(test_size),
-                    "val_size": float(val_size),
-                    "optuna_n_jobs": int(optuna_n_jobs),
-                    "max_k_limit": int(max_k_limit),
-                    "step_size": int(step_size),
-                }
-                if tramo_info:
-                    exp_meta["tramo"] = tramo_info
-                exp_db_path = _init_experiment_db("Features sampler", exp_meta)
-                if exp_db_path:
-                    st.caption(f"DB live: {exp_db_path}")
-
-                def _db_callback(payload: Dict[str, object]) -> None:
-                    payload = dict(payload)
-                    payload["experiment"] = "Features sampler"
-                    payload["run_id"] = run_id
-                    payload["model_choice"] = model_choice
-                    if tramo_info:
-                        payload["tramo"] = tramo_info
-                    _append_experiment_result(exp_db_path, payload)
-                
-                # 1. Feature Importance (Full dataset)
-                with st.spinner("Calculando importancia de variables (dataset completo)..."):
-                    if not base_cols:
-                        st.error("No hay columnas de flujo base encontradas.")
-                        return
-                    imp_full = runner.calculate_feature_importance(
-                        base_df, all_feature_cols
-                    )
-                    combined_ordered = imp_full["variable"].tolist()
-                    base_ordered = [
-                        col for col in combined_ordered if col in base_cols
-                    ]
-                st.success(
-                    "Importancia calculada "
-                    f"({len(combined_ordered)} variables totales, "
-                    f"{len(base_ordered)} base)."
-                )
-                combined_ordered_for_run = combined_ordered if cluster_cols else []
-                
-                # 3. Run Loop
-                progress_bar = st.progress(0, text="Iniciando experimentos...")
-                total_ordered = combined_ordered_for_run or base_ordered
-                k_limit = min(len(total_ordered), int(max_k_limit))
-                start_k = min(int(step_size), k_limit) if k_limit else 0
-                st.info(
-                    "Iniciando loop de experimentos "
-                    f"(K={start_k}..{k_limit}, paso={int(step_size)})..."
-                )
-
-                results: List[Dict[str, object]] = []
-                for calibration_method in calibration_methods:
-                    results.extend(
-                        runner.run_iterative_experiment(
-                            base_df=base_df,
-                            base_features_ordered=base_ordered,
-                            cluster_features=combined_ordered_for_run,
-                            model_choice=model_choice,
-                            n_trials=int(n_trials),
-                            timeout=int(timeout),
-                            optuna_n_jobs=int(optuna_n_jobs),
-                            far_target=float(far_target),
-                            search_space_config=search_space,
-                            step_size=int(step_size),
-                            test_size=float(test_size),
-                            val_size=float(val_size),
-                            objective_key=objective_key,
-                            objective_direction=objective_direction,
-                            objective_label=objective_label,
-                            cluster_feature_names=cluster_cols,
-                            threshold_strategy=threshold_strategy,
-                            calibration_method=str(calibration_method),
-                            progress_bar=progress_bar,
-                            dataset_name=selected_event,
-                            features_name=selected_features,
-                            max_k_limit=int(max_k_limit),
-                            result_callback=_db_callback,
-                        )
-                    )
-                
-                # Results
-                if results:
-                    res_df = pd.DataFrame(results)
-                    st.dataframe(res_df, width="stretch")
-                    
-                    # Save
-                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    res_path = RESULTS_DIR / f"experiments_results_{stamp}.csv"
-                    res_df.to_csv(res_path, index=False)
-                    st.success(f"Resultados guardados en {res_path}")
-                    
-                    # Plot
-                    try:
-                         import altair as alt
-                         plot_df = res_df.copy()
-                         plot_metric_key = objective_key
-                         plot_metric_label = objective_label
-                         if plot_metric_key == "far_sens":
-                             if {"far", "sensitivity"}.issubset(plot_df.columns):
-                                 plot_df["far_sens"] = (
-                                     plot_df["far"]
-                                     - (plot_df["sensitivity"] * 1e-3)
-                                 )
-                             else:
-                                 plot_metric_key = "best_f1"
-                                 plot_metric_label = "F1"
-                         if plot_metric_key not in plot_df.columns:
-                             plot_metric_key = "best_f1"
-                             plot_metric_label = "F1"
-                         chart = alt.Chart(plot_df).mark_line(point=True).encode(
-                             x=alt.X("k", axis=alt.Axis(title="Top K Features")),
-                             y=alt.Y(
-                                 plot_metric_key,
-                                 axis=alt.Axis(title=plot_metric_label),
-                             ),
-                             color="type",
-                             tooltip=["k", plot_metric_key, "type"],
-                         ).interactive()
-                         
-                         chart = chart.properties(width=700)
-                         st.altair_chart(chart)
-                    except ImportError:
-                         st.warning("Altair no instalado para graficos.")
-                else:
-                    st.warning("No se generaron resultados.")
-                
-            except Exception as e:
-                st.error(f"Error en experimento: {e}")
 def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None:
     _init_state()
     if set_page_config:
@@ -23382,36 +30936,42 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
     if show_exit_button and st.sidebar.button("Cerrar app"):
         os._exit(0)
 
-    tabs = st.tabs(
-        [
-            "Eventos",
-            "Feature engineering",
-            "Match",
-            "Feature selection",
-            "Optuna",
-            "Balance",
-            "Modelos",
-            "History",
-            "Experiments",
-        ]
+    section_options = [
+        "Eventos",
+        "Feature engineering",
+        "Match",
+        "Feature selection",
+        "Optuna",
+        "Balance",
+        "Modelos",
+        "History",
+        "Experiments",
+    ]
+    selected_section = st.radio(
+        "Sección",
+        section_options,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="crash_prediction_active_section",
     )
-    with tabs[0]:
+
+    if selected_section == "Eventos":
         _render_event_tab()
-    with tabs[2]:
+    elif selected_section == "Match":
         _render_match_tab()
-    with tabs[1]:
+    elif selected_section == "Feature engineering":
         _render_variables_tab()
-    with tabs[3]:
+    elif selected_section == "Feature selection":
         _render_feature_selection_tab()
-    with tabs[4]:
+    elif selected_section == "Optuna":
         _render_optuna_tab()
-    with tabs[5]:
+    elif selected_section == "Balance":
         _render_balance_tab()
-    with tabs[6]:
+    elif selected_section == "Modelos":
         _render_model_tab()
-    with tabs[7]:
+    elif selected_section == "History":
         _render_history_tab()
-    with tabs[8]:
+    elif selected_section == "Experiments":
         _render_experiments_tab()
 
 

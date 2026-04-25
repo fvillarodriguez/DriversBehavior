@@ -152,6 +152,7 @@ class MLPNet(nn.Module):
         dropout: float,
         num_classes: int = 2,
         use_batch_norm: bool = False,
+        hidden_activation: str = "relu",
     ):
         super().__init__()
         layers: List[nn.Module] = []
@@ -160,11 +161,24 @@ class MLPNet(nn.Module):
             layers.append(nn.Linear(dim_in, hidden_dim))
             if use_batch_norm:
                 layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.ReLU())
+            layers.append(self._build_activation(hidden_activation))
             layers.append(nn.Dropout(dropout))
             dim_in = hidden_dim
         layers.append(nn.Linear(dim_in, num_classes))
         self.net = nn.Sequential(*layers)
+
+    @staticmethod
+    def _build_activation(name: str) -> nn.Module:
+        key = str(name or "relu").strip().lower().replace("-", "_")
+        if key == "gelu":
+            return nn.GELU()
+        if key == "elu":
+            return nn.ELU()
+        if key == "leaky_relu":
+            return nn.LeakyReLU(negative_slope=0.01)
+        if key == "tanh":
+            return nn.Tanh()
+        return nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)

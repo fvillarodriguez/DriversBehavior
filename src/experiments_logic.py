@@ -2121,6 +2121,42 @@ def _optuna_trial_state_counts(study: optuna.Study) -> Dict[str, int]:
     return counts
 
 
+def _optuna_trial_progress_fields(
+    study: optuna.Study,
+    *,
+    target_trials: int,
+    trial: Optional[optuna.trial.FrozenTrial] = None,
+) -> Dict[str, object]:
+    counts = _optuna_trial_state_counts(study)
+    done = int(counts["complete"] + counts["pruned"] + counts["failed"])
+    target = max(1, int(target_trials))
+    payload: Dict[str, object] = {
+        "optuna_trials_target": target,
+        "optuna_trials_done": done,
+        "optuna_trials_completed": int(counts["complete"]),
+        "optuna_trials_pruned": int(counts["pruned"]),
+        "optuna_trials_failed": int(counts["failed"]),
+        "optuna_trials_running": int(counts["running"]),
+        "optuna_trials_waiting": int(counts["waiting"]),
+        "optuna_trials_total": int(counts["total"]),
+        "optuna_trial_fraction": float(min(1.0, done / target)),
+    }
+    if trial is not None:
+        payload["trial_number"] = getattr(trial, "number", None)
+        payload["trial_state"] = _trial_state_name(getattr(trial, "state", None))
+        trial_values = getattr(trial, "values", None)
+        if trial_values is not None:
+            payload["trial_values"] = [float(value) for value in trial_values]
+        else:
+            try:
+                trial_value = getattr(trial, "value", None)
+            except Exception:
+                trial_value = None
+            if trial_value is not None:
+                payload["trial_value"] = float(trial_value)
+    return payload
+
+
 def _nearest_choice(values: Sequence[object], target: object) -> Optional[object]:
     choices = list(values or [])
     if not choices:
@@ -3847,6 +3883,31 @@ class ExperimentsRunner:
                 "batch_size": list(
                     nn_cfg.get("batch_size", [256, 512, 1024, 2048])
                 ),
+                "hidden_activation": list(
+                    nn_cfg.get(
+                        "hidden_activation",
+                        ["relu", "gelu", "leaky_relu", "elu", "tanh"],
+                    )
+                ),
+                "output_activation": list(
+                    nn_cfg.get("output_activation", ["softmax", "sigmoid"])
+                ),
+                "loss_function": list(
+                    nn_cfg.get(
+                        "loss_function",
+                        [
+                            "cross_entropy",
+                            "binary_cross_entropy",
+                            "focal",
+                        ],
+                    )
+                ),
+                "optimizer_name": list(
+                    nn_cfg.get(
+                        "optimizer_name",
+                        nn_cfg.get("optimizer", ["adamw", "adam", "rmsprop"]),
+                    )
+                ),
                 # epochs no se optimiza: se fija a un maximo + early stopping
                 # (patience=5) para que cada trial entrene hasta convergencia
                 # sin sobreajuste. El maximo real se configura en Modelos.
@@ -3857,7 +3918,6 @@ class ExperimentsRunner:
             }
             for key in (
                 "use_batch_norm",
-                "loss_function",
                 "lr_scheduler",
                 "temperature_scaling",
             ):
@@ -4623,6 +4683,7 @@ class ExperimentsRunner:
         optuna_objective_mode: str = CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
         execution_backend: str = EXECUTION_BACKEND_LOCAL,
         ray_runtime: Optional[RayClusterRuntime] = None,
+        progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
     ) -> Dict[str, object]:
         feature_k_metadata = dict(feature_k_metadata or {})
         candidate_features = (
@@ -4834,6 +4895,112 @@ class ExperimentsRunner:
             )
 
         ray_hosts_used: List[str] = []
+        max_optuna_trials = max(1, int(n_trials))
+
+        def _emit_combo_progress(
+            event: str,
+            message: str,
+            *,
+            stage: str,
+            combo_fraction: Optional[float] = None,
+            **extra: object,
+        ) -> None:
+            if progress_callback is None:
+                return
+            payload: Dict[str, object] = {
+                "event": str(event),
+                "stage": str(stage),
+                "message": str(message),
+                "model_name": str(model_name),
+                "feature_set": str(feature_set),
+                "balance_mode": str(balance_mode),
+                "objective_metric": str(objective_metric),
+                "threshold_protocol": str(threshold_protocol),
+                "threshold_objective": str(threshold_objective),
+                "calibration_method": str(calibration_method),
+                "candidate_feature_count": int(len(candidate_features)),
+                "selected_feature_count": int(len(selected_features)),
+                "effective_optuna_n_jobs": int(effective_optuna_n_jobs),
+                "effective_parallel_jobs": int(resolved_parallel_jobs),
+                "effective_xgb_parallel_jobs": int(resolved_xgb_parallel_jobs),
+                "effective_threshold_n_jobs": int(threshold_parallel_jobs),
+                "execution_backend": str(execution_backend),
+            }
+            if combo_fraction is not None:
+                payload["combo_fraction"] = float(
+                    min(1.0, max(0.0, float(combo_fraction)))
+                )
+            payload.update(extra)
+            try:
+                progress_callback(payload)
+            except Exception:
+                pass
+
+        def _emit_optuna_progress(
+            event: str,
+            message: str,
+            study: optuna.Study,
+            trial: Optional[optuna.trial.FrozenTrial] = None,
+        ) -> None:
+            if progress_callback is None:
+                return
+            fields = _optuna_trial_progress_fields(
+                study,
+                target_trials=max_optuna_trials,
+                trial=trial,
+            )
+            fraction = 0.10 + 0.75 * float(fields["optuna_trial_fraction"])
+            _emit_combo_progress(
+                event,
+                message,
+                stage="Optuna",
+                combo_fraction=fraction,
+                **fields,
+            )
+
+        def _optuna_trial_callback(
+            study: optuna.Study,
+            trial: optuna.trial.FrozenTrial,
+        ) -> None:
+            if progress_callback is None:
+                return
+            fields = _optuna_trial_progress_fields(
+                study,
+                target_trials=max_optuna_trials,
+                trial=trial,
+            )
+            _emit_optuna_progress(
+                "optuna_trial_finished",
+                (
+                    f"Optuna: {int(fields['optuna_trials_done'])}/"
+                    f"{int(fields['optuna_trials_target'])} trials evaluados."
+                ),
+                study,
+                trial,
+            )
+
+        _emit_combo_progress(
+            "combo_setup",
+            "Preparando matrices y espacio de búsqueda.",
+            stage="Preparación",
+            combo_fraction=0.02,
+        )
+        _emit_combo_progress(
+            "optuna_start",
+            (
+                f"Iniciando Optuna: {max_optuna_trials} trials, "
+                f"concurrencia efectiva {int(effective_optuna_n_jobs)}."
+            ),
+            stage="Optuna",
+            combo_fraction=0.08,
+            optuna_trials_target=max_optuna_trials,
+            optuna_trials_done=0,
+            optuna_trials_completed=0,
+            optuna_trials_pruned=0,
+            optuna_trials_failed=0,
+            optuna_trials_running=0,
+            optuna_trials_total=0,
+        )
 
         if optuna_objective_mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE:
             multiobjective_metric = CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY
@@ -4857,7 +5024,7 @@ class ExperimentsRunner:
                 val_ref = ray_module.put(val_df.copy())
                 pending: Dict[object, optuna.Trial] = {}
                 launched_trials = 0
-                max_trials = max(1, int(n_trials))
+                max_trials = max_optuna_trials
                 deadline = time.monotonic() + max(1, int(timeout))
                 stop_launching = False
                 final_step = int(pruning_config.get("intermediate_steps") or 0) + 1
@@ -4923,6 +5090,15 @@ class ExperimentsRunner:
                             remote_eval.remote(payload, train_ref, val_ref)
                         ] = trial
                         launched_trials += 1
+                        _emit_optuna_progress(
+                            "optuna_trial_launched",
+                            (
+                                f"Optuna: trial {int(getattr(trial, 'number', launched_trials - 1))} "
+                                f"lanzado ({launched_trials}/{max_trials})."
+                            ),
+                            study,
+                            trial,
+                        )
 
                     if not pending:
                         if launched_trials >= max_trials or stop_launching:
@@ -4975,6 +5151,15 @@ class ExperimentsRunner:
                             study.tell(
                                 trial,
                                 state=optuna.trial.TrialState.FAIL,
+                            )
+                            _emit_optuna_progress(
+                                "optuna_trial_failed",
+                                (
+                                    f"Optuna: {int(_optuna_trial_state_counts(study)['failed'])} "
+                                    "trials fallidos."
+                                ),
+                                study,
+                                trial,
                             )
                             continue
 
@@ -5040,6 +5225,12 @@ class ExperimentsRunner:
                                 trial,
                                 state=optuna.trial.TrialState.PRUNED,
                             )
+                            _emit_optuna_progress(
+                                "optuna_trial_pruned",
+                                "Optuna: trial podado.",
+                                study,
+                                trial,
+                            )
                             continue
 
                         for step, step_score in sorted(step_scores.items()):
@@ -5049,6 +5240,12 @@ class ExperimentsRunner:
                             ).append(float(step_score))
                         completed_final_proxy_scores.append(float(proxy_score))
                         study.tell(trial, values)
+                        _emit_optuna_progress(
+                            "optuna_trial_completed",
+                            "Optuna: trial completado.",
+                            study,
+                            trial,
+                        )
 
                 completed_trials = [
                     trial
@@ -5090,6 +5287,16 @@ class ExperimentsRunner:
                 def objective_multiobjective(
                     trial: optuna.Trial,
                 ) -> Tuple[float, float, float, float]:
+                    _emit_optuna_progress(
+                        "optuna_trial_started",
+                        (
+                            f"Optuna: ejecutando trial "
+                            f"{int(getattr(trial, 'number', 0)) + 1}/"
+                            f"{max_optuna_trials}."
+                        ),
+                        study,
+                        trial,
+                    )
                     if tune_top_k:
                         trial_top_k = int(
                             trial.suggest_categorical(
@@ -5241,9 +5448,14 @@ class ExperimentsRunner:
 
                 study.optimize(
                     objective_multiobjective,
-                    n_trials=max(1, int(n_trials)),
+                    n_trials=max_optuna_trials,
                     timeout=max(1, int(timeout)),
                     n_jobs=max(1, int(effective_optuna_n_jobs)),
+                    callbacks=(
+                        [_optuna_trial_callback]
+                        if progress_callback is not None
+                        else None
+                    ),
                 )
 
                 completed_trials = [
@@ -5289,6 +5501,18 @@ class ExperimentsRunner:
                 ray_hosts_used=ray_hosts_used,
             )
 
+            _emit_combo_progress(
+                "final_training_start",
+                "Entrenando protocolo final con el mejor trial.",
+                stage="Entrenamiento final",
+                combo_fraction=0.90,
+                **_optuna_trial_progress_fields(
+                    study,
+                    target_trials=max_optuna_trials,
+                    trial=best_trial,
+                ),
+                best_top_k=int(best_top_k),
+            )
             protocol_result = train_model_with_protocol(
                 train_df,
                 val_df,
@@ -5312,6 +5536,18 @@ class ExperimentsRunner:
             val_metrics = dict(protocol_result.get("validation_metrics") or {})
             test_metrics = dict(protocol_result.get("metrics") or {})
             val_metrics["far_target"] = float(far_target)
+            _emit_combo_progress(
+                "final_training_done",
+                "Evaluación final completada.",
+                stage="Entrenamiento final",
+                combo_fraction=0.97,
+                **_optuna_trial_progress_fields(
+                    study,
+                    target_trials=max_optuna_trials,
+                    trial=best_trial,
+                ),
+                best_top_k=int(best_top_k),
+            )
             decision_threshold = float(test_metrics.get("threshold", 0.5))
             val_objective_values = dict(
                 zip(
@@ -5589,7 +5825,7 @@ class ExperimentsRunner:
             val_ref = ray_module.put(val_df.copy())
             pending: Dict[object, optuna.Trial] = {}
             launched_trials = 0
-            max_trials = max(1, int(n_trials))
+            max_trials = max_optuna_trials
             deadline = time.monotonic() + max(1, int(timeout))
             stop_launching = False
             final_step = int(pruning_config.get("intermediate_steps") or 0) + 1
@@ -5653,6 +5889,15 @@ class ExperimentsRunner:
                     }
                     pending[remote_eval.remote(payload, train_ref, val_ref)] = trial
                     launched_trials += 1
+                    _emit_optuna_progress(
+                        "optuna_trial_launched",
+                        (
+                            f"Optuna: trial {int(getattr(trial, 'number', launched_trials - 1))} "
+                            f"lanzado ({launched_trials}/{max_trials})."
+                        ),
+                        study,
+                        trial,
+                    )
 
                 if not pending:
                     if launched_trials >= max_trials or stop_launching:
@@ -5711,6 +5956,12 @@ class ExperimentsRunner:
                             trial,
                             state=optuna.trial.TrialState.FAIL,
                         )
+                        _emit_optuna_progress(
+                            "optuna_trial_failed",
+                            "Optuna: trial fallido.",
+                            study,
+                            trial,
+                        )
                         continue
 
                     step_scores = {
@@ -5749,6 +6000,12 @@ class ExperimentsRunner:
                             trial,
                             state=optuna.trial.TrialState.PRUNED,
                         )
+                        _emit_optuna_progress(
+                            "optuna_trial_pruned",
+                            "Optuna: trial podado.",
+                            study,
+                            trial,
+                        )
                         continue
 
                     for step, step_score in sorted(step_scores.items()):
@@ -5758,6 +6015,12 @@ class ExperimentsRunner:
                         ).append(float(step_score))
                     completed_final_scores.append(float(score))
                     study.tell(trial, float(score))
+                    _emit_optuna_progress(
+                        "optuna_trial_completed",
+                        "Optuna: trial completado.",
+                        study,
+                        trial,
+                    )
 
             completed_trials = [
                 trial
@@ -5797,6 +6060,16 @@ class ExperimentsRunner:
             _enqueue_warm_trials(study)
 
             def objective(trial: optuna.Trial) -> float:
+                _emit_optuna_progress(
+                    "optuna_trial_started",
+                    (
+                        f"Optuna: ejecutando trial "
+                        f"{int(getattr(trial, 'number', 0)) + 1}/"
+                        f"{max_optuna_trials}."
+                    ),
+                    study,
+                    trial,
+                )
                 if tune_top_k:
                     trial_top_k = int(
                         trial.suggest_categorical(
@@ -5882,9 +6155,14 @@ class ExperimentsRunner:
 
             study.optimize(
                 objective,
-                n_trials=max(1, int(n_trials)),
+                n_trials=max_optuna_trials,
                 timeout=max(1, int(timeout)),
                 n_jobs=max(1, int(effective_optuna_n_jobs)),
+                callbacks=(
+                    [_optuna_trial_callback]
+                    if progress_callback is not None
+                    else None
+                ),
             )
 
             completed_trials = [
@@ -5934,6 +6212,18 @@ class ExperimentsRunner:
             ray_hosts_used=ray_hosts_used,
         )
 
+        _emit_combo_progress(
+            "final_training_start",
+            "Entrenando protocolo final con el mejor trial.",
+            stage="Entrenamiento final",
+            combo_fraction=0.90,
+            **_optuna_trial_progress_fields(
+                study,
+                target_trials=max_optuna_trials,
+                trial=best_trial,
+            ),
+            best_top_k=int(best_top_k),
+        )
         protocol_result = train_model_with_protocol(
             train_df,
             val_df,
@@ -5956,6 +6246,18 @@ class ExperimentsRunner:
         )
         val_metrics = dict(protocol_result.get("validation_metrics") or {})
         test_metrics = dict(protocol_result.get("metrics") or {})
+        _emit_combo_progress(
+            "final_training_done",
+            "Evaluación final completada.",
+            stage="Entrenamiento final",
+            combo_fraction=0.97,
+            **_optuna_trial_progress_fields(
+                study,
+                target_trials=max_optuna_trials,
+                trial=best_trial,
+            ),
+            best_top_k=int(best_top_k),
+        )
         decision_threshold = float(test_metrics.get("threshold", 0.5))
         val_objective_score = _controlled_objective_score_from_metrics(
             val_metrics,
@@ -6417,6 +6719,7 @@ class ExperimentsRunner:
         auto_resume: bool = True,
         start_fresh: bool = False,
         checkpoint_run_id_override: Optional[str] = None,
+        progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
         result_callback: Optional[Callable[[Dict[str, object]], None]] = None,
     ) -> Dict[str, object]:
         if base_df is None or base_df.empty:
@@ -6425,6 +6728,31 @@ class ExperimentsRunner:
             raise ValueError("El dataset debe incluir interval_start para split temporal.")
         if pd.Series(base_df["target"]).astype(int).nunique() < 2:
             raise ValueError("El target debe contener ambas clases.")
+
+        def _emit_sweep_progress(
+            event: str,
+            message: str,
+            **extra: object,
+        ) -> None:
+            if progress_callback is None:
+                return
+            payload = {
+                "event": str(event),
+                "message": str(message),
+                "stage": str(extra.pop("stage", "")),
+            }
+            payload.update(extra)
+            try:
+                progress_callback(payload)
+            except Exception:
+                pass
+
+        _emit_sweep_progress(
+            "run_start",
+            "Validando dataset y configuración del barrido.",
+            stage="Preparación",
+            total_rows=int(len(base_df)),
+        )
 
         resolved_model_name = _resolve_controlled_models([model_name])[0]
         numeric_feature_cols = _numeric_feature_cols(base_df)
@@ -6511,6 +6839,11 @@ class ExperimentsRunner:
         search_space = dict(search_space_config or {})
         pruning_config = _resolve_calibration_pruning_config(optuna_pruning_config)
 
+        _emit_sweep_progress(
+            "split_start",
+            "Construyendo split temporal train/validación/test.",
+            stage="Split temporal",
+        )
         train_val_df, test_df = temporal_train_test_split(
             base_df,
             test_size=float(test_size),
@@ -6525,6 +6858,14 @@ class ExperimentsRunner:
             raise ValueError("El split temporal dejó una sola clase en validación.")
         if test_df["target"].astype(int).nunique() < 2:
             raise ValueError("El split temporal dejó una sola clase en test.")
+        _emit_sweep_progress(
+            "split_ready",
+            "Split temporal listo.",
+            stage="Split temporal",
+            train_rows=int(len(train_df)),
+            val_rows=int(len(val_df)),
+            test_rows=int(len(test_df)),
+        )
 
         feature_k_config_payload = dict(feature_k_config or {})
         feature_k_mode = str(
@@ -6542,6 +6883,15 @@ class ExperimentsRunner:
         top_k_step_value: Optional[int] = None
 
         if feature_k_mode in {"fixed_top_k", "optuna_top_k"}:
+            _emit_sweep_progress(
+                "feature_ranking_start",
+                (
+                    f"Calculando ranking de {len(candidate_feature_cols)} variables "
+                    f"con {int(parallel_jobs)} jobs."
+                ),
+                stage="Ranking de variables",
+                candidate_feature_count=int(len(candidate_feature_cols)),
+            )
             ranking_df = self.calculate_feature_importance(
                 train_df,
                 candidate_feature_cols,
@@ -6555,6 +6905,13 @@ class ExperimentsRunner:
             ]
             if not ranked_feature_cols:
                 ranked_feature_cols = list(candidate_feature_cols)
+            _emit_sweep_progress(
+                "feature_ranking_done",
+                "Ranking de variables listo.",
+                stage="Ranking de variables",
+                candidate_feature_count=int(len(candidate_feature_cols)),
+                ranked_feature_count=int(len(ranked_feature_cols)),
+            )
 
             if feature_k_mode == "fixed_top_k":
                 fixed_k = max(
@@ -6751,6 +7108,15 @@ class ExperimentsRunner:
                 )
             )
 
+        _emit_sweep_progress(
+            "checkpoint_ready",
+            f"Checkpoint activo: {effective_run_id}.",
+            stage="Checkpoint",
+            run_id=str(effective_run_id),
+            auto_resumed=bool(auto_resumed),
+            loaded_from_checkpoint=bool(loaded_from_checkpoint),
+        )
+
         if manifest is None:
             manifest = {
                 "run_id": effective_run_id,
@@ -6824,6 +7190,12 @@ class ExperimentsRunner:
 
         split_step = dict((manifest.get("steps_index") or {}).get("split_freeze") or {})
         if str(split_step.get("status") or "") != "completed":
+            _emit_sweep_progress(
+                "split_freeze_start",
+                "Persistiendo split temporal congelado.",
+                stage="Split temporal",
+                run_id=str(effective_run_id),
+            )
             split_artifacts = self._persist_controlled_splits(
                 train_df=train_df,
                 val_df=val_df,
@@ -6842,6 +7214,15 @@ class ExperimentsRunner:
                     "val_rows": int(len(val_df)),
                     "test_rows": int(len(test_df)),
                 },
+            )
+            _emit_sweep_progress(
+                "split_freeze_done",
+                "Split temporal congelado en checkpoint.",
+                stage="Split temporal",
+                run_id=str(effective_run_id),
+                train_rows=int(len(train_df)),
+                val_rows=int(len(val_df)),
+                test_rows=int(len(test_df)),
             )
 
         grid_results_df = _read_checkpoint_frame(paths["grid_results"])
@@ -6943,6 +7324,44 @@ class ExperimentsRunner:
                 "event_path": str(event_path or ""),
                 "features_path": str(features_path or ""),
             }
+            combo_label = (
+                f"{objective_metric} | {calibration_method} | "
+                f"{threshold_objective} | {balance_mode}"
+            )
+            combo_context = {
+                "run_id": str(effective_run_id),
+                "combo_id": combo_step_id,
+                "combo_index": int(combo_index),
+                "total_combinations": int(len(combos)),
+                "combo_label": combo_label,
+                "model_name": resolved_model_name,
+                "objective_metric": str(objective_metric),
+                "calibration_method": str(calibration_method),
+                "threshold_objective": str(threshold_objective),
+                "balance_mode": str(balance_mode),
+            }
+
+            def _combo_progress_callback(
+                event_payload: Dict[str, object],
+                *,
+                _combo_context: Dict[str, object] = combo_context,
+            ) -> None:
+                if progress_callback is None:
+                    return
+                merged = dict(event_payload or {})
+                merged.update(_combo_context)
+                try:
+                    progress_callback(merged)
+                except Exception:
+                    pass
+
+            _emit_sweep_progress(
+                "combo_start",
+                f"Evaluando combinación {combo_index}/{len(combos)}: {combo_label}.",
+                stage="Combinación",
+                combo_fraction=0.0,
+                **combo_context,
+            )
             _mark_step(
                 paths,
                 manifest,
@@ -7006,6 +7425,7 @@ class ExperimentsRunner:
                         "ranked_cols": list(ranked_feature_cols),
                     },
                     ray_runtime=ray_runtime,
+                    progress_callback=_combo_progress_callback,
                 )
                 payload.update(
                     _controlled_payload_updates_from_result(
@@ -7084,9 +7504,32 @@ class ExperimentsRunner:
             grid_records.append(dict(payload))
             grid_results_df = pd.DataFrame(grid_records)
             _write_checkpoint_frame(grid_results_df, paths["grid_results"])
+            _emit_sweep_progress(
+                "combo_done",
+                (
+                    f"Combinación {combo_index}/{len(combos)} finalizada "
+                    f"con estado {payload.get('status')}."
+                ),
+                stage="Combinación",
+                combo_fraction=1.0,
+                status=str(payload.get("status") or ""),
+                optuna_trials_completed=int(
+                    payload.get("optuna_trials_completed") or 0
+                ),
+                optuna_trials_pruned=int(payload.get("optuna_trials_pruned") or 0),
+                optuna_trials_failed=int(payload.get("optuna_trials_failed") or 0),
+                optuna_trials_total=int(payload.get("optuna_trials_total") or 0),
+                **combo_context,
+            )
             if result_callback:
                 result_callback(dict(payload))
 
+        _emit_sweep_progress(
+            "leaderboard_start",
+            "Construyendo leaderboard y frente de Pareto.",
+            stage="Leaderboard",
+            run_id=str(effective_run_id),
+        )
         _mark_step(
             paths,
             manifest,
@@ -7144,6 +7587,12 @@ class ExperimentsRunner:
             status="completed",
             message="Experimento de calibración finalizado.",
             extra={"artifact_paths": manifest.get("artifacts") or {}},
+        )
+        _emit_sweep_progress(
+            "run_completed",
+            "Experimento de calibración finalizado.",
+            stage="Finalización",
+            run_id=str(effective_run_id),
         )
         return self._assemble_calibration_sweep_payload(
             run_id=effective_run_id,

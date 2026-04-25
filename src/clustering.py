@@ -7,12 +7,16 @@ Funciones para calcular variables de clusterizacion y ejecutar clustering.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import os
 import re
 import subprocess
 import sys
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -29,6 +33,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from utils import (
+    FLOW_TABLE_NAME,
     FlowColumns,
     ensure_flow_db_summary,
     load_flujos,
@@ -45,6 +50,12 @@ CLUSTER_DB_PATH = ROOT_DIR / "Resultados" / "cluster_features.duckdb"
 CLUSTER_TABLE_NAME = "cluster_features"
 CLUSTER_BATCH_TABLE_NAME = "cluster_features_batches"
 CLUSTER_META_TABLE_NAME = "cluster_features_meta"
+DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME = "dynamic_assignments"
+DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME = "dynamic_window_summary"
+DYNAMIC_GMM_METADATA_TABLE_NAME = "dynamic_metadata"
+DYNAMIC_GMM_LIVE_EVENTS_TABLE_NAME = "dynamic_live_events"
+DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME = "dynamic_window_checkpoint"
+DYNAMIC_GMM_RUN_STATUS_TABLE_NAME = "dynamic_run_status"
 DEFAULT_CLUSTER_FEATURES = [
     "avg_speed_kmh",
     "exceso_velocidad",
@@ -987,6 +998,166 @@ def assign_clusters_kmeans(
     return full_df, kmeans, threshold
 
 
+def fit_gmm_cluster_model(
+    frequent_df: pd.DataFrame,
+    feature_cols: List[str],
+    k: int,
+    random_state: int = 42,
+    covariance_type: str = "full",
+    max_iter: int = 100,
+    n_init: int = 3,
+) -> Tuple[object, object]:
+    """
+    Fit a GaussianMixture and its StandardScaler on the frequent-driver subset.
+    """
+    try:
+        from sklearn.mixture import GaussianMixture
+    except ImportError as exc:
+        raise ImportError("scikit-learn required") from exc
+
+    if frequent_df is None or frequent_df.empty:
+        raise ValueError("frequent_df must contain rows to fit GMM.")
+    if not feature_cols:
+        raise ValueError("feature_cols must not be empty.")
+    missing = [col for col in feature_cols if col not in frequent_df.columns]
+    if missing:
+        raise ValueError(f"Missing GMM feature columns: {', '.join(missing)}")
+
+    X_freq_scaled, scaler = _scale_cluster_features(frequent_df, feature_cols)
+    gmm = GaussianMixture(
+        n_components=int(k),
+        covariance_type=covariance_type,
+        random_state=random_state,
+        max_iter=max_iter,
+        n_init=n_init,
+    )
+    gmm.fit(X_freq_scaled)
+    return gmm, scaler
+
+
+def _cluster_probability_columns(k: int) -> List[str]:
+    return [f"cluster_prob_{cluster_idx}" for cluster_idx in range(int(k))]
+
+
+def _add_soft_entropy(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    prob_cols = [
+        col for col in result.columns if re.match(r"^cluster_prob_\d+$", str(col))
+    ]
+    prob_cols = sorted(prob_cols, key=lambda col: int(str(col).rsplit("_", 1)[1]))
+    if not prob_cols:
+        result["soft_entropy"] = math.nan
+        return result
+    probs = result[prob_cols].to_numpy(dtype=float)
+    probs = np.clip(probs, 0.0, 1.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_probs = np.where(probs > 0, np.log(probs), 0.0)
+    entropy = -(probs * log_probs).sum(axis=1)
+    if len(prob_cols) > 1:
+        entropy = entropy / math.log(len(prob_cols))
+    result["soft_entropy"] = entropy
+    return result
+
+
+def predict_gmm_cluster_membership(
+    features_df: pd.DataFrame,
+    feature_cols: List[str],
+    model: object,
+    scaler: object,
+    confidence_threshold_proba: float = 0.70,
+    min_window_passes: Optional[int] = None,
+    include_membership_probabilities: bool = True,
+    apply_confidence_threshold: bool = True,
+) -> pd.DataFrame:
+    """
+    Apply a fitted GMM/scaler pair to a feature table and return hard labels,
+    soft memberships and assignment diagnostics.
+    """
+    if features_df is None:
+        features_df = pd.DataFrame()
+    result = features_df.copy()
+    k = int(getattr(model, "n_components", 0) or 0)
+    if k <= 0:
+        k = 0
+
+    if result.empty:
+        for col in [
+            "raw_cluster_label",
+            "cluster_label",
+            "confidence_score",
+            "assignment_status",
+            "is_low_support",
+        ]:
+            result[col] = pd.Series(dtype="float64" if col != "assignment_status" else "object")
+        if include_membership_probabilities:
+            for col in _cluster_probability_columns(k):
+                result[col] = pd.Series(dtype="float64")
+        result["soft_entropy"] = pd.Series(dtype="float64")
+        return result
+
+    missing = [col for col in feature_cols if col not in result.columns]
+    if missing:
+        raise ValueError(f"Missing GMM prediction columns: {', '.join(missing)}")
+
+    working = result.copy()
+    for col in feature_cols:
+        working[col] = pd.to_numeric(working[col], errors="coerce")
+    working = working.replace([math.inf, -math.inf], math.nan)
+    working = working.dropna(subset=feature_cols)
+    if working.empty:
+        result = result.iloc[0:0].copy()
+        for col in [
+            "raw_cluster_label",
+            "cluster_label",
+            "confidence_score",
+            "assignment_status",
+            "is_low_support",
+        ]:
+            result[col] = pd.Series(dtype="float64" if col != "assignment_status" else "object")
+        if include_membership_probabilities:
+            for col in _cluster_probability_columns(k):
+                result[col] = pd.Series(dtype="float64")
+        result["soft_entropy"] = pd.Series(dtype="float64")
+        return result
+
+    X = working[feature_cols].to_numpy(dtype=float)
+    X_scaled = scaler.transform(X)
+    probs = model.predict_proba(X_scaled)
+    k = probs.shape[1]
+    raw_labels = probs.argmax(axis=1).astype(int)
+    max_probs = probs.max(axis=1)
+
+    labels = raw_labels.copy()
+    low_confidence = (
+        max_probs < float(confidence_threshold_proba)
+        if apply_confidence_threshold
+        else np.zeros(len(working), dtype=bool)
+    )
+    if min_window_passes is not None and "total_passes" in working.columns:
+        total_passes = pd.to_numeric(working["total_passes"], errors="coerce").fillna(0)
+        low_support = total_passes.to_numpy(dtype=float) < float(min_window_passes)
+    else:
+        low_support = np.zeros(len(working), dtype=bool)
+    labels[low_confidence | low_support] = -1
+
+    status = np.full(len(working), "assigned", dtype=object)
+    status[low_confidence] = "low_confidence"
+    status[low_support] = "low_support"
+    status[low_confidence & low_support] = "low_support_low_confidence"
+
+    predicted = working.copy()
+    predicted["raw_cluster_label"] = raw_labels
+    predicted["cluster_label"] = labels
+    predicted["confidence_score"] = max_probs
+    predicted["assignment_status"] = status
+    predicted["is_low_support"] = low_support
+    if include_membership_probabilities:
+        for cluster_idx in range(k):
+            predicted[f"cluster_prob_{cluster_idx}"] = probs[:, cluster_idx]
+    predicted = _add_soft_entropy(predicted)
+    return predicted
+
+
 def assign_clusters_gmm(
     frequent_df: pd.DataFrame,
     rare_df: pd.DataFrame,
@@ -995,60 +1166,46 @@ def assign_clusters_gmm(
     confidence_threshold_proba: float = 0.70,
     random_state: int = 42,
     covariance_type: str = "full",
+    include_membership_probabilities: bool = False,
 ) -> Tuple[pd.DataFrame, object, float]:
     """
     Entrena GMM en frequent_df. Asigna clusters a rare_df con umbral de probabilidad.
     Retorna (df_consolidado, model, threshold_used).
     """
-    try:
-        from sklearn.mixture import GaussianMixture
-    except ImportError as exc:
-        raise ImportError("scikit-learn required") from exc
-
-    # 1. Scale based on frequent
-    X_freq_scaled, scaler = _scale_cluster_features(frequent_df, feature_cols)
-    
-    # 2. Train GMM
-    gmm = GaussianMixture(
-        n_components=k,
-        covariance_type=covariance_type,
+    gmm, scaler = fit_gmm_cluster_model(
+        frequent_df,
+        feature_cols,
+        k=int(k),
         random_state=random_state,
-        n_init=3
+        covariance_type=covariance_type,
+        n_init=3,
     )
-    gmm.fit(X_freq_scaled)
-    
-    # 3. Predict Frequent (mostly to get consistency check, though GMM is soft)
-    freq_probs = gmm.predict_proba(X_freq_scaled)
-    freq_max_probs = freq_probs.max(axis=1)
-    freq_labels = gmm.predict(X_freq_scaled)
-    
-    # 4. Process Rare
+
+    freq_result = predict_gmm_cluster_membership(
+        frequent_df,
+        feature_cols,
+        gmm,
+        scaler,
+        confidence_threshold_proba=confidence_threshold_proba,
+        include_membership_probabilities=include_membership_probabilities,
+        apply_confidence_threshold=False,
+    )
+    freq_result["is_rare"] = False
+
     if not rare_df.empty:
-        X_rare = rare_df[feature_cols].to_numpy(dtype=float)
-        X_rare_scaled = scaler.transform(X_rare)
-        
-        rare_probs = gmm.predict_proba(X_rare_scaled)
-        rare_max_probs = rare_probs.max(axis=1)
-        rare_labels = gmm.predict(X_rare_scaled)
-        
-        # Apply threshold
-        # If max_prob < threshold -> -1
-        mask_unknown = rare_max_probs < confidence_threshold_proba
-        rare_labels[mask_unknown] = -1
-        
-        rare_result = rare_df.copy()
-        rare_result["cluster_label"] = rare_labels
-        rare_result["confidence_score"] = rare_max_probs
+        rare_result = predict_gmm_cluster_membership(
+            rare_df,
+            feature_cols,
+            gmm,
+            scaler,
+            confidence_threshold_proba=confidence_threshold_proba,
+            include_membership_probabilities=include_membership_probabilities,
+            apply_confidence_threshold=True,
+        )
         rare_result["is_rare"] = True
     else:
         rare_result = pd.DataFrame()
-        
-    # 5. Build Frequent request
-    freq_result = frequent_df.copy()
-    freq_result["cluster_label"] = freq_labels
-    freq_result["confidence_score"] = freq_max_probs
-    freq_result["is_rare"] = False
-    
+
     full_df = pd.concat([freq_result, rare_result], axis=0)
     return full_df, gmm, confidence_threshold_proba
 
@@ -1169,6 +1326,1779 @@ def load_cluster_features_duckdb(
 ) -> pd.DataFrame:
     features_df, _metadata = load_cluster_feature_bundle_duckdb(db_path)
     return features_df
+
+
+def _require_joblib():
+    try:
+        import joblib  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "joblib is required to persist dynamic GMM artifacts."
+        ) from exc
+    return joblib
+
+
+def list_dynamic_gmm_db_paths(output_dir: Optional[Path] = None) -> List[Path]:
+    target_dir = output_dir or (ROOT_DIR / "Resultados")
+    if not target_dir.exists():
+        return []
+    return sorted(target_dir.glob("dynamic_gmm_*.duckdb"))
+
+
+def list_dynamic_gmm_checkpoint_db_paths(output_dir: Optional[Path] = None) -> List[Path]:
+    paths = list_dynamic_gmm_db_paths(output_dir=output_dir)
+    if not paths or duckdb is None:
+        return []
+    checkpoint_paths: List[Path] = []
+    for path in paths:
+        try:
+            conn = duckdb.connect(str(path), read_only=True)
+            try:
+                if _dynamic_gmm_table_exists(
+                    conn,
+                    DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME,
+                ):
+                    checkpoint_paths.append(path)
+            finally:
+                conn.close()
+        except Exception:
+            continue
+    return checkpoint_paths
+
+
+def _dynamic_gmm_now() -> str:
+    return pd.Timestamp.now().isoformat(timespec="seconds")
+
+
+def _dynamic_gmm_stamp() -> str:
+    return pd.Timestamp.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _dynamic_gmm_table_exists(conn, table_name: str) -> bool:
+    try:
+        info = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    except Exception:
+        return False
+    return bool(info)
+
+
+def _load_dynamic_gmm_metadata_from_conn(conn) -> Dict[str, object]:
+    if not _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_METADATA_TABLE_NAME):
+        return {}
+    try:
+        meta_df = conn.execute(
+            f"SELECT key, value_json FROM {DYNAMIC_GMM_METADATA_TABLE_NAME}"
+        ).df()
+    except Exception:
+        return {}
+    metadata: Dict[str, object] = {}
+    for row in meta_df.itertuples(index=False):
+        key = str(getattr(row, "key", "") or "").strip()
+        if not key:
+            continue
+        raw_value = getattr(row, "value_json", None)
+        try:
+            metadata[key] = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError):
+            metadata[key] = raw_value
+    return metadata
+
+
+def _dynamic_gmm_config_fingerprint(config: Dict[str, object]) -> str:
+    payload = json.dumps(config, sort_keys=True, default=str, ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _dynamic_gmm_empty_assignments_df(
+    effective_feature_cols: List[str],
+    k: int,
+    include_membership_probabilities: bool,
+) -> pd.DataFrame:
+    probability_cols = (
+        _cluster_probability_columns(int(k))
+        if include_membership_probabilities
+        else []
+    )
+    return pd.DataFrame(
+        columns=[
+            "run_id",
+            "window_index",
+            "window_label",
+            "window_start",
+            "window_end",
+            "plate",
+            *effective_feature_cols,
+            "raw_cluster_label",
+            "cluster_label",
+            "confidence_score",
+            "assignment_status",
+            "is_low_support",
+            *probability_cols,
+            "soft_entropy",
+        ]
+    )
+
+
+def _dynamic_gmm_empty_window_summary(
+    *,
+    run_id: str,
+    window_index: int,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    window_label: str,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "run_id": str(run_id),
+                "window_index": int(window_index),
+                "window_label": str(window_label),
+                "window_start": pd.Timestamp(window_start),
+                "window_end": pd.Timestamp(window_end),
+                "rows": 0,
+                "assigned_rows": 0,
+                "unknown_rows": 0,
+                "low_support_rows": 0,
+                "low_confidence_rows": 0,
+                "mean_confidence": math.nan,
+                "mean_soft_entropy": math.nan,
+            }
+        ]
+    )
+
+
+def _dynamic_gmm_append_df(conn, table_name: str, df: pd.DataFrame) -> None:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    work = df.copy()
+    for col in work.columns:
+        if pd.api.types.is_datetime64_any_dtype(work[col]) or col in {
+            "window_start",
+            "window_end",
+        }:
+            converted = pd.to_datetime(work[col], errors="coerce")
+            if converted.notna().any():
+                work[col] = converted.astype("datetime64[us]")
+    view_name = f"_{table_name}_view"
+    conn.register(view_name, work)
+    try:
+        if not _dynamic_gmm_table_exists(conn, table_name):
+            conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {view_name}")
+        else:
+            conn.execute(f"INSERT INTO {table_name} SELECT * FROM {view_name}")
+    finally:
+        conn.unregister(view_name)
+
+
+def _dynamic_gmm_replace_metadata(conn, metadata: Dict[str, object]) -> None:
+    conn.execute(f"DROP TABLE IF EXISTS {DYNAMIC_GMM_METADATA_TABLE_NAME}")
+    meta_rows = _feature_metadata_to_rows(metadata)
+    if meta_rows.empty:
+        meta_rows = pd.DataFrame(columns=["key", "value_json"])
+    conn.register("dynamic_metadata_df", meta_rows)
+    try:
+        conn.execute(
+            f"CREATE TABLE {DYNAMIC_GMM_METADATA_TABLE_NAME} AS "
+            "SELECT * FROM dynamic_metadata_df"
+        )
+    finally:
+        conn.unregister("dynamic_metadata_df")
+
+
+def _dynamic_gmm_replace_run_status(conn, row: Dict[str, object]) -> None:
+    df = pd.DataFrame([row])
+    conn.register("dynamic_run_status_df", df)
+    try:
+        conn.execute(f"DROP TABLE IF EXISTS {DYNAMIC_GMM_RUN_STATUS_TABLE_NAME}")
+        conn.execute(
+            f"CREATE TABLE {DYNAMIC_GMM_RUN_STATUS_TABLE_NAME} AS "
+            "SELECT * FROM dynamic_run_status_df"
+        )
+    finally:
+        conn.unregister("dynamic_run_status_df")
+
+
+def _dynamic_gmm_checkpoint_rows(
+    run_id: str,
+    windows: List[Tuple[pd.Timestamp, pd.Timestamp, str]],
+) -> pd.DataFrame:
+    now = _dynamic_gmm_now()
+    rows = pd.DataFrame(
+        [
+            {
+                "run_id": str(run_id),
+                "window_index": int(idx),
+                "window_label": str(window_label),
+                "window_start": pd.Timestamp(window_start),
+                "window_end": pd.Timestamp(window_end),
+                "status": "pending",
+                "started_at": None,
+                "completed_at": None,
+                "updated_at": now,
+                "worker_id": None,
+                "rows": 0,
+                "error": None,
+                "attempts": 0,
+            }
+            for idx, (window_start, window_end, window_label) in enumerate(
+                windows,
+                start=1,
+            )
+        ]
+    )
+    for col in [
+        "run_id",
+        "window_label",
+        "status",
+        "started_at",
+        "completed_at",
+        "updated_at",
+        "worker_id",
+        "error",
+    ]:
+        if col in rows.columns:
+            rows[col] = rows[col].astype("string")
+    return rows
+
+
+def _dynamic_gmm_insert_initial_checkpoint(
+    conn,
+    run_id: str,
+    windows: List[Tuple[pd.Timestamp, pd.Timestamp, str]],
+) -> None:
+    rows = _dynamic_gmm_checkpoint_rows(run_id, windows)
+    conn.register("dynamic_checkpoint_df", rows)
+    try:
+        conn.execute(f"DROP TABLE IF EXISTS {DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME}")
+        conn.execute(
+            f"CREATE TABLE {DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME} AS "
+            "SELECT * FROM dynamic_checkpoint_df"
+        )
+    finally:
+        conn.unregister("dynamic_checkpoint_df")
+
+
+def _dynamic_gmm_mark_running_stale(conn, run_id: str) -> None:
+    if not _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME):
+        return
+    now = _dynamic_gmm_now()
+    conn.execute(
+        f"""
+        UPDATE {DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME}
+        SET status = 'failed_stale',
+            error = COALESCE(error, 'Run interrupted while window was running.'),
+            updated_at = ?
+        WHERE run_id = ? AND status = 'running'
+        """,
+        [now, str(run_id)],
+    )
+
+
+def _dynamic_gmm_checkpoint_df(conn, run_id: str) -> pd.DataFrame:
+    if not _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME):
+        return pd.DataFrame()
+    return conn.execute(
+        f"""
+        SELECT *
+        FROM {DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME}
+        WHERE run_id = ?
+        ORDER BY window_index
+        """,
+        [str(run_id)],
+    ).df()
+
+
+def _dynamic_gmm_todo_windows(
+    conn,
+    run_id: str,
+    windows: List[Tuple[pd.Timestamp, pd.Timestamp, str]],
+) -> List[Tuple[int, pd.Timestamp, pd.Timestamp, str]]:
+    checkpoint = _dynamic_gmm_checkpoint_df(conn, run_id)
+    if checkpoint.empty:
+        return [
+            (idx, window_start, window_end, window_label)
+            for idx, (window_start, window_end, window_label) in enumerate(
+                windows,
+                start=1,
+            )
+        ]
+    completed = set(
+        pd.to_numeric(
+            checkpoint.loc[checkpoint["status"].astype(str) == "completed", "window_index"],
+            errors="coerce",
+        )
+        .dropna()
+        .astype(int)
+        .tolist()
+    )
+    return [
+        (idx, window_start, window_end, window_label)
+        for idx, (window_start, window_end, window_label) in enumerate(
+            windows,
+            start=1,
+        )
+        if idx not in completed
+    ]
+
+
+def _dynamic_gmm_update_checkpoint(
+    conn,
+    *,
+    run_id: str,
+    window_index: int,
+    status: str,
+    worker_id: Optional[str] = None,
+    rows: Optional[int] = None,
+    error: Optional[str] = None,
+    increment_attempts: bool = False,
+) -> None:
+    if not _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME):
+        return
+    now = _dynamic_gmm_now()
+    if increment_attempts:
+        conn.execute(
+            f"""
+            UPDATE {DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME}
+            SET status = ?,
+                started_at = COALESCE(started_at, ?),
+                updated_at = ?,
+                worker_id = ?,
+                attempts = COALESCE(attempts, 0) + 1,
+                error = NULL
+            WHERE run_id = ? AND window_index = ?
+            """,
+            [
+                str(status),
+                now,
+                now,
+                None if worker_id is None else str(worker_id),
+                str(run_id),
+                int(window_index),
+            ],
+        )
+        return
+    completed_at = now if str(status) == "completed" else None
+    conn.execute(
+        f"""
+        UPDATE {DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME}
+        SET status = ?,
+            completed_at = COALESCE(?, completed_at),
+            updated_at = ?,
+            worker_id = COALESCE(?, worker_id),
+            rows = COALESCE(?, rows),
+            error = ?
+        WHERE run_id = ? AND window_index = ?
+        """,
+        [
+            str(status),
+            completed_at,
+            now,
+            None if worker_id is None else str(worker_id),
+            None if rows is None else int(rows),
+            error,
+            str(run_id),
+            int(window_index),
+        ],
+    )
+
+
+def _dynamic_gmm_counts(conn, run_id: str, total_windows: int) -> Dict[str, int]:
+    completed = 0
+    failed = 0
+    running = 0
+    pending = int(total_windows)
+    if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME):
+        rows = conn.execute(
+            f"""
+            SELECT status, COUNT(*) AS n
+            FROM {DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME}
+            WHERE run_id = ?
+            GROUP BY status
+            """,
+            [str(run_id)],
+        ).fetchall()
+        counts = {str(status): int(n or 0) for status, n in rows}
+        completed = int(counts.get("completed", 0))
+        running = int(counts.get("running", 0))
+        failed = int(
+            counts.get("failed", 0)
+            + counts.get("failed_stale", 0)
+            + counts.get("skipped", 0)
+        )
+        pending = int(counts.get("pending", 0))
+    assignment_rows = 0
+    if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME):
+        try:
+            assignment_rows = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME}
+                    WHERE run_id = ?
+                    """,
+                    [str(run_id)],
+                ).fetchone()[0]
+                or 0
+            )
+        except Exception:
+            assignment_rows = 0
+    return {
+        "completed_windows": completed,
+        "failed_windows": failed,
+        "running_windows": running,
+        "pending_windows": pending,
+        "assignment_rows": assignment_rows,
+    }
+
+
+def _dynamic_gmm_append_event(
+    conn,
+    *,
+    run_id: str,
+    event_type: str,
+    status: str,
+    total_windows: int,
+    message: str,
+    window_index: Optional[int] = None,
+    window_label: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    counts = _dynamic_gmm_counts(conn, run_id, total_windows)
+    completed = int(counts["completed_windows"])
+    progress_ratio = completed / float(max(1, int(total_windows)))
+    event_index = 1
+    if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_LIVE_EVENTS_TABLE_NAME):
+        try:
+            event_index = int(
+                conn.execute(
+                    f"SELECT COALESCE(MAX(event_index), 0) + 1 FROM {DYNAMIC_GMM_LIVE_EVENTS_TABLE_NAME}"
+                ).fetchone()[0]
+                or 1
+            )
+        except Exception:
+            event_index = 1
+    row = pd.DataFrame(
+        [
+            {
+                "event_index": int(event_index),
+                "timestamp": _dynamic_gmm_now(),
+                "run_id": str(run_id),
+                "event_type": str(event_type),
+                "status": str(status),
+                "window_index": None if window_index is None else int(window_index),
+                "window_label": window_label,
+                "message": str(message),
+                "completed_windows": completed,
+                "failed_windows": int(counts["failed_windows"]),
+                "running_windows": int(counts["running_windows"]),
+                "pending_windows": int(counts["pending_windows"]),
+                "total_windows": int(total_windows),
+                "assignment_rows": int(counts["assignment_rows"]),
+                "progress_ratio": float(progress_ratio),
+                "error": error,
+            }
+        ]
+    )
+    for col in [
+        "timestamp",
+        "run_id",
+        "event_type",
+        "status",
+        "window_label",
+        "message",
+        "error",
+    ]:
+        if col in row.columns:
+            row[col] = row[col].astype("string")
+    if "window_index" in row.columns:
+        row["window_index"] = pd.to_numeric(row["window_index"], errors="coerce").astype(
+            "Int64"
+        )
+    _dynamic_gmm_append_df(conn, DYNAMIC_GMM_LIVE_EVENTS_TABLE_NAME, row)
+
+
+def _dynamic_gmm_write_run_status(
+    conn,
+    *,
+    run_id: str,
+    status: str,
+    result_status: str,
+    total_windows: int,
+    duckdb_path: Path,
+    model_path: Optional[Path],
+    config_fingerprint: str,
+    parallel_jobs: int,
+    started_at: str,
+    message: str,
+    error: Optional[str] = None,
+) -> None:
+    counts = _dynamic_gmm_counts(conn, run_id, total_windows)
+    completed = int(counts["completed_windows"])
+    row = {
+        "run_id": str(run_id),
+        "status": str(status),
+        "result_status": str(result_status),
+        "started_at": str(started_at),
+        "updated_at": _dynamic_gmm_now(),
+        "completed_windows": completed,
+        "failed_windows": int(counts["failed_windows"]),
+        "running_windows": int(counts["running_windows"]),
+        "pending_windows": int(counts["pending_windows"]),
+        "total_windows": int(total_windows),
+        "assignment_rows": int(counts["assignment_rows"]),
+        "progress_ratio": float(completed) / float(max(1, int(total_windows))),
+        "duckdb_path": str(duckdb_path),
+        "model_path": str(model_path) if model_path is not None else None,
+        "config_fingerprint": str(config_fingerprint),
+        "parallel_jobs": int(parallel_jobs),
+        "last_message": str(message),
+        "last_error": error,
+    }
+    _dynamic_gmm_replace_run_status(conn, row)
+
+
+def _dynamic_gmm_delete_window_rows(
+    conn,
+    *,
+    run_id: str,
+    window_index: int,
+) -> None:
+    for table_name in [
+        DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME,
+        DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME,
+    ]:
+        if not _dynamic_gmm_table_exists(conn, table_name):
+            continue
+        try:
+            conn.execute(
+                f"DELETE FROM {table_name} WHERE run_id = ? AND window_index = ?",
+                [str(run_id), int(window_index)],
+            )
+        except Exception:
+            continue
+
+
+def _dynamic_gmm_save_model_artifact(
+    *,
+    model: object,
+    scaler: object,
+    metadata: Dict[str, object],
+    model_path: Path,
+) -> None:
+    joblib = _require_joblib()
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "model": model,
+            "scaler": scaler,
+            "metadata": dict(metadata),
+        },
+        model_path,
+    )
+
+
+def _compute_dynamic_gmm_window_job(payload: Dict[str, object]) -> Dict[str, object]:
+    run_id = str(payload["run_id"])
+    window_index = int(payload["window_index"])
+    window_start = pd.Timestamp(payload["window_start"])
+    window_end = pd.Timestamp(payload["window_end"])
+    window_label = str(payload["window_label"])
+    effective_feature_cols = list(payload["effective_feature_cols"])
+    k = int(payload["k"])
+    include_membership_probabilities = bool(payload["include_membership_probabilities"])
+    try:
+        flows_df = load_flujos_range(window_start, window_end)
+        if flows_df is None or flows_df.empty:
+            return {
+                "run_id": run_id,
+                "window_index": window_index,
+                "window_label": window_label,
+                "status": "completed",
+                "event_status": "empty_flows",
+                "rows": 0,
+                "assignments": _dynamic_gmm_empty_assignments_df(
+                    effective_feature_cols,
+                    k,
+                    include_membership_probabilities,
+                ),
+                "window_summary": _dynamic_gmm_empty_window_summary(
+                    run_id=run_id,
+                    window_index=window_index,
+                    window_start=window_start,
+                    window_end=window_end,
+                    window_label=window_label,
+                ),
+                "error": None,
+            }
+        window_features = Clusterization(
+            flows_df,
+            payload["flow_cols"],
+            ttc_max_map=payload.get("ttc_max_map"),
+            monthly_weighting=False,
+            include_counts=False,
+            ttc_mode=str(payload.get("ttc_mode") or "dynamic"),
+            fixed_ttc_s=payload.get("fixed_ttc_s"),
+            speed_limit_map=payload.get("speed_limit_map"),
+            progress=None,
+            group_progress=None,
+            **dict(payload.get("clean_kwargs") or {}),
+        )
+        if window_features is None or window_features.empty:
+            return {
+                "run_id": run_id,
+                "window_index": window_index,
+                "window_label": window_label,
+                "status": "completed",
+                "event_status": "empty_features",
+                "rows": 0,
+                "assignments": _dynamic_gmm_empty_assignments_df(
+                    effective_feature_cols,
+                    k,
+                    include_membership_probabilities,
+                ),
+                "window_summary": _dynamic_gmm_empty_window_summary(
+                    run_id=run_id,
+                    window_index=window_index,
+                    window_start=window_start,
+                    window_end=window_end,
+                    window_label=window_label,
+                ),
+                "error": None,
+            }
+        missing_window_cols = [
+            col for col in effective_feature_cols if col not in window_features.columns
+        ]
+        if missing_window_cols:
+            raise ValueError(
+                "La ventana no contiene columnas usadas por el GMM dinamico: "
+                + ", ".join(missing_window_cols)
+            )
+        window_cluster_df = _prepare_cluster_features(
+            window_features,
+            effective_feature_cols,
+        )
+        if window_cluster_df.empty:
+            return {
+                "run_id": run_id,
+                "window_index": window_index,
+                "window_label": window_label,
+                "status": "completed",
+                "event_status": "empty_cluster_features",
+                "rows": 0,
+                "assignments": _dynamic_gmm_empty_assignments_df(
+                    effective_feature_cols,
+                    k,
+                    include_membership_probabilities,
+                ),
+                "window_summary": _dynamic_gmm_empty_window_summary(
+                    run_id=run_id,
+                    window_index=window_index,
+                    window_start=window_start,
+                    window_end=window_end,
+                    window_label=window_label,
+                ),
+                "error": None,
+            }
+        predicted = predict_gmm_cluster_membership(
+            window_cluster_df,
+            effective_feature_cols,
+            payload["model"],
+            payload["scaler"],
+            confidence_threshold_proba=float(payload["confidence_threshold_proba"]),
+            min_window_passes=int(payload["min_window_passes"]),
+            include_membership_probabilities=include_membership_probabilities,
+            apply_confidence_threshold=True,
+        )
+        if predicted.empty:
+            assignments = _dynamic_gmm_empty_assignments_df(
+                effective_feature_cols,
+                k,
+                include_membership_probabilities,
+            )
+            summary = _dynamic_gmm_empty_window_summary(
+                run_id=run_id,
+                window_index=window_index,
+                window_start=window_start,
+                window_end=window_end,
+                window_label=window_label,
+            )
+            event_status = "empty_predictions"
+        else:
+            predicted.insert(0, "run_id", run_id)
+            predicted.insert(1, "window_index", int(window_index))
+            predicted.insert(2, "window_label", window_label)
+            predicted.insert(3, "window_start", pd.Timestamp(window_start))
+            predicted.insert(4, "window_end", pd.Timestamp(window_end))
+            assignments = predicted
+            summary = build_dynamic_gmm_window_summary(assignments)
+            if "run_id" not in summary.columns:
+                summary.insert(0, "run_id", run_id)
+            event_status = "completed"
+        return {
+            "run_id": run_id,
+            "window_index": window_index,
+            "window_label": window_label,
+            "status": "completed",
+            "event_status": event_status,
+            "rows": int(len(assignments)),
+            "assignments": assignments,
+            "window_summary": summary,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "run_id": run_id,
+            "window_index": window_index,
+            "window_label": window_label,
+            "status": "failed",
+            "event_status": "failed",
+            "rows": 0,
+            "assignments": _dynamic_gmm_empty_assignments_df(
+                effective_feature_cols,
+                k,
+                include_membership_probabilities,
+            ),
+            "window_summary": _dynamic_gmm_empty_window_summary(
+                run_id=run_id,
+                window_index=window_index,
+                window_start=window_start,
+                window_end=window_end,
+                window_label=window_label,
+            ),
+            "error": f"{exc}\n{traceback.format_exc()}",
+        }
+
+
+def _dynamic_gmm_available_memory_bytes() -> Optional[int]:
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    if hasattr(os, "sysconf"):
+        try:
+            return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") * 0.5)
+        except Exception:
+            return None
+    return None
+
+
+def estimate_dynamic_gmm_parallelism(
+    *,
+    date_start: pd.Timestamp,
+    date_end: pd.Timestamp,
+    window_days: int,
+    memory_fraction: float = 0.60,
+    bytes_per_flow_row: int = 900,
+    worker_overhead_bytes: int = 512 * 1024 * 1024,
+    max_cpu_count: Optional[int] = None,
+) -> Dict[str, object]:
+    _ensure_duckdb_available()
+    windows = build_dynamic_gmm_windows(date_start, date_end, int(window_days))
+    if not windows:
+        return {
+            "n_windows": 0,
+            "recommended_parallel_jobs": 1,
+            "max_parallel_jobs_by_memory": 1,
+            "max_parallel_jobs_by_cpu": 1,
+            "available_memory_bytes": _dynamic_gmm_available_memory_bytes(),
+            "max_window_rows": 0,
+            "mean_window_rows": 0.0,
+            "estimated_worker_bytes": int(worker_overhead_bytes),
+        }
+    summary = ensure_flow_db_summary()
+    if summary is None:
+        raise RuntimeError("No se pudo obtener resumen de la base de flujos.")
+    conn = duckdb.connect(str(summary.db_path), read_only=True)
+    counts: List[int] = []
+    try:
+        for window_start, window_end, _label in windows:
+            count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {FLOW_TABLE_NAME}
+                    WHERE FECHA >= ? AND FECHA < ?
+                    """,
+                    [pd.Timestamp(window_start), pd.Timestamp(window_end)],
+                ).fetchone()[0]
+                or 0
+            )
+            counts.append(count)
+    finally:
+        conn.close()
+    max_window_rows = max(counts) if counts else 0
+    mean_window_rows = float(np.mean(counts)) if counts else 0.0
+    estimated_worker_bytes = int(
+        worker_overhead_bytes + max_window_rows * int(bytes_per_flow_row)
+    )
+    available_memory = _dynamic_gmm_available_memory_bytes()
+    memory_budget = int((available_memory or estimated_worker_bytes) * float(memory_fraction))
+    max_by_memory = max(1, int(memory_budget // max(1, estimated_worker_bytes)))
+    cpu_count = max_cpu_count or os.cpu_count() or 1
+    max_by_cpu = max(1, int(cpu_count) - 1)
+    recommended = max(1, min(max_by_memory, max_by_cpu))
+    return {
+        "n_windows": int(len(windows)),
+        "recommended_parallel_jobs": int(recommended),
+        "max_parallel_jobs_by_memory": int(max_by_memory),
+        "max_parallel_jobs_by_cpu": int(max_by_cpu),
+        "available_memory_bytes": available_memory,
+        "memory_budget_bytes": int(memory_budget),
+        "max_window_rows": int(max_window_rows),
+        "mean_window_rows": float(mean_window_rows),
+        "estimated_worker_bytes": int(estimated_worker_bytes),
+        "bytes_per_flow_row": int(bytes_per_flow_row),
+        "worker_overhead_bytes": int(worker_overhead_bytes),
+    }
+
+
+def build_dynamic_gmm_windows(
+    date_start: pd.Timestamp,
+    date_end: pd.Timestamp,
+    window_days: int,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp, str]]:
+    """
+    Build full daily sliding windows [start, end) over inclusive date bounds.
+    """
+    window_days = int(window_days)
+    if window_days < 1:
+        raise ValueError("window_days must be >= 1.")
+    start = pd.Timestamp(date_start).normalize()
+    end_inclusive = pd.Timestamp(date_end).normalize()
+    if end_inclusive < start:
+        return []
+
+    last_start = end_inclusive - pd.Timedelta(days=window_days - 1)
+    if last_start < start:
+        return []
+
+    windows: List[Tuple[pd.Timestamp, pd.Timestamp, str]] = []
+    current = start
+    while current <= last_start:
+        window_end = current + pd.Timedelta(days=window_days)
+        label = (
+            f"{current:%Y-%m-%d}_to_"
+            f"{(window_end - pd.Timedelta(days=1)):%Y-%m-%d}"
+        )
+        windows.append((current, window_end, label))
+        current += pd.Timedelta(days=1)
+    return windows
+
+
+def build_dynamic_gmm_driver_summary(assignments_df: pd.DataFrame) -> pd.DataFrame:
+    if assignments_df is None or assignments_df.empty or "plate" not in assignments_df.columns:
+        return pd.DataFrame(
+            columns=[
+                "plate",
+                "n_windows",
+                "n_assigned_windows",
+                "transitions",
+                "changes",
+                "stability_score",
+                "change_rate",
+                "dominant_cluster",
+                "dominant_cluster_share",
+                "mean_confidence",
+                "mean_soft_entropy",
+                "low_support_windows",
+                "unknown_windows",
+            ]
+        )
+
+    df = assignments_df.copy()
+    if "window_start" in df.columns:
+        df["window_start"] = pd.to_datetime(df["window_start"], errors="coerce")
+        df = df.sort_values(["plate", "window_start"], kind="mergesort")
+    rows = []
+    for plate, group in df.groupby("plate", sort=False):
+        labels = pd.to_numeric(group["cluster_label"], errors="coerce").astype("Int64")
+        assigned = labels[labels != -1].dropna().astype(int)
+        transitions = max(len(assigned) - 1, 0)
+        changes = int((assigned.diff().dropna() != 0).sum()) if transitions else 0
+        stability = (
+            1.0 - (changes / transitions)
+            if transitions > 0
+            else (1.0 if len(assigned) > 0 else math.nan)
+        )
+        if len(assigned) > 0:
+            counts = assigned.value_counts()
+            dominant_cluster = int(counts.index[0])
+            dominant_share = float(counts.iloc[0] / len(assigned))
+        else:
+            dominant_cluster = -1
+            dominant_share = math.nan
+        low_support_windows = (
+            int(group["is_low_support"].fillna(False).astype(bool).sum())
+            if "is_low_support" in group.columns
+            else 0
+        )
+        rows.append(
+            {
+                "plate": plate,
+                "n_windows": int(len(group)),
+                "n_assigned_windows": int(len(assigned)),
+                "transitions": int(transitions),
+                "changes": int(changes),
+                "stability_score": float(stability) if not pd.isna(stability) else math.nan,
+                "change_rate": (
+                    float(1.0 - stability) if not pd.isna(stability) else math.nan
+                ),
+                "dominant_cluster": int(dominant_cluster),
+                "dominant_cluster_share": float(dominant_share)
+                if not pd.isna(dominant_share)
+                else math.nan,
+                "mean_confidence": float(
+                    pd.to_numeric(group.get("confidence_score"), errors="coerce").mean()
+                ),
+                "mean_soft_entropy": float(
+                    pd.to_numeric(group.get("soft_entropy"), errors="coerce").mean()
+                )
+                if "soft_entropy" in group.columns
+                else math.nan,
+                "low_support_windows": low_support_windows,
+                "unknown_windows": int((labels == -1).sum()),
+            }
+        )
+    summary = pd.DataFrame(rows)
+    if summary.empty:
+        return summary
+    return summary.sort_values(
+        ["change_rate", "n_assigned_windows", "plate"],
+        ascending=[False, False, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def build_dynamic_gmm_window_summary(
+    assignments_df: pd.DataFrame,
+    windows: Optional[List[Tuple[pd.Timestamp, pd.Timestamp, str]]] = None,
+) -> pd.DataFrame:
+    base_rows = []
+    if windows:
+        for window_index, (window_start, window_end, window_label) in enumerate(
+            windows,
+            start=1,
+        ):
+            base_rows.append(
+                {
+                    "window_index": int(window_index),
+                    "window_label": window_label,
+                    "window_start": pd.Timestamp(window_start),
+                    "window_end": pd.Timestamp(window_end),
+                }
+            )
+    base = pd.DataFrame(base_rows)
+    if assignments_df is None or assignments_df.empty:
+        if base.empty:
+            return pd.DataFrame()
+        for col in [
+            "rows",
+            "assigned_rows",
+            "unknown_rows",
+            "low_support_rows",
+            "low_confidence_rows",
+            "mean_confidence",
+            "mean_soft_entropy",
+        ]:
+            base[col] = 0.0 if col.startswith("mean") else 0
+        return base
+
+    df = assignments_df.copy()
+    df["window_start"] = pd.to_datetime(df["window_start"], errors="coerce")
+    df["window_end"] = pd.to_datetime(df["window_end"], errors="coerce")
+    df["cluster_label"] = pd.to_numeric(df["cluster_label"], errors="coerce")
+    grouped = df.groupby(["window_label", "window_start", "window_end"], sort=False)
+    rows = []
+    for keys, group in grouped:
+        window_label, window_start, window_end = keys
+        status = group.get("assignment_status", pd.Series(index=group.index, dtype=object))
+        labels = pd.to_numeric(group["cluster_label"], errors="coerce")
+        row = {
+            "window_label": window_label,
+            "window_start": window_start,
+            "window_end": window_end,
+            "rows": int(len(group)),
+            "assigned_rows": int((labels != -1).sum()),
+            "unknown_rows": int((labels == -1).sum()),
+            "low_support_rows": int(
+                group.get("is_low_support", pd.Series(False, index=group.index))
+                .fillna(False)
+                .astype(bool)
+                .sum()
+            ),
+            "low_confidence_rows": int(status.astype(str).str.contains("low_confidence").sum()),
+            "mean_confidence": float(
+                pd.to_numeric(group.get("confidence_score"), errors="coerce").mean()
+            ),
+            "mean_soft_entropy": float(
+                pd.to_numeric(group.get("soft_entropy"), errors="coerce").mean()
+            )
+            if "soft_entropy" in group.columns
+            else math.nan,
+        }
+        for label, count in labels.value_counts(dropna=True).items():
+            label_int = int(label)
+            row[f"cluster_count_{label_int}"] = int(count)
+            row[f"cluster_share_{label_int}"] = float(count / len(group)) if len(group) else 0.0
+        if base.empty and "window_index" in group.columns:
+            group_window_indexes = pd.to_numeric(
+                group["window_index"],
+                errors="coerce",
+            ).dropna()
+            if not group_window_indexes.empty:
+                row["window_index"] = int(group_window_indexes.iloc[0])
+        rows.append(row)
+    summary = pd.DataFrame(rows)
+    if not base.empty:
+        summary = base.merge(
+            summary,
+            on=["window_label", "window_start", "window_end"],
+            how="left",
+        )
+    count_cols = [col for col in summary.columns if col.startswith("cluster_count_")]
+    share_cols = [col for col in summary.columns if col.startswith("cluster_share_")]
+    for col in [
+        "rows",
+        "assigned_rows",
+        "unknown_rows",
+        "low_support_rows",
+        "low_confidence_rows",
+        *count_cols,
+    ]:
+        if col in summary.columns:
+            summary[col] = summary[col].fillna(0).astype(int)
+    for col in ["mean_confidence", "mean_soft_entropy", *share_cols]:
+        if col in summary.columns:
+            summary[col] = pd.to_numeric(summary[col], errors="coerce")
+    if "window_index" in summary.columns:
+        summary["window_index"] = pd.to_numeric(
+            summary["window_index"],
+            errors="coerce",
+        ).astype("Int64")
+        return summary.sort_values(["window_index", "window_start"]).reset_index(drop=True)
+    return summary.sort_values("window_start").reset_index(drop=True)
+
+
+def save_dynamic_gmm_results(
+    assignments_df: pd.DataFrame,
+    window_summary_df: pd.DataFrame,
+    model: object,
+    scaler: object,
+    metadata: Dict[str, object],
+    output_dir: Optional[Path] = None,
+    stem: Optional[str] = None,
+) -> Tuple[Path, Path]:
+    target_dir = output_dir or (ROOT_DIR / "Resultados")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    run_stem = stem or f"dynamic_gmm_{pd.Timestamp.now():%Y%m%d_%H%M%S_%f}"
+    model_path = target_dir / f"{run_stem}.joblib"
+    db_path = target_dir / f"{run_stem}.duckdb"
+
+    joblib = _require_joblib()
+    model_metadata = dict(metadata or {})
+    model_metadata["model_path"] = str(model_path)
+    model_metadata["duckdb_path"] = str(db_path)
+    joblib.dump(
+        {
+            "model": model,
+            "scaler": scaler,
+            "metadata": model_metadata,
+        },
+        model_path,
+    )
+
+    _ensure_duckdb_available()
+    if db_path.exists():
+        db_path.unlink()
+    conn = duckdb.connect(str(db_path))
+    try:
+        conn.register("dynamic_assignments_df", assignments_df)
+        conn.execute(
+            f"CREATE TABLE {DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME} AS "
+            "SELECT * FROM dynamic_assignments_df"
+        )
+        conn.unregister("dynamic_assignments_df")
+
+        conn.register("dynamic_window_summary_df", window_summary_df)
+        conn.execute(
+            f"CREATE TABLE {DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME} AS "
+            "SELECT * FROM dynamic_window_summary_df"
+        )
+        conn.unregister("dynamic_window_summary_df")
+
+        meta_rows = _feature_metadata_to_rows(model_metadata)
+        conn.register("dynamic_metadata_df", meta_rows)
+        conn.execute(
+            f"CREATE TABLE {DYNAMIC_GMM_METADATA_TABLE_NAME} AS "
+            "SELECT * FROM dynamic_metadata_df"
+        )
+        conn.unregister("dynamic_metadata_df")
+    finally:
+        conn.close()
+    return model_path, db_path
+
+
+def load_dynamic_gmm_results_duckdb(
+    db_path: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    _ensure_duckdb_available()
+    if not db_path.exists():
+        return pd.DataFrame(), pd.DataFrame(), {}
+    conn = duckdb.connect(str(db_path), read_only=True)
+    try:
+        if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME):
+            assignments = conn.execute(
+                f"SELECT * FROM {DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME}"
+            ).df()
+        else:
+            assignments = pd.DataFrame()
+        if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME):
+            window_summary = conn.execute(
+                f"SELECT * FROM {DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME}"
+            ).df()
+        else:
+            window_summary = pd.DataFrame()
+        metadata = _load_dynamic_gmm_metadata_from_conn(conn)
+    finally:
+        conn.close()
+    return assignments, window_summary, metadata
+
+
+def run_dynamic_gmm_clustering(
+    base_features_df: pd.DataFrame,
+    feature_cols: List[str],
+    flow_cols: FlowColumns,
+    ttc_max_map: Optional[Dict[int, float]],
+    k: int,
+    confidence_threshold_proba: float,
+    window_days: int,
+    date_start: pd.Timestamp,
+    date_end: pd.Timestamp,
+    min_window_passes: int = 5,
+    train_params: Optional[Dict[str, int]] = None,
+    random_state: int = 42,
+    covariance_type: str = "full",
+    ttc_mode: str = "dynamic",
+    fixed_ttc_s: Optional[float] = None,
+    speed_limit_map: Optional[Dict[str, float]] = None,
+    metadata: Optional[Dict[str, object]] = None,
+    output_dir: Optional[Path] = None,
+    persist: bool = True,
+    progress: Optional[object] = None,
+    include_membership_probabilities: bool = True,
+    window_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    parallel_jobs: int = 1,
+    checkpoint_enabled: bool = True,
+    incremental_db_path: Optional[Path] = None,
+    resume_existing: bool = False,
+    load_final_result: bool = True,
+    run_id: Optional[str] = None,
+    **clean_kwargs,
+) -> Dict[str, object]:
+    train_params = dict(train_params or {})
+    min_total_passes = int(train_params.get("min_total_passes", 20))
+    min_days_active = int(train_params.get("min_days_active", 1))
+    min_months_active = int(train_params.get("min_months_active", 1))
+
+    effective_feature_cols = [
+        col for col in feature_cols if col in base_features_df.columns
+    ]
+    if not effective_feature_cols:
+        raise ValueError("No hay columnas de features disponibles para GMM dinamico.")
+
+    base_cluster_df = _prepare_cluster_features(base_features_df, effective_feature_cols)
+    frequent_df, _rare_df = split_frequent_drivers(
+        base_features_df,
+        min_total_passes=min_total_passes,
+        min_days_active=min_days_active,
+        min_months_active=min_months_active,
+    )
+    cluster_freq = base_cluster_df.loc[
+        base_cluster_df.index.intersection(frequent_df.index)
+    ]
+    if len(cluster_freq) <= int(k):
+        raise ValueError(
+            "No hay suficientes conductores frecuentes para entrenar GMM "
+            f"con K={int(k)}."
+        )
+
+    model, scaler = fit_gmm_cluster_model(
+        cluster_freq,
+        effective_feature_cols,
+        k=int(k),
+        random_state=random_state,
+        covariance_type=covariance_type,
+        n_init=3,
+    )
+    windows = build_dynamic_gmm_windows(date_start, date_end, int(window_days))
+    if not windows:
+        raise ValueError("El rango seleccionado no contiene ventanas completas.")
+
+    config_payload: Dict[str, object] = {
+        "method": "gmm_dynamic",
+        "feature_cols": list(effective_feature_cols),
+        "requested_feature_cols": list(feature_cols),
+        "k": int(k),
+        "confidence_threshold_proba": float(confidence_threshold_proba),
+        "window_days": int(window_days),
+        "window_step_days": 1,
+        "min_window_passes": int(min_window_passes),
+        "date_start": str(pd.Timestamp(date_start).date()),
+        "date_end": str(pd.Timestamp(date_end).date()),
+        "n_windows": int(len(windows)),
+        "covariance_type": covariance_type,
+        "random_state": int(random_state),
+        "include_membership_probabilities": bool(include_membership_probabilities),
+        "train_params": {
+            "min_total_passes": min_total_passes,
+            "min_days_active": min_days_active,
+            "min_months_active": min_months_active,
+        },
+        "ttc_mode": ttc_mode,
+        "ttc_fixed_seconds": fixed_ttc_s,
+    }
+    config_fingerprint = _dynamic_gmm_config_fingerprint(config_payload)
+    run_stem = run_id or f"dynamic_gmm_{_dynamic_gmm_stamp()}"
+    result_metadata: Dict[str, object] = {
+        **config_payload,
+        "created_at": pd.Timestamp.now().isoformat(),
+        "run_id": str(run_stem),
+        "config_fingerprint": config_fingerprint,
+        "checkpoint_enabled": bool(checkpoint_enabled and persist),
+        "parallel_jobs": max(1, int(parallel_jobs)),
+    }
+    if metadata:
+        result_metadata.update(metadata)
+
+    def _build_payload(
+        window_index: int,
+        window_start: pd.Timestamp,
+        window_end: pd.Timestamp,
+        window_label: str,
+        payload_run_id: str,
+    ) -> Dict[str, object]:
+        return {
+            "run_id": str(payload_run_id),
+            "window_index": int(window_index),
+            "window_start": pd.Timestamp(window_start),
+            "window_end": pd.Timestamp(window_end),
+            "window_label": str(window_label),
+            "effective_feature_cols": list(effective_feature_cols),
+            "flow_cols": flow_cols,
+            "ttc_max_map": ttc_max_map,
+            "k": int(k),
+            "model": model,
+            "scaler": scaler,
+            "confidence_threshold_proba": float(confidence_threshold_proba),
+            "min_window_passes": int(min_window_passes),
+            "include_membership_probabilities": bool(include_membership_probabilities),
+            "ttc_mode": ttc_mode,
+            "fixed_ttc_s": fixed_ttc_s,
+            "speed_limit_map": speed_limit_map,
+            "clean_kwargs": dict(clean_kwargs),
+        }
+
+    if not persist or not checkpoint_enabled:
+        memory_run_id = str(run_stem)
+        assignment_parts: List[pd.DataFrame] = []
+        task_specs = [
+            (idx, window_start, window_end, window_label)
+            for idx, (window_start, window_end, window_label) in enumerate(
+                windows,
+                start=1,
+            )
+        ]
+
+        def _handle_memory_result(result: Dict[str, object]) -> None:
+            status = str(result.get("event_status") or result.get("status") or "")
+            assignments = result.get("assignments")
+            if str(result.get("status")) == "failed":
+                raise RuntimeError(str(result.get("error") or "Error en GMM dinamico."))
+            if isinstance(assignments, pd.DataFrame) and not assignments.empty:
+                assignment_parts.append(assignments.copy())
+            if window_callback is not None:
+                window_callback(
+                    {
+                        "window_index": int(result.get("window_index", 0) or 0),
+                        "total_windows": int(len(windows)),
+                        "window_label": str(result.get("window_label") or ""),
+                        "status": status,
+                        "assignments": assignments if isinstance(assignments, pd.DataFrame) else pd.DataFrame(),
+                    }
+                )
+            if progress is not None and hasattr(progress, "update"):
+                progress.update(1)
+
+        effective_parallel = max(1, int(parallel_jobs))
+        if effective_parallel > 1 and len(task_specs) > 1:
+            with ProcessPoolExecutor(max_workers=effective_parallel) as executor:
+                future_map = {}
+                for idx, window_start, window_end, window_label in task_specs:
+                    if progress is not None and hasattr(progress, "set_description"):
+                        progress.set_description(
+                            f"Encolando ventana {idx}/{len(windows)}: {window_label}"
+                        )
+                    payload = _build_payload(
+                        idx,
+                        window_start,
+                        window_end,
+                        window_label,
+                        memory_run_id,
+                    )
+                    future_map[executor.submit(_compute_dynamic_gmm_window_job, payload)] = (
+                        idx,
+                        window_label,
+                    )
+                for future in as_completed(future_map):
+                    idx, window_label = future_map[future]
+                    if progress is not None and hasattr(progress, "set_description"):
+                        progress.set_description(
+                            f"Ventana {idx}/{len(windows)} lista: {window_label}"
+                        )
+                    _handle_memory_result(future.result())
+        else:
+            for idx, window_start, window_end, window_label in task_specs:
+                if progress is not None and hasattr(progress, "set_description"):
+                    progress.set_description(
+                        f"Ventana {idx}/{len(windows)}: {window_label}"
+                    )
+                _handle_memory_result(
+                    _compute_dynamic_gmm_window_job(
+                        _build_payload(
+                            idx,
+                            window_start,
+                            window_end,
+                            window_label,
+                            memory_run_id,
+                        )
+                    )
+                )
+        if assignment_parts:
+            assignments_df = pd.concat(assignment_parts, ignore_index=True, sort=False)
+        else:
+            assignments_df = _dynamic_gmm_empty_assignments_df(
+                effective_feature_cols,
+                int(k),
+                bool(include_membership_probabilities),
+            )
+        window_summary_df = build_dynamic_gmm_window_summary(assignments_df, windows)
+        driver_summary_df = build_dynamic_gmm_driver_summary(assignments_df)
+        model_path = None
+        duckdb_path = None
+        if persist:
+            model_path, duckdb_path = save_dynamic_gmm_results(
+                assignments_df,
+                window_summary_df,
+                model,
+                scaler,
+                result_metadata,
+                output_dir=output_dir,
+            )
+            result_metadata["model_path"] = str(model_path)
+            result_metadata["duckdb_path"] = str(duckdb_path)
+        return {
+            "assignments": assignments_df,
+            "window_summary": window_summary_df,
+            "driver_summary": driver_summary_df,
+            "metadata": result_metadata,
+            "model": model,
+            "scaler": scaler,
+            "model_path": model_path,
+            "duckdb_path": duckdb_path,
+            "feature_cols": effective_feature_cols,
+            "windows": windows,
+        }
+
+    _ensure_duckdb_available()
+    target_dir = output_dir or (ROOT_DIR / "Resultados")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    duckdb_path = Path(incremental_db_path) if incremental_db_path is not None else target_dir / f"{run_stem}.duckdb"
+    model_path = duckdb_path.with_suffix(".joblib")
+    started_at = _dynamic_gmm_now()
+    if duckdb_path.exists() and not resume_existing:
+        duckdb_path.unlink()
+    conn = duckdb.connect(str(duckdb_path))
+    try:
+        existing_metadata = _load_dynamic_gmm_metadata_from_conn(conn)
+        if resume_existing and existing_metadata:
+            existing_fingerprint = str(existing_metadata.get("config_fingerprint") or "")
+            if existing_fingerprint and existing_fingerprint != config_fingerprint:
+                raise ValueError(
+                    "El checkpoint existe, pero sus parametros no coinciden con "
+                    "la configuracion actual. Inicie un nuevo run o use los mismos parametros."
+                )
+            run_id_value = str(existing_metadata.get("run_id") or run_stem)
+            result_metadata["run_id"] = run_id_value
+            started_at = str(existing_metadata.get("created_at") or started_at)
+            _dynamic_gmm_mark_running_stale(conn, run_id_value)
+            if not _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME):
+                raise ValueError(
+                    "El archivo seleccionado no contiene checkpoint incremental para retomar."
+                )
+        else:
+            run_id_value = str(run_stem)
+            result_metadata["run_id"] = run_id_value
+            for table_name in [
+                DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME,
+                DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME,
+                DYNAMIC_GMM_METADATA_TABLE_NAME,
+                DYNAMIC_GMM_LIVE_EVENTS_TABLE_NAME,
+                DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME,
+                DYNAMIC_GMM_RUN_STATUS_TABLE_NAME,
+            ]:
+                conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            _dynamic_gmm_insert_initial_checkpoint(conn, run_id_value, windows)
+
+        result_metadata["duckdb_path"] = str(duckdb_path)
+        result_metadata["model_path"] = str(model_path)
+        _dynamic_gmm_save_model_artifact(
+            model=model,
+            scaler=scaler,
+            metadata=result_metadata,
+            model_path=model_path,
+        )
+        _dynamic_gmm_replace_metadata(conn, result_metadata)
+        effective_parallel = max(1, int(parallel_jobs))
+        todo_windows = _dynamic_gmm_todo_windows(conn, str(result_metadata["run_id"]), windows)
+        completed_before = len(windows) - len(todo_windows)
+        if progress is not None and completed_before > 0 and hasattr(progress, "update"):
+            progress.update(completed_before)
+        _dynamic_gmm_write_run_status(
+            conn,
+            run_id=str(result_metadata["run_id"]),
+            status="running",
+            result_status="partial",
+            total_windows=len(windows),
+            duckdb_path=duckdb_path,
+            model_path=model_path,
+            config_fingerprint=config_fingerprint,
+            parallel_jobs=effective_parallel,
+            started_at=started_at,
+            message=f"Procesando {len(todo_windows)} ventanas pendientes.",
+        )
+        _dynamic_gmm_append_event(
+            conn,
+            run_id=str(result_metadata["run_id"]),
+            event_type="run_start" if not resume_existing else "run_resume",
+            status="running",
+            total_windows=len(windows),
+            message=f"Ventanas pendientes: {len(todo_windows):,}.",
+        )
+
+        def _handle_incremental_result(result: Dict[str, object]) -> None:
+            window_index = int(result.get("window_index") or 0)
+            window_label = str(result.get("window_label") or "")
+            event_status = str(result.get("event_status") or result.get("status") or "")
+            assignments = result.get("assignments")
+            window_summary = result.get("window_summary")
+            if str(result.get("status")) == "failed":
+                error = str(result.get("error") or "Error en ventana GMM dinamico.")
+                _dynamic_gmm_update_checkpoint(
+                    conn,
+                    run_id=str(result_metadata["run_id"]),
+                    window_index=window_index,
+                    status="failed",
+                    rows=0,
+                    error=error,
+                )
+                _dynamic_gmm_append_event(
+                    conn,
+                    run_id=str(result_metadata["run_id"]),
+                    event_type="window_failed",
+                    status="failed",
+                    total_windows=len(windows),
+                    message=f"Ventana {window_index}/{len(windows)} fallo.",
+                    window_index=window_index,
+                    window_label=window_label,
+                    error=error,
+                )
+                if window_callback is not None:
+                    window_callback(
+                        {
+                            "window_index": window_index,
+                            "total_windows": int(len(windows)),
+                            "window_label": window_label,
+                            "status": "failed",
+                            "assignments": pd.DataFrame(),
+                            "error": error,
+                        }
+                    )
+                if progress is not None and hasattr(progress, "update"):
+                    progress.update(1)
+                _dynamic_gmm_write_run_status(
+                    conn,
+                    run_id=str(result_metadata["run_id"]),
+                    status="running",
+                    result_status="partial",
+                    total_windows=len(windows),
+                    duckdb_path=duckdb_path,
+                    model_path=model_path,
+                    config_fingerprint=config_fingerprint,
+                    parallel_jobs=effective_parallel,
+                    started_at=started_at,
+                    message=f"Ventana fallida: {window_label}.",
+                    error=error,
+                )
+                return
+            _dynamic_gmm_delete_window_rows(
+                conn,
+                run_id=str(result_metadata["run_id"]),
+                window_index=window_index,
+            )
+            if isinstance(assignments, pd.DataFrame) and not assignments.empty:
+                _dynamic_gmm_append_df(conn, DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME, assignments)
+            if isinstance(window_summary, pd.DataFrame) and not window_summary.empty:
+                _dynamic_gmm_append_df(conn, DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME, window_summary)
+            rows = int(result.get("rows") or 0)
+            _dynamic_gmm_update_checkpoint(
+                conn,
+                run_id=str(result_metadata["run_id"]),
+                window_index=window_index,
+                status="completed",
+                rows=rows,
+                error=None,
+            )
+            _dynamic_gmm_append_event(
+                conn,
+                run_id=str(result_metadata["run_id"]),
+                event_type="window_done",
+                status=event_status,
+                total_windows=len(windows),
+                message=f"Ventana {window_index}/{len(windows)} completada ({rows:,} asignaciones).",
+                window_index=window_index,
+                window_label=window_label,
+            )
+            if window_callback is not None:
+                window_callback(
+                    {
+                        "window_index": window_index,
+                        "total_windows": int(len(windows)),
+                        "window_label": window_label,
+                        "status": event_status,
+                        "assignments": assignments if isinstance(assignments, pd.DataFrame) else pd.DataFrame(),
+                    }
+                )
+            if progress is not None and hasattr(progress, "update"):
+                progress.update(1)
+            if progress is not None and hasattr(progress, "set_description"):
+                progress.set_description(
+                    f"Ventana {window_index}/{len(windows)}: {window_label}"
+                )
+            _dynamic_gmm_write_run_status(
+                conn,
+                run_id=str(result_metadata["run_id"]),
+                status="running",
+                result_status="partial",
+                total_windows=len(windows),
+                duckdb_path=duckdb_path,
+                model_path=model_path,
+                config_fingerprint=config_fingerprint,
+                parallel_jobs=effective_parallel,
+                started_at=started_at,
+                message=f"Ultima ventana completada: {window_label}.",
+            )
+
+        if effective_parallel > 1 and len(todo_windows) > 1:
+            with ProcessPoolExecutor(max_workers=effective_parallel) as executor:
+                future_map = {}
+                for idx, window_start, window_end, window_label in todo_windows:
+                    _dynamic_gmm_update_checkpoint(
+                        conn,
+                        run_id=str(result_metadata["run_id"]),
+                        window_index=idx,
+                        status="running",
+                        worker_id=f"process_pool_{idx}",
+                        increment_attempts=True,
+                    )
+                    _dynamic_gmm_append_event(
+                        conn,
+                        run_id=str(result_metadata["run_id"]),
+                        event_type="window_start",
+                        status="running",
+                        total_windows=len(windows),
+                        message=f"Ventana {idx}/{len(windows)} iniciada.",
+                        window_index=idx,
+                        window_label=window_label,
+                    )
+                    payload = _build_payload(
+                        idx,
+                        window_start,
+                        window_end,
+                        window_label,
+                        str(result_metadata["run_id"]),
+                    )
+                    future_map[executor.submit(_compute_dynamic_gmm_window_job, payload)] = (
+                        idx,
+                        window_label,
+                    )
+                for future in as_completed(future_map):
+                    idx, window_label = future_map[future]
+                    try:
+                        _handle_incremental_result(future.result())
+                    except Exception as exc:
+                        error = f"{exc}\n{traceback.format_exc()}"
+                        _dynamic_gmm_update_checkpoint(
+                            conn,
+                            run_id=str(result_metadata["run_id"]),
+                            window_index=idx,
+                            status="failed",
+                            rows=0,
+                            error=error,
+                        )
+                        _dynamic_gmm_append_event(
+                            conn,
+                            run_id=str(result_metadata["run_id"]),
+                            event_type="window_failed",
+                            status="failed",
+                            total_windows=len(windows),
+                            message=f"Ventana {idx}/{len(windows)} fallo.",
+                            window_index=idx,
+                            window_label=window_label,
+                            error=error,
+                        )
+                        if progress is not None and hasattr(progress, "update"):
+                            progress.update(1)
+                        if progress is not None and hasattr(progress, "set_description"):
+                            progress.set_description(
+                                f"Ventana {idx}/{len(windows)} fallo: {window_label}"
+                            )
+                        _dynamic_gmm_write_run_status(
+                            conn,
+                            run_id=str(result_metadata["run_id"]),
+                            status="running",
+                            result_status="partial",
+                            total_windows=len(windows),
+                            duckdb_path=duckdb_path,
+                            model_path=model_path,
+                            config_fingerprint=config_fingerprint,
+                            parallel_jobs=effective_parallel,
+                            started_at=started_at,
+                            message=f"Ventana fallida: {window_label}.",
+                            error=error,
+                        )
+        else:
+            for idx, window_start, window_end, window_label in todo_windows:
+                _dynamic_gmm_update_checkpoint(
+                    conn,
+                    run_id=str(result_metadata["run_id"]),
+                    window_index=idx,
+                    status="running",
+                    worker_id="main",
+                    increment_attempts=True,
+                )
+                _dynamic_gmm_append_event(
+                    conn,
+                    run_id=str(result_metadata["run_id"]),
+                    event_type="window_start",
+                    status="running",
+                    total_windows=len(windows),
+                    message=f"Ventana {idx}/{len(windows)} iniciada.",
+                    window_index=idx,
+                    window_label=window_label,
+                )
+                _handle_incremental_result(
+                    _compute_dynamic_gmm_window_job(
+                        _build_payload(
+                            idx,
+                            window_start,
+                            window_end,
+                            window_label,
+                            str(result_metadata["run_id"]),
+                        )
+                    )
+                )
+
+        counts = _dynamic_gmm_counts(conn, str(result_metadata["run_id"]), len(windows))
+        failed_windows = int(counts["failed_windows"])
+        pending_windows = int(counts["pending_windows"]) + int(counts["running_windows"])
+        final_status = "completed" if failed_windows == 0 and pending_windows == 0 else "failed_partial"
+        result_status = "completed" if final_status == "completed" else "partial"
+        result_metadata["n_assignments"] = int(counts["assignment_rows"])
+        result_metadata["status"] = final_status
+        _dynamic_gmm_replace_metadata(conn, result_metadata)
+        _dynamic_gmm_write_run_status(
+            conn,
+            run_id=str(result_metadata["run_id"]),
+            status=final_status,
+            result_status=result_status,
+            total_windows=len(windows),
+            duckdb_path=duckdb_path,
+            model_path=model_path,
+            config_fingerprint=config_fingerprint,
+            parallel_jobs=effective_parallel,
+            started_at=started_at,
+            message="GMM dinamico completado." if final_status == "completed" else "GMM dinamico finalizo con ventanas fallidas.",
+            error=None if final_status == "completed" else "Hay ventanas fallidas; revise dynamic_window_checkpoint.",
+        )
+        _dynamic_gmm_append_event(
+            conn,
+            run_id=str(result_metadata["run_id"]),
+            event_type="run_completed",
+            status=final_status,
+            total_windows=len(windows),
+            message="Run completado." if final_status == "completed" else "Run con resultados parciales.",
+        )
+    except Exception:
+        try:
+            _dynamic_gmm_write_run_status(
+                conn,
+                run_id=str(result_metadata.get("run_id") or run_stem),
+                status="failed",
+                result_status="failed",
+                total_windows=len(windows),
+                duckdb_path=duckdb_path,
+                model_path=model_path,
+                config_fingerprint=config_fingerprint,
+                parallel_jobs=max(1, int(parallel_jobs)),
+                started_at=started_at,
+                message="GMM dinamico fallo.",
+                error=traceback.format_exc(),
+            )
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    if load_final_result:
+        assignments_df, window_summary_df, loaded_metadata = load_dynamic_gmm_results_duckdb(duckdb_path)
+        result_metadata.update(loaded_metadata)
+    else:
+        assignments_df = _dynamic_gmm_empty_assignments_df(
+            effective_feature_cols,
+            int(k),
+            bool(include_membership_probabilities),
+        )
+        conn = duckdb.connect(str(duckdb_path), read_only=True)
+        try:
+            if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME):
+                window_summary_df = conn.execute(
+                    f"SELECT * FROM {DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME} ORDER BY window_index"
+                ).df()
+            else:
+                window_summary_df = pd.DataFrame()
+        finally:
+            conn.close()
+    driver_summary_df = (
+        build_dynamic_gmm_driver_summary(assignments_df)
+        if not assignments_df.empty
+        else pd.DataFrame()
+    )
+
+    return {
+        "assignments": assignments_df,
+        "window_summary": window_summary_df,
+        "driver_summary": driver_summary_df,
+        "metadata": result_metadata,
+        "model": model,
+        "scaler": scaler,
+        "model_path": model_path,
+        "duckdb_path": duckdb_path,
+        "feature_cols": effective_feature_cols,
+        "windows": windows,
+    }
 
 
 def compute_kmeans_metrics(

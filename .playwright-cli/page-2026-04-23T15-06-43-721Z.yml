@@ -1,0 +1,438 @@
+- generic [ref=e2]:
+  - button "Cerrar app" [ref=e14] [cursor=pointer]:
+    - paragraph [ref=e18]: Cerrar app
+  - generic [ref=e3]:
+    - banner [ref=e21]:
+      - generic [ref=e24]:
+        - button "Deploy" [ref=e26] [cursor=pointer]:
+          - generic [ref=e28]: Deploy
+        - button [ref=e30] [cursor=pointer]:
+          - img [ref=e31]
+    - generic [ref=e34]:
+      - heading "Crash prediction by Drivers Behavior" [level=1] [ref=e39]: Crash prediction by Drivers Behavior
+      - radiogroup "Sección" [ref=e43] [cursor=pointer]:
+        - generic [ref=e44]:
+          - radio "Eventos"
+          - paragraph [ref=e49]: Eventos
+        - generic [ref=e50]:
+          - radio "Feature engineering"
+          - paragraph [ref=e55]: Feature engineering
+        - generic [ref=e56]:
+          - radio "Match"
+          - paragraph [ref=e61]: Match
+        - generic [ref=e62]:
+          - radio "Feature selection"
+          - paragraph [ref=e67]: Feature selection
+        - generic [ref=e68]:
+          - radio "Optuna"
+          - paragraph [ref=e73]: Optuna
+        - generic [ref=e74]:
+          - radio "Balance"
+          - paragraph [ref=e79]: Balance
+        - generic [ref=e80]:
+          - radio "Modelos"
+          - paragraph [ref=e85]: Modelos
+        - generic [ref=e86]:
+          - radio "History" [checked] [active]
+          - paragraph [ref=e91]: History
+        - generic [ref=e92]:
+          - radio "Experiments"
+          - paragraph [ref=e97]: Experiments
+      - heading "History" [level=3] [ref=e150]: History
+      - generic [ref=e152]:
+        - generic [ref=e156]:
+          - paragraph [ref=e159]: Etapa
+          - generic [ref=e161]:
+            - generic [ref=e162]:
+              - generic [ref=e163]: Todos
+              - combobox "Selected Todos. Etapa" [ref=e165]
+            - img "open" [ref=e167]
+        - generic [ref=e172]:
+          - paragraph [ref=e175]: Estrella
+          - generic [ref=e177]:
+            - generic [ref=e178]:
+              - generic [ref=e179]: Todos
+              - combobox "Selected Todos. Estrella" [ref=e181]
+            - img "open" [ref=e183]
+        - generic [ref=e188]:
+          - paragraph [ref=e191]: Archivo features
+          - generic [ref=e193]:
+            - generic [ref=e194]:
+              - generic [ref=e195]: Todos
+              - combobox "Selected Todos. Archivo features" [ref=e197]
+            - img "open" [ref=e199]
+        - generic [ref=e204]:
+          - paragraph [ref=e207]: Tramo
+          - generic [ref=e209]:
+            - generic [ref=e210]:
+              - generic [ref=e211]: Todos
+              - combobox "Selected Todos. Tramo" [ref=e213]
+            - img "open" [ref=e215]
+      - generic [ref=e218]:
+        - generic [ref=e222]:
+          - paragraph [ref=e225]: Modelo
+          - generic [ref=e227]:
+            - generic [ref=e228]:
+              - generic [ref=e229]: Todos
+              - combobox "Selected Todos. Modelo" [ref=e231]
+            - img "open" [ref=e233]
+        - generic [ref=e238]:
+          - paragraph [ref=e241]: Calibración
+          - generic [ref=e243]:
+            - generic [ref=e244]:
+              - generic [ref=e245]: Todos
+              - combobox "Selected Todos. Calibración" [ref=e247]
+            - img "open" [ref=e249]
+        - generic [ref=e254]:
+          - paragraph [ref=e257]: Objetivo
+          - generic [ref=e259]:
+            - generic [ref=e260]:
+              - generic [ref=e261]: Todos
+              - combobox "Selected Todos. Objetivo" [ref=e263]
+            - img "open" [ref=e265]
+      - generic [ref=e268]:
+        - paragraph [ref=e271]: Registros a listar
+        - generic [ref=e273]:
+          - generic [ref=e274]:
+            - generic [ref=e275]: "100"
+            - combobox "Selected 100. Registros a listar" [ref=e277]
+          - img "open" [ref=e279]
+      - paragraph [ref=e284]: "Registros listados: 100 | Base: /Users/felipe/Desktop/Tesis/Resultados/crash_prediction_history.sqlite"
+      - generic [ref=e289]:
+        - button "Download as CSV" [ref=e292] [cursor=pointer]:
+          - img [ref=e293]
+        - button "Search" [ref=e298] [cursor=pointer]:
+          - img [ref=e299]
+        - button "Fullscreen" [ref=e304] [cursor=pointer]:
+          - img [ref=e305]
+      - generic [ref=e317]:
+        - paragraph [ref=e320]: Detalle
+        - generic [ref=e322]:
+          - generic [ref=e323]:
+            - generic [ref=e324]: 72 | Modelos | 2026-04-23T09:27:19.522572 | XGBoost
+            - combobox "Selected 72 | Modelos | 2026-04-23T09:27:19.522572 | XGBoost. Detalle" [ref=e326]
+          - img "open" [ref=e328]
+      - generic [ref=e331]:
+        - button "Marcar estrella" [ref=e336] [cursor=pointer]:
+          - paragraph [ref=e340]: Marcar estrella
+        - generic [ref=e342]:
+          - generic [ref=e345] [cursor=pointer]:
+            - checkbox "Confirmar eliminación"
+            - paragraph [ref=e350]: Confirmar eliminación
+          - button "Eliminar registro y artefactos generados" [disabled] [ref=e353]:
+            - paragraph [ref=e357]: Eliminar registro y artefactos generados
+      - paragraph [ref=e362]:
+        - strong [ref=e363]: Resumen
+      - generic [ref=e369]:
+        - generic [ref=e371] [cursor=pointer]:
+          - img [ref=e374]
+          - generic [ref=e376]: "{"
+        - generic [ref=e378]:
+          - generic [ref=e379]:
+            - generic [ref=e380]:
+              - generic [ref=e381]:
+                - text: "\""
+                - generic [ref=e382]: id
+                - text: "\""
+              - generic [ref=e383]: ":"
+            - generic [ref=e385]: "72"
+          - generic [ref=e386]:
+            - generic [ref=e387]:
+              - generic [ref=e388]:
+                - text: "\""
+                - generic [ref=e389]: stage
+                - text: "\""
+              - generic [ref=e390]: ":"
+            - generic [ref=e393]: "\"Modelos\""
+          - generic [ref=e394]:
+            - generic [ref=e395]:
+              - generic [ref=e396]:
+                - text: "\""
+                - generic [ref=e397]: created_at
+                - text: "\""
+              - generic [ref=e398]: ":"
+            - generic [ref=e401]: "\"2026-04-23T09:27:19.522572\""
+          - generic [ref=e402]:
+            - generic [ref=e403]:
+              - generic [ref=e404]:
+                - text: "\""
+                - generic [ref=e405]: context_key
+                - text: "\""
+              - generic [ref=e406]: ":"
+            - generic [ref=e409]: "\"20260423_092719_78e0fcab\""
+          - generic [ref=e410]:
+            - generic [ref=e411]:
+              - generic [ref=e412]:
+                - text: "\""
+                - generic [ref=e413]: feature_context_key
+                - text: "\""
+              - generic [ref=e414]: ":"
+            - generic [ref=e417]: "\"/Users/felipe/Desktop/SUMO/Resultados/accident_flow_features_cluster_gmm_k5_(2022_01-2024_09).duckdb\""
+          - generic [ref=e418]:
+            - generic [ref=e419]:
+              - generic [ref=e420]:
+                - text: "\""
+                - generic [ref=e421]: optuna_context_key
+                - text: "\""
+              - generic [ref=e422]: ":"
+            - generic [ref=e424]: "NULL"
+          - generic [ref=e425]:
+            - generic [ref=e426]:
+              - generic [ref=e427]:
+                - text: "\""
+                - generic [ref=e428]: features_path
+                - text: "\""
+              - generic [ref=e429]: ":"
+            - generic [ref=e432]: "\"/Users/felipe/Desktop/SUMO/Resultados/accident_flow_features_cluster_gmm_k5_(2022_01-2024_09).duckdb\""
+          - generic [ref=e433]:
+            - generic [ref=e434]:
+              - generic [ref=e435]:
+                - text: "\""
+                - generic [ref=e436]: features_source
+                - text: "\""
+              - generic [ref=e437]: ":"
+            - generic [ref=e440]: "\"duckdb\""
+          - generic [ref=e441]:
+            - generic [ref=e442]:
+              - generic [ref=e443]:
+                - text: "\""
+                - generic [ref=e444]: features_date_min
+                - text: "\""
+              - generic [ref=e445]: ":"
+            - generic [ref=e448]: "\"2022-01-01T00:00:00\""
+          - generic [ref=e449]:
+            - generic [ref=e450]:
+              - generic [ref=e451]:
+                - text: "\""
+                - generic [ref=e452]: features_date_max
+                - text: "\""
+              - generic [ref=e453]: ":"
+            - generic [ref=e456]: "\"2024-07-31T23:55:00\""
+          - generic [ref=e457]:
+            - generic [ref=e458]:
+              - generic [ref=e459]:
+                - text: "\""
+                - generic [ref=e460]: tramo_label
+                - text: "\""
+              - generic [ref=e461]: ":"
+            - generic [ref=e464]: "\"RUTA 5 SUR | Oriente | 3 -> 5\""
+          - generic [ref=e465]:
+            - generic [ref=e466]:
+              - generic [ref=e467]:
+                - text: "\""
+                - generic [ref=e468]: feature_signature
+                - text: "\""
+              - generic [ref=e469]: ":"
+            - generic [ref=e471]: "NULL"
+          - generic [ref=e472]:
+            - generic [ref=e473]:
+              - generic [ref=e474]:
+                - text: "\""
+                - generic [ref=e475]: model_name
+                - text: "\""
+              - generic [ref=e476]: ":"
+            - generic [ref=e479]: "\"XGBoost\""
+          - generic [ref=e480]:
+            - generic [ref=e481]:
+              - generic [ref=e482]:
+                - text: "\""
+                - generic [ref=e483]: optuna_objective
+                - text: "\""
+              - generic [ref=e484]: ":"
+            - generic [ref=e486]: "NULL"
+          - generic [ref=e487]:
+            - generic [ref=e488]:
+              - generic [ref=e489]:
+                - text: "\""
+                - generic [ref=e490]: threshold_objective
+                - text: "\""
+              - generic [ref=e491]: ":"
+            - generic [ref=e494]: "\"far\""
+          - generic [ref=e495]:
+            - generic [ref=e496]:
+              - generic [ref=e497]:
+                - text: "\""
+                - generic [ref=e498]: calibration_method
+                - text: "\""
+              - generic [ref=e499]: ":"
+            - generic [ref=e502]: "\"sigmoid\""
+          - generic [ref=e503]:
+            - generic [ref=e504]:
+              - generic [ref=e505]:
+                - text: "\""
+                - generic [ref=e506]: balance_strategy
+                - text: "\""
+              - generic [ref=e507]: ":"
+            - generic [ref=e510]: "\"none\""
+          - generic [ref=e511]:
+            - generic [ref=e513] [cursor=pointer]:
+              - img [ref=e516]
+              - generic [ref=e518]:
+                - generic [ref=e519]: "\"protocols\""
+                - generic [ref=e520]: ":"
+              - generic [ref=e521]: "["
+            - generic [ref=e523]:
+              - generic [ref=e524]:
+                - generic [ref=e525]:
+                  - text: "0"
+                  - generic [ref=e526]: ":"
+                - generic [ref=e529]: "\"conservative\""
+              - generic [ref=e530]:
+                - generic [ref=e531]:
+                  - text: "1"
+                  - generic [ref=e532]: ":"
+                - generic [ref=e535]: "\"robust\""
+            - generic [ref=e537] [cursor=pointer]: "]"
+        - generic [ref=e539] [cursor=pointer]: "}"
+      - paragraph [ref=e544]:
+        - strong [ref=e545]: Parámetros
+      - generic [ref=e551]:
+        - generic [ref=e553] [cursor=pointer]:
+          - img [ref=e556]
+          - generic [ref=e558]: "{"
+        - generic [ref=e560]:
+          - generic [ref=e561]:
+            - generic [ref=e562]:
+              - generic [ref=e563]:
+                - text: "\""
+                - generic [ref=e564]: alerts_per_day
+                - text: "\""
+              - generic [ref=e565]: ":"
+            - generic [ref=e567]: "5"
+          - generic [ref=e568]:
+            - generic [ref=e569]:
+              - generic [ref=e570]:
+                - text: "\""
+                - generic [ref=e571]: balance_strategy
+                - text: "\""
+              - generic [ref=e572]: ":"
+            - generic [ref=e575]: "\"none\""
+          - generic [ref=e576]:
+            - generic [ref=e577]:
+              - generic [ref=e578]:
+                - text: "\""
+                - generic [ref=e579]: calibration_method
+                - text: "\""
+              - generic [ref=e580]: ":"
+            - generic [ref=e583]: "\"sigmoid\""
+          - generic [ref=e584]:
+            - generic [ref=e585]:
+              - generic [ref=e586]:
+                - text: "\""
+                - generic [ref=e587]: far_target
+                - text: "\""
+              - generic [ref=e588]: ":"
+            - generic [ref=e590]: "0.2"
+          - generic [ref=e591]:
+            - generic [ref=e592]:
+              - generic [ref=e593]:
+                - text: "\""
+                - generic [ref=e594]: fn_cost
+                - text: "\""
+              - generic [ref=e595]: ":"
+            - generic [ref=e597]: "10"
+          - generic [ref=e598]:
+            - generic [ref=e599]:
+              - generic [ref=e600]:
+                - text: "\""
+                - generic [ref=e601]: fp_cost
+                - text: "\""
+              - generic [ref=e602]: ":"
+            - generic [ref=e604]: "1"
+          - generic [ref=e605]:
+            - generic [ref=e606]:
+              - generic [ref=e607]:
+                - text: "\""
+                - generic [ref=e608]: model_n_jobs
+                - text: "\""
+              - generic [ref=e609]: ":"
+            - generic [ref=e611]: "10"
+          - generic [ref=e612]:
+            - generic [ref=e613]:
+              - generic [ref=e614]:
+                - text: "\""
+                - generic [ref=e615]: random_state
+                - text: "\""
+              - generic [ref=e616]: ":"
+            - generic [ref=e618]: "42"
+          - generic [ref=e619]:
+            - generic [ref=e620]:
+              - generic [ref=e621]:
+                - text: "\""
+                - generic [ref=e622]: robust_folds
+                - text: "\""
+              - generic [ref=e623]: ":"
+            - generic [ref=e625]: "3"
+          - generic [ref=e626]:
+            - generic [ref=e627]:
+              - generic [ref=e628]:
+                - text: "\""
+                - generic [ref=e629]: test_size
+                - text: "\""
+              - generic [ref=e630]: ":"
+            - generic [ref=e632]: "0.2"
+          - generic [ref=e633]:
+            - generic [ref=e634]:
+              - generic [ref=e635]:
+                - text: "\""
+                - generic [ref=e636]: threshold_objective
+                - text: "\""
+              - generic [ref=e637]: ":"
+            - generic [ref=e640]: "\"far\""
+          - generic [ref=e641]:
+            - generic [ref=e643] [cursor=pointer]:
+              - img [ref=e646]
+              - generic [ref=e648]:
+                - generic [ref=e649]: "\"threshold_protocols\""
+                - generic [ref=e650]: ":"
+              - generic [ref=e651]: "["
+            - generic [ref=e653]:
+              - generic [ref=e654]:
+                - generic [ref=e655]:
+                  - text: "0"
+                  - generic [ref=e656]: ":"
+                - generic [ref=e659]: "\"conservative\""
+              - generic [ref=e660]:
+                - generic [ref=e661]:
+                  - text: "1"
+                  - generic [ref=e662]: ":"
+                - generic [ref=e665]: "\"robust\""
+            - generic [ref=e667] [cursor=pointer]: "]"
+          - generic [ref=e668]:
+            - generic [ref=e669]:
+              - generic [ref=e670]:
+                - text: "\""
+                - generic [ref=e671]: use_balanced
+                - text: "\""
+              - generic [ref=e672]: ":"
+            - generic [ref=e674]: "false"
+          - generic [ref=e675]:
+            - generic [ref=e676]:
+              - generic [ref=e677]:
+                - text: "\""
+                - generic [ref=e678]: val_size
+                - text: "\""
+              - generic [ref=e679]: ":"
+            - generic [ref=e681]: "0.2"
+        - generic [ref=e683] [cursor=pointer]: "}"
+      - paragraph [ref=e688]:
+        - strong [ref=e689]: Métricas
+      - generic [ref=e694]:
+        - button "Download as CSV" [ref=e697] [cursor=pointer]:
+          - img [ref=e698]
+        - button "Search" [ref=e703] [cursor=pointer]:
+          - img [ref=e704]
+        - button "Fullscreen" [ref=e709] [cursor=pointer]:
+          - img [ref=e710]
+      - paragraph [ref=e725]:
+        - strong [ref=e726]: Artefactos
+      - generic [ref=e731]:
+        - button "Download as CSV" [ref=e734] [cursor=pointer]:
+          - img [ref=e735]
+        - button "Search" [ref=e740] [cursor=pointer]:
+          - img [ref=e741]
+        - button "Fullscreen" [ref=e746] [cursor=pointer]:
+          - img [ref=e747]
+      - generic [ref=e760] [cursor=pointer]:
+        - checkbox "Mostrar metadata completa"
+        - paragraph [ref=e765]: Mostrar metadata completa

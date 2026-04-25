@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from src import pipeline_ray_runtime as runtime_module
+import src as src_package
 
 
 class _FakeRayModule:
@@ -69,9 +70,11 @@ def test_connect_ray_cluster_uses_saved_address_and_alive_nodes(monkeypatch):
 
     runtime = runtime_module.connect_ray_cluster(ray_module=fake_ray)
 
-    assert fake_ray.init_calls == [
-        {"address": "ray://cluster", "ignore_reinit_error": True}
-    ]
+    assert len(fake_ray.init_calls) == 1
+    init_call = fake_ray.init_calls[0]
+    assert init_call["address"] == "ray://cluster"
+    assert init_call["ignore_reinit_error"] is True
+    assert init_call["runtime_env"]["py_modules"] == [src_package]
     assert runtime.config.ray_address == "ray://cluster"
     assert runtime.total_cpus == 6
     assert runtime.max_node_cpus == 4

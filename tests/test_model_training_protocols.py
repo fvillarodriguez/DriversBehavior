@@ -349,6 +349,91 @@ def test_threshold_selection_uses_calibrated_scores(monkeypatch, calibration_met
     assert result["metrics"]["calibration_method"] == calibration_method
 
 
+def test_get_model_scores_prefers_decision_function_when_requested():
+    class _DualScoreModel:
+        _score_preference = "decision_function"
+
+        def predict_proba(self, X):
+            n = len(X)
+            return np.column_stack([np.full(n, 0.1), np.full(n, 0.9)])
+
+        def decision_function(self, X):
+            return np.full(len(X), -3.0)
+
+    frame = pd.DataFrame({"signal": [0.1, 0.2, 0.3]})
+    scores = model_training.get_model_scores(_DualScoreModel(), frame)
+
+    assert scores.tolist() == [-3.0, -3.0, -3.0]
+
+
+def test_svm_build_model_linear_returns_raw_scores_and_probabilities():
+    X = pd.DataFrame(
+        {
+            "speed": [-2.0, -1.0, 1.0, 2.0],
+            "flow": [-1.0, -0.5, 0.5, 1.0],
+        }
+    )
+    y = np.asarray([0, 0, 1, 1], dtype=int)
+
+    model = model_training.build_model(
+        "SVM",
+        {
+            "C": 1.0,
+            "kernel": "linear",
+            "probability": True,
+            "epochs": 4,
+            "batch_size": 2,
+        },
+        random_state=17,
+    )
+    model.fit(X, y)
+
+    scores = model_training.get_model_scores(model, X)
+    proba = model.predict_proba(X)
+
+    assert getattr(model, "_score_preference", "") == "decision_function"
+    assert getattr(model, "backend_", None) in {"mlx", "sklearn_linear"}
+    assert scores.shape == (4,)
+    assert np.isfinite(scores).all()
+    assert proba.shape == (4, 2)
+    assert np.allclose(proba.sum(axis=1), 1.0, atol=1e-6)
+
+
+def test_svm_build_model_rbf_uses_random_fourier_features():
+    X = pd.DataFrame(
+        {
+            "x1": [0.0, 0.0, 1.0, 1.0, 0.2, 0.2, 0.8, 0.8],
+            "x2": [0.0, 1.0, 0.0, 1.0, 0.2, 0.8, 0.2, 0.8],
+        }
+    )
+    y = np.asarray([0, 1, 1, 0, 0, 1, 1, 0], dtype=int)
+
+    model = model_training.build_model(
+        "SVM",
+        {
+            "C": 1.0,
+            "kernel": "rbf",
+            "gamma": "scale",
+            "probability": True,
+            "rff_components": 32,
+            "epochs": 4,
+            "batch_size": 4,
+        },
+        random_state=23,
+    )
+    model.fit(X, y)
+
+    scores = model_training.get_model_scores(model, X)
+    proba = model.predict_proba(X)
+
+    assert getattr(model, "kernel_", "") == "rbf"
+    assert getattr(model, "feature_map_", None) is not None
+    assert getattr(model, "backend_", None) in {"mlx", "sklearn_linear"}
+    assert scores.shape == (8,)
+    assert np.isfinite(scores).all()
+    assert proba.shape == (8, 2)
+
+
 def test_neural_network_build_model_passes_phase1_options():
     model = model_training.build_model(
         "Neural Network",
@@ -361,10 +446,14 @@ def test_neural_network_build_model_passes_phase1_options():
             "batch_size": 64,
             "epochs": 7,
             "early_stopping_patience": 2,
+            "early_stopping_min_delta": 0.002,
             "pos_weight": 4.0,
             "val_fraction": 0.25,
             "use_batch_norm": True,
+            "hidden_activation": "gelu",
+            "output_activation": "sigmoid",
             "loss_function": "focal",
+            "optimizer": "Adam",
             "focal_gamma": 1.5,
             "focal_alpha": 0.7,
             "max_grad_norm": 0.75,
@@ -381,9 +470,13 @@ def test_neural_network_build_model_passes_phase1_options():
     assert wrapper.hidden_dim == 32
     assert wrapper.num_layers == 3
     assert wrapper.use_batch_norm is True
+    assert wrapper.hidden_activation == "gelu"
+    assert wrapper.output_activation == "sigmoid"
     assert wrapper.loss_function == "focal"
+    assert wrapper.optimizer_name == "Adam"
     assert wrapper.focal_gamma == pytest.approx(1.5)
     assert wrapper.focal_alpha == pytest.approx(0.7)
+    assert wrapper.early_stopping_min_delta == pytest.approx(0.002)
     assert wrapper.max_grad_norm == pytest.approx(0.75)
     assert wrapper.lr_scheduler == "reduce_on_plateau"
     assert wrapper.temperature_scaling is True
@@ -398,6 +491,22 @@ def test_mlp_net_inserts_batch_norm_only_when_requested():
 
     assert sum(isinstance(layer, torch.nn.BatchNorm1d) for layer in with_bn.net) == 2
     assert sum(isinstance(layer, torch.nn.BatchNorm1d) for layer in without_bn.net) == 0
+
+
+def test_mlp_net_uses_requested_hidden_activation():
+    torch = pytest.importorskip("torch")
+    from src.mlp_tabular import MLPNet
+
+    gelu_net = MLPNet(
+        4,
+        hidden_dim=8,
+        num_layers=2,
+        dropout=0.1,
+        hidden_activation="gelu",
+    )
+
+    assert sum(isinstance(layer, torch.nn.GELU) for layer in gelu_net.net) == 2
+    assert sum(isinstance(layer, torch.nn.ReLU) for layer in gelu_net.net) == 0
 
 
 def test_mlp_focal_loss_matches_manual_formula():
@@ -428,10 +537,42 @@ def test_mlp_focal_loss_matches_manual_formula():
     assert observed.item() == pytest.approx(expected.item())
 
 
+def test_mlp_classifier_trains_with_bce_sigmoid_and_adam_aliases():
+    pytest.importorskip("torch")
+
+    rng = np.random.default_rng(17)
+    X = rng.normal(size=(40, 4)).astype(np.float32)
+    y = (X[:, 0] - 0.25 * X[:, 1] > 0.0).astype(int)
+
+    clf = model_training.MLPClassifierWrapper(
+        hidden_dim=8,
+        num_layers=1,
+        dropout=0.0,
+        learning_rate=0.01,
+        batch_size=8,
+        epochs=2,
+        early_stopping_patience=2,
+        val_fraction=0.25,
+        hidden_activation="LeakyReLU",
+        output_activation="Sigmoid",
+        loss_function="BCE",
+        optimizer_name="Adam",
+        random_state=21,
+    ).fit(X, y)
+
+    proba = clf.predict_proba(X[:5])
+
+    assert proba.shape == (5, 2)
+    assert np.allclose(proba.sum(axis=1), 1.0, atol=1e-6)
+    assert np.isfinite(proba).all()
+    assert clf.train_loss_history_
+
+
 def test_mlp_classifier_trains_with_phase1_options(monkeypatch):
     torch = pytest.importorskip("torch")
 
     scheduler_steps = []
+    callback_payloads = []
 
     class _FakePlateauScheduler:
         def __init__(self, optimizer, **kwargs):
@@ -470,6 +611,7 @@ def test_mlp_classifier_trains_with_phase1_options(monkeypatch):
         batch_size=8,
         epochs=3,
         early_stopping_patience=3,
+        early_stopping_min_delta=0.01,
         val_fraction=0.25,
         use_batch_norm=True,
         loss_function="focal",
@@ -480,7 +622,11 @@ def test_mlp_classifier_trains_with_phase1_options(monkeypatch):
         scheduler_patience=0,
         temperature_scaling=True,
         random_state=11,
-    ).fit(X, y)
+    ).fit(
+        X,
+        y,
+        epoch_callback=lambda payload: callback_payloads.append(dict(payload)),
+    )
 
     proba = clf.predict_proba(X[:6])
     assert proba.shape == (6, 2)
@@ -488,5 +634,12 @@ def test_mlp_classifier_trains_with_phase1_options(monkeypatch):
     assert clip_calls
     assert set(clip_calls) == {0.5}
     assert scheduler_steps == pytest.approx(clf.val_loss_history_)
+    assert len(clf.train_loss_history_) == len(clf.val_loss_history_)
+    assert clf.train_loss_history_
     assert clf.lr_history_
+    assert clf.epochs_ran_ == len(clf.train_loss_history_)
+    assert len(callback_payloads) >= len(clf.train_loss_history_)
+    assert callback_payloads[-1]["train_loss"] == pytest.approx(
+        clf.train_loss_history_
+    )
     assert clf.temperature_ > 0.0

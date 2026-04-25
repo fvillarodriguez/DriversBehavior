@@ -1,7 +1,7 @@
 """
 Shared model training and evaluation logic for the Crash Prediction App.
 """
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import importlib
 import os
 import numpy as np
@@ -285,11 +285,15 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         batch_size: int = 1024,
         epochs: int = 30,
         early_stopping_patience: int = 5,
+        early_stopping_min_delta: float = 0.0,
         pos_weight: float = 1.0,
         val_fraction: float = 0.15,
         random_state: int = 42,
         use_batch_norm: bool = False,
+        hidden_activation: str = "relu",
+        output_activation: str = "softmax",
         loss_function: str = "cross_entropy",
+        optimizer_name: str = "adamw",
         focal_gamma: float = 2.0,
         focal_alpha: Optional[float] = None,
         max_grad_norm: Optional[float] = None,
@@ -307,11 +311,15 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         self.batch_size = batch_size
         self.epochs = epochs
         self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_delta = early_stopping_min_delta
         self.pos_weight = pos_weight
         self.val_fraction = val_fraction
         self.random_state = random_state
         self.use_batch_norm = use_batch_norm
+        self.hidden_activation = hidden_activation
+        self.output_activation = output_activation
         self.loss_function = loss_function
+        self.optimizer_name = optimizer_name
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
         self.max_grad_norm = max_grad_norm
@@ -325,8 +333,14 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         self.device_ = None
         self.classes_ = np.array([0, 1])
         self.temperature_ = 1.0
+        self.train_loss_history_: List[float] = []
         self.lr_history_: List[float] = []
         self.val_loss_history_: List[float] = []
+        self.epochs_ran_: int = 0
+        self.early_stopping_used_: bool = False
+        self.early_stopping_triggered_: bool = False
+        self.best_epoch_: Optional[int] = None
+        self.best_monitor_value_: Optional[float] = None
 
     @staticmethod
     def _normalize_loss_function(value: object) -> str:
@@ -334,8 +348,13 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         aliases = {
             "": "cross_entropy",
             "ce": "cross_entropy",
+            "mce": "cross_entropy",
+            "categorical_cross_entropy": "cross_entropy",
             "crossentropy": "cross_entropy",
             "cross_entropy": "cross_entropy",
+            "bce": "binary_cross_entropy",
+            "bce_with_logits": "binary_cross_entropy",
+            "binary_cross_entropy": "binary_cross_entropy",
             "focal": "focal",
             "focal_loss": "focal",
         }
@@ -355,11 +374,77 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         }
         return aliases.get(text, "none")
 
+    @staticmethod
+    def _normalize_hidden_activation(value: object) -> str:
+        text = str(value or "").strip().lower().replace("-", "_")
+        aliases = {
+            "": "relu",
+            "relu": "relu",
+            "gelu": "gelu",
+            "elu": "elu",
+            "leaky_relu": "leaky_relu",
+            "leakyrelu": "leaky_relu",
+            "tanh": "tanh",
+        }
+        return aliases.get(text, "relu")
+
+    @staticmethod
+    def _normalize_output_activation(value: object) -> str:
+        text = str(value or "").strip().lower().replace("-", "_")
+        aliases = {
+            "": "softmax",
+            "softmax": "softmax",
+            "sigmoid": "sigmoid",
+        }
+        return aliases.get(text, "softmax")
+
+    @staticmethod
+    def _normalize_optimizer_name(value: object) -> str:
+        text = str(value or "").strip().lower().replace("-", "_")
+        aliases = {
+            "": "adamw",
+            "adamw": "adamw",
+            "adam": "adam",
+            "rmsprop": "rmsprop",
+        }
+        return aliases.get(text, "adamw")
+
+    @staticmethod
+    def _positive_logit(logits):
+        import torch
+
+        if logits.ndim == 1:
+            return logits
+        if logits.size(1) <= 1:
+            return logits.reshape(-1)
+        return logits[:, 1] - logits[:, 0]
+
+    def _positive_probability(self, logits):
+        import torch
+        import torch.nn.functional as F
+
+        output_key = self._normalize_output_activation(self.output_activation)
+        if output_key == "sigmoid":
+            return torch.sigmoid(self._positive_logit(logits))
+        return F.softmax(logits, dim=1)[:, 1]
+
     def _compute_loss(self, logits, targets, class_weight):
         import torch
         import torch.nn.functional as F
 
         loss_key = self._normalize_loss_function(self.loss_function)
+        if loss_key == "binary_cross_entropy":
+            pos_logits = self._positive_logit(logits)
+            pos_weight = torch.tensor(
+                float(self.pos_weight),
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            return F.binary_cross_entropy_with_logits(
+                pos_logits,
+                targets.float(),
+                pos_weight=pos_weight,
+            )
         if loss_key != "focal":
             return F.cross_entropy(logits, targets, weight=class_weight)
 
@@ -425,7 +510,12 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         # 2 GB por defecto como umbral de seguridad.
         return est_bytes <= 2 * 1024 ** 3
 
-    def fit(self, X, y):
+    def fit(
+        self,
+        X,
+        y,
+        epoch_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    ):
         import torch
         import torch.nn.functional as F
         from src.mlp_tabular import MLPNet
@@ -435,8 +525,14 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
         self.in_dim_ = X_np.shape[1]
         self.device_ = self._resolve_device()
         self.temperature_ = 1.0
+        self.train_loss_history_ = []
         self.lr_history_ = []
         self.val_loss_history_ = []
+        self.epochs_ran_ = 0
+        self.early_stopping_used_ = False
+        self.early_stopping_triggered_ = False
+        self.best_epoch_ = None
+        self.best_monitor_value_ = None
 
         torch.manual_seed(self.random_state)
 
@@ -448,6 +544,7 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
             self.early_stopping_patience > 0
             and int(self.val_fraction * len(y_np)) >= 2
         )
+        self.early_stopping_used_ = bool(use_early_stopping)
         if use_early_stopping:
             from sklearn.model_selection import train_test_split as _split
 
@@ -475,22 +572,50 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
             self.num_layers,
             self.dropout,
             use_batch_norm=_coerce_bool(self.use_batch_norm),
+            hidden_activation=self._normalize_hidden_activation(
+                self.hidden_activation
+            ),
         ).to(self.device_)
 
-        # AdamW fused solo en CUDA (no soportado en MPS).
-        adamw_kwargs = {
+        optimizer_key = self._normalize_optimizer_name(self.optimizer_name)
+        optimizer_kwargs = {
             "lr": self.learning_rate,
             "weight_decay": self.weight_decay,
         }
-        if self.device_.type == "cuda":
-            try:
+        if optimizer_key == "adamw":
+            if self.device_.type == "cuda":
+                try:
+                    optimizer = torch.optim.AdamW(
+                        model.parameters(), fused=True, **optimizer_kwargs
+                    )
+                except (TypeError, RuntimeError):
+                    optimizer = torch.optim.AdamW(
+                        model.parameters(), **optimizer_kwargs
+                    )
+            else:
                 optimizer = torch.optim.AdamW(
-                    model.parameters(), fused=True, **adamw_kwargs
+                    model.parameters(), **optimizer_kwargs
                 )
-            except (TypeError, RuntimeError):
-                optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+        elif optimizer_key == "adam":
+            if self.device_.type == "cuda":
+                try:
+                    optimizer = torch.optim.Adam(
+                        model.parameters(), fused=True, **optimizer_kwargs
+                    )
+                except (TypeError, RuntimeError):
+                    optimizer = torch.optim.Adam(
+                        model.parameters(), **optimizer_kwargs
+                    )
+            else:
+                optimizer = torch.optim.Adam(
+                    model.parameters(), **optimizer_kwargs
+                )
+        elif optimizer_key == "rmsprop":
+            optimizer = torch.optim.RMSprop(
+                model.parameters(), **optimizer_kwargs
+            )
         else:
-            optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+            optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
 
         scheduler_key = self._normalize_lr_scheduler(self.lr_scheduler)
         scheduler = None
@@ -552,8 +677,47 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
             int(self.random_state)
         )
 
+        def _emit_epoch_payload(epoch_number: int, status: str = "running") -> None:
+            if epoch_callback is None:
+                return
+            payload: Dict[str, object] = {
+                "epoch": int(epoch_number),
+                "epochs": list(range(1, len(self.train_loss_history_) + 1)),
+                "train_loss": [float(value) for value in self.train_loss_history_],
+                "val_loss": [float(value) for value in self.val_loss_history_],
+                "epochs_ran": int(
+                    max(
+                        len(self.train_loss_history_),
+                        len(self.val_loss_history_),
+                    )
+                ),
+                "max_epochs": int(self.epochs),
+                "early_stopping_used": bool(self.early_stopping_used_),
+                "early_stopping_triggered": bool(
+                    self.early_stopping_triggered_
+                ),
+                "early_stopping_patience": int(
+                    self.early_stopping_patience
+                ),
+                "early_stopping_min_delta": float(
+                    self.early_stopping_min_delta
+                ),
+                "status": str(status),
+            }
+            if self.best_epoch_ is not None:
+                payload["best_epoch"] = int(self.best_epoch_)
+            if self.best_monitor_value_ is not None:
+                payload["best_monitor_value"] = float(
+                    self.best_monitor_value_
+                )
+            try:
+                epoch_callback(payload)
+            except Exception:
+                pass
+
         for _epoch in range(self.epochs):
             model.train()
+            epoch_loss_total = 0.0
             epoch_seen = 0
             if preload_to_device:
                 # Permutacion en CPU (randperm en MPS no es siempre estable)
@@ -574,7 +738,9 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                             model.parameters(), float(self.max_grad_norm)
                         )
                     optimizer.step()
-                    epoch_seen += int(yb.size(0))
+                    batch_seen = int(yb.size(0))
+                    epoch_loss_total += float(loss.detach().cpu().item()) * batch_seen
+                    epoch_seen += batch_seen
             else:
                 non_block = self.device_.type == "cuda"
                 for xb, yb in train_loader:
@@ -590,11 +756,18 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                             model.parameters(), float(self.max_grad_norm)
                         )
                     optimizer.step()
-                    epoch_seen += int(yb.size(0))
+                    batch_seen = int(yb.size(0))
+                    epoch_loss_total += float(loss.detach().cpu().item()) * batch_seen
+                    epoch_seen += batch_seen
 
+            epoch_train_loss = (
+                float(epoch_loss_total / epoch_seen) if epoch_seen > 0 else float("nan")
+            )
+            self.train_loss_history_.append(epoch_train_loss)
             if epoch_seen > 0:
                 self.lr_history_.append(float(optimizer.param_groups[0]["lr"]))
 
+            should_stop = False
             if use_early_stopping and X_es is not None:
                 model.eval()
                 with torch.inference_mode():
@@ -614,9 +787,7 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                         .cpu()
                         .item()
                     )
-                    es_probs = (
-                        F.softmax(es_out, dim=1)[:, 1].detach().cpu().numpy()
-                    )
+                    es_probs = self._positive_probability(es_out).detach().cpu().numpy()
                 from sklearn.metrics import average_precision_score
 
                 self.val_loss_history_.append(val_loss)
@@ -628,8 +799,11 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                 else:
                     val_score = 0.0
 
-                if val_score > best_val_score + 1e-6:
+                min_delta = max(float(self.early_stopping_min_delta), 0.0)
+                if val_score > best_val_score + min_delta:
                     best_val_score = val_score
+                    self.best_monitor_value_ = float(val_score)
+                    self.best_epoch_ = int(_epoch) + 1
                     best_state = {
                         k: v.detach().cpu().clone()
                         for k, v in model.state_dict().items()
@@ -638,7 +812,19 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                 else:
                     no_improve += 1
                 if no_improve >= self.early_stopping_patience:
-                    break
+                    self.early_stopping_triggered_ = True
+                    should_stop = True
+
+            self.epochs_ran_ = max(
+                len(self.train_loss_history_),
+                len(self.val_loss_history_),
+            )
+            _emit_epoch_payload(
+                int(_epoch) + 1,
+                status="completed" if should_stop else "running",
+            )
+            if should_stop:
+                break
 
         if best_state is not None:
             model.load_state_dict(best_state)
@@ -661,6 +847,11 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
             self.temperature_ = self._fit_temperature_from_logits(logits, labels)
         else:
             self.temperature_ = 1.0
+        self.epochs_ran_ = max(
+            len(self.train_loss_history_),
+            len(self.val_loss_history_),
+        )
+        _emit_epoch_payload(int(self.epochs_ran_), status="finished")
         self.model_ = model
         return self
 
@@ -683,8 +874,19 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
                 )
                 logits = self.model_(tensor)
                 temperature = max(float(getattr(self, "temperature_", 1.0)), 1e-6)
-                logits = logits / temperature
-                probs_chunk = F.softmax(logits, dim=1).detach().cpu().numpy()
+                if (
+                    self._normalize_output_activation(self.output_activation)
+                    == "sigmoid"
+                ):
+                    pos_logits = self._positive_logit(logits) / temperature
+                    pos_probs = torch.sigmoid(pos_logits)
+                    probs_chunk = torch.stack(
+                        [1.0 - pos_probs, pos_probs],
+                        dim=1,
+                    ).detach().cpu().numpy()
+                else:
+                    logits = logits / temperature
+                    probs_chunk = F.softmax(logits, dim=1).detach().cpu().numpy()
                 out_parts.append(probs_chunk)
         if not out_parts:
             return np.empty((0, 2), dtype=np.float32)
@@ -692,6 +894,61 @@ class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
 
     def predict(self, X):
         return np.argmax(self.predict_proba(X), axis=1)
+
+
+def _extract_training_curves(model: object) -> Dict[str, object]:
+    wrapper = model
+    named_steps = getattr(model, "named_steps", None)
+    if isinstance(named_steps, dict):
+        wrapper = named_steps.get("model")
+
+    train_loss = getattr(wrapper, "train_loss_history_", None)
+    val_loss = getattr(wrapper, "val_loss_history_", None)
+    if not isinstance(train_loss, list) and not isinstance(val_loss, list):
+        return {}
+
+    train_series = (
+        [float(value) for value in train_loss]
+        if isinstance(train_loss, list)
+        else []
+    )
+    val_series = (
+        [float(value) for value in val_loss]
+        if isinstance(val_loss, list)
+        else []
+    )
+    max_len = max(len(train_series), len(val_series))
+    if max_len <= 0:
+        return {}
+
+    best_epoch = getattr(wrapper, "best_epoch_", None)
+    epochs_ran = getattr(wrapper, "epochs_ran_", max_len)
+    payload: Dict[str, object] = {
+        "epochs": list(range(1, max_len + 1)),
+        "train_loss": train_series,
+        "val_loss": val_series,
+        "epochs_ran": int(epochs_ran),
+        "max_epochs": int(getattr(wrapper, "epochs", max_len)),
+        "early_stopping_used": bool(
+            getattr(wrapper, "early_stopping_used_", False)
+        ),
+        "early_stopping_triggered": bool(
+            getattr(wrapper, "early_stopping_triggered_", False)
+        ),
+        "early_stopping_patience": int(
+            getattr(wrapper, "early_stopping_patience", 0)
+        ),
+        "early_stopping_min_delta": float(
+            getattr(wrapper, "early_stopping_min_delta", 0.0)
+        ),
+        "monitor_metric": "average_precision",
+    }
+    if best_epoch is not None:
+        payload["best_epoch"] = int(best_epoch)
+    best_monitor_value = getattr(wrapper, "best_monitor_value_", None)
+    if best_monitor_value is not None:
+        payload["best_monitor_value"] = float(best_monitor_value)
+    return payload
 
 
 def _normalize_class_weight(value: object) -> Optional[object]:
@@ -773,33 +1030,25 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
         return xgb.XGBClassifier(**xgb_params)
 
     if model_name == "SVM":
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.svm import SVC
+        from src.mlx_svm import MLXAcceleratedSVMClassifier
 
         probability = bool(params.get("probability", True))
         cache_size = float(params.get("cache_size", 200.0))
 
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "model",
-                    SVC(
-                        C=float(params["C"]),
-                        kernel=str(params["kernel"]),
-                        gamma=params.get("gamma", "scale"),
-                        degree=int(params.get("degree", 3)),
-                        coef0=float(params.get("coef0", 0.0)),
-                        probability=probability,
-                        cache_size=cache_size,
-                        class_weight=_normalize_class_weight(
-                            params.get("class_weight")
-                        ),
-                        random_state=random_state,
-                    ),
-                ),
-            ]
+        return MLXAcceleratedSVMClassifier(
+            C=float(params["C"]),
+            kernel=str(params["kernel"]),
+            gamma=params.get("gamma", "scale"),
+            degree=int(params.get("degree", 3)),
+            coef0=float(params.get("coef0", 0.0)),
+            probability=probability,
+            cache_size=cache_size,
+            class_weight=_normalize_class_weight(params.get("class_weight")),
+            random_state=random_state,
+            learning_rate=float(params.get("learning_rate", 1e-3)),
+            epochs=int(params.get("epochs", 40)),
+            batch_size=int(params.get("batch_size", 8192)),
+            rff_components=int(params.get("rff_components", 2048)),
         )
 
     if model_name == "Neural Network":
@@ -822,14 +1071,26 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
                         early_stopping_patience=int(
                             params.get("early_stopping_patience", 5)
                         ),
+                        early_stopping_min_delta=float(
+                            params.get("early_stopping_min_delta", 0.0)
+                        ),
                         pos_weight=float(params.get("pos_weight", 1.0)),
                         val_fraction=float(params.get("val_fraction", 0.15)),
                         random_state=random_state,
                         use_batch_norm=_coerce_bool(
                             params.get("use_batch_norm", False)
                         ),
+                        hidden_activation=str(
+                            params.get("hidden_activation", "relu")
+                        ),
+                        output_activation=str(
+                            params.get("output_activation", "softmax")
+                        ),
                         loss_function=str(
                             params.get("loss_function", "cross_entropy")
+                        ),
+                        optimizer_name=str(
+                            params.get("optimizer_name", params.get("optimizer", "adamw"))
                         ),
                         focal_gamma=float(params.get("focal_gamma", 2.0)),
                         focal_alpha=_coerce_optional_float(
@@ -901,6 +1162,14 @@ def temporal_train_test_split(
 
 
 def get_model_scores(model, X: pd.DataFrame) -> np.ndarray:
+    if (
+        getattr(model, "_score_preference", "") == "decision_function"
+        and hasattr(model, "decision_function")
+    ):
+        try:
+            return np.asarray(model.decision_function(X), dtype=float)
+        except Exception:
+            pass
     if hasattr(model, "predict_proba"):
         try:
             return model.predict_proba(X)[:, 1]
@@ -1958,6 +2227,7 @@ def _fit_protocol_model(
     random_state: int,
     balance_strategy: str,
     smote_params: Optional[Dict[str, object]] = None,
+    epoch_callback: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> object:
     X_train = train_df[feature_cols].fillna(0)
     y_train = train_df["target"].astype(int)
@@ -1977,7 +2247,10 @@ def _fit_protocol_model(
             smote_params=smote_params,
         )
     model = build_model(model_name, params, random_state)
-    model.fit(X_fit, y_fit)
+    fit_kwargs: Dict[str, object] = {}
+    if model_name == "Neural Network" and epoch_callback is not None:
+        fit_kwargs["model__epoch_callback"] = epoch_callback
+    model.fit(X_fit, y_fit, **fit_kwargs)
     return model
 
 
@@ -2033,6 +2306,7 @@ def train_model_with_protocol(
     balance_strategy: str = "none",
     smote_params: Optional[Dict[str, object]] = None,
     threshold_n_jobs: Optional[int] = None,
+    epoch_callback: Optional[Callable[[Dict[str, object]], None]] = None,
     random_state: int,
 ) -> Dict[str, object]:
     protocol_key = normalize_threshold_protocol(threshold_protocol)
@@ -2117,6 +2391,7 @@ def train_model_with_protocol(
                     random_state=int(random_state),
                     balance_strategy=balance_key,
                     smote_params=smote_params,
+                    epoch_callback=epoch_callback,
                 )
                 X_test = test_df[feature_cols].fillna(0)
                 y_test = test_df["target"].astype(int).to_numpy()
@@ -2171,6 +2446,7 @@ def train_model_with_protocol(
                     "validation_metrics": validation_metrics,
                     "threshold_info": thr_info,
                     "confusion_matrix": test_metrics["confusion_matrix"],
+                    "training_curves": _extract_training_curves(final_model),
                     "model": final_model,
                     "calibrator": calibrator,
                     "split_info": split_info,
@@ -2198,6 +2474,7 @@ def train_model_with_protocol(
         random_state=int(random_state),
         balance_strategy=balance_key,
         smote_params=smote_params,
+        epoch_callback=epoch_callback,
     )
     X_val = val_df[feature_cols].fillna(0)
     y_val = val_df["target"].astype(int).to_numpy()
@@ -2276,6 +2553,7 @@ def train_model_with_protocol(
         "validation_metrics": validation_metrics,
         "threshold_info": thr_info,
         "confusion_matrix": test_metrics["confusion_matrix"],
+        "training_curves": _extract_training_curves(model),
         "model": model,
         "calibrator": calibrator,
         "split_info": split_info,
@@ -2315,6 +2593,7 @@ def train_model(
     robust_folds: int = 3,
     balance_strategy: str = "none",
     smote_params: Optional[Dict[str, object]] = None,
+    epoch_callback: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> Dict[str, object]:
     y = df["target"].astype(int)
     if y.nunique() < 2:
@@ -2359,6 +2638,7 @@ def train_model(
         robust_folds=int(robust_folds),
         balance_strategy=balance_strategy,
         smote_params=smote_params,
+        epoch_callback=epoch_callback,
         random_state=int(random_state),
     )
 
@@ -2382,6 +2662,7 @@ def train_model_on_split(
     robust_folds: int = 3,
     balance_strategy: str = "none",
     smote_params: Optional[Dict[str, object]] = None,
+    epoch_callback: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> Dict[str, object]:
     train_df, val_df = split_train_val_for_threshold(
         train_df, val_size=val_size, random_state=random_state
@@ -2415,5 +2696,6 @@ def train_model_on_split(
         robust_folds=int(robust_folds),
         balance_strategy=balance_strategy,
         smote_params=smote_params,
+        epoch_callback=epoch_callback,
         random_state=int(random_state),
     )

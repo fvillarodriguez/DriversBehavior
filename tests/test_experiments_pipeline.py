@@ -769,6 +769,34 @@ def test_neural_network_search_space_accepts_phase1_opt_in_knobs():
     assert model_space["temperature_scaling"] == [False, True]
 
 
+def test_neural_network_search_space_includes_activation_loss_and_optimizer_defaults():
+    runner = ExperimentsRunner(random_state=42)
+    y_train = pd.Series(([0] * 24) + ([1] * 6))
+
+    nn_space = runner._controlled_comparison_search_space(
+        model_name="Neural Network",
+        balance_mode="none",
+        search_space_config={},
+        y_train=y_train,
+    )
+
+    model_space = nn_space["model"]
+    assert model_space["hidden_activation"] == [
+        "relu",
+        "gelu",
+        "leaky_relu",
+        "elu",
+        "tanh",
+    ]
+    assert model_space["output_activation"] == ["softmax", "sigmoid"]
+    assert model_space["loss_function"] == [
+        "cross_entropy",
+        "binary_cross_entropy",
+        "focal",
+    ]
+    assert model_space["optimizer_name"] == ["adamw", "adam", "rmsprop"]
+
+
 def test_run_calibration_sweep_persists_artifacts_and_ranks_on_validation(
     tmp_path, monkeypatch
 ):
@@ -942,6 +970,59 @@ def test_run_calibration_sweep_persists_artifacts_and_ranks_on_validation(
     assert not payload["pareto_front_df"].empty
     top_balance_mode = payload["leaderboard_df"].iloc[0]["balance_mode"]
     assert top_balance_mode == "none"
+
+
+def test_run_calibration_sweep_emits_intermediate_progress_events(
+    tmp_path,
+    monkeypatch,
+):
+    base_df = _synthetic_calibration_base_df()
+    runner = ExperimentsRunner(random_state=42)
+    progress_events = []
+
+    def _fake_optimize(self, **kwargs):
+        combo_callback = kwargs.get("progress_callback")
+        if combo_callback:
+            combo_callback(
+                {
+                    "event": "optuna_trial_finished",
+                    "stage": "Optuna",
+                    "message": "Optuna: 1/1 trials evaluados.",
+                    "combo_fraction": 0.5,
+                    "optuna_trials_done": 1,
+                    "optuna_trials_target": 1,
+                    "optuna_trials_completed": 1,
+                    "optuna_trials_pruned": 0,
+                    "optuna_trials_failed": 0,
+                    "optuna_trials_running": 0,
+                    "optuna_trials_total": 1,
+                }
+            )
+        return _fake_calibration_optimize_result(kwargs, score=0.72)
+
+    monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
+
+    runner.run_calibration_sweep(
+        base_df,
+        model_name="Random Forest",
+        selected_features=["signal", "aux_signal"],
+        objective_metrics=["mcc"],
+        calibration_methods=["sigmoid"],
+        threshold_objectives=["far"],
+        n_trials=1,
+        timeout=30,
+        checkpoint_root=tmp_path / "calibration_progress",
+        progress_callback=lambda event: progress_events.append(dict(event)),
+    )
+
+    event_names = [str(event.get("event")) for event in progress_events]
+    assert "split_start" in event_names
+    assert "split_freeze_done" in event_names
+    assert event_names.count("combo_start") == 2
+    assert "optuna_trial_finished" in event_names
+    assert "combo_done" in event_names
+    assert "leaderboard_start" in event_names
+    assert any(event.get("combo_index") == 1 for event in progress_events)
 
 
 def test_run_calibration_sweep_multiobjective_persists_contract_columns(

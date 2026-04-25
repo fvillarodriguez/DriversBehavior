@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -14,20 +15,36 @@ from typing import Any, Dict, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
+try:
+    import duckdb  # type: ignore
+except ImportError:
+    duckdb = None  # type: ignore
+
 from src.drift_bias_variance import (
     BIAS_VARIANCE_NOISE_COLUMNS,
     build_bias_variance_noise_lookup,
     drift_row_group_key,
 )
+from src.clustering import (
+    DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME,
+    DYNAMIC_GMM_LIVE_EVENTS_TABLE_NAME,
+    DYNAMIC_GMM_METADATA_TABLE_NAME,
+    DYNAMIC_GMM_RUN_STATUS_TABLE_NAME,
+    DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME,
+    DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME,
+)
 from src.pipeline_ray_runtime import EXECUTION_BACKEND_LOCAL
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-RESULTS_DIR = ROOT_DIR / "Resultados"
+DEFAULT_RESULTS_DIR = ROOT_DIR / "Resultados"
+RESULTS_DIR = DEFAULT_RESULTS_DIR
 CALIBRATION_EXPERIMENTS_DIR = RESULTS_DIR / "calibration_experiment_runs"
 DRIFT_RUNS_DIR = RESULTS_DIR / "drift_recalibration_runs"
 NEURAL_DRIFT_EXPERIMENTS_DIR = RESULTS_DIR / "neural_drift_experiments"
 NLP_PAPER_RUNS_DIR = RESULTS_DIR / "nlp_in_severity" / "paper_replication"
 NLP_LANGUAGE_MODELING_LIVE_DIR = RESULTS_DIR / "nlp_in_severity" / "language_modeling_live"
+MODEL_HISTORY_DIR = RESULTS_DIR / "model_history"
+MODEL_OPTUNA_BATCH_LIVE_DIR = MODEL_HISTORY_DIR / "optuna_batch_live"
 PAPER_MODEL_CODES = ("M1", "M2", "M3")
 THESIS_CHART_COLORS = {
     "paper": "#fdfcfa",
@@ -39,6 +56,7 @@ THESIS_CHART_COLORS = {
     "accent": "#1b3a6b",
     "sage": "#3b7a57",
 }
+DYNAMIC_GMM_PLATE_PAGE_SIZE = 10
 
 
 def _list_live_db_files() -> list[Path]:
@@ -49,6 +67,253 @@ def _list_live_db_files() -> list[Path]:
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
+
+
+def _list_dynamic_gmm_db_files() -> list[Path]:
+    if not RESULTS_DIR.exists():
+        return []
+    return sorted(
+        RESULTS_DIR.glob("dynamic_gmm_*.duckdb"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _dynamic_gmm_table_exists(conn, table_name: str) -> bool:
+    try:
+        exists = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_name = ?
+            """,
+            [str(table_name)],
+        ).fetchone()[0]
+        return bool(exists)
+    except Exception:
+        return False
+
+
+def _dynamic_gmm_table_columns(conn, table_name: str) -> list[str]:
+    if not _dynamic_gmm_table_exists(conn, table_name):
+        return []
+    try:
+        rows = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    except Exception:
+        return []
+    return [str(row[1]) for row in rows]
+
+
+def _read_dynamic_gmm_metadata(conn) -> Dict[str, object]:
+    if not _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_METADATA_TABLE_NAME):
+        return {}
+    try:
+        meta_df = conn.execute(
+            f"SELECT key, value_json FROM {DYNAMIC_GMM_METADATA_TABLE_NAME}"
+        ).df()
+    except Exception:
+        return {}
+    metadata: Dict[str, object] = {}
+    for row in meta_df.itertuples(index=False):
+        key = str(getattr(row, "key", "") or "").strip()
+        if not key:
+            continue
+        raw_value = getattr(row, "value_json", None)
+        try:
+            metadata[key] = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError):
+            metadata[key] = raw_value
+    return metadata
+
+
+def _read_dynamic_gmm_status(conn) -> Dict[str, object]:
+    if not _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_RUN_STATUS_TABLE_NAME):
+        return {}
+    try:
+        df = conn.execute(
+            f"SELECT * FROM {DYNAMIC_GMM_RUN_STATUS_TABLE_NAME} LIMIT 1"
+        ).df()
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    return dict(df.iloc[0].dropna().to_dict())
+
+
+def _read_dynamic_gmm_source_header(path: Path) -> Dict[str, object]:
+    if duckdb is None:
+        return {}
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        metadata = _read_dynamic_gmm_metadata(conn)
+        status = _read_dynamic_gmm_status(conn)
+        has_checkpoint = _dynamic_gmm_table_exists(
+            conn,
+            DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME,
+        )
+    except Exception:
+        metadata = {}
+        status = {}
+        has_checkpoint = False
+    finally:
+        conn.close()
+    run_id = str(status.get("run_id") or metadata.get("run_id") or path.stem)
+    status_label = str(
+        status.get("status")
+        or metadata.get("status")
+        or ("completed_legacy" if not has_checkpoint else "unknown")
+    )
+    updated_at = str(
+        status.get("updated_at")
+        or metadata.get("created_at")
+        or pd.Timestamp.fromtimestamp(path.stat().st_mtime).isoformat()
+    )
+    return {
+        "run_id": run_id,
+        "status": status_label,
+        "updated_at": updated_at,
+        "has_checkpoint": has_checkpoint,
+    }
+
+
+def _dynamic_gmm_probability_columns(df: pd.DataFrame) -> list[str]:
+    if df is None or df.empty:
+        return []
+    cols = [col for col in df.columns if str(col).startswith("cluster_prob_")]
+
+    def _sort_key(name: str) -> tuple[int, str]:
+        suffix = str(name).rsplit("_", 1)[-1]
+        try:
+            return int(suffix), str(name)
+        except ValueError:
+            return 9999, str(name)
+
+    return sorted(cols, key=_sort_key)
+
+
+def _dynamic_gmm_ensure_window_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    work = df.copy()
+    if "window_index" in work.columns:
+        work["window_index"] = pd.to_numeric(
+            work["window_index"],
+            errors="coerce",
+        )
+        if work["window_index"].notna().any():
+            work["window_index"] = work["window_index"].astype("Int64")
+            return work.sort_values(["window_index", "plate"], kind="mergesort")
+    sort_cols = []
+    if "window_start" in work.columns:
+        work["window_start"] = pd.to_datetime(work["window_start"], errors="coerce")
+        sort_cols.append("window_start")
+    if "window_label" in work.columns:
+        sort_cols.append("window_label")
+    if not sort_cols:
+        work["window_index"] = pd.Series(range(1, len(work) + 1), dtype="Int64")
+        return work
+    windows = (
+        work[sort_cols]
+        .drop_duplicates()
+        .sort_values(sort_cols, kind="mergesort")
+        .reset_index(drop=True)
+    )
+    windows["window_index"] = pd.Series(range(1, len(windows) + 1), dtype="Int64")
+    work = work.merge(windows, on=sort_cols, how="left")
+    return work.sort_values(["window_index", "plate"], kind="mergesort")
+
+
+def _dynamic_gmm_read_plate_count(conn) -> int:
+    columns = _dynamic_gmm_table_columns(conn, DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME)
+    if "plate" not in columns:
+        return 0
+    try:
+        return int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM (
+                    SELECT CAST(plate AS VARCHAR) AS plate
+                    FROM {DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME}
+                    WHERE plate IS NOT NULL
+                    GROUP BY CAST(plate AS VARCHAR)
+                )
+                """
+            ).fetchone()[0]
+            or 0
+        )
+    except Exception:
+        return 0
+
+
+def _dynamic_gmm_read_plate_page(
+    conn,
+    page_index: int,
+    page_size: int = DYNAMIC_GMM_PLATE_PAGE_SIZE,
+) -> tuple[list[str], int, int]:
+    total = _dynamic_gmm_read_plate_count(conn)
+    if total <= 0:
+        return [], 0, 0
+    page_count = max(1, math.ceil(total / max(1, int(page_size))))
+    normalized_page = int(page_index) % page_count
+    offset = normalized_page * int(page_size)
+    columns = _dynamic_gmm_table_columns(conn, DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME)
+    if "window_index" in columns:
+        order_expr = "MIN(window_index)"
+    elif "window_start" in columns:
+        order_expr = "MIN(window_start)"
+    else:
+        order_expr = "MIN(0)"
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT CAST(plate AS VARCHAR) AS plate
+            FROM {DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME}
+            WHERE plate IS NOT NULL
+            GROUP BY CAST(plate AS VARCHAR)
+            ORDER BY {order_expr}, plate
+            LIMIT ? OFFSET ?
+            """,
+            [int(page_size), int(offset)],
+        ).fetchall()
+    except Exception:
+        return [], total, normalized_page
+    return [str(row[0]) for row in rows], total, normalized_page
+
+
+def _dynamic_gmm_read_assignments_for_plates(
+    conn,
+    plates: list[str],
+) -> pd.DataFrame:
+    if not plates:
+        return pd.DataFrame()
+    columns = _dynamic_gmm_table_columns(conn, DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME)
+    if "plate" not in columns:
+        return pd.DataFrame()
+    order_cols = []
+    if "window_index" in columns:
+        order_cols.append("a.window_index")
+    elif "window_start" in columns:
+        order_cols.append("a.window_start")
+    order_cols.append("a.plate")
+    order_clause = ", ".join(order_cols)
+    plate_df = pd.DataFrame({"plate": [str(plate) for plate in plates]})
+    conn.register("dynamic_gmm_selected_plates", plate_df)
+    try:
+        assignments = conn.execute(
+            f"""
+            SELECT a.*
+            FROM {DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME} AS a
+            INNER JOIN dynamic_gmm_selected_plates AS p
+                ON CAST(a.plate AS VARCHAR) = p.plate
+            ORDER BY {order_clause}
+            """
+        ).df()
+    except Exception:
+        assignments = pd.DataFrame()
+    finally:
+        conn.unregister("dynamic_gmm_selected_plates")
+    return _dynamic_gmm_ensure_window_index(assignments)
 
 
 def _load_json_file(path: Path, default: Any = None) -> Any:
@@ -392,6 +657,20 @@ def _list_language_modeling_manifest_files() -> list[Path]:
     )
 
 
+def _list_model_optuna_batch_manifest_files() -> list[Path]:
+    live_dir = MODEL_OPTUNA_BATCH_LIVE_DIR
+    default_live_dir = DEFAULT_RESULTS_DIR / "model_history" / "optuna_batch_live"
+    if RESULTS_DIR != DEFAULT_RESULTS_DIR and live_dir == default_live_dir:
+        live_dir = RESULTS_DIR / "model_history" / "optuna_batch_live"
+    if not live_dir.exists():
+        return []
+    return sorted(
+        live_dir.glob("*/manifest.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def _build_live_sources() -> list[Dict[str, object]]:
     entries: list[Dict[str, object]] = []
     for path in _list_calibration_experiment_manifest_files():
@@ -462,6 +741,36 @@ def _build_live_sources() -> list[Dict[str, object]]:
                 "path": path,
                 "sort_key": float(path.stat().st_mtime),
                 "label": f"Language modeling | {run_type} | {run_id} | {status} | {updated_at}",
+            }
+        )
+    for path in _list_model_optuna_batch_manifest_files():
+        manifest = _load_json_file(path, default={})
+        run_id = str((manifest or {}).get("run_id") or path.parent.name)
+        status = str((manifest or {}).get("status") or "unknown")
+        updated_at = str(
+            (manifest or {}).get("updated_at")
+            or (manifest or {}).get("created_at")
+            or "-"
+        )
+        entries.append(
+            {
+                "type": "model_optuna_batch",
+                "path": path,
+                "sort_key": float(path.stat().st_mtime),
+                "label": f"Modelos | batch Optuna | {run_id} | {status} | {updated_at}",
+            }
+        )
+    for path in _list_dynamic_gmm_db_files():
+        header = _read_dynamic_gmm_source_header(path)
+        run_id = str(header.get("run_id") or path.stem)
+        status = str(header.get("status") or "unknown")
+        updated_at = str(header.get("updated_at") or "-")
+        entries.append(
+            {
+                "type": "dynamic_gmm",
+                "path": path,
+                "sort_key": float(path.stat().st_mtime),
+                "label": f"GMM dinamico | {run_id} | {status} | {updated_at}",
             }
         )
     for path in _list_live_db_files():
@@ -1705,6 +2014,206 @@ def _load_csv_file(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _model_optuna_batch_normalize_live_event(
+    row: Dict[str, object],
+    *,
+    manifest: Dict[str, object],
+    live_status: Dict[str, object],
+) -> Dict[str, object]:
+    payload = dict(row or {})
+    progress = dict(payload.get("progress") or {})
+    completed_steps = pd.to_numeric(
+        progress.get("completed_steps", payload.get("completed_steps")),
+        errors="coerce",
+    )
+    total_steps = pd.to_numeric(
+        progress.get("total_steps", payload.get("total_steps")),
+        errors="coerce",
+    )
+    progress_ratio = pd.to_numeric(
+        payload.get("progress_ratio", progress.get("progress_ratio")),
+        errors="coerce",
+    )
+    if (
+        pd.isna(progress_ratio)
+        and not pd.isna(completed_steps)
+        and not pd.isna(total_steps)
+        and float(total_steps) > 0
+    ):
+        progress_ratio = float(completed_steps) / float(total_steps)
+    progress_pct = None if pd.isna(progress_ratio) else max(0.0, min(100.0, 100.0 * float(progress_ratio)))
+
+    return {
+        "event_index": _maybe_int(payload.get("event_index")),
+        "timestamp": str(
+            payload.get("timestamp")
+            or live_status.get("timestamp")
+            or manifest.get("updated_at")
+            or manifest.get("created_at")
+            or ""
+        ),
+        "status": str(payload.get("status") or manifest.get("status") or ""),
+        "result_status": str(
+            payload.get("result_status")
+            or manifest.get("result_status")
+            or payload.get("status")
+            or manifest.get("status")
+            or ""
+        ),
+        "step_id": str(
+            payload.get("step_id")
+            or live_status.get("step_id")
+            or progress.get("current_step_id")
+            or ""
+        ),
+        "step_status": str(payload.get("step_status") or ""),
+        "message": str(payload.get("message") or ""),
+        "progress_completed_steps": None if pd.isna(completed_steps) else int(completed_steps),
+        "progress_total_steps": None if pd.isna(total_steps) else int(total_steps),
+        "progress_ratio": None if pd.isna(progress_ratio) else max(0.0, min(1.0, float(progress_ratio))),
+        "progress_pct": progress_pct,
+        "combo_index": _maybe_int(payload.get("combo_index")),
+        "total_combinations": _maybe_int(payload.get("total_combinations")),
+        "combo_label": str(payload.get("combo_label") or ""),
+        "model_name": str(payload.get("model_name") or ""),
+        "objective_metric": str(payload.get("objective_metric") or ""),
+        "calibration_method": str(payload.get("calibration_method") or ""),
+        "threshold_objective": str(payload.get("threshold_objective") or ""),
+        "threshold_objective_label": str(payload.get("threshold_objective_label") or ""),
+        "balance_mode": str(payload.get("balance_mode") or ""),
+        "balance_mode_label": str(payload.get("balance_mode_label") or ""),
+        "threshold_protocol": str(payload.get("threshold_protocol") or ""),
+        "backend": str(payload.get("backend") or "local"),
+        "model_n_jobs": payload.get("model_n_jobs"),
+    }
+
+
+def _read_model_optuna_batch_run(manifest_path: Path) -> Dict[str, object]:
+    manifest = _load_json_file(manifest_path, default={}) or {}
+    run_dir = manifest_path.parent
+    live_status_path = run_dir / "live_status.json"
+    live_events_path = run_dir / "live_events.jsonl"
+    partial_results_path = run_dir / "partial_results.csv"
+
+    live_status = _load_json_file(live_status_path, default={}) or {}
+    live_event_rows = _read_jsonl_records(live_events_path)
+    if not live_event_rows and isinstance(live_status, dict) and live_status:
+        live_event_rows = [live_status]
+    if not live_event_rows and manifest:
+        live_event_rows = [
+            {
+                "timestamp": manifest.get("updated_at") or manifest.get("created_at"),
+                "status": manifest.get("status"),
+                "result_status": manifest.get("result_status"),
+                "step_id": (manifest.get("progress") or {}).get("current_step_id"),
+                "message": manifest.get("error") or "",
+                "progress": dict(manifest.get("progress") or {}),
+            }
+        ]
+
+    live_events_df = pd.DataFrame(
+        [
+            _model_optuna_batch_normalize_live_event(
+                row,
+                manifest=manifest,
+                live_status=live_status,
+            )
+            for row in live_event_rows
+            if isinstance(row, dict)
+        ]
+    )
+    if not live_events_df.empty:
+        fallback_index = range(1, len(live_events_df) + 1)
+        if "event_index" not in live_events_df.columns:
+            live_events_df["event_index"] = list(fallback_index)
+        else:
+            live_events_df["event_index"] = pd.to_numeric(
+                live_events_df["event_index"],
+                errors="coerce",
+            )
+            live_events_df["event_index"] = live_events_df["event_index"].fillna(
+                pd.Series(list(fallback_index), index=live_events_df.index)
+            ).astype(int)
+
+    partial_results_df = _load_csv_file(partial_results_path)
+    progress = dict(manifest.get("progress") or {})
+    live_progress = dict(live_status.get("progress") or {})
+    progress_ratio = pd.to_numeric(
+        live_status.get(
+            "progress_ratio",
+            live_progress.get("progress_ratio", progress.get("progress_ratio")),
+        ),
+        errors="coerce",
+    )
+    completed_steps = pd.to_numeric(
+        live_progress.get("completed_steps", progress.get("completed_steps")),
+        errors="coerce",
+    )
+    total_steps = pd.to_numeric(
+        live_progress.get("total_steps", progress.get("total_steps")),
+        errors="coerce",
+    )
+    if (
+        pd.isna(progress_ratio)
+        and not pd.isna(completed_steps)
+        and not pd.isna(total_steps)
+        and float(total_steps) > 0
+    ):
+        progress_ratio = float(completed_steps) / float(total_steps)
+    if pd.isna(progress_ratio):
+        progress_ratio = 0.0
+
+    first_result = (
+        partial_results_df.iloc[0].to_dict()
+        if isinstance(partial_results_df, pd.DataFrame) and not partial_results_df.empty
+        else {}
+    )
+    current_context = {
+        "status": str(live_status.get("status") or manifest.get("status") or ""),
+        "result_status": str(
+            live_status.get("result_status")
+            or manifest.get("result_status")
+            or live_status.get("status")
+            or manifest.get("status")
+            or ""
+        ),
+        "progress_ratio": max(0.0, min(1.0, float(progress_ratio))),
+        "current_step_id": str(
+            live_status.get("step_id")
+            or live_progress.get("current_step_id")
+            or progress.get("current_step_id")
+            or ""
+        ),
+        "message": str(live_status.get("message") or progress.get("message") or ""),
+        "updated_at": str(
+            live_status.get("timestamp")
+            or manifest.get("updated_at")
+            or manifest.get("created_at")
+            or ""
+        ),
+        "model_name": str(live_status.get("model_name") or first_result.get("model_name") or ""),
+        "objective_metric": str(live_status.get("objective_metric") or first_result.get("objective_metric") or ""),
+        "threshold_objective": str(live_status.get("threshold_objective") or first_result.get("threshold_objective") or ""),
+        "calibration_method": str(live_status.get("calibration_method") or first_result.get("calibration_method") or ""),
+        "threshold_protocol": str(live_status.get("threshold_protocol") or first_result.get("threshold_protocol") or ""),
+        "backend": str(live_status.get("backend") or first_result.get("backend") or "local"),
+        "model_n_jobs": live_status.get("model_n_jobs", first_result.get("model_n_jobs")),
+    }
+
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "run_dir": run_dir,
+        "live_status": live_status,
+        "live_events_df": live_events_df,
+        "live_status_path": live_status_path,
+        "live_events_path": live_events_path,
+        "partial_results_df": partial_results_df,
+        "partial_results_path": partial_results_path,
+        "current_context": current_context,
+    }
+
+
 def _neural_drift_experiment_artifact_path(
     run_dir: Path,
     manifest: Dict[str, object],
@@ -2904,13 +3413,21 @@ def _calibration_progress_curve_df(
         col
         for col in [
             "combo_id",
+            "subrun_id",
+            "feature_set_label",
+            "candidate_label",
+            "trial_number",
+            "model_name",
             "optuna_objective_metric",
             "objective_metric",
             "objective_label",
             "calibration_method",
             "threshold_objective",
             "threshold_objective_label",
+            "threshold_protocol",
+            "threshold_protocol_label",
             "balance_mode",
+            "balance_mode_label",
             "decision_threshold",
         ]
         if col in work.columns
@@ -3028,14 +3545,29 @@ def _build_calibration_progress_chart(
         alt.Tooltip("series_label:N", title="Serie"),
         alt.Tooltip("value_label:N", title=metric_label),
     ]
-    tooltip_context = [("calibration_method", "Calibración")]
+    tooltip_context = [
+        ("model_name", "Modelo"),
+        ("feature_set_label", "Feature set"),
+        ("candidate_label", "Candidato"),
+        ("trial_number", "Trial"),
+        ("calibration_method", "Calibración"),
+    ]
     if "threshold_objective_label" in observed_df.columns:
         tooltip_context.append(("threshold_objective_label", "Objetivo threshold"))
     elif "threshold_objective" in observed_df.columns:
         tooltip_context.append(("threshold_objective", "Objetivo threshold"))
+    if "threshold_protocol_label" in observed_df.columns:
+        tooltip_context.append(("threshold_protocol_label", "Protocolo"))
+    elif "threshold_protocol" in observed_df.columns:
+        tooltip_context.append(("threshold_protocol", "Protocolo"))
     tooltip_context.extend(
         [
-            ("balance_mode", "Balanceo"),
+            (
+                "balance_mode_label"
+                if "balance_mode_label" in observed_df.columns
+                else "balance_mode",
+                "Balanceo",
+            ),
             ("decision_threshold", "Threshold"),
         ]
     )
@@ -5727,6 +6259,268 @@ def _render_language_modeling_live_view(data: Dict[str, object]) -> None:
             st.dataframe(_streamlit_arrow_safe_df(live_events_df), width="stretch")
 
 
+def _model_optuna_batch_counts(
+    partial_results_df: pd.DataFrame,
+    *,
+    total_steps: int,
+) -> Dict[str, int]:
+    completed = 0
+    failed = 0
+    if (
+        isinstance(partial_results_df, pd.DataFrame)
+        and not partial_results_df.empty
+        and "status" in partial_results_df.columns
+    ):
+        counts = (
+            partial_results_df["status"]
+            .astype(str)
+            .str.lower()
+            .value_counts()
+            .to_dict()
+        )
+        completed = int(counts.get("completed", 0))
+        failed = int(counts.get("failed", 0))
+    total = max(int(total_steps or 0), completed + failed)
+    return {
+        "completed": completed,
+        "failed": failed,
+        "total": total,
+        "pending": max(0, total - completed - failed),
+    }
+
+
+def _render_model_optuna_batch_live_view(data: Dict[str, object]) -> None:
+    manifest = dict(data.get("manifest") or {})
+    live_status = dict(data.get("live_status") or {})
+    live_events_df = data.get("live_events_df")
+    partial_results_df = data.get("partial_results_df")
+    current_context = dict(data.get("current_context") or {})
+
+    manifest_progress = dict(manifest.get("progress") or {})
+    live_progress = dict(live_status.get("progress") or {})
+    total_steps = _safe_int(
+        live_progress.get("total_steps", manifest_progress.get("total_steps")),
+        default=0,
+    )
+    progress_ratio = pd.to_numeric(
+        current_context.get("progress_ratio"),
+        errors="coerce",
+    )
+    if pd.isna(progress_ratio):
+        progress_ratio = 0.0
+    progress_ratio = max(0.0, min(1.0, float(progress_ratio)))
+    counts = _model_optuna_batch_counts(
+        partial_results_df if isinstance(partial_results_df, pd.DataFrame) else pd.DataFrame(),
+        total_steps=total_steps,
+    )
+
+    status = str(current_context.get("status") or "unknown")
+    result_status = str(current_context.get("result_status") or status)
+    current_step = str(current_context.get("current_step_id") or "-")
+    current_message = str(current_context.get("message") or "")
+    updated_at = str(current_context.get("updated_at") or "-")
+    model_name = str(current_context.get("model_name") or "-")
+    backend = str(current_context.get("backend") or "local")
+    objective_metric = str(current_context.get("objective_metric") or "")
+
+    st.caption("Experimento detectado: Crash prediction | Modelos <- batch Optuna")
+    st.caption(f"Checkpoint: {data.get('manifest_path')}")
+    st.caption(f"Run dir: {data.get('run_dir')}")
+
+    if status == "failed":
+        st.error(
+            manifest.get("error")
+            or current_message
+            or "Entrenamiento de Modelos fallido sin detalle persistido."
+        )
+    elif status == "completed":
+        st.success("Entrenamiento de Modelos completado. Se muestran resultados finales y eventos persistidos.")
+    else:
+        st.info("Entrenamiento de Modelos en progreso. La vista usa eventos y resultados parciales persistidos.")
+
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6, kpi_7 = st.columns(7)
+    kpi_1.metric("Modelo", model_name)
+    kpi_2.metric("Estado", status)
+    kpi_3.metric("Resultado", result_status)
+    kpi_4.metric("Progreso", f"{100.0 * progress_ratio:.1f}%")
+    kpi_5.metric("Combinaciones OK", f"{counts['completed']}/{counts['total'] or '-'}")
+    kpi_6.metric("Fallidas", f"{counts['failed']}")
+    kpi_7.metric("Backend", backend)
+
+    st.progress(progress_ratio)
+    st.caption(
+        f"Threshold protocol: {current_context.get('threshold_protocol') or '-'} | "
+        f"Backend: {backend} | "
+        f"model_n_jobs={current_context.get('model_n_jobs') or '-'}"
+    )
+    st.caption(f"Step actual: {current_step}")
+    if current_message:
+        st.caption(current_message)
+    st.caption(f"Ultima actualizacion: {updated_at}")
+
+    live_tab, results_tab, data_tab = st.tabs(["Live", "Results", "Raw data"])
+
+    with live_tab:
+        st.markdown("**Avance temporal**")
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            plot_df = live_events_df[["event_index", "progress_pct"]].dropna(
+                subset=["progress_pct"]
+            )
+            if not plot_df.empty:
+                st.line_chart(
+                    plot_df.set_index("event_index")["progress_pct"],
+                    width="stretch",
+                )
+            visible_cols = [
+                col
+                for col in [
+                    "event_index",
+                    "timestamp",
+                    "step_id",
+                    "step_status",
+                    "combo_index",
+                    "total_combinations",
+                    "model_name",
+                    "objective_metric",
+                    "calibration_method",
+                    "threshold_objective",
+                    "threshold_protocol",
+                    "balance_mode",
+                    "progress_pct",
+                    "message",
+                ]
+                if col in live_events_df.columns
+            ]
+            st.dataframe(
+                _streamlit_arrow_safe_df(live_events_df[visible_cols]),
+                width="stretch",
+            )
+        else:
+            st.info("No hay eventos live persistidos todavía.")
+
+        st.markdown("**Evolución del mejor resultado observado**")
+        metric_options = {
+            key: label
+            for key, label in _calibration_metric_options().items()
+            if isinstance(partial_results_df, pd.DataFrame)
+            and not partial_results_df.empty
+            and key in partial_results_df.columns
+        }
+        if metric_options:
+            protocol = {"objective_metric": objective_metric}
+            metric_keys = list(metric_options.keys())
+            default_metric = _calibration_default_progress_metric(
+                protocol,
+                metric_options,
+            )
+            default_metric_index = (
+                metric_keys.index(default_metric)
+                if default_metric in metric_keys
+                else 0
+            )
+            selected_metric_label = st.selectbox(
+                "Métrica de avance",
+                options=list(metric_options.values()),
+                index=default_metric_index,
+                key=f"model_optuna_batch_live_metric_{manifest.get('run_id') or 'current'}",
+            )
+            selected_metric = next(
+                key
+                for key, label in metric_options.items()
+                if label == selected_metric_label
+            )
+            metric_curve_df = _calibration_progress_curve_df(
+                partial_results_df,
+                metric_col=selected_metric,
+            )
+            if not metric_curve_df.empty:
+                progress_summary = _calibration_progress_summary(
+                    metric_curve_df,
+                    metric_col=selected_metric,
+                )
+                if progress_summary:
+                    st.caption(
+                        f"Mejor acumulado: {_format_decimal_es(progress_summary.get('best_value'))} "
+                        f"en combinación {progress_summary.get('best_combo_index')} "
+                        f"de {progress_summary.get('observations')} "
+                        f"({progress_summary.get('direction_label')})."
+                    )
+                try:
+                    progress_chart = _build_calibration_progress_chart(
+                        metric_curve_df,
+                        metric_col=selected_metric,
+                        metric_label=selected_metric_label,
+                    )
+                    if progress_chart is not None:
+                        st.altair_chart(progress_chart, width="stretch")
+                    else:
+                        st.info("No hay datos numéricos suficientes para graficar.")
+                except ImportError:
+                    st.line_chart(
+                        metric_curve_df.set_index("combo_index")[
+                            ["current_value", "best_so_far"]
+                        ],
+                        width="stretch",
+                    )
+                    st.warning(
+                        "Altair no está instalado; se muestra el gráfico básico de Streamlit."
+                    )
+            else:
+                st.info("Todavía no hay combinaciones completadas con esa métrica.")
+        else:
+            st.info("No hay métricas parciales disponibles para graficar.")
+
+    with results_tab:
+        if isinstance(partial_results_df, pd.DataFrame) and not partial_results_df.empty:
+            visible_cols = [
+                col
+                for col in [
+                    "status",
+                    "combo_index",
+                    "subrun_id",
+                    "feature_set_label",
+                    "candidate_label",
+                    "trial_number",
+                    "threshold_protocol_label",
+                    "objective_metric",
+                    "calibration_method",
+                    "threshold_objective",
+                    "balance_mode_label",
+                    "decision_threshold",
+                    "val_mcc",
+                    "val_pr_auc",
+                    "val_brier_score",
+                    "val_balanced_f1",
+                    "test_mcc",
+                    "test_pr_auc",
+                    "test_brier_score",
+                    "test_balanced_f1",
+                    "error",
+                ]
+                if col in partial_results_df.columns
+            ]
+            st.markdown("**Resultados parciales acumulados**")
+            st.dataframe(
+                _streamlit_arrow_safe_df(partial_results_df[visible_cols]),
+                width="stretch",
+            )
+        else:
+            st.info("No hay resultados parciales persistidos todavía.")
+
+    with data_tab:
+        st.markdown("**Manifest**")
+        st.json(manifest, expanded=False)
+        if live_status:
+            st.markdown("**Live status**")
+            st.json(live_status, expanded=False)
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            st.markdown("**Live events**")
+            st.dataframe(_streamlit_arrow_safe_df(live_events_df), width="stretch")
+        if isinstance(partial_results_df, pd.DataFrame) and not partial_results_df.empty:
+            st.markdown("**Partial results**")
+            st.dataframe(_streamlit_arrow_safe_df(partial_results_df), width="stretch")
+
+
 def _render_calibration_experiment_live_view(data: Dict[str, object]) -> None:
     manifest = dict(data.get("manifest") or {})
     protocol = dict(data.get("protocol") or {})
@@ -6350,6 +7144,380 @@ def _render_neural_drift_experiment_live_view(data: Dict[str, object]) -> None:
             st.dataframe(_streamlit_arrow_safe_df(phase_status_df), width="stretch")
 
 
+def _dynamic_gmm_assignment_plot_frame(assignments: pd.DataFrame) -> pd.DataFrame:
+    if assignments is None or assignments.empty:
+        return pd.DataFrame()
+    required = {"plate", "window_index", "cluster_label"}
+    if not required.issubset(assignments.columns):
+        return pd.DataFrame()
+    plot_df = assignments.copy()
+    plot_df["plate"] = plot_df["plate"].astype(str)
+    plot_df["window_index"] = pd.to_numeric(
+        plot_df["window_index"],
+        errors="coerce",
+    )
+    plot_df["cluster_label"] = pd.to_numeric(
+        plot_df["cluster_label"],
+        errors="coerce",
+    )
+    plot_df = plot_df.dropna(subset=["window_index", "cluster_label"])
+    if plot_df.empty:
+        return pd.DataFrame()
+    plot_df["week_label"] = "Semana " + plot_df["window_index"].astype(int).astype(str)
+    if "window_start" in plot_df.columns:
+        start = pd.to_datetime(plot_df["window_start"], errors="coerce").dt.date.astype(str)
+    else:
+        start = pd.Series("-", index=plot_df.index)
+    if "window_end" in plot_df.columns:
+        end = pd.to_datetime(plot_df["window_end"], errors="coerce").dt.date.astype(str)
+    else:
+        end = pd.Series("-", index=plot_df.index)
+    plot_df["window_range"] = start + " -> " + end
+    if "assignment_status" not in plot_df.columns:
+        plot_df["assignment_status"] = "-"
+    if "confidence_score" not in plot_df.columns:
+        plot_df["confidence_score"] = float("nan")
+    plot_df["confidence_score"] = pd.to_numeric(
+        plot_df["confidence_score"],
+        errors="coerce",
+    )
+    return plot_df.sort_values(["plate", "window_index"], kind="mergesort")
+
+
+def _render_dynamic_gmm_assignment_chart(assignments: pd.DataFrame) -> None:
+    plot_df = _dynamic_gmm_assignment_plot_frame(assignments)
+    if plot_df.empty:
+        st.info("No hay asignaciones para graficar en las patentes seleccionadas.")
+        return
+    try:
+        import altair as alt
+
+        chart = (
+            alt.Chart(plot_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X(
+                    "window_index:Q",
+                    title="Semana",
+                    axis=alt.Axis(format="d"),
+                ),
+                y=alt.Y("cluster_label:Q", title="# cluster"),
+                color=alt.Color("plate:N", title="Patente"),
+                tooltip=[
+                    alt.Tooltip("plate:N", title="Patente"),
+                    alt.Tooltip("week_label:N", title="Semana"),
+                    alt.Tooltip("window_range:N", title="Rango ventana"),
+                    alt.Tooltip("cluster_label:Q", title="Cluster"),
+                    alt.Tooltip("confidence_score:Q", title="Confianza", format=".3f"),
+                    alt.Tooltip("assignment_status:N", title="Estado"),
+                ],
+            )
+            .interactive()
+        )
+        st.altair_chart(chart, width="stretch")
+    except Exception:
+        pivot = plot_df.pivot_table(
+            index="window_index",
+            columns="plate",
+            values="cluster_label",
+            aggfunc="last",
+        ).sort_index()
+        st.line_chart(pivot, width="stretch")
+
+
+def _render_dynamic_gmm_probability_charts(assignments: pd.DataFrame) -> None:
+    probability_cols = _dynamic_gmm_probability_columns(assignments)
+    if not probability_cols:
+        st.info("Este resultado no contiene columnas cluster_prob_*.")
+        return
+    base_plot = _dynamic_gmm_assignment_plot_frame(assignments)
+    if base_plot.empty:
+        st.info("No hay probabilidades para graficar.")
+        return
+    try:
+        import altair as alt
+    except Exception:
+        alt = None  # type: ignore
+    for probability_col in probability_cols:
+        if probability_col not in assignments.columns:
+            continue
+        plot_df = base_plot.copy()
+        plot_df[probability_col] = pd.to_numeric(
+            assignments.loc[plot_df.index, probability_col],
+            errors="coerce",
+        )
+        plot_df = plot_df.dropna(subset=[probability_col])
+        if plot_df.empty:
+            continue
+        cluster_label = probability_col.replace("cluster_prob_", "Cluster ")
+        st.markdown(f"**{cluster_label}**")
+        if alt is not None:
+            chart = (
+                alt.Chart(plot_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X(
+                        "window_index:Q",
+                        title="Semana",
+                        axis=alt.Axis(format="d"),
+                    ),
+                    y=alt.Y(
+                        f"{probability_col}:Q",
+                        title="Probabilidad",
+                        scale=alt.Scale(domain=[0, 1]),
+                    ),
+                    color=alt.Color("plate:N", title="Patente"),
+                    tooltip=[
+                        alt.Tooltip("plate:N", title="Patente"),
+                        alt.Tooltip("week_label:N", title="Semana"),
+                        alt.Tooltip("window_range:N", title="Rango ventana"),
+                        alt.Tooltip(f"{probability_col}:Q", title="Probabilidad", format=".3f"),
+                        alt.Tooltip("cluster_label:Q", title="Cluster asignado"),
+                        alt.Tooltip("assignment_status:N", title="Estado"),
+                    ],
+                )
+                .interactive()
+            )
+            st.altair_chart(chart, width="stretch")
+        else:
+            pivot = plot_df.pivot_table(
+                index="window_index",
+                columns="plate",
+                values=probability_col,
+                aggfunc="last",
+            ).sort_index()
+            st.line_chart(pivot, width="stretch")
+
+
+def _dynamic_gmm_query_count(conn, table_name: str) -> int:
+    if not _dynamic_gmm_table_exists(conn, table_name):
+        return 0
+    try:
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0] or 0)
+    except Exception:
+        return 0
+
+
+def _render_dynamic_gmm_live_view(path: Path) -> None:
+    st.caption("Experimento detectado: GMM dinamico")
+    st.caption(f"DuckDB: {path}")
+    if duckdb is None:
+        st.error("DuckDB no esta instalado en este entorno.")
+        return
+    if not path.exists():
+        st.error("El archivo DuckDB ya no existe.")
+        return
+
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        metadata = _read_dynamic_gmm_metadata(conn)
+        status_row = _read_dynamic_gmm_status(conn)
+        if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME):
+            checkpoint_df = conn.execute(
+                f"""
+                SELECT *
+                FROM {DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME}
+                ORDER BY window_index
+                """
+            ).df()
+        else:
+            checkpoint_df = pd.DataFrame()
+        if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_LIVE_EVENTS_TABLE_NAME):
+            events_df = conn.execute(
+                f"""
+                SELECT *
+                FROM {DYNAMIC_GMM_LIVE_EVENTS_TABLE_NAME}
+                ORDER BY event_index DESC
+                LIMIT 500
+                """
+            ).df()
+        else:
+            events_df = pd.DataFrame()
+        if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME):
+            summary_cols = _dynamic_gmm_table_columns(
+                conn,
+                DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME,
+            )
+            order_col = "window_index" if "window_index" in summary_cols else "window_start"
+            window_summary_df = conn.execute(
+                f"""
+                SELECT *
+                FROM {DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME}
+                ORDER BY {order_col}
+                """
+            ).df()
+        else:
+            window_summary_df = pd.DataFrame()
+
+        assignment_rows = _dynamic_gmm_query_count(
+            conn,
+            DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME,
+        )
+        total_plates = _dynamic_gmm_read_plate_count(conn)
+        page_key = "dynamic_gmm_live_plate_page_" + re.sub(
+            r"[^A-Za-z0-9_]+",
+            "_",
+            path.stem,
+        )
+        page_count = max(
+            1,
+            math.ceil(total_plates / DYNAMIC_GMM_PLATE_PAGE_SIZE)
+            if total_plates
+            else 1,
+        )
+        current_page = int(st.session_state.get(page_key, 0)) % page_count
+        selected_plates, total_plates, current_page = _dynamic_gmm_read_plate_page(
+            conn,
+            current_page,
+            DYNAMIC_GMM_PLATE_PAGE_SIZE,
+        )
+        selected_assignments = _dynamic_gmm_read_assignments_for_plates(
+            conn,
+            selected_plates,
+        )
+    finally:
+        conn.close()
+
+    if not status_row:
+        if not checkpoint_df.empty:
+            completed = int(
+                checkpoint_df["status"].astype(str).str.lower().eq("completed").sum()
+            )
+            total_windows = int(len(checkpoint_df))
+            failed = int(
+                checkpoint_df["status"]
+                .astype(str)
+                .str.lower()
+                .isin(["failed", "failed_stale"])
+                .sum()
+            )
+            status_row = {
+                "status": metadata.get("status") or "unknown",
+                "result_status": "partial" if failed else "completed",
+                "completed_windows": completed,
+                "failed_windows": failed,
+                "total_windows": total_windows,
+                "assignment_rows": assignment_rows,
+                "progress_ratio": completed / float(max(1, total_windows)),
+                "run_id": metadata.get("run_id") or path.stem,
+                "parallel_jobs": metadata.get("parallel_jobs") or 1,
+                "updated_at": metadata.get("created_at") or "-",
+            }
+        else:
+            total_windows = int(len(window_summary_df))
+            status_row = {
+                "status": metadata.get("status") or "completed_legacy",
+                "result_status": "completed",
+                "completed_windows": total_windows,
+                "failed_windows": 0,
+                "total_windows": total_windows,
+                "assignment_rows": assignment_rows,
+                "progress_ratio": 1.0 if total_windows else 0.0,
+                "run_id": metadata.get("run_id") or path.stem,
+                "parallel_jobs": metadata.get("parallel_jobs") or 1,
+                "updated_at": metadata.get("created_at") or "-",
+            }
+
+    progress_ratio = pd.to_numeric(status_row.get("progress_ratio", 0.0), errors="coerce")
+    if pd.isna(progress_ratio):
+        completed = _safe_int(status_row.get("completed_windows"))
+        total = max(1, _safe_int(status_row.get("total_windows"), 1))
+        progress_ratio = completed / float(total)
+    progress_ratio = max(0.0, min(float(progress_ratio), 1.0))
+    status = str(status_row.get("status") or "unknown")
+    result_status = str(status_row.get("result_status") or status)
+    completed_windows = _safe_int(status_row.get("completed_windows"))
+    failed_windows = _safe_int(status_row.get("failed_windows"))
+    total_windows = _safe_int(status_row.get("total_windows"))
+    assignment_rows = _safe_int(status_row.get("assignment_rows"), assignment_rows)
+
+    if status in {"failed", "failed_partial"}:
+        st.warning("Run con resultados parciales o ventanas fallidas.")
+    elif status == "completed":
+        st.success("Run completado.")
+    else:
+        st.info("Run en progreso o checkpoint parcial.")
+
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6 = st.columns(6)
+    kpi_1.metric("Estado", status)
+    kpi_2.metric("Resultado", result_status)
+    kpi_3.metric("Progreso", f"{100.0 * progress_ratio:.1f}%")
+    kpi_4.metric("Ventanas", f"{completed_windows}/{total_windows}")
+    kpi_5.metric("Fallidas", str(failed_windows))
+    kpi_6.metric("Asignaciones", f"{assignment_rows:,}")
+    st.progress(
+        progress_ratio,
+        text=(
+            f"Run {status_row.get('run_id', path.stem)} | "
+            f"paralelos: {status_row.get('parallel_jobs', '-')}"
+        ),
+    )
+    last_message = str(status_row.get("last_message") or "")
+    if last_message:
+        st.caption(last_message)
+    last_error = str(status_row.get("last_error") or "")
+    if last_error and last_error.lower() != "nan":
+        with st.expander("Ultimo error", expanded=False):
+            st.code(last_error)
+
+    live_tab, checkpoint_tab, data_tab = st.tabs(["Live", "Checkpoint", "Raw data"])
+    with live_tab:
+        st.markdown("**Patentes monitoreadas**")
+        control_cols = st.columns([2, 1])
+        start = current_page * DYNAMIC_GMM_PLATE_PAGE_SIZE
+        end = min(start + DYNAMIC_GMM_PLATE_PAGE_SIZE, total_plates)
+        control_cols[0].caption(
+            f"Mostrando {start + 1 if total_plates else 0}-{end} de {total_plates} patentes."
+        )
+        if control_cols[1].button(
+            "Siguientes 10 patentes",
+            disabled=total_plates <= DYNAMIC_GMM_PLATE_PAGE_SIZE,
+            key=f"{page_key}_next",
+        ):
+            st.session_state[page_key] = (current_page + 1) % page_count
+            st.rerun()
+        if selected_plates:
+            st.caption(", ".join(selected_plates))
+        _render_dynamic_gmm_assignment_chart(selected_assignments)
+        st.markdown("**Probabilidades por cluster**")
+        _render_dynamic_gmm_probability_charts(selected_assignments)
+
+        st.markdown("**Eventos recientes**")
+        if isinstance(events_df, pd.DataFrame) and not events_df.empty:
+            st.dataframe(_streamlit_arrow_safe_df(events_df), width="stretch")
+        else:
+            st.info("No hay eventos live persistidos todavia.")
+
+    with checkpoint_tab:
+        if isinstance(checkpoint_df, pd.DataFrame) and not checkpoint_df.empty:
+            status_counts = (
+                checkpoint_df["status"]
+                .astype(str)
+                .value_counts()
+                .rename_axis("status")
+                .reset_index(name="count")
+            )
+            st.bar_chart(status_counts.set_index("status")["count"], width="stretch")
+            st.dataframe(_streamlit_arrow_safe_df(checkpoint_df), width="stretch")
+        else:
+            st.info("Este DuckDB no contiene tabla de checkpoint incremental.")
+        if isinstance(window_summary_df, pd.DataFrame) and not window_summary_df.empty:
+            st.markdown("**Resumen por ventana**")
+            st.dataframe(_streamlit_arrow_safe_df(window_summary_df), width="stretch")
+
+    with data_tab:
+        st.markdown("**Metadata**")
+        st.json(metadata, expanded=False)
+        st.markdown("**Run status**")
+        st.json(status_row, expanded=False)
+        if isinstance(events_df, pd.DataFrame) and not events_df.empty:
+            st.markdown("**Live events**")
+            st.dataframe(_streamlit_arrow_safe_df(events_df), width="stretch")
+        if not selected_assignments.empty:
+            st.markdown("**Asignaciones de patentes seleccionadas**")
+            st.dataframe(_streamlit_arrow_safe_df(selected_assignments), width="stretch")
+
+
 def main(*, set_page_config: bool = True) -> None:
     if set_page_config:
         st.set_page_config(page_title="Experiments Live", layout="wide")
@@ -6397,6 +7565,11 @@ def main(*, set_page_config: bool = True) -> None:
     elif source_type == "language_modeling":
         run_data = _read_language_modeling_run(path)
         _render_language_modeling_live_view(run_data)
+    elif source_type == "model_optuna_batch":
+        run_data = _read_model_optuna_batch_run(path)
+        _render_model_optuna_batch_live_view(run_data)
+    elif source_type == "dynamic_gmm":
+        _render_dynamic_gmm_live_view(path)
     else:
         meta, df, best_row = _read_live_db(path)
         st.caption(f"Archivo: {path}")

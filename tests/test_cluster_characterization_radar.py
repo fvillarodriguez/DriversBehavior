@@ -22,6 +22,29 @@ def _import_clustering_tabs_app(monkeypatch):
     return importlib.import_module("clustering_tabs_app")
 
 
+def test_validate_features_allows_missing_exceso_velocidad(monkeypatch):
+    clustering_tabs_app = _import_clustering_tabs_app(monkeypatch)
+
+    df = pd.DataFrame(
+        {
+            "plate": ["ABC123"],
+            "total_passes": [10],
+            "avg_speed_kmh": [80.0],
+            "avg_relative_speed": [1.1],
+            "avg_headway_s": [2.5],
+            "conflict_rate": [0.0],
+            "lane_prop_1": [0.6],
+            "lane_prop_2": [0.4],
+            "lane_change_rate": [0.1],
+        }
+    )
+
+    valid, missing = clustering_tabs_app._validate_features(df)
+
+    assert valid is True
+    assert missing == []
+
+
 def test_char_normalize_profile_uses_reference_for_single_cluster(monkeypatch):
     clustering_tabs_app = _import_clustering_tabs_app(monkeypatch)
 

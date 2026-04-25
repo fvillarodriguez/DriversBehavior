@@ -7,7 +7,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+pytest.importorskip("optuna")
+pytest.importorskip("imblearn")
+
 import src.cluster_accident_app as app
+import src.crash_prediction_history_store as history_store
 from src.model_training import train_model
 from src.model_xai import compute_xai_report
 from tests.pipeline_helpers import build_synthetic_base_df
@@ -16,6 +20,182 @@ from tests.pipeline_helpers import build_synthetic_base_df
 class _FakeStreamlit:
     def __init__(self) -> None:
         self.session_state: dict = {}
+
+
+class _SelectorFakeStreamlit:
+    def __init__(self, selected: str) -> None:
+        self.session_state: dict = {}
+        self.selected = selected
+        self.options: list[str] = []
+        self.captions: list[str] = []
+        self.infos: list[str] = []
+        self.warnings: list[str] = []
+
+    def selectbox(self, _label, options=None, **_kwargs):
+        self.options = list(options or [])
+        return self.selected
+
+    def caption(self, message: str) -> None:
+        self.captions.append(str(message))
+
+    def info(self, message: str) -> None:
+        self.infos.append(str(message))
+
+    def warning(self, message: str) -> None:
+        self.warnings.append(str(message))
+
+
+def _make_optuna_batch_record(
+    *,
+    record_id: int,
+    feature_key: str,
+    dataset_fingerprint: str,
+    feature_cols,
+    feature_set_label: str,
+    balance_mode: str = "none",
+    calibration_method: str = "sigmoid",
+    threshold_objective: str = "far",
+    model_name: str = "XGBoost",
+    objective_mode: str = app.CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
+    best_model_params: dict | None = None,
+    best_smote_params: dict | None = None,
+    pareto_front_csv: str | None = None,
+    extra_settings: dict | None = None,
+) -> dict:
+    settings = {
+        "feature_set_label": feature_set_label,
+        "threshold_objective": threshold_objective,
+        "calibration_method": calibration_method,
+        "objective_mode": objective_mode,
+        "best_feature_cols": list(feature_cols),
+        "ranked_cols": list(feature_cols),
+        "best_top_k": len(list(feature_cols)),
+        "test_size": 0.2,
+        "val_size": 0.2,
+        "far_target": 0.2,
+        "alerts_per_day": 5.0,
+        "fn_cost": 10.0,
+        "fp_cost": 1.0,
+        "robust_folds": 3,
+        "random_state": 42,
+        "objective_label": "MCC",
+    }
+    if extra_settings:
+        settings.update(extra_settings)
+
+    variant = {
+        "model_choice": model_name,
+        "balance_mode": balance_mode,
+        "calibration_method": calibration_method,
+        "best_model_params": dict(best_model_params or {"n_estimators": 120}),
+        "best_smote_params": dict(best_smote_params or {}),
+        "best_trial_number": 7,
+        "objective_mode": objective_mode,
+        "optuna_settings": settings,
+    }
+    if pareto_front_csv:
+        variant["pareto_front_csv"] = str(pareto_front_csv)
+
+    return {
+        "id": int(record_id),
+        "record_uid": f"optuna-record-{record_id}",
+        "created_at": f"2026-04-23T12:{record_id:02d}:00",
+        "model_name": model_name,
+        "balance_strategy": balance_mode,
+        "calibration_method": calibration_method,
+        "threshold_objective": threshold_objective,
+        "metadata": {
+            "feature_cols": list(feature_cols),
+            "feature_set_label": feature_set_label,
+            "store_entry": {
+                "feature_key": feature_key,
+                "dataset_fingerprint": dataset_fingerprint,
+                "feature_cols": list(feature_cols),
+            },
+            "variant": variant,
+        },
+    }
+
+
+def test_build_tramo_selector_offers_combined_feature_engineering_option(monkeypatch):
+    fake_st = _SelectorFakeStreamlit(app.COMBINED_TRAMO_LABEL)
+    monkeypatch.setattr(app, "st", fake_st)
+
+    selected = app._build_tramo_selector(
+        None,
+        date_start=None,
+        date_end=None,
+        key="test_combined_tramo",
+        include_combined_tramo=True,
+    )
+
+    assert selected == app.COMBINED_TRAMO_SELECTION
+    assert app.COMBINED_TRAMO_LABEL in fake_st.options
+    assert fake_st.captions == [f"Filtro activo: {app.COMBINED_TRAMO_LABEL}"]
+
+
+def test_combined_tramo_duckdb_filter_expands_to_three_segment_pairs():
+    clauses, params, filter_ok = app._build_tramo_duckdb_filters(
+        app.COMBINED_TRAMO_SELECTION,
+        {"portico_last", "portico_next"},
+    )
+
+    assert filter_ok is True
+    assert len(clauses) == 1
+    assert clauses[0].count("portico_last = ? AND portico_next = ?") == 3
+    assert " OR " in clauses[0]
+    assert params == ["15", "14", "14", "12", "12", "11"]
+
+
+def test_apply_combined_tramo_filter_matches_requested_accident_pairs():
+    df = pd.DataFrame(
+        {
+            "ultimo_portico": ["15", "14", "12", "15", "11"],
+            "proximo_portico": ["14", "12", "11", "12", "9"],
+            "value": [1, 2, 3, 4, 5],
+        }
+    )
+
+    filtered, filter_ok = app._apply_tramo_filter_df(
+        df,
+        app.COMBINED_TRAMO_SELECTION,
+    )
+
+    assert filter_ok is True
+    assert list(filtered["value"]) == [1, 2, 3]
+
+
+def test_combined_tramo_portico_codes_limit_flow_query_to_chain():
+    assert app._tramo_portico_codes(app.COMBINED_TRAMO_SELECTION) == (
+        "15",
+        "14",
+        "12",
+        "11",
+    )
+
+
+def test_filter_segments_for_combined_tramo_returns_chain_order_without_duplicates():
+    segments_df = pd.DataFrame(
+        {
+            "eje": ["NS", "NS", "NS", "NS", "NS"],
+            "calzada": ["Poniente"] * 5,
+            "portico_last": ["15", "15", "14", "12", "14"],
+            "portico_next": ["14", "14", "12", "11", "15"],
+            "marker": ["old_duplicate", "selected", "middle", "end", "reverse"],
+        }
+    )
+
+    filtered = app._filter_segments_for_tramo(
+        segments_df,
+        app.COMBINED_TRAMO_SELECTION,
+    )
+
+    assert list(zip(filtered["portico_last"], filtered["portico_next"])) == [
+        ("15", "14"),
+        ("14", "12"),
+        ("12", "11"),
+    ]
+    assert list(filtered["marker"]) == ["selected", "middle", "end"]
 
 
 def test_record_experiment_history_persists_base_cluster_xai_bundle(
@@ -289,6 +469,225 @@ def test_apply_optuna_model_params_respects_calibration_fallback_opt_in(
     assert status is not None
     assert "aplicados" in status.lower()
     assert fake_st.session_state["cluster_model_xgb_n_estimators"] == 321
+
+
+def test_apply_optuna_model_params_skips_groups_outside_last_optuna_filter(
+    tmp_path,
+    monkeypatch,
+):
+    base_df, feature_cols, _base_cols, cluster_cols = build_synthetic_base_df(tmp_path)
+    features_df = base_df.drop(columns=["target"]).copy()
+    features_path = str(tmp_path / "flow_features.duckdb")
+    feature_key = app._feature_selection_key(features_path, "duckdb", features_df)
+    dataset_fingerprint = app._dataset_content_fingerprint(features_df)
+    cluster_key = app._optuna_result_key(feature_key, cluster_cols)
+    base_cluster_key = app._optuna_result_key(feature_key, feature_cols)
+
+    fake_st = _FakeStreamlit()
+    fake_st.session_state.update(
+        {
+            "flow_features_path": features_path,
+            "flow_features_source": "duckdb",
+            "selected_features": feature_cols,
+            "model_feature_source": "optuna",
+            "allow_optuna_calibration_fallback": False,
+            "optuna_last_optimized_feature_sets": ["Base", "Base + Cluster"],
+            "optuna_last_optimized_feature_key": feature_key,
+            "optuna_last_optimized_dataset_fingerprint": dataset_fingerprint,
+            "optuna_results_store": {
+                cluster_key: {
+                    "results": {
+                        "XGBoost": {
+                            "model_choice": "XGBoost",
+                            "by_balance_mode": {
+                                "smote": {
+                                    "by_calibration_method": {
+                                        "sigmoid": {
+                                            "model_choice": "XGBoost",
+                                            "best_model_params": {"n_estimators": 111},
+                                            "best_smote_params": {},
+                                            "optuna_settings": {
+                                                "balance_mode": "smote",
+                                                "calibration_method": "sigmoid",
+                                            },
+                                            "search_space": {},
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    }
+                },
+                base_cluster_key: {
+                    "results": {
+                        "XGBoost": {
+                            "model_choice": "XGBoost",
+                            "by_balance_mode": {
+                                "smote": {
+                                    "by_calibration_method": {
+                                        "sigmoid": {
+                                            "model_choice": "XGBoost",
+                                            "best_model_params": {"n_estimators": 222},
+                                            "best_smote_params": {},
+                                            "optuna_settings": {
+                                                "balance_mode": "smote",
+                                                "calibration_method": "sigmoid",
+                                            },
+                                            "search_space": {},
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    }
+                },
+            },
+            "optuna_model_params_applied_signatures": {},
+        }
+    )
+    monkeypatch.setattr(app, "st", fake_st)
+
+    status = app._apply_optuna_model_params_to_state(
+        model_choice="XGBoost",
+        balance_mode="smote",
+        calibration_method="sigmoid",
+        base_df=base_df,
+        features_df=features_df,
+    )
+
+    assert status is not None
+    assert "filtrados: Cluster" in status
+    assert fake_st.session_state["cluster_model_xgb_n_estimators"] == 222
+    assert "cluster_only_model_xgb_n_estimators" not in fake_st.session_state
+
+
+def test_apply_optuna_model_params_ignores_last_optuna_filter_in_feature_selection_mode(
+    tmp_path,
+    monkeypatch,
+):
+    base_df, feature_cols, _base_cols, cluster_cols = build_synthetic_base_df(tmp_path)
+    features_df = base_df.drop(columns=["target"]).copy()
+    features_path = str(tmp_path / "flow_features.duckdb")
+    feature_key = app._feature_selection_key(features_path, "duckdb", features_df)
+    cluster_key = app._optuna_result_key(feature_key, cluster_cols)
+
+    fake_st = _FakeStreamlit()
+    fake_st.session_state.update(
+        {
+            "flow_features_path": features_path,
+            "flow_features_source": "duckdb",
+            "selected_features": feature_cols,
+            "model_feature_source": "feature_selection",
+            "optuna_last_optimized_feature_sets": ["Base", "Base + Cluster"],
+            "optuna_last_optimized_feature_key": feature_key,
+            "optuna_last_optimized_dataset_fingerprint": app._dataset_content_fingerprint(
+                features_df
+            ),
+            "optuna_results_store": {
+                cluster_key: {
+                    "results": {
+                        "XGBoost": {
+                            "model_choice": "XGBoost",
+                            "by_balance_mode": {
+                                "smote": {
+                                    "by_calibration_method": {
+                                        "sigmoid": {
+                                            "model_choice": "XGBoost",
+                                            "best_model_params": {"n_estimators": 333},
+                                            "best_smote_params": {},
+                                            "optuna_settings": {
+                                                "balance_mode": "smote",
+                                                "calibration_method": "sigmoid",
+                                            },
+                                            "search_space": {},
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    }
+                }
+            },
+            "optuna_model_params_applied_signatures": {},
+        }
+    )
+    monkeypatch.setattr(app, "st", fake_st)
+
+    status = app._apply_optuna_model_params_to_state(
+        model_choice="XGBoost",
+        balance_mode="smote",
+        calibration_method="sigmoid",
+        base_df=base_df,
+        features_df=features_df,
+    )
+
+    assert status is not None
+    assert "Cluster" in status
+    assert fake_st.session_state["cluster_only_model_xgb_n_estimators"] == 333
+
+
+def test_resolve_model_optuna_feature_set_filter_excludes_cluster_for_pareto(
+    monkeypatch,
+):
+    fake_st = _FakeStreamlit()
+    fake_st.session_state.update(
+        {
+            "model_feature_source": "optuna",
+            "optuna_last_optimized_feature_sets": ["Base", "Base + Cluster"],
+            "optuna_last_optimized_feature_key": "/tmp/features.duckdb",
+            "optuna_last_optimized_dataset_fingerprint": "fp_1",
+        }
+    )
+    monkeypatch.setattr(app, "st", fake_st)
+
+    filter_info = app._resolve_model_optuna_feature_set_filter(
+        current_feature_key="/tmp/features.duckdb",
+        current_dataset_fingerprint="fp_1",
+        available_feature_sets=["Base", "Cluster", "Base + Cluster"],
+    )
+    pareto_candidates = {
+        "Base": {"candidates": [1]},
+        "Cluster": {"candidates": [1]},
+        "Base + Cluster": {"candidates": [1]},
+    }
+    available_pareto_feature_sets = [
+        label
+        for label in app.MODEL_FEATURE_SET_ORDER
+        if label in pareto_candidates
+        and label in set(filter_info["allowed_feature_sets"])
+    ]
+
+    assert filter_info["applies"] is True
+    assert available_pareto_feature_sets == ["Base", "Base + Cluster"]
+
+
+def test_resolve_model_optuna_feature_set_filter_ignores_mismatched_context(
+    monkeypatch,
+):
+    fake_st = _FakeStreamlit()
+    fake_st.session_state.update(
+        {
+            "model_feature_source": "optuna",
+            "optuna_last_optimized_feature_sets": ["Base", "Base + Cluster"],
+            "optuna_last_optimized_feature_key": "/tmp/other_features.duckdb",
+            "optuna_last_optimized_dataset_fingerprint": "fp_old",
+        }
+    )
+    monkeypatch.setattr(app, "st", fake_st)
+
+    filter_info = app._resolve_model_optuna_feature_set_filter(
+        current_feature_key="/tmp/features.duckdb",
+        current_dataset_fingerprint="fp_new",
+        available_feature_sets=["Base", "Cluster", "Base + Cluster"],
+    )
+
+    assert filter_info["applies"] is False
+    assert filter_info["allowed_feature_sets"] == [
+        "Base",
+        "Cluster",
+        "Base + Cluster",
+    ]
+    assert filter_info["reason"] == "feature_key_mismatch"
 
 
 def test_lookup_optuna_best_feature_cols_falls_back_within_same_balance_mode(
@@ -771,6 +1170,274 @@ def test_get_active_optuna_best_matches_legacy_top_level_semantics(
     assert result["search_space"] == legacy_top_level["optuna_best_search_space"]
 
 
+def test_history_optuna_batch_options_preserve_all_subruns(tmp_path, monkeypatch):
+    base_df, feature_cols, base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    features_df = base_df.drop(columns=["target"]).copy()
+
+    fake_st = _FakeStreamlit()
+    fake_st.session_state.update(
+        {
+            "flow_features_path": str(tmp_path / "flow_features.duckdb"),
+            "flow_features_source": "duckdb",
+            "flow_features_tramo_label": "Toda la autopista",
+            "accident_files": ["accidentes.csv"],
+        }
+    )
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(app, "HISTORY_PATH", tmp_path / "empty_history.jsonl")
+
+    context = app._history_context_details(features_df, selected_features=None)
+    db_path = app._history_db_path()
+    history_store.set_meta(db_path, "legacy_seed_v1", "done")
+    feature_key = app._feature_selection_key(
+        fake_st.session_state["flow_features_path"],
+        "duckdb",
+        features_df,
+    )
+    current_fp = app._dataset_content_fingerprint(features_df)
+
+    first_record = _make_optuna_batch_record(
+        record_id=101,
+        feature_key=feature_key,
+        dataset_fingerprint=current_fp,
+        feature_cols=base_cols,
+        feature_set_label="Base",
+    )
+    second_record = _make_optuna_batch_record(
+        record_id=102,
+        feature_key=feature_key,
+        dataset_fingerprint=current_fp,
+        feature_cols=feature_cols,
+        feature_set_label="Base + Cluster",
+        balance_mode="smote",
+        best_smote_params={
+            "smote_k_neighbors": 5,
+            "smote_sampling_strategy": 0.5,
+        },
+    )
+
+    for record in (first_record, second_record):
+        history_store.insert_record(
+            db_path,
+            stage="Optuna",
+            record_uid=str(record["record_uid"]),
+            created_at=str(record["created_at"]),
+            feature_context_key=str(context["feature_context_key"]),
+            batch_key="batch-optuna-001",
+            model_name=str(record["model_name"]),
+            threshold_objective=str(record["threshold_objective"]),
+            calibration_method=str(record["calibration_method"]),
+            balance_strategy=str(record["balance_strategy"]),
+            metadata=record["metadata"],
+        )
+
+    options = app._history_optuna_batch_options_for_model_tab(
+        feature_context_key=str(context["feature_context_key"])
+    )
+
+    assert len(options) == 1
+    assert options[0]["subrun_count"] == 2
+    assert len(options[0]["records"]) == 2
+    assert len(options[0]["record_ids"]) == 2
+    assert set(options[0]["feature_set_labels"]) == {"Base", "Base + Cluster"}
+
+
+def test_build_model_optuna_batch_contract_expands_all_subruns_and_blocks_incompatible(
+    tmp_path,
+):
+    base_df, feature_cols, base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    features_df = base_df.drop(columns=["target"]).copy()
+    current_fp = app._dataset_content_fingerprint(features_df)
+    feature_key = app._feature_selection_key(
+        str(tmp_path / "flow_features.duckdb"),
+        "duckdb",
+        features_df,
+    )
+
+    option = {
+        "token": "batch-001",
+        "batch_key": "batch-001",
+        "label": "Batch 001",
+        "record_ids": [11, 12],
+        "subrun_count": 2,
+        "feature_set_labels": ["Base", "Base + Cluster"],
+        "records": [
+            _make_optuna_batch_record(
+                record_id=11,
+                feature_key=feature_key,
+                dataset_fingerprint=current_fp,
+                feature_cols=base_cols,
+                feature_set_label="Base",
+            ),
+            _make_optuna_batch_record(
+                record_id=12,
+                feature_key=feature_key,
+                dataset_fingerprint="fingerprint-distinto",
+                feature_cols=feature_cols,
+                feature_set_label="Base + Cluster",
+                balance_mode="smote",
+                best_smote_params={
+                    "smote_k_neighbors": 5,
+                    "smote_sampling_strategy": 0.5,
+                },
+            ),
+        ],
+    }
+
+    contract = app._build_model_optuna_batch_contract(
+        option,
+        current_feature_key=feature_key,
+        current_dataset_fingerprint=current_fp,
+        base_df=base_df,
+        cluster_df=base_df,
+    )
+
+    assert len(contract["subruns"]) == 2
+    assert contract["subruns"][0]["compatible"] is True
+    assert contract["subruns"][1]["compatible"] is False
+    assert contract["compatible"] is False
+    assert any(
+        "fingerprint del dataset no coincide" in reason
+        for reason in contract["reasons"]
+    )
+
+
+def test_build_model_optuna_batch_contract_rejects_heterogeneous_shared_metadata(
+    tmp_path,
+):
+    base_df, _feature_cols, base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
+    features_df = base_df.drop(columns=["target"]).copy()
+    current_fp = app._dataset_content_fingerprint(features_df)
+    feature_key = app._feature_selection_key(
+        str(tmp_path / "flow_features.duckdb"),
+        "duckdb",
+        features_df,
+    )
+
+    option = {
+        "token": "batch-hetero",
+        "batch_key": "batch-hetero",
+        "label": "Batch heterogéneo",
+        "records": [
+            _make_optuna_batch_record(
+                record_id=21,
+                feature_key=feature_key,
+                dataset_fingerprint=current_fp,
+                feature_cols=base_cols,
+                feature_set_label="Base",
+                calibration_method="sigmoid",
+            ),
+            _make_optuna_batch_record(
+                record_id=22,
+                feature_key=feature_key,
+                dataset_fingerprint=current_fp,
+                feature_cols=base_cols,
+                feature_set_label="Base",
+                calibration_method="isotonic",
+            ),
+        ],
+    }
+
+    contract = app._build_model_optuna_batch_contract(
+        option,
+        current_feature_key=feature_key,
+        current_dataset_fingerprint=current_fp,
+        base_df=base_df,
+        cluster_df=base_df,
+    )
+
+    assert contract["compatible"] is False
+    assert any("batch heterogéneo" in reason for reason in contract["reasons"])
+
+
+def test_optuna_subrun_candidates_from_variant_returns_all_pareto_candidates(
+    tmp_path,
+):
+    pareto_front_path = tmp_path / "pareto_front.csv"
+    pd.DataFrame(
+        [
+            {
+                "trial_number": 3,
+                "params_xgb_n_estimators": 150,
+                "params_top_k": 2,
+                "values_0": 0.61,
+                "values_1": 0.18,
+                "selected_trial": True,
+            },
+            {
+                "trial_number": 5,
+                "params_xgb_n_estimators": 220,
+                "params_top_k": 3,
+                "values_0": 0.58,
+                "values_1": 0.14,
+                "selected_trial": False,
+            },
+        ]
+    ).to_csv(pareto_front_path, index=False)
+
+    entry = {"feature_cols": ["f1", "f2", "f3"]}
+    variant = {
+        "best_model_params": {"n_estimators": 120},
+        "best_smote_params": {"smote_k_neighbors": 5},
+        "optuna_settings": {
+            "objective_mode": app.CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE,
+            "ranked_cols": ["f1", "f2", "f3"],
+            "best_feature_cols": ["f1", "f2", "f3"],
+            "best_top_k": 3,
+        },
+        "pareto_front_csv": str(pareto_front_path),
+    }
+
+    candidates, error = app._optuna_subrun_candidates_from_variant(
+        entry=entry,
+        variant=variant,
+        model_choice="XGBoost",
+        feature_cols_fallback=["f1", "f2", "f3"],
+        best_model_params={"n_estimators": 120},
+        best_smote_params={"smote_k_neighbors": 5},
+    )
+
+    assert error is None
+    assert len(candidates) == 2
+    assert candidates[0]["candidate_kind"] == "pareto"
+    assert candidates[0]["feature_cols"] == ["f1", "f2"]
+    assert candidates[1]["feature_cols"] == ["f1", "f2", "f3"]
+
+
+def test_apply_model_history_record_to_state_restores_optuna_batch_selection(
+    monkeypatch,
+):
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    record = {
+        "model_name": "XGBoost",
+        "threshold_objective": "far",
+        "calibration_method": "sigmoid",
+        "protocols": ["conservative", "robust"],
+        "params": {
+            "source_mode": "optuna_batch",
+            "test_size": 0.2,
+            "optuna_batch": {
+                "batch_ref": {"token": "batch-token-77"},
+            },
+        },
+    }
+
+    app._apply_model_history_record_to_state(record)
+
+    assert fake_st.session_state["model_feature_source"] == "optuna"
+    assert fake_st.session_state["model_feature_source_radio"] == "Optuna (batch explícito)"
+    assert fake_st.session_state["model_optuna_batch_token"] == "batch-token-77"
+    assert fake_st.session_state["model_choice"] == "XGBoost"
+    assert fake_st.session_state["model_threshold_protocols"] == [
+        "Conservador",
+        "Robusto",
+    ]
+    assert fake_st.session_state["test_size"] == 0.2
+
+
 # =============================================================================
 # Tests para los contratos de estado por tab (punto 5)
 # =============================================================================
@@ -952,6 +1619,145 @@ def test_controlled_feature_date_bounds_and_loader_filter_interval(tmp_path):
     assert len(filtered) == 1
     assert filtered["interval_start"].iloc[0] == pd.Timestamp("2024-01-02 08:00:00")
     assert filtered["flow_light"].iloc[0] == pytest.approx(11.0)
+
+
+def test_load_feature_segment_catalog_uses_duckdb_metadata_and_porticos(
+    tmp_path,
+    monkeypatch,
+):
+    duckdb = pytest.importorskip("duckdb")
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    features_path = tmp_path / "segments.duckdb"
+    raw_df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                [
+                    "2024-01-01 08:00:00",
+                    "2024-01-01 08:05:00",
+                    "2024-01-03 08:00:00",
+                ]
+            ),
+            "portico_last": ["1", "1", "2"],
+            "portico_next": ["2", "2", "3"],
+            "cluster_count_0": [1.0, 2.0, 3.0],
+        }
+    )
+    con = duckdb.connect(str(features_path))
+    try:
+        con.register("features_view", raw_df)
+        con.execute("CREATE TABLE flow_features AS SELECT * FROM features_view")
+    finally:
+        con.close()
+
+    porticos_df = pd.DataFrame(
+        {
+            "eje": ["N", "N", "N"],
+            "calzada": ["Oriente", "Oriente", "Oriente"],
+            "orden": [1, 2, 3],
+            "km": [10.0, 11.0, 12.0],
+            "portico": ["1", "2", "3"],
+        }
+    )
+    monkeypatch.setattr(app, "load_porticos", lambda: porticos_df.copy())
+
+    segments = app._load_feature_segment_catalog(
+        features_path,
+        date_start=pd.Timestamp("2024-01-01 00:00:00"),
+        date_end=pd.Timestamp("2024-01-02 23:59:59"),
+    )
+
+    assert len(segments) == 1
+    assert segments.loc[0, "portico_last"] == "1"
+    assert segments.loc[0, "portico_next"] == "2"
+    assert segments.loc[0, "eje"] == "N"
+    assert segments.loc[0, "calzada"] == "Oriente"
+    assert segments.loc[0, "km_last"] == pytest.approx(10.0)
+    assert segments.loc[0, "km_next"] == pytest.approx(11.0)
+
+
+def test_load_accidents_for_event_can_skip_session_cache(monkeypatch):
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    processed_df = pd.DataFrame(
+        {
+            "accidente_time": pd.to_datetime(["2024-01-01 08:00:00"]),
+            "ultimo_portico": ["1"],
+            "proximo_portico": ["2"],
+        }
+    )
+    monkeypatch.setattr(
+        app,
+        "read_csv_with_progress",
+        lambda _path: pd.DataFrame({"raw": [1]}),
+    )
+    monkeypatch.setattr(
+        app,
+        "load_porticos",
+        lambda: pd.DataFrame({"portico": ["1", "2"]}),
+    )
+    monkeypatch.setattr(
+        app,
+        "process_accidentes_df",
+        lambda *_args, **_kwargs: (processed_df.copy(), pd.DataFrame()),
+    )
+
+    loaded = app._load_accidents_for_event(
+        Path("/tmp/fake_events.csv"),
+        cache_in_session=False,
+    )
+
+    assert loaded is not None
+    assert loaded.equals(processed_df)
+    assert fake_st.session_state["accidents_by_event_cache"] == {}
+
+
+def test_prepare_controlled_comparison_base_df_reuses_prefetched_features(
+    monkeypatch,
+):
+    tramo_tuple = ("N", "Oriente", "1", "2")
+    accidents_df = pd.DataFrame(
+        {
+            "accidente_time": pd.to_datetime(
+                ["2024-01-01 08:00:00", "2024-01-01 08:05:00"]
+            ),
+            "ultimo_portico": ["1", "1"],
+            "proximo_portico": ["2", "2"],
+        }
+    )
+    features_df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                ["2024-01-01 08:00:00", "2024-01-01 08:05:00"]
+            ),
+            "portico_last": ["1", "1"],
+            "portico_next": ["2", "2"],
+            "cluster_count_0": [1.0, 2.0],
+        }
+    )
+
+    def _fail_loader(*_args, **_kwargs):
+        raise AssertionError("No debería recargar features si ya vienen prefetched.")
+
+    def _fake_add_accident_target(prefetched_features, _accidents_segment):
+        result = prefetched_features.copy()
+        result["target"] = [0, 1]
+        return result
+
+    monkeypatch.setattr(app, "_load_controlled_features_df", _fail_loader)
+    monkeypatch.setattr(app, "add_accident_target", _fake_add_accident_target)
+
+    base_df = app._prepare_controlled_comparison_base_df(
+        accidents_df_for_tramo=accidents_df,
+        selected_features_path=Path("/tmp/unused.duckdb"),
+        tramo_tuple=tramo_tuple,
+        features_df=features_df,
+    )
+
+    assert list(base_df["cluster_count_0"]) == [1.0, 2.0]
+    assert list(base_df["target"]) == [0, 1]
 
 
 def test_controlled_comparison_metric_options_include_extended_metrics():
@@ -1230,3 +2036,25 @@ def test_load_controlled_comparison_result_frames_tolerates_legacy_without_delta
     assert loaded_curves.empty
     assert loaded_detail.empty
     assert loaded_deltas.empty
+
+
+def test_history_protocol_results_summary_keeps_training_curves():
+    summary = app._history_protocol_results_summary(
+        {
+            "Base": {
+                "conservative": {
+                    "metrics": {"f1": 0.42},
+                    "training_curves": {
+                        "epochs": [1, 2],
+                        "train_loss": [0.8, 0.5],
+                        "val_loss": [0.9, 0.6],
+                    },
+                }
+            }
+        }
+    )
+
+    assert summary["Base"]["conservative"]["training_curves"]["train_loss"] == [
+        0.8,
+        0.5,
+    ]

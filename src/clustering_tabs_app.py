@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import math
 from datetime import datetime, time as dt_time
 import json
 from pathlib import Path
@@ -57,13 +58,19 @@ from clustering import (  # noqa: E402
     split_frequent_drivers,
     assign_clusters_kmeans,
     assign_clusters_gmm,
+    build_dynamic_gmm_driver_summary,
+    build_dynamic_gmm_windows,
+    estimate_dynamic_gmm_parallelism,
+    list_dynamic_gmm_checkpoint_db_paths,
+    list_dynamic_gmm_db_paths,
+    load_dynamic_gmm_results_duckdb,
+    run_dynamic_gmm_clustering,
 )
 
 REQUIRED_FEATURE_COLS = {
     "plate",
     "total_passes",
     "avg_speed_kmh",
-    "exceso_velocidad",
     "avg_relative_speed",
     "avg_headway_s",
     "conflict_rate",
@@ -73,6 +80,7 @@ REQUIRED_FEATURE_COLS = {
 }
 RUN_LOG_PATH = RESULTS_DIR / "cluster_run_log.jsonl"
 COLOR_MAP_PATH = RESULTS_DIR / "cluster_color_map.csv"
+DYNAMIC_GMM_PLATE_PAGE_SIZE = 10
 CLUSTER_LABEL_PATTERN = re.compile(
     r"^cluster_(?P<method>kmeans|gmm|hdbscan)(?:_k(?P<k>\d+))?(?:.*)?\.csv$"
 )
@@ -208,6 +216,26 @@ def _init_state() -> None:
     st.session_state.setdefault("metrics_x_scaled", None)
     st.session_state.setdefault("metrics_path", None)
     st.session_state.setdefault("metrics_params", None)
+    st.session_state.setdefault("dynamic_gmm_result", None)
+    st.session_state.setdefault("dynamic_gmm_plate_page_index", 0)
+    st.session_state.setdefault("dynamic_gmm_parallel_estimate", None)
+
+
+def _format_bytes(value: object) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(number) or number < 0:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    idx = 0
+    while number >= 1024 and idx < len(units) - 1:
+        number /= 1024
+        idx += 1
+    if idx == 0:
+        return f"{int(number)} {units[idx]}"
+    return f"{number:.2f} {units[idx]}"
 
 
 def _reset_metrics_state() -> None:
@@ -551,6 +579,45 @@ def _log_cluster_run(
         entry["metrics_params"] = metrics_params
     if extra_params:
         entry["params"] = extra_params
+    if train_params:
+        entry["train_params"] = train_params
+    if train_distribution:
+        entry["distribution"] = train_distribution
+    _write_run_log(entry)
+
+
+def _log_dynamic_gmm_run(
+    *,
+    feature_cols: List[str],
+    rows: int,
+    duckdb_path: Optional[Path],
+    model_path: Optional[Path],
+    params: dict,
+    train_params: Optional[dict] = None,
+    train_distribution: Optional[dict] = None,
+) -> None:
+    feature_path, feature_file = _feature_file_info()
+    entry = {
+        "run_id": _run_id("gmm_dynamic"),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "event": "gmm_dynamic",
+        "method": "gmm_dynamic",
+        "feature_cols": list(feature_cols),
+        "rows": int(rows),
+        "feature_source": st.session_state.get("features_source"),
+        "feature_path": feature_path,
+        "feature_file": feature_file,
+        "params": dict(params or {}),
+    }
+    if duckdb_path is not None:
+        entry["duckdb_path"] = str(duckdb_path)
+        entry["duckdb_file"] = duckdb_path.name
+    if model_path is not None:
+        entry["model_path"] = str(model_path)
+        entry["model_file"] = model_path.name
+    feature_config = _current_feature_config()
+    if feature_config:
+        entry["feature_config"] = feature_config
     if train_params:
         entry["train_params"] = train_params
     if train_distribution:
@@ -1078,6 +1145,871 @@ def _prepare_cluster_data(
     return cluster_df
 
 
+def _dynamic_gmm_probability_columns(df: pd.DataFrame) -> List[str]:
+    if not isinstance(df, pd.DataFrame):
+        return []
+    prob_cols = [
+        col for col in df.columns if re.match(r"^cluster_prob_\d+$", str(col))
+    ]
+    return sorted(prob_cols, key=lambda col: int(str(col).rsplit("_", 1)[1]))
+
+
+def _ensure_dynamic_window_index(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    result = df.copy()
+    if "window_start" in result.columns:
+        result["window_start"] = pd.to_datetime(result["window_start"], errors="coerce")
+    if "window_end" in result.columns:
+        result["window_end"] = pd.to_datetime(result["window_end"], errors="coerce")
+    if result.empty:
+        if "window_index" not in result.columns:
+            result["window_index"] = pd.Series(dtype="Int64")
+        return result
+
+    if "window_index" in result.columns:
+        current_index = pd.to_numeric(result["window_index"], errors="coerce")
+        if current_index.notna().all():
+            result["window_index"] = current_index.astype("Int64")
+            return result
+
+    keys = [
+        col
+        for col in ["window_label", "window_start", "window_end"]
+        if col in result.columns
+    ]
+    if not keys:
+        result["window_index"] = pd.Series(
+            range(1, len(result) + 1),
+            index=result.index,
+            dtype="Int64",
+        )
+        return result
+
+    unique_windows = result[keys].drop_duplicates().copy()
+    sort_cols = [
+        col
+        for col in ["window_start", "window_label", "window_end"]
+        if col in unique_windows.columns
+    ]
+    if sort_cols:
+        unique_windows = unique_windows.sort_values(sort_cols, kind="mergesort")
+    unique_windows["window_index"] = range(1, len(unique_windows) + 1)
+    result = result.drop(columns=["window_index"], errors="ignore").merge(
+        unique_windows,
+        on=keys,
+        how="left",
+        sort=False,
+    )
+    result["window_index"] = pd.to_numeric(
+        result["window_index"],
+        errors="coerce",
+    ).astype("Int64")
+    return result
+
+
+def _dynamic_gmm_plate_order(assignments: pd.DataFrame) -> List[str]:
+    if not isinstance(assignments, pd.DataFrame) or "plate" not in assignments.columns:
+        return []
+    plates = assignments["plate"].dropna().astype(str)
+    return list(dict.fromkeys(plates.tolist()))
+
+
+def _next_dynamic_gmm_plate_page_index(
+    current_page_index: int,
+    total_plates: int,
+    page_size: int = DYNAMIC_GMM_PLATE_PAGE_SIZE,
+) -> int:
+    if int(total_plates) <= int(page_size):
+        return 0
+    total_pages = int(math.ceil(int(total_plates) / int(page_size)))
+    return (max(0, int(current_page_index)) + 1) % max(1, total_pages)
+
+
+def _dynamic_gmm_selected_plate_page(
+    assignments: pd.DataFrame,
+    page_index: int,
+    page_size: int = DYNAMIC_GMM_PLATE_PAGE_SIZE,
+) -> Tuple[List[str], int, int, int, int]:
+    plates = _dynamic_gmm_plate_order(assignments)
+    total = len(plates)
+    if total == 0:
+        return [], 0, 0, 0, 0
+    total_pages = int(math.ceil(total / int(page_size)))
+    normalized_page = max(0, int(page_index)) % max(1, total_pages)
+    start = normalized_page * int(page_size)
+    end = min(start + int(page_size), total)
+    return plates[start:end], start, end, total, normalized_page
+
+
+def _dynamic_gmm_assignment_plot_frame(
+    assignments: pd.DataFrame,
+    selected_plates: List[str],
+) -> pd.DataFrame:
+    if (
+        not isinstance(assignments, pd.DataFrame)
+        or assignments.empty
+        or "plate" not in assignments.columns
+        or "cluster_label" not in assignments.columns
+        or not selected_plates
+    ):
+        return pd.DataFrame()
+    df = _ensure_dynamic_window_index(assignments)
+    df["plate"] = df["plate"].astype(str)
+    plot_df = df[df["plate"].isin([str(plate) for plate in selected_plates])].copy()
+    if plot_df.empty:
+        return plot_df
+    plot_df["cluster_label"] = pd.to_numeric(
+        plot_df["cluster_label"],
+        errors="coerce",
+    ).fillna(-1).astype(int)
+    plot_df["window_index"] = pd.to_numeric(
+        plot_df["window_index"],
+        errors="coerce",
+    )
+    plot_df["week_label"] = plot_df["window_index"].apply(
+        lambda value: f"Semana {int(value)}" if pd.notna(value) else "Semana -"
+    )
+    if "window_label" in plot_df.columns:
+        plot_df["window_range"] = plot_df["window_label"].astype(str)
+    else:
+        plot_df["window_range"] = plot_df["week_label"]
+    if "confidence_score" in plot_df.columns:
+        plot_df["confidence_score"] = pd.to_numeric(
+            plot_df["confidence_score"],
+            errors="coerce",
+        )
+    else:
+        plot_df["confidence_score"] = math.nan
+    if "assignment_status" not in plot_df.columns:
+        plot_df["assignment_status"] = ""
+    return plot_df.sort_values(["plate", "window_index"], kind="mergesort")
+
+
+def _dynamic_gmm_probability_plot_frame(
+    assignments: pd.DataFrame,
+    selected_plates: List[str],
+    probability_col: str,
+) -> pd.DataFrame:
+    if (
+        not isinstance(assignments, pd.DataFrame)
+        or probability_col not in assignments.columns
+    ):
+        return pd.DataFrame()
+    plot_df = _dynamic_gmm_assignment_plot_frame(assignments, selected_plates)
+    if plot_df.empty or probability_col not in assignments.columns:
+        return pd.DataFrame()
+    source = _ensure_dynamic_window_index(assignments)
+    source["plate"] = source["plate"].astype(str)
+    source = source[source["plate"].isin([str(plate) for plate in selected_plates])].copy()
+    if source.empty:
+        return pd.DataFrame()
+    source["probability"] = pd.to_numeric(source[probability_col], errors="coerce")
+    source["cluster_probability"] = probability_col
+    source["probability_cluster"] = probability_col.rsplit("_", 1)[1]
+    if "cluster_label" in source.columns:
+        source["cluster_label"] = pd.to_numeric(
+            source["cluster_label"],
+            errors="coerce",
+        ).fillna(-1).astype(int)
+    else:
+        source["cluster_label"] = math.nan
+    if "confidence_score" in source.columns:
+        source["confidence_score"] = pd.to_numeric(
+            source["confidence_score"],
+            errors="coerce",
+        )
+    else:
+        source["confidence_score"] = math.nan
+    if "assignment_status" not in source.columns:
+        source["assignment_status"] = ""
+    if "window_label" in source.columns:
+        source["window_range"] = source["window_label"].astype(str)
+    else:
+        source["window_range"] = source["window_index"].apply(
+            lambda value: f"Semana {int(value)}" if pd.notna(value) else "Semana -"
+        )
+    source["week_label"] = source["window_index"].apply(
+        lambda value: f"Semana {int(value)}" if pd.notna(value) else "Semana -"
+    )
+    return source.sort_values(["plate", "window_index"], kind="mergesort")
+
+
+def _render_dynamic_gmm_plate_window_charts(
+    assignments: pd.DataFrame,
+    selected_plates: List[str],
+    *,
+    include_probabilities: bool,
+) -> None:
+    try:
+        import plotly.express as px
+    except ImportError:
+        st.info("plotly no esta instalado. Los graficos live no estan disponibles.")
+        return
+
+    assignment_plot = _dynamic_gmm_assignment_plot_frame(assignments, selected_plates)
+    if assignment_plot.empty:
+        st.info("Aun no hay asignaciones para las patentes seleccionadas.")
+        return
+
+    assignment_fig = px.line(
+        assignment_plot,
+        x="window_index",
+        y="cluster_label",
+        color="plate",
+        markers=True,
+        labels={
+            "window_index": "Semana",
+            "cluster_label": "Cluster",
+            "plate": "Patente",
+        },
+        hover_data={
+            "plate": True,
+            "week_label": True,
+            "window_range": True,
+            "confidence_score": ":.3f",
+            "assignment_status": True,
+            "window_index": False,
+        },
+        title="Asignacion de cluster por semana",
+    )
+    assignment_fig.update_xaxes(dtick=1)
+    assignment_fig.update_yaxes(dtick=1)
+    st.plotly_chart(assignment_fig, width="stretch")
+
+    if not include_probabilities:
+        return
+
+    for probability_col in _dynamic_gmm_probability_columns(assignments):
+        probability_plot = _dynamic_gmm_probability_plot_frame(
+            assignments,
+            selected_plates,
+            probability_col,
+        )
+        if probability_plot.empty:
+            continue
+        cluster_id = probability_col.rsplit("_", 1)[1]
+        probability_fig = px.line(
+            probability_plot,
+            x="window_index",
+            y="probability",
+            color="plate",
+            markers=True,
+            range_y=[0, 1],
+            labels={
+                "window_index": "Semana",
+                "probability": "Probabilidad",
+                "plate": "Patente",
+            },
+            hover_data={
+                "plate": True,
+                "week_label": True,
+                "window_range": True,
+                "probability_cluster": True,
+                "cluster_label": True,
+                "confidence_score": ":.3f",
+                "assignment_status": True,
+                "probability": ":.3f",
+                "window_index": False,
+            },
+            title=f"Probabilidad de pertenencia al cluster {cluster_id}",
+        )
+        probability_fig.update_xaxes(dtick=1)
+        st.plotly_chart(probability_fig, width="stretch")
+
+
+def _render_dynamic_gmm_plate_page_panel(
+    assignments: pd.DataFrame,
+    *,
+    include_probabilities: bool,
+    live_status: Optional[str] = None,
+    show_controls: bool = True,
+    key_prefix: str = "dynamic_gmm",
+) -> None:
+    normalized = _ensure_dynamic_window_index(assignments)
+    plates = _dynamic_gmm_plate_order(normalized)
+    if live_status:
+        st.caption(live_status)
+    if not plates:
+        st.info("Aun no hay patentes para visualizar.")
+        return
+
+    if show_controls:
+        current_page = int(st.session_state.get("dynamic_gmm_plate_page_index", 0))
+        disabled = len(plates) <= DYNAMIC_GMM_PLATE_PAGE_SIZE
+        control_cols = st.columns([3, 1])
+        with control_cols[1]:
+            if st.button(
+                "Siguientes 10 patentes",
+                key=f"{key_prefix}_next_plate_page",
+                disabled=disabled,
+            ):
+                current_page = _next_dynamic_gmm_plate_page_index(
+                    current_page,
+                    len(plates),
+                )
+                st.session_state["dynamic_gmm_plate_page_index"] = current_page
+        selected_plates, start, end, total, normalized_page = (
+            _dynamic_gmm_selected_plate_page(normalized, current_page)
+        )
+        st.session_state["dynamic_gmm_plate_page_index"] = normalized_page
+        with control_cols[0]:
+            st.caption(f"Patentes {start + 1}-{end} de {total}")
+    else:
+        selected_plates, start, end, total, normalized_page = (
+            _dynamic_gmm_selected_plate_page(
+                normalized,
+                int(st.session_state.get("dynamic_gmm_plate_page_index", 0)),
+            )
+        )
+        if total:
+            st.caption(f"Patentes {start + 1}-{end} de {total}")
+
+    _render_dynamic_gmm_plate_window_charts(
+        normalized,
+        selected_plates,
+        include_probabilities=include_probabilities,
+    )
+
+
+def _render_dynamic_gmm_results(result: dict) -> None:
+    assignments = result.get("assignments")
+    window_summary = result.get("window_summary")
+    driver_summary = result.get("driver_summary")
+    metadata = result.get("metadata") or {}
+    if not isinstance(assignments, pd.DataFrame):
+        assignments = pd.DataFrame()
+    if not isinstance(window_summary, pd.DataFrame):
+        window_summary = pd.DataFrame()
+    assignments = _ensure_dynamic_window_index(assignments)
+    window_summary = _ensure_dynamic_window_index(window_summary)
+    if not isinstance(driver_summary, pd.DataFrame):
+        driver_summary = build_dynamic_gmm_driver_summary(assignments)
+
+    st.subheader("Evolucion dinamica GMM")
+    if metadata:
+        parts = []
+        if metadata.get("window_days") is not None:
+            parts.append(f"ventana={metadata.get('window_days')} dias")
+        if metadata.get("k") is not None:
+            parts.append(f"K={metadata.get('k')}")
+        if metadata.get("confidence_threshold_proba") is not None:
+            parts.append(f"umbral={float(metadata.get('confidence_threshold_proba')):.2f}")
+        if parts:
+            st.caption(" | ".join(parts))
+
+    if assignments.empty:
+        st.info("El resultado dinamico no contiene asignaciones.")
+        if not window_summary.empty:
+            st.dataframe(window_summary, width="stretch")
+        return
+
+    labels = pd.to_numeric(assignments["cluster_label"], errors="coerce")
+    total_rows = len(assignments)
+    assigned_rows = int((labels != -1).sum())
+    assigned_share = assigned_rows / total_rows if total_rows else 0.0
+    unique_plates = assignments["plate"].nunique() if "plate" in assignments.columns else 0
+    n_windows = (
+        window_summary["window_label"].nunique()
+        if "window_label" in window_summary.columns and not window_summary.empty
+        else assignments["window_label"].nunique()
+    )
+    stability = (
+        pd.to_numeric(driver_summary.get("stability_score"), errors="coerce").mean()
+        if not driver_summary.empty and "stability_score" in driver_summary.columns
+        else math.nan
+    )
+    change_rate = (
+        pd.to_numeric(driver_summary.get("change_rate"), errors="coerce").mean()
+        if not driver_summary.empty and "change_rate" in driver_summary.columns
+        else math.nan
+    )
+    mean_conf = pd.to_numeric(
+        assignments.get("confidence_score"), errors="coerce"
+    ).mean()
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Ventanas", f"{int(n_windows):,}")
+    c2.metric("Patentes", f"{int(unique_plates):,}")
+    c3.metric("Cobertura asignada", f"{assigned_share:.1%}")
+    c4.metric(
+        "Estabilidad media",
+        "-" if pd.isna(stability) else f"{float(stability):.1%}",
+    )
+    c5.metric(
+        "Cambio medio",
+        "-" if pd.isna(change_rate) else f"{float(change_rate):.1%}",
+        help="1 - estabilidad, calculado sobre transiciones asignadas por patente.",
+    )
+    st.caption(
+        "Confianza media: "
+        + ("-" if pd.isna(mean_conf) else f"{float(mean_conf):.3f}")
+    )
+
+    try:
+        import plotly.express as px
+    except ImportError:
+        st.info("plotly no esta instalado. Se muestran tablas solamente.")
+        st.dataframe(window_summary, width="stretch")
+        st.dataframe(driver_summary, width="stretch")
+        return
+
+    assignments_plot = assignments.copy()
+    assignments_plot["window_start"] = pd.to_datetime(
+        assignments_plot["window_start"], errors="coerce"
+    )
+    assignments_plot["cluster_label"] = pd.to_numeric(
+        assignments_plot["cluster_label"], errors="coerce"
+    ).fillna(-1).astype(int)
+
+    composition = (
+        assignments_plot.groupby(["window_start", "cluster_label"], dropna=False)
+        .size()
+        .reset_index(name="rows")
+    )
+    totals = composition.groupby("window_start")["rows"].transform("sum")
+    composition["share"] = composition["rows"] / totals.replace(0, np.nan)
+    composition["cluster_label"] = composition["cluster_label"].astype(str)
+    fig = px.area(
+        composition,
+        x="window_start",
+        y="share",
+        color="cluster_label",
+        labels={
+            "window_start": "Ventana",
+            "share": "Proporcion",
+            "cluster_label": "Cluster",
+        },
+        title="Composicion temporal por cluster",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    transition_rows = []
+    if "plate" in assignments_plot.columns:
+        for plate, group in assignments_plot.sort_values(
+            ["plate", "window_start"], kind="mergesort"
+        ).groupby("plate", sort=False):
+            labels_seq = group["cluster_label"].tolist()
+            for prev_label, next_label in zip(labels_seq, labels_seq[1:]):
+                transition_rows.append(
+                    {
+                        "from_cluster": int(prev_label),
+                        "to_cluster": int(next_label),
+                        "count": 1,
+                    }
+                )
+    if transition_rows:
+        transition_df = pd.DataFrame(transition_rows)
+        matrix = transition_df.pivot_table(
+            index="from_cluster",
+            columns="to_cluster",
+            values="count",
+            aggfunc="sum",
+            fill_value=0,
+        ).sort_index().sort_index(axis=1)
+        heat_fig = px.imshow(
+            matrix,
+            text_auto=True,
+            labels={"x": "Cluster siguiente", "y": "Cluster anterior", "color": "Transiciones"},
+            title="Matriz de transiciones entre ventanas consecutivas",
+        )
+        st.plotly_chart(heat_fig, width="stretch")
+
+    st.subheader("Seguimiento de 10 patentes")
+    include_probabilities = bool(
+        metadata.get(
+            "include_membership_probabilities",
+            bool(_dynamic_gmm_probability_columns(assignments_plot)),
+        )
+    )
+    _render_dynamic_gmm_plate_page_panel(
+        assignments_plot,
+        include_probabilities=include_probabilities,
+        key_prefix="dynamic_gmm_results",
+    )
+
+    st.subheader("Patentes con mayor variacion")
+    if not driver_summary.empty:
+        st.dataframe(driver_summary.head(25), width="stretch", hide_index=True)
+    else:
+        st.info("No hay resumen por patente disponible.")
+
+    if "plate" not in assignments_plot.columns:
+        return
+    plate_options = (
+        driver_summary["plate"].tolist()
+        if not driver_summary.empty and "plate" in driver_summary.columns
+        else sorted(assignments_plot["plate"].dropna().unique().tolist())
+    )
+    if not plate_options:
+        return
+    selected_plate = st.selectbox(
+        "Patente para trayectoria",
+        plate_options,
+        key="dynamic_gmm_plate_selector",
+    )
+    plate_df = assignments_plot[
+        assignments_plot["plate"].astype(str) == str(selected_plate)
+    ].sort_values("window_start")
+    if plate_df.empty:
+        return
+
+    traj_fig = px.line(
+        plate_df,
+        x="window_start",
+        y="cluster_label",
+        markers=True,
+        labels={"window_start": "Ventana", "cluster_label": "Cluster"},
+        title=f"Trayectoria de cluster: {selected_plate}",
+    )
+    st.plotly_chart(traj_fig, width="stretch")
+
+    conf_fig = px.line(
+        plate_df,
+        x="window_start",
+        y="confidence_score",
+        markers=True,
+        labels={"window_start": "Ventana", "confidence_score": "Confianza"},
+        title=f"Confianza GMM: {selected_plate}",
+    )
+    st.plotly_chart(conf_fig, width="stretch")
+
+    prob_cols = [
+        col for col in plate_df.columns if re.match(r"^cluster_prob_\d+$", str(col))
+    ]
+    prob_cols = sorted(prob_cols, key=lambda col: int(str(col).rsplit("_", 1)[1]))
+    if prob_cols:
+        prob_long = plate_df[["window_start", *prob_cols]].melt(
+            id_vars="window_start",
+            value_vars=prob_cols,
+            var_name="cluster",
+            value_name="probability",
+        )
+        prob_fig = px.line(
+            prob_long,
+            x="window_start",
+            y="probability",
+            color="cluster",
+            markers=True,
+            labels={"window_start": "Ventana", "probability": "Probabilidad"},
+            title=f"Probabilidades soft: {selected_plate}",
+        )
+        st.plotly_chart(prob_fig, width="stretch")
+
+
+def _render_dynamic_gmm_controls(
+    features_df: pd.DataFrame,
+    feature_cols: List[str],
+    k_choice: int,
+    confidence_proba: float,
+    train_params: dict,
+    train_distribution: dict,
+) -> None:
+    with st.expander("GMM/Clusters dinamicos", expanded=False):
+        st.caption(
+            "Entrena un GMM base con el historial cargado y asigna clusters en "
+            "ventanas deslizantes recalculadas desde flujos."
+        )
+        try:
+            flow_summary = get_flow_db_summary()
+        except ImportError as exc:
+            st.error(str(exc))
+            return
+        if flow_summary.row_count == 0:
+            st.warning("La base de flujos esta vacia.")
+            return
+        default_start, default_end = _date_defaults(flow_summary)
+        c1, c2 = st.columns(2)
+        with c1:
+            dynamic_start = st.date_input(
+                "Inicio evaluacion",
+                value=default_start,
+                key="dynamic_gmm_start",
+            )
+        with c2:
+            dynamic_end = st.date_input(
+                "Fin evaluacion",
+                value=default_end,
+                key="dynamic_gmm_end",
+            )
+
+        c3, c4, c5 = st.columns(3)
+        with c3:
+            window_days = st.number_input(
+                "Tamaño ventana (dias)",
+                min_value=1,
+                value=7,
+                step=1,
+                key="dynamic_gmm_window_days",
+            )
+        with c4:
+            min_window_passes = st.number_input(
+                "Minimo pasadas por ventana",
+                min_value=1,
+                value=5,
+                step=1,
+                key="dynamic_gmm_min_passes",
+            )
+        with c5:
+            dynamic_confidence = st.slider(
+                "Umbral dinamico",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(confidence_proba),
+                step=0.05,
+                key="dynamic_gmm_confidence",
+            )
+        include_dynamic_probabilities = st.checkbox(
+            "Guardar probabilidades de pertenencia por cluster",
+            value=False,
+            key="dynamic_gmm_save_membership_probabilities",
+            help=(
+                "Agrega columnas cluster_prob_* al resultado dinamico y habilita "
+                "graficos de probabilidad por cluster para las patentes monitoreadas."
+            ),
+        )
+
+        windows = build_dynamic_gmm_windows(
+            pd.Timestamp(dynamic_start),
+            pd.Timestamp(dynamic_end),
+            int(window_days),
+        )
+        st.caption(f"Ventanas completas a evaluar: {len(windows):,}")
+        if not windows:
+            st.warning("El rango seleccionado no alcanza para una ventana completa.")
+
+        db_paths = list_dynamic_gmm_db_paths()
+        checkpoint_paths = list_dynamic_gmm_checkpoint_db_paths()
+        execution_cols = st.columns(2)
+        with execution_cols[0]:
+            parallel_jobs = st.number_input(
+                "Paralelos GMM dinamico",
+                min_value=1,
+                value=1,
+                step=1,
+                key="dynamic_gmm_parallel_jobs",
+                help="Cantidad de ventanas de X dias que se calculan simultaneamente.",
+            )
+        with execution_cols[1]:
+            resume_checkpoint = st.checkbox(
+                "Retomar checkpoint si existe",
+                value=True,
+                key="dynamic_gmm_resume_checkpoint",
+                help=(
+                    "Si selecciona un DuckDB incremental compatible, se saltan "
+                    "ventanas completadas y se recalculan pendientes/fallidas."
+                ),
+            )
+
+        resume_db_path: Optional[Path] = None
+        if resume_checkpoint and checkpoint_paths:
+            resume_names = [path.name for path in checkpoint_paths]
+            selected_resume_name = st.selectbox(
+                "Checkpoint DuckDB para retomar",
+                resume_names,
+                index=0,
+                key="dynamic_gmm_resume_db",
+            )
+            resume_db_path = RESULTS_DIR / selected_resume_name
+        elif resume_checkpoint:
+            st.caption("No hay checkpoints incrementales previos; se creara un run nuevo.")
+
+        estimate_signature = {
+            "date_start": str(dynamic_start),
+            "date_end": str(dynamic_end),
+            "window_days": int(window_days),
+        }
+        if st.button(
+            "Estimar paralelos maximos",
+            disabled=not windows,
+            key="dynamic_gmm_estimate_parallelism",
+        ):
+            try:
+                with st.spinner("Estimando paralelos seguros para GMM dinamico..."):
+                    estimate = estimate_dynamic_gmm_parallelism(
+                        date_start=pd.Timestamp(dynamic_start),
+                        date_end=pd.Timestamp(dynamic_end),
+                        window_days=int(window_days),
+                    )
+                st.session_state["dynamic_gmm_parallel_estimate"] = {
+                    "signature": estimate_signature,
+                    "payload": estimate,
+                }
+            except Exception as exc:
+                st.error(f"No se pudo estimar paralelismo: {exc}")
+
+        cached_estimate = st.session_state.get("dynamic_gmm_parallel_estimate")
+        if (
+            isinstance(cached_estimate, dict)
+            and cached_estimate.get("signature") == estimate_signature
+        ):
+            estimate = dict(cached_estimate.get("payload") or {})
+            metric_cols = st.columns(4)
+            metric_cols[0].metric(
+                "Recomendado",
+                str(estimate.get("recommended_parallel_jobs", "-")),
+            )
+            metric_cols[1].metric(
+                "Max RAM",
+                str(estimate.get("max_parallel_jobs_by_memory", "-")),
+            )
+            metric_cols[2].metric(
+                "Max CPU",
+                str(estimate.get("max_parallel_jobs_by_cpu", "-")),
+            )
+            metric_cols[3].metric(
+                "Peor ventana",
+                f"{int(estimate.get('max_window_rows') or 0):,} filas",
+            )
+            st.caption(
+                "RAM disponible: "
+                f"{_format_bytes(estimate.get('available_memory_bytes'))} | "
+                "memoria estimada por paralelo: "
+                f"{_format_bytes(estimate.get('estimated_worker_bytes'))}"
+            )
+
+        run_dynamic = st.button(
+            "GMM/Clusters dinamicos",
+            disabled=not windows,
+            key="run_dynamic_gmm",
+        )
+        if run_dynamic:
+            feature_config = _current_feature_config()
+            ttc_mode = str(feature_config.get("ttc_mode") or "dynamic")
+            fixed_ttc_s = feature_config.get("ttc_fixed_seconds")
+            with st.spinner("Ejecutando GMM dinamico..."):
+                progress = StreamlitProgress(
+                    total=max(1, len(windows)),
+                    label="Ventanas dinamicas",
+                )
+                try:
+                    result = run_dynamic_gmm_clustering(
+                        base_features_df=features_df,
+                        feature_cols=feature_cols,
+                        flow_cols=FlowColumns(),
+                        ttc_max_map=TTC_MAX_BY_PORTICO,
+                        k=int(k_choice),
+                        confidence_threshold_proba=float(dynamic_confidence),
+                        window_days=int(window_days),
+                        date_start=pd.Timestamp(dynamic_start),
+                        date_end=pd.Timestamp(dynamic_end),
+                        min_window_passes=int(min_window_passes),
+                        train_params=train_params,
+                        ttc_mode=ttc_mode,
+                        fixed_ttc_s=(
+                            float(fixed_ttc_s)
+                            if fixed_ttc_s is not None
+                            else None
+                        ),
+                        metadata={
+                            "feature_config": feature_config,
+                            "include_membership_probabilities": bool(
+                                include_dynamic_probabilities
+                            ),
+                        },
+                        progress=progress,
+                        include_membership_probabilities=bool(
+                            include_dynamic_probabilities
+                        ),
+                        parallel_jobs=int(parallel_jobs),
+                        checkpoint_enabled=True,
+                        incremental_db_path=(
+                            resume_db_path if resume_db_path is not None else None
+                        ),
+                        resume_existing=bool(
+                            resume_checkpoint and resume_db_path is not None
+                        ),
+                        load_final_result=False,
+                    )
+                except Exception as exc:
+                    st.error(f"Error en GMM dinamico: {exc}")
+                    return
+                finally:
+                    progress.close()
+
+            display_result = {
+                key: value
+                for key, value in result.items()
+                if key not in {"model", "scaler"}
+            }
+            st.session_state["dynamic_gmm_result"] = display_result
+            result_metadata = dict(result.get("metadata") or {})
+            try:
+                logged_rows = int(result_metadata.get("n_assignments") or 0)
+            except (TypeError, ValueError):
+                logged_rows = 0
+            _log_dynamic_gmm_run(
+                feature_cols=list(result.get("feature_cols") or feature_cols),
+                rows=logged_rows,
+                duckdb_path=result.get("duckdb_path"),
+                model_path=result.get("model_path"),
+                params={
+                    "k": int(k_choice),
+                    "window_days": int(window_days),
+                    "window_step_days": 1,
+                    "min_window_passes": int(min_window_passes),
+                    "confidence_proba": float(dynamic_confidence),
+                    "date_start": str(dynamic_start),
+                    "date_end": str(dynamic_end),
+                    "include_membership_probabilities": bool(
+                        include_dynamic_probabilities
+                    ),
+                },
+                train_params=train_params,
+                train_distribution=train_distribution,
+            )
+            result_status = str(result_metadata.get("status") or "completed")
+            if result_status == "completed":
+                st.success("GMM dinamico completado y persistido en DuckDB.")
+            else:
+                st.warning(
+                    "GMM dinamico finalizo con resultados parciales; revise "
+                    "las ventanas fallidas en Experiments Live."
+                )
+            st.info("La visualizacion live y los checkpoints quedan en Experiments Live.")
+            if result.get("duckdb_path") is not None:
+                st.caption(f"DuckDB: {result['duckdb_path']}")
+            if result.get("model_path") is not None:
+                st.caption(f"Modelo: {result['model_path']}")
+
+        db_paths = list_dynamic_gmm_db_paths()
+        if db_paths:
+            names = [path.name for path in db_paths]
+            selected_name = st.selectbox(
+                "Resultado dinamico guardado",
+                names,
+                index=max(len(names) - 1, 0),
+                key="dynamic_gmm_saved_result",
+            )
+            if st.button("Cargar resultado dinamico", key="load_dynamic_gmm"):
+                path = RESULTS_DIR / selected_name
+                try:
+                    assignments, window_summary, metadata = (
+                        load_dynamic_gmm_results_duckdb(path)
+                    )
+                except Exception as exc:
+                    st.error(f"No se pudo cargar resultado dinamico: {exc}")
+                    return
+                assignments = _ensure_dynamic_window_index(assignments)
+                window_summary = _ensure_dynamic_window_index(window_summary)
+                loaded = {
+                    "assignments": assignments,
+                    "window_summary": window_summary,
+                    "driver_summary": build_dynamic_gmm_driver_summary(assignments),
+                    "metadata": metadata,
+                    "duckdb_path": path,
+                    "model_path": metadata.get("model_path"),
+                }
+                st.session_state["dynamic_gmm_result"] = loaded
+                st.success(f"Resultado cargado: {path.name}")
+
+        stored = st.session_state.get("dynamic_gmm_result")
+        if isinstance(stored, dict) and not run_dynamic:
+            stored_assignments = stored.get("assignments")
+            if isinstance(stored_assignments, pd.DataFrame) and not stored_assignments.empty:
+                _render_dynamic_gmm_results(stored)
+
+
 def _store_metrics(
     method: str,
     feature_cols: List[str],
@@ -1443,6 +2375,14 @@ def _render_gmm(
             min_value=0.0, max_value=1.0, value=0.70, step=0.05,
             help="Si la probabilidad máxima de pertenencia a un cluster es menor a este valor, se marca como Desconocido (-1)."
         )
+    save_membership_probabilities = st.checkbox(
+        "Guardar probabilidades de pertenencia por cluster",
+        value=False,
+        help=(
+            "Solo aplica a GMM. Agrega columnas cluster_prob_* al CSV; "
+            "la generación de variables de accidente las usará como membresía soft."
+        ),
+    )
     
     criterio = st.selectbox("Criterio sugerido", ["bic", "aic"], index=0)
 
@@ -1518,7 +2458,10 @@ def _render_gmm(
                     feature_cols=feature_cols,
                     k=int(k_choice),
                     confidence_threshold_proba=float(confidence_proba),
-                    random_state=42
+                    random_state=42,
+                    include_membership_probabilities=bool(
+                        save_membership_probabilities
+                    ),
                 )
             except Exception as exc:
                 st.error(f"Error en clustering: {exc}")
@@ -1555,6 +2498,9 @@ def _render_gmm(
             extra_params={
                 "k": int(k_choice),
                 "confidence_proba": confidence_proba,
+                "include_membership_probabilities": bool(
+                    save_membership_probabilities
+                ),
             },
             train_params=train_params,
             train_distribution=train_distribution,
@@ -1572,6 +2518,14 @@ def _render_gmm(
         st.subheader("Resumen por cluster")
         st.dataframe(summary_df, width="stretch")
 
+    _render_dynamic_gmm_controls(
+        features_df,
+        feature_cols,
+        int(k_choice),
+        float(confidence_proba),
+        train_params,
+        train_distribution,
+    )
     _render_export_inputs(features_df, metrics_df)
 
 

@@ -75,7 +75,13 @@ def connect_ray_cluster(*, ray_module: Any | None = None) -> RayClusterRuntime:
         ray_module = imported_ray
 
     if not ray_module.is_initialized():
-        ray_module.init(address=config.ray_address, ignore_reinit_error=True)
+        import src as src_package  # type: ignore
+
+        ray_module.init(
+            address=config.ray_address,
+            ignore_reinit_error=True,
+            runtime_env={"py_modules": [src_package]},
+        )
 
     raw_nodes = list(ray_module.nodes() or [])
     alive_nodes = [dict(node) for node in raw_nodes if bool(node.get("Alive"))]

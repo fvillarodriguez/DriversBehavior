@@ -968,8 +968,13 @@ def prepare_ssh_access(
     return [key_result, bootstrap, postcheck]
 
 
-def build_head_start_args(config: RayClusterConfig, *, root_dir: Path = ROOT_DIR) -> list[str]:
-    return [
+def build_head_start_args(
+    config: RayClusterConfig,
+    *,
+    root_dir: Path = ROOT_DIR,
+    block: bool = False,
+) -> list[str]:
+    args = [
         str(ray_bin(root_dir)),
         "start",
         "--head",
@@ -985,6 +990,9 @@ def build_head_start_args(config: RayClusterConfig, *, root_dir: Path = ROOT_DIR
         f"--num-cpus={max(1, int(config.head_cpus))}",
         "--disable-usage-stats",
     ]
+    if block:
+        args.append("--block")
+    return args
 
 
 def build_worker_start_script(config: RayClusterConfig) -> str:
@@ -1099,11 +1107,13 @@ def start_head(config: RayClusterConfig, *, runner: Optional[CommandRunner] = No
             prefix="No se puede iniciar el head mientras existan checks bloqueantes.",
         )
     stop_head(config, runner=active_runner)
-    return active_runner.run(
-        build_head_start_args(config),
+    return run_background_command(
+        build_head_start_args(config, block=True),
         cwd=ROOT_DIR,
-        timeout=config.command_timeout_s,
         env=ray_process_env(),
+        stdout_path=CONFIG_DIR / "head.out.log",
+        stderr_path=CONFIG_DIR / "head.err.log",
+        startup_wait_s=3.0,
     )
 
 
@@ -1269,6 +1279,63 @@ def _bridge_expected_detail(ip: str, netmask: str) -> str:
     return f"{THUNDERBOLT_BRIDGE_NAME} debe quedar en {ip}/{netmask}."
 
 
+def _is_executable_file(path: Path) -> bool:
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def _venv_missing_entries(venv_path: Path) -> list[str]:
+    expected = (
+        venv_path / "bin" / "python",
+        venv_path / "bin" / "ray",
+    )
+    return [str(path.relative_to(venv_path)) for path in expected if not path.exists()]
+
+
+def sync_local_venv(
+    *,
+    root_dir: Path = ROOT_DIR,
+    venv_path: Optional[Path] = None,
+    requirements_path: Optional[Path] = None,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 600,
+) -> CommandResult:
+    effective_root = root_dir.expanduser()
+    effective_venv = (venv_path or (effective_root / ".venv")).expanduser()
+    effective_requirements = (requirements_path or requirements_file(effective_root)).expanduser()
+    python_path = effective_venv / "bin" / "python"
+
+    if not effective_requirements.exists():
+        return CommandResult(
+            ok=False,
+            returncode=2,
+            stderr=f"No existe {effective_requirements}.",
+            command=f"{python_path} -m pip install -r {effective_requirements}",
+        )
+    if not _is_executable_file(python_path):
+        return CommandResult(
+            ok=False,
+            returncode=2,
+            stderr=f"No se puede resincronizar automaticamente porque falta {python_path} o no es ejecutable.",
+            command=f"{python_path} -m pip install -r {effective_requirements}",
+        )
+
+    active_runner = runner or CommandRunner()
+    result = active_runner.run(
+        [str(python_path), "-m", "pip", "install", "-r", str(effective_requirements)],
+        cwd=effective_root,
+        timeout=timeout,
+    )
+    if result.ok:
+        try:
+            os.utime(effective_venv, None)
+        except OSError:
+            pass
+    return result
+
+
 def _tcp_check(
     host: str,
     port: int,
@@ -1293,6 +1360,8 @@ def check_local_venv_sync(
     root_dir: Path = ROOT_DIR,
     venv_path: Optional[Path] = None,
     requirements_path: Optional[Path] = None,
+    runner: Optional[CommandRunner] = None,
+    timeout: int = 600,
 ) -> CheckResult:
     effective_venv = (venv_path or (root_dir / ".venv")).expanduser()
     effective_requirements = (requirements_path or requirements_file(root_dir)).expanduser()
@@ -1310,24 +1379,64 @@ def check_local_venv_sync(
             f"No existe {effective_venv}.",
             blocking=True,
         )
-    python_path = effective_venv / "bin" / "python"
-    ray_path = effective_venv / "bin" / "ray"
-    missing = [str(path.relative_to(effective_venv)) for path in (python_path, ray_path) if not path.exists()]
+    missing = _venv_missing_entries(effective_venv)
     if missing:
+        sync_result: CommandResult | None = None
+        if _is_executable_file(effective_venv / "bin" / "python"):
+            sync_result = sync_local_venv(
+                root_dir=root_dir,
+                venv_path=effective_venv,
+                requirements_path=effective_requirements,
+                runner=runner,
+                timeout=timeout,
+            )
+            if sync_result.ok:
+                missing = _venv_missing_entries(effective_venv)
+                if not missing and effective_venv.stat().st_mtime >= effective_requirements.stat().st_mtime:
+                    return CheckResult(
+                        "Venv local",
+                        True,
+                        f"Venv local resincronizada automaticamente con {effective_requirements.name}.",
+                        sync_result.command,
+                    )
         return CheckResult(
             "Venv local",
             False,
-            f"La venv local no esta completa; faltan {', '.join(missing)}.",
+            (
+                f"La venv local no esta completa; faltan {', '.join(missing)}."
+                if sync_result is None
+                else (
+                    f"La venv local no esta completa; faltan {', '.join(missing)}. "
+                    f"La resincronizacion automatica no alcanzo a corregirlo: {_result_detail(sync_result, '')}"
+                )
+            ),
+            sync_result.command if sync_result else "",
             blocking=True,
         )
     if effective_venv.stat().st_mtime < effective_requirements.stat().st_mtime:
+        sync_result = sync_local_venv(
+            root_dir=root_dir,
+            venv_path=effective_venv,
+            requirements_path=effective_requirements,
+            runner=runner,
+            timeout=timeout,
+        )
+        if sync_result.ok and effective_venv.stat().st_mtime >= effective_requirements.stat().st_mtime:
+            return CheckResult(
+                "Venv local",
+                True,
+                f"Venv local resincronizada automaticamente con {effective_requirements.name}.",
+                sync_result.command,
+            )
         return CheckResult(
             "Venv local",
             False,
             (
                 f"La venv local ({effective_venv}) es mas antigua que {effective_requirements.name}. "
-                "Resincronice dependencias antes de usar Ray."
+                "La resincronizacion automatica no pudo completarse: "
+                f"{_result_detail(sync_result, '')}"
             ),
+            sync_result.command,
             blocking=True,
         )
     return CheckResult(
@@ -1373,27 +1482,47 @@ def check_local_ray_version(
 
 def check_local_ray_dependencies(
     *,
+    root_dir: Path = ROOT_DIR,
     runner: Optional[CommandRunner] = None,
     timeout: int = 10,
+    sync_timeout: int = 600,
 ) -> CheckResult:
+    def run_dependency_probe() -> CommandResult:
+        script = (
+            "import importlib, json, sys\n"
+            "missing = []\n"
+            "for name in sys.argv[1:]:\n"
+            "    try:\n"
+            "        importlib.import_module(name)\n"
+            "    except Exception as exc:\n"
+            "        missing.append({'module': name, 'error': f'{type(exc).__name__}: {exc}'})\n"
+            "if missing:\n"
+            "    print(json.dumps({'missing': missing}, ensure_ascii=False))\n"
+            "    raise SystemExit(1)\n"
+            "print('OK')\n"
+        )
+        return active_runner.run(
+            [str(python_bin(root_dir)), "-c", script, *REQUIRED_RAY_PYTHON_MODULES],
+            timeout=timeout,
+        )
+
+    def parse_missing_modules(result: CommandResult) -> list[str]:
+        missing_modules: list[str] = []
+        payload = result.stdout.strip()
+        if payload.startswith("{"):
+            try:
+                data = json.loads(payload)
+                missing_modules = [
+                    entry.get("module", "")
+                    for entry in data.get("missing", [])
+                    if entry.get("module")
+                ]
+            except Exception:
+                missing_modules = []
+        return missing_modules
+
     active_runner = runner or CommandRunner()
-    script = (
-        "import importlib, json, sys\n"
-        "missing = []\n"
-        "for name in sys.argv[1:]:\n"
-        "    try:\n"
-        "        importlib.import_module(name)\n"
-        "    except Exception as exc:\n"
-        "        missing.append({'module': name, 'error': f'{type(exc).__name__}: {exc}'})\n"
-        "if missing:\n"
-        "    print(json.dumps({'missing': missing}, ensure_ascii=False))\n"
-        "    raise SystemExit(1)\n"
-        "print('OK')\n"
-    )
-    result = active_runner.run(
-        [str(python_bin()), "-c", script, *REQUIRED_RAY_PYTHON_MODULES],
-        timeout=timeout,
-    )
+    result = run_dependency_probe()
     if result.ok:
         return CheckResult(
             "Extras Ray local",
@@ -1402,25 +1531,60 @@ def check_local_ray_dependencies(
             result.command,
         )
 
-    missing_modules = []
-    payload = result.stdout.strip()
-    if payload.startswith("{"):
-        try:
-            data = json.loads(payload)
-            missing_modules = [entry.get("module", "") for entry in data.get("missing", []) if entry.get("module")]
-        except Exception:
-            missing_modules = []
+    missing_modules = parse_missing_modules(result)
     if missing_modules:
+        sync_result = sync_local_venv(
+            root_dir=root_dir,
+            runner=active_runner,
+            timeout=sync_timeout,
+        )
+        if sync_result.ok:
+            retry = run_dependency_probe()
+            if retry.ok:
+                return CheckResult(
+                    "Extras Ray local",
+                    True,
+                    "Extras de dashboard y metrics restaurados automaticamente en la venv local.",
+                    sync_result.command,
+                )
+            missing_modules = parse_missing_modules(retry)
+            if missing_modules:
+                detail = (
+                    "Faltan modulos de Ray en la venv local incluso despues de la resincronizacion automatica: "
+                    + ", ".join(missing_modules)
+                    + "."
+                )
+            else:
+                detail = _result_detail(
+                    retry,
+                    "No se pudo validar los extras de Ray en la venv local despues de la resincronizacion automatica.",
+                )
+            return CheckResult(
+                "Extras Ray local",
+                False,
+                detail,
+                retry.command,
+                blocking=True,
+            )
+
         detail = (
             "Faltan modulos de Ray en la venv local: "
             + ", ".join(missing_modules)
-            + ". Reinstale requirements.txt para recuperar dashboard y metrics."
+            + ". La resincronizacion automatica fallo: "
+            + _result_detail(sync_result, "")
         )
-    else:
-        detail = _result_detail(
-            result,
-            "No se pudo validar los extras de Ray en la venv local.",
+        return CheckResult(
+            "Extras Ray local",
+            False,
+            detail,
+            sync_result.command,
+            blocking=True,
         )
+
+    detail = _result_detail(
+        result,
+        "No se pudo validar los extras de Ray en la venv local.",
+    )
     return CheckResult(
         "Extras Ray local",
         False,
@@ -1589,7 +1753,7 @@ def local_ray_environment_checks(
     runner: Optional[CommandRunner] = None,
 ) -> list[CheckResult]:
     return [
-        check_local_venv_sync(),
+        check_local_venv_sync(runner=runner),
         check_local_python_version(runner=runner),
         check_local_ray_version(config, runner=runner),
         check_local_ray_dependencies(runner=runner),

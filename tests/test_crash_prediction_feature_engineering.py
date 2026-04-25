@@ -126,3 +126,97 @@ def test_compute_cluster_features_polars_input():
     ]
     for col in expected_cols:
         assert col in result.columns
+
+
+def test_compute_cluster_features_soft_membership_pandas():
+    flows_df = pd.DataFrame(
+        {
+            "FECHA": pd.to_datetime(
+                ["2023-01-01 10:00:00", "2023-01-01 10:01:00"]
+            ),
+            "VELOCIDAD": [80.0, 100.0],
+            "MATRICULA": ["A1", "A2"],
+            "PORTICO": ["P1", "P1"],
+        }
+    )
+    cluster_df = pd.DataFrame(
+        {
+            "plate": ["A1", "A2"],
+            "cluster_prob_0": [0.75, 0.25],
+            "cluster_prob_1": [0.25, 0.75],
+        }
+    )
+
+    result = compute_cluster_features(
+        flows_df,
+        cluster_df,
+        interval_minutes=5,
+        lanes=1,
+        include_counts=True,
+        include_speed=True,
+    )
+
+    row = result.iloc[0]
+    assert row["cluster_share_0"] == pytest.approx(0.5)
+    assert row["cluster_share_1"] == pytest.approx(0.5)
+    assert row["cluster_flow_0"] == pytest.approx(12.0)
+    assert row["cluster_flow_1"] == pytest.approx(12.0)
+    assert row["cluster_speed_0"] == pytest.approx(85.0)
+    assert row["cluster_speed_1"] == pytest.approx(95.0)
+
+
+def test_compute_cluster_features_soft_membership_polars_matches_pandas():
+    flows_pd = pd.DataFrame(
+        {
+            "FECHA": pd.to_datetime(
+                ["2023-01-01 10:00:00", "2023-01-01 10:01:00"]
+            ),
+            "VELOCIDAD": [80.0, 100.0],
+            "MATRICULA": ["A1", "A2"],
+            "PORTICO": ["P1", "P1"],
+        }
+    )
+    cluster_df = pd.DataFrame(
+        {
+            "plate": ["A1", "A2"],
+            "cluster_prob_0": [0.75, 0.25],
+            "cluster_prob_1": [0.25, 0.75],
+        }
+    )
+
+    pandas_result = compute_cluster_features(
+        flows_pd,
+        cluster_df,
+        interval_minutes=5,
+        lanes=1,
+        include_counts=True,
+        include_speed=True,
+        include_density=True,
+        include_entropy=True,
+    )
+    polars_result = compute_cluster_features(
+        pl.from_pandas(flows_pd),
+        cluster_df,
+        interval_minutes=5,
+        lanes=1,
+        include_counts=True,
+        include_speed=True,
+        include_density=True,
+        include_entropy=True,
+    )
+
+    metric_cols = [
+        "cluster_share_0",
+        "cluster_share_1",
+        "cluster_flow_0",
+        "cluster_flow_1",
+        "cluster_speed_0",
+        "cluster_speed_1",
+        "cluster_density_0",
+        "cluster_density_1",
+        "cluster_entropy",
+    ]
+    for col in metric_cols:
+        assert polars_result.iloc[0][col] == pytest.approx(
+            pandas_result.iloc[0][col]
+        )

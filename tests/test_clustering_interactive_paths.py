@@ -55,7 +55,7 @@ def _patch_common_flow(monkeypatch, tmp_path: Path, method: str) -> dict:
     monkeypatch.setattr(
         clustering,
         "save_cluster_features_duckdb",
-        lambda df, db_path=None: db_path or tmp_path / "cluster_features.duckdb",
+        lambda df, db_path=None, **kwargs: db_path or tmp_path / "cluster_features.duckdb",
     )
     monkeypatch.setattr(
         clustering,

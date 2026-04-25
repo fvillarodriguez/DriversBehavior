@@ -58,6 +58,14 @@ def test_build_head_start_args_uses_fixed_ray_ports():
     assert "--disable-usage-stats" in args
 
 
+def test_build_head_start_args_supports_block_mode():
+    config = manager.RayClusterConfig(head_ip="10.10.10.1", head_cpus=8)
+
+    args = manager.build_head_start_args(config, root_dir=Path("/repo"), block=True)
+
+    assert "--block" in args
+
+
 def test_automatic_bridge_config_forces_default_bridge_profile():
     config = manager.RayClusterConfig(
         head_ip="192.168.1.10",
@@ -255,7 +263,34 @@ def test_check_local_venv_sync_detects_stale_venv(tmp_path: Path):
     assert "mas antigua" in check.detail
 
 
-def test_check_local_ray_dependencies_reports_missing_modules():
+def test_check_local_venv_sync_auto_resyncs_stale_venv(tmp_path: Path):
+    venv_path = tmp_path / ".venv"
+    python_path = venv_path / "bin" / "python"
+    ray_path = venv_path / "bin" / "ray"
+    python_path.parent.mkdir(parents=True)
+    python_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python_path.chmod(0o755)
+    ray_path.write_text("", encoding="utf-8")
+    requirements_path = tmp_path / "requirements.txt"
+    requirements_path.write_text("ray[default]==2.53.0\n", encoding="utf-8")
+    os.utime(venv_path, (1, 1))
+    os.utime(requirements_path, (2, 2))
+    fake = FakeRunner([manager.CommandResult(ok=True, returncode=0, stdout="ok\n", command="pip install")])
+
+    check = manager.check_local_venv_sync(
+        root_dir=tmp_path,
+        venv_path=venv_path,
+        requirements_path=requirements_path,
+        runner=fake,
+    )
+
+    assert check.ok
+    assert "resincronizada automaticamente" in check.detail
+    assert fake.calls[0][-2:] == ["-r", str(requirements_path)]
+
+
+def test_check_local_ray_dependencies_reports_missing_modules(tmp_path: Path):
+    (tmp_path / "requirements.txt").write_text("ray[default]==2.53.0\n", encoding="utf-8")
     fake = FakeRunner(
         [
             manager.CommandResult(
@@ -275,12 +310,46 @@ def test_check_local_ray_dependencies_reports_missing_modules():
         ]
     )
 
-    check = manager.check_local_ray_dependencies(runner=fake)
+    check = manager.check_local_ray_dependencies(root_dir=tmp_path, runner=fake)
 
     assert not check.ok
     assert check.blocking
     assert "aiohttp_cors" in check.detail
     assert "opencensus" in check.detail
+
+
+def test_check_local_ray_dependencies_auto_resyncs_missing_modules(tmp_path: Path):
+    python_path = tmp_path / ".venv" / "bin" / "python"
+    python_path.parent.mkdir(parents=True)
+    python_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python_path.chmod(0o755)
+    (tmp_path / "requirements.txt").write_text("ray[default]==2.53.0\n", encoding="utf-8")
+    fake = FakeRunner(
+        [
+            manager.CommandResult(
+                ok=False,
+                returncode=1,
+                stdout=json.dumps(
+                    {
+                        "missing": [
+                            {"module": "aiohttp_cors", "error": "ModuleNotFoundError: missing"},
+                            {"module": "opencensus", "error": "ModuleNotFoundError: missing"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                command="python -c",
+            ),
+            manager.CommandResult(ok=True, returncode=0, stdout="installed\n", command="pip install"),
+            manager.CommandResult(ok=True, returncode=0, stdout="OK\n", command="python -c"),
+        ]
+    )
+
+    check = manager.check_local_ray_dependencies(root_dir=tmp_path, runner=fake)
+
+    assert check.ok
+    assert "restaurados automaticamente" in check.detail
+    assert fake.calls[1][-2:] == ["-r", str(tmp_path / "requirements.txt")]
 
 
 def test_check_tmp_disk_headroom_warns_and_blocks(monkeypatch: pytest.MonkeyPatch):

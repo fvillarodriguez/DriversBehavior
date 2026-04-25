@@ -109,3 +109,22 @@ def test_assign_clusters_gmm():
     assert r2["cluster_label"] == -1
     assert 0.0 <= threshold <= 1.0
     assert 0.0 <= r2["confidence_score"] < r1["confidence_score"] <= 1.0
+    assert not any(col.startswith("cluster_prob_") for col in full_df.columns)
+
+    full_soft_df, _model, _threshold = assign_clusters_gmm(
+        freq_df,
+        rare_df,
+        ["val"],
+        k=2,
+        confidence_threshold_proba=0.9,
+        include_membership_probabilities=True,
+    )
+
+    prob_cols = ["cluster_prob_0", "cluster_prob_1"]
+    for col in prob_cols:
+        assert col in full_soft_df.columns
+    for value in full_soft_df[prob_cols].sum(axis=1):
+        assert value == pytest.approx(1.0)
+    r2_soft = full_soft_df[full_soft_df["plate"] == "R2"].iloc[0]
+    assert r2_soft["cluster_label"] == -1
+    assert r2_soft[prob_cols].sum() == pytest.approx(1.0)

@@ -501,6 +501,184 @@ def test_build_live_sources_includes_calibration_experiment_manifests(
     assert "calibration_sweep_demo" in str(sources[0]["label"])
 
 
+def test_build_live_sources_includes_model_optuna_batch_manifests(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(
+        live_app,
+        "CALIBRATION_EXPERIMENTS_DIR",
+        tmp_path / "calibration_experiment_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "DRIFT_RUNS_DIR",
+        tmp_path / "drift_recalibration_runs",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NEURAL_DRIFT_EXPERIMENTS_DIR",
+        tmp_path / "neural_drift_experiments",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_PAPER_RUNS_DIR",
+        tmp_path / "nlp_in_severity" / "paper_replication",
+    )
+    monkeypatch.setattr(
+        live_app,
+        "NLP_LANGUAGE_MODELING_LIVE_DIR",
+        tmp_path / "nlp_in_severity" / "language_modeling_live",
+    )
+
+    run_dir = (
+        tmp_path
+        / "model_history"
+        / "optuna_batch_live"
+        / "model_optuna_batch_demo"
+    )
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "model_optuna_batch_demo",
+                "status": "running",
+                "result_status": "running",
+                "updated_at": "2026-04-23T17:30:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sources = live_app._build_live_sources()
+
+    assert len(sources) == 1
+    assert sources[0]["type"] == "model_optuna_batch"
+    assert "Modelos | batch Optuna" in str(sources[0]["label"])
+    assert "model_optuna_batch_demo" in str(sources[0]["label"])
+
+
+def test_read_model_optuna_batch_run_loads_progress_artifacts(tmp_path):
+    run_dir = (
+        tmp_path
+        / "model_history"
+        / "optuna_batch_live"
+        / "model_optuna_batch_demo"
+    )
+    run_dir.mkdir(parents=True)
+    manifest_path = run_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": "model_optuna_batch_demo",
+                "status": "running",
+                "result_status": "running",
+                "updated_at": "2026-04-23T17:31:00",
+                "progress": {
+                    "completed_steps": 1,
+                    "total_steps": 2,
+                    "current_step_id": "combo_done",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    live_status = {
+        "timestamp": "2026-04-23T17:31:00",
+        "step_id": "combo_done",
+        "message": "Base | Sin SMOTE | Candidato 1 | Conservador completado.",
+        "progress_ratio": 0.5,
+        "model_name": "XGBoost",
+        "objective_metric": "balanced_f1",
+        "calibration_method": "sigmoid",
+        "threshold_objective": "far",
+        "threshold_protocol": "conservative",
+        "backend": "local",
+    }
+    (run_dir / "live_status.json").write_text(
+        json.dumps(live_status),
+        encoding="utf-8",
+    )
+    (run_dir / "live_events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-23T17:30:00",
+                        "step_id": "run_start",
+                        "step_status": "running",
+                        "message": "Entrenando batch Optuna...",
+                        "progress": {
+                            "completed_steps": 0,
+                            "total_steps": 2,
+                            "progress_ratio": 0.0,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-23T17:31:00",
+                        "step_id": "combo_done",
+                        "step_status": "completed",
+                        "message": "Combo completado.",
+                        "combo_index": 1,
+                        "total_combinations": 2,
+                        "model_name": "XGBoost",
+                        "objective_metric": "balanced_f1",
+                        "calibration_method": "sigmoid",
+                        "threshold_objective": "far",
+                        "threshold_protocol": "conservative",
+                        "balance_mode": "none",
+                        "progress": {
+                            "completed_steps": 1,
+                            "total_steps": 2,
+                            "progress_ratio": 0.5,
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        [
+            {
+                "status": "completed",
+                "combo_id": "a",
+                "model_name": "XGBoost",
+                "objective_metric": "balanced_f1",
+                "calibration_method": "sigmoid",
+                "threshold_objective": "far",
+                "threshold_protocol": "conservative",
+                "balance_mode": "none",
+                "val_balanced_f1": 0.42,
+                "test_balanced_f1": 0.40,
+            },
+            {
+                "status": "failed",
+                "combo_id": "b",
+                "model_name": "XGBoost",
+                "objective_metric": "balanced_f1",
+                "val_balanced_f1": None,
+            },
+        ]
+    ).to_csv(run_dir / "partial_results.csv", index=False)
+
+    payload = live_app._read_model_optuna_batch_run(manifest_path)
+
+    assert payload["current_context"]["model_name"] == "XGBoost"
+    assert payload["current_context"]["progress_ratio"] == pytest.approx(0.5)
+    assert payload["live_events_df"]["progress_pct"].iloc[-1] == pytest.approx(50.0)
+    assert payload["live_events_df"]["combo_index"].iloc[-1] == 1
+    assert len(payload["partial_results_df"]) == 2
+    curve_df = live_app._calibration_progress_curve_df(
+        payload["partial_results_df"],
+        metric_col="val_balanced_f1",
+    )
+    assert curve_df["best_so_far"].tolist() == pytest.approx([0.42])
+
+
 def test_read_language_modeling_run_loads_live_artifacts(tmp_path):
     run_dir = tmp_path / "nlp_in_severity" / "language_modeling_live" / "language_search_demo"
     run_dir.mkdir(parents=True)

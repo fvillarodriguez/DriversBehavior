@@ -6,6 +6,7 @@ tqdm==4.67.1
 duckdb==1.4.3
 scikit-learn==1.8.0
 numpy==2.4.0
+mlx; platform_system == "Darwin" and platform_machine == "arm64"
 streamlit==1.52.2
 plotly==6.5.1
 pytest==9.0.2

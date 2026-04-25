@@ -1528,6 +1528,35 @@ def _sanitize_cluster_label(value: object) -> str:
     return _slugify(text)
 
 
+def _cluster_probability_columns(
+    columns: Sequence[object],
+    probability_prefix: str = "cluster_prob_",
+) -> List[str]:
+    def sort_key(column: str) -> Tuple[int, Union[int, str]]:
+        suffix = column[len(probability_prefix):]
+        try:
+            return (0, int(suffix))
+        except ValueError:
+            return (1, suffix)
+
+    prob_cols = [
+        str(column)
+        for column in columns
+        if str(column).startswith(probability_prefix)
+    ]
+    return sorted(prob_cols, key=sort_key)
+
+
+def _cluster_label_from_probability_column(
+    column: object,
+    probability_prefix: str = "cluster_prob_",
+) -> str:
+    text = str(column)
+    if text.startswith(probability_prefix):
+        return text[len(probability_prefix):] or "unknown"
+    return text
+
+
 def buscar_columna(
     df: pd.DataFrame,
     nombre_esperado: str,
@@ -2318,6 +2347,8 @@ def compute_cluster_features(
     plate_col_cluster: str = "plate",
     cluster_col: str = "cluster_label",
     speed_col: str = "VELOCIDAD",
+    use_soft_membership: bool = True,
+    probability_prefix: str = "cluster_prob_",
 ) -> pd.DataFrame:
     """
     Calcula proporciones de clusters por portico e intervalo, y Flow/Speed/Density/Delta.
@@ -2356,12 +2387,18 @@ def compute_cluster_features(
             plate_col_cluster=plate_col_cluster,
             cluster_col=cluster_col,
             speed_col=speed_col,
+            use_soft_membership=use_soft_membership,
+            probability_prefix=probability_prefix,
         )
     if _is_empty_df(flows_df):
         return pd.DataFrame()
     if _is_empty_df(cluster_labels_df):
         return pd.DataFrame()
-    if cluster_col not in cluster_labels_df.columns:
+    probability_cols = _cluster_probability_columns(
+        cluster_labels_df.columns, probability_prefix
+    )
+    use_soft = bool(use_soft_membership and probability_cols)
+    if not use_soft and cluster_col not in cluster_labels_df.columns:
         raise ValueError("El archivo de clusters no contiene 'cluster_label'.")
     if plate_col_cluster not in cluster_labels_df.columns:
         raise ValueError("El archivo de clusters no contiene la columna de placas.")
@@ -2387,15 +2424,27 @@ def compute_cluster_features(
     if df.empty:
         return pd.DataFrame()
 
-    clusters = cluster_labels_df[[plate_col_cluster, cluster_col]].copy()
+    if use_soft:
+        cluster_value_cols = list(probability_cols)
+    else:
+        cluster_value_cols = [cluster_col]
+
+    clusters = cluster_labels_df[[plate_col_cluster] + cluster_value_cols].copy()
     clusters["plate_clean"] = normalize_plate_series(clusters[plate_col_cluster])
     clusters = clusters.dropna(subset=["plate_clean"])
+    if use_soft:
+        for prob_col in probability_cols:
+            clusters[prob_col] = pd.to_numeric(
+                clusters[prob_col], errors="coerce"
+            ).fillna(0.0)
+    else:
+        clusters = clusters.dropna(subset=[cluster_col])
     clusters = clusters.drop_duplicates(subset=["plate_clean"])
     if clusters.empty:
         return pd.DataFrame()
 
     merged = df.merge(
-        clusters[["plate_clean", cluster_col]],
+        clusters[["plate_clean"] + cluster_value_cols],
         on="plate_clean",
         how="inner",
     )
@@ -2405,20 +2454,61 @@ def compute_cluster_features(
     merged["interval_start"] = merged[timestamp_col].dt.floor(
         f"{interval_minutes}min"
     )
-    grouped = merged.groupby(
-        [portico_col, "interval_start", cluster_col]
-    ).agg(count=("plate_clean", "size"))
-    if need_speed:
-        grouped["speed_mean"] = merged.groupby(
-            [portico_col, "interval_start", cluster_col]
-        )[speed_col].mean()
-    grouped = grouped.reset_index()
+    group_keys = [portico_col, "interval_start", cluster_col]
+    if use_soft:
+        id_cols = [portico_col, "interval_start", "plate_clean"]
+        if need_speed:
+            id_cols.append(speed_col)
+        long = merged.melt(
+            id_vars=id_cols,
+            value_vars=probability_cols,
+            var_name="_cluster_probability_col",
+            value_name="membership_weight",
+        )
+        long["membership_weight"] = pd.to_numeric(
+            long["membership_weight"], errors="coerce"
+        ).fillna(0.0)
+        long[cluster_col] = long["_cluster_probability_col"].map(
+            lambda col: _cluster_label_from_probability_column(
+                col, probability_prefix
+            )
+        )
+        agg_spec = {
+            "count": ("membership_weight", "sum"),
+            "total": ("plate_clean", "size"),
+        }
+        if need_speed:
+            valid_speed = long[speed_col].notna()
+            long["_weighted_speed"] = (
+                long[speed_col].where(valid_speed, 0.0)
+                * long["membership_weight"]
+            )
+            long["_speed_weight"] = long["membership_weight"].where(
+                valid_speed, 0.0
+            )
+            agg_spec["_weighted_speed_sum"] = ("_weighted_speed", "sum")
+            agg_spec["_speed_weight_sum"] = ("_speed_weight", "sum")
+        grouped = long.groupby(group_keys).agg(**agg_spec).reset_index()
+        if need_speed:
+            denom = grouped["_speed_weight_sum"].replace(0, np.nan)
+            grouped["speed_mean"] = (
+                grouped["_weighted_speed_sum"] / denom
+            ).fillna(0.0)
+            grouped = grouped.drop(
+                columns=["_weighted_speed_sum", "_speed_weight_sum"]
+            )
+    else:
+        grouped = merged.groupby(group_keys).agg(count=("plate_clean", "size"))
+        if need_speed:
+            grouped["speed_mean"] = merged.groupby(group_keys)[speed_col].mean()
+        grouped = grouped.reset_index()
     if grouped.empty:
         return pd.DataFrame()
 
-    grouped["total"] = grouped.groupby([portico_col, "interval_start"])[
-        "count"
-    ].transform("sum")
+    if "total" not in grouped.columns:
+        grouped["total"] = grouped.groupby([portico_col, "interval_start"])[
+            "count"
+        ].transform("sum")
     grouped["share"] = grouped["count"] / grouped["total"].replace(0, 1)
     interval_factor = 60.0 / max(1, interval_minutes)
     lanes_value = max(1, lanes)
@@ -2565,6 +2655,8 @@ def _compute_cluster_features_polars(
     plate_col_cluster: str = "plate",
     cluster_col: str = "cluster_label",
     speed_col: str = "VELOCIDAD",
+    use_soft_membership: bool = True,
+    probability_prefix: str = "cluster_prob_",
 ) -> pd.DataFrame:
     if flows_df is None or flows_df.is_empty():
         return pd.DataFrame()
@@ -2576,7 +2668,11 @@ def _compute_cluster_features_polars(
         if cluster_labels_df.is_empty():
             return pd.DataFrame()
         labels = cluster_labels_df
-    if cluster_col not in labels.columns:
+    probability_cols = _cluster_probability_columns(
+        labels.columns, probability_prefix
+    )
+    use_soft = bool(use_soft_membership and probability_cols)
+    if not use_soft and cluster_col not in labels.columns:
         raise ValueError("El archivo de clusters no contiene 'cluster_label'.")
     if plate_col_cluster not in labels.columns:
         raise ValueError("El archivo de clusters no contiene la columna de placas.")
@@ -2623,16 +2719,16 @@ def _compute_cluster_features_polars(
     if need_speed:
         flow_cols.append(speed_col)
 
-        work = flows_df.select(flow_cols).with_columns(
-            [
-                time_expr.alias(timestamp_col),
-                pl.col(portico_col)
-                .cast(pl.Utf8, strict=False)
-                .str.strip_chars()
-                .alias(portico_col),
-                _normalize_plate_expr(plate_col_flow).alias("plate_clean"),
-            ]
-        )
+    work = flows_df.select(flow_cols).with_columns(
+        [
+            time_expr.alias(timestamp_col),
+            pl.col(portico_col)
+            .cast(pl.Utf8, strict=False)
+            .str.strip_chars()
+            .alias(portico_col),
+            _normalize_plate_expr(plate_col_flow).alias("plate_clean"),
+        ]
+    )
     if need_speed:
         work = work.with_columns(
             pl.col(speed_col).cast(pl.Float64, strict=False)
@@ -2643,16 +2739,33 @@ def _compute_cluster_features_polars(
     if work.is_empty():
         return pd.DataFrame()
 
-    labels = labels.select([plate_col_cluster, cluster_col]).with_columns(
+    if use_soft:
+        label_cols = [plate_col_cluster] + probability_cols
+    else:
+        label_cols = [plate_col_cluster, cluster_col]
+    labels = labels.select(label_cols).with_columns(
         _normalize_plate_expr(plate_col_cluster).alias("plate_clean")
     )
-    labels = labels.drop_nulls([plate_col_cluster, cluster_col, "plate_clean"])
+    if use_soft:
+        labels = labels.with_columns(
+            [
+                pl.col(prob_col)
+                .cast(pl.Float64, strict=False)
+                .fill_null(0.0)
+                .alias(prob_col)
+                for prob_col in probability_cols
+            ]
+        )
+        labels = labels.drop_nulls([plate_col_cluster, "plate_clean"])
+    else:
+        labels = labels.drop_nulls([plate_col_cluster, cluster_col, "plate_clean"])
     labels = labels.unique(subset=["plate_clean"])
     if labels.is_empty():
         return pd.DataFrame()
 
+    label_join_cols = probability_cols if use_soft else [cluster_col]
     merged = work.join(
-        labels.select(["plate_clean", cluster_col]),
+        labels.select(["plate_clean"] + label_join_cols),
         on="plate_clean",
         how="inner",
     )
@@ -2665,18 +2778,76 @@ def _compute_cluster_features_polars(
         .alias("interval_start")
     )
 
-    agg_exprs = [pl.len().alias("count")]
-    if need_speed:
-        agg_exprs.append(pl.col(speed_col).mean().alias("speed_mean"))
-    grouped = merged.group_by(
-        [portico_col, "interval_start", cluster_col]
-    ).agg(agg_exprs)
+    group_keys = [portico_col, "interval_start", cluster_col]
+    if use_soft:
+        id_vars = [portico_col, "interval_start", "plate_clean"]
+        if need_speed:
+            id_vars.append(speed_col)
+        long = merged.unpivot(
+            index=id_vars,
+            on=probability_cols,
+            variable_name="_cluster_probability_col",
+            value_name="membership_weight",
+        ).with_columns(
+            [
+                pl.col("membership_weight")
+                .cast(pl.Float64, strict=False)
+                .fill_null(0.0),
+                pl.col("_cluster_probability_col")
+                .str.strip_prefix(probability_prefix)
+                .alias(cluster_col),
+            ]
+        )
+        agg_exprs = [
+            pl.col("membership_weight").sum().alias("count"),
+            pl.len().alias("total"),
+        ]
+        if need_speed:
+            long = long.with_columns(
+                [
+                    (
+                        pl.when(pl.col(speed_col).is_not_null())
+                        .then(pl.col(speed_col) * pl.col("membership_weight"))
+                        .otherwise(0.0)
+                    ).alias("_weighted_speed"),
+                    (
+                        pl.when(pl.col(speed_col).is_not_null())
+                        .then(pl.col("membership_weight"))
+                        .otherwise(0.0)
+                    ).alias("_speed_weight"),
+                ]
+            )
+            agg_exprs.extend(
+                [
+                    pl.col("_weighted_speed").sum().alias("_weighted_speed_sum"),
+                    pl.col("_speed_weight").sum().alias("_speed_weight_sum"),
+                ]
+            )
+        grouped = long.group_by(group_keys).agg(agg_exprs)
+        if need_speed:
+            grouped = grouped.with_columns(
+                pl.when(pl.col("_speed_weight_sum") == 0)
+                .then(0.0)
+                .otherwise(
+                    pl.col("_weighted_speed_sum") / pl.col("_speed_weight_sum")
+                )
+                .alias("speed_mean")
+            ).drop(["_weighted_speed_sum", "_speed_weight_sum"])
+    else:
+        agg_exprs = [pl.len().alias("count")]
+        if need_speed:
+            agg_exprs.append(pl.col(speed_col).mean().alias("speed_mean"))
+        grouped = merged.group_by(group_keys).agg(agg_exprs)
     if grouped.is_empty():
         return pd.DataFrame()
 
     interval_factor = 60.0 / max(1, interval_minutes)
     lanes_value = max(1, lanes)
-    total_expr = pl.col("count").sum().over([portico_col, "interval_start"])
+    total_expr = (
+        pl.col("total")
+        if use_soft
+        else pl.col("count").sum().over([portico_col, "interval_start"])
+    )
     grouped = grouped.with_columns(
         [
             total_expr.alias("total"),
