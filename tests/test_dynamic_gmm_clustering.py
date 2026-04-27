@@ -72,6 +72,49 @@ def test_build_dynamic_gmm_windows_uses_full_daily_sliding_windows():
     assert windows[0][1] == pd.Timestamp("2024-01-04")
 
 
+def test_resolve_dynamic_gmm_output_dir_accepts_custom_directory(tmp_path):
+    target = tmp_path / "dynamic_outputs"
+
+    resolved, error = clustering_app._resolve_dynamic_gmm_output_dir(target)
+
+    assert error is None
+    assert resolved == target.resolve()
+
+
+def test_resolve_dynamic_gmm_output_dir_rejects_files(tmp_path):
+    target = tmp_path / "not_a_directory.txt"
+    target.write_text("content", encoding="utf-8")
+
+    resolved, error = clustering_app._resolve_dynamic_gmm_output_dir(target)
+
+    assert resolved == target.resolve()
+    assert error is not None
+    assert "no es una carpeta" in error
+
+
+def test_build_prevalent_plate_selection_ranks_and_selects_exactly():
+    features = pd.DataFrame(
+        {
+            "plate": ["A", "B", "C", "D", "E"],
+            "feature": [1, 2, 3, 4, 5],
+            "n_months_active": [3, 3, 2, 1, 1],
+            "n_years_active": [1, 2, 2, 2, 1],
+            "total_passes": [100, 20, 200, 10, 500],
+        }
+    )
+
+    selection = clustering.build_prevalent_plate_selection(
+        features,
+        fraction_pct=40,
+        feature_cols=["feature"],
+    )
+
+    assert selection["selected_count"] == 2
+    assert selection["total_valid_plates"] == 5
+    assert selection["plates"] == ["B", "A"]
+    assert selection["ranked"]["plate"].tolist() == ["B", "A", "C", "D", "E"]
+
+
 def test_predict_gmm_cluster_membership_marks_low_confidence_and_support():
     class FixedGmm:
         n_components = 2
@@ -162,6 +205,82 @@ def test_run_dynamic_gmm_clustering_uses_fixed_model_across_windows(monkeypatch)
     assert [event["window_index"] for event in events] == [1, 2]
     assert [event["status"] for event in events] == ["completed", "completed"]
     assert events[0]["assignments"]["window_index"].tolist() == [1, 1]
+
+
+def test_run_dynamic_gmm_clustering_prevalent_scope_filters_window_plates(monkeypatch):
+    base_features = pd.DataFrame(
+        {
+            "plate": ["A", "B", "C", "D", "E"],
+            "feature": [1.0, 6.0, 2.0, 7.0, 3.0],
+            "total_passes": [20, 20, 20, 20, 20],
+            "n_days_active": [3, 3, 3, 3, 3],
+            "n_months_active": [5, 1, 4, 2, 3],
+            "n_years_active": [2, 1, 2, 1, 1],
+        }
+    )
+    monkeypatch.setattr(
+        clustering,
+        "fit_gmm_cluster_model",
+        lambda *args, **kwargs: (ThresholdGmm(), IdentityScaler()),
+    )
+    monkeypatch.setattr(
+        clustering,
+        "load_flujos_range",
+        lambda start, end: pd.DataFrame(
+            {
+                "FECHA": [pd.Timestamp(start)] * 5,
+                "MATRICULA": ["A", "B", "C", "D", "E"],
+                "VELOCIDAD": [80, 81, 82, 83, 84],
+                "PORTICO": ["P1"] * 5,
+                "CARRIL": [1] * 5,
+            }
+        ),
+    )
+    seen_window_plates = []
+
+    def fake_clusterization(flujos_df, flow_cols, *args, **kwargs):
+        plates = sorted(flujos_df[flow_cols.plate_id].astype(str).unique().tolist())
+        seen_window_plates.append(plates)
+        feature_by_plate = {"A": 1.0, "B": 6.0, "C": 2.0, "D": 7.0, "E": 3.0}
+        return pd.DataFrame(
+            {
+                "plate": plates,
+                "feature": [feature_by_plate[plate] for plate in plates],
+                "total_passes": [6] * len(plates),
+            }
+        )
+
+    monkeypatch.setattr(clustering, "Clusterization", fake_clusterization)
+
+    result = clustering.run_dynamic_gmm_clustering(
+        base_features_df=base_features,
+        feature_cols=["feature"],
+        flow_cols=clustering.FlowColumns(),
+        ttc_max_map=None,
+        k=2,
+        confidence_threshold_proba=0.7,
+        window_days=2,
+        date_start=pd.Timestamp("2024-01-01"),
+        date_end=pd.Timestamp("2024-01-03"),
+        min_window_passes=5,
+        train_params={
+            "min_total_passes": 1,
+            "min_days_active": 1,
+            "min_months_active": 1,
+        },
+        persist=False,
+        assignment_scope="prevalent",
+        prevalent_fraction_pct=40,
+    )
+
+    assignments = result["assignments"]
+    assert seen_window_plates == [["A", "C"], ["A", "C"]]
+    assert assignments["plate"].tolist() == ["A", "C", "A", "C"]
+    assert result["metadata"]["assignment_scope"] == "prevalent"
+    assert result["metadata"]["prevalent_fraction_pct"] == 40.0
+    assert result["metadata"]["prevalent_plate_count"] == 2
+    assert result["metadata"]["prevalent_valid_plate_count"] == 5
+    assert result["metadata"]["prevalent_source"] == "historical_features"
 
 
 def test_run_dynamic_gmm_clustering_can_omit_membership_probabilities(monkeypatch):
@@ -479,6 +598,58 @@ def test_run_dynamic_gmm_clustering_persists_incrementally(tmp_path, monkeypatch
     assert run_status == ("completed", 4)
 
 
+def test_dynamic_gmm_append_df_aligns_variable_window_summary_schema(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+
+    db_path = tmp_path / "dynamic_gmm_schema_test.duckdb"
+    conn = duckdb.connect(str(db_path))
+    try:
+        first = pd.DataFrame(
+            {
+                "run_id": ["run"],
+                "window_index": [1],
+                "window_label": ["w1"],
+                "rows": [10],
+                "cluster_count_-1": [2],
+                "cluster_share_-1": [0.2],
+                "cluster_count_0": [8],
+                "cluster_share_0": [0.8],
+            }
+        )
+        second = pd.DataFrame(
+            {
+                "run_id": ["run"],
+                "window_index": [2],
+                "window_label": ["w2"],
+                "rows": [5],
+                "cluster_count_1": [5],
+                "cluster_share_1": [1.0],
+            }
+        )
+        clustering._dynamic_gmm_append_df(
+            conn,
+            clustering.DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME,
+            first,
+        )
+        clustering._dynamic_gmm_append_df(
+            conn,
+            clustering.DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME,
+            second,
+        )
+        loaded = conn.execute(
+            f"SELECT * FROM {clustering.DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME} "
+            "ORDER BY window_index"
+        ).df()
+    finally:
+        conn.close()
+
+    assert loaded["window_index"].tolist() == [1, 2]
+    assert loaded.loc[1, "cluster_count_-1"] == 0
+    assert loaded.loc[1, "cluster_share_-1"] == 0.0
+    assert loaded.loc[0, "cluster_count_1"] == 0
+    assert loaded.loc[0, "cluster_share_1"] == 0.0
+
+
 def test_run_dynamic_gmm_clustering_resume_skips_completed_windows(tmp_path, monkeypatch):
     duckdb = pytest.importorskip("duckdb")
     pytest.importorskip("joblib")
@@ -613,7 +784,7 @@ def test_run_dynamic_gmm_clustering_rejects_incompatible_resume(tmp_path, monkey
         run_id="dynamic_gmm_incompatible_test",
     )
 
-    with pytest.raises(ValueError, match="parametros no coinciden"):
+    with pytest.raises(ValueError) as exc_info:
         clustering.run_dynamic_gmm_clustering(
             base_features_df=base_features,
             feature_cols=["feature"],
@@ -636,6 +807,87 @@ def test_run_dynamic_gmm_clustering_rejects_incompatible_resume(tmp_path, monkey
             resume_existing=True,
             load_final_result=False,
         )
+    message = str(exc_info.value)
+    assert "parametros no coinciden" in message
+    assert "Variables diferentes" in message
+    assert "confidence_threshold_proba" in message
+    assert "checkpoint=0.7" in message
+    assert "actual=0.6" in message
+
+
+def test_run_dynamic_gmm_clustering_rejects_prevalent_fraction_resume_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("joblib")
+
+    base_features = pd.DataFrame(
+        {
+            "plate": ["A", "B", "C", "D", "E"],
+            "feature": [1.0, 6.0, 2.0, 7.0, 3.0],
+            "total_passes": [20, 20, 20, 20, 20],
+            "n_days_active": [3, 3, 3, 3, 3],
+            "n_months_active": [5, 1, 4, 2, 3],
+            "n_years_active": [2, 1, 2, 1, 1],
+        }
+    )
+    _patch_dynamic_gmm_dependencies(monkeypatch)
+
+    first = clustering.run_dynamic_gmm_clustering(
+        base_features_df=base_features,
+        feature_cols=["feature"],
+        flow_cols=clustering.FlowColumns(),
+        ttc_max_map=None,
+        k=2,
+        confidence_threshold_proba=0.7,
+        window_days=2,
+        date_start=pd.Timestamp("2024-01-01"),
+        date_end=pd.Timestamp("2024-01-03"),
+        min_window_passes=5,
+        train_params={
+            "min_total_passes": 1,
+            "min_days_active": 1,
+            "min_months_active": 1,
+        },
+        persist=True,
+        checkpoint_enabled=True,
+        output_dir=tmp_path,
+        load_final_result=False,
+        run_id="dynamic_gmm_prevalent_incompatible_test",
+        assignment_scope="prevalent",
+        prevalent_fraction_pct=40,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        clustering.run_dynamic_gmm_clustering(
+            base_features_df=base_features,
+            feature_cols=["feature"],
+            flow_cols=clustering.FlowColumns(),
+            ttc_max_map=None,
+            k=2,
+            confidence_threshold_proba=0.7,
+            window_days=2,
+            date_start=pd.Timestamp("2024-01-01"),
+            date_end=pd.Timestamp("2024-01-03"),
+            min_window_passes=5,
+            train_params={
+                "min_total_passes": 1,
+                "min_days_active": 1,
+                "min_months_active": 1,
+            },
+            persist=True,
+            checkpoint_enabled=True,
+            incremental_db_path=first["duckdb_path"],
+            resume_existing=True,
+            load_final_result=False,
+            assignment_scope="prevalent",
+            prevalent_fraction_pct=20,
+        )
+
+    message = str(exc_info.value)
+    assert "parametros no coinciden" in message
+    assert "prevalent_fraction_pct" in message
 
 
 def test_estimate_dynamic_gmm_parallelism_limits_by_memory_and_cpu(tmp_path, monkeypatch):
@@ -702,6 +954,7 @@ def test_dynamic_gmm_experiments_live_reads_plate_pages_from_duckdb(tmp_path):
             "assignment_status": ["assigned"] * 13,
             "cluster_prob_0": [0.8] * 13,
             "cluster_prob_1": [0.2] * 13,
+            "total_passes": [10, 10, 10, 50, 10, 10, 10, 10, 10, 10, 10, 10, 10],
         }
     )
     conn = duckdb.connect(str(db_path))
@@ -711,17 +964,30 @@ def test_dynamic_gmm_experiments_live_reads_plate_pages_from_duckdb(tmp_path):
             f"CREATE TABLE {clustering.DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME} AS "
             "SELECT * FROM assignments_df"
         )
+        plate_options = live_app._dynamic_gmm_read_plate_options(conn)
         selected, total, page = live_app._dynamic_gmm_read_plate_page(conn, 0)
         selected_2, total_2, page_2 = live_app._dynamic_gmm_read_plate_page(conn, 1)
         selected_assignments = live_app._dynamic_gmm_read_assignments_for_plates(
             conn,
             selected_2,
         )
+        single_plate_assignments = live_app._dynamic_gmm_read_assignments_for_plates(
+            conn,
+            ["P01"],
+        )
     finally:
         conn.close()
 
+    assert plate_options == ["P03", "P01"] + [
+        plate for plate in [f"P{i:02d}" for i in range(12)] if plate not in {"P01", "P03"}
+    ]
+    assert live_app._dynamic_gmm_resolve_selected_plate(plate_options, "P10") == "P10"
+    assert live_app._dynamic_gmm_resolve_selected_plate(plate_options, "missing") == "P03"
+    assert live_app._dynamic_gmm_resolve_selected_plate([], "P00") is None
     assert selected == [f"P{i:02d}" for i in range(10)]
     assert (total, page) == (12, 0)
     assert selected_2 == ["P10", "P11"]
     assert (total_2, page_2) == (12, 1)
     assert selected_assignments["plate"].drop_duplicates().tolist() == ["P10", "P11"]
+    assert single_plate_assignments["plate"].drop_duplicates().tolist() == ["P01"]
+    assert len(single_plate_assignments) == 2

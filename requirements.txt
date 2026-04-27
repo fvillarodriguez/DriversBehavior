@@ -37,6 +37,9 @@ scipy==1.16.3
 shap
 latexmk
 psutil
+bokeh>=3.1.0
+httpx>=0.28.0
+-e ./dask
 ray[default]==2.53.0
 aiohttp-cors
 colorful

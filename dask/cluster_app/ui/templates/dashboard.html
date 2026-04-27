@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dask Cluster App Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <h1>Dashboard</h1>
+          <p id="dashboard-status">Loading...</p>
+        </div>
+        <a href="/">Back to App</a>
+      </section>
+
+      <section class="stats">
+        <div class="metric">
+          <span>Nodes</span>
+          <strong id="metric-nodes">0</strong>
+        </div>
+        <div class="metric">
+          <span>Queued</span>
+          <strong id="metric-queued">0</strong>
+        </div>
+        <div class="metric">
+          <span>Active Job</span>
+          <strong id="metric-active">none</strong>
+        </div>
+        <div class="metric">
+          <span>Dask Native</span>
+          <strong id="metric-dask">offline</strong>
+        </div>
+        <div class="metric">
+          <span>Failed Jobs</span>
+          <strong id="metric-failed">0</strong>
+        </div>
+      </section>
+
+      <section class="function-catalog" aria-labelledby="functions-title">
+        <div class="catalog-heading">
+          <div>
+            <span class="eyebrow">Mapa funcional</span>
+            <h2 id="functions-title">Funciones de la app</h2>
+          </div>
+          <p>
+            Descripcion operativa de todo lo que este panel, la UI principal, la API y el CLI
+            permiten hacer en el cluster local.
+          </p>
+        </div>
+
+        <div class="function-groups">
+          <article class="function-group">
+            <h3>Usuarios y sesiones</h3>
+            <ul class="function-list">
+              <li><strong>Registro y login local:</strong> crea o reutiliza usuarios por nombre y email, emite un token firmado y guarda la sesion en el navegador para autorizar acciones sensibles.</li>
+              <li><strong>Actividad de usuarios:</strong> registra sesiones vistas en los ultimos minutos para mostrar quienes estan conectados desde la pantalla principal.</li>
+              <li><strong>Administracion de usuarios:</strong> lista usuarios registrados y permite borrar cuentas cuando no tienen jobs activos o en cola.</li>
+            </ul>
+          </article>
+
+          <article class="function-group">
+            <h3>Jobs y cola</h3>
+            <ul class="function-list">
+              <li><strong>Explorador de carpetas:</strong> navega el filesystem local, filtra carpetas y scripts Python, y ayuda a escoger el entrypoint correcto dentro del folder del job.</li>
+              <li><strong>Envio de jobs:</strong> empaqueta una carpeta, argumentos y entrypoint; crea un workspace aislado por job y deja el trabajo listo para la cola.</li>
+              <li><strong>Cola con un activo global:</strong> mantiene un solo job corriendo a la vez, reintenta fallas segun configuracion y avisa si un job largo bloquea la cola.</li>
+              <li><strong>Dependencias y checkpoints:</strong> reutiliza entornos virtuales por hash de requirements y ofrece helpers para guardar o recuperar checkpoints del job.</li>
+              <li><strong>Detalle, logs y cancelacion:</strong> muestra estado, duracion, espera en cola, scheduler usado, stdout/stderr y datos de fallo; tambien permite detener jobs activos.</li>
+            </ul>
+          </article>
+
+          <article class="function-group">
+            <h3>Dask y recursos</h3>
+            <ul class="function-list">
+              <li><strong>Scheduler administrado:</strong> arranca, detiene e inspecciona el scheduler Dask local, o usa un scheduler elegido desde otro nodo cuando corresponde.</li>
+              <li><strong>Workers administrados:</strong> conecta workers al scheduler activo con TLS, limites de memoria y recursos detectados por hardware.</li>
+              <li><strong>Dashboard de Dask:</strong> expone el enlace al panel nativo de Dask cuando el scheduler esta online y el puerto es alcanzable.</li>
+              <li><strong>Recursos por nodo:</strong> resume CPU, RAM, GPU/backends, host, estado y ultima presencia de cada nodo registrado.</li>
+            </ul>
+          </article>
+
+          <article class="function-group">
+            <h3>Nodos y descubrimiento</h3>
+            <ul class="function-list">
+              <li><strong>Presencia mDNS:</strong> publica el nodo local y escanea la LAN usando el servicio configurado para descubrir otros nodos automaticamente.</li>
+              <li><strong>Fallback por IP:</strong> permite agregar nodos remotos manualmente cuando multicast o discovery no estan disponibles.</li>
+              <li><strong>Pruebas de conectividad:</strong> valida alcance TCP de cada nodo y reporta errores de red, CPU y presencia de GPU.</li>
+              <li><strong>Limpieza y revocacion:</strong> marca nodos viejos como offline, elimina nodos inactivos o revocados y conserva los nodos online.</li>
+            </ul>
+          </article>
+
+          <article class="function-group">
+            <h3>Seguridad y configuracion</h3>
+            <ul class="function-list">
+              <li><strong>TLS obligatorio:</strong> genera una CA interna, certificados por nodo y variables de entorno para que los procesos Dask hablen cifrado.</li>
+              <li><strong>Tokens firmados:</strong> usa HMAC para sesiones web y pairing de nodos, con secretos locales persistidos en el state dir.</li>
+              <li><strong>Config YAML/JSON:</strong> carga configuracion desde archivo, expande paths de usuario y crea directorios de estado, workspaces, envs, logs y certificados.</li>
+              <li><strong>Backup de CA:</strong> incluye soporte para respaldar y restaurar la CA interna con cifrado Fernet.</li>
+            </ul>
+          </article>
+
+          <article class="function-group">
+            <h3>Operacion y herramientas</h3>
+            <ul class="function-list">
+              <li><strong>CLI cluster-app:</strong> inicializa config, arranca la web, ejecuta agente, diagnostica red, envia jobs, muestra estado y genera planes de servicio.</li>
+              <li><strong>Diagnosticos:</strong> prueba puertos, host local y disponibilidad del scheduler para detectar bloqueos de red o configuracion.</li>
+              <li><strong>Planes de firewall y servicio:</strong> calcula comandos para abrir puertos y preparar LaunchDaemon o servicio de Windows sin aplicarlos automaticamente.</li>
+              <li><strong>Eventos en tiempo real:</strong> envia por WebSocket el estado de cola, job activo y nodos; las metricas HTTP alimentan este Dashboard cada pocos segundos.</li>
+              <li><strong>Helpers para notebooks:</strong> ofrece un helper de conexion para notebooks que necesitan usar el scheduler Dask administrado por la app.</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <h2>Node Resources</h2>
+          <div id="node-details"><div class="muted">Loading...</div></div>
+          <div class="row" style="margin-top:10px">
+            <button type="button" id="test-nodes" class="secondary">Test All Nodes</button>
+          </div>
+          <p id="test-status" class="notice" aria-live="polite"></p>
+          <div id="test-results" style="margin-top:8px"></div>
+        </div>
+        <div class="panel">
+          <h2>Active Job</h2>
+          <div id="active-job-detail"><div class="muted">No active job</div></div>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <h2>Recent Jobs</h2>
+          <div id="jobs"></div>
+        </div>
+        <div class="panel">
+          <h2>Failed Jobs</h2>
+          <div id="failed-jobs"><div class="muted">No failures</div></div>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Registered Users</h2>
+            <button type="button" id="refresh-users" class="secondary small">Refresh</button>
+          </div>
+          <p id="users-status" class="notice" aria-live="polite"></p>
+          <div id="registered-users" class="compact-list">
+            <div class="muted">Sign in to manage users</div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <div id="job-detail-modal" class="modal" aria-hidden="true">
+      <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal-header">
+          <div>
+            <h2 id="modal-title">Job Detail</h2>
+            <p id="modal-subtitle" class="muted"></p>
+          </div>
+          <button type="button" id="close-modal" class="secondary">Close</button>
+        </div>
+        <div id="modal-body" style="margin-top:12px; max-height:60vh; overflow:auto"></div>
+      </div>
+    </div>
+
+    <script src="/static/dashboard.js?v=users-dashboard-1"></script>
+  </body>
+</html>

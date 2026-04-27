@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dask-cluster-app"
+version = "0.1.0"
+description = "Local multi-user Dask Distributed cluster manager for Windows and macOS."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "Private" }
+authors = [{ name = "Dask Cluster App" }]
+dependencies = [
+  "dask[distributed,diagnostics]>=2026.1.0",
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.34.0",
+  "jinja2>=3.1.0",
+  "python-multipart>=0.0.20",
+  "zeroconf>=0.136.0",
+  "cryptography>=44.0.0",
+  "psutil>=6.1.0",
+  "pyyaml>=6.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+  "httpx>=0.28.0",
+  "ruff>=0.9.0",
+]
+gpu = [
+  "mlx>=0.22.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+
+[project.scripts]
+cluster-app = "cluster_app.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cluster_app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

@@ -89,11 +89,11 @@ from src.experiments_logic import (
     estimate_controlled_comparison_parallelism,
     preview_controlled_comparison_checkpoint,
 )
-from src.pipeline_ray_runtime import (
+from src.pipeline_dask_runtime import (
     EXECUTION_BACKEND_LOCAL,
-    EXECUTION_BACKEND_RAY_CLUSTER,
+    EXECUTION_BACKEND_DASK_CLUSTER,
     EXECUTION_BACKEND_VALUES,
-    connect_ray_cluster,
+    connect_dask_cluster,
 )
 
 try:
@@ -692,11 +692,11 @@ def _render_execution_backend_input(
             format_func=lambda value: (
                 "Local"
                 if value == EXECUTION_BACKEND_LOCAL
-                else "Ray Cluster"
+                else "Dask Cluster"
             ),
             help=(
-                "`local` ejecuta Optuna en este proceso. `ray_cluster` distribuye "
-                "los trials de Optuna usando el cluster configurado en la UI Ray Cluster."
+                "`local` ejecuta Optuna en este proceso. `dask_cluster` distribuye "
+                "los trials de Optuna usando el cluster configurado en la UI Dask Cluster."
             ),
         )
     )
@@ -9601,7 +9601,7 @@ def _render_calibration_sweep_experiment() -> None:
             default=EXECUTION_BACKEND_LOCAL,
         )
     st.caption(
-        "Si eliges `ray_cluster`, `Optuna jobs paralelos` pasa a ser la "
+        "Si eliges `dask_cluster`, `Optuna jobs paralelos` pasa a ser la "
         "concurrencia máxima de trials remotos."
     )
 
@@ -9833,11 +9833,11 @@ def _render_calibration_sweep_experiment() -> None:
         if not feature_cols:
             st.error("No hay variables disponibles para ejecutar el experimento.")
             return
-        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+        if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER:
             try:
-                connect_ray_cluster()
+                connect_dask_cluster()
             except Exception as exc:
-                st.error(f"Ray Cluster no disponible: {exc}")
+                st.error(f"Dask Cluster no disponible: {exc}")
                 return
 
         selected_objective_metrics = [
@@ -28626,7 +28626,7 @@ def _render_controlled_comparison_experiment() -> None:
     st.caption(
         "La UI es la fuente de verdad: Random Forest usa `Jobs paralelos RF/ranking`, "
         "XGBoost usa `Jobs paralelos XGBoost`, y Optuna usa sólo sus jobs de trials. "
-        "Si eliges `ray_cluster`, esos jobs pasan a ser concurrencia máxima de trials remotos."
+        "Si eliges `dask_cluster`, esos jobs pasan a ser concurrencia máxima de trials remotos."
     )
 
     k_state_file_key = "exp_controlled_k_feature_file"
@@ -29448,16 +29448,16 @@ def _render_controlled_comparison_experiment() -> None:
             f"Cluster={k_grid_by_set['Cluster']} | "
             f"Base + Cluster={k_grid_by_set['Base + Cluster']}"
         )
-    preview_ray_address = None
-    preview_ray_active_nodes = None
-    if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+    preview_dask_address = None
+    preview_dask_active_nodes = None
+    if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER:
         try:
-            preview_ray_runtime = connect_ray_cluster()
-            preview_ray_address = str(preview_ray_runtime.config.ray_address or "")
-            preview_ray_active_nodes = int(preview_ray_runtime.active_nodes)
+            preview_dask_runtime = connect_dask_cluster()
+            preview_dask_address = str(preview_dask_runtime.address or "")
+            preview_dask_active_nodes = int(preview_dask_runtime.active_nodes)
         except Exception:
-            preview_ray_address = None
-            preview_ray_active_nodes = None
+            preview_dask_address = None
+            preview_dask_active_nodes = None
     protocol_preview = {
         "protocol_family": protocol_family,
         "split_mode": "Temporal",
@@ -29514,16 +29514,16 @@ def _render_controlled_comparison_experiment() -> None:
         "execution_backend": str(execution_backend),
         "parallel_jobs": int(parallel_jobs),
         "xgb_parallel_jobs": int(xgb_parallel_jobs),
-        "ray_address": preview_ray_address,
-        "ray_requested_trial_concurrency": (
+        "dask_address": preview_dask_address,
+        "dask_requested_trial_concurrency": (
             int(optuna_n_jobs)
-            if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
+            if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER
             else None
         ),
-        "ray_effective_trial_concurrency": None,
-        "ray_trial_cpus": None,
-        "ray_active_nodes": preview_ray_active_nodes,
-        "ray_hosts_used": [],
+        "dask_effective_trial_concurrency": None,
+        "dask_trial_cpus": None,
+        "dask_active_nodes": preview_dask_active_nodes,
+        "dask_hosts_used": [],
         "search_space_config": search_space,
         "segment_info": segment_info,
         "event_path": str(selected_event_path),
@@ -29652,11 +29652,11 @@ def _render_controlled_comparison_experiment() -> None:
         except Exception as exc:
             st.error(f"No se pudo preparar el dataset del tramo: {exc}")
             return
-        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
+        if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER:
             try:
-                connect_ray_cluster()
+                connect_dask_cluster()
             except Exception as exc:
-                st.error(f"Ray Cluster no disponible: {exc}")
+                st.error(f"Dask Cluster no disponible: {exc}")
                 return
 
         exp_meta = {
@@ -30936,43 +30936,21 @@ def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None
     if show_exit_button and st.sidebar.button("Cerrar app"):
         os._exit(0)
 
-    section_options = [
-        "Eventos",
-        "Feature engineering",
-        "Match",
-        "Feature selection",
-        "Optuna",
-        "Balance",
-        "Modelos",
-        "History",
-        "Experiments",
+    tab_specs: List[Tuple[str, Callable[[], None]]] = [
+        ("Eventos", _render_event_tab),
+        ("Feature engineering", _render_variables_tab),
+        ("Match", _render_match_tab),
+        ("Feature selection", _render_feature_selection_tab),
+        ("Optuna", _render_optuna_tab),
+        ("Balance", _render_balance_tab),
+        ("Modelos", _render_model_tab),
+        ("History", _render_history_tab),
+        ("Experiments", _render_experiments_tab),
     ]
-    selected_section = st.radio(
-        "Sección",
-        section_options,
-        horizontal=True,
-        label_visibility="collapsed",
-        key="crash_prediction_active_section",
-    )
-
-    if selected_section == "Eventos":
-        _render_event_tab()
-    elif selected_section == "Match":
-        _render_match_tab()
-    elif selected_section == "Feature engineering":
-        _render_variables_tab()
-    elif selected_section == "Feature selection":
-        _render_feature_selection_tab()
-    elif selected_section == "Optuna":
-        _render_optuna_tab()
-    elif selected_section == "Balance":
-        _render_balance_tab()
-    elif selected_section == "Modelos":
-        _render_model_tab()
-    elif selected_section == "History":
-        _render_history_tab()
-    elif selected_section == "Experiments":
-        _render_experiments_tab()
+    tabs = st.tabs([label for label, _ in tab_specs])
+    for tab, (_, render_fn) in zip(tabs, tab_specs):
+        with tab:
+            render_fn()
 
 
 if __name__ == "__main__":

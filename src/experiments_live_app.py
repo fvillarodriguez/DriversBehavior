@@ -33,7 +33,7 @@ from src.clustering import (
     DYNAMIC_GMM_WINDOW_CHECKPOINT_TABLE_NAME,
     DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME,
 )
-from src.pipeline_ray_runtime import EXECUTION_BACKEND_LOCAL
+from src.pipeline_dask_runtime import EXECUTION_BACKEND_LOCAL
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_RESULTS_DIR = ROOT_DIR / "Resultados"
@@ -94,6 +94,18 @@ def _dynamic_gmm_table_exists(conn, table_name: str) -> bool:
         return False
 
 
+def _connect_dynamic_gmm_duckdb(path: Path, *, read_only: bool = False):
+    if duckdb is None:
+        raise ImportError("DuckDB no esta instalado.")
+    try:
+        return duckdb.connect(str(path), read_only=bool(read_only))
+    except Exception as exc:
+        message = str(exc).lower()
+        if read_only and "different configuration" in message:
+            return duckdb.connect(str(path))
+        raise
+
+
 def _dynamic_gmm_table_columns(conn, table_name: str) -> list[str]:
     if not _dynamic_gmm_table_exists(conn, table_name):
         return []
@@ -143,7 +155,16 @@ def _read_dynamic_gmm_status(conn) -> Dict[str, object]:
 def _read_dynamic_gmm_source_header(path: Path) -> Dict[str, object]:
     if duckdb is None:
         return {}
-    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        conn = _connect_dynamic_gmm_duckdb(path, read_only=False)
+    except Exception as exc:
+        return {
+            "run_id": path.stem,
+            "status": "unavailable",
+            "updated_at": pd.Timestamp.fromtimestamp(path.stat().st_mtime).isoformat(),
+            "has_checkpoint": False,
+            "error": str(exc),
+        }
     try:
         metadata = _read_dynamic_gmm_metadata(conn)
         status = _read_dynamic_gmm_status(conn)
@@ -246,6 +267,29 @@ def _dynamic_gmm_read_plate_count(conn) -> int:
         return 0
 
 
+def _dynamic_gmm_read_plate_options(conn) -> list[str]:
+    columns = _dynamic_gmm_table_columns(conn, DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME)
+    if "plate" not in columns:
+        return []
+    if "total_passes" in columns:
+        observation_expr = "COALESCE(SUM(TRY_CAST(total_passes AS DOUBLE)), 0)"
+    else:
+        observation_expr = "COUNT(*)"
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT CAST(plate AS VARCHAR) AS plate
+            FROM {DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME}
+            WHERE plate IS NOT NULL
+            GROUP BY CAST(plate AS VARCHAR)
+            ORDER BY {observation_expr} DESC, COUNT(*) DESC, plate
+            """
+        ).fetchall()
+    except Exception:
+        return []
+    return [str(row[0]) for row in rows]
+
+
 def _dynamic_gmm_read_plate_page(
     conn,
     page_index: int,
@@ -279,6 +323,18 @@ def _dynamic_gmm_read_plate_page(
     except Exception:
         return [], total, normalized_page
     return [str(row[0]) for row in rows], total, normalized_page
+
+
+def _dynamic_gmm_resolve_selected_plate(
+    plate_options: list[str],
+    requested_plate: object,
+) -> Optional[str]:
+    if not plate_options:
+        return None
+    requested = None if requested_plate is None else str(requested_plate)
+    if requested in plate_options:
+        return requested
+    return str(plate_options[0])
 
 
 def _dynamic_gmm_read_assignments_for_plates(
@@ -4147,17 +4203,17 @@ def _render_controlled_comparison_live_view(
     execution_backend = str(
         _meta_or_df_value("execution_backend", EXECUTION_BACKEND_LOCAL)
     ).strip() or EXECUTION_BACKEND_LOCAL
-    ray_requested = _meta_or_df_value("ray_requested_trial_concurrency")
-    ray_effective = _meta_or_df_value("ray_effective_trial_concurrency")
-    ray_trial_cpus = _meta_or_df_value("ray_trial_cpus")
-    ray_active_nodes = _meta_or_df_value("ray_active_nodes")
-    ray_hosts_used = _meta_or_df_value("ray_hosts_used", [])
-    if isinstance(ray_hosts_used, str):
+    dask_requested = _meta_or_df_value("dask_requested_trial_concurrency")
+    dask_effective = _meta_or_df_value("dask_effective_trial_concurrency")
+    dask_trial_cpus = _meta_or_df_value("dask_trial_cpus")
+    dask_active_nodes = _meta_or_df_value("dask_active_nodes")
+    dask_hosts_used = _meta_or_df_value("dask_hosts_used", [])
+    if isinstance(dask_hosts_used, str):
         try:
-            parsed_hosts = json.loads(ray_hosts_used)
+            parsed_hosts = json.loads(dask_hosts_used)
         except Exception:
-            parsed_hosts = [ray_hosts_used]
-        ray_hosts_used = parsed_hosts if isinstance(parsed_hosts, list) else []
+            parsed_hosts = [dask_hosts_used]
+        dask_hosts_used = parsed_hosts if isinstance(parsed_hosts, list) else []
 
     metric_col = (
         "val_objective_score"
@@ -4241,14 +4297,14 @@ def _render_controlled_comparison_live_view(
     kpi_5.metric("Objetivo", objective_label)
     kpi_6.metric("Optuna jobs", str(meta.get("optuna_n_jobs") or "-"))
     kpi_7.metric("Backend", execution_backend)
-    if execution_backend == "ray_cluster":
+    if execution_backend == "dask_cluster":
         st.caption(
-            "Ray: "
-            f"requested={ray_requested or '-'} | "
-            f"effective={ray_effective or '-'} | "
-            f"trial_cpus={ray_trial_cpus or '-'} | "
-            f"active_nodes={ray_active_nodes or '-'} | "
-            f"hosts={len(ray_hosts_used) if isinstance(ray_hosts_used, list) else 0}"
+            "Dask: "
+            f"requested={dask_requested or '-'} | "
+            f"effective={dask_effective or '-'} | "
+            f"trial_cpus={dask_trial_cpus or '-'} | "
+            f"active_nodes={dask_active_nodes or '-'} | "
+            f"hosts={len(dask_hosts_used) if isinstance(dask_hosts_used, list) else 0}"
         )
 
     if completed_df.empty:
@@ -4646,7 +4702,7 @@ def _render_gnn_optuna_objectives_view(
 def _render_gnn_recursive_view(
     df: pd.DataFrame, best_row: Optional[Dict[str, object]]
 ) -> None:
-    st.caption("Experimento detectado: Opt.Recursiva (Optuna vs Ray)")
+    st.caption("Experimento detectado: Opt.Recursiva (Optuna vs Dask)")
     plot_df = _ensure_balance_strategy_column(df.copy())
 
     include_errors = st.checkbox(
@@ -4699,8 +4755,8 @@ def _render_gnn_recursive_view(
     with col_filters_3:
         selected_optimizer = st.multiselect(
             "Optimizadores",
-            options=optimizer_options or ["Optuna", "Ray"],
-            default=optimizer_options or ["Optuna", "Ray"],
+            options=optimizer_options or ["Optuna", "Dask"],
+            default=optimizer_options or ["Optuna", "Dask"],
             key="live_gnn_recursive_optimizer",
         )
     if variant_options:
@@ -6622,17 +6678,17 @@ def _render_calibration_experiment_live_view(data: Dict[str, object]) -> None:
         or manifest.get("execution_backend")
         or EXECUTION_BACKEND_LOCAL
     ).strip() or EXECUTION_BACKEND_LOCAL
-    ray_hosts_used = (
-        protocol.get("ray_hosts_used")
-        or manifest.get("ray_hosts_used")
+    dask_hosts_used = (
+        protocol.get("dask_hosts_used")
+        or manifest.get("dask_hosts_used")
         or []
     )
-    if isinstance(ray_hosts_used, str):
+    if isinstance(dask_hosts_used, str):
         try:
-            parsed_hosts = json.loads(ray_hosts_used)
+            parsed_hosts = json.loads(dask_hosts_used)
         except Exception:
-            parsed_hosts = [ray_hosts_used]
-        ray_hosts_used = parsed_hosts if isinstance(parsed_hosts, list) else []
+            parsed_hosts = [dask_hosts_used]
+        dask_hosts_used = parsed_hosts if isinstance(parsed_hosts, list) else []
 
     st.caption("Experimento detectado: Crash prediction | Calibración score + threshold")
     st.caption(f"Checkpoint: {data.get('manifest_path')}")
@@ -6663,14 +6719,14 @@ def _render_calibration_experiment_live_view(data: Dict[str, object]) -> None:
         f"Threshold protocol: {protocol.get('threshold_protocol') or '-'} | "
         f"Backend: {execution_backend}"
     )
-    if execution_backend == "ray_cluster":
+    if execution_backend == "dask_cluster":
         st.caption(
-            "Ray: "
-            f"requested={protocol.get('ray_requested_trial_concurrency') or '-'} | "
-            f"effective={protocol.get('ray_effective_trial_concurrency') or '-'} | "
-            f"trial_cpus={protocol.get('ray_trial_cpus') or '-'} | "
-            f"active_nodes={protocol.get('ray_active_nodes') or '-'} | "
-            f"hosts={len(ray_hosts_used) if isinstance(ray_hosts_used, list) else 0}"
+            "Dask: "
+            f"requested={protocol.get('dask_requested_trial_concurrency') or '-'} | "
+            f"effective={protocol.get('dask_effective_trial_concurrency') or '-'} | "
+            f"trial_cpus={protocol.get('dask_trial_cpus') or '-'} | "
+            f"active_nodes={protocol.get('dask_active_nodes') or '-'} | "
+            f"hosts={len(dask_hosts_used) if isinstance(dask_hosts_used, list) else 0}"
         )
     st.caption(f"Step actual: {current_step}")
     if current_message:
@@ -7308,7 +7364,11 @@ def _render_dynamic_gmm_live_view(path: Path) -> None:
         st.error("El archivo DuckDB ya no existe.")
         return
 
-    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        conn = _connect_dynamic_gmm_duckdb(path, read_only=False)
+    except Exception as exc:
+        st.error(f"No se pudo abrir el DuckDB dinamico: {exc}")
+        return
     try:
         metadata = _read_dynamic_gmm_metadata(conn)
         status_row = _read_dynamic_gmm_status(conn)
@@ -7354,27 +7414,12 @@ def _render_dynamic_gmm_live_view(path: Path) -> None:
             DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME,
         )
         total_plates = _dynamic_gmm_read_plate_count(conn)
-        page_key = "dynamic_gmm_live_plate_page_" + re.sub(
+        plate_key = "dynamic_gmm_live_plate_selected_" + re.sub(
             r"[^A-Za-z0-9_]+",
             "_",
             path.stem,
         )
-        page_count = max(
-            1,
-            math.ceil(total_plates / DYNAMIC_GMM_PLATE_PAGE_SIZE)
-            if total_plates
-            else 1,
-        )
-        current_page = int(st.session_state.get(page_key, 0)) % page_count
-        selected_plates, total_plates, current_page = _dynamic_gmm_read_plate_page(
-            conn,
-            current_page,
-            DYNAMIC_GMM_PLATE_PAGE_SIZE,
-        )
-        selected_assignments = _dynamic_gmm_read_assignments_for_plates(
-            conn,
-            selected_plates,
-        )
+        plate_options = _dynamic_gmm_read_plate_options(conn)
     finally:
         conn.close()
 
@@ -7462,22 +7507,36 @@ def _render_dynamic_gmm_live_view(path: Path) -> None:
 
     live_tab, checkpoint_tab, data_tab = st.tabs(["Live", "Checkpoint", "Raw data"])
     with live_tab:
-        st.markdown("**Patentes monitoreadas**")
-        control_cols = st.columns([2, 1])
-        start = current_page * DYNAMIC_GMM_PLATE_PAGE_SIZE
-        end = min(start + DYNAMIC_GMM_PLATE_PAGE_SIZE, total_plates)
-        control_cols[0].caption(
-            f"Mostrando {start + 1 if total_plates else 0}-{end} de {total_plates} patentes."
+        st.markdown("**Matricula monitoreada**")
+        selected_assignments = pd.DataFrame()
+        selected_plate = _dynamic_gmm_resolve_selected_plate(
+            plate_options,
+            st.session_state.get(plate_key),
         )
-        if control_cols[1].button(
-            "Siguientes 10 patentes",
-            disabled=total_plates <= DYNAMIC_GMM_PLATE_PAGE_SIZE,
-            key=f"{page_key}_next",
-        ):
-            st.session_state[page_key] = (current_page + 1) % page_count
-            st.rerun()
-        if selected_plates:
-            st.caption(", ".join(selected_plates))
+        if selected_plate is None:
+            st.info("No hay matriculas disponibles para graficar.")
+        else:
+            if st.session_state.get(plate_key) != selected_plate:
+                st.session_state[plate_key] = selected_plate
+            selected_index = plate_options.index(selected_plate)
+            selected_plate = st.selectbox(
+                "Selecciona una matricula",
+                options=plate_options,
+                index=selected_index,
+                key=plate_key,
+            )
+            st.caption(f"{total_plates:,} matriculas disponibles.")
+            try:
+                conn = _connect_dynamic_gmm_duckdb(path, read_only=False)
+                try:
+                    selected_assignments = _dynamic_gmm_read_assignments_for_plates(
+                        conn,
+                        [str(selected_plate)],
+                    )
+                finally:
+                    conn.close()
+            except Exception as exc:
+                st.error(f"No se pudieron leer las asignaciones de la matricula: {exc}")
         _render_dynamic_gmm_assignment_chart(selected_assignments)
         st.markdown("**Probabilidades por cluster**")
         _render_dynamic_gmm_probability_charts(selected_assignments)

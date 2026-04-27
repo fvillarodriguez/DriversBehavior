@@ -119,12 +119,50 @@ def test_clustering_features_generation_with_monthly_weighting():
 
     assert row_a1["total_passes"] == 4
     assert row_a1["n_months_active"] == 2
+    assert row_a1["n_years_active"] == 1
     assert row_a1["avg_speed_kmh"] == pytest.approx(85.0)
     assert row_a1["exceso_velocidad"] == pytest.approx(0.75)
     assert row_b2["total_passes"] == 2
     assert row_b2["n_months_active"] == 1
+    assert row_b2["n_years_active"] == 1
     assert row_b2["exceso_velocidad"] == pytest.approx(0.0)
     assert "speed_limit_count" not in result.columns
+
+
+def test_clustering_features_count_calendar_year_month_activity():
+    df = pd.DataFrame(
+        {
+            "FECHA": pd.to_datetime(
+                [
+                    "2024-01-01 10:00:00",
+                    "2025-01-01 10:00:00",
+                ]
+            ),
+            "VELOCIDAD": [80, 90],
+            "PORTICO": ["P1", "P1"],
+            "CARRIL": [1, 1],
+            "MATRICULA": ["AAAAA1", "AAAAA1"],
+        }
+    )
+    flow_cols = FlowColumns(
+        timestamp="FECHA",
+        speed_kmh="VELOCIDAD",
+        portico="PORTICO",
+        lane="CARRIL",
+        plate_id="MATRICULA",
+    )
+
+    result = Clusterization(
+        df,
+        flow_cols,
+        ttc_max_map=None,
+        speed_limit_map={"P1": 100},
+        outlier_action="none",
+    )
+
+    row = result[result["plate"] == "AAAAA1"].iloc[0]
+    assert row["n_months_active"] == 2
+    assert row["n_years_active"] == 2
 
 
 def test_clustering_speeding_feature_defaults_to_zero_without_valid_limits():
@@ -176,6 +214,8 @@ def test_aggregate_batch_features_monthly_weighting():
             "speed_limit_count": [2, 4, 0],
             "n_days_active": [1, 2, 3],
             "n_months_active": [1, 1, 1],
+            "n_years_active": [1, 1, 1],
+            "batch_start": ["2024-01-01", "2024-02-01", "2024-01-01"],
         }
     )
 
@@ -188,6 +228,7 @@ def test_aggregate_batch_features_monthly_weighting():
 
     assert result.loc["A", "total_passes"] == 6
     assert result.loc["A", "n_months_active"] == 2
+    assert result.loc["A", "n_years_active"] == 1
     assert result.loc["A", "avg_speed_kmh"] == pytest.approx((10.0 * 2 + 20.0 * 4) / 6)
     assert result.loc["A", "exceso_velocidad"] == pytest.approx((0.5 * 2 + 0.25 * 4) / 6)
     assert result.loc["B", "exceso_velocidad"] == pytest.approx(0.0)

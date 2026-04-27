@@ -1,0 +1,44 @@
+cluster:
+  name: local-dask-cluster
+  scheduler_wait_seconds: 15
+  preferred_scheduler: false
+  service_type: auto
+paths:
+  state_dir: ~/.dask-cluster-app
+  workspace_dir: ~/DaskCluster/workspace
+  envs_dir: ~/DaskCluster/envs
+  logs_dir: ~/DaskCluster/logs
+network:
+  host: 0.0.0.0
+  web_port: 8080
+  dask_scheduler_port: 8786
+  dask_dashboard_port: 8787
+  worker_port_start: 9000
+  worker_port_end: 9999
+  auto_ports: true
+  discovery_service: _dask-cluster._tcp.local.
+security:
+  tls_required: true
+  cert_valid_days: 180
+  token_autoapprove: true
+  ca_backup_replicas: true
+jobs:
+  single_active_job: true
+  warn_after_hours: 24
+  retention_days: 30
+  retry_count: 1
+  copy_inputs: true
+  interrupt_on_time_limit: false
+dask:
+  worker_memory_fraction: 0.9
+  pause_threshold: 0.8
+  terminate_threshold: 0.95
+  nanny: true
+gpu:
+  cpu_fallback: true
+  strict_default: false
+path_mappings:
+  enabled: true
+  auto_cwd: true
+  auto_home: true
+  mappings: {}

@@ -43,16 +43,23 @@ raise SystemExit(0 if venv.stat().st_mtime < requirements.stat().st_mtime else 1
 PY
 }
 
-ray_runtime_audit() {
+dask_runtime_audit() {
   local output=""
   if output="$(
     .venv/bin/python - <<'PY' 2>&1
 import importlib
 import json
-from src import ray_cluster_manager as manager
 
 missing = []
-for module_name in manager.REQUIRED_RAY_PYTHON_MODULES:
+for module_name in (
+    "cluster_app",
+    "distributed",
+    "dask",
+    "fastapi",
+    "uvicorn",
+    "zeroconf",
+    "cryptography",
+):
     try:
         importlib.import_module(module_name)
     except Exception as exc:
@@ -62,18 +69,18 @@ if missing:
     print(json.dumps({"missing": missing}, ensure_ascii=False))
     raise SystemExit(1)
 
-print("ray_runtime_ok")
+print("dask_runtime_ok")
 PY
   )"; then
-    RAY_RUNTIME_AUDIT_OUTPUT="$output"
+    DASK_RUNTIME_AUDIT_OUTPUT="$output"
     return 0
   fi
 
-  RAY_RUNTIME_AUDIT_OUTPUT="$output"
+  DASK_RUNTIME_AUDIT_OUTPUT="$output"
   return 1
 }
 
-repair_ray_runtime_if_needed() {
+repair_dask_runtime_if_needed() {
   local needs_repair=0
 
   if venv_is_stale; then
@@ -81,10 +88,10 @@ repair_ray_runtime_if_needed() {
     needs_repair=1
   fi
 
-  if ! ray_runtime_audit; then
-    echo "Detected incomplete Ray runtime in .venv."
-    if [ -n "${RAY_RUNTIME_AUDIT_OUTPUT:-}" ]; then
-      echo "$RAY_RUNTIME_AUDIT_OUTPUT"
+  if ! dask_runtime_audit; then
+    echo "Detected incomplete Dask runtime in .venv."
+    if [ -n "${DASK_RUNTIME_AUDIT_OUTPUT:-}" ]; then
+      echo "$DASK_RUNTIME_AUDIT_OUTPUT"
     fi
     needs_repair=1
   fi
@@ -94,7 +101,7 @@ repair_ray_runtime_if_needed() {
   fi
 
   if [ ! -f "requirements.txt" ]; then
-    echo "requirements.txt not found. Cannot repair Ray runtime."
+    echo "requirements.txt not found. Cannot repair Dask runtime."
     exit 1
   fi
 
@@ -102,12 +109,12 @@ repair_ray_runtime_if_needed() {
   pip install -r "requirements.txt"
   touch ".venv"
 
-  if ! ray_runtime_audit; then
-    echo "Ray runtime audit failed after reinstall. Streamlit will not start."
-    if [ -n "${RAY_RUNTIME_AUDIT_OUTPUT:-}" ]; then
-      echo "$RAY_RUNTIME_AUDIT_OUTPUT"
+  if ! dask_runtime_audit; then
+    echo "Dask runtime audit failed after reinstall. Streamlit will not start."
+    if [ -n "${DASK_RUNTIME_AUDIT_OUTPUT:-}" ]; then
+      echo "$DASK_RUNTIME_AUDIT_OUTPUT"
     fi
-    echo "Run 'pip install -r requirements.txt' manually and verify the missing Ray extras."
+    echo "Run 'pip install -r requirements.txt' manually and verify the missing Dask extras."
     exit 1
   fi
 }
@@ -119,7 +126,7 @@ else
   create_env
 fi
 
-repair_ray_runtime_if_needed
+repair_dask_runtime_if_needed
 
 load_env_file() {
   local env_file="$1"

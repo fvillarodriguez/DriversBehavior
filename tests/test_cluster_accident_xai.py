@@ -45,6 +45,35 @@ class _SelectorFakeStreamlit:
         self.warnings.append(str(message))
 
 
+class _FakeTab:
+    def __init__(self, label: str) -> None:
+        self.label = label
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _TabsFakeStreamlit(_FakeStreamlit):
+    def __init__(self) -> None:
+        super().__init__()
+        self.titles: list[str] = []
+        self.tabs_calls: list[list[str]] = []
+
+    def title(self, message: str) -> None:
+        self.titles.append(str(message))
+
+    def tabs(self, labels):
+        label_list = list(labels)
+        self.tabs_calls.append(label_list)
+        return [_FakeTab(label) for label in label_list]
+
+    def radio(self, *args, **kwargs):
+        raise AssertionError("Crash prediction main navigation must use st.tabs")
+
+
 def _make_optuna_batch_record(
     *,
     record_id: int,
@@ -1441,6 +1470,47 @@ def test_apply_model_history_record_to_state_restores_optuna_batch_selection(
 # =============================================================================
 # Tests para los contratos de estado por tab (punto 5)
 # =============================================================================
+
+
+def test_main_navigation_uses_streamlit_tabs(monkeypatch):
+    fake_st = _TabsFakeStreamlit()
+    rendered_sections: list[str] = []
+    expected_labels = [
+        "Eventos",
+        "Feature engineering",
+        "Match",
+        "Feature selection",
+        "Optuna",
+        "Balance",
+        "Modelos",
+        "History",
+        "Experiments",
+    ]
+    renderers = {
+        "_render_event_tab": "Eventos",
+        "_render_variables_tab": "Feature engineering",
+        "_render_match_tab": "Match",
+        "_render_feature_selection_tab": "Feature selection",
+        "_render_optuna_tab": "Optuna",
+        "_render_balance_tab": "Balance",
+        "_render_model_tab": "Modelos",
+        "_render_history_tab": "History",
+        "_render_experiments_tab": "Experiments",
+    }
+
+    monkeypatch.setattr(app, "st", fake_st)
+    for function_name, label in renderers.items():
+        monkeypatch.setattr(
+            app,
+            function_name,
+            lambda section=label: rendered_sections.append(section),
+        )
+
+    app.main(set_page_config=False, show_exit_button=False)
+
+    assert fake_st.tabs_calls == [expected_labels]
+    assert rendered_sections == expected_labels
+    assert fake_st.session_state.get("crash_prediction_active_section") is None
 
 
 def test_validate_tab_state_unknown_tab_returns_error():

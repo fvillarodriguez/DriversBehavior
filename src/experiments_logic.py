@@ -45,11 +45,12 @@ from src.model_training import (
     temporal_train_test_split,
     train_model_with_protocol,
 )
-from src.pipeline_ray_runtime import (
+from src.pipeline_dask_runtime import (
+    EXECUTION_BACKEND_DASK_CLUSTER,
     EXECUTION_BACKEND_LOCAL,
-    EXECUTION_BACKEND_RAY_CLUSTER,
-    RayClusterRuntime,
-    connect_ray_cluster,
+    DaskClusterRuntime,
+    connect_dask_cluster,
+    dask_submit_resources,
     normalize_execution_backend,
 )
 
@@ -534,17 +535,17 @@ def _controlled_payload_updates_from_result(
         "execution_backend": str(
             result.get("execution_backend", EXECUTION_BACKEND_LOCAL)
         ),
-        "ray_address": result.get("ray_address"),
-        "ray_requested_trial_concurrency": result.get(
-            "ray_requested_trial_concurrency"
+        "dask_address": result.get("dask_address"),
+        "dask_requested_trial_concurrency": result.get(
+            "dask_requested_trial_concurrency"
         ),
-        "ray_effective_trial_concurrency": result.get(
-            "ray_effective_trial_concurrency"
+        "dask_effective_trial_concurrency": result.get(
+            "dask_effective_trial_concurrency"
         ),
-        "ray_trial_cpus": result.get("ray_trial_cpus"),
-        "ray_active_nodes": result.get("ray_active_nodes"),
-        "ray_hosts_used": json.dumps(
-            list(result.get("ray_hosts_used") or []),
+        "dask_trial_cpus": result.get("dask_trial_cpus"),
+        "dask_active_nodes": result.get("dask_active_nodes"),
+        "dask_hosts_used": json.dumps(
+            list(result.get("dask_hosts_used") or []),
             ensure_ascii=True,
             default=_json_default,
         ),
@@ -1067,51 +1068,120 @@ def _controlled_scalar_trials_dataframe(
 def _controlled_result_backend_metadata(
     *,
     execution_backend: str,
-    ray_runtime: Optional[RayClusterRuntime],
+    dask_runtime: Optional[DaskClusterRuntime],
     requested_trial_concurrency: int,
     effective_trial_concurrency: int,
-    ray_trial_cpus: Optional[int],
-    ray_hosts_used: Optional[Sequence[object]] = None,
+    dask_trial_cpus: Optional[int],
+    dask_hosts_used: Optional[Sequence[object]] = None,
 ) -> Dict[str, object]:
     backend = normalize_execution_backend(execution_backend)
     hosts = sorted(
         {
             str(host).strip()
-            for host in list(ray_hosts_used or [])
+            for host in list(dask_hosts_used or [])
             if str(host).strip()
         }
     )
-    if backend != EXECUTION_BACKEND_RAY_CLUSTER:
+    if backend != EXECUTION_BACKEND_DASK_CLUSTER:
         return {
             "execution_backend": EXECUTION_BACKEND_LOCAL,
-            "ray_address": None,
-            "ray_requested_trial_concurrency": None,
-            "ray_effective_trial_concurrency": None,
-            "ray_trial_cpus": None,
-            "ray_active_nodes": None,
-            "ray_hosts_used": [],
+            "dask_address": None,
+            "dask_requested_trial_concurrency": None,
+            "dask_effective_trial_concurrency": None,
+            "dask_trial_cpus": None,
+            "dask_active_nodes": None,
+            "dask_hosts_used": [],
         }
-    runtime = ray_runtime
+    runtime = dask_runtime
     return {
-        "execution_backend": EXECUTION_BACKEND_RAY_CLUSTER,
-        "ray_address": (
+        "execution_backend": EXECUTION_BACKEND_DASK_CLUSTER,
+        "dask_address": (
             None
             if runtime is None
-            else str(runtime.config.ray_address or "")
+            else str(runtime.address or "")
         ),
-        "ray_requested_trial_concurrency": int(requested_trial_concurrency),
-        "ray_effective_trial_concurrency": int(effective_trial_concurrency),
-        "ray_trial_cpus": (
-            None if ray_trial_cpus is None else int(ray_trial_cpus)
+        "dask_requested_trial_concurrency": int(requested_trial_concurrency),
+        "dask_effective_trial_concurrency": int(effective_trial_concurrency),
+        "dask_trial_cpus": (
+            None if dask_trial_cpus is None else int(dask_trial_cpus)
         ),
-        "ray_active_nodes": (
+        "dask_active_nodes": (
             None if runtime is None else int(runtime.active_nodes)
         ),
-        "ray_hosts_used": hosts,
+        "dask_hosts_used": hosts,
     }
 
 
-def _ray_run_controlled_trial(
+def _scatter_dask_dataframe(client: object, frame: pd.DataFrame) -> object:
+    scatter = getattr(client, "scatter", None)
+    if not callable(scatter):
+        return frame.copy()
+    try:
+        return scatter(frame.copy(), broadcast=True)
+    except TypeError:
+        return scatter(frame.copy())
+
+
+def _submit_dask_controlled_trial(
+    runtime: DaskClusterRuntime,
+    payload: Dict[str, object],
+    train_ref: object,
+    val_ref: object,
+    *,
+    trial_cpus: int | None,
+) -> object:
+    kwargs: Dict[str, object] = {"pure": False}
+    resources = dask_submit_resources(runtime, trial_cpus)
+    if resources:
+        kwargs["resources"] = resources
+    return runtime.client.submit(
+        _dask_run_controlled_trial,
+        payload,
+        train_ref,
+        val_ref,
+        **kwargs,
+    )
+
+
+def _wait_for_one_dask_future(
+    client: object,
+    futures: Sequence[object],
+    *,
+    timeout: float | None,
+) -> List[object]:
+    future_list = list(futures)
+    if not future_list:
+        return []
+    wait_method = getattr(client, "wait", None)
+    if callable(wait_method):
+        done, _pending = wait_method(future_list, num_returns=1, timeout=timeout)
+        return list(done)
+    try:
+        from distributed import wait as distributed_wait  # type: ignore
+
+        done, _pending = distributed_wait(
+            future_list,
+            timeout=timeout,
+            return_when="FIRST_COMPLETED",
+        )
+        return list(done)
+    except Exception:
+        if timeout is not None and float(timeout) <= 0:
+            return []
+        return future_list[:1]
+
+
+def _dask_future_result(client: object, future: object) -> object:
+    result = getattr(future, "result", None)
+    if callable(result):
+        return result()
+    gather = getattr(client, "gather", None)
+    if callable(gather):
+        return gather(future)
+    return future
+
+
+def _dask_run_controlled_trial(
     payload: Dict[str, object],
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -1126,7 +1196,7 @@ def _ray_run_controlled_trial(
             if str(feature) in train_df.columns and str(feature) in val_df.columns
         ]
         if not selected_features:
-            raise ValueError("Sin variables para el trial Ray.")
+            raise ValueError("Sin variables para el trial Dask.")
 
         X_train = train_df[selected_features].fillna(0).astype("float32")
         y_train = train_df["target"].astype(int)
@@ -4682,7 +4752,7 @@ class ExperimentsRunner:
         feature_k_metadata: Optional[Dict[str, object]] = None,
         optuna_objective_mode: str = CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
         execution_backend: str = EXECUTION_BACKEND_LOCAL,
-        ray_runtime: Optional[RayClusterRuntime] = None,
+        dask_runtime: Optional[DaskClusterRuntime] = None,
         progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
     ) -> Dict[str, object]:
         feature_k_metadata = dict(feature_k_metadata or {})
@@ -4724,10 +4794,10 @@ class ExperimentsRunner:
 
         execution_backend = normalize_execution_backend(execution_backend)
         if (
-            execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
-            and ray_runtime is None
+            execution_backend == EXECUTION_BACKEND_DASK_CLUSTER
+            and dask_runtime is None
         ):
-            ray_runtime = connect_ray_cluster()
+            dask_runtime = connect_dask_cluster()
 
         optuna_objective_mode = _normalize_calibration_sweep_objective_mode(
             optuna_objective_mode
@@ -4745,15 +4815,15 @@ class ExperimentsRunner:
         threshold_objective_label = THRESHOLD_OBJECTIVE_LABELS.get(
             threshold_objective, str(threshold_objective).upper()
         )
-        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
-            if ray_runtime is None:
-                raise RuntimeError("Ray Cluster no está disponible.")
+        if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER:
+            if dask_runtime is None:
+                raise RuntimeError("Dask Cluster no está disponible.")
             effective_parallelism = _resolve_controlled_optimization_parallelism(
                 model_name=model_name,
                 requested_optuna_n_jobs=1,
                 parallel_jobs=int(parallel_jobs),
                 xgb_parallel_jobs=int(xgb_parallel_jobs),
-                max_cpu_count=max(1, int(ray_runtime.max_node_cpus)),
+                max_cpu_count=max(1, int(dask_runtime.max_node_cpus)),
             )
         else:
             effective_parallelism = _resolve_controlled_optimization_parallelism(
@@ -4765,21 +4835,21 @@ class ExperimentsRunner:
         resolved_parallel_jobs = int(effective_parallelism["parallel_jobs"])
         resolved_xgb_parallel_jobs = int(effective_parallelism["xgb_parallel_jobs"])
         threshold_parallel_jobs = int(effective_parallelism["trial_threads"])
-        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
-            if ray_runtime is None:
-                raise RuntimeError("Ray Cluster no está disponible.")
-            ray_trial_cpus = max(1, int(threshold_parallel_jobs))
+        if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER:
+            if dask_runtime is None:
+                raise RuntimeError("Dask Cluster no está disponible.")
+            dask_trial_cpus = max(1, int(threshold_parallel_jobs))
             optuna_jobs_cpu_cap = max(
                 1,
-                int(ray_runtime.total_cpus) // max(1, int(ray_trial_cpus)),
+                int(dask_runtime.total_cpus) // max(1, int(dask_trial_cpus)),
             )
             effective_optuna_n_jobs = max(
                 1,
                 min(int(optuna_n_jobs), int(optuna_jobs_cpu_cap)),
             )
-            cpu_count = int(ray_runtime.total_cpus)
+            cpu_count = int(dask_runtime.total_cpus)
         else:
-            ray_trial_cpus = None
+            dask_trial_cpus = None
             effective_optuna_n_jobs = int(effective_parallelism["optuna_n_jobs"])
             optuna_jobs_cpu_cap = int(
                 effective_parallelism["cpu_limited_optuna_jobs"]
@@ -4809,12 +4879,12 @@ class ExperimentsRunner:
             raise ValueError("SMOTE no es valido para el split actual.")
         pruning_type = str(pruning_config.get("type") or "median").strip().lower()
         if (
-            execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
+            execution_backend == EXECUTION_BACKEND_DASK_CLUSTER
             and _as_bool(pruning_config.get("enabled"), True)
             and pruning_type == "hyperband"
         ):
             raise ValueError(
-                "Hyperband no está soportado con execution_backend=ray_cluster."
+                "Hyperband no está soportado con execution_backend=dask_cluster."
             )
 
         def _build_sampler() -> optuna.samplers.BaseSampler:
@@ -4894,7 +4964,7 @@ class ExperimentsRunner:
                 best_top_k,
             )
 
-        ray_hosts_used: List[str] = []
+        dask_hosts_used: List[str] = []
         max_optuna_trials = max(1, int(n_trials))
 
         def _emit_combo_progress(
@@ -5005,9 +5075,9 @@ class ExperimentsRunner:
         if optuna_objective_mode == CALIBRATION_SWEEP_OBJECTIVE_MODE_MULTIOBJECTIVE:
             multiobjective_metric = CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY
             multiobjective_label = CALIBRATION_SWEEP_MULTIOBJECTIVE_LABEL
-            if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
-                if ray_runtime is None:
-                    raise RuntimeError("Ray Cluster no está disponible.")
+            if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER:
+                if dask_runtime is None:
+                    raise RuntimeError("Dask Cluster no está disponible.")
                 study = optuna.create_study(
                     directions=list(CALIBRATION_SWEEP_MULTIOBJECTIVE_DIRECTIONS),
                     sampler=_build_sampler(),
@@ -5016,12 +5086,9 @@ class ExperimentsRunner:
                 _enqueue_warm_trials(study)
                 completed_proxy_scores_by_step: Dict[int, List[float]] = {}
                 completed_final_proxy_scores: List[float] = []
-                ray_module = ray_runtime.ray_module
-                remote_eval = ray_module.remote(
-                    num_cpus=max(1, int(ray_trial_cpus or 1))
-                )(_ray_run_controlled_trial)
-                train_ref = ray_module.put(train_df.copy())
-                val_ref = ray_module.put(val_df.copy())
+                client = dask_runtime.client
+                train_ref = _scatter_dask_dataframe(client, train_df)
+                val_ref = _scatter_dask_dataframe(client, val_df)
                 pending: Dict[object, optuna.Trial] = {}
                 launched_trials = 0
                 max_trials = max_optuna_trials
@@ -5087,7 +5154,13 @@ class ExperimentsRunner:
                             "smote_params": dict(smote_params),
                         }
                         pending[
-                            remote_eval.remote(payload, train_ref, val_ref)
+                            _submit_dask_controlled_trial(
+                                dask_runtime,
+                                payload,
+                                train_ref,
+                                val_ref,
+                                trial_cpus=dask_trial_cpus,
+                            )
                         ] = trial
                         launched_trials += 1
                         _emit_optuna_progress(
@@ -5110,24 +5183,24 @@ class ExperimentsRunner:
                         if stop_launching or launched_trials >= max_trials
                         else max(0.0, deadline - time.monotonic())
                     )
-                    done_refs, _ = ray_module.wait(
+                    done_futures = _wait_for_one_dask_future(
+                        client,
                         list(pending.keys()),
-                        num_returns=1,
                         timeout=wait_timeout,
                     )
-                    if not done_refs:
+                    if not done_futures:
                         stop_launching = True
-                        done_refs, _ = ray_module.wait(
+                        done_futures = _wait_for_one_dask_future(
+                            client,
                             list(pending.keys()),
-                            num_returns=1,
                             timeout=None,
                         )
-                    for done_ref in done_refs:
-                        trial = pending.pop(done_ref)
-                        remote_result = ray_module.get(done_ref)
+                    for done_future in done_futures:
+                        trial = pending.pop(done_future)
+                        remote_result = _dask_future_result(client, done_future)
                         host = str(remote_result.get("hostname") or "").strip()
                         if host:
-                            ray_hosts_used.append(host)
+                            dask_hosts_used.append(host)
                         elapsed_s = pd.to_numeric(
                             remote_result.get("elapsed_s"),
                             errors="coerce",
@@ -5140,7 +5213,7 @@ class ExperimentsRunner:
                             )
                         trial.set_user_attr(
                             "execution_backend",
-                            EXECUTION_BACKEND_RAY_CLUSTER,
+                            EXECUTION_BACKEND_DASK_CLUSTER,
                         )
                         if str(remote_result.get("status") or "") != "completed":
                             if remote_result.get("error") is not None:
@@ -5494,11 +5567,11 @@ class ExperimentsRunner:
             ) = _resolve_best_trial_payload(best_trial)
             backend_metadata = _controlled_result_backend_metadata(
                 execution_backend=execution_backend,
-                ray_runtime=ray_runtime,
+                dask_runtime=dask_runtime,
                 requested_trial_concurrency=int(optuna_n_jobs),
                 effective_trial_concurrency=int(effective_optuna_n_jobs),
-                ray_trial_cpus=ray_trial_cpus,
-                ray_hosts_used=ray_hosts_used,
+                dask_trial_cpus=dask_trial_cpus,
+                dask_hosts_used=dask_hosts_used,
             )
 
             _emit_combo_progress(
@@ -5806,9 +5879,9 @@ class ExperimentsRunner:
                 **backend_metadata,
             }
 
-        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
-            if ray_runtime is None:
-                raise RuntimeError("Ray Cluster no está disponible.")
+        if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER:
+            if dask_runtime is None:
+                raise RuntimeError("Dask Cluster no está disponible.")
             study = optuna.create_study(
                 direction=objective_direction,
                 sampler=_build_sampler(),
@@ -5817,12 +5890,9 @@ class ExperimentsRunner:
             _enqueue_warm_trials(study)
             completed_scores_by_step: Dict[int, List[float]] = {}
             completed_final_scores: List[float] = []
-            ray_module = ray_runtime.ray_module
-            remote_eval = ray_module.remote(
-                num_cpus=max(1, int(ray_trial_cpus or 1))
-            )(_ray_run_controlled_trial)
-            train_ref = ray_module.put(train_df.copy())
-            val_ref = ray_module.put(val_df.copy())
+            client = dask_runtime.client
+            train_ref = _scatter_dask_dataframe(client, train_df)
+            val_ref = _scatter_dask_dataframe(client, val_df)
             pending: Dict[object, optuna.Trial] = {}
             launched_trials = 0
             max_trials = max_optuna_trials
@@ -5887,7 +5957,15 @@ class ExperimentsRunner:
                         "model_params": dict(model_params),
                         "smote_params": dict(smote_params),
                     }
-                    pending[remote_eval.remote(payload, train_ref, val_ref)] = trial
+                    pending[
+                        _submit_dask_controlled_trial(
+                            dask_runtime,
+                            payload,
+                            train_ref,
+                            val_ref,
+                            trial_cpus=dask_trial_cpus,
+                        )
+                    ] = trial
                     launched_trials += 1
                     _emit_optuna_progress(
                         "optuna_trial_launched",
@@ -5909,24 +5987,24 @@ class ExperimentsRunner:
                     if stop_launching or launched_trials >= max_trials
                     else max(0.0, deadline - time.monotonic())
                 )
-                done_refs, _ = ray_module.wait(
+                done_futures = _wait_for_one_dask_future(
+                    client,
                     list(pending.keys()),
-                    num_returns=1,
                     timeout=wait_timeout,
                 )
-                if not done_refs:
+                if not done_futures:
                     stop_launching = True
-                    done_refs, _ = ray_module.wait(
+                    done_futures = _wait_for_one_dask_future(
+                        client,
                         list(pending.keys()),
-                        num_returns=1,
                         timeout=None,
                     )
-                for done_ref in done_refs:
-                    trial = pending.pop(done_ref)
-                    remote_result = ray_module.get(done_ref)
+                for done_future in done_futures:
+                    trial = pending.pop(done_future)
+                    remote_result = _dask_future_result(client, done_future)
                     host = str(remote_result.get("hostname") or "").strip()
                     if host:
-                        ray_hosts_used.append(host)
+                        dask_hosts_used.append(host)
                     elapsed_s = pd.to_numeric(
                         remote_result.get("elapsed_s"),
                         errors="coerce",
@@ -5939,7 +6017,7 @@ class ExperimentsRunner:
                         )
                     trial.set_user_attr(
                         "execution_backend",
-                        EXECUTION_BACKEND_RAY_CLUSTER,
+                        EXECUTION_BACKEND_DASK_CLUSTER,
                     )
                     for key, value in dict(
                         remote_result.get("user_attrs") or {}
@@ -6205,11 +6283,11 @@ class ExperimentsRunner:
         ) = _resolve_best_trial_payload(best_trial)
         backend_metadata = _controlled_result_backend_metadata(
             execution_backend=execution_backend,
-            ray_runtime=ray_runtime,
+            dask_runtime=dask_runtime,
             requested_trial_concurrency=int(optuna_n_jobs),
             effective_trial_concurrency=int(effective_optuna_n_jobs),
-            ray_trial_cpus=ray_trial_cpus,
-            ray_hosts_used=ray_hosts_used,
+            dask_trial_cpus=dask_trial_cpus,
+            dask_hosts_used=dask_hosts_used,
         )
 
         _emit_combo_progress(
@@ -6770,25 +6848,25 @@ class ExperimentsRunner:
         if not feature_cols:
             raise ValueError("No hay variables efectivas para ejecutar el experimento.")
         execution_backend = normalize_execution_backend(execution_backend)
-        ray_runtime: Optional[RayClusterRuntime] = None
-        ray_protocol_trial_cpus: Optional[int] = None
-        ray_protocol_effective_concurrency: Optional[int] = None
-        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
-            ray_runtime = connect_ray_cluster()
+        dask_runtime: Optional[DaskClusterRuntime] = None
+        dask_protocol_trial_cpus: Optional[int] = None
+        dask_protocol_effective_concurrency: Optional[int] = None
+        if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER:
+            dask_runtime = connect_dask_cluster()
             preview_parallelism = _resolve_controlled_optimization_parallelism(
                 model_name=resolved_model_name,
                 requested_optuna_n_jobs=1,
                 parallel_jobs=int(parallel_jobs),
                 xgb_parallel_jobs=int(xgb_parallel_jobs),
-                max_cpu_count=max(1, int(ray_runtime.max_node_cpus)),
+                max_cpu_count=max(1, int(dask_runtime.max_node_cpus)),
             )
-            ray_protocol_trial_cpus = int(preview_parallelism["trial_threads"])
-            ray_protocol_effective_concurrency = max(
+            dask_protocol_trial_cpus = int(preview_parallelism["trial_threads"])
+            dask_protocol_effective_concurrency = max(
                 1,
                 min(
                     int(optuna_n_jobs),
-                    int(ray_runtime.total_cpus)
-                    // max(1, int(ray_protocol_trial_cpus)),
+                    int(dask_runtime.total_cpus)
+                    // max(1, int(dask_protocol_trial_cpus)),
                 ),
             )
 
@@ -6981,22 +7059,22 @@ class ExperimentsRunner:
             "execution_backend": str(execution_backend),
             "parallel_jobs": int(parallel_jobs),
             "xgb_parallel_jobs": int(xgb_parallel_jobs),
-            "ray_address": (
+            "dask_address": (
                 None
-                if ray_runtime is None
-                else str(ray_runtime.config.ray_address or "")
+                if dask_runtime is None
+                else str(dask_runtime.address or "")
             ),
-            "ray_requested_trial_concurrency": (
+            "dask_requested_trial_concurrency": (
                 int(optuna_n_jobs)
-                if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
+                if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER
                 else None
             ),
-            "ray_effective_trial_concurrency": ray_protocol_effective_concurrency,
-            "ray_trial_cpus": ray_protocol_trial_cpus,
-            "ray_active_nodes": (
-                None if ray_runtime is None else int(ray_runtime.active_nodes)
+            "dask_effective_trial_concurrency": dask_protocol_effective_concurrency,
+            "dask_trial_cpus": dask_protocol_trial_cpus,
+            "dask_active_nodes": (
+                None if dask_runtime is None else int(dask_runtime.active_nodes)
             ),
-            "ray_hosts_used": [],
+            "dask_hosts_used": [],
             "far_target": float(far_target),
             "alerts_per_day": float(alerts_per_day),
             "fn_cost": float(fn_cost),
@@ -7125,16 +7203,16 @@ class ExperimentsRunner:
                 "protocol_family": CALIBRATION_SWEEP_PROTOCOL_FAMILY,
                 "protocol": dict(protocol),
                 "execution_backend": str(execution_backend),
-                "ray_address": protocol.get("ray_address"),
-                "ray_requested_trial_concurrency": protocol.get(
-                    "ray_requested_trial_concurrency"
+                "dask_address": protocol.get("dask_address"),
+                "dask_requested_trial_concurrency": protocol.get(
+                    "dask_requested_trial_concurrency"
                 ),
-                "ray_effective_trial_concurrency": protocol.get(
-                    "ray_effective_trial_concurrency"
+                "dask_effective_trial_concurrency": protocol.get(
+                    "dask_effective_trial_concurrency"
                 ),
-                "ray_trial_cpus": protocol.get("ray_trial_cpus"),
-                "ray_active_nodes": protocol.get("ray_active_nodes"),
-                "ray_hosts_used": list(protocol.get("ray_hosts_used") or []),
+                "dask_trial_cpus": protocol.get("dask_trial_cpus"),
+                "dask_active_nodes": protocol.get("dask_active_nodes"),
+                "dask_hosts_used": list(protocol.get("dask_hosts_used") or []),
                 "status": "running",
                 "result_status": "running",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -7424,7 +7502,7 @@ class ExperimentsRunner:
                         "candidate_feature_count": int(len(candidate_feature_cols)),
                         "ranked_cols": list(ranked_feature_cols),
                     },
-                    ray_runtime=ray_runtime,
+                    dask_runtime=dask_runtime,
                     progress_callback=_combo_progress_callback,
                 )
                 payload.update(
@@ -7741,9 +7819,9 @@ class ExperimentsRunner:
         if pd.Series(base_df["target"]).astype(int).nunique() < 2:
             raise ValueError("El target debe tener al menos dos clases.")
         execution_backend = normalize_execution_backend(execution_backend)
-        ray_runtime: Optional[RayClusterRuntime] = None
-        if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER:
-            ray_runtime = connect_ray_cluster()
+        dask_runtime: Optional[DaskClusterRuntime] = None
+        if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER:
+            dask_runtime = connect_dask_cluster()
         objective_metric = _normalize_controlled_objective_metric(objective_metric)
         resolved_models = _resolve_controlled_models(selected_models)
         resolved_threshold_protocols = _normalize_controlled_threshold_protocols(
@@ -7911,22 +7989,22 @@ class ExperimentsRunner:
             "execution_backend": str(execution_backend),
             "parallel_jobs": int(parallel_jobs),
             "xgb_parallel_jobs": int(xgb_parallel_jobs),
-            "ray_address": (
+            "dask_address": (
                 None
-                if ray_runtime is None
-                else str(ray_runtime.config.ray_address or "")
+                if dask_runtime is None
+                else str(dask_runtime.address or "")
             ),
-            "ray_requested_trial_concurrency": (
+            "dask_requested_trial_concurrency": (
                 int(optuna_n_jobs)
-                if execution_backend == EXECUTION_BACKEND_RAY_CLUSTER
+                if execution_backend == EXECUTION_BACKEND_DASK_CLUSTER
                 else None
             ),
-            "ray_effective_trial_concurrency": None,
-            "ray_trial_cpus": None,
-            "ray_active_nodes": (
-                None if ray_runtime is None else int(ray_runtime.active_nodes)
+            "dask_effective_trial_concurrency": None,
+            "dask_trial_cpus": None,
+            "dask_active_nodes": (
+                None if dask_runtime is None else int(dask_runtime.active_nodes)
             ),
-            "ray_hosts_used": [],
+            "dask_hosts_used": [],
             "search_space_config": search_space_config,
             "segment_info": dict(segment_info or {}),
             "event_path": str(event_path or ""),
@@ -8091,16 +8169,16 @@ class ExperimentsRunner:
                 "last_error": None,
                 "protocol": protocol,
                 "execution_backend": str(execution_backend),
-                "ray_address": protocol.get("ray_address"),
-                "ray_requested_trial_concurrency": protocol.get(
-                    "ray_requested_trial_concurrency"
+                "dask_address": protocol.get("dask_address"),
+                "dask_requested_trial_concurrency": protocol.get(
+                    "dask_requested_trial_concurrency"
                 ),
-                "ray_effective_trial_concurrency": protocol.get(
-                    "ray_effective_trial_concurrency"
+                "dask_effective_trial_concurrency": protocol.get(
+                    "dask_effective_trial_concurrency"
                 ),
-                "ray_trial_cpus": protocol.get("ray_trial_cpus"),
-                "ray_active_nodes": protocol.get("ray_active_nodes"),
-                "ray_hosts_used": list(protocol.get("ray_hosts_used") or []),
+                "dask_trial_cpus": protocol.get("dask_trial_cpus"),
+                "dask_active_nodes": protocol.get("dask_active_nodes"),
+                "dask_hosts_used": list(protocol.get("dask_hosts_used") or []),
                 "input_fingerprints": {
                     "event": context["event_fingerprint"],
                     "features": context["features_fingerprint"],
@@ -8527,7 +8605,7 @@ class ExperimentsRunner:
                         search_space_config=search_space_config,
                         parallel_jobs=int(parallel_jobs),
                         xgb_parallel_jobs=int(xgb_parallel_jobs),
-                        ray_runtime=ray_runtime,
+                        dask_runtime=dask_runtime,
                     )
                     payload.update(
                         _controlled_payload_updates_from_result(
@@ -8939,7 +9017,7 @@ class ExperimentsRunner:
                         search_space_config=search_space_config,
                         parallel_jobs=int(parallel_jobs),
                         xgb_parallel_jobs=int(xgb_parallel_jobs),
-                        ray_runtime=ray_runtime,
+                        dask_runtime=dask_runtime,
                     )
                 payload.update(
                     _controlled_payload_updates_from_result(

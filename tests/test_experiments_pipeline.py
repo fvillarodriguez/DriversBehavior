@@ -21,9 +21,9 @@ from src.experiments_logic import (
     preview_controlled_comparison_checkpoint,
 )
 from src.model_training import temporal_train_test_split
-from src.pipeline_ray_runtime import (
-    EXECUTION_BACKEND_RAY_CLUSTER,
-    RayClusterRuntime,
+from src.pipeline_dask_runtime import (
+    EXECUTION_BACKEND_DASK_CLUSTER,
+    DaskClusterRuntime,
 )
 from tests.pipeline_helpers import build_synthetic_base_df
 
@@ -3228,83 +3228,61 @@ def test_controlled_combo_xgboost_keeps_ui_optuna_jobs(
     assert result["optuna_jobs_cpu_cap"] == 8
 
 
-class _FakeObjectRef:
+class _FakeDaskFuture:
     def __init__(self, value):
         self.value = value
 
-
-class _FakeRemoteFunction:
-    def __init__(self, fn):
-        self.fn = fn
-
-    def remote(self, *args, **kwargs):
-        return _FakeObjectRef(self.fn(*args, **kwargs))
+    def result(self):
+        return self.value
 
 
-class _FakeRayModule:
+class _FakeDaskClient:
     def __init__(self, *, total_cpus: int = 8, max_node_cpus: int = 4):
         self._total_cpus = int(total_cpus)
         self._max_node_cpus = int(max_node_cpus)
-        self._initialized = True
 
-    def is_initialized(self):
-        return self._initialized
-
-    def init(self, **kwargs):
-        self._initialized = True
-        return kwargs
-
-    def nodes(self):
-        return [
-            {"Alive": True, "Resources": {"CPU": float(self._max_node_cpus)}},
-            {"Alive": True, "Resources": {"CPU": float(self._max_node_cpus)}},
-        ]
-
-    def cluster_resources(self):
-        return {"CPU": float(self._total_cpus)}
-
-    def put(self, value):
+    def scatter(self, value, **kwargs):
         return value
 
-    def get(self, ref):
-        return ref.value
+    def submit(self, fn, *args, **kwargs):
+        return _FakeDaskFuture(fn(*args))
+
+    def gather(self, future):
+        return future.result()
 
     def wait(self, refs, num_returns=1, timeout=None):
         resolved = list(refs)
         return resolved[:num_returns], resolved[num_returns:]
 
-    def remote(self, *args, **kwargs):
-        if args and callable(args[0]) and len(args) == 1 and not kwargs:
-            return _FakeRemoteFunction(args[0])
 
-        def _wrapper(fn):
-            return _FakeRemoteFunction(fn)
-
-        return _wrapper
-
-
-def _fake_ray_runtime(
+def _fake_dask_runtime(
     *,
     total_cpus: int = 8,
     max_node_cpus: int = 4,
-) -> RayClusterRuntime:
-    fake_ray = _FakeRayModule(
+) -> DaskClusterRuntime:
+    fake_dask = _FakeDaskClient(
         total_cpus=total_cpus,
         max_node_cpus=max_node_cpus,
     )
-    return RayClusterRuntime(
-        config=SimpleNamespace(ray_address="ray://cluster"),
-        status=SimpleNamespace(ok=True, combined_output="ok"),
-        ray_module=fake_ray,
-        nodes=fake_ray.nodes(),
-        cluster_resources=fake_ray.cluster_resources(),
+    return DaskClusterRuntime(
+        config=SimpleNamespace(),
+        cluster=SimpleNamespace(),
+        client=fake_dask,
+        scheduler_info={},
+        workers={
+            "worker-a": {"resources": {"CPU": float(max_node_cpus)}},
+            "worker-b": {"resources": {"CPU": float(max_node_cpus)}},
+        },
         total_cpus=int(total_cpus),
         max_node_cpus=int(max_node_cpus),
         active_nodes=2,
+        address="tls://cluster",
+        dashboard_url=None,
+        has_cpu_resource=True,
     )
 
 
-def test_controlled_combo_ray_cluster_driver_manages_trials_and_trial_metadata(
+def test_controlled_combo_dask_cluster_driver_manages_trials_and_trial_metadata(
     tmp_path, monkeypatch
 ):
     pytest.importorskip("sklearn")
@@ -3315,7 +3293,7 @@ def test_controlled_combo_ray_cluster_driver_manages_trials_and_trial_metadata(
     runner = ExperimentsRunner(random_state=42)
     train_val_df, test_df = temporal_train_test_split(base_df, test_size=0.2)
     train_df, val_df = temporal_train_test_split(train_val_df, test_size=0.25)
-    runtime = _fake_ray_runtime(total_cpus=8, max_node_cpus=4)
+    runtime = _fake_dask_runtime(total_cpus=8, max_node_cpus=4)
 
     monkeypatch.setattr(
         experiments_logic_module,
@@ -3340,31 +3318,31 @@ def test_controlled_combo_ray_cluster_driver_manages_trials_and_trial_metadata(
         n_trials=2,
         timeout=30,
         optuna_n_jobs=3,
-        execution_backend=EXECUTION_BACKEND_RAY_CLUSTER,
+        execution_backend=EXECUTION_BACKEND_DASK_CLUSTER,
         search_space_config=_controlled_search_space(),
         parallel_jobs=2,
         xgb_parallel_jobs=1,
-        ray_runtime=runtime,
+        dask_runtime=runtime,
     )
 
-    assert result["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
-    assert result["ray_address"] == "ray://cluster"
-    assert result["ray_requested_trial_concurrency"] == 3
-    assert result["ray_effective_trial_concurrency"] == 3
-    assert result["ray_trial_cpus"] == 2
-    assert result["ray_active_nodes"] == 2
-    assert result["ray_hosts_used"] == ["node-a"]
+    assert result["execution_backend"] == EXECUTION_BACKEND_DASK_CLUSTER
+    assert result["dask_address"] == "tls://cluster"
+    assert result["dask_requested_trial_concurrency"] == 3
+    assert result["dask_effective_trial_concurrency"] == 3
+    assert result["dask_trial_cpus"] == 2
+    assert result["dask_active_nodes"] == 2
+    assert result["dask_hosts_used"] == ["node-a"]
     assert not result["trials_df"].empty
     assert "trial_host" in result["trials_df"].columns
     assert "trial_elapsed_s" in result["trials_df"].columns
     assert "execution_backend" in result["trials_df"].columns
     assert set(result["trials_df"]["trial_host"].dropna().astype(str)) == {"node-a"}
     assert set(result["trials_df"]["execution_backend"].dropna().astype(str)) == {
-        EXECUTION_BACKEND_RAY_CLUSTER
+        EXECUTION_BACKEND_DASK_CLUSTER
     }
 
 
-def test_controlled_combo_ray_cluster_rejects_hyperband(
+def test_controlled_combo_dask_cluster_rejects_hyperband(
     tmp_path,
 ):
     pytest.importorskip("sklearn")
@@ -3389,22 +3367,22 @@ def test_controlled_combo_ray_cluster_rejects_hyperband(
             n_trials=1,
             timeout=30,
             optuna_n_jobs=2,
-            execution_backend=EXECUTION_BACKEND_RAY_CLUSTER,
+            execution_backend=EXECUTION_BACKEND_DASK_CLUSTER,
             search_space_config=_controlled_search_space(),
             parallel_jobs=2,
             xgb_parallel_jobs=1,
             optuna_pruning_config={"enabled": True, "type": "hyperband"},
-            ray_runtime=_fake_ray_runtime(),
+            dask_runtime=_fake_dask_runtime(),
         )
 
 
-def test_run_calibration_sweep_propagates_ray_backend_metadata(
+def test_run_calibration_sweep_propagates_dask_backend_metadata(
     tmp_path,
     monkeypatch,
 ):
     base_df = _synthetic_calibration_base_df()
     runner = ExperimentsRunner(random_state=42)
-    runtime = _fake_ray_runtime()
+    runtime = _fake_dask_runtime()
     captured_calls = []
 
     def _fake_optimize(self, **kwargs):
@@ -3412,20 +3390,20 @@ def test_run_calibration_sweep_propagates_ray_backend_metadata(
         result = _fake_calibration_optimize_result(kwargs, score=0.74)
         result.update(
             {
-                "execution_backend": EXECUTION_BACKEND_RAY_CLUSTER,
-                "ray_address": "ray://cluster",
-                "ray_requested_trial_concurrency": 3,
-                "ray_effective_trial_concurrency": 2,
-                "ray_trial_cpus": 2,
-                "ray_active_nodes": 2,
-                "ray_hosts_used": ["node-a"],
+                "execution_backend": EXECUTION_BACKEND_DASK_CLUSTER,
+                "dask_address": "tls://cluster",
+                "dask_requested_trial_concurrency": 3,
+                "dask_effective_trial_concurrency": 2,
+                "dask_trial_cpus": 2,
+                "dask_active_nodes": 2,
+                "dask_hosts_used": ["node-a"],
             }
         )
         return result
 
     monkeypatch.setattr(
         experiments_logic_module,
-        "connect_ray_cluster",
+        "connect_dask_cluster",
         lambda: runtime,
     )
     monkeypatch.setattr(ExperimentsRunner, "_optimize_controlled_combo", _fake_optimize)
@@ -3440,25 +3418,25 @@ def test_run_calibration_sweep_propagates_ray_backend_metadata(
         n_trials=1,
         timeout=30,
         optuna_n_jobs=3,
-        execution_backend=EXECUTION_BACKEND_RAY_CLUSTER,
+        execution_backend=EXECUTION_BACKEND_DASK_CLUSTER,
         parallel_jobs=2,
         checkpoint_root=tmp_path / "calibration_runs",
     )
 
     assert len(captured_calls) == 2
     assert all(
-        call["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
+        call["execution_backend"] == EXECUTION_BACKEND_DASK_CLUSTER
         for call in captured_calls
     )
-    assert payload["protocol"]["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
-    assert payload["protocol"]["ray_address"] == "ray://cluster"
+    assert payload["protocol"]["execution_backend"] == EXECUTION_BACKEND_DASK_CLUSTER
+    assert payload["protocol"]["dask_address"] == "tls://cluster"
     assert "execution_backend" in payload["leaderboard_df"].columns
     assert set(
         payload["leaderboard_df"]["execution_backend"].dropna().astype(str)
-    ) == {EXECUTION_BACKEND_RAY_CLUSTER}
+    ) == {EXECUTION_BACKEND_DASK_CLUSTER}
 
 
-def test_run_controlled_comparison_propagates_ray_backend_metadata(
+def test_run_controlled_comparison_propagates_dask_backend_metadata(
     tmp_path,
     monkeypatch,
 ):
@@ -3468,7 +3446,7 @@ def test_run_controlled_comparison_propagates_ray_backend_metadata(
 
     base_df, feature_cols, _base_cols, _cluster_cols = build_synthetic_base_df(tmp_path)
     runner = ExperimentsRunner(random_state=42)
-    runtime = _fake_ray_runtime()
+    runtime = _fake_dask_runtime()
     captured_calls = []
 
     def _fake_importance(self, df, feature_cols, **kwargs):
@@ -3504,20 +3482,20 @@ def test_run_controlled_comparison_propagates_ray_backend_metadata(
         )
         result.update(
             {
-                "execution_backend": EXECUTION_BACKEND_RAY_CLUSTER,
-                "ray_address": "ray://cluster",
-                "ray_requested_trial_concurrency": 3,
-                "ray_effective_trial_concurrency": 2,
-                "ray_trial_cpus": 2,
-                "ray_active_nodes": 2,
-                "ray_hosts_used": ["node-a"],
+                "execution_backend": EXECUTION_BACKEND_DASK_CLUSTER,
+                "dask_address": "tls://cluster",
+                "dask_requested_trial_concurrency": 3,
+                "dask_effective_trial_concurrency": 2,
+                "dask_trial_cpus": 2,
+                "dask_active_nodes": 2,
+                "dask_hosts_used": ["node-a"],
             }
         )
         return result
 
     monkeypatch.setattr(
         experiments_logic_module,
-        "connect_ray_cluster",
+        "connect_dask_cluster",
         lambda: runtime,
     )
     monkeypatch.setattr(
@@ -3541,7 +3519,7 @@ def test_run_controlled_comparison_propagates_ray_backend_metadata(
         n_trials=1,
         timeout=30,
         optuna_n_jobs=3,
-        execution_backend=EXECUTION_BACKEND_RAY_CLUSTER,
+        execution_backend=EXECUTION_BACKEND_DASK_CLUSTER,
         parallel_jobs=2,
         xgb_parallel_jobs=1,
         selected_models=["Random Forest"],
@@ -3552,11 +3530,11 @@ def test_run_controlled_comparison_propagates_ray_backend_metadata(
 
     assert captured_calls
     assert all(
-        call["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
+        call["execution_backend"] == EXECUTION_BACKEND_DASK_CLUSTER
         for call in captured_calls
     )
-    assert payload["protocol"]["execution_backend"] == EXECUTION_BACKEND_RAY_CLUSTER
+    assert payload["protocol"]["execution_backend"] == EXECUTION_BACKEND_DASK_CLUSTER
     assert "execution_backend" in payload["grid_results_df"].columns
-    assert EXECUTION_BACKEND_RAY_CLUSTER in set(
+    assert EXECUTION_BACKEND_DASK_CLUSTER in set(
         payload["grid_results_df"]["execution_backend"].dropna().astype(str)
     )

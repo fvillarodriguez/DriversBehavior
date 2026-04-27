@@ -406,6 +406,7 @@ def Clusterization(
     n_months_active = (
         timestamps.dt.to_period("M").groupby(plates_clean, sort=False).nunique()
     )
+    n_years_active = timestamps.dt.year.groupby(plates_clean, sort=False).nunique()
 
     _tick("Preparando datos")
 
@@ -676,6 +677,9 @@ def Clusterization(
     summary["n_months_active"] = (
         summary["plate"].map(n_months_active).fillna(0).astype(int)
     )
+    summary["n_years_active"] = (
+        summary["plate"].map(n_years_active).fillna(0).astype(int)
+    )
     summary = summary.sort_values(
         by=["total_passes", "plate"], ascending=[False, True]
     ).reset_index(drop=True)
@@ -893,6 +897,116 @@ def split_frequent_drivers(
         mask &= features_df["n_months_active"] >= min_months_active
 
     return features_df[mask], features_df[~mask]
+
+
+def _normalize_plate_values(values: object) -> List[str]:
+    if values is None:
+        return []
+    if isinstance(values, pd.Series):
+        series = values
+    elif isinstance(values, (list, tuple, set, np.ndarray, pd.Index)):
+        series = pd.Series(list(values), dtype="object")
+    else:
+        series = pd.Series([values], dtype="object")
+    normalized = normalize_plate_series(series).dropna().astype(str)
+    return list(dict.fromkeys(normalized.tolist()))
+
+
+def _dynamic_gmm_plate_filter_hash(plates: List[str]) -> str:
+    payload = json.dumps(list(plates), ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_prevalent_plate_selection(
+    features_df: pd.DataFrame,
+    fraction_pct: float = 10.0,
+    feature_cols: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    """
+    Select the exact top fraction of historical plates ranked by prevalence.
+    """
+    fraction = float(fraction_pct)
+    if not math.isfinite(fraction):
+        raise ValueError("fraction_pct must be finite.")
+    fraction = min(max(fraction, 0.0), 100.0)
+    empty_ranked = pd.DataFrame(
+        columns=[
+            "plate",
+            "n_months_active",
+            "n_years_active",
+            "total_passes",
+        ]
+    )
+    if features_df is None or features_df.empty or "plate" not in features_df.columns:
+        return {
+            "plates": [],
+            "ranked": empty_ranked,
+            "selected_count": 0,
+            "total_valid_plates": 0,
+            "fraction_pct": fraction,
+            "plate_hash": _dynamic_gmm_plate_filter_hash([]),
+        }
+
+    work = features_df.copy()
+    if feature_cols:
+        valid_feature_cols = [col for col in feature_cols if col in work.columns]
+        if valid_feature_cols:
+            work = _prepare_cluster_features(work, valid_feature_cols)
+    if work.empty:
+        return {
+            "plates": [],
+            "ranked": empty_ranked,
+            "selected_count": 0,
+            "total_valid_plates": 0,
+            "fraction_pct": fraction,
+            "plate_hash": _dynamic_gmm_plate_filter_hash([]),
+        }
+
+    work["plate"] = normalize_plate_series(work["plate"])
+    work = work[work["plate"].notna()].copy()
+    if work.empty:
+        return {
+            "plates": [],
+            "ranked": empty_ranked,
+            "selected_count": 0,
+            "total_valid_plates": 0,
+            "fraction_pct": fraction,
+            "plate_hash": _dynamic_gmm_plate_filter_hash([]),
+        }
+
+    for col in ["n_months_active", "n_years_active", "total_passes"]:
+        if col not in work.columns:
+            work[col] = 0
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+
+    ranked = (
+        work.groupby("plate", sort=False)
+        .agg(
+            n_months_active=("n_months_active", "max"),
+            n_years_active=("n_years_active", "max"),
+            total_passes=("total_passes", "max"),
+        )
+        .reset_index()
+    )
+    ranked = ranked.sort_values(
+        ["n_months_active", "n_years_active", "total_passes", "plate"],
+        ascending=[False, False, False, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    total_valid = int(len(ranked))
+    selected_count = int(math.ceil(total_valid * fraction / 100.0)) if total_valid else 0
+    if total_valid and fraction > 0:
+        selected_count = max(1, selected_count)
+    selected_count = min(selected_count, total_valid)
+    plates = ranked["plate"].head(selected_count).astype(str).tolist()
+    return {
+        "plates": plates,
+        "ranked": ranked,
+        "selected_count": int(selected_count),
+        "total_valid_plates": int(total_valid),
+        "fraction_pct": fraction,
+        "plate_hash": _dynamic_gmm_plate_filter_hash(plates),
+    }
 
 
 def _scale_cluster_features(
@@ -1352,7 +1466,7 @@ def list_dynamic_gmm_checkpoint_db_paths(output_dir: Optional[Path] = None) -> L
     checkpoint_paths: List[Path] = []
     for path in paths:
         try:
-            conn = duckdb.connect(str(path), read_only=True)
+            conn = _connect_dynamic_gmm_duckdb(path, read_only=False)
             try:
                 if _dynamic_gmm_table_exists(
                     conn,
@@ -1382,6 +1496,43 @@ def _dynamic_gmm_table_exists(conn, table_name: str) -> bool:
     return bool(info)
 
 
+def _dynamic_gmm_quote_identifier(identifier: str) -> str:
+    return '"' + str(identifier).replace('"', '""') + '"'
+
+
+def _dynamic_gmm_table_column_types(conn, table_name: str) -> Dict[str, str]:
+    if not _dynamic_gmm_table_exists(conn, table_name):
+        return {}
+    try:
+        rows = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    except Exception:
+        return {}
+    return {str(row[1]): str(row[2] or "VARCHAR") for row in rows}
+
+
+def _dynamic_gmm_duckdb_type_for_series(series: pd.Series) -> str:
+    if pd.api.types.is_bool_dtype(series):
+        return "BOOLEAN"
+    if pd.api.types.is_integer_dtype(series):
+        return "BIGINT"
+    if pd.api.types.is_float_dtype(series):
+        return "DOUBLE"
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "TIMESTAMP"
+    return "VARCHAR"
+
+
+def _connect_dynamic_gmm_duckdb(path: Path, *, read_only: bool = False):
+    _ensure_duckdb_available()
+    try:
+        return duckdb.connect(str(path), read_only=bool(read_only))
+    except Exception as exc:
+        message = str(exc).lower()
+        if read_only and "different configuration" in message:
+            return duckdb.connect(str(path))
+        raise
+
+
 def _load_dynamic_gmm_metadata_from_conn(conn) -> Dict[str, object]:
     if not _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_METADATA_TABLE_NAME):
         return {}
@@ -1407,6 +1558,226 @@ def _load_dynamic_gmm_metadata_from_conn(conn) -> Dict[str, object]:
 def _dynamic_gmm_config_fingerprint(config: Dict[str, object]) -> str:
     payload = json.dumps(config, sort_keys=True, default=str, ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _dynamic_gmm_normalize_config_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            str(key): _dynamic_gmm_normalize_config_value(val)
+            for key, val in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_dynamic_gmm_normalize_config_value(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        numeric = float(value)
+        return None if math.isnan(numeric) else numeric
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, pd.Timedelta):
+        return str(value)
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
+def _dynamic_gmm_config_differences(
+    checkpoint_value: object,
+    current_value: object,
+    *,
+    path: str = "",
+) -> List[Tuple[str, object, object]]:
+    checkpoint_normalized = _dynamic_gmm_normalize_config_value(checkpoint_value)
+    current_normalized = _dynamic_gmm_normalize_config_value(current_value)
+    if isinstance(checkpoint_normalized, dict) and isinstance(current_normalized, dict):
+        diffs: List[Tuple[str, object, object]] = []
+        for key in sorted(set(checkpoint_normalized) | set(current_normalized)):
+            child_path = f"{path}.{key}" if path else str(key)
+            diffs.extend(
+                _dynamic_gmm_config_differences(
+                    checkpoint_normalized.get(key),
+                    current_normalized.get(key),
+                    path=child_path,
+                )
+            )
+        return diffs
+    if checkpoint_normalized != current_normalized:
+        return [(path, checkpoint_normalized, current_normalized)]
+    return []
+
+
+def _dynamic_gmm_format_config_value(value: object, *, max_len: int = 160) -> str:
+    try:
+        text = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
+    except TypeError:
+        text = str(value)
+    if len(text) > int(max_len):
+        return text[: int(max_len) - 3] + "..."
+    return text
+
+
+def _dynamic_gmm_config_mismatch_details(
+    checkpoint_metadata: Dict[str, object],
+    current_config: Dict[str, object],
+    *,
+    max_differences: int = 12,
+) -> str:
+    checkpoint_config = {
+        key: checkpoint_metadata.get(key)
+        for key in current_config.keys()
+    }
+    diffs = _dynamic_gmm_config_differences(checkpoint_config, current_config)
+    if not diffs:
+        return (
+            "No se pudo aislar diferencias campo a campo; el fingerprint guardado "
+            "difiere del fingerprint actual."
+        )
+    lines = ["Variables diferentes:"]
+    for key, checkpoint_value, current_value in diffs[: int(max_differences)]:
+        lines.append(
+            "- "
+            + str(key)
+            + ": checkpoint="
+            + _dynamic_gmm_format_config_value(checkpoint_value)
+            + " | actual="
+            + _dynamic_gmm_format_config_value(current_value)
+        )
+    remaining = len(diffs) - int(max_differences)
+    if remaining > 0:
+        lines.append(f"- ... y {remaining} diferencia(s) adicional(es).")
+    return "\n".join(lines)
+
+
+def build_dynamic_gmm_config_payload(
+    *,
+    base_features_df: pd.DataFrame,
+    feature_cols: List[str],
+    k: int,
+    confidence_threshold_proba: float,
+    window_days: int,
+    date_start: pd.Timestamp,
+    date_end: pd.Timestamp,
+    min_window_passes: int = 5,
+    train_params: Optional[Dict[str, int]] = None,
+    random_state: int = 42,
+    covariance_type: str = "full",
+    include_membership_probabilities: bool = True,
+    ttc_mode: str = "dynamic",
+    fixed_ttc_s: Optional[float] = None,
+    assignment_scope: str = "all",
+    prevalent_fraction_pct: Optional[float] = None,
+    prevalent_plate_count: Optional[int] = None,
+    prevalent_valid_plate_count: Optional[int] = None,
+    prevalent_plate_hash: Optional[str] = None,
+    prevalent_source: Optional[str] = None,
+) -> Dict[str, object]:
+    train_params = dict(train_params or {})
+    min_total_passes = int(train_params.get("min_total_passes", 20))
+    min_days_active = int(train_params.get("min_days_active", 1))
+    min_months_active = int(train_params.get("min_months_active", 1))
+    effective_feature_cols = [
+        col for col in feature_cols if col in base_features_df.columns
+    ]
+    windows = build_dynamic_gmm_windows(date_start, date_end, int(window_days))
+    payload: Dict[str, object] = {
+        "method": "gmm_dynamic",
+        "feature_cols": list(effective_feature_cols),
+        "requested_feature_cols": list(feature_cols),
+        "k": int(k),
+        "confidence_threshold_proba": float(confidence_threshold_proba),
+        "window_days": int(window_days),
+        "window_step_days": 1,
+        "min_window_passes": int(min_window_passes),
+        "date_start": str(pd.Timestamp(date_start).date()),
+        "date_end": str(pd.Timestamp(date_end).date()),
+        "n_windows": int(len(windows)),
+        "covariance_type": covariance_type,
+        "random_state": int(random_state),
+        "include_membership_probabilities": bool(include_membership_probabilities),
+        "train_params": {
+            "min_total_passes": min_total_passes,
+            "min_days_active": min_days_active,
+            "min_months_active": min_months_active,
+        },
+        "ttc_mode": ttc_mode,
+        "ttc_fixed_seconds": fixed_ttc_s,
+    }
+    normalized_scope = str(assignment_scope or "all").strip().lower()
+    if normalized_scope != "all":
+        payload.update(
+            {
+                "assignment_scope": normalized_scope,
+                "prevalent_fraction_pct": (
+                    None
+                    if prevalent_fraction_pct is None
+                    else float(prevalent_fraction_pct)
+                ),
+                "prevalent_plate_count": (
+                    None if prevalent_plate_count is None else int(prevalent_plate_count)
+                ),
+                "prevalent_valid_plate_count": (
+                    None
+                    if prevalent_valid_plate_count is None
+                    else int(prevalent_valid_plate_count)
+                ),
+                "prevalent_plate_hash": prevalent_plate_hash,
+                "prevalent_source": prevalent_source,
+            }
+        )
+    return payload
+
+
+def check_dynamic_gmm_checkpoint_compatibility(
+    db_path: Path,
+    current_config: Dict[str, object],
+) -> Dict[str, object]:
+    _ensure_duckdb_available()
+    path = Path(db_path)
+    if not path.exists():
+        return {
+            "compatible": False,
+            "details": f"No existe el checkpoint: {path}",
+            "metadata": {},
+        }
+    conn = _connect_dynamic_gmm_duckdb(path, read_only=False)
+    try:
+        metadata = _load_dynamic_gmm_metadata_from_conn(conn)
+    finally:
+        conn.close()
+    if not metadata:
+        return {
+            "compatible": False,
+            "details": "El DuckDB seleccionado no contiene metadata de GMM dinamico.",
+            "metadata": {},
+        }
+    current_fingerprint = _dynamic_gmm_config_fingerprint(current_config)
+    checkpoint_fingerprint = str(metadata.get("config_fingerprint") or "")
+    if checkpoint_fingerprint and checkpoint_fingerprint != current_fingerprint:
+        return {
+            "compatible": False,
+            "details": _dynamic_gmm_config_mismatch_details(
+                metadata,
+                current_config,
+            ),
+            "metadata": metadata,
+            "checkpoint_fingerprint": checkpoint_fingerprint,
+            "current_fingerprint": current_fingerprint,
+        }
+    if not checkpoint_fingerprint:
+        return {
+            "compatible": False,
+            "details": "El checkpoint no tiene fingerprint de configuracion para validar resume.",
+            "metadata": metadata,
+            "current_fingerprint": current_fingerprint,
+        }
+    return {
+        "compatible": True,
+        "details": "",
+        "metadata": metadata,
+        "checkpoint_fingerprint": checkpoint_fingerprint,
+        "current_fingerprint": current_fingerprint,
+    }
 
 
 def _dynamic_gmm_empty_assignments_df(
@@ -1485,7 +1856,47 @@ def _dynamic_gmm_append_df(conn, table_name: str, df: pd.DataFrame) -> None:
         if not _dynamic_gmm_table_exists(conn, table_name):
             conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {view_name}")
         else:
-            conn.execute(f"INSERT INTO {table_name} SELECT * FROM {view_name}")
+            table_types = _dynamic_gmm_table_column_types(conn, table_name)
+            for col in work.columns:
+                if col in table_types:
+                    continue
+                col_type = _dynamic_gmm_duckdb_type_for_series(work[col])
+                conn.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN "
+                    f"{_dynamic_gmm_quote_identifier(col)} {col_type}"
+                )
+                table_types[col] = col_type
+                if col.startswith("cluster_count_"):
+                    conn.execute(
+                        f"UPDATE {table_name} SET "
+                        f"{_dynamic_gmm_quote_identifier(col)} = 0 "
+                        f"WHERE {_dynamic_gmm_quote_identifier(col)} IS NULL"
+                    )
+                elif col.startswith("cluster_share_"):
+                    conn.execute(
+                        f"UPDATE {table_name} SET "
+                        f"{_dynamic_gmm_quote_identifier(col)} = 0.0 "
+                        f"WHERE {_dynamic_gmm_quote_identifier(col)} IS NULL"
+                    )
+            insert_cols = list(table_types.keys())
+            select_exprs = []
+            for col in insert_cols:
+                quoted_col = _dynamic_gmm_quote_identifier(col)
+                if col in work.columns:
+                    select_exprs.append(quoted_col)
+                elif col.startswith("cluster_count_"):
+                    select_exprs.append(f"CAST(0 AS {table_types[col]}) AS {quoted_col}")
+                elif col.startswith("cluster_share_"):
+                    select_exprs.append(f"CAST(0.0 AS {table_types[col]}) AS {quoted_col}")
+                else:
+                    select_exprs.append(f"CAST(NULL AS {table_types[col]}) AS {quoted_col}")
+            conn.execute(
+                f"INSERT INTO {table_name} ("
+                + ", ".join(_dynamic_gmm_quote_identifier(col) for col in insert_cols)
+                + ") SELECT "
+                + ", ".join(select_exprs)
+                + f" FROM {view_name}"
+            )
     finally:
         conn.unregister(view_name)
 
@@ -1906,30 +2317,47 @@ def _compute_dynamic_gmm_window_job(payload: Dict[str, object]) -> Dict[str, obj
     effective_feature_cols = list(payload["effective_feature_cols"])
     k = int(payload["k"])
     include_membership_probabilities = bool(payload["include_membership_probabilities"])
+
+    def _empty_result(event_status: str) -> Dict[str, object]:
+        return {
+            "run_id": run_id,
+            "window_index": window_index,
+            "window_label": window_label,
+            "status": "completed",
+            "event_status": event_status,
+            "rows": 0,
+            "assignments": _dynamic_gmm_empty_assignments_df(
+                effective_feature_cols,
+                k,
+                include_membership_probabilities,
+            ),
+            "window_summary": _dynamic_gmm_empty_window_summary(
+                run_id=run_id,
+                window_index=window_index,
+                window_start=window_start,
+                window_end=window_end,
+                window_label=window_label,
+            ),
+            "error": None,
+        }
+
     try:
         flows_df = load_flujos_range(window_start, window_end)
         if flows_df is None or flows_df.empty:
-            return {
-                "run_id": run_id,
-                "window_index": window_index,
-                "window_label": window_label,
-                "status": "completed",
-                "event_status": "empty_flows",
-                "rows": 0,
-                "assignments": _dynamic_gmm_empty_assignments_df(
-                    effective_feature_cols,
-                    k,
-                    include_membership_probabilities,
-                ),
-                "window_summary": _dynamic_gmm_empty_window_summary(
-                    run_id=run_id,
-                    window_index=window_index,
-                    window_start=window_start,
-                    window_end=window_end,
-                    window_label=window_label,
-                ),
-                "error": None,
-            }
+            return _empty_result("empty_flows")
+        assignment_plate_filter = _normalize_plate_values(
+            payload.get("assignment_plate_filter")
+        )
+        if assignment_plate_filter:
+            flows_df = flows_df.copy()
+            flow_cols = payload["flow_cols"]
+            ensure_plate_clean_column(flows_df, flow_cols)
+            if PLATE_CLEAN_COL not in flows_df.columns:
+                return _empty_result("empty_prevalent_flows")
+            selected = set(assignment_plate_filter)
+            flows_df = flows_df[flows_df[PLATE_CLEAN_COL].astype(str).isin(selected)].copy()
+            if flows_df.empty:
+                return _empty_result("empty_prevalent_flows")
         window_features = Clusterization(
             flows_df,
             payload["flow_cols"],
@@ -1944,27 +2372,7 @@ def _compute_dynamic_gmm_window_job(payload: Dict[str, object]) -> Dict[str, obj
             **dict(payload.get("clean_kwargs") or {}),
         )
         if window_features is None or window_features.empty:
-            return {
-                "run_id": run_id,
-                "window_index": window_index,
-                "window_label": window_label,
-                "status": "completed",
-                "event_status": "empty_features",
-                "rows": 0,
-                "assignments": _dynamic_gmm_empty_assignments_df(
-                    effective_feature_cols,
-                    k,
-                    include_membership_probabilities,
-                ),
-                "window_summary": _dynamic_gmm_empty_window_summary(
-                    run_id=run_id,
-                    window_index=window_index,
-                    window_start=window_start,
-                    window_end=window_end,
-                    window_label=window_label,
-                ),
-                "error": None,
-            }
+            return _empty_result("empty_features")
         missing_window_cols = [
             col for col in effective_feature_cols if col not in window_features.columns
         ]
@@ -1978,27 +2386,7 @@ def _compute_dynamic_gmm_window_job(payload: Dict[str, object]) -> Dict[str, obj
             effective_feature_cols,
         )
         if window_cluster_df.empty:
-            return {
-                "run_id": run_id,
-                "window_index": window_index,
-                "window_label": window_label,
-                "status": "completed",
-                "event_status": "empty_cluster_features",
-                "rows": 0,
-                "assignments": _dynamic_gmm_empty_assignments_df(
-                    effective_feature_cols,
-                    k,
-                    include_membership_probabilities,
-                ),
-                "window_summary": _dynamic_gmm_empty_window_summary(
-                    run_id=run_id,
-                    window_index=window_index,
-                    window_start=window_start,
-                    window_end=window_end,
-                    window_label=window_label,
-                ),
-                "error": None,
-            }
+            return _empty_result("empty_cluster_features")
         predicted = predict_gmm_cluster_membership(
             window_cluster_df,
             effective_feature_cols,
@@ -2446,7 +2834,7 @@ def load_dynamic_gmm_results_duckdb(
     _ensure_duckdb_available()
     if not db_path.exists():
         return pd.DataFrame(), pd.DataFrame(), {}
-    conn = duckdb.connect(str(db_path), read_only=True)
+    conn = _connect_dynamic_gmm_duckdb(db_path, read_only=False)
     try:
         if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME):
             assignments = conn.execute(
@@ -2495,6 +2883,9 @@ def run_dynamic_gmm_clustering(
     resume_existing: bool = False,
     load_final_result: bool = True,
     run_id: Optional[str] = None,
+    assignment_scope: str = "all",
+    prevalent_fraction_pct: Optional[float] = None,
+    assignment_plate_filter: Optional[List[str]] = None,
     **clean_kwargs,
 ) -> Dict[str, object]:
     train_params = dict(train_params or {})
@@ -2507,6 +2898,10 @@ def run_dynamic_gmm_clustering(
     ]
     if not effective_feature_cols:
         raise ValueError("No hay columnas de features disponibles para GMM dinamico.")
+
+    normalized_assignment_scope = str(assignment_scope or "all").strip().lower()
+    if normalized_assignment_scope not in {"all", "prevalent"}:
+        raise ValueError("assignment_scope must be 'all' or 'prevalent'.")
 
     base_cluster_df = _prepare_cluster_features(base_features_df, effective_feature_cols)
     frequent_df, _rare_df = split_frequent_drivers(
@@ -2536,29 +2931,79 @@ def run_dynamic_gmm_clustering(
     if not windows:
         raise ValueError("El rango seleccionado no contiene ventanas completas.")
 
-    config_payload: Dict[str, object] = {
-        "method": "gmm_dynamic",
-        "feature_cols": list(effective_feature_cols),
-        "requested_feature_cols": list(feature_cols),
-        "k": int(k),
-        "confidence_threshold_proba": float(confidence_threshold_proba),
-        "window_days": int(window_days),
-        "window_step_days": 1,
-        "min_window_passes": int(min_window_passes),
-        "date_start": str(pd.Timestamp(date_start).date()),
-        "date_end": str(pd.Timestamp(date_end).date()),
-        "n_windows": int(len(windows)),
-        "covariance_type": covariance_type,
-        "random_state": int(random_state),
-        "include_membership_probabilities": bool(include_membership_probabilities),
-        "train_params": {
+    prevalent_selection: Dict[str, object] = {
+        "plates": [],
+        "ranked": pd.DataFrame(),
+        "selected_count": 0,
+        "total_valid_plates": int(base_features_df["plate"].nunique())
+        if "plate" in base_features_df.columns
+        else 0,
+        "fraction_pct": None,
+        "plate_hash": _dynamic_gmm_plate_filter_hash([]),
+    }
+    selected_assignment_plates: List[str] = []
+    if normalized_assignment_scope == "prevalent":
+        if assignment_plate_filter is None:
+            prevalent_selection = build_prevalent_plate_selection(
+                base_features_df,
+                fraction_pct=(
+                    10.0
+                    if prevalent_fraction_pct is None
+                    else float(prevalent_fraction_pct)
+                ),
+                feature_cols=effective_feature_cols,
+            )
+            selected_assignment_plates = list(prevalent_selection["plates"])
+        else:
+            selected_assignment_plates = _normalize_plate_values(assignment_plate_filter)
+            fraction = (
+                100.0
+                if prevalent_fraction_pct is None
+                else float(prevalent_fraction_pct)
+            )
+            prevalent_selection = {
+                "plates": selected_assignment_plates,
+                "ranked": pd.DataFrame(),
+                "selected_count": int(len(selected_assignment_plates)),
+                "total_valid_plates": int(len(selected_assignment_plates)),
+                "fraction_pct": fraction,
+                "plate_hash": _dynamic_gmm_plate_filter_hash(selected_assignment_plates),
+            }
+        if not selected_assignment_plates:
+            raise ValueError(
+                "No hay patentes prevalentes validas para asignacion dinamica."
+            )
+
+    config_payload = build_dynamic_gmm_config_payload(
+        base_features_df=base_features_df,
+        feature_cols=feature_cols,
+        k=int(k),
+        confidence_threshold_proba=float(confidence_threshold_proba),
+        window_days=int(window_days),
+        date_start=pd.Timestamp(date_start),
+        date_end=pd.Timestamp(date_end),
+        min_window_passes=int(min_window_passes),
+        train_params={
             "min_total_passes": min_total_passes,
             "min_days_active": min_days_active,
             "min_months_active": min_months_active,
         },
-        "ttc_mode": ttc_mode,
-        "ttc_fixed_seconds": fixed_ttc_s,
-    }
+        random_state=int(random_state),
+        covariance_type=covariance_type,
+        include_membership_probabilities=bool(include_membership_probabilities),
+        ttc_mode=ttc_mode,
+        fixed_ttc_s=fixed_ttc_s,
+        assignment_scope=normalized_assignment_scope,
+        prevalent_fraction_pct=prevalent_selection.get("fraction_pct"),
+        prevalent_plate_count=prevalent_selection.get("selected_count"),
+        prevalent_valid_plate_count=prevalent_selection.get("total_valid_plates"),
+        prevalent_plate_hash=prevalent_selection.get("plate_hash"),
+        prevalent_source=(
+            "historical_features"
+            if normalized_assignment_scope == "prevalent"
+            else None
+        ),
+    )
     config_fingerprint = _dynamic_gmm_config_fingerprint(config_payload)
     run_stem = run_id or f"dynamic_gmm_{_dynamic_gmm_stamp()}"
     result_metadata: Dict[str, object] = {
@@ -2568,7 +3013,25 @@ def run_dynamic_gmm_clustering(
         "config_fingerprint": config_fingerprint,
         "checkpoint_enabled": bool(checkpoint_enabled and persist),
         "parallel_jobs": max(1, int(parallel_jobs)),
+        "assignment_scope": normalized_assignment_scope,
     }
+    if normalized_assignment_scope == "prevalent":
+        result_metadata.update(
+            {
+                "prevalent_fraction_pct": float(
+                    prevalent_selection.get("fraction_pct") or 0.0
+                ),
+                "prevalent_plate_count": int(
+                    prevalent_selection.get("selected_count") or 0
+                ),
+                "prevalent_valid_plate_count": int(
+                    prevalent_selection.get("total_valid_plates") or 0
+                ),
+                "prevalent_source": "historical_features",
+                "prevalent_plate_hash": str(prevalent_selection.get("plate_hash") or ""),
+                "prevalent_plates": list(selected_assignment_plates),
+            }
+        )
     if metadata:
         result_metadata.update(metadata)
 
@@ -2597,6 +3060,7 @@ def run_dynamic_gmm_clustering(
             "ttc_mode": ttc_mode,
             "fixed_ttc_s": fixed_ttc_s,
             "speed_limit_map": speed_limit_map,
+            "assignment_plate_filter": list(selected_assignment_plates),
             "clean_kwargs": dict(clean_kwargs),
         }
 
@@ -2722,12 +3186,21 @@ def run_dynamic_gmm_clustering(
     conn = duckdb.connect(str(duckdb_path))
     try:
         existing_metadata = _load_dynamic_gmm_metadata_from_conn(conn)
+        if resume_existing and not existing_metadata:
+            raise ValueError(
+                "El DuckDB seleccionado no contiene metadata de GMM dinamico para retomar."
+            )
         if resume_existing and existing_metadata:
             existing_fingerprint = str(existing_metadata.get("config_fingerprint") or "")
             if existing_fingerprint and existing_fingerprint != config_fingerprint:
+                mismatch_details = _dynamic_gmm_config_mismatch_details(
+                    existing_metadata,
+                    config_payload,
+                )
                 raise ValueError(
                     "El checkpoint existe, pero sus parametros no coinciden con "
-                    "la configuracion actual. Inicie un nuevo run o use los mismos parametros."
+                    "la configuracion actual. Inicie un nuevo run o use los mismos parametros.\n"
+                    f"{mismatch_details}"
                 )
             run_id_value = str(existing_metadata.get("run_id") or run_stem)
             result_metadata["run_id"] = run_id_value
@@ -3071,7 +3544,7 @@ def run_dynamic_gmm_clustering(
             int(k),
             bool(include_membership_probabilities),
         )
-        conn = duckdb.connect(str(duckdb_path), read_only=True)
+        conn = _connect_dynamic_gmm_duckdb(duckdb_path, read_only=False)
         try:
             if _dynamic_gmm_table_exists(conn, DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME):
                 window_summary_df = conn.execute(
@@ -3829,6 +4302,32 @@ def _aggregate_batch_features(
         if batch_mode == "month" and "n_months_active" in batches_df.columns
         else None
     )
+    n_years_active = None
+    if "batch_start" in batches_df.columns:
+        batch_year = pd.to_datetime(batches_df["batch_start"], errors="coerce").dt.year
+        year_df = pd.DataFrame(
+            {
+                "plate": batches_df["plate"],
+                "batch_year": batch_year,
+            }
+        ).dropna(subset=["batch_year"])
+        if not year_df.empty:
+            n_years_active = year_df.groupby("plate", sort=False)["batch_year"].nunique()
+    elif "batch_month" in batches_df.columns:
+        month_start = pd.to_datetime(
+            batches_df["batch_month"].astype(str) + "-01",
+            errors="coerce",
+        )
+        year_df = pd.DataFrame(
+            {
+                "plate": batches_df["plate"],
+                "batch_year": month_start.dt.year,
+            }
+        ).dropna(subset=["batch_year"])
+        if not year_df.empty:
+            n_years_active = year_df.groupby("plate", sort=False)["batch_year"].nunique()
+    elif "n_years_active" in batches_df.columns:
+        n_years_active = grouped["n_years_active"].sum()
 
     if monthly_weighting:
         transitions_sum = (
@@ -3875,6 +4374,8 @@ def _aggregate_batch_features(
             summary["n_weeks_active"] = n_weeks_active
         if n_months_active is not None:
             summary["n_months_active"] = n_months_active
+        if n_years_active is not None:
+            summary["n_years_active"] = n_years_active
         if "lane_changes" in batches_df.columns:
             lane_changes_sum = grouped["lane_changes"].sum()
             if lane_changes_extra:
@@ -3977,6 +4478,8 @@ def _aggregate_batch_features(
         summary["n_weeks_active"] = n_weeks_active
     if n_months_active is not None:
         summary["n_months_active"] = n_months_active
+    if n_years_active is not None:
+        summary["n_years_active"] = n_years_active
     if speed_limit_count is not None:
         summary["speed_limit_count"] = speed_limit_count
     return summary.reset_index()
@@ -4030,6 +4533,7 @@ def _aggregate_weekly_batches_by_month(
         "speed_limit_count",
         "n_days_active",
         "n_weeks_active",
+        "n_years_active",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -4153,6 +4657,7 @@ def _aggregate_weekly_batches_by_month(
     if speed_limit_count is not None:
         summary["speed_limit_count"] = speed_limit_count
     summary["n_months_active"] = 1
+    summary["n_years_active"] = 1
     return summary.reset_index()
 
 

@@ -1,0 +1,165 @@
+INFO:     Started server process [58487]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:50156 (Press CTRL+C to quit)
+Web UI: http://127.0.0.1:50156
+INFO:     127.0.0.1:50180 - "GET / HTTP/1.1" 200 OExINFO:     Shutting down
+INFO:     Waiting for application shutdown.
+ERROR:    Traceback (most recent call last):
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/starlette/routing.py", line 638, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 244, in __aexit__
+    await self._router._shutdown()
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 4900, in _shutdown
+    await handler()
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/api/app.py", line 99, in shutdown
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/jobs/queue.py", line 68, in stop
+    name=package_name,
+    ^^^^^^^^^^^^^^^^
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/jobs/queue.py", line 86, in _loop
+    async def run_once(self) -> bool:
+            ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/jobs/queue.py", line 71, in run_once
+    args=args or [],
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/storage/repositories.py", line 252, in active
+    INSERT INTO jobs(
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/storage/db.py", line 19, in connect
+    conn = sqlite3.connect(self.path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: unable to open database file
+
+ERROR:    Application shutdown failed. Exiting.
+INFO:     Finished server process [53188]
+
+ast):
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/starlette/routing.py", line 638, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^INFO:     Waiting for application shutdown.
+ERROR:    Traceback (most recent call last):
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/starlette/routing.py", line 638, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 216, in merged_lifespan
+    async with original_context(app) as maybe_original_state:
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 244, in __aexit__
+    await self._router._shutdown()
+  File "/Users/felipe/Desktop/Dask Distributed/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 4900, in _shutdown
+    await handler()
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/api/app.py", line 99, in shutdown
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/jobs/queue.py", line 68, in stop
+    name=package_name,
+    ^^^^^^^^^^^^^^^^
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/jobs/queue.py", line 86, in _loop
+    async def run_once(self) -> bool:
+            ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/jobs/queue.py", line 71, in run_once
+    args=args or [],
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/storage/repositories.py", line 252, in active
+    INSERT INTO jobs(
+  File "/Users/felipe/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "/Users/felipe/Desktop/Dask Distributed/cluster_app/storage/db.py", line 19, in connect
+    conn = sqlite3.connect(self.path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: unable to open database file
+
+ERROR:    Application shutdown failed. Exiting.
+INFO:     Finished server process [53008]

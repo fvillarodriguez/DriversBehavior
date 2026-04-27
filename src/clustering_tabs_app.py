@@ -43,8 +43,11 @@ from clustering import (  # noqa: E402
     _prepare_cluster_features,
     _scale_cluster_features,
     build_ttc_feature_metadata,
+    build_dynamic_gmm_config_payload,
+    build_prevalent_plate_selection,
     build_cluster_descriptive,
     build_cluster_summary,
+    check_dynamic_gmm_checkpoint_compatibility,
     compute_gmm_metrics,
     compute_kmeans_metrics,
     load_cluster_feature_bundle_duckdb,
@@ -165,7 +168,8 @@ FEATURE_DETAILS = {
         ("lane_changes", "Numero absoluto de cambios de carril detectados antes de normalizar."),
         ("n_days_active", "Numero de dias distintos con actividad para la patente."),
         ("n_weeks_active", "Numero de semanas ISO distintas con actividad para la patente."),
-        ("n_months_active", "Numero de meses distintos con actividad para la patente."),
+        ("n_months_active", "Numero de meses calendario distintos con actividad para la patente, distinguiendo año-mes."),
+        ("n_years_active", "Numero de años calendario distintos con actividad para la patente."),
     ],
 }
 
@@ -236,6 +240,107 @@ def _format_bytes(value: object) -> str:
     if idx == 0:
         return f"{int(number)} {units[idx]}"
     return f"{number:.2f} {units[idx]}"
+
+
+def _resolve_dynamic_gmm_output_dir(raw_path: object) -> Tuple[Path, Optional[str]]:
+    text = str(raw_path or "").strip()
+    if not text:
+        return RESULTS_DIR, "Seleccione una carpeta de destino."
+    try:
+        expanded = os.path.expandvars(text)
+        path = Path(expanded).expanduser()
+        if not path.is_absolute():
+            path = ROOT_DIR / path
+        path = path.resolve()
+    except Exception as exc:
+        return RESULTS_DIR, f"No se pudo interpretar la carpeta destino: {exc}"
+    if path.exists() and not path.is_dir():
+        return path, "La ruta seleccionada existe, pero no es una carpeta."
+    return path, None
+
+
+def _applescript_string(value: object) -> str:
+    text = str(value)
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _open_macos_directory_selector(
+    initial_dir: Path,
+) -> Tuple[Optional[Path], Optional[str]]:
+    import subprocess
+
+    initial = initial_dir if initial_dir.exists() else RESULTS_DIR
+    if not initial.exists():
+        initial = ROOT_DIR
+    script = [
+        f"set defaultFolder to POSIX file {_applescript_string(str(initial))}",
+        (
+            "set chosenFolder to choose folder with prompt "
+            + _applescript_string(
+                "Seleccionar carpeta para resultados GMM dinamico"
+            )
+            + " default location defaultFolder"
+        ),
+        "POSIX path of chosenFolder",
+    ]
+    try:
+        result = subprocess.run(
+            ["osascript", *sum([["-e", line] for line in script], [])],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, "No se encontro osascript para abrir el selector de carpetas."
+    except Exception as exc:
+        return None, f"No se pudo abrir el selector de carpetas: {exc}"
+
+    if result.returncode != 0:
+        stderr = str(result.stderr or "").strip()
+        if "User canceled" in stderr or "cancel" in stderr.lower():
+            return None, None
+        return None, stderr or "No se pudo abrir el selector de carpetas del sistema."
+
+    selected = str(result.stdout or "").strip()
+    if not selected:
+        return None, None
+    return Path(selected), None
+
+
+def _open_directory_selector(initial_dir: Path) -> Tuple[Optional[Path], Optional[str]]:
+    if sys.platform == "darwin":
+        return _open_macos_directory_selector(initial_dir)
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        return None, f"No se pudo cargar el selector de carpetas: {exc}"
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        initial = initial_dir if initial_dir.exists() else RESULTS_DIR
+        selected = filedialog.askdirectory(
+            title="Seleccionar carpeta para resultados GMM dinamico",
+            initialdir=str(initial),
+            mustexist=False,
+            parent=root,
+        )
+    except Exception as exc:
+        return None, f"No se pudo abrir el selector de carpetas: {exc}"
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+    if not selected:
+        return None, None
+    return Path(selected), None
 
 
 def _reset_metrics_state() -> None:
@@ -1495,6 +1600,19 @@ def _render_dynamic_gmm_results(result: dict) -> None:
             parts.append(f"K={metadata.get('k')}")
         if metadata.get("confidence_threshold_proba") is not None:
             parts.append(f"umbral={float(metadata.get('confidence_threshold_proba')):.2f}")
+        assignment_scope = str(metadata.get("assignment_scope") or "all")
+        if assignment_scope == "prevalent":
+            plate_count = metadata.get("prevalent_plate_count")
+            fraction = metadata.get("prevalent_fraction_pct")
+            scope_label = "modo=prevalentes"
+            if plate_count is not None:
+                scope_label += f" ({int(plate_count):,} patentes"
+                if fraction is not None:
+                    scope_label += f", {float(fraction):.0f}%"
+                scope_label += ")"
+            parts.append(scope_label)
+        else:
+            parts.append("modo=todas las patentes")
         if parts:
             st.caption(" | ".join(parts))
 
@@ -1768,6 +1886,30 @@ def _render_dynamic_gmm_controls(
                 "graficos de probabilidad por cluster para las patentes monitoreadas."
             ),
         )
+        prevalent_fraction_pct = st.number_input(
+            "Porcentaje patentes prevalentes",
+            min_value=1,
+            max_value=100,
+            value=10,
+            step=1,
+            key="dynamic_gmm_prevalent_fraction_pct",
+            help=(
+                "Selecciona exactamente ceil(N * porcentaje / 100) patentes del "
+                "historico cargado, ordenadas por meses activos, años activos y pasadas."
+            ),
+        )
+        prevalent_selection = build_prevalent_plate_selection(
+            features_df,
+            fraction_pct=float(prevalent_fraction_pct),
+            feature_cols=feature_cols,
+        )
+        prevalent_plate_count = int(prevalent_selection.get("selected_count") or 0)
+        prevalent_total_plates = int(prevalent_selection.get("total_valid_plates") or 0)
+        st.caption(
+            "GMM Dinamico prevalentes seleccionara "
+            f"{prevalent_plate_count:,} de {prevalent_total_plates:,} patentes "
+            "del historico cargado."
+        )
 
         windows = build_dynamic_gmm_windows(
             pd.Timestamp(dynamic_start),
@@ -1778,8 +1920,63 @@ def _render_dynamic_gmm_controls(
         if not windows:
             st.warning("El rango seleccionado no alcanza para una ventana completa.")
 
-        db_paths = list_dynamic_gmm_db_paths()
-        checkpoint_paths = list_dynamic_gmm_checkpoint_db_paths()
+        output_dir_key = "dynamic_gmm_output_dir_path"
+        st.session_state.setdefault(output_dir_key, str(RESULTS_DIR))
+        dynamic_output_dir = RESULTS_DIR
+        output_dir_error: Optional[str] = None
+        use_custom_output_dir = st.checkbox(
+            "Guardar resultados en carpeta seleccionada",
+            value=False,
+            key="dynamic_gmm_use_custom_output_dir",
+        )
+        if use_custom_output_dir:
+            current_output_dir, _current_output_error = _resolve_dynamic_gmm_output_dir(
+                st.session_state.get(output_dir_key)
+            )
+            output_cols = st.columns([1, 3])
+            with output_cols[0]:
+                if st.button(
+                    "Seleccionar carpeta",
+                    key="dynamic_gmm_select_output_dir",
+                ):
+                    selected_dir, selector_error = _open_directory_selector(
+                        current_output_dir
+                    )
+                    if selector_error:
+                        st.warning(selector_error)
+                    elif selected_dir is not None:
+                        st.session_state[output_dir_key] = str(selected_dir)
+            with output_cols[1]:
+                output_dir_text = st.text_input(
+                    "Carpeta destino",
+                    key=output_dir_key,
+                    help=(
+                        "Los archivos DuckDB y joblib del GMM dinamico se guardan "
+                        "en esta carpeta. Si no existe, se creara al ejecutar."
+                    ),
+                )
+            dynamic_output_dir, output_dir_error = _resolve_dynamic_gmm_output_dir(
+                output_dir_text
+            )
+            if output_dir_error:
+                st.error(output_dir_error)
+            elif dynamic_output_dir.exists():
+                st.caption(f"Destino de resultados: {dynamic_output_dir}")
+            else:
+                st.caption(f"Destino de resultados: {dynamic_output_dir} (se creara)")
+        else:
+            st.caption(f"Destino de resultados: {RESULTS_DIR}")
+
+        db_paths = (
+            list_dynamic_gmm_db_paths(output_dir=dynamic_output_dir)
+            if output_dir_error is None
+            else []
+        )
+        checkpoint_paths = (
+            list_dynamic_gmm_checkpoint_db_paths(output_dir=dynamic_output_dir)
+            if output_dir_error is None
+            else []
+        )
         execution_cols = st.columns(2)
         with execution_cols[0]:
             parallel_jobs = st.number_input(
@@ -1803,14 +2000,18 @@ def _render_dynamic_gmm_controls(
 
         resume_db_path: Optional[Path] = None
         if resume_checkpoint and checkpoint_paths:
-            resume_names = [path.name for path in checkpoint_paths]
+            resume_options = {path.name: path for path in checkpoint_paths}
+            resume_names = list(resume_options.keys())
+            resume_key = "dynamic_gmm_resume_db"
+            if st.session_state.get(resume_key) not in resume_names:
+                st.session_state.pop(resume_key, None)
             selected_resume_name = st.selectbox(
                 "Checkpoint DuckDB para retomar",
                 resume_names,
                 index=0,
-                key="dynamic_gmm_resume_db",
+                key=resume_key,
             )
-            resume_db_path = RESULTS_DIR / selected_resume_name
+            resume_db_path = resume_options[selected_resume_name]
         elif resume_checkpoint:
             st.caption("No hay checkpoints incrementales previos; se creara un run nuevo.")
 
@@ -1868,16 +2069,31 @@ def _render_dynamic_gmm_controls(
                 f"{_format_bytes(estimate.get('estimated_worker_bytes'))}"
             )
 
-        run_dynamic = st.button(
-            "GMM/Clusters dinamicos",
-            disabled=not windows,
-            key="run_dynamic_gmm",
-        )
-        if run_dynamic:
+        run_disabled = (not windows) or output_dir_error is not None
+        run_cols = st.columns(2)
+        with run_cols[0]:
+            run_dynamic = st.button(
+                "GMM/Clusters dinamicos",
+                disabled=run_disabled,
+                key="run_dynamic_gmm",
+            )
+        with run_cols[1]:
+            run_prevalent_dynamic = st.button(
+                "GMM Dinamico prevalentes",
+                disabled=run_disabled or prevalent_plate_count == 0,
+                key="run_dynamic_gmm_prevalent",
+            )
+        if run_dynamic or run_prevalent_dynamic:
+            assignment_scope = "prevalent" if run_prevalent_dynamic else "all"
+            run_label = (
+                "GMM dinamico prevalentes"
+                if assignment_scope == "prevalent"
+                else "GMM dinamico"
+            )
             feature_config = _current_feature_config()
             ttc_mode = str(feature_config.get("ttc_mode") or "dynamic")
             fixed_ttc_s = feature_config.get("ttc_fixed_seconds")
-            with st.spinner("Ejecutando GMM dinamico..."):
+            with st.spinner(f"Ejecutando {run_label}..."):
                 progress = StreamlitProgress(
                     total=max(1, len(windows)),
                     label="Ventanas dinamicas",
@@ -1906,7 +2122,9 @@ def _render_dynamic_gmm_controls(
                             "include_membership_probabilities": bool(
                                 include_dynamic_probabilities
                             ),
+                            "output_dir": str(dynamic_output_dir),
                         },
+                        output_dir=dynamic_output_dir,
                         progress=progress,
                         include_membership_probabilities=bool(
                             include_dynamic_probabilities
@@ -1920,9 +2138,15 @@ def _render_dynamic_gmm_controls(
                             resume_checkpoint and resume_db_path is not None
                         ),
                         load_final_result=False,
+                        assignment_scope=assignment_scope,
+                        prevalent_fraction_pct=(
+                            float(prevalent_fraction_pct)
+                            if assignment_scope == "prevalent"
+                            else None
+                        ),
                     )
                 except Exception as exc:
-                    st.error(f"Error en GMM dinamico: {exc}")
+                    st.error(f"Error en {run_label}: {exc}")
                     return
                 finally:
                     progress.close()
@@ -1951,8 +2175,20 @@ def _render_dynamic_gmm_controls(
                     "confidence_proba": float(dynamic_confidence),
                     "date_start": str(dynamic_start),
                     "date_end": str(dynamic_end),
+                    "output_dir": str(dynamic_output_dir),
                     "include_membership_probabilities": bool(
                         include_dynamic_probabilities
+                    ),
+                    "assignment_scope": assignment_scope,
+                    "prevalent_fraction_pct": (
+                        float(prevalent_fraction_pct)
+                        if assignment_scope == "prevalent"
+                        else None
+                    ),
+                    "prevalent_plate_count": (
+                        prevalent_plate_count
+                        if assignment_scope == "prevalent"
+                        else None
                     ),
                 },
                 train_params=train_params,
@@ -1960,10 +2196,10 @@ def _render_dynamic_gmm_controls(
             )
             result_status = str(result_metadata.get("status") or "completed")
             if result_status == "completed":
-                st.success("GMM dinamico completado y persistido en DuckDB.")
+                st.success(f"{run_label} completado y persistido en DuckDB.")
             else:
                 st.warning(
-                    "GMM dinamico finalizo con resultados parciales; revise "
+                    f"{run_label} finalizo con resultados parciales; revise "
                     "las ventanas fallidas en Experiments Live."
                 )
             st.info("La visualizacion live y los checkpoints quedan en Experiments Live.")
@@ -1972,17 +2208,25 @@ def _render_dynamic_gmm_controls(
             if result.get("model_path") is not None:
                 st.caption(f"Modelo: {result['model_path']}")
 
-        db_paths = list_dynamic_gmm_db_paths()
+        db_paths = (
+            list_dynamic_gmm_db_paths(output_dir=dynamic_output_dir)
+            if output_dir_error is None
+            else []
+        )
         if db_paths:
-            names = [path.name for path in db_paths]
+            result_options = {path.name: path for path in db_paths}
+            names = list(result_options.keys())
+            result_key = "dynamic_gmm_saved_result"
+            if st.session_state.get(result_key) not in names:
+                st.session_state.pop(result_key, None)
             selected_name = st.selectbox(
                 "Resultado dinamico guardado",
                 names,
                 index=max(len(names) - 1, 0),
-                key="dynamic_gmm_saved_result",
+                key=result_key,
             )
             if st.button("Cargar resultado dinamico", key="load_dynamic_gmm"):
-                path = RESULTS_DIR / selected_name
+                path = result_options[selected_name]
                 try:
                     assignments, window_summary, metadata = (
                         load_dynamic_gmm_results_duckdb(path)
@@ -2004,7 +2248,7 @@ def _render_dynamic_gmm_controls(
                 st.success(f"Resultado cargado: {path.name}")
 
         stored = st.session_state.get("dynamic_gmm_result")
-        if isinstance(stored, dict) and not run_dynamic:
+        if isinstance(stored, dict) and not run_dynamic and not run_prevalent_dynamic:
             stored_assignments = stored.get("assignments")
             if isinstance(stored_assignments, pd.DataFrame) and not stored_assignments.empty:
                 _render_dynamic_gmm_results(stored)

@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dask Cluster App</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <h1>Dask Cluster App</h1>
+          <p id="cluster-status">Connecting...</p>
+        </div>
+        <a id="cluster-dashboard" href="/dashboard">Dashboard</a>
+      </section>
+
+      <section class="grid">
+        <form id="auth-form" class="panel">
+          <h2>Login / Register</h2>
+          <input name="name" placeholder="Name">
+          <input name="email" type="email" placeholder="Email" required>
+          <div class="row">
+            <button type="submit">Save User</button>
+          </div>
+          <p id="auth-status" class="notice" aria-live="polite"></p>
+          <div class="panel-subsection">
+            <div class="panel-header compact">
+              <h3>Online Users</h3>
+              <button type="button" id="refresh-online-users" class="secondary small">Refresh</button>
+            </div>
+            <div id="online-users" class="compact-list">
+              <div class="muted">Sign in to see online users</div>
+            </div>
+          </div>
+        </form>
+
+        <form id="job-form" class="panel">
+          <h2>Submit Job</h2>
+          <div class="field-row">
+            <input id="source-dir" name="source_dir" placeholder="/path/to/job-folder" required>
+            <button type="button" id="browse-folder" class="secondary">Folder</button>
+          </div>
+          <div class="field-row">
+            <select id="entrypoint-select" name="entrypoint_select" aria-label="Python entrypoint">
+              <option value="">Select folder first</option>
+            </select>
+            <button type="button" id="browse-file" class="secondary">File</button>
+          </div>
+          <input id="entrypoint" name="entrypoint" placeholder="main.py">
+          <input name="args" placeholder="args separated by spaces">
+          <button type="submit">Submit</button>
+          <p id="job-status" class="notice" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Queue</h2>
+            <button type="button" id="clear-queue-records" class="secondary small">Clear Records</button>
+          </div>
+          <p id="queue-status" class="notice" aria-live="polite"></p>
+          <div id="jobs"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Nodes</h2>
+            <button type="button" id="cleanup-old-nodes" class="secondary small">Remove Old Nodes</button>
+          </div>
+          <div class="row">
+            <button type="button" id="start-scheduler">Start Scheduler</button>
+            <button type="button" id="start-worker" class="secondary">Start Worker</button>
+            <a id="native-dashboard-main" class="secondary" href="#" target="_blank" rel="noreferrer" aria-disabled="true">Dask Dashboard</a>
+          </div>
+          <p id="scheduler-status" class="notice" aria-live="polite"></p>
+          <p id="worker-status" class="notice" aria-live="polite"></p>
+          <form id="manual-node-form" class="inline-form">
+            <input name="host" placeholder="Node IP, e.g. 192.168.1.20" required>
+            <input name="port" type="number" min="1" max="65535" value="18080" required>
+            <button type="submit" class="secondary">Add IP</button>
+          </form>
+          <p id="node-status" class="notice" aria-live="polite"></p>
+          <div id="nodes"></div>
+        </div>
+      </section>
+    </main>
+    <div id="file-dialog" class="modal" aria-hidden="true">
+      <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="file-dialog-title">
+        <div class="modal-header">
+          <div>
+            <h2 id="file-dialog-title">Select Folder</h2>
+            <p id="file-dialog-path" class="muted"></p>
+          </div>
+          <button type="button" id="close-file-dialog" class="secondary">Close</button>
+        </div>
+        <div class="row">
+          <button type="button" id="file-home" class="secondary">Home</button>
+          <button type="button" id="file-up" class="secondary">Up</button>
+          <button type="button" id="choose-current-folder">Choose This Folder</button>
+        </div>
+        <div id="file-list" class="file-list"></div>
+      </div>
+    </div>
+    <script src="/static/app.js?v=users-dashboard-1"></script>
+  </body>
+</html>
