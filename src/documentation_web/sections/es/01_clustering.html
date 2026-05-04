@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="es" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>§ 1 · Clustering</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: {
+      inlineMath: [['\\(', '\\)']],
+      displayMath: [['\\[', '\\]']],
+      processEscapes: true,
+      tags: 'none'
+    },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <section class="lab-section reveal" id="s1">
+    <header class="lab-section-head" data-stagger>
+      <div class="num reveal">01</div>
+      <div>
+        <span class="meta reveal">Capítulo · Clustering de conductores</span>
+        <h2 class="reveal">Agrupación por comportamiento observado</h2>
+      </div>
+    </header>
+
+    <h3 class="reveal">Objetivo</h3>
+    <p class="reveal">El módulo agrupa conductores —identificados por su matrícula— según indicadores de comportamiento observados en los registros de detección (<code>flujos</code>). Los grupos se usan para análisis exploratorio y para construir variables agregadas por pórtico e intervalo que alimentan los modelos posteriores.</p>
+
+    <h3 class="reveal">Datos y preprocesamiento</h3>
+    <p class="reveal">Se parte de observaciones \( r_j = (t_j, p_j, \ell_j, v_j, \text{plate}_j) \) con tiempo, pórtico, carril, velocidad y matrícula. La normalización pasa la matrícula a mayúsculas, descarta valores inválidos (<code>""</code>, <code>nan</code>, <code>null</code>, <code>none</code>) y filtra largos fuera de \([5,6]\). Los carriles se restringen a \(\ell\in\{1,2,3\}\) y se eliminan duplicados exactos por la llave \((\text{plate}, p, \ell, t)\).</p>
+
+    <p class="reveal">Para el tratamiento de atípicos en velocidad, por cada grupo \((p,\ell)\) se calculan cuantiles \(q_\alpha\) y \(q_\beta\), y según el modo se aplica winsorización \(v\leftarrow\min(\max(v,q_\alpha),q_\beta)\), filtrado duro, o nada.</p>
+
+    <h3 class="reveal">Ingeniería de features por conductor</h3>
+    <p class="reveal">Se construye un vector \(x_i\in\mathbb{R}^d\) agregando sobre las pasadas del conductor \(i\). Los artefactos se guardan en <code>Resultados/cluster_features*.duckdb</code> (tabla <code>cluster_features</code>).</p>
+
+    <h4 class="reveal">Conteos, velocidad media y uso de carril</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ N_i = \sum_{j=1}^{N}\mathbf{1}[\text{plate}_j=i],\quad \overline{v}_i = \frac{1}{N_i}\sum_{j:\text{plate}_j=i} v_j,\quad \pi_{i,k} = \frac{1}{N_i}\sum_{j:\text{plate}_j=i}\mathbf{1}[\ell_j=k] \]</div>
+      <div class="num">(1.1)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>N<sub>i</sub></dt><dd>Pasadas totales del conductor <em>i</em> (cardinalidad de su historial).</dd>
+          <dt>v̄<sub>i</sub></dt><dd>Velocidad media del conductor sobre todas sus pasadas.</dd>
+          <dt>π<sub>i,k</sub></dt><dd>Proporción de pasadas del conductor <em>i</em> en el carril <em>k</em> (uso de carril).</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 413–476)</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Velocidad relativa</h4>
+    <p class="reveal">Sobre intervalos de 5 minutos por pórtico se define una velocidad media de referencia \( \overline{v}_{p,\tau} \). Para cada pasada, \( \rho_j = v_j/\overline{v}_{p_j,\lfloor t_j\rfloor_{5\text{min}}} \), y por conductor \( \overline{\rho}_i = \frac{1}{|\mathcal{J}_i|}\sum_{j\in\mathcal{J}_i}\rho_j \).</p>
+
+    <h4 class="reveal">Headway</h4>
+    <p class="reveal">Por grupo \((p,\ell)\) ordenado por \((t,\text{plate})\): \( h_j = t_j - t_{j-1} \) en segundos. Headways mayores que \(h_{\max}=60\,\text{s}\) se tratan como faltantes.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \overline{h}_i = \frac{1}{|\mathcal{H}_i|}\sum_{j\in\mathcal{H}_i} h_j,\qquad \mathcal{H}_i=\{j:\text{plate}_j=i,\ 0&lt;h_j\le h_{\max}\} \]</div>
+      <div class="num">(1.2)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>h̄<sub>i</sub></dt><dd>Headway medio (separación temporal con el vehículo previo) por conductor.</dd>
+          <dt>ℋ<sub>i</sub></dt><dd>Conjunto de pasadas del conductor con headway válido (positivo y menor a 60 s).</dd>
+          <dt>h<sub>max</sub></dt><dd>Umbral de validez del headway, fijado en 60 s.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 544–553)</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">TTC y tasa de conflictos</h4>
+    <p class="reveal">Para cada pasada con vehículo previo en el mismo \((p,\ell)\), se define \(\Delta v_j=v_j-v_{j-1}\). Sólo en cierres (\(\Delta v_j&gt;0\)) existe un TTC finito: \( \mathrm{TTC}_j = h_j v_j / \Delta v_j \). Por pórtico existe un umbral \(\tau_p\) (<code>TTC_MAX_BY_PORTICO</code>). La tasa por conductor usa como denominador todos los pares con headway válido y velocidad previa observada; los no cierres aportan cero:</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{conflict\_rate}_i = \frac{\sum_{j\in\mathcal{K}_i}\mathbf{1}[\Delta v_j&gt;0\ \land\ \mathrm{TTC}_j&lt;\tau_{p_j}]}{|\mathcal{K}_i|},\qquad \mathcal{K}_i=\{j:\text{plate}_j=i,\ h_j&gt;0,\ v_{j-1}\ \text{definida}\} \]</div>
+      <div class="num">(1.3)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>TTC<sub>j</sub></dt><dd>Time-to-collision en la pasada <em>j</em>; sólo se calcula cuando hay cierre (Δv &gt; 0).</dd>
+          <dt>τ<sub>p</sub></dt><dd>Umbral por pórtico desde la constante <code>TTC_MAX_BY_PORTICO</code>.</dd>
+          <dt>𝒦<sub>i</sub></dt><dd>Pares consecutivos del conductor con headway positivo y velocidad previa observada.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 557–590)</span>
+      </aside>
+    </div>
+    <p class="reveal">En la implementación, \(\mathrm{TTC}_j\) se acota por arriba a \(\tau_{p_j}\) para evitar valores extremos.</p>
+
+    <h4 class="reveal">Cambios de carril y actividad</h4>
+    <p class="reveal">Se cuentan cambios de carril ordenando por conductor y tiempo: \(\mathrm{lane\_changes}_i = \sum_{m=2}^{N_i}\mathbf{1}[\ell_{i,m}\neq\ell_{i,m-1}]\) y su tasa. La actividad temporal incluye conteos de días, semanas y meses activos.</p>
+
+    <h4 class="reveal">Ponderación mensual (opcional)</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \overline{x}_i = \frac{\sum_m N_{i,m}\,x_{i,m}}{\sum_m N_{i,m}} \]</div>
+      <div class="num">(1.4)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>x̄<sub>i</sub></dt><dd>Estadístico consolidado del conductor por ponderación mensual.</dd>
+          <dt>x<sub>i,m</sub></dt><dd>Valor del estadístico en el mes <em>m</em>.</dd>
+          <dt>N<sub>i,m</sub></dt><dd>Pasadas del conductor en el mes <em>m</em> — actúa como peso.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 629–665)</span>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Métodos de clustering</h3>
+    <p class="reveal">Antes de clusterizar se aplica z-score con <code>StandardScaler</code>. Se comparan tres familias:</p>
+    <ul class="reveal">
+      <li><strong>K-means</strong>: minimiza \(\sum_i \lVert x_i-\mu_{c_i}\rVert^2\). La selección de \(K\) se guía por Silhouette, Davies–Bouldin y Calinski–Harabasz.</li>
+      <li><strong>GMM</strong>: \(p(x)=\sum_{k=1}^K\pi_k\mathcal{N}(x\mid\mu_k,\Sigma_k)\) con EM; \(K\) se elige por AIC/BIC.</li>
+      <li><strong>HDBSCAN</strong>: jerarquía basada en densidad con <code>min_cluster_size</code> y <code>min_samples</code>; las observaciones ruidosas reciben etiqueta \(-1\).</li>
+    </ul>
+
+    <div class="lab-callout reveal">
+      <div class="label">Frecuentes vs. raros</div>
+      <p>Para robustez, el modelo puede entrenarse sólo con conductores frecuentes (\(N_i\ge N_{\min}\)). A los raros se les asigna etiqueta por distancia al centroide (K‑means) o por posterior máxima (GMM); si la confianza cae bajo el umbral, se marcan como desconocidos (\(-1\)) y se guarda <code>confidence_score</code> junto a <code>is_rare</code>.</p>
+    </div>
+
+    <h3 class="reveal">Variables agregadas por pórtico e intervalo</h3>
+    <p class="reveal">A partir de la tabla <code>plate → cluster_label</code>, para cada \((p,\tau,c)\):</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ n_{p,\tau,c} = \#\{j:\,p_j=p,\ \lfloor t_j\rfloor_\Delta=\tau,\ \text{cluster}(\text{plate}_j)=c\},\qquad \mathrm{share}_{p,\tau,c} = \frac{n_{p,\tau,c}}{\sum_{c'}n_{p,\tau,c'}} \]</div>
+      <div class="num">(1.5)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>n<sub>p,τ,c</sub></dt><dd>Conteo de detecciones del cluster <em>c</em> en pórtico <em>p</em> e intervalo τ.</dd>
+          <dt>share<sub>p,τ,c</sub></dt><dd>Proporción del cluster <em>c</em> en el mix de la celda (p,τ).</dd>
+          <dt>Δ</dt><dd>Tamaño del bin temporal (típicamente 5 min).</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/clustering.py · _add_soft_entropy</span>
+      </aside>
+    </div>
+    <p class="reveal">Opcionalmente se derivan flujo, velocidad media, densidad, diferencias temporales, y la entropía de mezcla \( H_{p,\tau} = -\sum_c \mathrm{share}_{p,\tau,c}\log\mathrm{share}_{p,\tau,c} \).</p>
+
+    <h3 class="reveal">Detalle de variables conductuales</h3>
+    <p class="reveal">El detalle que antes estaba separado como capítulo 05 queda integrado aquí porque estas variables son parte del vector de clustering por conductor.</p>
+
+    <h4 class="reveal">Preprocesamiento operativo</h4>
+    <ol class="reveal">
+      <li>Normalización de patentes: alfanuméricas, mayúsculas, largo en \([5,6]\); se filtran <code>NULL</code>, <code>NAN</code>.</li>
+      <li>Filtrado de carriles a \(\{1,2,3\}\).</li>
+      <li>Deduplicación por \((\text{plate},p,\ell,t)\).</li>
+      <li>Winsorización de velocidad por \((p,\ell)\), si está habilitada, usando los cuantiles configurados.</li>
+    </ol>
+
+    <h4 class="reveal">Velocidad relativa indexada</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ v_{\text{rel},j} = \frac{v_j}{\overline{v}_{p_j,\lfloor t_j\rfloor_{5\text{min}}}} \]</div>
+      <div class="num">(1.6)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>v<sub>rel,j</sub></dt><dd>Velocidad de la pasada <em>j</em> normalizada por la velocidad media de su pórtico e intervalo.</dd>
+          <dt>v̄<sub>p,τ</sub></dt><dd>Velocidad media por pórtico en el bin de 5 minutos.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 489–492)</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Evento TTC e indicador de conflicto</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{TTC}_j = \frac{h_j\,v_j}{v_j-v_{j-1}}\quad(\text{si }v_j&gt;v_{j-1}),\qquad c_j=\mathbf{1}\left[v_j&gt;v_{j-1}\ \land\ \mathrm{TTC}_j&lt;\tau_{p_j}\right] \]</div>
+      <div class="num">(1.7)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>c<sub>j</sub></dt><dd>Indicador binario de conflicto para la pasada <em>j</em>.</dd>
+          <dt>v<sub>j-1</sub></dt><dd>Velocidad del vehículo previo en el mismo pórtico y carril.</dd>
+          <dt>τ<sub>p</sub></dt><dd>Umbral TTC por pórtico o valor fijo, según la configuración activa.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 557–590)</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Agregación y consolidación por patente</h4>
+    <p class="reveal">Por conductor se agregan velocidad media, velocidad relativa, headway, tasa de conflicto, uso de carril, tasa de cambio de carril y actividad temporal. Cuando se usa ponderación mensual, cada estadístico mensual se pondera por el volumen observado del mes.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ X_{i,\mathrm{final}} = \frac{\sum_m X_{i,m}\,N_{i,m}}{\sum_m N_{i,m}} \]</div>
+      <div class="num">(1.8)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>X<sub>i,final</sub></dt><dd>Estadístico consolidado del conductor por ponderación mensual.</dd>
+          <dt>X<sub>i,m</sub></dt><dd>Valor mensual del estadístico.</dd>
+          <dt>N<sub>i,m</sub></dt><dd>Pasadas del conductor en el mes <em>m</em>.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/clustering.py · _monthly_weighted_average</span>
+      </aside>
+    </div>
+    <p class="reveal">La lógica vive en <code>src/clustering.py</code>. <code>clean_flujos_for_clustering</code> realiza la preparación y <code>Clusterization</code> orquesta métricas simples, velocidad relativa, interacciones con <em>shift</em> vectorizado, cambios de carril y ponderación mensual.</p>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Próximamente · Resultados interactivos</div>
+      <p>Esta sección incluirá un explorador dinámico de clusters: silhouette por <em>K</em>, comparación AIC/BIC entre familias, y mapa de calor de <code>share<sub>p,τ,c</sub></code> por corredor. Los datos se cargarán desde <code>Resultados/cluster_features*.duckdb</code>.</p>
+    </div>
+
+  </section>
+
+  <footer class="lab-coda">
+    <span>Capítulo § 1 · 8 ecuaciones · 2 callouts</span>
+    <span>Compilado desde <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/clustering_es.tex</code> + <code style="font-family:var(--font-mono);font-size:11.5px;">clustering_features_detail_es.tex</code></span>
+  </footer>
+
+</main>
+
+<aside class="lab-margin" aria-label="Notas al margen">
+  <div class="pinned">
+    <span class="label">Inspector</span>
+    <p>Pasa el cursor sobre cualquier ecuación numerada para abrir el panel con definiciones y la referencia exacta al código que la implementa.</p>
+    <p><strong>Convención.</strong> Los nombres entre <code style="font-family:var(--font-mono);font-size:11.5px;">monospace</code> referencian funciones, constantes o tablas reales del repositorio.</p>
+    <p><strong>Pórtico.</strong> En este texto, <em>pórtico</em> designa una estación de detección AVI con uno o más carriles instrumentados.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

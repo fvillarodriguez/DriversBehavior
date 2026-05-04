@@ -30,6 +30,14 @@ def _chapter_sections() -> tuple[documentation_app.SectionDef, ...]:
     return tuple(section for section in documentation_app.SECTIONS if section.sid != "hero")
 
 
+def test_web_documentation_assets_live_under_src() -> None:
+    assert documentation_app.WEB_DIR == documentation_app.ROOT_DIR / "src" / "documentation_web"
+    assert documentation_app.STYLES_CSS.exists()
+    assert documentation_app.THEME_JS.exists()
+    assert documentation_app.HERO_DIR.exists()
+    assert documentation_app.SECTIONS_DIR.exists()
+
+
 def test_hero_toc_links_target_existing_chapter_anchors() -> None:
     expected = {
         section.sid: f"#{documentation_app._section_anchor_id(section)}"

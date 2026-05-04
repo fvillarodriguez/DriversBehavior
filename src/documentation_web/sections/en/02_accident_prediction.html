@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>§ 2 · Accident prediction</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true, tags: 'none' },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <section class="lab-section reveal" id="s2">
+    <header class="lab-section-head" data-stagger>
+      <div class="num reveal">02</div>
+      <div>
+        <span class="meta reveal">Chapter · Supervised prediction</span>
+        <h2 class="reveal">Accident prediction</h2>
+      </div>
+    </header>
+
+    <h3 class="reveal">Goal and sources</h3>
+    <p class="reveal">Build and evaluate models that predict the occurrence of an accident at a gantry, from aggregated flow variables and, optionally, variables derived from driver clusters. Flows are stored in DuckDB. Accidents come from event files filtered by type <em>Accident</em> and <em>Road</em>, with <code>accidente_time</code> and a mapping to nearby gantries via <code>Datos/Porticos.csv</code>; the assigned gantry is stored as <code>ultimo_portico</code>.</p>
+
+    <h3 class="reveal">Temporal discretisation</h3>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \tau(t) = \left\lfloor \frac{t}{\Delta}\right\rfloor\Delta \]</div>
+      <div class="num">(2.1)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>τ(t)</dt><dd>Temporal bin of size Δ that contains instant <em>t</em>.</dd>
+          <dt>Δ</dt><dd>Bin size (configurable, typically 5 min).</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/features.py · compute_pm_features (temporal bucketing)</span>
+      </aside>
+    </div>
+    <p class="reveal">Variables are aggregated by pair \((p,\tau)\).</p>
+
+    <h3 class="reveal">Macro flow features</h3>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ n_{p,\tau,c}=\#\{\text{detections in }(p,\tau,c)\},\qquad \overline{v}_{p,\tau,c}=\frac{1}{n_{p,\tau,c}}\sum v \]</div>
+      <div class="num">(2.2)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>n<sub>p,τ,c</sub></dt><dd>Detection count of category <em>c</em> in (p, τ).</dd>
+          <dt>v̄<sub>p,τ,c</sub></dt><dd>Mean speed observed in the cell.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/features.py · compute_pm_features</span>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ q_{p,\tau,c}=\frac{60}{\Delta}\frac{n_{p,\tau,c}}{L},\qquad k_{p,\tau,c}=\frac{q_{p,\tau,c}}{\overline{v}_{p,\tau,c}} \]</div>
+      <div class="num">(2.3)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>q<sub>p,τ,c</sub></dt><dd>Flow (vehicles/hour) normalised by Δ and by the number of lanes <em>L</em>.</dd>
+          <dt>k<sub>p,τ,c</sub></dt><dd>Fundamental density flow / speed.</dd>
+          <dt>L</dt><dd>Number of gantry lanes.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/features.py · compute_pm_features (flow/density)</span>
+      </aside>
+    </div>
+    <p class="reveal">Optionally, per-gantry first differences \( \Delta\overline{v} \) and \( \Delta k \) are added, producing a wide matrix with columns <code>flow_&lt;cat&gt;</code>, <code>speed_&lt;cat&gt;</code>, <code>density_&lt;cat&gt;</code>, etc.</p>
+
+    <h3 class="reveal">Cluster variables (optional)</h3>
+    <p class="reveal">If the table <code>plate → cluster_label</code> exists, detections are joined with their cluster \(\kappa\) and aggregated by \((p,\tau,\kappa)\). The mix entropy \( H_{p,\tau}=-\sum_\kappa\mathrm{share}_{p,\tau,\kappa}\log\mathrm{share}_{p,\tau,\kappa} \) is also added. They are stored as <code>cluster_share_*</code>, <code>cluster_flow_*</code>, <code>cluster_speed_*</code>, etc.</p>
+
+    <h3 class="reveal">Target definition</h3>
+    <p class="reveal">An accident at \((t_a,p_a)\) is labelled at the previous interval: \( \tau_a = \tau(t_a) - \Delta \), with</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ y_{p,\tau} = \begin{cases} 1, & \text{if there is an accident with }(p_a,\tau_a)=(p,\tau) \\ 0, & \text{otherwise} \end{cases} \]</div>
+      <div class="num">(2.4)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>y<sub>p,τ</sub></dt><dd>Binary target "an accident will happen in the next interval".</dd>
+          <dt>τ<sub>a</sub></dt><dd>Bin preceding the accident (one-Δ lead time).</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/drift_detection_app.py · _add_interval_accident_target</span>
+      </aside>
+    </div>
+    <p class="reveal">Hence \( y_{p,\tau}=1 \) means "an accident will happen in the next interval".</p>
+
+    <h3 class="reveal">Split, imbalance and models</h3>
+    <p class="reveal">To avoid temporal leakage, the split is chronological by <code>interval_start</code>: the final stretch is the test set (<code>test_size</code>). Inside the train/val block, validation is isolated with <code>val_size</code>. Imbalance is handled with class weighting (<code>class_weight="balanced"</code> in RF) or SMOTE applied only on training (synthetic rows marked <code>synthetic=True</code>).</p>
+    <p class="reveal">Three families are considered: <strong>Random Forest</strong>, <strong>XGBoost</strong> and <strong>SVM</strong> (with <code>StandardScaler</code> and probabilistic output). Each model produces a score \(s(x)\).</p>
+
+    <h3 class="reveal">FAR-constrained threshold calibration</h3>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{FAR}=\frac{FP}{FP+TN},\qquad \mathrm{Sens}=\frac{TP}{TP+FN} \]</div>
+      <div class="num">(2.5)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>FAR</dt><dd>False Alarm Rate — fraction of non-events classified as events.</dd>
+          <dt>Sens</dt><dd>Sensitivity / positive recall.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/drift_detection_app.py · compute_classification_metrics</span>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \theta = \arg\max_{\theta:\mathrm{FAR}(\theta)\le \alpha}\mathrm{Sens}(\theta) \]</div>
+      <div class="num">(2.6)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>θ</dt><dd>Optimal threshold over the score s(x).</dd>
+          <dt>α</dt><dd>Maximum admissible FAR (per-experiment configuration).</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/drift_detection_app.py · youden_threshold</span>
+      </aside>
+    </div>
+    <p class="reveal">On test we report Accuracy, Precision, Recall, F1, FAR, Sens and ROC-AUC alongside the confusion matrix.</p>
+
+    <h3 class="reveal">Feature selection and Optuna</h3>
+    <p class="reveal">An importance ranking from Random Forest orders the variables. Optuna optimises model and SMOTE hyperparameters: on each trial SMOTE is applied to train, the model is fit, the threshold is calibrated under the FAR constraint on validation, and the result is evaluated (e.g. F1).</p>
+
+    <h3 class="reveal">Cluster effect: Base vs. Base+Cluster</h3>
+    <p class="reveal">To quantify the cluster contribution, two scenarios are compared for \(K=5,10,\dots\):</p>
+    <ul class="reveal">
+      <li><strong>Base</strong>: top-\(K\) ranking variables without clusters.</li>
+      <li><strong>Base+Cluster</strong>: top-\(K\) of the combined ranking.</li>
+    </ul>
+
+    <h3 class="reveal">Artefacts and XAI</h3>
+    <p class="reveal">The pipeline produces, under <code>Resultados/</code>, CSV/DuckDB feature stores, balanced datasets, Optuna outputs, iterative experiments and reproducible bundles <code>model_history/&lt;run_id&gt;/&lt;strategy&gt;/</code> with <code>model.joblib</code>, <code>manifest.json</code>, <code>background.parquet</code> and <code>explain_rows.parquet</code>.</p>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Reproducible bundle</div>
+      <p>The <code>manifest.json</code> persists model, hyperparameters, columns, metrics, calibrated threshold, final split, exact provenance of <em>flow features</em> and cluster variables, selection, and whether balancing was used. With this, the <em>History</em> tab reopens the explanation without recomputing features.</p>
+    </div>
+
+    <p class="reveal">Explainability is computed with SHAP over two persisted subsets: up to 128 real training rows as background and up to 64 test rows enriched with representative cases (highest score, strong TP, strong FP, relevant FN). We report a global ranking by \(\mathrm{mean}(|\mathrm{SHAP}|)\), Base vs. Cluster aggregation, a cluster-specific top, and local cases. Tree models use <code>TreeExplainer</code>; SVM uses <code>KernelExplainer</code> over the positive probability.</p>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Coming soon · Interactive results</div>
+      <p>This section will include dynamic FAR vs Sens curves, α sliders to recalibrate the threshold live, and a per-<code>run_id</code> SHAP explorer that loads from <code>model_history/</code>.</p>
+    </div>
+
+  </section>
+
+  <footer class="lab-coda">
+    <span>Chapter § 2 · 6 equations</span>
+    <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/accident_prediction_en.tex</code></span>
+  </footer>
+
+</main>
+
+<aside class="lab-margin" aria-label="Marginalia">
+  <div class="pinned">
+    <span class="label">FAR</span>
+    <p>False Alarm Rate is the main operational metric: how many alerts are issued without an actual accident. A real-time warning system requires low FAR even at the cost of sensitivity.</p>
+    <p><strong>Temporal leakage.</strong> All splits are by time, never random — the model must not see the future.</p>
+    <p><strong>SMOTE.</strong> Train only. Synthetic rows are flagged <code style="font-family:var(--font-mono);font-size:11.5px;">synthetic=True</code> to be auditable.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

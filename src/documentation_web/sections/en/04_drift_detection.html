@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>§ 4 · Drift detection</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true, tags: 'none' },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <section class="lab-section reveal" id="s4">
+    <header class="lab-section-head" data-stagger>
+      <div class="num reveal">04</div>
+      <div>
+        <span class="meta reveal">Chapter · Batch vs adaptive recalibration</span>
+        <h2 class="reveal">Drift detection</h2>
+      </div>
+    </header>
+
+    <h3 class="reveal">Scope and paper alignment</h3>
+    <p class="reveal">The module <code>src/drift_detection_app.py</code> replicates the paper <em>Evaluating recalibration strategies for real-time crash prediction: adaptive drift detection vs. cumulative retraining</em>. It concentrates dataset preparation, yearly batch strategies, ADWIN/ARF/KSWIN adaptive strategies, checkpoint persistence, tuning cache and SMOTE artefacts, with outputs aligned to Appendix A.6–A.9 and Figure 7.</p>
+    <p class="reveal">The paper's locked configuration fixes <code>PAPER_TIME_SPAN = 2018-01-01 to 2024-09-30</code> and a gantry corridor <code>DRIFT_FOCUS_PORTICOS = {11,12,14,15}</code>, with segments 15→14, 14→12 and 12→11.</p>
+
+    <h3 class="reveal">UI map</h3>
+    <ul class="reveal">
+      <li><strong>Events</strong>: accident loading and mapping.</li>
+      <li><strong>Feature engineering</strong>: build or load features; export DuckDB with <code>raw_features</code> and <code>clean_features</code>.</li>
+      <li><strong>Feature Selection</strong>: correlation filter and Random Forest ranking.</li>
+      <li><strong>Experiments</strong>: runs <code>run_recalibration_experiments()</code> with preview, resume and clean start.</li>
+      <li><strong>Neural drift</strong>: tab delegated to <code>src/Neural_drift_app.py</code>.</li>
+    </ul>
+
+    <h3 class="reveal">Feature engineering</h3>
+    <p class="reveal">With \(\Delta=5\) min and \(b(\tau)=\lfloor\tau/\Delta\rfloor\Delta\), the corridor's full predictor space yields 260 variables:</p>
+    <ul class="reveal">
+      <li>96 per gantry and category (4 base metrics + 4 deltas, 4 gantries × 3 categories).</li>
+      <li>8 compositional per gantry (<code>ft_motorcycle_*</code>, <code>ft_heavy_*</code>).</li>
+      <li>72 per segment and category (5 base + 3 deltas).</li>
+      <li>21 global per segment (4 base + 3 deltas).</li>
+      <li>63 per origin lane (4 base + 3 deltas).</li>
+    </ul>
+
+    <h4 class="reveal">Per-gantry, per-category variables</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{Flow}_{t,p,c}=|G_{t,p,c}|,\quad \mathrm{Vel}_{t,p,c}=\frac{1}{|G_{t,p,c}|}\sum v_r,\quad \mathrm{Den}_{t,p,c}=\frac{\mathrm{Flow}}{\mathrm{Vel}}\ (\text{if }\mathrm{Vel}>0) \]</div>
+      <div class="num">(4.1)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>G<sub>t,p,c</sub></dt><dd>Set of detections at bin <em>t</em>, gantry <em>p</em>, category <em>c</em>.</dd>
+          <dt>Flow</dt><dd>Raw bin count (filled with 0 when no observations).</dd>
+          <dt>Vel / Den</dt><dd>Mean speed and density — NaN when there is no support.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/drift_detection_app.py · _compute_drift_article_features</span>
+      </aside>
+    </div>
+    <p class="reveal">Flows fill with 0 when no observations are present; \(\mathrm{Vel}\), \(\mathrm{Sd}\) and \(\mathrm{Den}\) remain NaN when unsupported. Deltas use first temporal difference.</p>
+
+    <h4 class="reveal">Segment matching and spatial speed</h4>
+    <p class="reveal">An upstream/downstream pair is accepted if it shares the plate, category matches, the downstream pass is later, and travel time falls within \( \tau_s=\max(30, 60 d_s/20) \) minutes. For each match \(m\):</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{TT}_m = \tau^{\text{end}}_m - \tau^{\text{start}}_m,\quad \mathrm{SegVel}_m = \frac{d_s}{\mathrm{TT}_m/1\,\text{h}},\quad \mathrm{LC}_m = \mathbf{1}\{\ell^{\text{start}}_m\neq\ell^{\text{end}}_m\} \]</div>
+      <div class="num">(4.2)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>TT<sub>m</sub></dt><dd>Match travel time on the segment.</dd>
+          <dt>SegVel<sub>m</sub></dt><dd>Implied spatial speed in km/h.</dd>
+          <dt>LC<sub>m</sub></dt><dd>Binary indicator of a lane change between upstream and downstream.</dd>
+          <dt>τ<sub>s</sub></dt><dd>Travel-time upper bound, function of distance <em>d<sub>s</sub></em>.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/snapshot_pipeline.py · add_window_features_polars</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Target construction</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ y_t = 1 \iff \exists a\ \text{such that }b(t_a) = t+\Delta \]</div>
+      <div class="num">(4.3)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>y<sub>t</sub></dt><dd>Binary label of the current bin: 1 if there is an accident in the next bin.</dd>
+          <dt>b(·)</dt><dd>Temporal bucketing to multiples of Δ.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/drift_detection_app.py · _add_interval_accident_target</span>
+      </aside>
+    </div>
+    <p class="reveal">In other words, a one-bin lead time: features at \(t\) anticipate accidents in the next 5 minutes.</p>
+
+    <h3 class="reveal">Stage 1 and Stage 2</h3>
+    <ul class="reveal">
+      <li><strong>Stage 1</strong>: drops variables with &gt;1% missing and rows with any remaining missing.</li>
+      <li><strong>Stage 2</strong>: drops windows of at least 7 consecutive days with <code>target=0</code>.</li>
+    </ul>
+
+    <h3 class="reveal">Selection and experimental design</h3>
+    <p class="reveal">Selection combines a correlation filter with RF ranking. Strategies are <code>static</code>, <code>period_aligned</code>, <code>cumulative</code>, <code>adaptive_adwin</code>, <code>adaptive_arf</code> and <code>adaptive_kswin</code>; batch models are XGBoost, AdaBoost, Random Forest and NNet; online variants are <code>ARFmoderate</code>, <code>ARFmaj</code>, <code>ARFfast</code>, <code>KSWINpaper</code> and <code>KSWINseasonal</code>.</p>
+
+    <h4 class="reveal">Inner training and Youden threshold</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \hat\theta = \arg\max_{\theta\in\Theta_{m,b}}\frac{1}{K}\sum_{k=1}^{K}\mathrm{AUC}_k(\theta),\quad \hat\tau = \arg\max_\tau\left[\mathrm{TPR}(\tau)-\mathrm{FPR}(\tau)\right] \]</div>
+      <div class="num">(4.4)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>θ̂</dt><dd>Optimal hyperparameters of model <em>m</em> with balancing <em>b</em>, by mean CV AUC.</dd>
+          <dt>τ̂</dt><dd>Optimal threshold by Youden's rule (maximises TPR − FPR).</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/drift_detection_app.py · youden_threshold</span>
+      </aside>
+    </div>
+    <p class="reveal">If <code>balance_mode=smote</code>, the search incorporates <code>sampling_strategy</code> and <code>k_neighbors</code>; <code>smote</code> is never applied to test or stream, only to training folds and the final refit.</p>
+
+    <h4 class="reveal">Yearly batch strategies</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathcal{T}^{\text{static}}_j=\{t:\mathrm{year}(t)=Y_0\},\ \mathcal{T}^{\text{period}}_j=\{t:\mathrm{year}(t)=Y_j-1\},\ \mathcal{T}^{\text{cum}}_j=\{t:\mathrm{year}(t)\le Y_j-1\} \]</div>
+      <div class="num">(4.5)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>𝒯<sup>static</sup></dt><dd>Train fixed at the base year Y<sub>0</sub> — negative control, never recalibrates.</dd>
+          <dt>𝒯<sup>period</sup></dt><dd>Train on the immediately preceding year — sliding window.</dd>
+          <dt>𝒯<sup>cum</sup></dt><dd>Cumulative train — all years up to Y<sub>j</sub>−1.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/drift_detection_app.py · run_adaptive_strategy</span>
+      </aside>
+    </div>
+    <p class="reveal">Evaluation is always \(\mathcal{E}_j=\{t:\mathrm{year}(t)=Y_j\}\). In <code>static</code>, training is identical for all <em>j</em> and reused.</p>
+
+    <h4 class="reveal">ADWIN</h4>
+    <p class="reveal">The detector keeps an error window \(W = W_0\cup W_1\). It declares drift if \(|\mu_0-\mu_1| &gt; \epsilon\), with</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ m=\left(\tfrac{1}{n_0}+\tfrac{1}{n_1}\right)^{-1},\quad \delta'=\tfrac{\delta}{n},\quad \epsilon = \sqrt{\tfrac{1}{2m}\log\tfrac{4n}{\delta}} \]</div>
+      <div class="num">(4.6)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>W<sub>0</sub>, W<sub>1</sub></dt><dd>Compared sub-windows (older vs newer).</dd>
+          <dt>m</dt><dd>Effective harmonic size.</dd>
+          <dt>δ, δ'</dt><dd>Global and per-point confidence (Bonferroni correction).</dd>
+          <dt>ε</dt><dd>Hoeffding bound to declare a significant difference.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/drift_detection_app.py · SimpleADWIN._hoeffding_cut_threshold</span>
+      </aside>
+    </div>
+    <p class="reveal">After a cut, the model is recalibrated using the most recent \(|W_1|\) observations if minimums are met.</p>
+
+    <h4 class="reveal">ARF and KSWIN</h4>
+    <p class="reveal">ARF is genuinely online: \(s_t = f_{t-1}(x_t)\), \(f_t = \mathcal{U}(f_{t-1}, x_t, y_t)\). It does not duplicate per <code>balance_mode</code>.</p>
+    <p class="reveal">KSWIN monitors the <em>top-k</em> columns with \(\alpha=10^{-4}\), <code>window_size=300</code>, <code>stat_size=30</code>. It triggers drift if \(|F_t|\ge\texttt{vote_threshold}\); recalibrates with a temporal window \(\mathcal{R}_t=\{i:t_i\ge t-D\}\).</p>
+
+    <div class="lab-callout ochre reveal">
+      <div class="label">NNet · stability policy</div>
+      <p>NNet trains with per-fold <code>StandardScaler</code> (avoids temporal leakage), <code>solver=adam</code>, <code>early_stopping=True</code>, <code>validation_fraction=0.1</code>, <code>n_iter_no_change=20</code>, <code>tol=1e-4</code>. The <code>maxit</code> grid is \(\{300,500\}\) in <em>fast mode</em> and \(\{300,500,800\}\) in full mode. A non-converged fold is marked <em>invalid</em>; the final refit retries once with doubled <code>max_iter</code> (cap 1000) and, if it still fails, the block is <em>skipped</em>.</p>
+    </div>
+
+    <h3 class="reveal">Persistence and expected results</h3>
+    <p class="reveal">The central manifest tracks progress, completed blocks, skipped blocks and errors. With <code>continue_on_block_error=True</code>, failed blocks are marked <code>skipped_failed</code> and the run continues; global tuning remains <em>fail-fast</em>. NNet cache compatibility depends on <code>NNET_TRAINING_POLICY_VERSION</code>.</p>
+    <p class="reveal">Consolidated outputs include <code>yearly_results</code>, <code>adaptive_results</code>, <code>summary</code>, <code>appendix_tables</code> (A.6–A.9) and <code>appendix_tables_mean</code>, <code>average_roc</code> (101-point FPR grid), and <code>run_manifest</code> + <code>execution_log</code>.</p>
+
+    <h3 class="reveal">Neural drift</h3>
+    <p class="reveal">The submodule <code>src/Neural_drift_app.py</code> implements online backtesting. The experimental unit is \( (\texttt{model}, \texttt{strategy}, \texttt{balance\_mode}) \), with three predictors (XGBoost, Torch MLP, Torch MLP + Attention), four strategies (<code>fixed</code>, <code>recalibration</code>, <code>fine_tuning</code>, <code>retrain</code>) and four drift channels (<em>input</em>, <em>score</em>, <em>error</em>, <em>embedding</em>).</p>
+
+    <h4 class="reveal">Augmentation and windows</h4>
+    <p class="reveal">Deltas, <code>rate</code>, rolling stats (window 3) and regime variables (<code>shock_speed_drop</code>, <code>shock_density_jump</code>, <code>relative_congestion</code>, etc.) are added. The window has length \(L=\texttt{lookback\_steps}\) and the future objective is \( \tilde y_t = \max\{y_t,\dots,y_{t+H-1}\} \). The split admits <code>fractions</code> or <code>fixed_dates</code> (base 2018, stream 2019+).</p>
+
+    <h4 class="reveal">Configuration</h4>
+    <table class="lab-table reveal">
+      <caption><strong>Table 4.1.</strong> Key Neural drift parameters.</caption>
+      <thead><tr><th>Parameter</th><th class="num">Default</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>interval_minutes</code></td><td class="num">5</td><td>Temporal bin</td></tr>
+        <tr><td><code>lookback_steps</code></td><td class="num">12</td><td>History window</td></tr>
+        <tr><td><code>horizon_steps</code></td><td class="num">1</td><td>Binary horizon</td></tr>
+        <tr><td><code>train_fraction</code> / <code>validation_fraction</code></td><td class="num">0.60 / 0.20</td><td>Fractional split</td></tr>
+        <tr><td><code>max_stream_rows</code></td><td class="num">600</td><td>Stream cap</td></tr>
+        <tr><td><code>rolling_metric_window</code></td><td class="num">48</td><td>Rolling smoothing</td></tr>
+        <tr><td><code>recent_window_size</code></td><td class="num">96</td><td>Detector recent window</td></tr>
+        <tr><td><code>severity_threshold</code> (\(\tau\))</td><td class="num">0.50</td><td>Drift event threshold</td></tr>
+        <tr><td><code>detector_adwin_delta</code></td><td class="num">0.002</td><td>ADWIN sensitivity</td></tr>
+      </tbody>
+    </table>
+
+    <h4 class="reveal">Global severity</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{severity\_score}_t = \frac{1}{|C_t|}\sum_{c\in C_t}c,\qquad \mathrm{max\_channel\_score}_t = \max_{c\in C_t} c \]</div>
+      <div class="num">(4.7)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>C<sub>t</sub></dt><dd>Set of active drift channels at <em>t</em> (input, score, error, embedding).</dd>
+          <dt>severity_score</dt><dd>Mean severity across active channels.</dd>
+          <dt>max_channel</dt><dd>Maximum severity across channels — captures a single triggered channel.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/Neural_drift_app.py · _build_channel_scores</span>
+      </aside>
+    </div>
+    <p class="reveal">An event is registered if \(\mathrm{severity\_score}_t\ge\tau\) or \(\mathrm{max\_channel\_score}_t\ge\tau\), with continuous intensity</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{severity\_intensity}_t = \mathrm{clip}\left(\frac{\max(\mathrm{severity\_score}_t,\mathrm{max\_channel\_score}_t)-\tau}{1-\tau},0,1\right) \]</div>
+      <div class="num">(4.8)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>severity_intensity</dt><dd>Continuous event magnitude, normalised to [0,1].</dd>
+          <dt>τ</dt><dd>Event threshold (default 0.50).</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/Neural_drift_app.py · _severity_intensity</span>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Adaptation strategies</h3>
+    <ul class="reveal">
+      <li><strong>fixed</strong>: the predictor never changes; severity is still recorded as a negative control.</li>
+      <li><strong>recalibration</strong>: recomputes scores, retrains the Platt calibrator, re-optimises the threshold with \(F_\beta\) and rebuilds reference statistics.</li>
+      <li><strong>fine_tuning</strong>: Torch lowers LR and shrinks the budget; XGBoost selects an adaptive sub-window and optimises \(\eta_t = \eta_{\text{base}}[1+(\texttt{eta\_multiplier\_max}-1)\mathrm{severity\_intensity}_t]\) and recency weights.</li>
+      <li><strong>retrain</strong>: builds a hybrid dataset \(\mathcal{H}_t = \text{history}\cup W_t\) and retrains from scratch.</li>
+    </ul>
+
+    <h3 class="reveal">Experimental sweep</h3>
+    <p class="reveal"><code>src/neural_drift_experiments.py</code> fixes the protocol (base 2018, dev 2019–2022, holdout 2023–2024), seeds <code>(42, 7, 123)</code> and Optuna phases for <code>adwin</code> and <code>neural</code>. The ranking score aggregates by calendar month:</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{score} = \mathrm{median\_month}(\mathrm{PR\text{-}AUC}) - 0.05\cdot\mathrm{action\_cost} - 0.10\cdot\mathrm{stability\_penalty} \]</div>
+      <div class="num">(4.9)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>median_month</dt><dd>Monthly median of PR-AUC over the holdout.</dd>
+          <dt>action_cost</dt><dd>Aggregate cost of retrains / fine-tunings.</dd>
+          <dt>stability_penalty</dt><dd>Penalty for the model's temporal variance.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/neural_drift_experiments.py · _build_experiment_score</span>
+      </aside>
+    </div>
+    <p class="reveal">The promotion gate uses one-sided Wilcoxon + BCa bootstrap on holdout months with \(p&lt;0.05/3\) (Bonferroni), CI lower bound \(&gt;0\) and median monthly PR-AUC gain \(&gt;0.01\).</p>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Coming soon · Experiment replay</div>
+      <p>This section will include an animated temporal replay of the monthly PR-AUC per strategy, overlaid ADWIN/KSWIN events, and a statistical comparator (Wilcoxon + bootstrap) loaded from the <code>run_manifest</code>.</p>
+    </div>
+
+  </section>
+
+  <footer class="lab-coda">
+    <span>Chapter § 4 · 9 equations · 1 table · 1 callout</span>
+    <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/drift_detection_en.tex</code></span>
+  </footer>
+
+</main>
+
+<aside class="lab-margin" aria-label="Marginalia">
+  <div class="pinned">
+    <span class="label">Drift</span>
+    <p>The paper compares <em>batch recalibration</em> (yearly, calendar-driven) with <em>adaptive detection</em> (ADWIN, ARF, KSWIN). The operational question: when does retraining pay off?</p>
+    <p><strong>Lead time.</strong> 5 minutes: features at bin <em>t</em> must anticipate accidents at <em>t</em>+1.</p>
+    <p><strong>SMOTE.</strong> Train folds only. Never on stream or test.</p>
+    <p><strong>Severity.</strong> Combination of four channels (input, score, error, embedding) under an OR rule against the threshold.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

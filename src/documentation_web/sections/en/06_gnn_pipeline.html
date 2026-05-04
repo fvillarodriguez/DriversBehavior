@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>§ 6 · Graph Neural Network</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true, tags: 'none' },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <section class="lab-section reveal" id="s6">
+    <header class="lab-section-head" data-stagger>
+      <div class="num reveal">06</div>
+      <div>
+        <span class="meta reveal">Chapter · Spatio-temporal graph</span>
+        <h2 class="reveal">Graph Neural Network</h2>
+      </div>
+    </header>
+
+    <h3 class="reveal">Scope</h3>
+    <p class="reveal">Audit of the GNN pipeline (<code>src/graph_builder_app.py</code>, <code>src/graph.py</code>, <code>src/gat_model.py</code>, <code>src/gnn_main.py</code>, <code>src/train_pretrain.py</code>) with its balancing mechanisms (GraphSMOTE in <code>src/graphsmote.py</code>, ImGAGN in <code>src/imgagn.py</code>) and Optuna hyperparameter search.</p>
+
+    <h3 class="reveal">Conceptual map</h3>
+    <ol class="reveal">
+      <li>Base data: gantries, flows and accidents (<code>src/utils.py</code>).</li>
+      <li>Feature engineering: snapshot/flow (<code>src/snapshot_pipeline.py</code>, <code>src/features.py</code>).</li>
+      <li>Manual / guided feature selection and persistence.</li>
+      <li>Graph: <code>pm</code> nodes, <code>temporal</code>/<code>spatial</code>/<code>st_fwd</code> edges and attributes.</li>
+      <li>Training: HeteroGAT + TemporalAggregator (optional).</li>
+      <li>Balancing: GraphSMOTE and/or ImGAGN.</li>
+      <li>Evaluation: F1, AUC, AUPRC, MCC and thresholds.</li>
+      <li>Artefacts: models, <code>_hparams.json</code> sidecars, augmented graphs and <code>gnn_history.jsonl</code>.</li>
+    </ol>
+
+    <h3 class="reveal">Graph data model</h3>
+    <ul class="reveal">
+      <li><strong>Node</strong>: <code>pm</code> (gantry-minute), with <code>pm.y</code> and <code>pm.is_accident_pm</code>.</li>
+      <li><strong>Edges</strong>: <code>temporal</code> \(P_{i,t}\to P_{i,t+1}\); <code>spatial</code> \(P_{i,t}\to P_{i+1,t}\); <code>st_fwd</code> optional; <code>spatial_back</code> optional.</li>
+      <li><strong>Attributes</strong>: \( \Delta x \) between target and source; extras on <code>spatial</code> (gradients, shock, distance); <code>temporal</code> and <code>st_fwd</code> are zero-padded.</li>
+      <li><strong>Masks</strong>: <code>train/val/test_mask</code> with temporal cut and <code>sequence_mask</code>.</li>
+    </ul>
+
+    <h3 class="reveal">HeteroGAT and variants</h3>
+    <p class="reveal">The base model is <code>src/gat_model.py::HeteroGAT</code>: <code>HeteroConv</code> layers with <code>GATConvSaveAlpha</code>, <code>aggr1</code> and <code>aggr2</code> aggregations, attentions captured under <code>XAI=1</code> used for \(L^2\) regularisation, batch-wise <code>edge_attr</code> validation and optional <em>gradient checkpointing</em>.</p>
+    <p class="reveal">Variant registration is controlled by <code>GNN_VARIANT</code> and <code>GNN_TEMPORAL_CACHE_STRATEGY</code>, materialised in <code>_build_gnn_model</code>, <code>_build_temporal_head_for_variant</code> and <code>_prime_temporal_cache_if_needed</code>. Registered variants:</p>
+    <ol class="reveal">
+      <li><code>gat_snapshot</code> (baseline).</li>
+      <li><code>gat_gru</code>, <code>gat_transformer</code>, <code>gat_attnpool</code> (temporal heads).</li>
+      <li><code>gat_edge_mlp</code>, <code>gat_edge_mlp_gru</code>, <code>gat_edge_mlp_transformer</code> (edge encoder + head).</li>
+      <li><code>gnn_edge_aware</code>, <code>gnn_edge_aware_gru</code>, <code>gnn_edge_aware_transformer</code> (<code>TransformerConv</code>).</li>
+    </ol>
+
+    <h4 class="reveal">"Five minutes before" labelling</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \text{positive interval} = (t+\gamma,\ t+\gamma+H] \]</div>
+      <div class="num">(6.1)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>γ</dt><dd>Guard band (anti-leakage): minutes between the observed bin and the start of the positive interval.</dd>
+          <dt>H</dt><dd>Horizon: length of the interval where the accident is considered.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/graph.py · build_graph (SequenceConfig labelling)</span>
+      </aside>
+    </div>
+    <p class="reveal">Recommended protocol: <code>GUARD_BAND_MINUTES=5</code> and <code>HORIZON_MINUTES=5</code> (or 10–20 for windowed risk).</p>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Temporal cache</div>
+      <p><em>incremental</em> keeps a per-batch cache (cheaper, sampler-dependent); <em>global_epoch</em> performs a full forward per epoch for consistent sequences. For scientific work <em>global_epoch</em> is recommended.</p>
+    </div>
+
+    <h3 class="reveal">Training and loss</h3>
+    <p class="reveal"><code>train_minibatch</code> in <code>src/train_pretrain.py</code> classifies on <code>pm</code> (first <code>batch_size</code> from <code>NeighborLoader</code>) with</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathcal{L} = \mathcal{L}_{\text{cls}} + \lambda_{\text{edge}}\mathcal{L}_{\text{edge}} + \lambda_{\text{att}}\mathcal{L}_{\text{att}} \]</div>
+      <div class="num">(6.2)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>ℒ<sub>cls</sub></dt><dd>Main binary classification loss on <code>pm</code>.</dd>
+          <dt>ℒ<sub>edge</sub></dt><dd>Edge reconstruction with negative sampling (when <code>edge_gen</code> is on).</dd>
+          <dt>ℒ<sub>att</sub></dt><dd>L² regularisation over captured attentions (XAI=1).</dd>
+          <dt>λ<sub>edge</sub>, λ<sub>att</sub></dt><dd>Coefficients tuned by Optuna.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/train_pretrain.py · train_minibatch</span>
+      </aside>
+    </div>
+    <p class="reveal">\(\mathcal{L}_{\text{edge}}\) is reconstruction with negative sampling (if <code>edge_gen</code> is set). \(\mathcal{L}_{\text{att}}\) is \(L^2\) over attentions when <code>XAI=1</code>. The loop uses gradient accumulation (<code>accumulation_steps=2</code>), <code>grad_clip</code>, <code>OneCycleLR</code> and AMP on CUDA.</p>
+
+    <h3 class="reveal">GraphSMOTE</h3>
+    <ol class="reveal">
+      <li>Per-minibatch \(\ell^2\)-normalised embeddings.</li>
+      <li>SMOTE in embedding space: \( \mathbf{z}_{\text{syn}} = (1-\alpha)\mathbf{z}_i + \alpha\mathbf{z}_j \), \(\alpha\sim U(0,1)\).</li>
+      <li>Per-node-type \(z\to x\) decoders with SmoothL1/MSE and early stopping.</li>
+      <li>Insertion of synthetic nodes respecting <code>train/val/test_mask</code>.</li>
+      <li>Edge generation with <code>RelEdgeGen</code>; real candidates via <code>GRAPHSMOTE_CONECT</code> and direction via <code>BIDIRECCTION</code>.</li>
+    </ol>
+
+    <h3 class="reveal">ImGAGN</h3>
+    <p class="reveal">Generates synthetic nodes as convex combinations of training minority nodes. Defines the synthetic count by:</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \lambda_1 = \frac{n_{\min}+n_g}{n_{\text{maj}}}\ \Rightarrow\ n_g = \max(0,\ \lambda_1 n_{\text{maj}} - n_{\min}) \]</div>
+      <div class="num">(6.3)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>n<sub>min</sub>, n<sub>maj</sub></dt><dd>Real minority and majority training nodes.</dd>
+          <dt>n<sub>g</sub></dt><dd>Synthetic nodes to generate to reach target ratio λ₁.</dd>
+          <dt>λ<sub>1</sub></dt><dd>Final target minority/majority ratio (configurable).</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/imgagn.py · train_imgagn</span>
+      </aside>
+    </div>
+    <p class="reveal">The generator produces weights \(T=\mathrm{softmax}(G(z))\) and features \(X_g = T X_{\min}\). The GCN discriminator combines two heads (real/fake and minority/majority) plus <code>_mm_separation</code>. Per epoch: noise sampling → synthetic build without gradients → discriminator training for \(d_{\text{steps}}\) minibatches → recompute \(X_g\) with gradients and optimise \(G\) minimising \(\mathcal{L}_G = \mathcal{L}_{rf} + \mathcal{L}_{mi} + \mathcal{L}_{di}\).</p>
+
+    <h3 class="reveal">Optuna and evaluation</h3>
+    <p class="reveal"><code>objective</code> maximises validation F0.5 (precision-priority), searches <code>hidden_channels</code>, <code>num_heads</code>, <code>dropout</code>, <code>num_layers</code> and <code>aggr1/aggr2</code>. With GraphSMOTE it tunes <code>smote_k</code>, <code>target_pos_ratio</code>, <code>smote_every_n_epochs</code> and <code>lambda_edge</code>. Without GraphSMOTE it uses <code>FocalLoss</code> with <code>focal_alpha</code> and <code>focal_gamma</code>. Seed sampling can be re-sampled per epoch, fixed per trial, or load the full graph.</p>
+    <p class="reveal">Evaluation: F1, AUC, AUPRC, MCC; threshold \(\tau\) chosen with <code>pick_tau_fbeta</code>; optional Platt calibration (<code>AUTOCALIBRATE_PROBS</code>); <code>_hparams.json</code> sidecar and graph hash (<code>_calculate_graph_hash</code>) for traceability.</p>
+
+    <div class="lab-callout rust reveal">
+      <div class="label">Audited risks</div>
+      <p>Manual balancing leakage (mitigated: <code>run_graphsmote</code> restricts embeddings and minority pool to <code>train_mask</code>); <code>BIDIRECCTION</code> dependence in message diffusion; configurable <code>accumulation_steps</code> requires per-hardware tuning; using GraphSMOTE/ImGAGN disables class weights and validation metrics must be monitored.</p>
+    </div>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Coming soon · Graph visualisation</div>
+      <p>This section will include an interactive gantry-minute graph explorer with minority-node highlighting, a GraphSMOTE vs ImGAGN comparator, and a per-layer attention viewer loaded from the XAI sidecars.</p>
+    </div>
+
+  </section>
+
+  <footer class="lab-coda">
+    <span>Chapter § 6 · 3 equations · 2 callouts</span>
+    <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/gnn_pipeline_audit_en.tex</code></span>
+  </footer>
+
+</main>
+
+<aside class="lab-margin" aria-label="Marginalia">
+  <div class="pinned">
+    <span class="label">Gantry-minute</span>
+    <p>Graph nodes are not gantries but <em>(gantry, minute)</em>: each temporal bin is a distinct node. This models evolution without external recurrent networks.</p>
+    <p><strong>Guard band.</strong> Separates the observed bin from the positive interval to prevent leakage: the model must not see the accident in its own features.</p>
+    <p><strong>Balancing.</strong> GraphSMOTE interpolates in embedding space; ImGAGN synthesises via a GAN with a dual GCN discriminator.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

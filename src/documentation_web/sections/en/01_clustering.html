@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>§ 1 · Clustering</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: {
+      inlineMath: [['\\(', '\\)']],
+      displayMath: [['\\[', '\\]']],
+      processEscapes: true,
+      tags: 'none'
+    },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <section class="lab-section reveal" id="s1">
+    <header class="lab-section-head" data-stagger>
+      <div class="num reveal">01</div>
+      <div>
+        <span class="meta reveal">Chapter · Driver clustering</span>
+        <h2 class="reveal">Grouping by observed behaviour</h2>
+      </div>
+    </header>
+
+    <h3 class="reveal">Goal</h3>
+    <p class="reveal">The module groups drivers —identified by their licence plate— according to behavioural indicators observed in the detection records (<code>flujos</code>). The groups are used for exploratory analysis and to build aggregated variables per gantry and interval that feed the downstream models.</p>
+
+    <h3 class="reveal">Data and preprocessing</h3>
+    <p class="reveal">We start from observations \( r_j = (t_j, p_j, \ell_j, v_j, \text{plate}_j) \) with time, gantry, lane, speed and plate. Normalisation upper-cases the plate, drops invalid values (<code>""</code>, <code>nan</code>, <code>null</code>, <code>none</code>) and filters lengths outside \([5,6]\). Lanes are restricted to \(\ell\in\{1,2,3\}\) and exact duplicates by key \((\text{plate}, p, \ell, t)\) are removed.</p>
+
+    <p class="reveal">For speed-outlier handling, per group \((p,\ell)\) quantiles \(q_\alpha\) and \(q_\beta\) are computed; depending on the mode we apply winsorisation \(v\leftarrow\min(\max(v,q_\alpha),q_\beta)\), hard filtering, or none.</p>
+
+    <h3 class="reveal">Per-driver feature engineering</h3>
+    <p class="reveal">A vector \(x_i\in\mathbb{R}^d\) is built by aggregating over driver <em>i</em>'s passes. Artefacts are stored in <code>Resultados/cluster_features*.duckdb</code> (table <code>cluster_features</code>).</p>
+
+    <h4 class="reveal">Counts, mean speed and lane usage</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ N_i = \sum_{j=1}^{N}\mathbf{1}[\text{plate}_j=i],\quad \overline{v}_i = \frac{1}{N_i}\sum_{j:\text{plate}_j=i} v_j,\quad \pi_{i,k} = \frac{1}{N_i}\sum_{j:\text{plate}_j=i}\mathbf{1}[\ell_j=k] \]</div>
+      <div class="num">(1.1)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>N<sub>i</sub></dt><dd>Total passes by driver <em>i</em> (history cardinality).</dd>
+          <dt>v̄<sub>i</sub></dt><dd>Mean speed of driver across all passes.</dd>
+          <dt>π<sub>i,k</sub></dt><dd>Fraction of passes by driver <em>i</em> on lane <em>k</em> (lane usage).</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 413–476)</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Relative speed</h4>
+    <p class="reveal">Over 5-minute per-gantry intervals a reference mean speed \( \overline{v}_{p,\tau} \) is defined. For each pass, \( \rho_j = v_j/\overline{v}_{p_j,\lfloor t_j\rfloor_{5\text{min}}} \), and per driver \( \overline{\rho}_i = \frac{1}{|\mathcal{J}_i|}\sum_{j\in\mathcal{J}_i}\rho_j \).</p>
+
+    <h4 class="reveal">Headway</h4>
+    <p class="reveal">Per group \((p,\ell)\) ordered by \((t,\text{plate})\): \( h_j = t_j - t_{j-1} \) in seconds. Headways larger than \(h_{\max}=60\,\text{s}\) are treated as missing.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \overline{h}_i = \frac{1}{|\mathcal{H}_i|}\sum_{j\in\mathcal{H}_i} h_j,\qquad \mathcal{H}_i=\{j:\text{plate}_j=i,\ 0&lt;h_j\le h_{\max}\} \]</div>
+      <div class="num">(1.2)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>h̄<sub>i</sub></dt><dd>Mean headway (gap to the previous vehicle) per driver.</dd>
+          <dt>ℋ<sub>i</sub></dt><dd>Set of driver passes with valid headway (positive and below 60 s).</dd>
+          <dt>h<sub>max</sub></dt><dd>Headway validity threshold, fixed at 60 s.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 544–553)</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">TTC and conflict rate</h4>
+    <p class="reveal">For each pass with a previous vehicle in the same \((p,\ell)\), define \(\Delta v_j=v_j-v_{j-1}\). A finite TTC exists only for closing pairs (\(\Delta v_j&gt;0\)): \( \mathrm{TTC}_j = h_j v_j / \Delta v_j \). A per-gantry threshold \(\tau_p\) (<code>TTC_MAX_BY_PORTICO</code>) is fixed. The driver-level rate uses all pairs with valid headway and an observed previous speed in the denominator; non-closing pairs contribute zero:</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{conflict\_rate}_i = \frac{\sum_{j\in\mathcal{K}_i}\mathbf{1}[\Delta v_j&gt;0\ \land\ \mathrm{TTC}_j&lt;\tau_{p_j}]}{|\mathcal{K}_i|},\qquad \mathcal{K}_i=\{j:\text{plate}_j=i,\ h_j&gt;0,\ v_{j-1}\ \text{defined}\} \]</div>
+      <div class="num">(1.3)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>TTC<sub>j</sub></dt><dd>Time-to-collision on pass <em>j</em>; defined only when there is closing (Δv &gt; 0).</dd>
+          <dt>τ<sub>p</sub></dt><dd>Per-gantry threshold from the constant <code>TTC_MAX_BY_PORTICO</code>.</dd>
+          <dt>𝒦<sub>i</sub></dt><dd>Consecutive driver pairs with positive headway and observed previous speed.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 557–590)</span>
+      </aside>
+    </div>
+    <p class="reveal">In the implementation, \(\mathrm{TTC}_j\) is upper-clipped to \(\tau_{p_j}\) to avoid extreme values.</p>
+
+    <h4 class="reveal">Lane changes and activity</h4>
+    <p class="reveal">Lane changes are counted by ordering by driver and time: \(\mathrm{lane\_changes}_i = \sum_{m=2}^{N_i}\mathbf{1}[\ell_{i,m}\neq\ell_{i,m-1}]\) and its rate. Temporal activity includes counts of active days, weeks and months.</p>
+
+    <h4 class="reveal">Monthly weighting (optional)</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \overline{x}_i = \frac{\sum_m N_{i,m}\,x_{i,m}}{\sum_m N_{i,m}} \]</div>
+      <div class="num">(1.4)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>x̄<sub>i</sub></dt><dd>Driver statistic consolidated by monthly weighting.</dd>
+          <dt>x<sub>i,m</sub></dt><dd>Statistic value in month <em>m</em>.</dd>
+          <dt>N<sub>i,m</sub></dt><dd>Driver passes in month <em>m</em> — used as the weight.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 629–665)</span>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Clustering methods</h3>
+    <p class="reveal">Before clustering, z-score is applied with <code>StandardScaler</code>. Three families are compared:</p>
+    <ul class="reveal">
+      <li><strong>K-means</strong>: minimises \(\sum_i \lVert x_i-\mu_{c_i}\rVert^2\). Selection of \(K\) is guided by Silhouette, Davies–Bouldin and Calinski–Harabasz.</li>
+      <li><strong>GMM</strong>: \(p(x)=\sum_{k=1}^K\pi_k\mathcal{N}(x\mid\mu_k,\Sigma_k)\) via EM; \(K\) is chosen by AIC/BIC.</li>
+      <li><strong>HDBSCAN</strong>: density-based hierarchy with <code>min_cluster_size</code> and <code>min_samples</code>; noisy observations get label \(-1\).</li>
+    </ul>
+
+    <div class="lab-callout reveal">
+      <div class="label">Frequent vs. rare</div>
+      <p>For robustness, the model can be trained only on frequent drivers (\(N_i\ge N_{\min}\)). Rare drivers are then assigned a label by centroid distance (K-means) or maximum posterior (GMM); if confidence falls below a threshold they are marked unknown (\(-1\)) and <code>confidence_score</code> is stored alongside <code>is_rare</code>.</p>
+    </div>
+
+    <h3 class="reveal">Aggregated variables per gantry and interval</h3>
+    <p class="reveal">Starting from the table <code>plate → cluster_label</code>, for each \((p,\tau,c)\):</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ n_{p,\tau,c} = \#\{j:\,p_j=p,\ \lfloor t_j\rfloor_\Delta=\tau,\ \text{cluster}(\text{plate}_j)=c\},\qquad \mathrm{share}_{p,\tau,c} = \frac{n_{p,\tau,c}}{\sum_{c'}n_{p,\tau,c'}} \]</div>
+      <div class="num">(1.5)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>n<sub>p,τ,c</sub></dt><dd>Detection count of cluster <em>c</em> at gantry <em>p</em>, interval τ.</dd>
+          <dt>share<sub>p,τ,c</sub></dt><dd>Cluster <em>c</em> share in the mix of cell (p,τ).</dd>
+          <dt>Δ</dt><dd>Temporal bin size (typically 5 min).</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/clustering.py · _add_soft_entropy</span>
+      </aside>
+    </div>
+    <p class="reveal">Optionally we derive flow, mean speed, density, temporal first differences, and the mix entropy \( H_{p,\tau} = -\sum_c \mathrm{share}_{p,\tau,c}\log\mathrm{share}_{p,\tau,c} \).</p>
+
+    <h3 class="reveal">Behavioural feature detail</h3>
+    <p class="reveal">The detail that was previously separated as chapter 05 is now integrated here because these variables are part of the driver clustering vector.</p>
+
+    <h4 class="reveal">Operational preprocessing</h4>
+    <ol class="reveal">
+      <li>Plate normalisation: alphanumeric, upper-case, length in \([5,6]\); <code>NULL</code>, <code>NAN</code> filtered.</li>
+      <li>Lane filter to \(\{1,2,3\}\).</li>
+      <li>Deduplication by \((\text{plate},p,\ell,t)\).</li>
+      <li>Speed winsorisation per \((p,\ell)\), when enabled, using the configured quantiles.</li>
+    </ol>
+
+    <h4 class="reveal">Indexed relative speed</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ v_{\text{rel},j} = \frac{v_j}{\overline{v}_{p_j,\lfloor t_j\rfloor_{5\text{min}}}} \]</div>
+      <div class="num">(1.6)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>v<sub>rel,j</sub></dt><dd>Pass <em>j</em> speed normalised by the mean speed of its gantry and interval.</dd>
+          <dt>v̄<sub>p,τ</sub></dt><dd>Per-gantry mean speed in the 5-minute bin.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 489–492)</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">TTC event and conflict indicator</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{TTC}_j = \frac{h_j\,v_j}{v_j-v_{j-1}}\quad(\text{if }v_j&gt;v_{j-1}),\qquad c_j=\mathbf{1}\left[v_j&gt;v_{j-1}\ \land\ \mathrm{TTC}_j&lt;\tau_{p_j}\right] \]</div>
+      <div class="num">(1.7)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>c<sub>j</sub></dt><dd>Binary conflict indicator for pass <em>j</em>.</dd>
+          <dt>v<sub>j-1</sub></dt><dd>Previous vehicle speed in the same gantry and lane.</dd>
+          <dt>τ<sub>p</sub></dt><dd>Per-gantry TTC threshold or fixed value, depending on the active configuration.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/clustering.py · Clusterization (lines 557–590)</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Per-plate aggregation and consolidation</h4>
+    <p class="reveal">For each driver, the module aggregates mean speed, relative speed, headway, conflict rate, lane usage, lane-change rate and temporal activity. Under monthly weighting, each monthly statistic is weighted by the observed monthly volume.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ X_{i,\mathrm{final}} = \frac{\sum_m X_{i,m}\,N_{i,m}}{\sum_m N_{i,m}} \]</div>
+      <div class="num">(1.8)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>X<sub>i,final</sub></dt><dd>Driver statistic consolidated by monthly weighting.</dd>
+          <dt>X<sub>i,m</sub></dt><dd>Monthly value of the statistic.</dd>
+          <dt>N<sub>i,m</sub></dt><dd>Driver passes in month <em>m</em>.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/clustering.py · _monthly_weighted_average</span>
+      </aside>
+    </div>
+    <p class="reveal">The logic lives in <code>src/clustering.py</code>. <code>clean_flujos_for_clustering</code> performs preparation and <code>Clusterization</code> orchestrates simple metrics, relative speed, vectorised <em>shift</em>-based interactions, lane changes and monthly weighting.</p>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Coming soon · Interactive results</div>
+      <p>This section will include a dynamic cluster explorer: silhouette across <em>K</em>, AIC/BIC comparison between families, and a heat map of <code>share<sub>p,τ,c</sub></code> by corridor. Data will be loaded from <code>Resultados/cluster_features*.duckdb</code>.</p>
+    </div>
+
+  </section>
+
+  <footer class="lab-coda">
+    <span>Chapter § 1 · 8 equations · 2 callouts</span>
+    <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/clustering_en.tex</code> + <code style="font-family:var(--font-mono);font-size:11.5px;">clustering_features_detail_en.tex</code></span>
+  </footer>
+
+</main>
+
+<aside class="lab-margin" aria-label="Marginalia">
+  <div class="pinned">
+    <span class="label">Inspector</span>
+    <p>Hover any numbered equation to open the side panel with variable definitions and the exact code reference where it is implemented.</p>
+    <p><strong>Convention.</strong> Names in <code style="font-family:var(--font-mono);font-size:11.5px;">monospace</code> reference real functions, constants or tables in the repository.</p>
+    <p><strong>Gantry.</strong> In this text, <em>gantry</em> denotes an AVI detection station with one or more instrumented lanes.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

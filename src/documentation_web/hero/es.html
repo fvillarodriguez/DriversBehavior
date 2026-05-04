@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="es" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Crash Prediction · Manuscrito Técnico</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: {
+      inlineMath: [['\\(', '\\)']],
+      displayMath: [['\\[', '\\]']],
+      processEscapes: true
+    },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <header class="hero">
+    <div class="hero-marker">§</div>
+
+    <div class="hero-eyebrow reveal">Manuscrito Técnico · v {{VERSION}}</div>
+
+    <h1 class="hero-title reveal">Crash <em>Prediction</em></h1>
+
+    <p class="hero-subtitle reveal">
+      Metodología, implementación y auditoría del pipeline de predicción
+      de accidentes en autopistas urbanas.
+    </p>
+
+    <div class="hero-spec reveal" data-stagger>
+      <div><span>Programa</span><strong>Doctorado en Ingeniería Industrial</strong></div>
+      <div><span>Ámbito</span><strong>Big data y seguridad vial</strong></div>
+      <div><span>Capítulos</span><strong>6 secciones técnicas</strong></div>
+      <div><span>Versión</span><strong>{{VERSION}}</strong></div>
+    </div>
+
+    <p class="hero-lede reveal">
+      Este documento concentra la descripción técnica del pipeline completo
+      de Crash Prediction implementado en el repositorio. Cada sección
+      describe las fórmulas, los invariantes del código y los artefactos
+      persistidos, de modo que la documentación sea a la vez una guía
+      de lectura y un contrato auditable con la implementación.
+    </p>
+
+    <nav class="hero-toc reveal" data-stagger aria-label="Índice de capítulos">
+      <a href="#s1" data-section="01_clustering">
+        <div class="num">§ 1</div>
+        <div>
+          <strong class="title">Clustering</strong>
+          <span class="desc">Agrupación de conductores por comportamiento, con K-means, GMM y HDBSCAN.</span>
+        </div>
+      </a>
+      <a href="#s2" data-section="02_accident_prediction">
+        <div class="num">§ 2</div>
+        <div>
+          <strong class="title">Predicción de accidentes</strong>
+          <span class="desc">Modelos supervisados sobre flujo más variables de cluster con calibración de FAR.</span>
+        </div>
+      </a>
+      <a href="#s3" data-section="03_nlp_severity">
+        <div class="num">§ 3</div>
+        <div>
+          <strong class="title">NLP en severidad</strong>
+          <span class="desc">Réplica del estudio NLP con M1, M2 y M3 sobre dataset bloqueado.</span>
+        </div>
+      </a>
+      <a href="#s4" data-section="04_drift_detection">
+        <div class="num">§ 4</div>
+        <div>
+          <strong class="title">Drift detection</strong>
+          <span class="desc">Recalibración batch anual vs estrategias adaptativas ADWIN, ARF y KSWIN.</span>
+        </div>
+      </a>
+      <a href="#s6" data-section="06_gnn_pipeline">
+        <div class="num">§ 6</div>
+        <div>
+          <strong class="title">Graph Neural Network</strong>
+          <span class="desc">Grafo pórtico-minuto con HeteroGAT, GraphSMOTE e ImGAGN.</span>
+        </div>
+      </a>
+      <a href="#s7" data-section="07_mairl">
+        <div class="num">§ 7</div>
+        <div>
+          <strong class="title">MA-AIRL</strong>
+          <span class="desc">Aprendizaje multi-agente adversarial con exportación a SUMO.</span>
+        </div>
+      </a>
+    </nav>
+
+    <footer class="lab-coda">
+      <span>Compilado desde <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/*_es.tex</code></span>
+      <span>v {{VERSION}} · ES</span>
+    </footer>
+  </header>
+
+</main>
+
+<aside class="lab-margin" aria-label="Notas al margen">
+  <div class="pinned">
+    <span class="label">Convenciones</span>
+    <p>Las ecuaciones se numeran por capítulo (p. ej. 4.6) y exponen un <em>inspector</em> al pasar el cursor con definiciones y referencias al código.</p>
+    <p><strong>Fuentes.</strong> Fraunces (display, ejes <em>opsz</em> y <em>SOFT</em>), Newsreader (cuerpo), IBM Plex Sans (UI), JetBrains Mono (código y números).</p>
+    <p><strong>Acento.</strong> Azul estratosférico <code style="font-family:var(--font-mono);">#0a3d62</code>; ámbar <code style="font-family:var(--font-mono);">#c8771e</code> en estados secundarios.</p>
+    <p><strong>Modo oscuro.</strong> Pizarra <code style="font-family:var(--font-mono);">#0d1117</code> con cian eléctrico para el énfasis nocturno.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

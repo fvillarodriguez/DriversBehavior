@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Crash Prediction · Technical Manuscript</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: {
+      inlineMath: [['\\(', '\\)']],
+      displayMath: [['\\[', '\\]']],
+      processEscapes: true
+    },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <header class="hero">
+    <div class="hero-marker">§</div>
+
+    <div class="hero-eyebrow reveal">Technical Manuscript · v {{VERSION}}</div>
+
+    <h1 class="hero-title reveal">Crash <em>Prediction</em></h1>
+
+    <p class="hero-subtitle reveal">
+      Methodology, implementation and audit of the urban-highway
+      crash prediction pipeline.
+    </p>
+
+    <div class="hero-spec reveal" data-stagger>
+      <div><span>Program</span><strong>PhD in Industrial Engineering</strong></div>
+      <div><span>Field</span><strong>Big data &amp; road safety</strong></div>
+      <div><span>Chapters</span><strong>6 technical sections</strong></div>
+      <div><span>Version</span><strong>{{VERSION}}</strong></div>
+    </div>
+
+    <p class="hero-lede reveal">
+      This document concentrates the technical description of the complete
+      Crash Prediction pipeline implemented in the repository. Each section
+      describes the formulas, the code invariants and the persisted
+      artefacts, so the documentation is at once a reading guide and an
+      auditable contract against the implementation.
+    </p>
+
+    <nav class="hero-toc reveal" data-stagger aria-label="Chapter index">
+      <a href="#s1" data-section="01_clustering">
+        <div class="num">§ 1</div>
+        <div>
+          <strong class="title">Clustering</strong>
+          <span class="desc">Driver behaviour grouping with K-means, GMM and HDBSCAN.</span>
+        </div>
+      </a>
+      <a href="#s2" data-section="02_accident_prediction">
+        <div class="num">§ 2</div>
+        <div>
+          <strong class="title">Accident prediction</strong>
+          <span class="desc">Supervised models on flow + cluster variables with FAR-constrained calibration.</span>
+        </div>
+      </a>
+      <a href="#s3" data-section="03_nlp_severity">
+        <div class="num">§ 3</div>
+        <div>
+          <strong class="title">NLP on severity</strong>
+          <span class="desc">Replication of the NLP study with M1, M2 and M3 on a frozen dataset.</span>
+        </div>
+      </a>
+      <a href="#s4" data-section="04_drift_detection">
+        <div class="num">§ 4</div>
+        <div>
+          <strong class="title">Drift detection</strong>
+          <span class="desc">Yearly batch recalibration vs adaptive ADWIN / ARF / KSWIN strategies.</span>
+        </div>
+      </a>
+      <a href="#s6" data-section="06_gnn_pipeline">
+        <div class="num">§ 6</div>
+        <div>
+          <strong class="title">Graph Neural Network</strong>
+          <span class="desc">Portico-minute graph with HeteroGAT, GraphSMOTE and ImGAGN.</span>
+        </div>
+      </a>
+      <a href="#s7" data-section="07_mairl">
+        <div class="num">§ 7</div>
+        <div>
+          <strong class="title">MA-AIRL</strong>
+          <span class="desc">Multi-agent adversarial inverse RL with SUMO export.</span>
+        </div>
+      </a>
+    </nav>
+
+    <footer class="lab-coda">
+      <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/*_en.tex</code></span>
+      <span>v {{VERSION}} · EN</span>
+    </footer>
+  </header>
+
+</main>
+
+<aside class="lab-margin" aria-label="Marginalia">
+  <div class="pinned">
+    <span class="label">Conventions</span>
+    <p>Equations are numbered by chapter (e.g. 4.6) and reveal an <em>inspector</em> on hover with variable definitions and code references.</p>
+    <p><strong>Type.</strong> Fraunces (display, <em>opsz</em> and <em>SOFT</em> axes), Newsreader (body), IBM Plex Sans (UI), JetBrains Mono (code &amp; numerals).</p>
+    <p><strong>Accent.</strong> Stratosphere blue <code style="font-family:var(--font-mono);">#0a3d62</code>; amber <code style="font-family:var(--font-mono);">#c8771e</code> for secondary states.</p>
+    <p><strong>Dark mode.</strong> Slate <code style="font-family:var(--font-mono);">#0d1117</code> with electric cyan for night-time emphasis.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

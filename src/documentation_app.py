@@ -11,7 +11,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-WEB_DIR = ROOT_DIR / "docs" / "web"
+WEB_DIR = ROOT_DIR / "src" / "documentation_web"
 LEGACY_DIR = ROOT_DIR / "docs" / "html"
 STYLES_CSS = WEB_DIR / "styles.css"
 THEME_JS = WEB_DIR / "theme.js"

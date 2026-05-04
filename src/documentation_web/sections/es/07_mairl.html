@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="es" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>§ 7 · MA-AIRL</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true, tags: 'none' },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <section class="lab-section reveal" id="s7">
+    <header class="lab-section-head" data-stagger>
+      <div class="num reveal">07</div>
+      <div>
+        <span class="meta reveal">Capítulo · Multi-agent adversarial IRL</span>
+        <h2 class="reveal">Implementación de MA-AIRL</h2>
+      </div>
+    </header>
+
+    <h3 class="reveal">Objetivo y alcance</h3>
+    <p class="reveal">Implementación funcional de Multi-Agent Adversarial IRL siguiendo el marco de <code>src/MAIRL.pdf</code>. Para cada cluster de conductores se aprende una política estocástica y una función de recompensa que expliquen las demostraciones, y se exportan parámetros de <code>vType</code> para SUMO. La arquitectura está dividida en núcleo (<code>src/marl_core.py</code>) e interfaz (<code>src/multi_agent_rl_app.py</code>).</p>
+
+    <h3 class="reveal">Datos y estado</h3>
+    <p class="reveal">La entrada son CSV de clusters con <code>cluster_label</code>. Cada fila es una muestra experta con estado \(s\) formado por columnas numéricas seleccionadas (por defecto: <code>avg_speed_kmh</code>, <code>avg_headway_s</code>, <code>lane_change_rate</code>). Se estandariza con un <code>StandardScaler</code> propio y se separa por agente (cluster).</p>
+
+    <h3 class="reveal">Acciones proxy</h3>
+    <p class="reveal">Como el CSV no contiene acciones reales, se construye un proxy: las métricas se mapean a parámetros de <em>car-following</em> (<code>maxSpeed</code>, <code>accel</code>, <code>decel</code>, <code>minGap</code>, <code>sigma</code>, <code>impatience</code>), se aplican transformaciones heurísticas y se recortan a <code>PARAM_BOUNDS</code>. Las acciones se normalizan a \([-1,1]\) para entrenamiento estable.</p>
+
+    <h3 class="reveal">Modelos</h3>
+    <p class="reveal">Por agente se instancian tres redes:</p>
+    <ul class="reveal">
+      <li><strong>Política gaussiana</strong> \( q_\theta(a\mid s) \) (MLP que produce \(\mu\) y \(\log\sigma\)).</li>
+      <li><strong>Recompensa</strong> \( g_\omega(s,a) \) (MLP sobre estado-acción).</li>
+      <li><strong>Potencial</strong> \( h_\phi(s) \).</li>
+    </ul>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ f_{\omega,\phi}(s,a,s') = g_\omega(s,a) + \gamma\,h_\phi(s') - h_\phi(s) \]</div>
+      <div class="num">(7.1)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>g<sub>ω</sub>(s,a)</dt><dd>Recompensa parametrizada — qué tan buena es la acción <em>a</em> en el estado <em>s</em>.</dd>
+          <dt>h<sub>φ</sub>(s)</dt><dd>Función potencial sobre el estado, hace <em>shaping</em> sin alterar la política óptima.</dd>
+          <dt>γ</dt><dd>Factor de descuento.</dd>
+          <dt>f<sub>ω,φ</sub></dt><dd>Recompensa formada — entrada al discriminador.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/marl_core.py · MAIRLAgent.f</span>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Discriminador y objetivos</h3>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ D_\omega(s,a) = \frac{\exp(f_\omega(s,a))}{\exp(f_\omega(s,a)) + q_\theta(a\mid s)} \]</div>
+      <div class="num">(7.2)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>D<sub>ω</sub>(s,a)</dt><dd>Probabilidad de que (s,a) provenga del experto, según el discriminador.</dd>
+          <dt>q<sub>θ</sub>(a∣s)</dt><dd>Probabilidad de la acción bajo la política aprendida.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/marl_core.py · MAIRL training loop (no explicit D function)</span>
+      </aside>
+    </div>
+    <p class="reveal">El discriminador maximiza \( \mathbb{E}_{X_E}[\log D] + \mathbb{E}_{X_\pi}[\log(1-D)] \); la política maximiza \( \mathbb{E}_{X_\pi}[f_\omega(s,a) - \log q_\theta(a\mid s)] \) (Ec. 12 del paper).</p>
+
+    <div class="lab-callout ochre reveal">
+      <div class="label">Proxy temporal</div>
+      <p>Ante la ausencia de transiciones explícitas, se aplica un proxy de un paso \( s' = s \). La decisión está documentada en el código: permite conservar la estructura del potencial sin requerir secuencias completas, y queda como limitación conocida hasta disponer de trayectorias reales.</p>
+    </div>
+
+    <h3 class="reveal">Exportación a SUMO</h3>
+    <p class="reveal">Al finalizar el entrenamiento, se evalúa la política en el estado medio y se desnormalizan los parámetros a los rangos SUMO. El archivo generado es <code>mairl_vtypes.add.xml</code>, con un <code>vType</code> por cluster.</p>
+
+    <h3 class="reveal">UI y métricas</h3>
+    <p class="reveal">La interfaz ofrece un selector de algoritmo: <em>MA-AIRL (paper)</em> frente a <em>CEM (legacy)</em>, con controles de batch size, \(\gamma\), learning rates, tamaño de red y dispositivo. Durante el entrenamiento se reportan <code>disc_loss</code>, <code>policy_loss</code> y <code>reward_mean</code>.</p>
+
+    <h3 class="reveal">Limitaciones y próximos pasos</h3>
+    <ul class="reveal">
+      <li>\(s' = s\) por falta de secuencias temporales explícitas.</li>
+      <li>Acciones expertas como heurística a partir de métricas agregadas.</li>
+      <li>Construir trayectorias reales desde SUMO o datos temporales para estimar \(s'\) y acciones reales.</li>
+    </ul>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Próximamente · Visualizador de políticas</div>
+      <p>Esta sección incluirá curvas de pérdida discriminador/política por cluster, un explorador de la recompensa aprendida \(g_\omega\) sobre el espacio (s,a), y un comparador SUMO vs MA-AIRL con los <code>vType</code> exportados.</p>
+    </div>
+
+  </section>
+
+  <footer class="lab-coda">
+    <span>Capítulo § 7 · 2 ecuaciones · 1 callout</span>
+    <span>Compilado desde <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/mairl_implementation_es.tex</code></span>
+  </footer>
+
+</main>
+
+<aside class="lab-margin" aria-label="Notas al margen">
+  <div class="pinned">
+    <span class="label">MA-AIRL</span>
+    <p>Multi-Agent Adversarial Inverse Reinforcement Learning: aprende simultáneamente una política y una recompensa que <em>expliquen</em> las demostraciones, sin asumir una función de recompensa conocida.</p>
+    <p><strong>Por cluster.</strong> Una política y una recompensa por cluster de conductores — captura comportamientos heterogéneos en una sola corrida.</p>
+    <p><strong>SUMO export.</strong> El producto final son parámetros de <code style="font-family:var(--font-mono);font-size:11.5px;">vType</code> que pueden cargarse directamente en una simulación SUMO para reproducir la heterogeneidad observada.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

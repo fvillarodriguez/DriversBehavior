@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="es" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>§ 6 · Graph Neural Network</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true, tags: 'none' },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <section class="lab-section reveal" id="s6">
+    <header class="lab-section-head" data-stagger>
+      <div class="num reveal">06</div>
+      <div>
+        <span class="meta reveal">Capítulo · Grafo espacio-temporal</span>
+        <h2 class="reveal">Graph Neural Network</h2>
+      </div>
+    </header>
+
+    <h3 class="reveal">Alcance</h3>
+    <p class="reveal">Auditoría del pipeline GNN (<code>src/graph_builder_app.py</code>, <code>src/graph.py</code>, <code>src/gat_model.py</code>, <code>src/gnn_main.py</code>, <code>src/train_pretrain.py</code>) con sus mecanismos de balanceo (GraphSMOTE en <code>src/graphsmote.py</code>, ImGAGN en <code>src/imgagn.py</code>) y la búsqueda de hiperparámetros con Optuna.</p>
+
+    <h3 class="reveal">Mapa conceptual</h3>
+    <ol class="reveal">
+      <li>Datos base: pórticos, flujos y accidentes (<code>src/utils.py</code>).</li>
+      <li>Feature engineering: snapshot/flow (<code>src/snapshot_pipeline.py</code>, <code>src/features.py</code>).</li>
+      <li>Feature selection manual/guiada y persistencia.</li>
+      <li>Grafo: nodos <code>pm</code>, aristas <code>temporal</code>/<code>spatial</code>/<code>st_fwd</code> y atributos.</li>
+      <li>Entrenamiento: HeteroGAT + TemporalAggregator (opcional).</li>
+      <li>Balanceo: GraphSMOTE y/o ImGAGN.</li>
+      <li>Evaluación: F1, AUC, AUPRC, MCC y umbrales.</li>
+      <li>Artefactos: modelos, sidecars <code>_hparams.json</code>, grafos aumentados y <code>gnn_history.jsonl</code>.</li>
+    </ol>
+
+    <h3 class="reveal">Modelo de datos del grafo</h3>
+    <ul class="reveal">
+      <li><strong>Nodo</strong>: <code>pm</code> (pórtico-minuto), con <code>pm.y</code> y <code>pm.is_accident_pm</code>.</li>
+      <li><strong>Aristas</strong>: <code>temporal</code> \(P_{i,t}\to P_{i,t+1}\); <code>spatial</code> \(P_{i,t}\to P_{i+1,t}\); <code>st_fwd</code> opcional; <code>spatial_back</code> opcional.</li>
+      <li><strong>Atributos</strong>: \( \Delta x \) entre destino y origen; extras en <code>spatial</code> (gradientes, shock, distancia); en <code>temporal</code> y <code>st_fwd</code> se rellenan con ceros.</li>
+      <li><strong>Máscaras</strong>: <code>train/val/test_mask</code> con corte temporal y <code>sequence_mask</code>.</li>
+    </ul>
+
+    <h3 class="reveal">HeteroGAT y variantes</h3>
+    <p class="reveal">El modelo base es <code>src/gat_model.py::HeteroGAT</code>: capas <code>HeteroConv</code> con <code>GATConvSaveAlpha</code>, agregaciones <code>aggr1</code> y <code>aggr2</code>, atenciones capturadas bajo <code>XAI=1</code> usadas para regularización \(L^2\), validación por batch de <code>edge_attr</code> y <em>gradient checkpointing</em> opcional.</p>
+    <p class="reveal">El registro de variantes está controlado por <code>GNN_VARIANT</code> y <code>GNN_TEMPORAL_CACHE_STRATEGY</code>, materializado en <code>_build_gnn_model</code>, <code>_build_temporal_head_for_variant</code> y <code>_prime_temporal_cache_if_needed</code>. Las variantes registradas son:</p>
+    <ol class="reveal">
+      <li><code>gat_snapshot</code> (baseline).</li>
+      <li><code>gat_gru</code>, <code>gat_transformer</code>, <code>gat_attnpool</code> (heads temporales).</li>
+      <li><code>gat_edge_mlp</code>, <code>gat_edge_mlp_gru</code>, <code>gat_edge_mlp_transformer</code> (codificador de aristas + head).</li>
+      <li><code>gnn_edge_aware</code>, <code>gnn_edge_aware_gru</code>, <code>gnn_edge_aware_transformer</code> (<code>TransformerConv</code>).</li>
+    </ol>
+
+    <h4 class="reveal">Etiquetado «5 minutos antes»</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \text{intervalo positivo} = (t+\gamma,\ t+\gamma+H] \]</div>
+      <div class="num">(6.1)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>γ</dt><dd>Guard band (anti-fuga): minutos entre el bin observado y el inicio del intervalo positivo.</dd>
+          <dt>H</dt><dd>Horizonte: largo del intervalo donde se considera el accidente.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/graph.py · build_graph (SequenceConfig labelling)</span>
+      </aside>
+    </div>
+    <p class="reveal">Para el protocolo recomendado: <code>GUARD_BAND_MINUTES=5</code> y <code>HORIZON_MINUTES=5</code> (o 10–20 para riesgo en ventana).</p>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Cache temporal</div>
+      <p><em>incremental</em> mantiene cache por batch (más barato, depende del sampler); <em>global_epoch</em> realiza un forward global por época para secuencias consistentes. Para trabajo científico se recomienda <em>global_epoch</em>.</p>
+    </div>
+
+    <h3 class="reveal">Entrenamiento y pérdida</h3>
+    <p class="reveal"><code>train_minibatch</code> en <code>src/train_pretrain.py</code> clasifica sobre <code>pm</code> (primeros <code>batch_size</code> del <code>NeighborLoader</code>) con</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathcal{L} = \mathcal{L}_{\text{cls}} + \lambda_{\text{edge}}\mathcal{L}_{\text{edge}} + \lambda_{\text{att}}\mathcal{L}_{\text{att}} \]</div>
+      <div class="num">(6.2)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>ℒ<sub>cls</sub></dt><dd>Pérdida principal de clasificación binaria sobre <code>pm</code>.</dd>
+          <dt>ℒ<sub>edge</sub></dt><dd>Reconstrucción de aristas con muestreo negativo (cuando hay <code>edge_gen</code>).</dd>
+          <dt>ℒ<sub>att</sub></dt><dd>Regularización L² sobre las atenciones capturadas (XAI=1).</dd>
+          <dt>λ<sub>edge</sub>, λ<sub>att</sub></dt><dd>Coeficientes ajustados por Optuna.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/train_pretrain.py · train_minibatch</span>
+      </aside>
+    </div>
+    <p class="reveal">\(\mathcal{L}_{\text{edge}}\) es reconstrucción con muestreo negativo (si hay <code>edge_gen</code>). \(\mathcal{L}_{\text{att}}\) es \(L^2\) sobre atenciones cuando <code>XAI=1</code>. El loop usa gradiente acumulado (<code>accumulation_steps=2</code>), <code>grad_clip</code>, <code>OneCycleLR</code> y AMP en CUDA.</p>
+
+    <h3 class="reveal">GraphSMOTE</h3>
+    <ol class="reveal">
+      <li>Embeddings por minibatch normalizados en \(\ell^2\).</li>
+      <li>SMOTE en el espacio embedding: \( \mathbf{z}_{\text{syn}} = (1-\alpha)\mathbf{z}_i + \alpha\mathbf{z}_j \), \(\alpha\sim U(0,1)\).</li>
+      <li>Decodificadores \(z\to x\) por tipo de nodo con SmoothL1/MSE y early stopping.</li>
+      <li>Inserción de nodos sintéticos respetando <code>train/val/test_mask</code>.</li>
+      <li>Generación de aristas con <code>RelEdgeGen</code>; candidatos reales por <code>GRAPHSMOTE_CONECT</code> y dirección por <code>BIDIRECCTION</code>.</li>
+    </ol>
+
+    <h3 class="reveal">ImGAGN</h3>
+    <p class="reveal">Genera nodos sintéticos como combinaciones convexas de nodos minoritarios del entrenamiento. Define la cantidad de sintéticos por:</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \lambda_1 = \frac{n_{\min}+n_g}{n_{\text{maj}}}\ \Rightarrow\ n_g = \max(0,\ \lambda_1 n_{\text{maj}} - n_{\min}) \]</div>
+      <div class="num">(6.3)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>n<sub>min</sub>, n<sub>maj</sub></dt><dd>Nodos minoritarios y mayoritarios reales de entrenamiento.</dd>
+          <dt>n<sub>g</sub></dt><dd>Nodos sintéticos a generar para alcanzar la razón objetivo λ₁.</dd>
+          <dt>λ<sub>1</sub></dt><dd>Razón objetivo final minoritaria/mayoritaria (configurable).</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/imgagn.py · train_imgagn</span>
+      </aside>
+    </div>
+    <p class="reveal">El generador produce pesos \(T=\mathrm{softmax}(G(z))\) y features \(X_g = T X_{\min}\). El discriminador GCN combina dos cabezas (real/fake y minority/majority) más <code>_mm_separation</code>. Por época: muestreo de ruido → construcción de sintéticos sin gradientes → entrenamiento del discriminador \(d_{\text{steps}}\) minibatches → recálculo de \(X_g\) con gradientes y optimización de \(G\) minimizando \(\mathcal{L}_G = \mathcal{L}_{rf} + \mathcal{L}_{mi} + \mathcal{L}_{di}\).</p>
+
+    <h3 class="reveal">Optuna y evaluación</h3>
+    <p class="reveal"><code>objective</code> maximiza F0.5 en validación (prioriza precisión), busca <code>hidden_channels</code>, <code>num_heads</code>, <code>dropout</code>, <code>num_layers</code> y <code>aggr1/aggr2</code>. Con GraphSMOTE ajusta <code>smote_k</code>, <code>target_pos_ratio</code>, <code>smote_every_n_epochs</code> y <code>lambda_edge</code>. Sin GraphSMOTE, usa <code>FocalLoss</code> con <code>focal_alpha</code> y <code>focal_gamma</code>. El muestreo de seeds puede resamplearse por época, fijarse por trial o cargarse el grafo completo.</p>
+    <p class="reveal">En evaluación: F1, AUC, AUPRC, MCC; el umbral \(\tau\) se elige con <code>pick_tau_fbeta</code>; calibración opcional con Platt (<code>AUTOCALIBRATE_PROBS</code>); sidecar <code>_hparams.json</code> y hash del grafo (<code>_calculate_graph_hash</code>) para trazabilidad.</p>
+
+    <div class="lab-callout rust reveal">
+      <div class="label">Riesgos auditados</div>
+      <p>Fuga en balanceo manual (mitigado: <code>run_graphsmote</code> restringe embeddings y pool minoritario a <code>train_mask</code>); dependencia de <code>BIDIRECCTION</code> en la difusión de mensajes; <code>accumulation_steps</code> configurable requiere tuning por hardware; al usar GraphSMOTE/ImGAGN se desactivan los pesos de clase y hay que monitorizar métricas en validación.</p>
+    </div>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Próximamente · Visualización del grafo</div>
+      <p>Esta sección incluirá un explorador interactivo del grafo pórtico-minuto con highlight de nodos minoritarios, comparador GraphSMOTE vs ImGAGN, y un visor de atenciones por capa cargado desde los sidecars XAI.</p>
+    </div>
+
+  </section>
+
+  <footer class="lab-coda">
+    <span>Capítulo § 6 · 3 ecuaciones · 2 callouts</span>
+    <span>Compilado desde <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/gnn_pipeline_audit_es.tex</code></span>
+  </footer>
+
+</main>
+
+<aside class="lab-margin" aria-label="Notas al margen">
+  <div class="pinned">
+    <span class="label">Pórtico-minuto</span>
+    <p>Los nodos del grafo no son pórticos sino <em>(pórtico, minuto)</em>: cada bin temporal es un nodo distinto. Esto permite modelar evolución sin recurrir a redes recurrentes externas.</p>
+    <p><strong>Guard band.</strong> Separa el bin observado del intervalo positivo para evitar fuga: el modelo no debe ver el accidente en sus propias features.</p>
+    <p><strong>Balanceo.</strong> GraphSMOTE interpola en el espacio embedding; ImGAGN sintetiza vía un GAN con discriminador GCN dual.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

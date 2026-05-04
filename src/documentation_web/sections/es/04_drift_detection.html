@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="es" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>§ 4 · Drift detection</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true, tags: 'none' },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <section class="lab-section reveal" id="s4">
+    <header class="lab-section-head" data-stagger>
+      <div class="num reveal">04</div>
+      <div>
+        <span class="meta reveal">Capítulo · Recalibración batch vs adaptiva</span>
+        <h2 class="reveal">Drift detection</h2>
+      </div>
+    </header>
+
+    <h3 class="reveal">Alcance y relación con el paper</h3>
+    <p class="reveal">El módulo <code>src/drift_detection_app.py</code> replica el paper <em>Evaluating recalibration strategies for real-time crash prediction: adaptive drift detection vs. cumulative retraining</em>. Concentra la preparación del dataset, estrategias batch anuales, estrategias adaptativas ADWIN/ARF/KSWIN, persistencia de checkpoints, caché de tuning y artefactos SMOTE, y salidas alineadas con Appendix A.6–A.9 y Figure 7.</p>
+    <p class="reveal">La configuración bloqueada del paper fija <code>PAPER_TIME_SPAN = 2018-01-01 to 2024-09-30</code> y un corredor de pórticos <code>DRIFT_FOCUS_PORTICOS = {11,12,14,15}</code>, con segmentos 15→14, 14→12 y 12→11.</p>
+
+    <h3 class="reveal">Mapa de la UI</h3>
+    <ul class="reveal">
+      <li><strong>Eventos</strong>: carga y mapeo de accidentes.</li>
+      <li><strong>Feature engineering</strong>: genera o carga features; exporta DuckDB con <code>raw_features</code> y <code>clean_features</code>.</li>
+      <li><strong>Feature Selection</strong>: filtrado por correlación y ranking con Random Forest.</li>
+      <li><strong>Experiments</strong>: ejecuta <code>run_recalibration_experiments()</code> con preview, resume y arranque limpio.</li>
+      <li><strong>Neural drift</strong>: pestaña delegada en <code>src/Neural_drift_app.py</code>.</li>
+    </ul>
+
+    <h3 class="reveal">Feature engineering</h3>
+    <p class="reveal">Con \(\Delta=5\) min y \(b(\tau)=\lfloor\tau/\Delta\rfloor\Delta\), el espacio completo del corredor produce 260 predictores:</p>
+    <ul class="reveal">
+      <li>96 variables por pórtico y categoría (4 métricas base + 4 deltas, 4 pórticos × 3 categorías).</li>
+      <li>8 composicionales por pórtico (<code>ft_motorcycle_*</code>, <code>ft_heavy_*</code>).</li>
+      <li>72 por segmento y categoría (5 base + 3 deltas).</li>
+      <li>21 globales por segmento (4 base + 3 deltas).</li>
+      <li>63 por carril de origen (4 base + 3 deltas).</li>
+    </ul>
+
+    <h4 class="reveal">Variables por pórtico y categoría</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{Flow}_{t,p,c}=|G_{t,p,c}|,\quad \mathrm{Vel}_{t,p,c}=\frac{1}{|G_{t,p,c}|}\sum v_r,\quad \mathrm{Den}_{t,p,c}=\frac{\mathrm{Flow}}{\mathrm{Vel}}\ (\text{si }\mathrm{Vel}>0) \]</div>
+      <div class="num">(4.1)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>G<sub>t,p,c</sub></dt><dd>Conjunto de detecciones del bin <em>t</em>, pórtico <em>p</em>, categoría <em>c</em>.</dd>
+          <dt>Flow</dt><dd>Conteo bruto del bin (rellenado con 0 si no hay observaciones).</dd>
+          <dt>Vel / Den</dt><dd>Velocidad media y densidad — NaN cuando no hay soporte.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/drift_detection_app.py · _compute_drift_article_features</span>
+      </aside>
+    </div>
+    <p class="reveal">Los flujos se rellenan con 0 en ausencia de observaciones; \(\mathrm{Vel}\), \(\mathrm{Sd}\) y \(\mathrm{Den}\) quedan NaN cuando no hay soporte. Los deltas usan primera diferencia temporal.</p>
+
+    <h4 class="reveal">Matching segmental y velocidad espacial</h4>
+    <p class="reveal">Un par upstream/downstream se acepta si comparte patente, la categoría coincide, el paso downstream es posterior y el tiempo de viaje cae dentro de \( \tau_s=\max(30, 60 d_s/20) \) minutos. Sobre cada match \(m\):</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{TT}_m = \tau^{\text{end}}_m - \tau^{\text{start}}_m,\quad \mathrm{SegVel}_m = \frac{d_s}{\mathrm{TT}_m/1\,\text{h}},\quad \mathrm{LC}_m = \mathbf{1}\{\ell^{\text{start}}_m\neq\ell^{\text{end}}_m\} \]</div>
+      <div class="num">(4.2)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>TT<sub>m</sub></dt><dd>Tiempo de viaje del match en el segmento.</dd>
+          <dt>SegVel<sub>m</sub></dt><dd>Velocidad espacial implícita en km/h.</dd>
+          <dt>LC<sub>m</sub></dt><dd>Indicador binario de cambio de carril entre upstream y downstream.</dd>
+          <dt>τ<sub>s</sub></dt><dd>Cota máxima del tiempo de viaje, función de la distancia <em>d<sub>s</sub></em>.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/snapshot_pipeline.py · add_window_features_polars</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Construcción del target</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ y_t = 1 \iff \exists a\ \text{tal que }b(t_a) = t+\Delta \]</div>
+      <div class="num">(4.3)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>y<sub>t</sub></dt><dd>Etiqueta binaria del bin actual: 1 si hay accidente en el siguiente bin.</dd>
+          <dt>b(·)</dt><dd>Bucketing temporal a múltiplos de Δ.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/drift_detection_app.py · _add_interval_accident_target</span>
+      </aside>
+    </div>
+    <p class="reveal">Es decir, lead-time de un bin: las features de \(t\) anticipan accidentes en los próximos 5 minutos.</p>
+
+    <h3 class="reveal">Stage 1 y Stage 2</h3>
+    <ul class="reveal">
+      <li><strong>Stage 1</strong>: elimina variables con &gt;1% de faltantes y filas con cualquier faltante restante.</li>
+      <li><strong>Stage 2</strong>: elimina ventanas de al menos 7 días consecutivos con <code>target=0</code>.</li>
+    </ul>
+
+    <h3 class="reveal">Selección y diseño experimental</h3>
+    <p class="reveal">La selección combina filtro por correlación y ranking RF. Las estrategias son <code>static</code>, <code>period_aligned</code>, <code>cumulative</code>, <code>adaptive_adwin</code>, <code>adaptive_arf</code> y <code>adaptive_kswin</code>; los modelos batch son XGBoost, AdaBoost, Random Forest y NNet; las variantes online son <code>ARFmoderate</code>, <code>ARFmaj</code>, <code>ARFfast</code>, <code>KSWINpaper</code> y <code>KSWINseasonal</code>.</p>
+
+    <h4 class="reveal">Entrenamiento interno y umbral de Youden</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \hat\theta = \arg\max_{\theta\in\Theta_{m,b}}\frac{1}{K}\sum_{k=1}^{K}\mathrm{AUC}_k(\theta),\quad \hat\tau = \arg\max_\tau\left[\mathrm{TPR}(\tau)-\mathrm{FPR}(\tau)\right] \]</div>
+      <div class="num">(4.4)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>θ̂</dt><dd>Hiperparámetros óptimos del modelo <em>m</em> con balanceo <em>b</em>, por AUC media en CV.</dd>
+          <dt>τ̂</dt><dd>Umbral óptimo por la regla de Youden (maximiza TPR − FPR).</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/drift_detection_app.py · youden_threshold</span>
+      </aside>
+    </div>
+    <p class="reveal">Si <code>balance_mode=smote</code>, la búsqueda incorpora <code>sampling_strategy</code> y <code>k_neighbors</code>; <code>smote</code> nunca se aplica sobre test o stream, sólo sobre folds de entrenamiento y refit final.</p>
+
+    <h4 class="reveal">Estrategias batch anuales</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathcal{T}^{\text{static}}_j=\{t:\mathrm{year}(t)=Y_0\},\ \mathcal{T}^{\text{period}}_j=\{t:\mathrm{year}(t)=Y_j-1\},\ \mathcal{T}^{\text{cum}}_j=\{t:\mathrm{year}(t)\le Y_j-1\} \]</div>
+      <div class="num">(4.5)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>𝒯<sup>static</sup></dt><dd>Train fijo en el año base Y<sub>0</sub> — control negativo, no se recalibra.</dd>
+          <dt>𝒯<sup>period</sup></dt><dd>Train con el año inmediatamente anterior — sliding window.</dd>
+          <dt>𝒯<sup>cum</sup></dt><dd>Train acumulativo — todos los años hasta Y<sub>j</sub>−1.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/drift_detection_app.py · run_adaptive_strategy</span>
+      </aside>
+    </div>
+    <p class="reveal">La evaluación es siempre \(\mathcal{E}_j=\{t:\mathrm{year}(t)=Y_j\}\). En <code>static</code>, el entrenamiento es idéntico para todo \(j\) y se reutiliza.</p>
+
+    <h4 class="reveal">ADWIN</h4>
+    <p class="reveal">El detector mantiene una ventana de errores \(W = W_0\cup W_1\). Declara drift si \(|\mu_0-\mu_1| &gt; \epsilon\), con</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ m=\left(\tfrac{1}{n_0}+\tfrac{1}{n_1}\right)^{-1},\quad \delta'=\tfrac{\delta}{n},\quad \epsilon = \sqrt{\tfrac{1}{2m}\log\tfrac{4n}{\delta}} \]</div>
+      <div class="num">(4.6)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>W<sub>0</sub>, W<sub>1</sub></dt><dd>Sub-ventanas comparadas (vieja vs nueva).</dd>
+          <dt>m</dt><dd>Tamaño efectivo armónico.</dd>
+          <dt>δ, δ'</dt><dd>Confianza global y por punto (corrección de Bonferroni).</dd>
+          <dt>ε</dt><dd>Cota Hoeffding para declarar diferencia significativa.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/drift_detection_app.py · SimpleADWIN._hoeffding_cut_threshold</span>
+      </aside>
+    </div>
+    <p class="reveal">Tras un corte se recalibra el modelo usando las \(|W_1|\) observaciones más recientes si cumplen los mínimos.</p>
+
+    <h4 class="reveal">ARF y KSWIN</h4>
+    <p class="reveal">ARF es genuinamente online: \(s_t = f_{t-1}(x_t)\), \(f_t = \mathcal{U}(f_{t-1}, x_t, y_t)\). No se duplica por <code>balance_mode</code>.</p>
+    <p class="reveal">KSWIN monitoriza las <em>top-k</em> columnas con \(\alpha=10^{-4}\), <code>window_size=300</code>, <code>stat_size=30</code>. Dispara drift si \(|F_t|\ge\texttt{vote_threshold}\); recalibra con una ventana temporal \(\mathcal{R}_t=\{i:t_i\ge t-D\}\).</p>
+
+    <div class="lab-callout ochre reveal">
+      <div class="label">NNet · política de estabilidad</div>
+      <p>NNet entrena con <code>StandardScaler</code> por fold (evita leakage temporal), <code>solver=adam</code>, <code>early_stopping=True</code>, <code>validation_fraction=0.1</code>, <code>n_iter_no_change=20</code>, <code>tol=1e-4</code>. La grilla de <code>maxit</code> es \(\{300,500\}\) en <em>fast mode</em> y \(\{300,500,800\}\) en modo completo. Un fold que no converge se marca <em>inválido</em>; el refit final reintenta una vez con <code>max_iter</code> duplicado (tope 1000) y, si falla, el bloque queda <em>skipped</em>.</p>
+    </div>
+
+    <h3 class="reveal">Persistencia y resultados esperados</h3>
+    <p class="reveal">El manifest central mantiene progreso, bloques completados, bloques omitidos y errores. Con <code>continue_on_block_error=True</code>, los bloques fallidos se marcan <code>skipped_failed</code> y la corrida continúa; el tuning global sigue siendo <em>fail-fast</em>. La compatibilidad de caché para NNet depende de <code>NNET_TRAINING_POLICY_VERSION</code>.</p>
+    <p class="reveal">Las salidas consolidadas incluyen <code>yearly_results</code>, <code>adaptive_results</code>, <code>summary</code>, <code>appendix_tables</code> (A.6–A.9) y <code>appendix_tables_mean</code>, <code>average_roc</code> (grilla de 101 puntos FPR), y <code>run_manifest</code> + <code>execution_log</code>.</p>
+
+    <h3 class="reveal">Neural drift</h3>
+    <p class="reveal">El submódulo <code>src/Neural_drift_app.py</code> implementa un backtesting online. La unidad experimental es \( (\texttt{model}, \texttt{strategy}, \texttt{balance\_mode}) \), con tres predictores (XGBoost, Torch MLP, Torch MLP + Attention), cuatro estrategias (<code>fixed</code>, <code>recalibration</code>, <code>fine_tuning</code>, <code>retrain</code>) y cuatro canales de drift (<em>input</em>, <em>score</em>, <em>error</em>, <em>embedding</em>).</p>
+
+    <h4 class="reveal">Augmentación y ventanas</h4>
+    <p class="reveal">Se agregan deltas, <code>rate</code>, rolling stats de ventana 3 y variables de régimen (<code>shock_speed_drop</code>, <code>shock_density_jump</code>, <code>relative_congestion</code>, etc.). La ventana tiene longitud \(L=\texttt{lookback\_steps}\) y el objetivo futuro es \( \tilde y_t = \max\{y_t,\dots,y_{t+H-1}\} \). El split admite <code>fractions</code> o <code>fixed_dates</code> (base 2018, stream 2019+).</p>
+
+    <h4 class="reveal">Configuración</h4>
+    <table class="lab-table reveal">
+      <caption><strong>Tabla 4.1.</strong> Parámetros clave de Neural drift.</caption>
+      <thead><tr><th>Parámetro</th><th class="num">Default</th><th>Rol</th></tr></thead>
+      <tbody>
+        <tr><td><code>interval_minutes</code></td><td class="num">5</td><td>Bin temporal</td></tr>
+        <tr><td><code>lookback_steps</code></td><td class="num">12</td><td>Ventana histórica</td></tr>
+        <tr><td><code>horizon_steps</code></td><td class="num">1</td><td>Horizonte binario</td></tr>
+        <tr><td><code>train_fraction</code> / <code>validation_fraction</code></td><td class="num">0.60 / 0.20</td><td>Split fraccional</td></tr>
+        <tr><td><code>max_stream_rows</code></td><td class="num">600</td><td>Recorte del stream</td></tr>
+        <tr><td><code>rolling_metric_window</code></td><td class="num">48</td><td>Suavizado rolling</td></tr>
+        <tr><td><code>recent_window_size</code></td><td class="num">96</td><td>Ventana reciente del detector</td></tr>
+        <tr><td><code>severity_threshold</code> (\(\tau\))</td><td class="num">0.50</td><td>Umbral del evento de drift</td></tr>
+        <tr><td><code>detector_adwin_delta</code></td><td class="num">0.002</td><td>Sensibilidad ADWIN</td></tr>
+      </tbody>
+    </table>
+
+    <h4 class="reveal">Severidad global</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{severity\_score}_t = \frac{1}{|C_t|}\sum_{c\in C_t}c,\qquad \mathrm{max\_channel\_score}_t = \max_{c\in C_t} c \]</div>
+      <div class="num">(4.7)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>C<sub>t</sub></dt><dd>Conjunto de canales de drift activos en <em>t</em> (input, score, error, embedding).</dd>
+          <dt>severity_score</dt><dd>Promedio de severidad de los canales activos.</dd>
+          <dt>max_channel</dt><dd>Severidad máxima entre canales — captura un canal único disparado.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/Neural_drift_app.py · _build_channel_scores</span>
+      </aside>
+    </div>
+    <p class="reveal">Se registra un evento si \(\mathrm{severity\_score}_t\ge\tau\) o \(\mathrm{max\_channel\_score}_t\ge\tau\), con intensidad continua</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{severity\_intensity}_t = \mathrm{clip}\left(\frac{\max(\mathrm{severity\_score}_t,\mathrm{max\_channel\_score}_t)-\tau}{1-\tau},0,1\right) \]</div>
+      <div class="num">(4.8)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>severity_intensity</dt><dd>Magnitud continua del evento, normalizada a [0,1].</dd>
+          <dt>τ</dt><dd>Umbral del evento (default 0.50).</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/Neural_drift_app.py · _severity_intensity</span>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Strategies de adaptación</h3>
+    <ul class="reveal">
+      <li><strong>fixed</strong>: el predictor no cambia; sigue registrando severidad como control negativo.</li>
+      <li><strong>recalibration</strong>: recalcula scores, reentrena el calibrador de Platt, reoptimiza el umbral con \(F_\beta\) y reconstruye estadísticas de referencia.</li>
+      <li><strong>fine_tuning</strong>: Torch baja el LR y reduce el presupuesto; XGBoost selecciona subventana adaptativa y optimiza \(\eta_t = \eta_{\text{base}}[1+(\texttt{eta\_multiplier\_max}-1)\mathrm{severity\_intensity}_t]\) y pesos de recencia.</li>
+      <li><strong>retrain</strong>: construye dataset híbrido \(\mathcal{H}_t = \text{historia}\cup W_t\) y reentrena desde cero.</li>
+    </ul>
+
+    <h3 class="reveal">Sweep experimental</h3>
+    <p class="reveal"><code>src/neural_drift_experiments.py</code> fija protocolo (base 2018, dev 2019–2022, holdout 2023–2024), semillas <code>(42, 7, 123)</code> y fases Optuna para <code>adwin</code> y <code>neural</code>. El score de ranking agrega por mes calendario:</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathrm{score} = \mathrm{median\_month}(\mathrm{PR\text{-}AUC}) - 0.05\cdot\mathrm{action\_cost} - 0.10\cdot\mathrm{stability\_penalty} \]</div>
+      <div class="num">(4.9)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>median_month</dt><dd>Mediana mensual de PR-AUC sobre el holdout.</dd>
+          <dt>action_cost</dt><dd>Costo agregado por reentrenamientos / fine-tunings.</dd>
+          <dt>stability_penalty</dt><dd>Penalización por varianza temporal del modelo.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/neural_drift_experiments.py · _build_experiment_score</span>
+      </aside>
+    </div>
+    <p class="reveal">El gate de promoción usa Wilcoxon unilateral + bootstrap BCa sobre meses de holdout con \(p&lt;0.05/3\) (Bonferroni), límite inferior del IC \(&gt;0\) y ganancia mediana en PR-AUC mensual \(&gt;0.01\).</p>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Próximamente · Replay de experimentos</div>
+      <p>Esta sección incluirá un replay temporal animado de la PR-AUC mensual por estrategia, eventos ADWIN/KSWIN superpuestos y comparador estadístico (Wilcoxon + bootstrap) cargado desde el <code>run_manifest</code>.</p>
+    </div>
+
+  </section>
+
+  <footer class="lab-coda">
+    <span>Capítulo § 4 · 9 ecuaciones · 1 tabla · 1 callout</span>
+    <span>Compilado desde <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/drift_detection_es.tex</code></span>
+  </footer>
+
+</main>
+
+<aside class="lab-margin" aria-label="Notas al margen">
+  <div class="pinned">
+    <span class="label">Drift</span>
+    <p>El paper compara <em>recalibración batch</em> (anual, contra el calendario) con <em>detección adaptativa</em> (ADWIN, ARF, KSWIN). La pregunta operacional: ¿cuándo paga el costo del retrain?</p>
+    <p><strong>Lead-time.</strong> 5 minutos: las features del bin <em>t</em> deben anticipar accidentes en <em>t</em>+1.</p>
+    <p><strong>SMOTE.</strong> Sólo en folds de entrenamiento. Nunca sobre stream o test.</p>
+    <p><strong>Severidad.</strong> Combinación de cuatro canales (input, score, error, embedding) con regla OR sobre el umbral.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>

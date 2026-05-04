@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>§ 3 · NLP on severity</title>
+<link rel="stylesheet" href="{{CSS_HREF}}" />
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true, tags: 'none' },
+    options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<div class="lab-page">
+
+<main class="lab-main">
+
+  <section class="lab-section reveal" id="s3">
+    <header class="lab-section-head" data-stagger>
+      <div class="num reveal">03</div>
+      <div>
+        <span class="meta reveal">Chapter · Multimodal replication</span>
+        <h2 class="reveal">NLP on severity replication</h2>
+      </div>
+    </header>
+
+    <h3 class="reveal">Purpose</h3>
+    <p class="reveal">The pipeline in <code>src/nlp_severity_app.py</code> reproduces the ablation study from <code>NLP/Latex/main.tex</code> with three models:</p>
+    <ul class="reveal">
+      <li><strong>M1</strong>: flow variables only.</li>
+      <li><strong>M2</strong>: narrative embeddings only.</li>
+      <li><strong>M3</strong>: fused multimodal representation.</li>
+    </ul>
+    <p class="reveal">The entry point is <code>run_paper_replication</code>. The code adds reproducibility controls absent from the manuscript: three paths (<code>frozen</code>, <code>raw</code>, <code>update_embeddings</code>), checkpoint resume, strict comparison between paths, and conditional asset promotion to LaTeX.</p>
+
+    <h3 class="reveal">Locked protocol</h3>
+    <p class="reveal">Constants such as <code>PAPER_PROTOCOL</code>, <code>PAPER_EXPECTED_COUNTS</code>, <code>PAPER_K_GRID</code> and <code>PAPER_VALIDATION_ALPHA</code> fix:</p>
+    <ul class="reveal">
+      <li>Binary target <code>severity_target</code>, temporal holdout with <code>test_size=0.2</code>, <code>random_state=42</code>.</li>
+      <li>Expected counts: 2,070 rows, 432 flow variables, 200 embedding variables, 632 total; split 1,656/414.</li>
+      <li>\(k\) grid in <em>manual</em> mode: \( k\in\{10,15,20,25,30,40,50,70,100,150,200,250,300,350,400,432\} \).</li>
+      <li>Validation score \(\mathrm{Score}_{val} = \alpha F1_{global} + (1-\alpha)(1-\mathrm{FNRate})\) with \(\alpha=0.3\), \(\varepsilon=0.001\).</li>
+      <li>Inner/outer CV folds configurable (5 by default).</li>
+    </ul>
+
+    <h3 class="reveal">Execution stages</h3>
+    <ol class="reveal">
+      <li><strong>Context</strong>: fingerprints of the frozen dataset <code>resultado.pkl</code>, the raw source, the fine-tuned Transformer and the protocol; derived into <code>computed_run_id</code>.</li>
+      <li><strong>Resume / load / start</strong>: the code inspects <code>Resultados/nlp_in_severity/paper_replication/&lt;run_id&gt;/</code>. If <em>completed</em>, the payload is loaded; if <em>running</em> or <em>failed</em>, it resumes; if no checkpoint, a fresh manifest is created.</li>
+      <li><strong>Frozen path</strong>: loads <code>resultado.pkl</code>, normalises columns and validates against locked expectations.</li>
+      <li><strong>Raw path</strong>: rebuilds from source events, generates flow features, filters by AVI coverage, builds <code>text_bert</code>, resolves the Transformer, extracts embeddings (method <code>transformer_finetuned</code>, <code>max_length=128</code>, <code>batch=16</code>, projection <code>cls</code>), ranks dimensions with RF and keeps the top-200 to assemble the 632-variable dataset.</li>
+      <li><strong>Modalities M1/M2/M3</strong>: per model, variables are resolved, median-imputed, ranked pre-SMOTE and \(k\) is searched with nested CV; \(k^\ast\) is chosen by best <code>validation_score</code> (ties broken by smallest \(k\)).</li>
+      <li><strong>Nested CV and final fit</strong>: stratified outer/inner folds; SMOTE is applied inside the inner search (<code>sampling_strategy</code>, <code>k_neighbors</code>), not directly on the outer fold.</li>
+      <li><strong>Per-path consolidation</strong>: comparative table per model, per-class metrics, unified predictions over the same test IDs and the \(k\) table for M3.</li>
+      <li><strong>update_embeddings path (optional)</strong>: replaces embedding columns on the frozen dataset leaving flow intact.</li>
+      <li><strong>frozen/raw comparison</strong>: discrete quantities must match exactly; numeric metrics may differ by at most \(0.001\). If raw is blocked or the comparison fails, the whole replication is <code>blocked</code>.</li>
+      <li><strong>Staging and LaTeX promotion</strong>: <code>accuracy_vs_k.png</code>, <code>f1_score_vs_k.png</code>, <code>false_negatives_pct_vs_k.png</code>, <code>validation_score_vs_k.png</code>, <code>metrics.png</code>, <code>gridsearch_k.tex</code> and <code>metricas_modelos.tex</code> are produced. Promotion only happens if the comparison passes.</li>
+    </ol>
+
+    <h3 class="reveal">XGBoost tuning profiles</h3>
+    <table class="lab-table reveal">
+      <caption><strong>Table 3.1.</strong> Search spaces by profile.</caption>
+      <thead>
+        <tr><th>Profile</th><th><code>max_depth</code></th><th><code>learning_rate</code></th><th><code>n_estimators</code></th><th><code>subsample</code> / <code>colsample_bytree</code></th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Fast (def.)</td><td>\(\{3,5\}\)</td><td>\(\{0.05,0.1\}\)</td><td>\(\{150,300\}\)</td><td>\(\{0.8,1.0\}\)</td></tr>
+        <tr><td>Wide</td><td>\(\{3,5,7\}\)</td><td>\(\{0.03,0.05,0.1\}\)</td><td>\(\{150,300,500\}\)</td><td>\(\{0.8,1.0\}\)</td></tr>
+        <tr><td>GridSearch</td><td>\(\{3,5,7,10,15,20\}\)</td><td>\(\{0.01,0.05,0.1\}\)</td><td>\(\{100,250,500,750,1000\}\)</td><td>\(\{0.5,0.8,1.0\}\)</td></tr>
+      </tbody>
+    </table>
+    <p class="reveal">Regularisation (<code>min_child_weight</code>, <code>gamma</code>, <code>reg_alpha</code>, <code>reg_lambda</code>) is only included when <code>use_regularization</code> is on. Backend can be <code>gridsearch</code> (GridSearchCV) or <code>optuna</code> (24 trials by default).</p>
+
+    <h3 class="reveal">Contrast with the manuscript</h3>
+    <ul class="reveal">
+      <li>The Spanish BERT Transformer is not retrained in the replication; the latest compatible fine-tune is reused from the registry.</li>
+      <li>Reduction is fixed operationally to <em>top-200</em>, not a generic \(p\).</li>
+      <li>RF ranking is applied per modality (one for M1, M2 and M3) over pre-SMOTE data to avoid leakage.</li>
+      <li>The paper reports the M3 grid, but the code searches \(k\) for all three modalities.</li>
+      <li><code>false_negative_rate_positive_class</code> in <code>_classification_metrics</code> is computed as \(\mathrm{FN}/N\) (not \(\mathrm{FN}/P\)).</li>
+      <li>SMOTE is jointly optimised with XGBoost inside <code>_paper_optimize_xgb_model</code>, not as a previous step.</li>
+      <li>The holdout is temporal (<code>split_mode="Temporal"</code>); stratified is the fallback.</li>
+      <li>The \(k^\ast\) rule changed to "best score" instead of marginal benefit.</li>
+      <li>Three profiles exist (<em>Fast</em>, <em>Wide</em>, <em>Original GridSearch</em>) and two backends.</li>
+    </ul>
+
+    <h3 class="reveal">Checkpoint structure and reading order</h3>
+    <p class="reveal">Under <code>Resultados/nlp_in_severity/paper_replication/&lt;run_id&gt;/</code> live <code>manifest.json</code>, <code>live_status.json</code>, <code>live_events.jsonl</code> and the subdirectories <code>frozen/</code>, <code>raw_build/</code>, <code>raw/</code>, <code>update_emb_build/</code>, <code>update_emb/</code>, <code>compare/</code> and <code>export/</code>.</p>
+    <p class="reveal">When auditing a run the recommended order is: <code>manifest.json</code> → <code>frozen/dataset_validation.json</code> and <code>raw/summary.json</code> → <code>compare/summary.json</code> and <code>compare/diff.csv</code> → <code>export/payload.json</code> and the promoted assets.</p>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Coming soon · Interactive comparator</div>
+      <p>This section will incorporate a frozen/raw comparator that loads <code>compare/diff.csv</code>, will display per-<em>k</em> validation curves for M1/M2/M3 with live data, and a visual diff of promoted assets.</p>
+    </div>
+
+  </section>
+
+  <footer class="lab-coda">
+    <span>Chapter § 3 · 1 table · 10 stages</span>
+    <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/nlp_severity_replication_en.tex</code></span>
+  </footer>
+
+</main>
+
+<aside class="lab-margin" aria-label="Marginalia">
+  <div class="pinned">
+    <span class="label">Replication</span>
+    <p>The protocol is locked by constants (<code style="font-family:var(--font-mono);font-size:11.5px;">PAPER_*</code>) — any change to seeds, splits or counts invalidates the run. Dataset <em>fingerprints</em> guard reproducibility.</p>
+    <p><strong>Three paths.</strong> <em>frozen</em> (immutable snapshot), <em>raw</em> (rebuild from source) and <em>update_embeddings</em> (re-extract embeddings on frozen flow).</p>
+    <p><strong>SMOTE.</strong> Only inside the inner search of the nested CV — never on the outer fold.</p>
+  </div>
+</aside>
+
+</div>
+
+<script src="{{JS_HREF}}"></script>
+</body>
+</html>
