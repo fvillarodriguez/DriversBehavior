@@ -2,6 +2,10 @@ import sys as _sys
 import torch
 import torch.nn.functional as F
 from torch.nn import LayerNorm, Linear, ModuleList
+from src.gnn_mps_scatter import install_gnn_mps_scatter_policy
+
+install_gnn_mps_scatter_policy()
+
 from torch_geometric.nn import GATConv, HeteroConv, TransformerConv
 from torch.utils.checkpoint import checkpoint
 from src.config import DEBUG, XAI

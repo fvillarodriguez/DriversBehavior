@@ -4,6 +4,38 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+PIP_INSTALL_LOG="${ROOT_DIR}/.venv/start_app_pip_install.log"
+
+run_pip_install_requirements() {
+  mkdir -p "$(dirname "$PIP_INSTALL_LOG")"
+
+  if python -m pip install -q -r "requirements.txt" >"$PIP_INSTALL_LOG" 2>&1; then
+    return 0
+  fi
+
+  echo "Dependency installation failed. Last pip log lines:"
+  tail -n 40 "$PIP_INSTALL_LOG" || true
+  echo "Full pip log: $PIP_INSTALL_LOG"
+  return 1
+}
+
+repair_macos_hidden_python_metadata() {
+  if [ "$(uname -s)" != "Darwin" ] || [ ! -d ".venv" ]; then
+    return
+  fi
+
+  chflags nohidden ".venv" ".venv/lib" >/dev/null 2>&1 || true
+  local python_dir
+  for python_dir in .venv/lib/python*; do
+    [ -d "$python_dir" ] || continue
+    local site_packages_dir="${python_dir}/site-packages"
+    chflags nohidden "$python_dir" "$site_packages_dir" >/dev/null 2>&1 || true
+    if [ -d "$site_packages_dir" ] && compgen -G "${site_packages_dir}/*.pth" >/dev/null; then
+      chflags nohidden "$site_packages_dir"/*.pth >/dev/null 2>&1 || true
+    fi
+  done
+}
+
 create_env() {
   local py_cmd=""
   if command -v python3 >/dev/null 2>&1; then
@@ -22,7 +54,8 @@ create_env() {
 
   if [ -f "requirements.txt" ]; then
     echo "Installing dependencies from requirements.txt..."
-    pip install -r "requirements.txt"
+    run_pip_install_requirements
+    repair_macos_hidden_python_metadata
   else
     echo "requirements.txt not found. Cannot install dependencies."
     exit 1
@@ -83,16 +116,13 @@ PY
 repair_dask_runtime_if_needed() {
   local needs_repair=0
 
+  repair_macos_hidden_python_metadata
+
   if venv_is_stale; then
-    echo "Detected outdated .venv relative to requirements.txt. Reinstalling dependencies..."
     needs_repair=1
   fi
 
   if ! dask_runtime_audit; then
-    echo "Detected incomplete Dask runtime in .venv."
-    if [ -n "${DASK_RUNTIME_AUDIT_OUTPUT:-}" ]; then
-      echo "$DASK_RUNTIME_AUDIT_OUTPUT"
-    fi
     needs_repair=1
   fi
 
@@ -105,8 +135,9 @@ repair_dask_runtime_if_needed() {
     exit 1
   fi
 
-  echo "Repairing local Python environment from requirements.txt..."
-  pip install -r "requirements.txt"
+  echo "Preparing local Python environment..."
+  run_pip_install_requirements
+  repair_macos_hidden_python_metadata
   touch ".venv"
 
   if ! dask_runtime_audit; then

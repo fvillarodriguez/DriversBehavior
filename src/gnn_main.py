@@ -12,6 +12,10 @@ import re
 from datetime import datetime
 import numpy as np
 import torch 
+from src.gnn_mps_scatter import install_gnn_mps_scatter_policy
+
+install_gnn_mps_scatter_policy()
+
 from torch_geometric.data import Data
 from torch_geometric.loader import (
     NeighborLoader,
@@ -24,7 +28,10 @@ import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_curve, average_precision_score, matthews_corrcoef
 import optuna 
 import logging
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 import warnings
 from optuna import TrialPruned
 from optuna.exceptions import ExperimentalWarning
@@ -347,17 +354,29 @@ def _prime_temporal_cache_if_needed(model, graph, node_type: str = "pm", context
 
     was_training = bool(model.training)
     prev_checkpointing = getattr(model, "use_checkpointing", None)
+    graph_for_cache = graph
+    cloned_graph_for_cache = False
     try:
         temporal_module.reset_cache()
-        if not hasattr(graph, "edge_attr_dict"):
-            graph.edge_attr_dict = {
-                et: getattr(graph[et], "edge_attr", None)
-                for et in getattr(graph, "edge_types", [])
-            }
+        try:
+            model_device = next(model.parameters()).device
+        except Exception:
+            model_device = torch.device("cpu")
+        try:
+            graph_device = graph[node_type].x.device
+        except Exception:
+            graph_device = model_device
+        if graph_device != model_device:
+            graph_for_cache = graph.clone().to(model_device)
+            cloned_graph_for_cache = True
+        graph_for_cache.edge_attr_dict = {
+            et: getattr(graph_for_cache[et], "edge_attr", None)
+            for et in getattr(graph_for_cache, "edge_types", [])
+        }
         model.eval()
         if prev_checkpointing is not None:
             model.use_checkpointing = False
-        z_dict = compute_epoch_embeddings(model, graph)
+        z_dict = compute_epoch_embeddings(model, graph_for_cache)
         z_pm = z_dict.get(node_type)
         if z_pm is None:
             return False
@@ -384,6 +403,18 @@ def _prime_temporal_cache_if_needed(model, graph, node_type: str = "pm", context
                 temporal_module.train(was_training)
         except Exception:
             pass
+        if cloned_graph_for_cache:
+            try:
+                del graph_for_cache
+            except Exception:
+                pass
+            try:
+                if hasattr(torch, "mps") and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 
 def _find_best_model_path(
@@ -1608,6 +1639,7 @@ def test(
     node_indices: Optional[torch.Tensor] = None,
     mask_name: str = "subset_mask",
     num_neighbors=None,
+    criterion=None,
 ):
     """
     Evalúa el rendimiento de un modelo usando mini-batches para evitar OOM.
@@ -1676,6 +1708,8 @@ def test(
         )
 
         all_preds, all_probs, all_true = [], [], []
+        loss_sum = 0.0
+        loss_count = 0
 
         if temporal_module is not None:
             temporal_module.reset_cache()
@@ -1718,6 +1752,18 @@ def test(
             else:
                 preds = (prob1 >= threshold).long()  # UMBRAL DE VALIDACIÓN
             true = batch[node_type].y[:batch[node_type].batch_size]
+            if criterion is not None:
+                try:
+                    loss_tensor = criterion(logits_target, true)
+                    if torch.is_tensor(loss_tensor):
+                        if loss_tensor.numel() > 1:
+                            loss_tensor = loss_tensor.mean()
+                        if torch.isfinite(loss_tensor):
+                            target_count = int(true.numel())
+                            loss_sum += float(loss_tensor.detach().cpu().item()) * max(target_count, 1)
+                            loss_count += max(target_count, 1)
+                except Exception:
+                    pass
             
             all_preds.append(preds.cpu())
             all_probs.append(probs.cpu())
@@ -1770,6 +1816,8 @@ def test(
             'mcc': mcc,
             'node_idx': node_indices,  # para exportar claves
         }
+        if criterion is not None and loss_count > 0:
+            results[mask_name]['loss'] = float(loss_sum / float(loss_count))
         
     return results
 
@@ -2195,7 +2243,11 @@ def run_gat_training(
     data.edge_attr_dict = { et: getattr(data[et], 'edge_attr', None) for et in data.edge_types }
 
     # 3) SummaryWriter + hparams
-    writer = SummaryWriter(log_dir=os.path.join(RESULTADOS_DIR, "runs_attention"), flush_secs=30)
+    writer = None
+    if SummaryWriter is not None:
+        writer = SummaryWriter(log_dir=os.path.join(RESULTADOS_DIR, "runs_attention"), flush_secs=30)
+    else:
+        logger.warning("TensorBoard no esta instalado; se omite SummaryWriter.")
     hparam_payload = {}
     for key, value in best_params.items():
         if isinstance(value, (list, tuple, dict)):
@@ -2205,7 +2257,8 @@ def run_gat_training(
                 hparam_payload[key] = str(value)
         else:
             hparam_payload[key] = value
-    writer.add_hparams(hparam_payload, {'hparam/val_f1': 0.0})
+    if writer is not None:
+        writer.add_hparams(hparam_payload, {'hparam/val_f1': 0.0})
 
     # 4) Modelo y optimizador
     num_classes = len(torch.unique(data['pm'].y))
@@ -2870,7 +2923,8 @@ def run_gat_training(
                                   suppress_missing_att_warning=suppress_missing_att_warning,
                                   batch_callback=batch_event_cb,
                                   accumulation_steps=accumulation_steps)
-        writer.add_scalar("Loss/train", loss, epoch)
+        if writer is not None:
+            writer.add_scalar("Loss/train", loss, epoch)
 
         # Validación (siempre sobre el grafo original)
         model.use_checkpointing = False
@@ -3232,7 +3286,8 @@ def run_gat_training(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
-    writer.close()
+    if writer is not None:
+        writer.close()
     epochs_run = int(epoch) if "epoch" in locals() else 0
     _emit_training_event(
         "train_end",

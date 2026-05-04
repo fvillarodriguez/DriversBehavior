@@ -7362,11 +7362,8 @@ def _render_history_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any
         )
 
 
-def _apply_experiment_winner_config_to_session_state(winner_config: Dict[str, Any]) -> None:
-    if not isinstance(winner_config, dict) or not winner_config:
-        return
-
-    visible_key_map = {
+def _visible_config_session_key_map() -> Dict[str, str]:
+    return {
         "lookback_steps": "neural_drift_lookback_steps",
         "horizon_steps": "neural_drift_horizon_steps",
         "dataset_percent": "neural_drift_dataset_percent",
@@ -7409,6 +7406,67 @@ def _apply_experiment_winner_config_to_session_state(winner_config: Dict[str, An
         "attention_dropout": "neural_drift_attention_dropout",
         "attention_top_k": "neural_drift_attention_top_k",
     }
+
+
+def _normalize_public_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = {**copy.deepcopy(DEFAULT_CONFIG), **dict(config or {})}
+    normalized["balance_modes"] = _resolve_balance_modes(normalized.get("balance_modes"))
+    normalized["models"] = [
+        str(model)
+        for model in list(normalized.get("models") or [])
+        if str(model) in AVAILABLE_MODELS
+    ] or list(DEFAULT_CONFIG["models"])
+    normalized["strategies"] = [
+        str(strategy)
+        for strategy in list(normalized.get("strategies") or [])
+        if str(strategy) in AVAILABLE_STRATEGIES
+    ] or list(DEFAULT_CONFIG["strategies"])
+    normalized["drift_channels"] = [
+        str(channel)
+        for channel in list(normalized.get("drift_channels") or [])
+        if str(channel) in AVAILABLE_DRIFT_CHANNELS
+    ] or list(DEFAULT_CONFIG["drift_channels"])
+    normalized["detector_sensitivity_preset"] = _resolve_detector_sensitivity_preset(
+        normalized.get("detector_sensitivity_preset")
+    )
+    normalized["drift_monitor_profile"] = _resolve_drift_monitor_profile(
+        normalized.get("drift_monitor_profile")
+    )
+    normalized["drift_monitor_architecture"] = _resolve_drift_monitor_architecture(
+        normalized.get("drift_monitor_architecture")
+    )
+    normalized["xgb_fine_tune_selection_metric"] = _resolve_xgb_fine_tune_selection_metric(
+        normalized.get("xgb_fine_tune_selection_metric")
+    )
+    normalized["xgb_parallel_neural_enabled"] = bool(
+        normalized.get("xgb_parallel_neural_enabled", DEFAULT_CONFIG["xgb_parallel_neural_enabled"])
+    )
+    return normalized
+
+
+def resolve_current_config_from_session_state(
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    config = {**copy.deepcopy(DEFAULT_CONFIG)}
+    try:
+        session_config = st.session_state.get("neural_drift_config")
+        if isinstance(session_config, dict):
+            config.update(session_config)
+        for config_key, session_key in _visible_config_session_key_map().items():
+            if session_key in st.session_state:
+                config[config_key] = st.session_state[session_key]
+    except Exception:
+        pass
+    if isinstance(overrides, dict):
+        config.update(overrides)
+    return _normalize_public_config(config)
+
+
+def _apply_experiment_winner_config_to_session_state(winner_config: Dict[str, Any]) -> None:
+    if not isinstance(winner_config, dict) or not winner_config:
+        return
+
+    visible_key_map = _visible_config_session_key_map()
     for config_key, session_key in visible_key_map.items():
         if config_key in winner_config:
             st.session_state[session_key] = winner_config[config_key]
@@ -7418,7 +7476,7 @@ def _apply_experiment_winner_config_to_session_state(winner_config: Dict[str, An
         **dict(st.session_state.get("neural_drift_config") or {}),
         **dict(winner_config),
     }
-    st.session_state["neural_drift_config"] = merged_config
+    st.session_state["neural_drift_config"] = _normalize_public_config(merged_config)
 
 
 def _render_experiments_subtab(dataset_bundle: Dict[str, Any], config: Dict[str, Any]) -> None:

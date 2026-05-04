@@ -208,7 +208,7 @@ class MLXAcceleratedSVMClassifier(BaseEstimator, ClassifierMixin):
 
     `kernel="linear"` trains a linear SVM directly.
     `kernel="rbf"` uses Random Fourier Features + linear SVM.
-    Unsupported kernels fall back to sklearn's `SVC`.
+    Unsupported kernels fall back to sklearn's `SVC` unless `require_mlx=True`.
     """
 
     def __init__(
@@ -227,6 +227,7 @@ class MLXAcceleratedSVMClassifier(BaseEstimator, ClassifierMixin):
         epochs: int = 40,
         batch_size: int = 8192,
         rff_components: int = 2048,
+        require_mlx: bool = False,
     ):
         self.C = C
         self.kernel = kernel
@@ -241,6 +242,7 @@ class MLXAcceleratedSVMClassifier(BaseEstimator, ClassifierMixin):
         self.epochs = epochs
         self.batch_size = batch_size
         self.rff_components = rff_components
+        self.require_mlx = require_mlx
         self._score_preference = "decision_function"
 
     def _fit_probability_model(self, scores: np.ndarray, y: np.ndarray) -> None:
@@ -340,6 +342,13 @@ class MLXAcceleratedSVMClassifier(BaseEstimator, ClassifierMixin):
 
         kernel_name = _normalize_kernel_name(self.kernel)
         if kernel_name not in {"linear", "rbf"}:
+            if bool(self.require_mlx):
+                self.backend_ = "unsupported_mlx_kernel"
+                self.fit_warning_ = (
+                    f"kernel={kernel_name!r} no tiene backend MLX. "
+                    "Use kernel='linear' o kernel='rbf'."
+                )
+                raise RuntimeError(self.fit_warning_)
             self.backend_ = "sklearn_svc"
             self.legacy_model_ = self._build_legacy_svc()
             self.legacy_model_.fit(X, y_arr)
@@ -363,6 +372,13 @@ class MLXAcceleratedSVMClassifier(BaseEstimator, ClassifierMixin):
             self.coef_ = np.asarray(weights, dtype=np.float32).reshape(1, -1)
             self.intercept_ = np.asarray([bias], dtype=np.float32)
         except Exception as exc:
+            if bool(self.require_mlx):
+                self.backend_ = "mlx_failed"
+                self.fit_warning_ = str(exc)
+                raise RuntimeError(
+                    "SVM requiere backend MLX/Metal, pero el entrenamiento MLX "
+                    f"fallo: {exc}"
+                ) from exc
             self.backend_ = "sklearn_linear"
             self.fit_warning_ = str(exc)
             self._fit_linear_backend(X_features, y_arr)

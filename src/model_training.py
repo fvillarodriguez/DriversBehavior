@@ -1049,6 +1049,7 @@ def build_model(model_name: str, params: Dict[str, object], random_state: int):
             epochs=int(params.get("epochs", 40)),
             batch_size=int(params.get("batch_size", 8192)),
             rff_components=int(params.get("rff_components", 2048)),
+            require_mlx=bool(params.get("require_mlx", False)),
         )
 
     if model_name == "Neural Network":

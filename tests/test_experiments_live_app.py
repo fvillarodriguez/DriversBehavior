@@ -160,6 +160,184 @@ def test_calibration_default_progress_metric_prefers_protocol_objective():
     assert selected == "val_balanced_f1"
 
 
+def test_gnn_optuna_progress_ratio_clamps_and_falls_back():
+    manifest = {"progress": {"completed_trials": 2, "total_trials": 4}}
+
+    assert live_app._gnn_optuna_normalize_progress(manifest, {}) == pytest.approx(0.5)
+    assert live_app._gnn_optuna_normalize_progress(
+        manifest,
+        {"progress_ratio": 1.25},
+    ) == pytest.approx(1.0)
+    assert live_app._gnn_optuna_normalize_progress(
+        manifest,
+        {"progress_ratio": -0.25},
+    ) == pytest.approx(0.0)
+
+
+def test_gnn_optuna_loss_curve_preserves_partial_validation_loss():
+    df = pd.DataFrame(
+        [
+            {
+                "trial_number": 0,
+                "epoch": 1,
+                "train_loss": 0.8,
+                "val_loss": None,
+                "score": None,
+                "best_score": None,
+                "status": "running",
+            },
+            {
+                "trial_number": 0,
+                "epoch": 2,
+                "train_loss": 0.6,
+                "val_loss": 0.55,
+                "score": 0.42,
+                "best_score": 0.42,
+                "status": "running",
+            },
+        ]
+    )
+
+    curve = live_app._gnn_optuna_loss_curve_df(df)
+
+    assert curve["point"].tolist() == [1, 2]
+    assert curve["train_loss"].tolist() == pytest.approx([0.8, 0.6])
+    assert pd.isna(curve["val_loss"].iloc[0])
+    assert curve["val_loss"].iloc[1] == pytest.approx(0.55)
+
+
+def test_gnn_optuna_search_curve_excludes_non_complete_trials():
+    trials_df = pd.DataFrame(
+        [
+            {"number": 0, "value": 0.40, "state": "COMPLETE"},
+            {"number": 1, "value": 0.99, "state": "FAIL"},
+            {"number": 2, "value": 0.45, "state": "COMPLETE"},
+            {"number": 3, "value": 0.43, "state": "PRUNED"},
+        ]
+    )
+
+    curve = live_app._gnn_optuna_search_curve_df(trials_df)
+
+    assert curve["trial_index"].tolist() == [1, 3]
+    assert curve["objective"].tolist() == pytest.approx([0.40, 0.45])
+    assert curve["best_so_far"].tolist() == pytest.approx([0.40, 0.45])
+
+
+def test_read_gnn_optuna_run_loads_live_events_loss_and_trials(tmp_path):
+    run_dir = tmp_path / "gnn_optuna_1"
+    run_dir.mkdir()
+    manifest = {
+        "run_id": "gnn_optuna_1",
+        "run_type": "gnn_optuna",
+        "status": "running",
+        "result_status": "running",
+        "objective_metric": "F1",
+        "backend": "optuna",
+        "model_name": "GNN",
+        "balancing_strategy": "Sin balancear",
+        "updated_at": "2026-05-04T12:00:00",
+        "progress": {
+            "completed_trials": 1,
+            "total_trials": 2,
+            "current_trial": 1,
+            "current_epoch": 2,
+            "total_epochs": 4,
+            "progress_ratio": 0.5,
+        },
+    }
+    live_status = {
+        "timestamp": "2026-05-04T12:00:01",
+        "status": "running",
+        "result_status": "running",
+        "event_type": "optuna_epoch_evaluated",
+        "message": "Trial 1 epoch 2/4",
+        "progress_ratio": 0.5,
+        "completed_trials": 1,
+        "total_trials": 2,
+        "current_trial": 1,
+        "current_epoch": 2,
+        "total_epochs": 4,
+        "best_score": 0.45,
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (run_dir / "live_status.json").write_text(json.dumps(live_status), encoding="utf-8")
+    (run_dir / "live_events.jsonl").write_text(
+        json.dumps({"event_type": "run_start", "progress_ratio": 0.0}) + "\n"
+        + json.dumps(live_status)
+        + "\n",
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        [
+            {
+                "trial_number": 1,
+                "epoch": 1,
+                "train_loss": 0.8,
+                "val_loss": None,
+                "score": None,
+                "best_score": None,
+                "status": "running",
+            },
+            {
+                "trial_number": 1,
+                "epoch": 2,
+                "train_loss": 0.6,
+                "val_loss": 0.5,
+                "score": 0.45,
+                "best_score": 0.45,
+                "status": "running",
+            },
+        ]
+    ).to_csv(run_dir / "loss_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"number": 0, "value": 0.40, "state": "COMPLETE"},
+            {"number": 1, "value": 0.45, "state": "COMPLETE"},
+        ]
+    ).to_csv(run_dir / "trials_live.csv", index=False)
+
+    payload = live_app._read_gnn_optuna_run(run_dir / "manifest.json")
+
+    assert payload["current_context"]["progress_ratio"] == pytest.approx(0.5)
+    assert payload["current_context"]["best_score"] == pytest.approx(0.45)
+    assert payload["live_events_df"]["event_type"].tolist() == [
+        "run_start",
+        "optuna_epoch_evaluated",
+    ]
+    assert payload["loss_curve_df"]["train_loss"].tolist() == pytest.approx([0.8, 0.6])
+    assert payload["search_curve_df"]["best_so_far"].tolist() == pytest.approx([0.40, 0.45])
+
+
+def test_build_live_sources_detects_gnn_optuna_manifest(tmp_path, monkeypatch):
+    live_root = tmp_path / "gnn_optuna_live"
+    run_dir = live_root / "gnn_optuna_1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "gnn_optuna_1",
+                "status": "running",
+                "objective_metric": "F1",
+                "updated_at": "2026-05-04T12:00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(live_app, "GNN_OPTUNA_LIVE_DIR", live_root)
+    monkeypatch.setattr(live_app, "CALIBRATION_EXPERIMENTS_DIR", tmp_path / "calibration")
+    monkeypatch.setattr(live_app, "DRIFT_RUNS_DIR", tmp_path / "drift")
+    monkeypatch.setattr(live_app, "NLP_PAPER_RUNS_DIR", tmp_path / "paper")
+    monkeypatch.setattr(live_app, "NEURAL_DRIFT_EXPERIMENTS_DIR", tmp_path / "neural")
+    monkeypatch.setattr(live_app, "NLP_LANGUAGE_MODELING_LIVE_DIR", tmp_path / "lm")
+    monkeypatch.setattr(live_app, "MODEL_OPTUNA_BATCH_LIVE_DIR", tmp_path / "model_optuna")
+    monkeypatch.setattr(live_app, "RESULTS_DIR", tmp_path / "results")
+
+    sources = live_app._build_live_sources()
+
+    assert [source["type"] for source in sources] == ["gnn_optuna"]
+    assert "GNN Optuna | gnn_optuna_1 | F1 | running" in sources[0]["label"]
+
+
 def test_controlled_live_best_payload_uses_best_test_fallbacks():
     row = {
         "model_name": "XGBoost",

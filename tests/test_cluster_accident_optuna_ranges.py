@@ -38,6 +38,88 @@ class _FakeStreamlit:
         return self.session_state.get(key, value)
 
 
+class _ProgressBoardFakeElement:
+    def __init__(self, root: "_ProgressBoardFakeStreamlit") -> None:
+        self.root = root
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def empty(self):
+        return self
+
+    def container(self):
+        return self
+
+    def caption(self, *args, **kwargs):
+        self.root.caption_calls.append((args, kwargs))
+
+    def metric(self, *args, **kwargs):
+        self.root.metric_calls.append((args, kwargs))
+
+    def progress(self, *args, **kwargs):
+        self.root.progress_calls.append((args, kwargs))
+
+    def info(self, *args, **kwargs):
+        self.root.info_calls.append((args, kwargs))
+
+    def success(self, *args, **kwargs):
+        self.root.success_calls.append((args, kwargs))
+
+    def error(self, *args, **kwargs):
+        self.root.error_calls.append((args, kwargs))
+
+
+class _ProgressBoardFakeStreamlit:
+    def __init__(self) -> None:
+        self.session_state: dict = {}
+        self.caption_calls: list[tuple] = []
+        self.metric_calls: list[tuple] = []
+        self.progress_calls: list[tuple] = []
+        self.info_calls: list[tuple] = []
+        self.success_calls: list[tuple] = []
+        self.error_calls: list[tuple] = []
+        self.selectbox_calls: list[dict] = []
+        self.chart_calls: list[dict] = []
+        self._seen_selectbox_keys: set[str] = set()
+
+    def container(self):
+        return _ProgressBoardFakeElement(self)
+
+    def empty(self):
+        return _ProgressBoardFakeElement(self)
+
+    def columns(self, spec):
+        count = int(spec) if isinstance(spec, int) else len(spec)
+        return [_ProgressBoardFakeElement(self) for _ in range(count)]
+
+    def caption(self, *args, **kwargs):
+        self.caption_calls.append((args, kwargs))
+
+    def info(self, *args, **kwargs):
+        self.info_calls.append((args, kwargs))
+
+    def selectbox(self, label, options, *, index=0, key=None, **kwargs):
+        if key in self._seen_selectbox_keys:
+            raise AssertionError(f"duplicate selectbox key: {key}")
+        self._seen_selectbox_keys.add(key)
+        selected = self.session_state.get(key, options[index])
+        self.session_state[key] = selected
+        self.selectbox_calls.append(
+            {
+                "label": label,
+                "options": list(options),
+                "index": index,
+                "key": key,
+                **kwargs,
+            }
+        )
+        return selected
+
+
 def _make_optuna_variant(
     *,
     model_choice: str = "XGBoost",
@@ -318,6 +400,108 @@ def test_optuna_parameter_profile_defaults_refine_xgboost_local_profile():
     assert defaults["optuna_xgb_reg_lambda_max"] == pytest.approx(12.0)
     assert defaults["optuna_xgb_gamma_min"] == pytest.approx(3.8)
     assert defaults["optuna_xgb_gamma_max"] == pytest.approx(4.8)
+
+
+def test_optuna_parameter_profile_defaults_xgboost_base_cluster_none_profile():
+    defaults = app._optuna_parameter_profile_defaults(
+        app.OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211,
+        model_choice="XGBoost",
+    )
+
+    assert defaults["optuna_pruner_startup_trials"] == 30
+    assert defaults["optuna_tune_topk"] is True
+    assert defaults["optuna_k_min"] == 60
+    assert defaults["optuna_k_max"] == 100
+    assert defaults["optuna_xgb_n_min"] == 400
+    assert defaults["optuna_xgb_n_max"] == 800
+    assert defaults["optuna_xgb_depth_min"] == 2
+    assert defaults["optuna_xgb_depth_max"] == 4
+    assert defaults["optuna_xgb_lr_min"] == pytest.approx(0.02)
+    assert defaults["optuna_xgb_lr_max"] == pytest.approx(0.07)
+    assert defaults["optuna_xgb_reg_lambda_min"] == pytest.approx(6.0)
+    assert defaults["optuna_xgb_reg_lambda_max"] == pytest.approx(14.0)
+    assert defaults["optuna_xgb_gamma_min"] == pytest.approx(3.5)
+    assert defaults["optuna_xgb_gamma_max"] == pytest.approx(6.0)
+
+
+def test_optuna_parameter_profile_defaults_xgboost_base_cluster_smote_profile():
+    defaults = app._optuna_parameter_profile_defaults(
+        app.OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211,
+        model_choice="XGBoost",
+    )
+
+    assert defaults["optuna_pruner_startup_trials"] == 30
+    assert defaults["optuna_tune_topk"] is True
+    assert defaults["optuna_k_min"] == 10
+    assert defaults["optuna_k_max"] == 30
+    assert defaults["optuna_smote_k_min"] == 5
+    assert defaults["optuna_smote_k_max"] == 9
+    assert defaults["optuna_smote_sampling_min"] == pytest.approx(0.01)
+    assert defaults["optuna_smote_sampling_max"] == pytest.approx(0.10)
+    assert defaults["optuna_xgb_n_min"] == 50
+    assert defaults["optuna_xgb_n_max"] == 200
+    assert defaults["optuna_xgb_sub_min"] == pytest.approx(0.50)
+    assert defaults["optuna_xgb_sub_max"] == pytest.approx(0.70)
+    assert defaults["optuna_xgb_col_min"] == pytest.approx(0.90)
+    assert defaults["optuna_xgb_col_max"] == pytest.approx(1.00)
+    assert defaults["optuna_xgb_gamma_min"] == pytest.approx(0.0)
+    assert defaults["optuna_xgb_gamma_max"] == pytest.approx(2.0)
+
+
+def test_optuna_base_cluster_profiles_limit_feature_set_options():
+    available = ["Base", "Cluster", "Base + Cluster"]
+
+    assert app._optuna_parameter_profile_feature_set_options(
+        app.OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211,
+        available,
+    ) == ["Base + Cluster"]
+    assert app._optuna_parameter_profile_feature_set_options(
+        app.OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211,
+        available,
+    ) == ["Base + Cluster"]
+    assert app._optuna_parameter_profile_feature_set_options(
+        app.OPTUNA_PARAMETER_PROFILE_WIDE,
+        available,
+    ) == ["Base", "Cluster", "Base + Cluster"]
+
+
+def test_optuna_base_cluster_profiles_force_balance_options():
+    assert app._optuna_parameter_profile_forced_balance_modes(
+        app.OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211
+    ) == ["none"]
+    assert app._optuna_parameter_profile_balance_options(
+        app.OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211
+    ) == ["none"]
+    assert app._optuna_parameter_profile_forced_balance_modes(
+        app.OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211
+    ) == ["smote"]
+    assert app._optuna_parameter_profile_balance_options(
+        app.OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211
+    ) == ["SMOTE"]
+
+
+def test_apply_optuna_parameter_profile_scope_clears_stale_widget_values():
+    session_state = {
+        "optuna_feature_sets_selected": ["Base", "Base + Cluster"],
+        "optuna_balance_modes_selected": ["none", "SMOTE"],
+    }
+
+    app._apply_optuna_parameter_profile_scope(
+        session_state,
+        profile_label=app.OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211,
+        available_feature_sets=["Base", "Cluster", "Base + Cluster"],
+    )
+
+    assert session_state["optuna_feature_sets_selected"] == ["Base + Cluster"]
+    assert session_state["optuna_balance_modes_selected"] == ["SMOTE"]
+
+
+def test_optuna_balance_mode_keeps_class_weight_as_distinct_mode():
+    assert app._normalize_optuna_balance_mode("class_weight") == "class_weight"
+    assert app._normalize_optuna_balance_mode("Class weight") == "class_weight"
+    assert app._optuna_normalize_balance_mode_selection(
+        ["SMOTE", "none", "class_weight", "SMOTE"]
+    ) == ["none", "class_weight", "smote"]
 
 
 def test_apply_optuna_parameter_profile_updates_session_state():
@@ -1220,6 +1404,308 @@ def test_persist_optuna_results_keeps_multiobjective_metadata_and_pareto_csv(
     assert not loaded_pareto_df.empty
 
 
+def test_optuna_trial_metrics_dataframe_includes_val_and_test_metrics():
+    class _State:
+        name = "COMPLETE"
+
+    class _Trial:
+        number = 3
+        value = 0.72
+        values = None
+        params = {"rf_n_estimators": 40}
+        state = _State()
+
+        def __init__(self) -> None:
+            self.user_attrs = {}
+
+        def set_user_attr(self, key, value):
+            self.user_attrs[key] = value
+
+    trial = _Trial()
+    app._record_optuna_trial_metrics(
+        trial,
+        trial_payload={
+            "trial_cols": ["signal"],
+            "model_params": {"n_estimators": 40},
+        },
+        scored_val={
+            "score": 0.72,
+            "threshold": 0.42,
+            "metrics": {
+                "accuracy": 0.8,
+                "pr_auc": 0.7,
+                "mcc": 0.3,
+                "confusion_matrix": [[8, 1], [2, 3]],
+            },
+        },
+        scored_test={
+            "score": 0.62,
+            "threshold": 0.42,
+            "metrics": {
+                "accuracy": 0.75,
+                "pr_auc": 0.65,
+                "mcc": 0.2,
+                "confusion_matrix": [[7, 2], [2, 3]],
+            },
+        },
+        objective_score=0.72,
+        objective_metric="balanced_f1",
+        objective_direction="maximize",
+    )
+
+    trials_df = app._optuna_trials_dataframe_from_trials(
+        [trial],
+        objective_direction="maximize",
+        pruner_name="MedianPruner",
+    )
+
+    expected_cols = {
+        "val_accuracy",
+        "val_pr_auc",
+        "val_mcc",
+        "test_accuracy",
+        "test_pr_auc",
+        "test_mcc",
+        "val_confusion_matrix",
+        "test_confusion_matrix",
+    }
+    assert expected_cols.issubset(set(trials_df.columns))
+    assert trials_df.loc[0, "val_mcc"] == pytest.approx(0.3)
+    assert trials_df.loc[0, "test_pr_auc"] == pytest.approx(0.65)
+    assert trials_df.loc[0, "val_confusion_matrix"] == [[8, 1], [2, 3]]
+    assert trials_df.loc[0, "test_confusion_matrix"] == [[7, 2], [2, 3]]
+
+
+def test_svm_gpu_parallel_optuna_scheduler_uses_ask_tell_and_worker_attrs():
+    import concurrent.futures
+    import optuna
+
+    class _ImmediateExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self.max_workers = int(max_workers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def submit(self, fn, payload):
+            future: concurrent.futures.Future = concurrent.futures.Future()
+            future.set_result(fn(payload))
+            return future
+
+    def _executor_factory(max_workers: int):
+        return _ImmediateExecutor(max_workers)
+
+    def _build_trial_payload(trial):
+        c_value = trial.suggest_float("svm_C", 0.1, 0.3, step=0.1)
+        return {
+            "trial_cols": ["signal"],
+            "model_params": {"kernel": "linear", "C": float(c_value)},
+        }
+
+    def _worker(payload):
+        trial_payload = dict(payload["trial_payload"])
+        score = float(trial_payload["model_params"]["C"])
+        scored = {
+            "score": score,
+            "threshold": 0.5,
+            "metrics": {
+                "accuracy": score,
+                "mcc": score,
+                "pr_auc": score,
+                "confusion_matrix": [[1, 0], [0, 1]],
+            },
+        }
+        return {
+            "status": "completed",
+            "score": score,
+            "scored_val": scored,
+            "scored_test": scored,
+            "svm_backend": "mlx",
+            "svm_fit_warning": "",
+            "worker_pid": 1234,
+            "execution_backend": "local_process_pool_spawn",
+        }
+
+    study = optuna.create_study(direction="maximize")
+    app._run_svm_gpu_parallel_optuna(
+        study=study,
+        n_trials=3,
+        timeout=30,
+        max_workers=2,
+        build_trial_payload=_build_trial_payload,
+        worker_payload_base={},
+        is_multiobjective=False,
+        objective_metric="mcc",
+        objective_direction="maximize",
+        far_target=0.2,
+        executor_factory=_executor_factory,
+        worker_fn=_worker,
+    )
+
+    completed = [
+        trial
+        for trial in study.trials
+        if trial.state == optuna.trial.TrialState.COMPLETE
+    ]
+    assert len(completed) == 3
+    assert all(trial.user_attrs["svm_backend"] == "mlx" for trial in completed)
+    assert all(trial.user_attrs["worker_pid"] == 1234 for trial in completed)
+    assert all(
+        trial.user_attrs["execution_backend"] == "local_process_pool_spawn"
+        for trial in completed
+    )
+
+
+def test_persist_optuna_results_writes_trials_json_and_best_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "RESULTS_DIR", tmp_path)
+
+    features_df = pd.DataFrame(
+        {
+            "signal": [0.1, 0.9, 0.3],
+            "interval_start": pd.date_range("2024-01-01", periods=3, freq="D"),
+        }
+    )
+    trials_df = pd.DataFrame(
+        [
+            {
+                "number": 0,
+                "value": 0.55,
+                "state": "COMPLETE",
+                "val_accuracy": 0.70,
+                "val_pr_auc": 0.50,
+                "val_mcc": 0.10,
+                "test_accuracy": 0.65,
+                "test_pr_auc": 0.45,
+                "test_mcc": 0.08,
+                "val_confusion_matrix": [[5, 1], [2, 1]],
+                "test_confusion_matrix": [[4, 2], [2, 1]],
+            }
+        ]
+    )
+
+    app._persist_optuna_results(
+        optuna_key="optuna_base_key",
+        optuna_id="optuna_base_id",
+        feature_key="feature_base",
+        feature_id="feature_base",
+        features_path="features.duckdb",
+        features_source="duckdb",
+        features_df=features_df,
+        selected_features=["signal"],
+        feature_cols=["signal"],
+        model_choice="Random Forest",
+        balance_mode="none",
+        calibration_method="none",
+        best_score=0.55,
+        best_smote_params={},
+        best_model_params={"n_estimators": 40},
+        trials_df=trials_df,
+        optuna_settings={
+            "objective_metric": "balanced_f1",
+            "objective_label": "Balanced F1",
+            "objective_direction": "maximize",
+            "feature_set_label": "Base",
+        },
+        search_space={},
+        best_summary={
+            "feature_set_label": "Base",
+            "model_choice": "Random Forest",
+            "balance_mode": "none",
+            "balance_mode_label": "Sin SMOTE",
+            "calibration_method": "none",
+            "calibration_method_label": "Sin calibración",
+            "objective_metric": "balanced_f1",
+            "objective_label": "Balanced F1",
+            "objective_direction": "maximize",
+            "best_score": 0.55,
+            "best_trial_number": 0,
+            "val_mcc": 0.10,
+            "test_mcc": 0.08,
+        },
+    )
+    app._persist_optuna_results(
+        optuna_key="optuna_cluster_key",
+        optuna_id="optuna_cluster_id",
+        feature_key="feature_cluster",
+        feature_id="feature_cluster",
+        features_path="features.duckdb",
+        features_source="duckdb",
+        features_df=features_df,
+        selected_features=["cluster_signal"],
+        feature_cols=["cluster_signal"],
+        model_choice="Random Forest",
+        balance_mode="none",
+        calibration_method="none",
+        best_score=0.75,
+        best_smote_params={},
+        best_model_params={"n_estimators": 60},
+        trials_df=trials_df.assign(value=0.75, val_mcc=0.2, test_mcc=0.15),
+        optuna_settings={
+            "objective_metric": "balanced_f1",
+            "objective_label": "Balanced F1",
+            "objective_direction": "maximize",
+            "feature_set_label": "Cluster",
+        },
+        search_space={},
+        best_summary={
+            "feature_set_label": "Cluster",
+            "model_choice": "Random Forest",
+            "balance_mode": "none",
+            "balance_mode_label": "Sin SMOTE",
+            "calibration_method": "none",
+            "calibration_method_label": "Sin calibración",
+            "objective_metric": "balanced_f1",
+            "objective_label": "Balanced F1",
+            "objective_direction": "maximize",
+            "best_score": 0.75,
+            "best_trial_number": 0,
+            "val_mcc": 0.20,
+            "test_mcc": 0.15,
+        },
+    )
+
+    payload = json.loads(
+        (tmp_path / "optuna_optuna_base_id.json").read_text(encoding="utf-8")
+    )
+    payload_variant = app._get_optuna_model_result_variant(
+        payload["results"],
+        model_choice="Random Forest",
+        balance_mode="none",
+        calibration_method="none",
+    )
+    assert payload_variant is not None
+    assert payload_variant["trials_json"]
+    assert payload_variant["best_summary_json"]
+    trials_json_path = Path(str(payload_variant["trials_json"]))
+    summary_json_path = Path(str(payload_variant["best_summary_json"]))
+    assert trials_json_path.exists()
+    assert summary_json_path.exists()
+    trials_payload = json.loads(trials_json_path.read_text(encoding="utf-8"))
+    assert trials_payload["records"][0]["val_mcc"] == pytest.approx(0.10)
+    summary_payload = json.loads(summary_json_path.read_text(encoding="utf-8"))
+    assert summary_payload["test_mcc"] == pytest.approx(0.08)
+
+    rows = app._optuna_best_summary_rows_from_store(
+        configs=[
+            {"key": "optuna_base_key", "label": "Base"},
+            {"key": "optuna_cluster_key", "label": "Cluster"},
+        ],
+        store=fake_st.session_state["optuna_results_store"],
+        model_choice="Random Forest",
+    )
+    by_feature_set = {row["feature_set_label"]: row for row in rows}
+    assert by_feature_set["Base"]["is_best_global"] is False
+    assert by_feature_set["Cluster"]["is_best_global"] is True
+
+
 def test_default_model_pareto_feature_sets_prefers_base_and_base_cluster():
     assert app._default_model_pareto_feature_sets(
         ["Base", "Cluster", "Base + Cluster"]
@@ -1850,6 +2336,90 @@ def test_model_optuna_batch_best_so_far_uses_selected_metric():
     assert metric_col == "test_roc_auc"
     assert lower_is_better is False
     assert curve_df["best_so_far"].round(2).tolist() == [0.72, 0.76]
+
+
+def test_model_optuna_batch_progress_board_defers_metric_selector_until_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake_st = _ProgressBoardFakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    def _fake_chart(_rows, **kwargs):
+        fake_st.chart_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        app,
+        "_render_model_optuna_batch_best_so_far_chart",
+        _fake_chart,
+    )
+    board = app._ModelOptunaBatchProgressBoard(
+        model_name="XGBoost",
+        total_steps=2,
+        batch_ref={},
+        run_dir="Resultados/model_optuna_batch_test",
+    )
+    rows = [
+        {
+            "status": "completed",
+            "combo_id": "combo-1",
+            "test_roc_auc": 0.82,
+            "val_balanced_f1": 0.46,
+        }
+    ]
+
+    def _state(step_id: str, *, status: str = "running") -> dict:
+        return {
+            "run_id": "model_optuna_batch_test",
+            "manifest": {
+                "run_id": "model_optuna_batch_test",
+                "status": status,
+                "result_status": status,
+                "progress": {
+                    "completed_steps": 1,
+                    "total_steps": 2,
+                    "current_step_id": step_id,
+                    "progress_ratio": 0.5,
+                },
+            },
+            "live_status": {
+                "step_id": step_id,
+                "message": step_id,
+                "progress_ratio": 0.5,
+            },
+        }
+
+    board.update(_state("combo_done"), rows, objective_metric="balanced_f1")
+    board.update(_state("combo_start"), rows, objective_metric="balanced_f1")
+
+    assert fake_st.selectbox_calls == []
+    assert [call["metric_col"] for call in fake_st.chart_calls] == [
+        "test_roc_auc",
+        "test_roc_auc",
+    ]
+
+    board.update(
+        _state("run_completed", status="completed"),
+        rows,
+        objective_metric="balanced_f1",
+    )
+    board.update(
+        _state("run_completed", status="completed"),
+        rows,
+        objective_metric="balanced_f1",
+    )
+
+    keys = [call["key"] for call in fake_st.selectbox_calls]
+    assert len(keys) == 2
+    assert len(set(keys)) == 2
+    assert keys[0].startswith(
+        "model_optuna_batch_metric_selector_model_optuna_batch_test_"
+    )
+    assert (
+        fake_st.session_state[
+            "model_optuna_batch_metric_choice_model_optuna_batch_test"
+        ]
+        == "test_roc_auc"
+    )
 
 
 def test_model_optuna_batch_result_progress_row_includes_roc_auc_metrics():

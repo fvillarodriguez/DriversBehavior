@@ -10,6 +10,7 @@ full "Drift detection" section in a single source file.
 from __future__ import annotations
 
 import gc
+import copy
 import hashlib
 import importlib
 import io
@@ -2477,6 +2478,22 @@ def _safe_pr_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
         return float("nan")
 
 
+def _safe_brier_score(y_true: Any, scores: Any) -> float:
+    try:
+        y = np.asarray(y_true, dtype=float)
+        s = np.asarray(scores, dtype=float)
+    except (TypeError, ValueError):
+        return float("nan")
+    if y.size == 0 or s.size == 0 or y.size != s.size:
+        return float("nan")
+    finite_mask = np.isfinite(y) & np.isfinite(s)
+    if not bool(finite_mask.any()):
+        return float("nan")
+    y_valid = np.clip(y[finite_mask], 0.0, 1.0)
+    s_valid = np.clip(s[finite_mask], 0.0, 1.0)
+    return float(np.mean((s_valid - y_valid) ** 2))
+
+
 def compute_classification_metrics(
     y_true: np.ndarray,
     scores: np.ndarray,
@@ -2497,6 +2514,7 @@ def compute_classification_metrics(
     return {
         "auc": _safe_auc(y, s),
         "pr_auc": _safe_pr_auc(y, s),
+        "brier_score": _safe_brier_score(y, decision),
         "f1": float(f1_score(y, preds, zero_division=0)),
         "sensitivity": sensitivity,
         "specificity": specificity,
@@ -2550,7 +2568,14 @@ YEARLY_STRATEGIES = ["static", "period_aligned", "cumulative"]
 ADAPTIVE_ADWIN_STRATEGY = "adaptive_adwin"
 ADAPTIVE_ARF_STRATEGY = "adaptive_arf"
 ADAPTIVE_KSWIN_STRATEGY = "adaptive_kswin"
-EXPERIMENT_STRATEGIES = YEARLY_STRATEGIES + [ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_ARF_STRATEGY, ADAPTIVE_KSWIN_STRATEGY]
+ADAPTIVE_NEURAL_DRIFT_STRATEGY = "adaptive_neural_drift"
+NEURAL_DRIFT_STRATEGY_MODEL = "Neural drift"
+EXPERIMENT_STRATEGIES = YEARLY_STRATEGIES + [
+    ADAPTIVE_ADWIN_STRATEGY,
+    ADAPTIVE_ARF_STRATEGY,
+    ADAPTIVE_KSWIN_STRATEGY,
+    ADAPTIVE_NEURAL_DRIFT_STRATEGY,
+]
 ARF_VARIANT_NAMES = ["ARFmoderate", "ARFmaj", "ARFfast"]
 ARF_DEFAULT_VARIANTS: Tuple[str, ...] = ("ARFmoderate", "ARFmaj")
 KSWIN_VARIANT_NAMES = ["KSWINpaper", "KSWINseasonal"]
@@ -2604,7 +2629,7 @@ EXPERIMENT_PRESET_CONFIGS: Dict[str, Dict[str, Any]] = {
     "Full Base": {
         "description": (
             "Replica la configuracion del ultimo experimento completo: cuatro modelos, "
-            "todas las estrategias, `none` + `smote`, seed 42 y KSWINpaper."
+            "todas las estrategias incluyendo Neural drift, `none` + `smote`, seed 42 y KSWINpaper."
         ),
         "resource_mode": DEFAULT_EXPERIMENT_RESOURCE_MODE,
         "models": list(MODEL_NAMES),
@@ -3194,6 +3219,7 @@ def _model_execution_priority(model_name: str) -> int:
         "AdaBoost": 1,
         "Random Forest": 2,
         "XGBoost": 3,
+        NEURAL_DRIFT_STRATEGY_MODEL: 4,
     }
     return int(priority.get(str(model_name), 99))
 
@@ -3283,6 +3309,7 @@ def _build_recalibration_run_id(
     feature_selection_context: Dict[str, Any],
     continue_on_block_error: bool = False,
     resource_policy_overrides: Optional[Dict[str, Any]] = None,
+    neural_drift_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     signature_cols = [col for col in [time_col, target_col] + list(feature_cols) if col in df.columns]
     dataset_signature = _frame_signature(df, columns=signature_cols, include_index=True)
@@ -3315,6 +3342,8 @@ def _build_recalibration_run_id(
         "continue_on_block_error": bool(continue_on_block_error),
         "custom_grids": _to_json_safe(custom_grids or {}),
     }
+    if ADAPTIVE_NEURAL_DRIFT_STRATEGY in [str(strategy) for strategy in strategies]:
+        payload["neural_drift_config"] = _to_json_safe(neural_drift_config or {})
     if _resource_policy_differs_from_default(resource_mode, overrides=resource_policy_overrides):
         payload["resource_policy"] = _resource_policy_signature(
             resource_mode,
@@ -3656,6 +3685,7 @@ def _preview_recalibration_checkpoint(
     balance_modes: Optional[Sequence[str]] = None,
     feature_selection_context: Optional[Dict[str, Any]] = None,
     checkpoint_root: Optional[Path] = None,
+    neural_drift_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if model_names is None:
         model_names = MODEL_NAMES
@@ -3673,6 +3703,12 @@ def _preview_recalibration_checkpoint(
     normalized_feature_selection_context = _normalize_feature_selection_context(
         feature_selection_context,
         feature_cols=feature_cols,
+    )
+    neural_drift_enabled = ADAPTIVE_NEURAL_DRIFT_STRATEGY in [str(strategy) for strategy in strategies]
+    resolved_neural_drift_config = (
+        _neural_drift_experiment_config(neural_drift_config)
+        if neural_drift_enabled
+        else None
     )
     effective_base_year = _canonical_base_year(df, time_col=time_col, base_year=base_year)
     run_id = _build_recalibration_run_id(
@@ -3704,6 +3740,7 @@ def _preview_recalibration_checkpoint(
         continue_on_block_error=bool(continue_on_block_error),
         custom_grids=custom_grids,
         feature_selection_context=normalized_feature_selection_context,
+        neural_drift_config=resolved_neural_drift_config,
     )
     run_dir = _recalibration_run_dir(run_id, checkpoint_root=checkpoint_root)
     paths = _recalibration_run_paths(run_dir)
@@ -3954,6 +3991,7 @@ def _load_completed_block_payloads(manifest: Dict[str, Any], *, blocks_dir: Path
         ADAPTIVE_ADWIN_STRATEGY: 3,
         ADAPTIVE_ARF_STRATEGY: 4,
         ADAPTIVE_KSWIN_STRATEGY: 5,
+        ADAPTIVE_NEURAL_DRIFT_STRATEGY: 6,
     }
     payloads.sort(
         key=lambda payload: (
@@ -4152,6 +4190,8 @@ def _estimate_recalibration_workload(
         if strategy in YEARLY_STRATEGIES:
             lower_bound_fits += pred_years
         elif strategy in {ADAPTIVE_ADWIN_STRATEGY, ADAPTIVE_KSWIN_STRATEGY}:
+            lower_bound_fits += 1
+        elif strategy == ADAPTIVE_NEURAL_DRIFT_STRATEGY:
             lower_bound_fits += 1
     lower_bound_fits *= max(1, len(repetition_seeds))
     high_risk = (
@@ -6543,6 +6583,15 @@ def run_yearly_strategy(
             metrics_before_calibration = eval_payload["metrics_before_calibration"]
             metrics_after_calibration = eval_payload["metrics_after_calibration"]
             operating_context = _bundle_operating_context(bundle)
+            metric_brier_score = float(
+                metrics.get(
+                    "brier_score",
+                    _safe_brier_score(
+                        eval_payload.get("y_true", []),
+                        eval_payload.get("calibrated_scores", eval_payload.get("scores", [])),
+                    ),
+                )
+            )
             row = {
                 "strategy": strategy,
                 "iteration": int(pred_year - years[0]),
@@ -6552,6 +6601,7 @@ def run_yearly_strategy(
                 "balance_mode": balance_mode,
                 "auc": float(metrics["auc"]),
                 "pr_auc": float(metrics["pr_auc"]),
+                "brier_score": metric_brier_score,
                 "f1": float(metrics["f1"]),
                 "sensitivity": float(metrics["sensitivity"]),
                 "specificity": float(metrics["specificity"]),
@@ -7040,6 +7090,7 @@ def run_adaptive_strategy(
                     "model": model_name,
                     "auc": float(seg_metrics["auc"]),
                     "pr_auc": float(seg_metrics["pr_auc"]),
+                    "brier_score": float(seg_metrics["brier_score"]),
                     "f1": float(seg_metrics["f1"]),
                     "sensitivity": float(seg_metrics["sensitivity"]),
                     "specificity": float(seg_metrics["specificity"]),
@@ -7334,6 +7385,7 @@ def run_adaptive_strategy(
                 "model": model_name,
                 "auc": float(seg_metrics["auc"]),
                 "pr_auc": float(seg_metrics["pr_auc"]),
+                "brier_score": float(seg_metrics["brier_score"]),
                 "f1": float(seg_metrics["f1"]),
                 "sensitivity": float(seg_metrics["sensitivity"]),
                 "specificity": float(seg_metrics["specificity"]),
@@ -7591,6 +7643,7 @@ def run_arf_strategy(
                 "model": variant_name,
                 "auc": float(seg_metrics["auc"]),
                 "pr_auc": float(seg_metrics["pr_auc"]),
+                "brier_score": float(seg_metrics["brier_score"]),
                 "f1": float(seg_metrics["f1"]),
                 "sensitivity": float(seg_metrics["sensitivity"]),
                 "specificity": float(seg_metrics["specificity"]),
@@ -8124,6 +8177,7 @@ def run_kswin_strategy(
                     "model": model_label,
                     "auc": float(seg_metrics["auc"]),
                     "pr_auc": float(seg_metrics["pr_auc"]),
+                    "brier_score": float(seg_metrics["brier_score"]),
                     "f1": float(seg_metrics["f1"]),
                     "sensitivity": float(seg_metrics["sensitivity"]),
                     "specificity": float(seg_metrics["specificity"]),
@@ -8456,6 +8510,7 @@ def run_kswin_strategy(
                     "model": model_label,
                     "auc": float(seg_metrics["auc"]),
                     "pr_auc": float(seg_metrics["pr_auc"]),
+                    "brier_score": float(seg_metrics["brier_score"]),
                     "f1": float(seg_metrics["f1"]),
                     "sensitivity": float(seg_metrics["sensitivity"]),
                     "specificity": float(seg_metrics["specificity"]),
@@ -8530,6 +8585,333 @@ def run_kswin_strategy(
     return out, roc_payload
 
 
+def _active_neural_drift_config(
+    neural_drift_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if isinstance(neural_drift_config, dict):
+        return neural_drift_app.resolve_current_config_from_session_state(neural_drift_config)
+    try:
+        return neural_drift_app.resolve_current_config_from_session_state()
+    except Exception:
+        return copy.deepcopy(neural_drift_app.DEFAULT_CONFIG)
+
+
+def _neural_drift_experiment_config(
+    neural_drift_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    config = _active_neural_drift_config(neural_drift_config)
+    neural_models = [
+        str(model_name)
+        for model_name in list(config.get("models") or [])
+        if str(model_name) != neural_drift_app.MODEL_XGBOOST
+    ]
+    if not neural_models:
+        neural_models = [
+            str(model_name)
+            for model_name in list(neural_drift_app.DEFAULT_CONFIG.get("models") or [])
+            if str(model_name) != neural_drift_app.MODEL_XGBOOST
+        ]
+    config["models"] = neural_models
+    return config
+
+
+def _neural_drift_protocol_config(
+    config: Dict[str, Any],
+    *,
+    base_year: int,
+    validation_size: float,
+    run_seed: int,
+    balance_mode: str,
+) -> Dict[str, Any]:
+    protocol_config = _neural_drift_experiment_config(config)
+    protocol_config.update(
+        {
+            "split_mode": "fixed_dates",
+            "base_start": f"{int(base_year)}-01-01",
+            "base_end": f"{int(base_year)}-12-31",
+            "stream_start": f"{int(base_year) + 1}-01-01",
+            "dataset_percent": 100,
+            "validation_fraction": float(validation_size),
+            "max_stream_rows": None,
+            "random_state": int(run_seed),
+            "balance_modes": [str(balance_mode)],
+        }
+    )
+    return protocol_config
+
+
+def _neural_drift_dataset_bundle(
+    df: pd.DataFrame,
+    *,
+    feature_cols: Sequence[str],
+    target_col: str,
+    time_col: str,
+    feature_selection_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    work = df.copy()
+    if str(time_col) != "interval_start":
+        work["interval_start"] = work[time_col]
+    if str(target_col) != "target":
+        work["target"] = work[target_col]
+    work["interval_start"] = pd.to_datetime(work["interval_start"], errors="coerce")
+    work["target"] = pd.to_numeric(work["target"], errors="coerce").fillna(0).astype(int)
+    resolved_features = [
+        str(col)
+        for col in feature_cols
+        if str(col) in work.columns and str(col) not in {"interval_start", "target"}
+    ]
+    return {
+        "source": "drift_detection_experiments",
+        "df": work,
+        "raw_df": None,
+        "feature_cols": resolved_features,
+        "selection_metadata": dict(feature_selection_context or {}),
+        "feature_export_path": str((feature_selection_context or {}).get("feature_export_path") or ""),
+    }
+
+
+def _neural_drift_group_label(model_name: str, strategy: str) -> str:
+    return f"{NEURAL_DRIFT_STRATEGY_MODEL} · {model_name} · {strategy}"
+
+
+def _neural_drift_adaptive_rows_and_roc(
+    results: Dict[str, Any],
+    *,
+    balance_mode: str,
+    run_seed: int,
+    run_order: int,
+    config: Dict[str, Any],
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    stream_df = results.get("stream_metrics")
+    if not isinstance(stream_df, pd.DataFrame) or stream_df.empty:
+        return pd.DataFrame(), []
+    stream_df = stream_df.copy()
+    stream_df["timestamp"] = pd.to_datetime(stream_df.get("timestamp"), errors="coerce")
+    stream_df = stream_df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    if stream_df.empty:
+        return pd.DataFrame(), []
+
+    drift_events = results.get("drift_events")
+    drift_df = drift_events.copy() if isinstance(drift_events, pd.DataFrame) else pd.DataFrame()
+    if not drift_df.empty and "timestamp" in drift_df.columns:
+        drift_df["timestamp"] = pd.to_datetime(drift_df["timestamp"], errors="coerce")
+
+    rows: List[Dict[str, Any]] = []
+    roc_payload: List[Dict[str, Any]] = []
+    grouped = stream_df.groupby(["model", "strategy", "balance_mode"], dropna=False)
+    for drift_idx, ((internal_model, internal_strategy, internal_balance), group) in enumerate(grouped, start=1):
+        group = group.sort_values("timestamp").reset_index(drop=True)
+        y_true = pd.to_numeric(group.get("y_true"), errors="coerce").fillna(0).astype(int).to_numpy()
+        scores = pd.to_numeric(group.get("score"), errors="coerce").to_numpy(dtype=float)
+        finite_mask = np.isfinite(scores)
+        y_true = y_true[finite_mask]
+        scores = scores[finite_mask]
+        if y_true.size == 0 or scores.size == 0:
+            continue
+        threshold_source = (
+            group["decision_threshold"]
+            if "decision_threshold" in group.columns
+            else pd.Series([0.5])
+        )
+        threshold_series = pd.to_numeric(threshold_source, errors="coerce").dropna()
+        threshold = float(threshold_series.iloc[-1]) if not threshold_series.empty else 0.5
+        metrics = compute_classification_metrics(
+            y_true,
+            scores,
+            threshold=threshold,
+            decision_scores=scores,
+        )
+        brier_score = float(np.mean((scores - y_true) ** 2)) if y_true.size else float("nan")
+        model_label = _neural_drift_group_label(str(internal_model), str(internal_strategy))
+        related_events = pd.DataFrame()
+        if not drift_df.empty and {"model", "strategy", "balance_mode"}.issubset(drift_df.columns):
+            related_events = drift_df.loc[
+                drift_df["model"].astype(str).eq(str(internal_model))
+                & drift_df["strategy"].astype(str).eq(str(internal_strategy))
+                & drift_df["balance_mode"].astype(str).eq(str(internal_balance))
+            ].copy()
+        action_count = (
+            int(group.get("action_taken", pd.Series(dtype=object)).astype(str).ne("none").sum())
+            if "action_taken" in group.columns
+            else 0
+        )
+        drift_event_count = int(len(related_events))
+        last_ts = pd.Timestamp(group["timestamp"].iloc[-1])
+        recent_window = int(config.get("recent_window_size", neural_drift_app.DEFAULT_CONFIG["recent_window_size"]))
+        row = {
+            "strategy": ADAPTIVE_NEURAL_DRIFT_STRATEGY,
+            "drift": int(drift_idx),
+            "drift_date": last_ts,
+            "prediction_year": int(last_ts.year),
+            "balance_mode": str(balance_mode),
+            "segment_rows": int(len(group)),
+            "n_internal_drifts": int(drift_event_count),
+            "n_internal_warnings": 0,
+            "vote_count": int(action_count),
+            "vote_threshold": 1,
+            "monitor_feature_count": int(len(config.get("drift_channels") or [])),
+            "retrain_rows": int(action_count),
+            "retrain_positive_rows": int(
+                pd.to_numeric(related_events.get("recent_positive_rows"), errors="coerce").fillna(0).sum()
+            ) if not related_events.empty and "recent_positive_rows" in related_events.columns else 0,
+            "detected_features": json.dumps([], ensure_ascii=True),
+            "monitored_features": json.dumps(list(config.get("drift_channels") or []), ensure_ascii=True),
+            "W": int(recent_window),
+            "W0": np.nan,
+            "W1": int(recent_window),
+            "remaining_periods": 0,
+            "base_model": str(internal_model),
+            "detector_variant": str(internal_strategy),
+            "model": model_label,
+            "auc": float(metrics["auc"]),
+            "pr_auc": float(metrics["pr_auc"]),
+            "brier_score": brier_score,
+            "f1": float(metrics["f1"]),
+            "sensitivity": float(metrics["sensitivity"]),
+            "specificity": float(metrics["specificity"]),
+            "sensitivity_before_calibration": float(metrics["sensitivity"]),
+            "specificity_before_calibration": float(metrics["specificity"]),
+            "sensitivity_after_calibration": float(metrics["sensitivity"]),
+            "specificity_after_calibration": float(metrics["specificity"]),
+            "error_rate": float(metrics["error_rate"]),
+            "training_time_sec": np.nan,
+            "threshold": float(threshold),
+            "operating_threshold": float(threshold),
+            "raw_youden_threshold": float(threshold),
+            "threshold_policy": "neural_drift_active_config",
+            "calibration_method": "neural_drift",
+            "fn_cost": np.nan,
+            "fp_cost": np.nan,
+            "run_seed": int(run_seed),
+            "run_order": int(run_order),
+        }
+        rows.append(row)
+        roc_payload.append(
+            {
+                "strategy": ADAPTIVE_NEURAL_DRIFT_STRATEGY,
+                "model": model_label,
+                "balance_mode": str(balance_mode),
+                "segment": f"drift_{int(drift_idx)}",
+                "y_true": np.asarray(y_true),
+                "scores": np.asarray(scores, dtype=float),
+                "calibrated_scores": np.asarray(scores, dtype=float),
+                "raw_threshold": float(threshold),
+                "calibrated_threshold": float(threshold),
+                "run_seed": int(run_seed),
+                "run_order": int(run_order),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["model", "drift"]).reset_index(drop=True)
+    return out, roc_payload
+
+
+def run_neural_drift_strategy(
+    df: pd.DataFrame,
+    *,
+    feature_cols: Sequence[str],
+    target_col: str = "target",
+    time_col: str = "interval_start",
+    base_year: Optional[int] = None,
+    random_state: int = 42,
+    validation_size: float = 0.2,
+    run_seed: Optional[int] = None,
+    run_order: int = 1,
+    balance_mode: str = BALANCE_MODE_NONE,
+    neural_drift_config: Optional[Dict[str, Any]] = None,
+    feature_selection_context: Optional[Dict[str, Any]] = None,
+    execution_log: Optional[List[Dict[str, Any]]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    work = _sort_frame_by_time(df, time_col)
+    effective_base_year = _canonical_base_year(work, time_col=time_col, base_year=base_year)
+    if effective_base_year is None:
+        return pd.DataFrame(), []
+    effective_seed = int(random_state if run_seed is None else run_seed)
+    config = _neural_drift_protocol_config(
+        neural_drift_config or {},
+        base_year=int(effective_base_year),
+        validation_size=float(validation_size),
+        run_seed=effective_seed,
+        balance_mode=str(balance_mode),
+    )
+    dataset_bundle = _neural_drift_dataset_bundle(
+        work,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        time_col=time_col,
+        feature_selection_context=feature_selection_context,
+    )
+    _append_execution_log(
+        execution_log,
+        phase="neural_drift_start",
+        status="started",
+        message="Starting Neural drift adaptive strategy using the active Neural drift implementation.",
+        strategy=ADAPTIVE_NEURAL_DRIFT_STRATEGY,
+        model=NEURAL_DRIFT_STRATEGY_MODEL,
+        balance_mode=balance_mode,
+        training_year=int(effective_base_year),
+        run_seed=effective_seed,
+        run_order=run_order,
+        neural_drift_config=_to_json_safe(config),
+    )
+
+    def progress_bridge(ratio: float, label: str) -> None:
+        _emit_experiment_progress(
+            progress_callback,
+            ratio=max(0.0, min(float(ratio), 1.0)),
+            label=str(label),
+            detail=f"Estrategia {ADAPTIVE_NEURAL_DRIFT_STRATEGY} | Balance {balance_mode}",
+        )
+
+    results = neural_drift_app.run_backtest_pipeline(
+        dataset_bundle,
+        config=config,
+        progress_callback=progress_bridge,
+    )
+    adaptive_df, roc_payload = _neural_drift_adaptive_rows_and_roc(
+        results,
+        balance_mode=str(balance_mode),
+        run_seed=effective_seed,
+        run_order=run_order,
+        config=config,
+    )
+    if adaptive_df.empty:
+        _append_execution_log(
+            execution_log,
+            phase="neural_drift_empty",
+            status="skipped",
+            message="Neural drift did not produce stream metrics.",
+            strategy=ADAPTIVE_NEURAL_DRIFT_STRATEGY,
+            model=NEURAL_DRIFT_STRATEGY_MODEL,
+            balance_mode=balance_mode,
+            run_seed=effective_seed,
+            run_order=run_order,
+        )
+        return adaptive_df, roc_payload
+    _append_execution_log(
+        execution_log,
+        phase="neural_drift_complete",
+        status="ok",
+        message="Completed Neural drift adaptive strategy.",
+        strategy=ADAPTIVE_NEURAL_DRIFT_STRATEGY,
+        model=NEURAL_DRIFT_STRATEGY_MODEL,
+        balance_mode=balance_mode,
+        run_seed=effective_seed,
+        run_order=run_order,
+        adaptive_rows=int(len(adaptive_df)),
+        roc_payloads=int(len(roc_payload)),
+    )
+    _emit_experiment_progress(
+        progress_callback,
+        ratio=1.0,
+        label="Bloque adaptive_neural_drift completado.",
+        detail=f"Balance {balance_mode}",
+    )
+    return adaptive_df, roc_payload
+
+
 def _build_experiment_blocks(
     *,
     model_names: Sequence[str],
@@ -8578,6 +8960,17 @@ def _build_experiment_blocks(
                                 "balance_mode": str(balance_mode),
                             }
                         )
+            continue
+        if strategy == ADAPTIVE_NEURAL_DRIFT_STRATEGY:
+            for balance_mode in normalized_balance_modes:
+                blocks.append(
+                    {
+                        "strategy": str(strategy),
+                        "model": NEURAL_DRIFT_STRATEGY_MODEL,
+                        "detector_variant": "active_config",
+                        "balance_mode": str(balance_mode),
+                    }
+                )
             continue
         raise ValueError(f"Unsupported strategy: {strategy}")
     strategy_priority = {name: idx for idx, name in enumerate(strategies)}
@@ -9269,6 +9662,7 @@ def run_recalibration_experiments(
     reuse_smote_cache: bool = True,
     continue_on_block_error: bool = False,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    neural_drift_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Main orchestrator for yearly, ADWIN-adaptive and ARF-adaptive strategies.
@@ -9302,6 +9696,12 @@ def run_recalibration_experiments(
         repetition_seeds = DEFAULT_REPETITION_SEEDS
     if balance_modes is None:
         balance_modes = DEFAULT_BATCH_BALANCE_MODES
+    neural_drift_enabled = ADAPTIVE_NEURAL_DRIFT_STRATEGY in [str(strategy) for strategy in strategies]
+    resolved_neural_drift_config = (
+        _neural_drift_experiment_config(neural_drift_config)
+        if neural_drift_enabled
+        else None
+    )
     normalized_feature_selection_context = _normalize_feature_selection_context(
         feature_selection_context,
         feature_cols=feature_cols,
@@ -9996,6 +10396,15 @@ def run_recalibration_experiments(
         "feature_selection_context": normalized_feature_selection_context,
         "preflight": preflight,
     }
+    if resolved_neural_drift_config is not None:
+        run_manifest["neural_drift_config"] = _to_json_safe(resolved_neural_drift_config)
+        run_manifest["neural_drift_protocol_overrides"] = {
+            "split_mode": "fixed_dates",
+            "dataset_percent": 100,
+            "max_stream_rows": None,
+            "stream_start_policy": "base_year_plus_one",
+            "validation_fraction_source": "Experiments validation_size",
+        }
     computed_run_id = _build_recalibration_run_id(
         df=df,
         feature_cols=feature_cols,
@@ -10025,6 +10434,7 @@ def run_recalibration_experiments(
         continue_on_block_error=bool(continue_on_block_error),
         custom_grids=custom_grids,
         feature_selection_context=normalized_feature_selection_context,
+        neural_drift_config=resolved_neural_drift_config,
     )
     run_id = str(checkpoint_run_id_override or computed_run_id)
     run_dir = _recalibration_run_dir(run_id, checkpoint_root=checkpoint_root)
@@ -11099,6 +11509,23 @@ def run_recalibration_experiments(
                     smote_cache_dir=paths["smote_dir"] if reuse_smote_cache else None,
                     smote_cache_registry=smote_registry_block,
 
+                    progress_callback=block_progress,
+                )
+            elif strategy == ADAPTIVE_NEURAL_DRIFT_STRATEGY:
+                adaptive_df, roc_data = run_neural_drift_strategy(
+                    df,
+                    feature_cols=feature_cols,
+                    target_col=target_col,
+                    time_col=time_col,
+                    base_year=effective_base_year,
+                    random_state=random_state,
+                    validation_size=validation_size,
+                    run_seed=run_seed,
+                    run_order=run_order,
+                    balance_mode=balance_mode,
+                    neural_drift_config=resolved_neural_drift_config,
+                    feature_selection_context=normalized_feature_selection_context,
+                    execution_log=block_execution_log,
                     progress_callback=block_progress,
                 )
             else:
@@ -13560,6 +13987,9 @@ def _execution_config_from_checkpoint_run_manifest(
     checkpoint_custom_grids = run_manifest.get("custom_grids")
     if isinstance(checkpoint_custom_grids, dict):
         config["custom_grids"] = _to_json_safe(checkpoint_custom_grids)
+    checkpoint_neural_config = run_manifest.get("neural_drift_config")
+    if isinstance(checkpoint_neural_config, dict):
+        config["neural_drift_config"] = _to_json_safe(checkpoint_neural_config)
     return config
 
 
@@ -14145,26 +14575,86 @@ def _render_feature_engineering_tab() -> None:
         st.dataframe(feature_engineering_reference_table(), width="stretch")
     interval_minutes = st.number_input("Intervalo (minutos)", min_value=1, max_value=60, value=5, step=1)
 
-    stage1_mode = st.selectbox(
-        "Stage 1: missing data >1% + drop intervalos incompletos",
-        ["Aplicar", "Omitir"],
-        index=0,
-        key="drift_stage1_selector",
+    st.markdown("**Preparacion Stage 1 / Stage 2**")
+    st.caption(
+        "Estas etapas se ejecutan despues de construir las variables y el `target`. "
+        "Controlan la calidad del dataset completo que se exporta como `clean_features` "
+        "antes de cualquier split train/test."
     )
-    missing_threshold = st.number_input("Umbral Stage 1", min_value=0.0, max_value=1.0, value=0.01, step=0.001)
-    stage2_mode = st.selectbox(
-        "Stage 2: filtrar ventanas multi-dia sin accidentes",
-        ["Aplicar", "Omitir"],
-        index=0,
-        key="drift_stage2_selector",
-    )
-    min_zero_days = st.number_input(
-        "Dias minimos sin accidentes (Stage 2)",
-        min_value=1,
-        max_value=60,
-        value=7,
-        step=1,
-    )
+    stage1_col, stage2_col = st.columns(2)
+    with stage1_col:
+        st.markdown("**Stage 1 - Missing data**")
+        st.caption(
+            "Evalua cada predictor antes del entrenamiento. Si una variable supera el "
+            "umbral de missing configurado, se elimina completa. Luego, con las variables "
+            "que quedan, se descartan los intervalos que aun tengan algun valor faltante. "
+            "Uselo para evitar que el modelo aprenda desde columnas incompletas o filas "
+            "con informacion parcial."
+        )
+        stage1_mode = st.selectbox(
+            "Selector Stage 1",
+            ["Aplicar", "Omitir"],
+            index=0,
+            key="drift_stage1_selector",
+            help=(
+                "`Aplicar` elimina variables sobre el umbral de missing y despues elimina "
+                "intervalos incompletos en los predictores restantes. `Omitir` conserva esas "
+                "variables y filas para la siguiente etapa."
+            ),
+        )
+        missing_threshold = st.number_input(
+            "Umbral Stage 1",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.01,
+            step=0.001,
+            help=(
+                "Proporcion maxima permitida de valores faltantes por variable. "
+                "0.01 equivale a 1%. Subirlo conserva mas variables; bajarlo hace "
+                "la limpieza mas estricta."
+            ),
+        )
+        st.caption(
+            f"Con el umbral actual, Stage 1 remueve variables con mas de "
+            f"{float(missing_threshold) * 100:.2f}% de datos faltantes."
+        )
+    with stage2_col:
+        st.markdown("**Stage 2 - Ventanas sin accidentes**")
+        st.caption(
+            "Busca secuencias consecutivas donde `target` es 0 durante varios dias. "
+            "Cuando una ventana alcanza el minimo configurado, se eliminan sus intervalos "
+            "para reducir tramos largos sin eventos que pueden dominar el dataset y "
+            "aumentar el desbalance de clases. Este filtro se aplica sobre todo el "
+            "dataset de Feature engineering antes de separar train/test."
+        )
+        stage2_mode = st.selectbox(
+            "Selector Stage 2",
+            ["Aplicar", "Omitir"],
+            index=0,
+            key="drift_stage2_selector",
+            help=(
+                "`Aplicar` detecta y elimina ventanas consecutivas sin accidentes segun "
+                "el minimo de dias. Se ejecuta sobre el dataset completo antes de "
+                "cualquier split train/test. `Omitir` mantiene todos los periodos sin "
+                "accidentes."
+            ),
+        )
+        min_zero_days = st.number_input(
+            "Dias minimos sin accidentes (Stage 2)",
+            min_value=1,
+            max_value=60,
+            value=7,
+            step=1,
+            help=(
+                "Longitud minima de una secuencia sin accidentes para filtrarla. "
+                "Con intervalos de 5 minutos, 7 dias equivalen a 2016 intervalos."
+            ),
+        )
+        min_zero_intervals = int(math.ceil((int(min_zero_days) * 24 * 60) / float(interval_minutes)))
+        st.caption(
+            f"Con el intervalo actual ({int(interval_minutes)} min), Stage 2 filtra "
+            f"ventanas de al menos {min_zero_intervals:,} intervalos consecutivos sin accidentes."
+        )
 
     if st.button("Calcular nuevas variables", key="drift_run_feature_engineering", disabled=not range_valid):
         flow_date_start = sample.date_start
@@ -14605,7 +15095,7 @@ def _render_experiments_tab() -> None:
         f"Feature set locked for experiments: {len(feature_cols)} variables after correlation filtering + RF ranking."
     )
     st.caption(
-        "ARF corre como estrategia online inmediata separada de los modelos batch. "
+        "ARF y Neural drift corren como enfoques adaptativos separados de los modelos batch. "
         "Los modelos seleccionados abajo aplican a static / period_aligned / cumulative / adaptive_adwin / adaptive_kswin."
     )
 
@@ -14814,6 +15304,15 @@ def _render_experiments_tab() -> None:
             default=EXPERIMENT_STRATEGIES,
             key="drift_exp_strategies",
         )
+        neural_drift_strategy_config: Optional[Dict[str, Any]] = None
+        if ADAPTIVE_NEURAL_DRIFT_STRATEGY in selected_strategies:
+            neural_drift_strategy_config = _neural_drift_experiment_config(
+                neural_drift_app.resolve_current_config_from_session_state()
+            )
+            st.caption(
+                "Neural drift usa la arquitectura y configuracion activa del tab `Neural drift`, "
+                "sin XGBoost interno, y corre con el protocolo temporal de Experiments para comparacion justa."
+            )
     with col2:
         fast_mode = st.checkbox(
             "Fast hyperparameter mode",
@@ -15179,6 +15678,7 @@ def _render_experiments_tab() -> None:
             "feature_selection_context": _current_feature_selection_context(),
             "custom_grids": custom_grids,
             "continue_on_block_error": bool(continue_on_block_error),
+            "neural_drift_config": neural_drift_strategy_config,
         }
         loaded_checkpoint_feature_selection_context = dict(
             st.session_state.get("drift_exp_loaded_checkpoint_feature_selection_context") or {}
@@ -15246,6 +15746,7 @@ def _render_experiments_tab() -> None:
                 auto_resume=bool(execution_checkpoint_run_id_override) and bool(execution_mode != "fresh"),
                 recompute_blocks_from_checkpoint=bool(execution_mode == "retrain"),
                 continue_on_block_error=execution_config["continue_on_block_error"],
+                neural_drift_config=execution_config.get("neural_drift_config"),
                 progress_callback=progress.update,
             )
         except Exception as exc:
@@ -15576,11 +16077,12 @@ def _render_experiments_tab() -> None:
             st.markdown("**Yearly strategy results**")
             st.dataframe(_streamlit_arrow_safe_df(yearly), width="stretch")
         if isinstance(adaptive, pd.DataFrame) and not adaptive.empty:
-            st.markdown("**Adaptive strategy segments (ADWIN + ARF + KSWIN)**")
+            st.markdown("**Adaptive strategy segments (ADWIN + ARF + KSWIN + Neural drift)**")
             st.caption(
                 "ADWIN reporta segmentos delimitados por drift detectado. "
                 "ARF reporta segmentos anuales online con su conteo interno de drifts y warnings. "
-                "KSWIN reporta segmentos cerrados por drift en covariables, con voto de features y ventana de reentrenamiento fija."
+                "KSWIN reporta segmentos cerrados por drift en covariables. "
+                "Neural drift resume cada combinacion neuronal interna con la configuracion activa del tab Neural drift."
             )
             st.dataframe(_streamlit_arrow_safe_df(adaptive), width="stretch")
         if isinstance(execution_log, pd.DataFrame) and not execution_log.empty:

@@ -74,6 +74,23 @@ class _TabsFakeStreamlit(_FakeStreamlit):
         raise AssertionError("Crash prediction main navigation must use st.tabs")
 
 
+def test_history_selectbox_stable_resets_stale_selection(monkeypatch):
+    fake_st = _SelectorFakeStreamlit(selected=10)
+    fake_st.session_state["history_selected_record_id"] = 999
+    monkeypatch.setattr(app, "st", fake_st)
+
+    selected = app._history_selectbox_stable(
+        "Detalle",
+        [10, 11],
+        key="history_selected_record_id",
+        format_func=str,
+    )
+
+    assert selected == 10
+    assert fake_st.session_state["history_selected_record_id"] == 10
+    assert fake_st.options == [10, 11]
+
+
 def _make_optuna_batch_record(
     *,
     record_id: int,

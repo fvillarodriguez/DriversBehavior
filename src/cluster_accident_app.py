@@ -7,6 +7,8 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import concurrent.futures
+import multiprocessing as mp
 import os
 import re
 import shutil
@@ -16,7 +18,7 @@ import time
 import unicodedata
 from datetime import datetime, time as dt_time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,6 +39,7 @@ from src.utils import (
     load_flujos,
     load_flujos_range,
     load_porticos,
+    normalize_plate_series,
     process_accidentes_df,
     get_portico_segments,
     _slugify,
@@ -110,22 +113,34 @@ RESULTS_DIR = ROOT_DIR / "Resultados"
 DATA_DIR = ROOT_DIR / "Datos"
 HISTORY_PATH = RESULTS_DIR / "experiment_history.jsonl"
 MODELS_DIR = RESULTS_DIR / "model_history"
+DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME = "dynamic_assignments"
+DYNAMIC_GMM_METADATA_TABLE_NAME = "dynamic_metadata"
 CLUSTER_LABEL_PATTERN = re.compile(
     r"^cluster_(?P<method>kmeans|gmm|hdbscan)(?:_k(?P<k>\d+))?(?:.*)?\.csv$"
 )
 XAI_GROUP_COLOR_DOMAIN = ["Base", "Cluster"]
 XAI_GROUP_COLOR_RANGE = ["#2f6c7a", "#c66a10"]
 XAI_FEATURE_VALUE_RANGE = ["#2f6c7a", "#f4f1de", "#c66a10"]
-OPTUNA_BALANCE_MODE_ORDER = ("none", "smote")
+OPTUNA_BALANCE_MODE_ORDER = ("none", "class_weight", "smote")
+OPTUNA_BALANCE_MODE_UI_OPTIONS = ("none", "class_weight", "SMOTE")
 OPTUNA_BALANCE_MODE_LABELS = {
     "none": "Sin SMOTE",
+    "class_weight": "Class weight / scale_pos_weight",
     "smote": "Con SMOTE",
 }
 OPTUNA_PARAMETER_PROFILE_WIDE = "Búsqueda amplia"
 OPTUNA_PARAMETER_PROFILE_LOCAL = "Refinamiento local"
+OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211 = (
+    "15->14->12->11 XGBoost Base + Cluster / none"
+)
+OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211 = (
+    "15->14->12->11 XGBoost Base + Cluster / SMOTE"
+)
 OPTUNA_PARAMETER_PROFILE_OPTIONS = (
     OPTUNA_PARAMETER_PROFILE_WIDE,
     OPTUNA_PARAMETER_PROFILE_LOCAL,
+    OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211,
+    OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211,
 )
 OPTUNA_MODEL_ORDER = (
     "XGBoost",
@@ -1134,6 +1149,14 @@ def _duckdb_quote_identifier(name: str) -> str:
     return f'"{safe}"'
 
 
+def _duckdb_quote_qualified_identifier(name: str) -> str:
+    return ".".join(_duckdb_quote_identifier(part) for part in str(name).split("."))
+
+
+def _duckdb_quote_literal(value: object) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _pick_duckdb_table(tables: List[str], preferred: List[str]) -> Optional[str]:
     for name in preferred:
         if name in tables:
@@ -2052,9 +2075,12 @@ def _normalize_optuna_balance_mode(value: object) -> str:
         "sin balance": "none",
         "no_smote": "none",
         "no-smote": "none",
-        "class_weight": "none",
-        "class weight": "none",
+        "class_weight": "class_weight",
+        "class weight": "class_weight",
+        "scale_pos_weight": "class_weight",
+        "class_weight/scale_pos_weight": "class_weight",
         "smote": "smote",
+        "SMOTE": "smote",
         "con smote": "smote",
         "with_smote": "smote",
         "with-smote": "smote",
@@ -2065,6 +2091,56 @@ def _normalize_optuna_balance_mode(value: object) -> str:
 def _optuna_balance_mode_label(balance_mode: object) -> str:
     mode = _normalize_optuna_balance_mode(balance_mode)
     return OPTUNA_BALANCE_MODE_LABELS.get(mode, str(balance_mode))
+
+
+def _optuna_balance_mode_widget_label(balance_mode: object) -> str:
+    mode = _normalize_optuna_balance_mode(balance_mode)
+    if mode == "smote":
+        return "SMOTE"
+    if mode == "class_weight":
+        return "class_weight"
+    return "none"
+
+
+def _optuna_normalize_balance_mode_selection(
+    values: Optional[Sequence[object]],
+) -> List[str]:
+    selected: List[str] = []
+    for value in list(values or []):
+        mode = _normalize_optuna_balance_mode(value)
+        if mode and mode not in selected:
+            selected.append(mode)
+    return [mode for mode in OPTUNA_BALANCE_MODE_ORDER if mode in selected]
+
+
+def _optuna_positive_weight_from_y(y_train: pd.Series) -> float:
+    y_arr = pd.Series(y_train).astype(int)
+    positives = int((y_arr == 1).sum())
+    negatives = int((y_arr == 0).sum())
+    if positives <= 0:
+        return 1.0
+    return max(1.0, float(negatives / positives))
+
+
+def _apply_optuna_balance_model_params(
+    *,
+    model_choice: str,
+    model_params: Dict[str, object],
+    y_train: pd.Series,
+    balance_mode: str,
+) -> Dict[str, object]:
+    params = dict(model_params or {})
+    mode = _normalize_optuna_balance_mode(balance_mode)
+    if model_choice == "XGBoost":
+        if mode == "class_weight":
+            params["scale_pos_weight"] = _optuna_positive_weight_from_y(y_train)
+        else:
+            params.pop("scale_pos_weight", None)
+    elif model_choice in {"Random Forest", "SVM"}:
+        params["class_weight"] = "balanced" if mode == "class_weight" else None
+    elif model_choice == "Neural Network" and mode == "class_weight":
+        params["pos_weight"] = _optuna_positive_weight_from_y(y_train)
+    return params
 
 
 def _ordered_calibration_methods(methods: Optional[List[object]] = None) -> List[str]:
@@ -2168,6 +2244,96 @@ def _optuna_parameter_profile_defaults(
 ) -> Dict[str, object]:
     profile = str(profile_label or OPTUNA_PARAMETER_PROFILE_WIDE)
     defaults: Dict[str, object] = {}
+
+    if profile == OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211:
+        defaults.update(
+            {
+                "optuna_pruner_startup_trials": 30,
+                "optuna_tune_topk": True,
+                "optuna_k_min": 60,
+                "optuna_k_max": 100,
+                "optuna_k_step": 5,
+                "optuna_ranking_method_label": "Random Forest (importancia)",
+            }
+        )
+        if str(model_choice or "") == "XGBoost":
+            defaults.update(
+                {
+                    "optuna_xgb_n_min": 400,
+                    "optuna_xgb_n_max": 800,
+                    "optuna_xgb_n_step": 50,
+                    "optuna_xgb_depth_min": 2,
+                    "optuna_xgb_depth_max": 4,
+                    "optuna_xgb_depth_step": 1,
+                    "optuna_xgb_lr_min": 0.02,
+                    "optuna_xgb_lr_max": 0.07,
+                    "optuna_xgb_lr_step": 0.01,
+                    "optuna_xgb_sub_min": 0.85,
+                    "optuna_xgb_sub_max": 0.90,
+                    "optuna_xgb_sub_step": 0.05,
+                    "optuna_xgb_col_min": 0.65,
+                    "optuna_xgb_col_max": 0.75,
+                    "optuna_xgb_col_step": 0.05,
+                    "optuna_xgb_reg_alpha_min": 2.5,
+                    "optuna_xgb_reg_alpha_max": 3.8,
+                    "optuna_xgb_reg_alpha_step": 0.1,
+                    "optuna_xgb_reg_lambda_min": 6.0,
+                    "optuna_xgb_reg_lambda_max": 14.0,
+                    "optuna_xgb_reg_lambda_step": 0.5,
+                    "optuna_xgb_gamma_min": 3.5,
+                    "optuna_xgb_gamma_max": 6.0,
+                    "optuna_xgb_gamma_step": 0.1,
+                }
+            )
+        return defaults
+
+    if profile == OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211:
+        defaults.update(
+            {
+                "optuna_pruner_startup_trials": 30,
+                "optuna_tune_topk": True,
+                "optuna_k_min": 10,
+                "optuna_k_max": 30,
+                "optuna_k_step": 5,
+                "optuna_ranking_method_label": "Random Forest (importancia)",
+                "optuna_smote_k_min": 5,
+                "optuna_smote_k_max": 9,
+                "optuna_smote_k_step": 1,
+                "optuna_smote_sampling_min": 0.01,
+                "optuna_smote_sampling_max": 0.10,
+                "optuna_smote_sampling_step": 0.01,
+            }
+        )
+        if str(model_choice or "") == "XGBoost":
+            defaults.update(
+                {
+                    "optuna_xgb_n_min": 50,
+                    "optuna_xgb_n_max": 200,
+                    "optuna_xgb_n_step": 25,
+                    "optuna_xgb_depth_min": 3,
+                    "optuna_xgb_depth_max": 5,
+                    "optuna_xgb_depth_step": 1,
+                    "optuna_xgb_lr_min": 0.03,
+                    "optuna_xgb_lr_max": 0.10,
+                    "optuna_xgb_lr_step": 0.01,
+                    "optuna_xgb_sub_min": 0.50,
+                    "optuna_xgb_sub_max": 0.70,
+                    "optuna_xgb_sub_step": 0.05,
+                    "optuna_xgb_col_min": 0.90,
+                    "optuna_xgb_col_max": 1.00,
+                    "optuna_xgb_col_step": 0.05,
+                    "optuna_xgb_reg_alpha_min": 3.0,
+                    "optuna_xgb_reg_alpha_max": 4.2,
+                    "optuna_xgb_reg_alpha_step": 0.1,
+                    "optuna_xgb_reg_lambda_min": 3.0,
+                    "optuna_xgb_reg_lambda_max": 5.5,
+                    "optuna_xgb_reg_lambda_step": 0.1,
+                    "optuna_xgb_gamma_min": 0.0,
+                    "optuna_xgb_gamma_max": 2.0,
+                    "optuna_xgb_gamma_step": 0.1,
+                }
+            )
+        return defaults
 
     if profile == OPTUNA_PARAMETER_PROFILE_LOCAL:
         defaults.update(
@@ -2863,9 +3029,7 @@ def _optuna_model_tab_balance_mode(
 ) -> str:
     if bool(use_balanced):
         return "smote"
-    if str(balance_strategy).strip().lower() == "smote":
-        return "smote"
-    return "none"
+    return _normalize_optuna_balance_mode(balance_strategy)
 
 
 def _optuna_trials_path(
@@ -2912,6 +3076,807 @@ def _optuna_variant_frame_path(
     return RESULTS_DIR / f"optuna_{optuna_id}_{frame_suffix}.csv"
 
 
+def _optuna_variant_json_path(
+    optuna_id: str,
+    *,
+    model_choice: Optional[str] = None,
+    balance_mode: Optional[str] = None,
+    calibration_method: Optional[str] = None,
+    artifact_kind: str = "trials",
+) -> Path:
+    frame_path = _optuna_variant_frame_path(
+        optuna_id,
+        model_choice=model_choice,
+        balance_mode=balance_mode,
+        calibration_method=calibration_method,
+        frame_kind=artifact_kind,
+    )
+    return frame_path.with_suffix(".json")
+
+
+def _optuna_trial_state_name(trial: object) -> str:
+    state = getattr(trial, "state", "")
+    return str(getattr(state, "name", state or "") or "")
+
+
+def _optuna_jsonable_value(value: object) -> object:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (int,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+    if value is None:
+        return None
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if isinstance(value, np.ndarray):
+        return [_optuna_jsonable_value(item) for item in value.tolist()]
+    if isinstance(value, pd.Series):
+        return [_optuna_jsonable_value(item) for item in value.tolist()]
+    if isinstance(value, pd.DataFrame):
+        return [
+            {str(key): _optuna_jsonable_value(item) for key, item in row.items()}
+            for row in value.to_dict(orient="records")
+        ]
+    if isinstance(value, dict):
+        return {
+            str(key): _optuna_jsonable_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_optuna_jsonable_value(item) for item in list(value)]
+    if isinstance(value, Path):
+        return str(value)
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
+def _set_optuna_trial_user_attr(
+    trial: object,
+    key: str,
+    value: object,
+) -> None:
+    try:
+        trial.set_user_attr(str(key), _optuna_jsonable_value(value))
+    except Exception:
+        return
+
+
+def _record_optuna_trial_metrics(
+    trial: object,
+    *,
+    trial_payload: Dict[str, object],
+    scored_val: Dict[str, object],
+    scored_test: Dict[str, object],
+    objective_score: float,
+    objective_metric: str,
+    objective_direction: str,
+) -> None:
+    val_metrics = dict(scored_val.get("metrics") or {})
+    test_metrics = dict(scored_test.get("metrics") or {})
+    val_threshold = scored_val.get("threshold")
+    test_threshold = scored_test.get("threshold")
+    trial_cols = list(trial_payload.get("trial_cols") or [])
+    model_params = dict(trial_payload.get("model_params") or {})
+
+    base_attrs = {
+        "objective_metric": str(objective_metric),
+        "objective_direction": str(objective_direction),
+        "objective_score": float(objective_score),
+        "val_objective_score": scored_val.get("score"),
+        "test_objective_score": scored_test.get("score"),
+        "val_threshold": val_threshold,
+        "test_threshold": test_threshold,
+        "decision_threshold": val_threshold,
+        "feature_count": len(trial_cols),
+        "trial_feature_cols": trial_cols,
+        "trial_model_params": model_params,
+    }
+    for key, value in base_attrs.items():
+        _set_optuna_trial_user_attr(trial, key, value)
+
+    for prefix, metrics in (("val", val_metrics), ("test", test_metrics)):
+        for metric_name, metric_value in metrics.items():
+            _set_optuna_trial_user_attr(
+                trial,
+                f"{prefix}_{metric_name}",
+                metric_value,
+            )
+
+
+def _svm_gpu_optuna_worker(payload: Dict[str, object]) -> Dict[str, object]:
+    """Fit and score one strict-MLX SVM Optuna trial in a spawned process."""
+    worker_pid = os.getpid()
+    execution_backend = "local_process_pool_spawn"
+    trial_payload = dict(payload.get("trial_payload") or {})
+    model_params = dict(trial_payload.get("model_params") or {})
+    kernel = str(model_params.get("kernel", "")).strip().lower()
+    if kernel not in {"linear", "rbf"}:
+        return {
+            "status": "pruned",
+            "error": (
+                f"SVM kernel {kernel!r} no tiene backend MLX. "
+                "Use kernel='linear' o kernel='rbf'."
+            ),
+            "svm_backend": "unsupported_mlx_kernel",
+            "svm_fit_warning": "CPU fallback bloqueado por require_mlx=True.",
+            "worker_pid": int(worker_pid),
+            "execution_backend": execution_backend,
+        }
+
+    model_params["require_mlx"] = True
+    model_params["probability"] = False
+    trial_payload["model_params"] = model_params
+
+    try:
+        random_state = int(payload.get("random_state") or 42)
+        model = _build_model("SVM", model_params, random_state)
+        model.fit(trial_payload["X_res"], trial_payload["y_res"])
+        svm_backend = str(getattr(model, "backend_", "") or "")
+        svm_fit_warning = str(getattr(model, "fit_warning_", "") or "")
+        if svm_backend != "mlx":
+            raise RuntimeError(
+                f"SVM require_mlx=True esperaba backend='mlx' y obtuvo "
+                f"{svm_backend!r}. {svm_fit_warning}".strip()
+            )
+
+        y_val_np = np.asarray(payload.get("y_val"), dtype=int)
+        y_test_np = np.asarray(payload.get("y_test"), dtype=int)
+        raw_scores_val = _get_model_scores(model, trial_payload["X_val_trial"])
+        calibrator = _fit_score_calibrator(
+            y_val_np,
+            raw_scores_val,
+            method=str(payload.get("calibration_method") or "none"),
+        )
+        scores_val = calibrator.transform(raw_scores_val)
+        raw_scores_test = _get_model_scores(model, trial_payload["X_test_trial"])
+        scores_test = calibrator.transform(raw_scores_test)
+        threshold_objective = str(payload.get("threshold_objective") or "far")
+        val_df = payload.get("val_df")
+        test_df = payload.get("test_df")
+        far_target = float(payload.get("far_target") or 0.20)
+        alerts_per_day = float(payload.get("alerts_per_day") or 5.0)
+        fn_cost = float(payload.get("fn_cost") or 10.0)
+        fp_cost = float(payload.get("fp_cost") or 1.0)
+
+        if bool(payload.get("is_multiobjective")):
+            scored_val = _score_optuna_objective(
+                y_val_np,
+                scores_val,
+                objective_metric="mcc",
+                threshold_objective=threshold_objective,
+                eval_df=val_df if isinstance(val_df, pd.DataFrame) else None,
+                far_target=far_target,
+                alerts_per_day=alerts_per_day,
+                fn_cost=fn_cost,
+                fp_cost=fp_cost,
+            )
+            metrics = dict(scored_val.get("metrics") or {})
+            values = _calibration_multiobjective_values_from_metrics(metrics)
+            proxy_score = _calibration_multiobjective_pruning_proxy_from_metrics(
+                metrics,
+                far_target=far_target,
+            )
+            if any(pd.isna(value) for value in values) or pd.isna(proxy_score):
+                return {
+                    "status": "pruned",
+                    "error": "Vector multiobjetivo invalido en validacion.",
+                    "svm_backend": svm_backend,
+                    "svm_fit_warning": svm_fit_warning,
+                    "worker_pid": int(worker_pid),
+                    "execution_backend": execution_backend,
+                }
+            scored_test = _score_optuna_objective(
+                y_test_np,
+                scores_test,
+                objective_metric="mcc",
+                threshold=float(scored_val.get("threshold", 0.5)),
+                threshold_objective=threshold_objective,
+                eval_df=test_df if isinstance(test_df, pd.DataFrame) else None,
+                far_target=far_target,
+                alerts_per_day=alerts_per_day,
+                fn_cost=fn_cost,
+                fp_cost=fp_cost,
+            )
+            return {
+                "status": "completed",
+                "values": [float(value) for value in values],
+                "score": float(proxy_score),
+                "scored_val": scored_val,
+                "scored_test": scored_test,
+                "svm_backend": svm_backend,
+                "svm_fit_warning": svm_fit_warning,
+                "worker_pid": int(worker_pid),
+                "execution_backend": execution_backend,
+            }
+
+        objective_metric = str(payload.get("objective_metric") or "f1")
+        scored_val = _score_optuna_objective(
+            y_val_np,
+            scores_val,
+            objective_metric=objective_metric,
+            threshold_objective=threshold_objective,
+            eval_df=val_df if isinstance(val_df, pd.DataFrame) else None,
+            far_target=far_target,
+            alerts_per_day=alerts_per_day,
+            fn_cost=fn_cost,
+            fp_cost=fp_cost,
+        )
+        score = float(scored_val.get("score", float("nan")))
+        if pd.isna(score):
+            return {
+                "status": "pruned",
+                "error": f"{objective_metric} invalido en validacion.",
+                "svm_backend": svm_backend,
+                "svm_fit_warning": svm_fit_warning,
+                "worker_pid": int(worker_pid),
+                "execution_backend": execution_backend,
+            }
+        scored_test = _score_optuna_objective(
+            y_test_np,
+            scores_test,
+            objective_metric=objective_metric,
+            threshold=float(scored_val.get("threshold", 0.5)),
+            threshold_objective=threshold_objective,
+            eval_df=test_df if isinstance(test_df, pd.DataFrame) else None,
+            far_target=far_target,
+            alerts_per_day=alerts_per_day,
+            fn_cost=fn_cost,
+            fp_cost=fp_cost,
+        )
+        return {
+            "status": "completed",
+            "score": float(score),
+            "scored_val": scored_val,
+            "scored_test": scored_test,
+            "svm_backend": svm_backend,
+            "svm_fit_warning": svm_fit_warning,
+            "worker_pid": int(worker_pid),
+            "execution_backend": execution_backend,
+        }
+    except Exception as exc:
+        return {
+            "status": "pruned",
+            "error": str(exc),
+            "svm_backend": str(getattr(locals().get("model", None), "backend_", "")),
+            "svm_fit_warning": str(
+                getattr(locals().get("model", None), "fit_warning_", "")
+            ),
+            "worker_pid": int(worker_pid),
+            "execution_backend": execution_backend,
+        }
+
+
+def _set_svm_gpu_trial_worker_attrs(
+    trial: object,
+    result: Dict[str, object],
+) -> None:
+    for key in ("svm_backend", "svm_fit_warning", "worker_pid", "execution_backend"):
+        if key in result:
+            _set_optuna_trial_user_attr(trial, key, result.get(key))
+    if result.get("error"):
+        _set_optuna_trial_user_attr(trial, "trial_error", result.get("error"))
+
+
+def _tell_svm_gpu_optuna_result(
+    study: object,
+    trial: object,
+    *,
+    trial_payload: Dict[str, object],
+    result: Dict[str, object],
+    is_multiobjective: bool,
+    objective_metric: str,
+    objective_direction: str,
+    far_target: float,
+) -> None:
+    import optuna  # type: ignore
+
+    _set_svm_gpu_trial_worker_attrs(trial, result)
+    if str(result.get("status") or "") != "completed":
+        state = (
+            optuna.trial.TrialState.FAIL
+            if str(result.get("status") or "") == "failed"
+            else optuna.trial.TrialState.PRUNED
+        )
+        study.tell(trial, state=state)
+        return
+
+    scored_val = dict(result.get("scored_val") or {})
+    scored_test = dict(result.get("scored_test") or {})
+    score = float(result.get("score", float("nan")))
+    if is_multiobjective:
+        values = tuple(float(value) for value in list(result.get("values") or []))
+        metrics = dict(scored_val.get("metrics") or {})
+        _record_optuna_trial_metrics(
+            trial,
+            trial_payload=trial_payload,
+            scored_val=scored_val,
+            scored_test=scored_test,
+            objective_score=score,
+            objective_metric=str(CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY),
+            objective_direction="multiobjective",
+        )
+        for metric_name, value in zip(CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS, values):
+            trial.set_user_attr(metric_name, float(value))
+        trial.set_user_attr("val_far", float(metrics.get("far", float("nan"))))
+        trial.set_user_attr(
+            "val_false_negatives",
+            int(metrics.get("false_negatives", 0)),
+        )
+        trial.set_user_attr(
+            "val_true_positives",
+            int(metrics.get("true_positives", 0)),
+        )
+        trial.set_user_attr(
+            "decision_threshold",
+            float(scored_val.get("threshold", 0.5)),
+        )
+        trial.set_user_attr("pruning_proxy_score", float(score))
+        trial.set_user_attr(
+            "far_gate_pass",
+            bool(
+                _calibration_multiobjective_far_gate(
+                    metrics,
+                    far_target=float(far_target),
+                )
+            ),
+        )
+        study.tell(trial, values)
+        return
+
+    _record_optuna_trial_metrics(
+        trial,
+        trial_payload=trial_payload,
+        scored_val=scored_val,
+        scored_test=scored_test,
+        objective_score=score,
+        objective_metric=str(objective_metric),
+        objective_direction=str(objective_direction),
+    )
+    trial.report(score, step=0)
+    if trial.should_prune():
+        study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+    else:
+        study.tell(trial, float(score))
+
+
+def _default_svm_gpu_executor(max_workers: int):
+    context = mp.get_context("spawn")
+    return concurrent.futures.ProcessPoolExecutor(
+        max_workers=max(1, int(max_workers)),
+        mp_context=context,
+    )
+
+
+def _run_svm_gpu_parallel_optuna(
+    *,
+    study: object,
+    n_trials: int,
+    timeout: int,
+    max_workers: int,
+    build_trial_payload: Callable[[object], Dict[str, object]],
+    worker_payload_base: Dict[str, object],
+    is_multiobjective: bool,
+    objective_metric: str,
+    objective_direction: str,
+    far_target: float,
+    progress_callback: Optional[Callable[[object, object], None]] = None,
+    executor_factory: Optional[Callable[[int], Any]] = None,
+    worker_fn: Callable[[Dict[str, object]], Dict[str, object]] = _svm_gpu_optuna_worker,
+) -> None:
+    import optuna  # type: ignore
+
+    max_trials = max(1, int(n_trials))
+    max_workers = max(1, int(max_workers))
+    deadline = time.monotonic() + max(1, int(timeout))
+    launched_trials = 0
+    stop_launching = False
+    pending: Dict[object, Tuple[object, Dict[str, object]]] = {}
+    make_executor = executor_factory or _default_svm_gpu_executor
+
+    with make_executor(max_workers) as executor:
+        while launched_trials < max_trials or pending:
+            while (
+                not stop_launching
+                and launched_trials < max_trials
+                and len(pending) < max_workers
+            ):
+                if time.monotonic() >= deadline:
+                    stop_launching = True
+                    break
+                trial = study.ask()
+                try:
+                    trial_payload = build_trial_payload(trial)
+                    trial_payload = dict(trial_payload)
+                    model_params = dict(trial_payload.get("model_params") or {})
+                    model_params["require_mlx"] = True
+                    model_params["probability"] = False
+                    trial_payload["model_params"] = model_params
+                except Exception as exc:
+                    _set_optuna_trial_user_attr(trial, "trial_error", str(exc))
+                    state = (
+                        optuna.trial.TrialState.PRUNED
+                        if isinstance(exc, optuna.TrialPruned)
+                        else optuna.trial.TrialState.FAIL
+                    )
+                    study.tell(trial, state=state)
+                    launched_trials += 1
+                    if progress_callback is not None:
+                        progress_callback(study, trial)
+                    continue
+
+                worker_payload = dict(worker_payload_base)
+                worker_payload["trial_payload"] = trial_payload
+                worker_payload["trial_number"] = int(getattr(trial, "number", -1))
+                future = executor.submit(worker_fn, worker_payload)
+                pending[future] = (trial, trial_payload)
+                launched_trials += 1
+
+            if not pending:
+                if launched_trials >= max_trials or stop_launching:
+                    break
+                continue
+
+            wait_timeout = (
+                None
+                if stop_launching or launched_trials >= max_trials
+                else max(0.0, deadline - time.monotonic())
+            )
+            done, _not_done = concurrent.futures.wait(
+                list(pending.keys()),
+                timeout=wait_timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                stop_launching = True
+                done, _not_done = concurrent.futures.wait(
+                    list(pending.keys()),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+
+            for future in list(done):
+                trial, trial_payload = pending.pop(future)
+                try:
+                    result = dict(future.result())
+                except Exception as exc:
+                    result = {
+                        "status": "failed",
+                        "error": str(exc),
+                        "execution_backend": "local_process_pool_spawn",
+                    }
+                _tell_svm_gpu_optuna_result(
+                    study,
+                    trial,
+                    trial_payload=trial_payload,
+                    result=result,
+                    is_multiobjective=bool(is_multiobjective),
+                    objective_metric=str(objective_metric),
+                    objective_direction=str(objective_direction),
+                    far_target=float(far_target),
+                )
+                if progress_callback is not None:
+                    progress_callback(study, trial)
+
+
+def _optuna_trials_dataframe_from_trials(
+    trials: Sequence[object],
+    *,
+    objective_direction: str,
+    multiobjective_metrics: Optional[Sequence[object]] = None,
+    pruner_name: Optional[str] = None,
+) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    metric_names = [str(metric) for metric in list(multiobjective_metrics or [])]
+    for trial in list(trials or []):
+        attrs = dict(getattr(trial, "user_attrs", {}) or {})
+        row: Dict[str, object] = {
+            "number": int(getattr(trial, "number", -1)),
+            "state": _optuna_trial_state_name(trial),
+            "trial_state": _optuna_trial_state_name(trial),
+        }
+        if pruner_name:
+            row["pruner"] = str(pruner_name)
+        value = getattr(trial, "value", None)
+        if value is not None:
+            row["value"] = _optuna_jsonable_value(value)
+        values = list(getattr(trial, "values", None) or [])
+        if values:
+            row["values_json"] = _optuna_jsonable_value(values)
+            for idx, item in enumerate(values):
+                metric_name = metric_names[idx] if idx < len(metric_names) else str(idx)
+                row[f"value_{metric_name}"] = _optuna_jsonable_value(item)
+        for key, value in dict(getattr(trial, "params", {}) or {}).items():
+            row[f"params_{key}"] = _optuna_jsonable_value(value)
+        for key, value in attrs.items():
+            row[str(key)] = _optuna_jsonable_value(value)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    if "value" in frame.columns:
+        frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
+        frame = frame.sort_values(
+            ["state", "value"],
+            ascending=[True, str(objective_direction) == "minimize"],
+            kind="stable",
+        ).reset_index(drop=True)
+    elif "pruning_proxy_score" in frame.columns:
+        frame["pruning_proxy_score"] = pd.to_numeric(
+            frame["pruning_proxy_score"],
+            errors="coerce",
+        )
+        frame = frame.sort_values(
+            ["state", "pruning_proxy_score"],
+            ascending=[True, False],
+            kind="stable",
+        ).reset_index(drop=True)
+    return frame
+
+
+def _optuna_best_summary_from_trial_row(
+    *,
+    trial_row: Dict[str, object],
+    model_choice: str,
+    feature_set_label: str,
+    balance_mode: str,
+    balance_mode_label: str,
+    calibration_method: str,
+    calibration_method_label: str,
+    objective_mode: str,
+    objective_metric: str,
+    objective_label: str,
+    objective_direction: str,
+    best_score: float,
+    best_trial_number: int,
+    best_model_params: Dict[str, object],
+    best_smote_params: Dict[str, object],
+    best_top_k: int,
+    best_feature_cols: Sequence[object],
+    ranked_cols: Sequence[object],
+) -> Dict[str, object]:
+    summary: Dict[str, object] = {
+        "is_best_global": False,
+        "model_choice": str(model_choice),
+        "feature_set_label": str(feature_set_label),
+        "balance_mode": str(balance_mode),
+        "balance_mode_label": str(balance_mode_label),
+        "calibration_method": str(calibration_method),
+        "calibration_method_label": str(calibration_method_label),
+        "objective_mode": str(objective_mode),
+        "objective_metric": str(objective_metric),
+        "objective_label": str(objective_label),
+        "objective_direction": str(objective_direction),
+        "best_score": _optuna_jsonable_value(best_score),
+        "best_trial_number": int(best_trial_number),
+        "best_model_params": dict(best_model_params),
+        "best_smote_params": dict(best_smote_params),
+        "best_top_k": int(best_top_k),
+        "best_feature_cols": list(best_feature_cols),
+        "ranked_cols": list(ranked_cols),
+        "selected_feature_count": len(list(best_feature_cols)),
+    }
+    for key, value in dict(trial_row or {}).items():
+        key_text = str(key)
+        if (
+            key_text.startswith("val_")
+            or key_text.startswith("test_")
+            or key_text in {"value", "values_json", "pruning_proxy_score"}
+        ):
+            summary[key_text] = _optuna_jsonable_value(value)
+    return summary
+
+
+def _optuna_best_summary_score(row: Dict[str, object]) -> float:
+    raw_score = row.get("best_score")
+    if raw_score is None:
+        raw_score = row.get("value")
+    try:
+        score = float(raw_score)
+    except (TypeError, ValueError):
+        score = float("nan")
+    if not np.isfinite(score):
+        return float("-inf")
+    direction = str(row.get("objective_direction") or "").strip().lower()
+    return -score if direction == "minimize" else score
+
+
+def _mark_optuna_best_summary_global(rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    marked = [dict(row) for row in list(rows or [])]
+    if not marked:
+        return []
+    best_idx = max(range(len(marked)), key=lambda idx: _optuna_best_summary_score(marked[idx]))
+    for idx, row in enumerate(marked):
+        row["is_best_global"] = idx == best_idx
+    return marked
+
+
+def _optuna_best_summary_rows_from_store(
+    *,
+    configs: Sequence[Dict[str, object]],
+    store: Dict[str, object],
+    model_choice: str,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for cfg in list(configs or []):
+        entry = store.get(str(cfg.get("key") or ""))
+        if not isinstance(entry, dict):
+            continue
+        results_cfg = entry.get("results")
+        model_container = _get_optuna_model_result_container(
+            results_cfg if isinstance(results_cfg, dict) else None,
+            model_choice,
+        )
+        by_balance_mode = (
+            model_container.get("by_balance_mode")
+            if isinstance(model_container, dict)
+            else None
+        )
+        if not isinstance(by_balance_mode, dict):
+            continue
+        for balance_mode, mode_container in by_balance_mode.items():
+            if not isinstance(mode_container, dict):
+                continue
+            by_calibration = mode_container.get("by_calibration_method")
+            if not isinstance(by_calibration, dict):
+                continue
+            for calibration_method, variant in by_calibration.items():
+                if not isinstance(variant, dict):
+                    continue
+                summary_payload = _load_optuna_variant_json(
+                    variant,
+                    payload_key="best_summary",
+                    json_key="best_summary_json",
+                )
+                if isinstance(summary_payload, dict) and summary_payload:
+                    row = dict(summary_payload)
+                else:
+                    settings = (
+                        variant.get("optuna_settings")
+                        if isinstance(variant.get("optuna_settings"), dict)
+                        else {}
+                    )
+                    objective_label, objective_metric = _optuna_variant_objective_fields(
+                        variant
+                    )
+                    row = {
+                        "is_best_global": False,
+                        "model_choice": str(model_choice),
+                        "feature_set_label": str(
+                            settings.get("feature_set_label")
+                            or cfg.get("label")
+                            or ""
+                        ),
+                        "balance_mode": str(balance_mode),
+                        "balance_mode_label": _optuna_balance_mode_label(balance_mode),
+                        "calibration_method": _normalize_calibration_method(
+                            calibration_method
+                        ),
+                        "calibration_method_label": _calibration_method_label(
+                            calibration_method
+                        ),
+                        "objective_mode": str(
+                            settings.get(
+                                "objective_mode",
+                                variant.get(
+                                    "optuna_objective_mode",
+                                    CALIBRATION_SWEEP_OBJECTIVE_MODE_SCALAR,
+                                ),
+                            )
+                        ),
+                        "objective_metric": objective_metric,
+                        "objective_label": objective_label,
+                        "objective_direction": str(
+                            variant.get("objective_direction")
+                            or settings.get("objective_direction")
+                            or _optuna_objective_direction(objective_metric)
+                        ),
+                        "best_score": variant.get("best_score"),
+                        "best_trial_number": variant.get("best_trial_number"),
+                        "best_model_params": variant.get("best_model_params", {}),
+                        "best_smote_params": variant.get("best_smote_params", {}),
+                    }
+                row.setdefault("model_choice", str(model_choice))
+                row.setdefault("feature_set_label", str(cfg.get("label") or ""))
+                row.setdefault("balance_mode", str(balance_mode))
+                row.setdefault(
+                    "balance_mode_label",
+                    _optuna_balance_mode_label(balance_mode),
+                )
+                row.setdefault(
+                    "calibration_method",
+                    _normalize_calibration_method(calibration_method),
+                )
+                row.setdefault(
+                    "calibration_method_label",
+                    _calibration_method_label(calibration_method),
+                )
+                rows.append(row)
+    return _mark_optuna_best_summary_global(rows)
+
+
+def _optuna_best_summary_display_frame(
+    rows: Sequence[Dict[str, object]],
+) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(list(rows))
+    preferred_cols = [
+        "is_best_global",
+        "model_choice",
+        "feature_set_label",
+        "balance_mode_label",
+        "calibration_method_label",
+        "objective_label",
+        "objective_direction",
+        "best_score",
+        "best_trial_number",
+        "val_objective_score",
+        "test_objective_score",
+        "val_accuracy",
+        "test_accuracy",
+        "val_recall",
+        "test_recall",
+        "val_precision",
+        "test_precision",
+        "val_f1",
+        "test_f1",
+        "val_balanced_f1",
+        "test_balanced_f1",
+        "val_mcc",
+        "test_mcc",
+        "val_roc_auc",
+        "test_roc_auc",
+        "val_pr_auc",
+        "test_pr_auc",
+        "val_brier_score",
+        "test_brier_score",
+        "val_far",
+        "test_far",
+        "val_sensitivity",
+        "test_sensitivity",
+        "val_specificity",
+        "test_specificity",
+        "val_recall_at_alerts_per_day",
+        "test_recall_at_alerts_per_day",
+        "val_operational_cost",
+        "test_operational_cost",
+        "val_cost_per_day",
+        "test_cost_per_day",
+        "val_false_negatives",
+        "test_false_negatives",
+        "val_false_positives",
+        "test_false_positives",
+        "val_true_negatives",
+        "test_true_negatives",
+        "val_true_positives",
+        "test_true_positives",
+        "val_confusion_matrix",
+        "test_confusion_matrix",
+        "val_threshold",
+        "best_top_k",
+        "selected_feature_count",
+        "best_model_params",
+        "best_smote_params",
+        "best_feature_cols",
+    ]
+    visible_cols = [col for col in preferred_cols if col in frame.columns]
+    remaining_cols = [col for col in frame.columns if col not in visible_cols]
+    display = frame[visible_cols + remaining_cols].copy()
+    for column in display.columns:
+        if display[column].map(lambda value: isinstance(value, (dict, list, tuple, set, Path))).any():
+            display[column] = display[column].apply(_stringify_streamlit_cell)
+    return display
+
+
 def _load_optuna_variant_frame(
     result: Optional[Dict[str, object]],
     *,
@@ -2938,6 +3903,34 @@ def _load_optuna_variant_frame(
         return None
     result[frame_key] = frame
     return frame
+
+
+def _load_optuna_variant_json(
+    result: Optional[Dict[str, object]],
+    *,
+    payload_key: str,
+    json_key: str,
+) -> Optional[object]:
+    if not isinstance(result, dict):
+        return None
+    payload = result.get(payload_key)
+    if payload is not None:
+        return payload
+    json_path = result.get(json_key)
+    if not json_path:
+        return None
+    try:
+        candidate = Path(str(json_path))
+    except Exception:
+        return None
+    if not candidate.exists():
+        return None
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    result[payload_key] = payload
+    return payload
 
 
 def _load_optuna_result_from_disk(
@@ -3065,12 +4058,15 @@ def _build_optuna_store_entry(
             "search_space": payload_dict.get("search_space", {}),
             "saved_at": payload_dict.get("saved_at"),
             "trials_csv": trials_csv,
+            "trials_json": payload_dict.get("trials_json"),
             "calibration_method": payload_dict.get("calibration_method"),
             "balance_mode": payload_dict.get("balance_mode"),
             "objective_metric": payload_dict.get("objective_metric"),
             "objective_label": payload_dict.get("objective_label"),
             "threshold_objective": payload_dict.get("threshold_objective"),
             "pareto_front_csv": payload_dict.get("pareto_front_csv"),
+            "best_summary": payload_dict.get("best_summary"),
+            "best_summary_json": payload_dict.get("best_summary_json"),
         }
         if trials_df is not None:
             legacy_result["trials_df"] = trials_df
@@ -3228,7 +4224,8 @@ def _optuna_model_rank(model_choice: object) -> int:
 
 def _optuna_previous_result_preference_key(option: Dict[str, object]) -> Tuple[int, int, str]:
     balance_mode = _normalize_optuna_balance_mode(option.get("balance_mode"))
-    balance_rank = 0 if balance_mode == "smote" else 1
+    balance_rank_map = {"smote": 0, "class_weight": 1, "none": 2}
+    balance_rank = balance_rank_map.get(balance_mode, len(balance_rank_map))
     return (
         _optuna_model_rank(option.get("model_choice")),
         balance_rank,
@@ -3548,7 +4545,7 @@ def _optuna_history_option_balance_modes(
                 continue
             for mode in by_balance.keys():
                 add_mode(mode)
-    canonical_order = ["none", "smote"]
+    canonical_order = list(OPTUNA_BALANCE_MODE_ORDER)
     ordered = [mode for mode in canonical_order if mode in raw_modes]
     ordered.extend(
         str(mode)
@@ -3986,8 +4983,11 @@ def _persist_optuna_results(
     trials_df: Optional[pd.DataFrame],
     optuna_settings: Optional[Dict[str, object]],
     search_space: Dict[str, object],
+    trials_json: Optional[object] = None,
     extra_result_fields: Optional[Dict[str, object]] = None,
     pareto_front_df: Optional[pd.DataFrame] = None,
+    best_summary: Optional[Dict[str, object]] = None,
+    best_summary_json: Optional[object] = None,
 ) -> None:
     store = st.session_state.setdefault("optuna_results_store", {})
     entry = store.get(optuna_key, {})
@@ -4013,6 +5013,9 @@ def _persist_optuna_results(
                         "saved_at": entry.get("saved_at"),
                         "trials_df": entry.get("trials_df"),
                         "trials_csv": entry.get("trials_csv"),
+                        "trials_json": entry.get("trials_json"),
+                        "best_summary": entry.get("best_summary"),
+                        "best_summary_json": entry.get("best_summary_json"),
                     }
                 }
             )
@@ -4036,6 +5039,7 @@ def _persist_optuna_results(
     by_calibration_method = mode_container.setdefault("by_calibration_method", {})
 
     trials_csv = None
+    trials_json_path = str(trials_json) if trials_json else None
     if trials_df is not None and not trials_df.empty:
         try:
             RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -4049,9 +5053,45 @@ def _persist_optuna_results(
             trials_csv = str(trials_path)
         except Exception:
             trials_csv = None
+        if not trials_json_path:
+            try:
+                trials_json_file = _optuna_variant_json_path(
+                    optuna_id,
+                    model_choice=model_choice,
+                    balance_mode=normalized_balance_mode,
+                    calibration_method=normalized_calibration_method,
+                    artifact_kind="trials",
+                )
+                trials_records = [
+                    {
+                        str(key): _optuna_jsonable_value(value)
+                        for key, value in row.items()
+                    }
+                    for row in trials_df.to_dict(orient="records")
+                ]
+                trials_payload = {
+                    "optuna_id": optuna_id,
+                    "model_choice": str(model_choice),
+                    "balance_mode": normalized_balance_mode,
+                    "calibration_method": normalized_calibration_method,
+                    "row_count": int(len(trials_records)),
+                    "records": trials_records,
+                }
+                with trials_json_file.open("w", encoding="utf-8") as handle:
+                    json.dump(
+                        trials_payload,
+                        handle,
+                        ensure_ascii=True,
+                        indent=2,
+                        default=_json_default,
+                    )
+                trials_json_path = str(trials_json_file)
+            except Exception:
+                trials_json_path = None
     else:
         existing = by_calibration_method.get(normalized_calibration_method, {})
         trials_csv = existing.get("trials_csv")
+        trials_json_path = trials_json_path or existing.get("trials_json")
 
     pareto_front_csv = None
     if pareto_front_df is not None and not pareto_front_df.empty:
@@ -4071,6 +5111,49 @@ def _persist_optuna_results(
     else:
         existing = by_calibration_method.get(normalized_calibration_method, {})
         pareto_front_csv = existing.get("pareto_front_csv")
+
+    best_summary_payload = (
+        {
+            str(key): _optuna_jsonable_value(value)
+            for key, value in dict(best_summary or {}).items()
+        }
+        if isinstance(best_summary, dict)
+        else None
+    )
+    best_summary_json_path = str(best_summary_json) if best_summary_json else None
+    if best_summary_payload:
+        if not best_summary_json_path:
+            try:
+                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                best_summary_file = _optuna_variant_json_path(
+                    optuna_id,
+                    model_choice=model_choice,
+                    balance_mode=normalized_balance_mode,
+                    calibration_method=normalized_calibration_method,
+                    artifact_kind="best_summary",
+                )
+                with best_summary_file.open("w", encoding="utf-8") as handle:
+                    json.dump(
+                        best_summary_payload,
+                        handle,
+                        ensure_ascii=True,
+                        indent=2,
+                        default=_json_default,
+                    )
+                best_summary_json_path = str(best_summary_file)
+            except Exception:
+                best_summary_json_path = None
+    else:
+        existing = by_calibration_method.get(normalized_calibration_method, {})
+        existing_summary = existing.get("best_summary")
+        best_summary_payload = (
+            dict(existing_summary)
+            if isinstance(existing_summary, dict)
+            else None
+        )
+        best_summary_json_path = (
+            best_summary_json_path or existing.get("best_summary_json")
+        )
 
     variant_settings = dict(optuna_settings)
     variant_settings["balance_mode"] = normalized_balance_mode
@@ -4106,8 +5189,11 @@ def _persist_optuna_results(
             "saved_at": datetime.now().isoformat(),
             "trials_df": trials_df,
             "trials_csv": trials_csv,
+            "trials_json": trials_json_path,
             "pareto_front_df": pareto_front_df,
             "pareto_front_csv": pareto_front_csv,
+            "best_summary": best_summary_payload or {},
+            "best_summary_json": best_summary_json_path,
         },
     )
     if isinstance(extra_result_fields, dict):
@@ -4490,14 +5576,56 @@ def _register_feature_engineering_history(
     params: Dict[str, object],
     metrics: Dict[str, object],
     cluster_label_path: Optional[object] = None,
+    dynamic_gmm_path: Optional[object] = None,
+    extra_metadata: Optional[Dict[str, object]] = None,
+    features_profile: Optional[Dict[str, object]] = None,
 ) -> Optional[int]:
     context = _history_context_details(features_df, selected_features=None)
+    if features_profile:
+        rows = int(features_profile.get("rows") or context["features_rows"])
+        cols = int(features_profile.get("cols") or context["features_cols"])
+        date_min = features_profile.get("date_min")
+        date_max = features_profile.get("date_max")
+        context["features_rows"] = rows
+        context["features_cols"] = cols
+        context["features_date_min"] = (
+            None if date_min is None else pd.Timestamp(date_min).isoformat()
+        )
+        context["features_date_max"] = (
+            None if date_max is None else pd.Timestamp(date_max).isoformat()
+        )
+        context["dataset_fingerprint"] = str(
+            features_profile.get("dataset_fingerprint")
+            or context["dataset_fingerprint"]
+        )
+        context["feature_context_key"] = history_store.build_context_key(
+            event_files=context["event_files"],
+            features_path=context["features_path"],
+            features_source=context["features_source"],
+            features_date_min=context["features_date_min"],
+            features_date_max=context["features_date_max"],
+            tramo_label=context["tramo_label"],
+            features_rows=rows,
+            features_cols=cols,
+            dataset_fingerprint=context["dataset_fingerprint"],
+            selected_features=None,
+        )
+        context["context_key"] = context["feature_context_key"]
     artifacts = _history_input_artifacts(include_features=False)
     if cluster_label_path:
         artifacts.append(
             {
                 "path": str(cluster_label_path),
                 "role": "cluster_labels_input",
+                "generated": False,
+                "delete_on_record_delete": False,
+            }
+        )
+    if dynamic_gmm_path:
+        artifacts.append(
+            {
+                "path": str(dynamic_gmm_path),
+                "role": "dynamic_gmm_input",
                 "generated": False,
                 "delete_on_record_delete": False,
             }
@@ -4513,6 +5641,13 @@ def _register_feature_engineering_history(
     record_uid = hashlib.md5(
         f"feature-engineering|{features_db_path}|{datetime.now().isoformat()}".encode("utf-8")
     ).hexdigest()
+    metadata = {
+        "features_rows": context["features_rows"],
+        "features_cols": context["features_cols"],
+        "dataset_fingerprint": context["dataset_fingerprint"],
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
     return _history_insert_record(
         stage="Feature engineering",
         record_uid=record_uid,
@@ -4527,11 +5662,7 @@ def _register_feature_engineering_history(
         feature_signature_value=context["feature_signature"],
         params=params,
         metrics=metrics,
-        metadata={
-            "features_rows": context["features_rows"],
-            "features_cols": context["features_cols"],
-            "dataset_fingerprint": context["dataset_fingerprint"],
-        },
+        metadata=metadata,
         artifacts=artifacts,
         legacy_ref=str(features_db_path),
     )
@@ -7741,6 +8872,7 @@ class _ModelOptunaBatchProgressBoard:
         self.total_steps = max(1, int(total_steps))
         self.batch_ref = dict(batch_ref or {})
         self.run_dir = str(run_dir or "")
+        self._metric_selector_render_count = 0
         with st.container():
             st.caption("Experimento detectado: Crash prediction | Modelos <- batch Optuna")
             st.caption(
@@ -7825,13 +8957,37 @@ class _ModelOptunaBatchProgressBoard:
                 else 0
             )
             run_key = str(manifest.get("run_id") or state.get("run_id") or "current")
+            current_step_id = str(
+                live_status.get("step_id")
+                or progress.get("current_step_id")
+                or ""
+            )
+            if current_step_id not in {"run_completed", "run_failed"}:
+                _render_model_optuna_batch_best_so_far_chart(
+                    partial_rows,
+                    objective_metric=objective_metric,
+                    metric_col=default_metric_col,
+                    metric_label=metric_labels.get(default_metric_col),
+                )
+                return
+
+            self._metric_selector_render_count += 1
+            selection_state_key = f"model_optuna_batch_metric_choice_{run_key}"
+            stored_metric_col = str(st.session_state.get(selection_state_key) or "")
+            if stored_metric_col in metric_cols:
+                default_index = metric_cols.index(stored_metric_col)
+            selector_key = (
+                f"model_optuna_batch_metric_selector_{run_key}_"
+                f"{self._metric_selector_render_count}"
+            )
             selected_metric_col = st.selectbox(
                 "Métrica",
                 metric_cols,
                 index=default_index,
                 format_func=lambda value: metric_labels.get(value, value),
-                key=f"model_optuna_batch_metric_selector_{run_key}",
+                key=selector_key,
             )
+            st.session_state[selection_state_key] = selected_metric_col
             _render_model_optuna_batch_best_so_far_chart(
                 partial_rows,
                 objective_metric=objective_metric,
@@ -10717,6 +11873,43 @@ def _build_xai_feature_bar_chart(
     )
 
 
+def _build_rf_feature_importance_chart(importance_df: pd.DataFrame):
+    alt = _import_altair()
+    if alt is None or importance_df.empty:
+        return None
+    plot_df = importance_df.copy().reset_index(drop=True)
+    plot_df["rank"] = np.arange(1, len(plot_df) + 1)
+    plot_df["feature_group"] = np.where(
+        plot_df["variable"].map(_history_is_cluster_feature_name),
+        "Cluster",
+        "Base",
+    )
+    order = list(plot_df["variable"].astype(str))
+    return (
+        alt.Chart(plot_df)
+        .mark_bar(size=16)
+        .encode(
+            x=alt.X("importance:Q", axis=alt.Axis(title="Importancia RF")),
+            y=alt.Y("variable:N", sort=order, axis=alt.Axis(title=None)),
+            color=alt.Color(
+                "feature_group:N",
+                scale=alt.Scale(
+                    domain=XAI_GROUP_COLOR_DOMAIN,
+                    range=XAI_GROUP_COLOR_RANGE,
+                ),
+                legend=alt.Legend(title="Grupo"),
+            ),
+            tooltip=[
+                alt.Tooltip("variable:N", title="Variable"),
+                alt.Tooltip("importance:Q", title="Importancia", format=".6f"),
+                alt.Tooltip("rank:Q", title="Ranking"),
+                alt.Tooltip("feature_group:N", title="Grupo"),
+            ],
+        )
+        .properties(height=max(220, 24 * len(plot_df)))
+    )
+
+
 def _build_xai_beeswarm_chart(
     beeswarm_df: pd.DataFrame,
     *,
@@ -12133,6 +13326,70 @@ def _sync_loaded_optuna_feature_sets_to_form(
         current = list(desired)
     st.session_state["optuna_loaded_feature_sets_sync_pending"] = False
     return _sanitize_optuna_feature_set_selection(available, current)
+
+
+def _optuna_parameter_profile_forced_feature_sets(
+    profile_label: object,
+) -> List[str]:
+    profile = str(profile_label or "").strip()
+    if profile in {
+        OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211,
+        OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211,
+    }:
+        return ["Base + Cluster"]
+    return []
+
+
+def _optuna_parameter_profile_feature_set_options(
+    profile_label: object,
+    available_labels: Sequence[object],
+) -> List[str]:
+    available = _normalize_model_feature_set_labels(available_labels)
+    forced = _optuna_parameter_profile_forced_feature_sets(profile_label)
+    if forced:
+        return [label for label in forced if label in set(available)]
+    return available
+
+
+def _optuna_parameter_profile_forced_balance_modes(
+    profile_label: object,
+) -> List[str]:
+    profile = str(profile_label or "").strip()
+    if profile == OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211:
+        return ["none"]
+    if profile == OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211:
+        return ["smote"]
+    return []
+
+
+def _optuna_parameter_profile_balance_options(profile_label: object) -> List[str]:
+    forced = _optuna_parameter_profile_forced_balance_modes(profile_label)
+    if forced:
+        return [_optuna_balance_mode_widget_label(mode) for mode in forced]
+    return list(OPTUNA_BALANCE_MODE_UI_OPTIONS)
+
+
+def _apply_optuna_parameter_profile_scope(
+    session_state: Dict[str, object],
+    *,
+    profile_label: object,
+    available_feature_sets: Sequence[object],
+) -> None:
+    forced_feature_sets = _optuna_parameter_profile_feature_set_options(
+        profile_label,
+        available_feature_sets,
+    )
+    if _optuna_parameter_profile_forced_feature_sets(profile_label):
+        session_state["optuna_feature_sets_selected"] = list(forced_feature_sets)
+
+    forced_balance_modes = _optuna_parameter_profile_forced_balance_modes(
+        profile_label
+    )
+    if forced_balance_modes:
+        session_state["optuna_balance_modes_selected"] = [
+            _optuna_balance_mode_widget_label(mode)
+            for mode in forced_balance_modes
+        ]
 
 
 def _store_optuna_last_optimized_context(
@@ -14511,6 +15768,1487 @@ def _load_cluster_labels(cluster_path: Path) -> pd.DataFrame:
     return loaded[usecols]
 
 
+def _dynamic_gmm_probability_columns(
+    columns: Sequence[object],
+    probability_prefix: str = "cluster_prob_",
+) -> List[str]:
+    def _prob_sort_key(column: str) -> tuple[int, object]:
+        suffix = column[len(probability_prefix) :]
+        try:
+            return (0, int(suffix))
+        except ValueError:
+            return (1, suffix)
+
+    return sorted(
+        [
+            str(column)
+            for column in columns
+            if str(column).startswith(probability_prefix)
+        ],
+        key=_prob_sort_key,
+    )
+
+
+def _dynamic_gmm_membership_ui_message(
+    probability_cols: Sequence[object],
+) -> str:
+    clean_cols = [str(col) for col in probability_cols if str(col).strip()]
+    if clean_cols:
+        preview = ", ".join(clean_cols[:4])
+        if len(clean_cols) > 4:
+            preview += ", ..."
+        return (
+            f"Se detectaron {len(clean_cols):,} columnas cluster_prob_*"
+            f" ({preview}). Feature engineering usara membresia soft: cada pasada "
+            "aporta a todos los clusters con peso igual a su probabilidad, alineada "
+            "causalmente con la ultima ventana window_end <= FECHA. Las variables "
+            "cluster_share_*, cluster_flow_*, cluster_speed_*, cluster_density_*, "
+            "deltas y cluster_entropy se calculan con esos pesos; cluster_label "
+            "queda como fallback si no hay probabilidades."
+        )
+    return (
+        "No se detectaron columnas cluster_prob_*; Feature engineering usara "
+        "etiquetas hard cluster_label para las variables de cluster."
+    )
+
+
+def _dynamic_gmm_user_path(raw_path: object) -> Optional[Path]:
+    text = str(raw_path or "").strip().strip("\"'")
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    return path.resolve()
+
+
+def _applescript_dialog_string(value: object) -> str:
+    text = str(value)
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _open_macos_duckdb_file_selector(
+    initial_dir: Path,
+) -> Tuple[Optional[Path], Optional[str]]:
+    import subprocess
+
+    initial = initial_dir if initial_dir.exists() else RESULTS_DIR
+    if not initial.exists():
+        initial = ROOT_DIR
+    script = [
+        f"set defaultFolder to POSIX file {_applescript_dialog_string(str(initial))}",
+        (
+            "set chosenFile to choose file with prompt "
+            + _applescript_dialog_string("Seleccionar DuckDB de GMM dinamico")
+            + " default location defaultFolder"
+        ),
+        "POSIX path of chosenFile",
+    ]
+    try:
+        result = subprocess.run(
+            ["osascript", *sum([["-e", line] for line in script], [])],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, "No se encontro osascript para abrir el selector de archivos."
+    except Exception as exc:
+        return None, f"No se pudo abrir el selector de archivos: {exc}"
+    if result.returncode != 0:
+        stderr = str(result.stderr or "").strip()
+        if "User canceled" in stderr or "cancel" in stderr.lower():
+            return None, None
+        return None, stderr or "No se pudo abrir el selector de archivos del sistema."
+    selected = str(result.stdout or "").strip()
+    if not selected:
+        return None, None
+    return Path(selected).expanduser().resolve(), None
+
+
+def _open_duckdb_file_selector(
+    initial_dir: Path,
+) -> Tuple[Optional[Path], Optional[str]]:
+    if sys.platform == "darwin":
+        return _open_macos_duckdb_file_selector(initial_dir)
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        return None, f"No se pudo cargar el selector de archivos: {exc}"
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        initial = initial_dir if initial_dir.exists() else RESULTS_DIR
+        selected = filedialog.askopenfilename(
+            title="Seleccionar DuckDB de GMM dinamico",
+            initialdir=str(initial),
+            filetypes=[("DuckDB", "*.duckdb"), ("Todos los archivos", "*.*")],
+            parent=root,
+        )
+    except Exception as exc:
+        return None, f"No se pudo abrir el selector de archivos: {exc}"
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+    if not selected:
+        return None, None
+    return Path(selected).expanduser().resolve(), None
+
+
+def _list_dynamic_gmm_db_paths(raw_path: object) -> Tuple[List[Path], Optional[str]]:
+    path = _dynamic_gmm_user_path(raw_path)
+    if path is None:
+        return [], "Ingrese una ruta a un archivo .duckdb o carpeta."
+    if not path.exists():
+        return [], f"La ruta no existe: {path}"
+    if path.is_file():
+        if path.suffix.lower() != ".duckdb":
+            return [], "El archivo de GMM dinamico debe ser .duckdb."
+        return [path], None
+    if not path.is_dir():
+        return [], f"La ruta no es un archivo ni carpeta: {path}"
+    candidates = sorted(path.glob("dynamic_gmm_*.duckdb"))
+    if not candidates:
+        return [], f"No se encontraron archivos dynamic_gmm_*.duckdb en {path}"
+    return candidates, None
+
+
+def _load_dynamic_gmm_metadata(path: Path) -> Dict[str, object]:
+    if duckdb is None:
+        raise RuntimeError("duckdb no esta instalado.")
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+        if DYNAMIC_GMM_METADATA_TABLE_NAME not in tables:
+            return {}
+        rows = con.execute(
+            f"SELECT key, value_json FROM {_duckdb_quote_identifier(DYNAMIC_GMM_METADATA_TABLE_NAME)}"
+        ).fetchall()
+    finally:
+        con.close()
+    metadata: Dict[str, object] = {}
+    for key, value_json in rows:
+        try:
+            metadata[str(key)] = json.loads(value_json)
+        except Exception:
+            metadata[str(key)] = value_json
+    return metadata
+
+
+def _inspect_dynamic_gmm_duckdb(path: Path) -> Dict[str, object]:
+    if duckdb is None:
+        raise RuntimeError("duckdb no esta instalado.")
+    if path.suffix.lower() != ".duckdb":
+        raise ValueError("El archivo de GMM dinamico debe ser .duckdb.")
+    if not path.exists():
+        raise FileNotFoundError(f"No existe el archivo de GMM dinamico: {path}")
+
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+        if DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME not in tables:
+            raise ValueError(
+                "El DuckDB seleccionado no contiene la tabla dynamic_assignments."
+            )
+        table_ref = _duckdb_quote_identifier(DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME)
+        cols_info = con.execute(f"DESCRIBE {table_ref}").fetchall()
+        columns = [row[0] for row in cols_info]
+        missing = [
+            col
+            for col in ["plate", "window_end", "cluster_label"]
+            if col not in columns
+        ]
+        if missing:
+            raise ValueError(
+                "dynamic_assignments no contiene columnas requeridas: "
+                + ", ".join(missing)
+            )
+        probability_cols = _dynamic_gmm_probability_columns(columns)
+        row = con.execute(
+            f"SELECT COUNT(*), MIN(window_end), MAX(window_end) FROM {table_ref}"
+        ).fetchone()
+    finally:
+        con.close()
+
+    metadata = _load_dynamic_gmm_metadata(path)
+    return {
+        "path": path,
+        "rows": int(row[0] or 0) if row else 0,
+        "window_end_min": row[1] if row else None,
+        "window_end_max": row[2] if row else None,
+        "probability_cols": probability_cols,
+        "metadata": metadata,
+    }
+
+
+def _load_dynamic_gmm_assignments(path: Path) -> pd.DataFrame:
+    info = _inspect_dynamic_gmm_duckdb(path)
+    probability_cols = list(info.get("probability_cols") or [])
+    selected_cols = ["plate", "window_end", "cluster_label", *probability_cols]
+    if duckdb is None:
+        raise RuntimeError("duckdb no esta instalado.")
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        table_ref = _duckdb_quote_identifier(DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME)
+        selected_ref = ", ".join(
+            _duckdb_quote_identifier(col) for col in selected_cols
+        )
+        assignments = con.execute(
+            f"SELECT {selected_ref} FROM {table_ref}"
+        ).df()
+    finally:
+        con.close()
+    if assignments.empty:
+        return assignments
+    assignments["window_end"] = pd.to_datetime(
+        assignments["window_end"], errors="coerce"
+    )
+    assignments = assignments.dropna(subset=["window_end"])
+    return assignments.sort_values(
+        ["plate", "window_end"], kind="mergesort"
+    ).reset_index(drop=True)
+
+
+def _dynamic_gmm_cluster_label_suffix(value: object) -> str:
+    text = str(value).strip().lower()
+    if text.startswith("-"):
+        text = "neg_" + text[1:]
+    return _slugify(text)
+
+
+def _dynamic_gmm_cluster_suffixes(
+    assignments_df: pd.DataFrame,
+    probability_cols: Sequence[str],
+    *,
+    cluster_col: str = "cluster_label",
+    probability_prefix: str = "cluster_prob_",
+) -> List[str]:
+    if probability_cols:
+        return [
+            _dynamic_gmm_cluster_label_suffix(col[len(probability_prefix) :])
+            for col in probability_cols
+        ]
+    if cluster_col not in assignments_df.columns:
+        return []
+    unique = assignments_df[cluster_col].dropna().drop_duplicates().tolist()
+
+    def _sort_key(value: object) -> tuple[int, object]:
+        try:
+            return (0, float(value))
+        except Exception:
+            return (1, str(value))
+
+    return [
+        _dynamic_gmm_cluster_label_suffix(value)
+        for value in sorted(unique, key=_sort_key)
+    ]
+
+
+def _dynamic_gmm_expected_feature_columns(
+    assignments_df: pd.DataFrame,
+    probability_cols: Sequence[str],
+    *,
+    include_counts: bool,
+    include_entropy: bool,
+    include_speed: bool,
+    include_density: bool,
+    include_delta_speed: bool,
+    include_delta_density: bool,
+) -> List[str]:
+    suffixes = _dynamic_gmm_cluster_suffixes(assignments_df, probability_cols)
+    return _dynamic_gmm_expected_feature_columns_from_suffixes(
+        suffixes,
+        include_counts=include_counts,
+        include_entropy=include_entropy,
+        include_speed=include_speed,
+        include_density=include_density,
+        include_delta_speed=include_delta_speed,
+        include_delta_density=include_delta_density,
+    )
+
+
+def _dynamic_gmm_expected_feature_columns_from_suffixes(
+    suffixes: Sequence[str],
+    *,
+    include_counts: bool,
+    include_entropy: bool,
+    include_speed: bool,
+    include_density: bool,
+    include_delta_speed: bool,
+    include_delta_density: bool,
+) -> List[str]:
+    prefixes = ["cluster_share_"]
+    if include_counts:
+        prefixes.append("cluster_flow_")
+    if include_speed:
+        prefixes.append("cluster_speed_")
+    if include_density:
+        prefixes.append("cluster_density_")
+    if include_delta_speed:
+        prefixes.append("cluster_delta_speed_")
+    if include_delta_density:
+        prefixes.append("cluster_delta_density_")
+    cols = [f"{prefix}{suffix}" for prefix in prefixes for suffix in suffixes]
+    if include_entropy:
+        cols.append("cluster_entropy")
+    return cols
+
+
+def _empty_dynamic_gmm_cluster_features(
+    expected_cols: Sequence[str],
+    *,
+    total_rows: int = 0,
+    matched_rows: int = 0,
+    probability_cols: Sequence[str] = (),
+) -> pd.DataFrame:
+    result = pd.DataFrame(
+        {
+            "portico": pd.Series(dtype="object"),
+            "interval_start": pd.Series(dtype="datetime64[ns]"),
+            **{col: pd.Series(dtype="float64") for col in expected_cols},
+        }
+    )
+    result.attrs["dynamic_gmm_total_flow_rows"] = int(total_rows)
+    result.attrs["dynamic_gmm_matched_flow_rows"] = int(matched_rows)
+    result.attrs["dynamic_gmm_probability_cols"] = list(probability_cols)
+    return result
+
+
+def _flow_batch_where_sql(
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    selected_porticos: Sequence[str] = (),
+    date_start: Optional[pd.Timestamp] = None,
+    date_end: Optional[pd.Timestamp] = None,
+) -> Tuple[str, List[object]]:
+    clauses = ["FECHA >= ?", "FECHA < ?"]
+    params: List[object] = [pd.Timestamp(start), pd.Timestamp(end)]
+    if date_start is not None:
+        clauses.append("FECHA >= ?")
+        params.append(pd.Timestamp(date_start))
+    if date_end is not None:
+        clauses.append("FECHA <= ?")
+        params.append(pd.Timestamp(date_end))
+    clean_porticos = [str(item).strip() for item in selected_porticos if str(item).strip()]
+    if clean_porticos:
+        placeholders = ", ".join("?" for _ in clean_porticos)
+        clauses.append(f"TRIM(CAST(PORTICO AS VARCHAR)) IN ({placeholders})")
+        params.extend(clean_porticos)
+    return " AND ".join(clauses), params
+
+
+def _compute_flow_features_duckdb_batch(
+    con,
+    flow_table_ref: str,
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    selected_porticos: Sequence[str] = (),
+    date_start: Optional[pd.Timestamp] = None,
+    date_end: Optional[pd.Timestamp] = None,
+    interval_minutes: int = 5,
+    lanes: int = 3,
+    metrics: Optional[Sequence[str]] = None,
+    categories: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    metric_names = list(metrics or ["flow", "speed", "density"])
+    if not metric_names:
+        return pd.DataFrame()
+
+    category_labels = ["Light", "Heavy", "Motorcycles"]
+    if categories:
+        selected_categories = sorted(
+            label for label in category_labels if label in set(categories)
+        )
+        if not selected_categories:
+            return pd.DataFrame()
+    else:
+        selected_categories = sorted(category_labels)
+
+    where_sql, params = _flow_batch_where_sql(
+        start=start,
+        end=end,
+        selected_porticos=selected_porticos,
+        date_start=date_start,
+        date_end=date_end,
+    )
+    interval_factor = 60.0 / max(1, int(interval_minutes))
+    lanes_value = max(1, int(lanes))
+    table_ref = _duckdb_quote_qualified_identifier(flow_table_ref)
+
+    metric_sources = {
+        "flow": "flow_per_hour",
+        "speed": "speed_mean",
+        "speed_std": "speed_std",
+        "density": "density",
+        "delta_speed": "delta_speed",
+        "delta_density": "delta_density",
+    }
+    select_exprs = []
+    pivot_params: List[object] = []
+    for metric in metric_names:
+        value_col = metric_sources.get(str(metric))
+        if value_col is None:
+            continue
+        for category in selected_categories:
+            alias = f"{metric}_{_slugify(category)}"
+            select_exprs.append(
+                f"MAX(CASE WHEN category_label = ? THEN {value_col} ELSE 0 END) "
+                f"AS {_duckdb_quote_identifier(alias)}"
+            )
+            pivot_params.append(category)
+    if not select_exprs:
+        return pd.DataFrame()
+
+    category_filter = ""
+    category_params: List[object] = []
+    if categories:
+        placeholders = ", ".join("?" for _ in selected_categories)
+        category_filter = f"WHERE category_label IN ({placeholders})"
+        category_params.extend(selected_categories)
+
+    query = f"""
+        WITH cleaned AS (
+            SELECT
+                time_bucket(INTERVAL '{int(interval_minutes)} minutes', FECHA) AS interval_start,
+                TRIM(CAST(PORTICO AS VARCHAR)) AS portico,
+                TRY_CAST(VELOCIDAD AS DOUBLE) AS speed,
+                CASE TRY_CAST(CATEGORIA AS BIGINT)
+                    WHEN 1 THEN 'Light'
+                    WHEN 2 THEN 'Heavy'
+                    WHEN 3 THEN 'Heavy'
+                    WHEN 4 THEN 'Motorcycles'
+                    ELSE NULL
+                END AS category_label
+            FROM {table_ref}
+            WHERE {where_sql}
+                AND FECHA IS NOT NULL
+                AND PORTICO IS NOT NULL
+                AND VELOCIDAD IS NOT NULL
+                AND CATEGORIA IS NOT NULL
+        ),
+        filtered AS (
+            SELECT *
+            FROM cleaned
+            WHERE category_label IS NOT NULL
+        ),
+        selected AS (
+            SELECT *
+            FROM filtered
+            {category_filter}
+        ),
+        grouped AS (
+            SELECT
+                portico,
+                interval_start,
+                category_label,
+                COUNT(*) AS flow_count,
+                AVG(speed) AS speed_mean,
+                COALESCE(STDDEV_SAMP(speed), 0.0) AS speed_std
+            FROM selected
+            GROUP BY portico, interval_start, category_label
+        ),
+        metrics AS (
+            SELECT
+                *,
+                flow_count * ? / ? AS flow_per_hour,
+                CASE
+                    WHEN speed_mean <= 0 OR speed_mean IS NULL THEN 0.0
+                    ELSE (flow_count * ? / ?) / speed_mean
+                END AS density
+            FROM grouped
+        ),
+        deltas AS (
+            SELECT
+                *,
+                COALESCE(
+                    speed_mean - LAG(speed_mean) OVER (
+                        PARTITION BY portico, category_label
+                        ORDER BY interval_start
+                    ),
+                    0.0
+                ) AS delta_speed,
+                COALESCE(
+                    density - LAG(density) OVER (
+                        PARTITION BY portico, category_label
+                        ORDER BY interval_start
+                    ),
+                    0.0
+                ) AS delta_density,
+                SUM(flow_count) OVER () AS _input_rows
+            FROM metrics
+        )
+        SELECT
+            portico,
+            interval_start,
+            {", ".join(select_exprs)},
+            MAX(_input_rows) AS _input_rows
+        FROM deltas
+        GROUP BY portico, interval_start
+        ORDER BY interval_start, portico
+    """
+    all_params = [
+        *params,
+        *category_params,
+        interval_factor,
+        lanes_value,
+        interval_factor,
+        lanes_value,
+        *pivot_params,
+    ]
+    result = con.execute(query, all_params).df()
+    input_rows = 0
+    if "_input_rows" in result.columns:
+        if not result.empty:
+            input_rows = int(result["_input_rows"].fillna(0).max() or 0)
+        result = result.drop(columns=["_input_rows"])
+    result.attrs["input_rows"] = input_rows
+    return result
+
+
+def _dynamic_gmm_suffixes_from_duckdb(
+    con,
+    assignment_table_ref: str,
+    probability_cols: Sequence[str],
+    *,
+    cluster_col: str = "cluster_label",
+    probability_prefix: str = "cluster_prob_",
+) -> List[str]:
+    if probability_cols:
+        return [
+            _dynamic_gmm_cluster_label_suffix(col[len(probability_prefix) :])
+            for col in probability_cols
+        ]
+    table_ref = _duckdb_quote_qualified_identifier(assignment_table_ref)
+    cluster_ref = _duckdb_quote_identifier(cluster_col)
+    rows = con.execute(
+        f"SELECT DISTINCT {cluster_ref} FROM {table_ref} WHERE {cluster_ref} IS NOT NULL"
+    ).fetchall()
+    values = [row[0] for row in rows]
+
+    def _sort_key(value: object) -> tuple[int, object]:
+        try:
+            return (0, float(value))
+        except Exception:
+            return (1, str(value))
+
+    return [
+        _dynamic_gmm_cluster_label_suffix(value)
+        for value in sorted(values, key=_sort_key)
+    ]
+
+
+def _dynamic_gmm_label_pairs_from_duckdb(
+    con,
+    assignment_table_ref: str,
+    probability_cols: Sequence[str],
+    *,
+    cluster_col: str = "cluster_label",
+    probability_prefix: str = "cluster_prob_",
+) -> List[Tuple[str, str]]:
+    if probability_cols:
+        return [
+            (
+                col[len(probability_prefix) :],
+                _dynamic_gmm_cluster_label_suffix(col[len(probability_prefix) :]),
+            )
+            for col in probability_cols
+        ]
+    table_ref = _duckdb_quote_qualified_identifier(assignment_table_ref)
+    cluster_ref = _duckdb_quote_identifier(cluster_col)
+    rows = con.execute(
+        f"SELECT DISTINCT {cluster_ref} FROM {table_ref} WHERE {cluster_ref} IS NOT NULL"
+    ).fetchall()
+    values = [row[0] for row in rows]
+
+    def _sort_key(value: object) -> tuple[int, object]:
+        try:
+            return (0, float(value))
+        except Exception:
+            return (1, str(value))
+
+    return [
+        (str(value), _dynamic_gmm_cluster_label_suffix(value))
+        for value in sorted(values, key=_sort_key)
+    ]
+
+
+def _compute_dynamic_gmm_cluster_features_duckdb_batch(
+    con,
+    flow_table_ref: str,
+    assignment_table_ref: str,
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    selected_porticos: Sequence[str] = (),
+    date_start: Optional[pd.Timestamp] = None,
+    date_end: Optional[pd.Timestamp] = None,
+    interval_minutes: int = 5,
+    include_counts: bool = False,
+    include_entropy: bool = False,
+    include_speed: bool = False,
+    include_density: bool = False,
+    include_delta_speed: bool = False,
+    include_delta_density: bool = False,
+    lanes: int = 3,
+    probability_cols: Optional[Sequence[str]] = None,
+    cluster_col: str = "cluster_label",
+    probability_prefix: str = "cluster_prob_",
+    use_soft_membership: bool = True,
+) -> pd.DataFrame:
+    probability_cols = list(probability_cols or [])
+    use_soft = bool(use_soft_membership and probability_cols)
+    label_pairs = _dynamic_gmm_label_pairs_from_duckdb(
+        con,
+        assignment_table_ref,
+        probability_cols,
+        cluster_col=cluster_col,
+        probability_prefix=probability_prefix,
+    )
+    suffixes = [suffix for _label, suffix in label_pairs]
+    expected_cols = _dynamic_gmm_expected_feature_columns_from_suffixes(
+        suffixes,
+        include_counts=include_counts,
+        include_entropy=include_entropy,
+        include_speed=include_speed,
+        include_density=include_density,
+        include_delta_speed=include_delta_speed,
+        include_delta_density=include_delta_density,
+    )
+    if not suffixes:
+        return _empty_dynamic_gmm_cluster_features(expected_cols)
+
+    flow_where_sql, flow_params = _flow_batch_where_sql(
+        start=start,
+        end=end,
+        selected_porticos=selected_porticos,
+        date_start=date_start,
+        date_end=date_end,
+    )
+    flow_table = _duckdb_quote_qualified_identifier(flow_table_ref)
+    assignment_table = _duckdb_quote_qualified_identifier(assignment_table_ref)
+    cluster_ref = _duckdb_quote_identifier(cluster_col)
+    interval_factor = 60.0 / max(1, int(interval_minutes))
+    lanes_value = max(1, int(lanes))
+
+    assignment_select_cols = [
+        "plate_clean",
+        "valid_from",
+        f"{cluster_ref} AS cluster_label",
+    ]
+    for prob_col in probability_cols:
+        assignment_select_cols.append(
+            f"TRY_CAST({_duckdb_quote_identifier(prob_col)} AS DOUBLE) AS {_duckdb_quote_identifier(prob_col)}"
+        )
+
+    if use_soft:
+        long_parts = []
+        for prob_col in probability_cols:
+            label = prob_col[len(probability_prefix) :]
+            long_parts.append(
+                "SELECT portico, interval_start, plate_clean, speed, "
+                f"{_duckdb_quote_literal(label)} AS cluster_label, "
+                f"COALESCE({_duckdb_quote_identifier(prob_col)}, 0.0) AS membership_weight "
+                "FROM matched_valid"
+            )
+        long_sql = "\nUNION ALL\n".join(long_parts)
+    else:
+        long_sql = """
+            SELECT
+                portico,
+                interval_start,
+                plate_clean,
+                speed,
+                CAST(cluster_label AS VARCHAR) AS cluster_label,
+                1.0 AS membership_weight
+            FROM matched_valid
+            WHERE cluster_label IS NOT NULL
+        """
+
+    def _pivot_metric(value_col: str, prefix: str) -> Tuple[List[str], List[object]]:
+        exprs = []
+        params_out: List[object] = []
+        for label, suffix in label_pairs:
+            alias = f"{prefix}{suffix}"
+            exprs.append(
+                f"MAX(CASE WHEN cluster_label = ? THEN {value_col} ELSE 0 END) "
+                f"AS {_duckdb_quote_identifier(alias)}"
+            )
+            params_out.append(label)
+        return exprs, params_out
+
+    select_exprs: List[str] = []
+    pivot_params: List[object] = []
+    for exprs, params_out in [
+        _pivot_metric("share", "cluster_share_"),
+        _pivot_metric("flow_per_hour", "cluster_flow_") if include_counts else ([], []),
+        _pivot_metric("speed_mean", "cluster_speed_") if include_speed else ([], []),
+        _pivot_metric("density", "cluster_density_") if include_density else ([], []),
+        _pivot_metric("delta_speed", "cluster_delta_speed_") if include_delta_speed else ([], []),
+        _pivot_metric("delta_density", "cluster_delta_density_") if include_delta_density else ([], []),
+    ]:
+        select_exprs.extend(exprs)
+        pivot_params.extend(params_out)
+    if include_entropy:
+        select_exprs.append(
+            "SUM(CASE WHEN share > 0 THEN -share * LN(share) ELSE 0 END) AS cluster_entropy"
+        )
+
+    query = f"""
+        WITH flows AS (
+            SELECT
+                FECHA,
+                time_bucket(INTERVAL '{int(interval_minutes)} minutes', FECHA) AS interval_start,
+                TRIM(CAST(PORTICO AS VARCHAR)) AS portico,
+                CASE
+                    WHEN UPPER(TRIM(CAST(MATRICULA AS VARCHAR))) IN ('', 'NAN', 'NULL', 'NONE') THEN NULL
+                    ELSE UPPER(TRIM(CAST(MATRICULA AS VARCHAR)))
+                END AS plate_clean,
+                TRY_CAST(VELOCIDAD AS DOUBLE) AS speed
+            FROM {flow_table}
+            WHERE {flow_where_sql}
+                AND FECHA IS NOT NULL
+                AND PORTICO IS NOT NULL
+                AND MATRICULA IS NOT NULL
+        ),
+        flow_plates AS (
+            SELECT DISTINCT plate_clean
+            FROM flows
+            WHERE plate_clean IS NOT NULL
+        ),
+        assignments_raw AS (
+            SELECT
+                CASE
+                    WHEN UPPER(TRIM(CAST(plate AS VARCHAR))) IN ('', 'NAN', 'NULL', 'NONE') THEN NULL
+                    ELSE UPPER(TRIM(CAST(plate AS VARCHAR)))
+                END AS plate_clean,
+                TRY_CAST(window_end AS TIMESTAMP) AS valid_from,
+                {", ".join(assignment_select_cols[2:])}
+            FROM {assignment_table}
+            WHERE window_end IS NOT NULL
+                AND TRY_CAST(window_end AS TIMESTAMP) < ?
+        ),
+        assignments AS (
+            SELECT a.*
+            FROM assignments_raw a
+            INNER JOIN flow_plates p ON a.plate_clean = p.plate_clean
+            WHERE a.plate_clean IS NOT NULL
+                AND a.valid_from IS NOT NULL
+        ),
+        matched AS (
+            SELECT
+                f.portico,
+                f.interval_start,
+                f.plate_clean,
+                f.speed,
+                a.valid_from,
+                a.cluster_label
+                {"," if probability_cols else ""}
+                {", ".join("a." + _duckdb_quote_identifier(col) for col in probability_cols)}
+            FROM flows f
+            ASOF LEFT JOIN assignments a
+                ON f.plate_clean = a.plate_clean
+                AND f.FECHA >= a.valid_from
+            WHERE f.plate_clean IS NOT NULL
+        ),
+        matched_valid AS (
+            SELECT *
+            FROM matched
+            WHERE valid_from IS NOT NULL
+        ),
+        long AS (
+            {long_sql}
+        ),
+        grouped AS (
+            SELECT
+                portico,
+                interval_start,
+                cluster_label,
+                SUM(membership_weight) AS count,
+                COUNT(*) AS total,
+                SUM(CASE WHEN speed IS NOT NULL THEN speed * membership_weight ELSE 0.0 END) AS weighted_speed,
+                SUM(CASE WHEN speed IS NOT NULL THEN membership_weight ELSE 0.0 END) AS speed_weight
+            FROM long
+            GROUP BY portico, interval_start, cluster_label
+        ),
+        metrics AS (
+            SELECT
+                portico,
+                interval_start,
+                cluster_label,
+                count,
+                {'total' if use_soft else 'SUM(count) OVER (PARTITION BY portico, interval_start)'} AS total,
+                CASE WHEN speed_weight = 0 THEN 0.0 ELSE weighted_speed / speed_weight END AS speed_mean
+            FROM grouped
+        ),
+        derived AS (
+            SELECT
+                *,
+                CASE WHEN total = 0 THEN 0.0 ELSE count / total END AS share,
+                count * ? / ? AS flow_per_hour,
+                CASE
+                    WHEN speed_mean <= 0 OR speed_mean IS NULL THEN 0.0
+                    ELSE (count * ? / ?) / speed_mean
+                END AS density
+            FROM metrics
+        ),
+        deltas AS (
+            SELECT
+                *,
+                COALESCE(
+                    speed_mean - LAG(speed_mean) OVER (
+                        PARTITION BY portico, cluster_label
+                        ORDER BY interval_start
+                    ),
+                    0.0
+                ) AS delta_speed,
+                COALESCE(
+                    density - LAG(density) OVER (
+                        PARTITION BY portico, cluster_label
+                        ORDER BY interval_start
+                    ),
+                    0.0
+                ) AS delta_density
+            FROM derived
+        )
+        SELECT
+            portico,
+            interval_start,
+            {", ".join(select_exprs)}
+        FROM deltas
+        GROUP BY portico, interval_start
+        ORDER BY interval_start, portico
+    """
+    params = [
+        *flow_params,
+        pd.Timestamp(end),
+        interval_factor,
+        lanes_value,
+        interval_factor,
+        lanes_value,
+        *pivot_params,
+    ]
+    result = con.execute(query, params).df()
+    counts_query = f"""
+        WITH flows AS (
+            SELECT
+                FECHA,
+                CASE
+                    WHEN UPPER(TRIM(CAST(MATRICULA AS VARCHAR))) IN ('', 'NAN', 'NULL', 'NONE') THEN NULL
+                    ELSE UPPER(TRIM(CAST(MATRICULA AS VARCHAR)))
+                END AS plate_clean
+            FROM {flow_table}
+            WHERE {flow_where_sql}
+                AND FECHA IS NOT NULL
+                AND PORTICO IS NOT NULL
+                AND MATRICULA IS NOT NULL
+        ),
+        flow_plates AS (
+            SELECT DISTINCT plate_clean
+            FROM flows
+            WHERE plate_clean IS NOT NULL
+        ),
+        assignments_raw AS (
+            SELECT
+                CASE
+                    WHEN UPPER(TRIM(CAST(plate AS VARCHAR))) IN ('', 'NAN', 'NULL', 'NONE') THEN NULL
+                    ELSE UPPER(TRIM(CAST(plate AS VARCHAR)))
+                END AS plate_clean,
+                TRY_CAST(window_end AS TIMESTAMP) AS valid_from
+            FROM {assignment_table}
+            WHERE window_end IS NOT NULL
+                AND TRY_CAST(window_end AS TIMESTAMP) < ?
+        ),
+        assignments AS (
+            SELECT a.*
+            FROM assignments_raw a
+            INNER JOIN flow_plates p ON a.plate_clean = p.plate_clean
+            WHERE a.plate_clean IS NOT NULL
+                AND a.valid_from IS NOT NULL
+        ),
+        matched AS (
+            SELECT f.plate_clean, a.valid_from
+            FROM flows f
+            ASOF LEFT JOIN assignments a
+                ON f.plate_clean = a.plate_clean
+                AND f.FECHA >= a.valid_from
+            WHERE f.plate_clean IS NOT NULL
+        )
+        SELECT COUNT(*) AS total_rows, COUNT(valid_from) AS matched_rows
+        FROM matched
+    """
+    total_rows, matched_rows = con.execute(
+        counts_query,
+        [*flow_params, pd.Timestamp(end)],
+    ).fetchone()
+    if result.empty:
+        empty = _empty_dynamic_gmm_cluster_features(
+            expected_cols,
+            total_rows=int(total_rows or 0),
+            matched_rows=int(matched_rows or 0),
+            probability_cols=probability_cols,
+        )
+        return empty
+    for col in expected_cols:
+        if col not in result.columns:
+            result[col] = 0.0
+    metric_cols = [
+        col for col in result.columns if col not in {"portico", "interval_start"}
+    ]
+    if metric_cols:
+        result[metric_cols] = result[metric_cols].fillna(0.0)
+    ordered_cols = [
+        "portico",
+        "interval_start",
+        *[col for col in expected_cols if col in result.columns],
+        *[
+            col
+            for col in result.columns
+            if col not in {"portico", "interval_start", *expected_cols}
+        ],
+    ]
+    result = result[ordered_cols]
+    result.attrs["dynamic_gmm_total_flow_rows"] = int(total_rows or 0)
+    result.attrs["dynamic_gmm_matched_flow_rows"] = int(matched_rows or 0)
+    result.attrs["dynamic_gmm_probability_cols"] = list(probability_cols)
+    return result
+
+
+def _profile_feature_table_duckdb(
+    path: Path,
+    *,
+    table_name: Optional[str] = None,
+    clauses: Optional[Sequence[str]] = None,
+    params: Optional[Sequence[object]] = None,
+) -> Dict[str, object]:
+    if duckdb is None:
+        raise RuntimeError("duckdb no esta instalado.")
+    path = Path(path)
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        if table_name is None:
+            tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+            table_name = _pick_duckdb_table(tables, ["flow_features", "features"])
+        if not table_name:
+            return {
+                "table_name": None,
+                "rows": 0,
+                "cols": 0,
+                "columns": [],
+                "date_min": None,
+                "date_max": None,
+                "dataset_fingerprint": "empty",
+            }
+        table_ref = _duckdb_quote_identifier(table_name)
+        cols_info = con.execute(f"DESCRIBE {table_ref}").fetchall()
+        columns = [row[0] for row in cols_info]
+        where_sql = ""
+        query_params = list(params or [])
+        if clauses:
+            where_sql = " WHERE " + " AND ".join(str(clause) for clause in clauses)
+        row_count = int(
+            con.execute(
+                f"SELECT COUNT(*) FROM {table_ref}{where_sql}",
+                query_params,
+            ).fetchone()[0]
+            or 0
+        )
+        date_min = None
+        date_max = None
+        if "interval_start" in columns:
+            date_min, date_max = con.execute(
+                f"SELECT MIN(interval_start), MAX(interval_start) FROM {table_ref}{where_sql}",
+                query_params,
+            ).fetchone()
+        fingerprint_payload = {
+            "path": str(path),
+            "table": table_name,
+            "rows": row_count,
+            "columns": [(str(row[0]), str(row[1])) for row in cols_info],
+        }
+        dataset_fingerprint = hashlib.md5(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                ensure_ascii=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "table_name": table_name,
+            "rows": row_count,
+            "cols": len(columns),
+            "columns": columns,
+            "date_min": date_min,
+            "date_max": date_max,
+            "dataset_fingerprint": dataset_fingerprint,
+        }
+    finally:
+        con.close()
+
+
+def _load_feature_preview_duckdb(
+    path: Path,
+    *,
+    table_name: Optional[str] = None,
+    clauses: Optional[Sequence[str]] = None,
+    params: Optional[Sequence[object]] = None,
+    limit: int = 50,
+) -> pd.DataFrame:
+    if duckdb is None:
+        raise RuntimeError("duckdb no esta instalado.")
+    path = Path(path)
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        if table_name is None:
+            tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+            table_name = _pick_duckdb_table(tables, ["flow_features", "features"])
+        if not table_name:
+            return pd.DataFrame()
+        table_ref = _duckdb_quote_identifier(table_name)
+        columns = {
+            row[0] for row in con.execute(f"DESCRIBE {table_ref}").fetchall()
+        }
+        where_sql = ""
+        if clauses:
+            where_sql = " WHERE " + " AND ".join(str(clause) for clause in clauses)
+        order_sql = " ORDER BY interval_start" if "interval_start" in columns else ""
+        return con.execute(
+            f"SELECT * FROM {table_ref}{where_sql}{order_sql} LIMIT ?",
+            [*(params or []), max(1, int(limit))],
+        ).df()
+    finally:
+        con.close()
+
+
+def _normalize_loaded_feature_df(features_df: pd.DataFrame) -> pd.DataFrame:
+    loaded_df = features_df.copy()
+    if "interval_start" in loaded_df.columns:
+        loaded_df["interval_start"] = pd.to_datetime(
+            loaded_df["interval_start"], errors="coerce"
+        )
+    has_segment_cols = {"portico_last", "portico_next"}.issubset(loaded_df.columns)
+    has_alt_segment_cols = {"portico_inicio", "portico_fin"}.issubset(
+        loaded_df.columns
+    )
+    if not has_segment_cols and not has_alt_segment_cols:
+        portico_col_found = next(
+            (
+                c
+                for c in [
+                    "portico",
+                    "portico_last",
+                    "ultimo_portico",
+                    "portico_inicio",
+                ]
+                if c in loaded_df.columns
+            ),
+            None,
+        )
+        if portico_col_found and portico_col_found != "portico":
+            loaded_df = loaded_df.rename(columns={portico_col_found: "portico"})
+    for col in ["portico", "portico_last", "portico_next"]:
+        if col in loaded_df.columns:
+            loaded_df[col] = loaded_df[col].astype(str).str.strip()
+    return loaded_df
+
+
+def _load_feature_table_with_memory_policy(
+    path: Path,
+    *,
+    table_name: Optional[str] = None,
+    clauses: Optional[Sequence[str]] = None,
+    params: Optional[Sequence[object]] = None,
+    load_full: bool = False,
+) -> Dict[str, object]:
+    profile = _profile_feature_table_duckdb(
+        path,
+        table_name=table_name,
+        clauses=clauses,
+        params=params,
+    )
+    row_count = int(profile.get("rows") or 0)
+    preview_df = _normalize_loaded_feature_df(
+        _load_feature_preview_duckdb(
+            path,
+            table_name=table_name,
+            clauses=clauses,
+            params=params,
+        )
+    )
+    full_df = pd.DataFrame()
+    if load_full:
+        full_df = _normalize_loaded_feature_df(
+            _load_feature_preview_duckdb(
+                path,
+                table_name=table_name,
+                clauses=clauses,
+                params=params,
+                limit=max(1, row_count),
+            )
+        )
+    return {
+        "profile": profile,
+        "preview_df": preview_df,
+        "full_df": full_df,
+        "row_count": row_count,
+        "loaded_full": bool(not full_df.empty),
+    }
+
+
+def _merge_dynamic_gmm_assignments_causal(
+    flows_df: pd.DataFrame,
+    assignments_df: pd.DataFrame,
+    *,
+    timestamp_col: str,
+) -> pd.DataFrame:
+    left = flows_df.reset_index(drop=True).copy()
+    left["_flow_row_id"] = np.arange(len(left))
+    left = left.sort_values(
+        [timestamp_col, "plate_clean", "_flow_row_id"],
+        kind="mergesort",
+    )
+    right = assignments_df.sort_values(
+        ["valid_from", "plate_clean"],
+        kind="mergesort",
+    )
+    try:
+        return pd.merge_asof(
+            left,
+            right,
+            left_on=timestamp_col,
+            right_on="valid_from",
+            by="plate_clean",
+            direction="backward",
+            allow_exact_matches=True,
+        )
+    except ValueError:
+        parts: List[pd.DataFrame] = []
+        assignment_groups = {
+            plate: group.sort_values("valid_from", kind="mergesort")
+            for plate, group in right.groupby("plate_clean", sort=False)
+        }
+        for plate, group in left.groupby("plate_clean", sort=False):
+            assignment_group = assignment_groups.get(plate)
+            if assignment_group is None or assignment_group.empty:
+                empty_right = right.iloc[0:0].drop(columns=["plate_clean"])
+                merged = group.merge(
+                    empty_right,
+                    how="left",
+                    left_index=True,
+                    right_index=True,
+                )
+            else:
+                merged = pd.merge_asof(
+                    group.sort_values(timestamp_col, kind="mergesort"),
+                    assignment_group.drop(columns=["plate_clean"]),
+                    left_on=timestamp_col,
+                    right_on="valid_from",
+                    direction="backward",
+                    allow_exact_matches=True,
+                )
+            merged["plate_clean"] = plate
+            parts.append(merged)
+        if not parts:
+            return left
+        return pd.concat(parts, ignore_index=True, sort=False)
+
+
+def _compute_dynamic_gmm_cluster_features(
+    flows_df: pd.DataFrame,
+    dynamic_assignments_df: pd.DataFrame,
+    *,
+    interval_minutes: int = 5,
+    include_counts: bool = False,
+    include_entropy: bool = False,
+    include_speed: bool = False,
+    include_density: bool = False,
+    include_delta_speed: bool = False,
+    include_delta_density: bool = False,
+    lanes: int = 3,
+    timestamp_col: str = "FECHA",
+    portico_col: str = "PORTICO",
+    plate_col_flow: str = "MATRICULA",
+    plate_col_cluster: str = "plate",
+    cluster_col: str = "cluster_label",
+    speed_col: str = "VELOCIDAD",
+    use_soft_membership: bool = True,
+    probability_prefix: str = "cluster_prob_",
+) -> pd.DataFrame:
+    if flows_df is None or flows_df.empty:
+        return pd.DataFrame()
+    if dynamic_assignments_df is None or dynamic_assignments_df.empty:
+        return pd.DataFrame()
+
+    probability_cols = _dynamic_gmm_probability_columns(
+        dynamic_assignments_df.columns,
+        probability_prefix,
+    )
+    use_soft = bool(use_soft_membership and probability_cols)
+    if not use_soft and cluster_col not in dynamic_assignments_df.columns:
+        raise ValueError("El GMM dinamico no contiene 'cluster_label'.")
+    if plate_col_cluster not in dynamic_assignments_df.columns:
+        raise ValueError("El GMM dinamico no contiene la columna de placas.")
+    if "window_end" not in dynamic_assignments_df.columns:
+        raise ValueError("El GMM dinamico no contiene 'window_end'.")
+
+    expected_cols = _dynamic_gmm_expected_feature_columns(
+        dynamic_assignments_df,
+        probability_cols,
+        include_counts=include_counts,
+        include_entropy=include_entropy,
+        include_speed=include_speed,
+        include_density=include_density,
+        include_delta_speed=include_delta_speed,
+        include_delta_density=include_delta_density,
+    )
+    need_speed = (
+        include_speed
+        or include_density
+        or include_delta_speed
+        or include_delta_density
+    )
+    missing_flow_cols = [
+        col
+        for col in [timestamp_col, portico_col, plate_col_flow]
+        if col not in flows_df.columns
+    ]
+    if missing_flow_cols:
+        raise ValueError(
+            "El archivo de flujos no contiene columnas requeridas: "
+            + ", ".join(missing_flow_cols)
+        )
+    if need_speed and speed_col not in flows_df.columns:
+        raise ValueError(f"El archivo de flujos no contiene '{speed_col}'.")
+
+    flow_cols = [timestamp_col, portico_col, plate_col_flow]
+    if need_speed:
+        flow_cols.append(speed_col)
+    flows = flows_df[flow_cols].copy()
+    flows[timestamp_col] = pd.to_datetime(flows[timestamp_col], errors="coerce")
+    flows[portico_col] = flows[portico_col].astype(str).str.strip()
+    flows["plate_clean"] = normalize_plate_series(flows[plate_col_flow])
+    if need_speed:
+        flows[speed_col] = pd.to_numeric(flows[speed_col], errors="coerce")
+    flows = flows.dropna(subset=[timestamp_col, portico_col, "plate_clean"])
+    total_flow_rows = int(len(flows))
+    if flows.empty:
+        return _empty_dynamic_gmm_cluster_features(
+            expected_cols,
+            total_rows=0,
+            matched_rows=0,
+            probability_cols=probability_cols,
+        )
+
+    assignment_cols = [plate_col_cluster, "window_end"]
+    if cluster_col in dynamic_assignments_df.columns:
+        assignment_cols.append(cluster_col)
+    assignment_cols.extend(probability_cols)
+    assignments = dynamic_assignments_df[assignment_cols].copy()
+    assignments["valid_from"] = pd.to_datetime(
+        assignments["window_end"], errors="coerce"
+    )
+    assignments["plate_clean"] = normalize_plate_series(assignments[plate_col_cluster])
+    assignments = assignments.dropna(subset=["valid_from", "plate_clean"])
+    if use_soft:
+        for prob_col in probability_cols:
+            assignments[prob_col] = pd.to_numeric(
+                assignments[prob_col], errors="coerce"
+            ).fillna(0.0)
+    else:
+        assignments = assignments.dropna(subset=[cluster_col])
+    assignments = assignments.drop_duplicates(
+        subset=["plate_clean", "valid_from"],
+        keep="last",
+    )
+    if assignments.empty:
+        return _empty_dynamic_gmm_cluster_features(
+            expected_cols,
+            total_rows=total_flow_rows,
+            matched_rows=0,
+            probability_cols=probability_cols,
+        )
+
+    matched = _merge_dynamic_gmm_assignments_causal(
+        flows,
+        assignments.drop(columns=["window_end"]),
+        timestamp_col=timestamp_col,
+    )
+    matched_count = int(matched["valid_from"].notna().sum())
+    matched = matched.loc[matched["valid_from"].notna()].copy()
+    if matched.empty:
+        return _empty_dynamic_gmm_cluster_features(
+            expected_cols,
+            total_rows=total_flow_rows,
+            matched_rows=0,
+            probability_cols=probability_cols,
+        )
+
+    matched["interval_start"] = matched[timestamp_col].dt.floor(
+        f"{int(interval_minutes)}min"
+    )
+    feature_cluster_col = "_dynamic_cluster_label"
+    group_keys = [portico_col, "interval_start", feature_cluster_col]
+    if use_soft:
+        id_vars = [portico_col, "interval_start", "plate_clean"]
+        if need_speed:
+            id_vars.append(speed_col)
+        long = matched.melt(
+            id_vars=id_vars,
+            value_vars=probability_cols,
+            var_name="_cluster_probability_col",
+            value_name="membership_weight",
+        )
+        long["membership_weight"] = pd.to_numeric(
+            long["membership_weight"], errors="coerce"
+        ).fillna(0.0)
+        long[feature_cluster_col] = long["_cluster_probability_col"].map(
+            lambda col: str(col)[len(probability_prefix) :]
+        )
+        grouped = long.groupby(group_keys).agg(
+            count=("membership_weight", "sum"),
+            total=("plate_clean", "size"),
+        )
+        if need_speed:
+            valid_speed = long[speed_col].notna()
+            long["_weighted_speed"] = (
+                long[speed_col].where(valid_speed, 0.0)
+                * long["membership_weight"]
+            )
+            long["_speed_weight"] = long["membership_weight"].where(
+                valid_speed,
+                0.0,
+            )
+            speed_grouped = long.groupby(group_keys).agg(
+                _weighted_speed_sum=("_weighted_speed", "sum"),
+                _speed_weight_sum=("_speed_weight", "sum"),
+            )
+            grouped = grouped.join(speed_grouped)
+            denom = grouped["_speed_weight_sum"].replace(0, np.nan)
+            grouped["speed_mean"] = (
+                grouped["_weighted_speed_sum"] / denom
+            ).fillna(0.0)
+            grouped = grouped.drop(
+                columns=["_weighted_speed_sum", "_speed_weight_sum"]
+            )
+        grouped = grouped.reset_index()
+    else:
+        matched[feature_cluster_col] = matched[cluster_col]
+        grouped = matched.groupby(group_keys).agg(count=("plate_clean", "size"))
+        if need_speed:
+            grouped["speed_mean"] = matched.groupby(group_keys)[speed_col].mean()
+        grouped = grouped.reset_index()
+        grouped["total"] = grouped.groupby([portico_col, "interval_start"])[
+            "count"
+        ].transform("sum")
+
+    if grouped.empty:
+        return _empty_dynamic_gmm_cluster_features(
+            expected_cols,
+            total_rows=total_flow_rows,
+            matched_rows=matched_count,
+            probability_cols=probability_cols,
+        )
+
+    grouped["share"] = grouped["count"] / grouped["total"].replace(0, 1)
+    interval_factor = 60.0 / max(1, int(interval_minutes))
+    lanes_value = max(1, int(lanes))
+    grouped["flow_per_hour"] = grouped["count"] * interval_factor / lanes_value
+    need_density = include_density or include_delta_density
+    if need_density:
+        grouped["density"] = grouped["flow_per_hour"] / grouped["speed_mean"]
+        grouped.loc[grouped["speed_mean"] <= 0, "density"] = 0
+        grouped["density"] = grouped["density"].fillna(0)
+    if include_delta_speed or include_delta_density:
+        grouped = grouped.sort_values(
+            [portico_col, feature_cluster_col, "interval_start"],
+            kind="mergesort",
+        )
+    if include_delta_speed:
+        grouped["delta_speed"] = (
+            grouped.groupby([portico_col, feature_cluster_col])["speed_mean"]
+            .diff()
+            .fillna(0)
+        )
+    if include_delta_density:
+        grouped["delta_density"] = (
+            grouped.groupby([portico_col, feature_cluster_col])["density"]
+            .diff()
+            .fillna(0)
+        )
+
+    def _pivot_metric(value_col: str, prefix: str) -> pd.DataFrame:
+        pivot = grouped.pivot_table(
+            index=[portico_col, "interval_start"],
+            columns=feature_cluster_col,
+            values=value_col,
+            fill_value=0,
+        )
+        pivot.columns = [
+            f"{prefix}{_dynamic_gmm_cluster_label_suffix(label)}"
+            for label in pivot.columns
+        ]
+        return pivot
+
+    share_pivot = _pivot_metric("share", "cluster_share_")
+    frames = [share_pivot]
+    if include_counts:
+        frames.append(_pivot_metric("flow_per_hour", "cluster_flow_"))
+    if include_speed:
+        frames.append(_pivot_metric("speed_mean", "cluster_speed_"))
+    if include_density:
+        frames.append(_pivot_metric("density", "cluster_density_"))
+    if include_delta_speed:
+        frames.append(_pivot_metric("delta_speed", "cluster_delta_speed_"))
+    if include_delta_density:
+        frames.append(_pivot_metric("delta_density", "cluster_delta_density_"))
+
+    if include_entropy:
+        share_values = share_pivot.to_numpy(dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_values = np.where(share_values > 0, np.log(share_values), 0.0)
+        entropy = -np.sum(share_values * log_values, axis=1)
+        frames.append(
+            pd.Series(entropy, index=share_pivot.index, name="cluster_entropy")
+        )
+
+    result = pd.concat(frames, axis=1).reset_index()
+    result = result.rename(columns={portico_col: "portico"})
+    for col in expected_cols:
+        if col not in result.columns:
+            result[col] = 0.0
+    metric_cols = [
+        col for col in result.columns if col not in {"portico", "interval_start"}
+    ]
+    if metric_cols:
+        result[metric_cols] = result[metric_cols].fillna(0)
+    ordered_cols = [
+        "portico",
+        "interval_start",
+        *[col for col in expected_cols if col in result.columns],
+        *[
+            col
+            for col in result.columns
+            if col not in {"portico", "interval_start", *expected_cols}
+        ],
+    ]
+    result = result[ordered_cols]
+    result.attrs["dynamic_gmm_total_flow_rows"] = total_flow_rows
+    result.attrs["dynamic_gmm_matched_flow_rows"] = matched_count
+    result.attrs["dynamic_gmm_probability_cols"] = list(probability_cols)
+    return result
+
+
 def _call_compute_cluster_features(
     flows_df: pd.DataFrame,
     cluster_labels_df: pd.DataFrame,
@@ -15392,12 +18130,6 @@ def _render_variables_tab() -> None:
                                     if date_end_exclusive is not None:
                                         clauses.append("interval_start < ?")
                                         params.append(date_end_exclusive)
-                                query = f"SELECT * FROM {table_ref}"
-                                if clauses:
-                                    query += " WHERE " + " AND ".join(clauses)
-                                progress.progress(45)
-                                loaded_df = con.execute(query, params).df()
-                                progress.progress(55)
                             except Exception as exc:
                                 st.error(f"No se pudo cargar {selected}: {exc}")
                                 return
@@ -15405,41 +18137,17 @@ def _render_variables_tab() -> None:
                                 if con is not None:
                                     con.close()
 
-                            if "interval_start" in loaded_df.columns:
-                                loaded_df["interval_start"] = pd.to_datetime(
-                                    loaded_df["interval_start"], errors="coerce"
-                                )
-                            has_segment_cols = {
-                                "portico_last",
-                                "portico_next",
-                            }.issubset(loaded_df.columns)
-                            has_alt_segment_cols = {
-                                "portico_inicio",
-                                "portico_fin",
-                            }.issubset(loaded_df.columns)
-                            if not has_segment_cols and not has_alt_segment_cols:
-                                portico_col_found = next(
-                                    (
-                                        c
-                                        for c in [
-                                            "portico",
-                                            "portico_last",
-                                            "ultimo_portico",
-                                            "portico_inicio",
-                                        ]
-                                        if c in loaded_df.columns
-                                    ),
-                                    None,
-                                )
-                                if portico_col_found and portico_col_found != "portico":
-                                    loaded_df = loaded_df.rename(
-                                        columns={portico_col_found: "portico"}
-                                    )
-                            if "portico" in loaded_df.columns:
-                                loaded_df["portico"] = (
-                                    loaded_df["portico"].astype(str).str.strip()
-                                )
-                            progress.progress(70)
+                            progress.progress(45)
+                            load_result = _load_feature_table_with_memory_policy(
+                                path,
+                                table_name=table_name,
+                                clauses=clauses,
+                                params=params,
+                                load_full=True,
+                            )
+                            row_count = int(load_result["row_count"])
+                            loaded_df = load_result["full_df"]
+                            progress.progress(55)
                             if loaded_df.empty:
                                 if tramo_tuple:
                                     st.warning(
@@ -15448,6 +18156,12 @@ def _render_variables_tab() -> None:
                                 else:
                                     st.warning("El archivo de features esta vacio.")
                                 return
+                            progress.progress(70)
+                            if row_count != len(loaded_df):
+                                st.caption(
+                                    f"Perfil DuckDB: {row_count:,} filas; "
+                                    f"cargadas: {len(loaded_df):,}."
+                                )
                             progress.progress(85)
                             st.session_state["flow_features_df"] = loaded_df
                             st.session_state["flow_features_path"] = str(path)
@@ -15499,6 +18213,168 @@ def _render_variables_tab() -> None:
         key="acc_flow_include_cluster_vars",
     )
 
+    cluster_choice = "(sin clusters)"
+    cluster_source = "static_csv"
+    dynamic_gmm_path: Optional[Path] = None
+    dynamic_gmm_info: Dict[str, object] = {}
+    cluster_vars: List[str] = []
+
+    if include_cluster_vars:
+        cluster_source_label = st.radio(
+            "Fuente de cluster",
+            ["Etiquetas estaticas CSV", "GMM dinamico DuckDB"],
+            horizontal=True,
+            key="acc_flow_cluster_source",
+        )
+        cluster_source = (
+            "dynamic_gmm"
+            if cluster_source_label == "GMM dinamico DuckDB"
+            else "static_csv"
+        )
+        if cluster_source == "static_csv":
+            cluster_files = _list_cluster_label_files()
+            if not cluster_files:
+                st.warning("No se encontraron archivos cluster_*.csv en Resultados.")
+            else:
+                cluster_names = [path.name for path in cluster_files]
+                cluster_choice = st.selectbox(
+                    "Archivo de etiquetas de cluster",
+                    options=["(ninguno)"] + cluster_names,
+                    key="acc_flow_cluster_choice",
+                )
+        else:
+            dynamic_origin = st.radio(
+                "Origen GMM dinamico",
+                ["Resultados", "Archivo externo"],
+                horizontal=True,
+                key="acc_flow_dynamic_gmm_origin",
+            )
+            if dynamic_origin == "Resultados":
+                dynamic_candidates, dynamic_path_error = _list_dynamic_gmm_db_paths(
+                    RESULTS_DIR
+                )
+                if dynamic_path_error:
+                    st.warning(
+                        "No se encontraron resultados GMM dinamico en Resultados/. "
+                        "Use Archivo externo para seleccionar un DuckDB en otra carpeta."
+                    )
+                else:
+                    option_map = {str(path): path for path in dynamic_candidates}
+                    selected_dynamic = st.selectbox(
+                        "Resultado GMM dinamico",
+                        list(option_map.keys()),
+                        format_func=lambda value: Path(value).name,
+                        key="acc_flow_dynamic_gmm_file",
+                    )
+                    dynamic_gmm_path = option_map[selected_dynamic]
+            else:
+                external_key = "acc_flow_dynamic_gmm_external_file"
+                current_external = _dynamic_gmm_user_path(
+                    st.session_state.get(external_key)
+                )
+                cols_external = st.columns([1, 3])
+                with cols_external[0]:
+                    if st.button(
+                        "Seleccionar DuckDB",
+                        key="acc_flow_dynamic_gmm_select_external",
+                    ):
+                        selected_path, selector_error = _open_duckdb_file_selector(
+                            current_external.parent
+                            if current_external is not None
+                            else RESULTS_DIR
+                        )
+                        if selector_error:
+                            st.warning(selector_error)
+                        elif selected_path is not None:
+                            st.session_state[external_key] = str(selected_path)
+                            current_external = selected_path
+                with cols_external[1]:
+                    if current_external is None:
+                        st.caption("No hay DuckDB externo seleccionado.")
+                    else:
+                        st.caption(f"Archivo externo: {current_external}")
+                if current_external is not None:
+                    if current_external.suffix.lower() != ".duckdb":
+                        st.warning("El archivo externo seleccionado debe ser .duckdb.")
+                    elif not current_external.exists():
+                        st.warning(f"El archivo externo no existe: {current_external}")
+                    else:
+                        dynamic_gmm_path = current_external
+            if dynamic_gmm_path is not None:
+                cluster_choice = dynamic_gmm_path.name
+                try:
+                    dynamic_gmm_info = _inspect_dynamic_gmm_duckdb(dynamic_gmm_path)
+                except Exception as exc:
+                    st.warning(f"No se pudo inspeccionar el GMM dinamico: {exc}")
+                    dynamic_gmm_path = None
+                else:
+                    prob_cols = list(dynamic_gmm_info.get("probability_cols") or [])
+                    metadata = dict(dynamic_gmm_info.get("metadata") or {})
+                    st.caption(
+                        "GMM dinamico: "
+                        f"{int(dynamic_gmm_info.get('rows') or 0):,} asignaciones | "
+                        f"columnas cluster_prob_*={len(prob_cols):,} | "
+                        "alineacion causal por window_end."
+                    )
+                    membership_message = _dynamic_gmm_membership_ui_message(prob_cols)
+                    if prob_cols:
+                        st.info(membership_message)
+                    else:
+                        st.caption(membership_message)
+                    if str(metadata.get("assignment_scope") or "").lower() == "prevalent":
+                        st.info(
+                            "Este GMM dinamico fue generado para patentes prevalentes; "
+                            "las variables de cluster solo cubriran esas patentes."
+                        )
+        cluster_var_options = [
+            "Proporciones por cluster",
+            "Flow por tipo de cluster",
+            "Entropia de cluster",
+            "Speed por tipo de cluster",
+            "Density por tipo de cluster",
+            "Delta.Speed por tipo de cluster",
+            "Delta.Density por tipo de cluster",
+        ]
+        existing_vars = st.session_state.get("acc_flow_cluster_vars")
+        default_vars = cluster_var_options
+        if isinstance(existing_vars, list):
+            normalized: List[str] = []
+            for item in existing_vars:
+                if item in {
+                    "Conteos por cluster",
+                    "Conteo por cluster",
+                    "Conteo por tipo de cluster",
+                }:
+                    normalized.append("Flow por tipo de cluster")
+                elif item in {"Speed por cluster"}:
+                    normalized.append("Speed por tipo de cluster")
+                elif item in {"Density por cluster"}:
+                    normalized.append("Density por tipo de cluster")
+                elif item in {
+                    "Delta-Speed por tipo de cluster",
+                    "Delta.Speed por cluster",
+                    "Delta-Speed por cluster",
+                }:
+                    normalized.append("Delta.Speed por tipo de cluster")
+                elif item in {
+                    "Delta-Density por tipo de cluster",
+                    "Delta.Density por cluster",
+                    "Delta-Density por cluster",
+                }:
+                    normalized.append("Delta.Density por tipo de cluster")
+                else:
+                    normalized.append(item)
+            st.session_state["acc_flow_cluster_vars"] = normalized
+            default_vars = normalized
+        multiselect_kwargs = {
+            "label": "Variables de cluster",
+            "options": cluster_var_options,
+            "key": "acc_flow_cluster_vars",
+        }
+        if "acc_flow_cluster_vars" not in st.session_state:
+            multiselect_kwargs["default"] = default_vars
+        cluster_vars = st.multiselect(**multiselect_kwargs)
+
     with st.form("acc_flow_features_form"):
         sample, percent_mode, range_valid = _build_flow_sample_inputs(
             summary, mode, key_prefix="acc_flow"
@@ -15525,13 +18401,6 @@ def _render_variables_tab() -> None:
                 key="acc_flow_batch_mode",
             )
         
-        keep_flow_in_memory = st.checkbox(
-            "Mantener flujos en memoria (usa RAM)",
-            value=False,
-            disabled=not use_batches,
-            key="acc_flow_keep_flows",
-        )
-
         metric_options = {
             "Flow": "flow",
             "Speed": "speed",
@@ -15564,69 +18433,6 @@ def _render_variables_tab() -> None:
             key="acc_flow_lanes",
         )
 
-        cluster_choice = "(sin clusters)"
-        cluster_vars: List[str] = []
-        
-        if include_cluster_vars:
-            cluster_files = _list_cluster_label_files()
-            if not cluster_files:
-                st.warning("No se encontraron archivos cluster_*.csv en Resultados.")
-            else:
-                cluster_names = [path.name for path in cluster_files]
-                cluster_choice = st.selectbox(
-                    "Archivo de etiquetas de cluster",
-                    options=["(ninguno)"] + cluster_names,
-                    key="acc_flow_cluster_choice",
-                )
-            cluster_var_options = [
-                "Proporciones por cluster",
-                "Flow por tipo de cluster",
-                "Entropia de cluster",
-                "Speed por tipo de cluster",
-                "Density por tipo de cluster",
-                "Delta.Speed por tipo de cluster",
-                "Delta.Density por tipo de cluster",
-            ]
-            existing_vars = st.session_state.get("acc_flow_cluster_vars")
-            default_vars = cluster_var_options
-            if isinstance(existing_vars, list):
-                normalized: List[str] = []
-                for item in existing_vars:
-                    if item in {
-                        "Conteos por cluster",
-                        "Conteo por cluster",
-                        "Conteo por tipo de cluster",
-                    }:
-                        normalized.append("Flow por tipo de cluster")
-                    elif item in {"Speed por cluster"}:
-                        normalized.append("Speed por tipo de cluster")
-                    elif item in {"Density por cluster"}:
-                        normalized.append("Density por tipo de cluster")
-                    elif item in {
-                        "Delta-Speed por tipo de cluster",
-                        "Delta.Speed por cluster",
-                        "Delta-Speed por cluster",
-                    }:
-                        normalized.append("Delta.Speed por tipo de cluster")
-                    elif item in {
-                        "Delta-Density por tipo de cluster",
-                        "Delta.Density por cluster",
-                        "Delta-Density por cluster",
-                    }:
-                        normalized.append("Delta.Density por tipo de cluster")
-                    else:
-                        normalized.append(item)
-                st.session_state["acc_flow_cluster_vars"] = normalized
-                default_vars = normalized
-            multiselect_kwargs = {
-                "label": "Variables de cluster",
-                "options": cluster_var_options,
-                "key": "acc_flow_cluster_vars",
-            }
-            if "acc_flow_cluster_vars" not in st.session_state:
-                multiselect_kwargs["default"] = default_vars
-            cluster_vars = st.multiselect(**multiselect_kwargs)
-
         col_upd, col_run = st.columns(2)
         with col_upd:
             update_filters = st.form_submit_button("Actualizar filtros")
@@ -15642,76 +18448,114 @@ def _render_variables_tab() -> None:
             if not cluster_vars:
                 st.warning("Seleccione al menos una variable de cluster.")
                 return
-            if cluster_choice in {"(sin clusters)", "(ninguno)"}:
+            if (
+                cluster_source == "static_csv"
+                and cluster_choice in {"(sin clusters)", "(ninguno)"}
+            ):
                 st.warning("Seleccione un archivo de etiquetas de cluster.")
                 return
+            if cluster_source == "dynamic_gmm" and dynamic_gmm_path is None:
+                st.warning("Seleccione un DuckDB valido de GMM dinamico.")
+                return
 
-        # Step 0: Create temp DB and load filtered data
-        temp_db_path = RESULTS_DIR / "temp_work_features.duckdb"
-        if temp_db_path.exists():
-            temp_db_path.unlink()
-
-        con_temp = duckdb.connect(str(temp_db_path))
-        try:
-            flow_summary = get_flow_db_summary()
-            flow_db_path = flow_summary.db_path
-            con_temp.execute(f"ATTACH '{flow_db_path}' AS flow_db (READ_ONLY)")
-            
-            query = (
-                "CREATE TABLE work_flujos AS "
-                "SELECT * FROM flow_db.flujos_duckdb WHERE 1=1"
+        if sample.row_limit is not None:
+            st.warning(
+                "El muestreo por porcentaje no es compatible con el calculo "
+                "streaming por DuckDB. Use un rango de fechas."
             )
-            params = []
-            if sample.date_start:
-                query += " AND FECHA >= ?"
-                params.append(sample.date_start)
-            if sample.date_end:
-                query += " AND FECHA <= ?"
-                params.append(sample.date_end)
-            selected_porticos = _tramo_portico_codes(tramo_tuple)
-            if selected_porticos:
-                placeholders = ", ".join("?" for _ in selected_porticos)
-                query += f" AND CAST(PORTICO AS VARCHAR) IN ({placeholders})"
-                params.extend(selected_porticos)
-            if sample.row_limit is not None:
-                query += f" LIMIT {max(1, int(sample.row_limit))}"
-            
-            with st.spinner("Creando base de trabajo temporal..."):
-                con_temp.execute(query, params)
-        except Exception as exc:
-            st.error(f"Error creando base temporal: {exc}")
-            con_temp.close()
             return
 
-        # Step 1: Create persistent DB
+        # Step 0: Create persistent DB and attach sources.
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        suffix = _cluster_choice_suffix(cluster_choice) if include_cluster_vars else "sin_cluster"
+        if include_cluster_vars and cluster_source == "dynamic_gmm":
+            suffix = _cluster_choice_suffix(
+                f"dynamic_gmm_{Path(dynamic_gmm_path).stem}"
+            )
+        else:
+            suffix = _cluster_choice_suffix(cluster_choice) if include_cluster_vars else "sin_cluster"
         features_db_name = f"accident_flow_features_{suffix}_{stamp}.duckdb"
         features_db_path = RESULTS_DIR / features_db_name
         
         con_feat = duckdb.connect(str(features_db_path))
+        selected_porticos = _tramo_portico_codes(tramo_tuple)
+        flow_summary = get_flow_db_summary()
+        flow_db_path = flow_summary.db_path
+        flow_table_ref = "flow_db.flujos_duckdb"
+        assignment_table_ref = f"dynamic_gmm_db.{DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME}"
+        try:
+            con_feat.execute(
+                f"ATTACH {_duckdb_quote_literal(flow_db_path)} AS flow_db (READ_ONLY)"
+            )
+            if include_cluster_vars and cluster_source == "dynamic_gmm":
+                con_feat.execute(
+                    f"ATTACH {_duckdb_quote_literal(dynamic_gmm_path)} AS dynamic_gmm_db (READ_ONLY)"
+                )
+        except Exception as exc:
+            con_feat.close()
+            if features_db_path.exists():
+                features_db_path.unlink()
+            st.error(f"Error adjuntando bases DuckDB: {exc}")
+            return
 
         # Step 2: Batches
-        min_max = con_temp.execute("SELECT MIN(FECHA), MAX(FECHA) FROM work_flujos").fetchone()
+        minmax_clauses = ["1=1"]
+        minmax_params: List[object] = []
+        if sample.date_start:
+            minmax_clauses.append("FECHA >= ?")
+            minmax_params.append(sample.date_start)
+        if sample.date_end:
+            minmax_clauses.append("FECHA <= ?")
+            minmax_params.append(sample.date_end)
+        if selected_porticos:
+            placeholders = ", ".join("?" for _ in selected_porticos)
+            minmax_clauses.append(
+                f"TRIM(CAST(PORTICO AS VARCHAR)) IN ({placeholders})"
+            )
+            minmax_params.extend(selected_porticos)
+        min_max = con_feat.execute(
+            "SELECT MIN(FECHA), MAX(FECHA) "
+            f"FROM {_duckdb_quote_qualified_identifier(flow_table_ref)} "
+            "WHERE " + " AND ".join(minmax_clauses),
+            minmax_params,
+        ).fetchone()
         if min_max[0] is None:
             st.warning("No se encontraron datos en el rango seleccionado.")
-            con_temp.close()
             con_feat.close()
-            temp_db_path.unlink()
+            if features_db_path.exists():
+                features_db_path.unlink()
             return
             
         ranges = _build_batch_ranges(pd.Timestamp(min_max[0]), pd.Timestamp(min_max[1]), batch_mode)
         
         cluster_labels_df = None
+        dynamic_gmm_probability_cols: List[str] = []
+        dynamic_gmm_metadata: Dict[str, object] = {}
         if include_cluster_vars:
-            try:
-                cluster_labels_df = _load_cluster_labels(RESULTS_DIR / cluster_choice)
-            except Exception as exc:
-                st.error(f"Error cargando clusters: {exc}")
-                con_temp.close()
-                con_feat.close()
-                return
+            if cluster_source == "dynamic_gmm":
+                try:
+                    dynamic_gmm_info = _inspect_dynamic_gmm_duckdb(Path(dynamic_gmm_path))
+                    dynamic_gmm_probability_cols = list(
+                        dynamic_gmm_info.get("probability_cols") or []
+                    )
+                    dynamic_gmm_metadata = _load_dynamic_gmm_metadata(
+                        Path(dynamic_gmm_path)
+                    )
+                except Exception as exc:
+                    st.error(f"Error cargando GMM dinamico: {exc}")
+                    con_feat.close()
+                    return
+                if int(dynamic_gmm_info.get("rows") or 0) <= 0:
+                    st.warning("El GMM dinamico seleccionado no contiene asignaciones.")
+                    con_feat.close()
+                    return
+            else:
+                try:
+                    cluster_labels_df = _load_cluster_labels(RESULTS_DIR / cluster_choice)
+                except Exception as exc:
+                    st.error(f"Error cargando clusters: {exc}")
+                    con_feat.close()
+                    return
 
         # Prepare segments
         try:
@@ -15719,7 +18563,6 @@ def _render_variables_tab() -> None:
             all_segments = get_portico_segments(porticos_df)
         except Exception as exc:
             st.error(f"Error cargando segmentos: {exc}")
-            con_temp.close()
             con_feat.close()
             return
 
@@ -15731,7 +18574,6 @@ def _render_variables_tab() -> None:
             )
             if target_segments.empty:
                 st.warning("El tramo seleccionado no es valido en la configuracion actual de porticos.")
-                con_temp.close()
                 con_feat.close()
                 return
 
@@ -15759,6 +18601,8 @@ def _render_variables_tab() -> None:
             "feature_rows": 0,
             "step1_rows": 0,
             "final_rows": 0,
+            "dynamic_gmm_total_flow_rows": 0,
+            "dynamic_gmm_matched_flow_rows": 0,
             "porticos_features": set(),
             "porticos_segments": set(
                 target_segments["portico_last"].dropna().astype(str).tolist()
@@ -15769,133 +18613,187 @@ def _render_variables_tab() -> None:
         # Step 3 & 4: Process and Store
         for idx, (start, end, label) in enumerate(ranges, start=1):
             progress.set_description(f"Procesando lote {idx}/{len(ranges)}")
-            
-            # work_flujos is already limited to the selected segment porticos.
-            df_batch = con_temp.execute(
-                "SELECT * FROM work_flujos WHERE FECHA >= ? AND FECHA < ?",
-                [start, end]
-            ).df()
-            
-            diagnostics["input_rows"] += len(df_batch)
-            if not df_batch.empty:
-                # Calculate flow features for ALL porticos
-                feat_batch = compute_flow_features(
-                    df_batch,
+
+            feat_batch = _compute_flow_features_duckdb_batch(
+                con_feat,
+                flow_table_ref,
+                start=start,
+                end=end,
+                selected_porticos=selected_porticos,
+                date_start=sample.date_start,
+                date_end=sample.date_end,
+                interval_minutes=5,
+                lanes=int(lanes),
+                metrics=metrics,
+                categories=categories,
+            )
+            diagnostics["input_rows"] += int(feat_batch.attrs.get("input_rows", 0))
+            if not feat_batch.empty:
+                feat_batch["portico"] = _normalize_portico_series(
+                    feat_batch["portico"]
+                )
+                diagnostics["feature_rows"] += len(feat_batch)
+                if len(diagnostics["porticos_features"]) < 2000:
+                    diagnostics["porticos_features"].update(
+                        feat_batch["portico"].dropna().astype(str).tolist()
+                    )
+
+                if include_cluster_vars and cluster_labels_df is not None:
+                    need_cluster_speed = (
+                        include_speed
+                        or include_density
+                        or include_delta_speed
+                        or include_delta_density
+                    )
+                    raw_cols = ["FECHA", "PORTICO", "MATRICULA"]
+                    if need_cluster_speed:
+                        raw_cols.append("VELOCIDAD")
+                    batch_where, batch_params = _flow_batch_where_sql(
+                        start=start,
+                        end=end,
+                        selected_porticos=selected_porticos,
+                        date_start=sample.date_start,
+                        date_end=sample.date_end,
+                    )
+                    select_cols = ", ".join(
+                        _duckdb_quote_identifier(col) for col in raw_cols
+                    )
+                    df_batch = con_feat.execute(
+                        f"SELECT {select_cols} "
+                        f"FROM {_duckdb_quote_qualified_identifier(flow_table_ref)} "
+                        f"WHERE {batch_where}",
+                        batch_params,
+                    ).df()
+                    if int(feat_batch.attrs.get("input_rows", 0)) == 0:
+                        diagnostics["input_rows"] += len(df_batch)
+                    clust_batch = _call_compute_cluster_features(
+                        df_batch,
+                        cluster_labels_df,
                         interval_minutes=5,
+                        include_counts=include_flow,
+                        include_entropy=include_entropy,
+                        include_speed=include_speed,
+                        include_density=include_density,
+                        include_delta_speed=include_delta_speed,
+                        include_delta_density=include_delta_density,
                         lanes=int(lanes),
-                        metrics=metrics,
-                        categories=categories,
-                        progress=None,
                     )
-                
-                if not feat_batch.empty:
-                    feat_batch["portico"] = _normalize_portico_series(
-                        feat_batch["portico"]
+                elif include_cluster_vars and cluster_source == "dynamic_gmm":
+                    clust_batch = _compute_dynamic_gmm_cluster_features_duckdb_batch(
+                        con_feat,
+                        flow_table_ref,
+                        assignment_table_ref,
+                        start=start,
+                        end=end,
+                        selected_porticos=selected_porticos,
+                        date_start=sample.date_start,
+                        date_end=sample.date_end,
+                        interval_minutes=5,
+                        include_counts=include_flow,
+                        include_entropy=include_entropy,
+                        include_speed=include_speed,
+                        include_density=include_density,
+                        include_delta_speed=include_delta_speed,
+                        include_delta_density=include_delta_density,
+                        lanes=int(lanes),
+                        probability_cols=dynamic_gmm_probability_cols,
                     )
-                    diagnostics["feature_rows"] += len(feat_batch)
-                    if len(diagnostics["porticos_features"]) < 2000:
-                        diagnostics["porticos_features"].update(
-                            feat_batch["portico"].dropna().astype(str).tolist()
-                        )
-                    if include_cluster_vars and cluster_labels_df is not None:
-                        clust_batch = _call_compute_cluster_features(
-                            df_batch,
-                            cluster_labels_df,
-                            interval_minutes=5,
-                            include_counts=include_flow,
-                            include_entropy=include_entropy,
-                            include_speed=include_speed,
-                            include_density=include_density,
-                            include_delta_speed=include_delta_speed,
-                            include_delta_density=include_delta_density,
-                            lanes=int(lanes),
-                        )
-                        if not clust_batch.empty:
-                            clust_batch["portico"] = _normalize_portico_series(
-                                clust_batch["portico"]
-                            )
-                            feat_batch = feat_batch.merge(
-                                clust_batch,
-                                on=["portico", "interval_start"],
-                                how="left"
-                            )
-                            # Fillna for numeric cols
-                            num_cols = _get_feature_cols(feat_batch)
-                            feat_batch[num_cols] = feat_batch[num_cols].fillna(0)
-                            
-                            if not include_shares:
-                                share_cols = [c for c in feat_batch.columns if c.startswith("cluster_share_")]
-                                if share_cols:
-                                    feat_batch = feat_batch.drop(columns=share_cols)
+                    diagnostics["dynamic_gmm_total_flow_rows"] += int(
+                        clust_batch.attrs.get("dynamic_gmm_total_flow_rows", 0)
+                    )
+                    diagnostics["dynamic_gmm_matched_flow_rows"] += int(
+                        clust_batch.attrs.get("dynamic_gmm_matched_flow_rows", 0)
+                    )
+                else:
+                    clust_batch = pd.DataFrame()
 
-                    # --- Transform to Segment Features (Last/Next) ---
-                    # feat_batch has [portico, interval_start, ...features...]
-                    
-                    # 1. Prepare Last
-                    df_last = feat_batch.add_prefix("last_")
-                    df_last = df_last.rename(columns={"last_interval_start": "interval_start"})
-                    
-                    # 2. Prepare Next
-                    df_next = feat_batch.add_prefix("next_")
-                    df_next = df_next.rename(columns={"next_interval_start": "interval_start"})
-                    
-                    # 3. Join with Segments
-                    # Merge segments with Last (on portico_last)
-                    # result has: [eje, calzada, portico_last, km_last, portico_next, km_next, interval_start, last_features...]
-                    step1 = target_segments.merge(
-                        df_last,
-                        left_on="portico_last",
-                        right_on="last_portico",
-                        how="inner"
-                    )
-                    diagnostics["step1_rows"] += len(step1)
-                    
-                    # 4. Join with Next (on portico_next AND interval_start)
-                    # result has: [..., interval_start, last_features..., next_features...]
-                    final_batch = step1.merge(
-                        df_next,
-                        left_on=["portico_next", "interval_start"],
-                        right_on=["next_portico", "interval_start"],
-                        how="inner"
-                    )
-                    diagnostics["final_rows"] += len(final_batch)
-                    
-                    # Cleanup key columns if redundant
-                    # We keep portico_last/next from segments. last_portico/next_portico from features are redundant.
-                    final_batch = final_batch.drop(columns=["last_portico", "next_portico"], errors="ignore")
+                if include_cluster_vars:
+                    cluster_metric_cols = [
+                        col
+                        for col in clust_batch.columns
+                        if col not in {"portico", "interval_start"}
+                    ]
+                    if not clust_batch.empty:
+                        clust_batch["portico"] = _normalize_portico_series(
+                            clust_batch["portico"]
+                        )
+                    if cluster_metric_cols:
+                        feat_batch = feat_batch.merge(
+                            clust_batch,
+                            on=["portico", "interval_start"],
+                            how="left",
+                        )
+                        num_cols = _get_feature_cols(feat_batch)
+                        feat_batch[num_cols] = feat_batch[num_cols].fillna(0)
 
-                    if not final_batch.empty:
-                        # Store
-                        if not table_created:
-                            con_feat.execute("CREATE TABLE flow_features AS SELECT * FROM final_batch")
-                            table_created = True
-                        else:
-                            con_feat.execute("INSERT INTO flow_features SELECT * FROM final_batch")
-                        
-                        total_rows += len(final_batch)
-            
+                        if not include_shares:
+                            share_cols = [
+                                c
+                                for c in feat_batch.columns
+                                if c.startswith("cluster_share_")
+                            ]
+                            if share_cols:
+                                feat_batch = feat_batch.drop(columns=share_cols)
+
+                df_last = feat_batch.add_prefix("last_")
+                df_last = df_last.rename(columns={"last_interval_start": "interval_start"})
+
+                df_next = feat_batch.add_prefix("next_")
+                df_next = df_next.rename(columns={"next_interval_start": "interval_start"})
+
+                step1 = target_segments.merge(
+                    df_last,
+                    left_on="portico_last",
+                    right_on="last_portico",
+                    how="inner",
+                )
+                diagnostics["step1_rows"] += len(step1)
+
+                final_batch = step1.merge(
+                    df_next,
+                    left_on=["portico_next", "interval_start"],
+                    right_on=["next_portico", "interval_start"],
+                    how="inner",
+                )
+                diagnostics["final_rows"] += len(final_batch)
+
+                final_batch = final_batch.drop(
+                    columns=["last_portico", "next_portico"],
+                    errors="ignore",
+                )
+
+                if not final_batch.empty:
+                    if not table_created:
+                        con_feat.execute(
+                            "CREATE TABLE flow_features AS SELECT * FROM final_batch"
+                        )
+                        table_created = True
+                    else:
+                        con_feat.execute(
+                            "INSERT INTO flow_features SELECT * FROM final_batch"
+                        )
+
+                    total_rows += len(final_batch)
+
             progress.update()
-            
+
         progress.close()
-        con_temp.close()
-        if temp_db_path.exists():
-            temp_db_path.unlink()
         
         # Step 5: Load result
         if table_created:
-            with st.spinner("Cargando resultados en memoria..."):
-                final_df = con_feat.execute("SELECT * FROM flow_features").df()
             con_feat.close()
-            
-            if "interval_start" in final_df.columns:
-                final_df["interval_start"] = pd.to_datetime(final_df["interval_start"], errors="coerce")
-            
-            # Normalize strings
-            for col in ["portico_last", "portico_next"]:
-                if col in final_df.columns:
-                    final_df[col] = final_df[col].astype(str).str.strip()
+            load_result = _load_feature_table_with_memory_policy(
+                features_db_path,
+                load_full=True,
+            )
+            profile = load_result["profile"]
+            row_count = int(load_result["row_count"])
+            preview_df = load_result["preview_df"]
+            final_df = load_result["full_df"]
 
-            st.session_state["flow_features_df"] = final_df
+            st.session_state["flow_features_df"] = (
+                final_df if not final_df.empty else None
+            )
             st.session_state["flow_features_path"] = str(features_db_path)
             st.session_state["flow_features_source"] = "calculadas (DB)"
             _set_flow_tramo_selection(tramo_tuple)
@@ -15907,9 +18805,39 @@ def _render_variables_tab() -> None:
             st.session_state["cluster_choice"] = cluster_choice if include_cluster_vars else "(sin clusters)"
 
             st.success(f"Variables calculadas y guardadas en {features_db_name}: {total_rows:,} filas")
+            st.caption(
+                f"Archivo: {features_db_path} | Filas: {row_count:,} | "
+                f"Columnas: {int(profile.get('cols') or 0):,}"
+            )
+            if not preview_df.empty:
+                st.caption("Preview del resultado")
+                st.dataframe(preview_df, width="stretch")
+            if final_df.empty:
+                st.info(
+                    "El resultado quedo guardado en DuckDB, pero no contiene filas "
+                    "para cargar en memoria."
+                )
+            if include_cluster_vars and cluster_source == "dynamic_gmm":
+                dynamic_total = int(diagnostics.get("dynamic_gmm_total_flow_rows", 0))
+                dynamic_matched = int(diagnostics.get("dynamic_gmm_matched_flow_rows", 0))
+                dynamic_coverage = (
+                    float(dynamic_matched / dynamic_total)
+                    if dynamic_total > 0
+                    else 0.0
+                )
+                st.caption(
+                    "Cobertura GMM dinamico causal: "
+                    f"{dynamic_matched:,}/{dynamic_total:,} flujos "
+                    f"({dynamic_coverage:.1%})."
+                )
+                if str(dynamic_gmm_metadata.get("assignment_scope") or "").lower() == "prevalent":
+                    st.info(
+                        "Diagnostico: el GMM dinamico de entrada es de patentes "
+                        "prevalentes; la cobertura puede ser menor que con un GMM global."
+                    )
             try:
                 _register_feature_engineering_history(
-                    features_df=final_df,
+                    features_df=final_df if not final_df.empty else preview_df,
                     features_db_path=features_db_path,
                     params={
                         "sample_mode": mode,
@@ -15919,9 +18847,24 @@ def _render_variables_tab() -> None:
                         "use_batches": bool(use_batches),
                         "batch_mode": batch_mode if use_batches else None,
                         "include_cluster_vars": bool(include_cluster_vars),
+                        "cluster_source": cluster_source
+                        if include_cluster_vars
+                        else "none",
                         "cluster_choice": cluster_choice
                         if include_cluster_vars
                         else "(sin clusters)",
+                        "dynamic_gmm_alignment": (
+                            "causal_window_end"
+                            if include_cluster_vars and cluster_source == "dynamic_gmm"
+                            else None
+                        ),
+                        "dynamic_gmm_path": (
+                            str(dynamic_gmm_path)
+                            if include_cluster_vars
+                            and cluster_source == "dynamic_gmm"
+                            and dynamic_gmm_path is not None
+                            else None
+                        ),
                         "cluster_vars": list(cluster_vars),
                         "metrics": list(metrics),
                         "categories": list(categories),
@@ -15932,13 +18875,41 @@ def _render_variables_tab() -> None:
                         "input_rows": int(diagnostics.get("input_rows", 0)),
                         "feature_rows": int(diagnostics.get("feature_rows", 0)),
                         "final_rows": int(diagnostics.get("final_rows", 0)),
+                        "dynamic_gmm_total_flow_rows": int(
+                            diagnostics.get("dynamic_gmm_total_flow_rows", 0)
+                        ),
+                        "dynamic_gmm_matched_flow_rows": int(
+                            diagnostics.get("dynamic_gmm_matched_flow_rows", 0)
+                        ),
                     },
                     cluster_label_path=(
                         RESULTS_DIR / cluster_choice
                         if include_cluster_vars
+                        and cluster_source == "static_csv"
                         and cluster_choice not in {"(sin clusters)", "(ninguno)"}
                         else None
                     ),
+                    dynamic_gmm_path=(
+                        dynamic_gmm_path
+                        if include_cluster_vars and cluster_source == "dynamic_gmm"
+                        else None
+                    ),
+                    extra_metadata={
+                        "cluster_source": cluster_source
+                        if include_cluster_vars
+                        else "none",
+                        "dynamic_gmm_alignment": (
+                            "causal_window_end"
+                            if include_cluster_vars and cluster_source == "dynamic_gmm"
+                            else None
+                        ),
+                        "dynamic_gmm_assignment_scope": (
+                            dynamic_gmm_metadata.get("assignment_scope")
+                            if include_cluster_vars and cluster_source == "dynamic_gmm"
+                            else None
+                        ),
+                    },
+                    features_profile=profile,
                 )
                 st.caption("History SQLite actualizado: Feature engineering.")
             except Exception as exc:
@@ -16200,6 +19171,14 @@ def _render_feature_selection_tab() -> None:
                     f"Ranking calculado sobre **{fit_label}** "
                     f"({int(fit_rows or 0):,} filas, test excluido)."
                 )
+            rf_importance_chart = _build_rf_feature_importance_chart(importance_df)
+            if rf_importance_chart is not None:
+                st.altair_chart(rf_importance_chart, width="stretch")
+            else:
+                st.bar_chart(
+                    importance_df.set_index("variable")["importance"],
+                    width="stretch",
+                )
             st.dataframe(importance_df, width="stretch")
             ordered_vars = importance_df["variable"].tolist()
     else:
@@ -16386,8 +19365,23 @@ def _render_optuna_tab() -> None:
             "id": _optuna_result_id(feature_id, feature_cols_cluster)
         })
     available_optuna_feature_sets = [str(cfg["label"]) for cfg in configs]
+    optuna_profile_for_scope = st.session_state.get(
+        "optuna_param_profile",
+        OPTUNA_PARAMETER_PROFILE_WIDE,
+    )
+    _apply_optuna_parameter_profile_scope(
+        st.session_state,
+        profile_label=optuna_profile_for_scope,
+        available_feature_sets=available_optuna_feature_sets,
+    )
+    available_optuna_feature_sets_for_profile = (
+        _optuna_parameter_profile_feature_set_options(
+            optuna_profile_for_scope,
+            available_optuna_feature_sets,
+        )
+    )
     selected_optuna_feature_sets = _sync_loaded_optuna_feature_sets_to_form(
-        available_optuna_feature_sets
+        available_optuna_feature_sets_for_profile
     )
     st.session_state["optuna_feature_sets_selected"] = list(
         selected_optuna_feature_sets
@@ -16645,7 +19639,9 @@ def _render_optuna_tab() -> None:
             "`Búsqueda amplia` conserva los rangos actuales del tab. "
             "`Refinamiento local` aplica el ajuste recomendado para top-K y, "
             "si el modelo es XGBoost, estrecha el espacio a la zona con mejor "
-            "señal observada en los últimos resultados."
+            "señal observada en los últimos resultados. Los perfiles "
+            "15->14->12->11 aplican los rangos recomendados para XGBoost "
+            "Base + Cluster con objetivo F1."
         ),
     )
     if previous_parameter_profile is None:
@@ -16661,11 +19657,29 @@ def _render_optuna_tab() -> None:
         st.session_state["optuna_param_profile_last_selection"] = (
             optuna_parameter_profile
         )
+    _apply_optuna_parameter_profile_scope(
+        st.session_state,
+        profile_label=optuna_parameter_profile,
+        available_feature_sets=available_optuna_feature_sets,
+    )
     if optuna_parameter_profile == OPTUNA_PARAMETER_PROFILE_LOCAL:
         st.caption(
             "Refinamiento local: reaplica top-K=16..20, sube `startup_trials` "
             "y, con XGBoost, concentra la búsqueda en la zona local del frente "
             "de Pareto reciente."
+        )
+    elif optuna_parameter_profile == OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_NONE_15141211:
+        st.caption(
+            "Perfil 15->14->12->11 / none: recomendado para XGBoost Base + "
+            "Cluster sin balance interno; mantiene F1 como objetivo y abre "
+            "n_estimators, reg_lambda, gamma y top-K donde el run 324 quedó en borde."
+        )
+    elif optuna_parameter_profile == OPTUNA_PARAMETER_PROFILE_XGB_BASE_CLUSTER_SMOTE_15141211:
+        st.caption(
+            "Perfil 15->14->12->11 / SMOTE: recomendado para XGBoost Base + "
+            "Cluster con SMOTE; mantiene F1 como objetivo y concentra top-K, "
+            "SMOTE sampling, n_estimators, subsample y colsample donde el run 325 "
+            "mostró señal."
         )
     optuna_calibration_options = _calibration_method_options()
     optuna_calibration_labels = [
@@ -16716,6 +19730,7 @@ def _render_optuna_tab() -> None:
         key="optuna_n_jobs",
         default=1,
     )
+    svm_strict_mlx_optuna = model_choice == "SVM" and int(optuna_n_jobs) > 1
     optuna_rf_n_jobs: Optional[int] = None
     optuna_xgb_n_jobs: Optional[int] = None
     max_internal_jobs = _max_optuna_parallel_jobs()
@@ -17537,13 +20552,35 @@ def _render_optuna_tab() -> None:
             )
     elif model_choice == "SVM":
         st.markdown("**SVM**")
-        kernel_options = ["rbf", "linear", "poly", "sigmoid"]
+        kernel_options = (
+            ["rbf", "linear"]
+            if svm_strict_mlx_optuna
+            else ["rbf", "linear", "poly", "sigmoid"]
+        )
+        _sanitize_multiselect_state("optuna_svm_kernels", kernel_options)
+        if not st.session_state.get("optuna_svm_kernels"):
+            st.session_state["optuna_svm_kernels"] = list(kernel_options)
         svm_kernels = st.multiselect(
             "svm_kernels",
             kernel_options,
             default=kernel_options,
             key="optuna_svm_kernels",
         )
+        if svm_strict_mlx_optuna:
+            st.info(
+                "SVM con Optuna jobs > 1 usará procesos `spawn` y "
+                "`require_mlx=True`; sólo `rbf` y `linear` evitan fallback CPU."
+            )
+            if int(optuna_n_jobs) > 2:
+                st.warning(
+                    "Apple/Metal expone una sola GPU compartida: más workers "
+                    "pueden aumentar la latencia o memoria sin escalar linealmente."
+                )
+        else:
+            st.caption(
+                "`poly` y `sigmoid` usan sklearn/SVC en CPU. Para paralelizar "
+                "SVM en GPU, use Optuna jobs > 1 y kernels `rbf`/`linear`."
+            )
         col1, col2, col3 = st.columns(3)
         with col1:
             svm_c_min = st.number_input(
@@ -17573,9 +20610,30 @@ def _render_optuna_tab() -> None:
                 key="optuna_svm_c_step",
             )
 
+    available_optuna_feature_sets_for_profile = (
+        _optuna_parameter_profile_feature_set_options(
+            optuna_parameter_profile,
+            available_optuna_feature_sets,
+        )
+    )
+    if (
+        _optuna_parameter_profile_forced_feature_sets(optuna_parameter_profile)
+        and not available_optuna_feature_sets_for_profile
+    ):
+        st.warning(
+            "El perfil seleccionado requiere `Base + Cluster`, pero ese grupo "
+            "no esta disponible con las features actuales."
+        )
+    selected_optuna_feature_sets = _sanitize_optuna_feature_set_selection(
+        available_optuna_feature_sets_for_profile,
+        st.session_state.get("optuna_feature_sets_selected"),
+    )
+    st.session_state["optuna_feature_sets_selected"] = list(
+        selected_optuna_feature_sets
+    )
     selected_optuna_feature_sets = st.multiselect(
         "Grupos de features a optimizar",
-        available_optuna_feature_sets,
+        available_optuna_feature_sets_for_profile,
         default=selected_optuna_feature_sets,
         key="optuna_feature_sets_selected",
         help=(
@@ -17588,11 +20646,51 @@ def _render_optuna_tab() -> None:
         for cfg in configs
         if str(cfg["label"]) in set(selected_optuna_feature_sets)
     ]
+    raw_balance_mode_selection = st.session_state.get(
+        "optuna_balance_modes_selected"
+    )
+    optuna_balance_mode_options = _optuna_parameter_profile_balance_options(
+        optuna_parameter_profile
+    )
+    forced_balance_modes = _optuna_parameter_profile_forced_balance_modes(
+        optuna_parameter_profile
+    )
+    if forced_balance_modes:
+        st.session_state["optuna_balance_modes_selected"] = [
+            _optuna_balance_mode_widget_label(mode)
+            for mode in forced_balance_modes
+        ]
+    elif raw_balance_mode_selection is None:
+        st.session_state["optuna_balance_modes_selected"] = ["none", "SMOTE"]
+    else:
+        st.session_state["optuna_balance_modes_selected"] = [
+            _optuna_balance_mode_widget_label(mode)
+            for mode in _optuna_normalize_balance_mode_selection(
+                raw_balance_mode_selection
+            )
+        ]
+    selected_optuna_balance_labels = st.multiselect(
+        "Estrategia de balance",
+        optuna_balance_mode_options,
+        default=list(st.session_state.get("optuna_balance_modes_selected") or []),
+        key="optuna_balance_modes_selected",
+        help=(
+            "`none` entrena sin balance interno; `class_weight` usa "
+            "class_weight='balanced' o scale_pos_weight automático; `SMOTE` "
+            "sobremuestrea solo train dentro de cada trial."
+        ),
+    )
+    selected_optuna_balance_modes = _optuna_normalize_balance_mode_selection(
+        selected_optuna_balance_labels
+    )
 
     if st.button("Ejecutar Optuna"):
         st.session_state["optuna_loaded_result_state"] = None
         if not selected_optuna_feature_sets:
             st.error("Seleccione al menos un grupo de features para Optuna.")
+            return
+        if not selected_optuna_balance_modes:
+            st.error("Seleccione al menos una estrategia de balance para Optuna.")
             return
         try:
             import optuna  # type: ignore
@@ -17601,14 +20699,15 @@ def _render_optuna_tab() -> None:
                 "optuna no esta instalado. Ejecute `pip install optuna`."
             )
             return
-        try:
-            from imblearn.over_sampling import SMOTE  # type: ignore
-            smote_import_error = None
-        except ImportError:
-            SMOTE = None  # type: ignore[assignment]
-            smote_import_error = (
-                "imbalanced-learn no esta instalado. La variante Con SMOTE se omitirá."
-            )
+        SMOTE = None  # type: ignore[assignment]
+        smote_import_error = None
+        if "smote" in selected_optuna_balance_modes:
+            try:
+                from imblearn.over_sampling import SMOTE  # type: ignore
+            except ImportError:
+                smote_import_error = (
+                    "imbalanced-learn no esta instalado. La variante Con SMOTE se omitirá."
+                )
         if model_choice == "XGBoost":
             try:
                 import xgboost as xgb  # noqa: F401
@@ -17803,14 +20902,19 @@ def _render_optuna_tab() -> None:
                 st.warning("svm_C_step debe ser mayor a 0.")
                 return
 
-        balance_modes_to_run = ["none"]
-        if smote_skip_reason is None:
+        balance_modes_to_run = [
+            mode for mode in selected_optuna_balance_modes if mode != "smote"
+        ]
+        if "smote" in selected_optuna_balance_modes and smote_skip_reason is None:
             balance_modes_to_run.append("smote")
-        else:
+        elif "smote" in selected_optuna_balance_modes:
             st.warning(
                 "No se pudo ejecutar la variante Con SMOTE. "
                 f"Motivo: {smote_skip_reason}"
             )
+        if not balance_modes_to_run:
+            st.error("No quedan estrategias de balance ejecutables.")
+            return
 
         def _run_optimization(
             cols: List[str],
@@ -17826,7 +20930,7 @@ def _render_optuna_tab() -> None:
             sampler_kwargs: Dict[str, object] = {
                 "seed": int(optuna_random_state)
             }
-            if is_multiobjective_optuna and effective_optuna_n_jobs > 1:
+            if effective_optuna_n_jobs > 1:
                 sampler_kwargs["constant_liar"] = True
             try:
                 sampler = optuna.samplers.TPESampler(**sampler_kwargs)
@@ -17858,7 +20962,9 @@ def _render_optuna_tab() -> None:
 
             X_train_run = X_train[cols].fillna(0).astype("float32")
             X_val_run = X_val[cols].fillna(0).astype("float32")
+            X_test_run = X_test[cols].fillna(0).astype("float32")
             y_val_np = y_val.to_numpy()
+            y_test_np = y_test.to_numpy()
 
             ranked_cols: List[str] = list(cols)
             effective_k_low = 0
@@ -17910,6 +21016,7 @@ def _render_optuna_tab() -> None:
                     raise optuna.TrialPruned("trial_cols vacio.")
                 X_train_trial = X_train_run[trial_cols]
                 X_val_trial = X_val_run[trial_cols]
+                X_test_trial = X_test_run[trial_cols]
 
                 if balance_mode == "smote":
                     smote_k = _suggest_optuna_discrete_int(
@@ -18086,16 +21193,28 @@ def _render_optuna_tab() -> None:
                         step=float(svm_c_step),
                     )
                     model_params = {"kernel": kernel, "C": float(c_value)}
+                    if svm_strict_mlx_optuna:
+                        model_params["require_mlx"] = True
+                        model_params["probability"] = False
+                model_params = _apply_optuna_balance_model_params(
+                    model_choice=model_choice,
+                    model_params=model_params,
+                    y_train=y_train,
+                    balance_mode=balance_mode,
+                )
 
                 return {
                     "trial_cols": list(trial_cols),
                     "X_res": X_res,
                     "y_res": y_res,
                     "X_val_trial": X_val_trial,
+                    "X_test_trial": X_test_trial,
                     "model_params": model_params,
                 }
 
-            def _fit_trial_scores(trial_payload: Dict[str, object]) -> np.ndarray:
+            def _fit_trial_scores(
+                trial_payload: Dict[str, object],
+            ) -> Dict[str, np.ndarray]:
                 try:
                     model = _build_model(
                         model_choice,
@@ -18111,13 +21230,36 @@ def _render_optuna_tab() -> None:
                         raw_scores_val,
                         method=optuna_calibration_method,
                     )
-                    return calibrator.transform(raw_scores_val)
+                    raw_scores_test = _get_model_scores(
+                        model, trial_payload["X_test_trial"]
+                    )
+                    result = {
+                        "val": calibrator.transform(raw_scores_val),
+                        "test": calibrator.transform(raw_scores_test),
+                    }
+                    if model_choice == "SVM":
+                        result.update(
+                            {
+                                "svm_backend": getattr(model, "backend_", None),
+                                "svm_fit_warning": getattr(
+                                    model,
+                                    "fit_warning_",
+                                    "",
+                                ),
+                                "worker_pid": os.getpid(),
+                                "execution_backend": "local_optuna",
+                            }
+                        )
+                    return result
                 except Exception as exc:
                     raise optuna.TrialPruned(str(exc)) from exc
 
             def objective(trial: "optuna.Trial") -> float:
                 trial_payload = _prepare_trial_inputs(trial)
-                scores_val = _fit_trial_scores(trial_payload)
+                trial_scores = _fit_trial_scores(trial_payload)
+                if model_choice == "SVM":
+                    _set_svm_gpu_trial_worker_attrs(trial, trial_scores)
+                scores_val = trial_scores["val"]
                 scored = _score_optuna_objective(
                     y_val_np,
                     scores_val,
@@ -18135,6 +21277,27 @@ def _render_optuna_tab() -> None:
                     raise optuna.TrialPruned(
                         f"{objective_key} invalido en validacion."
                     )
+                scored_test = _score_optuna_objective(
+                    y_test_np,
+                    trial_scores["test"],
+                    objective_metric=objective_key,
+                    threshold=float(scored.get("threshold", 0.5)),
+                    threshold_objective=str(optuna_threshold_objective),
+                    eval_df=test_df,
+                    far_target=float(optuna_far_target),
+                    alerts_per_day=float(optuna_alerts_per_day),
+                    fn_cost=float(optuna_fn_cost),
+                    fp_cost=float(optuna_fp_cost),
+                )
+                _record_optuna_trial_metrics(
+                    trial,
+                    trial_payload=trial_payload,
+                    scored_val=scored,
+                    scored_test=scored_test,
+                    objective_score=score,
+                    objective_metric=str(objective_key),
+                    objective_direction=str(objective_direction),
+                )
                 trial.report(score, step=0)
                 if trial.should_prune():
                     raise optuna.TrialPruned("Pruned by MedianPruner")
@@ -18144,7 +21307,10 @@ def _render_optuna_tab() -> None:
                 trial: "optuna.Trial",
             ) -> Tuple[float, float, float, float]:
                 trial_payload = _prepare_trial_inputs(trial)
-                scores_val = _fit_trial_scores(trial_payload)
+                trial_scores = _fit_trial_scores(trial_payload)
+                if model_choice == "SVM":
+                    _set_svm_gpu_trial_worker_attrs(trial, trial_scores)
+                scores_val = trial_scores["val"]
                 scored = _score_optuna_objective(
                     y_val_np,
                     scores_val,
@@ -18168,6 +21334,27 @@ def _render_optuna_tab() -> None:
                     )
                 objective_values = dict(
                     zip(CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS, values)
+                )
+                scored_test = _score_optuna_objective(
+                    y_test_np,
+                    trial_scores["test"],
+                    objective_metric="mcc",
+                    threshold=float(scored.get("threshold", 0.5)),
+                    threshold_objective=str(optuna_threshold_objective),
+                    eval_df=test_df,
+                    far_target=float(optuna_far_target),
+                    alerts_per_day=float(optuna_alerts_per_day),
+                    fn_cost=float(optuna_fn_cost),
+                    fp_cost=float(optuna_fp_cost),
+                )
+                _record_optuna_trial_metrics(
+                    trial,
+                    trial_payload=trial_payload,
+                    scored_val=scored,
+                    scored_test=scored_test,
+                    objective_score=float(proxy_score),
+                    objective_metric=str(CALIBRATION_SWEEP_MULTIOBJECTIVE_KEY),
+                    objective_direction="multiobjective",
                 )
                 for metric_name, value in objective_values.items():
                     trial.set_user_attr(metric_name, float(value))
@@ -18332,13 +21519,42 @@ def _render_optuna_tab() -> None:
             if effective_optuna_n_jobs == 1:
                 optuna_callbacks = [_render_optuna_progress]
             with st.spinner(f"Optuna ({label} | {balance_label}) en ejecucion..."):
-                study.optimize(
-                    objective_multiobjective if is_multiobjective_optuna else objective,
-                    n_trials=int(n_trials),
-                    timeout=int(timeout),
-                    n_jobs=effective_optuna_n_jobs,
-                    callbacks=optuna_callbacks,
-                )
+                if svm_strict_mlx_optuna:
+                    _run_svm_gpu_parallel_optuna(
+                        study=study,
+                        n_trials=int(n_trials),
+                        timeout=int(timeout),
+                        max_workers=int(effective_optuna_n_jobs),
+                        build_trial_payload=_prepare_trial_inputs,
+                        worker_payload_base={
+                            "random_state": int(optuna_random_state),
+                            "calibration_method": str(optuna_calibration_method),
+                            "objective_metric": str(objective_key),
+                            "threshold_objective": str(optuna_threshold_objective),
+                            "far_target": float(optuna_far_target),
+                            "alerts_per_day": float(optuna_alerts_per_day),
+                            "fn_cost": float(optuna_fn_cost),
+                            "fp_cost": float(optuna_fp_cost),
+                            "is_multiobjective": bool(is_multiobjective_optuna),
+                            "y_val": y_val_np,
+                            "y_test": y_test_np,
+                            "val_df": val_df,
+                            "test_df": test_df,
+                        },
+                        is_multiobjective=bool(is_multiobjective_optuna),
+                        objective_metric=str(objective_key),
+                        objective_direction=str(objective_direction),
+                        far_target=float(optuna_far_target),
+                        progress_callback=_render_optuna_progress,
+                    )
+                else:
+                    study.optimize(
+                        objective_multiobjective if is_multiobjective_optuna else objective,
+                        n_trials=int(n_trials),
+                        timeout=int(timeout),
+                        n_jobs=effective_optuna_n_jobs,
+                        callbacks=optuna_callbacks,
+                    )
             _render_optuna_progress(study, None)
 
             if not study.trials:
@@ -18401,11 +21617,17 @@ def _render_optuna_tab() -> None:
                         )
                     ),
                 }
-                trials_df = _calibration_multiobjective_trials_dataframe(
-                    study.trials
+                trials_df = _optuna_trials_dataframe_from_trials(
+                    study.trials,
+                    objective_direction="maximize",
+                    multiobjective_metrics=CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS,
+                    pruner_name="NopPruner",
                 )
-                pareto_front_df = _calibration_multiobjective_trials_dataframe(
-                    pareto_trials
+                pareto_front_df = _optuna_trials_dataframe_from_trials(
+                    pareto_trials,
+                    objective_direction="maximize",
+                    multiobjective_metrics=CALIBRATION_SWEEP_MULTIOBJECTIVE_METRICS,
+                    pruner_name="NopPruner",
                 )
                 pareto_numbers = {
                     int(trial.number) for trial in pareto_trials
@@ -18434,12 +21656,13 @@ def _render_optuna_tab() -> None:
                 objective_values = {
                     "validation": {str(objective_key): float(best_score)}
                 }
-                trials_df = study.trials_dataframe(
-                    attrs=("number", "value", "params", "state")
+                trials_df = _optuna_trials_dataframe_from_trials(
+                    study.trials,
+                    objective_direction=str(objective_direction),
+                    pruner_name=(
+                        "NopPruner" if not pruner_enabled else "MedianPruner"
+                    ),
                 )
-                trials_df = trials_df.sort_values(
-                    "value", ascending=objective_direction == "minimize"
-                ).reset_index(drop=True)
                 pareto_front_df = None
                 far_gate_fallback = False
             best_params = dict(best_trial.params)
@@ -18483,6 +21706,15 @@ def _render_optuna_tab() -> None:
                     "kernel": best_params["svm_kernel"],
                     "C": float(best_params["svm_C"]),
                 }
+                if svm_strict_mlx_optuna:
+                    model_params["require_mlx"] = True
+                    model_params["probability"] = False
+            model_params = _apply_optuna_balance_model_params(
+                model_choice=model_choice,
+                model_params=model_params,
+                y_train=y_train,
+                balance_mode=balance_mode,
+            )
 
             if optuna_tune_topk and "top_k" in best_params:
                 best_top_k = int(best_params["top_k"])
@@ -18491,6 +21723,41 @@ def _render_optuna_tab() -> None:
             else:
                 best_top_k = len(cols)
                 best_feature_cols = list(cols)
+
+            best_trial_rows = (
+                trials_df[trials_df["number"].eq(int(best_trial.number))]
+                if isinstance(trials_df, pd.DataFrame)
+                and not trials_df.empty
+                and "number" in trials_df.columns
+                else pd.DataFrame()
+            )
+            best_trial_row = (
+                best_trial_rows.iloc[0].to_dict()
+                if not best_trial_rows.empty
+                else {}
+            )
+            best_summary = _optuna_best_summary_from_trial_row(
+                trial_row=best_trial_row,
+                model_choice=model_choice,
+                feature_set_label=label,
+                balance_mode=balance_mode,
+                balance_mode_label=balance_label,
+                calibration_method=optuna_calibration_method,
+                calibration_method_label=_calibration_method_label(
+                    optuna_calibration_method
+                ),
+                objective_mode=str(optuna_objective_mode),
+                objective_metric=str(objective_key),
+                objective_label=str(objective_label),
+                objective_direction=str(objective_direction),
+                best_score=best_score,
+                best_trial_number=int(best_trial.number),
+                best_model_params=model_params,
+                best_smote_params=smote_params,
+                best_top_k=int(best_top_k),
+                best_feature_cols=best_feature_cols,
+                ranked_cols=ranked_cols,
+            )
 
             return {
                 "balance_mode": balance_mode,
@@ -18538,7 +21805,15 @@ def _render_optuna_tab() -> None:
                     else None
                 ),
                 "best_trial_number": int(best_trial.number),
+                "best_summary": best_summary,
                 "pareto_front_df": pareto_front_df,
+                "effective_n_jobs": int(effective_optuna_n_jobs),
+                "svm_require_mlx": bool(svm_strict_mlx_optuna),
+                "execution_backend": (
+                    "local_process_pool_spawn"
+                    if svm_strict_mlx_optuna
+                    else "local_optuna"
+                ),
             }
 
         # Flag local para "ya promovimos un primary en esta corrida". Sustituye
@@ -18603,6 +21878,15 @@ def _render_optuna_tab() -> None:
                         ]
 
                 search_space: Dict[str, object] = {}
+                if res["balance_mode"] == "class_weight":
+                    search_space["balance"] = {
+                        "mode": "class_weight",
+                        "strategy": (
+                            "scale_pos_weight=negativos/positivos"
+                            if model_choice == "XGBoost"
+                            else "class_weight='balanced'"
+                        ),
+                    }
                 if res["balance_mode"] == "smote":
                     search_space["smote"] = {
                         "k_neighbors": {
@@ -18722,6 +22006,7 @@ def _render_optuna_tab() -> None:
                             "max": float(svm_c_max),
                             "step": float(svm_c_step),
                         },
+                        "require_mlx": bool(res.get("svm_require_mlx", False)),
                     }
 
                 optuna_settings_payload = {
@@ -18729,6 +22014,11 @@ def _render_optuna_tab() -> None:
                     "n_trials": int(n_trials),
                     "timeout": int(timeout),
                     "n_jobs": int(optuna_n_jobs),
+                    "effective_n_jobs": int(
+                        res.get("effective_n_jobs", optuna_n_jobs)
+                    ),
+                    "execution_backend": str(res.get("execution_backend", "local_optuna")),
+                    "svm_require_mlx": bool(res.get("svm_require_mlx", False)),
                     "random_state": int(optuna_random_state),
                     "test_size": float(optuna_test_size),
                     "val_size": float(optuna_val_size),
@@ -18834,13 +22124,17 @@ def _render_optuna_tab() -> None:
                         "objective_values": dict(
                             res.get("objective_values") or {}
                         ),
+                        "execution_backend": res.get("execution_backend"),
+                        "svm_require_mlx": res.get("svm_require_mlx"),
                         "pruning_proxy_score": res.get("pruning_proxy_score"),
                         "far_gate_pass": res.get("far_gate_pass"),
                         "far_gate_fallback": res.get("far_gate_fallback"),
                         "decision_threshold": res.get("decision_threshold"),
                         "best_trial_number": res.get("best_trial_number"),
+                        "best_summary": dict(res.get("best_summary") or {}),
                     },
                     pareto_front_df=res.get("pareto_front_df"),
+                    best_summary=dict(res.get("best_summary") or {}),
                 )
                 if is_multiobjective_optuna:
                     success_metric = (
@@ -18895,6 +22189,16 @@ def _render_optuna_tab() -> None:
         st.rerun()
 
     st.subheader("Resultados guardados")
+    best_summary_rows = _optuna_best_summary_rows_from_store(
+        configs=configs,
+        store=store,
+        model_choice=model_choice,
+    )
+    best_summary_display = _optuna_best_summary_display_frame(best_summary_rows)
+    if not best_summary_display.empty:
+        st.markdown("**Resumen de mejores modelos**")
+        st.dataframe(best_summary_display, width="stretch")
+
     res_tabs = st.tabs([c["label"] for c in configs])
     for idx, cfg in enumerate(configs):
         with res_tabs[idx]:
@@ -20661,8 +23965,6 @@ def _render_model_tab_optuna_batch_mode(
                 balance_mode = _normalize_optuna_balance_mode(
                     subrun.get("balance_mode")
                 )
-                if balance_mode != "smote":
-                    balance_mode = "none"
                 _model_optuna_batch_append_event(
                     progress_state,
                     step_id="subrun_start",
@@ -23062,6 +26364,7 @@ def _history_optuna_subrun_rows(
 
 
 HISTORY_MODEL_FEATURE_SET_ORDER = ("Base", "Cluster", "Base+Cluster")
+HISTORY_MODEL_BALANCE_ORDER = ("none", "class_weight", "smote")
 HISTORY_MODEL_ID_COLUMNS = [
     "record_id",
     "created_at",
@@ -23108,6 +26411,20 @@ HISTORY_MODEL_METRIC_LABELS = {
     "true_negatives": "TN",
     "true_positives": "TP",
 }
+HISTORY_MODEL_LEADERBOARD_METRICS = [
+    ("roc_auc", "ROC-AUC", ("roc_auc", "test_roc_auc")),
+    ("f1", "F1", ("f1", "test_f1", "balanced_f1", "test_balanced_f1")),
+    ("pr_auc", "PR-AUC", ("pr_auc", "test_pr_auc")),
+    ("recall", "Recall", ("recall", "test_recall")),
+    ("precision", "Precision", ("precision", "test_precision")),
+    ("mcc", "MCC", ("mcc", "test_mcc")),
+    ("far", "FAR", ("far", "test_far")),
+    ("threshold", "Threshold", ("threshold", "decision_threshold")),
+    ("true_positives", "TP", ("true_positives", "test_true_positives")),
+    ("false_positives", "FP", ("false_positives", "test_false_positives")),
+    ("true_negatives", "TN", ("true_negatives", "test_true_negatives")),
+    ("false_negatives", "FN", ("false_negatives", "test_false_negatives")),
+]
 
 
 def _history_normalize_model_feature_set_label(value: object) -> Optional[str]:
@@ -23144,6 +26461,40 @@ def _history_normalize_model_feature_set_label(value: object) -> Optional[str]:
 def _history_model_metric_label(metric_key: object) -> str:
     key = str(metric_key or "")
     return HISTORY_MODEL_METRIC_LABELS.get(key, key.replace("_", " ").title())
+
+
+def _history_feature_set_display_label(feature_set: object) -> str:
+    normalized = _history_normalize_model_feature_set_label(feature_set)
+    if normalized == "Base+Cluster":
+        return "Base + Cluster"
+    return normalized or str(feature_set or "")
+
+
+def _history_normalize_model_balance(value: object) -> str:
+    return _normalize_optuna_balance_mode(value)
+
+
+def _history_model_balance_label(value: object) -> str:
+    mode = _history_normalize_model_balance(value)
+    return _optuna_balance_mode_widget_label(mode)
+
+
+def _history_selectbox_stable(
+    label: str,
+    options: Sequence[object],
+    *,
+    key: str,
+    format_func: Optional[Callable[[object], object]] = None,
+) -> Optional[object]:
+    option_list = list(options or [])
+    if not option_list:
+        return None
+    if st.session_state.get(key) not in option_list:
+        st.session_state[key] = option_list[0]
+    kwargs: Dict[str, object] = {"key": key}
+    if format_func is not None:
+        kwargs["format_func"] = format_func
+    return st.selectbox(label, option_list, **kwargs)
 
 
 def _history_model_is_metric_payload(value: object) -> bool:
@@ -23354,9 +26705,22 @@ def _history_base_model_metric_row(
     subrun: object = "",
     candidate: object = "",
     protocol: object = None,
+    subrun_meta: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     metric_protocol = (
         metrics.get("threshold_protocol") if isinstance(metrics, dict) else None
+    )
+    balance_value = (
+        metrics.get("balance_strategy")
+        if isinstance(metrics, dict) and metrics.get("balance_strategy") is not None
+        else metrics.get("balance_mode")
+        if isinstance(metrics, dict) and metrics.get("balance_mode") is not None
+        else subrun_meta.get("balance_mode")
+        if isinstance(subrun_meta, dict) and subrun_meta.get("balance_mode") is not None
+        else subrun_meta.get("balance_strategy")
+        if isinstance(subrun_meta, dict) and subrun_meta.get("balance_strategy") is not None
+        else record.get("balance_strategy")
+        or ""
     )
     row: Dict[str, object] = {
         "record_id": int(record.get("id") or 0),
@@ -23374,11 +26738,7 @@ def _history_base_model_metric_row(
             if isinstance(metrics, dict) and metrics.get("calibration_method") is not None
             else record.get("calibration_method") or ""
         ),
-        "balance": (
-            metrics.get("balance_strategy")
-            if isinstance(metrics, dict) and metrics.get("balance_strategy") is not None
-            else record.get("balance_strategy") or ""
-        ),
+        "balance": _history_normalize_model_balance(balance_value),
         "tramo": record.get("tramo_label") or "",
         "features": Path(str(record.get("features_path") or "")).name,
         "run_id": _history_record_run_id(record),
@@ -23415,7 +26775,9 @@ def _history_model_metric_rows(records: Sequence[Dict[str, object]]) -> List[Dic
             )
             continue
 
+        subrun_lookup = _history_model_subrun_lookup(record)
         for feature_key, feature_value in metrics.items():
+            subrun_meta = subrun_lookup.get(str(feature_key))
             if _history_model_is_metric_payload(feature_value):
                 feature_set = _history_infer_model_feature_set_label(
                     record,
@@ -23427,14 +26789,13 @@ def _history_model_metric_rows(records: Sequence[Dict[str, object]]) -> List[Dic
                         record,
                         feature_set=feature_set,
                         metrics=feature_value,
+                        subrun_meta=subrun_meta,
                     )
                 )
                 continue
 
             if not isinstance(feature_value, dict):
                 continue
-            subrun_lookup = _history_model_subrun_lookup(record)
-            subrun_meta = subrun_lookup.get(str(feature_key))
             candidate_lookup = _history_model_candidate_lookup(subrun_meta)
             for candidate_key, candidate_value in feature_value.items():
                 if _history_model_is_metric_payload(candidate_value):
@@ -23452,6 +26813,7 @@ def _history_model_metric_rows(records: Sequence[Dict[str, object]]) -> List[Dic
                             metrics=candidate_value,
                             subrun=feature_key,
                             candidate=candidate_key,
+                            subrun_meta=subrun_meta,
                         )
                     )
                     continue
@@ -23486,6 +26848,7 @@ def _history_model_metric_rows(records: Sequence[Dict[str, object]]) -> List[Dic
                             subrun=feature_key,
                             candidate=candidate_key,
                             protocol=protocol_key,
+                            subrun_meta=subrun_meta,
                         )
                     )
     return rows
@@ -23505,6 +26868,179 @@ def _history_model_metrics_dataframe(
         if column not in set(id_columns)
     )
     return df[id_columns + metric_columns]
+
+
+def _history_numeric_row_value(
+    row: pd.Series,
+    aliases: Sequence[str],
+) -> float:
+    for column in aliases:
+        if column not in row.index:
+            continue
+        value = pd.to_numeric(pd.Series([row.get(column)]), errors="coerce").iloc[0]
+        if pd.notna(value) and np.isfinite(float(value)):
+            return float(value)
+    return float("nan")
+
+
+def _history_model_leaderboard_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    if "feature_set" not in work.columns or "balance" not in work.columns:
+        return pd.DataFrame()
+    work["feature_set"] = work["feature_set"].map(
+        lambda value: _history_normalize_model_feature_set_label(value)
+        or str(value or "")
+    )
+    work = work.loc[work["feature_set"].isin(HISTORY_MODEL_FEATURE_SET_ORDER)].copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["balance"] = work["balance"].map(_history_normalize_model_balance)
+    work = work.loc[work["balance"].isin(HISTORY_MODEL_BALANCE_ORDER)].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    for metric_key, _metric_label, aliases in HISTORY_MODEL_LEADERBOARD_METRICS:
+        work[metric_key] = work.apply(
+            lambda row, metric_aliases=aliases: _history_numeric_row_value(
+                row, metric_aliases
+            ),
+            axis=1,
+        )
+    work = work.dropna(subset=["roc_auc"])
+    if work.empty:
+        return pd.DataFrame()
+    work["f1"] = pd.to_numeric(work["f1"], errors="coerce")
+    work["_leaderboard_f1_rank"] = work["f1"].fillna(float("-inf"))
+    feature_rank = {value: idx for idx, value in enumerate(HISTORY_MODEL_FEATURE_SET_ORDER)}
+    balance_rank = {value: idx for idx, value in enumerate(HISTORY_MODEL_BALANCE_ORDER)}
+    work["_feature_rank"] = work["feature_set"].map(feature_rank).fillna(99)
+    work["_balance_rank"] = work["balance"].map(balance_rank).fillna(99)
+    work["_record_rank"] = pd.to_numeric(
+        work.get("record_id", pd.Series(0, index=work.index)),
+        errors="coerce",
+    ).fillna(0)
+    work["_created_rank"] = pd.to_datetime(
+        work.get("created_at", pd.Series("", index=work.index)),
+        errors="coerce",
+    )
+    work = work.sort_values(
+        [
+            "_feature_rank",
+            "_balance_rank",
+            "roc_auc",
+            "_leaderboard_f1_rank",
+            "_created_rank",
+            "_record_rank",
+        ],
+        ascending=[True, True, False, False, False, False],
+    )
+    winners = (
+        work.groupby(["feature_set", "balance"], sort=False, as_index=False)
+        .head(1)
+        .copy()
+    )
+    winners["feature_set_label"] = winners["feature_set"].map(
+        _history_feature_set_display_label
+    )
+    winners["balance_label"] = winners["balance"].map(_history_model_balance_label)
+    display_columns = [
+        "feature_set",
+        "feature_set_label",
+        "balance",
+        "balance_label",
+        "record_id",
+        "created_at",
+        "model",
+        "protocol",
+        "threshold_objective",
+        "calibration",
+        "run_id",
+        "subrun",
+        "candidate",
+    ] + [metric_key for metric_key, _label, _aliases in HISTORY_MODEL_LEADERBOARD_METRICS]
+    extra_columns = [
+        column
+        for column in ["tramo", "features", "confusion_matrix"]
+        if column in winners.columns and column not in display_columns
+    ]
+    return winners[
+        [column for column in display_columns + extra_columns if column in winners.columns]
+    ].reset_index(drop=True)
+
+
+def _history_model_leaderboard_display_frame(
+    winners: pd.DataFrame,
+) -> pd.DataFrame:
+    if not isinstance(winners, pd.DataFrame) or winners.empty:
+        return pd.DataFrame()
+    columns = {
+        "feature_set_label": "Grupo de features",
+        "balance_label": "Balance",
+        "model": "Modelo",
+        "protocol": "Protocolo",
+        "calibration": "Calibración",
+        "threshold_objective": "Objetivo",
+        "record_id": "ID",
+        "roc_auc": "ROC-AUC",
+        "f1": "F1",
+        "pr_auc": "PR-AUC",
+        "recall": "Recall",
+        "precision": "Precision",
+        "mcc": "MCC",
+        "far": "FAR",
+        "threshold": "Threshold",
+        "true_positives": "TP",
+        "false_positives": "FP",
+        "true_negatives": "TN",
+        "false_negatives": "FN",
+        "run_id": "Run",
+        "created_at": "Fecha",
+    }
+    ordered = [column for column in columns if column in winners.columns]
+    frame = winners[ordered].rename(columns=columns).copy()
+    return _prepare_dataframe_for_streamlit(frame)
+
+
+def _history_model_leaderboard_delta_frame(winners: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(winners, pd.DataFrame) or winners.empty:
+        return pd.DataFrame()
+    rows: List[Dict[str, object]] = []
+    for balance in HISTORY_MODEL_BALANCE_ORDER:
+        balance_df = winners.loc[winners["balance"].eq(balance)].copy()
+        base_rows = balance_df.loc[balance_df["feature_set"].eq("Base")]
+        if base_rows.empty:
+            continue
+        base_row = base_rows.iloc[0]
+        for feature_set in ("Cluster", "Base+Cluster"):
+            compare_rows = balance_df.loc[balance_df["feature_set"].eq(feature_set)]
+            if compare_rows.empty:
+                continue
+            compare_row = compare_rows.iloc[0]
+            for metric_key in ("roc_auc", "f1"):
+                base_value = pd.to_numeric(
+                    pd.Series([base_row.get(metric_key)]), errors="coerce"
+                ).iloc[0]
+                compare_value = pd.to_numeric(
+                    pd.Series([compare_row.get(metric_key)]), errors="coerce"
+                ).iloc[0]
+                if pd.isna(base_value) or pd.isna(compare_value):
+                    continue
+                rows.append(
+                    {
+                        "feature_set": feature_set,
+                        "feature_set_label": _history_feature_set_display_label(
+                            feature_set
+                        ),
+                        "balance": balance,
+                        "balance_label": _history_model_balance_label(balance),
+                        "metric": metric_key,
+                        "metric_label": _history_model_metric_label(metric_key),
+                        "delta": float(compare_value) - float(base_value),
+                    }
+                )
+    return pd.DataFrame(rows)
 
 
 def _history_numeric_metric_columns(df: pd.DataFrame) -> List[str]:
@@ -23719,6 +27255,361 @@ def _render_history_model_metrics_comparison(
             )
 
 
+def _history_load_model_detail_records(
+    db_path: Path,
+    records: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    details: List[Dict[str, object]] = []
+    for record in list(records or []):
+        if str(record.get("stage") or "") != "Modelos":
+            continue
+        try:
+            detail = history_store.get_record(db_path, int(record.get("id") or 0))
+        except Exception:
+            detail = None
+        details.append(detail if isinstance(detail, dict) else record)
+    return details
+
+
+def _history_records_overview_rows(
+    records: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for record in list(records or []):
+        balance_raw = record.get("balance_strategy")
+        balance_label = ""
+        if balance_raw:
+            balance_label = (
+                "Optuna batch"
+                if str(balance_raw).strip().lower() == "optuna_batch"
+                else _history_model_balance_label(balance_raw)
+            )
+        rows.append(
+            {
+                "id": record.get("id"),
+                "star": "*" if record.get("starred") else "",
+                "stage": record.get("stage"),
+                "created_at": record.get("created_at"),
+                "features": Path(str(record.get("features_path") or "")).name,
+                "tramo": record.get("tramo_label"),
+                "model": record.get("model_name"),
+                "objective": record.get("threshold_objective")
+                or record.get("optuna_objective"),
+                "calibration": record.get("calibration_method"),
+                "balance": balance_label,
+            }
+        )
+    return rows
+
+
+def _render_history_model_leaderboard_charts(winners: pd.DataFrame) -> None:
+    if not isinstance(winners, pd.DataFrame) or winners.empty:
+        return
+    alt = _import_altair()
+    chart_source = winners.copy()
+    chart_source["feature_set_label"] = chart_source["feature_set"].map(
+        _history_feature_set_display_label
+    )
+    chart_source["balance_label"] = chart_source["balance"].map(
+        _history_model_balance_label
+    )
+
+    st.markdown("**Mapa de desempeño por estrategia**")
+    if alt is None:
+        heatmap_fallback = chart_source.pivot(
+            index="feature_set_label",
+            columns="balance_label",
+            values="roc_auc",
+        )
+        st.dataframe(
+            _prepare_dataframe_for_streamlit(heatmap_fallback.reset_index()),
+            width="stretch",
+        )
+    else:
+        heatmap = (
+            alt.Chart(chart_source)
+            .mark_rect(stroke="#d8d5cd", strokeWidth=0.5)
+            .encode(
+                x=alt.X(
+                    "balance_label:N",
+                    title="Estrategia de balance",
+                    sort=[_history_model_balance_label(item) for item in HISTORY_MODEL_BALANCE_ORDER],
+                ),
+                y=alt.Y(
+                    "feature_set_label:N",
+                    title="Grupo de features",
+                    sort=[_history_feature_set_display_label(item) for item in HISTORY_MODEL_FEATURE_SET_ORDER],
+                ),
+                color=alt.Color(
+                    "roc_auc:Q",
+                    title="ROC-AUC",
+                    scale=alt.Scale(range=["#ecebe6", "#8fa4c7", "#1b3a6b"]),
+                ),
+                tooltip=[
+                    alt.Tooltip("feature_set_label:N", title="Features"),
+                    alt.Tooltip("balance_label:N", title="Balance"),
+                    alt.Tooltip("model:N", title="Modelo"),
+                    alt.Tooltip("protocol:N", title="Protocolo"),
+                    alt.Tooltip("roc_auc:Q", title="ROC-AUC", format=".6f"),
+                    alt.Tooltip("f1:Q", title="F1", format=".6f"),
+                ],
+            )
+            .properties(height=260)
+        )
+        st.altair_chart(heatmap, width="stretch")
+
+    metric_rows: List[Dict[str, object]] = []
+    for _, row in chart_source.iterrows():
+        for metric_key in ("roc_auc", "f1"):
+            value = pd.to_numeric(pd.Series([row.get(metric_key)]), errors="coerce").iloc[0]
+            if pd.isna(value):
+                continue
+            metric_rows.append(
+                {
+                    "config": (
+                        f"{row.get('feature_set_label')} | "
+                        f"{row.get('balance_label')}"
+                    ),
+                    "feature_set_label": row.get("feature_set_label"),
+                    "balance_label": row.get("balance_label"),
+                    "metric": metric_key,
+                    "metric_label": _history_model_metric_label(metric_key),
+                    "value": float(value),
+                    "model": row.get("model"),
+                    "record_id": row.get("record_id"),
+                }
+            )
+    metric_df = pd.DataFrame(metric_rows)
+    if not metric_df.empty:
+        st.markdown("**Ganadores: ROC-AUC y F1**")
+        if alt is None:
+            st.bar_chart(
+                metric_df.pivot(index="config", columns="metric_label", values="value")
+            )
+        else:
+            bars = (
+                alt.Chart(metric_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("config:N", title=None, axis=alt.Axis(labelAngle=-35)),
+                    y=alt.Y("value:Q", title="Valor test"),
+                    color=alt.Color(
+                        "metric_label:N",
+                        title="Métrica",
+                        scale=alt.Scale(range=["#1b3a6b", "#d4541a"]),
+                    ),
+                    xOffset="metric_label:N",
+                    tooltip=[
+                        alt.Tooltip("config:N", title="Configuración"),
+                        alt.Tooltip("metric_label:N", title="Métrica"),
+                        alt.Tooltip("value:Q", title="Valor", format=".6f"),
+                        alt.Tooltip("model:N", title="Modelo"),
+                        alt.Tooltip("record_id:Q", title="ID"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(bars, width="stretch")
+
+    delta_df = _history_model_leaderboard_delta_frame(chart_source)
+    if delta_df.empty:
+        return
+    st.markdown("**Mejora respecto a Base**")
+    if alt is None:
+        st.dataframe(_prepare_dataframe_for_streamlit(delta_df), width="stretch")
+        return
+    delta_chart = (
+        alt.Chart(delta_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("balance_label:N", title="Estrategia de balance"),
+            y=alt.Y("delta:Q", title="Delta vs Base"),
+            color=alt.Color(
+                "feature_set_label:N",
+                title="Grupo",
+                scale=alt.Scale(range=["#3b7a57", "#1b3a6b"]),
+            ),
+            column=alt.Column("metric_label:N", title=None),
+            tooltip=[
+                alt.Tooltip("feature_set_label:N", title="Features"),
+                alt.Tooltip("balance_label:N", title="Balance"),
+                alt.Tooltip("metric_label:N", title="Métrica"),
+                alt.Tooltip("delta:Q", title="Delta", format="+.6f"),
+            ],
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(delta_chart, width="stretch")
+
+
+def _render_history_model_leaderboard(
+    model_records: Sequence[Dict[str, object]],
+    *,
+    stage_filter: object,
+) -> None:
+    if str(stage_filter or "Todos") not in {"Todos", "Modelos"}:
+        st.info(
+            "El filtro Etapa excluye registros de Modelos. Seleccione Todos o "
+            "Modelos para construir el leaderboard."
+        )
+        return
+    df = _history_model_metrics_dataframe(model_records)
+    if df.empty:
+        st.info("No hay métricas de Modelos comparables para los filtros actuales.")
+        return
+    winners = _history_model_leaderboard_dataframe(df)
+    if winners.empty:
+        st.info(
+            "No hay candidatos con ROC-AUC disponible para construir el leaderboard."
+        )
+        return
+
+    st.markdown("**Leaderboard académico — mejores modelos por features y balance**")
+    st.caption(
+        "Criterio: maximiza ROC-AUC en test; en empates se prioriza F1. "
+        f"Ganadores: {len(winners)} de "
+        f"{len(HISTORY_MODEL_FEATURE_SET_ORDER) * len(HISTORY_MODEL_BALANCE_ORDER)} "
+        "celdas esperadas."
+    )
+    top_row = winners.sort_values(["roc_auc", "f1"], ascending=[False, False]).iloc[0]
+    cols = st.columns(4)
+    metric_specs = [
+        ("Mejor ROC-AUC", top_row.get("roc_auc")),
+        ("F1 del ganador", top_row.get("f1")),
+        ("PR-AUC", top_row.get("pr_auc")),
+        ("MCC", top_row.get("mcc")),
+    ]
+    for column, (label, value) in zip(cols, metric_specs):
+        with column:
+            numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+            column.metric(label, "-" if pd.isna(numeric) else f"{float(numeric):.4f}")
+    st.caption(
+        f"Ganador global: {_history_feature_set_display_label(top_row.get('feature_set'))} | "
+        f"{_history_model_balance_label(top_row.get('balance'))} | "
+        f"{top_row.get('model') or '-'} | ID {top_row.get('record_id')}"
+    )
+    st.dataframe(
+        _history_model_leaderboard_display_frame(winners),
+        width="stretch",
+    )
+    _render_history_model_leaderboard_charts(winners)
+
+
+def _render_history_record_detail_panel(
+    db_path: Path,
+    *,
+    record_id: int,
+    selected_summary: Optional[Dict[str, object]],
+) -> None:
+    selected_record = history_store.get_record(db_path, int(record_id))
+    if not isinstance(selected_record, dict):
+        st.warning("No se pudo cargar el registro seleccionado.")
+        return
+
+    col_star, col_delete = st.columns([1, 2])
+    with col_star:
+        star_label = (
+            "Quitar estrella"
+            if selected_summary and selected_summary.get("starred")
+            else "Marcar estrella"
+        )
+        if st.button(star_label, key=f"history_star_{record_id}"):
+            history_store.set_starred(
+                db_path,
+                int(record_id),
+                not bool(selected_summary and selected_summary.get("starred")),
+            )
+            st.rerun()
+    with col_delete:
+        confirm_key = f"history_delete_confirm_{record_id}"
+        confirm_delete = st.checkbox(
+            "Confirmar eliminación",
+            key=confirm_key,
+        )
+        if st.button(
+            "Eliminar registro y artefactos generados",
+            key=f"history_delete_{record_id}",
+            disabled=not confirm_delete,
+        ):
+            result = history_store.delete_record(db_path, int(record_id))
+            if result.get("deleted"):
+                deleted_count = len(result.get("deleted_paths") or [])
+                skipped_count = len(result.get("skipped_paths") or [])
+                st.success(
+                    f"Registro eliminado. Archivos borrados: {deleted_count}. "
+                    f"Omitidos: {skipped_count}."
+                )
+                st.rerun()
+            st.warning("No se pudo eliminar el registro.")
+
+    st.markdown("**Resumen**")
+    st.json(
+        {
+            "id": selected_record.get("id"),
+            "stage": selected_record.get("stage"),
+            "created_at": selected_record.get("created_at"),
+            "context_key": selected_record.get("context_key"),
+            "feature_context_key": selected_record.get("feature_context_key"),
+            "optuna_context_key": selected_record.get("optuna_context_key"),
+            "batch_key": selected_record.get("batch_key"),
+            "features_path": selected_record.get("features_path"),
+            "features_source": selected_record.get("features_source"),
+            "features_date_min": selected_record.get("features_date_min"),
+            "features_date_max": selected_record.get("features_date_max"),
+            "tramo_label": selected_record.get("tramo_label"),
+            "feature_signature": selected_record.get("feature_signature"),
+            "model_name": selected_record.get("model_name"),
+            "optuna_objective": selected_record.get("optuna_objective"),
+            "threshold_objective": selected_record.get("threshold_objective"),
+            "calibration_method": selected_record.get("calibration_method"),
+            "balance_strategy": selected_record.get("balance_strategy"),
+            "protocols": selected_record.get("protocols"),
+        }
+    )
+    st.markdown("**Parámetros**")
+    st.json(selected_record.get("params") or {})
+    st.markdown("**Métricas**")
+    metrics = selected_record.get("metrics") or {}
+    if isinstance(metrics, dict) and metrics:
+        if all(isinstance(value, dict) for value in metrics.values()):
+            try:
+                st.dataframe(pd.DataFrame(metrics).T, width="stretch")
+            except Exception:
+                st.json(metrics)
+        else:
+            st.json(metrics)
+    else:
+        st.info("Sin métricas registradas.")
+    st.markdown("**Artefactos**")
+    artifacts = selected_record.get("artifacts") or []
+    if artifacts:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "role": item.get("role"),
+                        "path": item.get("path"),
+                        "generated": item.get("generated"),
+                        "delete_on_record_delete": item.get(
+                            "delete_on_record_delete"
+                        ),
+                        "exists": Path(str(item.get("path"))).exists(),
+                    }
+                    for item in artifacts
+                    if isinstance(item, dict)
+                ]
+            ),
+            width="stretch",
+        )
+    else:
+        st.info("Sin artefactos registrados.")
+    if st.checkbox(
+        "Mostrar metadata completa",
+        key=f"history_show_metadata_{record_id}",
+    ):
+        st.json(selected_record.get("metadata") or {})
+
+
 def _render_history_tab() -> None:
     st.subheader("History")
     db_path = _history_db_path()
@@ -23839,8 +27730,8 @@ def _render_history_tab() -> None:
     optuna_only_records = bool(records) and all(
         str(record.get("stage") or "") == "Optuna" for record in records
     )
-    selected_summary: Optional[Dict[str, object]] = None
-    model_detail_records: List[Dict[str, object]] = []
+    model_detail_records = _history_load_model_detail_records(db_path, records)
+
     if optuna_only_records:
         grouped_records = _group_optuna_history_records(records)
         st.caption(
@@ -23851,69 +27742,79 @@ def _render_history_tab() -> None:
             pd.DataFrame(_history_optuna_batch_overview_rows(grouped_records)),
             width="stretch",
         )
-        batch_lookup = {
-            str(group.get("token")): group for group in grouped_records
-        }
-        batch_token = st.selectbox(
-            "Lote Optuna",
-            list(batch_lookup.keys()),
-            key="history_selected_optuna_batch",
-            format_func=lambda value: (
-                f"{len(batch_lookup[value].get('records') or [])} subcorridas | "
-                f"ids "
-                f"{max(int(record.get('id') or 0) for record in batch_lookup[value].get('records') or [{}])}"
-                f" -> "
-                f"{min(int(record.get('id') or 0) for record in batch_lookup[value].get('records') or [{}])}"
-            ),
-        )
-        selected_batch = batch_lookup.get(str(batch_token), {})
-        batch_records = list(selected_batch.get("records") or [])
-        if batch_records:
-            st.caption(
-                f"Subcorridas del lote seleccionado: {len(batch_records)}"
-            )
-            st.dataframe(
-                pd.DataFrame(
-                    _history_optuna_subrun_rows(db_path, batch_records)
-                ),
-                width="stretch",
-            )
-        record_lookup = {
-            int(record["id"]): record for record in batch_records
-        }
-        record_id = st.selectbox(
-            "Detalle de subcorrida",
-            list(record_lookup.keys()),
-            key="history_selected_optuna_record_id",
-            format_func=lambda value: (
-                f"{'* ' if record_lookup[int(value)].get('starred') else ''}"
-                f"{value} | {record_lookup[int(value)].get('created_at')} | "
-                f"{record_lookup[int(value)].get('balance_strategy') or '-'}"
-            ),
-        )
-        selected_summary = record_lookup.get(int(record_id))
     else:
         st.caption(f"Registros listados: {len(records)} | Base: {db_path}")
-        overview_rows = []
-        for record in records:
-            overview_rows.append(
-                {
-                    "id": record.get("id"),
-                    "star": "*" if record.get("starred") else "",
-                    "stage": record.get("stage"),
-                    "created_at": record.get("created_at"),
-                    "features": Path(str(record.get("features_path") or "")).name,
-                    "tramo": record.get("tramo_label"),
-                    "model": record.get("model_name"),
-                    "objective": record.get("threshold_objective")
-                    or record.get("optuna_objective"),
-                    "calibration": record.get("calibration_method"),
-                }
+        st.dataframe(
+            pd.DataFrame(_history_records_overview_rows(records)),
+            width="stretch",
+        )
+
+    leaderboard_tab, details_tab = st.tabs(
+        ["Leaderboard", "Detalles por experimentos"]
+    )
+    with leaderboard_tab:
+        _render_history_model_leaderboard(
+            model_detail_records,
+            stage_filter=stage_filter,
+        )
+
+    with details_tab:
+        if optuna_only_records:
+            batch_lookup = {
+                str(group.get("token")): group for group in grouped_records
+            }
+            batch_token = _history_selectbox_stable(
+                "Lote Optuna",
+                list(batch_lookup.keys()),
+                key="history_selected_optuna_batch",
+                format_func=lambda value: (
+                    f"{len(batch_lookup[value].get('records') or [])} subcorridas | "
+                    f"ids "
+                    f"{max(int(record.get('id') or 0) for record in batch_lookup[value].get('records') or [{}])}"
+                    f" -> "
+                    f"{min(int(record.get('id') or 0) for record in batch_lookup[value].get('records') or [{}])}"
+                ),
             )
-        st.dataframe(pd.DataFrame(overview_rows), width="stretch")
+            if batch_token is None:
+                st.info("No hay lotes Optuna para detallar.")
+                return
+            selected_batch = batch_lookup.get(str(batch_token), {})
+            batch_records = list(selected_batch.get("records") or [])
+            if batch_records:
+                st.caption(
+                    f"Subcorridas del lote seleccionado: {len(batch_records)}"
+                )
+                st.dataframe(
+                    pd.DataFrame(
+                        _history_optuna_subrun_rows(db_path, batch_records)
+                    ),
+                    width="stretch",
+                )
+            record_lookup = {
+                int(record["id"]): record for record in batch_records
+            }
+            record_id = _history_selectbox_stable(
+                "Detalle de subcorrida",
+                list(record_lookup.keys()),
+                key="history_selected_optuna_record_id",
+                format_func=lambda value: (
+                    f"{'* ' if record_lookup[int(value)].get('starred') else ''}"
+                    f"{value} | {record_lookup[int(value)].get('created_at')} | "
+                    f"{record_lookup[int(value)].get('balance_strategy') or '-'}"
+                ),
+            )
+            if record_id is None:
+                st.info("No hay subcorridas en el lote seleccionado.")
+                return
+            _render_history_record_detail_panel(
+                db_path,
+                record_id=int(record_id),
+                selected_summary=record_lookup.get(int(record_id)),
+            )
+            return
 
         record_lookup = {int(record["id"]): record for record in records}
-        record_id = st.selectbox(
+        record_id = _history_selectbox_stable(
             "Detalle",
             list(record_lookup.keys()),
             key="history_selected_record_id",
@@ -23924,132 +27825,19 @@ def _render_history_tab() -> None:
                 f"{record_lookup[int(value)].get('model_name') or '-'}"
             ),
         )
-        selected_summary = record_lookup.get(int(record_id))
-
-        model_summaries = [
-            record
-            for record in records
-            if str(record.get("stage") or "") == "Modelos"
-        ]
-        for record in model_summaries:
-            try:
-                detail = history_store.get_record(db_path, int(record.get("id") or 0))
-            except Exception:
-                detail = None
-            model_detail_records.append(detail if isinstance(detail, dict) else record)
-        if model_summaries:
+        if record_id is None:
+            st.info("No hay registros para detallar.")
+            return
+        if model_detail_records:
             _render_history_model_metrics_comparison(
                 model_detail_records,
-                key_prefix="history_modelos_comparison",
+                key_prefix="history_modelos_details",
             )
-
-    selected_record = history_store.get_record(db_path, int(record_id))
-    if not isinstance(selected_record, dict):
-        st.warning("No se pudo cargar el registro seleccionado.")
-        return
-
-    col_star, col_delete = st.columns([1, 2])
-    with col_star:
-        star_label = (
-            "Quitar estrella"
-            if selected_summary and selected_summary.get("starred")
-            else "Marcar estrella"
+        _render_history_record_detail_panel(
+            db_path,
+            record_id=int(record_id),
+            selected_summary=record_lookup.get(int(record_id)),
         )
-        if st.button(star_label, key=f"history_star_{record_id}"):
-            history_store.set_starred(
-                db_path,
-                int(record_id),
-                not bool(selected_summary and selected_summary.get("starred")),
-            )
-            st.rerun()
-    with col_delete:
-        confirm_key = f"history_delete_confirm_{record_id}"
-        confirm_delete = st.checkbox(
-            "Confirmar eliminación",
-            key=confirm_key,
-        )
-        if st.button(
-            "Eliminar registro y artefactos generados",
-            key=f"history_delete_{record_id}",
-            disabled=not confirm_delete,
-        ):
-            result = history_store.delete_record(db_path, int(record_id))
-            if result.get("deleted"):
-                deleted_count = len(result.get("deleted_paths") or [])
-                skipped_count = len(result.get("skipped_paths") or [])
-                st.success(
-                    f"Registro eliminado. Archivos borrados: {deleted_count}. "
-                    f"Omitidos: {skipped_count}."
-                )
-                st.rerun()
-            st.warning("No se pudo eliminar el registro.")
-
-    st.markdown("**Resumen**")
-    st.json(
-        {
-            "id": selected_record.get("id"),
-            "stage": selected_record.get("stage"),
-            "created_at": selected_record.get("created_at"),
-            "context_key": selected_record.get("context_key"),
-            "feature_context_key": selected_record.get("feature_context_key"),
-            "optuna_context_key": selected_record.get("optuna_context_key"),
-            "batch_key": selected_record.get("batch_key"),
-            "features_path": selected_record.get("features_path"),
-            "features_source": selected_record.get("features_source"),
-            "features_date_min": selected_record.get("features_date_min"),
-            "features_date_max": selected_record.get("features_date_max"),
-            "tramo_label": selected_record.get("tramo_label"),
-            "feature_signature": selected_record.get("feature_signature"),
-            "model_name": selected_record.get("model_name"),
-            "optuna_objective": selected_record.get("optuna_objective"),
-            "threshold_objective": selected_record.get("threshold_objective"),
-            "calibration_method": selected_record.get("calibration_method"),
-            "balance_strategy": selected_record.get("balance_strategy"),
-            "protocols": selected_record.get("protocols"),
-        }
-    )
-    st.markdown("**Parámetros**")
-    st.json(selected_record.get("params") or {})
-    st.markdown("**Métricas**")
-    metrics = selected_record.get("metrics") or {}
-    if isinstance(metrics, dict) and metrics:
-        if all(isinstance(value, dict) for value in metrics.values()):
-            try:
-                st.dataframe(pd.DataFrame(metrics).T, width="stretch")
-            except Exception:
-                st.json(metrics)
-        else:
-            st.json(metrics)
-    else:
-        st.info("Sin métricas registradas.")
-    st.markdown("**Artefactos**")
-    artifacts = selected_record.get("artifacts") or []
-    if artifacts:
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "role": item.get("role"),
-                        "path": item.get("path"),
-                        "generated": item.get("generated"),
-                        "delete_on_record_delete": item.get(
-                            "delete_on_record_delete"
-                        ),
-                        "exists": Path(str(item.get("path"))).exists(),
-                    }
-                    for item in artifacts
-                    if isinstance(item, dict)
-                ]
-            ),
-            width="stretch",
-        )
-    else:
-        st.info("Sin artefactos registrados.")
-    if st.checkbox(
-        "Mostrar metadata completa",
-        key=f"history_show_metadata_{record_id}",
-    ):
-        st.json(selected_record.get("metadata") or {})
 
 
 

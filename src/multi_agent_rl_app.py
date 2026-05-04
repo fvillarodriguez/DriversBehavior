@@ -22,7 +22,7 @@ except ImportError:
     CLUSTER_DB_PATH = None
 
 # Import MARL logic
-from src.marl_core import MARLManager, MAIRLManager
+from src.marl_core import DEFAULT_STATE_COLS, MARLManager, MAIRLManager
 from src.sumo_simulation_app import (
     find_sumo_binary, 
     SIMULATION_DIR,
@@ -44,6 +44,10 @@ def _init_state():
         st.session_state["marl_agent_config"] = []
     if "marl_cluster_df" not in st.session_state:
         st.session_state["marl_cluster_df"] = None
+    if "mairl_transition_df" not in st.session_state:
+        st.session_state["mairl_transition_df"] = None
+    if "mairl_sumo_result" not in st.session_state:
+        st.session_state["mairl_sumo_result"] = None
     if "mairl_feature_cols" not in st.session_state:
         st.session_state["mairl_feature_cols"] = []
     if "mairl_metrics_log" not in st.session_state:
@@ -92,17 +96,47 @@ def load_cluster_data(csv_path: Path):
         st.error(f"Error cargando CSV: {e}")
         return None
 
+def _agent_config_from_transitions(df: pd.DataFrame):
+    if df is None or df.empty or "agent_id" not in df.columns:
+        return []
+    config = []
+    for agent_id, group in df.groupby("agent_id", sort=True):
+        config.append(
+            {
+                "id": str(agent_id),
+                "name": f"Policy_{agent_id}",
+                "stats": {"transitions": int(len(group))},
+            }
+        )
+    return config
+
+
+def _training_agent_config(df: pd.DataFrame):
+    config = st.session_state.get("marl_agent_config", [])
+    if df is None or df.empty or "agent_id" not in df.columns:
+        return config
+    available = set(df["agent_id"].astype(str))
+    configured = {str(agent.get("id")) for agent in config}
+    if config and configured.issubset(available):
+        return config
+    return _agent_config_from_transitions(df)
+
+
 def render_configuration():
-    st.header("Configuración del Entorno MARL")
+    st.header("Configuración de Reward Learning")
     
-    st.subheader("1. Selección de Datos de Clústeres")
+    st.subheader("1. Datos expertos desde AVI/SUMO")
+    st.caption(
+        "MA-AIRL usa transiciones segment-level s, a, s_next reconstruidas entre pórticos. "
+        "Los clústeres quedan como baseline o agrupación experimental."
+    )
     
     # Scan for CSV files
     csv_files = glob.glob(str(RESULTS_DIR / "cluster_*.csv"))
     csv_options = [Path(p).name for p in csv_files]
     
     selected_file = st.selectbox(
-        "Seleccione archivo de clústeres:", 
+        "Archivo de clústeres opcional:",
         options=csv_options,
         index=0 if csv_options else None
     )
@@ -130,22 +164,8 @@ def render_configuration():
     
     # Display Stats
     if st.session_state["marl_cluster_stats"]:
-        st.write("Estadísticas de Clústeres (Target):")
+        st.write("Estadísticas de clústeres opcionales:")
         st.dataframe(pd.DataFrame(st.session_state["marl_cluster_stats"]).T)
-
-    if st.session_state.get("marl_cluster_df") is not None:
-        st.subheader("MA-AIRL: Selección de Features del Estado")
-        df = st.session_state["marl_cluster_df"]
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        default_cols = [c for c in ["avg_speed_kmh", "avg_headway_s", "lane_change_rate"] if c in numeric_cols]
-        selected_cols = st.multiselect(
-            "Columnas numéricas para estado (s)",
-            options=numeric_cols,
-            default=default_cols or numeric_cols[:3],
-            key="mairl_feature_cols",
-        )
-        if not selected_cols:
-            st.warning("Seleccione al menos una columna numérica para MA-AIRL.")
 
     st.subheader("2. Parámetros de Simulación (SUMO)")
     col1, col2 = st.columns(2)
@@ -156,11 +176,75 @@ def render_configuration():
         st.checkbox("Usar GUI de SUMO", value=False, key="marl_gui")
         st.selectbox("Estrategia de Emisión", ["Matriz OD"], key="marl_emission")
 
-    st.subheader("3. Configuración de Agentes")
+    st.subheader("3. Tráfico AVI y pórticos")
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown("##### Carga de flujos")
+        flujos_df = _render_flow_loader()
+
+    with col_b:
+        st.markdown("##### Carga de pórticos")
+        porticos_df = _render_porticos_loader()
+
+    if st.button("Reconstruir transiciones IRL desde AVI", type="primary"):
+        if flujos_df is None or flujos_df.empty:
+            st.error("Debe cargar flujos primero.")
+        elif porticos_df is None or porticos_df.empty:
+            st.error("Debe cargar pórticos primero.")
+        else:
+            with st.spinner("Reconstruyendo trayectorias parciales y transiciones IRL..."):
+                try:
+                    result = run_sumo_pipeline(
+                        flujos_df,
+                        porticos_df,
+                        flow_cols=FlowColumns(),
+                        output_dir=SIMULATION_DIR,
+                        segment_filter=None,
+                    )
+                except Exception as e:
+                    st.error(f"Error reconstruyendo transiciones: {e}")
+                    return
+            st.session_state["mairl_sumo_result"] = result
+            st.session_state["mairl_transition_df"] = result.irl_transitions
+            st.session_state["mairl_manager"] = None
+            st.session_state["mairl_metrics_log"] = []
+            config = _agent_config_from_transitions(result.irl_transitions)
+            if config:
+                st.session_state["marl_agent_config"] = config
+                st.session_state["marl_num_agents"] = len(config)
+            st.success(f"Transiciones IRL reconstruidas: {len(result.irl_transitions):,}.")
+
+    transition_df = st.session_state.get("mairl_transition_df")
+    if transition_df is not None and not transition_df.empty:
+        st.metric("Transiciones expertas", f"{len(transition_df):,}")
+        if "temporal_split" in transition_df.columns:
+            split_counts = transition_df["temporal_split"].value_counts().rename_axis("split").reset_index(name="transitions")
+            st.dataframe(split_counts, width="stretch")
+        st.dataframe(transition_df.head(200), width="stretch")
+
+        st.subheader("4. MA-AIRL: features del estado")
+        numeric_cols = transition_df.select_dtypes(include=[np.number, bool]).columns.tolist()
+        state_options = [
+            c
+            for c in numeric_cols
+            if c.startswith("state_") or c.startswith("flow_context_") or c == "vms_active"
+        ]
+        default_cols = [c for c in DEFAULT_STATE_COLS if c in state_options]
+        selected_cols = st.multiselect(
+            "Columnas para estado s",
+            options=state_options,
+            default=default_cols or state_options[:5],
+            key="mairl_feature_cols",
+        )
+        if not selected_cols:
+            st.warning("Seleccione al menos una columna de estado para MA-AIRL.")
+
+    st.subheader("5. Configuración de políticas compartidas")
     
     # Use config from state if available
     current_config = st.session_state.get("marl_agent_config", [])
-    num_clusters = st.number_input("Número de Agentes", value=len(current_config) if current_config else 3, min_value=1, max_value=10, key="marl_num_agents")
+    num_clusters = st.number_input("Número de políticas", value=len(current_config) if current_config else 3, min_value=1, max_value=20, key="marl_num_agents")
     
     # Adjust config list size if number changed manually
     if len(current_config) != num_clusters:
@@ -169,29 +253,21 @@ def render_configuration():
             current_config = current_config[:num_clusters]
         else:
              for i in range(len(current_config), num_clusters):
-                 current_config.append({"id": i, "name": f"Cluster_{i}", "stats": {}})
+                 current_config.append({"id": i, "name": f"Policy_{i}", "stats": {}})
         st.session_state["marl_agent_config"] = current_config
 
     cols = st.columns(3)
     updated_config = []
     for i, agent in enumerate(current_config):
         with cols[i % 3]:
-            new_name = st.text_input(f"Nombre Agente {i+1}", value=agent["name"], key=f"marl_agent_name_{i}")
+            new_name = st.text_input(f"Nombre política {i+1}", value=agent["name"], key=f"marl_agent_name_{i}")
             agent["name"] = new_name
             if agent["stats"]:
-                st.caption(f"Speed: {agent['stats'].get('avg_speed_kmh',0):.1f}, LC: {agent['stats'].get('lane_change_rate',0):.2f}")
+                if "transitions" in agent["stats"]:
+                    st.caption(f"Transiciones: {agent['stats'].get('transitions', 0):,}")
+                else:
+                    st.caption(f"Speed: {agent['stats'].get('avg_speed_kmh',0):.1f}, LC: {agent['stats'].get('lane_change_rate',0):.2f}")
             updated_config.append(agent)
-    
-    st.subheader("4. Tráfico de Fondo (Flujos)")
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        st.markdown("##### Carga de Flujos")
-        flujos_df = _render_flow_loader()
-    
-    with col_b:
-        st.markdown("##### Carga de Pórticos")
-        porticos_df = _render_porticos_loader()
 
     if st.button("Generar Rutas de Tráfico (Background Traffic)"):
         if flujos_df is None or flujos_df.empty:
@@ -201,13 +277,11 @@ def render_configuration():
         else:
             with st.spinner("Generando rutas SUMO desde flujos..."):
                 try:
-                    # Output to simulation dir
-                    output_path = SIMULATION_DIR / "background_traffic.rou.xml"
                     result = run_sumo_pipeline(
                         flujos_df,
                         porticos_df,
                         flow_cols=FlowColumns(),
-                        output_dir=output_path, 
+                        output_dir=SIMULATION_DIR,
                         segment_filter=None
                     )
                     
@@ -224,11 +298,11 @@ def render_configuration():
         st.info(f"Rutas de fondo activas: {Path(traffic_path).name}")
 
 def render_training():
-    st.header("Entrenamiento de Agentes")
+    st.header("Entrenamiento de Reward Learning")
 
     algorithm = st.selectbox(
         "Algoritmo",
-        options=["MA-AIRL (paper)", "CEM (legacy)"],
+        options=["MA-AIRL (transiciones AVI)", "CEM (legacy)"],
         index=0,
         key="marl_algorithm",
     )
@@ -237,7 +311,7 @@ def render_training():
     with col1:
         st.subheader("Control")
 
-        if algorithm == "MA-AIRL (paper)":
+        if algorithm == "MA-AIRL (transiciones AVI)":
             iterations = st.number_input("Iteraciones", value=200, min_value=1, step=50, key="mairl_iterations")
             batch_size = st.number_input("Batch size", value=256, min_value=8, step=16, key="mairl_batch")
             gamma = st.slider("Gamma (descuento)", min_value=0.80, max_value=0.99, value=0.99, step=0.01, key="mairl_gamma")
@@ -247,21 +321,27 @@ def render_training():
             device = st.selectbox("Device", options=["auto", "cpu"], index=0, key="mairl_device")
 
             if st.button("Iniciar Entrenamiento", type="primary", key="mairl_start"):
-                expert_df = st.session_state.get("marl_cluster_df")
+                expert_df = st.session_state.get("mairl_transition_df")
                 if expert_df is None or expert_df.empty:
-                    st.error("Debe cargar datos de clústeres para MA-AIRL.")
+                    st.error("Debe reconstruir transiciones IRL desde AVI antes de entrenar MA-AIRL.")
                 else:
+                    train_df = expert_df
+                    if "temporal_split" in expert_df.columns:
+                        train_df = expert_df[expert_df["temporal_split"] == "train"].copy()
+                    if train_df.empty:
+                        st.error("La partición temporal de entrenamiento no contiene transiciones válidas.")
+                        return
                     st.session_state["marl_training_active"] = True
                     st.session_state["mairl_metrics_log"] = []
 
-                    config = st.session_state.get("marl_agent_config", [])
+                    config = _training_agent_config(train_df)
                     if not config:
-                        st.warning("No hay agentes configurados. Usando defaults.")
-                        config = [{"id": i, "name": f"Cluster_{i}", "stats": {}} for i in range(3)]
+                        st.warning("No hay políticas configuradas. Usando una política compartida.")
+                        config = [{"id": "shared_policy", "name": "SharedPolicy", "stats": {}}]
 
                     try:
                         manager = MAIRLManager(
-                            expert_df=expert_df,
+                            expert_df=train_df,
                             agent_config=config,
                             feature_cols=st.session_state.get("mairl_feature_cols") or None,
                             hidden_sizes=(hidden, hidden),
@@ -304,13 +384,13 @@ def render_training():
                 st.session_state["marl_training_active"] = False
                 st.warning("Entrenamiento detenido.")
 
-            if st.session_state.get("mairl_manager") is not None and st.button("Exportar vTypes MA-AIRL"):
-                output_path = SIMULATION_DIR / "mairl_vtypes.add.xml"
+            if st.session_state.get("mairl_manager") is not None and st.button("Exportar perfiles MA-AIRL"):
+                output_path = SIMULATION_DIR / "mairl_policy_profiles.json"
                 try:
-                    st.session_state["mairl_manager"].export_vtypes(output_path)
-                    st.success(f"vTypes exportados en: {output_path}")
+                    st.session_state["mairl_manager"].export_policy_profiles(output_path)
+                    st.success(f"Perfiles exportados en: {output_path}")
                 except Exception as e:
-                    st.error(f"Error exportando vTypes: {e}")
+                    st.error(f"Error exportando perfiles: {e}")
         else:
             sumo_bin = find_sumo_binary("sumo")
             if not sumo_bin:
@@ -368,7 +448,7 @@ def render_training():
 
     with col2:
         st.subheader("Métricas en Tiempo Real")
-        if algorithm == "MA-AIRL (paper)":
+        if algorithm == "MA-AIRL (transiciones AVI)":
             if st.session_state["mairl_metrics_log"]:
                 df_metrics = pd.DataFrame(st.session_state["mairl_metrics_log"]).set_index("iteration")
                 st.line_chart(df_metrics[["disc_loss", "policy_loss", "reward_mean"]])
@@ -387,7 +467,7 @@ def render_training():
 
 def render_visualization():
     st.header("Análisis y Visualización")
-    st.write("Comparativa entre datos Reales y Simulados.")
+    st.write("Recompensas y políticas aprendidas desde transiciones AVI.")
 
     if st.session_state.get("mairl_metrics_log"):
         st.subheader("MA-AIRL: Métricas de Entrenamiento")
@@ -395,9 +475,9 @@ def render_visualization():
         st.dataframe(df_metrics)
         manager = st.session_state.get("mairl_manager")
         if manager is not None:
-            st.subheader("Parámetros Aprendidos (vType)")
+            st.subheader("Acciones aprendidas por política compartida")
             try:
-                params = manager.get_policy_params()
+                params = manager.get_policy_actions()
                 df_params = pd.DataFrame(params).T
                 st.dataframe(df_params)
             except Exception as e:
@@ -415,11 +495,11 @@ def render_visualization():
 def main(set_page_config: bool = True, show_exit_button: bool = True) -> None:
     _init_state()
     if set_page_config:
-        st.set_page_config(page_title="Multi Agent RL", layout="wide")
+        st.set_page_config(page_title="Reward Learning", layout="wide")
     
-    st.title("🤖 Multi Agent RL for Driver Clustering")
+    st.title("Reward Learning for Driver Behavior")
     
-    tabs = st.tabs(["⚙️ Configuración", "🧠 Entrenamiento", "📊 Análisis"])
+    tabs = st.tabs(["Configuración", "Entrenamiento", "Análisis"])
     
     with tabs[0]:
         render_configuration()

@@ -2,6 +2,7 @@ import json
 import os
 import smtplib
 import traceback
+from datetime import date, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -23,6 +24,25 @@ def load_email_config() -> Dict:
 def save_email_config(config: Dict):
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
+
+def _json_default(value: object) -> object:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, set):
+        return list(value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:
+            pass
+    return str(value)
 
 def format_history_html(history_entry: Dict) -> str:
     """Formats a GNN history entry into an HTML table."""
@@ -76,7 +96,7 @@ def send_notification_email(subject: str, history_entry: Dict) -> bool:
     msg["From"] = sender_email
     msg["To"] = ", ".join(recipients)
 
-    text = f"Detalles de la ejecución:\n{json.dumps(history_entry, indent=2)}"
+    text = f"Detalles de la ejecución:\n{json.dumps(history_entry, indent=2, default=_json_default)}"
     html = format_history_html(history_entry)
 
     part1 = MIMEText(text, "plain")

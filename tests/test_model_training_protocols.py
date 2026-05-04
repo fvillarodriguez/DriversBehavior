@@ -434,6 +434,58 @@ def test_svm_build_model_rbf_uses_random_fourier_features():
     assert proba.shape == (8, 2)
 
 
+def test_svm_require_mlx_blocks_linear_cpu_fallback(monkeypatch):
+    from src import mlx_svm
+
+    X = pd.DataFrame({"speed": [-1.0, 1.0], "flow": [-0.5, 0.5]})
+    y = np.asarray([0, 1], dtype=int)
+
+    def _raise_mlx_unavailable(*_args, **_kwargs):
+        raise RuntimeError("forced MLX failure")
+
+    monkeypatch.setattr(
+        mlx_svm,
+        "_train_linear_svm_with_mlx",
+        _raise_mlx_unavailable,
+    )
+    model = model_training.build_model(
+        "SVM",
+        {
+            "C": 1.0,
+            "kernel": "linear",
+            "require_mlx": True,
+            "epochs": 1,
+            "batch_size": 2,
+        },
+        random_state=17,
+    )
+
+    with pytest.raises(RuntimeError, match="requiere backend MLX"):
+        model.fit(X, y)
+
+    assert getattr(model, "backend_", None) == "mlx_failed"
+    assert not hasattr(model, "linear_model_")
+
+
+def test_svm_require_mlx_rejects_cpu_only_kernels():
+    X = pd.DataFrame({"speed": [-1.0, 1.0], "flow": [-0.5, 0.5]})
+    y = np.asarray([0, 1], dtype=int)
+    model = model_training.build_model(
+        "SVM",
+        {
+            "C": 1.0,
+            "kernel": "poly",
+            "require_mlx": True,
+        },
+        random_state=17,
+    )
+
+    with pytest.raises(RuntimeError, match="no tiene backend MLX"):
+        model.fit(X, y)
+
+    assert getattr(model, "backend_", None) == "unsupported_mlx_kernel"
+
+
 def test_neural_network_build_model_passes_phase1_options():
     model = model_training.build_model(
         "Neural Network",

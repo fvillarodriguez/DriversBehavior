@@ -710,6 +710,100 @@ def test_recalibration_run_id_is_deterministic():
     assert first != different
 
 
+def test_neural_drift_config_changes_recalibration_run_id():
+    df = pd.DataFrame(
+        {
+            "interval_start": pd.to_datetime(
+                [
+                    "2018-01-01 00:00:00",
+                    "2018-01-01 00:05:00",
+                    "2019-01-01 00:00:00",
+                    "2019-01-01 00:05:00",
+                ]
+            ),
+            "x": [0.1, 0.2, 0.3, 0.4],
+            "target": [0, 1, 0, 1],
+        }
+    )
+    common_kwargs = {
+        "df": df,
+        "feature_cols": ["x"],
+        "target_col": "target",
+        "time_col": "interval_start",
+        "model_names": [],
+        "strategies": [drift_app.ADAPTIVE_NEURAL_DRIFT_STRATEGY],
+        "arf_variants": ["ARFmoderate"],
+        "kswin_variants": ["KSWINpaper"],
+        "balance_modes": [BALANCE_MODE_NONE],
+        "repetition_seeds": [11],
+        "base_year": 2018,
+        "validation_size": 0.2,
+        "folds": 2,
+        "random_state": 11,
+        "fast_mode": True,
+        "resource_mode": drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
+        "grid_limit": 1,
+        "adwin_delta": 0.01,
+        "min_window": 40,
+        "min_retrain_size": 20,
+        "kswin_top_k_features": 3,
+        "kswin_vote_threshold": 1,
+        "kswin_retrain_days": 30,
+        "kswin_min_retrain_rows": 80,
+        "custom_grids": None,
+        "feature_selection_context": {"selected_features": ["x"], "feature_count": 1},
+    }
+
+    first = drift_app._build_recalibration_run_id(
+        **common_kwargs,
+        neural_drift_config={
+            "models": [drift_app.neural_drift_app.MODEL_TORCH_MLP],
+            "strategies": [drift_app.neural_drift_app.STRATEGY_FINE_TUNING],
+            "drift_monitor_bottleneck_dim": 4,
+        },
+    )
+    second = drift_app._build_recalibration_run_id(
+        **common_kwargs,
+        neural_drift_config={
+            "models": [drift_app.neural_drift_app.MODEL_TORCH_MLP],
+            "strategies": [drift_app.neural_drift_app.STRATEGY_FINE_TUNING],
+            "drift_monitor_bottleneck_dim": 8,
+        },
+    )
+
+    assert first != second
+
+
+def test_neural_drift_experiment_config_excludes_xgboost():
+    config = drift_app._neural_drift_experiment_config(
+        {
+            "models": [
+                drift_app.neural_drift_app.MODEL_XGBOOST,
+                drift_app.neural_drift_app.MODEL_TORCH_MLP,
+            ],
+            "strategies": [drift_app.neural_drift_app.STRATEGY_FINE_TUNING],
+        }
+    )
+
+    assert config["models"] == [drift_app.neural_drift_app.MODEL_TORCH_MLP]
+    assert drift_app.neural_drift_app.MODEL_XGBOOST not in config["models"]
+
+
+def test_neural_drift_experiment_config_falls_back_to_neural_models():
+    config = drift_app._neural_drift_experiment_config(
+        {
+            "models": [drift_app.neural_drift_app.MODEL_XGBOOST],
+            "strategies": [drift_app.neural_drift_app.STRATEGY_FIXED],
+        }
+    )
+
+    assert config["models"] == [
+        drift_app.neural_drift_app.MODEL_TORCH_MLP,
+        drift_app.neural_drift_app.MODEL_TORCH_MLP_ATTENTION,
+    ]
+    assert drift_app.neural_drift_app.MODEL_XGBOOST not in config["models"]
+
+
 def test_preview_recalibration_checkpoint_detects_resumable_manifest(tmp_path):
     df = pd.DataFrame(
         {
@@ -2348,6 +2442,52 @@ def test_batch_tuning_tasks_scope_by_window_and_dedupe_identical_train_signature
     assert any(task["window_kind"] == "cumulative" and task["prediction_year"] == 2020 for task in tasks)
 
 
+def test_neural_drift_strategy_generates_blocks_without_classic_tuning():
+    df = generate_synthetic_article_dataset(years=(2018, 2019), rows_per_year=40, random_state=241)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    blocks = drift_app._build_experiment_blocks(
+        model_names=[],
+        strategies=[drift_app.ADAPTIVE_NEURAL_DRIFT_STRATEGY],
+        arf_variants=[],
+        kswin_variants=[],
+        balance_modes=[BALANCE_MODE_NONE, BALANCE_MODE_SMOTE],
+    )
+    tuning_tasks = drift_app._batch_tuning_tasks(
+        df=df,
+        feature_cols=features,
+        target_col="target",
+        time_col="interval_start",
+        model_names=[],
+        strategies=[drift_app.ADAPTIVE_NEURAL_DRIFT_STRATEGY],
+        balance_modes=[BALANCE_MODE_NONE, BALANCE_MODE_SMOTE],
+        base_year=2018,
+        validation_size=0.2,
+        folds=2,
+        random_state=11,
+        fast_mode=True,
+        resource_mode=drift_app.DEFAULT_EXPERIMENT_RESOURCE_MODE,
+        grid_limit=1,
+        custom_grids=None,
+    )
+
+    assert len(blocks) == 2
+    assert {block["strategy"] for block in blocks} == {drift_app.ADAPTIVE_NEURAL_DRIFT_STRATEGY}
+    assert {block["model"] for block in blocks} == {drift_app.NEURAL_DRIFT_STRATEGY_MODEL}
+    assert {block["balance_mode"] for block in blocks} == {BALANCE_MODE_NONE, BALANCE_MODE_SMOTE}
+    assert tuning_tasks == []
+
+
 def test_load_or_create_smote_artifact_reuses_exact_signature(tmp_path, monkeypatch):
     pytest.importorskip("imblearn")
 
@@ -2828,6 +2968,133 @@ def test_recalibration_experiments_support_adaptive_kswin(tmp_path, monkeypatch)
     assert outputs["run_manifest"]["kswin_variants"] == ["KSWINpaper", "KSWINseasonal"]
     assert KSWIN_VARIANT_NAMES == ["KSWINpaper", "KSWINseasonal"]
     assert progress_events[-1]["completed_units"] == progress_events[-1]["total_units"] == 7
+
+
+def test_recalibration_experiments_support_adaptive_neural_drift(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+    captured = {}
+
+    def fake_run_backtest_pipeline(dataset_bundle, *, config, progress_callback=None):
+        captured["dataset_bundle"] = dataset_bundle
+        captured["config"] = config
+        if progress_callback is not None:
+            progress_callback(0.5, "fake neural progress")
+        return {
+            "stream_metrics": pd.DataFrame(
+                {
+                    "timestamp": pd.to_datetime(
+                        [
+                            "2019-01-01 00:00:00",
+                            "2019-01-01 00:05:00",
+                            "2019-01-01 00:10:00",
+                            "2019-01-01 00:15:00",
+                        ]
+                    ),
+                    "model": [drift_app.neural_drift_app.MODEL_TORCH_MLP] * 4,
+                    "strategy": [drift_app.neural_drift_app.STRATEGY_FINE_TUNING] * 4,
+                    "balance_mode": [BALANCE_MODE_NONE] * 4,
+                    "y_true": [0, 1, 0, 1],
+                    "prediction": [0, 1, 1, 1],
+                    "score": [0.1, 0.8, 0.6, 0.9],
+                    "decision_threshold": [0.5, 0.5, 0.5, 0.5],
+                    "severity_score": [0.1, 0.7, 0.2, 0.3],
+                    "max_channel_score": [0.1, 0.8, 0.2, 0.3],
+                    "action_taken": ["none", "fine_tuning", "none", "none"],
+                }
+            ),
+            "drift_events": pd.DataFrame(
+                {
+                    "timestamp": pd.to_datetime(["2019-01-01 00:05:00"]),
+                    "model": [drift_app.neural_drift_app.MODEL_TORCH_MLP],
+                    "strategy": [drift_app.neural_drift_app.STRATEGY_FINE_TUNING],
+                    "balance_mode": [BALANCE_MODE_NONE],
+                    "recent_rows": [4],
+                    "recent_positive_rows": [2],
+                }
+            ),
+        }
+
+    monkeypatch.setattr(
+        drift_app.neural_drift_app,
+        "run_backtest_pipeline",
+        fake_run_backtest_pipeline,
+    )
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=60, random_state=251)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+    neural_config = {
+        "models": [
+            drift_app.neural_drift_app.MODEL_XGBOOST,
+            drift_app.neural_drift_app.MODEL_TORCH_MLP,
+        ],
+        "strategies": [drift_app.neural_drift_app.STRATEGY_FINE_TUNING],
+        "drift_channels": [drift_app.neural_drift_app.DRIFT_EMBEDDING],
+        "recent_window_size": 12,
+        "dataset_percent": 20,
+        "max_stream_rows": 5,
+    }
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=[],
+        strategies=[drift_app.ADAPTIVE_NEURAL_DRIFT_STRATEGY],
+        validation_size=0.2,
+        folds=2,
+        random_state=23,
+        fast_mode=True,
+        grid_limit=1,
+        repetition_seeds=(23,),
+        balance_modes=(BALANCE_MODE_NONE,),
+        neural_drift_config=neural_config,
+        checkpoint_root=tmp_path / "runs",
+    )
+
+    adaptive = outputs["adaptive_results"]
+    summary = outputs["summary"]
+    average_roc = outputs["average_roc"]
+    appendix_a9 = outputs["appendix_tables"]["A.9"]
+    execution_log = outputs["execution_log"]
+
+    assert captured["config"]["split_mode"] == "fixed_dates"
+    assert captured["config"]["base_start"] == "2018-01-01"
+    assert captured["config"]["base_end"] == "2018-12-31"
+    assert captured["config"]["stream_start"] == "2019-01-01"
+    assert captured["config"]["dataset_percent"] == 100
+    assert captured["config"]["max_stream_rows"] is None
+    assert captured["config"]["random_state"] == 23
+    assert captured["config"]["balance_modes"] == [BALANCE_MODE_NONE]
+    assert captured["config"]["models"] == [drift_app.neural_drift_app.MODEL_TORCH_MLP]
+    assert captured["dataset_bundle"]["feature_cols"] == features
+    assert outputs["run_manifest"]["total_tuning_tasks"] == 0
+    assert outputs["run_manifest"]["neural_drift_config"]["recent_window_size"] == 12
+    assert outputs["run_manifest"]["neural_drift_config"]["models"] == [
+        drift_app.neural_drift_app.MODEL_TORCH_MLP
+    ]
+    assert outputs["yearly_results"].empty
+    assert not adaptive.empty
+    assert not summary.empty
+    assert not average_roc.empty
+    assert not appendix_a9.empty
+    assert set(adaptive["strategy"].unique()) == {drift_app.ADAPTIVE_NEURAL_DRIFT_STRATEGY}
+    assert adaptive["model"].iloc[0] == (
+        f"{drift_app.NEURAL_DRIFT_STRATEGY_MODEL} · "
+        f"{drift_app.neural_drift_app.MODEL_TORCH_MLP} · "
+        f"{drift_app.neural_drift_app.STRATEGY_FINE_TUNING}"
+    )
+    assert adaptive["base_model"].iloc[0] == drift_app.neural_drift_app.MODEL_TORCH_MLP
+    assert adaptive["detector_variant"].iloc[0] == drift_app.neural_drift_app.STRATEGY_FINE_TUNING
+    assert "neural_drift_complete" in set(execution_log["phase"].astype(str))
 
 
 def test_recalibration_experiments_passes_model_and_balance_to_block_tuning_resolver(tmp_path, monkeypatch):

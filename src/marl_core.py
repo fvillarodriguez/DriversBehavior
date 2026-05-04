@@ -235,9 +235,26 @@ class MARLManager:
 # MA-AIRL (Multi-Agent Adversarial IRL) core
 # =========================
 
-DEFAULT_FEATURE_COLS = ("avg_speed_kmh", "avg_headway_s", "lane_change_rate")
-PARAM_LOWS = np.array([PARAM_BOUNDS[k][0] for k in PARAM_KEYS], dtype=np.float32)
-PARAM_HIGHS = np.array([PARAM_BOUNDS[k][1] for k in PARAM_KEYS], dtype=np.float32)
+DEFAULT_STATE_COLS = (
+    "state_speed_kmh",
+    "state_lane",
+    "state_headway_s",
+    "state_relative_speed_kmh",
+    "flow_context_vehicle_count",
+    "flow_context_mean_speed_kmh",
+    "flow_context_density_veh_per_km",
+    "vms_active",
+)
+DEFAULT_ACTION_COLS = (
+    "action_delta_speed_kmh",
+    "action_accel_m_s2",
+    "action_lane_change",
+)
+DEFAULT_ACTION_BOUNDS = {
+    "action_delta_speed_kmh": (-80.0, 80.0),
+    "action_accel_m_s2": (-8.0, 8.0),
+    "action_lane_change": (0.0, 1.0),
+}
 
 
 def _resolve_device(prefer: str = "auto") -> str:
@@ -252,54 +269,75 @@ def _resolve_device(prefer: str = "auto") -> str:
 
 
 def _safe_numpy(df: pd.DataFrame, cols: List[str]) -> np.ndarray:
-    return df[cols].to_numpy(dtype=np.float32, copy=True)
+    values = df[cols].copy()
+    for col in cols:
+        if values[col].dtype == bool:
+            values[col] = values[col].astype(float)
+    return values.to_numpy(dtype=np.float32, copy=True)
 
 
-def _normalize_action_array(values: np.ndarray) -> np.ndarray:
-    denom = (PARAM_HIGHS - PARAM_LOWS)
+def _normalize_action_array(values: np.ndarray, lows: np.ndarray, highs: np.ndarray) -> np.ndarray:
+    denom = (highs - lows)
     denom = np.where(denom == 0, 1.0, denom)
-    return 2.0 * (values - PARAM_LOWS) / denom - 1.0
+    normalized = 2.0 * (values - lows) / denom - 1.0
+    return np.clip(normalized, -1.0, 1.0)
 
 
-def _denormalize_action_array(values: np.ndarray) -> np.ndarray:
-    return PARAM_LOWS + (values + 1.0) * 0.5 * (PARAM_HIGHS - PARAM_LOWS)
-
-
-def _row_to_action_values(row: pd.Series) -> np.ndarray:
-    action = np.array([(PARAM_BOUNDS[k][0] + PARAM_BOUNDS[k][1]) * 0.5 for k in PARAM_KEYS], dtype=np.float32)
-
-    speed_kmh = row.get("avg_speed_kmh")
-    if pd.notna(speed_kmh):
-        max_speed = np.clip(speed_kmh / 3.6 * 1.1, PARAM_BOUNDS["maxSpeed"][0], PARAM_BOUNDS["maxSpeed"][1])
-        action[PARAM_KEYS.index("maxSpeed")] = max_speed
-        accel = np.clip(0.6 + speed_kmh / 120.0, PARAM_BOUNDS["accel"][0], PARAM_BOUNDS["accel"][1])
-        decel = np.clip(2.5 + speed_kmh / 80.0, PARAM_BOUNDS["decel"][0], PARAM_BOUNDS["decel"][1])
-        action[PARAM_KEYS.index("accel")] = accel
-        action[PARAM_KEYS.index("decel")] = decel
-
-    headway = row.get("avg_headway_s")
-    if pd.notna(headway):
-        min_gap = np.clip(headway * 0.5, PARAM_BOUNDS["minGap"][0], PARAM_BOUNDS["minGap"][1])
-        action[PARAM_KEYS.index("minGap")] = min_gap
-
-    lane_change_rate = row.get("lane_change_rate")
-    if pd.notna(lane_change_rate):
-        sigma = np.clip(0.1 + 0.9 * np.tanh(float(lane_change_rate)), PARAM_BOUNDS["sigma"][0], PARAM_BOUNDS["sigma"][1])
-        impatience = np.clip(float(lane_change_rate), PARAM_BOUNDS["impatience"][0], PARAM_BOUNDS["impatience"][1])
-        action[PARAM_KEYS.index("sigma")] = sigma
-        action[PARAM_KEYS.index("impatience")] = impatience
-
-    return action
+def _denormalize_action_array(values: np.ndarray, lows: np.ndarray, highs: np.ndarray) -> np.ndarray:
+    return lows + (values + 1.0) * 0.5 * (highs - lows)
 
 
 def _infer_feature_cols(df: pd.DataFrame, feature_cols: Optional[List[str]] = None) -> List[str]:
     if feature_cols:
         return [c for c in feature_cols if c in df.columns]
-    cols = [c for c in DEFAULT_FEATURE_COLS if c in df.columns]
+    cols = [c for c in DEFAULT_STATE_COLS if c in df.columns]
     if cols:
         return cols
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    return [c for c in numeric_cols if c not in {"cluster_label"}]
+    excluded = {"cluster_label", "agent_id", *DEFAULT_ACTION_COLS}
+    return [c for c in numeric_cols if c not in excluded and not c.startswith("next_")]
+
+
+def _infer_action_cols(df: pd.DataFrame, action_cols: Optional[List[str]] = None) -> List[str]:
+    if action_cols:
+        return [c for c in action_cols if c in df.columns]
+    return [c for c in DEFAULT_ACTION_COLS if c in df.columns]
+
+
+def _next_feature_col(feature_col: str, df: pd.DataFrame) -> str:
+    if feature_col.startswith("state_"):
+        candidate = "next_" + feature_col[len("state_") :]
+        if candidate in df.columns:
+            return candidate
+    if feature_col in df.columns:
+        return feature_col
+    raise ValueError(f"No se encontró columna de siguiente estado para '{feature_col}'.")
+
+
+def _resolve_agent_col(df: pd.DataFrame, agent_col: Optional[str]) -> str:
+    if agent_col and agent_col in df.columns:
+        return agent_col
+    for candidate in ("agent_id", "vehicle_class", "cluster_label", "vehicle_type_id"):
+        if candidate in df.columns:
+            return candidate
+    return "__shared_agent"
+
+
+def _action_bounds(df: pd.DataFrame, action_cols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    lows = []
+    highs = []
+    for col in action_cols:
+        if col in DEFAULT_ACTION_BOUNDS:
+            low, high = DEFAULT_ACTION_BOUNDS[col]
+        else:
+            values = pd.to_numeric(df[col], errors="coerce")
+            low = float(values.min())
+            high = float(values.max())
+            if not np.isfinite(low) or not np.isfinite(high) or low == high:
+                low, high = -1.0, 1.0
+        lows.append(low)
+        highs.append(high)
+    return np.array(lows, dtype=np.float32), np.array(highs, dtype=np.float32)
 
 
 class StandardScaler:
@@ -328,49 +366,69 @@ class StandardScaler:
 class MAIRLExpertDataset:
     states: np.ndarray
     actions: np.ndarray
+    next_states: np.ndarray
 
 
 def build_expert_datasets(
     df: pd.DataFrame,
     feature_cols: Optional[List[str]] = None,
+    action_cols: Optional[List[str]] = None,
     agent_ids: Optional[List[str]] = None,
-) -> Tuple[Dict[str, MAIRLExpertDataset], StandardScaler, List[str]]:
-    if "cluster_label" not in df.columns:
-        raise ValueError("El dataset de expertos debe contener la columna 'cluster_label'.")
-
+    agent_col: Optional[str] = None,
+) -> Tuple[Dict[str, MAIRLExpertDataset], StandardScaler, List[str], List[str], np.ndarray, np.ndarray]:
     df = df.copy()
-    df["cluster_label"] = df["cluster_label"].astype(str)
+    resolved_agent_col = _resolve_agent_col(df, agent_col)
+    if resolved_agent_col == "__shared_agent":
+        df[resolved_agent_col] = "shared_policy"
+    df[resolved_agent_col] = df[resolved_agent_col].astype(str)
 
     feature_cols = _infer_feature_cols(df, feature_cols)
     if not feature_cols:
         raise ValueError("No se encontraron columnas numéricas para usar como estado.")
+    next_feature_cols = [_next_feature_col(col, df) for col in feature_cols]
 
-    clean_df = df.dropna(subset=feature_cols)
+    action_cols = _infer_action_cols(df, action_cols)
+    if not action_cols:
+        raise ValueError(
+            "El dataset de expertos debe contener acciones segment-level "
+            "(action_delta_speed_kmh, action_accel_m_s2, action_lane_change)."
+        )
+
+    clean_df = df.dropna(subset=feature_cols + next_feature_cols + action_cols)
     if clean_df.empty:
-        raise ValueError("No hay filas válidas para entrenar (NaNs en columnas de estado).")
+        raise ValueError("No hay transiciones válidas para entrenar (NaNs en estado, acción o siguiente estado).")
+
+    lows, highs = _action_bounds(clean_df, action_cols)
 
     scaler = StandardScaler()
-    all_states = _safe_numpy(clean_df, feature_cols)
+    states_raw = _safe_numpy(clean_df, feature_cols)
+    next_states_raw = _safe_numpy(clean_df, next_feature_cols)
+    all_states = np.vstack([states_raw, next_states_raw])
     scaler.fit(all_states)
 
     datasets: Dict[str, MAIRLExpertDataset] = {}
-    group = clean_df.groupby("cluster_label")
+    group = clean_df.groupby(resolved_agent_col)
 
     if agent_ids:
         agent_ids = [str(a) for a in agent_ids]
 
-    for cluster_id, group_df in group:
-        if agent_ids and cluster_id not in agent_ids:
+    for group_id, group_df in group:
+        if agent_ids and group_id not in agent_ids:
             continue
         states = scaler.transform(_safe_numpy(group_df, feature_cols))
-        actions = np.stack([_row_to_action_values(row) for _, row in group_df.iterrows()], axis=0)
-        actions_norm = _normalize_action_array(actions)
-        datasets[cluster_id] = MAIRLExpertDataset(states=states, actions=actions_norm)
+        next_states = scaler.transform(_safe_numpy(group_df, next_feature_cols))
+        actions = _safe_numpy(group_df, action_cols)
+        actions_norm = _normalize_action_array(actions, lows, highs)
+        datasets[group_id] = MAIRLExpertDataset(
+            states=states,
+            actions=actions_norm,
+            next_states=next_states,
+        )
 
     if not datasets:
         raise ValueError("No se encontraron clústeres con datos válidos para entrenamiento.")
 
-    return datasets, scaler, feature_cols
+    return datasets, scaler, feature_cols, action_cols, lows, highs
 
 
 class MAIRLDataloader:
@@ -379,15 +437,16 @@ class MAIRLDataloader:
             raise RuntimeError("PyTorch no está disponible. Instale torch para usar MA-AIRL.")
         self.states = torch.tensor(dataset.states, dtype=torch.float32, device=device)
         self.actions = torch.tensor(dataset.actions, dtype=torch.float32, device=device)
+        self.next_states = torch.tensor(dataset.next_states, dtype=torch.float32, device=device)
         self.num_samples = self.states.shape[0]
 
-    def sample(self, batch_size: int) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    def sample(self, batch_size: int) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
         idx = torch.randint(0, self.num_samples, (batch_size,), device=self.states.device)
-        return self.states[idx], self.actions[idx]
+        return self.states[idx], self.actions[idx], self.next_states[idx]
 
-    def sample_states(self, batch_size: int) -> "torch.Tensor":
+    def sample_states(self, batch_size: int) -> Tuple["torch.Tensor", "torch.Tensor"]:
         idx = torch.randint(0, self.num_samples, (batch_size,), device=self.states.device)
-        return self.states[idx]
+        return self.states[idx], self.next_states[idx]
 
     def mean_state(self) -> "torch.Tensor":
         return self.states.mean(dim=0, keepdim=True)
@@ -483,6 +542,7 @@ class MAIRLManager:
         expert_df: pd.DataFrame,
         agent_config: List[Dict[str, Any]],
         feature_cols: Optional[List[str]] = None,
+        action_cols: Optional[List[str]] = None,
         hidden_sizes: Tuple[int, ...] = (64, 64),
         gamma: float = 0.99,
         policy_lr: float = 3e-4,
@@ -496,14 +556,22 @@ class MAIRLManager:
         self.agent_ids = [str(agent["id"]) for agent in agent_config]
         self.agent_names = {str(agent["id"]): agent.get("name", str(agent["id"])) for agent in agent_config}
 
-        datasets, scaler, features = build_expert_datasets(expert_df, feature_cols, self.agent_ids)
+        datasets, scaler, features, actions, lows, highs = build_expert_datasets(
+            expert_df,
+            feature_cols=feature_cols,
+            action_cols=action_cols,
+            agent_ids=self.agent_ids,
+        )
         self.feature_cols = features
+        self.action_cols = actions
+        self.action_lows = lows
+        self.action_highs = highs
         self.scaler = scaler
         self.datasets = datasets
         self.loaders = {cid: MAIRLDataloader(ds, self.device) for cid, ds in datasets.items()}
 
         state_dim = len(self.feature_cols)
-        action_dim = len(PARAM_KEYS)
+        action_dim = len(self.action_cols)
         self.agents: Dict[str, MAIRLAgent] = {}
         for cid in self.datasets:
             self.agents[cid] = MAIRLAgent(
@@ -524,15 +592,14 @@ class MAIRLManager:
 
         for cid, agent in self.agents.items():
             loader = self.loaders[cid]
-            state_e, action_e = loader.sample(batch_size)
-            state_p = loader.sample_states(batch_size)
+            state_e, action_e, next_state_e = loader.sample(batch_size)
+            state_p, next_state_p = loader.sample_states(batch_size)
             action_p, logp_p = agent.policy.sample(state_p)
 
             logp_e = agent.policy.log_prob(state_e, action_e)
 
-            # Single-step proxy: usamos s' = s (no hay secuencias temporales explícitas en el CSV).
-            f_e = agent.f(state_e, action_e, state_e)
-            f_p = agent.f(state_p, action_p, state_p)
+            f_e = agent.f(state_e, action_e, next_state_e)
+            f_p = agent.f(state_p, action_p.detach(), next_state_p)
 
             logp_e_det = logp_e.detach()
             logp_p_det = logp_p.detach()
@@ -560,9 +627,11 @@ class MAIRLManager:
         metrics["disc_loss"] = float(np.mean(disc_losses)) if disc_losses else 0.0
         metrics["policy_loss"] = float(np.mean(policy_losses)) if policy_losses else 0.0
         metrics["reward_mean"] = float(np.mean(reward_means)) if reward_means else 0.0
+        metrics["agents"] = float(len(self.agents))
+        metrics["transitions"] = float(sum(loader.num_samples for loader in self.loaders.values()))
         return metrics
 
-    def get_policy_params(self) -> Dict[str, Dict[str, float]]:
+    def get_policy_actions(self) -> Dict[str, Dict[str, float]]:
         params = {}
         for cid, agent in self.agents.items():
             loader = self.loaders[cid]
@@ -571,19 +640,20 @@ class MAIRLManager:
                 mean, _ = agent.policy(state)
             action = mean.squeeze(0).cpu().numpy()
             action = np.clip(action, -1.0, 1.0)
-            denorm = _denormalize_action_array(action)
-            params[cid] = {k: float(v) for k, v in zip(PARAM_KEYS, denorm)}
+            denorm = _denormalize_action_array(action, self.action_lows, self.action_highs)
+            params[cid] = {k: float(v) for k, v in zip(self.action_cols, denorm)}
         return params
 
-    def export_vtypes(self, output_path: Path) -> Path:
-        action_params = self.get_policy_params()
-        root = ET.Element("additional")
-        for cid, params in action_params.items():
-            attr = {"id": f"vType_{cid}"}
-            attr.update({k: f"{v:.4f}" for k, v in params.items()})
-            attr["vClass"] = "passenger"
-            attr["color"] = "0,0.6,0.3"
-            ET.SubElement(root, "vType", attrib=attr)
-        tree = ET.ElementTree(root)
-        tree.write(output_path)
+    def get_policy_params(self) -> Dict[str, Dict[str, float]]:
+        """Backward-compatible alias for UI code that displayed policy outputs."""
+        return self.get_policy_actions()
+
+    def export_policy_profiles(self, output_path: Path) -> Path:
+        profiles = {
+            "feature_cols": self.feature_cols,
+            "action_cols": self.action_cols,
+            "policy_actions": self.get_policy_actions(),
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(profiles, indent=2), encoding="utf-8")
         return output_path

@@ -197,3 +197,139 @@ def test_history_model_metrics_dataframe_reads_protocol_results_from_metadata():
     assert set(df["protocol"]) == {"conservative", "robust"}
     assert set(df["candidate"]) == {"pareto_1"}
     assert df["pr_auc"].max() == 0.032
+
+
+def test_history_model_leaderboard_ranks_by_roc_auc_then_f1():
+    records = [
+        {
+            "id": 21,
+            "stage": "Modelos",
+            "created_at": "2026-04-23T12:00:00",
+            "model_name": "XGBoost",
+            "balance_strategy": "none",
+            "metrics": {"Base": {"roc_auc": 0.81, "f1": 0.90}},
+        },
+        {
+            "id": 22,
+            "stage": "Modelos",
+            "created_at": "2026-04-23T12:05:00",
+            "model_name": "Random Forest",
+            "balance_strategy": "none",
+            "metrics": {"Base": {"roc_auc": 0.84, "f1": 0.40}},
+        },
+        {
+            "id": 23,
+            "stage": "Modelos",
+            "created_at": "2026-04-23T12:10:00",
+            "model_name": "SVM",
+            "balance_strategy": "none",
+            "metrics": {"Base": {"roc_auc": 0.84, "f1": 0.55}},
+        },
+    ]
+
+    df = app._history_model_metrics_dataframe(records)
+    leaderboard = app._history_model_leaderboard_dataframe(df)
+
+    winner = leaderboard.set_index(["feature_set", "balance"]).loc[("Base", "none")]
+    assert int(winner["record_id"]) == 23
+    assert winner["model"] == "SVM"
+    assert winner["roc_auc"] == 0.84
+    assert winner["f1"] == 0.55
+
+
+def test_history_model_leaderboard_uses_test_metric_aliases():
+    record = {
+        "id": 24,
+        "stage": "Modelos",
+        "created_at": "2026-04-23T12:30:00",
+        "model_name": "XGBoost",
+        "balance_strategy": "class_weight",
+        "metrics": {
+            "Cluster": {
+                "test_roc_auc": 0.91,
+                "test_f1": 0.37,
+                "test_pr_auc": 0.29,
+            }
+        },
+    }
+
+    df = app._history_model_metrics_dataframe([record])
+    leaderboard = app._history_model_leaderboard_dataframe(df)
+
+    winner = leaderboard.set_index(["feature_set", "balance"]).loc[
+        ("Cluster", "class_weight")
+    ]
+    assert winner["roc_auc"] == 0.91
+    assert winner["f1"] == 0.37
+    assert winner["pr_auc"] == 0.29
+
+
+def test_history_model_metrics_dataframe_normalizes_balance_modes():
+    records = [
+        {
+            "id": 25,
+            "stage": "Modelos",
+            "model_name": "XGBoost",
+            "balance_strategy": "class_weight",
+            "metrics": {"Base": {"roc_auc": 0.73, "f1": 0.31}},
+        },
+        {
+            "id": 26,
+            "stage": "Modelos",
+            "model_name": "XGBoost",
+            "balance_strategy": "SMOTE",
+            "metrics": {"Base + Cluster": {"roc_auc": 0.83, "f1": 0.41}},
+        },
+    ]
+
+    df = app._history_model_metrics_dataframe(records)
+
+    assert set(df["balance"]) == {"class_weight", "smote"}
+
+
+def test_history_model_metrics_dataframe_reads_optuna_batch_subrun_balance():
+    record = {
+        "id": 27,
+        "stage": "Modelos",
+        "created_at": "2026-04-23T13:00:00",
+        "model_name": "XGBoost",
+        "balance_strategy": "optuna_batch",
+        "metrics": {
+            "optuna_record_9": {
+                "pareto_2": {
+                    "robust": {
+                        "roc_auc": 0.88,
+                        "f1": 0.52,
+                        "threshold_protocol": "robust",
+                    }
+                }
+            }
+        },
+        "metadata": {
+            "history_entry": {
+                "subruns": [
+                    {
+                        "subrun_id": "optuna_record_9",
+                        "feature_set_label": "Base + Cluster",
+                        "balance_mode": "smote",
+                        "candidates": [
+                            {
+                                "candidate_id": "pareto_2",
+                                "feature_cols": ["speed", "cluster_speed_0"],
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    }
+
+    df = app._history_model_metrics_dataframe([record])
+    leaderboard = app._history_model_leaderboard_dataframe(df)
+
+    assert df.loc[0, "balance"] == "smote"
+    winner = leaderboard.set_index(["feature_set", "balance"]).loc[
+        ("Base+Cluster", "smote")
+    ]
+    assert int(winner["record_id"]) == 27
+    assert winner["roc_auc"] == 0.88

@@ -108,7 +108,7 @@ def _render_home() -> None:
         - **NLP in Severity:** Build granular flow + text datasets to model accident severity.
         - **Drift detection:** Recalibration and drift detection replication module.
         - **Graph Neural Network:** Construct graphs for GNN models using crash prediction features.
-        - **Multi Agent RL:** Multi-Agent Reinforcement Learning modules.
+        - **Reward Learning:** Reconstruct AVI transitions and learn driver-behavior rewards.
         - **Events:** Load and visualize accident events on an interactive map.
         - **Experiments Live:** Real-time experiment monitoring.
         - **Simulacion SUMO:** SUMO traffic simulation integration.
@@ -184,7 +184,7 @@ def main() -> None:
     ps_nlp_sev = st.Page(p_nlp_severity, title="NLP in Severity", icon=":material/text_fields:")
     ps_drift = st.Page(p_drift, title="Drift detection", icon=":material/timeline:")
     ps_gnn = st.Page(_render_graph_builder, title="Graph Neural Network", icon=":material/hub:")
-    ps_marl = st.Page(p_marl, title="Multi Agent RL", icon=":material/groups:")
+    ps_marl = st.Page(p_marl, title="Reward Learning", icon=":material/groups:")
     
     ps_events = st.Page(p_events, title="Events", icon=":material/map:")
     ps_exp = st.Page(p_experiments, title="Experiments Live", icon=":material/science:")

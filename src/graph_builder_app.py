@@ -39,6 +39,8 @@ if str(ROOT_DIR) not in sys.path:
 # Auto-batch thresholds
 AUTO_BATCH_RANGE_DAYS = 14
 AUTO_BATCH_ROW_THRESHOLD = 2_000_000
+DUCKDB_FEATURE_MEMORY_ROW_LIMIT = 500_000
+DUCKDB_FEATURE_PREVIEW_ROWS = 200
 DATA_DIR = ROOT_DIR / "Datos"
 FORCE_SNAPSHOT_FEATURES = True
 
@@ -102,6 +104,7 @@ from src.optimizers import get_optimizer_cls
 
 FEATURE_SELECTION_DIR = Path(RESULTADOS_DIR)
 HISTORY_PATH = Path(RESULTADOS_DIR) / "gnn_history.jsonl"
+GNN_OPTUNA_LIVE_DIR = Path(RESULTADOS_DIR) / "gnn_optuna_live"
 
 try:
     import duckdb
@@ -354,6 +357,492 @@ def _json_default(obj):
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     return str(obj)
+
+
+class _GNNOptunaLiveTracker:
+    """Persist and render live state for the GNN Optuna optimization tab."""
+
+    loss_columns = [
+        "timestamp",
+        "trial_number",
+        "epoch",
+        "train_loss",
+        "val_loss",
+        "score",
+        "best_score",
+        "status",
+    ]
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        total_trials: int,
+        total_epochs: int,
+        objective_metric: str,
+        balancing_strategy: str,
+        graph_name: str,
+        backend: str = "optuna",
+        ui_slot: Optional[object] = None,
+    ) -> None:
+        self.run_id = str(run_id)
+        self.run_dir = GNN_OPTUNA_LIVE_DIR / self.run_id
+        self.paths = {
+            "manifest": self.run_dir / "manifest.json",
+            "live_status": self.run_dir / "live_status.json",
+            "live_events": self.run_dir / "live_events.jsonl",
+            "loss_history": self.run_dir / "loss_history.csv",
+            "trials_live": self.run_dir / "trials_live.csv",
+        }
+        self.total_trials = max(1, int(total_trials or 0))
+        self.total_epochs = max(1, int(total_epochs or 0))
+        self.objective_metric = str(objective_metric or "")
+        self.balancing_strategy = str(balancing_strategy or "")
+        self.graph_name = str(graph_name or "")
+        self.backend = str(backend or "optuna")
+        self.ui_slot = ui_slot
+        self.completed_trials = 0
+        self.ok_trials = 0
+        self.failed_trials = 0
+        self.pruned_trials = 0
+        self.current_trial: Optional[int] = None
+        self.current_epoch: Optional[int] = None
+        self.best_score: Optional[float] = None
+        self._loss_rows: List[Dict[str, object]] = []
+        self._status: Dict[str, object] = {}
+
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        now = self._now()
+        self.manifest: Dict[str, object] = {
+            "run_id": self.run_id,
+            "run_type": "gnn_optuna",
+            "title": "GNN Optuna",
+            "status": "created",
+            "result_status": "created",
+            "created_at": now,
+            "updated_at": now,
+            "objective_metric": self.objective_metric,
+            "backend": self.backend,
+            "model_name": "GNN",
+            "balancing_strategy": self.balancing_strategy,
+            "graph_name": self.graph_name,
+            "progress": {
+                "completed_trials": 0,
+                "ok_trials": 0,
+                "failed_trials": 0,
+                "pruned_trials": 0,
+                "total_trials": self.total_trials,
+                "current_trial": None,
+                "current_epoch": None,
+                "total_epochs": self.total_epochs,
+                "progress_ratio": 0.0,
+            },
+            "artifacts": {
+                "loss_history_csv": str(self.paths["loss_history"]),
+                "trials_live_csv": str(self.paths["trials_live"]),
+            },
+        }
+        self._write_json(self.paths["manifest"], self.manifest)
+        self._write_loss_history()
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        total_trials: int,
+        total_epochs: int,
+        objective_metric: str,
+        balancing_strategy: str,
+        graph_name: str,
+        backend: str = "optuna",
+        ui_slot: Optional[object] = None,
+    ) -> "_GNNOptunaLiveTracker":
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        digest = hashlib.md5(
+            f"{stamp}|{objective_metric}|{balancing_strategy}|{time.time_ns()}".encode()
+        ).hexdigest()[:8]
+        return cls(
+            run_id=f"gnn_optuna_{stamp}_{digest}",
+            total_trials=total_trials,
+            total_epochs=total_epochs,
+            objective_metric=objective_metric,
+            balancing_strategy=balancing_strategy,
+            graph_name=graph_name,
+            backend=backend,
+            ui_slot=ui_slot,
+        )
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().isoformat(timespec="seconds")
+
+    @staticmethod
+    def _finite_float(value: object) -> Optional[float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _progress_ratio(self, *, epoch: Optional[int] = None) -> float:
+        partial = 0.0
+        if epoch is not None and self.current_trial is not None:
+            partial = max(0.0, min(float(epoch) / float(self.total_epochs), 1.0))
+        ratio = (float(self.completed_trials) + partial) / float(self.total_trials)
+        return max(0.0, min(ratio, 1.0))
+
+    def _write_json(self, path: Path, payload: Dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=True, default=_json_default, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+
+    def _append_jsonl(self, path: Path, payload: Dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=True, default=_json_default) + "\n")
+
+    def _write_loss_history(self) -> None:
+        pd.DataFrame(self._loss_rows, columns=self.loss_columns).to_csv(
+            self.paths["loss_history"],
+            index=False,
+        )
+
+    def _refresh_manifest(
+        self,
+        *,
+        status: str,
+        result_status: Optional[str] = None,
+        progress_ratio: Optional[float] = None,
+        message: str = "",
+        extra: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        now = self._now()
+        ratio = (
+            self._progress_ratio()
+            if progress_ratio is None
+            else max(0.0, min(float(progress_ratio), 1.0))
+        )
+        self.manifest["status"] = str(status)
+        self.manifest["result_status"] = str(result_status or status)
+        self.manifest["updated_at"] = now
+        self.manifest["last_message"] = str(message or "")
+        progress = dict(self.manifest.get("progress") or {})
+        progress.update(
+            {
+                "completed_trials": int(self.completed_trials),
+                "ok_trials": int(self.ok_trials),
+                "failed_trials": int(self.failed_trials),
+                "pruned_trials": int(self.pruned_trials),
+                "total_trials": int(self.total_trials),
+                "current_trial": self.current_trial,
+                "current_epoch": self.current_epoch,
+                "total_epochs": int(self.total_epochs),
+                "progress_ratio": float(ratio),
+            }
+        )
+        self.manifest["progress"] = progress
+        if self.best_score is not None:
+            self.manifest["best_score"] = float(self.best_score)
+        if extra:
+            self.manifest.update(extra)
+        self._write_json(self.paths["manifest"], self.manifest)
+        return progress
+
+    def emit(
+        self,
+        event_type: str,
+        *,
+        status: str = "running",
+        result_status: Optional[str] = None,
+        message: str = "",
+        progress_ratio: Optional[float] = None,
+        extra: Optional[Dict[str, object]] = None,
+        render: bool = True,
+    ) -> None:
+        progress = self._refresh_manifest(
+            status=status,
+            result_status=result_status,
+            progress_ratio=progress_ratio,
+            message=message,
+        )
+        event: Dict[str, object] = {
+            "timestamp": self._now(),
+            "run_id": self.run_id,
+            "run_type": "gnn_optuna",
+            "event_type": str(event_type),
+            "status": str(status),
+            "result_status": str(result_status or status),
+            "step_id": str(event_type),
+            "step_status": str(status),
+            "message": str(message or ""),
+            "progress": progress,
+            "progress_ratio": float(progress.get("progress_ratio") or 0.0),
+            "completed_trials": int(self.completed_trials),
+            "ok_trials": int(self.ok_trials),
+            "failed_trials": int(self.failed_trials),
+            "pruned_trials": int(self.pruned_trials),
+            "total_trials": int(self.total_trials),
+            "current_trial": self.current_trial,
+            "current_epoch": self.current_epoch,
+            "total_epochs": int(self.total_epochs),
+            "objective_metric": self.objective_metric,
+            "backend": self.backend,
+            "model_name": "GNN",
+            "balancing_strategy": self.balancing_strategy,
+            "graph_name": self.graph_name,
+            "best_score": self.best_score,
+        }
+        if extra:
+            event.update(extra)
+        self._status = dict(event)
+        self._write_json(self.paths["live_status"], event)
+        self._append_jsonl(self.paths["live_events"], event)
+        if render:
+            self.render()
+
+    def configure(self, **metadata: object) -> None:
+        self.manifest.update({key: value for key, value in metadata.items() if value is not None})
+        self._write_json(self.paths["manifest"], self.manifest)
+
+    def mark_run_start(
+        self,
+        *,
+        done_trials: int = 0,
+        ok_trials: int = 0,
+        failed_trials: int = 0,
+        pruned_trials: int = 0,
+        study_name: str = "",
+    ) -> None:
+        self.completed_trials = max(0, min(int(done_trials or 0), self.total_trials))
+        self.ok_trials = max(0, min(int(ok_trials or 0), self.total_trials))
+        self.failed_trials = max(0, int(failed_trials or 0))
+        self.pruned_trials = max(0, int(pruned_trials or 0))
+        self.configure(study_name=study_name)
+        self.emit(
+            "run_start",
+            status="running",
+            result_status="running",
+            message=(
+                f"Optuna iniciado: {self.completed_trials}/{self.total_trials} "
+                "trials ya completados."
+            ),
+            progress_ratio=self._progress_ratio(),
+        )
+
+    def mark_trial_start(self, trial_number: int) -> None:
+        self.current_trial = int(trial_number)
+        self.current_epoch = 0
+        self.emit(
+            "trial_start",
+            status="running",
+            result_status="running",
+            message=f"Trial {int(trial_number)} iniciado.",
+            progress_ratio=self._progress_ratio(epoch=0),
+        )
+
+    def record_epoch(
+        self,
+        *,
+        trial_number: int,
+        epoch: int,
+        train_loss: object,
+        val_loss: object,
+        score: object,
+        status: str = "running",
+    ) -> None:
+        self.current_trial = int(trial_number)
+        self.current_epoch = int(epoch)
+        score_value = self._finite_float(score)
+        if score_value is not None and (
+            self.best_score is None or score_value > self.best_score
+        ):
+            self.best_score = score_value
+        row = {
+            "timestamp": self._now(),
+            "trial_number": int(trial_number),
+            "epoch": int(epoch),
+            "train_loss": self._finite_float(train_loss),
+            "val_loss": self._finite_float(val_loss),
+            "score": score_value,
+            "best_score": self.best_score,
+            "status": str(status),
+        }
+        self._loss_rows.append(row)
+        self._write_loss_history()
+        self.emit(
+            "optuna_epoch_evaluated",
+            status="running",
+            result_status="running",
+            message=(
+                f"Trial {int(trial_number)} epoch {int(epoch)}/{self.total_epochs} "
+                f"score={score_value:.4f}" if score_value is not None else
+                f"Trial {int(trial_number)} epoch {int(epoch)}/{self.total_epochs}"
+            ),
+            progress_ratio=self._progress_ratio(epoch=int(epoch)),
+            extra=row,
+        )
+
+    def write_trials_dataframe(self, study: object) -> None:
+        try:
+            study.trials_dataframe().to_csv(self.paths["trials_live"], index=False)
+        except Exception:
+            pass
+
+    def mark_trial_finished(
+        self,
+        study: object,
+        trial: object,
+        *,
+        completed: int,
+        ok_trials: Optional[int] = None,
+        failed_trials: Optional[int] = None,
+        pruned_trials: Optional[int] = None,
+    ) -> None:
+        self.completed_trials = max(0, min(int(completed or 0), self.total_trials))
+        state = str(getattr(getattr(trial, "state", None), "name", "") or "")
+        if ok_trials is not None:
+            self.ok_trials = max(0, min(int(ok_trials or 0), self.total_trials))
+        elif state == "COMPLETE":
+            self.ok_trials += 1
+        if failed_trials is not None:
+            self.failed_trials = max(0, int(failed_trials or 0))
+        elif state == "FAIL":
+            self.failed_trials += 1
+        if pruned_trials is not None:
+            self.pruned_trials = max(0, int(pruned_trials or 0))
+        elif state == "PRUNED":
+            self.pruned_trials += 1
+        value = self._finite_float(getattr(trial, "value", None))
+        if value is not None and (self.best_score is None or value > self.best_score):
+            self.best_score = value
+        self.write_trials_dataframe(study)
+        self.emit(
+            "optuna_trial_finished",
+            status="running",
+            result_status="running",
+            message=(
+                f"Trial {getattr(trial, 'number', '?')} finalizado "
+                f"({state or 'UNKNOWN'})."
+            ),
+            progress_ratio=self._progress_ratio(),
+            extra={
+                "trial_number": getattr(trial, "number", None),
+                "trial_state": state,
+                "score": value,
+            },
+        )
+
+    def mark_run_completed(
+        self,
+        study: object,
+        *,
+        best_path: str = "",
+        full_path: str = "",
+        completed_trials: Optional[int] = None,
+        ok_trials: Optional[int] = None,
+        failed_trials: Optional[int] = None,
+        pruned_trials: Optional[int] = None,
+    ) -> None:
+        if completed_trials is not None:
+            self.completed_trials = max(0, min(int(completed_trials or 0), self.total_trials))
+        else:
+            self.completed_trials = max(0, min(self.completed_trials, self.total_trials))
+        if ok_trials is not None:
+            self.ok_trials = max(0, min(int(ok_trials or 0), self.total_trials))
+        if failed_trials is not None:
+            self.failed_trials = max(0, int(failed_trials or 0))
+        if pruned_trials is not None:
+            self.pruned_trials = max(0, int(pruned_trials or 0))
+        if self.completed_trials >= self.total_trials:
+            self.current_epoch = self.total_epochs
+        artifacts = dict(self.manifest.get("artifacts") or {})
+        if best_path:
+            artifacts["best_params_csv"] = str(best_path)
+        if full_path:
+            artifacts["full_study_csv"] = str(full_path)
+        self.write_trials_dataframe(study)
+        self.emit(
+            "run_completed",
+            status="completed",
+            result_status="completed",
+            message="Optuna completado.",
+            progress_ratio=self._progress_ratio(),
+            extra={"artifacts": artifacts},
+            render=False,
+        )
+        self.manifest["artifacts"] = artifacts
+        self._write_json(self.paths["manifest"], self.manifest)
+        self.render()
+
+    def mark_run_failed(self, error: object) -> None:
+        self.emit(
+            "run_failed",
+            status="failed",
+            result_status="failed",
+            message=f"Optuna fallo: {error}",
+            progress_ratio=self._progress_ratio(),
+            extra={"error": str(error)},
+        )
+
+    def render(self) -> None:
+        if self.ui_slot is None:
+            return
+        try:
+            status = dict(self._status or {})
+            progress = dict(status.get("progress") or self.manifest.get("progress") or {})
+            ratio = max(0.0, min(float(progress.get("progress_ratio") or 0.0), 1.0))
+            loss_df = pd.DataFrame(self._loss_rows, columns=self.loss_columns)
+            with self.ui_slot.container():
+                st.markdown("### Avance Optuna")
+                st.caption(f"Run dir: {self.run_dir}")
+                k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
+                k1.metric("Modelo", "GNN")
+                k2.metric("Estado", str(status.get("status") or self.manifest.get("status") or "-"))
+                k3.metric("Resultado", str(status.get("result_status") or self.manifest.get("result_status") or "-"))
+                k4.metric("Progreso", f"{100.0 * ratio:.1f}%")
+                k5.metric("Trials OK", f"{self.ok_trials}/{self.total_trials}")
+                k6.metric("Fallidos/Pruned", f"{self.failed_trials}/{self.pruned_trials}")
+                best_label = "-" if self.best_score is None else f"{self.best_score:.4f}"
+                k7.metric("Best score", best_label)
+                st.progress(ratio)
+                msg = str(status.get("message") or self.manifest.get("last_message") or "")
+                st.caption(
+                    f"Objetivo: {self.objective_metric or '-'} | "
+                    f"Balance: {self.balancing_strategy or '-'} | "
+                    f"Trial actual: {self.current_trial if self.current_trial is not None else '-'} | "
+                    f"Epoch: {self.current_epoch if self.current_epoch is not None else '-'}"
+                )
+                if msg:
+                    st.caption(msg)
+                if not loss_df.empty:
+                    plot_df = loss_df.copy()
+                    plot_df["point"] = range(1, len(plot_df) + 1)
+                    for col in ("train_loss", "val_loss"):
+                        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+                    loss_cols = [
+                        col for col in ("train_loss", "val_loss") if plot_df[col].notna().any()
+                    ]
+                    if loss_cols:
+                        st.line_chart(plot_df.set_index("point")[loss_cols], width="stretch")
+                    visible_cols = [
+                        "trial_number",
+                        "epoch",
+                        "train_loss",
+                        "val_loss",
+                        "score",
+                        "best_score",
+                        "status",
+                    ]
+                    st.dataframe(plot_df[visible_cols].tail(12), width="stretch")
+                else:
+                    st.info("Aun no hay evaluaciones de loss para graficar.")
+        except Exception:
+            return
+
 
 def _init_gnn_experiment_db(
     experiment_name: str,
@@ -757,6 +1246,147 @@ def _ensure_porticos_loaded() -> Optional[pd.DataFrame]:
     return st.session_state.get("df_port")
 
 
+def _normalize_portico_key(value: object) -> Optional[str]:
+    try:
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and missing:
+            return None
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+    text = re.sub(r"\.0$", "", text)
+    numeric = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
+    if pd.notna(numeric):
+        numeric_float = float(numeric)
+        if abs(numeric_float - int(numeric_float)) < 1e-9:
+            return str(int(numeric_float))
+        return str(numeric_float)
+    return text.upper()
+
+
+def _format_portico_value(value: object) -> str:
+    text = str(value).strip()
+    return re.sub(r"\.0$", "", text)
+
+
+def _dedupe_portico_values(values: Sequence[object]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        key = _normalize_portico_key(value)
+        if not key or key in seen:
+            continue
+        out.append(_format_portico_value(value))
+        seen.add(key)
+    return out
+
+
+def _resolve_portico_interval_by_endpoints(
+    df_port: pd.DataFrame,
+    p_start: object,
+    p_end: object,
+) -> List[str]:
+    if df_port is None or df_port.empty:
+        raise ValueError("No hay pórticos disponibles para resolver el intervalo.")
+
+    portico_col = _find_column_by_keywords(
+        df_port, ["portico", "cod_portico", "id_portico"]
+    )
+    if not portico_col:
+        raise ValueError("Porticos.csv no contiene una columna de pórtico.")
+
+    start_key = _normalize_portico_key(p_start)
+    end_key = _normalize_portico_key(p_end)
+    if not start_key or not end_key:
+        raise ValueError("Ingrese pórtico de inicio y pórtico de término.")
+
+    work = df_port.copy()
+    work["_portico_key"] = work[portico_col].map(_normalize_portico_key)
+    work = work.dropna(subset=["_portico_key"]).copy()
+    available_keys = set(work["_portico_key"])
+    missing = []
+    if start_key not in available_keys:
+        missing.append(str(p_start).strip())
+    if end_key not in available_keys:
+        missing.append(str(p_end).strip())
+    if missing:
+        raise ValueError(
+            "No se encontraron en Porticos.csv: " + ", ".join(missing)
+        )
+
+    autopista_col = _find_column_by_keywords(work, ["autopista"])
+    calzada_col = _find_column_by_keywords(work, ["calzada"])
+    eje_col = _find_column_by_keywords(work, ["eje"])
+    orden_col = _find_column_by_keywords(work, ["orden"])
+    km_col = _find_column_by_keywords(work, ["km"])
+
+    work["_source_order"] = np.arange(len(work))
+    if orden_col:
+        work["_orden_num"] = pd.to_numeric(work[orden_col], errors="coerce")
+    else:
+        work["_orden_num"] = np.nan
+    if km_col:
+        work["_km_num"] = pd.to_numeric(work[km_col], errors="coerce")
+    else:
+        work["_km_num"] = np.nan
+
+    exact_group_cols = [
+        col for col in [autopista_col, calzada_col, eje_col] if col is not None
+    ]
+    group_col_sets: List[List[str]] = []
+    if exact_group_cols:
+        group_col_sets.append(exact_group_cols)
+        without_eje = [col for col in exact_group_cols if col != eje_col]
+        if eje_col and without_eje and without_eje != exact_group_cols:
+            group_col_sets.append(without_eje)
+    else:
+        group_col_sets.append([])
+
+    def _candidate_intervals(group_cols: List[str]) -> List[Tuple[int, int, List[str]]]:
+        candidates: List[Tuple[int, int, List[str]]] = []
+        if group_cols:
+            grouped = work.groupby(group_cols, dropna=False, sort=False)
+            groups = [group for _, group in grouped]
+        else:
+            groups = [work]
+
+        for group in groups:
+            sort_cols = []
+            if group["_orden_num"].notna().any():
+                sort_cols.append("_orden_num")
+            if group["_km_num"].notna().any():
+                sort_cols.append("_km_num")
+            sort_cols.append("_source_order")
+            group_sorted = group.sort_values(sort_cols)
+            keys = group_sorted["_portico_key"].tolist()
+            start_positions = [idx for idx, key in enumerate(keys) if key == start_key]
+            end_positions = [idx for idx, key in enumerate(keys) if key == end_key]
+            if not start_positions or not end_positions:
+                continue
+            for idx_s in start_positions:
+                for idx_e in end_positions:
+                    lo, hi = sorted((idx_s, idx_e))
+                    interval = _dedupe_portico_values(
+                        group_sorted.iloc[lo : hi + 1][portico_col].tolist()
+                    )
+                    if interval:
+                        candidates.append((len(interval), abs(idx_e - idx_s), interval))
+        return candidates
+
+    for group_cols in group_col_sets:
+        candidates = _candidate_intervals(group_cols)
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            return candidates[0][2]
+
+    raise ValueError(
+        "Los pórticos de inicio y término no comparten una secuencia ordenada "
+        "en Porticos.csv."
+    )
+
+
 def _render_tramo_selector(
     df_port: pd.DataFrame,
     key_prefix: str,
@@ -865,6 +1495,58 @@ def _render_tramo_selector(
                     st.error(f"Error leyendo reporte: {e}")
 
     else:
+        manual_mode_key = f"{key_prefix}_manual_mode"
+        manual_mode = st.radio(
+            "Modo manual",
+            ["Selector avanzado", "Solo inicio y término"],
+            horizontal=True,
+            key=manual_mode_key,
+        )
+        manual_state_key = f"{key_prefix}_manual_mode_state"
+        manual_key = f"{key_prefix}_manual_porticos"
+        if st.session_state.get(manual_state_key) != manual_mode:
+            st.session_state[manual_state_key] = manual_mode
+            st.session_state.pop(manual_key, None)
+
+        if manual_mode == "Solo inicio y término":
+            c_start, c_end = st.columns(2)
+            with c_start:
+                p_start_raw = st.text_input(
+                    "Pórtico inicio",
+                    key=f"{key_prefix}_portico_start_raw",
+                    placeholder="Ej: 12",
+                )
+            with c_end:
+                p_end_raw = st.text_input(
+                    "Pórtico término",
+                    key=f"{key_prefix}_portico_end_raw",
+                    placeholder="Ej: 18",
+                )
+
+            if str(p_start_raw).strip() and str(p_end_raw).strip():
+                try:
+                    porticos_a_incluir = _resolve_portico_interval_by_endpoints(
+                        df_port, p_start_raw, p_end_raw
+                    )
+                    st.session_state[manual_key] = porticos_a_incluir
+                    st.success(
+                        "Intervalo manual seleccionado: "
+                        f"{len(porticos_a_incluir)} pórticos"
+                    )
+                except ValueError as exc:
+                    st.session_state.pop(manual_key, None)
+                    st.error(str(exc))
+            else:
+                st.caption(
+                    "Ingrese ambos pórticos para filtrar todos los pórticos "
+                    "del intervalo."
+                )
+
+            if manual_key in st.session_state:
+                porticos_a_incluir = st.session_state[manual_key]
+                st.write(f"Selección actual: {porticos_a_incluir}")
+            return porticos_a_incluir, preselected_time_choice
+
         autopista = None
         if "autopista" in df_port.columns:
             autopista_options = list(
@@ -1001,7 +1683,6 @@ def _render_tramo_selector(
             except ValueError:
                 st.error("Error calculando rango de pórticos")
 
-        manual_key = f"{key_prefix}_manual_porticos"
         if manual_key in st.session_state:
             porticos_a_incluir = st.session_state[manual_key]
             st.write(f"Selección actual: {porticos_a_incluir}")
@@ -1102,6 +1783,9 @@ SNAPSHOT_LANE_COLUMNS = [
 SNAPSHOT_TEMPORAL_COLUMNS = ["tod_sin", "tod_cos", "dow_sin", "dow_cos"]
 SNAPSHOT_WINDOW_SUFFIXES = ("_w_mean", "_w_std", "_lag1", "_lag2", "_slope")
 SNAPSHOT_GRADIENT_SUFFIXES = ("_grad_upstream", "_grad_downstream")
+SNAPSHOT_DEFAULT_GROUP_KEYS = [
+    key for key in SNAPSHOT_GROUP_KEYS if key != "spatial_gradients"
+]
 SNAPSHOT_WINDOW_DEFAULT_COLS = [
     "speed_mean",
     "speed_std",
@@ -1132,6 +1816,24 @@ SNAPSHOT_WINDOW_COL_OPTIONS = [
     "lane_count",
 ]
 SNAPSHOT_GRADIENT_DEFAULT_COLS = ["speed_mean", "speed_mean_w_mean"]
+SNAPSHOT_DEFAULT_EDGE_DELTA_COLUMNS = [
+    "speed_mean",
+    "speed_harmonic",
+    "flow_total",
+    "slow_pct",
+    "speed_std",
+]
+CLASSIC_EDGE_PHYSICAL_FEATURES = [
+    "dist_km",
+    "grad_q",
+    "grad_k",
+    "grad_v",
+    "shock_speed",
+    "shock_indicator",
+]
+SNAPSHOT_EDGE_PHYSICAL_FEATURES = CLASSIC_EDGE_PHYSICAL_FEATURES + [
+    "grad_slow_pct",
+]
 
 
 def _filter_flow_features(
@@ -1646,42 +2348,64 @@ def _select_latest_gat_model(
     return candidates[-1] if candidates else None
 
 
+def _normalize_graph_hash_value(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if len(text) >= 16 and re.fullmatch(r"[0-9a-f]+", text):
+        return text
+    return None
+
+
+def _resolve_graph_hash_for_loaded_graph(obj: Dict[str, object]) -> Optional[str]:
+    if not isinstance(obj, dict):
+        return None
+
+    for raw in (obj.get("graph_hash"), obj.get("hash")):
+        normalized = _normalize_graph_hash_value(raw)
+        if normalized:
+            return normalized
+
+    for meta_key in ("metadata", "meta"):
+        meta = obj.get(meta_key)
+        if isinstance(meta, dict):
+            normalized = _normalize_graph_hash_value(meta.get("graph_hash"))
+            if normalized:
+                return normalized
+
+    data = obj.get("data")
+    for attr_name in ("graph_metadata", "metadata"):
+        meta = getattr(data, attr_name, None)
+        if isinstance(meta, dict):
+            normalized = _normalize_graph_hash_value(meta.get("graph_hash"))
+            if normalized:
+                return normalized
+
+    for attr_name in ("graph_hash", "hash"):
+        normalized = _normalize_graph_hash_value(getattr(data, attr_name, None))
+        if normalized:
+            return normalized
+
+    graph_path = obj.get("graph_path") or obj.get("path")
+    graph_filename = obj.get("filename")
+    try:
+        from src import gnn_main as graph_main
+
+        resolved = graph_main._calculate_graph_hash(
+            graph_filename=graph_filename,
+            graph_path=graph_path,
+        )
+        return _normalize_graph_hash_value(resolved)
+    except Exception:
+        return None
+
+
 def _list_hpo_files_for_training(
     *,
     use_graphsmote: Optional[bool],
     use_imgagn: Optional[bool] = None,
     graph_obj: Dict[str, object],
 ) -> List[str]:
-    def _resolve_graph_hash_for_loaded_graph(obj: Dict[str, object]) -> Optional[str]:
-        if not isinstance(obj, dict):
-            return None
-        direct = obj.get("graph_hash")
-        if isinstance(direct, str):
-            text = direct.strip().lower()
-            if len(text) >= 16:
-                return text
-        for meta_key in ("metadata", "meta"):
-            meta = obj.get(meta_key)
-            if isinstance(meta, dict):
-                raw = meta.get("graph_hash")
-                if isinstance(raw, str):
-                    text = raw.strip().lower()
-                    if len(text) >= 16:
-                        return text
-        graph_path = obj.get("graph_path")
-        graph_filename = obj.get("filename")
-        try:
-            from src import gnn_main as graph_main
-            resolved = graph_main._calculate_graph_hash(
-                graph_filename=graph_filename,
-                graph_path=graph_path,
-            )
-            if isinstance(resolved, str) and len(resolved) >= 16:
-                return resolved.strip().lower()
-        except Exception:
-            return None
-        return None
-
     all_hp_files = sorted(
         glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv")),
         key=os.path.getmtime,
@@ -1759,6 +2483,44 @@ def _list_hpo_files_for_training(
             continue
         filtered.append(path)
     return filtered
+
+
+def _list_hpo_files_for_gnn_training_prompt(
+    *,
+    use_graphsmote: bool,
+    graph_obj: Dict[str, object],
+) -> List[str]:
+    """Mirror ``gnn_main.run_gat_training`` hparam prompt ordering.
+
+    The Streamlit tab feeds an automatic numeric answer into the legacy
+    terminal prompt. The index must be computed against the same list that
+    ``run_gat_training`` will print, not against the UI's graph-hash-filtered
+    list.
+    """
+    all_hp_files = sorted(
+        glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv")),
+        key=os.path.getmtime,
+    )
+    want_imgagn = bool((graph_obj or {}).get("imgagn_best_params")) or (
+        "ImGAGN" in str((graph_obj or {}).get("filename", ""))
+    )
+
+    def _score_hp(path: str) -> Tuple[int, int, int, float]:
+        name = os.path.basename(path)
+        has_smote = "_GraphSMOTE" in name
+        has_imgagn = "_ImGAGN" in name
+        has_base = "_Base" in name
+        ok_smote = has_smote == bool(use_graphsmote)
+        ok_imgagn = has_imgagn == want_imgagn
+        base_pref = has_base and not bool(use_graphsmote)
+        return (int(ok_smote), int(ok_imgagn), int(base_pref), os.path.getmtime(path))
+
+    hp_files_sorted = sorted(all_hp_files, key=_score_hp)
+    return [
+        path
+        for path in hp_files_sorted
+        if ("_GraphSMOTE" in os.path.basename(path)) == bool(use_graphsmote)
+    ]
 
 
 def _compute_binary_metrics_from_cm(cm: np.ndarray) -> Dict[str, float]:
@@ -2905,18 +3667,27 @@ def _network_config_to_hparams(
 
 
 def _save_network_hparams(
-    cfg: Dict[str, object], *, use_graphsmote: bool
+    cfg: Dict[str, object],
+    *,
+    use_graphsmote: bool,
+    graph_obj: Optional[Dict[str, object]] = None,
 ) -> Optional[str]:
     if not cfg:
         return None
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj or {}) if graph_obj else None
+    hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
     variant_tag = "_GraphSMOTE" if use_graphsmote else "_Base"
     path = os.path.join(
         RESULTADOS_DIR,
-        f"optuna_hyperparams_network_{timestamp}{variant_tag}.csv",
+        f"optuna_hyperparams_network_{timestamp}{hash_tag}{variant_tag}.csv",
     )
     try:
+        os.makedirs(RESULTADOS_DIR, exist_ok=True)
         params = _network_config_to_hparams(cfg, use_graphsmote=use_graphsmote)
+        params["hparams_source"] = "Network"
+        if graph_hash:
+            params["graph_hash"] = graph_hash
         pd.DataFrame([params]).to_csv(path, index=False)
         return path
     except Exception:
@@ -2973,40 +3744,510 @@ def _compute_temporal_cutoffs_from_ts(
     return float(unique_ts[train_end_idx]), float(unique_ts[val_end_idx])
 
 
+def _label_lookahead_minutes(
+    feature_mode: Optional[object],
+    sequence_config: Optional[object],
+    dt_feat_minutes: int,
+) -> int:
+    mode = str(feature_mode or "").strip().lower()
+    if mode == "snapshot" and sequence_config is not None:
+        guard = getattr(sequence_config, "guard_band_minutes", 0)
+        horizon = getattr(sequence_config, "horizon_minutes", 0)
+        try:
+            return max(0, int(guard) + int(horizon))
+        except Exception:
+            return 0
+    try:
+        return max(0, int(dt_feat_minutes))
+    except Exception:
+        return 0
+
+
+def _sequence_mask_to_numpy(
+    sequence_mask: Optional[object], expected_len: int
+) -> Optional[np.ndarray]:
+    if sequence_mask is None:
+        return None
+    try:
+        if torch.is_tensor(sequence_mask):
+            arr = sequence_mask.detach().cpu().numpy().astype(bool)
+        else:
+            arr = np.asarray(sequence_mask, dtype=bool)
+    except Exception:
+        return None
+    if arr.shape[0] != expected_len:
+        return None
+    return arr
+
+
+def _compute_temporal_split_masks(
+    ts_values: Sequence[object],
+    train_ratio: int,
+    val_ratio: int,
+    *,
+    sequence_mask: Optional[object] = None,
+    label_lookahead_minutes: int = 0,
+) -> Dict[str, object]:
+    ts_arr = np.asarray(ts_values, dtype=float)
+    valid_mask = np.isfinite(ts_arr)
+    lookahead = max(0, int(label_lookahead_minutes or 0))
+    seq_mask = _sequence_mask_to_numpy(sequence_mask, len(ts_arr))
+
+    split_masks = {
+        "train_mask": np.zeros(len(ts_arr), dtype=bool),
+        "val_mask": np.zeros(len(ts_arr), dtype=bool),
+        "test_mask": np.zeros(len(ts_arr), dtype=bool),
+    }
+    cutoffs = _compute_temporal_cutoffs_from_ts(
+        ts_arr[valid_mask], int(train_ratio), int(val_ratio)
+    )
+    if cutoffs is None:
+        train_mask = valid_mask.copy()
+        val_mask = np.zeros(len(ts_arr), dtype=bool)
+        test_mask = np.zeros(len(ts_arr), dtype=bool)
+        split_status = "insufficient_timestamps"
+        train_cutoff = val_cutoff = None
+    else:
+        train_cutoff, val_cutoff = cutoffs
+        label_end_ts = ts_arr + float(lookahead)
+        train_mask = valid_mask & (label_end_ts <= float(train_cutoff))
+        val_mask = (
+            valid_mask
+            & (ts_arr > float(train_cutoff))
+            & (label_end_ts <= float(val_cutoff))
+        )
+        test_mask = valid_mask & (ts_arr > float(val_cutoff))
+        split_status = "ok"
+
+    train_before_seq = train_mask.copy()
+    val_before_seq = val_mask.copy()
+    test_before_seq = test_mask.copy()
+    if seq_mask is not None:
+        train_mask = train_mask & seq_mask
+        val_mask = val_mask & seq_mask
+        test_mask = test_mask & seq_mask
+
+    split_masks["train_mask"] = train_mask
+    split_masks["val_mask"] = val_mask
+    split_masks["test_mask"] = test_mask
+
+    assigned_mask = train_mask | val_mask | test_mask
+    pre_seq_assigned = train_before_seq | val_before_seq | test_before_seq
+    metadata = {
+        "strategy": "temporal_purged",
+        "status": split_status,
+        "train_ratio": int(train_ratio),
+        "val_ratio": int(val_ratio),
+        "test_ratio": int(100 - int(train_ratio) - int(val_ratio)),
+        "train_ts_cutoff": None if train_cutoff is None else float(train_cutoff),
+        "val_ts_cutoff": None if val_cutoff is None else float(val_cutoff),
+        "label_lookahead_minutes": int(lookahead),
+        "timeline_count": int(np.unique(ts_arr[valid_mask]).size),
+        "node_count": int(len(ts_arr)),
+        "sequence_mask_applied": bool(seq_mask is not None),
+        "train_count": int(train_mask.sum()),
+        "val_count": int(val_mask.sum()),
+        "test_count": int(test_mask.sum()),
+        "purged_count": int((valid_mask & ~pre_seq_assigned).sum()),
+        "sequence_excluded_count": int((pre_seq_assigned & ~assigned_mask).sum())
+        if seq_mask is not None
+        else 0,
+    }
+    return {
+        "train_mask": train_mask,
+        "val_mask": val_mask,
+        "test_mask": test_mask,
+        "metadata": metadata,
+    }
+
+
+def _build_raw_global_edge_features(
+    df_pm_raw: pd.DataFrame, portico_col: str
+) -> pd.DataFrame:
+    def _zeros() -> pd.Series:
+        return pd.Series(np.zeros(len(df_pm_raw)), index=df_pm_raw.index, dtype=float)
+
+    def _numeric_col(col: str) -> Optional[pd.Series]:
+        if col not in df_pm_raw.columns:
+            return None
+        return pd.to_numeric(df_pm_raw[col], errors="coerce")
+
+    def _sum_cols(cols: Sequence[str]) -> pd.Series:
+        available = [col for col in cols if col in df_pm_raw.columns]
+        if not available:
+            return _zeros()
+        numeric = df_pm_raw[available].apply(lambda s: pd.to_numeric(s, errors="coerce"))
+        return numeric.sum(axis=1)
+
+    family = _edge_feature_family_from_df(df_pm_raw)
+    sources: Dict[str, str] = {}
+
+    if family == "snapshot":
+        q = _numeric_col("flow_total")
+        if q is None:
+            q = _zeros()
+            sources["q"] = "zeros"
+        else:
+            sources["q"] = "flow_total"
+
+        v_h = _numeric_col("speed_harmonic")
+        if v_h is not None:
+            sources["v"] = "speed_harmonic"
+        else:
+            v_h = _numeric_col("speed_mean")
+            if v_h is not None:
+                sources["v"] = "speed_mean"
+            else:
+                v_h = _zeros()
+                sources["v"] = "zeros"
+
+        v_safe = v_h.replace(0, np.nan)
+        k = q / v_safe
+        sources["k"] = "flow_total/speed"
+
+        pi = _numeric_col("mix_cat_2")
+        if pi is not None:
+            sources["pi"] = "mix_cat_2"
+        else:
+            f2 = _numeric_col("flow_cat_2")
+            if f2 is not None:
+                pi = f2 / (q + 1e-12)
+                sources["pi"] = "flow_cat_2/flow_total"
+            else:
+                pi = _zeros()
+                sources["pi"] = "zeros"
+
+        slow_pct = _numeric_col("slow_pct")
+        if slow_pct is not None:
+            sources["slow_pct"] = "slow_pct"
+        else:
+            slow_pct = _zeros()
+            sources["slow_pct"] = "zeros"
+    else:
+        q = _numeric_col("flujo_total")
+        if q is not None:
+            sources["q"] = "flujo_total"
+        else:
+            q_cols = [f"flujo_{c}" for c in [1, 2, 3]]
+            q = _sum_cols(q_cols)
+            sources["q"] = (
+                "sum(flujo_1..3)"
+                if any(col in df_pm_raw.columns for col in q_cols)
+                else "zeros"
+            )
+
+        k = _numeric_col("densidad_total")
+        if k is not None:
+            sources["k"] = "densidad_total"
+        else:
+            k_cols = [f"densidad_{c}" for c in [1, 2, 3]]
+            k = _sum_cols(k_cols)
+            sources["k"] = (
+                "sum(densidad_1..3)"
+                if any(col in df_pm_raw.columns for col in k_cols)
+                else "zeros"
+            )
+
+        v_h = _numeric_col("v_armonica")
+        if v_h is not None:
+            sources["v"] = "v_armonica"
+        else:
+            v_h = q / k.replace(0, np.nan)
+            sources["v"] = "q/k"
+
+        pi = _numeric_col("prop_pesados")
+        if pi is not None:
+            sources["pi"] = "prop_pesados"
+        else:
+            f2 = _numeric_col("flujo_2")
+            if f2 is not None:
+                pi = f2 / (q + 1e-12)
+                sources["pi"] = "flujo_2/flujo_total"
+            else:
+                pi = _zeros()
+                sources["pi"] = "zeros"
+
+        slow_pct = _zeros()
+        sources["slow_pct"] = "zeros"
+
+    raw_globals = pd.DataFrame(
+        {
+            portico_col: df_pm_raw[portico_col].values,
+            "ts_min": df_pm_raw["ts_min"].values,
+            "q_total_raw": q.astype(float).fillna(0.0).values,
+            "k_total_raw": k.astype(float).fillna(0.0).values,
+            "v_armonica_raw": v_h.astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values,
+            "prop_pesados_raw": pi.astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values,
+            "slow_pct_raw": slow_pct.astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values,
+        }
+    )
+    raw_globals.attrs["raw_feature_family"] = family
+    raw_globals.attrs["edge_feature_sources"] = sources
+    return raw_globals
+
+
+def _build_edge_feature_extras(
+    edge_df: pd.DataFrame,
+    raw_globals: pd.DataFrame,
+    portico_col: str,
+    selected_physical_features: Sequence[str],
+    *,
+    src_port_col: str = "portico_src",
+    dst_port_col: str = "portico_dst",
+    src_ts_col: str = "ts_min",
+    dst_ts_col: str = "ts_min",
+) -> np.ndarray:
+    feature_names = list(selected_physical_features or [])
+    if edge_df is None or edge_df.empty:
+        return np.zeros((0, len(feature_names)), dtype=float)
+    if not feature_names:
+        return np.zeros((len(edge_df), 0), dtype=float)
+
+    raw_cols = [
+        portico_col,
+        "ts_min",
+        "q_total_raw",
+        "k_total_raw",
+        "v_armonica_raw",
+        "prop_pesados_raw",
+        "slow_pct_raw",
+    ]
+    raw_lookup = raw_globals[[col for col in raw_cols if col in raw_globals.columns]].copy()
+    src_vals = raw_lookup.rename(
+        columns={
+            portico_col: src_port_col,
+            "ts_min": src_ts_col,
+            "q_total_raw": "q_src",
+            "k_total_raw": "k_src",
+            "v_armonica_raw": "v_src",
+            "prop_pesados_raw": "pi_src",
+            "slow_pct_raw": "slow_src",
+        }
+    )
+    dst_vals = raw_lookup.rename(
+        columns={
+            portico_col: dst_port_col,
+            "ts_min": dst_ts_col,
+            "q_total_raw": "q_dst",
+            "k_total_raw": "k_dst",
+            "v_armonica_raw": "v_dst",
+            "prop_pesados_raw": "pi_dst",
+            "slow_pct_raw": "slow_dst",
+        }
+    )
+
+    se = edge_df.merge(src_vals, on=[src_port_col, src_ts_col], how="left")
+    se = se.merge(dst_vals, on=[dst_port_col, dst_ts_col], how="left")
+
+    n_edges = len(se)
+    zeros = np.zeros(n_edges, dtype=float)
+
+    def _arr(col: str) -> np.ndarray:
+        if col not in se.columns:
+            return zeros.copy()
+        return pd.to_numeric(se[col], errors="coerce").to_numpy(dtype=float)
+
+    dkm = _arr("dist_km")
+    dq = _arr("q_dst") - _arr("q_src")
+    dk = _arr("k_dst") - _arr("k_src")
+    dv = _arr("v_dst") - _arr("v_src")
+    dslow = _arr("slow_dst") - _arr("slow_src")
+
+    eps = 1e-9
+    feat_dict = {
+        "dist_km": np.nan_to_num(dkm, nan=0.0),
+        "grad_q": dq / (dkm + eps),
+        "grad_k": dk / (dkm + eps),
+        "grad_v": dv / (dkm + eps),
+        "grad_slow_pct": dslow / (dkm + eps),
+        "shock_speed": dq / (dk + eps),
+        "shock_indicator": np.maximum(0.0, dk) * np.maximum(0.0, -dq),
+    }
+    selected_arrays = [feat_dict.get(name, zeros) for name in feature_names]
+    extras = np.stack(selected_arrays, axis=1)
+    return np.nan_to_num(extras, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _compute_normalization_stats_from_train(
+    df_pm: pd.DataFrame,
+    feature_cols: Sequence[str],
+    train_mask: Sequence[bool],
+) -> Tuple[np.ndarray, np.ndarray]:
+    mask = np.asarray(train_mask, dtype=bool)
+    if mask.shape[0] != len(df_pm) or not mask.any():
+        raise ValueError("train_mask purgado vacío o incompatible para normalización.")
+    train_stats_df = df_pm.loc[mask, list(feature_cols)]
+    mu = train_stats_df.mean().values
+    sigma = train_stats_df.std(ddof=0).fillna(0.0).values + 1e-9
+    return mu, sigma
+
+
+def _metadata_label_lookahead_minutes(
+    metadata: Optional[Dict[str, object]]
+) -> Optional[int]:
+    if not isinstance(metadata, dict):
+        return None
+    labeling = metadata.get("labeling")
+    if not isinstance(labeling, dict):
+        return None
+    value = labeling.get("label_lookahead_minutes")
+    try:
+        return max(0, int(value))
+    except Exception:
+        return None
+
+
+def _pm_index_items_for_hash(pm_index: Optional[object]) -> List[Tuple[str, str]]:
+    rev = getattr(pm_index, "_rev", None)
+    if rev is None and isinstance(pm_index, dict):
+        rev = pm_index
+    if not isinstance(rev, dict):
+        return []
+    return sorted((str(k), str(v)) for k, v in rev.items())
+
+
+def _update_hash_with_tensor(hasher: "hashlib._Hash", value: object) -> None:
+    if value is None or not torch.is_tensor(value):
+        return
+    tensor = value.detach().cpu().contiguous()
+    hasher.update(str(tuple(tensor.shape)).encode("utf-8"))
+    hasher.update(str(tensor.dtype).encode("utf-8"))
+    hasher.update(tensor.numpy().tobytes())
+
+
+_GRAPH_HASH_NON_SEMANTIC_METADATA_KEYS = {
+    "graph_hash",
+    "created_at",
+    "stats_path",
+    "filename",
+    "filenames",
+    "file_path",
+    "file_paths",
+    "graph_path",
+    "loaded_acc_path",
+    "event_files",
+}
+
+
+def _metadata_for_graph_hash(value: object) -> object:
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            key_text = str(key)
+            key_norm = key_text.lower()
+            if key_norm in _GRAPH_HASH_NON_SEMANTIC_METADATA_KEYS:
+                continue
+            if key_norm.endswith(("_path", "_paths", "_file", "_files")):
+                continue
+            out[key_text] = _metadata_for_graph_hash(item)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_metadata_for_graph_hash(item) for item in value]
+    return value
+
+
+def _compute_graph_semantic_hash(
+    *,
+    data: HeteroData,
+    pm_index: Optional[object] = None,
+    feature_cols: Optional[Sequence[str]] = None,
+    split_metadata: Optional[Dict[str, object]] = None,
+    edge_config: Optional[Dict[str, object]] = None,
+    metadata: Optional[Dict[str, object]] = None,
+) -> str:
+    hasher = hashlib.sha256()
+    meta_for_hash = _metadata_for_graph_hash(dict(metadata or {}))
+    payload = {
+        "feature_cols": list(feature_cols or []),
+        "split_metadata": split_metadata or {},
+        "edge_config": edge_config or {},
+        "metadata": meta_for_hash,
+        "pm_index": _pm_index_items_for_hash(pm_index),
+    }
+    hasher.update(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True, default=_json_default).encode(
+            "utf-8"
+        )
+    )
+    for node_type in sorted(data.node_types):
+        store = data[node_type]
+        hasher.update(f"node:{node_type}".encode("utf-8"))
+        for attr in ("x", "y", "train_mask", "val_mask", "test_mask", "sequence_mask"):
+            _update_hash_with_tensor(hasher, getattr(store, attr, None))
+    for edge_type in sorted(data.edge_types, key=str):
+        store = data[edge_type]
+        hasher.update(f"edge:{edge_type}".encode("utf-8"))
+        _update_hash_with_tensor(hasher, getattr(store, "edge_index", None))
+        _update_hash_with_tensor(hasher, getattr(store, "edge_attr", None))
+    return hasher.hexdigest()
+
+
+def _attach_graph_metadata_hash(
+    *,
+    data: HeteroData,
+    pm_index: Optional[object],
+    feature_cols: Sequence[str],
+    split_metadata: Dict[str, object],
+    edge_config: Dict[str, object],
+    metadata: Dict[str, object],
+) -> Tuple[Dict[str, object], str]:
+    metadata_out = dict(metadata)
+    graph_hash = _compute_graph_semantic_hash(
+        data=data,
+        pm_index=pm_index,
+        feature_cols=feature_cols,
+        split_metadata=split_metadata,
+        edge_config=edge_config,
+        metadata=metadata_out,
+    )
+    metadata_out["graph_hash"] = graph_hash
+    try:
+        data.graph_metadata = metadata_out
+    except Exception:
+        pass
+    return metadata_out, graph_hash
+
+
 def _apply_temporal_split_to_graph(
     graph_data: HeteroData,
     pm_index: object,
     train_ratio: int,
     val_ratio: int,
+    *,
+    label_lookahead_minutes: Optional[int] = None,
+    graph_metadata: Optional[Dict[str, object]] = None,
 ) -> Optional[Dict[str, object]]:
     num_nodes = int(graph_data["pm"].num_nodes)
     ts_arr = _extract_ts_min_from_pm_index(pm_index, num_nodes)
     if ts_arr is None:
         return None
-    cutoffs = _compute_temporal_cutoffs_from_ts(
-        ts_arr, int(train_ratio), int(val_ratio)
-    )
-    if cutoffs is None:
-        return None
-    train_cutoff, val_cutoff = cutoffs
-
-    train_mask = np.zeros(num_nodes, dtype=bool)
-    val_mask = np.zeros(num_nodes, dtype=bool)
-    test_mask = np.zeros(num_nodes, dtype=bool)
-
-    valid_mask = np.isfinite(ts_arr)
-    train_mask[valid_mask] = ts_arr[valid_mask] <= train_cutoff
-    val_mask[valid_mask] = (ts_arr[valid_mask] > train_cutoff) & (
-        ts_arr[valid_mask] <= val_cutoff
-    )
-    test_mask[valid_mask] = ts_arr[valid_mask] > val_cutoff
+    lookahead_source = "argument"
+    if label_lookahead_minutes is None:
+        label_lookahead_minutes = _metadata_label_lookahead_minutes(graph_metadata)
+        lookahead_source = "metadata"
+    if label_lookahead_minutes is None:
+        data_metadata = getattr(graph_data, "graph_metadata", None)
+        label_lookahead_minutes = _metadata_label_lookahead_minutes(data_metadata)
+        lookahead_source = "data_metadata"
+    if label_lookahead_minutes is None:
+        label_lookahead_minutes = 0
+        lookahead_source = "legacy_default"
 
     sequence_mask = getattr(graph_data["pm"], "sequence_mask", None)
-    if sequence_mask is not None and len(sequence_mask) == num_nodes:
-        seq_mask_np = sequence_mask.cpu().numpy().astype(bool)
-        train_mask = train_mask & seq_mask_np
-        val_mask = val_mask & seq_mask_np
-        test_mask = test_mask & seq_mask_np
+    split = _compute_temporal_split_masks(
+        ts_arr,
+        int(train_ratio),
+        int(val_ratio),
+        sequence_mask=sequence_mask,
+        label_lookahead_minutes=int(label_lookahead_minutes),
+    )
+    meta = dict(split["metadata"])
+    if meta.get("status") != "ok":
+        return None
+
+    train_mask = np.asarray(split["train_mask"], dtype=bool)
+    val_mask = np.asarray(split["val_mask"], dtype=bool)
+    test_mask = np.asarray(split["test_mask"], dtype=bool)
 
     is_synthetic = getattr(graph_data["pm"], "is_synthetic", None)
     if is_synthetic is not None and len(is_synthetic) == num_nodes:
@@ -3020,12 +4261,35 @@ def _apply_temporal_split_to_graph(
     graph_data["pm"].test_mask = torch.from_numpy(test_mask)
 
     return {
-        "train_cutoff": train_cutoff,
-        "val_cutoff": val_cutoff,
+        "train_cutoff": meta.get("train_ts_cutoff"),
+        "val_cutoff": meta.get("val_ts_cutoff"),
         "train_count": int(train_mask.sum()),
         "val_count": int(val_mask.sum()),
         "test_count": int(test_mask.sum()),
+        "label_lookahead_minutes": int(label_lookahead_minutes),
+        "label_lookahead_source": lookahead_source,
+        "purged_count": int(meta.get("purged_count", 0)),
     }
+
+
+def _warn_legacy_temporal_split(split_info: Optional[Dict[str, object]]) -> None:
+    if not split_info:
+        return
+    if split_info.get("label_lookahead_source") != "legacy_default":
+        return
+    st.warning(
+        "El grafo no contiene metadata de horizonte para split purgado; "
+        "se aplicó compatibilidad legacy con embargo 0. Reconstruya el grafo "
+        "para obtener evaluación temporal estricta."
+    )
+
+
+def _error_temporal_split_required() -> None:
+    st.error(
+        "No se pudo aplicar el split temporal purgado. "
+        "Se detiene la corrida para evitar entrenar o evaluar con mascaras legacy "
+        "que pueden contaminar el split temporal."
+    )
 
 
 def _run_optuna_search(
@@ -3041,6 +4305,7 @@ def _run_optuna_search(
     stop_flag_key: Optional[str] = None,
     return_objective: bool = False,
     storage_path: Optional[str] = None,
+    live_tracker: Optional[_GNNOptunaLiveTracker] = None,
 ) -> Dict[str, object]:
     
     # --- LOGGING SETUP ---
@@ -3270,7 +4535,7 @@ def _run_optuna_search(
     num_epochs = int(optuna_settings["epochs"])
     eval_every = int(optuna_settings["eval_every"])
 
-    graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
+    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
     variant_tag = graph_main._variant_tags(
         use_graphsmote,
         graph_obj,
@@ -3376,6 +4641,8 @@ def _run_optuna_search(
         torch.manual_seed(trial_seed)
         np.random.seed(trial_seed)
         trial.set_user_attr("gnn_variant", gnn_variant_fixed)
+        if live_tracker is not None:
+            live_tracker.mark_trial_start(int(trial.number))
         
         # Clone data for this trial to avoid contamination (solo si se usa balanceo)
         if use_graphsmote or use_imgagn:
@@ -4072,7 +5339,7 @@ def _run_optuna_search(
                 except Exception:
                     pass
 
-                train_minibatch(
+                train_loss, train_cls_loss, train_edge_loss, train_l2_att_loss = train_minibatch(
                     model,
                     train_loader,
                     optimizer,
@@ -4165,6 +5432,7 @@ def _run_optuna_search(
                         batch_size=batch_size_candidate,
                         node_indices=val_idx,
                         mask_name=val_mask_name,
+                        criterion=criterion,
                     )
                 else:
                     val_results = graph_main.test(
@@ -4173,6 +5441,7 @@ def _run_optuna_search(
                         node_type="pm",
                         batch_size=batch_size_candidate,
                         masks=[val_mask_name],
+                        criterion=criterion,
                     )
                 if temporal_module is not None:
                     temporal_module.train()
@@ -4182,12 +5451,22 @@ def _run_optuna_search(
                     )
 
                 val_key = "val_mask"
+                val_loss = val_results[val_key].get("loss")
 
                 y_true_val = val_results[val_key]["true"].numpy().ravel()
                 y_prob1_val = (
                     val_results[val_key]["probs"][:, 1].numpy().ravel()
                 )
                 if np.unique(y_true_val).size < 2:
+                    if live_tracker is not None:
+                        live_tracker.record_epoch(
+                            trial_number=int(trial.number),
+                            epoch=int(epoch),
+                            train_loss=train_loss,
+                            val_loss=val_loss,
+                            score=None,
+                            status="skipped_single_class",
+                        )
                     continue
 
                 tau, _, _, fbeta = graph_main.pick_tau_fbeta(
@@ -4205,6 +5484,14 @@ def _run_optuna_search(
                     metrics, fbeta=float(fbeta), auprc=auprc, mcc=mcc
                 )
                 trial.report(score, epoch)
+                if live_tracker is not None:
+                    live_tracker.record_epoch(
+                        trial_number=int(trial.number),
+                        epoch=int(epoch),
+                        train_loss=train_loss,
+                        val_loss=val_loss,
+                        score=score,
+                    )
                 if trial.should_prune():
                     raise optuna.TrialPruned()
 
@@ -4281,16 +5568,47 @@ def _run_optuna_search(
             optuna.trial.TrialState.PRUNED,
             optuna.trial.TrialState.FAIL,
         }
+        complete_state = optuna.trial.TrialState.COMPLETE
+        pruned_state = optuna.trial.TrialState.PRUNED
+        fail_state = optuna.trial.TrialState.FAIL
     except Exception:
         done_states = set()
+        complete_state = None
+        pruned_state = None
+        fail_state = None
 
     def _count_done_trials(study_obj) -> int:
         if not done_states:
             return len(study_obj.trials)
         return sum(1 for t in study_obj.trials if t.state in done_states)
 
-    done_trials = _count_done_trials(study)
+    def _trial_state_counts(study_obj) -> Dict[str, int]:
+        trials = list(getattr(study_obj, "trials", []) or [])
+        if not done_states:
+            return {
+                "done": len(trials),
+                "ok": len(trials),
+                "failed": 0,
+                "pruned": 0,
+            }
+        return {
+            "done": sum(1 for t in trials if t.state in done_states),
+            "ok": sum(1 for t in trials if t.state == complete_state),
+            "failed": sum(1 for t in trials if t.state == fail_state),
+            "pruned": sum(1 for t in trials if t.state == pruned_state),
+        }
+
+    trial_counts = _trial_state_counts(study)
+    done_trials = int(trial_counts["done"])
     remaining_trials = max(0, n_trials - done_trials)
+    if live_tracker is not None:
+        live_tracker.mark_run_start(
+            done_trials=done_trials,
+            ok_trials=int(trial_counts["ok"]),
+            failed_trials=int(trial_counts["failed"]),
+            pruned_trials=int(trial_counts["pruned"]),
+            study_name=study_name,
+        )
 
     def progress_callback(study, trial):
         completed = _count_done_trials(study)
@@ -4315,6 +5633,16 @@ def _run_optuna_search(
             study.trials_dataframe().to_csv(live_path, index=False)
         except Exception:
             pass
+        if live_tracker is not None:
+            counts = _trial_state_counts(study)
+            live_tracker.mark_trial_finished(
+                study,
+                trial,
+                completed=int(counts["done"]),
+                ok_trials=int(counts["ok"]),
+                failed_trials=int(counts["failed"]),
+                pruned_trials=int(counts["pruned"]),
+            )
 
     try:
         if remaining_trials <= 0:
@@ -4322,6 +5650,8 @@ def _run_optuna_search(
             status_text.markdown(
                 f"**Optuna reanudado: {done_trials} ensayos ya completados (objetivo {n_trials}).**"
             )
+            if live_tracker is not None:
+                live_tracker.write_trials_dataframe(study)
         else:
             study.optimize(
                 objective,
@@ -4330,6 +5660,10 @@ def _run_optuna_search(
                 show_progress_bar=False,  # We use our own st.progress
                 callbacks=[progress_callback],
             )
+    except Exception as exc:
+        if live_tracker is not None:
+            live_tracker.mark_run_failed(exc)
+        raise
     finally:
         # CLEANUP HANDLER
         if handler:
@@ -4361,7 +5695,7 @@ def _run_optuna_search(
         best_params["use_imgagn_aug"] = bool(use_imgagn)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
+    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
     variant_tag = graph_main._variant_tags(
         use_graphsmote,
         graph_obj,
@@ -4393,6 +5727,16 @@ def _run_optuna_search(
         f"optuna_full_study_{timestamp}{hash_tag}{variant_tag}.csv",
     )
     trials_df.to_csv(full_study_path, index=False)
+    if live_tracker is not None:
+        live_tracker.mark_run_completed(
+            study,
+            best_path=best_params_path,
+            full_path=full_study_path,
+            completed_trials=_count_done_trials(study),
+            ok_trials=int(_trial_state_counts(study)["ok"]),
+            failed_trials=int(_trial_state_counts(study)["failed"]),
+            pruned_trials=int(_trial_state_counts(study)["pruned"]),
+        )
 
     range_analysis = _optuna_analyze_ranges(
         trials_df,
@@ -4406,6 +5750,10 @@ def _run_optuna_search(
         "best_params": best_params,
         "best_path": best_params_path,
         "full_path": full_study_path,
+        "live_run_dir": str(live_tracker.run_dir) if live_tracker is not None else "",
+        "live_manifest_path": (
+            str(live_tracker.paths["manifest"]) if live_tracker is not None else ""
+        ),
         "study": study,
         "trials_df": trials_df,
         "range_analysis": range_analysis,
@@ -5023,6 +6371,116 @@ def _get_feature_cols(df: pd.DataFrame) -> List[str]:
     ]
 
 
+GRAPH_NODE_FEATURE_EXCLUDE = {
+    "target",
+    "synthetic",
+    "portico",
+    "cod_portico",
+    "id_portico",
+    "ts_min",
+    "timestamp",
+    "interval_start",
+    "node_idx",
+    "next_ts_min",
+    "future_label",
+}
+
+
+def _filter_graph_node_feature_columns(columns: Sequence[object]) -> List[str]:
+    excluded = {_normalize_column_key(col) for col in GRAPH_NODE_FEATURE_EXCLUDE}
+    out: List[str] = []
+    seen = set()
+    for col in columns or []:
+        text = str(col)
+        key = _normalize_column_key(text)
+        if not key or key in excluded or key in seen:
+            continue
+        out.append(text)
+        seen.add(key)
+    return out
+
+
+def _available_graph_node_feature_columns(
+    feature_config: Optional[Dict[str, object]],
+    df_pm_cache: Optional[pd.DataFrame],
+) -> Tuple[List[str], str, Optional[str]]:
+    if isinstance(df_pm_cache, pd.DataFrame) and not df_pm_cache.empty:
+        return (
+            _filter_graph_node_feature_columns(df_pm_cache.columns),
+            "features en memoria",
+            None,
+        )
+
+    if _feature_config_is_duckdb(feature_config):
+        try:
+            duckdb_path = _feature_config_duckdb_path(feature_config)
+            table_name = _feature_config_duckdb_table(feature_config)
+            resolved_table, duckdb_cols, _ = _duckdb_feature_metadata(
+                str(duckdb_path),
+                [table_name] if table_name else [],
+                table_name=table_name,
+                include_count=False,
+            )
+            return (
+                _filter_graph_node_feature_columns(duckdb_cols),
+                f"DuckDB: {os.path.basename(str(duckdb_path))} / {resolved_table}",
+                None,
+            )
+        except Exception as exc:
+            return [], "DuckDB", str(exc)
+
+    csv_path = feature_config.get("csv_path") if isinstance(feature_config, dict) else None
+    if csv_path:
+        try:
+            header = pd.read_csv(str(csv_path), nrows=0)
+            return (
+                _filter_graph_node_feature_columns(header.columns),
+                f"CSV: {os.path.basename(str(csv_path))}",
+                None,
+            )
+        except Exception as exc:
+            return [], "CSV", str(exc)
+
+    return [], "sin fuente configurada", None
+
+
+def _resolve_graph_node_feature_preview(
+    feature_config: Optional[Dict[str, object]],
+    df_pm_cache: Optional[pd.DataFrame],
+    *,
+    selected_features_exists: bool,
+    selected_features: Optional[Sequence[object]],
+) -> Dict[str, object]:
+    available, source_label, error = _available_graph_node_feature_columns(
+        feature_config, df_pm_cache
+    )
+    available_set = set(available)
+
+    if selected_features_exists:
+        configured = [str(feature) for feature in (selected_features or [])]
+        if available:
+            used = [feature for feature in configured if feature in available_set]
+            missing = [feature for feature in configured if feature not in available_set]
+        else:
+            used = configured
+            missing = []
+        selection_source = "Feature selection"
+    else:
+        used = list(available)
+        missing = []
+        selection_source = "Todas las variables disponibles"
+
+    return {
+        "features": used,
+        "available": available,
+        "missing": missing,
+        "source_label": source_label,
+        "selection_source": selection_source,
+        "error": error,
+        "selected_features_exists": selected_features_exists,
+    }
+
+
 def _parse_neighbor_profile(
     text_value: str,
     *,
@@ -5294,6 +6752,45 @@ def _is_snapshot_features(df: Optional[pd.DataFrame]) -> bool:
     if any(col in columns for col in SNAPSHOT_TEMPORAL_COLUMNS):
         return True
     return False
+
+
+def _edge_feature_family_from_df(df: Optional[pd.DataFrame]) -> str:
+    if df is None or df.empty:
+        return "classic"
+    columns = set(df.columns)
+    classic_cols = {
+        "flujo_total",
+        "densidad_total",
+        "v_armonica",
+        "prop_pesados",
+    }
+    if columns.intersection(classic_cols):
+        return "classic"
+    snapshot_markers = {
+        "flow_total",
+        "speed_harmonic",
+        "speed_mean",
+        "slow_pct",
+    }
+    if columns.intersection(snapshot_markers):
+        return "snapshot"
+    if any(col.startswith(("flow_cat_", "mix_cat_")) for col in columns):
+        return "snapshot"
+    return "classic"
+
+
+def _default_edge_delta_features(
+    feature_cols: Sequence[str],
+    feature_mode: Optional[object] = None,
+) -> List[str]:
+    mode = str(feature_mode or "").strip().lower()
+    if mode == "snapshot":
+        defaults = [
+            col for col in SNAPSHOT_DEFAULT_EDGE_DELTA_COLUMNS if col in feature_cols
+        ]
+        if defaults:
+            return defaults
+    return list(feature_cols)
 
 
 def _is_empty_frame(obj: object) -> bool:
@@ -5911,18 +7408,640 @@ def _pick_duckdb_table(
     return tables[0] if tables else None
 
 
+def _quote_duckdb_identifier(name: object) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _quote_duckdb_literal(value: object) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _find_column_name(columns: Sequence[str], keywords: Sequence[str]) -> Optional[str]:
+    normalized = {_normalize_column_key(col): col for col in columns}
+    for key in keywords:
+        key_norm = _normalize_column_key(key)
+        if key_norm in normalized:
+            return normalized[key_norm]
+    for key in keywords:
+        key_norm = _normalize_column_key(key)
+        for norm, original in normalized.items():
+            if key_norm and key_norm in norm:
+                return original
+    return None
+
+
+def _pick_feature_duckdb_table(
+    tables: Sequence[str],
+    preferred: Sequence[str],
+) -> Optional[str]:
+    for name in preferred:
+        if name in tables:
+            return name
+    feature_tables = [name for name in tables if str(name).startswith("features_")]
+    return feature_tables[0] if feature_tables else (tables[0] if tables else None)
+
+
+def _feature_config_duckdb_path(config: Optional[Dict[str, object]]) -> Optional[str]:
+    if not isinstance(config, dict):
+        return None
+    path = config.get("duckdb_path")
+    if path:
+        return str(path)
+    csv_path = config.get("csv_path")
+    if csv_path and str(csv_path).lower().endswith(".duckdb"):
+        return str(csv_path)
+    params = config.get("params")
+    if isinstance(params, dict):
+        path = params.get("duckdb_path")
+        if path:
+            return str(path)
+    return None
+
+
+def _feature_config_duckdb_table(config: Optional[Dict[str, object]]) -> Optional[str]:
+    if not isinstance(config, dict):
+        return None
+    table = config.get("duckdb_table")
+    if table:
+        return str(table)
+    params = config.get("params")
+    if isinstance(params, dict):
+        table = params.get("duckdb_table")
+        if table:
+            return str(table)
+    return None
+
+
+def _feature_config_is_duckdb(config: Optional[Dict[str, object]]) -> bool:
+    return bool(_feature_config_duckdb_path(config))
+
+
+def _date_to_ts_min(value: object, *, end_exclusive: bool = False) -> int:
+    ts = pd.Timestamp(value).normalize()
+    if end_exclusive:
+        ts = ts + pd.Timedelta(days=1)
+    return int(ts.value // 60_000_000_000)
+
+
+def _duckdb_feature_filter_parts(
+    columns: Sequence[str],
+    *,
+    start_date: Optional[object] = None,
+    end_date: Optional[object] = None,
+    porticos_filter: Optional[Sequence[object]] = None,
+    time_filter_key: Optional[str] = None,
+) -> Tuple[List[str], List[object]]:
+    clauses: List[str] = []
+    params: List[object] = []
+    ts_col = _find_column_name(columns, ["ts_min", "timestamp", "interval_start"])
+
+    if ts_col and (start_date is not None or end_date is not None):
+        ts_expr = _quote_duckdb_identifier(ts_col)
+        if ts_col == "ts_min":
+            if start_date is not None:
+                clauses.append(f"{ts_expr} >= ?")
+                params.append(_date_to_ts_min(start_date))
+            if end_date is not None:
+                clauses.append(f"{ts_expr} < ?")
+                params.append(_date_to_ts_min(end_date, end_exclusive=True))
+        else:
+            if start_date is not None:
+                clauses.append(f"try_cast({ts_expr} AS TIMESTAMP) >= ?")
+                params.append(pd.Timestamp(start_date).normalize().to_pydatetime())
+            if end_date is not None:
+                end_ts = (
+                    pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
+                ).to_pydatetime()
+                clauses.append(f"try_cast({ts_expr} AS TIMESTAMP) < ?")
+                params.append(end_ts)
+
+    if ts_col and str(time_filter_key) in {"2", "3"}:
+        ts_expr = _quote_duckdb_identifier(ts_col)
+        if str(time_filter_key) == "2":
+            start_minute, end_minute = 6 * 60, 10 * 60
+        else:
+            start_minute, end_minute = 18 * 60, 22 * 60
+        if ts_col == "ts_min":
+            minute_expr = f"(({ts_expr} % 1440 + 1440) % 1440)"
+            clauses.append(f"{minute_expr} >= ? AND {minute_expr} < ?")
+            params.extend([start_minute, end_minute])
+        else:
+            hour_expr = f"EXTRACT(hour FROM try_cast({ts_expr} AS TIMESTAMP))"
+            clauses.append(f"{hour_expr} >= ? AND {hour_expr} < ?")
+            params.extend([start_minute // 60, end_minute // 60])
+
+    portico_col = _find_column_name(columns, ["portico", "cod_portico", "PORTICO"])
+    portico_values = []
+    if porticos_filter:
+        seen = set()
+        for value in porticos_filter:
+            key = _normalize_portico_key(value)
+            if key and key not in seen:
+                portico_values.append(key.upper())
+                seen.add(key)
+    if portico_col and portico_values:
+        placeholders = ", ".join(["?"] * len(portico_values))
+        portico_expr = (
+            "upper(regexp_replace(trim(CAST("
+            f"{_quote_duckdb_identifier(portico_col)} AS VARCHAR)), '[.]0$', ''))"
+        )
+        clauses.append(f"{portico_expr} IN ({placeholders})")
+        params.extend(portico_values)
+
+    return clauses, params
+
+
+def _duckdb_feature_metadata(
+    path: str,
+    preferred_tables: Sequence[str],
+    *,
+    table_name: Optional[str] = None,
+    include_count: bool = True,
+) -> Tuple[str, List[str], int]:
+    if duckdb is None:
+        raise RuntimeError("Librería duckdb no encontrada. Instale `duckdb`.")
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+        target_table = table_name if table_name in tables else None
+        if not target_table:
+            target_table = _pick_feature_duckdb_table(tables, preferred_tables)
+        if not target_table:
+            raise ValueError(f"No hay tablas en {os.path.basename(path)}.")
+        cols = [
+            row[0]
+            for row in con.execute(
+                f"DESCRIBE {_quote_duckdb_identifier(target_table)}"
+            ).fetchall()
+        ]
+        total_rows = -1
+        if include_count:
+            total_rows = int(
+                con.execute(
+                    f"SELECT COUNT(*) FROM {_quote_duckdb_identifier(target_table)}"
+                ).fetchone()[0]
+            )
+        return target_table, cols, total_rows
+    finally:
+        con.close()
+
+
+def _infer_feature_mode_from_duckdb_source(
+    source_path: str,
+    table_name: Optional[str],
+    columns: Sequence[str],
+) -> str:
+    label = f"{source_path} {table_name or ''}".lower()
+    if "snapshot" in label:
+        return "Snapshot"
+    if "flow" in label:
+        return "Flow 5 min"
+    snapshot_markers = {
+        "speed_mean",
+        "speed_harmonic",
+        "flow_total",
+        "slow_pct",
+    }
+    if snapshot_markers.intersection(set(columns)):
+        return "Snapshot"
+    return "Flow 5 min"
+
+
+def _load_duckdb_feature_frame(
+    path: str,
+    preferred_tables: Sequence[str],
+    *,
+    table_name: Optional[str] = None,
+    start_date: Optional[object] = None,
+    end_date: Optional[object] = None,
+    porticos_filter: Optional[Sequence[object]] = None,
+    time_filter_key: Optional[str] = None,
+    limit: Optional[int] = None,
+    max_rows: Optional[int] = None,
+    selected_columns: Optional[Sequence[str]] = None,
+) -> Tuple[pd.DataFrame, str, int]:
+    if duckdb is None:
+        raise RuntimeError("Librería duckdb no encontrada. Instale `duckdb`.")
+
+    target_table, cols, _ = _duckdb_feature_metadata(
+        path, preferred_tables, table_name=table_name, include_count=False
+    )
+    clauses, params = _duckdb_feature_filter_parts(
+        cols,
+        start_date=start_date,
+        end_date=end_date,
+        porticos_filter=porticos_filter,
+        time_filter_key=time_filter_key,
+    )
+    where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        count_sql = (
+            f"SELECT COUNT(*) FROM {_quote_duckdb_identifier(target_table)}"
+            f"{where_sql}"
+        )
+        filtered_rows = int(con.execute(count_sql, params).fetchone()[0])
+        if max_rows is not None and filtered_rows > int(max_rows):
+            raise MemoryError(
+                f"La consulta DuckDB devuelve {filtered_rows:,} filas; "
+                f"limite de carga en memoria: {int(max_rows):,}."
+            )
+
+        if selected_columns:
+            available = [col for col in selected_columns if col in cols]
+            select_sql = ", ".join(_quote_duckdb_identifier(col) for col in available)
+            if not select_sql:
+                select_sql = "*"
+        else:
+            select_sql = "*"
+
+        query = (
+            f"SELECT {select_sql} FROM {_quote_duckdb_identifier(target_table)}"
+            f"{where_sql}"
+        )
+        order_cols = [
+            col for col in ["portico", "ts_min", "timestamp", "interval_start"] if col in cols
+        ]
+        if order_cols:
+            query += " ORDER BY " + ", ".join(
+                _quote_duckdb_identifier(col) for col in order_cols
+            )
+        if limit is not None:
+            query += f" LIMIT {max(0, int(limit))}"
+        return con.execute(query, params).df(), target_table, filtered_rows
+    finally:
+        con.close()
+
+
 def _load_duckdb_df(path: str, preferred_tables: Sequence[str]) -> Optional[pd.DataFrame]:
     if duckdb is None:
         return None
     con = duckdb.connect(str(path), read_only=True)
     try:
         tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-        table_name = _pick_duckdb_table(tables, preferred_tables)
+        table_name = _pick_feature_duckdb_table(tables, preferred_tables)
         if not table_name:
             return None
-        return con.execute(f"SELECT * FROM {table_name}").df()
+        return con.execute(
+            f"SELECT * FROM {_quote_duckdb_identifier(table_name)}"
+        ).df()
     finally:
         con.close()
+
+
+def _load_existing_features_from_config(
+    feature_config: Dict[str, object],
+    *,
+    porticos_filter: Optional[Sequence[object]] = None,
+    time_filter_key: Optional[str] = None,
+    status: Optional[object] = None,
+    max_rows: Optional[int] = None,
+    preview_limit: Optional[int] = None,
+) -> Optional[pd.DataFrame]:
+    params = feature_config.get("params", {}) if isinstance(feature_config, dict) else {}
+    params = params if isinstance(params, dict) else {}
+
+    duckdb_path = _feature_config_duckdb_path(feature_config)
+    if duckdb_path:
+        table_name = _feature_config_duckdb_table(feature_config)
+        preferred = [table_name] if table_name else []
+        effective_porticos = (
+            porticos_filter
+            if porticos_filter is not None
+            else params.get("porticos_filter")
+        )
+        if status is not None:
+            try:
+                status.text("Consultando features desde DuckDB con filtros pushdown...")
+            except Exception:
+                pass
+        df, resolved_table, filtered_rows = _load_duckdb_feature_frame(
+            duckdb_path,
+            preferred,
+            table_name=table_name,
+            start_date=params.get("start_date"),
+            end_date=params.get("end_date"),
+            porticos_filter=effective_porticos,
+            time_filter_key=time_filter_key,
+            limit=preview_limit,
+            max_rows=max_rows,
+        )
+        st.session_state["feature_duckdb_last_query"] = {
+            "path": duckdb_path,
+            "table": resolved_table,
+            "filtered_rows": int(filtered_rows),
+            "preview_limit": preview_limit,
+        }
+        return df
+
+    csv_path = feature_config.get("csv_path") if isinstance(feature_config, dict) else None
+    if not csv_path:
+        return None
+    df = pd.read_csv(str(csv_path))
+    if porticos_filter:
+        df = _apply_tramo_filter(df, porticos_filter)
+    return df
+
+
+def _order_feature_porticos_by_reference(
+    porticos: Sequence[object],
+    df_port: Optional[pd.DataFrame],
+) -> List[str]:
+    raw_porticos = _dedupe_portico_values(porticos)
+    if not raw_porticos:
+        return []
+
+    raw_by_key: Dict[str, str] = {}
+    raw_order: List[str] = []
+    for portico in raw_porticos:
+        key = _normalize_portico_key(portico)
+        if not key or key in raw_by_key:
+            continue
+        raw_by_key[key] = _format_portico_value(portico)
+        raw_order.append(key)
+
+    if df_port is None or df_port.empty:
+        return [raw_by_key[key] for key in raw_order]
+
+    portico_col = _find_column_by_keywords(
+        df_port, ["portico", "cod_portico", "id_portico"]
+    )
+    if not portico_col:
+        return [raw_by_key[key] for key in raw_order]
+
+    work = df_port.copy()
+    work["_portico_key"] = work[portico_col].map(_normalize_portico_key)
+    work = work[work["_portico_key"].isin(raw_by_key.keys())].copy()
+    if work.empty:
+        return [raw_by_key[key] for key in raw_order]
+
+    work["_source_order"] = np.arange(len(work))
+    orden_col = _find_column_by_keywords(work, ["orden"])
+    km_col = _find_column_by_keywords(work, ["km"])
+    work["_orden_num"] = (
+        pd.to_numeric(work[orden_col], errors="coerce")
+        if orden_col
+        else np.nan
+    )
+    work["_km_num"] = (
+        pd.to_numeric(work[km_col], errors="coerce")
+        if km_col
+        else np.nan
+    )
+
+    route_cols = [
+        col
+        for col in [
+            _find_column_by_keywords(work, ["autopista"]),
+            _find_column_by_keywords(work, ["calzada"]),
+            _find_column_by_keywords(work, ["eje"]),
+        ]
+        if col is not None
+    ]
+
+    def _sort_group(group: pd.DataFrame) -> pd.DataFrame:
+        sort_cols = []
+        if group["_orden_num"].notna().any():
+            sort_cols.append("_orden_num")
+        if group["_km_num"].notna().any():
+            sort_cols.append("_km_num")
+        sort_cols.append("_source_order")
+        return group.sort_values(sort_cols)
+
+    if route_cols:
+        groups = [group for _, group in work.groupby(route_cols, dropna=False, sort=False)]
+        groups.sort(
+            key=lambda group: (
+                group["_portico_key"].nunique(),
+                -len(group),
+            ),
+            reverse=True,
+        )
+        best_group = groups[0] if groups else work
+        if best_group["_portico_key"].nunique() == len(raw_by_key):
+            ordered_source = _sort_group(best_group)
+        else:
+            ordered_source = work.sort_values(
+                route_cols + ["_orden_num", "_km_num", "_source_order"],
+                na_position="last",
+            )
+    else:
+        ordered_source = _sort_group(work)
+
+    ordered: List[str] = []
+    seen = set()
+    for key in ordered_source["_portico_key"].tolist():
+        if key not in raw_by_key or key in seen:
+            continue
+        ordered.append(raw_by_key[key])
+        seen.add(key)
+
+    for key in raw_order:
+        if key not in seen:
+            ordered.append(raw_by_key[key])
+            seen.add(key)
+
+    return ordered
+
+
+def _query_duckdb_feature_porticos(
+    path: str,
+    preferred_tables: Sequence[str],
+    *,
+    table_name: Optional[str] = None,
+    start_date: Optional[object] = None,
+    end_date: Optional[object] = None,
+    porticos_filter: Optional[Sequence[object]] = None,
+) -> Tuple[List[str], str, str]:
+    if duckdb is None:
+        raise RuntimeError("Librería duckdb no encontrada. Instale `duckdb`.")
+
+    target_table, cols, _ = _duckdb_feature_metadata(
+        path, preferred_tables, table_name=table_name, include_count=False
+    )
+    portico_col = _find_column_name(
+        cols, ["portico", "cod_portico", "id_portico", "PORTICO"]
+    )
+    if not portico_col:
+        raise ValueError("La tabla de features no contiene columna de pórtico.")
+
+    clauses, params = _duckdb_feature_filter_parts(
+        cols,
+        start_date=start_date,
+        end_date=end_date,
+        porticos_filter=porticos_filter,
+    )
+    portico_expr = (
+        "regexp_replace(trim(CAST("
+        f"{_quote_duckdb_identifier(portico_col)} AS VARCHAR)), '[.]0$', '')"
+    )
+    clauses.append(
+        f"{portico_expr} <> '' "
+        f"AND lower({portico_expr}) NOT IN ('nan', 'none', 'null')"
+    )
+    where_sql = " WHERE " + " AND ".join(clauses)
+    query = (
+        f"SELECT DISTINCT {portico_expr} AS portico "
+        f"FROM {_quote_duckdb_identifier(target_table)}"
+        f"{where_sql} "
+        "ORDER BY try_cast(portico AS DOUBLE), portico"
+    )
+
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        rows = con.execute(query, params).fetchall()
+    finally:
+        con.close()
+    return [row[0] for row in rows if row and row[0] is not None], target_table, portico_col
+
+
+def _query_csv_feature_porticos_with_duckdb(
+    path: str,
+    *,
+    start_date: Optional[object] = None,
+    end_date: Optional[object] = None,
+    porticos_filter: Optional[Sequence[object]] = None,
+) -> Tuple[List[str], str]:
+    header = pd.read_csv(str(path), nrows=0)
+    cols = list(header.columns)
+    portico_col = _find_column_name(
+        cols, ["portico", "cod_portico", "id_portico", "PORTICO"]
+    )
+    if not portico_col:
+        raise ValueError("El CSV de features no contiene columna de pórtico.")
+
+    if duckdb is None:
+        df_port = pd.read_csv(str(path), usecols=[portico_col])
+        if porticos_filter:
+            filter_keys = {
+                key
+                for key in (_normalize_portico_key(value) for value in porticos_filter)
+                if key
+            }
+            df_port = df_port[
+                df_port[portico_col].map(_normalize_portico_key).isin(filter_keys)
+            ]
+        values = df_port[portico_col].dropna().unique().tolist()
+        return values, portico_col
+
+    clauses, params = _duckdb_feature_filter_parts(
+        cols,
+        start_date=start_date,
+        end_date=end_date,
+        porticos_filter=porticos_filter,
+    )
+    portico_expr = (
+        "regexp_replace(trim(CAST("
+        f"{_quote_duckdb_identifier(portico_col)} AS VARCHAR)), '[.]0$', '')"
+    )
+    clauses.append(
+        f"{portico_expr} <> '' "
+        f"AND lower({portico_expr}) NOT IN ('nan', 'none', 'null')"
+    )
+    where_sql = " WHERE " + " AND ".join(clauses)
+    source_sql = f"read_csv_auto({_quote_duckdb_literal(path)})"
+    query = (
+        f"SELECT DISTINCT {portico_expr} AS portico "
+        f"FROM {source_sql}"
+        f"{where_sql} "
+        "ORDER BY try_cast(portico AS DOUBLE), portico"
+    )
+
+    con = duckdb.connect()
+    try:
+        rows = con.execute(query, params).fetchall()
+    finally:
+        con.close()
+    return [row[0] for row in rows if row and row[0] is not None], portico_col
+
+
+def _feature_portico_sequence_from_source(
+    feature_config: Optional[Dict[str, object]],
+    *,
+    df_port: Optional[pd.DataFrame] = None,
+    df_pm_cache: Optional[pd.DataFrame] = None,
+) -> Dict[str, object]:
+    params = feature_config.get("params", {}) if isinstance(feature_config, dict) else {}
+    params = params if isinstance(params, dict) else {}
+    porticos_filter = params.get("porticos_filter")
+    configured_filter_count = (
+        len(_dedupe_portico_values(porticos_filter))
+        if porticos_filter
+        else 0
+    )
+
+    duckdb_path = _feature_config_duckdb_path(feature_config)
+    if duckdb_path:
+        table_name = _feature_config_duckdb_table(feature_config)
+        porticos, resolved_table, portico_col = _query_duckdb_feature_porticos(
+            duckdb_path,
+            [table_name] if table_name else [],
+            table_name=table_name,
+            start_date=params.get("start_date"),
+            end_date=params.get("end_date"),
+            porticos_filter=porticos_filter,
+        )
+        ordered = _order_feature_porticos_by_reference(porticos, df_port)
+        return {
+            "porticos": ordered,
+            "source": duckdb_path,
+            "table": resolved_table,
+            "portico_col": portico_col,
+            "method": "DuckDB DISTINCT",
+            "configured_filter_count": configured_filter_count,
+        }
+
+    csv_path = feature_config.get("csv_path") if isinstance(feature_config, dict) else None
+    if csv_path:
+        porticos, portico_col = _query_csv_feature_porticos_with_duckdb(
+            str(csv_path),
+            start_date=params.get("start_date"),
+            end_date=params.get("end_date"),
+            porticos_filter=porticos_filter,
+        )
+        ordered = _order_feature_porticos_by_reference(porticos, df_port)
+        method = "DuckDB read_csv_auto DISTINCT" if duckdb is not None else "Pandas usecols"
+        return {
+            "porticos": ordered,
+            "source": str(csv_path),
+            "table": None,
+            "portico_col": portico_col,
+            "method": method,
+            "configured_filter_count": configured_filter_count,
+        }
+
+    if isinstance(df_pm_cache, pd.DataFrame) and not df_pm_cache.empty:
+        portico_col = _find_column_by_keywords(
+            df_pm_cache, ["portico", "cod_portico", "id_portico"]
+        )
+        if not portico_col:
+            raise ValueError("Las features en memoria no contienen columna de pórtico.")
+        if porticos_filter:
+            filter_keys = {
+                key
+                for key in (_normalize_portico_key(value) for value in porticos_filter)
+                if key
+            }
+            work = df_pm_cache[
+                df_pm_cache[portico_col].map(_normalize_portico_key).isin(filter_keys)
+            ]
+        else:
+            work = df_pm_cache
+        porticos = work[portico_col].dropna().unique().tolist()
+        ordered = _order_feature_porticos_by_reference(porticos, df_port)
+        return {
+            "porticos": ordered,
+            "source": "df_pm_cache",
+            "table": None,
+            "portico_col": portico_col,
+            "method": "memoria",
+            "configured_filter_count": configured_filter_count,
+        }
+
+    raise ValueError(
+        "No hay un archivo DuckDB/CSV de features ni features en memoria para inferir el tramo."
+    )
 
 
 def _estimate_flow_rows(
@@ -6031,7 +8150,7 @@ def run_feature_generation_workflow(params):
 
     snapshot_groups = gen_params.get("snapshot_groups") or []
     if use_snapshot and not snapshot_groups:
-        snapshot_groups = list(SNAPSHOT_GROUP_KEYS)
+        snapshot_groups = list(SNAPSHOT_DEFAULT_GROUP_KEYS)
         gen_params["snapshot_groups"] = snapshot_groups
     snapshot_group_set = set(snapshot_groups) if use_snapshot else set()
     include_window_features = "window_features" in snapshot_group_set
@@ -6518,28 +8637,36 @@ def run_feature_generation_workflow(params):
 
                 # Update Final Loading
                 if table_created:
-                    # Load full dataset as requested
-                    con_final = duckdb.connect(str(features_db_path), read_only=True)
-                    try:
-                        df_pm = con_final.execute(f"SELECT * FROM {table_name_out}").df()
-                    finally:
-                        con_final.close()
-                    
-                    st.session_state.df_pm_cache = df_pm.copy()
+                    df_pm, _, _ = _load_duckdb_feature_frame(
+                        features_db_path,
+                        [table_name_out],
+                        table_name=table_name_out,
+                        limit=DUCKDB_FEATURE_PREVIEW_ROWS,
+                    )
+                    st.session_state.df_pm_cache = None
                     st.session_state.feature_config = {
                         "source": "Generar nuevas (DuckDB)",
-                        "csv_path": table_name_out,
-                        "params": gen_params
+                        "csv_path": features_db_path,
+                        "duckdb_path": features_db_path,
+                        "duckdb_table": table_name_out,
+                        "params": {
+                            **gen_params,
+                            "duckdb_path": features_db_path,
+                            "duckdb_table": table_name_out,
+                        },
                     }
                     if force_snapshot: 
                          st.session_state.feature_config["params"]["feature_mode"] = "Snapshot"
                     else:
-                         st.session_state.feature_config["params"]["feature_mode"] = "Flow"
+                         st.session_state.feature_config["params"]["feature_mode"] = "Flow 5 min"
 
                     st.success(
-                        f"Proceso finalizado. Features generadas y cargadas: {total_rows_saved:,} filas."
+                        "Proceso finalizado. Features guardadas en DuckDB: "
+                        f"{total_rows_saved:,} filas. "
+                        "No se cargaron completas en RAM; se usara consulta filtrada al construir el grafo."
                     )
                     progress.empty()
+                    return df_pm
                 else:
                     st.warning("No se generaron features en ningún lote.")
                     # con_feat.close() Removed
@@ -6748,17 +8875,25 @@ def run_feature_generation_workflow(params):
                     dt_minutes=dt_m,
                 )
 
-        elif source_choice == "Cargar existentes":
-            csv_p = params.get("csv_path")
-            if csv_p:
-                 status.text(f"Cargando {os.path.basename(csv_p)}...")
-                 df_pm = pd.read_csv(csv_p)
-                 if force_snapshot and not _is_snapshot_features(df_pm):
-                     st.error(
-                         "Las features cargadas no corresponden a snapshots. "
-                         "Genere nuevamente en modo snapshot."
-                     )
-                     return None
+        elif str(source_choice).startswith("Cargar existentes") or _feature_config_is_duckdb(params):
+            if _feature_config_is_duckdb(params):
+                df_pm = _load_existing_features_from_config(
+                    params,
+                    porticos_filter=gen_params.get("porticos_filter"),
+                    status=status,
+                    max_rows=DUCKDB_FEATURE_MEMORY_ROW_LIMIT,
+                )
+            else:
+                csv_p = params.get("csv_path")
+                if csv_p:
+                     status.text(f"Cargando {os.path.basename(csv_p)}...")
+                     df_pm = pd.read_csv(csv_p)
+            if df_pm is not None and force_snapshot and not _is_snapshot_features(df_pm):
+                st.error(
+                    "Las features cargadas no corresponden a snapshots. "
+                    "Genere nuevamente en modo snapshot."
+                )
+                return None
 
         # --- POST PROCESSING (Sorting & Filtering) ---
         if df_pm is not None and not (use_batches and source_choice == "Generar nuevas"):
@@ -6908,6 +9043,9 @@ def run_feature_generation_workflow(params):
         
             # Cache Result
             st.session_state.df_pm_cache = df_pm.copy()
+            if str(source_choice) != "Generar nuevas":
+                progress.empty()
+                return df_pm
 
             # Auto-save to DuckDB (with versioning)
             # Auto-save to DuckDB (with versioning)
@@ -6919,20 +9057,35 @@ def run_feature_generation_workflow(params):
                 
                 # features_db_path is already set to unique file: features_....duckdb
                 # table_name_out is already set: features_...
+                if "features_db_path" not in locals() or "table_name_out" not in locals():
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    mode_tag = "Snapshot" if force_snapshot else "Flow"
+                    table_name_out = f"features_{mode_tag}_{timestamp}"
+                    features_db_path = os.path.join(
+                        RESULTADOS_DIR, f"{table_name_out}.duckdb"
+                    )
                 
                 con_feat = duckdb.connect(str(features_db_path))
 
                 # Create versioned table
-                con_feat.execute(f"CREATE TABLE {table_name_out} AS SELECT * FROM df_pm")
+                con_feat.execute(
+                    f"CREATE TABLE {_quote_duckdb_identifier(table_name_out)} AS SELECT * FROM df_pm"
+                )
                 con_feat.close()
 
                 # UPDATE CONFIG so history sees the generated file/table name
                 # Preserve existing params but update source/path
                 current_cfg = st.session_state.get("feature_config", {}).copy()
                 current_cfg["source"] = "Generar nuevas (DuckDB)"
-                current_cfg["csv_path"] = table_name  # We use csv_path field to store table name for uniformity
+                current_cfg["csv_path"] = features_db_path
+                current_cfg["duckdb_path"] = features_db_path
+                current_cfg["duckdb_table"] = table_name_out
                 if "params" not in current_cfg: current_cfg["params"] = {}
-                current_cfg["params"]["feature_mode"] = mode_tag
+                current_cfg["params"]["duckdb_path"] = features_db_path
+                current_cfg["params"]["duckdb_table"] = table_name_out
+                current_cfg["params"]["feature_mode"] = (
+                    "Snapshot" if force_snapshot else "Flow 5 min"
+                )
                 st.session_state.feature_config = current_cfg
 
                 # --- LOG HISTORY (Feature Generation) ---
@@ -7163,6 +9316,20 @@ def _render_optimization_tab() -> None:
                 progress_bar = st.progress(0)
                 with st.expander("Logs de Optuna (En vivo)", expanded=True):
                     log_container = st.empty()
+                live_slot = st.empty()
+                live_tracker = _GNNOptunaLiveTracker.create(
+                    total_trials=int(optuna_settings.get("n_trials", 1)),
+                    total_epochs=int(optuna_settings.get("epochs", 1)),
+                    objective_metric=str(objective_settings.get("metric") or ""),
+                    balancing_strategy=str(balancing_strategy),
+                    graph_name=str(
+                        graph_obj.get("filename")
+                        or st.session_state.get("graph_path")
+                        or "graph"
+                    ),
+                    backend="optuna",
+                    ui_slot=live_slot,
+                )
                 result = _run_optuna_search(
                     graph_obj=graph_obj,
                     balancing_strategy=balancing_strategy,
@@ -7172,6 +9339,7 @@ def _render_optimization_tab() -> None:
                     log_container=log_container,
                     progress_bar=progress_bar,
                     status_text=status_text,
+                    live_tracker=live_tracker,
                 )
             except Exception as exc:
                 st.error(f"Error en Optuna: {exc}")
@@ -7204,6 +9372,7 @@ def _render_optimization_tab() -> None:
                         "trials": len(result.get("trials", [])),
                         "path": str(result["best_path"]),
                         "full_path": str(result.get("full_path") or ""),
+                        "live_run_dir": str(result.get("live_run_dir") or ""),
                         "range_analysis": range_analysis,
                     },
                     "balance": {"strategy": balancing_strategy},
@@ -7451,9 +9620,16 @@ def _render_feature_engineering():
                 width='stretch',
             )
         else:
-            st.warning(
-                "⚠️ No hay features en memoria. Se generaran o cargaran en la proxima construccion."
-            )
+            feat_cfg = st.session_state.get("feature_config")
+            if _feature_config_is_duckdb(feat_cfg):
+                st.info(
+                    "Fuente DuckDB configurada. No se mantiene el archivo completo "
+                    "en RAM; se consultara filtrado al construir el grafo."
+                )
+            else:
+                st.warning(
+                    "⚠️ No hay features en memoria. Se generaran o cargaran en la proxima construccion."
+                )
 
     # --- CARGAR EXISTENTE ---
     elif source == "Cargar existentes":
@@ -7537,54 +9713,70 @@ def _render_feature_engineering():
                     key="feat_load_end_date"
                 )
 
-            if st.button("Cargar en Memoria", type="primary"):
+            if st.button("Cargar / configurar fuente", type="primary"):
                 source_type, source_path, label = selected_opt
                 with st.spinner(f"Cargando {label}..."):
                     try:
                         df_tmp = pd.DataFrame() # init
+                        configured_without_memory = False
                         
                         if source_type == "duckdb":
-                            # source_path is now the full path to the .duckdb file
-                            con_load = duckdb.connect(str(source_path), read_only=True)
-                            
-                            # We need to find the table name inside. 
-                            # Usually it matches the filename stem, but let's be robust and ask for tables.
-                            tables = con_load.execute("SHOW TABLES").fetchall()
-                            # Filter for features table
-                            target_table = None
-                            for t in tables:
-                                if t[0].startswith("features_"):
-                                    target_table = t[0]
-                                    break
-                            
-                            if target_table:
-                                query = f"SELECT * FROM {target_table}"
-                                filters = []
-                                
-                                # TIME FILTER FOR DUCKDB
-                                if use_date_filter_load and start_d_load and end_d_load:
-                                    # Check column existence for timestamp
-                                    cols = [c[0] for c in con_load.execute(f"DESCRIBE {target_table}").fetchall()]
-                                    ts_col = "ts_min" if "ts_min" in cols else "timestamp"
-                                    
-                                    if ts_col == "ts_min":
-                                         t_start = int(pd.Timestamp(start_d_load).timestamp() / 60)
-                                         t_end = int(pd.Timestamp(end_d_load).timestamp() / 60) + (24*60) # include end day
-                                         filters.append(f"{ts_col} >= {t_start}")
-                                         filters.append(f"{ts_col} <= {t_end}")
-                                    else:
-                                         filters.append(f"{ts_col} >= '{start_d_load}'")
-                                         filters.append(f"{ts_col} <= '{end_d_load}'")
-                                
-                                if filters:
-                                    query += " WHERE " + " AND ".join(filters)
-                                    
-                                df_tmp = con_load.execute(query).df()
-                            else:
-                                st.error(f"No se encontró una tabla válida 'features_*' en {os.path.basename(source_path)}")
-                                df_tmp = pd.DataFrame() # fail gracefully
-                            
-                            con_load.close()
+                            target_table, cols, total_rows = _duckdb_feature_metadata(
+                                source_path, []
+                            )
+                            inferred_mode = _infer_feature_mode_from_duckdb_source(
+                                source_path, target_table, cols
+                            )
+                            feature_params = {
+                                "feature_mode": inferred_mode,
+                                "duckdb_path": source_path,
+                                "duckdb_table": target_table,
+                            }
+                            if use_date_filter_load and start_d_load and end_d_load:
+                                feature_params["start_date"] = start_d_load
+                                feature_params["end_date"] = end_d_load
+                            if porticos_filter:
+                                feature_params["porticos_filter"] = porticos_filter
+                            feature_cfg = {
+                                "source": "Cargar existentes (DuckDB)",
+                                "csv_path": source_path,
+                                "duckdb_path": source_path,
+                                "duckdb_table": target_table,
+                                "params": feature_params,
+                            }
+                            st.session_state.feature_config = feature_cfg
+                            st.session_state.df_pm_cache = None
+                            try:
+                                df_tmp = _load_existing_features_from_config(
+                                    feature_cfg,
+                                    porticos_filter=porticos_filter,
+                                    max_rows=DUCKDB_FEATURE_MEMORY_ROW_LIMIT,
+                                )
+                            except MemoryError as exc:
+                                df_preview = _load_existing_features_from_config(
+                                    feature_cfg,
+                                    porticos_filter=porticos_filter,
+                                    preview_limit=DUCKDB_FEATURE_PREVIEW_ROWS,
+                                )
+                                st.session_state.df_pm_cache = None
+                                st.session_state.feature_config = feature_cfg
+                                last_query = st.session_state.get(
+                                    "feature_duckdb_last_query", {}
+                                )
+                                filtered_rows = last_query.get("filtered_rows", total_rows)
+                                st.warning(
+                                    f"{exc} No se cargo el dataset completo en RAM. "
+                                    "La fuente DuckDB quedo configurada y el grafo la consultara "
+                                    "con filtros de tramo/fecha/hora."
+                                )
+                                st.caption(
+                                    f"Tabla: {target_table} | Filas filtradas: {int(filtered_rows):,} "
+                                    f"| Filas totales: {int(total_rows):,}"
+                                )
+                                if df_preview is not None and not df_preview.empty:
+                                    st.dataframe(df_preview, width="stretch")
+                                configured_without_memory = True
+                                df_tmp = pd.DataFrame()
                         else:
                             df_tmp = pd.read_csv(source_path)
                             # Post-load filtering for CSV
@@ -7598,31 +9790,49 @@ def _render_feature_engineering():
                                  mask = (df_tmp['timestamp'].dt.date >= start_d_load) & (df_tmp['timestamp'].dt.date <= end_d_load)
                                  df_tmp = df_tmp[mask]
 
-                        if porticos_filter:
+                        if source_type != "duckdb" and porticos_filter:
                             df_tmp = _apply_tramo_filter(
                                 df_tmp, porticos_filter
                             )
 
                         if df_tmp is None or df_tmp.empty:
-                            st.error(
-                                "Features vacías tras filtrar por tramo. "
-                                "Verifique la selección."
-                            )
+                            if configured_without_memory:
+                                pass
+                            elif not _feature_config_is_duckdb(
+                                st.session_state.get("feature_config")
+                            ):
+                                st.error(
+                                    "Features vacías tras filtrar por tramo. "
+                                    "Verifique la selección."
+                                )
+                            else:
+                                st.warning(
+                                    "La fuente DuckDB quedo configurada, pero la consulta "
+                                    "actual no devuelve filas con esos filtros."
+                                )
                         else:
                             st.session_state.df_pm_cache = df_tmp
                             
                             # Update config for History tracking
-                            inferred_mode = "Unknown"
-                            if "Snapshot" in str(source_path):
-                                inferred_mode = "Snapshot"
-                            elif "Flow" in str(source_path):
-                                inferred_mode = "Flow 5 min"
+                            if source_type != "duckdb":
+                                inferred_mode = "Unknown"
+                                if "Snapshot" in str(source_path):
+                                    inferred_mode = "Snapshot"
+                                elif "Flow" in str(source_path):
+                                    inferred_mode = "Flow 5 min"
+                                feature_params = {"feature_mode": inferred_mode}
+                                if use_date_filter_load and start_d_load and end_d_load:
+                                    feature_params["start_date"] = start_d_load
+                                    feature_params["end_date"] = end_d_load
+                                if porticos_filter:
+                                    feature_params["porticos_filter"] = porticos_filter
+                                feature_cfg = {
+                                    "source": "Cargar existentes",
+                                    "csv_path": source_path,
+                                    "params": feature_params,
+                                }
                                 
-                            st.session_state.feature_config = {
-                                "source": "Cargar existentes",
-                                "csv_path": source_path,
-                                "params": {"feature_mode": inferred_mode}
-                            }
+                            st.session_state.feature_config = feature_cfg
                             
                             st.success(
                                 "Features cargadas en memoria: "
@@ -7761,7 +9971,11 @@ def _render_feature_engineering():
 
             st.markdown("#### Variables Snapshot")
             snapshot_group_labels = list(SNAPSHOT_GROUP_OPTIONS.keys())
-            snapshot_default = snapshot_group_labels
+            snapshot_default = [
+                label
+                for label in snapshot_group_labels
+                if SNAPSHOT_GROUP_OPTIONS[label] in SNAPSHOT_DEFAULT_GROUP_KEYS
+            ]
             snapshot_labels = st.multiselect(
                 "Selecciona grupos de features",
                 options=snapshot_group_labels,
@@ -7774,9 +9988,9 @@ def _render_feature_engineering():
             if not snapshot_groups:
                 st.warning(
                     "Selecciona al menos un grupo de features. "
-                    "Se usaran todos por defecto."
+                    "Se usaran los grupos snapshot por defecto."
                 )
-                snapshot_groups = list(SNAPSHOT_GROUP_KEYS)
+                snapshot_groups = list(SNAPSHOT_DEFAULT_GROUP_KEYS)
 
             snapshot_window_cols: List[str] = []
             if "window_features" in snapshot_groups:
@@ -10544,6 +12758,8 @@ def _render_gnn_strategy_reference_panel(
 
 
 def _render_training_tab() -> None:
+    from src import gnn_main as graph_main
+
     st.subheader("Training (GNN)")
     loaded_graph = st.session_state.get("loaded_graph")
     balanced_graph = st.session_state.get("balanced_graph")
@@ -11085,8 +13301,7 @@ def _render_training_tab() -> None:
     training_details = ""
     training_status = {}
     try:
-        from src import gnn_main as graph_main
-        graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
+        graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
         variant_tag = "GraphSMOTE" if use_graphsmote_effective else "Base"
         hp_label = hp_choice
         if hp_choice == "Auto (mas reciente)":
@@ -11512,8 +13727,10 @@ def _render_training_tab() -> None:
                 pm_index_ref,
                 split_train_ratio,
                 split_val_ratio,
+                graph_metadata=graph_obj.get("metadata"),
             )
         if split_info:
+            _warn_legacy_temporal_split(split_info)
             st.caption(
                 "Split aplicado: "
                 f"train={split_info['train_count']}, "
@@ -11521,15 +13738,14 @@ def _render_training_tab() -> None:
                 f"test={split_info['test_count']}"
             )
         else:
-            st.warning(
-                "No se pudo aplicar el split temporal; se usaran las mascaras actuales."
-            )
+            _error_temporal_split_required()
+            return
 
         hp_files_all = list(hp_files)
         network_hparams_path = None
         if network_option and hp_choice == network_option:
             network_hparams_path = _save_network_hparams(
-                network_cfg or {}, use_graphsmote=use_graphsmote_train
+                network_cfg or {}, use_graphsmote=use_graphsmote_train, graph_obj=graph_obj
             )
             if not network_hparams_path:
                 st.error("No se pudo exportar la configuracion de Network.")
@@ -11559,7 +13775,7 @@ def _render_training_tab() -> None:
         elif network_option and hp_choice == network_option and network_hparams_path:
             use_graphsmote_effective = "_GraphSMOTE" in os.path.basename(network_hparams_path)
 
-        hp_files_for_prompt = _list_hpo_files_for_training(
+        hp_files_for_prompt = _list_hpo_files_for_gnn_training_prompt(
             use_graphsmote=use_graphsmote_effective, graph_obj=graph_obj
         )
 
@@ -12208,6 +14424,10 @@ def _render_evaluation_tab() -> None:
             value=float(far_target),
             step=0.01,
             key="gnn_eval_far_target",
+            help=(
+                "Máxima tasa de falsas alarmas permitida al calibrar el umbral en val_mask. "
+                "Default: 0.20. Valores muy bajos pueden sacrificar sensibilidad y ocultar accidentes."
+            ),
         )
     else:
         threshold_strategy = "manual"
@@ -12218,6 +14438,10 @@ def _render_evaluation_tab() -> None:
             value=tau_default,
             step=0.01,
             key="gnn_eval_threshold",
+            help=(
+                "Probabilidad mínima para clasificar Accidente=1. Default: tau del modelo. "
+                "Cambiarlo sin calibración en validación puede invalidar comparaciones entre modelos."
+            ),
         )
 
     if st.button("Ejecutar Evaluacion en Grafo Actual"):
@@ -13437,6 +15661,20 @@ def _build_sampler_memory_loader(
             return None, "Subgrafo nativo no contiene nodos PM válidos."
         pm_nodes = torch.as_tensor(filtered, dtype=torch.long)
 
+        train_mask_full = getattr(graph_cpu["pm"], "train_mask", None)
+        if not torch.is_tensor(train_mask_full) or train_mask_full.numel() < total_pm:
+            return None, "train_mask inválida para supervisión del sampler nativo."
+        train_mask_full = train_mask_full.detach().cpu().bool()
+        supervised_mask = train_mask_full[pm_nodes]
+        supervised_count = int(supervised_mask.sum().item())
+        if supervised_count <= 0:
+            return None, "Subgrafo nativo sin nodos PM de train supervisados."
+        if supervised_count < int(pm_nodes.numel()):
+            pm_nodes = torch.cat(
+                [pm_nodes[supervised_mask], pm_nodes[~supervised_mask]],
+                dim=0,
+            )
+
         out = HeteroData()
         out["pm"].x = graph_cpu["pm"].x[pm_nodes].cpu()
         if hasattr(graph_cpu["pm"], "y") and graph_cpu["pm"].y is not None:
@@ -13450,7 +15688,10 @@ def _build_sampler_memory_loader(
                 out["pm"][mask_name] = mask_val[pm_nodes].cpu()
         out["pm"].num_nodes = int(pm_nodes.numel())
         out["pm"].n_id = pm_nodes.clone()
-        out["pm"].batch_size = int(pm_nodes.numel())
+        out["pm"].batch_size = int(supervised_count)
+        supervised_batch_mask = torch.zeros(int(pm_nodes.numel()), dtype=torch.bool)
+        supervised_batch_mask[:supervised_count] = True
+        out["pm"].supervised_mask = supervised_batch_mask
 
         g2l = torch.full((total_pm,), -1, dtype=torch.long)
         g2l[pm_nodes] = torch.arange(pm_nodes.numel(), dtype=torch.long)
@@ -14506,13 +16747,13 @@ def _materialize_sampler_hparams_variant(
 
     graph_hash = None
     variant_tag = "_GraphSMOTE" if use_graphsmote else "_Base"
+    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
     try:
         from src import gnn_main as graph_main
 
-        graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
         variant_tag = graph_main._variant_tags(bool(use_graphsmote), graph_obj)
     except Exception:
-        graph_hash = None
+        pass
 
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
     cfg_slug = _slugify(
@@ -14914,13 +17155,7 @@ def _render_sampler_fidelity_experiment(
         experiment_name = "GNN Sampler Fidelity"
         device = get_auto_device()
         eval_batch_size = int(_metric_float(base_params.get("batch_size")) or BATCH_SIZE)
-        graph_hash = None
-        try:
-            from src import gnn_main as graph_main
-
-            graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
-        except Exception:
-            graph_hash = None
+        graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
 
         exp_meta = {
             "run_id": run_id,
@@ -15955,20 +18190,26 @@ def _run_gnn_best_variant_experiment(
         st.error("Seleccione al menos una variante GNN.")
         return
 
+    split_info = None
     if pm_index_ref is not None:
         split_info = _apply_temporal_split_to_graph(
             graph_data,
             pm_index_ref,
             int(train_ratio),
             int(val_ratio),
+            graph_metadata=graph_obj.get("metadata"),
         )
-        if split_info:
-            st.caption(
-                "Split aplicado: "
-                f"train={split_info['train_count']}, "
-                f"val={split_info['val_count']}, "
-                f"test={split_info['test_count']}"
-            )
+    if split_info:
+        _warn_legacy_temporal_split(split_info)
+        st.caption(
+            "Split aplicado: "
+            f"train={split_info['train_count']}, "
+            f"val={split_info['val_count']}, "
+            f"test={split_info['test_count']}"
+        )
+    else:
+        _error_temporal_split_required()
+        return
 
     if has_active_run:
         run_id = exp_state.get("run_id")
@@ -17570,8 +19811,10 @@ def _render_gnn_experiments_tab() -> None:
                     pm_index_ref,
                     int(train_ratio),
                     int(val_ratio),
+                    graph_metadata=graph_obj.get("metadata"),
                 )
             if split_info:
+                _warn_legacy_temporal_split(split_info)
                 st.caption(
                     "Split aplicado: "
                     f"train={split_info['train_count']}, "
@@ -17579,9 +19822,8 @@ def _render_gnn_experiments_tab() -> None:
                     f"test={split_info['test_count']}"
                 )
             else:
-                st.warning(
-                    "No se pudo aplicar el split temporal; se usaran las mascaras actuales."
-                )
+                _error_temporal_split_required()
+                return
 
             search_space = {
                 "hidden_channels": {
@@ -18641,7 +20883,7 @@ def _render_network_tab() -> None:
     with col_export:
         if st.button("Exportar a Training", key="gnn_net_export"):
             export_path = _save_network_hparams(
-                config_payload, use_graphsmote=use_graphsmote
+                config_payload, use_graphsmote=use_graphsmote, graph_obj=loaded_graph
             )
             if export_path:
                 st.session_state["gnn_network_hparams_path"] = export_path
@@ -18944,7 +21186,7 @@ def _compute_optuna_study_name(
 
     use_graphsmote_search = (balancing_strategy == "Opt. balance con GraphSMOTE")
     use_imgagn_search = (balancing_strategy == "Opt. balance con ImGAGN")
-    graph_hash = graph_main._calculate_graph_hash(graph_obj.get("filename"))
+    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
     variant_tag = graph_main._variant_tags(use_graphsmote_search, graph_obj)
     if use_imgagn_search:
         if "_Base" in variant_tag:
@@ -19150,8 +21392,10 @@ def _collect_optuna_ray_settings(
             pm_index_ref,
             int(train_ratio),
             int(val_ratio),
+            graph_metadata=graph_obj.get("metadata"),
         )
     if split_info:
+        _warn_legacy_temporal_split(split_info)
         st.caption(
             "Split aplicado: "
             f"train={split_info['train_count']}, "
@@ -19159,9 +21403,8 @@ def _collect_optuna_ray_settings(
             f"test={split_info['test_count']}"
         )
     else:
-        st.warning(
-            "No se pudo aplicar el split temporal; se usaran las mascaras actuales."
-        )
+        _error_temporal_split_required()
+        return
 
     neighbor_profiles = {
         "compact": _parse_int_list(str(_get_state("gnn_optuna_neighbor_compact", "15,10")), [15, 10]),
@@ -20723,8 +22966,10 @@ def _render_ray_tune_tab() -> None:
             pm_index_ref,
             int(train_ratio),
             int(val_ratio),
+            graph_metadata=graph_obj.get("metadata"),
         )
     if split_info:
+        _warn_legacy_temporal_split(split_info)
         st.caption(
             "Split aplicado: "
             f"train={split_info['train_count']}, "
@@ -20732,9 +22977,8 @@ def _render_ray_tune_tab() -> None:
             f"test={split_info['test_count']}"
         )
     else:
-        st.warning(
-            "No se pudo aplicar el split temporal; se usaran las mascaras actuales."
-        )
+        _error_temporal_split_required()
+        return
 
     # --- Construir search_space desde Optuna ---
     hidden_min = int(_get_state("gnn_optuna_hidden_min", 32))
@@ -21345,7 +23589,12 @@ def _render_create_graph():
     # TRAMO SELECTION
     # st.markdown("#### Definición del Grafo (Tramo)")
     
-    tramo_mode = st.radio("Definición del Grafo (Tramo)", ["Manual", "Puntos Negros (Reporte)"], index=0)
+    tramo_mode = st.radio(
+        "Definición del Grafo (Tramo)",
+        ["Manual", "Puntos Negros (Reporte)", "Desde Features"],
+        index=0,
+        key="gnn_tramo_mode",
+    )
     
     porticos_a_incluir = None
     preselected_time_choice = None
@@ -21437,6 +23686,58 @@ def _render_create_graph():
                             st.info(f"Pórticos seleccionados ({len(porticos_a_incluir)}): {porticos_a_incluir}")
                 except Exception as e:
                     st.error(f"Error leyendo reporte: {e}")
+
+    elif tramo_mode == "Desde Features":
+        feature_config_for_tramo = st.session_state.get("feature_config", {})
+        df_pm_cache_for_tramo = st.session_state.get("df_pm_cache")
+        try:
+            feature_portico_info = _feature_portico_sequence_from_source(
+                feature_config_for_tramo,
+                df_port=st.session_state.get("df_port"),
+                df_pm_cache=df_pm_cache_for_tramo,
+            )
+            porticos_from_features = list(feature_portico_info.get("porticos", []))
+        except Exception as exc:
+            porticos_from_features = []
+            st.error(f"No se pudo obtener el tramo desde features: {exc}")
+
+        if porticos_from_features:
+            porticos_a_incluir = porticos_from_features
+            st.session_state["gnn_feature_porticos"] = porticos_from_features
+            source_label = os.path.basename(
+                str(feature_portico_info.get("source") or "features")
+            )
+            table_label = feature_portico_info.get("table")
+            method_label = feature_portico_info.get("method", "consulta")
+            portico_col_label = feature_portico_info.get("portico_col", "portico")
+            configured_filter_count = int(
+                feature_portico_info.get("configured_filter_count") or 0
+            )
+            st.success(
+                "Tramo inferido desde features: "
+                f"{len(porticos_from_features)} pórticos."
+            )
+            st.caption(
+                f"Fuente: `{source_label}`"
+                + (f" | Tabla: `{table_label}`" if table_label else "")
+                + f" | Columna: `{portico_col_label}` | Método: {method_label}"
+            )
+            if configured_filter_count:
+                st.caption(
+                    "Filtro de carga respetado: "
+                    f"{configured_filter_count} pórticos configurados."
+                )
+            st.dataframe(
+                pd.DataFrame(
+                    {
+                        "orden": range(1, len(porticos_from_features) + 1),
+                        "portico": porticos_from_features,
+                    }
+                ),
+                width="stretch",
+            )
+        else:
+            st.warning("La fuente de features no contiene pórticos detectables.")
 
     else: # Manual
         if st.session_state.df_port is not None:
@@ -21616,6 +23917,11 @@ def _render_create_graph():
             "Usar accidentes cargados en Eventos",
             value=True,
             key="gnn_use_events_tab",
+            help=(
+                "Usa los eventos ya procesados en la pestaña Eventos como fuente de etiquetas. "
+                "Default: activado cuando existen eventos en memoria. Cambiarlo puede mezclar "
+                "fuentes de accidentes y alterar labels/splits."
+            ),
         )
 
     sel_acc_file = None
@@ -21662,32 +23968,140 @@ def _render_create_graph():
     if preselected_time_choice == '2': def_idx = 1
     elif preselected_time_choice == '3': def_idx = 2
     
-    time_sel_key = st.selectbox("Franja Horaria", list(time_options.keys()), 
-                                format_func=lambda x: time_options[x], 
-                                index=def_idx)
+    time_sel_key = st.selectbox(
+        "Franja Horaria",
+        list(time_options.keys()),
+        format_func=lambda x: time_options[x],
+        index=def_idx,
+        help=(
+            "Filtra los snapshots/flows usados para construir nodos. "
+            "Default: sin filtro salvo preselección por punto negro. "
+            "Un filtro estrecho puede dejar train/val/test sin nodos tras el embargo."
+        ),
+    )
+
+    # NODE CONFIG
+    st.markdown("#### Configuración de Nodos")
+    feature_config_for_nodes = st.session_state.get("feature_config", {})
+    df_pm_cache_for_nodes = st.session_state.get("df_pm_cache")
+    node_feature_preview = _resolve_graph_node_feature_preview(
+        feature_config_for_nodes,
+        df_pm_cache_for_nodes,
+        selected_features_exists="selected_features" in st.session_state,
+        selected_features=st.session_state.get("selected_features"),
+    )
+    node_features = list(node_feature_preview.get("features", []))
+    node_available = list(node_feature_preview.get("available", []))
+    node_missing = list(node_feature_preview.get("missing", []))
+    with st.expander("Features de Nodo", expanded=True):
+        c_node_1, c_node_2 = st.columns(2)
+        with c_node_1:
+            st.metric("Variables usadas", len(node_features))
+        with c_node_2:
+            st.metric("Variables disponibles", len(node_available))
+        st.caption(
+            f"Fuente: {node_feature_preview.get('source_label', '-')}"
+            f" | Selección: {node_feature_preview.get('selection_source', '-')}"
+        )
+        if node_feature_preview.get("error"):
+            st.warning(
+                "No se pudo leer la metadata de features: "
+                f"{node_feature_preview['error']}"
+            )
+        if (
+            node_feature_preview.get("selected_features_exists")
+            and not st.session_state.get("selected_features")
+        ):
+            st.warning(
+                "No hay variables seleccionadas. Configure Feature selection "
+                "antes de construir el grafo."
+            )
+        if node_missing:
+            st.warning(
+                "Variables seleccionadas no disponibles en la fuente actual: "
+                + ", ".join(node_missing)
+            )
+        if node_features:
+            node_feature_df = pd.DataFrame(
+                {
+                    "orden": range(1, len(node_features) + 1),
+                    "variable": node_features,
+                }
+            )
+            st.dataframe(
+                node_feature_df,
+                width="stretch",
+                height=min(420, max(140, 35 * (len(node_features) + 1))),
+            )
+        else:
+            st.info(
+                "Las variables de nodo aparecerán al cargar/configurar features "
+                "o al guardar una selección de variables."
+            )
     
     # EDGE CONFIG
     st.markdown("#### Configuración de Aristas")
     c1, c2, c3, c4 = st.columns(4)
-    with c1: build_temporal = st.checkbox("Temporales", value=True)
-    with c2: build_spatial = st.checkbox("Espaciales", value=True)
-    with c3: build_st_fwd = st.checkbox("Espacio-Temporal (Fwd)", value=False)
-    with c4: build_spatial_back = st.checkbox("Espacial (Back)", value=False)
+    with c1:
+        build_temporal = st.checkbox(
+            "Temporales",
+            value=True,
+            help=(
+                "Conecta cada pórtico con su siguiente timestamp. Default: activado. "
+                "Desactivarlo elimina dependencia temporal directa y cambia la tarea GNN."
+            ),
+        )
+    with c2:
+        build_spatial = st.checkbox(
+            "Espaciales",
+            value=True,
+            help=(
+                "Conecta pórticos consecutivos en la misma franja temporal. Default: activado. "
+                "Desactivarlo reduce la semántica vial del grafo."
+            ),
+        )
+    with c3:
+        build_st_fwd = st.checkbox(
+            "Espacio-Temporal (Fwd)",
+            value=False,
+            help=(
+                "Conecta un pórtico en t con el pórtico siguiente en t+Δ. Default: desactivado. "
+                "Puede aumentar dependencia futura aparente si se interpreta sin revisar dirección temporal."
+            ),
+        )
+    with c4:
+        build_spatial_back = st.checkbox(
+            "Espacial (Back)",
+            value=False,
+            help=(
+                "Agrega aristas espaciales inversas. Default: desactivado. "
+                "Úselo solo si la hipótesis permite influencia upstream/backward."
+            ),
+        )
     
+    feature_config_for_edges = st.session_state.get("feature_config", {})
+    params_for_edges = (
+        feature_config_for_edges.get("params", {})
+        if isinstance(feature_config_for_edges, dict)
+        else {}
+    )
+    edge_feature_mode_hint = params_for_edges.get("feature_mode")
+    df_pm_cache_for_edges = st.session_state.get("df_pm_cache")
+    edge_family_hint = "snapshot" if edge_feature_mode_hint == "Snapshot" else "classic"
+    if isinstance(df_pm_cache_for_edges, pd.DataFrame) and not df_pm_cache_for_edges.empty:
+        edge_family_hint = _edge_feature_family_from_df(df_pm_cache_for_edges)
+
     # Physical Features Selector
-    PHYSICAL_FEATURES_OPTIONS = [
-        'dist_km', 
-        'grad_q', 
-        'grad_k', 
-        'grad_v', 
-        'shock_speed', 
-        'shock_indicator'
-    ]
+    PHYSICAL_FEATURES_OPTIONS = (
+        SNAPSHOT_EDGE_PHYSICAL_FEATURES
+        if edge_family_hint == "snapshot"
+        else CLASSIC_EDGE_PHYSICAL_FEATURES
+    )
     with st.expander("Features Físicas de Arista", expanded=False):
         selected_physical_features = st.multiselect(
             "Seleccione variables físicas a incluir en aristas espaciales:",
             options=PHYSICAL_FEATURES_OPTIONS,
-            default=PHYSICAL_FEATURES_OPTIONS, # Default to all for backward compatibility/richness
+            default=PHYSICAL_FEATURES_OPTIONS,
             help="Seleccione qué atributos físicos incluir en las aristas espaciales/st_fwd."
         )
 
@@ -21710,16 +24124,45 @@ def _render_create_graph():
             delta_feature_options = [
                 c for c in df_pm_cache.columns if c not in ignore_cols
             ]
+        elif _feature_config_is_duckdb(feature_config_for_edges):
+            try:
+                duckdb_path = _feature_config_duckdb_path(feature_config_for_edges)
+                table_name = _feature_config_duckdb_table(feature_config_for_edges)
+                _, duckdb_cols, _ = _duckdb_feature_metadata(
+                    str(duckdb_path),
+                    [table_name] if table_name else [],
+                    table_name=table_name,
+                    include_count=False,
+                )
+                ignore_cols = {
+                    "portico",
+                    "ts_min",
+                    "timestamp",
+                    "node_idx",
+                    "future_label",
+                    "next_ts_min",
+                    "target",
+                }
+                delta_feature_options = [
+                    c for c in duckdb_cols if c not in ignore_cols
+                ]
+            except Exception:
+                delta_feature_options = []
+    default_delta_feature_options = (
+        _default_edge_delta_features(delta_feature_options, "Snapshot")
+        if edge_family_hint == "snapshot"
+        else list(delta_feature_options)
+    )
     with st.expander("Features Delta de Arista (Δ nodo→nodo)", expanded=False):
         st.multiselect(
             "Seleccione variables de nodo para calcular Δ en las aristas:",
             options=delta_feature_options,
-            default=delta_feature_options,
+            default=default_delta_feature_options,
             key="edge_delta_features",
             help=(
                 "Estas variables se usan para construir edge_attr como diferencia "
-                "entre nodos. Si queda vacío y no hay selección previa, se usarán "
-                "todas las features disponibles."
+                "entre nodos. En Snapshot el default usa un subconjunto compacto "
+                "de velocidad, flujo y congestión; en Flow usa todas las features."
             ),
         )
         if not delta_feature_options:
@@ -21732,6 +24175,10 @@ def _render_create_graph():
         "Debug etiquetas (mostrar resumen)",
         value=False,
         key="gnn_debug_labels",
+        help=(
+            "Muestra conteos y rangos temporales usados para etiquetas. Default: desactivado. "
+            "Sirve para auditar alineación; no cambia el grafo ni las métricas."
+        ),
     )
 
     # BUILD BUTTON
@@ -21830,7 +24277,18 @@ def _render_create_graph():
             
             # Check Cache first
             df_pm_cache = st.session_state.get("df_pm_cache")
-            if isinstance(df_pm_cache, pd.DataFrame) and not df_pm_cache.empty:
+            if _feature_config_is_duckdb(feature_config):
+                try:
+                    df_pm = _load_existing_features_from_config(
+                        feature_config,
+                        porticos_filter=porticos_a_incluir,
+                        time_filter_key=time_sel_key,
+                        status=status,
+                    )
+                except Exception as exc:
+                    st.error(f"No se pudieron consultar features desde DuckDB: {exc}")
+                    return
+            elif isinstance(df_pm_cache, pd.DataFrame) and not df_pm_cache.empty:
                 status.text("Usando features en memoria cache...")
                 df_pm = df_pm_cache.copy()
             else:
@@ -22126,10 +24584,13 @@ def _render_create_graph():
             delta_options_available = bool(
                 st.session_state.get("edge_delta_options_available", False)
             )
+            default_delta_feature_cols = _default_edge_delta_features(
+                feature_cols, feature_mode
+            )
             if delta_feature_selection is None:
-                delta_feature_cols = list(feature_cols)
+                delta_feature_cols = list(default_delta_feature_cols)
             elif not delta_feature_selection and not delta_options_available:
-                delta_feature_cols = list(feature_cols)
+                delta_feature_cols = list(default_delta_feature_cols)
             else:
                 delta_feature_cols = [
                     f for f in (delta_feature_selection or []) if f in feature_cols
@@ -22145,32 +24606,63 @@ def _render_create_graph():
                 if delta_feature_selection and not delta_feature_cols:
                     st.warning(
                         "Ninguna feature delta coincide con las features actuales. "
-                        "Usando todas las features disponibles."
+                        "Usando el default de edge deltas."
                     )
-                    delta_feature_cols = list(feature_cols)
+                    delta_feature_cols = list(default_delta_feature_cols)
             delta_feature_idx = [
                 feature_cols.index(f) for f in delta_feature_cols if f in feature_cols
             ]
             
-            accident_ts_unique = affected_pms['ts_min'].unique().tolist()
-            train_ts_cutoff, val_ts_cutoff = _compute_time_cutoffs(accident_ts_unique, TRAIN_RATIO, VAL_RATIO)
-            
-            # Compute stats on train split
-            if np.isfinite(train_ts_cutoff):
-                train_stats_mask = df_pm['ts_min'] <= train_ts_cutoff
-            else:
-                train_stats_mask = np.ones(len(df_pm), dtype=bool)
-                
-            train_stats_df = df_pm.loc[train_stats_mask, feature_cols]
-            mu = train_stats_df.mean().values
-            sigmasigma = train_stats_df.std(ddof=0).fillna(0.0).values + 1e-9
+            label_lookahead_minutes = _label_lookahead_minutes(
+                feature_mode, sequence_config, dt_feat_minutes
+            )
+            split_result = _compute_temporal_split_masks(
+                df_pm["ts_min"].to_numpy(),
+                TRAIN_RATIO,
+                VAL_RATIO,
+                sequence_mask=sequence_mask,
+                label_lookahead_minutes=label_lookahead_minutes,
+            )
+            split_metadata = dict(split_result["metadata"])
+            train_mask = np.asarray(split_result["train_mask"], dtype=bool)
+            val_mask = np.asarray(split_result["val_mask"], dtype=bool)
+            test_mask = np.asarray(split_result["test_mask"], dtype=bool)
+            if (
+                split_metadata.get("status") != "ok"
+                or not train_mask.any()
+                or not val_mask.any()
+                or not test_mask.any()
+            ):
+                st.error(
+                    "El split temporal purgado dejó train/val/test vacío o inválido. "
+                    "Amplíe el rango temporal de features o ajuste TRAIN_RATIO/VAL_RATIO "
+                    "para mantener nodos suficientes después del embargo por horizonte."
+                )
+                return
+
+            train_ts_cutoff = split_metadata["train_ts_cutoff"]
+            val_ts_cutoff = split_metadata["val_ts_cutoff"]
+            df_pm_raw_for_edges = df_pm.copy()
+
+            # Compute stats strictly on purged train split.
+            try:
+                mu, sigmasigma = _compute_normalization_stats_from_train(
+                    df_pm, feature_cols, train_mask
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
             
             norm_stats_path = _save_normalization_stats(feature_cols, mu, sigmasigma, train_ts_cutoff, val_ts_cutoff)
             normalization_metadata = {
                 "feature_names": feature_cols,
                 "mean": mu.tolist(),
                 "std": sigmasigma.tolist(),
-                "stats_path": norm_stats_path
+                "stats_path": norm_stats_path,
+                "train_ts_cutoff": train_ts_cutoff,
+                "val_ts_cutoff": val_ts_cutoff,
+                "train_count": int(train_mask.sum()),
+                "split_strategy": split_metadata.get("strategy"),
             }
             
             # Apply Norm
@@ -22214,43 +24706,22 @@ def _render_create_graph():
             # Determine Extra Spatial Dimensions based on selection
             # Default options if not defined (safe fallback)
             if 'selected_physical_features' not in locals():
-                selected_physical_features = ['dist_km', 'grad_q', 'grad_k', 'grad_v', 'shock_speed', 'shock_indicator']
+                selected_physical_features = (
+                    SNAPSHOT_EDGE_PHYSICAL_FEATURES
+                    if feature_mode == "Snapshot"
+                    else CLASSIC_EDGE_PHYSICAL_FEATURES
+                )
             
+            raw_globals = _build_raw_global_edge_features(
+                df_pm_raw_for_edges, portico_col
+            )
+            raw_feature_family = str(
+                raw_globals.attrs.get("raw_feature_family", "classic")
+            )
+            edge_feature_sources = dict(
+                raw_globals.attrs.get("edge_feature_sources", {})
+            )
             EXTRA_SPATIAL = len(selected_physical_features)
-            
-            # Helper to prepare Global Raw features for physical calcs
-            def _ensure_or_compute_globals(df):
-                if 'flujo_total' in df.columns: q = df['flujo_total']
-                else: 
-                     q_cols = [f'flujo_{c}' for c in [1,2,3] if f'flujo_{c}' in df.columns]
-                     q = df[q_cols].sum(axis=1) if q_cols else pd.Series(np.zeros(len(df)))
-                
-                if 'densidad_total' in df.columns: k = df['densidad_total']
-                else:
-                     k_cols = [f'densidad_{c}' for c in [1,2,3] if f'densidad_{c}' in df.columns]
-                     k = df[k_cols].sum(axis=1) if k_cols else pd.Series(np.zeros(len(df)))
-
-                if 'v_armonica' in df.columns: v_h = df['v_armonica']
-                else:
-                     v_h = q / (k.replace(0, np.nan))
-                     v_h = v_h.fillna(0.0)
-
-                if 'prop_pesados' in df.columns: pi = df['prop_pesados']
-                else:
-                     f2 = df['flujo_2'] if 'flujo_2' in df.columns else 0.0
-                     pi = f2 / (q + 1e-12)
-                
-                return q.astype(float), k.astype(float), v_h.astype(float), pi.astype(float)
-
-            q_raw, k_raw, vhar_raw, pi_raw = _ensure_or_compute_globals(df_pm)
-            raw_globals = pd.DataFrame({
-                portico_col: df_pm[portico_col].values,
-                'ts_min': df_pm['ts_min'].values,
-                'q_total_raw': q_raw.values,
-                'k_total_raw': k_raw.values,
-                'v_armonica_raw': vhar_raw.values,
-                'prop_pesados_raw': pi_raw.values,
-            })
 
             # Temporal
             temporal_attr = None
@@ -22355,46 +24826,12 @@ def _render_create_graph():
                                 feat_mat_delta[spatial_dst]
                                 - feat_mat_delta[spatial_src]
                             )
-                            
-                            # Calculate Physical Features
-                            # Join raw globals
-                            src_vals = raw_globals.rename(columns={
-                                portico_col: 'portico_src',
-                                'q_total_raw': 'q_src', 'k_total_raw': 'k_src',
-                                'v_armonica_raw': 'v_src', 'prop_pesados_raw': 'pi_src'
-                            })
-                            dst_vals = raw_globals.rename(columns={
-                                portico_col: 'portico_dst',
-                                'q_total_raw': 'q_dst', 'k_total_raw': 'k_dst',
-                                'v_armonica_raw': 'v_dst', 'prop_pesados_raw': 'pi_dst'
-                            })
-                            
-                            # Merge into edges
-                            se = s_edges.merge(src_vals, on=['portico_src', 'ts_min'], how='left') \
-                                        .merge(dst_vals, on=['portico_dst', 'ts_min'], how='left')
-
-                            dkm = se['dist_km'].to_numpy(dtype=float)
-                            dq = (se['q_dst'] - se['q_src']).to_numpy(dtype=float)
-                            dk = (se['k_dst'] - se['k_src']).to_numpy(dtype=float)
-                            dv = (se['v_dst'] - se['v_src']).to_numpy(dtype=float)
-                            
-                            eps = 1e-9
-                            # Precompute all possible features
-                            feat_dict = {}
-                            feat_dict['dist_km'] = np.nan_to_num(dkm, nan=0.0)
-                            feat_dict['grad_q'] = dq / (dkm + eps)
-                            feat_dict['grad_k'] = dk / (dkm + eps)
-                            feat_dict['grad_v'] = dv / (dkm + eps)
-                            feat_dict['shock_speed'] = dq / (dk + eps)
-                            feat_dict['shock_indicator'] = np.maximum(0.0, dk) * np.maximum(0.0, -dq)
-                            
-                            # Stack selected features in order
-                            if EXTRA_SPATIAL > 0:
-                                selected_arrays = [feat_dict[fname] for fname in selected_physical_features]
-                                extras = np.stack(selected_arrays, axis=1)
-                                extras = np.nan_to_num(extras, nan=0.0)
-                            else:
-                                extras = np.zeros((len(delta_s), 0))
+                            extras = _build_edge_feature_extras(
+                                s_edges,
+                                raw_globals,
+                                portico_col,
+                                selected_physical_features,
+                            )
 
                             spatial_attr = np.concatenate(
                                 [delta_s, extras], axis=1
@@ -22416,9 +24853,26 @@ def _render_create_graph():
                             if build_spatial_back:
                                 spatial_back_src = spatial_dst
                                 spatial_back_dst = spatial_src
-                                delta_back = -delta_s
+                                delta_back = (
+                                    feat_mat_delta[spatial_back_dst]
+                                    - feat_mat_delta[spatial_back_src]
+                                )
+                                back_edges = pd.DataFrame(
+                                    {
+                                        "portico_src": s_edges["portico_dst"].values,
+                                        "portico_dst": s_edges["portico_src"].values,
+                                        "ts_min": s_edges["ts_min"].values,
+                                        "dist_km": s_edges["dist_km"].values,
+                                    }
+                                )
+                                back_extras = _build_edge_feature_extras(
+                                    back_edges,
+                                    raw_globals,
+                                    portico_col,
+                                    selected_physical_features,
+                                )
                                 spatial_back_attr = np.concatenate(
-                                    [delta_back, extras], axis=1
+                                    [delta_back, back_extras], axis=1
                                 )
                                 data[
                                     ("pm", "spatial_back", "pm")
@@ -22437,26 +24891,34 @@ def _render_create_graph():
                             df_pm["next_ts_min"] = (
                                 df_pm["ts_min"] + int(dt_feat_minutes)
                             )
+                        st_src = df_pm[
+                            [portico_col, "ts_min", "node_idx", "next_ts_min"]
+                        ].rename(
+                            columns={
+                                portico_col: "portico_src",
+                                "node_idx": "node_idx_src",
+                                "ts_min": "ts_min_src",
+                            }
+                        )
+                        st_dst = df_pm[
+                            [portico_col, "ts_min", "node_idx"]
+                        ].rename(
+                            columns={
+                                portico_col: "portico_dst",
+                                "node_idx": "node_idx_dst",
+                                "ts_min": "ts_min_dst",
+                            }
+                        )
                         st_edges = pd.merge(
-                            df_pm.rename(
-                                columns={
-                                    portico_col: "portico_src",
-                                    "node_idx": "node_idx_src",
-                                }
-                            ),
+                            st_src,
                             df_seq,
                             on="portico_src",
                         )
                         st_edges = pd.merge(
                             st_edges,
-                            df_pm.rename(
-                                columns={
-                                    portico_col: "portico_dst",
-                                    "node_idx": "node_idx_dst",
-                                }
-                            ),
+                            st_dst,
                             left_on=["next_ts_min", "portico_dst"],
-                            right_on=["ts_min", "portico_dst"],
+                            right_on=["ts_min_dst", "portico_dst"],
                             how="inner",
                         )
 
@@ -22467,21 +24929,14 @@ def _render_create_graph():
                                 feat_mat_delta[stfwd_dst]
                                 - feat_mat_delta[stfwd_src]
                             )
-                            
-                            # Re-use logic for physical features on ST edges? 
-                            # ST edges connect t -> t+1. 
-                            # Usually physical gradients are spatial at same time t or t+1.
-                            # Standard logic: fill with 0 or use same spatial features?
-                            # In graph.py, st_fwd uses just zeros for physical part usually.
-                            # But if user selected them, maybe we should just fill 0s to keep dimensions consistent?
-                            # Yes, temporal edges use 0 for physical part. ST_FWD usually the same.
-                            
-                            extras = np.zeros(
-                                (len(delta_st), EXTRA_SPATIAL)
+                            extras = _build_edge_feature_extras(
+                                st_edges,
+                                raw_globals,
+                                portico_col,
+                                selected_physical_features,
+                                src_ts_col="ts_min_src",
+                                dst_ts_col="ts_min_dst",
                             )
-                            # NOTE: graph.py implementation of st_fwd fills zeros for extra spatial.
-                            # ensuring dimension consistency
-                            
                             stfwd_attr = np.concatenate(
                                 [
                                     delta_st,
@@ -22504,21 +24959,93 @@ def _render_create_graph():
             for store in data.edge_stores:
                 _safe_clean_edges(store, data[store._key[0]].num_nodes, data[store._key[2]].num_nodes)
             
-            # Masks with time split
-            ts_array = df_pm['ts_min'].to_numpy()
-            train_mask = (ts_array <= train_ts_cutoff)
-            val_mask = (ts_array > train_ts_cutoff) & (ts_array <= val_ts_cutoff)
-            test_mask = (ts_array > val_ts_cutoff)
-            
-            data['pm'].train_mask = torch.from_numpy(train_mask) & sequence_mask
-            data['pm'].val_mask = torch.from_numpy(val_mask) & sequence_mask
-            data['pm'].test_mask = torch.from_numpy(test_mask) & sequence_mask
-            data['pm'].sequence_mask = sequence_mask
+            data['pm'].train_mask = torch.from_numpy(train_mask)
+            data['pm'].val_mask = torch.from_numpy(val_mask)
+            data['pm'].test_mask = torch.from_numpy(test_mask)
+            data['pm'].sequence_mask = sequence_mask.bool()
 
             # Save
             pm_map = df_pm.set_index([portico_col, 'ts_min'])['node_idx'].to_dict()
             pm_rev = {v: k for k, v in pm_map.items()}
             pm_index = PMIndex(pm_map, pm_rev)
+            edge_config = {
+                "physical_features": selected_physical_features
+                if 'selected_physical_features' in locals()
+                else [],
+                "delta_features": delta_feature_cols
+                if 'delta_feature_cols' in locals()
+                else [],
+                "raw_feature_family": raw_feature_family
+                if 'raw_feature_family' in locals()
+                else "classic",
+                "edge_attr_schema": list(delta_feature_cols)
+                + list(selected_physical_features),
+                "edge_feature_sources": edge_feature_sources
+                if 'edge_feature_sources' in locals()
+                else {},
+                "edge_types": [str(edge_type) for edge_type in data.edge_types],
+            }
+            label_metadata = {
+                "feature_mode": feature_mode,
+                "use_snapshot_labels": bool(use_snapshot_labels),
+                "label_lookahead_minutes": int(label_lookahead_minutes),
+                "dt_feat_minutes": int(dt_feat_minutes),
+                "sequence_length": int(sequence_config.sequence_length)
+                if sequence_config is not None
+                else None,
+                "guard_band_minutes": int(sequence_config.guard_band_minutes)
+                if sequence_config is not None
+                else None,
+                "horizon_minutes": int(sequence_config.horizon_minutes)
+                if sequence_config is not None
+                else None,
+                "include_downstream": bool(sequence_config.include_downstream)
+                if sequence_config is not None
+                else False,
+            }
+            event_source = {
+                "use_events_tab": bool(use_events),
+                "selected_file": None if use_events else sel_acc_file,
+                "loaded_acc_path": st.session_state.get("loaded_acc_path"),
+                "event_files": list(st.session_state.get("accident_files", []) or []),
+            }
+            normalization_summary = {
+                "stats_path": norm_stats_path,
+                "feature_count": int(len(feature_cols)),
+                "train_count": int(train_mask.sum()),
+                "train_ts_cutoff": train_ts_cutoff,
+                "val_ts_cutoff": val_ts_cutoff,
+            }
+            graph_metadata = {
+                "schema_version": 2,
+                "builder": "graph_builder_app",
+                "created_at": datetime.now().isoformat(),
+                "feature_config": copy.deepcopy(feature_config),
+                "feature_cols": list(feature_cols),
+                "tramo": {
+                    "source": tramo_mode,
+                    "porticos_count": int(len(porticos_a_incluir)),
+                    "porticos": list(porticos_a_incluir),
+                },
+                "time_filter": {
+                    "key": time_sel_key,
+                    "label": time_options.get(time_sel_key),
+                },
+                "event_source": event_source,
+                "seed": int(SEED),
+                "labeling": label_metadata,
+                "split": split_metadata,
+                "normalization": normalization_summary,
+                "edge_config": edge_config,
+            }
+            graph_metadata, graph_hash = _attach_graph_metadata_hash(
+                data=data,
+                pm_index=pm_index,
+                feature_cols=feature_cols,
+                split_metadata=split_metadata,
+                edge_config=edge_config,
+                metadata=graph_metadata,
+            )
             
             period_tag = "stream_build"
             timestamp = datetime.now().strftime('%d%m%Y_%H%M')
@@ -22532,16 +25059,13 @@ def _render_create_graph():
                 "sigma": sigmasigma,
                 "feature_cols": feature_cols,
                 "normalization": normalization_metadata,
-                "edge_config": {
-                    "physical_features": selected_physical_features
-                    if 'selected_physical_features' in locals()
-                    else [],
-                    "delta_features": delta_feature_cols
-                    if 'delta_feature_cols' in locals()
-                    else [],
-                },
+                "edge_config": edge_config,
                 "sequence_index": seq_index,
-                "sequence_config": sequence_config
+                "sequence_config": sequence_config,
+                "train_ts_cutoff": train_ts_cutoff,
+                "val_ts_cutoff": val_ts_cutoff,
+                "metadata": graph_metadata,
+                "graph_hash": graph_hash,
             }, output_path)
             
             progress.progress(100)
@@ -22551,6 +25075,13 @@ def _render_create_graph():
                 "pm_index": pm_index,
                 "filename": filename,
                 "graph_path": output_path,
+                "feature_cols": list(feature_cols),
+                "normalization": normalization_metadata,
+                "edge_config": edge_config,
+                "sequence_index": seq_index,
+                "sequence_config": sequence_config,
+                "metadata": graph_metadata,
+                "graph_hash": graph_hash,
             }
             st.session_state.graph_path = output_path
             

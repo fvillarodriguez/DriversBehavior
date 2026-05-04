@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import patch, MagicMock
+from datetime import date
 import os
 import sys
 
@@ -81,6 +82,26 @@ class TestNotificationSystem(unittest.TestCase):
         self.assertEqual(call_args[0][1], ["recipient@test.com"])
         msg_str = call_args[0][2]
         self.assertIn("Subject: Script finalizado: Subject Test", msg_str)
+
+    @patch("smtplib.SMTP")
+    def test_send_notification_email_accepts_date_values(self, mock_smtp):
+        config = {
+            "smtp_server": "smtp.test.com",
+            "smtp_port": 587,
+            "sender_email": "sender@test.com",
+            "sender_password": "password123",
+            "recipients": ["recipient@test.com"],
+        }
+        notification_system.save_email_config(config)
+        mock_smtp.return_value = MagicMock()
+
+        res = notification_system.send_notification_email(
+            "Subject Test",
+            {"status": "error", "context": {"start_date": date(2026, 5, 4)}},
+        )
+
+        self.assertTrue(res)
+        mock_smtp.return_value.sendmail.assert_called()
 
     @patch("smtplib.SMTP")
     def test_send_notification_email_missing_required_config_returns_false(self, mock_smtp):

@@ -164,3 +164,25 @@ def test_build_sampler_memory_loader_graphsaint_is_native():
     assert loader is not None
     assert str(getattr(loader, "sampler_impl", "")).startswith("graphsaint_native_")
     assert loader.__class__.__name__ != "NeighborLoader"
+
+
+def test_native_sampler_batch_supervises_train_nodes_only():
+    graph = _make_probe_graph()
+    loader, err = _build_sampler_memory_loader(
+        graph_cpu=graph,
+        sampler_config={
+            "train_sampler_mode": "graphsaint",
+            "graphsaint_mode": "node",
+            "graphsaint_batch_size": 128,
+            "graphsaint_num_steps": 1,
+        },
+        batch_size=128,
+        sampling_seed=42,
+    )
+
+    assert err is None
+    batch = next(iter(loader))
+    supervised = batch["pm"].n_id[: batch["pm"].batch_size]
+    assert graph["pm"].train_mask[supervised].all()
+    assert batch["pm"].train_mask[: batch["pm"].batch_size].all()
+    assert not batch["pm"].val_mask[: batch["pm"].batch_size].any()

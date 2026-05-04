@@ -151,6 +151,27 @@ def compute_bias_variance_noise_from_roc_items(
     }
 
 
+def compute_brier_score_from_roc_items(
+    roc_items: Sequence[Mapping[str, Any]],
+) -> float:
+    squared_error_total = 0.0
+    n_obs = 0
+    for item in roc_items:
+        y_true = [_rounded_binary(v) for v in sequence_to_numeric(item.get("y_true"))]
+        if not y_true:
+            continue
+        probability_scores = probability_scores_for_brier(item, expected_length=len(y_true))
+        if len(probability_scores) != len(y_true):
+            continue
+        for y_val, score in zip(y_true, probability_scores):
+            if not math.isfinite(y_val) or not math.isfinite(score):
+                continue
+            clipped_score = min(max(float(score), 0.0), 1.0)
+            squared_error_total += (clipped_score - y_val) ** 2
+            n_obs += 1
+    return float(squared_error_total / float(n_obs)) if n_obs else float("nan")
+
+
 def build_bias_variance_noise_lookup(
     roc_payload: Sequence[Mapping[str, Any]],
 ) -> dict[tuple[str, str, str, str], dict[str, float]]:
@@ -164,6 +185,19 @@ def build_bias_variance_noise_lookup(
     }
 
 
+def build_brier_score_lookup(
+    roc_payload: Sequence[Mapping[str, Any]],
+) -> dict[tuple[str, str, str, str], float]:
+    grouped_items: dict[tuple[str, str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for item in roc_payload:
+        if isinstance(item, Mapping):
+            grouped_items[drift_roc_group_key(item)].append(item)
+    return {
+        key: compute_brier_score_from_roc_items(items)
+        for key, items in grouped_items.items()
+    }
+
+
 def enrich_drift_rows_with_bias_variance(
     rows: Sequence[Mapping[str, Any]],
     roc_payload: Sequence[Mapping[str, Any]],
@@ -171,15 +205,35 @@ def enrich_drift_rows_with_bias_variance(
     yearly: bool,
 ) -> list[dict[str, Any]]:
     out = [dict(row) for row in rows if isinstance(row, Mapping)]
-    if not out or not roc_payload:
+    if not out:
+        return out
+    if not roc_payload:
+        for row in out:
+            if is_missing_numeric(row.get("brier_score")):
+                row["brier_score"] = float("nan")
+            for col in BIAS_VARIANCE_NOISE_COLUMNS:
+                if is_missing_numeric(row.get(col)):
+                    row[col] = float("nan")
         return out
 
     decomposition_lookup = build_bias_variance_noise_lookup(roc_payload)
+    brier_lookup = build_brier_score_lookup(roc_payload)
     for row in out:
-        metrics = decomposition_lookup.get(drift_row_group_key(row, yearly=yearly))
+        row_key = drift_row_group_key(row, yearly=yearly)
+        if is_missing_numeric(row.get("brier_score")):
+            row["brier_score"] = brier_lookup.get(row_key)
+        if is_missing_numeric(row.get("brier_score")):
+            row["brier_score"] = float("nan")
+        metrics = decomposition_lookup.get(row_key)
         if not isinstance(metrics, dict):
+            for col in BIAS_VARIANCE_NOISE_COLUMNS:
+                if is_missing_numeric(row.get(col)):
+                    row[col] = float("nan")
             continue
         for col in BIAS_VARIANCE_NOISE_COLUMNS:
             if is_missing_numeric(row.get(col)):
                 row[col] = metrics.get(col)
+        for col in BIAS_VARIANCE_NOISE_COLUMNS:
+            if is_missing_numeric(row.get(col)):
+                row[col] = float("nan")
     return out

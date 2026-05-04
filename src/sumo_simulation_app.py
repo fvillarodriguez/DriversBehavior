@@ -406,6 +406,7 @@ def _render_sumo_summary(result: SUMOResult) -> None:
     segments_count = len(result.segments)
     macro_count = len(result.macro_metrics)
     headway_count = len(result.headways)
+    irl_count = len(result.irl_transitions)
 
     st.subheader("Resumen SUMO")
     if result.segment_filter is not None:
@@ -415,10 +416,11 @@ def _render_sumo_summary(result: SUMOResult) -> None:
     col1.metric("Detecciones limpias", f"{clean_count:,}")
     col2.metric("Viajes detectados", f"{trajectories_count:,}")
     col3.metric("Segmentos", f"{segments_count:,}")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Ventanas macro", f"{macro_count:,}")
     col2.metric("Headways", f"{headway_count:,}")
-    col3.metric("Trips SUMO", f"{len(result.sumo_trips or []):,}")
+    col3.metric("Transiciones IRL", f"{irl_count:,}")
+    col4.metric("Trips SUMO", f"{len(result.sumo_trips or []):,}")
 
     if result.sumo_trips_path:
         st.caption(f"Trips XML: {result.sumo_trips_path}")
@@ -438,6 +440,8 @@ def _render_sumo_summary(result: SUMOResult) -> None:
         st.dataframe(result.macro_metrics.head(200), width="stretch")
         st.write("Headways")
         st.dataframe(result.headways.head(200), width="stretch")
+        st.write("IRL transitions")
+        st.dataframe(result.irl_transitions.head(200), width="stretch")
 
 
 def _get_existing_sumo_trips_path(result: Optional[SUMOResult]) -> Optional[Path]:

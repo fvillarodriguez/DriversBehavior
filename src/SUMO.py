@@ -99,6 +99,7 @@ class SUMOResult:
     segments: pd.DataFrame
     macro_metrics: pd.DataFrame
     headways: pd.DataFrame
+    irl_transitions: pd.DataFrame
     segment_filter: Optional["SegmentFilter"] = None
     sumo_trips: Optional[List["SumoTrip"]] = None
     sumo_trips_path: Optional[Path] = None
@@ -715,6 +716,8 @@ def build_segments_from_trajectories(
             "travel_time_min",
             "delta_km",
             "distance_km_abs",
+            "prev_speed",
+            flow_cols.speed_kmh,
             "avg_speed_kmh",
             "speed_change_kmh",
             "accel_m_s2",
@@ -735,6 +738,8 @@ def build_segments_from_trajectories(
             flow_cols.timestamp: "end_time",
             "prev_lane": "start_lane",
             "lane_numeric": "end_lane",
+            "prev_speed": "start_speed_kmh",
+            flow_cols.speed_kmh: "end_speed_kmh",
             "km": "end_km",
             "prev_km": "start_km",
         }
@@ -751,8 +756,10 @@ def compute_headways(events_df: pd.DataFrame, flow_cols: FlowColumns) -> pd.Data
     df = df.sort_values([flow_cols.portico, flow_cols.lane, flow_cols.timestamp])
     grouped = df.groupby([flow_cols.portico, flow_cols.lane])
     df["headway_s"] = grouped[flow_cols.timestamp].diff().dt.total_seconds()
+    df["leader_speed_kmh"] = grouped[flow_cols.speed_kmh].shift()
     df = df[df["headway_s"].notna()].copy()
     df["headway_m"] = (df["headway_s"] * df[flow_cols.speed_kmh]) / 3.6
+    df["relative_speed_kmh"] = df[flow_cols.speed_kmh] - df["leader_speed_kmh"]
     return df[
         [
             "__plate",
@@ -761,6 +768,8 @@ def compute_headways(events_df: pd.DataFrame, flow_cols: FlowColumns) -> pd.Data
             flow_cols.timestamp,
             "headway_s",
             "headway_m",
+            "leader_speed_kmh",
+            "relative_speed_kmh",
             flow_cols.speed_kmh,
         ]
     ].rename(columns={"__plate": "plate"})
@@ -822,6 +831,204 @@ def compute_acceleration(start_speed_kmh: float, end_speed_kmh: float, distance_
     return (end_ms ** 2 - start_ms ** 2) / (2 * distance_m)
 
 
+def _vehicle_class_label(value: object) -> str:
+    try:
+        class_id = int(value)
+    except (TypeError, ValueError):
+        return "class_unknown"
+    labels = {
+        1: "car",
+        2: "bus",
+        3: "truck",
+        4: "motorcycle",
+    }
+    return labels.get(class_id, f"class_{class_id}")
+
+
+def _assign_temporal_splits(df: pd.DataFrame, agent_col: str = "agent_id") -> pd.Series:
+    splits = pd.Series("train", index=df.index, dtype="object")
+    if df.empty or "state_time" not in df.columns:
+        return splits
+
+    ordered = df.sort_values("state_time")
+    grouped = ordered.groupby(agent_col, sort=False) if agent_col in ordered.columns else [("shared_policy", ordered)]
+    for _, group in grouped:
+        idx = list(group.index)
+        n = len(idx)
+        if n < 3:
+            continue
+        if n < 10:
+            splits.loc[idx[-2]] = "validation"
+            splits.loc[idx[-1]] = "test"
+            continue
+        train_end = max(1, int(n * 0.7))
+        validation_end = max(train_end + 1, int(n * 0.85))
+        validation_end = min(validation_end, n - 1)
+        splits.loc[idx[train_end:validation_end]] = "validation"
+        splits.loc[idx[validation_end:]] = "test"
+    return splits
+
+
+def build_irl_transition_dataset(
+    segments_df: pd.DataFrame,
+    headways_df: pd.DataFrame,
+    macro_metrics_df: pd.DataFrame,
+    window_minutes: int = 15,
+) -> pd.DataFrame:
+    """
+    Builds segment-level expert transitions for reward learning.
+
+    AVI detections are point observations at gates, so each row represents a
+    partial transition between two consecutive gates rather than a continuous
+    second-by-second trajectory.
+    """
+    if segments_df is None or segments_df.empty:
+        return pd.DataFrame()
+
+    df = segments_df.copy()
+    required = {
+        "trip_id",
+        "plate",
+        "start_portico",
+        "end_portico",
+        "start_time",
+        "end_time",
+        "start_speed_kmh",
+        "end_speed_kmh",
+        "start_lane",
+        "end_lane",
+        "delta_t_s",
+        "avg_speed_kmh",
+        "speed_change_kmh",
+        "accel_m_s2",
+        "lane_change",
+        "vehicle_type_id",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            "No se puede construir el dataset IRL; faltan columnas en segmentos: "
+            + ", ".join(sorted(missing))
+        )
+
+    df = df[df["delta_t_s"] > 0].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df["trajectory_id"] = df["trip_id"].astype(str)
+    df["vehicle_class"] = df["vehicle_type_id"].apply(_vehicle_class_label)
+    df["agent_id"] = df["vehicle_class"]
+    df["state_time"] = pd.to_datetime(df["start_time"], errors="coerce")
+    df["next_time"] = pd.to_datetime(df["end_time"], errors="coerce")
+    df["state_lane"] = pd.to_numeric(df["start_lane"], errors="coerce")
+    df["next_lane"] = pd.to_numeric(df["end_lane"], errors="coerce")
+    df["state_speed_kmh"] = pd.to_numeric(df["start_speed_kmh"], errors="coerce")
+    df["next_speed_kmh"] = pd.to_numeric(df["end_speed_kmh"], errors="coerce")
+    df["action_delta_speed_kmh"] = pd.to_numeric(df["speed_change_kmh"], errors="coerce")
+    df["action_accel_m_s2"] = pd.to_numeric(df["accel_m_s2"], errors="coerce")
+    df["action_lane_change"] = pd.to_numeric(df["lane_change"], errors="coerce").fillna(0)
+
+    if headways_df is not None and not headways_df.empty:
+        hw = headways_df.copy()
+        hw["next_time"] = pd.to_datetime(hw["FECHA"], errors="coerce")
+        hw["end_portico"] = hw["PORTICO"].astype(str).str.strip()
+        hw["next_lane"] = pd.to_numeric(hw["CARRIL"], errors="coerce")
+        hw = hw[
+            [
+                "plate",
+                "end_portico",
+                "next_time",
+                "next_lane",
+                "headway_s",
+                "headway_m",
+                "relative_speed_kmh",
+            ]
+        ].rename(
+            columns={
+                "headway_s": "next_headway_s",
+                "headway_m": "next_headway_m",
+                "relative_speed_kmh": "next_relative_speed_kmh",
+            }
+        )
+        df = df.merge(
+            hw,
+            on=["plate", "end_portico", "next_time", "next_lane"],
+            how="left",
+        )
+    else:
+        df["next_headway_s"] = np.nan
+        df["next_headway_m"] = np.nan
+        df["next_relative_speed_kmh"] = np.nan
+
+    if macro_metrics_df is not None and not macro_metrics_df.empty:
+        macro = macro_metrics_df.copy()
+        macro["window_start"] = pd.to_datetime(macro["window_start"], errors="coerce")
+        df["window_start"] = df["state_time"].dt.floor(f"{window_minutes}min")
+        macro = macro[
+            [
+                "start_portico",
+                "end_portico",
+                "window_start",
+                "vehicle_count",
+                "mean_speed_kmh",
+                "density_veh_per_km",
+            ]
+        ].rename(
+            columns={
+                "vehicle_count": "flow_context_vehicle_count",
+                "mean_speed_kmh": "flow_context_mean_speed_kmh",
+                "density_veh_per_km": "flow_context_density_veh_per_km",
+            }
+        )
+        df = df.merge(
+            macro,
+            on=["start_portico", "end_portico", "window_start"],
+            how="left",
+        )
+    else:
+        df["flow_context_vehicle_count"] = np.nan
+        df["flow_context_mean_speed_kmh"] = np.nan
+        df["flow_context_density_veh_per_km"] = np.nan
+
+    df["state_headway_s"] = df["next_headway_s"]
+    df["state_relative_speed_kmh"] = df["next_relative_speed_kmh"]
+    df["vms_active"] = False
+    df["vms_message_type"] = ""
+    df["temporal_split"] = _assign_temporal_splits(df)
+
+    columns = [
+        "trajectory_id",
+        "trip_id",
+        "plate",
+        "agent_id",
+        "vehicle_class",
+        "vehicle_type_id",
+        "start_portico",
+        "end_portico",
+        "state_time",
+        "next_time",
+        "delta_t_s",
+        "state_speed_kmh",
+        "next_speed_kmh",
+        "state_lane",
+        "next_lane",
+        "state_headway_s",
+        "next_headway_s",
+        "state_relative_speed_kmh",
+        "next_relative_speed_kmh",
+        "flow_context_vehicle_count",
+        "flow_context_mean_speed_kmh",
+        "flow_context_density_veh_per_km",
+        "action_delta_speed_kmh",
+        "action_accel_m_s2",
+        "action_lane_change",
+        "vms_active",
+        "vms_message_type",
+        "temporal_split",
+    ]
+    return df[columns].reset_index(drop=True)
+
+
 def run_sumo_pipeline(
     flujos_df: pd.DataFrame,
     porticos_df: pd.DataFrame,
@@ -844,6 +1051,7 @@ def run_sumo_pipeline(
     segments = build_segments_from_trajectories(trajectories, flow_cols)
     headways = compute_headways(clean, flow_cols)
     macro_metrics = aggregate_macro_metrics(segments)
+    irl_transitions = build_irl_transition_dataset(segments, headways, macro_metrics)
 
     sumo_trips: Optional[List[SumoTrip]] = None
     sumo_trips_path: Optional[Path] = None
@@ -872,6 +1080,7 @@ def run_sumo_pipeline(
         segments=segments,
         macro_metrics=macro_metrics,
         headways=headways,
+        irl_transitions=irl_transitions,
         segment_filter=segment_filter,
         sumo_trips=sumo_trips,
         sumo_trips_path=sumo_trips_path,

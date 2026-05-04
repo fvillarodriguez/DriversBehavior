@@ -45,6 +45,7 @@ NLP_PAPER_RUNS_DIR = RESULTS_DIR / "nlp_in_severity" / "paper_replication"
 NLP_LANGUAGE_MODELING_LIVE_DIR = RESULTS_DIR / "nlp_in_severity" / "language_modeling_live"
 MODEL_HISTORY_DIR = RESULTS_DIR / "model_history"
 MODEL_OPTUNA_BATCH_LIVE_DIR = MODEL_HISTORY_DIR / "optuna_batch_live"
+GNN_OPTUNA_LIVE_DIR = RESULTS_DIR / "gnn_optuna_live"
 PAPER_MODEL_CODES = ("M1", "M2", "M3")
 THESIS_CHART_COLORS = {
     "paper": "#fdfcfa",
@@ -727,6 +728,20 @@ def _list_model_optuna_batch_manifest_files() -> list[Path]:
     )
 
 
+def _list_gnn_optuna_manifest_files() -> list[Path]:
+    live_dir = GNN_OPTUNA_LIVE_DIR
+    default_live_dir = DEFAULT_RESULTS_DIR / "gnn_optuna_live"
+    if RESULTS_DIR != DEFAULT_RESULTS_DIR and live_dir == default_live_dir:
+        live_dir = RESULTS_DIR / "gnn_optuna_live"
+    if not live_dir.exists():
+        return []
+    return sorted(
+        live_dir.glob("*/manifest.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def _build_live_sources() -> list[Dict[str, object]]:
     entries: list[Dict[str, object]] = []
     for path in _list_calibration_experiment_manifest_files():
@@ -814,6 +829,24 @@ def _build_live_sources() -> list[Dict[str, object]]:
                 "path": path,
                 "sort_key": float(path.stat().st_mtime),
                 "label": f"Modelos | batch Optuna | {run_id} | {status} | {updated_at}",
+            }
+        )
+    for path in _list_gnn_optuna_manifest_files():
+        manifest = _load_json_file(path, default={})
+        run_id = str((manifest or {}).get("run_id") or path.parent.name)
+        status = str((manifest or {}).get("status") or "unknown")
+        objective = str((manifest or {}).get("objective_metric") or "-")
+        updated_at = str(
+            (manifest or {}).get("updated_at")
+            or (manifest or {}).get("created_at")
+            or "-"
+        )
+        entries.append(
+            {
+                "type": "gnn_optuna",
+                "path": path,
+                "sort_key": float(path.stat().st_mtime),
+                "label": f"GNN Optuna | {run_id} | {objective} | {status} | {updated_at}",
             }
         )
     for path in _list_dynamic_gmm_db_files():
@@ -2266,6 +2299,338 @@ def _read_model_optuna_batch_run(manifest_path: Path) -> Dict[str, object]:
         "live_events_path": live_events_path,
         "partial_results_df": partial_results_df,
         "partial_results_path": partial_results_path,
+        "current_context": current_context,
+    }
+
+
+def _gnn_optuna_normalize_progress(
+    manifest: Dict[str, object],
+    live_status: Optional[Dict[str, object]] = None,
+) -> float:
+    status_payload = dict(live_status or {})
+    manifest_progress = dict(manifest.get("progress") or {})
+    status_progress = dict(status_payload.get("progress") or {})
+    progress_ratio = pd.to_numeric(
+        status_payload.get(
+            "progress_ratio",
+            status_progress.get("progress_ratio", manifest_progress.get("progress_ratio")),
+        ),
+        errors="coerce",
+    )
+    completed_trials = pd.to_numeric(
+        status_payload.get(
+            "completed_trials",
+            status_progress.get(
+                "completed_trials",
+                manifest_progress.get("completed_trials"),
+            ),
+        ),
+        errors="coerce",
+    )
+    total_trials = pd.to_numeric(
+        status_payload.get(
+            "total_trials",
+            status_progress.get("total_trials", manifest_progress.get("total_trials")),
+        ),
+        errors="coerce",
+    )
+    if (
+        pd.isna(progress_ratio)
+        and not pd.isna(completed_trials)
+        and not pd.isna(total_trials)
+        and float(total_trials) > 0
+    ):
+        progress_ratio = float(completed_trials) / float(total_trials)
+    if pd.isna(progress_ratio):
+        progress_ratio = 0.0
+    return max(0.0, min(float(progress_ratio), 1.0))
+
+
+def _gnn_optuna_normalize_live_event(
+    row: Dict[str, object],
+    *,
+    manifest: Dict[str, object],
+    live_status: Dict[str, object],
+) -> Dict[str, object]:
+    payload = dict(row or {})
+    ratio = _gnn_optuna_normalize_progress(manifest, payload)
+    progress = dict(payload.get("progress") or {})
+    return {
+        "event_index": _maybe_int(payload.get("event_index")),
+        "timestamp": str(
+            payload.get("timestamp")
+            or live_status.get("timestamp")
+            or manifest.get("updated_at")
+            or manifest.get("created_at")
+            or ""
+        ),
+        "event_type": str(payload.get("event_type") or payload.get("step_id") or ""),
+        "status": str(payload.get("status") or manifest.get("status") or ""),
+        "result_status": str(
+            payload.get("result_status")
+            or manifest.get("result_status")
+            or payload.get("status")
+            or manifest.get("status")
+            or ""
+        ),
+        "step_id": str(payload.get("step_id") or ""),
+        "step_status": str(payload.get("step_status") or ""),
+        "message": str(payload.get("message") or ""),
+        "progress_ratio": ratio,
+        "progress_pct": 100.0 * ratio,
+        "completed_trials": _maybe_int(
+            payload.get("completed_trials", progress.get("completed_trials"))
+        ),
+        "ok_trials": _maybe_int(
+            payload.get("ok_trials", progress.get("ok_trials"))
+        ),
+        "failed_trials": _maybe_int(
+            payload.get("failed_trials", progress.get("failed_trials"))
+        ),
+        "pruned_trials": _maybe_int(
+            payload.get("pruned_trials", progress.get("pruned_trials"))
+        ),
+        "total_trials": _maybe_int(
+            payload.get("total_trials", progress.get("total_trials"))
+        ),
+        "current_trial": _maybe_int(
+            payload.get("current_trial", progress.get("current_trial"))
+        ),
+        "current_epoch": _maybe_int(
+            payload.get("current_epoch", progress.get("current_epoch"))
+        ),
+        "total_epochs": _maybe_int(
+            payload.get("total_epochs", progress.get("total_epochs"))
+        ),
+        "trial_number": _maybe_int(payload.get("trial_number")),
+        "trial_state": str(payload.get("trial_state") or ""),
+        "objective_metric": str(payload.get("objective_metric") or manifest.get("objective_metric") or ""),
+        "backend": str(payload.get("backend") or manifest.get("backend") or "optuna"),
+        "model_name": str(payload.get("model_name") or manifest.get("model_name") or "GNN"),
+        "balancing_strategy": str(
+            payload.get("balancing_strategy") or manifest.get("balancing_strategy") or ""
+        ),
+        "train_loss": pd.to_numeric(payload.get("train_loss"), errors="coerce"),
+        "val_loss": pd.to_numeric(payload.get("val_loss"), errors="coerce"),
+        "score": pd.to_numeric(payload.get("score"), errors="coerce"),
+        "best_score": pd.to_numeric(payload.get("best_score"), errors="coerce"),
+    }
+
+
+def _gnn_optuna_loss_curve_df(loss_history_df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(loss_history_df, pd.DataFrame) or loss_history_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "point",
+                "trial_number",
+                "epoch",
+                "train_loss",
+                "val_loss",
+                "score",
+                "best_score",
+                "status",
+            ]
+        )
+    work = loss_history_df.copy()
+    for col in ["trial_number", "epoch", "train_loss", "val_loss", "score", "best_score"]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+    if "status" not in work.columns:
+        work["status"] = ""
+    work = work.dropna(subset=["trial_number", "epoch"], how="all").reset_index(drop=True)
+    if work.empty:
+        return pd.DataFrame(columns=["point", "trial_number", "epoch", "train_loss", "val_loss"])
+    work["point"] = range(1, len(work) + 1)
+    keep_cols = [
+        col
+        for col in [
+            "point",
+            "timestamp",
+            "trial_number",
+            "epoch",
+            "train_loss",
+            "val_loss",
+            "score",
+            "best_score",
+            "status",
+        ]
+        if col in work.columns
+    ]
+    return work[keep_cols].reset_index(drop=True)
+
+
+def _gnn_optuna_search_curve_df(trials_df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(trials_df, pd.DataFrame) or trials_df.empty:
+        return pd.DataFrame(columns=["trial_index", "objective", "best_so_far", "state"])
+    value_col = "value" if "value" in trials_df.columns else "values_0" if "values_0" in trials_df.columns else ""
+    if not value_col:
+        return pd.DataFrame(columns=["trial_index", "objective", "best_so_far", "state"])
+    work = trials_df.copy()
+    state_col = "state" if "state" in work.columns else ""
+    if state_col:
+        work = work.loc[work[state_col].astype(str).str.upper().eq("COMPLETE")].copy()
+    work["objective"] = pd.to_numeric(work[value_col], errors="coerce")
+    if "number" in work.columns:
+        work["trial_index"] = pd.to_numeric(work["number"], errors="coerce") + 1
+    else:
+        work["trial_index"] = range(1, len(work) + 1)
+    work = work.dropna(subset=["trial_index", "objective"]).sort_values("trial_index")
+    if work.empty:
+        return pd.DataFrame(columns=["trial_index", "objective", "best_so_far", "state"])
+    work["best_so_far"] = work["objective"].cummax()
+    if not state_col:
+        work["state"] = "COMPLETE"
+    return work[["trial_index", "objective", "best_so_far", "state"]].reset_index(drop=True)
+
+
+def _read_gnn_optuna_run(manifest_path: Path) -> Dict[str, object]:
+    manifest = _load_json_file(manifest_path, default={}) or {}
+    run_dir = manifest_path.parent
+    live_status_path = run_dir / "live_status.json"
+    live_events_path = run_dir / "live_events.jsonl"
+    loss_history_path = run_dir / "loss_history.csv"
+    trials_live_path = run_dir / "trials_live.csv"
+
+    live_status = _load_json_file(live_status_path, default={}) or {}
+    live_event_rows = _read_jsonl_records(live_events_path)
+    if not live_event_rows and isinstance(live_status, dict) and live_status:
+        live_event_rows = [live_status]
+    if not live_event_rows and manifest:
+        live_event_rows = [
+            {
+                "timestamp": manifest.get("updated_at") or manifest.get("created_at"),
+                "status": manifest.get("status"),
+                "result_status": manifest.get("result_status"),
+                "message": manifest.get("last_message") or "",
+                "progress": dict(manifest.get("progress") or {}),
+            }
+        ]
+
+    live_events_df = pd.DataFrame(
+        [
+            _gnn_optuna_normalize_live_event(
+                row,
+                manifest=manifest,
+                live_status=live_status,
+            )
+            for row in live_event_rows
+            if isinstance(row, dict)
+        ]
+    )
+    if not live_events_df.empty:
+        fallback_index = range(1, len(live_events_df) + 1)
+        if "event_index" not in live_events_df.columns:
+            live_events_df["event_index"] = list(fallback_index)
+        else:
+            live_events_df["event_index"] = pd.to_numeric(
+                live_events_df["event_index"],
+                errors="coerce",
+            )
+            live_events_df["event_index"] = live_events_df["event_index"].fillna(
+                pd.Series(list(fallback_index), index=live_events_df.index)
+            ).astype(int)
+
+    loss_history_df = _load_csv_file(loss_history_path)
+    loss_curve_df = _gnn_optuna_loss_curve_df(loss_history_df)
+    trials_live_df = _load_csv_file(trials_live_path)
+    search_curve_df = _gnn_optuna_search_curve_df(trials_live_df)
+
+    progress = dict(manifest.get("progress") or {})
+    live_progress = dict(live_status.get("progress") or {})
+    current_context = {
+        "status": str(live_status.get("status") or manifest.get("status") or ""),
+        "result_status": str(
+            live_status.get("result_status")
+            or manifest.get("result_status")
+            or live_status.get("status")
+            or manifest.get("status")
+            or ""
+        ),
+        "progress_ratio": _gnn_optuna_normalize_progress(manifest, live_status),
+        "current_step_id": str(live_status.get("step_id") or ""),
+        "message": str(live_status.get("message") or manifest.get("last_message") or ""),
+        "updated_at": str(
+            live_status.get("timestamp")
+            or manifest.get("updated_at")
+            or manifest.get("created_at")
+            or ""
+        ),
+        "model_name": str(live_status.get("model_name") or manifest.get("model_name") or "GNN"),
+        "objective_metric": str(
+            live_status.get("objective_metric") or manifest.get("objective_metric") or ""
+        ),
+        "backend": str(live_status.get("backend") or manifest.get("backend") or "optuna"),
+        "balancing_strategy": str(
+            live_status.get("balancing_strategy") or manifest.get("balancing_strategy") or ""
+        ),
+        "completed_trials": _safe_int(
+            live_status.get(
+                "completed_trials",
+                live_progress.get("completed_trials", progress.get("completed_trials")),
+            )
+        ),
+        "ok_trials": _safe_int(
+            live_status.get(
+                "ok_trials",
+                live_progress.get("ok_trials", progress.get("ok_trials")),
+            )
+        ),
+        "failed_trials": _safe_int(
+            live_status.get(
+                "failed_trials",
+                live_progress.get("failed_trials", progress.get("failed_trials")),
+            )
+        ),
+        "pruned_trials": _safe_int(
+            live_status.get(
+                "pruned_trials",
+                live_progress.get("pruned_trials", progress.get("pruned_trials")),
+            )
+        ),
+        "total_trials": _safe_int(
+            live_status.get(
+                "total_trials",
+                live_progress.get("total_trials", progress.get("total_trials")),
+            )
+        ),
+        "current_trial": _maybe_int(
+            live_status.get(
+                "current_trial",
+                live_progress.get("current_trial", progress.get("current_trial")),
+            )
+        ),
+        "current_epoch": _maybe_int(
+            live_status.get(
+                "current_epoch",
+                live_progress.get("current_epoch", progress.get("current_epoch")),
+            )
+        ),
+        "total_epochs": _safe_int(
+            live_status.get(
+                "total_epochs",
+                live_progress.get("total_epochs", progress.get("total_epochs")),
+            )
+        ),
+        "best_score": pd.to_numeric(
+            live_status.get("best_score", manifest.get("best_score")),
+            errors="coerce",
+        ),
+    }
+
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "run_dir": run_dir,
+        "live_status": live_status,
+        "live_events_df": live_events_df,
+        "live_status_path": live_status_path,
+        "live_events_path": live_events_path,
+        "loss_history_df": loss_history_df,
+        "loss_history_path": loss_history_path,
+        "loss_curve_df": loss_curve_df,
+        "trials_live_df": trials_live_df,
+        "trials_live_path": trials_live_path,
+        "search_curve_df": search_curve_df,
         "current_context": current_context,
     }
 
@@ -6577,6 +6942,191 @@ def _render_model_optuna_batch_live_view(data: Dict[str, object]) -> None:
             st.dataframe(_streamlit_arrow_safe_df(partial_results_df), width="stretch")
 
 
+def _render_gnn_optuna_live_view(data: Dict[str, object]) -> None:
+    manifest = dict(data.get("manifest") or {})
+    live_status = dict(data.get("live_status") or {})
+    live_events_df = data.get("live_events_df")
+    loss_curve_df = data.get("loss_curve_df")
+    trials_live_df = data.get("trials_live_df")
+    search_curve_df = data.get("search_curve_df")
+    current_context = dict(data.get("current_context") or {})
+
+    progress_ratio = pd.to_numeric(
+        current_context.get("progress_ratio"),
+        errors="coerce",
+    )
+    if pd.isna(progress_ratio):
+        progress_ratio = 0.0
+    progress_ratio = max(0.0, min(1.0, float(progress_ratio)))
+    status = str(current_context.get("status") or "unknown")
+    result_status = str(current_context.get("result_status") or status)
+    model_name = str(current_context.get("model_name") or "GNN")
+    objective_metric = str(current_context.get("objective_metric") or "-")
+    backend = str(current_context.get("backend") or "optuna")
+    completed_trials = _safe_int(current_context.get("completed_trials"))
+    failed_trials = _safe_int(current_context.get("failed_trials"))
+    pruned_trials = _safe_int(current_context.get("pruned_trials"))
+    ok_trials = _safe_int(
+        current_context.get("ok_trials"),
+        default=max(0, completed_trials - failed_trials - pruned_trials),
+    )
+    total_trials = _safe_int(current_context.get("total_trials"))
+    current_trial = current_context.get("current_trial")
+    current_epoch = current_context.get("current_epoch")
+    total_epochs = _safe_int(current_context.get("total_epochs"))
+    best_score = pd.to_numeric(current_context.get("best_score"), errors="coerce")
+    updated_at = str(current_context.get("updated_at") or "-")
+    current_message = str(current_context.get("message") or "")
+
+    st.caption("Experimento detectado: GNN Optuna")
+    st.caption(f"Checkpoint: {data.get('manifest_path')}")
+    st.caption(f"Run dir: {data.get('run_dir')}")
+
+    if status == "failed":
+        st.error(manifest.get("last_error") or current_message or "Optuna GNN fallido sin detalle persistido.")
+    elif status == "completed":
+        st.success("Optuna GNN completado. Se muestran eventos, losses y trials persistidos.")
+    else:
+        st.info("Optuna GNN en progreso. La vista usa el tracker live persistido.")
+
+    kpi_1, kpi_2, kpi_3, kpi_4, kpi_5, kpi_6, kpi_7 = st.columns(7)
+    kpi_1.metric("Modelo", model_name)
+    kpi_2.metric("Estado", status)
+    kpi_3.metric("Resultado", result_status)
+    kpi_4.metric("Progreso", f"{100.0 * progress_ratio:.1f}%")
+    kpi_5.metric("Trials OK", f"{ok_trials}/{total_trials or '-'}")
+    kpi_6.metric("Fallidos/Pruned", f"{failed_trials}/{pruned_trials}")
+    kpi_7.metric(
+        "Best score",
+        "-" if pd.isna(best_score) else f"{float(best_score):.4f}",
+    )
+
+    st.progress(progress_ratio)
+    st.caption(
+        f"Objetivo: {objective_metric} | Backend: {backend} | "
+        f"Balance: {current_context.get('balancing_strategy') or '-'}"
+    )
+    st.caption(
+        f"Trial actual: {current_trial if current_trial is not None else '-'} | "
+        f"Epoch: {current_epoch if current_epoch is not None else '-'}/{total_epochs or '-'}"
+    )
+    if current_message:
+        st.caption(current_message)
+    st.caption(f"Ultima actualizacion: {updated_at}")
+
+    live_tab, results_tab, data_tab = st.tabs(["Live", "Results", "Raw data"])
+
+    with live_tab:
+        st.markdown("**Avance temporal**")
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            plot_df = live_events_df[["event_index", "progress_pct"]].dropna(
+                subset=["progress_pct"]
+            )
+            if not plot_df.empty:
+                st.line_chart(
+                    plot_df.set_index("event_index")["progress_pct"],
+                    width="stretch",
+                )
+            visible_cols = [
+                col
+                for col in [
+                    "event_index",
+                    "timestamp",
+                    "event_type",
+                    "status",
+                    "current_trial",
+                    "current_epoch",
+                    "progress_pct",
+                    "score",
+                    "best_score",
+                    "message",
+                ]
+                if col in live_events_df.columns
+            ]
+            st.dataframe(
+                _streamlit_arrow_safe_df(live_events_df[visible_cols]),
+                width="stretch",
+            )
+        else:
+            st.info("No hay eventos live persistidos todavia.")
+
+        st.markdown("**Loss Train / Validacion**")
+        if isinstance(loss_curve_df, pd.DataFrame) and not loss_curve_df.empty:
+            loss_plot_df = loss_curve_df.copy()
+            for col in ["train_loss", "val_loss"]:
+                if col in loss_plot_df.columns:
+                    loss_plot_df[col] = pd.to_numeric(loss_plot_df[col], errors="coerce")
+            loss_cols = [
+                col
+                for col in ["train_loss", "val_loss"]
+                if col in loss_plot_df.columns and loss_plot_df[col].notna().any()
+            ]
+            if loss_cols:
+                st.line_chart(
+                    loss_plot_df.set_index("point")[loss_cols],
+                    width="stretch",
+                )
+            else:
+                st.info("No hay valores numericos de loss todavia.")
+            st.dataframe(
+                _streamlit_arrow_safe_df(loss_plot_df.tail(50)),
+                width="stretch",
+            )
+        else:
+            st.info("No hay historial de loss persistido todavia.")
+
+        st.markdown("**Objective y best-so-far**")
+        if isinstance(search_curve_df, pd.DataFrame) and not search_curve_df.empty:
+            st.line_chart(
+                search_curve_df.set_index("trial_index")[["objective", "best_so_far"]],
+                width="stretch",
+            )
+            st.dataframe(
+                _streamlit_arrow_safe_df(search_curve_df),
+                width="stretch",
+            )
+        elif isinstance(loss_curve_df, pd.DataFrame) and not loss_curve_df.empty:
+            score_df = loss_curve_df.copy()
+            if {"point", "score", "best_score"}.issubset(score_df.columns):
+                score_df["score"] = pd.to_numeric(score_df["score"], errors="coerce")
+                score_df["best_score"] = pd.to_numeric(score_df["best_score"], errors="coerce")
+                score_df = score_df.dropna(subset=["score"])
+                if not score_df.empty:
+                    st.line_chart(
+                        score_df.set_index("point")[["score", "best_score"]],
+                        width="stretch",
+                    )
+                else:
+                    st.info("Aun no hay objective score numerico.")
+            else:
+                st.info("Aun no hay objective score numerico.")
+        else:
+            st.info("No hay curva de busqueda persistida todavia.")
+
+    with results_tab:
+        if isinstance(trials_live_df, pd.DataFrame) and not trials_live_df.empty:
+            st.markdown("**Trials Optuna persistidos**")
+            st.dataframe(_streamlit_arrow_safe_df(trials_live_df), width="stretch")
+        else:
+            st.info("No hay trials persistidos todavia.")
+        if isinstance(loss_curve_df, pd.DataFrame) and not loss_curve_df.empty:
+            st.markdown("**Loss history**")
+            st.dataframe(_streamlit_arrow_safe_df(loss_curve_df), width="stretch")
+
+    with data_tab:
+        st.markdown("**Manifest**")
+        st.json(manifest, expanded=False)
+        if live_status:
+            st.markdown("**Live status**")
+            st.json(live_status, expanded=False)
+        if isinstance(live_events_df, pd.DataFrame) and not live_events_df.empty:
+            st.markdown("**Live events**")
+            st.dataframe(_streamlit_arrow_safe_df(live_events_df), width="stretch")
+        if isinstance(trials_live_df, pd.DataFrame) and not trials_live_df.empty:
+            st.markdown("**Trials raw**")
+            st.dataframe(_streamlit_arrow_safe_df(trials_live_df), width="stretch")
+
+
 def _render_calibration_experiment_live_view(data: Dict[str, object]) -> None:
     manifest = dict(data.get("manifest") or {})
     protocol = dict(data.get("protocol") or {})
@@ -7627,6 +8177,9 @@ def main(*, set_page_config: bool = True) -> None:
     elif source_type == "model_optuna_batch":
         run_data = _read_model_optuna_batch_run(path)
         _render_model_optuna_batch_live_view(run_data)
+    elif source_type == "gnn_optuna":
+        run_data = _read_gnn_optuna_run(path)
+        _render_gnn_optuna_live_view(run_data)
     elif source_type == "dynamic_gmm":
         _render_dynamic_gmm_live_view(path)
     else:
