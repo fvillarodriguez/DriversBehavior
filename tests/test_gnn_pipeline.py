@@ -23,6 +23,7 @@ from src.graph_builder_app import (
     _compute_normalization_stats_from_train,
     _compute_temporal_split_masks,
     _compute_graph_semantic_hash,
+    _resolve_graph_identity_for_loaded_graph,
     _resolve_graph_hash_for_loaded_graph,
     PMIndex,
 )
@@ -428,20 +429,26 @@ def test_graph_semantic_hash_ignores_non_semantic_metadata_fields():
     assert hash_a == hash_b
 
 
-def test_resolve_graph_hash_prefers_semantic_metadata_over_file_hash():
+def test_resolve_graph_hash_prefers_semantic_metadata_over_file_hash(tmp_path):
     data = HeteroData()
     data.graph_metadata = {"graph_hash": "a" * 64}
+    graph_path = tmp_path / "graph.pt"
+    graph_path.write_bytes(b"graph bytes")
+    expected_file_hash = __import__("hashlib").sha256(b"graph bytes").hexdigest()
 
-    graph_hash = _resolve_graph_hash_for_loaded_graph(
-        {
-            "data": data,
-            "metadata": {"graph_hash": "b" * 64},
-            "graph_hash": "c" * 64,
-            "filename": "missing_graph.pt",
-        }
-    )
+    loaded = {
+        "data": data,
+        "metadata": {"graph_hash": "b" * 64},
+        "graph_hash": "c" * 64,
+        "graph_path": str(graph_path),
+    }
+    graph_hash = _resolve_graph_hash_for_loaded_graph(loaded)
+    identity = _resolve_graph_identity_for_loaded_graph(loaded)
 
     assert graph_hash == "c" * 64
+    assert identity["graph_hash"] == "c" * 64
+    assert identity["graph_file_hash"] == expected_file_hash
+    assert identity["graph_hash_source"] == "semantic_metadata"
 
 def test_network_config_translation():
     """

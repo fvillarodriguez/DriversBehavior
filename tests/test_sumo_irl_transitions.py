@@ -13,7 +13,13 @@ if str(SRC_DIR) not in sys.path:
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from SUMO import FlowColumns, build_irl_transition_dataset, run_sumo_pipeline  # noqa: E402
+from SUMO import (  # noqa: E402
+    FlowColumns,
+    build_irl_transition_dataset,
+    build_sumo_fcd_transition_dataset,
+    is_sumo_fcd_transition_dataset,
+    run_sumo_pipeline,
+)
 from src.marl_core import build_expert_datasets, MAIRLManager  # noqa: E402
 
 
@@ -123,6 +129,79 @@ def test_irl_transition_dataset_assigns_temporal_splits_by_agent():
     assert set(transitions["temporal_split"]) == {"train", "validation", "test"}
     for _, group in transitions.groupby("agent_id"):
         assert set(group["temporal_split"]) == {"train", "validation", "test"}
+
+
+def test_sumo_fcd_transition_dataset_uses_consecutive_vehicle_samples(tmp_path):
+    fcd_path = tmp_path / "sumo_fcd.xml"
+    fcd_path.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<fcd-export>
+  <timestep time="0.0">
+    <vehicle id="veh_a" type="car" speed="10.0" acceleration="0.0" lane="edge0_0" edge="edge0" pos="10.0" x="0.0" y="0.0"/>
+    <vehicle id="veh_b" type="truck" speed="8.0" acceleration="0.0" lane="edge0_0" edge="edge0" pos="25.0" x="15.0" y="0.0"/>
+  </timestep>
+  <timestep time="1.0">
+    <vehicle id="veh_a" type="car" speed="12.0" acceleration="2.0" lane="edge0_1" edge="edge0" pos="22.0" x="12.0" y="3.5"/>
+    <vehicle id="veh_b" type="truck" speed="8.5" acceleration="0.5" lane="edge0_0" edge="edge0" pos="33.0" x="23.0" y="0.0"/>
+  </timestep>
+  <timestep time="2.0">
+    <vehicle id="veh_a" type="car" speed="11.0" acceleration="-1.0" lane="edge0_1" edge="edge0" pos="33.0" x="23.0" y="3.5"/>
+    <vehicle id="veh_b" type="truck" speed="9.0" acceleration="0.5" lane="edge0_0" edge="edge0" pos="42.0" x="32.0" y="0.0"/>
+  </timestep>
+</fcd-export>
+""",
+        encoding="utf-8",
+    )
+
+    transitions = build_sumo_fcd_transition_dataset(fcd_path)
+
+    assert len(transitions) == 4
+    assert is_sumo_fcd_transition_dataset(transitions)
+    assert set(transitions["agent_id"]) == {"car", "truck"}
+    assert (transitions["source"] == "sumo_fcd").all()
+    assert (transitions["delta_t_s"] == 1.0).all()
+
+    veh_a_first = transitions[transitions["trajectory_id"] == "veh_a"].iloc[0]
+    assert veh_a_first["state_speed_kmh"] == pytest.approx(36.0)
+    assert veh_a_first["next_speed_kmh"] == pytest.approx(43.2)
+    assert veh_a_first["action_delta_speed_kmh"] == pytest.approx(7.2)
+    assert veh_a_first["action_accel_m_s2"] == pytest.approx(2.0)
+    assert veh_a_first["action_lane_change"] == pytest.approx(1.0)
+    assert veh_a_first["state_headway_s"] == pytest.approx(1.5)
+
+
+def test_sumo_fcd_dataset_feeds_next_states_without_proxy(tmp_path):
+    fcd_path = tmp_path / "sumo_fcd.xml"
+    fcd_path.write_text(
+        """<fcd-export>
+  <timestep time="0.0">
+    <vehicle id="veh_a" type="car" speed="10.0" lane="edge0_0" edge="edge0" pos="10.0"/>
+  </timestep>
+  <timestep time="1.0">
+    <vehicle id="veh_a" type="car" speed="12.0" lane="edge0_1" edge="edge0" pos="22.0"/>
+  </timestep>
+  <timestep time="2.0">
+    <vehicle id="veh_a" type="car" speed="11.0" lane="edge0_1" edge="edge0" pos="33.0"/>
+  </timestep>
+</fcd-export>
+""",
+        encoding="utf-8",
+    )
+    transitions = build_sumo_fcd_transition_dataset(fcd_path)
+
+    datasets, _, feature_cols, _, _, _ = build_expert_datasets(
+        transitions,
+        feature_cols=["state_speed_kmh", "state_lane", "state_pos_m"],
+        agent_ids=["car"],
+    )
+
+    assert "state_pos_m" in feature_cols
+    assert datasets["car"].states.shape == datasets["car"].next_states.shape
+    assert not (datasets["car"].states == datasets["car"].next_states).all()
+
+
+def test_non_fcd_dataset_is_not_accepted_for_fcd_training():
+    assert not is_sumo_fcd_transition_dataset(_transition_training_frame())
 
 
 def _transition_training_frame() -> pd.DataFrame:

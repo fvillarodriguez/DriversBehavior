@@ -78,21 +78,21 @@
     <p class="reveal">El discriminador maximiza \( \mathbb{E}_{X_E}[\log D] + \mathbb{E}_{X_\pi}[\log(1-D)] \); la política maximiza \( \mathbb{E}_{X_\pi}[f_\omega(s,a) - \log q_\theta(a\mid s)] \) (Ec. 12 del paper).</p>
 
     <div class="lab-callout ochre reveal">
-      <div class="label">Proxy temporal</div>
-      <p>Ante la ausencia de transiciones explícitas, se aplica un proxy de un paso \( s' = s \). La decisión está documentada en el código: permite conservar la estructura del potencial sin requerir secuencias completas, y queda como limitación conocida hasta disponer de trayectorias reales.</p>
+      <div class="label">Trayectorias SUMO FCD</div>
+      <p>La implementación activa construye \(s, a, s'\) desde muestras consecutivas de <a href="https://sumo.dlr.de/docs/Simulation/Output/FCDOutput.html">SUMO FCDOutput</a>. SUMOPy se conserva como <a href="https://sumo.dlr.de/docs/Contributed/SUMOPy/index.html">referencia conceptual</a>, pero no se añade como dependencia por su stack histórico Python 2.7/wxPython.</p>
     </div>
 
     <h3 class="reveal">Exportación a SUMO</h3>
     <p class="reveal">Al finalizar el entrenamiento, se evalúa la política en el estado medio y se desnormalizan los parámetros a los rangos SUMO. El archivo generado es <code>mairl_vtypes.add.xml</code>, con un <code>vType</code> por cluster.</p>
 
     <h3 class="reveal">UI y métricas</h3>
-    <p class="reveal">La interfaz ofrece un selector de algoritmo: <em>MA-AIRL (paper)</em> frente a <em>CEM (legacy)</em>, con controles de batch size, \(\gamma\), learning rates, tamaño de red y dispositivo. Durante el entrenamiento se reportan <code>disc_loss</code>, <code>policy_loss</code> y <code>reward_mean</code>.</p>
+    <p class="reveal">La interfaz ofrece un selector de algoritmo: <em>MA-AIRL (SUMO FCD)</em> frente a <em>CEM (legacy)</em>, importación/generación de <code>sumo_fcd.xml</code>, y controles de batch size, \(\gamma\), learning rates, tamaño de red y dispositivo. Durante el entrenamiento se reportan <code>disc_loss</code>, <code>policy_loss</code> y <code>reward_mean</code>.</p>
 
     <h3 class="reveal">Limitaciones y próximos pasos</h3>
     <ul class="reveal">
-      <li>\(s' = s\) por falta de secuencias temporales explícitas.</li>
-      <li>Acciones expertas como heurística a partir de métricas agregadas.</li>
-      <li>Construir trayectorias reales desde SUMO o datos temporales para estimar \(s'\) y acciones reales.</li>
+      <li>La fidelidad de \(s'\) y acciones reales depende del periodo FCD; el valor por defecto es 1 segundo.</li>
+      <li>El headway se estima por tiempo, edge, carril y posición dentro del FCD.</li>
+      <li>No hay fallback a \(s'=s\): MA-AIRL requiere transiciones FCD válidas.</li>
     </ul>
 
     <div class="lab-callout sage reveal">

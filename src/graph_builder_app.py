@@ -22,7 +22,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -2343,6 +2343,809 @@ def _load_hparams_for_model(model_path: str) -> Dict[str, object]:
         return {}
 
 
+def _list_gnn_model_files_for_baseline() -> List[str]:
+    return sorted(
+        glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+
+
+def _coerce_optional_float(value: object) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _mask_name_to_split(mask_name: str) -> str:
+    text = str(mask_name or "")
+    return text[:-5] if text.endswith("_mask") else text
+
+
+def _comparison_tau_from_val_result(
+    val_result: Optional[Dict[str, object]],
+    *,
+    fallback_tau: Optional[float] = None,
+) -> float:
+    if val_result:
+        try:
+            y_true = val_result.get("true")
+            y_prob = val_result.get("probs")
+            if torch.is_tensor(y_true):
+                y_true_np = y_true.detach().cpu().numpy().astype(int).ravel()
+            else:
+                y_true_np = np.asarray(y_true).astype(int).ravel()
+            if torch.is_tensor(y_prob):
+                y_prob_np = y_prob.detach().cpu().numpy()
+            else:
+                y_prob_np = np.asarray(y_prob)
+            if y_prob_np.ndim == 2 and y_prob_np.shape[1] > 1:
+                y_prob1 = y_prob_np[:, 1].astype(float).ravel()
+            else:
+                y_prob1 = y_prob_np.astype(float).ravel()
+            if y_true_np.size and y_true_np.size == y_prob1.size:
+                from sklearn.metrics import precision_recall_curve
+
+                prec, rec, thr = precision_recall_curve(y_true_np, y_prob1)
+                prec_, rec_, thr_ = prec[1:], rec[1:], thr
+                if len(thr_) and len(prec_):
+                    fbeta = 2.0 * prec_ * rec_ / np.clip(prec_ + rec_, 1e-12, None)
+                    if np.isfinite(fbeta).any():
+                        return float(thr_[int(np.nanargmax(fbeta))])
+        except Exception:
+            pass
+    if fallback_tau is not None:
+        coerced = _coerce_optional_float(fallback_tau)
+        if coerced is not None:
+            return float(coerced)
+    return 0.5
+
+
+def _checkpoint_tau_from_meta(meta: Mapping[str, object]) -> Optional[float]:
+    for key in ("best_val_tau", "best_tau", "tau"):
+        value = _coerce_optional_float(meta.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _f05_from_precision_recall(precision: object, recall: object) -> Optional[float]:
+    p = _coerce_optional_float(precision)
+    r = _coerce_optional_float(recall)
+    if p is None or r is None:
+        return None
+    beta2 = 0.25
+    denom = beta2 * p + r
+    if denom <= 0:
+        return 0.0
+    return float((1.0 + beta2) * p * r / denom)
+
+
+def _confusion_counts_from_result(result: Mapping[str, object]) -> Dict[str, int]:
+    cm = result.get("cm") if isinstance(result, Mapping) else None
+    try:
+        cm_arr = np.asarray(cm, dtype=int)
+        if cm_arr.shape == (2, 2):
+            tn, fp, fn, tp = cm_arr.ravel()
+            return {"tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn)}
+    except Exception:
+        pass
+
+    y_true = result.get("true") if isinstance(result, Mapping) else None
+    y_pred = result.get("preds") if isinstance(result, Mapping) else None
+    try:
+        y_true_np = (
+            y_true.detach().cpu().numpy()
+            if torch.is_tensor(y_true)
+            else np.asarray(y_true)
+        ).astype(int).ravel()
+        y_pred_np = (
+            y_pred.detach().cpu().numpy()
+            if torch.is_tensor(y_pred)
+            else np.asarray(y_pred)
+        ).astype(int).ravel()
+        if y_true_np.size and y_true_np.size == y_pred_np.size:
+            return {
+                "tp": int(((y_pred_np == 1) & (y_true_np == 1)).sum()),
+                "tn": int(((y_pred_np == 0) & (y_true_np == 0)).sum()),
+                "fp": int(((y_pred_np == 1) & (y_true_np == 0)).sum()),
+                "fn": int(((y_pred_np == 0) & (y_true_np == 1)).sum()),
+            }
+    except Exception:
+        pass
+    return {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
+
+
+def _brier_score_from_result(result: Mapping[str, object]) -> Optional[float]:
+    for key in ("brier_score", "brier"):
+        value = _coerce_optional_float(result.get(key))
+        if value is not None:
+            return value
+    y_true = result.get("true") if isinstance(result, Mapping) else None
+    y_prob = result.get("probs") if isinstance(result, Mapping) else None
+    try:
+        y_true_np = (
+            y_true.detach().cpu().numpy()
+            if torch.is_tensor(y_true)
+            else np.asarray(y_true)
+        ).astype(int).ravel()
+        y_prob_np = (
+            y_prob.detach().cpu().numpy()
+            if torch.is_tensor(y_prob)
+            else np.asarray(y_prob)
+        ).astype(float)
+        if y_prob_np.ndim == 2 and y_prob_np.shape[1] > 1:
+            prob1 = y_prob_np[:, 1]
+        else:
+            prob1 = y_prob_np.ravel()
+        if y_true_np.size and y_true_np.size == prob1.size:
+            return float(np.mean((np.clip(prob1, 0.0, 1.0) - y_true_np) ** 2))
+    except Exception:
+        pass
+    return None
+
+
+def _gnn_eval_result_to_comparison_row(
+    *,
+    model_path: str,
+    mask_name: str,
+    result: Dict[str, object],
+    tau: float,
+    meta: Mapping[str, object],
+) -> Dict[str, object]:
+    report = result.get("report") or {}
+    pos_report = report.get("Accidente (1)", {}) if isinstance(report, dict) else {}
+    true = result.get("true")
+    if torch.is_tensor(true):
+        y_true_np = true.detach().cpu().numpy().astype(int).ravel()
+    else:
+        y_true_np = np.asarray(true if true is not None else [], dtype=int).ravel()
+    far_raw = result.get("far")
+    if far_raw is None:
+        far_raw = result.get("false_alarm_ratio")
+    precision = _coerce_optional_float(pos_report.get("precision"))
+    recall = _coerce_optional_float(pos_report.get("recall"))
+    counts = _confusion_counts_from_result(result)
+    return {
+        "model": "GNN checkpoint",
+        "baseline": "gnn_checkpoint",
+        "split": _mask_name_to_split(mask_name),
+        "status": "completed",
+        "reason": "",
+        "model_path": os.path.basename(model_path),
+        "graph_hash": meta.get("graph_hash"),
+        "samples": int(y_true_np.size),
+        "positives": int(y_true_np.sum()) if y_true_np.size else 0,
+        "positive_rate": float(y_true_np.mean()) if y_true_np.size else 0.0,
+        "train_samples": None,
+        "val_samples": None,
+        "test_samples": None,
+        "epochs_run": None,
+        "best_epoch": meta.get("best_epoch"),
+        "best_val_auprc": _coerce_optional_float(meta.get("best_val_auprc")),
+        "train_loss": None,
+        "auprc": _coerce_optional_float(result.get("auprc")),
+        "auc": _coerce_optional_float(result.get("auc")),
+        "f1_at_tau_val": _coerce_optional_float(pos_report.get("f1-score")),
+        "f05_at_tau_val": _f05_from_precision_recall(precision, recall),
+        "precision": precision,
+        "recall": recall,
+        "far": _coerce_optional_float(far_raw),
+        "mcc": _coerce_optional_float(result.get("mcc")),
+        "accuracy": _coerce_optional_float(report.get("accuracy")) if isinstance(report, dict) else None,
+        "tp": counts["tp"],
+        "tn": counts["tn"],
+        "fp": counts["fp"],
+        "fn": counts["fn"],
+        "brier_score": _brier_score_from_result(result),
+        "tau": float(tau),
+        "tau_source": "val_f1_beta1",
+    }
+
+
+def _gnn_checkpoint_skip_rows_for_comparison(
+    *,
+    model_path: str,
+    reason: str,
+    meta: Optional[Mapping[str, object]] = None,
+    masks: Sequence[str] = ("val_mask", "test_mask"),
+) -> List[Dict[str, object]]:
+    meta = meta or {}
+    rows: List[Dict[str, object]] = []
+    for mask_name in masks:
+        rows.append(
+            {
+                "model": "GNN checkpoint",
+                "baseline": "gnn_checkpoint",
+                "split": _mask_name_to_split(mask_name),
+                "status": "skipped",
+                "reason": reason,
+                "model_path": os.path.basename(str(model_path)),
+                "graph_hash": meta.get("graph_hash"),
+                "samples": 0,
+                "positives": 0,
+                "positive_rate": 0.0,
+                "train_samples": None,
+                "val_samples": None,
+                "test_samples": None,
+                "epochs_run": None,
+                "best_epoch": meta.get("best_epoch"),
+                "best_val_auprc": _coerce_optional_float(meta.get("best_val_auprc")),
+                "train_loss": None,
+                "auprc": None,
+                "auc": None,
+                "f1_at_tau_val": None,
+                "f05_at_tau_val": None,
+                "precision": None,
+                "recall": None,
+                "far": None,
+                "mcc": None,
+                "accuracy": None,
+                "tp": 0,
+                "tn": 0,
+                "fp": 0,
+                "fn": 0,
+                "brier_score": None,
+                "tau": _checkpoint_tau_from_meta(meta),
+                "tau_source": "metadata_or_default",
+            }
+        )
+    return rows
+
+
+def _evaluate_gnn_checkpoint_for_comparison(
+    *,
+    model_path: str,
+    graph_obj: Dict[str, object],
+    graph_data: HeteroData,
+    device: object,
+    batch_size: int,
+    num_neighbors: Optional[object] = None,
+    progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+) -> List[Dict[str, object]]:
+    from src import gnn_main as graph_main
+
+    node_type = "pm"
+    meta = _load_hparams_for_model(model_path)
+
+    def _notify(**payload: object) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(dict(payload))
+        except Exception:
+            pass
+
+    try:
+        _notify(event="gnn_checkpoint_start", model=os.path.basename(str(model_path)))
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+        if isinstance(state_dict, dict) and ("model_state" in state_dict or "state_dict" in state_dict):
+            state_dict = state_dict.get("model_state") or state_dict.get("state_dict")
+        elif isinstance(state_dict, torch.nn.Module):
+            state_dict = state_dict.state_dict()
+        if not isinstance(state_dict, dict):
+            return _gnn_checkpoint_skip_rows_for_comparison(
+                model_path=model_path,
+                reason="El checkpoint no contiene state_dict evaluable.",
+                meta=meta,
+            )
+
+        is_ok, msg = _check_model_graph_compat(
+            model_path,
+            graph_data,
+            node_type=node_type,
+            meta=meta,
+            state_dict=state_dict,
+        )
+        if not is_ok:
+            return _gnn_checkpoint_skip_rows_for_comparison(
+                model_path=model_path,
+                reason=str(msg or "Checkpoint incompatible con el grafo actual."),
+                meta=meta,
+            )
+
+        if isinstance(device, str) and device in {"Auto", "CPU", "MPS", "CUDA"}:
+            eval_device = _resolve_eval_device(device)
+        else:
+            eval_device = torch.device(str(device))
+        arch = _infer_arch_from_state_dict(state_dict)
+        hidden_channels = int(meta.get("hidden_channels", arch["hidden_channels"]))
+        num_heads = int(meta.get("num_heads", arch["num_heads"]))
+        num_layers = int(meta.get("num_layers", arch["num_layers"]))
+        dropout = float(meta.get("dropout", 0.0))
+        out_channels = int(meta.get("out_channels", 0) or 0)
+        if out_channels <= 0:
+            try:
+                out_channels = int(len(torch.unique(graph_data[node_type].y)))
+            except Exception:
+                out_channels = 2
+        out_channels = max(out_channels, 2)
+
+        gnn_variant = _resolve_gnn_variant_for_checkpoint(model_path, meta, state_dict)
+        sequence_index = _resolve_sequence_index_for_checkpoint(
+            graph_obj.get("sequence_index") if isinstance(graph_obj, dict) else None,
+            state_dict,
+        )
+        checkpoint_temporal_kind = _checkpoint_temporal_kind(state_dict)
+        if checkpoint_temporal_kind is not None and sequence_index is None:
+            return _gnn_checkpoint_skip_rows_for_comparison(
+                model_path=model_path,
+                reason="El checkpoint temporal no tiene SequenceIndex disponible.",
+                meta=meta,
+            )
+
+        graph_num_nodes = int(
+            getattr(
+                graph_data[node_type],
+                "num_nodes",
+                graph_data[node_type].x.shape[0],
+            )
+        )
+        model_num_nodes = (
+            _temporal_num_nodes_from_state_dict(state_dict, graph_num_nodes)
+            if checkpoint_temporal_kind is not None
+            else graph_num_nodes
+        )
+        model = graph_main._build_gnn_model(
+            in_channels=int(graph_data[node_type].x.shape[1]),
+            hidden_channels=hidden_channels,
+            out_channels=out_channels,
+            num_heads=num_heads,
+            dropout=dropout,
+            edge_feature_dim=_infer_edge_feature_dim(graph_data),
+            num_layers=num_layers,
+            aggr1=meta.get("aggr1", "sum"),
+            aggr2=meta.get("aggr2", "sum"),
+            use_checkpointing=False,
+            gnn_variant=gnn_variant,
+            sequence_index=sequence_index,
+            num_nodes=model_num_nodes,
+            device=eval_device,
+        )
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+
+        available_masks = _list_available_masks(graph_data, node_type=node_type)
+        wanted_masks = [
+            mask
+            for mask in ("val_mask", "test_mask")
+            if mask in available_masks
+            and bool(graph_data[node_type][mask].sum().item() > 0)
+        ]
+        if not wanted_masks:
+            return _gnn_checkpoint_skip_rows_for_comparison(
+                model_path=model_path,
+                reason="No hay val_mask/test_mask no vacias para evaluar.",
+                meta=meta,
+            )
+
+        effective_neighbors = num_neighbors if num_neighbors not in (None, "") else meta.get("num_neighbors")
+        tau_fallback = _checkpoint_tau_from_meta(meta)
+        tau = tau_fallback if tau_fallback is not None else 0.5
+        if "val_mask" in wanted_masks:
+            _notify(event="gnn_checkpoint_calibrating", model=os.path.basename(str(model_path)))
+            val_results = graph_main.test(
+                model,
+                graph_data,
+                node_type=node_type,
+                threshold=None,
+                masks=["val_mask"],
+                batch_size=int(batch_size),
+                num_neighbors=effective_neighbors,
+            )
+            tau = _comparison_tau_from_val_result(
+                val_results.get("val_mask") if isinstance(val_results, dict) else None,
+                fallback_tau=tau_fallback,
+            )
+        _notify(event="gnn_checkpoint_tau", model=os.path.basename(str(model_path)), tau=float(tau))
+        eval_results = graph_main.test(
+            model,
+            graph_data,
+            node_type=node_type,
+            threshold=float(tau),
+            masks=wanted_masks,
+            batch_size=int(batch_size),
+            num_neighbors=effective_neighbors,
+        )
+
+        rows: List[Dict[str, object]] = []
+        for mask in ("val_mask", "test_mask"):
+            if mask not in wanted_masks:
+                rows.extend(
+                    _gnn_checkpoint_skip_rows_for_comparison(
+                        model_path=model_path,
+                        reason=f"{mask} no existe o esta vacia.",
+                        meta=meta,
+                        masks=(mask,),
+                    )
+                )
+                continue
+            result = eval_results.get(mask) if isinstance(eval_results, dict) else None
+            if not result:
+                rows.extend(
+                    _gnn_checkpoint_skip_rows_for_comparison(
+                        model_path=model_path,
+                        reason=f"No se obtuvieron resultados para {mask}.",
+                        meta=meta,
+                        masks=(mask,),
+                    )
+                )
+                continue
+            rows.append(
+                _gnn_eval_result_to_comparison_row(
+                    model_path=model_path,
+                    mask_name=mask,
+                    result=result,
+                    tau=float(tau),
+                    meta=meta,
+                )
+            )
+        _notify(event="gnn_checkpoint_done", model=os.path.basename(str(model_path)), tau=float(tau))
+        return rows
+    except Exception as exc:
+        return _gnn_checkpoint_skip_rows_for_comparison(
+            model_path=model_path,
+            reason=f"Error evaluando checkpoint: {exc}",
+            meta=meta,
+        )
+
+
+def _display_mlp_baseline_results(df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    display_cols = [
+        "model",
+        "split",
+        "status",
+        "auprc",
+        "auc",
+        "brier_score",
+        "f1_at_tau_val",
+        "f05_at_tau_val",
+        "precision",
+        "recall",
+        "far",
+        "mcc",
+        "accuracy",
+        "tp",
+        "tn",
+        "fp",
+        "fn",
+        "tau",
+        "samples",
+        "positives",
+        "positive_rate",
+        "best_epoch",
+        "epochs_run",
+        "tau_source",
+        "reason",
+        "model_path",
+    ]
+    rename_cols = {
+        "auprc": "PR_AUC",
+        "auc": "ROC_AUC",
+        "brier_score": "Brier_score",
+        "f1_at_tau_val": "F1@tau_val",
+        "f05_at_tau_val": "F0.5@tau_val",
+        "far": "FAR",
+        "mcc": "MCC",
+        "tp": "TP",
+        "tn": "TN",
+        "fp": "FP",
+        "fn": "FN",
+        "accuracy": "accuracy",
+        "tau": "tau",
+    }
+    available = [col for col in display_cols if col in df.columns]
+    display_df = df[available].rename(columns=rename_cols)
+    st.dataframe(display_df, width="stretch")
+
+
+def _render_mlp_baseline_results_chart(
+    df: pd.DataFrame,
+    *,
+    key: str = "gnn_mlp_baseline_chart_metrics",
+) -> None:
+    if df is None or df.empty:
+        return
+    metric_options = {
+        "MCC": "mcc",
+        "Brier_score": "brier_score",
+        "ROC_AUC": "auc",
+        "PR_AUC": "auprc",
+        "F1@tau_val": "f1_at_tau_val",
+        "F0.5@tau_val": "f05_at_tau_val",
+        "precision": "precision",
+        "recall": "recall",
+        "FAR": "far",
+        "accuracy": "accuracy",
+    }
+    available_labels = [
+        label
+        for label, col in metric_options.items()
+        if col in df.columns and pd.to_numeric(df[col], errors="coerce").notna().any()
+    ]
+    if not available_labels:
+        return
+    default_labels = [
+        label
+        for label in ("MCC", "Brier_score", "ROC_AUC", "PR_AUC")
+        if label in available_labels
+    ]
+    if not default_labels:
+        default_labels = available_labels[: min(4, len(available_labels))]
+    selected_labels = st.multiselect(
+        "Variables a graficar",
+        options=available_labels,
+        default=default_labels,
+        key=key,
+    )
+    if not selected_labels:
+        st.info("Seleccione al menos una variable para graficar.")
+        return
+
+    plot_df = df.copy()
+    if "status" in plot_df.columns:
+        plot_df = plot_df[
+            plot_df["status"].astype(str).isin(["completed", "metadata"])
+        ]
+    if plot_df.empty:
+        return
+    plot_df["model_split"] = (
+        plot_df["model"].astype(str) + " / " + plot_df["split"].astype(str)
+    )
+    value_cols = [metric_options[label] for label in selected_labels]
+    for col in value_cols:
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+    long_df = plot_df.melt(
+        id_vars=["model", "split", "model_split"],
+        value_vars=value_cols,
+        var_name="metric_col",
+        value_name="value",
+    ).dropna(subset=["value"])
+    if long_df.empty:
+        return
+    label_by_col = {col: label for label, col in metric_options.items()}
+    long_df["metric"] = long_df["metric_col"].map(label_by_col).fillna(long_df["metric_col"])
+
+    try:
+        import plotly.express as px
+
+        fig = px.bar(
+            long_df,
+            x="model_split",
+            y="value",
+            color="metric",
+            barmode="group",
+            facet_row="metric" if len(selected_labels) > 2 else None,
+            labels={
+                "model_split": "Modelo / split",
+                "value": "Valor",
+                "metric": "Métrica",
+            },
+            height=max(360, 170 * min(len(selected_labels), 5)),
+        )
+        fig.update_layout(legend_title_text="Métrica", margin=dict(l=10, r=10, t=35, b=10))
+        fig.update_xaxes(tickangle=-25)
+        fig.update_yaxes(matches=None)
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        fallback_df = long_df.pivot_table(
+            index="model_split",
+            columns="metric",
+            values="value",
+            aggfunc="first",
+        )
+        st.bar_chart(fallback_df)
+
+
+def _gnn_mlp_baseline_results_dir() -> Path:
+    return Path(RESULTADOS_DIR) / "gnn_mlp_baselines"
+
+
+def _comparison_hash_text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip().lower()
+    if not text or text in {"none", "nan", "unknown"}:
+        return ""
+    return re.sub(r"[^0-9a-zA-Z_.-]+", "_", text)
+
+
+def _comparison_graph_hash_matches(candidate: object, graph_hash: object) -> bool:
+    candidate_text = _comparison_hash_text(candidate)
+    graph_text = _comparison_hash_text(graph_hash)
+    if not candidate_text or not graph_text:
+        return False
+    if candidate_text == graph_text:
+        return True
+    prefix_len = min(len(candidate_text), len(graph_text), 16)
+    return prefix_len >= 6 and candidate_text[:prefix_len] == graph_text[:prefix_len]
+
+
+def _comparison_artifact_name_matches_graph(path: Path, graph_hash: object) -> bool:
+    graph_text = _comparison_hash_text(graph_hash)
+    if not graph_text:
+        return False
+    needle = graph_text[:16] if len(graph_text) >= 16 else graph_text
+    return needle in path.name.lower()
+
+
+def _comparison_dataframe_matches_graph(df: pd.DataFrame, graph_hash: object) -> bool:
+    if df is None or df.empty or "graph_hash" not in df.columns:
+        return False
+    return any(
+        _comparison_graph_hash_matches(value, graph_hash)
+        for value in df["graph_hash"].dropna().tolist()
+    )
+
+
+def _filter_comparison_dataframe_for_graph(
+    df: pd.DataFrame,
+    graph_hash: object,
+) -> pd.DataFrame:
+    if df is None or df.empty or "graph_hash" not in df.columns:
+        return df
+    match_mask = df["graph_hash"].apply(
+        lambda value: _comparison_graph_hash_matches(value, graph_hash)
+    )
+    missing_mask = df["graph_hash"].apply(lambda value: not _comparison_hash_text(value))
+    if not bool(match_mask.any()):
+        return df.iloc[0:0].copy()
+    return df[match_mask | missing_mask].reset_index(drop=True)
+
+
+def _read_gnn_mlp_baseline_result(path: Path) -> Optional[pd.DataFrame]:
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    df.attrs["artifact_path"] = str(path)
+    return df
+
+
+def _list_gnn_mlp_baseline_history(graph_hash: object) -> List[Dict[str, object]]:
+    graph_text = _comparison_hash_text(graph_hash)
+    if not graph_text:
+        return []
+    results_dir = _gnn_mlp_baseline_results_dir()
+    if not results_dir.exists():
+        return []
+
+    entries: List[Dict[str, object]] = []
+    paths = sorted(results_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in paths:
+        name_matches = _comparison_artifact_name_matches_graph(path, graph_text)
+        df = _read_gnn_mlp_baseline_result(path)
+        if df is None or df.empty:
+            continue
+        column_matches = _comparison_dataframe_matches_graph(df, graph_text)
+        if not column_matches and not (name_matches and "graph_hash" not in df.columns):
+            continue
+        if column_matches:
+            df = _filter_comparison_dataframe_for_graph(df, graph_text)
+            if df.empty:
+                continue
+        entries.append(
+            {
+                "path": path,
+                "df": df,
+                "mtime": path.stat().st_mtime,
+            }
+        )
+    return entries
+
+
+def _history_entry_label(entry: Mapping[str, object]) -> str:
+    path = entry.get("path")
+    path_obj = Path(path) if path is not None else Path("result.csv")
+    mtime = entry.get("mtime")
+    try:
+        stamp = datetime.fromtimestamp(float(mtime)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        stamp = "fecha desconocida"
+    return f"{stamp} - {path_obj.name}"
+
+
+def _summarize_gnn_mlp_baseline_history(entries: Sequence[Mapping[str, object]]) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for entry in entries:
+        path = Path(entry.get("path", "result.csv"))
+        df = entry.get("df")
+        if not isinstance(df, pd.DataFrame):
+            continue
+        if "status" in df.columns:
+            completed = df[df["status"].astype(str).eq("completed")]
+        else:
+            completed = df.copy()
+        metric_df = completed
+        if "split" in completed.columns:
+            test_df = completed[completed["split"].astype(str).str.lower().eq("test")]
+            if not test_df.empty:
+                metric_df = test_df
+        best_auprc = None
+        if "auprc" in metric_df.columns:
+            numeric_auprc = pd.to_numeric(metric_df["auprc"], errors="coerce")
+            if numeric_auprc.notna().any():
+                best_auprc = float(numeric_auprc.max())
+        models = []
+        if "model" in df.columns:
+            models = sorted(str(v) for v in df["model"].dropna().unique())
+        graph_sources = []
+        if "graph_source" in df.columns:
+            graph_sources = sorted(str(v) for v in df["graph_source"].dropna().unique())
+        try:
+            modified_at = datetime.fromtimestamp(float(entry.get("mtime", 0))).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except Exception:
+            modified_at = ""
+        rows.append(
+            {
+                "archivo": path.name,
+                "modificado": modified_at,
+                "filas": int(len(df)),
+                "modelos": ", ".join(models[:4]) + ("..." if len(models) > 4 else ""),
+                "fuente_grafo": ", ".join(graph_sources) if graph_sources else "N/A",
+                "mejor_PR_AUC_test": best_auprc,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _comparison_session_token(graph_obj: Mapping[str, object]) -> str:
+    graph_hash = _resolve_graph_hash_for_loaded_graph(dict(graph_obj))
+    source_label = str(graph_obj.get("_comparison_source_label") or "")
+    if graph_hash:
+        return f"hash:{graph_hash}|source:{source_label}"
+    for key in ("graph_path", "path"):
+        raw_path = graph_obj.get(key)
+        if raw_path:
+            try:
+                return f"path:{Path(str(raw_path)).resolve()}|source:{source_label}"
+            except Exception:
+                return f"path:{raw_path}|source:{source_label}"
+    filename = graph_obj.get("filename")
+    if filename:
+        return f"filename:{filename}|source:{source_label}"
+    return f"memory:{id(graph_obj.get('data'))}|source:{source_label}"
+
+
+def _attach_comparison_metadata(
+    df: pd.DataFrame,
+    *,
+    graph_hash: object,
+    graph_source: object,
+) -> pd.DataFrame:
+    out = df.copy()
+    graph_text = _comparison_hash_text(graph_hash)
+    if graph_text:
+        if "graph_hash" not in out.columns:
+            out["graph_hash"] = graph_text
+        else:
+            missing = out["graph_hash"].isna() | out["graph_hash"].astype(str).str.strip().str.lower().isin(
+                ["", "none", "nan", "unknown"]
+            )
+            out.loc[missing, "graph_hash"] = graph_text
+    source_text = str(graph_source or "").strip()
+    if source_text:
+        if "graph_source" not in out.columns:
+            out["graph_source"] = source_text
+        else:
+            missing = out["graph_source"].isna() | out["graph_source"].astype(str).str.strip().eq("")
+            out.loc[missing, "graph_source"] = source_text
+    return out
+
+
 def _list_available_masks(graph_data: HeteroData, node_type: str = "pm") -> List[str]:
     try:
         return [k for k in graph_data[node_type].keys() if k.endswith("_mask")]
@@ -2502,34 +3305,66 @@ def _normalize_graph_hash_value(value: object) -> Optional[str]:
     return None
 
 
-def _resolve_graph_hash_for_loaded_graph(obj: Dict[str, object]) -> Optional[str]:
+def _resolve_graph_identity_for_loaded_graph(obj: Dict[str, object]) -> Dict[str, Optional[str]]:
+    identity = {
+        "graph_hash": None,
+        "graph_file_hash": None,
+        "graph_hash_source": None,
+    }
     if not isinstance(obj, dict):
-        return None
+        return identity
+
+    try:
+        from src import gnn_main as graph_main
+
+        resolved = graph_main._resolve_graph_identity(obj)
+        if isinstance(resolved, dict):
+            identity.update(
+                {
+                    "graph_hash": _normalize_graph_hash_value(resolved.get("graph_hash")),
+                    "graph_file_hash": _normalize_graph_hash_value(resolved.get("graph_file_hash")),
+                    "graph_hash_source": resolved.get("graph_hash_source"),
+                }
+            )
+            return identity
+    except Exception:
+        pass
 
     for raw in (obj.get("graph_hash"), obj.get("hash")):
         normalized = _normalize_graph_hash_value(raw)
         if normalized:
-            return normalized
+            identity["graph_hash"] = normalized
+            identity["graph_hash_source"] = "semantic_metadata"
+            break
 
-    for meta_key in ("metadata", "meta"):
-        meta = obj.get(meta_key)
-        if isinstance(meta, dict):
-            normalized = _normalize_graph_hash_value(meta.get("graph_hash"))
-            if normalized:
-                return normalized
+    if not identity["graph_hash"]:
+        for meta_key in ("metadata", "meta"):
+            meta = obj.get(meta_key)
+            if isinstance(meta, dict):
+                normalized = _normalize_graph_hash_value(meta.get("graph_hash"))
+                if normalized:
+                    identity["graph_hash"] = normalized
+                    identity["graph_hash_source"] = "semantic_metadata"
+                    break
 
     data = obj.get("data")
-    for attr_name in ("graph_metadata", "metadata"):
-        meta = getattr(data, attr_name, None)
-        if isinstance(meta, dict):
-            normalized = _normalize_graph_hash_value(meta.get("graph_hash"))
-            if normalized:
-                return normalized
+    if not identity["graph_hash"]:
+        for attr_name in ("graph_metadata", "metadata"):
+            meta = getattr(data, attr_name, None)
+            if isinstance(meta, dict):
+                normalized = _normalize_graph_hash_value(meta.get("graph_hash"))
+                if normalized:
+                    identity["graph_hash"] = normalized
+                    identity["graph_hash_source"] = "semantic_metadata"
+                    break
 
-    for attr_name in ("graph_hash", "hash"):
-        normalized = _normalize_graph_hash_value(getattr(data, attr_name, None))
-        if normalized:
-            return normalized
+    if not identity["graph_hash"]:
+        for attr_name in ("graph_hash", "hash"):
+            normalized = _normalize_graph_hash_value(getattr(data, attr_name, None))
+            if normalized:
+                identity["graph_hash"] = normalized
+                identity["graph_hash_source"] = "semantic_metadata"
+                break
 
     graph_path = obj.get("graph_path") or obj.get("path")
     graph_filename = obj.get("filename")
@@ -2540,9 +3375,17 @@ def _resolve_graph_hash_for_loaded_graph(obj: Dict[str, object]) -> Optional[str
             graph_filename=graph_filename,
             graph_path=graph_path,
         )
-        return _normalize_graph_hash_value(resolved)
+        identity["graph_file_hash"] = _normalize_graph_hash_value(resolved)
     except Exception:
-        return None
+        pass
+    if not identity["graph_hash"] and identity["graph_file_hash"]:
+        identity["graph_hash"] = identity["graph_file_hash"]
+        identity["graph_hash_source"] = "file_sha256_fallback"
+    return identity
+
+
+def _resolve_graph_hash_for_loaded_graph(obj: Dict[str, object]) -> Optional[str]:
+    return _resolve_graph_identity_for_loaded_graph(obj).get("graph_hash")
 
 
 def _list_hpo_files_for_training(
@@ -2689,6 +3532,7 @@ def _compute_binary_metrics_from_cm(cm: np.ndarray) -> Dict[str, float]:
         "recall": float(recall),
         "f1": float(f1),
         "far": float(far),
+        "false_alarm_ratio": float(far),
         "specificity": float(specificity),
     }
 
@@ -3374,6 +4218,7 @@ def _train_gnn_with_best_params(
     graphsaint_walk_length: Optional[int] = None,
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
+    checkpoint_metric: Optional[str] = None,
 ) -> Optional[str]:
     try:
         from src import gnn_main as graph_main
@@ -3451,6 +4296,7 @@ def _train_gnn_with_best_params(
             graphsaint_walk_length=graphsaint_walk_length,
             eval_neighbors_mode=eval_neighbors_mode,
             eval_num_neighbors=eval_num_neighbors,
+            checkpoint_metric=checkpoint_metric,
         )
     finally:
         builtins.input = original_input
@@ -3619,6 +4465,8 @@ def _evaluate_gnn_model_far_target(
         "auprc": None,
         "auc": None,
         "mcc": None,
+        "brier_score": None,
+        "false_alarm_ratio": None,
     }
     if mask_key and test_results and mask_key in test_results:
         res = test_results[mask_key]
@@ -3635,6 +4483,17 @@ def _evaluate_gnn_model_far_target(
         payload["auc"] = res.get("auc")
         payload["auprc"] = res.get("auprc")
         payload["mcc"] = res.get("mcc")
+        brier_score = res.get("brier_score")
+        if brier_score is None:
+            brier_score = res.get("brier")
+        false_alarm_ratio = res.get("false_alarm_ratio")
+        if false_alarm_ratio is None:
+            false_alarm_ratio = res.get("far")
+        payload["brier_score"] = brier_score
+        payload["false_alarm_ratio"] = false_alarm_ratio
+        payload["metrics"]["brier_score"] = brier_score
+        payload["metrics"]["brier"] = brier_score
+        payload["metrics"]["false_alarm_ratio"] = false_alarm_ratio
 
     # Cleanup big tensors
     try:
@@ -3815,6 +4674,7 @@ def _network_config_to_hparams(
         "focal_alpha": float(cfg.get("focal_alpha", 0.75)),
         "batch_size": int(cfg.get("batch_size", 512)),
         "num_neighbors": json.dumps(cfg.get("num_neighbors", [15, 10])),
+        "checkpoint_metric": str(cfg.get("checkpoint_metric", "val_objective_score")),
         "use_graphsmote": bool(use_graphsmote),
         "value": 0.0,
     }
@@ -3841,7 +4701,10 @@ def _save_network_hparams(
     if not cfg:
         return None
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj or {}) if graph_obj else None
+    graph_identity = _resolve_graph_identity_for_loaded_graph(graph_obj or {}) if graph_obj else {}
+    graph_hash = graph_identity.get("graph_hash")
+    graph_file_hash = graph_identity.get("graph_file_hash")
+    graph_hash_source = graph_identity.get("graph_hash_source")
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
     variant_tag = "_GraphSMOTE" if use_graphsmote else "_Base"
     path = os.path.join(
@@ -3854,6 +4717,10 @@ def _save_network_hparams(
         params["hparams_source"] = "Network"
         if graph_hash:
             params["graph_hash"] = graph_hash
+        if graph_file_hash:
+            params["graph_file_hash"] = graph_file_hash
+        if graph_hash_source:
+            params["graph_hash_source"] = graph_hash_source
         pd.DataFrame([params]).to_csv(path, index=False)
         return path
     except Exception:
@@ -4701,7 +5568,10 @@ def _run_optuna_search(
     num_epochs = int(optuna_settings["epochs"])
     eval_every = int(optuna_settings["eval_every"])
 
-    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
+    graph_identity = _resolve_graph_identity_for_loaded_graph(graph_obj)
+    graph_hash = graph_identity.get("graph_hash")
+    graph_file_hash = graph_identity.get("graph_file_hash")
+    graph_hash_source = graph_identity.get("graph_hash_source")
     variant_tag = graph_main._variant_tags(
         use_graphsmote,
         graph_obj,
@@ -5701,6 +6571,8 @@ def _run_optuna_search(
             "study_name": study_name,
             "objective_metric": objective_metric,
             "graph_hash": graph_hash,
+            "graph_file_hash": graph_file_hash,
+            "graph_hash_source": graph_hash_source,
             "variant_tag": variant_tag,
             "gnn_variant": gnn_variant_fixed,
             "use_graphsmote": use_graphsmote,
@@ -5859,9 +6731,11 @@ def _run_optuna_search(
         )
     except Exception:
         best_params["use_imgagn_aug"] = bool(use_imgagn)
+    best_params["graph_hash"] = graph_hash
+    best_params["graph_file_hash"] = graph_file_hash
+    best_params["graph_hash_source"] = graph_hash_source
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
     variant_tag = graph_main._variant_tags(
         use_graphsmote,
         graph_obj,
@@ -5887,6 +6761,8 @@ def _run_optuna_search(
     trials_df = study.trials_dataframe()
     trials_df["use_graphsmote"] = use_graphsmote
     trials_df["graph_hash"] = graph_hash
+    trials_df["graph_file_hash"] = graph_file_hash
+    trials_df["graph_hash_source"] = graph_hash_source
     trials_df["gnn_variant"] = gnn_variant_fixed
     full_study_path = os.path.join(
         RESULTADOS_DIR,
@@ -6290,6 +7166,9 @@ def _run_ray_tune_search(
             )
         except Exception:
             best_params["use_imgagn_aug"] = bool(use_imgagn)
+        best_params["graph_hash"] = graph_hash
+        best_params["graph_file_hash"] = graph_file_hash
+        best_params["graph_hash_source"] = graph_hash_source
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
@@ -6318,6 +7197,8 @@ def _run_ray_tune_search(
         if trials_df is not None:
             trials_df["use_graphsmote"] = use_graphsmote
             trials_df["graph_hash"] = graph_hash
+            trials_df["graph_file_hash"] = graph_file_hash
+            trials_df["graph_hash_source"] = graph_hash_source
             trials_df["gnn_variant"] = gnn_variant_fixed
             full_study_path = os.path.join(
                 RESULTADOS_DIR,
@@ -9604,7 +10485,7 @@ def _render_optimization_tab() -> None:
 
 
 def render_graph_builder():
-    # --- Tabs for Eventos, Feature Engineering, Feature Selection, Graph, Network, Optimization, Balance, Training ---
+    # --- Tabs for Eventos, Feature Engineering, Feature Selection, Graph, Network, Optimization, Balance, Training, Comparison ---
     (
         tab_events,
         tab_features,
@@ -9616,6 +10497,7 @@ def render_graph_builder():
         tab_optimization,
         tab_balance,
         tab_training,
+        tab_comparison,
         tab_evaluation,
         tab_history,
         tab_experiments,
@@ -9631,6 +10513,7 @@ def render_graph_builder():
             "Optimization",
             "Balance",
             "Training",
+            "Comparación",
             "Evaluación Modelo",
             "History",
             "Experiments",
@@ -9681,6 +10564,9 @@ def render_graph_builder():
 
     with tab_training:
         _render_training_tab()
+
+    with tab_comparison:
+        _render_comparison_tab()
 
     with tab_evaluation:
         _render_evaluation_tab()
@@ -10022,8 +10908,16 @@ def _render_feature_engineering():
         start_d, end_d = None, None
         if use_date_filter:
             cd1, cd2 = st.columns(2)
-            start_d = cd1.date_input("Fecha Inicio", value=datetime(2023,1,1), key="feat_start_date")
-            end_d = cd2.date_input("Fecha Fin", value=datetime(2023,12,31), key="feat_end_date")
+            start_d = cd1.date_input(
+                "Fecha Inicio",
+                value=datetime(2023, 1, 1).date(),
+                key="feat_start_date",
+            )
+            end_d = cd2.date_input(
+                "Fecha Fin",
+                value=datetime(2023, 12, 31).date(),
+                key="feat_end_date",
+            )
 
         st.markdown("#### Configuración de Variables")
         
@@ -10055,12 +10949,14 @@ def _render_feature_engineering():
                             auto_batch_reason.append(
                                 f"rango {range_days} dias"
                             )
-                    if (
-                        start_d
+                    should_estimate_rows = (
+                        not use_batches
+                        and start_d
                         and end_d
                         and duckdb is not None
                         and DEFAULT_DUCKDB_FILE.exists()
-                    ):
+                    )
+                    if should_estimate_rows:
                         cache_key = f"{start_d}_{end_d}"
                         cached = st.session_state.get("auto_batch_estimate")
                         if (
@@ -10082,6 +10978,8 @@ def _render_feature_engineering():
                             auto_batch_reason.append(
                                 f"volumen {est_rows:,} filas"
                             )
+                    elif use_batches:
+                        st.session_state.pop("auto_batch_estimate", None)
             use_batches_effective = use_batches or (
                 auto_batch and auto_batch_trigger
             )
@@ -12923,6 +13821,374 @@ def _render_gnn_strategy_reference_panel(
         )
 
 
+def _render_gnn_mlp_baseline_panel(
+    graph_obj: Dict[str, object],
+    graph_data: HeteroData,
+) -> None:
+    st.markdown("#### Baseline MLP sin grafo")
+    st.caption(
+        "Entrena MLPs con los mismos `x/y` y las mismas mascaras `train/val/test` del grafo cargado, "
+        "sin `edge_index`, sin NeighborLoader y sin GraphSMOTE."
+    )
+    sequence_index = graph_obj.get("sequence_index")
+    if sequence_index is not None and getattr(sequence_index, "sequence_rows", None) is not None:
+        try:
+            seq_rows = getattr(sequence_index, "sequence_rows")
+            st.caption(
+                f"MLP temporal detectado: {int(seq_rows.shape[0])} secuencias, "
+                f"L={int(seq_rows.shape[1])}."
+            )
+        except Exception:
+            st.caption("MLP temporal detectado, pero no se pudo leer el tamano de `sequence_rows`.")
+    else:
+        st.caption("No se detecto `sequence_index`; el MLP temporal quedara marcado como skipped.")
+
+    col_base_a, col_base_b = st.columns(2)
+    run_current = col_base_a.checkbox(
+        "MLP actual",
+        value=True,
+        key="gnn_mlp_baseline_current",
+        help="Usa solo data['pm'].x del nodo objetivo.",
+    )
+    run_temporal = col_base_b.checkbox(
+        "MLP temporal",
+        value=True,
+        key="gnn_mlp_baseline_temporal",
+        help="Concatena la ventana temporal desde sequence_index.sequence_rows sin usar aristas.",
+    )
+
+    col_epochs, col_patience, col_batch = st.columns(3)
+    baseline_epochs = int(
+        col_epochs.number_input(
+            "epochs MLP",
+            min_value=1,
+            value=30,
+            step=5,
+            key="gnn_mlp_baseline_epochs",
+        )
+    )
+    baseline_patience = int(
+        col_patience.number_input(
+            "patience MLP",
+            min_value=1,
+            value=5,
+            step=1,
+            key="gnn_mlp_baseline_patience",
+        )
+    )
+    baseline_batch_size = int(
+        col_batch.number_input(
+            "batch_size MLP",
+            min_value=128,
+            value=4096,
+            step=512,
+            key="gnn_mlp_baseline_batch_size",
+        )
+    )
+
+    model_files = _list_gnn_model_files_for_baseline()
+    checkpoint_options = ["(sin GNN)"] + model_files
+    default_checkpoint_index = 0
+    last_model = st.session_state.get("gnn_train_last_model")
+    if isinstance(last_model, str) and last_model in model_files:
+        default_checkpoint_index = checkpoint_options.index(last_model)
+    elif model_files:
+        default_checkpoint_index = 1
+    selected_checkpoint = st.selectbox(
+        "Checkpoint GNN para comparar",
+        checkpoint_options,
+        index=default_checkpoint_index,
+        format_func=lambda p: p if p == "(sin GNN)" else os.path.basename(str(p)),
+        key="gnn_mlp_baseline_checkpoint",
+    )
+    col_gnn_batch, col_gnn_neighbors = st.columns(2)
+    gnn_eval_batch_size = int(
+        col_gnn_batch.number_input(
+            "batch_size GNN eval",
+            min_value=16,
+            value=int(min(BATCH_SIZE, 256)),
+            step=16,
+            key="gnn_mlp_baseline_gnn_eval_batch_size",
+            help="Batch usado para evaluar el checkpoint GNN en val/test.",
+        )
+    )
+    gnn_eval_num_neighbors = col_gnn_neighbors.text_input(
+        "num_neighbors GNN eval",
+        value="",
+        key="gnn_mlp_baseline_gnn_eval_neighbors",
+        help="Opcional. Vacío usa el perfil guardado en el checkpoint o config.py.",
+    )
+
+    selected_baselines = []
+    if run_current:
+        selected_baselines.append("current")
+    if run_temporal:
+        selected_baselines.append("temporal")
+
+    current_graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
+    current_session_token = _comparison_session_token(graph_obj)
+    graph_source_label = str(graph_obj.get("_comparison_source_label") or "Original")
+
+    progress_bar = st.progress(0.0)
+    progress_text = st.empty()
+    run_baseline = st.button(
+        "Ejecutar MLP sin grafo",
+        key="gnn_mlp_baseline_run",
+        help="Entrena los baselines seleccionados y guarda la comparacion en Resultados/gnn_mlp_baselines.",
+    )
+    if run_baseline:
+        if not selected_baselines:
+            st.warning("Seleccione al menos un baseline MLP.")
+        else:
+            from src.gnn_mlp_baseline import run_gnn_mlp_baselines
+
+            def _progress_cb(event: Dict[str, object]) -> None:
+                event_type = str(event.get("event", ""))
+                model_name = str(event.get("model", event.get("baseline", "MLP")))
+                if event_type == "baseline_start":
+                    progress_text.caption(
+                        f"{model_name}: train={event.get('train_samples')}, "
+                        f"val={event.get('val_samples')}, test={event.get('test_samples')}"
+                    )
+                    progress_bar.progress(0.0)
+                elif event_type == "epoch":
+                    epoch = int(event.get("epoch", 0) or 0)
+                    progress_bar.progress(min(1.0, epoch / max(1, baseline_epochs)))
+                    progress_text.caption(
+                        f"{model_name}: epoch {epoch}/{baseline_epochs}, "
+                        f"val AUPRC={float(event.get('val_auprc', 0.0) or 0.0):.4f}, "
+                        f"best={float(event.get('best_val_auprc', 0.0) or 0.0):.4f}"
+                    )
+                elif event_type == "baseline_skipped":
+                    progress_text.caption(
+                        f"{model_name}: skipped ({event.get('reason', 'sin detalle')})"
+                    )
+                elif event_type == "baseline_done":
+                    progress_bar.progress(1.0)
+                    progress_text.caption(
+                        f"{model_name}: best val AUPRC="
+                        f"{float(event.get('best_val_auprc', 0.0) or 0.0):.4f} "
+                        f"en epoch {event.get('best_epoch')}"
+                    )
+                elif event_type == "gnn_checkpoint_start":
+                    progress_bar.progress(0.0)
+                    progress_text.caption(f"{model_name}: cargando checkpoint GNN.")
+                elif event_type == "gnn_checkpoint_calibrating":
+                    progress_bar.progress(0.25)
+                    progress_text.caption(f"{model_name}: calibrando tau en val_mask.")
+                elif event_type == "gnn_checkpoint_tau":
+                    progress_bar.progress(0.50)
+                    progress_text.caption(
+                        f"{model_name}: evaluando val/test con tau="
+                        f"{float(event.get('tau', 0.5) or 0.5):.6f}"
+                    )
+                elif event_type == "gnn_checkpoint_done":
+                    progress_bar.progress(1.0)
+                    progress_text.caption(
+                        f"{model_name}: evaluación GNN finalizada con tau="
+                        f"{float(event.get('tau', 0.5) or 0.5):.6f}"
+                    )
+
+            try:
+                with st.spinner("Entrenando baselines MLP sin grafo..."):
+                    baseline_df = run_gnn_mlp_baselines(
+                        graph_obj,
+                        baselines=tuple(selected_baselines),
+                        epochs=baseline_epochs,
+                        patience=baseline_patience,
+                        batch_size=baseline_batch_size,
+                        device=get_auto_device(),
+                        save_dir=Path(RESULTADOS_DIR) / "gnn_mlp_baselines",
+                        graph_hash=current_graph_hash,
+                        progress_callback=_progress_cb,
+                    )
+            except Exception as exc:
+                st.error(f"Error al ejecutar baseline MLP sin grafo: {exc}")
+            else:
+                artifact_path = baseline_df.attrs.get("artifact_path")
+                comparison_df = baseline_df.copy()
+                if selected_checkpoint != "(sin GNN)":
+                    progress_text.caption("Evaluando checkpoint GNN seleccionado en val/test...")
+                    gnn_rows = _evaluate_gnn_checkpoint_for_comparison(
+                        model_path=str(selected_checkpoint),
+                        graph_obj=graph_obj,
+                        graph_data=graph_data,
+                        device=get_auto_device(),
+                        batch_size=int(gnn_eval_batch_size),
+                        num_neighbors=gnn_eval_num_neighbors.strip() or None,
+                        progress_callback=_progress_cb,
+                    )
+                    if gnn_rows:
+                        comparison_df = pd.concat(
+                            [comparison_df, pd.DataFrame(gnn_rows)],
+                            ignore_index=True,
+                            sort=False,
+                        )
+                if artifact_path:
+                    try:
+                        comparison_df = _attach_comparison_metadata(
+                            comparison_df,
+                            graph_hash=current_graph_hash,
+                            graph_source=graph_source_label,
+                        )
+                        comparison_df.to_csv(artifact_path, index=False)
+                    except Exception:
+                        pass
+                    comparison_df.attrs["artifact_path"] = artifact_path
+                st.session_state["gnn_mlp_baseline_results"] = comparison_df
+                st.session_state["gnn_mlp_baseline_artifact_path"] = artifact_path
+                st.session_state["gnn_mlp_baseline_graph_hash"] = current_graph_hash
+                st.session_state["gnn_mlp_baseline_session_token"] = current_session_token
+                if artifact_path:
+                    st.success(f"Resultados guardados: {artifact_path}")
+                else:
+                    st.success("Baseline MLP sin grafo finalizado.")
+
+    previous_df = st.session_state.get("gnn_mlp_baseline_results")
+    if isinstance(previous_df, pd.DataFrame) and not previous_df.empty:
+        session_token = st.session_state.get("gnn_mlp_baseline_session_token")
+        session_hash = st.session_state.get("gnn_mlp_baseline_graph_hash")
+        belongs_to_current_graph = session_token == current_session_token
+        if current_graph_hash:
+            belongs_to_current_graph = belongs_to_current_graph or _comparison_graph_hash_matches(
+                session_hash,
+                current_graph_hash,
+            )
+            belongs_to_current_graph = belongs_to_current_graph or _comparison_dataframe_matches_graph(
+                previous_df,
+                current_graph_hash,
+            )
+        if belongs_to_current_graph:
+            st.markdown("##### Comparacion")
+            _display_mlp_baseline_results(previous_df)
+            st.markdown("##### Visualizacion")
+            _render_mlp_baseline_results_chart(previous_df)
+            artifact_path = st.session_state.get("gnn_mlp_baseline_artifact_path")
+            if artifact_path:
+                st.caption(f"CSV: `{artifact_path}`")
+        else:
+            st.caption(
+                "La última ejecución en sesión pertenece a otro grafo o a otra fuente de comparación."
+            )
+
+    st.caption(
+        "Lectura rapida: MLP temporal > GNN sugiere que el grafo/sampler perjudica; "
+        "GNN > ambos MLP sugiere aporte espacial/temporal; ambos malos apunta a features, labels, split o desbalance."
+    )
+
+
+def _render_gnn_mlp_baseline_history_panel(graph_obj: Dict[str, object]) -> None:
+    st.markdown("#### Resultados anteriores")
+    graph_identity = _resolve_graph_identity_for_loaded_graph(graph_obj)
+    graph_hash = graph_identity.get("graph_hash")
+    if not graph_hash:
+        st.warning(
+            "No se pudo resolver un `graph_hash` para el grafo cargado en memoria. "
+            "El historial no se muestra para evitar mezclar resultados de otros grafos."
+        )
+        return
+
+    st.caption(
+        f"Filtro activo: grafo `{graph_hash[:16]}` "
+        f"({graph_identity.get('graph_hash_source') or 'fuente no especificada'})."
+    )
+    entries = _list_gnn_mlp_baseline_history(graph_hash)
+    if not entries:
+        st.info("No hay resultados anteriores guardados para el grafo cargado en memoria.")
+        return
+
+    summary_df = _summarize_gnn_mlp_baseline_history(entries)
+    if not summary_df.empty:
+        st.dataframe(summary_df, width="stretch")
+
+    entry_by_key: Dict[str, Mapping[str, object]] = {}
+    entry_keys: List[str] = []
+    for idx, entry in enumerate(entries):
+        path = entry.get("path")
+        base_key = str(Path(path).resolve()) if path is not None else f"history_{idx}"
+        entry_key = base_key
+        if entry_key in entry_by_key:
+            entry_key = f"{base_key}#{idx}"
+        entry_by_key[entry_key] = entry
+        entry_keys.append(entry_key)
+
+    selected_key = st.selectbox(
+        "Corrida histórica",
+        entry_keys,
+        index=0,
+        key="gnn_mlp_baseline_history_selected_path",
+        format_func=lambda key: _history_entry_label(entry_by_key.get(str(key), {})),
+    )
+    selected_entry = entry_by_key.get(str(selected_key))
+    if not isinstance(selected_entry, Mapping):
+        return
+    selected_df = selected_entry.get("df")
+    if not isinstance(selected_df, pd.DataFrame) or selected_df.empty:
+        st.info("La corrida seleccionada no contiene filas para visualizar.")
+        return
+
+    st.markdown("##### Comparacion guardada")
+    _display_mlp_baseline_results(selected_df)
+    st.markdown("##### Visualizacion guardada")
+    _render_mlp_baseline_results_chart(
+        selected_df,
+        key="gnn_mlp_baseline_history_chart_metrics",
+    )
+    selected_path = selected_entry.get("path")
+    if selected_path:
+        st.caption(f"CSV: `{selected_path}`")
+
+
+def _render_comparison_tab() -> None:
+    st.subheader("Comparación")
+    loaded_graph = st.session_state.get("loaded_graph")
+    balanced_graph = st.session_state.get("balanced_graph")
+    if loaded_graph is None:
+        st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+        return
+
+    graph_obj = dict(loaded_graph)
+    graph_source_label = "Original"
+    if balanced_graph is not None:
+        use_balanced = st.checkbox(
+            "Usar grafo balanceado",
+            value=False,
+            key="gnn_compare_use_balanced",
+            help="Permite comparar contra el grafo balanceado cargado en memoria.",
+        )
+        if use_balanced:
+            graph_obj["data"] = balanced_graph.get("data")
+            graph_source_label = f"Balanceado ({balanced_graph.get('source', 'N/A')})"
+    if not graph_obj.get("filename"):
+        graph_path = st.session_state.get("graph_path")
+        if graph_path:
+            graph_obj["filename"] = os.path.basename(graph_path)
+    graph_obj["_comparison_source_label"] = graph_source_label
+
+    graph_data = graph_obj.get("data")
+    if not isinstance(graph_data, HeteroData):
+        st.warning("El grafo seleccionado no es HeteroData.")
+        return
+    if "pm" not in graph_data.node_types:
+        st.warning("El grafo no contiene nodos 'pm'.")
+        return
+
+    pm_nodes = int(graph_data["pm"].num_nodes)
+    train_count = int(graph_data["pm"].train_mask.sum().item()) if hasattr(graph_data["pm"], "train_mask") else 0
+    val_count = int(graph_data["pm"].val_mask.sum().item()) if hasattr(graph_data["pm"], "val_mask") else 0
+    test_count = int(graph_data["pm"].test_mask.sum().item()) if hasattr(graph_data["pm"], "test_mask") else 0
+    st.markdown(
+        f"**Grafo para comparación:** {graph_source_label}  \n"
+        f"- Nodos PM: {pm_nodes}  \n"
+        f"- Split: train={train_count}, val={val_count}, test={test_count}"
+    )
+    current_tab, history_tab = st.tabs(["Estado actual", "Resultados anteriores"])
+    with current_tab:
+        _render_gnn_mlp_baseline_panel(graph_obj, graph_data)
+    with history_tab:
+        _render_gnn_mlp_baseline_history_panel(graph_obj)
+
+
 def _render_training_tab() -> None:
     from src import gnn_main as graph_main
 
@@ -13111,19 +14377,55 @@ def _render_training_tab() -> None:
     eval_device = get_auto_device()
     st.info(f"Dispositivo para evaluacion: {eval_device}")
     st.markdown("#### Early stopping")
+    checkpoint_metric_options = {
+        "Objective score": "val_objective_score",
+        "AUPRC": "val_auprc",
+        "F1": "val_f1",
+        "F0.5": "val_f05",
+        "MCC": "val_mcc",
+        "Accuracy": "val_accuracy",
+        "Validation loss": "val_loss",
+    }
+    checkpoint_default = str(
+        (network_cfg or {}).get(
+            "checkpoint_metric",
+            st.session_state.get("gnn_train_checkpoint_metric", "val_objective_score"),
+        )
+    )
+    checkpoint_default_label = next(
+        (
+            label
+            for label, value in checkpoint_metric_options.items()
+            if value == checkpoint_default
+        ),
+        "Objective score",
+    )
+    checkpoint_metric_label = st.selectbox(
+        "Checkpoint metric",
+        list(checkpoint_metric_options.keys()),
+        index=list(checkpoint_metric_options.keys()).index(checkpoint_default_label),
+        key="gnn_train_checkpoint_metric_label",
+        help=(
+            "Define que metrica guarda el mejor checkpoint y resetea early stopping. "
+            "Objective score usa objective_metric actual; valores altos son mejores salvo Validation loss. "
+            "En accidentes raros, Validation loss puede no coincidir con F1/AUPRC."
+        ),
+    )
+    checkpoint_metric_train = checkpoint_metric_options[checkpoint_metric_label]
+    st.session_state["gnn_train_checkpoint_metric"] = checkpoint_metric_train
     max_epochs_train = st.number_input(
         "max_epochs",
         min_value=1,
         value=300,
         step=10,
         key="gnn_train_max_epochs",
-        help="Limite maximo de epochs para el entrenamiento final; early stopping puede cortar antes si validation loss deja de bajar.",
+        help="Limite maximo de epochs para el entrenamiento final; early stopping puede cortar antes si la metrica de checkpoint deja de mejorar.",
     )
     early_stop_train = st.checkbox(
         "Early stopping",
         value=True,
         key="gnn_train_early_stop",
-        help="Detiene el entrenamiento cuando validation loss no mejora; no usa F1/AUPRC como criterio de parada.",
+        help="Detiene el entrenamiento cuando la metrica de checkpoint no mejora segun el modo configurado.",
     )
     early_patience_train = st.number_input(
         "patience",
@@ -13132,7 +14434,7 @@ def _render_training_tab() -> None:
         step=1,
         key="gnn_train_early_patience",
         disabled=not early_stop_train,
-        help="Cantidad de epochs consecutivas sin reduccion suficiente de validation loss antes de detener.",
+        help="Cantidad de epochs consecutivas sin mejora suficiente de la metrica de checkpoint antes de detener.",
     )
     early_min_delta_train = st.number_input(
         "min_delta",
@@ -13142,7 +14444,7 @@ def _render_training_tab() -> None:
         format="%.6f",
         key="gnn_train_early_min_delta",
         disabled=not early_stop_train,
-        help="Reduccion minima absoluta de validation loss para resetear paciencia; un valor alto puede cortar demasiado pronto.",
+        help="Mejora minima absoluta de la metrica de checkpoint para resetear paciencia; un valor alto puede cortar demasiado pronto.",
     )
     st.markdown("#### Gradient accumulation")
     accumulation_steps_train = st.number_input(
@@ -13481,7 +14783,7 @@ def _render_training_tab() -> None:
         elif network_option and hp_choice == network_option:
             hp_label = "network"
         config_sig = (
-            f"{variant_tag}|{graph_hash}|{hp_label}|{max_epochs_train}|{SEED}|"
+            f"{variant_tag}|{graph_hash}|{hp_label}|{max_epochs_train}|{SEED}|{checkpoint_metric_train}|"
             f"{train_sampler_mode}|{deterministic_sampling_train}|{sampling_seed_train}|"
             f"{disable_hard_undersampling_train}|{eval_neighbors_mode_train}|{eval_num_neighbors_train}"
         )
@@ -13498,6 +14800,9 @@ def _render_training_tab() -> None:
                 epoch_done = int(ckpt.get("epoch", 0))
                 max_epochs_ckpt = int(ckpt.get("max_epochs", max_epochs_train))
                 best_val_loss_ckpt = ckpt.get("best_val_loss")
+                monitor_metric_ckpt = ckpt.get("monitor_metric", "val_loss")
+                monitor_mode_ckpt = ckpt.get("monitor_mode", "min")
+                best_monitor_ckpt = ckpt.get("best_monitor_value", best_val_loss_ckpt)
                 best_val = ckpt.get("best_val_f1")
                 run_id = ckpt.get("run_id")
                 last_val_loss = ckpt.get("last_val_loss")
@@ -13513,6 +14818,9 @@ def _render_training_tab() -> None:
                     "epoch": epoch_done,
                     "max_epochs": max_epochs_ckpt,
                     "best_val_loss": best_val_loss_ckpt,
+                    "monitor_metric": monitor_metric_ckpt,
+                    "monitor_mode": monitor_mode_ckpt,
+                    "best_monitor_value": best_monitor_ckpt,
                     "best_val_f1": best_val,
                     "run_id": run_id,
                 }
@@ -13523,6 +14831,10 @@ def _render_training_tab() -> None:
                     f"Checkpoint detectado: {epoch_done}/{max_epochs_ckpt} epochs "
                     f"| Última actualización: {last_update}"
                 )
+                if best_monitor_ckpt is not None and math.isfinite(float(best_monitor_ckpt)):
+                    training_details += (
+                        f" | best_{monitor_metric_ckpt}={float(best_monitor_ckpt):.4f}"
+                    )
                 if best_val_loss_ckpt is not None and math.isfinite(float(best_val_loss_ckpt)):
                     training_details += f" | best_val_loss={float(best_val_loss_ckpt):.4f}"
                 if best_val is not None:
@@ -13592,7 +14904,7 @@ def _render_training_tab() -> None:
         metric_epoch = metric_cols[0].empty()
         metric_train_loss = metric_cols[1].empty()
         metric_val_loss = metric_cols[2].empty()
-        metric_best_val_loss = metric_cols[3].empty()
+        metric_best_monitor = metric_cols[3].empty()
         metric_val_f1 = metric_cols[4].empty()
         metric_val_auc = metric_cols[5].empty()
         metric_val_auprc = metric_cols[6].empty()
@@ -13601,7 +14913,7 @@ def _render_training_tab() -> None:
         metric_epoch.metric("Epoch", "0/0")
         metric_train_loss.metric("Train loss", "N/A")
         metric_val_loss.metric("Val loss", "N/A")
-        metric_best_val_loss.metric("Best val loss", "N/A")
+        metric_best_monitor.metric("Best monitor", "N/A")
         metric_val_f1.metric("Val F1", "N/A")
         metric_val_auc.metric("Val AUC", "N/A")
         metric_val_auprc.metric("Val AUPRC", "N/A")
@@ -13707,6 +15019,8 @@ def _render_training_tab() -> None:
                     "val_mcc",
                     "val_far",
                     "val_objective_score",
+                    "monitor_value",
+                    "best_monitor_value",
                     "val_tau",
                 )
                 if c in df.columns and df[c].notna().any()
@@ -13748,7 +15062,7 @@ def _render_training_tab() -> None:
                 metric_batch_l2.metric("Batch L2_Att", "N/A")
                 metric_batch_lr.metric("Batch LR", "N/A")
                 metric_val_loss.metric("Val loss", "N/A")
-                metric_best_val_loss.metric("Best val loss", "N/A")
+                metric_best_monitor.metric("Best monitor", "N/A")
                 return
 
             if event == "train_batch":
@@ -13794,6 +15108,9 @@ def _render_training_tab() -> None:
                 train_loss = payload.get("train_loss")
                 val_loss = payload.get("val_loss")
                 best_val_loss = payload.get("best_val_loss")
+                monitor_metric = payload.get("monitor_metric") or "val_loss"
+                monitor_value = payload.get("monitor_value")
+                best_monitor_value = payload.get("best_monitor_value")
                 val_f1 = payload.get("val_f1")
                 val_auc = payload.get("val_auc")
                 val_auprc = payload.get("val_auprc")
@@ -13806,8 +15123,11 @@ def _render_training_tab() -> None:
                     metric_train_loss.metric("Train loss", f"{train_loss:.4f}")
                 if val_loss is not None:
                     metric_val_loss.metric("Val loss", f"{val_loss:.4f}")
-                if best_val_loss is not None and math.isfinite(float(best_val_loss)):
-                    metric_best_val_loss.metric("Best val loss", f"{float(best_val_loss):.4f}")
+                if best_monitor_value is not None and math.isfinite(float(best_monitor_value)):
+                    metric_best_monitor.metric(
+                        "Best monitor",
+                        f"{monitor_metric}: {float(best_monitor_value):.4f}",
+                    )
                 if val_f1 is not None:
                     metric_val_f1.metric("Val F1", f"{val_f1:.4f}")
                 if val_auc is not None:
@@ -13843,8 +15163,10 @@ def _render_training_tab() -> None:
                     parts.append(f"loss={train_loss:.4f}")
                 if val_loss is not None:
                     parts.append(f"val_loss={val_loss:.4f}")
-                if best_val_loss is not None and math.isfinite(float(best_val_loss)):
-                    parts.append(f"best_val_loss={float(best_val_loss):.4f}")
+                if monitor_value is not None and math.isfinite(float(monitor_value)):
+                    parts.append(f"{monitor_metric}={float(monitor_value):.4f}")
+                if best_monitor_value is not None and math.isfinite(float(best_monitor_value)):
+                    parts.append(f"best_{monitor_metric}={float(best_monitor_value):.4f}")
                 if patience_counter is not None and patience is not None:
                     parts.append(f"patience={patience_counter}/{patience}")
                 if parts:
@@ -13870,6 +15192,8 @@ def _render_training_tab() -> None:
                     "val_f05": payload.get("val_f05"),
                     "val_objective_score": payload.get("val_objective_score"),
                     "best_val_loss": payload.get("best_val_loss"),
+                    "monitor_value": payload.get("monitor_value"),
+                    "best_monitor_value": payload.get("best_monitor_value"),
                     "best_val_objective_score": payload.get("best_val_objective_score"),
                     "val_tau": payload.get("val_tau"),
                     "lr": payload.get("lr"),
@@ -13908,12 +15232,20 @@ def _render_training_tab() -> None:
             parts = [f"Epoch {epoch}/{total_safe}"]
             val_loss = kwargs.get("val_loss")
             best_val_loss = kwargs.get("best_val_loss")
+            monitor_metric = kwargs.get("monitor_metric") or "val_loss"
+            monitor_value = kwargs.get("monitor_value")
+            best_monitor_value = kwargs.get("best_monitor_value")
             if val_loss is not None:
                 parts.append(f"val_loss={float(val_loss):.4f}")
                 metric_val_loss.metric("Val loss", f"{float(val_loss):.4f}")
-            if best_val_loss is not None and math.isfinite(float(best_val_loss)):
-                parts.append(f"best_val_loss={float(best_val_loss):.4f}")
-                metric_best_val_loss.metric("Best val loss", f"{float(best_val_loss):.4f}")
+            if monitor_value is not None and math.isfinite(float(monitor_value)):
+                parts.append(f"{monitor_metric}={float(monitor_value):.4f}")
+            if best_monitor_value is not None and math.isfinite(float(best_monitor_value)):
+                parts.append(f"best_{monitor_metric}={float(best_monitor_value):.4f}")
+                metric_best_monitor.metric(
+                    "Best monitor",
+                    f"{monitor_metric}: {float(best_monitor_value):.4f}",
+                )
             if val_f1 is not None:
                 parts.append(f"val_f1={val_f1:.4f}")
             parts.append(f"best_f1={best_val_f1:.4f}")
@@ -13948,8 +15280,10 @@ def _render_training_tab() -> None:
         hp_files_all = list(hp_files)
         network_hparams_path = None
         if network_option and hp_choice == network_option:
+            network_cfg_for_training = dict(network_cfg or {})
+            network_cfg_for_training["checkpoint_metric"] = checkpoint_metric_train
             network_hparams_path = _save_network_hparams(
-                network_cfg or {}, use_graphsmote=use_graphsmote_train, graph_obj=graph_obj
+                network_cfg_for_training, use_graphsmote=use_graphsmote_train, graph_obj=graph_obj
             )
             if not network_hparams_path:
                 st.error("No se pudo exportar la configuracion de Network.")
@@ -14067,6 +15401,7 @@ def _render_training_tab() -> None:
                         graphsaint_walk_length=int(graphsaint_walk_length_train),
                         eval_neighbors_mode=str(eval_neighbors_mode_train),
                         eval_num_neighbors=eval_num_neighbors_train,
+                        checkpoint_metric=str(checkpoint_metric_train),
                     )
             except Exception as exc:
                 st.error(f"Error en entrenamiento: {exc}")
@@ -14963,15 +16298,35 @@ def _perform_model_evaluation(
                     f"| muestreo: {sample_note}"
                 )
                 st.markdown("**Metricas principales**")
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4, col5 = st.columns(5)
                 rep = m_res.get("report", {})
                 f1_1 = rep.get("Accidente (1)", {}).get("f1-score", 0.0)
                 f1_0 = rep.get("No Accidente (0)", {}).get("f1-score", 0.0)
                 acc = rep.get("accuracy", 0.0)
+                far_raw = m_res.get("false_alarm_ratio")
+                if far_raw is None:
+                    far_raw = m_res.get("far")
+                brier_raw = m_res.get("brier_score")
+                if brier_raw is None:
+                    brier_raw = m_res.get("brier")
+                far_val = _metric_float(far_raw)
+                brier_val = _metric_float(brier_raw)
                 
                 col1.metric("F1 Accidente", f"{f1_1:.4f}")
                 col2.metric("F1 No Accidente", f"{f1_0:.4f}")
                 col3.metric("Accuracy", f"{acc:.4f}")
+                col4.metric(
+                    "Ratio falsas alarmas",
+                    f"{far_val:.4f}" if far_val is not None else "N/A",
+                )
+                col5.metric(
+                    "Brier score",
+                    f"{brier_val:.4f}" if brier_val is not None else "N/A",
+                )
+                st.caption(
+                    "Ratio falsas alarmas = FP / (FP + TN). "
+                    "Brier score = error cuadrático medio de la probabilidad de Accidente=1."
+                )
 
                 if m_res.get("auc") is not None:
                     st.write(f"- **AUC-ROC**: {m_res['auc']:.4f}")
@@ -14979,6 +16334,10 @@ def _perform_model_evaluation(
                     st.write(f"- **AUPRC**: {m_res['auprc']:.4f}")
                 if m_res.get("mcc") is not None:
                     st.write(f"- **MCC**: {m_res['mcc']:.4f}")
+                if far_val is not None:
+                    st.write(f"- **Ratio falsas alarmas (FAR)**: {far_val:.4f}")
+                if brier_val is not None:
+                    st.write(f"- **Brier score**: {brier_val:.4f}")
 
                 st.markdown("**Matriz de Confusión**")
                 cm = m_res.get("cm")
@@ -15799,6 +17158,9 @@ def _extract_sampler_metrics_from_eval(
     report = eval_payload.get("report") or {}
     metrics = eval_payload.get("metrics") or {}
     calib = eval_payload.get("calibration") or {}
+    test_brier_score = metrics.get("brier_score")
+    if test_brier_score is None:
+        test_brier_score = eval_payload.get("brier_score")
     return {
         "eval_threshold": eval_payload.get("threshold"),
         "val_far": calib.get("far"),
@@ -15808,7 +17170,9 @@ def _extract_sampler_metrics_from_eval(
         "test_recall": report.get("Accidente (1)", {}).get("recall"),
         "test_accuracy": report.get("accuracy"),
         "test_far": metrics.get("far"),
+        "test_false_alarm_ratio": metrics.get("false_alarm_ratio", metrics.get("far")),
         "test_specificity": metrics.get("specificity"),
+        "test_brier_score": test_brier_score,
         "test_auprc": eval_payload.get("auprc"),
         "test_auc": eval_payload.get("auc"),
         "test_mcc": eval_payload.get("mcc"),
@@ -17519,8 +18883,16 @@ def _materialize_sampler_hparams_variant(
     )
 
     graph_hash = None
+    graph_file_hash = None
+    graph_hash_source = None
     variant_tag = "_GraphSMOTE" if use_graphsmote else "_Base"
-    graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
+    graph_identity = _resolve_graph_identity_for_loaded_graph(graph_obj)
+    graph_hash = graph_identity.get("graph_hash")
+    graph_file_hash = graph_identity.get("graph_file_hash")
+    graph_hash_source = graph_identity.get("graph_hash_source")
+    params["graph_hash"] = graph_hash
+    params["graph_file_hash"] = graph_file_hash
+    params["graph_hash_source"] = graph_hash_source
     try:
         from src import gnn_main as graph_main
 
@@ -17928,13 +19300,18 @@ def _render_sampler_fidelity_experiment(
         experiment_name = "GNN Sampler Fidelity"
         device = get_auto_device()
         eval_batch_size = int(_metric_float(base_params.get("batch_size")) or BATCH_SIZE)
-        graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
+        graph_identity = _resolve_graph_identity_for_loaded_graph(graph_obj)
+        graph_hash = graph_identity.get("graph_hash")
+        graph_file_hash = graph_identity.get("graph_file_hash")
+        graph_hash_source = graph_identity.get("graph_hash_source")
 
         exp_meta = {
             "run_id": run_id,
             "graph": graph_obj.get("filename"),
             "graph_source": graph_source_label,
             "graph_hash": graph_hash,
+            "graph_file_hash": graph_file_hash,
+            "graph_hash_source": graph_hash_source,
             "base_hparams_path": selected_hparams_path,
             "base_variant": str(base_variant),
             "use_graphsmote": bool(use_graphsmote),
@@ -19233,7 +20610,9 @@ def _run_gnn_best_variant_experiment(
                         "test_recall": test_recall,
                         "test_accuracy": test_accuracy,
                         "test_far": metrics.get("far"),
+                        "test_false_alarm_ratio": metrics.get("false_alarm_ratio", metrics.get("far")),
                         "test_specificity": metrics.get("specificity"),
+                        "test_brier_score": metrics.get("brier_score", eval_payload.get("brier_score")),
                         "test_auprc": eval_payload.get("auprc"),
                         "test_auc": eval_payload.get("auc"),
                         "test_mcc": eval_payload.get("mcc"),
@@ -21101,7 +22480,9 @@ def _render_gnn_experiments_tab() -> None:
                                             "test_recall": test_recall,
                                             "test_accuracy": test_accuracy,
                                             "test_far": metrics.get("far"),
+                                            "test_false_alarm_ratio": metrics.get("false_alarm_ratio", metrics.get("far")),
                                             "test_specificity": metrics.get("specificity"),
+                                            "test_brier_score": metrics.get("brier_score", eval_payload.get("brier_score")),
                                             "test_auprc": eval_payload.get("auprc"),
                                             "test_auc": eval_payload.get("auc"),
                                             "test_mcc": eval_payload.get("mcc"),
@@ -21299,7 +22680,9 @@ def _render_gnn_experiments_tab() -> None:
                                     "test_recall": test_recall,
                                     "test_accuracy": test_accuracy,
                                     "test_far": metrics.get("far"),
+                                    "test_false_alarm_ratio": metrics.get("false_alarm_ratio", metrics.get("far")),
                                     "test_specificity": metrics.get("specificity"),
+                                    "test_brier_score": metrics.get("brier_score", eval_payload.get("brier_score")),
                                     "test_auprc": eval_payload.get("auprc"),
                                     "test_auc": eval_payload.get("auc"),
                                     "test_mcc": eval_payload.get("mcc"),

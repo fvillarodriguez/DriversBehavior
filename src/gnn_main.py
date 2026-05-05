@@ -1653,17 +1653,84 @@ def _update_val_loss_monitor(
     patience_counter: int,
     min_delta: float,
 ) -> Tuple[bool, float, int]:
-    current = float(val_loss)
+    return _update_metric_monitor(
+        monitor_value=val_loss,
+        best_monitor_value=best_val_loss,
+        patience_counter=patience_counter,
+        min_delta=min_delta,
+        monitor_mode="min",
+    )
+
+def _normalize_checkpoint_metric(metric: object) -> str:
+    raw = str(metric or "val_objective_score").strip().lower()
+    key = raw.replace(" ", "_").replace("-", "_")
+    aliases = {
+        "objective": "val_objective_score",
+        "objective_score": "val_objective_score",
+        "val_objective": "val_objective_score",
+        "val_objective_score": "val_objective_score",
+        "validation_objective": "val_objective_score",
+        "auprc": "val_auprc",
+        "average_precision": "val_auprc",
+        "val_auprc": "val_auprc",
+        "f1": "val_f1",
+        "val_f1": "val_f1",
+        "f0.5": "val_f05",
+        "f05": "val_f05",
+        "val_f0.5": "val_f05",
+        "val_f05": "val_f05",
+        "mcc": "val_mcc",
+        "val_mcc": "val_mcc",
+        "accuracy": "val_accuracy",
+        "val_accuracy": "val_accuracy",
+        "validation_loss": "val_loss",
+        "val_loss": "val_loss",
+        "loss": "val_loss",
+    }
+    return aliases.get(key, "val_objective_score")
+
+def _monitor_mode_for_metric(metric: str) -> str:
+    return "min" if _normalize_checkpoint_metric(metric) == "val_loss" else "max"
+
+def _initial_monitor_value(monitor_mode: str) -> float:
+    return float("inf") if monitor_mode == "min" else float("-inf")
+
+def _update_metric_monitor(
+    *,
+    monitor_value: float,
+    best_monitor_value: float,
+    patience_counter: int,
+    min_delta: float,
+    monitor_mode: str,
+) -> Tuple[bool, float, int]:
+    current = float(monitor_value)
     if not math.isfinite(current):
-        raise ValueError("val_loss debe ser finita para early stopping.")
+        raise ValueError("monitor_value debe ser finito para early stopping.")
     try:
-        previous = float(best_val_loss)
+        previous = float(best_monitor_value)
     except Exception:
-        previous = float("inf")
+        previous = _initial_monitor_value(monitor_mode)
     delta = max(float(min_delta), 0.0)
-    if (not math.isfinite(previous)) or (previous - current) > delta:
+    mode = str(monitor_mode or "max").lower()
+    if not math.isfinite(previous):
+        return True, current, 0
+    if mode == "min" and (previous - current) > delta:
+        return True, current, 0
+    if mode != "min" and (current - previous) > delta:
         return True, current, 0
     return False, previous, int(patience_counter) + 1
+
+def _metric_value_for_monitor(metric: str, values: Dict[str, Optional[float]]) -> float:
+    normalized = _normalize_checkpoint_metric(metric)
+    value = values.get(normalized)
+    if normalized == "val_objective_score" and value is None:
+        # Objective score can be absent in degenerate validation folds; F1 is the
+        # closest legacy objective fallback for keeping training resumable.
+        value = values.get("val_f1")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 def prior_shift_adjust(p_train, p_real, p_hat):
     # p_train: prevalencia en entrenamiento; p_real: prevalencia real
@@ -1718,6 +1785,49 @@ def pick_threshold_from_val(y_true_val, y_prob1_val, *, mode="fbeta", beta=0.5, 
     i = int(np.nanargmax(fbeta))
     tau = float(thr_[i])
     return tau, {"precision": float(prec_[i]), "recall": float(rec_[i]), "fbeta": float(fbeta[i])}
+
+
+def _compute_binary_eval_extras(y_true, y_pred, y_prob) -> Dict[str, Optional[float]]:
+    """Return operational binary metrics that are not in classification_report."""
+    extras: Dict[str, Optional[float]] = {
+        "false_alarm_ratio": None,
+        "far": None,
+        "brier_score": None,
+        "brier": None,
+    }
+    try:
+        y_true_np = np.asarray(y_true.detach().cpu() if torch.is_tensor(y_true) else y_true).astype(int).ravel()
+        y_pred_np = np.asarray(y_pred.detach().cpu() if torch.is_tensor(y_pred) else y_pred).astype(int).ravel()
+        y_prob_np = np.asarray(y_prob.detach().cpu() if torch.is_tensor(y_prob) else y_prob).astype(float)
+    except Exception:
+        return extras
+
+    if y_true_np.size == 0:
+        return extras
+
+    try:
+        cm = confusion_matrix(y_true_np, y_pred_np, labels=[0, 1])
+        tn, fp, _fn, _tp = cm.ravel()
+        far = float(fp / (fp + tn)) if (fp + tn) else 0.0
+        extras["false_alarm_ratio"] = far
+        extras["far"] = far
+    except Exception:
+        pass
+
+    try:
+        if y_prob_np.ndim == 2 and y_prob_np.shape[1] > 1:
+            prob1 = y_prob_np[:, 1]
+        else:
+            prob1 = y_prob_np.ravel()
+        if prob1.size == y_true_np.size:
+            brier = float(np.mean((np.clip(prob1, 0.0, 1.0) - y_true_np) ** 2))
+            extras["brier_score"] = brier
+            extras["brier"] = brier
+    except Exception:
+        pass
+
+    return extras
+
 
 @torch.no_grad()
 def test(
@@ -1940,6 +2050,7 @@ def test(
         except Exception as e:
             logger.warning(f"No se pudo calcular MCC: {e}")
 
+        extra_metrics = _compute_binary_eval_extras(y_true, y_pred, y_prob)
         results[mask_name] = {
             'report': report,
             'cm': cm,
@@ -1949,6 +2060,10 @@ def test(
             'auc': auc_score,
             'auprc': auprc,
             'mcc': mcc,
+            'false_alarm_ratio': extra_metrics.get("false_alarm_ratio"),
+            'far': extra_metrics.get("far"),
+            'brier_score': extra_metrics.get("brier_score"),
+            'brier': extra_metrics.get("brier"),
             'node_idx': node_indices,  # para exportar claves
         }
         if criterion is not None and loss_count > 0:
@@ -2039,6 +2154,71 @@ def _calculate_graph_hash(graph_filename=None, graph_path=None):
         logger.error(f"Error al leer el archivo del grafo para hashear: {e}")
         return None
 
+def _normalize_graph_hash_value(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if len(text) >= 16 and re.fullmatch(r"[0-9a-f]+", text):
+        return text
+    return None
+
+def _resolve_graph_identity(loaded_obj: object) -> Dict[str, Optional[str]]:
+    """Resolve semantic graph identity and optional file-content hash.
+
+    `graph_hash` is the semantic hash used for experiment identity when it is
+    present in graph metadata. `graph_file_hash` is retained only for audit
+    traceability and must not replace the semantic identifier.
+    """
+    if not isinstance(loaded_obj, dict):
+        return {
+            "graph_hash": None,
+            "graph_file_hash": None,
+            "graph_hash_source": None,
+        }
+
+    semantic_sources = []
+    for key in ("graph_hash", "hash"):
+        semantic_sources.append((loaded_obj.get(key), "semantic_metadata"))
+
+    for meta_key in ("metadata", "meta"):
+        meta = loaded_obj.get(meta_key)
+        if isinstance(meta, dict):
+            semantic_sources.append((meta.get("graph_hash"), "semantic_metadata"))
+
+    data_obj = loaded_obj.get("data")
+    for attr_name in ("graph_metadata", "metadata"):
+        meta = getattr(data_obj, attr_name, None)
+        if isinstance(meta, dict):
+            semantic_sources.append((meta.get("graph_hash"), "semantic_metadata"))
+
+    for attr_name in ("graph_hash", "hash"):
+        semantic_sources.append((getattr(data_obj, attr_name, None), "semantic_metadata"))
+
+    graph_hash = None
+    graph_hash_source = None
+    for raw, source in semantic_sources:
+        normalized = _normalize_graph_hash_value(raw)
+        if normalized:
+            graph_hash = normalized
+            graph_hash_source = source
+            break
+
+    graph_file_hash = _normalize_graph_hash_value(
+        _calculate_graph_hash(
+            graph_filename=loaded_obj.get("filename"),
+            graph_path=loaded_obj.get("graph_path") or loaded_obj.get("path"),
+        )
+    )
+    if graph_hash is None and graph_file_hash:
+        graph_hash = graph_file_hash
+        graph_hash_source = "file_sha256_fallback"
+
+    return {
+        "graph_hash": graph_hash,
+        "graph_file_hash": graph_file_hash,
+        "graph_hash_source": graph_hash_source,
+    }
+
 def _normalize_objective_metric(metric: object) -> str:
     raw = str(metric or "F1").strip()
     key = raw.lower().replace("_", "-")
@@ -2120,6 +2300,7 @@ def run_gat_training(
     graphsaint_walk_length: Optional[int] = None,
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
+    checkpoint_metric: Optional[str] = None,
 ):
     """
     Entrenamiento GAT completo con:
@@ -2435,10 +2616,10 @@ def run_gat_training(
     # Rutas y directorios por modelo (usar mismo ID para z2x + modelo)
     tag_suffix = _model_tag_suffix(use_graphsmote, loaded_obj, gnn_variant=gnn_variant)
     ts_stamp_save = datetime.now().strftime('%Y%m%d_%H%M%S')
-    graph_hash = _calculate_graph_hash(
-        loaded_obj.get('filename'),
-        loaded_obj.get('graph_path') or loaded_obj.get('path'),
-    )
+    graph_identity = _resolve_graph_identity(loaded_obj)
+    graph_hash = graph_identity.get("graph_hash")
+    graph_file_hash = graph_identity.get("graph_file_hash")
+    graph_hash_source = graph_identity.get("graph_hash_source")
     hash_tag8 = f"_{graph_hash[:8]}" if graph_hash else ""
     run_id = f"gnn_{ts_stamp_save}"
     if graph_hash:
@@ -2507,6 +2688,8 @@ def run_gat_training(
                         "best_epoch": 0,
                         "use_graphsmote": True,
                         "graph_hash": graph_hash,
+                        "graph_file_hash": graph_file_hash,
+                        "graph_hash_source": graph_hash_source,
                         "git_commit": _get_repo_version(),
                         "purpose": "GraphSMOTE embeddings (decoders only)",
                         "train_decoders_only": True,
@@ -2842,6 +3025,15 @@ def run_gat_training(
     )
     best_params["objective_metric"] = objective_metric
     best_params["threshold_beta"] = float(objective_threshold_beta)
+    monitor_metric = _normalize_checkpoint_metric(
+        checkpoint_metric
+        if checkpoint_metric is not None
+        else best_params.get("checkpoint_metric", "val_objective_score")
+    )
+    monitor_mode = _monitor_mode_for_metric(monitor_metric)
+    best_params["checkpoint_metric"] = monitor_metric
+    best_params["monitor_metric"] = monitor_metric
+    best_params["monitor_mode"] = monitor_mode
 
     has_val_mask = hasattr(base_graph["pm"], "val_mask")
     val_mask_count = int(base_graph["pm"].val_mask.sum().item()) if has_val_mask else 0
@@ -2863,6 +3055,8 @@ def run_gat_training(
         graphsmote_mode=str(GRAPHSMOTE_MODE),
         train_decoders_only=bool(train_decoders_only),
         graph_hash=graph_hash,
+        graph_file_hash=graph_file_hash,
+        graph_hash_source=graph_hash_source,
         batch_size=int(batch_size_hp),
         num_neighbors=loader_num_neighbors,
         smote_every_n_epochs=int(smote_every_override),
@@ -2882,6 +3076,8 @@ def run_gat_training(
         eval_num_neighbors=eval_num_neighbors_resolved,
         objective_metric=str(objective_metric),
         objective_threshold_beta=float(objective_threshold_beta),
+        monitor_metric=monitor_metric,
+        monitor_mode=monitor_mode,
     )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -2895,12 +3091,19 @@ def run_gat_training(
         save_state_path = resume_state_path
 
     start_epoch = 1
-    resume_best_val_loss = float("inf")
+    resume_best_val_loss = _initial_monitor_value("min")
     resume_best_val_f1 = 0.0
     resume_best_val_auprc = 0.0
+    resume_best_val_auc = None
+    resume_best_val_mcc = None
+    resume_best_val_far = None
+    resume_best_val_f05 = None
+    resume_best_val_tau = None
+    resume_best_val_accuracy = None
     resume_best_val_objective = float("-inf")
     resume_best_epoch = 0
     resume_patience_counter = 0
+    resume_best_monitor_value = _initial_monitor_value(monitor_mode)
     if resume_state_path:
         try:
             if os.path.exists(resume_state_path):
@@ -2912,16 +3115,20 @@ def run_gat_training(
                     if ckpt.get("scheduler_state"):
                         scheduler.load_state_dict(ckpt["scheduler_state"])
                     start_epoch = int(ckpt.get("epoch", 0)) + 1
-                    ckpt_has_val_loss = "best_val_loss" in ckpt
-                    if ckpt_has_val_loss:
-                        try:
-                            resume_best_val_loss = float(ckpt.get("best_val_loss"))
-                        except Exception:
-                            resume_best_val_loss = float("inf")
-                        if not math.isfinite(resume_best_val_loss):
-                            resume_best_val_loss = float("inf")
+                    try:
+                        resume_best_val_loss = float(ckpt.get("best_val_loss"))
+                    except Exception:
+                        resume_best_val_loss = _initial_monitor_value("min")
+                    if not math.isfinite(resume_best_val_loss):
+                        resume_best_val_loss = _initial_monitor_value("min")
                     resume_best_val_f1 = float(ckpt.get("best_val_f1", 0.0))
                     resume_best_val_auprc = float(ckpt.get("best_val_auprc", 0.0))
+                    resume_best_val_auc = ckpt.get("best_val_auc")
+                    resume_best_val_mcc = ckpt.get("best_val_mcc")
+                    resume_best_val_far = ckpt.get("best_val_far")
+                    resume_best_val_f05 = ckpt.get("best_val_f05")
+                    resume_best_val_tau = ckpt.get("best_val_tau")
+                    resume_best_val_accuracy = ckpt.get("best_val_accuracy")
                     try:
                         resume_best_val_objective = float(
                             ckpt.get("best_val_objective_score", ckpt.get("best_val_f1", float("-inf")))
@@ -2929,13 +3136,46 @@ def run_gat_training(
                     except Exception:
                         resume_best_val_objective = float("-inf")
                     resume_best_epoch = int(ckpt.get("best_epoch", 0))
-                    if ckpt_has_val_loss:
+                    ckpt_monitor_metric = _normalize_checkpoint_metric(
+                        ckpt.get("monitor_metric", "val_loss")
+                    )
+                    ckpt_monitor_mode = str(
+                        ckpt.get("monitor_mode", _monitor_mode_for_metric(ckpt_monitor_metric))
+                    ).lower()
+                    if ckpt_monitor_metric == monitor_metric and ckpt_monitor_mode == monitor_mode:
+                        try:
+                            resume_best_monitor_value = float(
+                                ckpt.get("best_monitor_value", _initial_monitor_value(monitor_mode))
+                            )
+                        except Exception:
+                            resume_best_monitor_value = _initial_monitor_value(monitor_mode)
                         resume_patience_counter = int(ckpt.get("patience_counter", 0))
                     else:
+                        resume_best_monitor_value = _metric_value_for_monitor(
+                            monitor_metric,
+                            {
+                                "val_loss": resume_best_val_loss,
+                                "val_f1": resume_best_val_f1,
+                                "val_auprc": resume_best_val_auprc,
+                                "val_auc": resume_best_val_auc,
+                                "val_mcc": resume_best_val_mcc,
+                                "val_far": resume_best_val_far,
+                                "val_f05": resume_best_val_f05,
+                                "val_tau": resume_best_val_tau,
+                                "val_accuracy": resume_best_val_accuracy,
+                                "val_objective_score": resume_best_val_objective,
+                            },
+                        )
+                        if not math.isfinite(resume_best_monitor_value):
+                            resume_best_monitor_value = _initial_monitor_value(monitor_mode)
                         resume_patience_counter = 0
                         logger.info(
-                            "Checkpoint anterior sin best_val_loss; se reinicia paciencia "
-                            "para usar early stopping por validation loss."
+                            "Checkpoint previo usa monitor %s/%s; se reanuda con monitor %s/%s "
+                            "y se reinicia paciencia.",
+                            ckpt_monitor_metric,
+                            ckpt_monitor_mode,
+                            monitor_metric,
+                            monitor_mode,
                         )
                     logger.info(
                         f"Reanudando entrenamiento desde epoch {start_epoch} "
@@ -2948,9 +3188,18 @@ def run_gat_training(
     best_val_loss = float(resume_best_val_loss)
     best_val_f1 = float(resume_best_val_f1)
     best_val_auprc = float(resume_best_val_auprc)
+    best_val_auc = resume_best_val_auc
+    best_val_mcc = resume_best_val_mcc
+    best_val_far = resume_best_val_far
+    best_val_f05 = resume_best_val_f05
+    best_val_tau = resume_best_val_tau
+    best_val_accuracy = resume_best_val_accuracy
     best_val_objective_score = float(resume_best_val_objective)
     if not math.isfinite(best_val_objective_score):
         best_val_objective_score = float("-inf")
+    best_monitor_value = float(resume_best_monitor_value)
+    if not math.isfinite(best_monitor_value):
+        best_monitor_value = _initial_monitor_value(monitor_mode)
     best_epoch = int(resume_best_epoch)
     patience_counter = int(resume_patience_counter)
     early_stop_enabled = bool(best_params.get("early_stop", True))
@@ -2971,8 +3220,10 @@ def run_gat_training(
                 best_val_f1=best_val_f1,
                 best_val_objective_score=best_val_objective_score,
                 objective_metric=objective_metric,
-                monitor_metric="val_loss",
-                monitor_mode="min",
+                monitor_metric=monitor_metric,
+                monitor_mode=monitor_mode,
+                monitor_value=None,
+                best_monitor_value=best_monitor_value,
                 patience=patience,
                 patience_counter=patience_counter,
             )
@@ -3256,17 +3507,37 @@ def run_gat_training(
                 except Exception:
                     pass
 
-        is_best, best_val_loss, patience_counter = _update_val_loss_monitor(
-            val_loss=val_loss,
-            best_val_loss=best_val_loss,
+        current_monitor_values = {
+            "val_loss": val_loss,
+            "val_f1": val_f1,
+            "val_auprc": val_auprc,
+            "val_auc": val_auc,
+            "val_mcc": val_mcc,
+            "val_far": val_far,
+            "val_f05": val_f05,
+            "val_tau": val_tau,
+            "val_accuracy": val_accuracy,
+            "val_objective_score": val_objective_score,
+        }
+        monitor_value = _metric_value_for_monitor(monitor_metric, current_monitor_values)
+        is_best, best_monitor_value, patience_counter = _update_metric_monitor(
+            monitor_value=monitor_value,
+            best_monitor_value=best_monitor_value,
             patience_counter=patience_counter,
             min_delta=min_delta,
+            monitor_mode=monitor_mode,
         )
         if is_best:
-            if val_objective_score is not None and math.isfinite(float(val_objective_score)):
-                best_val_objective_score = float(val_objective_score)
+            best_val_loss = float(val_loss)
             best_val_f1 = float(val_f1)
+            best_val_objective_score = float(val_objective_score) if val_objective_score is not None else float("-inf")
             best_val_auprc = float(val_auprc) if val_auprc is not None else 0.0
+            best_val_auc = float(val_auc) if val_auc is not None else None
+            best_val_mcc = float(val_mcc) if val_mcc is not None else None
+            best_val_far = float(val_far) if val_far is not None else None
+            best_val_f05 = float(val_f05) if val_f05 is not None else None
+            best_val_tau = float(val_tau) if val_tau is not None else None
+            best_val_accuracy = float(val_accuracy) if val_accuracy is not None else None
             best_epoch = epoch
             # Guardar modelo: copia única y alias estable
             try:
@@ -3281,7 +3552,7 @@ def run_gat_training(
             except Exception as e:
                 logger.error(f"No se pudo guardar el modelo en disco: {e}")
             logger.info(
-                f"Epoch {epoch:03d}: New best val_loss on validation: {best_val_loss:.6f} "
+                f"Epoch {epoch:03d}: New best {monitor_metric} on validation: {best_monitor_value:.6f} "
                 f"({objective_metric} ref={val_objective_score if val_objective_score is not None else float('nan'):.4f}, F1 ref={val_f1:.4f}).\n"
                 f"  → Guardado: {os.path.basename(best_model_path_unique)} (alias variante: {os.path.basename(best_model_path)}, alias global: gat_model_BEST.pt)"
             )
@@ -3291,24 +3562,28 @@ def run_gat_training(
                 meta.update({
                     'gnn_variant': _normalize_gnn_variant(gnn_variant),
                     'variant_tag': _variant_tags(use_graphsmote, loaded_obj, gnn_variant=gnn_variant),
-                    'monitor_metric': 'val_loss',
-                    'monitor_mode': 'min',
+                    'monitor_metric': monitor_metric,
+                    'monitor_mode': monitor_mode,
+                    'monitor_value': float(monitor_value),
+                    'best_monitor_value': float(best_monitor_value),
                     'best_val_loss': float(best_val_loss),
                     'best_val_f1': float(best_val_f1),
                     'best_val_objective_score': float(best_val_objective_score),
                     'best_val_auprc': float(best_val_auprc),
-                    'best_val_auc': float(val_auc) if val_auc is not None else None,
-                    'best_val_mcc': float(val_mcc) if val_mcc is not None else None,
-                    'best_val_far': float(val_far) if val_far is not None else None,
-                    'best_val_f05': float(val_f05) if val_f05 is not None else None,
-                    'best_val_tau': float(val_tau) if val_tau is not None else None,
-                    'best_val_accuracy': float(val_accuracy) if val_accuracy is not None else None,
+                    'best_val_auc': best_val_auc,
+                    'best_val_mcc': best_val_mcc,
+                    'best_val_far': best_val_far,
+                    'best_val_f05': best_val_f05,
+                    'best_val_tau': best_val_tau,
+                    'best_val_accuracy': best_val_accuracy,
                     'best_epoch': int(best_epoch),
                     'objective_metric': str(objective_metric),
                     'objective_threshold_beta': float(objective_threshold_beta),
                     'use_graphsmote': bool(use_graphsmote),
                     'graphsmote_mode': str(GRAPHSMOTE_MODE),
                     'graph_hash': graph_hash,
+                    'graph_file_hash': graph_file_hash,
+                    'graph_hash_source': graph_hash_source,
                     'git_commit': _get_repo_version(),
                     'purpose': purpose or loaded_obj.get('purpose', 'General') if isinstance(loaded_obj, dict) else 'General',
                     'target_pos_ratio_used': float(target_pos_ratio_override),
@@ -3354,8 +3629,10 @@ def run_gat_training(
                     val_objective_score=val_objective_score,
                     best_val_objective_score=best_val_objective_score,
                     objective_metric=objective_metric,
-                    monitor_metric="val_loss",
-                    monitor_mode="min",
+                    monitor_metric=monitor_metric,
+                    monitor_mode=monitor_mode,
+                    monitor_value=monitor_value,
+                    best_monitor_value=best_monitor_value,
                     patience=patience,
                     patience_counter=patience_counter,
                 )
@@ -3408,9 +3685,17 @@ def run_gat_training(
             best_val_f1=best_val_f1,
             best_val_objective_score=best_val_objective_score,
             best_val_auprc=best_val_auprc,
+            best_val_auc=best_val_auc,
+            best_val_mcc=best_val_mcc,
+            best_val_far=best_val_far,
+            best_val_f05=best_val_f05,
+            best_val_tau=best_val_tau,
+            best_val_accuracy=best_val_accuracy,
             best_epoch=best_epoch,
-            monitor_metric="val_loss",
-            monitor_mode="min",
+            monitor_metric=monitor_metric,
+            monitor_mode=monitor_mode,
+            monitor_value=monitor_value,
+            best_monitor_value=best_monitor_value,
             objective_metric=objective_metric,
             objective_threshold_beta=objective_threshold_beta,
             val_objective_score=val_objective_score,
@@ -3424,6 +3709,9 @@ def run_gat_training(
             lambda_l2_att=lambda_l2_att,
             train_sampler_mode=str(train_sampler_mode_resolved),
             eval_neighbors_mode=str(eval_neighbors_mode_resolved),
+            graph_hash=graph_hash,
+            graph_file_hash=graph_file_hash,
+            graph_hash_source=graph_hash_source,
             smote_synth_count=synth_count,
             epoch_time_sec=epoch_time_sec,
         )
@@ -3440,12 +3728,22 @@ def run_gat_training(
                     "best_val_f1": float(best_val_f1),
                     "best_val_objective_score": float(best_val_objective_score),
                     "best_val_auprc": float(best_val_auprc),
+                    "best_val_auc": float(best_val_auc) if best_val_auc is not None else None,
+                    "best_val_mcc": float(best_val_mcc) if best_val_mcc is not None else None,
+                    "best_val_far": float(best_val_far) if best_val_far is not None else None,
+                    "best_val_f05": float(best_val_f05) if best_val_f05 is not None else None,
+                    "best_val_tau": float(best_val_tau) if best_val_tau is not None else None,
+                    "best_val_accuracy": float(best_val_accuracy) if best_val_accuracy is not None else None,
                     "best_epoch": int(best_epoch),
-                    "monitor_metric": "val_loss",
-                    "monitor_mode": "min",
+                    "monitor_metric": monitor_metric,
+                    "monitor_mode": monitor_mode,
+                    "monitor_value": float(monitor_value),
+                    "best_monitor_value": float(best_monitor_value),
                     "patience_counter": int(patience_counter),
                     "run_id": run_id,
                     "graph_hash": graph_hash,
+                    "graph_file_hash": graph_file_hash,
+                    "graph_hash_source": graph_hash_source,
                     "gnn_variant": _normalize_gnn_variant(gnn_variant),
                     "variant_tag": _variant_tags(use_graphsmote, loaded_obj, gnn_variant=gnn_variant),
                     "use_graphsmote": bool(use_graphsmote),
@@ -3463,7 +3761,9 @@ def run_gat_training(
                     "last_val_auprc": float(val_auprc) if val_auprc is not None else None,
                     "last_val_mcc": float(val_mcc) if val_mcc is not None else None,
                     "last_val_far": float(val_far) if val_far is not None else None,
+                    "last_val_f05": float(val_f05) if val_f05 is not None else None,
                     "last_val_tau": float(val_tau) if val_tau is not None else None,
+                    "last_val_accuracy": float(val_accuracy) if val_accuracy is not None else None,
                     "epoch_time_sec": float(epoch_time_sec),
                 }
                 torch.save(ckpt_payload, save_state_path)
@@ -3472,10 +3772,11 @@ def run_gat_training(
 
         if early_stop_enabled and patience_counter >= patience:
             logger.info(
-                "Early stopping at epoch %d by val_loss (best=%g, last=%g, patience=%d, min_delta=%g).",
+                "Early stopping at epoch %d by %s (best=%g, last=%g, patience=%d, min_delta=%g).",
                 epoch,
-                best_val_loss,
-                val_loss,
+                monitor_metric,
+                best_monitor_value,
+                monitor_value,
                 patience,
                 min_delta,
             )
@@ -3503,15 +3804,26 @@ def run_gat_training(
         best_val_f1=best_val_f1,
         best_val_objective_score=best_val_objective_score,
         best_val_auprc=best_val_auprc,
+        best_val_auc=best_val_auc,
+        best_val_mcc=best_val_mcc,
+        best_val_far=best_val_far,
+        best_val_f05=best_val_f05,
+        best_val_tau=best_val_tau,
+        best_val_accuracy=best_val_accuracy,
         best_epoch=best_epoch,
-        monitor_metric="val_loss",
-        monitor_mode="min",
+        monitor_metric=monitor_metric,
+        monitor_mode=monitor_mode,
+        best_monitor_value=best_monitor_value,
         objective_metric=objective_metric,
         objective_threshold_beta=objective_threshold_beta,
+        graph_hash=graph_hash,
+        graph_file_hash=graph_file_hash,
+        graph_hash_source=graph_hash_source,
         stopped_early=stopped_early,
     )
     logger.info(
-        f"Training finished. Best val_loss: {best_val_loss:.6f} "
+        f"Training finished. Best {monitor_metric}: {best_monitor_value:.6f} "
+        f"(best_val_loss={best_val_loss:.6f}) "
         f"({objective_metric} ref={best_val_objective_score:.4f}) "
         f"(F1 ref={best_val_f1:.4f}) at epoch {best_epoch}."
     )
@@ -3792,7 +4104,6 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
 
 def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_overrides=None):
     global data, sequence_index_global, sequence_config_global
-    graph_filename = loaded_obj.get('filename')
     # Si la elección no viene desde el menú de entrenamiento, preguntar al usuario.
     if use_graphsmote_search is None:
         use_graphsmote_input = input("¿Desea que la búsqueda de hiperparámetros incluya GraphSMOTE? (s/n): ").strip().lower()
@@ -3804,7 +4115,10 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
         logger.info("La búsqueda de hiperparámetros NO incluirá opciones de GraphSMOTE.")
 
     # --- Carga inteligente de HPO ---
-    graph_hash = _calculate_graph_hash(graph_filename)
+    graph_identity = _resolve_graph_identity(loaded_obj)
+    graph_hash = graph_identity.get("graph_hash")
+    graph_file_hash = graph_identity.get("graph_file_hash")
+    graph_hash_source = graph_identity.get("graph_hash_source")
 
     if graph_hash:
         # Buscar todos los HPO del mismo grafo y luego filtrar por variante
@@ -3961,6 +4275,9 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
     best_params['gnn_variant'] = _normalize_gnn_variant(best_params.get('gnn_variant', GNN_VARIANT))
     best_params['variant_tag'] = _variant_tags(use_graphsmote_search, loaded_obj, gnn_variant=best_params['gnn_variant'])
     best_params.setdefault('undersample', 'auto')
+    best_params['graph_hash'] = graph_hash
+    best_params['graph_file_hash'] = graph_file_hash
+    best_params['graph_hash_source'] = graph_hash_source
     try:
         best_params['use_imgagn_aug'] = bool(_has_imgagn(loaded_obj))
     except Exception:
@@ -3979,6 +4296,8 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
     trials_df = study.trials_dataframe()
     trials_df['use_graphsmote'] = use_graphsmote_search
     trials_df['graph_hash'] = graph_hash
+    trials_df['graph_file_hash'] = graph_file_hash
+    trials_df['graph_hash_source'] = graph_hash_source
     trials_df['gnn_variant'] = _normalize_gnn_variant(best_params.get('gnn_variant', GNN_VARIANT))
     trials_df['variant_tag'] = variant_tag
     full_study_path = os.path.join(RESULTADOS_DIR, f"optuna_full_study_{timestamp}{hash_tag}{variant_tag}.csv")
@@ -4018,8 +4337,10 @@ def run_imgagn_hpo(loaded_obj):
         logger.error("La máscara de entrenamiento está vacía; no se puede ejecutar ImGAGN.")
         return
 
-    graph_filename = loaded_obj.get('filename')
-    graph_hash = _calculate_graph_hash(graph_filename)
+    graph_identity = _resolve_graph_identity(loaded_obj)
+    graph_hash = graph_identity.get("graph_hash")
+    graph_file_hash = graph_identity.get("graph_file_hash")
+    graph_hash_source = graph_identity.get("graph_hash_source")
 
     # Optuna: sampler y pruner razonables
     sampler = optuna.samplers.TPESampler(seed=SEED, multivariate=True, group=True)
@@ -4157,6 +4478,9 @@ def run_imgagn_hpo(loaded_obj):
     best_params = best.params.copy()
     best_params['value'] = best.value
     best_params['node_type'] = node_type
+    best_params['graph_hash'] = graph_hash
+    best_params['graph_file_hash'] = graph_file_hash
+    best_params['graph_hash_source'] = graph_hash_source
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
     os.makedirs(RESULTADOS_DIR, exist_ok=True)
@@ -4166,7 +4490,11 @@ def run_imgagn_hpo(loaded_obj):
     logger.info(f"[ImGAGN] Hiperparámetros top guardados en -> {os.path.basename(best_path)}")
 
     full_path = os.path.join(RESULTADOS_DIR, f"imgagn_full_study_{timestamp}{hash_tag}.csv")
-    study.trials_dataframe().to_csv(full_path, index=False)
+    trials_df = study.trials_dataframe()
+    trials_df['graph_hash'] = graph_hash
+    trials_df['graph_file_hash'] = graph_file_hash
+    trials_df['graph_hash_source'] = graph_hash_source
+    trials_df.to_csv(full_path, index=False)
     logger.info(f"[ImGAGN] Estudio completo guardado en -> {os.path.basename(full_path)}")
 
     print("\n=== Mejor configuración ImGAGN ===")
@@ -4182,8 +4510,10 @@ def run_imgagn_pipeline(loaded_obj, retrain_gat: bool = True):
     (3) guardar y (4) re-entrenar GAT sobre el grafo aumentado.
     """
     # 1) Intentar reutilizar HPO previo
-    graph_filename = loaded_obj.get('filename')
-    graph_hash = _calculate_graph_hash(graph_filename)
+    graph_identity = _resolve_graph_identity(loaded_obj)
+    graph_hash = graph_identity.get("graph_hash")
+    graph_file_hash = graph_identity.get("graph_file_hash")
+    graph_hash_source = graph_identity.get("graph_hash_source")
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
     existing = sorted(glob.glob(os.path.join(RESULTADOS_DIR, f"imgagn_hyperparams_*{hash_tag}.csv")))
 
@@ -4204,6 +4534,9 @@ def run_imgagn_pipeline(loaded_obj, retrain_gat: bool = True):
         if not best_params:
             logger.error("No se obtuvo configuración ImGAGN. Abortando pipeline.")
             return
+    best_params["graph_hash"] = graph_hash
+    best_params["graph_file_hash"] = graph_file_hash
+    best_params["graph_hash_source"] = graph_hash_source
 
     # 3) Construir cfg e invocar ImGAGN una vez
     try:

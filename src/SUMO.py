@@ -869,6 +869,298 @@ def _assign_temporal_splits(df: pd.DataFrame, agent_col: str = "agent_id") -> pd
     return splits
 
 
+def _xml_tag_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def _float_or_nan(value: object) -> float:
+    try:
+        if value is None:
+            return float("nan")
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _fcd_lane_index(lane_id: object) -> float:
+    lane = str(lane_id or "").strip()
+    if not lane:
+        return float("nan")
+    suffix = lane.rsplit("_", 1)[-1]
+    try:
+        return float(int(suffix))
+    except ValueError:
+        return float("nan")
+
+
+def _fcd_agent_label(vehicle_type: object, vehicle_class: object = None) -> str:
+    raw = str(vehicle_class or vehicle_type or "").strip()
+    label = raw.lower()
+    if not label:
+        return "unknown"
+    if label in {"passenger", "passenger/hov", "private", "car"}:
+        return "car"
+    if label in {"bus", "coach"}:
+        return "bus"
+    if label in {"truck", "trailer", "truck/trailer", "delivery"}:
+        return "truck"
+    if label in {"motorcycle", "moped", "moto"}:
+        return "motorcycle"
+    if "truck" in label:
+        return "truck"
+    if "bus" in label:
+        return "bus"
+    if "motorcycle" in label or "moto" in label:
+        return "motorcycle"
+    if "passenger" in label or label == "veh_passenger":
+        return "car"
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_")
+    return cleaned or "unknown"
+
+
+def _attach_fcd_context(records: pd.DataFrame) -> pd.DataFrame:
+    if records.empty:
+        return records
+
+    df = records.copy()
+    df["state_headway_m"] = 999.0
+    df["state_headway_s"] = 999.0
+    df["state_relative_speed_kmh"] = 0.0
+
+    group_cols = ["time_s", "edge", "lane"]
+    valid_context = df["edge"].astype(str).str.len().gt(0) & df["lane"].astype(str).str.len().gt(0)
+    for _, group in df[valid_context].groupby(group_cols, sort=False):
+        ordered = group.sort_values("pos_m", kind="mergesort")
+        lead_pos = ordered["pos_m"].shift(-1)
+        lead_speed = ordered["speed_m_s"].shift(-1)
+        gap_m = lead_pos - ordered["pos_m"]
+        valid_gap = gap_m.notna() & (gap_m > 0)
+
+        headway_m = gap_m.where(valid_gap, 999.0)
+        speed = ordered["speed_m_s"].where(ordered["speed_m_s"] > 0.1)
+        headway_s = (gap_m / speed).where(valid_gap & speed.notna(), 999.0)
+        relative_speed = ((lead_speed - ordered["speed_m_s"]) * 3.6).where(
+            lead_speed.notna(),
+            0.0,
+        )
+
+        df.loc[ordered.index, "state_headway_m"] = headway_m.to_numpy()
+        df.loc[ordered.index, "state_headway_s"] = headway_s.to_numpy()
+        df.loc[ordered.index, "state_relative_speed_kmh"] = relative_speed.to_numpy()
+
+    edge_context = (
+        df.groupby(["time_s", "edge"], dropna=False)
+        .agg(
+            flow_context_vehicle_count=("vehicle_id", "count"),
+            flow_context_mean_speed_kmh=("state_speed_kmh", "mean"),
+            edge_pos_min=("pos_m", "min"),
+            edge_pos_max=("pos_m", "max"),
+        )
+        .reset_index()
+    )
+    span_km = (edge_context["edge_pos_max"] - edge_context["edge_pos_min"]).abs() / 1000.0
+    span_km = span_km.where(span_km >= 1.0, 1.0)
+    edge_context["flow_context_density_veh_per_km"] = (
+        edge_context["flow_context_vehicle_count"] / span_km
+    )
+    edge_context = edge_context[
+        [
+            "time_s",
+            "edge",
+            "flow_context_vehicle_count",
+            "flow_context_mean_speed_kmh",
+            "flow_context_density_veh_per_km",
+        ]
+    ]
+    return df.merge(edge_context, on=["time_s", "edge"], how="left")
+
+
+def build_sumo_fcd_transition_dataset(fcd_path: Path | str) -> pd.DataFrame:
+    """
+    Builds expert transitions from SUMO FCD output.
+
+    Each transition is formed from two consecutive FCD samples for the same
+    vehicle, so MA-AIRL receives observed ``s, a, s'`` tuples instead of the
+    former one-step proxy.
+    """
+    path = Path(fcd_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"No existe el archivo FCD: {path}")
+
+    records = []
+    current_time = float("nan")
+    for event, elem in ET.iterparse(path, events=("start", "end")):
+        tag = _xml_tag_name(elem.tag)
+        if event == "start" and tag == "timestep":
+            current_time = _float_or_nan(elem.attrib.get("time"))
+            continue
+        if event != "end":
+            continue
+        if tag == "timestep":
+            current_time = float("nan")
+            elem.clear()
+            continue
+        if tag != "vehicle":
+            continue
+
+        vehicle_id = str(elem.attrib.get("id", "")).strip()
+        if not vehicle_id or math.isnan(current_time):
+            elem.clear()
+            continue
+
+        speed_m_s = _float_or_nan(elem.attrib.get("speed"))
+        if math.isnan(speed_m_s):
+            elem.clear()
+            continue
+
+        lane_id = str(elem.attrib.get("lane", "")).strip()
+        edge = str(elem.attrib.get("edge", "")).strip()
+        vehicle_type = elem.attrib.get("type", "")
+        vehicle_class = elem.attrib.get("vClass", elem.attrib.get("class", ""))
+        records.append(
+            {
+                "vehicle_id": vehicle_id,
+                "time_s": current_time,
+                "type": str(vehicle_type).strip(),
+                "edge": edge,
+                "lane": lane_id,
+                "lane_index": _fcd_lane_index(lane_id),
+                "pos_m": _float_or_nan(elem.attrib.get("pos")),
+                "x_m": _float_or_nan(elem.attrib.get("x")),
+                "y_m": _float_or_nan(elem.attrib.get("y")),
+                "speed_m_s": speed_m_s,
+                "state_speed_kmh": speed_m_s * 3.6,
+                "accel_m_s2": _float_or_nan(elem.attrib.get("acceleration")),
+                "agent_id": _fcd_agent_label(vehicle_type, vehicle_class),
+            }
+        )
+        elem.clear()
+
+    if not records:
+        return pd.DataFrame()
+
+    samples = _attach_fcd_context(pd.DataFrame(records))
+    samples = samples.sort_values(["vehicle_id", "time_s"], kind="mergesort").reset_index(drop=True)
+    rows = []
+    for vehicle_id, group in samples.groupby("vehicle_id", sort=False):
+        ordered = group.sort_values("time_s", kind="mergesort").reset_index(drop=True)
+        if len(ordered) < 2:
+            continue
+        for idx in range(len(ordered) - 1):
+            state = ordered.iloc[idx]
+            next_state = ordered.iloc[idx + 1]
+            delta_t = float(next_state["time_s"] - state["time_s"])
+            if delta_t <= 0:
+                continue
+
+            speed_delta_kmh = float(next_state["state_speed_kmh"] - state["state_speed_kmh"])
+            derived_accel = (float(next_state["speed_m_s"]) - float(state["speed_m_s"])) / delta_t
+            accel = float(next_state["accel_m_s2"])
+            if math.isnan(accel):
+                accel = derived_accel
+
+            state_lane = float(state["lane_index"]) if not math.isnan(float(state["lane_index"])) else np.nan
+            next_lane = float(next_state["lane_index"]) if not math.isnan(float(next_state["lane_index"])) else np.nan
+            lane_changed = 0.0
+            if not math.isnan(state_lane) and not math.isnan(next_lane):
+                lane_changed = float(state_lane != next_lane)
+
+            rows.append(
+                {
+                    "trajectory_id": str(vehicle_id),
+                    "trip_id": str(vehicle_id),
+                    "plate": str(vehicle_id),
+                    "agent_id": str(state["agent_id"]),
+                    "vehicle_class": str(state["agent_id"]),
+                    "vehicle_type_id": np.nan,
+                    "state_time": float(state["time_s"]),
+                    "next_time": float(next_state["time_s"]),
+                    "delta_t_s": delta_t,
+                    "state_edge": str(state["edge"]),
+                    "next_edge": str(next_state["edge"]),
+                    "state_lane_id": str(state["lane"]),
+                    "next_lane_id": str(next_state["lane"]),
+                    "state_lane": state_lane,
+                    "next_lane": next_lane,
+                    "state_pos_m": float(state["pos_m"]),
+                    "next_pos_m": float(next_state["pos_m"]),
+                    "state_x_m": float(state["x_m"]),
+                    "next_x_m": float(next_state["x_m"]),
+                    "state_y_m": float(state["y_m"]),
+                    "next_y_m": float(next_state["y_m"]),
+                    "state_speed_kmh": float(state["state_speed_kmh"]),
+                    "next_speed_kmh": float(next_state["state_speed_kmh"]),
+                    "state_headway_s": float(state["state_headway_s"]),
+                    "next_headway_s": float(next_state["state_headway_s"]),
+                    "state_relative_speed_kmh": float(state["state_relative_speed_kmh"]),
+                    "next_relative_speed_kmh": float(next_state["state_relative_speed_kmh"]),
+                    "flow_context_vehicle_count": float(state["flow_context_vehicle_count"]),
+                    "flow_context_mean_speed_kmh": float(state["flow_context_mean_speed_kmh"]),
+                    "flow_context_density_veh_per_km": float(state["flow_context_density_veh_per_km"]),
+                    "action_delta_speed_kmh": speed_delta_kmh,
+                    "action_accel_m_s2": accel,
+                    "action_lane_change": lane_changed,
+                    "vms_active": False,
+                    "vms_message_type": "",
+                    "source": "sumo_fcd",
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    transitions = pd.DataFrame(rows)
+    transitions["temporal_split"] = _assign_temporal_splits(transitions)
+    columns = [
+        "trajectory_id",
+        "trip_id",
+        "plate",
+        "agent_id",
+        "vehicle_class",
+        "vehicle_type_id",
+        "state_time",
+        "next_time",
+        "delta_t_s",
+        "state_edge",
+        "next_edge",
+        "state_lane_id",
+        "next_lane_id",
+        "state_lane",
+        "next_lane",
+        "state_pos_m",
+        "next_pos_m",
+        "state_x_m",
+        "next_x_m",
+        "state_y_m",
+        "next_y_m",
+        "state_speed_kmh",
+        "next_speed_kmh",
+        "state_headway_s",
+        "next_headway_s",
+        "state_relative_speed_kmh",
+        "next_relative_speed_kmh",
+        "flow_context_vehicle_count",
+        "flow_context_mean_speed_kmh",
+        "flow_context_density_veh_per_km",
+        "action_delta_speed_kmh",
+        "action_accel_m_s2",
+        "action_lane_change",
+        "vms_active",
+        "vms_message_type",
+        "source",
+        "temporal_split",
+    ]
+    return transitions[columns].reset_index(drop=True)
+
+
+def is_sumo_fcd_transition_dataset(df: Optional[pd.DataFrame]) -> bool:
+    if df is None or df.empty or "source" not in df.columns:
+        return False
+    return bool(df["source"].astype(str).eq("sumo_fcd").all())
+
+
 def build_irl_transition_dataset(
     segments_df: pd.DataFrame,
     headways_df: pd.DataFrame,

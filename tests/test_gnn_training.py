@@ -1,6 +1,7 @@
 
 import json
 import math
+import hashlib
 import pytest
 import torch
 import torch.nn.functional as F
@@ -137,6 +138,27 @@ def test_val_loss_monitor_resets_patience_only_on_min_delta_improvement():
         )
 
 
+def test_binary_eval_extras_include_false_alarm_ratio_and_brier_score():
+    y_true = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    y_pred = torch.tensor([0, 1, 1, 0], dtype=torch.long)
+    y_prob = torch.tensor(
+        [
+            [0.90, 0.10],
+            [0.40, 0.60],
+            [0.20, 0.80],
+            [0.70, 0.30],
+        ],
+        dtype=torch.float32,
+    )
+
+    metrics = gnn_main._compute_binary_eval_extras(y_true, y_pred, y_prob)
+
+    assert metrics["false_alarm_ratio"] == pytest.approx(0.5)
+    assert metrics["far"] == pytest.approx(0.5)
+    assert metrics["brier_score"] == pytest.approx(0.225)
+    assert metrics["brier"] == pytest.approx(0.225)
+
+
 def test_train_minibatch_reports_unscaled_loss_with_accumulation():
     HeteroData = pytest.importorskip("torch_geometric.data").HeteroData
     data = HeteroData()
@@ -172,35 +194,40 @@ def test_train_minibatch_reports_unscaled_loss_with_accumulation():
     assert l2_loss == pytest.approx(0.0)
 
 
-def test_run_gat_training_uses_val_loss_for_best_checkpoint_and_stop(tmp_path, monkeypatch):
+def _make_small_training_graph():
     HeteroData = pytest.importorskip("torch_geometric.data").HeteroData
     data = HeteroData()
     data["pm"].x = torch.zeros(4, 3)
     data["pm"].y = torch.tensor([0, 1, 0, 1], dtype=torch.long)
     data["pm"].train_mask = torch.tensor([True, True, False, False])
     data["pm"].val_mask = torch.tensor([False, False, True, True])
-    loaded_obj = {"data": data, "filename": "demo_graph.pt"}
+    return data
+
+
+def _write_fast_hparams(tmp_path, *, checkpoint_metric=None):
+    row = {
+        "value": 0.5,
+        "hidden_channels": 8,
+        "num_heads": 1,
+        "dropout": 0.0,
+        "num_layers": 1,
+        "lr": 0.01,
+        "weight_decay": 0.0,
+        "batch_size": 4,
+        "num_neighbors": "[1]",
+        "optimizer": "Adam",
+        "loss_type": "CrossEntropy",
+        "objective_metric": "F1",
+    }
+    if checkpoint_metric is not None:
+        row["checkpoint_metric"] = checkpoint_metric
 
     hp_path = tmp_path / "optuna_hyperparams_Base.csv"
-    pd.DataFrame(
-        [
-            {
-                "value": 0.5,
-                "hidden_channels": 8,
-                "num_heads": 1,
-                "dropout": 0.0,
-                "num_layers": 1,
-                "lr": 0.01,
-                "weight_decay": 0.0,
-                "batch_size": 4,
-                "num_neighbors": "[1]",
-                "optimizer": "Adam",
-                "loss_type": "CrossEntropy",
-                "objective_metric": "F1",
-            }
-        ]
-    ).to_csv(hp_path, index=False)
+    pd.DataFrame([row]).to_csv(hp_path, index=False)
+    return hp_path
 
+
+def _install_fast_training_mocks(monkeypatch, tmp_path, val_losses, prob_sequences, *, saved_paths=None):
     class FakeLoader:
         def __len__(self):
             return 1
@@ -214,16 +241,9 @@ def test_run_gat_training_uses_val_loss_for_best_checkpoint_and_stop(tmp_path, m
             self.param = torch.nn.Parameter(torch.zeros(()))
             self.use_checkpointing = False
 
-    saved_paths = []
     test_criteria = []
-    val_losses = [0.90, 0.80, 0.81, 0.82, 0.70]
-    prob_sequences = [
-        [0.9, 0.2],
-        [0.8, 0.3],
-        [0.1, 0.95],
-        [0.05, 0.98],
-        [0.1, 0.9],
-    ]
+    if saved_paths is None:
+        saved_paths = []
 
     def fake_test(*args, criterion=None, **kwargs):
         del args, kwargs
@@ -267,8 +287,79 @@ def test_run_gat_training_uses_val_loss_for_best_checkpoint_and_stop(tmp_path, m
     )
     monkeypatch.setattr(gnn_main, "test", fake_test)
     monkeypatch.setattr(gnn_main, "_get_repo_version", lambda: "test")
-    monkeypatch.setattr(gnn_main.torch, "save", lambda obj, path: saved_paths.append(str(path)))
     monkeypatch.setattr("builtins.input", lambda prompt="": "1")
+    return test_criteria, saved_paths
+
+
+def test_run_gat_training_defaults_to_objective_for_best_checkpoint(tmp_path, monkeypatch):
+    loaded_obj = {"data": _make_small_training_graph(), "filename": "demo_graph.pt"}
+    _write_fast_hparams(tmp_path)
+    saved_paths = []
+    test_criteria, _ = _install_fast_training_mocks(
+        monkeypatch,
+        tmp_path,
+        val_losses=[0.90, 0.80, 0.81, 0.82, 0.83],
+        prob_sequences=[
+            [0.9, 0.2],
+            [0.8, 0.3],
+            [0.1, 0.95],
+            [0.95, 0.1],
+            [0.85, 0.15],
+        ],
+        saved_paths=saved_paths,
+    )
+    monkeypatch.setattr(gnn_main.torch, "save", lambda obj, path: saved_paths.append(str(path)))
+
+    progress_events = []
+    gnn_main.run_gat_training(
+        loaded_obj,
+        force_use_graphsmote=False,
+        early_stop=True,
+        early_stop_patience=2,
+        early_stop_min_delta=0.0,
+        max_epochs=5,
+        progress_callback=lambda **payload: progress_events.append(dict(payload)),
+    )
+
+    epoch_events = [event for event in progress_events if event.get("epoch")]
+    assert len(test_criteria) == 5
+    assert all(criterion is not None for criterion in test_criteria)
+    assert len(saved_paths) == 2
+    assert epoch_events[-1]["epoch"] == 5
+    assert epoch_events[-1]["monitor_metric"] == "val_objective_score"
+    assert epoch_events[-1]["monitor_mode"] == "max"
+    assert epoch_events[-1]["best_val_loss"] == pytest.approx(0.81)
+    assert epoch_events[-1]["best_monitor_value"] == pytest.approx(1.0)
+    assert epoch_events[-1]["patience_counter"] == 2
+
+    hparams_files = sorted(tmp_path.glob("gat_model_BEST*_hparams.json"))
+    assert hparams_files
+    meta = json.loads(hparams_files[-1].read_text(encoding="utf-8"))
+    assert meta["monitor_metric"] == "val_objective_score"
+    assert meta["monitor_mode"] == "max"
+    assert meta["best_monitor_value"] == pytest.approx(1.0)
+    assert meta["best_val_loss"] == pytest.approx(0.81)
+    assert meta["best_epoch"] == 3
+
+
+def test_run_gat_training_can_fallback_to_val_loss_monitor(tmp_path, monkeypatch):
+    loaded_obj = {"data": _make_small_training_graph(), "filename": "demo_graph.pt"}
+    _write_fast_hparams(tmp_path, checkpoint_metric="val_loss")
+    saved_paths = []
+    test_criteria, _ = _install_fast_training_mocks(
+        monkeypatch,
+        tmp_path,
+        val_losses=[0.90, 0.80, 0.81, 0.82, 0.70],
+        prob_sequences=[
+            [0.9, 0.2],
+            [0.8, 0.3],
+            [0.1, 0.95],
+            [0.05, 0.98],
+            [0.1, 0.9],
+        ],
+        saved_paths=saved_paths,
+    )
+    monkeypatch.setattr(gnn_main.torch, "save", lambda obj, path: saved_paths.append(str(path)))
 
     progress_events = []
     gnn_main.run_gat_training(
@@ -283,11 +374,12 @@ def test_run_gat_training_uses_val_loss_for_best_checkpoint_and_stop(tmp_path, m
 
     epoch_events = [event for event in progress_events if event.get("epoch")]
     assert len(test_criteria) == 4
-    assert all(criterion is not None for criterion in test_criteria)
     assert len(saved_paths) == 2
     assert epoch_events[-1]["epoch"] == 4
+    assert epoch_events[-1]["monitor_metric"] == "val_loss"
+    assert epoch_events[-1]["monitor_mode"] == "min"
     assert epoch_events[-1]["best_val_loss"] == pytest.approx(0.80)
-    assert epoch_events[-1]["patience_counter"] == 2
+    assert epoch_events[-1]["best_monitor_value"] == pytest.approx(0.80)
 
     hparams_files = sorted(tmp_path.glob("gat_model_BEST*_hparams.json"))
     assert hparams_files
@@ -296,3 +388,92 @@ def test_run_gat_training_uses_val_loss_for_best_checkpoint_and_stop(tmp_path, m
     assert meta["monitor_mode"] == "min"
     assert meta["best_val_loss"] == pytest.approx(0.80)
     assert meta["best_epoch"] == 2
+
+
+def test_run_gat_training_resumes_old_val_loss_checkpoint_with_new_monitor(tmp_path, monkeypatch):
+    data = _make_small_training_graph()
+    loaded_obj = {"data": data, "filename": "demo_graph.pt"}
+    _write_fast_hparams(tmp_path)
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = torch.nn.Parameter(torch.zeros(()))
+            self.use_checkpointing = False
+
+    old_ckpt = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "epoch": 1,
+            "max_epochs": 3,
+            "model_state": FakeModel().state_dict(),
+            "best_val_loss": 0.10,
+            "best_val_f1": 0.10,
+            "best_val_objective_score": 0.10,
+            "best_val_auprc": 0.10,
+            "best_epoch": 1,
+            "monitor_metric": "val_loss",
+            "monitor_mode": "min",
+            "best_monitor_value": 0.10,
+            "patience_counter": 2,
+        },
+        old_ckpt,
+    )
+
+    test_criteria, _ = _install_fast_training_mocks(
+        monkeypatch,
+        tmp_path,
+        val_losses=[0.91, 0.92],
+        prob_sequences=[
+            [0.1, 0.95],
+            [0.95, 0.1],
+        ],
+    )
+    monkeypatch.setattr(gnn_main, "_build_gnn_model", lambda **kwargs: FakeModel())
+
+    progress_events = []
+    gnn_main.run_gat_training(
+        loaded_obj,
+        force_use_graphsmote=False,
+        early_stop=True,
+        early_stop_patience=2,
+        early_stop_min_delta=0.0,
+        max_epochs=3,
+        resume_state_path=str(old_ckpt),
+        save_state_path=str(old_ckpt),
+        progress_callback=lambda **payload: progress_events.append(dict(payload)),
+    )
+
+    epoch_events = [event for event in progress_events if event.get("epoch")]
+    assert len(test_criteria) == 2
+    assert epoch_events[0]["epoch"] == 2
+    assert epoch_events[0]["monitor_metric"] == "val_objective_score"
+    assert epoch_events[0]["best_monitor_value"] == pytest.approx(1.0)
+
+    saved_ckpt = torch.load(old_ckpt, map_location="cpu", weights_only=False)
+    assert saved_ckpt["monitor_metric"] == "val_objective_score"
+    assert saved_ckpt["monitor_mode"] == "max"
+    assert saved_ckpt["best_epoch"] == 2
+    assert saved_ckpt["best_val_loss"] == pytest.approx(0.91)
+
+
+def test_graph_identity_uses_semantic_hash_and_records_file_hash(tmp_path):
+    graph_path = tmp_path / "graph.pt"
+    graph_path.write_bytes(b"graph payload")
+    expected_file_hash = hashlib.sha256(b"graph payload").hexdigest()
+    semantic_hash = "c" * 64
+    data = _make_small_training_graph()
+    data.graph_metadata = {"graph_hash": "a" * 64}
+
+    identity = gnn_main._resolve_graph_identity(
+        {
+            "data": data,
+            "metadata": {"graph_hash": "b" * 64},
+            "graph_hash": semantic_hash,
+            "graph_path": str(graph_path),
+        }
+    )
+
+    assert identity["graph_hash"] == semantic_hash
+    assert identity["graph_file_hash"] == expected_file_hash
+    assert identity["graph_hash_source"] == "semantic_metadata"

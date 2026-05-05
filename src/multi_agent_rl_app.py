@@ -6,6 +6,8 @@ import sys
 import time
 import glob
 import os
+import subprocess
+from typing import Optional
 
 # Add src to path if needed
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -24,12 +26,18 @@ except ImportError:
 # Import MARL logic
 from src.marl_core import DEFAULT_STATE_COLS, MARLManager, MAIRLManager
 from src.sumo_simulation_app import (
+    _build_sumo_subprocess_env,
     find_sumo_binary, 
     SIMULATION_DIR,
     _render_flow_loader,
     _render_porticos_loader
 )
-from src.SUMO import run_sumo_pipeline, FlowColumns
+from src.SUMO import (
+    build_sumo_fcd_transition_dataset,
+    is_sumo_fcd_transition_dataset,
+    run_sumo_pipeline,
+    FlowColumns,
+)
 
 def _init_state():
     if "marl_manager" not in st.session_state:
@@ -46,6 +54,12 @@ def _init_state():
         st.session_state["marl_cluster_df"] = None
     if "mairl_transition_df" not in st.session_state:
         st.session_state["mairl_transition_df"] = None
+    if "mairl_avi_transition_df" not in st.session_state:
+        st.session_state["mairl_avi_transition_df"] = None
+    if "mairl_transition_source" not in st.session_state:
+        st.session_state["mairl_transition_source"] = None
+    if "mairl_fcd_path" not in st.session_state:
+        st.session_state["mairl_fcd_path"] = str(SIMULATION_DIR / "sumo_fcd.xml")
     if "mairl_sumo_result" not in st.session_state:
         st.session_state["mairl_sumo_result"] = None
     if "mairl_feature_cols" not in st.session_state:
@@ -122,14 +136,144 @@ def _training_agent_config(df: pd.DataFrame):
     return _agent_config_from_transitions(df)
 
 
+def _set_fcd_transitions(transition_df: pd.DataFrame, fcd_path: Path) -> None:
+    st.session_state["mairl_transition_df"] = transition_df
+    st.session_state["mairl_transition_source"] = "sumo_fcd"
+    st.session_state["mairl_fcd_path"] = str(fcd_path)
+    st.session_state["mairl_manager"] = None
+    st.session_state["mairl_metrics_log"] = []
+    st.session_state["mairl_last_metrics"] = {}
+    config = _agent_config_from_transitions(transition_df)
+    if config:
+        st.session_state["marl_agent_config"] = config
+        st.session_state["marl_num_agents"] = len(config)
+
+
+def _build_transitions_from_fcd(fcd_path: Path) -> Optional[pd.DataFrame]:
+    try:
+        transitions = build_sumo_fcd_transition_dataset(fcd_path)
+    except Exception as e:
+        st.error(f"Error leyendo FCD SUMO: {e}")
+        return None
+    if transitions.empty:
+        st.error("El FCD no contiene pares consecutivos válidos para construir transiciones.")
+        return None
+    _set_fcd_transitions(transitions, fcd_path)
+    st.success(f"Transiciones FCD reconstruidas: {len(transitions):,}.")
+    return transitions
+
+
 def render_configuration():
     st.header("Configuración de Reward Learning")
     
-    st.subheader("1. Datos expertos desde AVI/SUMO")
+    st.subheader("1. Trayectorias expertas desde SUMO FCD")
     st.caption(
-        "MA-AIRL usa transiciones segment-level s, a, s_next reconstruidas entre pórticos. "
-        "Los clústeres quedan como baseline o agrupación experimental."
+        "MA-AIRL entrena con transiciones reales s, a, s_next formadas desde muestras "
+        "consecutivas del FCD de SUMO. No hay fallback a s'=s."
     )
+
+    default_cfg = SIMULATION_DIR / "sample.sumocfg"
+    cfg_value = str(default_cfg) if default_cfg.exists() else ""
+    cfg_path = st.text_input("Archivo .sumocfg", value=cfg_value, key="mairl_sumo_cfg_path")
+    default_tripinfo = SIMULATION_DIR / "tripinfo.xml"
+    tripinfo_path = st.text_input(
+        "Salida tripinfo.xml",
+        value=str(default_tripinfo),
+        key="mairl_tripinfo_path",
+    )
+    fcd_path_value = st.text_input(
+        "Salida/importación FCD XML",
+        value=st.session_state.get("mairl_fcd_path", str(SIMULATION_DIR / "sumo_fcd.xml")),
+        key="mairl_fcd_output_path",
+    )
+    fcd_period = st.number_input(
+        "Periodo FCD (segundos)",
+        value=1.0,
+        min_value=0.1,
+        step=0.5,
+        key="mairl_fcd_period",
+    )
+
+    col_run, col_import = st.columns(2)
+    with col_run:
+        if st.button("Ejecutar SUMO y construir transiciones FCD", type="primary"):
+            if not cfg_path:
+                st.error("Ingrese la ruta del archivo .sumocfg.")
+            else:
+                cfg_file = Path(cfg_path).expanduser()
+                if not cfg_file.exists():
+                    st.error("El archivo .sumocfg no existe.")
+                else:
+                    tripinfo_file = Path(tripinfo_path).expanduser()
+                    fcd_file = Path(fcd_path_value).expanduser()
+                    tripinfo_file.parent.mkdir(parents=True, exist_ok=True)
+                    fcd_file.parent.mkdir(parents=True, exist_ok=True)
+
+                    executable = "sumo-gui" if st.session_state.get("marl_gui") else "sumo"
+                    sumo_bin = find_sumo_binary(executable)
+                    if sumo_bin is None:
+                        st.error(f"No se encontró el ejecutable '{executable}'. Configure SUMO_HOME o el PATH.")
+                    else:
+                        cmd = [
+                            str(sumo_bin),
+                            "-c",
+                            str(cfg_file),
+                            "--tripinfo-output",
+                            str(tripinfo_file),
+                            "--fcd-output",
+                            str(fcd_file),
+                            "--device.fcd.period",
+                            f"{float(fcd_period):.3f}",
+                            "--fcd-output.acceleration",
+                            "true",
+                            "--no-step-log",
+                            "true",
+                            "--duration-log.disable",
+                            "true",
+                        ]
+                        with st.spinner("Ejecutando SUMO con salida FCD..."):
+                            try:
+                                subprocess.run(cmd, check=True, env=_build_sumo_subprocess_env())
+                            except subprocess.CalledProcessError as exc:
+                                st.error(f"SUMO falló (código {exc.returncode}).")
+                            else:
+                                _build_transitions_from_fcd(fcd_file)
+
+    with col_import:
+        if st.button("Importar FCD existente"):
+            fcd_file = Path(fcd_path_value).expanduser()
+            if not fcd_file.exists():
+                st.error("El archivo FCD no existe.")
+            else:
+                _build_transitions_from_fcd(fcd_file)
+
+    transition_df = st.session_state.get("mairl_transition_df")
+    if transition_df is not None and not transition_df.empty:
+        st.metric("Transiciones FCD expertas", f"{len(transition_df):,}")
+        if "temporal_split" in transition_df.columns:
+            split_counts = transition_df["temporal_split"].value_counts().rename_axis("split").reset_index(name="transitions")
+            st.dataframe(split_counts, width="stretch")
+        st.dataframe(transition_df.head(200), width="stretch")
+
+        st.subheader("2. MA-AIRL: features del estado")
+        numeric_cols = transition_df.select_dtypes(include=[np.number, bool]).columns.tolist()
+        state_options = [
+            c
+            for c in numeric_cols
+            if c.startswith("state_") or c.startswith("flow_context_") or c == "vms_active"
+        ]
+        default_cols = [c for c in DEFAULT_STATE_COLS if c in state_options]
+        selected_cols = st.multiselect(
+            "Columnas para estado s",
+            options=state_options,
+            default=default_cols or state_options[:5],
+            key="mairl_feature_cols",
+        )
+        if not selected_cols:
+            st.warning("Seleccione al menos una columna de estado para MA-AIRL.")
+
+    st.subheader("3. Clústeres opcionales")
+    st.caption("Los clústeres quedan como baseline o agrupación experimental; no reemplazan las trayectorias FCD.")
     
     # Scan for CSV files
     csv_files = glob.glob(str(RESULTS_DIR / "cluster_*.csv"))
@@ -167,7 +311,7 @@ def render_configuration():
         st.write("Estadísticas de clústeres opcionales:")
         st.dataframe(pd.DataFrame(st.session_state["marl_cluster_stats"]).T)
 
-    st.subheader("2. Parámetros de Simulación (SUMO)")
+    st.subheader("4. Parámetros de Simulación (SUMO)")
     col1, col2 = st.columns(2)
     with col1:
         st.number_input("Duración de Episodio (segundos)", value=3600, step=600, key="marl_duration")
@@ -176,7 +320,8 @@ def render_configuration():
         st.checkbox("Usar GUI de SUMO", value=False, key="marl_gui")
         st.selectbox("Estrategia de Emisión", ["Matriz OD"], key="marl_emission")
 
-    st.subheader("3. Tráfico AVI y pórticos")
+    st.subheader("5. Diagnóstico AVI y pórticos")
+    st.caption("Este bloque reconstruye transiciones AVI parciales para inspección; MA-AIRL no las usa como fallback.")
     col_a, col_b = st.columns(2)
 
     with col_a:
@@ -187,7 +332,7 @@ def render_configuration():
         st.markdown("##### Carga de pórticos")
         porticos_df = _render_porticos_loader()
 
-    if st.button("Reconstruir transiciones IRL desde AVI", type="primary"):
+    if st.button("Reconstruir transiciones AVI para diagnóstico"):
         if flujos_df is None or flujos_df.empty:
             st.error("Debe cargar flujos primero.")
         elif porticos_df is None or porticos_df.empty:
@@ -206,41 +351,16 @@ def render_configuration():
                     st.error(f"Error reconstruyendo transiciones: {e}")
                     return
             st.session_state["mairl_sumo_result"] = result
-            st.session_state["mairl_transition_df"] = result.irl_transitions
-            st.session_state["mairl_manager"] = None
-            st.session_state["mairl_metrics_log"] = []
-            config = _agent_config_from_transitions(result.irl_transitions)
-            if config:
-                st.session_state["marl_agent_config"] = config
-                st.session_state["marl_num_agents"] = len(config)
-            st.success(f"Transiciones IRL reconstruidas: {len(result.irl_transitions):,}.")
+            st.session_state["mairl_sumo_result"] = result
+            st.session_state["mairl_avi_transition_df"] = result.irl_transitions
+            st.success(f"Transiciones AVI diagnósticas reconstruidas: {len(result.irl_transitions):,}.")
 
-    transition_df = st.session_state.get("mairl_transition_df")
-    if transition_df is not None and not transition_df.empty:
-        st.metric("Transiciones expertas", f"{len(transition_df):,}")
-        if "temporal_split" in transition_df.columns:
-            split_counts = transition_df["temporal_split"].value_counts().rename_axis("split").reset_index(name="transitions")
-            st.dataframe(split_counts, width="stretch")
-        st.dataframe(transition_df.head(200), width="stretch")
+    avi_df = st.session_state.get("mairl_avi_transition_df")
+    if avi_df is not None and not avi_df.empty:
+        st.metric("Transiciones AVI diagnósticas", f"{len(avi_df):,}")
+        st.dataframe(avi_df.head(100), width="stretch")
 
-        st.subheader("4. MA-AIRL: features del estado")
-        numeric_cols = transition_df.select_dtypes(include=[np.number, bool]).columns.tolist()
-        state_options = [
-            c
-            for c in numeric_cols
-            if c.startswith("state_") or c.startswith("flow_context_") or c == "vms_active"
-        ]
-        default_cols = [c for c in DEFAULT_STATE_COLS if c in state_options]
-        selected_cols = st.multiselect(
-            "Columnas para estado s",
-            options=state_options,
-            default=default_cols or state_options[:5],
-            key="mairl_feature_cols",
-        )
-        if not selected_cols:
-            st.warning("Seleccione al menos una columna de estado para MA-AIRL.")
-
-    st.subheader("5. Configuración de políticas compartidas")
+    st.subheader("6. Configuración de políticas compartidas")
     
     # Use config from state if available
     current_config = st.session_state.get("marl_agent_config", [])
@@ -302,7 +422,7 @@ def render_training():
 
     algorithm = st.selectbox(
         "Algoritmo",
-        options=["MA-AIRL (transiciones AVI)", "CEM (legacy)"],
+        options=["MA-AIRL (SUMO FCD)", "CEM (legacy)"],
         index=0,
         key="marl_algorithm",
     )
@@ -311,7 +431,7 @@ def render_training():
     with col1:
         st.subheader("Control")
 
-        if algorithm == "MA-AIRL (transiciones AVI)":
+        if algorithm == "MA-AIRL (SUMO FCD)":
             iterations = st.number_input("Iteraciones", value=200, min_value=1, step=50, key="mairl_iterations")
             batch_size = st.number_input("Batch size", value=256, min_value=8, step=16, key="mairl_batch")
             gamma = st.slider("Gamma (descuento)", min_value=0.80, max_value=0.99, value=0.99, step=0.01, key="mairl_gamma")
@@ -323,7 +443,12 @@ def render_training():
             if st.button("Iniciar Entrenamiento", type="primary", key="mairl_start"):
                 expert_df = st.session_state.get("mairl_transition_df")
                 if expert_df is None or expert_df.empty:
-                    st.error("Debe reconstruir transiciones IRL desde AVI antes de entrenar MA-AIRL.")
+                    st.error("Debe generar o importar transiciones FCD de SUMO antes de entrenar MA-AIRL.")
+                elif (
+                    st.session_state.get("mairl_transition_source") != "sumo_fcd"
+                    or not is_sumo_fcd_transition_dataset(expert_df)
+                ):
+                    st.error("MA-AIRL requiere transiciones FCD de SUMO; no se permite fallback a AVI ni a s'=s.")
                 else:
                     train_df = expert_df
                     if "temporal_split" in expert_df.columns:
@@ -448,7 +573,7 @@ def render_training():
 
     with col2:
         st.subheader("Métricas en Tiempo Real")
-        if algorithm == "MA-AIRL (transiciones AVI)":
+        if algorithm == "MA-AIRL (SUMO FCD)":
             if st.session_state["mairl_metrics_log"]:
                 df_metrics = pd.DataFrame(st.session_state["mairl_metrics_log"]).set_index("iteration")
                 st.line_chart(df_metrics[["disc_loss", "policy_loss", "reward_mean"]])
@@ -467,7 +592,7 @@ def render_training():
 
 def render_visualization():
     st.header("Análisis y Visualización")
-    st.write("Recompensas y políticas aprendidas desde transiciones AVI.")
+    st.write("Recompensas y políticas aprendidas desde transiciones SUMO FCD.")
 
     if st.session_state.get("mairl_metrics_log"):
         st.subheader("MA-AIRL: Métricas de Entrenamiento")
@@ -491,6 +616,15 @@ def render_visualization():
             st.info("No hay historial disponible.")
     else:
         st.info("No hay historial disponible.")
+
+    st.subheader("Limitaciones y próximos pasos")
+    st.markdown(
+        r"""
+        - \(s'\) y las acciones se estiman desde pares consecutivos del FCD de SUMO.
+        - La calidad de las recompensas depende de la resolución del FCD y de rutas SUMO válidas.
+        - SUMOPy queda como referencia conceptual; no se añade como dependencia por su stack histórico Python 2.7/wxPython.
+        """
+    )
 
 def main(set_page_config: bool = True, show_exit_button: bool = True) -> None:
     _init_state()

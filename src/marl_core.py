@@ -19,7 +19,13 @@ try:
     from torch.distributions import Normal
 except Exception:
     torch = None
-    nn = None
+    class _UnavailableNN:
+        Module = object
+
+        def __getattr__(self, name: str) -> Any:
+            raise RuntimeError("PyTorch no está disponible. Instale torch para usar MA-AIRL.")
+
+    nn = _UnavailableNN()
     optim = None
     Normal = None
 

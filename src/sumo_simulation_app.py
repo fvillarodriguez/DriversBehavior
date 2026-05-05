@@ -579,7 +579,7 @@ def _render_duarouter_tab() -> None:
 
 
 def _render_sumo_run_tab() -> None:
-    st.subheader("SUMO tripinfo")
+    st.subheader("SUMO tripinfo y FCD")
 
     default_cfg = SIMULATION_DIR / "sample.sumocfg"
     cfg_value = str(default_cfg) if default_cfg.exists() else ""
@@ -590,6 +590,9 @@ def _render_sumo_run_tab() -> None:
         str(default_tripinfo) if default_tripinfo.exists() else str(ROOT_DIR / "tripinfo.xml")
     )
     output_path = st.text_input("Salida tripinfo.xml", value=tripinfo_value, key="sumo_tripinfo_path")
+    default_fcd = SIMULATION_DIR / "sumo_fcd.xml"
+    fcd_value = str(default_fcd) if default_fcd.exists() else str(default_fcd)
+    fcd_output_path = st.text_input("Salida sumo_fcd.xml", value=fcd_value, key="sumo_fcd_path")
 
     if st.button("Ejecutar SUMO", key="sumo_run_sumo"):
         if not cfg_path:
@@ -601,6 +604,8 @@ def _render_sumo_run_tab() -> None:
             return
         out_file = Path(output_path).expanduser()
         out_file.parent.mkdir(parents=True, exist_ok=True)
+        fcd_file = Path(fcd_output_path).expanduser()
+        fcd_file.parent.mkdir(parents=True, exist_ok=True)
 
         sumo_bin = find_sumo_binary("sumo")
         if sumo_bin is None:
@@ -612,6 +617,12 @@ def _render_sumo_run_tab() -> None:
             str(cfg_file),
             "--tripinfo-output",
             str(out_file),
+            "--fcd-output",
+            str(fcd_file),
+            "--device.fcd.period",
+            "1.0",
+            "--fcd-output.acceleration",
+            "true",
             "--no-step-log",
             "true",
             "--duration-log.disable",
@@ -624,6 +635,7 @@ def _render_sumo_run_tab() -> None:
                 st.error(f"SUMO fallo (codigo {exc.returncode}).")
                 return
         st.success(f"tripinfo.xml generado en: {out_file}")
+        st.success(f"sumo_fcd.xml generado en: {fcd_file}")
 
 
 def main(*, set_page_config: bool = True, show_exit_button: bool = True) -> None:
