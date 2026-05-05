@@ -258,27 +258,27 @@ def train_minibatch(
 
         if use_amp and scaler is not None:
             with torch.amp.autocast("cuda"):
-                loss, cls_loss, edge_loss, l2_att_loss, h_loss = compute_loss()
-                loss = loss / accumulation_steps # Normalizar la loss
+                raw_loss, cls_loss, edge_loss, l2_att_loss, h_loss = compute_loss()
+                loss_for_backward = raw_loss / accumulation_steps
             
-            if torch.isfinite(loss):
+            if torch.isfinite(loss_for_backward):
                 if DEBUG:
-                    grad_fn_info = loss.grad_fn.__class__.__name__ if loss.grad_fn else 'None'
+                    grad_fn_info = loss_for_backward.grad_fn.__class__.__name__ if loss_for_backward.grad_fn else 'None'
                     logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Antes de backward (AMP). Loss grad_fn: {grad_fn_info}")
-                scaler.scale(loss).backward()
+                scaler.scale(loss_for_backward).backward()
                 if DEBUG:
                     logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Después de backward (AMP).")
             else:
                 logger.warning("Loss is NaN, skipping backward pass.")
 
         else:
-            loss, cls_loss, edge_loss, l2_att_loss, h_loss = compute_loss()
-            loss = loss / accumulation_steps # Normalizar la loss
-            if torch.isfinite(loss):
+            raw_loss, cls_loss, edge_loss, l2_att_loss, h_loss = compute_loss()
+            loss_for_backward = raw_loss / accumulation_steps
+            if torch.isfinite(loss_for_backward):
                 if DEBUG:
-                    grad_fn_info = loss.grad_fn.__class__.__name__ if loss.grad_fn else 'None'
+                    grad_fn_info = loss_for_backward.grad_fn.__class__.__name__ if loss_for_backward.grad_fn else 'None'
                     logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Antes de backward. Loss grad_fn: {grad_fn_info}")
-                loss.backward()
+                loss_for_backward.backward()
                 if DEBUG:
                     logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Después de backward.")
             else:
@@ -304,15 +304,15 @@ def train_minibatch(
             if scheduler is not None:
                 scheduler.step()
 
-        if torch.isfinite(loss):
-            total_loss += float(loss.item())
+        if torch.isfinite(raw_loss):
+            total_loss += float(raw_loss.item())
             total_cls_loss += float(cls_loss.item())
             total_edge_loss += float(edge_loss.item())
             total_l2_att_loss += float(l2_att_loss.item())
             total_h_loss += float(h_loss.item())
 
         progress_bar.set_postfix({
-            'Loss': f"{loss.item():.4f}" if torch.isfinite(loss) else "nan",
+            'Loss': f"{raw_loss.item():.4f}" if torch.isfinite(raw_loss) else "nan",
             'CLS': f"{cls_loss.item():.4f}" if torch.isfinite(cls_loss) else "nan",
             'H': f"{h_loss.item():.4f}" if torch.isfinite(h_loss) else "nan",
             'Edge': f"{edge_loss.item():.4f}" if torch.isfinite(edge_loss) else "nan",
@@ -335,7 +335,7 @@ def train_minibatch(
                         epoch=int(epoch),
                         batch_idx=int(i + 1),
                         batch_total=int(total_batches),
-                        train_loss=float(loss.item()) if torch.isfinite(loss) else None,
+                        train_loss=float(raw_loss.item()) if torch.isfinite(raw_loss) else None,
                         train_cls_loss=float(cls_loss.item()) if torch.isfinite(cls_loss) else None,
                         train_edge_loss=float(edge_loss.item()) if torch.isfinite(edge_loss) else None,
                         train_l2_att_loss=float(l2_att_loss.item()) if torch.isfinite(l2_att_loss) else None,

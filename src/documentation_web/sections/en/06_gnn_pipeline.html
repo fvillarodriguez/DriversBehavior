@@ -101,6 +101,29 @@
       </aside>
     </div>
     <p class="reveal">\(\mathcal{L}_{\text{edge}}\) is reconstruction with negative sampling (if <code>edge_gen</code> is set). \(\mathcal{L}_{\text{att}}\) is \(L^2\) over attentions when <code>XAI=1</code>. The loop uses gradient accumulation (<code>accumulation_steps=2</code>), <code>grad_clip</code>, <code>OneCycleLR</code> and AMP on CUDA.</p>
+    <p class="reveal">Gradient accumulation now scales only the backward pass: <code>loss_for_backward = raw_loss / accumulation_steps</code>. Reported <code>train_loss</code> and batch events aggregate the unscaled <code>raw_loss</code>, so the training-loss curve remains comparable when the accumulation factor changes.</p>
+
+    <h4 class="reveal">Validation-loss monitor and BEST checkpoint</h4>
+    <p class="reveal">Final training in <code>Graph Neural Networks &gt; Training</code> selects <code>BEST</code> and triggers early stopping by minimum validation loss. F1, F0.5, AUPRC, FAR and MCC remain diagnostic metrics for audit, threshold analysis and operational reporting, but they no longer reset patience or decide the final checkpoint.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathcal{L}_{\text{val}}^{(e)} = \frac{1}{Z_V}\sum_{i\in V}\ell(f_{\theta_e}(x_i,G), y_i) \]</div>
+      <div class="num">(6.3)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>V</dt><dd>Validation nodes from <code>val_mask</code>; training aborts if this split is absent or empty.</dd>
+          <dt>ℓ</dt><dd>The active criterion passed to <code>test(..., criterion=criterion)</code>.</dd>
+          <dt>Z<sub>V</sub></dt><dd>Valid-node count, or effective class-weight denominator for weighted cross entropy.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/gnn_main.py · _update_val_loss_monitor</span>
+      </aside>
+    </div>
+    <p class="reveal">A new best epoch requires <code>best_val_loss - val_loss &gt; early_stop_min_delta</code>. Otherwise <code>patience_counter</code> increases, and training stops once it reaches <code>early_stop_patience</code>. The sidecar records <code>monitor_metric="val_loss"</code>, <code>monitor_mode="min"</code>, <code>best_val_loss</code>, <code>best_epoch</code> and the classification metrics measured at that same epoch.</p>
+    <div class="lab-callout sage reveal">
+      <div class="label">Selection contract</div>
+      <p>Optuna/HPO keeps its configured <code>objective_metric</code>. The loss-based monitor applies to the final Training tab only, where it acts as a held-out empirical-risk criterion. Older resume checkpoints without <code>best_val_loss</code> restore weights and optimizer state but restart the new monitor from infinity with zero patience.</p>
+    </div>
 
     <h3 class="reveal">GraphSMOTE</h3>
     <ol class="reveal">
@@ -115,7 +138,7 @@
     <p class="reveal">Generates synthetic nodes as convex combinations of training minority nodes. Defines the synthetic count by:</p>
     <div class="lab-eq has-inspector reveal">
       <div class="formula">\[ \lambda_1 = \frac{n_{\min}+n_g}{n_{\text{maj}}}\ \Rightarrow\ n_g = \max(0,\ \lambda_1 n_{\text{maj}} - n_{\min}) \]</div>
-      <div class="num">(6.3)</div>
+      <div class="num">(6.4)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
@@ -146,7 +169,7 @@
   </section>
 
   <footer class="lab-coda">
-    <span>Chapter § 6 · 3 equations · 2 callouts</span>
+    <span>Chapter § 6 · 4 equations · 4 callouts</span>
     <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/gnn_pipeline_audit_en.tex</code></span>
   </footer>
 

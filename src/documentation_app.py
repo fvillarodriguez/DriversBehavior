@@ -41,7 +41,7 @@ SECTIONS: tuple[SectionDef, ...] = (
     SectionDef("02_accident_prediction",  "§ 2 · Predicción",       "§ 2 · Prediction",     "Modelos supervisados",            "Supervised models",                   5400),
     SectionDef("03_nlp_severity",         "§ 3 · NLP severidad",    "§ 3 · NLP severity",   "Réplica del estudio NLP",         "NLP study replication",               5200),
     SectionDef("04_drift_detection",      "§ 4 · Drift detection",  "§ 4 · Drift detection","Recalibración batch vs adaptiva", "Batch vs adaptive recalibration",     8800),
-    SectionDef("06_gnn_pipeline",         "§ 6 · Graph Neural Network", "§ 6 · Graph Neural Network", "Grafo espacio-temporal", "Spatio-temporal graph",               5400),
+    SectionDef("06_gnn_pipeline",         "§ 6 · Graph Neural Network", "§ 6 · Graph Neural Network", "Grafo espacio-temporal", "Spatio-temporal graph",               7600),
     SectionDef("07_mairl",                "§ 7 · MA-AIRL",          "§ 7 · MA-AIRL",        "Multi-agent adversarial IRL",     "Multi-agent adversarial IRL",         3500),
 )
 

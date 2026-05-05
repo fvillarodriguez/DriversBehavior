@@ -1573,6 +1573,98 @@ class FocalLoss(torch.nn.Module):
         else:
             return focal_loss
 
+def _criterion_loss_sum_and_denominator(criterion, logits: torch.Tensor, targets: torch.Tensor):
+    if criterion is None:
+        return None
+
+    if isinstance(criterion, torch.nn.CrossEntropyLoss):
+        weight = getattr(criterion, "weight", None)
+        ignore_index = int(getattr(criterion, "ignore_index", -100))
+        label_smoothing = float(getattr(criterion, "label_smoothing", 0.0))
+        per_item = F.cross_entropy(
+            logits,
+            targets,
+            weight=weight,
+            ignore_index=ignore_index,
+            reduction="none",
+            label_smoothing=label_smoothing,
+        ).view(-1)
+        targets_flat = targets.view(-1)
+        valid = targets_flat != ignore_index
+        if not bool(valid.any().item()):
+            return None
+        loss_sum = per_item[valid].sum()
+        if weight is not None:
+            weight = weight.to(device=targets.device, dtype=per_item.dtype)
+            denominator = weight[targets_flat[valid]].sum()
+        else:
+            denominator = valid.sum().to(device=per_item.device, dtype=per_item.dtype)
+        if torch.isfinite(loss_sum) and torch.isfinite(denominator) and float(denominator.detach().cpu().item()) > 0:
+            return loss_sum, denominator
+        return None
+
+    if isinstance(criterion, FocalLoss):
+        original_reduction = criterion.reduction
+        try:
+            criterion.reduction = "none"
+            per_item = criterion(logits, targets)
+        finally:
+            criterion.reduction = original_reduction
+        if torch.is_tensor(per_item):
+            per_item = per_item.view(-1)
+            if per_item.numel() > 0:
+                loss_sum = per_item.sum()
+                denominator = torch.as_tensor(
+                    per_item.numel(),
+                    device=per_item.device,
+                    dtype=per_item.dtype,
+                )
+                if torch.isfinite(loss_sum) and torch.isfinite(denominator):
+                    return loss_sum, denominator
+
+    try:
+        loss_tensor = criterion(logits, targets)
+    except Exception:
+        return None
+    if not torch.is_tensor(loss_tensor):
+        return None
+    if loss_tensor.numel() > 1:
+        flat_loss = loss_tensor.reshape(-1)
+        finite = torch.isfinite(flat_loss)
+        if not bool(finite.any().item()):
+            return None
+        loss_sum = flat_loss[finite].sum()
+        denominator = finite.sum().to(device=flat_loss.device, dtype=flat_loss.dtype)
+        return loss_sum, denominator
+    loss_tensor = loss_tensor.reshape(())
+    if not torch.isfinite(loss_tensor):
+        return None
+    denominator = torch.as_tensor(
+        max(int(targets.numel()), 1),
+        device=loss_tensor.device,
+        dtype=loss_tensor.dtype,
+    )
+    return loss_tensor * denominator, denominator
+
+def _update_val_loss_monitor(
+    *,
+    val_loss: float,
+    best_val_loss: float,
+    patience_counter: int,
+    min_delta: float,
+) -> Tuple[bool, float, int]:
+    current = float(val_loss)
+    if not math.isfinite(current):
+        raise ValueError("val_loss debe ser finita para early stopping.")
+    try:
+        previous = float(best_val_loss)
+    except Exception:
+        previous = float("inf")
+    delta = max(float(min_delta), 0.0)
+    if (not math.isfinite(previous)) or (previous - current) > delta:
+        return True, current, 0
+    return False, previous, int(patience_counter) + 1
+
 def prior_shift_adjust(p_train, p_real, p_hat):
     # p_train: prevalencia en entrenamiento; p_real: prevalencia real
     # p_hat: prob entrenada
@@ -1640,6 +1732,7 @@ def test(
     mask_name: str = "subset_mask",
     num_neighbors=None,
     criterion=None,
+    progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
 ):
     """
     Evalúa el rendimiento de un modelo usando mini-batches para evitar OOM.
@@ -1693,7 +1786,17 @@ def test(
             idx = mask.nonzero(as_tuple=False).view(-1)
             eval_items.append((mname, idx))
 
-    for mask_name, node_indices in eval_items:
+    total_eval_items = max(len(eval_items), 1)
+
+    def _emit_eval_progress(payload: Dict[str, object]) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(payload)
+        except Exception:
+            logger.debug("GNN evaluation progress callback failed", exc_info=True)
+
+    for mask_idx, (mask_name, node_indices) in enumerate(eval_items, start=1):
         num_neighbors_cfg = _resolve_num_neighbors(
             num_neighbors if num_neighbors is not None else NUM_NEIGHBORS,
             NUM_NEIGHBORS,
@@ -1710,12 +1813,30 @@ def test(
         all_preds, all_probs, all_true = [], [], []
         loss_sum = 0.0
         loss_count = 0
+        node_count = int(node_indices.numel())
+        try:
+            total_batches = int(math.ceil(node_count / max(int(batch_size), 1)))
+        except Exception:
+            total_batches = 1
+        total_batches = max(total_batches, 1)
+        _emit_eval_progress(
+            {
+                "event": "mask_start",
+                "mask_name": mask_name,
+                "mask_index": mask_idx,
+                "mask_total": total_eval_items,
+                "node_count": node_count,
+                "batch_index": 0,
+                "batch_total": total_batches,
+                "processed_nodes": 0,
+            }
+        )
 
         if temporal_module is not None:
             temporal_module.reset_cache()
             _prime_temporal_cache_if_needed(model, data, node_type=node_type, context=f"test:{mask_name}")
 
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader, start=1):
             batch = batch.to(device)
             
             # FIX: Reconstruir edge_attr_dict desde el batch para asegurar el slicing correcto
@@ -1754,20 +1875,34 @@ def test(
             true = batch[node_type].y[:batch[node_type].batch_size]
             if criterion is not None:
                 try:
-                    loss_tensor = criterion(logits_target, true)
-                    if torch.is_tensor(loss_tensor):
-                        if loss_tensor.numel() > 1:
-                            loss_tensor = loss_tensor.mean()
-                        if torch.isfinite(loss_tensor):
-                            target_count = int(true.numel())
-                            loss_sum += float(loss_tensor.detach().cpu().item()) * max(target_count, 1)
-                            loss_count += max(target_count, 1)
+                    loss_parts = _criterion_loss_sum_and_denominator(
+                        criterion,
+                        logits_target,
+                        true,
+                    )
+                    if loss_parts is not None:
+                        loss_numerator, loss_denominator = loss_parts
+                        loss_sum += float(loss_numerator.detach().cpu().item())
+                        loss_count += float(loss_denominator.detach().cpu().item())
                 except Exception:
                     pass
             
             all_preds.append(preds.cpu())
             all_probs.append(probs.cpu())
             all_true.append(true.cpu())
+            processed_nodes = min(int(batch_idx) * int(batch_size), node_count)
+            _emit_eval_progress(
+                {
+                    "event": "batch_done",
+                    "mask_name": mask_name,
+                    "mask_index": mask_idx,
+                    "mask_total": total_eval_items,
+                    "node_count": node_count,
+                    "batch_index": int(batch_idx),
+                    "batch_total": total_batches,
+                    "processed_nodes": processed_nodes,
+                }
+            )
 
         y_pred = torch.cat(all_preds)
         y_prob = torch.cat(all_probs)
@@ -1818,6 +1953,18 @@ def test(
         }
         if criterion is not None and loss_count > 0:
             results[mask_name]['loss'] = float(loss_sum / float(loss_count))
+        _emit_eval_progress(
+            {
+                "event": "mask_done",
+                "mask_name": mask_name,
+                "mask_index": mask_idx,
+                "mask_total": total_eval_items,
+                "node_count": node_count,
+                "batch_index": total_batches,
+                "batch_total": total_batches,
+                "processed_nodes": node_count,
+            }
+        )
         
     return results
 
@@ -2748,6 +2895,7 @@ def run_gat_training(
         save_state_path = resume_state_path
 
     start_epoch = 1
+    resume_best_val_loss = float("inf")
     resume_best_val_f1 = 0.0
     resume_best_val_auprc = 0.0
     resume_best_val_objective = float("-inf")
@@ -2764,6 +2912,14 @@ def run_gat_training(
                     if ckpt.get("scheduler_state"):
                         scheduler.load_state_dict(ckpt["scheduler_state"])
                     start_epoch = int(ckpt.get("epoch", 0)) + 1
+                    ckpt_has_val_loss = "best_val_loss" in ckpt
+                    if ckpt_has_val_loss:
+                        try:
+                            resume_best_val_loss = float(ckpt.get("best_val_loss"))
+                        except Exception:
+                            resume_best_val_loss = float("inf")
+                        if not math.isfinite(resume_best_val_loss):
+                            resume_best_val_loss = float("inf")
                     resume_best_val_f1 = float(ckpt.get("best_val_f1", 0.0))
                     resume_best_val_auprc = float(ckpt.get("best_val_auprc", 0.0))
                     try:
@@ -2773,7 +2929,14 @@ def run_gat_training(
                     except Exception:
                         resume_best_val_objective = float("-inf")
                     resume_best_epoch = int(ckpt.get("best_epoch", 0))
-                    resume_patience_counter = int(ckpt.get("patience_counter", 0))
+                    if ckpt_has_val_loss:
+                        resume_patience_counter = int(ckpt.get("patience_counter", 0))
+                    else:
+                        resume_patience_counter = 0
+                        logger.info(
+                            "Checkpoint anterior sin best_val_loss; se reinicia paciencia "
+                            "para usar early stopping por validation loss."
+                        )
                     logger.info(
                         f"Reanudando entrenamiento desde epoch {start_epoch} "
                         f"(checkpoint: {os.path.basename(resume_state_path)})"
@@ -2782,6 +2945,7 @@ def run_gat_training(
             logger.warning(f"No se pudo reanudar desde checkpoint: {exc}")
 
     # 10) Loop de entrenamiento
+    best_val_loss = float(resume_best_val_loss)
     best_val_f1 = float(resume_best_val_f1)
     best_val_auprc = float(resume_best_val_auprc)
     best_val_objective_score = float(resume_best_val_objective)
@@ -2801,10 +2965,14 @@ def run_gat_training(
             progress_callback(
                 epoch=0,
                 total=max_epochs,
+                val_loss=None,
+                best_val_loss=best_val_loss,
                 val_f1=None,
                 best_val_f1=best_val_f1,
                 best_val_objective_score=best_val_objective_score,
                 objective_metric=objective_metric,
+                monitor_metric="val_loss",
+                monitor_mode="min",
                 patience=patience,
                 patience_counter=patience_counter,
             )
@@ -2937,14 +3105,29 @@ def run_gat_training(
             batch_size=batch_size_hp,
             masks=[val_key],
             num_neighbors=eval_neighbors_cfg,
+            criterion=criterion,
         )
         if not val_res or val_key not in val_res:
             raise RuntimeError(
                 "No se pudieron obtener resultados sobre val_mask durante entrenamiento."
             )
+        val_loss = val_res[val_key].get('loss')
+        try:
+            val_loss = float(val_loss)
+        except (TypeError, ValueError):
+            val_loss = float("nan")
+        if not math.isfinite(val_loss):
+            raise RuntimeError(
+                "No se pudo calcular validation loss finita sobre val_mask durante entrenamiento."
+            )
         if temporal_module is not None:
             temporal_module.train()
         model.use_checkpointing = True
+        if writer is not None:
+            try:
+                writer.add_scalar("Loss/val", val_loss, epoch)
+            except Exception:
+                pass
         
         val_f1 = 0.0
         val_f1_pos = None
@@ -3073,18 +3256,18 @@ def run_gat_training(
                 except Exception:
                     pass
 
-        is_best = False
-        if (
-            val_objective_score is not None
-            and math.isfinite(float(val_objective_score))
-            and (float(val_objective_score) - float(best_val_objective_score)) > min_delta
-        ):
-            best_val_objective_score = float(val_objective_score)
+        is_best, best_val_loss, patience_counter = _update_val_loss_monitor(
+            val_loss=val_loss,
+            best_val_loss=best_val_loss,
+            patience_counter=patience_counter,
+            min_delta=min_delta,
+        )
+        if is_best:
+            if val_objective_score is not None and math.isfinite(float(val_objective_score)):
+                best_val_objective_score = float(val_objective_score)
             best_val_f1 = float(val_f1)
             best_val_auprc = float(val_auprc) if val_auprc is not None else 0.0
             best_epoch = epoch
-            patience_counter = 0
-            is_best = True
             # Guardar modelo: copia única y alias estable
             try:
                 # Copia única (con timestamp/hash)
@@ -3098,7 +3281,8 @@ def run_gat_training(
             except Exception as e:
                 logger.error(f"No se pudo guardar el modelo en disco: {e}")
             logger.info(
-                f"Epoch {epoch:03d}: New best {objective_metric} on validation: {best_val_objective_score:.4f} (F1 ref={val_f1:.4f}).\n"
+                f"Epoch {epoch:03d}: New best val_loss on validation: {best_val_loss:.6f} "
+                f"({objective_metric} ref={val_objective_score if val_objective_score is not None else float('nan'):.4f}, F1 ref={val_f1:.4f}).\n"
                 f"  → Guardado: {os.path.basename(best_model_path_unique)} (alias variante: {os.path.basename(best_model_path)}, alias global: gat_model_BEST.pt)"
             )
             # Guardar sidecar con hiperparámetros y metadatos del entrenamiento (para ambas rutas)
@@ -3107,9 +3291,18 @@ def run_gat_training(
                 meta.update({
                     'gnn_variant': _normalize_gnn_variant(gnn_variant),
                     'variant_tag': _variant_tags(use_graphsmote, loaded_obj, gnn_variant=gnn_variant),
+                    'monitor_metric': 'val_loss',
+                    'monitor_mode': 'min',
+                    'best_val_loss': float(best_val_loss),
                     'best_val_f1': float(best_val_f1),
                     'best_val_objective_score': float(best_val_objective_score),
                     'best_val_auprc': float(best_val_auprc),
+                    'best_val_auc': float(val_auc) if val_auc is not None else None,
+                    'best_val_mcc': float(val_mcc) if val_mcc is not None else None,
+                    'best_val_far': float(val_far) if val_far is not None else None,
+                    'best_val_f05': float(val_f05) if val_f05 is not None else None,
+                    'best_val_tau': float(val_tau) if val_tau is not None else None,
+                    'best_val_accuracy': float(val_accuracy) if val_accuracy is not None else None,
                     'best_epoch': int(best_epoch),
                     'objective_metric': str(objective_metric),
                     'objective_threshold_beta': float(objective_threshold_beta),
@@ -3148,19 +3341,21 @@ def run_gat_training(
                         pass
             except Exception as _e:
                 logger.warning(f"No se pudo guardar hparams JSON: {_e}")
-        else:
-            patience_counter += 1
 
         if progress_callback is not None:
             try:
                 progress_callback(
                     epoch=epoch,
                     total=max_epochs,
+                    val_loss=val_loss,
+                    best_val_loss=best_val_loss,
                     val_f1=val_f1,
                     best_val_f1=best_val_f1,
                     val_objective_score=val_objective_score,
                     best_val_objective_score=best_val_objective_score,
                     objective_metric=objective_metric,
+                    monitor_metric="val_loss",
+                    monitor_mode="min",
                     patience=patience,
                     patience_counter=patience_counter,
                 )
@@ -3195,6 +3390,7 @@ def run_gat_training(
             train_cls_loss=cls_loss,
             train_edge_loss=edge_loss,
             train_l2_att_loss=l2_att_loss,
+            val_loss=val_loss,
             val_f1=val_f1,
             val_f1_pos=val_f1_pos,
             val_f1_macro=val_f1_macro,
@@ -3208,10 +3404,13 @@ def run_gat_training(
             val_f05=val_f05,
             val_tau=val_tau,
             val_mask=val_key,
+            best_val_loss=best_val_loss,
             best_val_f1=best_val_f1,
             best_val_objective_score=best_val_objective_score,
             best_val_auprc=best_val_auprc,
             best_epoch=best_epoch,
+            monitor_metric="val_loss",
+            monitor_mode="min",
             objective_metric=objective_metric,
             objective_threshold_beta=objective_threshold_beta,
             val_objective_score=val_objective_score,
@@ -3237,10 +3436,13 @@ def run_gat_training(
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(),
+                    "best_val_loss": float(best_val_loss),
                     "best_val_f1": float(best_val_f1),
                     "best_val_objective_score": float(best_val_objective_score),
                     "best_val_auprc": float(best_val_auprc),
                     "best_epoch": int(best_epoch),
+                    "monitor_metric": "val_loss",
+                    "monitor_mode": "min",
                     "patience_counter": int(patience_counter),
                     "run_id": run_id,
                     "graph_hash": graph_hash,
@@ -3254,6 +3456,7 @@ def run_gat_training(
                     "sampling_seed": int(sampling_seed_resolved),
                     "eval_neighbors_mode": str(eval_neighbors_mode_resolved),
                     "eval_num_neighbors": eval_num_neighbors_resolved,
+                    "last_val_loss": float(val_loss),
                     "last_val_f1": float(val_f1) if val_f1 is not None else None,
                     "last_val_objective_score": float(val_objective_score) if val_objective_score is not None else None,
                     "last_val_auc": float(val_auc) if val_auc is not None else None,
@@ -3269,8 +3472,10 @@ def run_gat_training(
 
         if early_stop_enabled and patience_counter >= patience:
             logger.info(
-                "Early stopping at epoch %d (patience=%d, min_delta=%g).",
+                "Early stopping at epoch %d by val_loss (best=%g, last=%g, patience=%d, min_delta=%g).",
                 epoch,
+                best_val_loss,
+                val_loss,
                 patience,
                 min_delta,
             )
@@ -3294,16 +3499,20 @@ def run_gat_training(
         run_id,
         epochs_run=epochs_run,
         total=int(max_epochs),
+        best_val_loss=best_val_loss,
         best_val_f1=best_val_f1,
         best_val_objective_score=best_val_objective_score,
         best_val_auprc=best_val_auprc,
         best_epoch=best_epoch,
+        monitor_metric="val_loss",
+        monitor_mode="min",
         objective_metric=objective_metric,
         objective_threshold_beta=objective_threshold_beta,
         stopped_early=stopped_early,
     )
     logger.info(
-        f"Training finished. Best {objective_metric}: {best_val_objective_score:.4f} "
+        f"Training finished. Best val_loss: {best_val_loss:.6f} "
+        f"({objective_metric} ref={best_val_objective_score:.4f}) "
         f"(F1 ref={best_val_f1:.4f}) at epoch {best_epoch}."
     )
 

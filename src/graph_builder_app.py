@@ -21,6 +21,7 @@ import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -105,6 +106,7 @@ from src.optimizers import get_optimizer_cls
 FEATURE_SELECTION_DIR = Path(RESULTADOS_DIR)
 HISTORY_PATH = Path(RESULTADOS_DIR) / "gnn_history.jsonl"
 GNN_OPTUNA_LIVE_DIR = Path(RESULTADOS_DIR) / "gnn_optuna_live"
+GNN_EVAL_LIVE_DIR = Path(RESULTADOS_DIR) / "gnn_eval_live"
 
 try:
     import duckdb
@@ -2185,6 +2187,149 @@ def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str
     }
 
 
+def _checkpoint_temporal_kind(state_dict: Dict[str, torch.Tensor]) -> Optional[str]:
+    keys = [str(key) for key in (state_dict or {}).keys()]
+    temporal_keys = [key for key in keys if key.startswith("temporal_head.")]
+    if not temporal_keys:
+        return None
+    if any(
+        key.startswith("temporal_head.encoder.")
+        or key.startswith("temporal_head.input_norm.")
+        or key == "temporal_head.pos"
+        for key in temporal_keys
+    ):
+        return "transformer"
+    if any(
+        key.startswith("temporal_head.temporal_proj.")
+        or key.startswith("temporal_head.temporal_score.")
+        for key in temporal_keys
+    ):
+        return "attnpool"
+    return "gru"
+
+
+def _strip_temporal_from_gnn_variant(variant: Optional[object]) -> str:
+    name = _normalize_ui_gnn_variant(variant)
+    if name.startswith("gat_edge_mlp"):
+        return "gat_edge_mlp"
+    if name.startswith("gnn_edge_aware"):
+        return "gnn_edge_aware"
+    return "gat_snapshot"
+
+
+def _compose_gnn_variant_with_temporal(
+    base_variant: Optional[object],
+    temporal_kind: Optional[str],
+) -> str:
+    base = _strip_temporal_from_gnn_variant(base_variant)
+    kind = str(temporal_kind or "snapshot").strip().lower()
+    if kind == "snapshot":
+        return base
+    if base == "gat_edge_mlp":
+        if kind == "transformer":
+            return "gat_edge_mlp_transformer"
+        if kind == "gru":
+            return "gat_edge_mlp_gru"
+        return "gat_edge_mlp"
+    if base == "gnn_edge_aware":
+        if kind == "transformer":
+            return "gnn_edge_aware_transformer"
+        if kind == "gru":
+            return "gnn_edge_aware_gru"
+        return "gnn_edge_aware"
+    if kind == "transformer":
+        return "gat_transformer"
+    if kind == "attnpool":
+        return "gat_attnpool"
+    return "gat_gru"
+
+
+def _infer_gnn_variant_from_model_path(model_path: str) -> Optional[str]:
+    name = Path(model_path).stem.lower()
+    normalized_name = name.replace("+", "_").replace("-", "_").replace(" ", "_")
+    for variant in sorted(_supported_gnn_variants(), key=len, reverse=True):
+        if variant in normalized_name or f"gnn_{variant}" in normalized_name:
+            return variant
+    return None
+
+
+def _resolve_gnn_variant_for_checkpoint(
+    model_path: str,
+    meta: Optional[Dict[str, object]],
+    state_dict: Dict[str, torch.Tensor],
+) -> str:
+    raw_variant = None
+    if isinstance(meta, dict):
+        raw_variant = meta.get("gnn_variant")
+    raw_variant = raw_variant or _infer_gnn_variant_from_model_path(model_path)
+
+    if raw_variant is None:
+        if any(str(key).startswith("edge_attr_encoders.") for key in (state_dict or {}).keys()):
+            raw_variant = "gat_edge_mlp"
+        else:
+            raw_variant = "gat_snapshot"
+
+    temporal_kind = _checkpoint_temporal_kind(state_dict)
+    if temporal_kind is None:
+        return _strip_temporal_from_gnn_variant(raw_variant)
+    return _compose_gnn_variant_with_temporal(raw_variant, temporal_kind)
+
+
+def _sequence_index_from_checkpoint_state(
+    state_dict: Dict[str, torch.Tensor],
+) -> Optional[object]:
+    if not isinstance(state_dict, dict):
+        return None
+    sequence_rows = state_dict.get("temporal_head.sequence_rows")
+    target_rows = state_dict.get("temporal_head.target_rows")
+    if sequence_rows is None or target_rows is None:
+        return None
+    try:
+        if torch.is_tensor(sequence_rows):
+            sequence_rows_arr = sequence_rows.detach().cpu().numpy()
+        else:
+            sequence_rows_arr = np.asarray(sequence_rows)
+        if torch.is_tensor(target_rows):
+            target_rows_arr = target_rows.detach().cpu().numpy()
+        else:
+            target_rows_arr = np.asarray(target_rows)
+        sequence_rows_arr = np.asarray(sequence_rows_arr, dtype=np.int64)
+        target_rows_arr = np.asarray(target_rows_arr, dtype=np.int64)
+        if sequence_rows_arr.ndim != 2 or target_rows_arr.ndim != 1:
+            return None
+        if int(sequence_rows_arr.shape[0]) != int(target_rows_arr.shape[0]):
+            return None
+        return SimpleNamespace(
+            sequence_rows=sequence_rows_arr,
+            target_rows=target_rows_arr,
+        )
+    except Exception:
+        return None
+
+
+def _resolve_sequence_index_for_checkpoint(
+    sequence_index: Optional[object],
+    state_dict: Dict[str, torch.Tensor],
+) -> Optional[object]:
+    checkpoint_sequence_index = _sequence_index_from_checkpoint_state(state_dict)
+    return checkpoint_sequence_index or sequence_index
+
+
+def _temporal_num_nodes_from_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    fallback: int,
+) -> int:
+    for key in (
+        "temporal_head.embedding_cache",
+        "temporal_head.target_lookup",
+        "temporal_head.sequence_mask",
+    ):
+        tensor = (state_dict or {}).get(key)
+        if torch.is_tensor(tensor) and tensor.dim() >= 1:
+            return int(tensor.shape[0])
+    return int(fallback)
+
+
 def _load_hparams_for_model(model_path: str) -> Dict[str, object]:
     hparams_path = Path(model_path).with_name(
         f"{Path(model_path).stem}_hparams.json"
@@ -3354,7 +3499,24 @@ def _evaluate_gnn_model_far_target(
         except Exception:
             h_out = 2
 
-    gnn_variant = _normalize_ui_gnn_variant(meta.get("gnn_variant", GNN_VARIANT))
+    gnn_variant = _resolve_gnn_variant_for_checkpoint(model_path, meta, state_dict)
+    sequence_index_for_model = _resolve_sequence_index_for_checkpoint(
+        sequence_index,
+        state_dict,
+    )
+    checkpoint_temporal_kind = _checkpoint_temporal_kind(state_dict)
+    if checkpoint_temporal_kind is not None and sequence_index_for_model is None:
+        raise ValueError(
+            "El checkpoint incluye un head temporal, pero no contiene ni recibe SequenceIndex."
+        )
+    graph_num_nodes = int(
+        getattr(graph_data[node_type], "num_nodes", graph_data[node_type].x.shape[0])
+    )
+    model_num_nodes = (
+        _temporal_num_nodes_from_state_dict(state_dict, graph_num_nodes)
+        if checkpoint_temporal_kind is not None
+        else graph_num_nodes
+    )
     model = graph_main._build_gnn_model(
         in_channels=int(graph_data[node_type].x.shape[1]),
         hidden_channels=int(h_channels),
@@ -3367,10 +3529,14 @@ def _evaluate_gnn_model_far_target(
         aggr2=str(meta.get("aggr2", "sum")),
         use_checkpointing=False,
         gnn_variant=gnn_variant,
-        sequence_index=sequence_index,
-        num_nodes=int(getattr(graph_data[node_type], "num_nodes", graph_data[node_type].x.shape[0])),
+        sequence_index=sequence_index_for_model,
+        num_nodes=model_num_nodes,
         device=device,
     )
+    if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
+        raise ValueError(
+            f"El checkpoint requiere temporal_head, pero la variante reconstruida ({gnn_variant}) no lo creó."
+        )
 
     model.load_state_dict(state_dict, strict=True)
     model.eval()
@@ -12951,11 +13117,13 @@ def _render_training_tab() -> None:
         value=300,
         step=10,
         key="gnn_train_max_epochs",
+        help="Limite maximo de epochs para el entrenamiento final; early stopping puede cortar antes si validation loss deja de bajar.",
     )
     early_stop_train = st.checkbox(
         "Early stopping",
         value=True,
         key="gnn_train_early_stop",
+        help="Detiene el entrenamiento cuando validation loss no mejora; no usa F1/AUPRC como criterio de parada.",
     )
     early_patience_train = st.number_input(
         "patience",
@@ -12964,6 +13132,7 @@ def _render_training_tab() -> None:
         step=1,
         key="gnn_train_early_patience",
         disabled=not early_stop_train,
+        help="Cantidad de epochs consecutivas sin reduccion suficiente de validation loss antes de detener.",
     )
     early_min_delta_train = st.number_input(
         "min_delta",
@@ -12973,6 +13142,7 @@ def _render_training_tab() -> None:
         format="%.6f",
         key="gnn_train_early_min_delta",
         disabled=not early_stop_train,
+        help="Reduccion minima absoluta de validation loss para resetear paciencia; un valor alto puede cortar demasiado pronto.",
     )
     st.markdown("#### Gradient accumulation")
     accumulation_steps_train = st.number_input(
@@ -13327,8 +13497,10 @@ def _render_training_tab() -> None:
             if isinstance(ckpt, dict):
                 epoch_done = int(ckpt.get("epoch", 0))
                 max_epochs_ckpt = int(ckpt.get("max_epochs", max_epochs_train))
+                best_val_loss_ckpt = ckpt.get("best_val_loss")
                 best_val = ckpt.get("best_val_f1")
                 run_id = ckpt.get("run_id")
+                last_val_loss = ckpt.get("last_val_loss")
                 last_val_f1 = ckpt.get("last_val_f1")
                 last_val_auc = ckpt.get("last_val_auc")
                 last_val_auprc = ckpt.get("last_val_auprc")
@@ -13340,6 +13512,7 @@ def _render_training_tab() -> None:
                 training_status = {
                     "epoch": epoch_done,
                     "max_epochs": max_epochs_ckpt,
+                    "best_val_loss": best_val_loss_ckpt,
                     "best_val_f1": best_val,
                     "run_id": run_id,
                 }
@@ -13350,9 +13523,13 @@ def _render_training_tab() -> None:
                     f"Checkpoint detectado: {epoch_done}/{max_epochs_ckpt} epochs "
                     f"| Última actualización: {last_update}"
                 )
+                if best_val_loss_ckpt is not None and math.isfinite(float(best_val_loss_ckpt)):
+                    training_details += f" | best_val_loss={float(best_val_loss_ckpt):.4f}"
                 if best_val is not None:
                     training_details += f" | best_val_f1={float(best_val):.4f}"
                 metrics_parts = []
+                if last_val_loss is not None:
+                    metrics_parts.append(f"val_loss={float(last_val_loss):.4f}")
                 if last_val_f1 is not None:
                     metrics_parts.append(f"val_f1={float(last_val_f1):.4f}")
                 if last_val_auc is not None:
@@ -13411,16 +13588,20 @@ def _render_training_tab() -> None:
 
         st.markdown("#### Progreso y metricas en vivo")
         live_container = st.container()
-        metric_cols = live_container.columns(7)
+        metric_cols = live_container.columns(9)
         metric_epoch = metric_cols[0].empty()
         metric_train_loss = metric_cols[1].empty()
-        metric_val_f1 = metric_cols[2].empty()
-        metric_val_auc = metric_cols[3].empty()
-        metric_val_auprc = metric_cols[4].empty()
-        metric_best_f1 = metric_cols[5].empty()
-        metric_ram = metric_cols[6].empty()
+        metric_val_loss = metric_cols[2].empty()
+        metric_best_val_loss = metric_cols[3].empty()
+        metric_val_f1 = metric_cols[4].empty()
+        metric_val_auc = metric_cols[5].empty()
+        metric_val_auprc = metric_cols[6].empty()
+        metric_best_f1 = metric_cols[7].empty()
+        metric_ram = metric_cols[8].empty()
         metric_epoch.metric("Epoch", "0/0")
         metric_train_loss.metric("Train loss", "N/A")
+        metric_val_loss.metric("Val loss", "N/A")
+        metric_best_val_loss.metric("Best val loss", "N/A")
         metric_val_f1.metric("Val F1", "N/A")
         metric_val_auc.metric("Val AUC", "N/A")
         metric_val_auprc.metric("Val AUPRC", "N/A")
@@ -13494,6 +13675,7 @@ def _render_training_tab() -> None:
             loss_cols = [
                 c for c in (
                     "train_loss",
+                    "val_loss",
                     "train_cls_loss",
                     "train_edge_loss",
                     "train_l2_att_loss",
@@ -13565,6 +13747,8 @@ def _render_training_tab() -> None:
                 metric_batch_edge.metric("Batch Edge", "N/A")
                 metric_batch_l2.metric("Batch L2_Att", "N/A")
                 metric_batch_lr.metric("Batch LR", "N/A")
+                metric_val_loss.metric("Val loss", "N/A")
+                metric_best_val_loss.metric("Best val loss", "N/A")
                 return
 
             if event == "train_batch":
@@ -13608,6 +13792,8 @@ def _render_training_tab() -> None:
                 epoch = payload.get("epoch") or 0
                 total = payload.get("total") or 0
                 train_loss = payload.get("train_loss")
+                val_loss = payload.get("val_loss")
+                best_val_loss = payload.get("best_val_loss")
                 val_f1 = payload.get("val_f1")
                 val_auc = payload.get("val_auc")
                 val_auprc = payload.get("val_auprc")
@@ -13618,6 +13804,10 @@ def _render_training_tab() -> None:
                     metric_epoch.metric("Epoch", f"{epoch}/{total}")
                 if train_loss is not None:
                     metric_train_loss.metric("Train loss", f"{train_loss:.4f}")
+                if val_loss is not None:
+                    metric_val_loss.metric("Val loss", f"{val_loss:.4f}")
+                if best_val_loss is not None and math.isfinite(float(best_val_loss)):
+                    metric_best_val_loss.metric("Best val loss", f"{float(best_val_loss):.4f}")
                 if val_f1 is not None:
                     metric_val_f1.metric("Val F1", f"{val_f1:.4f}")
                 if val_auc is not None:
@@ -13651,6 +13841,10 @@ def _render_training_tab() -> None:
                     parts.append(f"val_auprc={val_auprc:.4f}")
                 if train_loss is not None:
                     parts.append(f"loss={train_loss:.4f}")
+                if val_loss is not None:
+                    parts.append(f"val_loss={val_loss:.4f}")
+                if best_val_loss is not None and math.isfinite(float(best_val_loss)):
+                    parts.append(f"best_val_loss={float(best_val_loss):.4f}")
                 if patience_counter is not None and patience is not None:
                     parts.append(f"patience={patience_counter}/{patience}")
                 if parts:
@@ -13659,6 +13853,7 @@ def _render_training_tab() -> None:
                 live_state["metrics"].append({
                     "epoch": epoch,
                     "train_loss": payload.get("train_loss"),
+                    "val_loss": payload.get("val_loss"),
                     "train_cls_loss": payload.get("train_cls_loss"),
                     "train_edge_loss": payload.get("train_edge_loss"),
                     "train_l2_att_loss": payload.get("train_l2_att_loss"),
@@ -13674,6 +13869,7 @@ def _render_training_tab() -> None:
                     "val_far": payload.get("val_far"),
                     "val_f05": payload.get("val_f05"),
                     "val_objective_score": payload.get("val_objective_score"),
+                    "best_val_loss": payload.get("best_val_loss"),
                     "best_val_objective_score": payload.get("best_val_objective_score"),
                     "val_tau": payload.get("val_tau"),
                     "lr": payload.get("lr"),
@@ -13710,6 +13906,14 @@ def _render_training_tab() -> None:
             total_safe = max(int(total or 1), 1)
             progress_bar.progress(min(epoch / total_safe, 1.0))
             parts = [f"Epoch {epoch}/{total_safe}"]
+            val_loss = kwargs.get("val_loss")
+            best_val_loss = kwargs.get("best_val_loss")
+            if val_loss is not None:
+                parts.append(f"val_loss={float(val_loss):.4f}")
+                metric_val_loss.metric("Val loss", f"{float(val_loss):.4f}")
+            if best_val_loss is not None and math.isfinite(float(best_val_loss)):
+                parts.append(f"best_val_loss={float(best_val_loss):.4f}")
+                metric_best_val_loss.metric("Best val loss", f"{float(best_val_loss):.4f}")
             if val_f1 is not None:
                 parts.append(f"val_f1={val_f1:.4f}")
             parts.append(f"best_f1={best_val_f1:.4f}")
@@ -13952,6 +14156,7 @@ def _render_training_tab() -> None:
                                 graph_data=eval_graph_data,
                                 device=eval_device,
                                 threshold=None,
+                                sequence_index=graph_obj.get("sequence_index"),
                                 num_neighbors=(
                                     ([-1] * int((network_cfg or {}).get("num_layers", 2)))
                                     if eval_neighbors_mode_train == "exhaustive"
@@ -13969,12 +14174,335 @@ def _render_training_tab() -> None:
             else:
                 st.warning("Entrenamiento completado, pero no se encontro modelo guardado.")
 
+
+def _gnn_eval_clamp_ratio(value: object) -> float:
+    try:
+        ratio = float(value)
+    except Exception:
+        ratio = 0.0
+    if not math.isfinite(ratio):
+        ratio = 0.0
+    return max(0.0, min(ratio, 1.0))
+
+
+def _gnn_eval_memory_text(device: object) -> str:
+    parts: List[str] = []
+    ram_mb = _get_ram_mb()
+    if ram_mb is not None:
+        parts.append(f"RSS {ram_mb:.0f} MB")
+    try:
+        dev = torch.device(str(device))
+    except Exception:
+        dev = torch.device("cpu")
+    if dev.type == "cuda" and torch.cuda.is_available():
+        try:
+            allocated = torch.cuda.memory_allocated(dev) / (1024 ** 2)
+            reserved = torch.cuda.memory_reserved(dev) / (1024 ** 2)
+            parts.append(f"CUDA {allocated:.0f}/{reserved:.0f} MB")
+        except Exception:
+            pass
+    elif dev.type == "mps" and hasattr(torch, "mps"):
+        try:
+            current = torch.mps.current_allocated_memory() / (1024 ** 2)
+            parts.append(f"MPS {current:.0f} MB")
+        except Exception:
+            pass
+    return " | ".join(parts) if parts else "Memoria no disponible"
+
+
+class _GNNGraphEvaluationProgress:
+    def __init__(
+        self,
+        *,
+        model_path: str,
+        device: object,
+        masks: Sequence[str],
+        batch_size: int,
+        threshold_strategy: str,
+        max_nodes_per_mask: int,
+    ) -> None:
+        self.model_path = str(model_path)
+        self.model_name = os.path.basename(str(model_path))
+        self.device = str(device)
+        self.masks = [str(mask) for mask in masks]
+        self.batch_size = int(batch_size)
+        self.threshold_strategy = str(threshold_strategy or "manual")
+        self.max_nodes_per_mask = int(max_nodes_per_mask or 0)
+        self.run_id = datetime.now().strftime("gnn_eval_%Y%m%d_%H%M%S")
+        self.run_dir = GNN_EVAL_LIVE_DIR / self.run_id
+        self.state_key = f"gnn_graph_eval_live_{self.run_id}"
+        self.started_at = time.time()
+        self.last_render_at = 0.0
+        self.events: List[Dict[str, object]] = []
+        self.state: Dict[str, object] = {
+            "run_id": self.run_id,
+            "status": "running",
+            "result_status": "running",
+            "model_path": self.model_path,
+            "model_name": self.model_name,
+            "device": self.device,
+            "masks": self.masks,
+            "batch_size": self.batch_size,
+            "threshold_strategy": self.threshold_strategy,
+            "max_nodes_per_mask": self.max_nodes_per_mask,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "progress": {
+                "completed_steps": 0,
+                "total_steps": 100,
+                "current_step_id": "init",
+            },
+            "live_status": {},
+        }
+
+        st.markdown("#### Progreso de evaluación")
+        st.caption(f"Run live: `{self.run_dir}`")
+        metric_cols = st.columns(6)
+        self._metric_model = metric_cols[0].empty()
+        self._metric_status = metric_cols[1].empty()
+        self._metric_progress = metric_cols[2].empty()
+        self._metric_mask = metric_cols[3].empty()
+        self._metric_batch = metric_cols[4].empty()
+        self._metric_memory = metric_cols[5].empty()
+        self._bar = st.progress(0.0)
+        self._status_slot = st.empty()
+        self._detail_slot = st.empty()
+        with st.expander("Detalle live de la evaluación", expanded=True):
+            self._events_slot = st.empty()
+            self._raw_slot = st.empty()
+        self.update(
+            0.0,
+            "Inicializando evaluación",
+            step_id="run_start",
+            detail=(
+                f"Máscaras: {', '.join(self.masks) if self.masks else 'auto'} | "
+                f"batch_size={self.batch_size} | dispositivo={self.device}"
+            ),
+            event_type="run_start",
+            force=True,
+        )
+
+    def _persist(self, event: Dict[str, object]) -> None:
+        try:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path = self.run_dir / "manifest.json"
+            events_path = self.run_dir / "events.jsonl"
+            manifest_payload = dict(self.state)
+            manifest_payload["recent_events"] = self.events[-20:]
+            manifest_path.write_text(
+                json.dumps(manifest_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            with events_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _render(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and (now - self.last_render_at) < 0.25:
+            return
+        self.last_render_at = now
+        live_status = dict(self.state.get("live_status") or {})
+        ratio = _gnn_eval_clamp_ratio(live_status.get("progress_ratio"))
+        pct_text = f"{ratio * 100.0:.1f}%"
+        current_mask = str(live_status.get("mask") or "-")
+        batch_text = str(live_status.get("batch") or "-")
+        memory_text = _gnn_eval_memory_text(self.device)
+        elapsed = max(time.time() - self.started_at, 0.0)
+        self._metric_model.metric("Modelo", self.model_name[:24])
+        self._metric_status.metric("Estado", str(self.state.get("status") or "running"))
+        self._metric_progress.metric("Progreso", pct_text)
+        self._metric_mask.metric("Máscara", current_mask[:24])
+        self._metric_batch.metric("Batch", batch_text[:24])
+        self._metric_memory.metric("Memoria", memory_text[:24])
+        self._bar.progress(ratio)
+        self._status_slot.info(
+            f"{pct_text} | {live_status.get('message') or 'Ejecutando evaluación'}"
+        )
+        detail = str(live_status.get("detail") or "")
+        self._detail_slot.caption(
+            f"{detail} | transcurrido={elapsed:.1f}s | actualizado={self.state.get('updated_at')}"
+        )
+        if self.events:
+            display_cols = [
+                "timestamp",
+                "event",
+                "step_id",
+                "message",
+                "progress_pct",
+                "mask",
+                "batch",
+                "detail",
+            ]
+            events_df = pd.DataFrame(self.events[-12:])
+            cols = [col for col in display_cols if col in events_df.columns]
+            self._events_slot.dataframe(events_df[cols], width="stretch")
+        raw_state = {
+            "run_id": self.run_id,
+            "status": self.state.get("status"),
+            "result_status": self.state.get("result_status"),
+            "progress": self.state.get("progress"),
+            "live_status": self.state.get("live_status"),
+            "run_dir": str(self.run_dir),
+        }
+        self._raw_slot.json(raw_state)
+
+    def update(
+        self,
+        ratio: object,
+        message: str,
+        *,
+        step_id: str,
+        detail: str = "",
+        event_type: str = "progress",
+        mask: Optional[str] = None,
+        batch: Optional[str] = None,
+        status: str = "running",
+        result_status: str = "running",
+        force: bool = False,
+    ) -> None:
+        bounded = _gnn_eval_clamp_ratio(ratio)
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        completed_steps = int(round(bounded * 100.0))
+        live_status = {
+            "timestamp": timestamp,
+            "step_id": str(step_id),
+            "message": str(message),
+            "detail": str(detail or ""),
+            "progress_ratio": bounded,
+            "mask": str(mask or ""),
+            "batch": str(batch or ""),
+            "memory": _gnn_eval_memory_text(self.device),
+        }
+        self.state.update(
+            {
+                "status": status,
+                "result_status": result_status,
+                "updated_at": timestamp,
+                "progress": {
+                    "completed_steps": completed_steps,
+                    "total_steps": 100,
+                    "current_step_id": str(step_id),
+                },
+                "live_status": live_status,
+            }
+        )
+        event = {
+            "timestamp": timestamp,
+            "run_id": self.run_id,
+            "status": status,
+            "result_status": result_status,
+            "event": str(event_type),
+            "step_id": str(step_id),
+            "message": str(message),
+            "progress_pct": round(bounded * 100.0, 1),
+            "mask": str(mask or ""),
+            "batch": str(batch or ""),
+            "detail": str(detail or ""),
+        }
+        self.events.append(event)
+        self.events = self.events[-200:]
+        st.session_state[self.state_key] = dict(self.state)
+        self._persist(event)
+        self._render(force=force)
+
+    def complete(self, message: str, *, detail: str = "") -> None:
+        self.update(
+            1.0,
+            message,
+            step_id="run_completed",
+            detail=detail,
+            event_type="run_completed",
+            status="completed",
+            result_status="completed",
+            force=True,
+        )
+
+    def fail(self, message: str, *, detail: str = "") -> None:
+        self.update(
+            self.state.get("live_status", {}).get("progress_ratio", 0.0),
+            message,
+            step_id="run_failed",
+            detail=detail,
+            event_type="run_failed",
+            status="failed",
+            result_status="failed",
+            force=True,
+        )
+
+
+def _make_gnn_eval_progress_callback(
+    progress_ui: Optional[_GNNGraphEvaluationProgress],
+    *,
+    phase_label: str,
+    start_ratio: float,
+    end_ratio: float,
+    display_mask_index: Optional[int] = None,
+    display_mask_total: Optional[int] = None,
+) -> Optional[Callable[[Dict[str, object]], None]]:
+    if progress_ui is None:
+        return None
+    start = _gnn_eval_clamp_ratio(start_ratio)
+    end = _gnn_eval_clamp_ratio(end_ratio)
+    span = max(end - start, 0.0)
+
+    def _callback(event: Dict[str, object]) -> None:
+        event_name = str(event.get("event") or "progress")
+        try:
+            mask_index = int(display_mask_index or event.get("mask_index") or 1)
+        except Exception:
+            mask_index = 1
+        try:
+            mask_total = int(display_mask_total or event.get("mask_total") or 1)
+        except Exception:
+            mask_total = 1
+        mask_total = max(mask_total, 1)
+        mask_index = min(max(mask_index, 1), mask_total)
+        try:
+            batch_total = int(event.get("batch_total") or 1)
+        except Exception:
+            batch_total = 1
+        batch_total = max(batch_total, 1)
+        try:
+            batch_index = int(event.get("batch_index") or 0)
+        except Exception:
+            batch_index = 0
+        if event_name == "mask_done":
+            batch_index = batch_total
+        batch_index = min(max(batch_index, 0), batch_total)
+        mask_fraction = batch_index / float(batch_total)
+        phase_fraction = ((mask_index - 1) + mask_fraction) / float(mask_total)
+        ratio = start + span * phase_fraction
+        mask_name = str(event.get("mask_name") or "")
+        node_count = int(event.get("node_count") or 0)
+        processed_nodes = int(event.get("processed_nodes") or 0)
+        batch_text = f"{batch_index}/{batch_total}"
+        detail = (
+            f"máscara {mask_index}/{mask_total}"
+            f" | nodos {processed_nodes:,}/{node_count:,}"
+            f" | batches {batch_text}"
+        )
+        progress_ui.update(
+            ratio,
+            f"{phase_label}: {mask_name}",
+            step_id=event_name,
+            detail=detail,
+            event_type=event_name,
+            mask=mask_name,
+            batch=batch_text,
+        )
+
+    return _callback
+
+
 def _perform_model_evaluation(
     model_path,
     graph_data,
     device="cpu",
     threshold=None,
     *,
+    sequence_index: Optional[object] = None,
     masks: Optional[List[str]] = None,
     max_nodes_per_mask: int = 0,
     seed: int = SEED,
@@ -13985,12 +14513,21 @@ def _perform_model_evaluation(
 ) -> None:
     try:
         from src import gnn_main as graph_main
-        from src.gat_model import HeteroGAT
     except Exception as exc:
         st.error(f"No se pudieron cargar módulos necesarios: {exc}")
         return
 
     node_type = "pm"
+    eval_batch_size = int(batch_size or BATCH_SIZE)
+    eval_masks = masks or _list_available_masks(graph_data, node_type=node_type)
+    progress_ui = _GNNGraphEvaluationProgress(
+        model_path=str(model_path),
+        device=device,
+        masks=eval_masks,
+        batch_size=eval_batch_size,
+        threshold_strategy=str(threshold_strategy or "manual"),
+        max_nodes_per_mask=int(max_nodes_per_mask or 0),
+    )
     meta = _load_hparams_for_model(model_path)
     purpose_text = "General"
     if isinstance(meta, dict):
@@ -14001,11 +14538,26 @@ def _perform_model_evaluation(
 
     try:
         # Cargar pesos
+        progress_ui.update(
+            0.04,
+            "Cargando checkpoint del modelo",
+            step_id="checkpoint_load_start",
+            detail=os.path.basename(str(model_path)),
+            event_type="checkpoint_load_start",
+            force=True,
+        )
         state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
         if isinstance(state_dict, dict) and ("model_state" in state_dict or "state_dict" in state_dict):
             state_dict = state_dict.get("model_state") or state_dict.get("state_dict")
         elif isinstance(state_dict, torch.nn.Module):
              state_dict = state_dict.state_dict()
+        progress_ui.update(
+            0.12,
+            "Checkpoint cargado",
+            step_id="checkpoint_loaded",
+            detail="Pesos disponibles en CPU; validando compatibilidad con el grafo.",
+            event_type="checkpoint_loaded",
+        )
 
         is_ok, msg = _check_model_graph_compat(
             model_path,
@@ -14015,10 +14567,28 @@ def _perform_model_evaluation(
             state_dict=state_dict,
         )
         if not is_ok:
+            progress_ui.fail(
+                "Evaluación bloqueada por incompatibilidad grafo-modelo",
+                detail=str(msg),
+            )
             st.error(f"{msg} Use el mismo grafo/feature set del entrenamiento o reentrene el modelo.")
             return
+        progress_ui.update(
+            0.20,
+            "Compatibilidad grafo-modelo validada",
+            step_id="compat_ready",
+            detail=str(msg or "Dimensiones compatibles."),
+            event_type="compat_ready",
+        )
         
         # Sincronizar Arquitectura
+        progress_ui.update(
+            0.26,
+            "Reconstruyendo arquitectura GNN",
+            step_id="architecture_resolve",
+            detail="Infiriendo capas, heads, variante temporal y dimensiones de salida.",
+            event_type="architecture_resolve",
+        )
         arch = _infer_arch_from_state_dict(state_dict)
         h_channels = int(meta.get("hidden_channels", arch["hidden_channels"]))
         h_heads = int(meta.get("num_heads", arch["num_heads"]))
@@ -14028,10 +14598,49 @@ def _perform_model_evaluation(
         if h_out == 0:
             try: h_out = len(torch.unique(graph_data[node_type].y))
             except: h_out = 2
+
+        gnn_variant = _resolve_gnn_variant_for_checkpoint(model_path, meta, state_dict)
+        sequence_index_for_model = _resolve_sequence_index_for_checkpoint(
+            sequence_index,
+            state_dict,
+        )
+        checkpoint_temporal_kind = _checkpoint_temporal_kind(state_dict)
+        if checkpoint_temporal_kind is not None and sequence_index_for_model is None:
+            progress_ui.fail(
+                "Evaluación bloqueada por SequenceIndex faltante",
+                detail="El checkpoint incluye un head temporal sin índice temporal disponible.",
+            )
+            st.error(
+                "El checkpoint incluye un head temporal, pero no contiene ni recibe "
+                "`SequenceIndex`. Cargue el grafo usado en entrenamiento o reentrene el modelo."
+            )
+            return
+        if checkpoint_temporal_kind is not None and sequence_index is None:
+            st.caption("SequenceIndex temporal reconstruido desde el checkpoint.")
+
+        graph_num_nodes = int(
+            getattr(
+                graph_data[node_type],
+                "num_nodes",
+                graph_data[node_type].x.shape[0],
+            )
+        )
+        model_num_nodes = (
+            _temporal_num_nodes_from_state_dict(state_dict, graph_num_nodes)
+            if checkpoint_temporal_kind is not None
+            else graph_num_nodes
+        )
         
         # Instanciar
-        model = HeteroGAT(
-            in_channels=graph_data[node_type].x.shape[1],
+        progress_ui.update(
+            0.34,
+            "Instanciando modelo GNN",
+            step_id="model_build_start",
+            detail=f"variant={gnn_variant} | hidden={h_channels} | layers={h_layers} | heads={h_heads}",
+            event_type="model_build_start",
+        )
+        model = graph_main._build_gnn_model(
+            in_channels=int(graph_data[node_type].x.shape[1]),
             hidden_channels=h_channels,
             out_channels=h_out,
             num_heads=h_heads,
@@ -14041,18 +14650,53 @@ def _perform_model_evaluation(
             aggr1=meta.get("aggr1", "sum"),
             aggr2=meta.get("aggr2", "sum"),
             use_checkpointing=False,
-        ).to(device)
+            gnn_variant=gnn_variant,
+            sequence_index=sequence_index_for_model,
+            num_nodes=model_num_nodes,
+            device=device,
+        )
+        if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
+            progress_ui.fail(
+                "Evaluación bloqueada por arquitectura temporal incompatible",
+                detail=f"La variante reconstruida ({gnn_variant}) no creó temporal_head.",
+            )
+            st.error(
+                "El checkpoint requiere `temporal_head`, pero la arquitectura reconstruida "
+                f"({gnn_variant}) no lo creó. Verifique la variante GNN y el SequenceIndex."
+            )
+            return
         
+        progress_ui.update(
+            0.40,
+            "Cargando pesos en la arquitectura",
+            step_id="weights_load_start",
+            detail="Aplicando state_dict estricto antes de inferencia.",
+            event_type="weights_load_start",
+        )
         model.load_state_dict(state_dict, strict=True)
         model.eval()
-
-        eval_batch_size = int(batch_size or BATCH_SIZE)
-        eval_masks = masks or _list_available_masks(graph_data, node_type=node_type)
+        progress_ui.update(
+            0.46,
+            "Modelo listo para inferencia",
+            step_id="model_ready",
+            detail=(
+                f"Máscaras seleccionadas: {', '.join(eval_masks) if eval_masks else 'auto'} "
+                f"| num_neighbors={num_neighbors if num_neighbors is not None else 'config'}"
+            ),
+            event_type="model_ready",
+        )
 
         # Determinar umbral
         eval_threshold = threshold
         strategy = str(threshold_strategy or "manual").lower()
         if strategy in {"min_far", "far", "auto_far", "far_target"}:
+            progress_ui.update(
+                0.50,
+                "Preparando calibración de umbral FAR",
+                step_id="threshold_calibration_start",
+                detail=f"Objetivo FAR={float(far_target):.2f}; se requiere val_mask no vacía.",
+                event_type="threshold_calibration_start",
+            )
             calib_mask = _pick_calibration_mask(
                 graph_data,
                 node_type=node_type,
@@ -14061,6 +14705,10 @@ def _perform_model_evaluation(
                 allow_train_mask=False,
             )
             if not calib_mask:
+                progress_ui.fail(
+                    "Calibración FAR bloqueada",
+                    detail="No se encontró val_mask no vacía.",
+                )
                 st.error(
                     "No se encontró val_mask no vacía para calibrar FAR. "
                     "Genera un split temporal válido antes de esta evaluación."
@@ -14068,6 +14716,14 @@ def _perform_model_evaluation(
                 return
             sampled_idx = None
             if max_nodes_per_mask > 0:
+                progress_ui.update(
+                    0.52,
+                    f"Muestreando nodos de calibración: {calib_mask}",
+                    step_id="threshold_sample_start",
+                    detail=f"Máximo {int(max_nodes_per_mask):,} nodos con ambas clases cuando sea posible.",
+                    event_type="threshold_sample_start",
+                    mask=calib_mask,
+                )
                 sampled_idx = _sample_mask_indices(
                     graph_data,
                     calib_mask,
@@ -14078,6 +14734,12 @@ def _perform_model_evaluation(
                 )
             if sampled_idx is not None and sampled_idx.numel() == 0:
                 sampled_idx = None
+            calib_callback = _make_gnn_eval_progress_callback(
+                progress_ui,
+                phase_label="Calibrando umbral FAR",
+                start_ratio=0.54,
+                end_ratio=0.64,
+            )
             if sampled_idx is not None:
                 calib_results = graph_main.test(
                     model,
@@ -14088,6 +14750,7 @@ def _perform_model_evaluation(
                     mask_name=calib_mask,
                     batch_size=eval_batch_size,
                     num_neighbors=num_neighbors,
+                    progress_callback=calib_callback,
                 )
             else:
                 calib_results = graph_main.test(
@@ -14098,9 +14761,14 @@ def _perform_model_evaluation(
                     masks=[calib_mask],
                     batch_size=eval_batch_size,
                     num_neighbors=num_neighbors,
+                    progress_callback=calib_callback,
                 )
             calib_key = calib_mask if calib_results and calib_mask in calib_results else None
             if not calib_key:
+                progress_ui.fail(
+                    "Calibración FAR sin resultados",
+                    detail=f"No se pudo obtener predicción en {calib_mask}.",
+                )
                 st.error(
                     "No se pudo obtener resultados en val_mask para calibrar FAR. "
                     "Revisa la máscara y vuelve a ejecutar."
@@ -14118,6 +14786,19 @@ def _perform_model_evaluation(
             eval_threshold = float(tau)
             note = str(info.get("note") or "").strip()
             note_txt = " (closest FAR)" if note == "closest_far" else ""
+            progress_ui.update(
+                0.66,
+                "Umbral FAR calibrado",
+                step_id="threshold_ready",
+                detail=(
+                    f"mask={calib_key} | tau={eval_threshold:.6f} | "
+                    f"FAR={info.get('far', float('nan')):.4f} | "
+                    f"Sens={info.get('sens', float('nan')):.4f}{note_txt}"
+                ),
+                event_type="threshold_ready",
+                mask=calib_key,
+                force=True,
+            )
             st.caption(
                 f"Umbral auto (FAR <= {target_far:.2f}) usando {calib_key}: "
                 f"tau={eval_threshold:.6f} | FAR={info.get('far', float('nan')):.4f} "
@@ -14135,10 +14816,54 @@ def _perform_model_evaluation(
                 eval_threshold = float(meta.get("best_tau", 0.5))
             except Exception:
                 eval_threshold = 0.5
+            progress_ui.update(
+                0.58,
+                "Umbral tomado desde metadatos/default",
+                step_id="threshold_ready",
+                detail=f"tau={eval_threshold:.6f}; estrategia={threshold_strategy}",
+                event_type="threshold_ready",
+            )
+        elif strategy not in {"min_far", "far", "auto_far", "far_target"}:
+            progress_ui.update(
+                0.58,
+                "Umbral manual listo",
+                step_id="threshold_ready",
+                detail=f"tau={float(eval_threshold):.6f}; estrategia={threshold_strategy}",
+                event_type="threshold_ready",
+            )
+
+        eval_start_ratio = 0.68 if strategy in {"min_far", "far", "auto_far", "far_target"} else 0.62
+        eval_end_ratio = 0.92
+        progress_ui.update(
+            eval_start_ratio,
+            "Iniciando evaluación de máscaras",
+            step_id="graph_eval_start",
+            detail=(
+                f"Máscaras={', '.join(eval_masks) if eval_masks else 'auto'} | "
+                f"tau={float(eval_threshold):.6f} | batch_size={eval_batch_size}"
+            ),
+            event_type="graph_eval_start",
+            force=True,
+        )
 
         if max_nodes_per_mask > 0 and eval_masks:
             results = {}
-            for mask in eval_masks:
+            total_masks = max(len(eval_masks), 1)
+            for mask_idx, mask in enumerate(eval_masks, start=1):
+                mask_start = eval_start_ratio + (eval_end_ratio - eval_start_ratio) * (
+                    (mask_idx - 1) / float(total_masks)
+                )
+                mask_end = eval_start_ratio + (eval_end_ratio - eval_start_ratio) * (
+                    mask_idx / float(total_masks)
+                )
+                progress_ui.update(
+                    mask_start,
+                    f"Muestreando máscara {mask}",
+                    step_id="mask_sample_start",
+                    detail=f"Máscara {mask_idx}/{total_masks}; límite={int(max_nodes_per_mask):,} nodos.",
+                    event_type="mask_sample_start",
+                    mask=mask,
+                )
                 sampled_idx = _sample_mask_indices(
                     graph_data,
                     mask,
@@ -14148,7 +14873,23 @@ def _perform_model_evaluation(
                     node_type=node_type,
                 )
                 if sampled_idx is None or sampled_idx.numel() == 0:
+                    progress_ui.update(
+                        mask_end,
+                        f"Máscara sin nodos evaluables: {mask}",
+                        step_id="mask_skipped",
+                        detail=f"Máscara {mask_idx}/{total_masks}; no se generó muestra válida.",
+                        event_type="mask_skipped",
+                        mask=mask,
+                    )
                     continue
+                eval_callback = _make_gnn_eval_progress_callback(
+                    progress_ui,
+                    phase_label="Evaluando máscara",
+                    start_ratio=mask_start,
+                    end_ratio=mask_end,
+                    display_mask_index=mask_idx,
+                    display_mask_total=total_masks,
+                )
                 partial = graph_main.test(
                     model,
                     graph_data,
@@ -14158,9 +14899,16 @@ def _perform_model_evaluation(
                     mask_name=mask,
                     batch_size=eval_batch_size,
                     num_neighbors=num_neighbors,
+                    progress_callback=eval_callback,
                 )
                 results.update(partial)
         else:
+            eval_callback = _make_gnn_eval_progress_callback(
+                progress_ui,
+                phase_label="Evaluando máscara",
+                start_ratio=eval_start_ratio,
+                end_ratio=eval_end_ratio,
+            )
             results = graph_main.test(
                 model,
                 graph_data,
@@ -14169,11 +14917,24 @@ def _perform_model_evaluation(
                 masks=eval_masks if masks is not None else None,
                 batch_size=eval_batch_size,
                 num_neighbors=num_neighbors,
+                progress_callback=eval_callback,
             )
 
         if not results:
+            progress_ui.fail(
+                "Evaluación sin resultados",
+                detail="No se obtuvieron métricas para las máscaras disponibles.",
+            )
             st.warning("No se obtuvieron resultados (¿faltan mascaras en el grafo?)")
             return
+        progress_ui.update(
+            0.94,
+            "Métricas calculadas",
+            step_id="metrics_ready",
+            detail=f"Splits con resultados: {len(results)}",
+            event_type="metrics_ready",
+            force=True,
+        )
 
         # Mostrar Reportes
         sample_note = (
@@ -14182,6 +14943,13 @@ def _perform_model_evaluation(
             else "Todos los nodos de la máscara."
         )
         threshold_note = f"{eval_threshold:.6f} ({threshold_strategy})"
+        progress_ui.update(
+            0.97,
+            "Renderizando reportes de evaluación",
+            step_id="render_results",
+            detail="Preparando métricas principales, matrices de confusión y reportes completos.",
+            event_type="render_results",
+        )
         for mask_name, m_res in results.items():
             with st.expander(f"Resultado Split: {mask_name}", expanded=True):
                 st.markdown("**Uso**: validar rendimiento del modelo en el split seleccionado.")
@@ -14230,8 +14998,13 @@ def _perform_model_evaluation(
             m_res.pop("preds", None)
             m_res.pop("probs", None)
             m_res.pop("true", None)
+        progress_ui.complete(
+            "Evaluación de grafo finalizada",
+            detail=f"Splits evaluados: {len(results)} | tau={float(eval_threshold):.6f}",
+        )
 
     except Exception as exc:
+        progress_ui.fail("Error durante evaluación", detail=str(exc))
         st.error(f"Error durante evaluación: {exc}")
         st.exception(exc)
 
@@ -14462,19 +15235,19 @@ def _render_evaluation_tab() -> None:
                 except Exception:
                     pass
         num_neighbors_val = num_neighbors_override.strip() or None
-        with st.spinner("Cargando y evaluando modelo..."):
-            _perform_model_evaluation(
-                model_path=selected_model_path,
-                graph_data=graph_data_eval,
-                device=eval_device,
-                threshold=eval_threshold,
-                threshold_strategy=threshold_strategy,
-                far_target=float(far_target),
-                masks=selected_masks,
-                max_nodes_per_mask=int(max_nodes_per_mask),
-                batch_size=int(eval_batch_size),
-                num_neighbors=num_neighbors_val,
-            )
+        _perform_model_evaluation(
+            model_path=selected_model_path,
+            graph_data=graph_data_eval,
+            device=eval_device,
+            threshold=eval_threshold,
+            sequence_index=loaded_graph.get("sequence_index"),
+            threshold_strategy=threshold_strategy,
+            far_target=float(far_target),
+            masks=selected_masks,
+            max_nodes_per_mask=int(max_nodes_per_mask),
+            batch_size=int(eval_batch_size),
+            num_neighbors=num_neighbors_val,
+        )
 
 
 def _coerce_neighbor_profile(
