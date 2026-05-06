@@ -291,6 +291,8 @@ def _build_gnn_model(
     sequence_index=None,
     num_nodes: Optional[int] = None,
     device=None,
+    use_residual: bool = False,
+    use_relation_self_loops: bool = True,
 ):
     variant_cfg = _parse_gnn_variant(gnn_variant)
     model_kwargs = dict(
@@ -304,6 +306,8 @@ def _build_gnn_model(
         use_checkpointing=bool(use_checkpointing),
         aggr1=aggr1,
         aggr2=aggr2,
+        use_residual=bool(use_residual),
+        use_relation_self_loops=bool(use_relation_self_loops),
     )
 
     if variant_cfg["encoder_kind"] == "edge_aware":
@@ -516,6 +520,7 @@ def _infer_arch_from_state_dict(sd: dict) -> dict:
         'num_layers': int(num_layers if num_layers else 2),
         'num_heads': int(num_heads if num_heads else 4),
         'hidden_channels': int(hidden if hidden else 32),
+        'use_residual': any(str(k).startswith("residual_lins.") for k in sd.keys()),
     }
 
 def _gather_gat_models_listing() -> list[dict]:
@@ -682,6 +687,125 @@ def _safe_cast(value, cast_type, default):
         return cast_type(value)
     except Exception:
         return default
+
+def _safe_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if isinstance(value, float) and np.isnan(value):
+                return bool(default)
+        except Exception:
+            pass
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "s", "si", "sí"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", ""}:
+        return False
+    return bool(default)
+
+LR_SCHEDULER_CHOICES = (
+    "one_cycle",
+    "cosine_warm_restarts",
+    "plateau_restart",
+)
+
+def _normalize_lr_scheduler_choice(value: object, default: str = "one_cycle") -> str:
+    raw = str(value or default).strip().lower()
+    key = raw.replace(" ", "_").replace("-", "_")
+    aliases = {
+        "onecycle": "one_cycle",
+        "one_cycle": "one_cycle",
+        "one_cycle_lr": "one_cycle",
+        "onecyclelr": "one_cycle",
+        "cosine": "cosine_warm_restarts",
+        "cosine_restart": "cosine_warm_restarts",
+        "cosine_restarts": "cosine_warm_restarts",
+        "cosine_warm_restart": "cosine_warm_restarts",
+        "cosine_warm_restarts": "cosine_warm_restarts",
+        "cosineannealingwarmrestarts": "cosine_warm_restarts",
+        "cosine_annealing_warm_restarts": "cosine_warm_restarts",
+        "plateau": "plateau_restart",
+        "plateau_restart": "plateau_restart",
+        "reduce_on_plateau": "plateau_restart",
+        "reduce_lr_on_plateau": "plateau_restart",
+        "reducelronplateau": "plateau_restart",
+    }
+    normalized = aliases.get(key, default)
+    return normalized if normalized in LR_SCHEDULER_CHOICES else default
+
+def _optimizer_steps_per_epoch(loader, accumulation_steps: int = 1) -> int:
+    try:
+        loader_len = max(1, int(len(loader)))
+    except Exception:
+        loader_len = 1
+    try:
+        accum = max(1, int(accumulation_steps))
+    except Exception:
+        accum = 1
+    return max(1, int(math.ceil(loader_len / accum)))
+
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    scheduler_name: object,
+    *,
+    max_lr: float,
+    steps_per_epoch: int,
+    epochs: int,
+    monitor_mode: str = "min",
+):
+    scheduler_key = _normalize_lr_scheduler_choice(scheduler_name)
+    steps = max(1, int(steps_per_epoch))
+    total_epochs = max(1, int(epochs))
+    lr_value = max(float(max_lr), 1e-12)
+    if scheduler_key == "one_cycle":
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr_value,
+            steps_per_epoch=steps,
+            epochs=total_epochs,
+            cycle_momentum=isinstance(optimizer, (torch.optim.AdamW, torch.optim.NAdam)),
+        )
+    if scheduler_key == "cosine_warm_restarts":
+        restart_epochs = max(1, min(10, max(1, total_epochs // 3)))
+        return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=max(1, steps * restart_epochs),
+            T_mult=2,
+            eta_min=lr_value * 0.01,
+        )
+    mode = "min" if str(monitor_mode or "min").lower() == "min" else "max"
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode=mode,
+        factor=0.5,
+        patience=max(1, min(10, total_epochs // 10 or 1)),
+        threshold=1e-4,
+    )
+
+def _lr_scheduler_steps_per_batch(scheduler_name: object) -> bool:
+    return _normalize_lr_scheduler_choice(scheduler_name) in {
+        "one_cycle",
+        "cosine_warm_restarts",
+    }
+
+def _scheduler_lr_value(scheduler, optimizer: torch.optim.Optimizer) -> Optional[float]:
+    try:
+        if scheduler is not None and hasattr(scheduler, "get_last_lr"):
+            values = scheduler.get_last_lr()
+            if values:
+                return float(values[0])
+    except Exception:
+        pass
+    try:
+        return float(optimizer.param_groups[0].get("lr"))
+    except Exception:
+        return None
 
 def _make_exhaustive_num_neighbors(edge_types, num_layers: int) -> dict:
     layers = max(int(num_layers), 1)
@@ -949,6 +1073,8 @@ def run_gnn_anomaly_pipeline(loaded_obj):
         sequence_index=loaded_obj.get('sequence_index') if isinstance(loaded_obj, dict) else None,
         num_nodes=data['pm'].num_nodes,
         device=device,
+        use_residual=_safe_bool(meta.get("use_residual", arch.get("use_residual", False))),
+        use_relation_self_loops=_safe_bool(meta.get("use_relation_self_loops"), True),
     )
 
     # Cargar pesos (elige el modelo correspondiente a la variante seleccionada)
@@ -1703,13 +1829,16 @@ def _update_metric_monitor(
     min_delta: float,
     monitor_mode: str,
 ) -> Tuple[bool, float, int]:
-    current = float(monitor_value)
-    if not math.isfinite(current):
-        raise ValueError("monitor_value debe ser finito para early stopping.")
     try:
         previous = float(best_monitor_value)
     except Exception:
         previous = _initial_monitor_value(monitor_mode)
+    try:
+        current = float(monitor_value)
+    except Exception:
+        current = float("nan")
+    if not math.isfinite(current):
+        return False, previous, int(patience_counter) + 1
     delta = max(float(min_delta), 0.0)
     mode = str(monitor_mode or "max").lower()
     if not math.isfinite(previous):
@@ -1731,6 +1860,18 @@ def _metric_value_for_monitor(metric: str, values: Dict[str, Optional[float]]) -
         return float(value)
     except (TypeError, ValueError):
         return float("nan")
+
+def _safe_matthews_corrcoef(y_true, y_pred) -> Optional[float]:
+    try:
+        y_true_np = np.asarray(y_true.detach().cpu() if torch.is_tensor(y_true) else y_true).ravel()
+        y_pred_np = np.asarray(y_pred.detach().cpu() if torch.is_tensor(y_pred) else y_pred).ravel()
+        if y_true_np.size == 0 or y_true_np.size != y_pred_np.size:
+            return None
+        value = float(matthews_corrcoef(y_true_np, y_pred_np))
+        return value if math.isfinite(value) else 0.0
+    except Exception as e:
+        logger.warning(f"No se pudo calcular MCC: {e}")
+        return None
 
 def prior_shift_adjust(p_train, p_real, p_hat):
     # p_train: prevalencia en entrenamiento; p_real: prevalencia real
@@ -2043,12 +2184,7 @@ def test(
         except Exception as e:
             logger.warning(f"No se pudo calcular AUPRC: {e}")
 
-        mcc = None
-        try:
-            if len(torch.unique(y_pred)) > 1:
-                mcc = matthews_corrcoef(y_true, y_pred)
-        except Exception as e:
-            logger.warning(f"No se pudo calcular MCC: {e}")
+        mcc = _safe_matthews_corrcoef(y_true, y_pred)
 
         extra_metrics = _compute_binary_eval_extras(y_true, y_pred, y_prob)
         results[mask_name] = {
@@ -2436,6 +2572,9 @@ def run_gat_training(
     except Exception:
         accumulation_steps = int(ACCUMULATION_STEPS)
     best_params["accumulation_steps"] = accumulation_steps
+    best_params["lr_scheduler"] = _normalize_lr_scheduler_choice(
+        best_params.get("lr_scheduler", best_params.get("lr_scheduler_choice", "one_cycle"))
+    )
 
     if smote_num_neighbors is None:
         smote_num_neighbors = best_params.get("smote_num_neighbors")
@@ -2610,6 +2749,8 @@ def run_gat_training(
         sequence_index=loaded_obj.get('sequence_index'),
         num_nodes=data['pm'].num_nodes,
         device=device,
+        use_residual=_safe_bool(best_params.get("use_residual"), False),
+        use_relation_self_loops=_safe_bool(best_params.get("use_relation_self_loops"), True),
     )
     temporal_module = getattr(model, 'temporal_head', None)
 
@@ -3031,9 +3172,11 @@ def run_gat_training(
         else best_params.get("checkpoint_metric", "val_objective_score")
     )
     monitor_mode = _monitor_mode_for_metric(monitor_metric)
+    lr_scheduler = _normalize_lr_scheduler_choice(best_params.get("lr_scheduler", "one_cycle"))
     best_params["checkpoint_metric"] = monitor_metric
     best_params["monitor_metric"] = monitor_metric
     best_params["monitor_mode"] = monitor_mode
+    best_params["lr_scheduler"] = lr_scheduler
 
     has_val_mask = hasattr(base_graph["pm"], "val_mask")
     val_mask_count = int(base_graph["pm"].val_mask.sum().item()) if has_val_mask else 0
@@ -3078,14 +3221,17 @@ def run_gat_training(
         objective_threshold_beta=float(objective_threshold_beta),
         monitor_metric=monitor_metric,
         monitor_mode=monitor_mode,
+        lr_scheduler=str(lr_scheduler),
     )
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    scheduler = _build_lr_scheduler(
         optimizer,
+        lr_scheduler,
         max_lr=float(best_params['lr']),
-        steps_per_epoch=len(train_loader),
+        steps_per_epoch=_optimizer_steps_per_epoch(train_loader, accumulation_steps),
         epochs=max_epochs,
-        cycle_momentum=isinstance(optimizer, (torch.optim.AdamW, torch.optim.NAdam))
+        monitor_mode=monitor_mode,
     )
+    batch_scheduler = scheduler if _lr_scheduler_steps_per_batch(lr_scheduler) else None
 
     if save_state_path is None and resume_state_path:
         save_state_path = resume_state_path
@@ -3335,7 +3481,7 @@ def run_gat_training(
         loss, cls_loss, edge_loss, l2_att_loss = train_minibatch(model, train_loader, optimizer, criterion,
                                   grad_clip_value=float(best_params.get('grad_clip', 1.0)),
                                   device=device, use_amp=use_amp, scaler=scaler,
-                                  scheduler=scheduler, writer=writer, epoch=epoch,
+                                  scheduler=batch_scheduler, writer=writer, epoch=epoch,
                                   lambda_H=current_lambda_H, node_type='pm',
                                   edge_gen=edge_gen, lambda_edge=lambda_edge,
                                   lambda_l2_att=lambda_l2_att,
@@ -3564,6 +3710,7 @@ def run_gat_training(
                     'variant_tag': _variant_tags(use_graphsmote, loaded_obj, gnn_variant=gnn_variant),
                     'monitor_metric': monitor_metric,
                     'monitor_mode': monitor_mode,
+                    'lr_scheduler': str(lr_scheduler),
                     'monitor_value': float(monitor_value),
                     'best_monitor_value': float(best_monitor_value),
                     'best_val_loss': float(best_val_loss),
@@ -3617,6 +3764,15 @@ def run_gat_training(
             except Exception as _e:
                 logger.warning(f"No se pudo guardar hparams JSON: {_e}")
 
+        if scheduler is not None and batch_scheduler is None:
+            try:
+                scheduler_metric = float(monitor_value)
+                if not math.isfinite(scheduler_metric):
+                    scheduler_metric = float(val_loss)
+                scheduler.step(scheduler_metric)
+            except Exception:
+                pass
+
         if progress_callback is not None:
             try:
                 progress_callback(
@@ -3641,10 +3797,7 @@ def run_gat_training(
 
         current_lr = None
         try:
-            if scheduler is not None:
-                current_lr = float(scheduler.get_last_lr()[0])
-            else:
-                current_lr = float(optimizer.param_groups[0].get("lr"))
+            current_lr = _scheduler_lr_value(scheduler, optimizer)
         except Exception:
             current_lr = None
 
@@ -3694,6 +3847,7 @@ def run_gat_training(
             best_epoch=best_epoch,
             monitor_metric=monitor_metric,
             monitor_mode=monitor_mode,
+            lr_scheduler=str(lr_scheduler),
             monitor_value=monitor_value,
             best_monitor_value=best_monitor_value,
             objective_metric=objective_metric,
@@ -3737,6 +3891,7 @@ def run_gat_training(
                     "best_epoch": int(best_epoch),
                     "monitor_metric": monitor_metric,
                     "monitor_mode": monitor_mode,
+                    "lr_scheduler": str(lr_scheduler),
                     "monitor_value": float(monitor_value),
                     "best_monitor_value": float(best_monitor_value),
                     "patience_counter": int(patience_counter),
@@ -3813,6 +3968,7 @@ def run_gat_training(
         best_epoch=best_epoch,
         monitor_metric=monitor_metric,
         monitor_mode=monitor_mode,
+        lr_scheduler=str(lr_scheduler),
         best_monitor_value=best_monitor_value,
         objective_metric=objective_metric,
         objective_threshold_beta=objective_threshold_beta,
@@ -3895,6 +4051,10 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
         overrides = optimizer_overrides or {}
         gnn_variant = overrides.get('gnn_variant', GNN_VARIANT)
         trial.set_user_attr('gnn_variant', _normalize_gnn_variant(gnn_variant))
+        use_residual = _safe_bool(overrides.get("use_residual"), True)
+        use_relation_self_loops = _safe_bool(overrides.get("use_relation_self_loops"), False)
+        trial.set_user_attr("use_residual", bool(use_residual))
+        trial.set_user_attr("use_relation_self_loops", bool(use_relation_self_loops))
         accumulation_steps = int(overrides.get("accumulation_steps", ACCUMULATION_STEPS))
         
         lr_override = overrides.get('lr')
@@ -3908,6 +4068,23 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             optimizer_name = trial.suggest_categorical('optimizer', [str(opt_name_override)])
         else:
             optimizer_name = trial.suggest_categorical('optimizer', ['Adam', 'AdamW', 'RAdam', 'Lion'])
+
+        raw_scheduler_choices = overrides.get("lr_scheduler_choices")
+        if raw_scheduler_choices is None:
+            raw_scheduler_choices = overrides.get("lr_scheduler")
+        if isinstance(raw_scheduler_choices, (list, tuple, set)):
+            scheduler_choices = []
+            for choice in raw_scheduler_choices:
+                normalized_choice = _normalize_lr_scheduler_choice(choice)
+                if normalized_choice not in scheduler_choices:
+                    scheduler_choices.append(normalized_choice)
+            scheduler_choices = scheduler_choices or ["one_cycle"]
+        elif raw_scheduler_choices:
+            scheduler_choices = [_normalize_lr_scheduler_choice(raw_scheduler_choices)]
+        else:
+            scheduler_choices = ["one_cycle"]
+        lr_scheduler = trial.suggest_categorical("lr_scheduler", scheduler_choices)
+        trial.set_user_attr("lr_scheduler", str(lr_scheduler))
 
         wd_override = overrides.get('weight_decay')
         if wd_override is not None:
@@ -3973,6 +4150,8 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             sequence_index=sequence_index_global,
             num_nodes=data['pm'].num_nodes,
             device=device,
+            use_residual=use_residual,
+            use_relation_self_loops=use_relation_self_loops,
         )
         temporal_module = getattr(model, 'temporal_head', None)
 
@@ -4015,6 +4194,23 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             shuffle=True
         )
         
+        try:
+            scheduler = _build_lr_scheduler(
+                optimizer,
+                lr_scheduler,
+                max_lr=float(lr),
+                steps_per_epoch=_optimizer_steps_per_epoch(
+                    train_loader,
+                    accumulation_steps,
+                ),
+                epochs=int(NUM_EPOCHS_OPTUNA),
+                monitor_mode="max",
+            )
+        except Exception as exc:
+            logger.warning(f"No se pudo crear lr_scheduler={lr_scheduler}: {exc}")
+            scheduler = None
+        batch_scheduler = scheduler if _lr_scheduler_steps_per_batch(lr_scheduler) else None
+
         best_f05 = -1.0
         best_tau = 0.5
         best_epoch = 0
@@ -4043,7 +4239,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             _prime_temporal_cache_if_needed(model, train_graph, node_type='pm', context=f"hpo_epoch_{epoch}")
             train_minibatch(
                 model, train_loader, optimizer, criterion, grad_clip_value=float(overrides.get('grad_clip', 1.0)), device=device,
-                use_amp=False, scaler=None, scheduler=None, writer=None, epoch=epoch,
+                use_amp=False, scaler=None, scheduler=batch_scheduler, writer=None, epoch=epoch,
                 lambda_H=current_lambda_H, node_type='pm', edge_gen=edge_gen, lambda_edge=lambda_edge,
                 lambda_l2_att=lambda_l2_att,
                 accumulation_steps=accumulation_steps
@@ -4071,6 +4267,11 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
 
                 auprc = average_precision_score(y_true_val, y_prob1_val)
                 tau, P, R, f05 = pick_tau_fbeta(y_true_val, y_prob1_val, beta=0.5)
+                if scheduler is not None and batch_scheduler is None:
+                    try:
+                        scheduler.step(float(f05))
+                    except Exception:
+                        pass
                 
                 trial.report(f05, epoch)
                 if trial.should_prune():
@@ -4811,6 +5012,8 @@ def run_gat_testing(loaded_obj):
         sequence_index=loaded_obj.get('sequence_index'),
         num_nodes=data['pm'].num_nodes,
         device=device,
+        use_residual=_safe_bool(best_params.get("use_residual"), False),
+        use_relation_self_loops=_safe_bool(best_params.get("use_relation_self_loops"), True),
     )
 
     # 4. Cargar el estado del modelo entrenado

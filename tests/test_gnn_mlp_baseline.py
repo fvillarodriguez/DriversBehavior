@@ -538,6 +538,11 @@ def test_gnn_checkpoint_comparison_evaluates_val_and_test(tmp_path: Path, monkey
             "test_mask": fake_result([0, 1, 0, 1]),
         }
 
+    platt_model = object()
+
+    def fake_platt_scale(y_true, y_prob):
+        return np.asarray(y_prob, dtype=float), platt_model
+
     monkeypatch.setattr(app, "_load_hparams_for_model", lambda path: dict(meta))
     monkeypatch.setattr(app.torch, "load", lambda *args, **kwargs: {"weight": torch.ones(1)})
     monkeypatch.setattr(app, "_check_model_graph_compat", lambda *args, **kwargs: (True, None))
@@ -551,6 +556,8 @@ def test_gnn_checkpoint_comparison_evaluates_val_and_test(tmp_path: Path, monkey
     monkeypatch.setattr(app, "_infer_edge_feature_dim", lambda graph_data: 0)
     monkeypatch.setattr(gnn_main, "_build_gnn_model", lambda **kwargs: _FakeModel())
     monkeypatch.setattr(gnn_main, "test", fake_test)
+    monkeypatch.setattr(gnn_main, "AUTOCALIBRATE_PROBS", True)
+    monkeypatch.setattr(gnn_main, "_platt_scale_probabilities", fake_platt_scale)
 
     rows = app._evaluate_gnn_checkpoint_for_comparison(
         model_path=str(model_path),
@@ -569,9 +576,11 @@ def test_gnn_checkpoint_comparison_evaluates_val_and_test(tmp_path: Path, monkey
     assert df.loc[df["split"] == "test", "fp"].iloc[0] == 1
     assert df.loc[df["split"] == "test", "fn"].iloc[0] == 0
     assert df.loc[df["split"] == "test", "brier_score"].iloc[0] == pytest.approx(0.2)
+    assert set(df["calibration_method"]) == {"platt_scaling"}
     assert any(call.get("threshold") is None for call in calls)
     eval_calls = [call for call in calls if call.get("threshold") is not None]
     assert eval_calls and "test_mask" in eval_calls[-1]["masks"]
+    assert eval_calls[-1]["calibration_model"] is platt_model
 
 
 def test_render_graph_builder_includes_comparison_tab(monkeypatch):

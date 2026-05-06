@@ -83,8 +83,21 @@ class HeteroGAT(torch.nn.Module):
     Modelo GAT Heterogéneo optimizado con HeteroConv, checkpointing y recuperación de atención.
     Soporta un número dinámico de capas.
     """
-    def __init__(self, in_channels, hidden_channels, out_channels, num_heads, dropout, edge_feature_dim, num_layers, use_checkpointing=False,
-                 aggr1='sum', aggr2='sum'):
+    def __init__(
+        self,
+        in_channels,
+        hidden_channels,
+        out_channels,
+        num_heads,
+        dropout,
+        edge_feature_dim,
+        num_layers,
+        use_checkpointing=False,
+        aggr1='sum',
+        aggr2='sum',
+        use_residual=False,
+        use_relation_self_loops=True,
+    ):
         super().__init__()
         self.hidden_channels = hidden_channels
         self.num_heads = num_heads
@@ -92,21 +105,26 @@ class HeteroGAT(torch.nn.Module):
         self.use_checkpointing = use_checkpointing
         self.num_layers = num_layers
         self.edge_feature_dim = edge_feature_dim
+        self.use_residual = bool(use_residual)
+        self.use_relation_self_loops = bool(use_relation_self_loops)
 
         self.convs = ModuleList()
         self.norms = ModuleList()
+        self.residual_lins = ModuleList()
 
         for i in range(num_layers):
             conv_in_channels = in_channels if i == 0 else hidden_channels * num_heads
             
             conv_dict = {
-                ('pm', 'spatial', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=True, edge_dim=edge_feature_dim),
-                ('pm', 'temporal', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=True, edge_dim=edge_feature_dim),
-                ('pm', 'spatial_back', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=True, edge_dim=edge_feature_dim),
-                ('pm', 'st_fwd', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=True, edge_dim=edge_feature_dim),
+                ('pm', 'spatial', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=self.use_relation_self_loops, edge_dim=edge_feature_dim),
+                ('pm', 'temporal', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=self.use_relation_self_loops, edge_dim=edge_feature_dim),
+                ('pm', 'spatial_back', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=self.use_relation_self_loops, edge_dim=edge_feature_dim),
+                ('pm', 'st_fwd', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=self.use_relation_self_loops, edge_dim=edge_feature_dim),
             }
             
             self.convs.append(HeteroConv(conv_dict, aggr=aggr1 if i == 0 else aggr2))
+            if self.use_residual:
+                self.residual_lins.append(Linear(conv_in_channels, hidden_channels * num_heads))
 
             norm_dict = torch.nn.ModuleDict()
             norm_dict['pm'] = LayerNorm(hidden_channels * num_heads)
@@ -143,9 +161,10 @@ class HeteroGAT(torch.nn.Module):
 
             conv = self.convs[i]
             norm = self.norms[i]
+            residual = self.residual_lins[i] if self.use_residual else None
 
             if self.use_checkpointing and self.training:
-                def _checkpointed_block(x_pm_tensor, x_dict_cap=x_dict, conv_cap=conv, norm_cap=norm, edge_index_dict_cap=edge_index_dict, edge_attr_dict_cap=edge_attr_dict):
+                def _checkpointed_block(x_pm_tensor, x_dict_cap=x_dict, conv_cap=conv, norm_cap=norm, residual_cap=residual, edge_index_dict_cap=edge_index_dict, edge_attr_dict_cap=edge_attr_dict):
                     tmp_x_dict = {**x_dict_cap, 'pm': x_pm_tensor}
                     
                     active_edge_types = conv_cap.convs.keys()
@@ -185,11 +204,15 @@ class HeteroGAT(torch.nn.Module):
                     
                     out_dict = conv_cap(tmp_x_dict, active_eid, active_ead)
                     
-                    processed_out_dict = {key: F.relu(norm_cap[key](x)) for key, x in out_dict.items()}
+                    processed_out_dict = {}
+                    for key, x in out_dict.items():
+                        if key == 'pm' and residual_cap is not None:
+                            x = x + residual_cap(x_pm_tensor)
+                        processed_out_dict[key] = F.relu(norm_cap[key](x))
                     
                     return processed_out_dict['pm']
 
-                x_dict = {'pm': checkpoint(_checkpointed_block, x_dict['pm'], use_reentrant=True)}
+                x_dict = {'pm': checkpoint(_checkpointed_block, x_dict['pm'], use_reentrant=False)}
 
             else:
                 # Original path without checkpointing
@@ -229,7 +252,10 @@ class HeteroGAT(torch.nn.Module):
                                 active_ead[k] = torch.zeros((num_e, self.edge_feature_dim), dtype=ref.dtype, device=ref.device)
                     return conv(xd, active_eid, active_ead)
                 
+                residual_input_pm = x_dict.get('pm')
                 x_dict = _conv_step(x_dict, edge_index_dict, edge_attr_dict)
+                if residual is not None and residual_input_pm is not None and 'pm' in x_dict:
+                    x_dict['pm'] = x_dict['pm'] + residual(residual_input_pm)
                 x_dict = {key: norm[key](x) for key, x in x_dict.items()}
                 x_dict = {key: F.relu(x) for key, x in x_dict.items()}
 
@@ -288,6 +314,8 @@ class HeteroGATWithEdgeEncoder(HeteroGAT):
         edge_encoder_hidden_dim=None,
         edge_encoded_dim=None,
         edge_encoder_dropout=0.0,
+        use_residual=False,
+        use_relation_self_loops=True,
     ):
         raw_edge_dim = int(edge_feature_dim or 0)
         encoded_edge_dim = int(edge_encoded_dim if edge_encoded_dim is not None else raw_edge_dim)
@@ -302,6 +330,8 @@ class HeteroGATWithEdgeEncoder(HeteroGAT):
             use_checkpointing=use_checkpointing,
             aggr1=aggr1,
             aggr2=aggr2,
+            use_residual=use_residual,
+            use_relation_self_loops=use_relation_self_loops,
         )
         self.raw_edge_feature_dim = raw_edge_dim
         self.encoded_edge_feature_dim = encoded_edge_dim
@@ -349,8 +379,21 @@ class HeteroEdgeAware(torch.nn.Module):
     the same output contract as HeteroGAT.
     """
 
-    def __init__(self, in_channels, hidden_channels, out_channels, num_heads, dropout, edge_feature_dim, num_layers, use_checkpointing=False,
-                 aggr1='sum', aggr2='sum'):
+    def __init__(
+        self,
+        in_channels,
+        hidden_channels,
+        out_channels,
+        num_heads,
+        dropout,
+        edge_feature_dim,
+        num_layers,
+        use_checkpointing=False,
+        aggr1='sum',
+        aggr2='sum',
+        use_residual=False,
+        use_relation_self_loops=True,
+    ):
         super().__init__()
         self.hidden_channels = hidden_channels
         self.num_heads = num_heads
@@ -358,9 +401,12 @@ class HeteroEdgeAware(torch.nn.Module):
         self.use_checkpointing = use_checkpointing
         self.num_layers = num_layers
         self.edge_feature_dim = edge_feature_dim
+        self.use_residual = bool(use_residual)
+        self.use_relation_self_loops = bool(use_relation_self_loops)
 
         self.convs = ModuleList()
         self.norms = ModuleList()
+        self.residual_lins = ModuleList()
 
         for i in range(num_layers):
             conv_in_channels = in_channels if i == 0 else hidden_channels * num_heads
@@ -371,6 +417,8 @@ class HeteroEdgeAware(torch.nn.Module):
                 ('pm', 'st_fwd', 'pm'): TransformerConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, dropout=dropout, edge_dim=edge_feature_dim),
             }
             self.convs.append(HeteroConv(conv_dict, aggr=aggr1 if i == 0 else aggr2))
+            if self.use_residual:
+                self.residual_lins.append(Linear(conv_in_channels, hidden_channels * num_heads))
 
             norm_dict = torch.nn.ModuleDict()
             norm_dict['pm'] = LayerNorm(hidden_channels * num_heads)

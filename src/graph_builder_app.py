@@ -6,6 +6,7 @@ import contextlib
 import gc
 import glob
 import hashlib
+import html
 import shutil
 import io
 import json
@@ -30,6 +31,10 @@ import polars as pl
 import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import streamlit as st
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+except Exception:
+    get_script_run_ctx = None
 import torch
 from torch_geometric.data import HeteroData
 
@@ -107,6 +112,16 @@ FEATURE_SELECTION_DIR = Path(RESULTADOS_DIR)
 HISTORY_PATH = Path(RESULTADOS_DIR) / "gnn_history.jsonl"
 GNN_OPTUNA_LIVE_DIR = Path(RESULTADOS_DIR) / "gnn_optuna_live"
 GNN_EVAL_LIVE_DIR = Path(RESULTADOS_DIR) / "gnn_eval_live"
+GNN_LR_SCHEDULER_LABELS: Dict[str, str] = {
+    "one_cycle": "OneCycleLR",
+    "cosine_warm_restarts": "CosineAnnealingWarmRestarts",
+    "plateau_restart": "ReduceLROnPlateau",
+}
+GNN_LR_SCHEDULER_HELP = (
+    "one_cycle: agenda por batch con subida/bajada rapida; "
+    "cosine_warm_restarts: coseno con reinicios calidos por batch; "
+    "plateau_restart: reduce LR cuando la metrica de validacion deja de mejorar."
+)
 
 try:
     import duckdb
@@ -120,6 +135,11 @@ try:
     import psutil  # optional for RAM usage
 except Exception:
     psutil = None
+
+def _has_streamlit_script_context() -> bool:
+    if get_script_run_ctx is None:
+        return True
+    return get_script_run_ctx(suppress_warning=True) is not None
 
 class StreamlitLogHandler(logging.Handler):
     """
@@ -143,12 +163,15 @@ class StreamlitLogHandler(logging.Handler):
             
             current_time = time.time()
             if current_time - self.last_update > self.update_interval:
+                if not _has_streamlit_script_context():
+                    return
                 log_text = "\n".join(self.lines)
                 # We use code block for monospaced font
                 self.container.code(log_text, language="text")
                 self.last_update = current_time
         except Exception:
-            self.handleError(record)
+            if _has_streamlit_script_context():
+                self.handleError(record)
 
 class _TuneTrialAdapter:
     """Adapter para reutilizar el objetivo de Optuna con Ray Tune."""
@@ -214,9 +237,12 @@ class StreamlitJSONLogHandler(logging.Handler):
             data = json.loads(msg)
             if self.scope and data.get("scope") != self.scope:
                 return
+            if not _has_streamlit_script_context():
+                return
             self.on_event(data)
         except Exception:
-            self.handleError(record)
+            if _has_streamlit_script_context():
+                self.handleError(record)
 
 def _get_file_date_range(source_type: str, source_path: str) -> Tuple[Optional[datetime], Optional[datetime]]:
     """Retrieves min and max dates from a feature file for filter initialization."""
@@ -322,8 +348,10 @@ class StreamlitStdout:
             self.lines = self.lines[-self.max_lines:]
         current_time = time.time()
         if current_time - self.last_update > self.update_interval:
+            if not _has_streamlit_script_context():
+                return
             # Mostrar logs en orden inverso (más recientes arriba) dentro de un div con scroll
-            reversed_lines = "\n".join(reversed(self.lines))
+            reversed_lines = html.escape("\n".join(reversed(self.lines)))
             html_content = f"""
             <div style="
                 height: 300px;
@@ -2157,7 +2185,7 @@ def _load_graph_data_for_eval(path: str) -> Optional[HeteroData]:
     return None
 
 
-def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, int]:
+def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, object]:
     num_layers = 0
     num_heads = None
     hidden = None
@@ -2184,6 +2212,7 @@ def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str
         "num_layers": int(num_layers if num_layers else 2),
         "num_heads": int(num_heads if num_heads else 4),
         "hidden_channels": int(hidden if hidden else 32),
+        "use_residual": any(str(key).startswith("residual_lins.") for key in state_dict.keys()),
     }
 
 
@@ -2361,6 +2390,28 @@ def _coerce_optional_float(value: object) -> Optional[float]:
     return out
 
 
+def _coerce_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if isinstance(value, float) and math.isnan(value):
+                return bool(default)
+        except Exception:
+            pass
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "s", "si", "sí"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", ""}:
+        return False
+    return bool(default)
+
+
 def _mask_name_to_split(mask_name: str) -> str:
     text = str(mask_name or "")
     return text[:-5] if text.endswith("_mask") else text
@@ -2496,6 +2547,7 @@ def _gnn_eval_result_to_comparison_row(
     result: Dict[str, object],
     tau: float,
     meta: Mapping[str, object],
+    calibration_method: str = "softmax_raw",
 ) -> Dict[str, object]:
     report = result.get("report") or {}
     pos_report = report.get("Accidente (1)", {}) if isinstance(report, dict) else {}
@@ -2544,6 +2596,7 @@ def _gnn_eval_result_to_comparison_row(
         "brier_score": _brier_score_from_result(result),
         "tau": float(tau),
         "tau_source": "val_f1_beta1",
+        "calibration_method": str(calibration_method),
     }
 
 
@@ -2592,6 +2645,7 @@ def _gnn_checkpoint_skip_rows_for_comparison(
                 "brier_score": None,
                 "tau": _checkpoint_tau_from_meta(meta),
                 "tau_source": "metadata_or_default",
+                "calibration_method": "not_applied",
             }
         )
     return rows
@@ -2705,6 +2759,8 @@ def _evaluate_gnn_checkpoint_for_comparison(
             sequence_index=sequence_index,
             num_nodes=model_num_nodes,
             device=eval_device,
+            use_residual=_coerce_bool(meta.get("use_residual", arch.get("use_residual", False))),
+            use_relation_self_loops=_coerce_bool(meta.get("use_relation_self_loops"), True),
         )
         model.load_state_dict(state_dict, strict=True)
         model.eval()
@@ -2726,6 +2782,8 @@ def _evaluate_gnn_checkpoint_for_comparison(
         effective_neighbors = num_neighbors if num_neighbors not in (None, "") else meta.get("num_neighbors")
         tau_fallback = _checkpoint_tau_from_meta(meta)
         tau = tau_fallback if tau_fallback is not None else 0.5
+        platt_model = None
+        calibration_method = "softmax_raw"
         if "val_mask" in wanted_masks:
             _notify(event="gnn_checkpoint_calibrating", model=os.path.basename(str(model_path)))
             val_results = graph_main.test(
@@ -2737,11 +2795,49 @@ def _evaluate_gnn_checkpoint_for_comparison(
                 batch_size=int(batch_size),
                 num_neighbors=effective_neighbors,
             )
+            val_result_for_tau = (
+                val_results.get("val_mask") if isinstance(val_results, dict) else None
+            )
+            if val_result_for_tau and bool(getattr(graph_main, "AUTOCALIBRATE_PROBS", False)):
+                try:
+                    y_true_val = val_result_for_tau["true"].detach().cpu().numpy().astype(int).ravel()
+                    y_prob_val = val_result_for_tau["probs"].detach().cpu().numpy()
+                    y_prob1_val_raw = (
+                        y_prob_val[:, 1].astype(float).ravel()
+                        if y_prob_val.ndim == 2 and y_prob_val.shape[1] > 1
+                        else y_prob_val.astype(float).ravel()
+                    )
+                    y_prob1_val, platt_model = graph_main._platt_scale_probabilities(
+                        y_true_val,
+                        y_prob1_val_raw,
+                    )
+                    if platt_model is not None:
+                        calibration_method = "platt_scaling"
+                        val_result_for_tau = dict(val_result_for_tau)
+                        val_result_for_tau["probs"] = np.column_stack(
+                            [
+                                np.clip(1.0 - y_prob1_val, 0.0, 1.0),
+                                np.clip(y_prob1_val, 0.0, 1.0),
+                            ]
+                        )
+                        _notify(
+                            event="gnn_checkpoint_platt",
+                            model=os.path.basename(str(model_path)),
+                            calibration_method=calibration_method,
+                        )
+                except Exception:
+                    platt_model = None
+                    calibration_method = "softmax_raw"
             tau = _comparison_tau_from_val_result(
-                val_results.get("val_mask") if isinstance(val_results, dict) else None,
+                val_result_for_tau,
                 fallback_tau=tau_fallback,
             )
-        _notify(event="gnn_checkpoint_tau", model=os.path.basename(str(model_path)), tau=float(tau))
+        _notify(
+            event="gnn_checkpoint_tau",
+            model=os.path.basename(str(model_path)),
+            tau=float(tau),
+            calibration_method=calibration_method,
+        )
         eval_results = graph_main.test(
             model,
             graph_data,
@@ -2750,6 +2846,7 @@ def _evaluate_gnn_checkpoint_for_comparison(
             masks=wanted_masks,
             batch_size=int(batch_size),
             num_neighbors=effective_neighbors,
+            calibration_model=platt_model,
         )
 
         rows: List[Dict[str, object]] = []
@@ -2782,9 +2879,15 @@ def _evaluate_gnn_checkpoint_for_comparison(
                     result=result,
                     tau=float(tau),
                     meta=meta,
+                    calibration_method=calibration_method,
                 )
             )
-        _notify(event="gnn_checkpoint_done", model=os.path.basename(str(model_path)), tau=float(tau))
+        _notify(
+            event="gnn_checkpoint_done",
+            model=os.path.basename(str(model_path)),
+            tau=float(tau),
+            calibration_method=calibration_method,
+        )
         return rows
     except Exception as exc:
         return _gnn_checkpoint_skip_rows_for_comparison(
@@ -2816,6 +2919,7 @@ def _display_mlp_baseline_results(df: pd.DataFrame) -> None:
         "fp",
         "fn",
         "tau",
+        "calibration_method",
         "samples",
         "positives",
         "positive_rate",
@@ -3246,6 +3350,563 @@ def _sample_mask_indices(
         seed=seed,
         ensure_both_classes=ensure_both_classes,
     )
+
+
+def _mask_to_cpu_bool(
+    graph_data: HeteroData,
+    mask_attr: str,
+    *,
+    node_type: str = "pm",
+) -> torch.Tensor:
+    total = int(getattr(graph_data[node_type], "num_nodes", graph_data[node_type].x.size(0)))
+    raw = getattr(graph_data[node_type], mask_attr, None)
+    if torch.is_tensor(raw) and raw.numel() >= total:
+        return raw[:total].detach().cpu().bool()
+    return torch.zeros(total, dtype=torch.bool)
+
+
+def _sample_indices_by_time_bins(
+    candidate_idx: torch.Tensor,
+    ts_arr: Optional[np.ndarray],
+    *,
+    n_select: int,
+    seed: int,
+    time_bins: int,
+) -> torch.Tensor:
+    candidate_idx = candidate_idx.view(-1).detach().cpu().long()
+    n_select = int(max(0, n_select))
+    if n_select <= 0 or candidate_idx.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+    if candidate_idx.numel() <= n_select:
+        return candidate_idx
+
+    rng = np.random.RandomState(int(seed))
+    values = candidate_idx.numpy()
+    if ts_arr is None:
+        chosen = rng.choice(values, size=n_select, replace=False)
+        return torch.from_numpy(np.asarray(chosen, dtype=np.int64))
+
+    try:
+        ts_values = np.asarray(ts_arr, dtype=float)[values]
+        finite = np.isfinite(ts_values)
+    except Exception:
+        finite = np.zeros(values.shape, dtype=bool)
+    if not finite.any() or int(time_bins) <= 1:
+        chosen = rng.choice(values, size=n_select, replace=False)
+        return torch.from_numpy(np.asarray(chosen, dtype=np.int64))
+
+    finite_values = values[finite]
+    finite_ts = ts_values[finite]
+    missing_values = values[~finite]
+    unique_ts = np.unique(finite_ts)
+    if unique_ts.size <= 1:
+        chosen = rng.choice(values, size=n_select, replace=False)
+        return torch.from_numpy(np.asarray(chosen, dtype=np.int64))
+
+    bin_count = int(max(1, min(int(time_bins), unique_ts.size)))
+    edges = np.quantile(finite_ts, np.linspace(0.0, 1.0, bin_count + 1))
+    edges = np.unique(edges)
+    if edges.size <= 1:
+        chosen = rng.choice(values, size=n_select, replace=False)
+        return torch.from_numpy(np.asarray(chosen, dtype=np.int64))
+    bin_ids = np.searchsorted(edges[1:-1], finite_ts, side="right")
+
+    groups: List[np.ndarray] = []
+    for bin_id in sorted(set(int(v) for v in bin_ids.tolist())):
+        group = finite_values[bin_ids == bin_id]
+        if group.size:
+            groups.append(group)
+    if missing_values.size:
+        groups.append(missing_values)
+    if not groups:
+        chosen = rng.choice(values, size=n_select, replace=False)
+        return torch.from_numpy(np.asarray(chosen, dtype=np.int64))
+
+    group_sizes = np.asarray([len(group) for group in groups], dtype=float)
+    raw_alloc = group_sizes / max(float(group_sizes.sum()), 1.0) * float(n_select)
+    alloc = np.floor(raw_alloc).astype(int)
+    non_empty = np.where(group_sizes > 0)[0]
+    if n_select >= len(non_empty):
+        alloc[non_empty] = np.maximum(alloc[non_empty], 1)
+    while int(alloc.sum()) > n_select:
+        candidates = np.where(alloc > 0)[0]
+        if candidates.size == 0:
+            break
+        over_idx = candidates[np.argmax(alloc[candidates])]
+        alloc[over_idx] -= 1
+    remainder_order = np.argsort(-(raw_alloc - np.floor(raw_alloc)))
+    cursor = 0
+    while int(alloc.sum()) < n_select and cursor < len(remainder_order) * 3:
+        group_idx = int(remainder_order[cursor % len(remainder_order)])
+        if alloc[group_idx] < len(groups[group_idx]):
+            alloc[group_idx] += 1
+        cursor += 1
+
+    selected: List[np.ndarray] = []
+    for group, count in zip(groups, alloc.tolist()):
+        if int(count) <= 0:
+            continue
+        selected.append(rng.choice(group, size=int(count), replace=False))
+    if not selected:
+        chosen = rng.choice(values, size=n_select, replace=False)
+        return torch.from_numpy(np.asarray(chosen, dtype=np.int64))
+    out = np.concatenate(selected).astype(np.int64)
+    if out.size > n_select:
+        out = rng.choice(out, size=n_select, replace=False).astype(np.int64)
+    rng.shuffle(out)
+    return torch.from_numpy(out)
+
+
+def _sample_pilot_split_nodes(
+    split_idx: torch.Tensor,
+    y_cpu: torch.Tensor,
+    ts_arr: Optional[np.ndarray],
+    *,
+    fraction: float,
+    min_positive: int,
+    seed: int,
+    time_bins: int,
+) -> torch.Tensor:
+    split_idx = split_idx.view(-1).detach().cpu().long()
+    if split_idx.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+    target = int(math.ceil(float(split_idx.numel()) * max(float(fraction), 0.0)))
+    target = max(1, min(int(split_idx.numel()), target))
+    y_split = y_cpu[split_idx].detach().cpu().long()
+    pos_idx = split_idx[(y_split == 1).nonzero(as_tuple=False).view(-1)]
+    neg_idx = split_idx[(y_split != 1).nonzero(as_tuple=False).view(-1)]
+    required_pos = min(int(max(0, min_positive)), int(pos_idx.numel()))
+    if required_pos > 0 and target < required_pos:
+        target = min(int(split_idx.numel()), required_pos)
+    if required_pos > 0 and neg_idx.numel() > 0 and target == required_pos:
+        target = min(int(split_idx.numel()), target + 1)
+
+    if pos_idx.numel() == 0 or neg_idx.numel() == 0:
+        return _sample_indices_by_time_bins(
+            split_idx,
+            ts_arr,
+            n_select=target,
+            seed=seed,
+            time_bins=time_bins,
+        )
+
+    pos_ratio = float(pos_idx.numel()) / max(float(split_idx.numel()), 1.0)
+    n_pos = int(round(float(target) * pos_ratio))
+    n_pos = max(required_pos, n_pos)
+    n_pos = min(int(pos_idx.numel()), int(target), int(n_pos))
+    n_neg = min(int(neg_idx.numel()), int(target) - int(n_pos))
+    if n_pos + n_neg < target:
+        remaining = int(target) - int(n_pos) - int(n_neg)
+        pos_left = int(pos_idx.numel()) - int(n_pos)
+        if pos_left > 0:
+            extra = min(remaining, pos_left)
+            n_pos += extra
+            remaining -= extra
+        if remaining > 0:
+            neg_left = int(neg_idx.numel()) - int(n_neg)
+            n_neg += min(remaining, neg_left)
+
+    pos_sel = _sample_indices_by_time_bins(
+        pos_idx,
+        ts_arr,
+        n_select=n_pos,
+        seed=int(seed) + 17,
+        time_bins=time_bins,
+    )
+    neg_sel = _sample_indices_by_time_bins(
+        neg_idx,
+        ts_arr,
+        n_select=n_neg,
+        seed=int(seed) + 31,
+        time_bins=time_bins,
+    )
+    out = torch.cat([pos_sel, neg_sel]).long()
+    if out.numel() <= 1:
+        return out
+    rng = np.random.RandomState(int(seed) + 47)
+    perm = rng.permutation(out.numel())
+    return out[torch.from_numpy(perm).long()]
+
+
+def _pilot_split_class_counts(
+    graph_data: HeteroData,
+    node_idx: torch.Tensor,
+    *,
+    node_type: str = "pm",
+) -> Dict[str, Dict[str, int]]:
+    node_idx = node_idx.view(-1).detach().cpu().long()
+    y = graph_data[node_type].y.detach().cpu().long()
+    counts: Dict[str, Dict[str, int]] = {}
+    for split_name, mask_attr in (
+        ("train", "train_mask"),
+        ("val", "val_mask"),
+        ("test", "test_mask"),
+    ):
+        mask = _mask_to_cpu_bool(graph_data, mask_attr, node_type=node_type)
+        split_nodes = node_idx[mask[node_idx]] if node_idx.numel() else node_idx
+        labels = y[split_nodes] if split_nodes.numel() else torch.empty(0, dtype=torch.long)
+        counts[split_name] = {
+            "total": int(split_nodes.numel()),
+            "positive": int((labels == 1).sum().item()) if labels.numel() else 0,
+            "negative": int((labels != 1).sum().item()) if labels.numel() else 0,
+        }
+    return counts
+
+
+def _select_stratified_pilot_pm_nodes(
+    graph_data: HeteroData,
+    pm_index: object,
+    *,
+    pilot_fraction: float = 0.10,
+    seed: int = SEED,
+    time_bins: int = 8,
+    min_train_pos: int = 25,
+    min_val_pos: int = 10,
+    node_type: str = "pm",
+) -> Dict[str, object]:
+    if node_type not in graph_data.node_types:
+        raise ValueError(f"El grafo no contiene nodos '{node_type}'.")
+    y = graph_data[node_type].y.detach().cpu().long()
+    total = int(getattr(graph_data[node_type], "num_nodes", y.numel()))
+    if y.numel() < total:
+        raise ValueError("Las etiquetas y no cubren todos los nodos PM.")
+    train_mask = _mask_to_cpu_bool(graph_data, "train_mask", node_type=node_type)
+    val_mask = _mask_to_cpu_bool(graph_data, "val_mask", node_type=node_type)
+    test_mask = _mask_to_cpu_bool(graph_data, "test_mask", node_type=node_type)
+    train_idx = torch.nonzero(train_mask & ~test_mask, as_tuple=False).view(-1).cpu()
+    val_idx = torch.nonzero(val_mask & ~test_mask, as_tuple=False).view(-1).cpu()
+    if train_idx.numel() == 0 or val_idx.numel() == 0:
+        raise ValueError("El piloto requiere nodos train y val disponibles.")
+
+    ts_arr = _extract_ts_min_from_pm_index(pm_index, total)
+    train_sel = _sample_pilot_split_nodes(
+        train_idx,
+        y,
+        ts_arr,
+        fraction=float(pilot_fraction),
+        min_positive=int(min_train_pos),
+        seed=int(seed),
+        time_bins=int(time_bins),
+    )
+    val_sel = _sample_pilot_split_nodes(
+        val_idx,
+        y,
+        ts_arr,
+        fraction=float(pilot_fraction),
+        min_positive=int(min_val_pos),
+        seed=int(seed) + 101,
+        time_bins=int(time_bins),
+    )
+    selected = torch.unique(torch.cat([train_sel, val_sel]).long(), sorted=True)
+    if selected.numel() == 0:
+        raise ValueError("No se pudo seleccionar nodos para el piloto.")
+    if bool(test_mask[selected].any().item()):
+        raise ValueError("La seleccion piloto incluyo nodos test; se aborta.")
+
+    all_train_pos = int((y[train_idx] == 1).sum().item())
+    all_val_pos = int((y[val_idx] == 1).sum().item())
+    required_train_pos = min(int(max(0, min_train_pos)), all_train_pos)
+    required_val_pos = min(int(max(0, min_val_pos)), all_val_pos)
+    selected_counts = _pilot_split_class_counts(
+        graph_data, selected, node_type=node_type
+    )
+    if required_train_pos > 0 and selected_counts["train"]["positive"] < required_train_pos:
+        raise ValueError(
+            "El piloto no conserva suficientes positivos de train "
+            f"({selected_counts['train']['positive']}/{required_train_pos})."
+        )
+    if required_val_pos > 0 and selected_counts["val"]["positive"] < required_val_pos:
+        raise ValueError(
+            "El piloto no conserva suficientes positivos de val "
+            f"({selected_counts['val']['positive']}/{required_val_pos})."
+        )
+
+    return {
+        "selected_nodes": selected,
+        "train_nodes": torch.unique(train_sel.long(), sorted=True),
+        "val_nodes": torch.unique(val_sel.long(), sorted=True),
+        "metadata": {
+            "pilot_fraction": float(pilot_fraction),
+            "seed": int(seed),
+            "time_bins": int(time_bins),
+            "total_pm_nodes": int(total),
+            "eligible_train_nodes": int(train_idx.numel()),
+            "eligible_val_nodes": int(val_idx.numel()),
+            "selected_supervised_nodes": int(selected.numel()),
+            "required_train_positives": int(required_train_pos),
+            "required_val_positives": int(required_val_pos),
+            "selected_counts": selected_counts,
+            "full_counts": _pilot_split_class_counts(
+                graph_data,
+                torch.arange(total, dtype=torch.long),
+                node_type=node_type,
+            ),
+        },
+    }
+
+
+def _expand_pilot_nodes_for_sequences(
+    selected_nodes: torch.Tensor,
+    sequence_index: Optional[object],
+    *,
+    test_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, object]:
+    selected_nodes = selected_nodes.view(-1).detach().cpu().long()
+    selected_set = {int(v) for v in selected_nodes.tolist()}
+    expanded = set(selected_set)
+    added_context: set[int] = set()
+    dropped_for_test = 0
+    if sequence_index is not None and selected_set:
+        seq_rows = getattr(sequence_index, "sequence_rows", None)
+        target_rows = getattr(sequence_index, "target_rows", None)
+        try:
+            seq_arr = np.asarray(seq_rows, dtype=np.int64)
+            target_arr = np.asarray(target_rows, dtype=np.int64).reshape(-1)
+        except Exception:
+            seq_arr = np.empty((0, 0), dtype=np.int64)
+            target_arr = np.empty((0,), dtype=np.int64)
+        if seq_arr.ndim == 2 and target_arr.size == seq_arr.shape[0]:
+            test_cpu = test_mask.detach().cpu().bool() if torch.is_tensor(test_mask) else None
+            for seq, target in zip(seq_arr, target_arr):
+                if int(target) not in selected_set:
+                    continue
+                seq_values = [int(v) for v in seq.tolist()]
+                has_test = False
+                if test_cpu is not None:
+                    for value in seq_values:
+                        if 0 <= value < int(test_cpu.numel()) and bool(test_cpu[value]):
+                            has_test = True
+                            break
+                if has_test:
+                    dropped_for_test += 1
+                    continue
+                for value in seq_values:
+                    if value not in expanded:
+                        added_context.add(value)
+                    expanded.add(value)
+    all_nodes = torch.tensor(sorted(expanded), dtype=torch.long)
+    return {
+        "all_nodes": all_nodes,
+        "context_nodes": torch.tensor(sorted(added_context), dtype=torch.long),
+        "metadata": {
+            "sequence_context_nodes": int(len(added_context)),
+            "sequence_targets_dropped_for_test_context": int(dropped_for_test),
+        },
+    }
+
+
+def _build_pm_induced_heterodata(
+    graph_data: HeteroData,
+    pm_nodes_raw: torch.Tensor,
+    *,
+    supervised_nodes: Optional[torch.Tensor] = None,
+    node_type: str = "pm",
+) -> Tuple[HeteroData, Dict[str, object]]:
+    if node_type not in graph_data.node_types:
+        raise ValueError(f"El grafo no contiene nodos '{node_type}'.")
+    total_pm = int(
+        getattr(graph_data[node_type], "num_nodes", graph_data[node_type].x.size(0))
+    )
+    pm_nodes = pm_nodes_raw.view(-1).detach().cpu().long()
+    pm_nodes = torch.unique(pm_nodes[(pm_nodes >= 0) & (pm_nodes < total_pm)], sorted=True)
+    if pm_nodes.numel() == 0:
+        raise ValueError("No hay nodos PM validos para inducir el subgrafo.")
+    supervised = (
+        supervised_nodes.view(-1).detach().cpu().long()
+        if torch.is_tensor(supervised_nodes)
+        else pm_nodes
+    )
+    supervised_set = {int(v) for v in supervised.tolist()}
+    supervised_local = torch.tensor(
+        [int(v) in supervised_set for v in pm_nodes.tolist()],
+        dtype=torch.bool,
+    )
+
+    out = HeteroData()
+    pm_store = graph_data[node_type]
+    out[node_type].x = pm_store.x[pm_nodes].detach().cpu().clone()
+    if hasattr(pm_store, "y") and pm_store.y is not None:
+        out[node_type].y = pm_store.y[pm_nodes].detach().cpu().clone()
+    for key, value in pm_store.items():
+        if key in {"x", "y", "num_nodes", "n_id", "batch_size"}:
+            continue
+        if not torch.is_tensor(value):
+            continue
+        if value.dim() == 0:
+            continue
+        if value.size(0) < total_pm:
+            continue
+        sliced = value[pm_nodes].detach().cpu().clone()
+        if key in {"train_mask", "val_mask"}:
+            sliced = sliced.bool() & supervised_local
+        elif key == "test_mask":
+            sliced = torch.zeros_like(sliced.bool())
+        out[node_type][key] = sliced
+    if "train_mask" not in out[node_type]:
+        out[node_type].train_mask = torch.zeros(pm_nodes.numel(), dtype=torch.bool)
+    if "val_mask" not in out[node_type]:
+        out[node_type].val_mask = torch.zeros(pm_nodes.numel(), dtype=torch.bool)
+    if "test_mask" not in out[node_type]:
+        out[node_type].test_mask = torch.zeros(pm_nodes.numel(), dtype=torch.bool)
+    out[node_type].num_nodes = int(pm_nodes.numel())
+    out[node_type].n_id = pm_nodes.clone()
+
+    g2l = torch.full((total_pm,), -1, dtype=torch.long)
+    g2l[pm_nodes] = torch.arange(pm_nodes.numel(), dtype=torch.long)
+    edge_counts: Dict[str, int] = {}
+    for edge_type in graph_data.edge_types:
+        if edge_type[0] != node_type or edge_type[2] != node_type:
+            continue
+        edge_index = getattr(graph_data[edge_type], "edge_index", None)
+        if edge_index is None:
+            continue
+        edge_index_cpu = edge_index.detach().cpu().long()
+        if edge_index_cpu.numel() == 0:
+            out[edge_type].edge_index = torch.zeros((2, 0), dtype=torch.long)
+            edge_counts[str(edge_type)] = 0
+            continue
+        src_local = g2l[edge_index_cpu[0]]
+        dst_local = g2l[edge_index_cpu[1]]
+        keep = (src_local >= 0) & (dst_local >= 0)
+        local_edge_index = torch.stack([src_local[keep], dst_local[keep]], dim=0)
+        out[edge_type].edge_index = local_edge_index
+        edge_counts[str(edge_type)] = int(local_edge_index.size(1))
+        edge_attr = getattr(graph_data[edge_type], "edge_attr", None)
+        if torch.is_tensor(edge_attr):
+            edge_attr_cpu = edge_attr.detach().cpu()
+            if edge_attr_cpu.size(0) == edge_index_cpu.size(1):
+                out[edge_type].edge_attr = edge_attr_cpu[keep].clone()
+            elif edge_attr_cpu.dim() >= 2:
+                out[edge_type].edge_attr = torch.zeros(
+                    (int(local_edge_index.size(1)), int(edge_attr_cpu.size(1))),
+                    dtype=edge_attr_cpu.dtype,
+                )
+
+    for required_edge_type in (
+        (node_type, "spatial", node_type),
+        (node_type, "temporal", node_type),
+        (node_type, "spatial_back", node_type),
+        (node_type, "st_fwd", node_type),
+    ):
+        if required_edge_type not in out.edge_types:
+            out[required_edge_type].edge_index = torch.zeros((2, 0), dtype=torch.long)
+            edge_counts[str(required_edge_type)] = 0
+
+    try:
+        out.graph_metadata = dict(getattr(graph_data, "graph_metadata", {}) or {})
+    except Exception:
+        pass
+    return out, {
+        "local_to_global": [int(v) for v in pm_nodes.tolist()],
+        "supervised_global_nodes": [int(v) for v in pm_nodes[supervised_local].tolist()],
+        "num_pm_nodes": int(pm_nodes.numel()),
+        "supervised_nodes": int(supervised_local.sum().item()),
+        "edge_counts": edge_counts,
+    }
+
+
+def _remap_pm_index_for_pilot(
+    pm_index: Optional[object],
+    global_pm_nodes: Sequence[int],
+) -> Optional[PMIndex]:
+    rev = getattr(pm_index, "_rev", None)
+    if rev is None and isinstance(pm_index, dict):
+        rev = pm_index
+    if not isinstance(rev, dict):
+        return None
+    local_rev: Dict[int, object] = {}
+    local_map: Dict[object, int] = {}
+    for local_idx, global_idx in enumerate(global_pm_nodes):
+        value = rev.get(int(global_idx))
+        if value is None:
+            continue
+        local_rev[int(local_idx)] = value
+        try:
+            local_map[value] = int(local_idx)
+        except Exception:
+            pass
+    return PMIndex(local_map, local_rev)
+
+
+def _remap_sequence_index_for_pilot(
+    sequence_index: Optional[object],
+    global_to_local: Mapping[int, int],
+) -> Optional[object]:
+    if sequence_index is None:
+        return None
+    seq_rows = getattr(sequence_index, "sequence_rows", None)
+    target_rows = getattr(sequence_index, "target_rows", None)
+    try:
+        seq_arr = np.asarray(seq_rows, dtype=np.int64)
+        target_arr = np.asarray(target_rows, dtype=np.int64).reshape(-1)
+    except Exception:
+        return None
+    if seq_arr.ndim != 2 or target_arr.size != seq_arr.shape[0]:
+        return None
+
+    keep_idx: List[int] = []
+    local_sequences: List[List[int]] = []
+    local_targets: List[int] = []
+    for idx, (seq, target) in enumerate(zip(seq_arr, target_arr)):
+        target_int = int(target)
+        if target_int not in global_to_local:
+            continue
+        local_seq: List[int] = []
+        valid = True
+        for value in seq.tolist():
+            value_int = int(value)
+            local_value = global_to_local.get(value_int)
+            if local_value is None:
+                valid = False
+                break
+            local_seq.append(int(local_value))
+        if not valid:
+            continue
+        keep_idx.append(int(idx))
+        local_sequences.append(local_seq)
+        local_targets.append(int(global_to_local[target_int]))
+
+    seq_len = int(seq_arr.shape[1])
+    local_seq_arr = (
+        np.asarray(local_sequences, dtype=np.int64)
+        if local_sequences
+        else np.empty((0, seq_len), dtype=np.int64)
+    )
+    local_target_arr = np.asarray(local_targets, dtype=np.int64)
+
+    def _slice_attr(name: str, fallback_dtype=object):
+        raw = getattr(sequence_index, name, None)
+        try:
+            arr = np.asarray(raw)
+            if arr.shape[0] == seq_arr.shape[0]:
+                return arr[keep_idx]
+        except Exception:
+            pass
+        return np.empty((len(keep_idx),), dtype=fallback_dtype)
+
+    labels = _slice_attr("labels", fallback_dtype=np.int8)
+    porticos = _slice_attr("porticos", fallback_dtype=object)
+    target_ts_min = _slice_attr("target_ts_min", fallback_dtype=np.int64)
+    config = getattr(sequence_index, "config", None)
+    seq_cls = sequence_index.__class__
+    try:
+        return seq_cls(
+            sequence_rows=local_seq_arr,
+            target_rows=local_target_arr,
+            labels=labels,
+            porticos=porticos,
+            target_ts_min=target_ts_min,
+            config=config,
+        )
+    except Exception:
+        return SimpleNamespace(
+            sequence_rows=local_seq_arr,
+            target_rows=local_target_arr,
+            labels=labels,
+            porticos=porticos,
+            target_ts_min=target_ts_min,
+            config=config,
+        )
 
 
 def _ensure_cpu_graph(graph_data: HeteroData) -> Tuple[HeteroData, bool]:
@@ -4378,6 +5039,8 @@ def _evaluate_gnn_model_far_target(
         sequence_index=sequence_index_for_model,
         num_nodes=model_num_nodes,
         device=device,
+        use_residual=_coerce_bool(meta.get("use_residual", arch.get("use_residual", False))),
+        use_relation_self_loops=_coerce_bool(meta.get("use_relation_self_loops"), True),
     )
     if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
         raise ValueError(
@@ -4657,13 +5320,16 @@ def _network_config_to_hparams(
         "hidden_channels": int(cfg.get("hidden_channels", 64)),
         "num_heads": int(cfg.get("num_heads", 4)),
         "num_layers": int(cfg.get("num_layers", 2)),
-        "dropout": float(cfg.get("dropout", 0.2)),
-        "aggr1": cfg.get("aggr1", "sum"),
-        "aggr2": cfg.get("aggr2", "sum"),
+        "dropout": float(cfg.get("dropout", 0.3)),
+        "aggr1": cfg.get("aggr1", "mean"),
+        "aggr2": cfg.get("aggr2", "mean"),
         "use_checkpointing": bool(cfg.get("use_checkpointing", False)),
-        "optimizer": cfg.get("optimizer", "Adam"),
-        "lr": float(cfg.get("lr", 1e-3)),
-        "weight_decay": float(cfg.get("weight_decay", 1e-6)),
+        "use_residual": _coerce_bool(cfg.get("use_residual"), True),
+        "use_relation_self_loops": _coerce_bool(cfg.get("use_relation_self_loops"), False),
+        "optimizer": cfg.get("optimizer", "AdamW"),
+        "lr_scheduler": cfg.get("lr_scheduler", "one_cycle"),
+        "lr": float(cfg.get("lr", 3e-4)),
+        "weight_decay": float(cfg.get("weight_decay", 1e-4)),
         "lambda_l2_att": float(cfg.get("lambda_l2_att", 1e-4)),
         "lambda_H_mode": cfg.get("lambda_H_mode", "fixed"),
         "lambda_H_fixed": float(cfg.get("lambda_H_fixed", 1e-4)),
@@ -4674,7 +5340,7 @@ def _network_config_to_hparams(
         "focal_alpha": float(cfg.get("focal_alpha", 0.75)),
         "batch_size": int(cfg.get("batch_size", 512)),
         "num_neighbors": json.dumps(cfg.get("num_neighbors", [15, 10])),
-        "checkpoint_metric": str(cfg.get("checkpoint_metric", "val_objective_score")),
+        "checkpoint_metric": str(cfg.get("checkpoint_metric", "val_auprc")),
         "use_graphsmote": bool(use_graphsmote),
         "value": 0.0,
     }
@@ -5668,6 +6334,7 @@ def _run_optuna_search(
         temporal_module = None
         edge_gen = None
         optimizer = None
+        scheduler = None
         train_loader = None
         z2x_decoders = None
         train_graph = None
@@ -5677,6 +6344,16 @@ def _run_optuna_search(
         torch.manual_seed(trial_seed)
         np.random.seed(trial_seed)
         trial.set_user_attr("gnn_variant", gnn_variant_fixed)
+        use_residual = _coerce_bool(
+            search_space.get("use_residual", True),
+            True,
+        )
+        use_relation_self_loops = _coerce_bool(
+            search_space.get("use_relation_self_loops", False),
+            False,
+        )
+        trial.set_user_attr("use_residual", bool(use_residual))
+        trial.set_user_attr("use_relation_self_loops", bool(use_relation_self_loops))
         if live_tracker is not None:
             live_tracker.mark_trial_start(int(trial.number))
         
@@ -5834,6 +6511,13 @@ def _run_optuna_search(
         optimizer_name = trial.suggest_categorical(
             "optimizer", list(search_space["optimizers"])
         )
+        lr_scheduler_choices = list(
+            search_space.get("lr_scheduler_choices", ["one_cycle"])
+        ) or ["one_cycle"]
+        lr_scheduler = str(
+            trial.suggest_categorical("lr_scheduler", lr_scheduler_choices)
+        )
+        trial.set_user_attr("lr_scheduler", lr_scheduler)
         weight_decay = trial.suggest_float(
             "weight_decay",
             float(wd_cfg["min"]),
@@ -6130,6 +6814,8 @@ def _run_optuna_search(
             sequence_index=sequence_index,
             num_nodes=int(getattr(data["pm"], "num_nodes", data["pm"].x.shape[0])),
             device=device,
+            use_residual=use_residual,
+            use_relation_self_loops=use_relation_self_loops,
         )
         temporal_module = getattr(model, "temporal_head", None)
 
@@ -6311,10 +6997,31 @@ def _run_optuna_search(
                 f"seed_count={int(active_seed_idx.numel()) if active_seed_idx is not None else 'all'}"
             ),
         )
+        try:
+            scheduler = graph_main._build_lr_scheduler(
+                optimizer,
+                lr_scheduler,
+                max_lr=float(lr),
+                steps_per_epoch=graph_main._optimizer_steps_per_epoch(
+                    train_loader,
+                    accumulation_steps,
+                ),
+                epochs=int(num_epochs),
+                monitor_mode="max",
+            )
+        except Exception as exc:
+            logger.warning(f"No se pudo crear lr_scheduler={lr_scheduler}: {exc}")
+            scheduler = None
+        batch_scheduler = (
+            scheduler
+            if graph_main._lr_scheduler_steps_per_batch(lr_scheduler)
+            else None
+        )
 
         best_score = -1e9
         best_tau = 0.5
         best_epoch = 0
+        best_val_metrics: Dict[str, object] = {}
 
         val_idx_fixed = None
         val_mask_fixed = None
@@ -6384,7 +7091,7 @@ def _run_optuna_search(
                     device=device,
                     use_amp=False,
                     scaler=None,
-                    scheduler=None,
+                    scheduler=batch_scheduler,
                     writer=None,
                     epoch=epoch,
                     lambda_H=current_lambda_H,
@@ -6519,6 +7226,11 @@ def _run_optuna_search(
                 score = _score_from_metrics(
                     metrics, fbeta=float(fbeta), auprc=auprc, mcc=mcc
                 )
+                if scheduler is not None and batch_scheduler is None:
+                    try:
+                        scheduler.step(float(score))
+                    except Exception:
+                        pass
                 trial.report(score, epoch)
                 if live_tracker is not None:
                     live_tracker.record_epoch(
@@ -6535,6 +7247,19 @@ def _run_optuna_search(
                     best_score = score
                     best_tau = tau
                     best_epoch = epoch
+                    best_val_metrics = {
+                        "val_f1": metrics.get("f1"),
+                        "val_precision": metrics.get("precision"),
+                        "val_recall": metrics.get("recall"),
+                        "val_far": metrics.get("far"),
+                        "val_false_alarm_ratio": metrics.get("false_alarm_ratio"),
+                        "val_specificity": metrics.get("specificity"),
+                        "val_accuracy": metrics.get("accuracy"),
+                        "val_auprc": float(auprc),
+                        "val_auc": float(val_results[val_key].get("auc") or 0.0),
+                        "val_mcc": float(mcc),
+                        "val_loss": _metric_float(val_loss),
+                    }
 
                 _mem_snapshot(f"trial_{trial.number}_epoch_{epoch}", extra=f"score={score:.4f}")
         finally:
@@ -6544,7 +7269,7 @@ def _run_optuna_search(
                     temporal_module.reset_cache()
             except Exception:
                 pass
-            for obj in (train_loader, model, edge_gen, optimizer, z2x_decoders, train_graph, base_graph, data):
+            for obj in (train_loader, model, edge_gen, optimizer, scheduler, z2x_decoders, train_graph, base_graph, data):
                 try:
                     del obj
                 except Exception:
@@ -6563,6 +7288,8 @@ def _run_optuna_search(
         trial.set_user_attr("best_metric", best_score)
         trial.set_user_attr("best_tau", float(best_tau))
         trial.set_user_attr("best_epoch", int(best_epoch))
+        for metric_name, metric_value in best_val_metrics.items():
+            trial.set_user_attr(metric_name, metric_value)
         return float(best_score)
 
     if return_objective:
@@ -6934,6 +7661,7 @@ def _run_ray_tune_search(
             "graphsaint_walk_length": _choice(search_space["graphsaint_walk_lengths"]),
             "lr": _loguniform_or_choice(lr_cfg["min"], lr_cfg["max"]),
             "optimizer": _choice(search_space["optimizers"]),
+            "lr_scheduler": _choice(search_space.get("lr_scheduler_choices", ["one_cycle"])),
             "weight_decay": _loguniform_or_choice(wd_cfg["min"], wd_cfg["max"]),
             "lambda_l2_att": _loguniform_or_choice(lambda_l2_cfg["min"], lambda_l2_cfg["max"]),
             "lambda_H_mode": _choice(search_space["lambda_H_mode"]),
@@ -7084,6 +7812,7 @@ def _run_ray_tune_search(
                 "graphsaint_num_steps",
                 "graphsaint_walk_length",
                 "use_checkpointing",
+                "lr_scheduler",
                 "best_tau",
                 "best_epoch",
                 "best_metric",
@@ -7152,6 +7881,7 @@ def _run_ray_tune_search(
             "graphsaint_num_steps",
             "graphsaint_walk_length",
             "use_checkpointing",
+            "lr_scheduler",
             "best_tau",
             "best_epoch",
             "best_metric",
@@ -7433,11 +8163,12 @@ GRAPH_NODE_FEATURE_EXCLUDE = {
 }
 
 
-def _filter_graph_node_feature_columns(columns: Sequence[object]) -> List[str]:
+def _filter_graph_node_feature_columns(columns: Optional[Sequence[object]]) -> List[str]:
     excluded = {_normalize_column_key(col) for col in GRAPH_NODE_FEATURE_EXCLUDE}
     out: List[str] = []
     seen = set()
-    for col in columns or []:
+    iterable_columns = [] if columns is None else columns
+    for col in iterable_columns:
         text = str(col)
         key = _normalize_column_key(text)
         if not key or key in excluded or key in seen:
@@ -12336,6 +13067,22 @@ def _render_balance_tab() -> None:
                         )
                         if opt_name != "(Auto)":
                             optimizer_overrides["optimizer"] = opt_name
+                        scheduler_override_choices = st.multiselect(
+                            "lr_scheduler choices",
+                            list(GNN_LR_SCHEDULER_LABELS.keys()),
+                            default=[
+                                "one_cycle",
+                                "cosine_warm_restarts",
+                                "plateau_restart",
+                            ],
+                            key="gnn_hpo_lr_scheduler_choices",
+                            format_func=lambda value: GNN_LR_SCHEDULER_LABELS.get(str(value), str(value)),
+                            help=GNN_LR_SCHEDULER_HELP,
+                        )
+                        if scheduler_override_choices:
+                            optimizer_overrides["lr_scheduler_choices"] = [
+                                str(value) for value in scheduler_override_choices
+                            ]
                         
                         lr_val = st.text_input("Learning Rate (vacio=Auto)", value="", key="gnn_hpo_lr")
                         if lr_val.strip():
@@ -13975,18 +14722,23 @@ def _render_gnn_mlp_baseline_panel(
                     progress_text.caption(f"{model_name}: cargando checkpoint GNN.")
                 elif event_type == "gnn_checkpoint_calibrating":
                     progress_bar.progress(0.25)
-                    progress_text.caption(f"{model_name}: calibrando tau en val_mask.")
+                    progress_text.caption(f"{model_name}: calibrando Platt/tau en val_mask.")
+                elif event_type == "gnn_checkpoint_platt":
+                    progress_bar.progress(0.40)
+                    progress_text.caption(f"{model_name}: Platt scaling ajustado en val_mask.")
                 elif event_type == "gnn_checkpoint_tau":
                     progress_bar.progress(0.50)
                     progress_text.caption(
                         f"{model_name}: evaluando val/test con tau="
-                        f"{float(event.get('tau', 0.5) or 0.5):.6f}"
+                        f"{float(event.get('tau', 0.5) or 0.5):.6f} "
+                        f"({event.get('calibration_method', 'softmax_raw')})"
                     )
                 elif event_type == "gnn_checkpoint_done":
                     progress_bar.progress(1.0)
                     progress_text.caption(
                         f"{model_name}: evaluación GNN finalizada con tau="
-                        f"{float(event.get('tau', 0.5) or 0.5):.6f}"
+                        f"{float(event.get('tau', 0.5) or 0.5):.6f} "
+                        f"({event.get('calibration_method', 'softmax_raw')})"
                     )
 
             try:
@@ -14389,7 +15141,7 @@ def _render_training_tab() -> None:
     checkpoint_default = str(
         (network_cfg or {}).get(
             "checkpoint_metric",
-            st.session_state.get("gnn_train_checkpoint_metric", "val_objective_score"),
+            st.session_state.get("gnn_train_checkpoint_metric", "val_auprc"),
         )
     )
     checkpoint_default_label = next(
@@ -14398,7 +15150,7 @@ def _render_training_tab() -> None:
             for label, value in checkpoint_metric_options.items()
             if value == checkpoint_default
         ),
-        "Objective score",
+        "AUPRC",
     )
     checkpoint_metric_label = st.selectbox(
         "Checkpoint metric",
@@ -14782,10 +15534,12 @@ def _render_training_tab() -> None:
             hp_label = "search"
         elif network_option and hp_choice == network_option:
             hp_label = "network"
+        scheduler_sig = str((network_cfg or {}).get("lr_scheduler", "auto"))
         config_sig = (
             f"{variant_tag}|{graph_hash}|{hp_label}|{max_epochs_train}|{SEED}|{checkpoint_metric_train}|"
             f"{train_sampler_mode}|{deterministic_sampling_train}|{sampling_seed_train}|"
-            f"{disable_hard_undersampling_train}|{eval_neighbors_mode_train}|{eval_num_neighbors_train}"
+            f"{disable_hard_undersampling_train}|{eval_neighbors_mode_train}|{eval_num_neighbors_train}|"
+            f"{scheduler_sig}"
         )
         config_hash = hashlib.sha1(config_sig.encode("utf-8")).hexdigest()[:10]
         ckpt_dir = Path(RESULTADOS_DIR) / "gnn_train_checkpoints" / f"{variant_tag}_{config_hash}"
@@ -15404,7 +16158,12 @@ def _render_training_tab() -> None:
                         checkpoint_metric=str(checkpoint_metric_train),
                     )
             except Exception as exc:
-                st.error(f"Error en entrenamiento: {exc}")
+                exc_text = str(exc).strip() or repr(exc)
+                tb_text = traceback.format_exc()
+                logging.getLogger(__name__).exception("Error durante entrenamiento GNN")
+                st.error(f"Error en entrenamiento: {exc_text}")
+                with st.expander("Traceback del entrenamiento", expanded=False):
+                    st.code(tb_text, language="text")
                 if use_notify:
                     notification_system.send_error_notification_email(
                         "Entrenamiento GNN",
@@ -15989,6 +16748,8 @@ def _perform_model_evaluation(
             sequence_index=sequence_index_for_model,
             num_nodes=model_num_nodes,
             device=device,
+            use_residual=_coerce_bool(meta.get("use_residual", arch.get("use_residual", False))),
+            use_relation_self_loops=_coerce_bool(meta.get("use_relation_self_loops"), True),
         )
         if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
             progress_ui.fail(
@@ -16024,7 +16785,10 @@ def _perform_model_evaluation(
         # Determinar umbral
         eval_threshold = threshold
         strategy = str(threshold_strategy or "manual").lower()
-        if strategy in {"min_far", "far", "auto_far", "far_target"}:
+        far_strategies = {"min_far", "far", "auto_far", "far_target"}
+        platt_enabled = bool(getattr(graph_main, "AUTOCALIBRATE_PROBS", False))
+        platt_model = None
+        if strategy in far_strategies:
             progress_ui.update(
                 0.50,
                 "Preparando calibración de umbral FAR",
@@ -16110,7 +16874,31 @@ def _perform_model_evaluation(
                 )
                 return
             y_true_val = calib_results[calib_key]["true"].numpy().ravel()
-            y_prob1_val = calib_results[calib_key]["probs"][:, 1].numpy().ravel()
+            y_prob1_val_raw = calib_results[calib_key]["probs"][:, 1].numpy().ravel()
+            y_prob1_val = y_prob1_val_raw
+            if platt_enabled:
+                y_prob1_val, platt_model = graph_main._platt_scale_probabilities(
+                    y_true_val,
+                    y_prob1_val_raw,
+                )
+                if platt_model is not None:
+                    progress_ui.update(
+                        0.65,
+                        "Platt scaling ajustado",
+                        step_id="platt_ready",
+                        detail=f"Calibrador entrenado en {calib_key}; tau se seleccionará sobre probabilidades calibradas.",
+                        event_type="platt_ready",
+                        mask=calib_key,
+                    )
+                    st.caption(
+                        f"Platt scaling activo: calibrador ajustado en {calib_key} "
+                        "antes de seleccionar el umbral FAR."
+                    )
+                else:
+                    st.caption(
+                        "Platt scaling activo en configuración, pero no se pudo ajustar "
+                        "en val_mask; se usan probabilidades softmax crudas."
+                    )
             target_far = 0.0 if strategy == "min_far" else float(far_target)
             tau, info = _select_threshold_for_far_target(
                 y_true_val,
@@ -16158,7 +16946,7 @@ def _perform_model_evaluation(
                 detail=f"tau={eval_threshold:.6f}; estrategia={threshold_strategy}",
                 event_type="threshold_ready",
             )
-        elif strategy not in {"min_far", "far", "auto_far", "far_target"}:
+        elif strategy not in far_strategies:
             progress_ui.update(
                 0.58,
                 "Umbral manual listo",
@@ -16167,7 +16955,104 @@ def _perform_model_evaluation(
                 event_type="threshold_ready",
             )
 
-        eval_start_ratio = 0.68 if strategy in {"min_far", "far", "auto_far", "far_target"} else 0.62
+        if strategy not in far_strategies and platt_enabled:
+            calib_mask = _pick_calibration_mask(
+                graph_data,
+                node_type=node_type,
+                preferred=("val_mask",),
+                fallback=(),
+                allow_train_mask=False,
+            )
+            if calib_mask:
+                progress_ui.update(
+                    0.60,
+                    "Ajustando Platt scaling",
+                    step_id="platt_start",
+                    detail=f"Calibrador de probabilidades sobre {calib_mask}; el umbral manual se aplicará a probas calibradas.",
+                    event_type="platt_start",
+                    mask=calib_mask,
+                )
+                platt_sampled_idx = None
+                if max_nodes_per_mask > 0:
+                    platt_sampled_idx = _sample_mask_indices(
+                        graph_data,
+                        calib_mask,
+                        max_nodes=int(max_nodes_per_mask),
+                        seed=int(seed),
+                        ensure_both_classes=True,
+                        node_type=node_type,
+                    )
+                if platt_sampled_idx is not None and platt_sampled_idx.numel() == 0:
+                    platt_sampled_idx = None
+                platt_callback = _make_gnn_eval_progress_callback(
+                    progress_ui,
+                    phase_label="Ajustando Platt scaling",
+                    start_ratio=0.61,
+                    end_ratio=0.66,
+                )
+                if platt_sampled_idx is not None:
+                    platt_results = graph_main.test(
+                        model,
+                        graph_data,
+                        node_type=node_type,
+                        threshold=None,
+                        node_indices=platt_sampled_idx,
+                        mask_name=calib_mask,
+                        batch_size=eval_batch_size,
+                        num_neighbors=num_neighbors,
+                        progress_callback=platt_callback,
+                    )
+                else:
+                    platt_results = graph_main.test(
+                        model,
+                        graph_data,
+                        node_type=node_type,
+                        threshold=None,
+                        masks=[calib_mask],
+                        batch_size=eval_batch_size,
+                        num_neighbors=num_neighbors,
+                        progress_callback=platt_callback,
+                    )
+                platt_key = calib_mask if platt_results and calib_mask in platt_results else None
+                if platt_key:
+                    y_true_platt = platt_results[platt_key]["true"].numpy().ravel()
+                    y_prob1_platt = platt_results[platt_key]["probs"][:, 1].numpy().ravel()
+                    _, platt_model = graph_main._platt_scale_probabilities(
+                        y_true_platt,
+                        y_prob1_platt,
+                    )
+                    if platt_model is not None:
+                        progress_ui.update(
+                            0.66,
+                            "Platt scaling ajustado",
+                            step_id="platt_ready",
+                            detail=f"Calibrador entrenado en {platt_key}; inferencia final usará probabilidades calibradas.",
+                            event_type="platt_ready",
+                            mask=platt_key,
+                        )
+                        st.caption(
+                            f"Platt scaling activo: calibrador ajustado en {platt_key} "
+                            "antes de la evaluación final."
+                        )
+                    else:
+                        st.caption(
+                            "Platt scaling activo en configuración, pero no se pudo ajustar "
+                            "en val_mask; se usan probabilidades softmax crudas."
+                        )
+                    for m_res in platt_results.values():
+                        m_res.pop("preds", None)
+                        m_res.pop("probs", None)
+                        m_res.pop("true", None)
+                else:
+                    st.caption(
+                        "Platt scaling omitido: no se obtuvieron probabilidades en val_mask."
+                    )
+            else:
+                st.caption(
+                    "Platt scaling omitido: no hay val_mask no vacía para ajustar el calibrador."
+                )
+
+        eval_start_ratio = 0.68 if strategy in far_strategies or platt_model is not None else 0.62
         eval_end_ratio = 0.92
         progress_ui.update(
             eval_start_ratio,
@@ -16175,7 +17060,8 @@ def _perform_model_evaluation(
             step_id="graph_eval_start",
             detail=(
                 f"Máscaras={', '.join(eval_masks) if eval_masks else 'auto'} | "
-                f"tau={float(eval_threshold):.6f} | batch_size={eval_batch_size}"
+                f"tau={float(eval_threshold):.6f} | batch_size={eval_batch_size} | "
+                f"calibración={'Platt' if platt_model is not None else 'softmax crudo'}"
             ),
             event_type="graph_eval_start",
             force=True,
@@ -16234,6 +17120,7 @@ def _perform_model_evaluation(
                     mask_name=mask,
                     batch_size=eval_batch_size,
                     num_neighbors=num_neighbors,
+                    calibration_model=platt_model,
                     progress_callback=eval_callback,
                 )
                 results.update(partial)
@@ -16252,6 +17139,7 @@ def _perform_model_evaluation(
                 masks=eval_masks if masks is not None else None,
                 batch_size=eval_batch_size,
                 num_neighbors=num_neighbors,
+                calibration_model=platt_model,
                 progress_callback=eval_callback,
             )
 
@@ -16278,6 +17166,7 @@ def _perform_model_evaluation(
             else "Todos los nodos de la máscara."
         )
         threshold_note = f"{eval_threshold:.6f} ({threshold_strategy})"
+        calibration_note = "Platt scaling" if platt_model is not None else "softmax crudo"
         progress_ui.update(
             0.97,
             "Renderizando reportes de evaluación",
@@ -16295,7 +17184,7 @@ def _perform_model_evaluation(
                 )
                 st.caption(
                     f"Cómo se hace: inferencia sobre `{mask_name}` | umbral={threshold_note} "
-                    f"| muestreo: {sample_note}"
+                    f"| calibración: {calibration_note} | muestreo: {sample_note}"
                 )
                 st.markdown("**Metricas principales**")
                 col1, col2, col3, col4, col5 = st.columns(5)
@@ -20314,6 +21203,683 @@ def _render_sampler_memory_budget_experiment(
             st.warning(f"No se pudo guardar en historial: {exc}")
 
 
+def _render_gnn_architecture_pilot_experiment() -> Dict[str, object]:
+    st.markdown("### GNN architecture pilot (10% -> full)")
+    st.caption(
+        "Busca configuraciones en un subgrafo inducido estratificado y reentrena "
+        "los finalistas sobre el grafo completo."
+    )
+    with st.expander("Protocolo metodológico", expanded=False):
+        st.markdown(
+            "- El piloto solo toma nodos `train` y `val`; `test` queda fuera del subgrafo.\n"
+            "- El muestreo se estratifica por split, clase y bins temporales.\n"
+            "- Para variantes temporales se agregan nodos de contexto de secuencia, pero no quedan supervisados salvo que fueran seleccionados.\n"
+            "- Los finalistas se reentrenan en el grafo completo y recién ahí se evalúan en `test`."
+        )
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        pilot_fraction = st.slider(
+            "pilot_fraction",
+            min_value=0.01,
+            max_value=0.50,
+            value=0.10,
+            step=0.01,
+            key="gnn_exp_arch_pilot_fraction",
+            help="Fracción de train y val usada para construir el subgrafo piloto.",
+        )
+        pilot_seed = st.number_input(
+            "pilot_seed",
+            min_value=0,
+            value=int(SEED),
+            step=1,
+            key="gnn_exp_arch_pilot_seed",
+        )
+    with col_b:
+        time_bins = st.number_input(
+            "time_bins",
+            min_value=1,
+            max_value=50,
+            value=8,
+            step=1,
+            key="gnn_exp_arch_pilot_time_bins",
+        )
+        min_train_pos = st.number_input(
+            "min positivos train",
+            min_value=0,
+            value=25,
+            step=1,
+            key="gnn_exp_arch_pilot_min_train_pos",
+        )
+    with col_c:
+        min_val_pos = st.number_input(
+            "min positivos val",
+            min_value=0,
+            value=10,
+            step=1,
+            key="gnn_exp_arch_pilot_min_val_pos",
+        )
+        top_k_finalists = st.number_input(
+            "top_k_finalists",
+            min_value=1,
+            max_value=20,
+            value=3,
+            step=1,
+            key="gnn_exp_arch_pilot_top_k",
+        )
+    full_repeats = st.number_input(
+        "full_repeats",
+        min_value=1,
+        max_value=5,
+        value=1,
+        step=1,
+        key="gnn_exp_arch_pilot_full_repeats",
+        help="Repeticiones de entrenamiento final por finalista en el grafo completo.",
+    )
+    return {
+        "pilot_fraction": float(pilot_fraction),
+        "pilot_seed": int(pilot_seed),
+        "time_bins": int(time_bins),
+        "min_train_pos": int(min_train_pos),
+        "min_val_pos": int(min_val_pos),
+        "top_k_finalists": int(top_k_finalists),
+        "full_repeats": int(full_repeats),
+    }
+
+
+class _NoopStreamlitStatus:
+    def progress(self, *args, **kwargs):
+        return self
+
+    def markdown(self, *args, **kwargs):
+        return self
+
+    def empty(self, *args, **kwargs):
+        return self
+
+
+def _json_safe_gnn_value(value: object) -> object:
+    if torch.is_tensor(value):
+        if value.ndim == 0:
+            return _json_safe_gnn_value(value.item())
+        return [_json_safe_gnn_value(v) for v in value.detach().cpu().tolist()]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        val = float(value)
+        return val if math.isfinite(val) else None
+    if isinstance(value, (np.ndarray,)):
+        return [_json_safe_gnn_value(v) for v in value.tolist()]
+    if isinstance(value, (Path,)):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe_gnn_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_gnn_value(v) for v in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
+
+
+def _pilot_val_metrics_from_best_params(best_params: Mapping[str, object]) -> Dict[str, object]:
+    return {
+        "pilot_val_f1": best_params.get("val_f1"),
+        "pilot_val_precision": best_params.get("val_precision"),
+        "pilot_val_recall": best_params.get("val_recall"),
+        "pilot_val_far": best_params.get("val_far"),
+        "pilot_val_auprc": best_params.get("val_auprc"),
+        "pilot_val_auc": best_params.get("val_auc"),
+        "pilot_val_mcc": best_params.get("val_mcc"),
+        "pilot_val_loss": best_params.get("val_loss"),
+    }
+
+
+def _rank_gnn_architecture_pilot_rows(
+    rows: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    ok_rows = [
+        dict(row)
+        for row in rows
+        if str(row.get("status", "")).strip().lower() in {"ok", "pilot_ok"}
+    ]
+
+    def _key(row: Dict[str, object]) -> Tuple[float, float, float]:
+        auprc = _metric_float(row.get("pilot_val_auprc"))
+        mcc = _metric_float(row.get("pilot_val_mcc"))
+        far = _metric_float(row.get("pilot_val_far"))
+        return (
+            auprc if auprc is not None else -1.0,
+            mcc if mcc is not None else -1.0,
+            -(far if far is not None else 1.0),
+        )
+
+    ok_rows.sort(key=_key, reverse=True)
+    for rank, row in enumerate(ok_rows, start=1):
+        row["pilot_rank"] = int(rank)
+    return ok_rows
+
+
+def _full_metrics_from_eval_payload(eval_payload: Dict[str, object]) -> Dict[str, object]:
+    base = _extract_sampler_metrics_from_eval(eval_payload)
+    return {
+        "test_f1": base.get("test_f1"),
+        "test_precision": base.get("test_precision"),
+        "test_recall": base.get("test_recall"),
+        "test_accuracy": base.get("test_accuracy"),
+        "test_far": base.get("test_far"),
+        "test_false_alarm_ratio": base.get("test_false_alarm_ratio"),
+        "test_specificity": base.get("test_specificity"),
+        "test_brier_score": base.get("test_brier_score"),
+        "test_auprc": base.get("test_auprc"),
+        "test_auc": base.get("test_auc"),
+        "test_mcc": base.get("test_mcc"),
+        "eval_threshold": base.get("eval_threshold"),
+        "val_far": base.get("val_far"),
+        "val_sens": base.get("val_sens"),
+        "confusion_matrix": base.get("confusion_matrix"),
+    }
+
+
+def _sort_gnn_architecture_full_rows(
+    rows: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    ranked = [
+        dict(row)
+        for row in rows
+        if str(row.get("status", "")).strip().lower() == "ok"
+    ]
+
+    def _key(row: Dict[str, object]) -> Tuple[float, float, float]:
+        auprc = _metric_float(row.get("test_auprc"))
+        mcc = _metric_float(row.get("test_mcc"))
+        recall = _metric_float(row.get("test_recall"))
+        return (
+            auprc if auprc is not None else -1.0,
+            mcc if mcc is not None else -1.0,
+            recall if recall is not None else -1.0,
+        )
+
+    ranked.sort(key=_key, reverse=True)
+    for rank, row in enumerate(ranked, start=1):
+        row["full_rank"] = int(rank)
+    return ranked
+
+
+def _write_gnn_architecture_pilot_metadata(
+    *,
+    run_id: str,
+    metadata: Dict[str, object],
+) -> str:
+    out_path = Path(RESULTADOS_DIR) / f"gnn_architecture_pilot_{run_id}_metadata.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(_json_safe_gnn_value(metadata), fh, indent=2, ensure_ascii=False)
+    return str(out_path)
+
+
+def _run_gnn_architecture_pilot_experiment(
+    *,
+    graph_obj: Dict[str, object],
+    graph_data: HeteroData,
+    pm_index_ref: object,
+    graph_source_label: str,
+    train_ratio: int,
+    val_ratio: int,
+    test_ratio: int,
+    balancing_strategies: List[str],
+    objective_metrics: List[str],
+    selected_variants: List[str],
+    search_space: Dict[str, object],
+    optuna_settings: Dict[str, object],
+    threshold_beta: float,
+    far_target: float,
+    max_epochs_train: int,
+    early_stop_train: bool,
+    early_patience_train: int,
+    early_min_delta_train: float,
+    pilot_fraction: float,
+    pilot_seed: int,
+    time_bins: int,
+    min_train_pos: int,
+    min_val_pos: int,
+    top_k_finalists: int,
+    full_repeats: int,
+    render_ui: bool = True,
+) -> Dict[str, object]:
+    if not selected_variants:
+        raise ValueError("Seleccione al menos una variante GNN.")
+    if not balancing_strategies:
+        raise ValueError("Seleccione al menos una estrategia de balanceo.")
+    if not objective_metrics:
+        raise ValueError("Seleccione al menos un objetivo de Optuna.")
+    if pm_index_ref is None:
+        raise ValueError("El experimento piloto requiere pm_index para split temporal.")
+
+    def _ui(method: str, *args, **kwargs):
+        if not render_ui:
+            return None
+        return getattr(st, method)(*args, **kwargs)
+
+    split_info = _apply_temporal_split_to_graph(
+        graph_data,
+        pm_index_ref,
+        int(train_ratio),
+        int(val_ratio),
+        graph_metadata=graph_obj.get("metadata"),
+    )
+    if not split_info:
+        raise ValueError(
+            "No se pudo aplicar el split temporal purgado para el experimento piloto."
+        )
+    if render_ui:
+        _warn_legacy_temporal_split(split_info)
+        st.caption(
+            "Split full aplicado: "
+            f"train={split_info['train_count']}, "
+            f"val={split_info['val_count']}, test={split_info['test_count']}"
+        )
+
+    selection = _select_stratified_pilot_pm_nodes(
+        graph_data,
+        pm_index_ref,
+        pilot_fraction=float(pilot_fraction),
+        seed=int(pilot_seed),
+        time_bins=int(time_bins),
+        min_train_pos=int(min_train_pos),
+        min_val_pos=int(min_val_pos),
+    )
+    supervised_nodes = selection["selected_nodes"]
+    test_mask = _mask_to_cpu_bool(graph_data, "test_mask")
+    expansion = _expand_pilot_nodes_for_sequences(
+        supervised_nodes,
+        graph_obj.get("sequence_index"),
+        test_mask=test_mask,
+    )
+    all_pilot_nodes = expansion["all_nodes"]
+    pilot_graph, induced_meta = _build_pm_induced_heterodata(
+        graph_data,
+        all_pilot_nodes,
+        supervised_nodes=supervised_nodes,
+    )
+    local_to_global = list(induced_meta.get("local_to_global", []))
+    global_to_local = {int(g): int(i) for i, g in enumerate(local_to_global)}
+    pilot_pm_index = _remap_pm_index_for_pilot(pm_index_ref, local_to_global)
+    pilot_sequence_index = _remap_sequence_index_for_pilot(
+        graph_obj.get("sequence_index"),
+        global_to_local,
+    )
+    pilot_obj = dict(graph_obj)
+    pilot_obj["data"] = pilot_graph
+    if pilot_pm_index is not None:
+        pilot_obj["pm_index"] = pilot_pm_index
+    if pilot_sequence_index is not None:
+        pilot_obj["sequence_index"] = pilot_sequence_index
+    pilot_obj["filename"] = f"{graph_obj.get('filename', 'graph')}_architecture_pilot"
+    pilot_obj["metadata"] = dict(graph_obj.get("metadata") or {})
+    pilot_obj["metadata"]["architecture_pilot"] = True
+
+    pilot_counts = _pilot_split_class_counts(
+        pilot_graph,
+        torch.arange(int(pilot_graph["pm"].num_nodes), dtype=torch.long),
+    )
+    if pilot_counts["train"]["positive"] <= 0 or pilot_counts["val"]["positive"] <= 0:
+        raise ValueError(
+            "El subgrafo piloto no contiene positivos en train y val; "
+            "aumente pilot_fraction o revise el split temporal."
+        )
+
+    experiment_name = "GNN Architecture Pilot 10% -> Full"
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    graph_identity = _resolve_graph_identity_for_loaded_graph(graph_obj)
+    pilot_identity = _resolve_graph_identity_for_loaded_graph(pilot_obj)
+    exp_meta = {
+        "run_id": run_id,
+        "graph": graph_obj.get("filename"),
+        "graph_source": graph_source_label,
+        "graph_hash": graph_identity.get("graph_hash"),
+        "pilot_graph_hash": pilot_identity.get("graph_hash"),
+        "train_ratio": int(train_ratio),
+        "val_ratio": int(val_ratio),
+        "test_ratio": int(test_ratio),
+        "pilot_fraction": float(pilot_fraction),
+        "pilot_seed": int(pilot_seed),
+        "time_bins": int(time_bins),
+        "top_k_finalists": int(top_k_finalists),
+        "full_repeats": int(full_repeats),
+        "objectives": list(objective_metrics),
+        "gnn_variants": list(selected_variants),
+        "balance_strategies": list(balancing_strategies),
+    }
+    exp_db_path = _init_gnn_experiment_db(experiment_name, exp_meta)
+    if render_ui and exp_db_path:
+        st.caption(f"DB live: {exp_db_path}")
+
+    pilot_metadata = {
+        "run_id": run_id,
+        "experiment": experiment_name,
+        "graph": graph_obj.get("filename"),
+        "graph_source": graph_source_label,
+        "graph_identity": graph_identity,
+        "pilot_identity": pilot_identity,
+        "split_info": split_info,
+        "selection": selection.get("metadata"),
+        "sequence_expansion": expansion.get("metadata"),
+        "induced_graph": induced_meta,
+        "pilot_counts": pilot_counts,
+        "selected_global_pm_nodes": supervised_nodes.detach().cpu().tolist(),
+        "context_global_pm_nodes": expansion["context_nodes"].detach().cpu().tolist(),
+        "all_pilot_global_pm_nodes": all_pilot_nodes.detach().cpu().tolist(),
+    }
+    metadata_path = _write_gnn_architecture_pilot_metadata(
+        run_id=run_id,
+        metadata=pilot_metadata,
+    )
+    if render_ui:
+        st.success(f"Metadata piloto guardada en {metadata_path}")
+        st.json(
+            {
+                "pilot_nodes": int(pilot_graph["pm"].num_nodes),
+                "supervised_nodes": int(induced_meta.get("supervised_nodes", 0)),
+                "pilot_counts": pilot_counts,
+                "edge_counts": induced_meta.get("edge_counts"),
+            }
+        )
+
+    device = get_auto_device()
+    total_pilot_runs = max(
+        1,
+        len(selected_variants) * len(balancing_strategies) * len(objective_metrics),
+    )
+    progress = st.progress(0.0) if render_ui else _NoopStreamlitStatus()
+    status_box = st.empty() if render_ui else _NoopStreamlitStatus()
+    pilot_rows: List[Dict[str, object]] = []
+    run_counter = 0
+
+    for variant_name in selected_variants:
+        variant_norm = _normalize_ui_gnn_variant(variant_name)
+        for balancing_strategy in balancing_strategies:
+            use_graphsmote_search = balancing_strategy == "Opt. balance con GraphSMOTE"
+            use_imgagn_search = balancing_strategy == "Opt. balance con ImGAGN"
+            for objective_metric in objective_metrics:
+                run_counter += 1
+                status_box.markdown(
+                    f"Piloto {run_counter}/{total_pilot_runs}: "
+                    f"{variant_norm} · {balancing_strategy} · {objective_metric}"
+                )
+                progress.progress(min(run_counter / total_pilot_runs, 1.0))
+                log_container = st.empty() if render_ui else None
+                progress_bar = st.progress(0.0) if render_ui else None
+                status_text = st.empty() if render_ui else None
+                objective_settings = {
+                    "metric": objective_metric,
+                    "threshold_beta": float(threshold_beta),
+                    "device": device,
+                    "gnn_variant": variant_norm,
+                }
+                try:
+                    result = _run_optuna_search(
+                        graph_obj=pilot_obj,
+                        balancing_strategy=balancing_strategy,
+                        search_space=search_space,
+                        optuna_settings=optuna_settings,
+                        objective_settings=objective_settings,
+                        log_container=log_container,
+                        progress_bar=progress_bar,
+                        status_text=status_text,
+                        storage_path=str(exp_db_path) if exp_db_path else None,
+                    )
+                    best_params = result.get("best_params", {}) or {}
+                    payload = {
+                        "experiment": experiment_name,
+                        "run_id": run_id,
+                        "role": "pilot_candidate",
+                        "status": "pilot_ok",
+                        "graph": graph_obj.get("filename"),
+                        "graph_source": graph_source_label,
+                        "graph_hash": graph_identity.get("graph_hash"),
+                        "pilot_graph_hash": pilot_identity.get("graph_hash"),
+                        "gnn_variant": best_params.get("gnn_variant", variant_norm),
+                        "balance_strategy": balancing_strategy,
+                        "objective_label": objective_metric,
+                        "objective_metric": objective_metric,
+                        "optuna_best_value": best_params.get("value"),
+                        "optuna_best_epoch": best_params.get("best_epoch"),
+                        "optuna_best_tau": best_params.get("best_tau"),
+                        "optuna_best_path": result.get("best_path"),
+                        "optuna_full_path": result.get("full_path"),
+                        "optuna_range_analysis": result.get("range_analysis"),
+                        "use_graphsmote": bool(use_graphsmote_search),
+                        "use_imgagn": bool(use_imgagn_search),
+                        "pilot_fraction": float(pilot_fraction),
+                        "pilot_metadata_path": metadata_path,
+                        "best_params": best_params,
+                    }
+                    payload.update(_pilot_val_metrics_from_best_params(best_params))
+                except Exception as exc:
+                    payload = {
+                        "experiment": experiment_name,
+                        "run_id": run_id,
+                        "role": "pilot_candidate",
+                        "status": "pilot_error",
+                        "graph": graph_obj.get("filename"),
+                        "graph_hash": graph_identity.get("graph_hash"),
+                        "pilot_graph_hash": pilot_identity.get("graph_hash"),
+                        "gnn_variant": variant_norm,
+                        "balance_strategy": balancing_strategy,
+                        "objective_label": objective_metric,
+                        "objective_metric": objective_metric,
+                        "error": str(exc),
+                        "pilot_fraction": float(pilot_fraction),
+                        "pilot_metadata_path": metadata_path,
+                    }
+                    if render_ui:
+                        st.error(f"Error en piloto ({variant_norm}, {objective_metric}): {exc}")
+                _append_gnn_experiment_result(exp_db_path, payload)
+                pilot_rows.append(payload)
+                _cleanup_experiment_memory()
+
+    ranked_pilot = _rank_gnn_architecture_pilot_rows(pilot_rows)
+    finalists = ranked_pilot[: max(1, int(top_k_finalists))]
+    if render_ui:
+        st.markdown("### Ranking piloto")
+        st.dataframe(pd.DataFrame(ranked_pilot), width="stretch")
+    if not finalists:
+        raise ValueError("No hay finalistas piloto válidos para reentrenar en full.")
+
+    full_rows: List[Dict[str, object]] = []
+    total_full_runs = max(1, len(finalists) * max(1, int(full_repeats)))
+    full_counter = 0
+    full_progress = st.progress(0.0) if render_ui else _NoopStreamlitStatus()
+    full_status = st.empty() if render_ui else _NoopStreamlitStatus()
+    for finalist in finalists:
+        best_params = dict(finalist.get("best_params") or {})
+        best_path = str(finalist.get("optuna_best_path") or "")
+        balancing_strategy = str(finalist.get("balance_strategy") or "Sin balancear")
+        use_graphsmote_final = balancing_strategy == "Opt. balance con GraphSMOTE"
+        use_imgagn_final = balancing_strategy == "Opt. balance con ImGAGN"
+        for repeat_idx in range(1, max(1, int(full_repeats)) + 1):
+            full_counter += 1
+            full_status.markdown(
+                f"Full {full_counter}/{total_full_runs}: "
+                f"{finalist.get('gnn_variant')} · rank piloto {finalist.get('pilot_rank')} · rep {repeat_idx}"
+            )
+            full_progress.progress(min(full_counter / total_full_runs, 1.0))
+            graph_train_obj = dict(graph_obj)
+            graph_train_data = graph_data
+            train_error = None
+            eval_error = None
+            model_path = None
+            eval_payload: Dict[str, object] = {}
+            if use_imgagn_final:
+                try:
+                    graph_train_data = _apply_imgagn_to_graph(
+                        graph_data,
+                        best_params,
+                        device,
+                    )
+                    graph_train_obj["data"] = graph_train_data
+                    graph_train_obj["imgagn_best_params"] = best_params
+                except Exception as exc:
+                    train_error = f"ImGAGN fallo: {exc}"
+            if train_error is None:
+                try:
+                    base_sampling_seed = int(
+                        _metric_float(best_params.get("sampling_seed")) or int(pilot_seed)
+                    )
+                    model_path = _train_gnn_with_best_params(
+                        graph_train_obj,
+                        best_path,
+                        use_graphsmote=bool(use_graphsmote_final),
+                        max_epochs=int(max_epochs_train),
+                        early_stop=bool(early_stop_train),
+                        early_stop_patience=int(early_patience_train),
+                        early_stop_min_delta=float(early_min_delta_train),
+                        train_sampler_mode=str(best_params.get("train_sampler_mode", "neighbor")),
+                        deterministic_sampling=_metric_bool(
+                            best_params.get("deterministic_sampling"),
+                            default=False,
+                        ),
+                        sampling_seed=int(base_sampling_seed + repeat_idx - 1),
+                        disable_hard_undersampling=_metric_bool(
+                            best_params.get("disable_hard_undersampling"),
+                            default=False,
+                        ),
+                        cluster_gcn_num_parts=int(
+                            _metric_float(best_params.get("cluster_gcn_num_parts")) or 0
+                        ),
+                        cluster_gcn_parts_per_epoch=int(
+                            _metric_float(best_params.get("cluster_gcn_parts_per_epoch")) or 0
+                        ),
+                        graphsaint_mode=str(best_params.get("graphsaint_mode", "node")),
+                        graphsaint_batch_size=int(
+                            _metric_float(best_params.get("graphsaint_batch_size")) or 0
+                        ),
+                        graphsaint_num_steps=int(
+                            _metric_float(best_params.get("graphsaint_num_steps")) or 0
+                        ),
+                        graphsaint_walk_length=int(
+                            _metric_float(best_params.get("graphsaint_walk_length")) or 0
+                        ),
+                        eval_neighbors_mode=str(best_params.get("eval_neighbors_mode", "same")),
+                        eval_num_neighbors=best_params.get("eval_num_neighbors"),
+                        checkpoint_metric=str(best_params.get("checkpoint_metric", "val_auprc")),
+                    )
+                except Exception as exc:
+                    train_error = str(exc)
+            if model_path:
+                try:
+                    eval_payload = _evaluate_gnn_model_far_target(
+                        model_path=model_path,
+                        graph_data=graph_train_data,
+                        sequence_index=graph_train_obj.get("sequence_index"),
+                        device=device,
+                        far_target=float(far_target),
+                        batch_size=int(_metric_float(best_params.get("batch_size")) or BATCH_SIZE),
+                        num_neighbors=best_params.get("num_neighbors"),
+                    )
+                except Exception as exc:
+                    eval_error = str(exc)
+
+            status = "ok"
+            if model_path is None:
+                status = "train_error"
+            elif eval_error:
+                status = "eval_error"
+            payload = {
+                "experiment": experiment_name,
+                "run_id": run_id,
+                "role": "full_finalist",
+                "status": status,
+                "graph": graph_obj.get("filename"),
+                "graph_source": graph_source_label,
+                "graph_hash": graph_identity.get("graph_hash"),
+                "pilot_graph_hash": pilot_identity.get("graph_hash"),
+                "pilot_rank": finalist.get("pilot_rank"),
+                "full_repeat": int(repeat_idx),
+                "gnn_variant": finalist.get("gnn_variant"),
+                "balance_strategy": balancing_strategy,
+                "objective_label": finalist.get("objective_label"),
+                "objective_metric": finalist.get("objective_metric"),
+                "optuna_best_path": best_path,
+                "pilot_val_auprc": finalist.get("pilot_val_auprc"),
+                "pilot_val_mcc": finalist.get("pilot_val_mcc"),
+                "pilot_val_far": finalist.get("pilot_val_far"),
+                "model_path": model_path,
+                "train_error": train_error,
+                "eval_error": eval_error,
+                "far_target": float(far_target),
+                "pilot_metadata_path": metadata_path,
+            }
+            payload.update(_full_metrics_from_eval_payload(eval_payload))
+            _append_gnn_experiment_result(exp_db_path, payload)
+            full_rows.append(payload)
+            _cleanup_experiment_memory()
+
+    final_rows = pilot_rows + _sort_gnn_architecture_full_rows(full_rows)
+    results_df = pd.DataFrame(final_rows)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    res_path = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+    results_df.to_csv(res_path, index=False)
+    if render_ui:
+        st.markdown("### Resultados finales")
+        st.dataframe(results_df, width="stretch")
+        st.success(f"Resultados guardados en {res_path}")
+
+    ranked_full = _sort_gnn_architecture_full_rows(full_rows)
+    if ranked_full:
+        _append_gnn_experiment_best(exp_db_path, ranked_full[0])
+        if render_ui:
+            st.success(
+                f"Mejor full: {ranked_full[0].get('gnn_variant')} | "
+                f"test_auprc={ranked_full[0].get('test_auprc')}"
+            )
+            st.json(
+                {
+                    "gnn_variant": ranked_full[0].get("gnn_variant"),
+                    "balance_strategy": ranked_full[0].get("balance_strategy"),
+                    "test_auprc": ranked_full[0].get("test_auprc"),
+                    "test_mcc": ranked_full[0].get("test_mcc"),
+                    "test_recall": ranked_full[0].get("test_recall"),
+                    "test_far": ranked_full[0].get("test_far"),
+                    "model_path": ranked_full[0].get("model_path"),
+                }
+            )
+
+    try:
+        entry = _collect_gnn_context()
+        entry.update(
+            {
+                "type": "GNN Experiment",
+                "experiment": {
+                    "name": experiment_name,
+                    "run_id": run_id,
+                    "results_path": str(res_path),
+                    "metadata_path": str(metadata_path),
+                    "db_path": str(exp_db_path) if exp_db_path else None,
+                    "pilot_fraction": float(pilot_fraction),
+                    "top_k_finalists": int(top_k_finalists),
+                    "full_repeats": int(full_repeats),
+                    "pilot_candidates": len(pilot_rows),
+                    "full_runs": len(full_rows),
+                },
+            }
+        )
+        _append_gnn_history(entry)
+    except Exception as exc:
+        if render_ui:
+            st.warning(f"No se pudo guardar en historial: {exc}")
+
+    return {
+        "run_id": run_id,
+        "results_path": str(res_path),
+        "metadata_path": metadata_path,
+        "exp_db_path": str(exp_db_path) if exp_db_path else None,
+        "pilot_rows": pilot_rows,
+        "ranked_pilot": ranked_pilot,
+        "full_rows": full_rows,
+        "ranked_full": ranked_full,
+    }
+
+
 def _run_gnn_best_variant_experiment(
     *,
     graph_obj: Dict[str, object],
@@ -20849,6 +22415,7 @@ def _render_gnn_experiments_tab() -> None:
         experiments = [
             "Optuna objectives (GNN)",
             "Opt.Recursiva",
+            "GNN architecture pilot (10% -> full)",
             "Best GNN Variant (Optuna+Train+Test)",
             "Sampler fidelity (Full-batch)",
             "Sampler memory budget (95% VRAM)",
@@ -20876,7 +22443,9 @@ def _render_gnn_experiments_tab() -> None:
 
         is_recursive_exp = experiment_choice == "Opt.Recursiva"
         is_variant_search_exp = experiment_choice == "Best GNN Variant (Optuna+Train+Test)"
+        is_arch_pilot_exp = experiment_choice == "GNN architecture pilot (10% -> full)"
         selected_variants = [_normalize_ui_gnn_variant(GNN_VARIANT)]
+        arch_pilot_settings: Optional[Dict[str, object]] = None
         if is_recursive_exp:
             st.markdown("### Opt.Recursiva (Optuna vs Ray)")
             col_rec_a, col_rec_b, col_rec_c = st.columns(3)
@@ -20918,12 +22487,20 @@ def _render_gnn_experiments_tab() -> None:
                 "Si hay alertas rojas, se ajusta el rango sugerido y se re-optimiza "
                 "hasta no tener alertas rojas o alcanzar el maximo de iteraciones."
             )
-        elif is_variant_search_exp:
-            st.markdown("### Búsqueda de Mejor Variante GNN")
-            st.caption(
-                "Ejecuta Optuna + entrenamiento + test para cada variante seleccionada "
-                "sobre el mismo grafo y con las mismas opciones de balanceo/objetivo/sampling."
-            )
+        elif is_variant_search_exp or is_arch_pilot_exp:
+            if is_arch_pilot_exp:
+                arch_pilot_settings = _render_gnn_architecture_pilot_experiment()
+                st.markdown("### Variantes candidatas para piloto")
+                st.caption(
+                    "Cada variante corre Optuna en el subgrafo piloto; solo los "
+                    "mejores candidatos pasan al entrenamiento full."
+                )
+            else:
+                st.markdown("### Búsqueda de Mejor Variante GNN")
+                st.caption(
+                    "Ejecuta Optuna + entrenamiento + test para cada variante seleccionada "
+                    "sobre el mismo grafo y con las mismas opciones de balanceo/objetivo/sampling."
+                )
             labels = _gnn_variant_ui_labels()
             all_variants = _supported_gnn_variants()
             recommended_variants = [
@@ -20964,6 +22541,8 @@ def _render_gnn_experiments_tab() -> None:
             "Cargar todo el grafo en memoria (sin muestreo)",
         ]
         prev_full_graph = bool(st.session_state.get("gnn_exp_full_graph", False))
+        if is_arch_pilot_exp and "gnn_exp_full_graph" not in st.session_state:
+            prev_full_graph = True
         if not prev_full_graph:
             try:
                 prev_train_nodes = int(st.session_state.get("gnn_exp_sample_train", 0))
@@ -22105,6 +23684,43 @@ def _render_gnn_experiments_tab() -> None:
                 "fixed_train_subset": bool(fixed_train_subset),
             }
 
+            if is_arch_pilot_exp:
+                settings = arch_pilot_settings or {}
+                try:
+                    _run_gnn_architecture_pilot_experiment(
+                        graph_obj=graph_obj,
+                        graph_data=graph_data,
+                        pm_index_ref=pm_index_ref,
+                        graph_source_label=graph_source_label,
+                        train_ratio=int(train_ratio),
+                        val_ratio=int(val_ratio),
+                        test_ratio=int(test_ratio),
+                        balancing_strategies=list(balancing_strategies),
+                        objective_metrics=list(objective_metrics),
+                        selected_variants=[
+                            _normalize_ui_gnn_variant(v) for v in selected_variants
+                        ],
+                        search_space=search_space,
+                        optuna_settings=optuna_settings,
+                        threshold_beta=float(threshold_beta),
+                        far_target=float(far_target),
+                        max_epochs_train=int(max_epochs_train),
+                        early_stop_train=bool(early_stop_train),
+                        early_patience_train=int(early_patience_train),
+                        early_min_delta_train=float(early_min_delta_train),
+                        pilot_fraction=float(settings.get("pilot_fraction", 0.10)),
+                        pilot_seed=int(settings.get("pilot_seed", SEED)),
+                        time_bins=int(settings.get("time_bins", 8)),
+                        min_train_pos=int(settings.get("min_train_pos", 25)),
+                        min_val_pos=int(settings.get("min_val_pos", 10)),
+                        top_k_finalists=int(settings.get("top_k_finalists", 3)),
+                        full_repeats=int(settings.get("full_repeats", 1)),
+                        render_ui=True,
+                    )
+                except Exception as exc:
+                    st.error(f"Error en GNN architecture pilot: {exc}")
+                return
+
             if is_variant_search_exp:
                 _run_gnn_best_variant_experiment(
                     graph_obj=graph_obj,
@@ -22814,7 +24430,7 @@ def _render_network_tab() -> None:
             "dropout",
             min_value=0.0,
             max_value=0.9,
-            value=float(existing_cfg.get("dropout", 0.2)),
+            value=float(existing_cfg.get("dropout", 0.3)),
             step=0.05,
             key="gnn_net_dropout",
         )
@@ -22830,7 +24446,7 @@ def _render_network_tab() -> None:
             "aggr1",
             ["sum", "mean", "max"],
             index=["sum", "mean", "max"].index(
-                str(existing_cfg.get("aggr1", "sum"))
+                str(existing_cfg.get("aggr1", "mean"))
             ),
             key="gnn_net_aggr1",
         )
@@ -22838,7 +24454,7 @@ def _render_network_tab() -> None:
             "aggr2",
             ["sum", "mean", "max"],
             index=["sum", "mean", "max"].index(
-                str(existing_cfg.get("aggr2", "sum"))
+                str(existing_cfg.get("aggr2", "mean"))
             ),
             key="gnn_net_aggr2",
         )
@@ -22847,6 +24463,16 @@ def _render_network_tab() -> None:
             "use_checkpointing",
             value=bool(existing_cfg.get("use_checkpointing", False)),
             key="gnn_net_checkpoint",
+        )
+        use_residual = st.checkbox(
+            "use_residual",
+            value=_coerce_bool(existing_cfg.get("use_residual"), True),
+            key="gnn_net_residual",
+        )
+        use_relation_self_loops = st.checkbox(
+            "use_relation_self_loops",
+            value=_coerce_bool(existing_cfg.get("use_relation_self_loops"), False),
+            key="gnn_net_relation_self_loops",
         )
         batch_size = st.number_input(
             "batch_size",
@@ -22886,15 +24512,27 @@ def _render_network_tab() -> None:
             "optimizer",
             ["Adam", "AdamW", "RAdam", "Lion"],
             index=["Adam", "AdamW", "RAdam", "Lion"].index(
-                str(existing_cfg.get("optimizer", "Adam"))
+                str(existing_cfg.get("optimizer", "AdamW"))
             ),
             key="gnn_net_optimizer",
+        )
+        scheduler_options = list(GNN_LR_SCHEDULER_LABELS.keys())
+        scheduler_default = str(existing_cfg.get("lr_scheduler", "one_cycle"))
+        if scheduler_default not in scheduler_options:
+            scheduler_default = "one_cycle"
+        lr_scheduler = st.selectbox(
+            "lr_scheduler",
+            scheduler_options,
+            index=scheduler_options.index(scheduler_default),
+            key="gnn_net_lr_scheduler",
+            format_func=lambda value: GNN_LR_SCHEDULER_LABELS.get(str(value), str(value)),
+            help=GNN_LR_SCHEDULER_HELP,
         )
         lr = st.number_input(
             "lr",
             min_value=1e-6,
             max_value=1.0,
-            value=float(existing_cfg.get("lr", 1e-3)),
+            value=float(existing_cfg.get("lr", 3e-4)),
             format="%.6f",
             key="gnn_net_lr",
         )
@@ -22903,7 +24541,7 @@ def _render_network_tab() -> None:
             "weight_decay",
             min_value=1e-8,
             max_value=1e-1,
-            value=float(existing_cfg.get("weight_decay", 1e-6)),
+            value=float(existing_cfg.get("weight_decay", 1e-4)),
             format="%.8f",
             key="gnn_net_wd",
         )
@@ -23005,8 +24643,11 @@ def _render_network_tab() -> None:
         "aggr1": aggr1,
         "aggr2": aggr2,
         "use_checkpointing": bool(use_checkpointing),
+        "use_residual": bool(use_residual),
+        "use_relation_self_loops": bool(use_relation_self_loops),
         "num_neighbors": num_neighbors,
         "optimizer": optimizer_name,
+        "lr_scheduler": str(lr_scheduler),
         "lr": float(lr),
         "weight_decay": float(weight_decay),
         "loss_type": loss_type,
@@ -23017,7 +24658,8 @@ def _render_network_tab() -> None:
         "lambda_H_fixed": float(lambda_H_fixed),
         "initial_lambda_H": float(initial_lambda_H),
         "final_lambda_H": float(final_lambda_H),
-        "batch_size": int(batch_size)
+        "batch_size": int(batch_size),
+        "checkpoint_metric": str(existing_cfg.get("checkpoint_metric", "val_auprc")),
     }
 
     st.session_state["gnn_network_config"] = config_payload
@@ -23468,6 +25110,12 @@ def _search_space_signature_from_state() -> str:
         "lambda_H_mode": list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"])),
         "loss_type": list(_get_state("gnn_optuna_loss_type", ["CrossEntropy", "FocalLoss"])),
         "optimizers": list(_get_state("gnn_optuna_optimizers", ["AdamW", "Lion"])),
+        "lr_scheduler_choices": list(
+            _get_state(
+                "gnn_optuna_lr_scheduler_choices",
+                ["one_cycle", "cosine_warm_restarts", "plateau_restart"],
+            )
+        ),
         "target_pos_ratio": [
             v.strip()
             for v in str(_get_state("gnn_optuna_target_ratio", "0.25,0.35,0.5")).split(",")
@@ -23573,6 +25221,14 @@ def _collect_optuna_ray_settings(
     aggr2 = list(_get_state("gnn_optuna_aggr2", ["sum", "mean"]))
     loss_types = list(_get_state("gnn_optuna_loss_type", ["CrossEntropy", "FocalLoss"]))
     optimizer_choices = list(_get_state("gnn_optuna_optimizers", ["AdamW", "Lion"]))
+    lr_scheduler_choices = [
+        str(value)
+        for value in _get_state(
+            "gnn_optuna_lr_scheduler_choices",
+            ["one_cycle", "cosine_warm_restarts", "plateau_restart"],
+        )
+        if str(value) in GNN_LR_SCHEDULER_LABELS
+    ]
     checkpoint_choices = list(_get_state("gnn_optuna_checkpoint", [False, True]))
     lambda_H_modes = list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"]))
     sampler_alias = {
@@ -23634,6 +25290,8 @@ def _collect_optuna_ray_settings(
         errors.append("Seleccione al menos un loss_type.")
     if not optimizer_choices:
         errors.append("Seleccione al menos un optimizador.")
+    if not lr_scheduler_choices:
+        errors.append("Seleccione al menos un lr_scheduler.")
     if not checkpoint_choices:
         errors.append("Seleccione al menos un valor para use_checkpointing.")
     if not lambda_H_modes:
@@ -23752,6 +25410,7 @@ def _collect_optuna_ray_settings(
         "focal_alpha": {"min": focal_alpha_min, "max": focal_alpha_max, "step": focal_alpha_step},
         "batch_size": {"min": batch_min, "max": batch_max, "step": batch_step},
         "optimizers": optimizer_choices,
+        "lr_scheduler_choices": lr_scheduler_choices,
         "smote_k": {"min": smote_k_min, "max": smote_k_max, "step": smote_k_step},
         "target_pos_ratio": target_pos_ratio,
         "smote_every_n_epochs": smote_every_n_epochs,
@@ -24733,6 +26392,23 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             default=["AdamW", "Lion"],
             key="gnn_optuna_optimizers",
         )
+        scheduler_options = list(GNN_LR_SCHEDULER_LABELS.keys())
+        scheduler_defaults = [
+            str(value)
+            for value in st.session_state.get(
+                "gnn_optuna_lr_scheduler_choices",
+                ["one_cycle", "cosine_warm_restarts", "plateau_restart"],
+            )
+            if str(value) in scheduler_options
+        ] or ["one_cycle"]
+        lr_scheduler_choices = st.multiselect(
+            "lr_scheduler",
+            scheduler_options,
+            default=scheduler_defaults,
+            key="gnn_optuna_lr_scheduler_choices",
+            format_func=lambda value: GNN_LR_SCHEDULER_LABELS.get(str(value), str(value)),
+            help=GNN_LR_SCHEDULER_HELP,
+        )
 
     with st.expander("Regularizacion"):
         lambda_l2_min = st.number_input(
@@ -25013,6 +26689,14 @@ def _render_ray_tune_tab() -> None:
     aggr2 = list(_get_state("gnn_optuna_aggr2", ["sum", "mean"]))
     loss_types = list(_get_state("gnn_optuna_loss_type", ["CrossEntropy", "FocalLoss"]))
     optimizer_choices = list(_get_state("gnn_optuna_optimizers", ["AdamW", "Lion"]))
+    lr_scheduler_choices = [
+        str(value)
+        for value in _get_state(
+            "gnn_optuna_lr_scheduler_choices",
+            ["one_cycle", "cosine_warm_restarts", "plateau_restart"],
+        )
+        if str(value) in GNN_LR_SCHEDULER_LABELS
+    ]
     checkpoint_choices = list(_get_state("gnn_optuna_checkpoint", [False, True]))
     lambda_H_modes = list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"]))
     sampler_alias = {
@@ -25078,6 +26762,9 @@ def _render_ray_tune_tab() -> None:
         return
     if not optimizer_choices:
         st.error("Seleccione al menos un optimizador (Optuna).")
+        return
+    if not lr_scheduler_choices:
+        st.error("Seleccione al menos un lr_scheduler (Optuna).")
         return
     if not checkpoint_choices:
         st.error("Seleccione al menos un valor para use_checkpointing (Optuna).")
@@ -25245,6 +26932,7 @@ def _render_ray_tune_tab() -> None:
         "focal_alpha": {"min": focal_alpha_min, "max": focal_alpha_max, "step": focal_alpha_step},
         "batch_size": {"min": batch_min, "max": batch_max, "step": batch_step},
         "optimizers": optimizer_choices,
+        "lr_scheduler_choices": lr_scheduler_choices,
         "smote_k": {"min": smote_k_min, "max": smote_k_max, "step": smote_k_step},
         "target_pos_ratio": target_pos_ratio,
         "smote_every_n_epochs": smote_every_n_epochs,

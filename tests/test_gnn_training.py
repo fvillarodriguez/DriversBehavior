@@ -88,6 +88,79 @@ def test_gat_model_training_step(dummy_graph_data):
     # Ideally checking before/after, but basic gradient check is sufficient for 'can train' verification.
 
 
+def test_gat_residual_without_relation_self_loops_strict_roundtrip(dummy_graph_data):
+    data = dummy_graph_data
+    model = HeteroGAT(
+        in_channels=data["pm"].x.shape[1],
+        hidden_channels=8,
+        out_channels=2,
+        num_heads=2,
+        dropout=0.0,
+        edge_feature_dim=_infer_edge_feature_dim(data),
+        num_layers=2,
+        use_residual=True,
+        use_relation_self_loops=False,
+    )
+
+    edge_attr_dict = {
+        edge_type: data[edge_type].edge_attr
+        for edge_type in data.edge_types
+        if "edge_attr" in data[edge_type]
+    }
+    out, z, _ = model(data.x_dict, data.edge_index_dict, edge_attr_dict)
+    assert out["pm"].shape == (data["pm"].num_nodes, 2)
+    assert z["pm"].shape[0] == data["pm"].num_nodes
+    assert len(model.residual_lins) == 2
+
+    rebuilt = HeteroGAT(
+        in_channels=data["pm"].x.shape[1],
+        hidden_channels=8,
+        out_channels=2,
+        num_heads=2,
+        dropout=0.0,
+        edge_feature_dim=_infer_edge_feature_dim(data),
+        num_layers=2,
+        use_residual=True,
+        use_relation_self_loops=False,
+    )
+    missing, unexpected = rebuilt.load_state_dict(model.state_dict(), strict=True)
+    assert missing == []
+    assert unexpected == []
+
+
+def test_gat_checkpointing_backpropagates_into_conv_layers(dummy_graph_data):
+    data = dummy_graph_data
+    assert data["pm"].x.requires_grad is False
+
+    model = HeteroGAT(
+        in_channels=data["pm"].x.shape[1],
+        hidden_channels=8,
+        out_channels=2,
+        num_heads=2,
+        dropout=0.0,
+        edge_feature_dim=_infer_edge_feature_dim(data),
+        num_layers=1,
+        use_checkpointing=True,
+    )
+    model.train()
+
+    edge_attr_dict = {
+        edge_type: data[edge_type].edge_attr
+        for edge_type in data.edge_types
+        if "edge_attr" in data[edge_type]
+    }
+    out, _, _ = model(data.x_dict, data.edge_index_dict, edge_attr_dict)
+    loss = torch.nn.CrossEntropyLoss()(out["pm"], data["pm"].y)
+    loss.backward()
+
+    conv_grad_norm = sum(
+        param.grad.detach().abs().sum().item()
+        for name, param in model.named_parameters()
+        if name.startswith("convs.") and param.grad is not None
+    )
+    assert conv_grad_norm > 0.0
+
+
 def test_val_loss_monitor_resets_patience_only_on_min_delta_improvement():
     improved, best_loss, patience = gnn_main._update_val_loss_monitor(
         val_loss=0.80,
@@ -129,13 +202,15 @@ def test_val_loss_monitor_resets_patience_only_on_min_delta_improvement():
         assert improved is False
 
     assert patience >= 2
-    with pytest.raises(ValueError):
-        gnn_main._update_val_loss_monitor(
-            val_loss=float("nan"),
-            best_val_loss=best_loss,
-            patience_counter=patience,
-            min_delta=0.0,
-        )
+    improved, best_loss, patience_after_nan = gnn_main._update_val_loss_monitor(
+        val_loss=float("nan"),
+        best_val_loss=best_loss,
+        patience_counter=patience,
+        min_delta=0.0,
+    )
+    assert improved is False
+    assert best_loss == pytest.approx(0.78)
+    assert patience_after_nan == patience + 1
 
 
 def test_binary_eval_extras_include_false_alarm_ratio_and_brier_score():
@@ -225,6 +300,41 @@ def _write_fast_hparams(tmp_path, *, checkpoint_metric=None):
     hp_path = tmp_path / "optuna_hyperparams_Base.csv"
     pd.DataFrame([row]).to_csv(hp_path, index=False)
     return hp_path
+
+
+def test_safe_mcc_returns_zero_for_single_class_predictions():
+    y_true = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+    y_pred = torch.tensor([0, 0, 0, 0], dtype=torch.long)
+
+    assert gnn_main._safe_matthews_corrcoef(y_true, y_pred) == pytest.approx(0.0)
+
+
+def test_metric_monitor_treats_nonfinite_value_as_no_improvement():
+    is_best, best_value, patience_counter = gnn_main._update_metric_monitor(
+        monitor_value=float("nan"),
+        best_monitor_value=0.25,
+        patience_counter=2,
+        min_delta=0.0,
+        monitor_mode="max",
+    )
+
+    assert is_best is False
+    assert best_value == pytest.approx(0.25)
+    assert patience_counter == 3
+
+
+def test_lr_scheduler_choice_normalization_and_step_scope():
+    assert gnn_main._normalize_lr_scheduler_choice("OneCycleLR") == "one_cycle"
+    assert (
+        gnn_main._normalize_lr_scheduler_choice("cosine-warm-restarts")
+        == "cosine_warm_restarts"
+    )
+    assert (
+        gnn_main._normalize_lr_scheduler_choice("reduce_lr_on_plateau")
+        == "plateau_restart"
+    )
+    assert gnn_main._lr_scheduler_steps_per_batch("plateau_restart") is False
+    assert gnn_main._lr_scheduler_steps_per_batch("one_cycle") is True
 
 
 def _install_fast_training_mocks(monkeypatch, tmp_path, val_losses, prob_sequences, *, saved_paths=None):

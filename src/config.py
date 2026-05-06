@@ -197,7 +197,7 @@ EMB_BATCH_SIZE = BATCH_SIZE                # idem
 AUTO_IMGAGN_PRETRAIN = 0  # 1 = ejecutar ImGAGN antes de cada entrenamiento GAT si no hay artefacto previo
 
 # Calibración automática de probabilidades (Platt scaling sobre validación)
-AUTOCALIBRATE_PROBS = 0  # 1 = habilitar
+AUTOCALIBRATE_PROBS = 1  # 1 = habilitar
 
 # ImGAGN edges
 # 1 = bidireccionales (real <-> sintético), 0 = solo dirigidas real -> sintético
