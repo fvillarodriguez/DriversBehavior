@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from src import graph_builder_app as app
@@ -90,3 +91,38 @@ def test_temporal_checkpoint_rebuilds_model_for_strict_load():
     assert missing == []
     assert unexpected == []
     assert hasattr(rebuilt, "temporal_head")
+
+
+def test_gat_gru_requires_sequence_index_in_strict_mode():
+    with pytest.raises(ValueError, match="SequenceIndex"):
+        gnn_main._build_gnn_model(
+            in_channels=3,
+            hidden_channels=4,
+            out_channels=2,
+            num_heads=2,
+            dropout=0.0,
+            edge_feature_dim=1,
+            num_layers=1,
+            gnn_variant="gat_gru",
+            sequence_index=None,
+            num_nodes=4,
+            require_temporal_head=True,
+        )
+
+
+def test_snapshot_variant_does_not_require_sequence_index():
+    model = gnn_main._build_gnn_model(
+        in_channels=3,
+        hidden_channels=4,
+        out_channels=2,
+        num_heads=2,
+        dropout=0.0,
+        edge_feature_dim=1,
+        num_layers=1,
+        gnn_variant="gat_snapshot",
+        sequence_index=None,
+        num_nodes=4,
+        require_temporal_head=True,
+    )
+
+    assert not hasattr(model, "temporal_head")

@@ -7455,7 +7455,7 @@ def _render_paper_replication_subtab(*, accidents_df: Optional[pd.DataFrame]) ->
             ]
             for image_name, image_path in available_images:
                 if Path(image_path).exists():
-                    st.image(image_path, caption=image_name, use_container_width=True)
+                    st.image(image_path, caption=image_name, width="stretch")
         if payload.get("promoted_paths"):
             st.caption("Assets promovidos")
             st.json(payload.get("promoted_paths"))

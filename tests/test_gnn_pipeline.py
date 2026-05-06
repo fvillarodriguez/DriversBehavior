@@ -25,6 +25,8 @@ from src.graph_builder_app import (
     _compute_graph_semantic_hash,
     _resolve_graph_identity_for_loaded_graph,
     _resolve_graph_hash_for_loaded_graph,
+    _default_gnn_objective_metrics,
+    _split_val_mask_for_calibration_threshold,
     PMIndex,
 )
 
@@ -178,6 +180,86 @@ def test_apply_temporal_split_respects_metadata_lookahead():
     ]
     assert data["pm"].val_mask.nonzero(as_tuple=False).view(-1).tolist() == [7]
     assert data["pm"].test_mask.nonzero(as_tuple=False).view(-1).tolist() == [9]
+
+
+def test_apply_temporal_split_accepts_top_level_lookahead_metadata():
+    data = HeteroData()
+    data["pm"].x = torch.randn(10, 2)
+    data["pm"].y = torch.zeros(10, dtype=torch.long)
+    pm_map = {("P1", int(idx * 5)): idx for idx in range(10)}
+    pm_rev = {idx: ("P1", int(idx * 5)) for idx in range(10)}
+    pm_index = PMIndex(pm_map, pm_rev)
+
+    split_info = _apply_temporal_split_to_graph(
+        data,
+        pm_index,
+        train_ratio=60,
+        val_ratio=20,
+        graph_metadata={"label_lookahead_minutes": 5},
+    )
+
+    assert split_info["label_lookahead_minutes"] == 5
+    assert split_info["label_lookahead_source"] == "metadata"
+
+
+def test_apply_temporal_split_strict_rejects_missing_lookahead_metadata():
+    data = HeteroData()
+    data["pm"].x = torch.randn(10, 2)
+    data["pm"].y = torch.zeros(10, dtype=torch.long)
+    pm_map = {("P1", int(idx * 5)): idx for idx in range(10)}
+    pm_rev = {idx: ("P1", int(idx * 5)) for idx in range(10)}
+    pm_index = PMIndex(pm_map, pm_rev)
+
+    split_info = _apply_temporal_split_to_graph(
+        data,
+        pm_index,
+        train_ratio=60,
+        val_ratio=20,
+        graph_metadata={},
+        strict_lookahead=True,
+    )
+
+    assert split_info is None
+
+
+def test_val_mask_split_uses_time_order_for_calibration_and_threshold():
+    data = HeteroData()
+    n_nodes = 12
+    data["pm"].x = torch.randn(n_nodes, 2)
+    data["pm"].y = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+    data["pm"].val_mask = torch.tensor(
+        [False, False, True, True, True, True, True, True, True, True, False, False]
+    )
+    pm_map = {("P1", int(idx * 5)): idx for idx in range(n_nodes)}
+    pm_rev = {idx: ("P1", int(idx * 5)) for idx in range(n_nodes)}
+    pm_index = PMIndex(pm_map, pm_rev)
+
+    split = _split_val_mask_for_calibration_threshold(data, pm_index)
+
+    assert split["calibration_mask_source"] == "val_calib"
+    assert split["threshold_mask_source"] == "val_threshold"
+    assert split["calib_idx"].max().item() < split["threshold_idx"].min().item()
+    for idx_key in ("calib_idx", "threshold_idx"):
+        labels = set(data["pm"].y[split[idx_key]].tolist())
+        assert labels == {0, 1}
+
+
+def test_val_mask_split_rejects_single_class_side():
+    data = HeteroData()
+    n_nodes = 8
+    data["pm"].x = torch.randn(n_nodes, 2)
+    data["pm"].y = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+    data["pm"].val_mask = torch.ones(n_nodes, dtype=torch.bool)
+    pm_map = {("P1", int(idx * 5)): idx for idx in range(n_nodes)}
+    pm_rev = {idx: ("P1", int(idx * 5)) for idx in range(n_nodes)}
+    pm_index = PMIndex(pm_map, pm_rev)
+
+    with pytest.raises(ValueError, match="ambas clases"):
+        _split_val_mask_for_calibration_threshold(data, pm_index)
+
+
+def test_gnn_objective_defaults_focus_on_extreme_imbalance_metrics():
+    assert _default_gnn_objective_metrics() == ["AUPRC", "MCC", "Recall-FAR"]
 
 
 def test_normalization_stats_use_purged_train_mask_only():

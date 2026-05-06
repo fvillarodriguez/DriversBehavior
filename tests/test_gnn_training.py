@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import sys
 import os
 import pandas as pd
+import numpy as np
 
 # Ensure src is in path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -16,6 +17,42 @@ from src.gat_model import HeteroGAT
 from src.graph_builder_app import _infer_edge_feature_dim
 from src import gnn_main
 from src.train_pretrain import train_minibatch
+
+
+def test_make_epoch_seeds_targets_positive_ratio_for_rare_train_labels():
+    HeteroData = pytest.importorskip("torch_geometric.data").HeteroData
+    graph = HeteroData()
+    n_nodes = 1000
+    graph["pm"].y = torch.zeros(n_nodes, dtype=torch.long)
+    graph["pm"].y[:3] = 1
+    graph["pm"].train_mask = torch.zeros(n_nodes, dtype=torch.bool)
+    graph["pm"].train_mask[:n_nodes] = True
+
+    gen1 = torch.Generator(device="cpu")
+    gen1.manual_seed(123)
+    gen2 = torch.Generator(device="cpu")
+    gen2.manual_seed(123)
+
+    seeds1 = gnn_main.make_epoch_seeds(
+        graph,
+        node_type="pm",
+        strategy="random",
+        generator=gen1,
+        target_positive_ratio=0.10,
+    )
+    seeds2 = gnn_main.make_epoch_seeds(
+        graph,
+        node_type="pm",
+        strategy="random",
+        generator=gen2,
+        target_positive_ratio=0.10,
+    )
+
+    assert torch.equal(seeds1, seeds2)
+    assert bool(graph["pm"].train_mask[seeds1].all())
+    y_seed = graph["pm"].y[seeds1]
+    assert int((y_seed == 1).sum().item()) == 3
+    assert float((y_seed == 1).float().mean().item()) == pytest.approx(0.10, abs=0.015)
 
 def test_gat_model_training_step(dummy_graph_data):
     """
@@ -232,6 +269,27 @@ def test_binary_eval_extras_include_false_alarm_ratio_and_brier_score():
     assert metrics["far"] == pytest.approx(0.5)
     assert metrics["brier_score"] == pytest.approx(0.225)
     assert metrics["brier"] == pytest.approx(0.225)
+
+
+def test_platt_calibrated_probabilities_preserve_source_tensor_dtype_and_device():
+    class Float64PlattModel:
+        def predict_proba(self, x):
+            assert x.dtype == np.float32
+            return np.asarray(
+                [
+                    [0.75, 0.25],
+                    [0.20, 0.80],
+                ],
+                dtype=np.float64,
+            )
+
+    prob1 = torch.tensor([0.1, 0.9], dtype=torch.float32)
+
+    calibrated = gnn_main._calibrated_probability_tensor(prob1, Float64PlattModel())
+
+    assert calibrated.dtype == prob1.dtype
+    assert calibrated.device == prob1.device
+    assert calibrated.tolist() == pytest.approx([0.25, 0.80])
 
 
 def test_train_minibatch_reports_unscaled_loss_with_accumulation():

@@ -1,4 +1,5 @@
 import sys as _sys
+import warnings
 import torch
 import torch.nn.functional as F
 from torch.nn import LayerNorm, Linear, ModuleList
@@ -9,6 +10,16 @@ install_gnn_mps_scatter_policy()
 from torch_geometric.nn import GATConv, HeteroConv, TransformerConv
 from torch.utils.checkpoint import checkpoint
 from src.config import DEBUG, XAI
+
+# PyTorch's non-reentrant checkpoint path still enters torch.cpu.amp.autocast()
+# internally on some 2.x releases. Keep the filter scoped to that upstream
+# deprecation so GNN training logs stay readable without hiding local warnings.
+warnings.filterwarnings(
+    "ignore",
+    message=r"`torch\.cpu\.amp\.autocast\(args\.\.\.\)` is deprecated\. Please use `torch\.amp\.autocast\('cpu', args\.\.\.\)` instead\.",
+    category=FutureWarning,
+    module=r"torch\.utils\.checkpoint",
+)
 
 # Ensure module is available under the expected name for PyG inspector
 _sys.modules.setdefault("src.gat_model", _sys.modules[__name__])
