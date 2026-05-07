@@ -14,6 +14,27 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
 VENV_DIR = ROOT_DIR / ".venv"
+PYTORCH_VERSION = "2.4.1"
+PYG_TORCH_WHEEL_VERSION = "2.4.0"
+PYG_PACKAGES = [
+    "pyg-lib",
+    "torch-scatter",
+    "torch-sparse",
+    "torch-cluster",
+    "torch-spline-conv",
+]
+TORCH_BACKENDS = {
+    "cpu": {
+        "label": "CPU",
+        "torch_index_url": None,
+        "pyg_find_links": f"https://data.pyg.org/whl/torch-{PYG_TORCH_WHEEL_VERSION}+cpu.html",
+    },
+    "cu121": {
+        "label": "CUDA 12.1",
+        "torch_index_url": "https://download.pytorch.org/whl/cu121",
+        "pyg_find_links": f"https://data.pyg.org/whl/torch-{PYG_TORCH_WHEEL_VERSION}+cu121.html",
+    },
+}
 
 
 def _run(cmd: list[str], *, check: bool = True) -> int:
@@ -82,23 +103,67 @@ def _ensure_supported_python(python_exec: Path) -> None:
         )
         raise SystemExit(1)
 
-def _install_pyg_stack(python_exec: Path) -> None:
-    _run([str(python_exec), "-m", "pip", "install", "torch==2.4.1"])
+
+def _nvidia_smi_available() -> bool:
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and "GPU" in (result.stdout or result.stderr)
+
+
+def _resolve_torch_backend(requested: str | None) -> str:
+    requested_norm = (
+        requested or os.environ.get("TORCH_BACKEND") or "auto"
+    ).strip().lower()
+    if requested_norm == "auto":
+        if os.name == "nt" and _nvidia_smi_available():
+            return "cu121"
+        return "cpu"
+    if requested_norm in TORCH_BACKENDS:
+        return requested_norm
+    allowed = ", ".join(["auto", *TORCH_BACKENDS.keys()])
+    print(
+        f"Error: backend de PyTorch no soportado: {requested!r}. "
+        f"Use uno de: {allowed}."
+    )
+    raise SystemExit(1)
+
+
+def _install_pyg_stack(python_exec: Path, *, torch_backend: str = "auto") -> str:
+    backend = _resolve_torch_backend(torch_backend)
+    cfg = TORCH_BACKENDS[backend]
+    print(f"Instalando stack PyTorch/PyG para backend: {cfg['label']}")
+    torch_cmd = [
+        str(python_exec),
+        "-m",
+        "pip",
+        "install",
+        f"torch=={PYTORCH_VERSION}",
+    ]
+    if cfg["torch_index_url"]:
+        torch_cmd += ["--index-url", str(cfg["torch_index_url"])]
+    _run(torch_cmd)
     _run(
         [
             str(python_exec),
             "-m",
             "pip",
             "install",
-            "pyg-lib",
-            "torch-scatter",
-            "torch-sparse",
-            "torch-cluster",
-            "torch-spline-conv",
+            *PYG_PACKAGES,
             "-f",
-            "https://data.pyg.org/whl/torch-2.4.0+cpu.html",
+            str(cfg["pyg_find_links"]),
         ]
     )
+    return backend
 
 
 def _prompt_choice() -> str:
@@ -115,6 +180,16 @@ def main() -> None:
     parser.add_argument(
         "--python",
         help="Ruta o nombre del ejecutable de Python para crear el venv.",
+    )
+    parser.add_argument(
+        "--torch-backend",
+        default=os.environ.get("TORCH_BACKEND", "auto"),
+        choices=["auto", *TORCH_BACKENDS.keys()],
+        help=(
+            "Backend de PyTorch/PyG a instalar. "
+            "`auto` usa CUDA 12.1 en Windows si nvidia-smi detecta una GPU NVIDIA; "
+            "en otros casos usa CPU."
+        ),
     )
     args = parser.parse_args()
 
@@ -155,11 +230,28 @@ def main() -> None:
             )
             raise SystemExit(1)
 
-    _run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-    _install_pyg_stack(venv_python)
+    _run(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "pip",
+            "setuptools",
+            "wheel",
+        ]
+    )
+    backend = _install_pyg_stack(venv_python, torch_backend=args.torch_backend)
     _run([str(venv_python), "-m", "pip", "install", "-r", "requirements.txt"])
 
     print("Entorno virtual listo.")
+    if backend == "cu121":
+        print("Verificar CUDA:")
+        print(
+            "  python -c \"import torch; print(torch.__version__, torch.version.cuda, "
+            "torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'sin CUDA')\""
+        )
     if os.name == "nt":
         print("Activar: .venv\\Scripts\\activate")
     else:

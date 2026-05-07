@@ -97,6 +97,17 @@ py -3.12 venv_start.py
 .venv\Scripts\activate
 ```
 
+Windows con GPU NVIDIA:
+
+```bat
+rmdir /s /q .venv
+py -3.12 venv_start.py --torch-backend cu121
+.venv\Scripts\activate
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'sin CUDA')"
+```
+
+Si ese comando imprime `False`, Streamlit tambien seleccionara CPU en Training GNN. En ese caso el problema no es la UI: el entorno activo tiene PyTorch/PyG sin CUDA o el driver NVIDIA no esta visible para Python.
+
 ## Arranque De La Aplicación
 
 ### Opción recomendada
@@ -110,6 +121,13 @@ macOS:
 Windows:
 
 ```bat
+start_app_windows.bat
+```
+
+Para forzar instalacion CUDA al crear un entorno nuevo desde el launcher de Windows:
+
+```bat
+set TORCH_BACKEND=cu121
 start_app_windows.bat
 ```
 

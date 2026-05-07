@@ -4,16 +4,95 @@ except Exception:
     torch = None
 import numpy as np # type: ignore
 import os
+import platform
+import shutil
+import subprocess
+import sys
+from functools import lru_cache
 
 def get_auto_device():
     """Retorna el mejor dispositivo disponible: MPS > CUDA > CPU."""
     if torch is not None:
-        if torch.backends.mps.is_available():
+        mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
             return torch.device("mps")
         if torch.cuda.is_available():
             return torch.device("cuda")
         return torch.device("cpu")
     return "cpu"
+
+
+@lru_cache(maxsize=1)
+def _nvidia_smi_summary() -> dict:
+    path = shutil.which("nvidia-smi")
+    if not path:
+        return {"available": False, "path": None, "summary": ""}
+    try:
+        result = subprocess.run(
+            [path, "-L"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        return {
+            "available": False,
+            "path": path,
+            "summary": f"{type(exc).__name__}: {exc}",
+        }
+    output = (result.stdout or result.stderr or "").strip()
+    return {
+        "available": result.returncode == 0 and bool(output),
+        "path": path,
+        "summary": output,
+    }
+
+
+def get_device_diagnostics() -> dict:
+    """Return concise runtime diagnostics for the selected PyTorch device."""
+    selected = get_auto_device()
+    diag = {
+        "selected_device": str(selected),
+        "platform": platform.platform(),
+        "python_executable": sys.executable,
+        "virtualenv": os.environ.get("VIRTUAL_ENV", ""),
+        "torch_imported": torch is not None,
+        "torch_version": None,
+        "torch_cuda_build": None,
+        "cuda_available": False,
+        "cuda_device_count": 0,
+        "cuda_devices": [],
+        "mps_available": False,
+        "nvidia_smi": _nvidia_smi_summary(),
+    }
+    if torch is None:
+        return diag
+    diag["torch_version"] = getattr(torch, "__version__", None)
+    diag["torch_cuda_build"] = getattr(getattr(torch, "version", None), "cuda", None)
+    try:
+        diag["cuda_available"] = bool(torch.cuda.is_available())
+    except Exception:
+        diag["cuda_available"] = False
+    try:
+        diag["cuda_device_count"] = (
+            int(torch.cuda.device_count()) if hasattr(torch, "cuda") else 0
+        )
+    except Exception:
+        diag["cuda_device_count"] = 0
+    devices = []
+    if diag["cuda_device_count"]:
+        for idx in range(int(diag["cuda_device_count"])):
+            try:
+                devices.append(torch.cuda.get_device_name(idx))
+            except Exception:
+                devices.append(f"cuda:{idx}")
+    diag["cuda_devices"] = devices
+    try:
+        mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+        diag["mps_available"] = bool(mps_backend and mps_backend.is_available())
+    except Exception:
+        diag["mps_available"] = False
+    return diag
 
 # --------------------------------------------------------------------------- #
 # CONFIGURACIÓN GLOBAL Y CONSTANTES

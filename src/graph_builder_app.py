@@ -102,6 +102,7 @@ from src.config import (
     TRAIN_RATIO,
     VAL_RATIO,
     get_auto_device,
+    get_device_diagnostics,
 )
 from src.features import compute_pm_features
 from src.graph_visualization import render_visual_graph_tab
@@ -4256,6 +4257,55 @@ def _resolve_eval_device(choice: str):
     if choice == "CUDA":
         return torch.device("cuda")
     return get_auto_device()
+
+
+def _render_training_device_status() -> torch.device:
+    device = get_auto_device()
+    diag = get_device_diagnostics()
+    selected = str(diag.get("selected_device") or device)
+    nvidia = diag.get("nvidia_smi") if isinstance(diag.get("nvidia_smi"), dict) else {}
+    cuda_devices = diag.get("cuda_devices") if isinstance(diag.get("cuda_devices"), list) else []
+    torch_cuda_build = diag.get("torch_cuda_build")
+
+    if selected.startswith("cuda"):
+        gpu_label = cuda_devices[0] if cuda_devices else "CUDA"
+        st.success(f"Dispositivo para entrenamiento/evaluacion: {selected} ({gpu_label})")
+    elif selected == "mps":
+        st.success("Dispositivo para entrenamiento/evaluacion: mps")
+    else:
+        base_msg = "Dispositivo para entrenamiento/evaluacion: cpu"
+        if bool(nvidia.get("available")) and not bool(diag.get("cuda_available")):
+            st.warning(
+                f"{base_msg}. Se detecto NVIDIA con nvidia-smi, pero el PyTorch del venv "
+                "no expone CUDA. Reinstale el entorno con backend CUDA o revise el driver."
+            )
+        elif torch_cuda_build is None:
+            st.warning(
+                f"{base_msg}. Este PyTorch parece CPU-only (`torch.version.cuda` es None)."
+            )
+        else:
+            st.info(base_msg)
+
+    expanded = selected == "cpu" and (
+        bool(nvidia.get("available"))
+        or torch_cuda_build is None
+        or not bool(diag.get("cuda_available"))
+    )
+    with st.expander("Diagnostico de dispositivo PyTorch", expanded=expanded):
+        st.json(diag)
+        if selected == "cpu":
+            st.caption(
+                "En Windows con NVIDIA, la GPU solo aparece aqui si el venv tiene PyTorch "
+                "y las extensiones PyG instaladas con ruedas CUDA compatibles."
+            )
+            st.code(
+                "rmdir /s /q .venv\n"
+                "py -3.12 venv_start.py --torch-backend cu121\n"
+                ".venv\\Scripts\\activate\n"
+                "python -c \"import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'sin CUDA')\"",
+                language="bat",
+            )
+    return torch.device(str(device))
 
 
 def _select_latest_gat_model(
@@ -15708,8 +15758,7 @@ def _render_training_tab() -> None:
         st.caption(f"Se reutilizaran los hiperparametros: {hp_choice}.")
 
     # Selección automática de dispositivo
-    eval_device = get_auto_device()
-    st.info(f"Dispositivo para evaluacion: {eval_device}")
+    eval_device = _render_training_device_status()
     st.markdown("#### Early stopping")
     checkpoint_metric_options = {
         "Objective score": "val_objective_score",
