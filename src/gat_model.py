@@ -69,6 +69,17 @@ def _edge_type_module_key(edge_type):
     return str(edge_type)
 
 
+# Edge types por defecto si no se pasa el parámetro al constructor.
+# Mantiene compatibilidad con grafos legacy que tenían 4 relaciones (incluido st_fwd).
+# Para grafos nuevos (3 relaciones), pasar edge_types=tuple(data.edge_types) desde fuera.
+DEFAULT_EDGE_TYPES = (
+    ('pm', 'spatial', 'pm'),
+    ('pm', 'temporal', 'pm'),
+    ('pm', 'spatial_back', 'pm'),
+    ('pm', 'st_fwd', 'pm'),
+)
+
+
 class EdgeAttrEncoder(torch.nn.Module):
     """Small MLP to learn a task-adapted representation of raw edge attributes."""
 
@@ -108,6 +119,7 @@ class HeteroGAT(torch.nn.Module):
         aggr2='sum',
         use_residual=False,
         use_relation_self_loops=True,
+        edge_types=None,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -118,6 +130,9 @@ class HeteroGAT(torch.nn.Module):
         self.edge_feature_dim = edge_feature_dim
         self.use_residual = bool(use_residual)
         self.use_relation_self_loops = bool(use_relation_self_loops)
+        # Edge types: si no se especifican, usa los 4 legacy (compat). Para grafos
+        # nuevos (3 relaciones) pasar edge_types=tuple(data.edge_types).
+        self.edge_types_list = [tuple(et) for et in (edge_types if edge_types is not None else DEFAULT_EDGE_TYPES)]
 
         self.convs = ModuleList()
         self.norms = ModuleList()
@@ -125,14 +140,18 @@ class HeteroGAT(torch.nn.Module):
 
         for i in range(num_layers):
             conv_in_channels = in_channels if i == 0 else hidden_channels * num_heads
-            
+
             conv_dict = {
-                ('pm', 'spatial', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=self.use_relation_self_loops, edge_dim=edge_feature_dim),
-                ('pm', 'temporal', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=self.use_relation_self_loops, edge_dim=edge_feature_dim),
-                ('pm', 'spatial_back', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=self.use_relation_self_loops, edge_dim=edge_feature_dim),
-                ('pm', 'st_fwd', 'pm'): GATConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, add_self_loops=self.use_relation_self_loops, edge_dim=edge_feature_dim),
+                et: GATConvSaveAlpha(
+                    conv_in_channels,
+                    hidden_channels,
+                    heads=num_heads,
+                    add_self_loops=self.use_relation_self_loops,
+                    edge_dim=edge_feature_dim,
+                )
+                for et in self.edge_types_list
             }
-            
+
             self.convs.append(HeteroConv(conv_dict, aggr=aggr1 if i == 0 else aggr2))
             if self.use_residual:
                 self.residual_lins.append(Linear(conv_in_channels, hidden_channels * num_heads))
@@ -327,6 +346,7 @@ class HeteroGATWithEdgeEncoder(HeteroGAT):
         edge_encoder_dropout=0.0,
         use_residual=False,
         use_relation_self_loops=True,
+        edge_types=None,
     ):
         raw_edge_dim = int(edge_feature_dim or 0)
         encoded_edge_dim = int(edge_encoded_dim if edge_encoded_dim is not None else raw_edge_dim)
@@ -343,6 +363,7 @@ class HeteroGATWithEdgeEncoder(HeteroGAT):
             aggr2=aggr2,
             use_residual=use_residual,
             use_relation_self_loops=use_relation_self_loops,
+            edge_types=edge_types,
         )
         self.raw_edge_feature_dim = raw_edge_dim
         self.encoded_edge_feature_dim = encoded_edge_dim
@@ -404,6 +425,7 @@ class HeteroEdgeAware(torch.nn.Module):
         aggr2='sum',
         use_residual=False,
         use_relation_self_loops=True,
+        edge_types=None,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -414,6 +436,7 @@ class HeteroEdgeAware(torch.nn.Module):
         self.edge_feature_dim = edge_feature_dim
         self.use_residual = bool(use_residual)
         self.use_relation_self_loops = bool(use_relation_self_loops)
+        self.edge_types_list = [tuple(et) for et in (edge_types if edge_types is not None else DEFAULT_EDGE_TYPES)]
 
         self.convs = ModuleList()
         self.norms = ModuleList()
@@ -422,10 +445,14 @@ class HeteroEdgeAware(torch.nn.Module):
         for i in range(num_layers):
             conv_in_channels = in_channels if i == 0 else hidden_channels * num_heads
             conv_dict = {
-                ('pm', 'spatial', 'pm'): TransformerConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, dropout=dropout, edge_dim=edge_feature_dim),
-                ('pm', 'temporal', 'pm'): TransformerConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, dropout=dropout, edge_dim=edge_feature_dim),
-                ('pm', 'spatial_back', 'pm'): TransformerConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, dropout=dropout, edge_dim=edge_feature_dim),
-                ('pm', 'st_fwd', 'pm'): TransformerConvSaveAlpha(conv_in_channels, hidden_channels, heads=num_heads, dropout=dropout, edge_dim=edge_feature_dim),
+                et: TransformerConvSaveAlpha(
+                    conv_in_channels,
+                    hidden_channels,
+                    heads=num_heads,
+                    dropout=dropout,
+                    edge_dim=edge_feature_dim,
+                )
+                for et in self.edge_types_list
             }
             self.convs.append(HeteroConv(conv_dict, aggr=aggr1 if i == 0 else aggr2))
             if self.use_residual:

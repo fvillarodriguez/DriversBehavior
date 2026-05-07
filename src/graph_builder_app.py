@@ -225,6 +225,115 @@ try:
 except Exception:
     psutil = None
 
+GNN_LIVE_CHART_SERIES: Dict[str, Tuple[Tuple[str, str], ...]] = {
+    "loss": (
+        ("train_loss", "Train Loss"),
+        ("val_loss", "Val Loss"),
+    ),
+    "classification": (
+        ("val_accuracy", "Accuracy"),
+        ("val_recall_pos", "Recall"),
+        ("val_precision_pos", "Precision"),
+        ("val_f1_macro", "F1_macro"),
+    ),
+    "ranking": (
+        ("val_auprc", "AUPRC"),
+        ("val_mcc", "MCC"),
+    ),
+    "operational": (
+        ("val_far", "FAR"),
+        ("val_recall_pos", "TPR"),
+    ),
+}
+GNN_LIVE_CHART_COLOR_MAP: Dict[str, str] = {
+    "Train Loss": "#1b3a6b",
+    "Val Loss": "#d4541a",
+    "Accuracy": "#1b3a6b",
+    "Recall": "#3b7a57",
+    "Precision": "#2a6a8a",
+    "F1_macro": "#6b3a7a",
+    "AUPRC": "#1b3a6b",
+    "MCC": "#d4541a",
+    "FAR": "#a8493d",
+    "TPR": "#3b7a57",
+    "Learning rate": "#1b3a6b",
+    "Sinteticos": "#2a6a8a",
+}
+
+
+def _build_gnn_live_training_chart_frames(
+    metrics: Sequence[Mapping[str, object]],
+) -> Dict[str, pd.DataFrame]:
+    frames = {key: pd.DataFrame() for key in GNN_LIVE_CHART_SERIES}
+    if not metrics:
+        return frames
+
+    df = pd.DataFrame(metrics)
+    if df.empty or "epoch" not in df.columns:
+        return frames
+
+    df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
+    df = df.dropna(subset=["epoch"])
+    if df.empty:
+        return frames
+
+    df = df.sort_values("epoch").drop_duplicates("epoch", keep="last")
+    df = df.set_index("epoch")
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    for frame_key, series in GNN_LIVE_CHART_SERIES.items():
+        chart_df = pd.DataFrame(index=df.index)
+        for source_col, label in series:
+            if source_col in df.columns and df[source_col].notna().any():
+                chart_df[label] = df[source_col]
+        chart_df = chart_df.dropna(how="all")
+        if not chart_df.empty:
+            frames[frame_key] = chart_df
+    return frames
+
+
+def _render_gnn_live_line_chart(container, chart_df: pd.DataFrame) -> None:
+    if chart_df.empty:
+        return
+    try:
+        import plotly.express as px
+
+        plot_df = chart_df.reset_index().melt(
+            id_vars=["epoch"],
+            var_name="Metrica",
+            value_name="Valor",
+        )
+        plot_df = plot_df.dropna(subset=["Valor"])
+        if plot_df.empty:
+            return
+        fig = px.line(
+            plot_df,
+            x="epoch",
+            y="Valor",
+            color="Metrica",
+            color_discrete_map=GNN_LIVE_CHART_COLOR_MAP,
+            labels={"epoch": "Epoch", "Valor": "Valor", "Metrica": "Metrica"},
+        )
+        fig.update_traces(line=dict(width=2))
+        fig.update_layout(
+            legend_title_text="Metrica",
+            margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="#fdfcfa",
+            font=dict(family="Inter, Arial, sans-serif", color="#1a1a1a"),
+            xaxis=dict(gridcolor="#e6e3dc", zerolinecolor="#d8d5cd"),
+            yaxis=dict(gridcolor="#e6e3dc", zerolinecolor="#d8d5cd"),
+        )
+        container.plotly_chart(
+            fig,
+            width="stretch",
+            config={"displayModeBar": False},
+        )
+    except Exception:
+        container.line_chart(chart_df, width="stretch")
+
+
 def _has_streamlit_script_context() -> bool:
     if get_script_run_ctx is None:
         return True
@@ -5440,14 +5549,16 @@ def _load_optuna_params_from_csv(path: str) -> Dict[str, object]:
 def _network_config_to_hparams(
     cfg: Dict[str, object], *, use_graphsmote: bool
 ) -> Dict[str, object]:
+    # Defaults alineados con RECOMMENDED_NETWORK_DEFAULTS para clase rara (~0.3%):
+    # FocalLoss(α=0.95), hidden=96, dropout=0.2, aggr=sum, num_neighbors asimétrico.
     params: Dict[str, object] = {
         "gnn_variant": _normalize_ui_gnn_variant(cfg.get("gnn_variant", GNN_VARIANT)),
-        "hidden_channels": int(cfg.get("hidden_channels", 64)),
+        "hidden_channels": int(cfg.get("hidden_channels", 96)),
         "num_heads": int(cfg.get("num_heads", 4)),
         "num_layers": int(cfg.get("num_layers", 2)),
-        "dropout": float(cfg.get("dropout", 0.3)),
-        "aggr1": cfg.get("aggr1", "mean"),
-        "aggr2": cfg.get("aggr2", "mean"),
+        "dropout": float(cfg.get("dropout", 0.2)),
+        "aggr1": cfg.get("aggr1", "sum"),
+        "aggr2": cfg.get("aggr2", "sum"),
         "use_checkpointing": bool(cfg.get("use_checkpointing", False)),
         "use_residual": _coerce_bool(cfg.get("use_residual"), True),
         "use_relation_self_loops": _coerce_bool(cfg.get("use_relation_self_loops"), False),
@@ -5460,10 +5571,12 @@ def _network_config_to_hparams(
         "lambda_H_fixed": float(cfg.get("lambda_H_fixed", 1e-4)),
         "initial_lambda_H": float(cfg.get("initial_lambda_H", 1e-4)),
         "final_lambda_H": float(cfg.get("final_lambda_H", 1e-2)),
-        "loss_type": cfg.get("loss_type", "CrossEntropy"),
+        "loss_type": cfg.get("loss_type", "FocalLoss"),
         "focal_gamma": float(cfg.get("focal_gamma", 2.0)),
-        "focal_alpha": float(cfg.get("focal_alpha", 0.75)),
+        "focal_alpha": float(cfg.get("focal_alpha", 0.95)),
         "batch_size": int(cfg.get("batch_size", 512)),
+        # JSON-serializa lista plana o dict por relación; _resolve_num_neighbors
+        # en gnn_main.py mapea dict (string keys) → tuple (edge_type) automáticamente.
         "num_neighbors": json.dumps(cfg.get("num_neighbors", [15, 10])),
         "checkpoint_metric": str(cfg.get("checkpoint_metric", "val_auprc")),
         "use_graphsmote": bool(use_graphsmote),
@@ -16040,6 +16153,8 @@ def _render_training_tab() -> None:
         chart_metrics = charts_container.empty()
         charts_container.caption("Metricas de ranking (val, 0-1)")
         chart_rank = charts_container.empty()
+        charts_container.caption("FAR, TPR (val, 0-1)")
+        chart_operational = charts_container.empty()
         charts_container.caption("Learning rate")
         chart_lr = charts_container.empty()
         charts_container.caption("Conteo sinteticos (GraphSMOTE)")
@@ -16074,6 +16189,12 @@ def _render_training_tab() -> None:
         def _update_charts() -> None:
             if not live_state["metrics"]:
                 return
+            chart_frames = _build_gnn_live_training_chart_frames(live_state["metrics"])
+            _render_gnn_live_line_chart(chart_loss, chart_frames["loss"])
+            _render_gnn_live_line_chart(chart_metrics, chart_frames["classification"])
+            _render_gnn_live_line_chart(chart_rank, chart_frames["ranking"])
+            _render_gnn_live_line_chart(chart_operational, chart_frames["operational"])
+
             df = pd.DataFrame(live_state["metrics"])
             if "epoch" not in df.columns:
                 return
@@ -16082,55 +16203,13 @@ def _render_training_tab() -> None:
             for col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            loss_cols = [
-                c for c in (
-                    "train_loss",
-                    "val_loss",
-                    "train_cls_loss",
-                    "train_edge_loss",
-                    "train_l2_att_loss",
-                )
-                if c in df.columns and df[c].notna().any()
-            ]
-            if loss_cols:
-                chart_loss.line_chart(df[loss_cols])
-
-            metric_cols = [
-                c for c in (
-                    "val_f1",
-                    "val_f05",
-                    "val_f1_pos",
-                    "val_f1_macro",
-                    "val_precision_pos",
-                    "val_recall_pos",
-                    "val_accuracy",
-                )
-                if c in df.columns and df[c].notna().any()
-            ]
-            if metric_cols:
-                chart_metrics.line_chart(df[metric_cols])
-
-            rank_cols = [
-                c for c in (
-                    "val_auc",
-                    "val_auprc",
-                    "val_mcc",
-                    "val_far",
-                    "val_objective_score",
-                    "monitor_value",
-                    "best_monitor_value",
-                    "val_tau",
-                )
-                if c in df.columns and df[c].notna().any()
-            ]
-            if rank_cols:
-                chart_rank.line_chart(df[rank_cols])
-
             if "lr" in df.columns and df["lr"].notna().any():
-                chart_lr.line_chart(df[["lr"]])
+                chart_lr.line_chart(df[["lr"]].rename(columns={"lr": "Learning rate"}))
 
             if "smote_synth_count" in df.columns and df["smote_synth_count"].notna().any():
-                chart_synth.line_chart(df[["smote_synth_count"]])
+                chart_synth.line_chart(
+                    df[["smote_synth_count"]].rename(columns={"smote_synth_count": "Sinteticos"})
+                )
 
         def _handle_training_event(payload: dict) -> None:
             if payload.get("scope") != "gnn_training":
@@ -22189,12 +22268,22 @@ def _render_network_builder_tab() -> None:
         st.info("Puedes diseñar sin grafo cargado. Carga un grafo en la pestaña Graph para validar dimensiones y secuencias.")
 
     _gnn_builder_render_library_controls()
-    # Editor visual basado en streamlit-flow. Mantiene el contrato del editor
-    # antiguo (`_gnn_builder_render_editor`): lee/escribe las mismas keys de
-    # session_state y devuelve un `NetworkArchitecture`. El editor por
-    # acordeón sigue disponible en el módulo por si hace falta revertir.
-    from src.gnn_network_builder_canvas import render_canvas_editor
-    arch = render_canvas_editor(graph_info=graph_info)
+    editor_mode = st.radio(
+        "Editor",
+        ["Formulario", "Canvas visual"],
+        horizontal=True,
+        key="gnn_builder_editor_mode",
+        help=(
+            "Formulario evita montar el componente canvas durante los reruns "
+            "globales de Streamlit. Use Canvas visual solo cuando vaya a editar "
+            "la arquitectura en ese modo."
+        ),
+    )
+    if editor_mode == "Canvas visual":
+        from src.gnn_network_builder_canvas import render_canvas_editor
+        arch = render_canvas_editor(graph_info=graph_info)
+    else:
+        arch = _gnn_builder_render_editor()
     _gnn_builder_render_preview(arch, graph_info)
 
     col_save, col_use, col_export = st.columns(3)
@@ -25351,6 +25440,45 @@ def _render_gnn_experiments_tab() -> None:
                     st.warning(f"No se pudo guardar en historial: {exc}")
 
 
+# Defaults recomendados para predicción de clase rara (~0.3% positivos):
+#   - Variante con edge MLP encoder y head temporal GRU (aprovecha edge_attr 12-dim).
+#   - 2 capas: evita oversmoothing (clase rara se diluye con +profundidad).
+#   - hidden=96, heads=4, dropout=0.2: capacidad razonable sin overfit en ~258 positivos.
+#   - FocalLoss con alpha=0.95 calibrado al desbalance.
+#   - Vecindario asimétrico: temporal denso, spatial reducido (4 pórticos en cadena).
+RECOMMENDED_NETWORK_DEFAULTS: Dict[str, object] = {
+    "gnn_variant": "gat_edge_mlp_gru",
+    "hidden_channels": 96,
+    "num_heads": 4,
+    "num_layers": 2,
+    "dropout": 0.2,
+    "aggr1": "sum",
+    "aggr2": "sum",
+    "use_checkpointing": False,
+    "use_residual": True,
+    "use_relation_self_loops": False,
+    "batch_size": 512,
+    "num_neighbors": {
+        "temporal": [25, 25],
+        "spatial": [3, 3],
+        "spatial_back": [3, 3],
+    },
+    "optimizer": "AdamW",
+    "lr_scheduler": "one_cycle",
+    "lr": 3e-4,
+    "weight_decay": 1e-4,
+    "loss_type": "FocalLoss",
+    "focal_gamma": 2.0,
+    "focal_alpha": 0.95,
+    "lambda_l2_att": 1e-4,
+    "lambda_H_mode": "fixed",
+    "lambda_H_fixed": 1e-4,
+    "initial_lambda_H": 1e-4,
+    "final_lambda_H": 1e-2,
+    "checkpoint_metric": "val_auprc",
+}
+
+
 def _render_network_tab() -> None:
     st.subheader("Network (GNN)")
 
@@ -25389,6 +25517,40 @@ def _render_network_tab() -> None:
     st.caption(
         f"edge_attr_dim={edge_feature_dim} | clases={num_classes} | tipos de aristas={len(graph_data.edge_types)}"
     )
+
+    # Detectar nombres de relación reales del grafo (para UI asimétrica de vecindario y preset).
+    relation_names: List[str] = []
+    for et in graph_data.edge_types:
+        if isinstance(et, tuple) and len(et) >= 2:
+            relation_names.append(str(et[1]))
+        else:
+            relation_names.append(str(et))
+
+    # Preset de defaults recomendados (clase rara ~0.3%).
+    preset_col, _ = st.columns([0.45, 0.55])
+    with preset_col:
+        if st.button(
+            "Cargar defaults recomendados (clase rara ~0.3%)",
+            key="gnn_net_load_recommended",
+            help=(
+                "Pre-rellena: gat_edge_mlp_gru, hidden=96, heads=4, layers=2, "
+                "dropout=0.2, FocalLoss(α=0.95), num_neighbors asimétrico por tipo "
+                "de arista (temporal denso, spatial reducido)."
+            ),
+        ):
+            new_cfg = dict(RECOMMENDED_NETWORK_DEFAULTS)
+            # Adaptar num_neighbors a los tipos de arista reales del grafo.
+            new_cfg["num_neighbors"] = {
+                rel: ([25, 25] if rel == "temporal" else [3, 3])
+                for rel in relation_names
+            }
+            st.session_state["gnn_network_config"] = new_cfg
+            # Limpiar widget keys para que tomen los nuevos defaults en el rerun.
+            for k in list(st.session_state.keys()):
+                if isinstance(k, str) and k.startswith("gnn_net_") and k != "gnn_net_load_recommended":
+                    del st.session_state[k]
+            st.rerun()
+
     existing_cfg = st.session_state.get("gnn_network_config", {})
     st.markdown("**Variante GNN del experimento**")
     selected_variant = _render_gnn_variant_selector(
@@ -25414,14 +25576,14 @@ def _render_network_tab() -> None:
         hidden_channels = st.number_input(
             "hidden_channels",
             min_value=8,
-            value=int(existing_cfg.get("hidden_channels", 64)),
+            value=int(existing_cfg.get("hidden_channels", RECOMMENDED_NETWORK_DEFAULTS["hidden_channels"])),
             step=8,
             key="gnn_net_hidden",
         )
         num_layers = st.number_input(
             "num_layers",
             min_value=1,
-            value=int(existing_cfg.get("num_layers", 2)),
+            value=int(existing_cfg.get("num_layers", RECOMMENDED_NETWORK_DEFAULTS["num_layers"])),
             step=1,
             key="gnn_net_layers",
         )
@@ -25429,7 +25591,7 @@ def _render_network_tab() -> None:
             "dropout",
             min_value=0.0,
             max_value=0.9,
-            value=float(existing_cfg.get("dropout", 0.3)),
+            value=float(existing_cfg.get("dropout", RECOMMENDED_NETWORK_DEFAULTS["dropout"])),
             step=0.05,
             key="gnn_net_dropout",
         )
@@ -25437,7 +25599,7 @@ def _render_network_tab() -> None:
         num_heads = st.number_input(
             "num_heads",
             min_value=1,
-            value=int(existing_cfg.get("num_heads", 4)),
+            value=int(existing_cfg.get("num_heads", RECOMMENDED_NETWORK_DEFAULTS["num_heads"])),
             step=1,
             key="gnn_net_heads",
         )
@@ -25445,7 +25607,7 @@ def _render_network_tab() -> None:
             "aggr1",
             ["sum", "mean", "max"],
             index=["sum", "mean", "max"].index(
-                str(existing_cfg.get("aggr1", "mean"))
+                str(existing_cfg.get("aggr1", RECOMMENDED_NETWORK_DEFAULTS["aggr1"]))
             ),
             key="gnn_net_aggr1",
         )
@@ -25453,7 +25615,7 @@ def _render_network_tab() -> None:
             "aggr2",
             ["sum", "mean", "max"],
             index=["sum", "mean", "max"].index(
-                str(existing_cfg.get("aggr2", "mean"))
+                str(existing_cfg.get("aggr2", RECOMMENDED_NETWORK_DEFAULTS["aggr2"]))
             ),
             key="gnn_net_aggr2",
         )
@@ -25466,13 +25628,13 @@ def _render_network_tab() -> None:
         )
         use_residual = st.checkbox(
             "use_residual",
-            value=_coerce_bool(existing_cfg.get("use_residual"), True),
+            value=_coerce_bool(existing_cfg.get("use_residual"), bool(RECOMMENDED_NETWORK_DEFAULTS["use_residual"])),
             key="gnn_net_residual",
             help=GNN_USE_RESIDUAL_HELP,
         )
         use_relation_self_loops = st.checkbox(
             "use_relation_self_loops",
-            value=_coerce_bool(existing_cfg.get("use_relation_self_loops"), False),
+            value=_coerce_bool(existing_cfg.get("use_relation_self_loops"), bool(RECOMMENDED_NETWORK_DEFAULTS["use_relation_self_loops"])),
             key="gnn_net_relation_self_loops",
             help=GNN_USE_RELATION_SELF_LOOPS_HELP,
         )
@@ -25499,13 +25661,64 @@ def _render_network_tab() -> None:
             neighbor_default = json.loads(neighbor_default)
         except Exception:
             neighbor_default = [15, 10]
-    neighbor_text = st.text_input(
-        "num_neighbors (por capa, ej: 15,10)",
-        value=",".join(str(v) for v in neighbor_default),
-        key="gnn_net_neighbors",
+
+    # Modo de vecindario: uniforme (misma fanout para todos los tipos) o asimétrico
+    # (fanout distinto por tipo, recomendado para grafos con degrees muy distintos).
+    default_mode = "asimétrico" if isinstance(neighbor_default, dict) else "uniforme"
+    neighbor_mode = st.radio(
+        "Modo de vecindario",
+        options=["uniforme", "asimétrico"],
+        index=["uniforme", "asimétrico"].index(default_mode),
+        horizontal=True,
+        key="gnn_net_neighbor_mode",
+        help=(
+            "Uniforme: misma fanout para todos los tipos de arista (ej. [15,10]). "
+            "Asimétrico: fanout distinto por tipo, recomendado cuando los degrees "
+            "varían fuerte entre relaciones (ej. temporal denso, spatial con pocos pórticos)."
+        ),
     )
-    num_neighbors = _parse_int_list(neighbor_text, [15, 10])
-    st.caption(f"Perfil activo: {num_neighbors}")
+
+    if neighbor_mode == "uniforme":
+        if isinstance(neighbor_default, dict):
+            first_val = next(iter(neighbor_default.values()), [15, 10])
+            flat_default = first_val if isinstance(first_val, list) else [15, 10]
+        elif isinstance(neighbor_default, list):
+            flat_default = neighbor_default
+        else:
+            flat_default = [15, 10]
+        neighbor_text = st.text_input(
+            "num_neighbors (por capa, ej: 15,10)",
+            value=",".join(str(v) for v in flat_default),
+            key="gnn_net_neighbors_uniform",
+        )
+        num_neighbors = _parse_int_list(neighbor_text, [15, 10])
+        st.caption(f"Aplicado a todos los tipos: {num_neighbors}")
+    else:
+        if isinstance(neighbor_default, dict):
+            per_rel_default = neighbor_default
+        else:
+            # Defaults asimétricos típicos para grafo de tráfico.
+            per_rel_default = {
+                "temporal": [25, 25],
+                "spatial": [3, 3],
+                "spatial_back": [3, 3],
+                "st_fwd": [25, 25],
+            }
+        num_neighbors = {}
+        n_cols = max(1, min(len(relation_names), 3))
+        cols = st.columns(n_cols)
+        for i, rel in enumerate(relation_names):
+            with cols[i % n_cols]:
+                rel_default = per_rel_default.get(rel, [10, 10])
+                if not isinstance(rel_default, list):
+                    rel_default = [10, 10]
+                txt = st.text_input(
+                    f"num_neighbors[{rel}]",
+                    value=",".join(str(v) for v in rel_default),
+                    key=f"gnn_net_neighbors_{rel}",
+                )
+                num_neighbors[rel] = _parse_int_list(txt, rel_default)
+        st.caption(f"Perfil asimétrico activo: {num_neighbors}")
 
     st.markdown("**Optimizador y loss**")
     col_opt1, col_opt2, col_opt3 = st.columns(3)
@@ -25514,7 +25727,7 @@ def _render_network_tab() -> None:
             "optimizer",
             ["Adam", "AdamW", "RAdam", "Lion"],
             index=["Adam", "AdamW", "RAdam", "Lion"].index(
-                str(existing_cfg.get("optimizer", "AdamW"))
+                str(existing_cfg.get("optimizer", RECOMMENDED_NETWORK_DEFAULTS["optimizer"]))
             ),
             key="gnn_net_optimizer",
         )
@@ -25551,7 +25764,7 @@ def _render_network_tab() -> None:
             "loss_type",
             ["CrossEntropy", "FocalLoss"],
             index=["CrossEntropy", "FocalLoss"].index(
-                str(existing_cfg.get("loss_type", "CrossEntropy"))
+                str(existing_cfg.get("loss_type", RECOMMENDED_NETWORK_DEFAULTS["loss_type"]))
             ),
             key="gnn_net_loss",
         )
@@ -25573,8 +25786,8 @@ def _render_network_tab() -> None:
             key="gnn_net_lambda_mode",
         )
 
-    focal_gamma = float(existing_cfg.get("focal_gamma", 2.0))
-    focal_alpha = float(existing_cfg.get("focal_alpha", 0.75))
+    focal_gamma = float(existing_cfg.get("focal_gamma", RECOMMENDED_NETWORK_DEFAULTS["focal_gamma"]))
+    focal_alpha = float(existing_cfg.get("focal_alpha", RECOMMENDED_NETWORK_DEFAULTS["focal_alpha"]))
     if loss_type == "FocalLoss":
         col_fg, col_fa = st.columns(2)
         with col_fg:

@@ -165,12 +165,22 @@ N_TRIALS = 30  #100
 NUM_EPOCHS_OPTUNA = 10 #50 epoch por cada prueba
 #EARLY_STOPPING_EPOCH_OPTUNA = 10
 
-# NeighborLoader
+# NeighborLoader — fanout asimétrico por tipo de arista.
+# Razonamiento sobre el grafo actual (4 pórticos en cadena, dt_feat=1min):
+#   - temporal: degree real ≈ 1 → cualquier valor satura, dejamos amplio.
+#   - spatial / spatial_back: solo 4 pórticos → 3 vecinos cubren todo.
+# 2 capas (no 3) para minimizar oversmoothing con clase rara (~0.3%).
 BATCH_SIZE = 512
 NUM_NEIGHBORS = {
-    ('pm', 'spatial', 'pm'): [10, 5, 5],
-    ('pm', 'temporal', 'pm'): [10, 5, 5],
-} #2 niveles (Recordar desvanecimiento de la información con la profundidad.)
+    ('pm', 'temporal',     'pm'): [25, 25],
+    ('pm', 'spatial',      'pm'): [3, 3],
+    ('pm', 'spatial_back', 'pm'): [3, 3],
+}
+
+# Override explícito post-Optuna. Si NO es None, sustituye best_params['num_neighbors']
+# después de cargar/buscar hiperparámetros. Útil para fijar el fanout sin re-buscar.
+# Acepta: lista plana, dict por tuple/relation-name, o JSON string.
+NUM_NEIGHBORS_OVERRIDE = None
 
 TRAIN_RATIO = 70
 VAL_RATIO = 15

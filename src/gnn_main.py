@@ -64,7 +64,7 @@ from src.graphsmote import (RelEdgeGen,train_z2x_decoders,augment_graph_offline_
 from src.imgagn import ImGAGNConfig, train_imgagn
 from src.optimizers import get_optimizer_cls
 from src.config import (SEED,DT_MINUTES,MAX_EPOCHS,EARLY_STOPPING_PATIENCE,EARLY_STOPPING_MIN_DELTA,RESULTADOS_DIR,
-                        BATCH_SIZE,NUM_NEIGHBORS,N_TRIALS,DEBUG,NUM_EPOCHS_OPTUNA,ACCUMULATION_STEPS,
+                        BATCH_SIZE,NUM_NEIGHBORS,NUM_NEIGHBORS_OVERRIDE,N_TRIALS,DEBUG,NUM_EPOCHS_OPTUNA,ACCUMULATION_STEPS,
                         GRAPHSMOTE_MODE, TARGET_POS_RATIO,
                         GRAPHSMOTE_K, PRETRAIN_EDGE_EPOCHS, SMOTE_EVERY_N_EPOCHS,
                         GS_SEED, SAVE_AUG_GRAPH_PATH, DECODER_EPOCHS, F_BETA_THRESHOLD, XAI,
@@ -293,6 +293,7 @@ def _build_gnn_model(
     use_residual: bool = False,
     use_relation_self_loops: bool = True,
     require_temporal_head: bool = False,
+    edge_types=None,
 ):
     variant_cfg = _parse_gnn_variant(gnn_variant)
     model_kwargs = dict(
@@ -308,6 +309,7 @@ def _build_gnn_model(
         aggr2=aggr2,
         use_residual=bool(use_residual),
         use_relation_self_loops=bool(use_relation_self_loops),
+        edge_types=tuple(tuple(et) for et in edge_types) if edge_types is not None else None,
     )
 
     if variant_cfg["encoder_kind"] == "edge_aware":
@@ -678,10 +680,17 @@ def _resolve_num_neighbors(value, default_value, edge_types) -> dict:
     if isinstance(parsed, dict):
         fallback = _pick_default(default_value, [15, 10])
         default_profile = _pick_default(parsed, fallback)
-        return {
-            edge_type: _normalize_profile(parsed.get(edge_type), default_profile)
-            for edge_type in edge_types
-        }
+        out = {}
+        for edge_type in edge_types:
+            prof = parsed.get(edge_type)
+            # Fallback: lookup por nombre de relación (edge_type[1]) para soportar
+            # dicts con claves string como {'temporal': [...], 'spatial': [...]}.
+            # Esto permite que el perfil 'asymmetric' de Optuna sobreviva el roundtrip
+            # a CSV (donde las tuplas se pierden) usando JSON con claves string.
+            if prof is None and isinstance(edge_type, tuple) and len(edge_type) >= 2:
+                prof = parsed.get(edge_type[1])
+            out[edge_type] = _normalize_profile(prof, default_profile)
+        return out
     fallback = _pick_default(default_value, [15, 10])
     return {edge_type: fallback for edge_type in edge_types}
 
@@ -1081,6 +1090,7 @@ def run_gnn_anomaly_pipeline(loaded_obj):
         use_residual=_safe_bool(meta.get("use_residual", arch.get("use_residual", False))),
         use_relation_self_loops=_safe_bool(meta.get("use_relation_self_loops"), True),
         require_temporal_head=_variant_has_temporal_head(chosen_gnn_variant),
+        edge_types=tuple(data.edge_types) if hasattr(data, 'edge_types') else None,
     )
 
     # Cargar pesos (elige el modelo correspondiente a la variante seleccionada)
@@ -2580,6 +2590,20 @@ def run_gat_training(
         best_params.get("lr_scheduler", best_params.get("lr_scheduler_choice", "one_cycle"))
     )
 
+    # Override explícito de num_neighbors. Si NUM_NEIGHBORS_OVERRIDE está definido
+    # en config.py, sobrescribe la elección de Optuna / valor cargado desde CSV.
+    # Acepta lista plana, dict con tuple/string keys, o JSON string;
+    # _resolve_num_neighbors normaliza el formato más adelante.
+    if NUM_NEIGHBORS_OVERRIDE is not None:
+        if isinstance(NUM_NEIGHBORS_OVERRIDE, dict):
+            best_params["num_neighbors"] = json.dumps(
+                {(k if isinstance(k, str) else (k[1] if isinstance(k, tuple) and len(k) >= 2 else str(k))): v
+                 for k, v in NUM_NEIGHBORS_OVERRIDE.items()}
+            )
+        else:
+            best_params["num_neighbors"] = NUM_NEIGHBORS_OVERRIDE
+        logger.info(f"NUM_NEIGHBORS_OVERRIDE aplicado: {best_params['num_neighbors']}")
+
     if smote_num_neighbors is None:
         smote_num_neighbors = best_params.get("smote_num_neighbors")
     if smote_num_neighbors is None:
@@ -2756,6 +2780,7 @@ def run_gat_training(
         use_residual=_safe_bool(best_params.get("use_residual"), False),
         use_relation_self_loops=_safe_bool(best_params.get("use_relation_self_loops"), True),
         require_temporal_head=_variant_has_temporal_head(gnn_variant),
+        edge_types=tuple(data.edge_types) if hasattr(data, 'edge_types') else None,
     )
     temporal_module = getattr(model, 'temporal_head', None)
 
@@ -2886,7 +2911,8 @@ def run_gat_training(
 
     loss_type = best_params.get('loss_type', 'CrossEntropy')
     if loss_type == 'FocalLoss':
-        alpha_val = [1 - best_params.get('focal_alpha', 0.25), best_params.get('focal_alpha', 0.25)]
+        # Default 0.95 calibrado para clase rara (~0.3%): peso fuerte a la clase positiva.
+        alpha_val = [1 - best_params.get('focal_alpha', 0.95), best_params.get('focal_alpha', 0.95)]
         if use_graphsmote:
             alpha_val = None
             logger.info("GraphSMOTE is active, so alpha weighting for FocalLoss is disabled.")
@@ -2903,8 +2929,11 @@ def run_gat_training(
             y_train = data['pm'].y[data['pm'].train_mask]
             counts = torch.bincount(y_train)
             if counts.numel() > 1:
-                weight = (1.0 / counts.float())
-                logger.info(f"Class weighting enabled for CrossEntropyLoss. Weights: {weight.cpu().numpy()}")
+                # Tempered class weights: sqrt(1/counts) en lugar de 1/counts.
+                # Con 0.3% positivos el ratio crudo es ~333× y desestabiliza
+                # gradientes; sqrt lo baja a ~18× sin perder señal de balance.
+                weight = (1.0 / counts.float()).sqrt()
+                logger.info(f"Class weighting (tempered sqrt) enabled for CE. Weights: {weight.cpu().numpy()}")
         else:
             reason = "GraphSMOTE active" if use_graphsmote else "ImGAGN-augmented graph detected"
             logger.info(f"Class weighting for CrossEntropyLoss disabled ({reason}).")
@@ -4049,20 +4078,27 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
 
         # --- Espacio de búsqueda de hiperparámetros ---
 
-        # Arquitectura
-        hidden_channels = trial.suggest_int('hidden_channels', 32, 128, step=32)
-        num_heads = trial.suggest_int('num_heads', 2, 8, step=2)
-        dropout = trial.suggest_float('dropout', 0.05, 0.6)
-        num_layers = trial.suggest_int('num_layers', 2, 5)
+        # Arquitectura — rangos calibrados para clase rara (~0.3%):
+        #   hidden 64-128: capacidad razonable sin overfit en ~258 positivos
+        #   heads 4-8:     atención multi-cabeza efectiva
+        #   layers 2-3:    evita oversmoothing (clase rara se diluye con +profundidad)
+        #   dropout 0.1-0.3: rango clásico, descarta valores patológicos
+        hidden_channels = trial.suggest_int('hidden_channels', 64, 128, step=32)
+        num_heads = trial.suggest_int('num_heads', 4, 8, step=2)
+        dropout = trial.suggest_float('dropout', 0.1, 0.3)
+        num_layers = trial.suggest_int('num_layers', 2, 3)
         aggr1 = trial.suggest_categorical('aggr1', ['sum', 'mean', 'max'])
         aggr2 = trial.suggest_categorical('aggr2', ['sum', 'mean', 'max'])
         use_checkpointing_flag = trial.suggest_categorical('use_checkpointing', [False, True])
 
         neighbor_candidates = {
-            'compact': [15, 10],
-            'focused': [10, 5],
-            'broad': [25, 15, 10],
-            'wide': [30, 20],
+            'compact':    [15, 10],
+            'focused':    [10, 5],
+            'broad':      [25, 15, 10],
+            'wide':       [30, 20],
+            # Fanout asimétrico por tipo de arista (claves string =
+            # nombre de relación; _resolve_num_neighbors mapea a tuple).
+            'asymmetric': {'temporal': [25, 25], 'spatial': [3, 3], 'spatial_back': [3, 3]},
         }
         neighbor_choice = trial.suggest_categorical('num_neighbors_choice', list(neighbor_candidates.keys()))
         neighbor_profile = neighbor_candidates[neighbor_choice]
@@ -4147,7 +4183,10 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             smote_every_n_epochs = SMOTE_EVERY_N_EPOCHS
 
         batch_size_candidate = trial.suggest_int('batch_size', 512, 4096, step=512)
-        trial.set_user_attr('num_neighbors', neighbor_profile)
+        # Si el perfil es dict, serializar como JSON para sobrevivir CSV roundtrip
+        # (pandas convierte dicts a repr Python con comillas simples y json.loads falla).
+        nb_attr = json.dumps(neighbor_profile) if isinstance(neighbor_profile, dict) else neighbor_profile
+        trial.set_user_attr('num_neighbors', nb_attr)
         trial.set_user_attr('use_checkpointing', use_checkpointing_flag)
 
         # --- Construcción del Modelo ---
@@ -4173,6 +4212,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             use_residual=use_residual,
             use_relation_self_loops=use_relation_self_loops,
             require_temporal_head=_variant_has_temporal_head(gnn_variant),
+            edge_types=tuple(data.edge_types) if hasattr(data, 'edge_types') else None,
         )
         temporal_module = getattr(model, 'temporal_head', None)
 
@@ -4189,8 +4229,15 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
         if loss_type == 'FocalLoss':
             alpha_val = None
             if not use_graphsmote_search:
-                focal_alpha = trial.suggest_float('focal_alpha', 0.5, 0.95) # Alpha for the positive class
-                alpha_val = [1 - focal_alpha, focal_alpha]
+                # Para clase rara (~0.3%) el alpha óptimo de la clase positiva
+                # vive cerca de 1. Muestreamos (1-alpha) log-uniform sobre
+                # [1e-3, 3e-1] para cubrir bien la cola: focal_alpha ∈ [0.7, 0.999].
+                focal_alpha_complement = trial.suggest_float(
+                    'focal_alpha_complement', 1e-3, 3e-1, log=True
+                )
+                focal_alpha = 1.0 - focal_alpha_complement
+                trial.set_user_attr('focal_alpha', focal_alpha)
+                alpha_val = [focal_alpha_complement, focal_alpha]
             criterion = FocalLoss(gamma=trial.suggest_float('focal_gamma', 1.0, 3.0), alpha=alpha_val)
         else: # CrossEntropy
             weight = None
@@ -4198,7 +4245,10 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
                 y_train = data['pm'].y[data['pm'].train_mask]
                 counts = torch.bincount(y_train)
                 if counts.numel() > 1:
-                    weight = (1.0 / counts.float()).to(device)
+                    # Tempered class weights: sqrt(1/counts) en lugar de 1/counts.
+                    # Con 0.3% positivos el ratio crudo es ~333× y desestabiliza
+                    # gradientes; sqrt lo baja a ~18× sin perder señal de balance.
+                    weight = (1.0 / counts.float()).sqrt().to(device)
             criterion = torch.nn.CrossEntropyLoss(weight=weight)
 
         # --- Preparación para el loop de entrenamiento ---
@@ -4206,7 +4256,9 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
         train_graph = base_graph
         z2x_decoders = train_z2x_decoders(model, base_graph, device=device, epochs=DECODER_EPOCHS) if use_graphsmote_search else None
         
-        num_neighbors_dict = {edge_type: neighbor_profile for edge_type in train_graph.edge_types}
+        # _resolve_num_neighbors maneja perfiles list (compact/focused/...) y dict
+        # (asymmetric, con claves string mapeadas a tuple por nombre de relación).
+        num_neighbors_dict = _resolve_num_neighbors(neighbor_profile, NUM_NEIGHBORS, train_graph.edge_types)
         train_loader = NeighborLoader(
             train_graph.cpu(),
             input_nodes=('pm', train_graph['pm'].train_mask),
@@ -5036,6 +5088,7 @@ def run_gat_testing(loaded_obj):
         use_residual=_safe_bool(best_params.get("use_residual"), False),
         use_relation_self_loops=_safe_bool(best_params.get("use_relation_self_loops"), True),
         require_temporal_head=_variant_has_temporal_head(gnn_variant),
+        edge_types=tuple(data.edge_types) if hasattr(data, 'edge_types') else None,
     )
 
     # 4. Cargar el estado del modelo entrenado
