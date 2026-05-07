@@ -12,12 +12,32 @@ def main(set_page_config: bool = False, show_exit_button: bool = False) -> None:
     st.markdown("Sync your local code with the remote GitHub repository.")
     
     logs = [] # Initialize logs to avoid UnboundLocalError
+    was_git_repo = git_sync.is_git_repo()
 
+    st.subheader("Actualizar repo local")
+    st.caption(
+        "Descarga la base de código pública desde GitHub por HTTPS y sobrescribe "
+        "los cambios locales de código. Las carpetas de datos/salidas ignoradas se preservan."
+    )
+    if st.button("Actualizar repo local", type="primary", width="stretch"):
+        st.session_state["sync_logs"] = []
+        with st.spinner("Actualizando repo local desde GitHub..."):
+            success, message = git_sync.update_local_repo_from_github()
+
+        if success:
+            st.success(message)
+            if not was_git_repo:
+                time.sleep(1)
+                st.rerun()
+        else:
+            st.error(message)
+
+    st.divider()
 
     # Verificar si es un repo git
-    if not git_sync.is_git_repo():
+    if not was_git_repo:
         st.error("⚠️ La carpeta actual NO es un repositorio Git.")
-        st.info("Configura la URL remota para inicializar y descargar el código.")
+        st.info("Usa “Actualizar repo local” para inicializar automáticamente y descargar el código oficial.")
         
         with st.expander("Inicializar Repositorio", expanded=True):
             remote_url = st.text_input("URL del Repositorio Remoto (e.g., git@github.com:user/repo.git)")

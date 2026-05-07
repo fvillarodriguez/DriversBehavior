@@ -14,6 +14,19 @@ from pathlib import Path
 from typing import Iterable, List, Tuple, Optional, Generator
 
 GITHUB_FILE_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_GITHUB_REPO_URL = "https://github.com/fvillarodriguez/DriversBehavior.git"
+DEFAULT_GITHUB_BRANCH = "main"
+LOCAL_UPDATE_CLEAN_EXCLUDES = (
+    "Datos/",
+    "Resultados/",
+    "simulación/",
+    "simulación/",
+    "docs/",
+    "NLP/",
+    "DRIFT/",
+    ".venv/",
+    "venv/",
+)
 
 # Códigos de escape ANSI para colores
 class Colors:
@@ -88,6 +101,125 @@ def run_command(command: List[str], description: str) -> Tuple[bool, str]:
         
     return success, "\n".join(logs)
 
+
+def _run_quiet_git(args: List[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+
+def _format_git_error(action: str, result: subprocess.CompletedProcess[str]) -> str:
+    detail = "\n".join(
+        part.strip()
+        for part in (result.stderr, result.stdout)
+        if part and part.strip()
+    )
+    if len(detail) > 600:
+        detail = f"{detail[:600]}..."
+    if detail:
+        return f"{action}: {detail}"
+    return f"{action}: Git terminó con código {result.returncode}."
+
+
+def _is_git_work_tree(repo_dir: Path) -> bool:
+    result = _run_quiet_git(["rev-parse", "--show-toplevel"], repo_dir)
+    if result.returncode != 0:
+        return False
+
+    try:
+        return Path(result.stdout.strip()).resolve() == repo_dir.resolve()
+    except OSError:
+        return False
+
+
+def _clean_untracked_nonignored(repo_dir: Path) -> Tuple[bool, str]:
+    command = ["clean", "-ffd"]
+    for pattern in LOCAL_UPDATE_CLEAN_EXCLUDES:
+        command.extend(["-e", pattern])
+    command.extend(["--", "."])
+
+    result = _run_quiet_git(command, repo_dir)
+    if result.returncode != 0:
+        return False, _format_git_error("No se pudo limpiar archivos locales no versionados", result)
+    return True, ""
+
+
+def _set_origin_url(repo_dir: Path, remote_url: str) -> Tuple[bool, str]:
+    current = _run_quiet_git(["remote", "get-url", "origin"], repo_dir)
+    if current.returncode == 0:
+        result = _run_quiet_git(["remote", "set-url", "origin", remote_url], repo_dir)
+        action = "No se pudo actualizar el remoto origin"
+    else:
+        result = _run_quiet_git(["remote", "add", "origin", remote_url], repo_dir)
+        action = "No se pudo configurar el remoto origin"
+
+    if result.returncode != 0:
+        return False, _format_git_error(action, result)
+    return True, ""
+
+
+def update_local_repo_from_github(
+    repo_dir: Optional[Path] = None,
+    remote_url: str = DEFAULT_GITHUB_REPO_URL,
+    branch: str = DEFAULT_GITHUB_BRANCH,
+) -> Tuple[bool, str]:
+    """
+    Sobrescribe la copia local con la rama pública de GitHub usando HTTPS.
+
+    La descarga no depende de origin ni de claves SSH. Los archivos no
+    versionados que no estén ignorados se eliminan; las raíces de datos/salidas
+    se preservan explícitamente además de las reglas de .gitignore vigentes.
+    """
+    target_dir = Path(repo_dir).resolve() if repo_dir is not None else Path.cwd().resolve()
+    selected_branch = branch.strip()
+
+    if not target_dir.exists() or not target_dir.is_dir():
+        return False, f"La carpeta del proyecto no existe: {target_dir}"
+    if not remote_url.strip():
+        return False, "La URL remota está vacía."
+    if not selected_branch:
+        return False, "La rama remota está vacía."
+
+    try:
+        if not _is_git_work_tree(target_dir):
+            result = _run_quiet_git(["init"], target_dir)
+            if result.returncode != 0:
+                return False, _format_git_error("No se pudo inicializar Git en la carpeta local", result)
+
+        refspec = f"+refs/heads/{selected_branch}:refs/remotes/origin/{selected_branch}"
+        fetch = _run_quiet_git(["fetch", "--prune", remote_url, refspec], target_dir)
+        if fetch.returncode != 0:
+            return False, _format_git_error("No se pudo descargar la base de código desde GitHub", fetch)
+
+        success, message = _set_origin_url(target_dir, remote_url)
+        if not success:
+            return False, message
+
+        success, message = _clean_untracked_nonignored(target_dir)
+        if not success:
+            return False, message
+
+        remote_ref = f"refs/remotes/origin/{selected_branch}"
+        reset = _run_quiet_git(["reset", "--hard", remote_ref], target_dir)
+        if reset.returncode != 0:
+            return False, _format_git_error("No se pudo sobrescribir la copia local", reset)
+
+        checkout = _run_quiet_git(["checkout", "-B", selected_branch, remote_ref], target_dir)
+        if checkout.returncode != 0:
+            return False, _format_git_error("No se pudo activar la rama local actualizada", checkout)
+
+        success, message = _clean_untracked_nonignored(target_dir)
+        if not success:
+            return False, message
+
+        return True, "Repositorio local actualizado desde GitHub."
+    except Exception as exc:
+        return False, f"Error inesperado al actualizar el repositorio local: {exc}"
+
 def check_git_status() -> bool:
     try:
         result = subprocess.run(
@@ -112,7 +244,7 @@ def has_staged_changes() -> bool:
         return False
 
 def is_git_repo() -> bool:
-    return Path(".git").is_dir()
+    return _is_git_work_tree(Path.cwd())
 
 
 def get_tracked_ignored_paths() -> List[str]:
