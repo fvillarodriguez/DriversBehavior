@@ -11,7 +11,13 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.gat_model import HeteroGAT
-from src.graphsmote import smote_nodes, Z2XDecoders
+from src.graphsmote import (
+    _smote_in_z_space,
+    Z2XDecoders,
+    RelEdgeGen,
+    evaluate_edge_generator_auc,
+    evaluate_embedding_separability,
+)
 from src.graph_builder_app import (
     _network_config_to_hparams,
     _compute_n_syn_from_ratio,
@@ -79,33 +85,141 @@ def test_gat_model_forward(dummy_graph_data):
 def test_smote_nodes_logic():
     """
     Test Step 2: Verify GraphSMOTE Node Generation
-    Goal: Verify synthetic node generation logic works for imbalanced classes.
+    Goal: Verify synthetic node generation logic works for imbalanced classes,
+    using the canonical helper (_smote_in_z_space) with α~U[0,1] (Eq. 4 del paper).
     """
-    # Create synthetic imbalanced data
     # Class 0: 100 samples
     # Class 1: 5 samples (Minority)
     z_maj = torch.randn(100, 10)
-    z_min = torch.randn(5, 10) + 5 # Shift mean to make them distinct
-    
+    z_min = torch.randn(5, 10) + 5  # shift mean to make them distinct
+
     z = torch.cat([z_maj, z_min], dim=0)
     y = torch.cat([torch.zeros(100), torch.ones(5)], dim=0).long()
-    
+
     n_new = 10
     k_neighbors = 2
-    
-    syn_features, syn_labels, _ = smote_nodes(
-        z, y, 
-        minority_class=1, 
-        k=k_neighbors, 
-        n_samples=n_new, 
-        random_state=42
+
+    rng = np.random.RandomState(42)
+    syn_features, syn_labels = _smote_in_z_space(
+        z, y,
+        minority_class=1,
+        k=k_neighbors,
+        n_samples=n_new,
+        rng=rng,
+        return_renormalized=True,
     )
-    
-    # Assertions
+
     assert syn_features.shape == (n_new, 10)
     assert syn_labels.shape == (n_new,)
-    assert (syn_labels == 1).all() # All should be minority class
+    assert (syn_labels == 1).all()
     assert torch.isfinite(syn_features).all()
+    # Re-normalized: should be on the unit hypersphere (within fp tolerance)
+    norms = syn_features.norm(p=2, dim=1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+
+def test_smote_in_z_space_handles_too_few_minority():
+    """If minority has fewer than 2 samples, helper returns empty tensors gracefully."""
+    z = torch.randn(50, 8)
+    y = torch.zeros(50, dtype=torch.long)
+    y[0] = 1  # solo 1 minoritario
+
+    rng = np.random.RandomState(0)
+    syn_z, syn_y = _smote_in_z_space(
+        z, y, minority_class=1, k=3, n_samples=10, rng=rng
+    )
+    assert syn_z.numel() == 0
+    assert syn_y.numel() == 0
+
+
+def test_edge_generator_auc_separates_real_from_random():
+    """RelEdgeGen entrenado a mano sobre embeddings clusterizados debe dar AUC > 0.8."""
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    n = 80
+    d = 16
+    # Dos clusters bien separados; aristas reales solo dentro de un cluster.
+    z_cluster_a = torch.nn.functional.normalize(torch.randn(n // 2, d), p=2, dim=1)
+    z_cluster_b = torch.nn.functional.normalize(torch.randn(n // 2, d) + 5.0, p=2, dim=1)
+    z = torch.cat([z_cluster_a, z_cluster_b], dim=0)
+    z_dict = {'pm': z}
+
+    # Aristas reales: dentro de cluster A (todos los pares (i, i+1))
+    edges = []
+    for i in range(n // 2 - 1):
+        edges.append([i, i + 1])
+    ei = torch.tensor(edges, dtype=torch.long).t()
+    edge_index_dict = {('pm', 'spatial', 'pm'): ei}
+
+    # Inicializar S como I/sqrt(d) y entrenar 100 pasos contra negativos
+    rels = list(edge_index_dict.keys())
+    edge_gen = RelEdgeGen({'pm': d}, rels)
+    opt = torch.optim.Adam(edge_gen.parameters(), lr=0.05)
+    bce = torch.nn.BCEWithLogitsLoss()
+    key = 'pm:spatial:pm'
+    for _ in range(100):
+        S = edge_gen.S[key]
+        pos = (z[ei[0]] @ S * z[ei[1]]).sum(dim=1)
+        neg_dst = torch.randint(0, n, (ei.size(1),))
+        neg = (z[ei[0]] @ S * z[neg_dst]).sum(dim=1)
+        loss = bce(torch.cat([pos, neg]), torch.cat([torch.ones_like(pos), torch.zeros_like(neg)]))
+        opt.zero_grad(); loss.backward(); opt.step()
+
+    report = evaluate_edge_generator_auc(
+        edge_gen, z_dict, edge_index_dict, holdout_frac=0.5, num_neg=2, min_edges=1
+    )
+    macro = report.get('_macro')
+    assert macro is not None, f"esperaba métricas macro, recibí {report}"
+    assert macro['auc'] > 0.8, f"AUC={macro['auc']:.3f} es muy bajo para datos separables"
+
+
+def test_embedding_separability_probe_returns_sane_metrics():
+    """Probe sobre embeddings sintéticos linealmente separables debe dar AUPRC alto."""
+    torch.manual_seed(0)
+    np.random.seed(0)
+    n = 100
+    d = 8
+
+    z_neg = torch.randn(n, d)
+    z_pos = torch.randn(n, d) + 4.0
+    z = torch.cat([z_neg, z_pos], dim=0)
+    y = torch.cat([torch.zeros(n), torch.ones(n)], dim=0).long()
+
+    train_mask = torch.zeros(2 * n, dtype=torch.bool)
+    val_mask = torch.zeros(2 * n, dtype=torch.bool)
+    train_mask[: int(0.8 * n)] = True            # 80 negativos
+    train_mask[n : n + int(0.8 * n)] = True       # 80 positivos
+    val_mask[int(0.8 * n) : n] = True             # 20 negativos
+    val_mask[n + int(0.8 * n) :] = True           # 20 positivos
+
+    data = HeteroData()
+    data['pm'].x = z
+    data['pm'].y = y
+    data['pm'].train_mask = train_mask
+    data['pm'].val_mask = val_mask
+
+    out = evaluate_embedding_separability({'pm': z}, data, node_type='pm')
+    assert out is not None
+    assert out['val_auprc'] > 0.8
+    assert out['val_roc_auc'] > 0.8
+    assert out['n_train'] == int(train_mask.sum().item())
+    assert out['n_val'] == int(val_mask.sum().item())
+
+
+def test_embedding_separability_probe_returns_none_when_unaligned():
+    """Si z no está alineado con todos los nodos, el probe debe salir limpio."""
+    data = HeteroData()
+    n = 50
+    data['pm'].x = torch.randn(n, 4)
+    data['pm'].y = torch.cat([torch.zeros(n // 2), torch.ones(n // 2)]).long()
+    data['pm'].train_mask = torch.tensor([True] * (n // 2) + [False] * (n // 2))
+    data['pm'].val_mask = ~data['pm'].train_mask
+
+    # z solo trae train (ej. compute_train_embeddings)
+    z_train_only = torch.randn(n // 2, 4)
+    out = evaluate_embedding_separability({'pm': z_train_only}, data, node_type='pm')
+    assert out is None
 
 def test_compute_n_syn_from_ratio():
     """

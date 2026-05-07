@@ -2922,7 +2922,8 @@ def run_gat_training(
             pretrain_epochs=PRETRAIN_EDGE_EPOCHS,
             optimizer=torch.optim.Adam(edge_gen.parameters(), lr=1e-3),
             criterion=torch.nn.BCEWithLogitsLoss(),
-            writer=writer
+            writer=writer,
+            report_path=os.path.join(z2x_run_dir, "edge_gen_auc.json"),
         )
 
     # 8) Selección de modo GraphSMOTE y preparación de grafos

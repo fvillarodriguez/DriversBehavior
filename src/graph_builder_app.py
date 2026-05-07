@@ -13704,30 +13704,81 @@ def _render_balance_tab() -> None:
                             try:
                                 with open(history_path, "r") as f:
                                     hist_data = json.load(f)
-                                
+
                                 if isinstance(hist_data, list) and len(hist_data) > 0:
                                     df_hist = pd.DataFrame(hist_data)
                                     if "epoch" not in df_hist.columns:
                                         df_hist["epoch"] = list(range(1, len(df_hist) + 1))
-                                    val_series = None
-                                    if "val_loss" in df_hist.columns:
-                                        val_series = pd.to_numeric(df_hist["val_loss"], errors="coerce")
-                                        if val_series.notna().any():
-                                            z2x_summary["best_val_loss"] = float(val_series.min())
-                                            best_idx = int(val_series.idxmin())
-                                            z2x_summary["best_epoch"] = int(df_hist.loc[best_idx, "epoch"])
-                                    if "train_loss" in df_hist.columns:
-                                        train_series = pd.to_numeric(df_hist["train_loss"], errors="coerce")
-                                        if train_series.notna().any():
-                                            z2x_summary["best_train_loss"] = float(train_series.min())
+
+                                    # Convertir todas las columnas numéricas (algunas pueden ser None)
+                                    numeric_cols = [
+                                        "train_loss",
+                                        "val_loss",
+                                        "mixup_loss",
+                                        "val_loss_minority",
+                                        "val_loss_majority",
+                                    ]
+                                    for c in numeric_cols:
+                                        if c in df_hist.columns:
+                                            df_hist[c] = pd.to_numeric(df_hist[c], errors="coerce")
+
+                                    # Resúmenes para tarjetas
+                                    if "val_loss" in df_hist.columns and df_hist["val_loss"].notna().any():
+                                        z2x_summary["best_val_loss"] = float(df_hist["val_loss"].min())
+                                        best_idx = int(df_hist["val_loss"].idxmin())
+                                        z2x_summary["best_epoch"] = int(df_hist.loc[best_idx, "epoch"])
+                                    if "train_loss" in df_hist.columns and df_hist["train_loss"].notna().any():
+                                        z2x_summary["best_train_loss"] = float(df_hist["train_loss"].min())
+                                    if "val_loss_minority" in df_hist.columns and df_hist["val_loss_minority"].notna().any():
+                                        z2x_summary["best_val_loss_minority"] = float(df_hist["val_loss_minority"].min())
+                                    if "val_loss_majority" in df_hist.columns and df_hist["val_loss_majority"].notna().any():
+                                        z2x_summary["best_val_loss_majority"] = float(df_hist["val_loss_majority"].min())
+
                                     df_hist = df_hist.set_index("epoch")
-                                    
-                                    # Mostrar metrics
-                                    best_val = df_hist["val_loss"].min() if "val_loss" in df_hist.columns else None
-                                    if best_val is not None:
-                                        st.metric("Mejor Validation Loss (z→x)", f"{best_val:.6f}")
-                                    
-                                    st.line_chart(df_hist[["train_loss", "val_loss"]])
+
+                                    # Tarjetas de métricas (incluyendo desagregación por clase)
+                                    metric_cols = st.columns(3)
+                                    with metric_cols[0]:
+                                        bv = z2x_summary.get("best_val_loss")
+                                        st.metric("Mejor Val Loss (z→x)", f"{bv:.6f}" if bv is not None else "N/A")
+                                    with metric_cols[1]:
+                                        bvm = z2x_summary.get("best_val_loss_minority")
+                                        st.metric("Mejor Val Loss minoritaria", f"{bvm:.6f}" if bvm is not None else "N/A")
+                                    with metric_cols[2]:
+                                        bvM = z2x_summary.get("best_val_loss_majority")
+                                        st.metric("Mejor Val Loss mayoritaria", f"{bvM:.6f}" if bvM is not None else "N/A")
+
+                                    if (
+                                        z2x_summary.get("best_val_loss_minority") is not None
+                                        and z2x_summary.get("best_val_loss_majority") is not None
+                                    ):
+                                        ratio = z2x_summary["best_val_loss_minority"] / max(
+                                            z2x_summary["best_val_loss_majority"], 1e-12
+                                        )
+                                        if ratio > 5.0:
+                                            st.warning(
+                                                f"La reconstrucción minoritaria es {ratio:.1f}× peor que la mayoritaria. "
+                                                "El decoder no representa bien la región crítica — los `syn_x` "
+                                                "estarán fuera de distribución. Considera entrenar más epochs, "
+                                                "subir mixup_ratio, o revisar la calidad del encoder."
+                                            )
+
+                                    # Curvas principales: train vs val
+                                    main_cols = [c for c in ("train_loss", "val_loss") if c in df_hist.columns]
+                                    if main_cols:
+                                        st.caption("Curvas de entrenamiento vs. validación")
+                                        st.line_chart(df_hist[main_cols])
+
+                                    # Curvas desagregadas por clase
+                                    class_cols = [c for c in ("val_loss_minority", "val_loss_majority") if c in df_hist.columns]
+                                    if class_cols and any(df_hist[c].notna().any() for c in class_cols):
+                                        st.caption("Validación desagregada por clase")
+                                        st.line_chart(df_hist[class_cols])
+
+                                    # Curva de mixup
+                                    if "mixup_loss" in df_hist.columns and df_hist["mixup_loss"].notna().any():
+                                        st.caption("Mixup loss (puntos sintéticos durante el entrenamiento del decoder)")
+                                        st.line_chart(df_hist[["mixup_loss"]])
                                 else:
                                     st.warning("El historial de entrenamiento z→x está vacío o tiene formato incorrecto.")
                             except Exception as e:
@@ -13748,6 +13799,46 @@ def _render_balance_tab() -> None:
                                     "No se encontró historial de entrenamiento z→x. "
                                     "Posiblemente el modelo se entrenó sin GraphSMOTE, o los archivos se movieron."
                                 )
+
+                        # Reporte AUC del Edge Generator (link prediction)
+                        edge_gen_path = os.path.join(z2x_dir, "edge_gen_auc.json")
+                        if os.path.exists(edge_gen_path):
+                            st.markdown("##### RelEdgeGen — link prediction")
+                            try:
+                                with open(edge_gen_path, "r") as f:
+                                    eg_payload = json.load(f)
+                                macro = eg_payload.get("macro") or {}
+                                per_rel = eg_payload.get("per_relation") or {}
+                                cols_eg = st.columns(3)
+                                with cols_eg[0]:
+                                    auc_val = macro.get("auc")
+                                    st.metric(
+                                        "AUC macro (post-pretrain)",
+                                        f"{auc_val:.3f}" if isinstance(auc_val, (int, float)) else "N/A",
+                                    )
+                                with cols_eg[1]:
+                                    ap_val = macro.get("ap")
+                                    st.metric(
+                                        "AP macro",
+                                        f"{ap_val:.3f}" if isinstance(ap_val, (int, float)) else "N/A",
+                                    )
+                                with cols_eg[2]:
+                                    st.metric(
+                                        "# relaciones evaluadas",
+                                        macro.get("n_relations", "N/A"),
+                                    )
+                                if isinstance(auc_val, (int, float)) and auc_val < 0.6:
+                                    st.warning(
+                                        f"AUC macro={auc_val:.3f} < 0.6 — el generador de aristas "
+                                        "no aprendió señal. Los nodos sintéticos quedarán mal "
+                                        "conectados. Sube `PRETRAIN_EDGE_EPOCHS` o `lambda_edge`."
+                                    )
+                                if per_rel:
+                                    df_eg = pd.DataFrame(per_rel).T
+                                    df_eg.index.name = "relación"
+                                    st.dataframe(df_eg, use_container_width=True)
+                            except Exception as e:
+                                st.error(f"Error cargando reporte de edge generator: {e}")
                     else:
                         st.info("Este modelo no fue entrenado con GraphSMOTE activos (z→x no disponible).")
 

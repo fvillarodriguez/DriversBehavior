@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Union, List, Tuple
+from typing import Optional, Union, List, Tuple, Dict
 import random
 import torch
 import torch.nn.functional as F
@@ -21,7 +21,6 @@ from src.config import (
 from src.config import BIDIRECCTION, GRAPHSMOTE_CONECT
 import logging
 from tqdm import tqdm
-from src.smote_cpu_cache import get_knn_cached, simple_smote_from_knn
 logger = logging.getLogger(__name__)
 
 # ============================================================
@@ -307,6 +306,187 @@ def get_embeddings(model, data):
 
     return z_dict
 
+
+# ============================================================
+# Probes de validación de los modelos internos de GraphSMOTE
+# ============================================================
+@torch.no_grad()
+def evaluate_edge_generator_auc(
+    edge_gen,
+    z_dict: Dict[str, torch.Tensor],
+    edge_index_dict,
+    *,
+    holdout_frac: float = 0.1,
+    num_neg: int = 1,
+    seed: int = SEED,
+    min_edges: int = 50,
+) -> Dict[str, Dict[str, float]]:
+    """
+    AUC-ROC y AP de link prediction por relación para el `RelEdgeGen`.
+
+    Para cada relación con >= ``min_edges`` aristas: toma una fracción holdout
+    de positivos, samplea destinos aleatorios como negativos (colisión con
+    aristas reales tiene probabilidad despreciable a las densidades típicas),
+    aplica el score bilineal `z_src^T S_r z_dst` y calcula AUC/AP.
+
+    Devuelve `{'src:rel:dst': {'auc','ap','n_pos','n_neg'}}` y una entrada
+    `'_macro'` con el promedio. Si no hay relaciones evaluables, dict vacío.
+    """
+    try:
+        from sklearn.metrics import roc_auc_score, average_precision_score
+    except Exception as exc:
+        logger.warning(f"[EdgeGen eval] sklearn no disponible: {exc}")
+        return {}
+
+    rng = np.random.RandomState(int(seed))
+    out: Dict[str, Dict[str, float]] = {}
+    aucs, aps = [], []
+
+    for et, ei in edge_index_dict.items():
+        if not isinstance(et, tuple) or len(et) != 3:
+            continue
+        src_t, rel, dst_t = et
+        if src_t not in z_dict or dst_t not in z_dict:
+            continue
+        zs = z_dict[src_t]
+        zd = z_dict[dst_t]
+        if zs.numel() == 0 or zd.numel() == 0:
+            continue
+        E = ei.size(1)
+        if E < int(min_edges):
+            continue
+        key = f"{src_t}:{rel}:{dst_t}"
+        if not hasattr(edge_gen, 'S') or key not in edge_gen.S:
+            continue
+
+        n_holdout = max(1, int(round(E * float(holdout_frac))))
+        perm = rng.permutation(E)[:n_holdout]
+        device = zs.device
+        ei_dev = ei.to(device)
+
+        pos_src = ei_dev[0, perm]
+        pos_dst = ei_dev[1, perm]
+
+        n_neg_total = n_holdout * int(num_neg)
+        neg_src = torch.from_numpy(
+            rng.randint(0, zs.size(0), size=n_neg_total)
+        ).long().to(device)
+        neg_dst = torch.from_numpy(
+            rng.randint(0, zd.size(0), size=n_neg_total)
+        ).long().to(device)
+
+        S = edge_gen.S[key].to(device)
+        pos_logits = torch.sum((zs.index_select(0, pos_src) @ S) * zd.index_select(0, pos_dst), dim=1)
+        neg_logits = torch.sum((zs.index_select(0, neg_src) @ S) * zd.index_select(0, neg_dst), dim=1)
+
+        y_true = np.concatenate(
+            [np.ones(pos_logits.numel(), dtype=np.int64),
+             np.zeros(neg_logits.numel(), dtype=np.int64)]
+        )
+        y_score = np.concatenate(
+            [pos_logits.detach().cpu().numpy(), neg_logits.detach().cpu().numpy()]
+        )
+
+        try:
+            auc = float(roc_auc_score(y_true, y_score))
+            ap = float(average_precision_score(y_true, y_score))
+        except Exception as exc:
+            logger.warning(f"[EdgeGen eval] {key}: no se pudo calcular AUC ({exc})")
+            continue
+
+        out[key] = {
+            'auc': auc,
+            'ap': ap,
+            'n_pos': int(pos_logits.numel()),
+            'n_neg': int(neg_logits.numel()),
+        }
+        aucs.append(auc)
+        aps.append(ap)
+
+    if aucs:
+        out['_macro'] = {
+            'auc': float(sum(aucs) / len(aucs)),
+            'ap': float(sum(aps) / len(aps)),
+            'n_relations': len(aucs),
+        }
+    return out
+
+
+def evaluate_embedding_separability(
+    z_dict: Dict[str, torch.Tensor],
+    data,
+    node_type: str = 'pm',
+    *,
+    seed: int = SEED,
+    max_iter: int = 1000,
+) -> Optional[Dict[str, float]]:
+    """
+    Sondea la separabilidad lineal del encoder. Ajusta una LogisticRegression
+    sobre embeddings de TRAIN y reporta F1 (macro y minoritaria), AUPRC y
+    ROC-AUC sobre VAL. Si los embeddings codifican señal de la clase, este
+    probe es alto incluso sin la cabeza GAT — útil para aislar si el cuello de
+    botella está en el encoder o en el clasificador.
+
+    Devuelve None si faltan máscaras, si no hay dos clases en train+val o si
+    el `z_dict[node_type]` no está alineado con todos los nodos del tipo.
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import f1_score, average_precision_score, roc_auc_score
+    except Exception as exc:
+        logger.warning(f"[Embed probe] sklearn no disponible: {exc}")
+        return None
+
+    if node_type not in z_dict:
+        return None
+    z_tensor = z_dict[node_type]
+    if z_tensor is None or z_tensor.numel() == 0:
+        return None
+    z = z_tensor.detach().cpu().to(torch.float32).numpy()
+
+    store = data[node_type]
+    if 'y' not in store or 'train_mask' not in store or 'val_mask' not in store:
+        return None
+    y = store.y.cpu().numpy().astype(int)
+    train_mask = store.train_mask.cpu().numpy().astype(bool)
+    val_mask = store.val_mask.cpu().numpy().astype(bool)
+
+    if z.shape[0] != y.shape[0]:
+        # z viene filtrado a TRAIN (p.ej. compute_train_embeddings); este probe
+        # requiere alineación completa para usar val_mask. Avisamos y salimos.
+        logger.info(
+            f"[Embed probe] z[{node_type}]={z.shape[0]} no coincide con y={y.shape[0]}; "
+            "el probe necesita embeddings de todos los nodos."
+        )
+        return None
+
+    z_tr, y_tr = z[train_mask], y[train_mask]
+    z_va, y_va = z[val_mask], y[val_mask]
+
+    if len(np.unique(y_tr)) < 2 or len(np.unique(y_va)) < 2:
+        return None
+    if z_tr.shape[0] < 5 or z_va.shape[0] < 5:
+        return None
+
+    clf = LogisticRegression(
+        class_weight='balanced',
+        max_iter=int(max_iter),
+        random_state=int(seed),
+    )
+    clf.fit(z_tr, y_tr)
+    proba_va = clf.predict_proba(z_va)[:, 1]
+    pred = (proba_va >= 0.5).astype(int)
+
+    return {
+        'val_f1_macro': float(f1_score(y_va, pred, average='macro', zero_division=0)),
+        'val_f1_minority': float(f1_score(y_va, pred, pos_label=1, zero_division=0)),
+        'val_auprc': float(average_precision_score(y_va, proba_va)),
+        'val_roc_auc': float(roc_auc_score(y_va, proba_va)),
+        'n_train': int(z_tr.shape[0]),
+        'n_val': int(z_va.shape[0]),
+    }
+
+
 # ============================================================
 # 3) Decodificadores z->x por tipo (entrenados una sola vez)
 # ============================================================
@@ -356,19 +536,67 @@ def train_z2x_decoders(
     show_progress: bool = True, #False para mostrar resultados de cada epoch de entrenamiento en la consola
     num_neighbors=NUM_NEIGHBORS,
     progress_callback: Optional[callable] = None,
+    *,
+    minority_classes: Optional[Dict[str, int]] = None,
+    use_mixup: bool = True,
+    mixup_k: int = 5,
+    mixup_ratio: float = 1.0,
+    mixup_weight: float = 1.0,
 ):
     """
     Entrena un decodificador z->x por tipo usando z extraído en modo eval.
+
+    Correcciones respecto al diseño anterior:
+    - **Excluye nodos sintéticos previos** (`is_synthetic`) del set de entrenamiento
+      y validación para evitar que el decoder aprenda de sus propias predicciones.
+    - **Augmentación tipo mixup** sobre vecinos minoritarios: en cada época se
+      construyen pares interpolados `(z_mix, x_mix)` con `α~U[0,1]` y se entrena
+      al decoder explícitamente sobre puntos del tipo que generará SMOTE. El
+      `z_mix` se L2-normaliza para mantener consistencia con la entrada que el
+      decoder verá en inferencia.
+    - **Validación desagregada por clase** (mayoritaria vs. minoritaria) para
+      diagnosticar la calidad de la reconstrucción donde más importa.
+
+    `minority_classes` es un dict `{ntype: clase_minoritaria}`; por defecto se
+    asume `{'pm': 1}` (convención del pipeline). Pasar `use_mixup=False`
+    desactiva la augmentación.
+
     Guarda pesos por tipo en save_dir y retorna el Z2XDecoders entrenado.
     """
     os.makedirs(save_dir, exist_ok=True)
 
     if device is None:
         device = next(model.parameters()).device
-    
+
     z_dict = get_embeddings_minibatch(
         model, data, num_neighbors=num_neighbors
     )
+
+    # Probe de separabilidad lineal del encoder sobre val (sanity del feature
+    # extractor antes de gastar epochs entrenando el decoder z->x).
+    for ntype in z_dict.keys():
+        if (node_types is not None) and (ntype not in node_types):
+            continue
+        try:
+            probe = evaluate_embedding_separability(z_dict, data, node_type=ntype)
+        except Exception as exc:
+            logger.warning(f"[Z2X] probe de separabilidad falló para '{ntype}': {exc}")
+            probe = None
+        if probe is not None:
+            logger.info(
+                f"[Z2X] separabilidad encoder '{ntype}' (LogReg sobre z): "
+                f"F1_macro={probe['val_f1_macro']:.3f} "
+                f"F1_min={probe['val_f1_minority']:.3f} "
+                f"AUPRC={probe['val_auprc']:.3f} "
+                f"ROC_AUC={probe['val_roc_auc']:.3f} "
+                f"(n_train={probe['n_train']}, n_val={probe['n_val']})"
+            )
+            if probe['val_auprc'] < 0.1 and probe['val_roc_auc'] < 0.6:
+                logger.warning(
+                    f"[Z2X] embeddings de '{ntype}' tienen muy poca señal de clase "
+                    "(AUPRC<0.1 y ROC_AUC<0.6); SMOTE en este espacio probablemente "
+                    "no ayudará. Re-entrena el encoder antes de aumentar."
+                )
 
     # dims por tipo
     dims_per_type = {}
@@ -379,6 +607,9 @@ def train_z2x_decoders(
                 x_dim = data[ntype].x.size(1)
                 dims_per_type[ntype] = (z_dim, x_dim)
 
+    if minority_classes is None:
+        minority_classes = {ntype: 1 for ntype in dims_per_type.keys()}
+
     dec = Z2XDecoders(dims_per_type).to(device)
     opt = torch.optim.AdamW(dec.parameters(), lr=lr, weight_decay=weight_decay)
     crit = torch.nn.SmoothL1Loss() if loss_type == "huber" else torch.nn.MSELoss()
@@ -386,8 +617,11 @@ def train_z2x_decoders(
     # Precompute device tensors and masks per type
     z_all = {}
     x_all = {}
+    y_all = {}
     train_idx = {}
     val_idx = {}
+    minority_train_idx = {}        # subset of train_idx donde y == clase minoritaria
+    mixup_neighbors = {}           # ntype -> (k_eff, nbr_idx tensor [N_min, k_eff])
     has_any_val = False
 
     rng = np.random.RandomState(SEED)
@@ -395,6 +629,10 @@ def train_z2x_decoders(
     for ntype in dims_per_type.keys():
         z_all[ntype] = z_dict[ntype].to(device)
         x_all[ntype] = data[ntype].x.to(device)
+        if 'y' in data[ntype]:
+            y_all[ntype] = data[ntype].y.to(device)
+        else:
+            y_all[ntype] = None
 
         N = x_all[ntype].size(0)
         m_train_base = torch.ones(N, dtype=torch.bool, device=device)
@@ -416,12 +654,64 @@ def train_z2x_decoders(
                 chosen = torch.from_numpy(rng.choice(base_idx.cpu().numpy(), size=n_val, replace=False)).to(device)
                 m_val[chosen] = True
 
+        # Excluir nodos sintéticos previos para evitar feedback loop:
+        # el decoder no debe entrenarse sobre x's que él mismo (o una versión
+        # anterior) produjo en una iteración previa de aumentación.
+        if 'is_synthetic' in data[ntype]:
+            is_synth = data[ntype]['is_synthetic'].to(device)
+            if is_synth.dtype != torch.bool:
+                is_synth = is_synth.bool()
+            n_synth = int(is_synth.sum().item())
+            if n_synth > 0:
+                m_train_base = m_train_base & (~is_synth)
+                m_val = m_val & (~is_synth)
+                logger.info(
+                    f"[Z2X] '{ntype}': excluyendo {n_synth} nodo(s) sintético(s) previo(s)."
+                )
+
         # Ensure disjoint
         m_train = m_train_base & (~m_val)
 
         train_idx[ntype] = torch.nonzero(m_train, as_tuple=True)[0]
         val_idx[ntype] = torch.nonzero(m_val, as_tuple=True)[0]
         has_any_val = has_any_val or (val_idx[ntype].numel() > 0)
+
+        # Subset minoritario y kNN para mixup
+        min_label = minority_classes.get(ntype, None)
+        if (
+            use_mixup
+            and min_label is not None
+            and y_all[ntype] is not None
+            and train_idx[ntype].numel() > 0
+        ):
+            y_train_t = y_all[ntype].index_select(0, train_idx[ntype])
+            min_local = (y_train_t == int(min_label))
+            min_train_idx = train_idx[ntype][min_local]
+            minority_train_idx[ntype] = min_train_idx
+            n_min = int(min_train_idx.numel())
+            if n_min >= 2:
+                k_eff = min(int(mixup_k), n_min - 1)
+                z_min_np = (
+                    z_all[ntype]
+                    .index_select(0, min_train_idx)
+                    .detach()
+                    .cpu()
+                    .to(torch.float32)
+                    .numpy()
+                )
+                nbrs = NearestNeighbors(n_neighbors=k_eff + 1, metric='cosine').fit(z_min_np)
+                nbr_np = nbrs.kneighbors(z_min_np, return_distance=False)[:, 1:]
+                mixup_neighbors[ntype] = (
+                    int(k_eff),
+                    torch.from_numpy(nbr_np).long().to(device),
+                )
+                logger.info(
+                    f"[Z2X] '{ntype}': mixup activo sobre {n_min} minoritarios (k_eff={k_eff})."
+                )
+            else:
+                logger.info(
+                    f"[Z2X] '{ntype}': mixup desactivado (solo {n_min} minoritario(s) en train)."
+                )
 
     best_val = float('inf')
     best_state = None
@@ -437,6 +727,7 @@ def train_z2x_decoders(
         dec.train()
         opt.zero_grad()
         total_train_loss = 0.0
+        total_mixup_loss = 0.0
 
         for ntype in dims_per_type.keys():
             if train_idx[ntype].numel() == 0:
@@ -448,15 +739,50 @@ def train_z2x_decoders(
             loss.backward()
             total_train_loss += float(loss.item())
 
+            # --- Mixup augmentation ---
+            if ntype in mixup_neighbors:
+                k_eff, nbr_idx = mixup_neighbors[ntype]
+                m_idx = minority_train_idx[ntype]
+                n_min = int(m_idx.numel())
+                n_mix = max(1, int(round(mixup_ratio * n_min)))
+                base_np = rng.randint(0, n_min, size=n_mix)
+                nbr_np = rng.randint(0, k_eff, size=n_mix)
+                alpha_np = rng.random_sample(size=n_mix).astype(np.float32)
+
+                base_t = torch.from_numpy(base_np).long().to(device)
+                nbr_t = torch.from_numpy(nbr_np).long().to(device)
+                j_t = nbr_idx[base_t, nbr_t]
+                alpha_t = torch.from_numpy(alpha_np).to(device).unsqueeze(1)
+
+                z_min_full = z_all[ntype].index_select(0, m_idx)
+                x_min_full = x_all[ntype].index_select(0, m_idx)
+                z_a = z_min_full.index_select(0, base_t)
+                z_b = z_min_full.index_select(0, j_t)
+                x_a = x_min_full.index_select(0, base_t)
+                x_b = x_min_full.index_select(0, j_t)
+
+                z_mix = (1.0 - alpha_t) * z_a + alpha_t * z_b
+                z_mix = F.normalize(z_mix, p=2, dim=1, eps=1e-12)
+                x_mix = (1.0 - alpha_t) * x_a + alpha_t * x_b
+
+                xhat_mix = dec.project_one(ntype, z_mix)
+                mloss = float(mixup_weight) * crit(xhat_mix, x_mix)
+                mloss.backward()
+                total_mixup_loss += float(mloss.item())
+
         opt.step()
 
-        # Validation
+        # Validation (total + per-class si aplica)
         total_val_loss = None
+        val_loss_minority = None
+        val_loss_majority = None
         if early_stop and has_any_val:
             dec.eval()
             with torch.no_grad():
                 vloss = 0.0
                 vcount = 0
+                v_min_losses = []
+                v_maj_losses = []
                 for ntype in dims_per_type.keys():
                     if val_idx[ntype].numel() == 0:
                         continue
@@ -466,10 +792,21 @@ def train_z2x_decoders(
                     loss = crit(xhat, x)
                     vloss += float(loss.item())
                     vcount += 1
+
+                    min_label = minority_classes.get(ntype, None)
+                    if min_label is not None and y_all[ntype] is not None:
+                        y_val = y_all[ntype].index_select(0, val_idx[ntype])
+                        min_mask = (y_val == int(min_label))
+                        if min_mask.any():
+                            v_min_losses.append(float(crit(xhat[min_mask], x[min_mask]).item()))
+                        if (~min_mask).any():
+                            v_maj_losses.append(float(crit(xhat[~min_mask], x[~min_mask]).item()))
                 if vcount > 0:
                     total_val_loss = vloss / vcount
-                else:
-                    total_val_loss = None
+                if v_min_losses:
+                    val_loss_minority = sum(v_min_losses) / len(v_min_losses)
+                if v_maj_losses:
+                    val_loss_majority = sum(v_maj_losses) / len(v_maj_losses)
 
             # Early stopping check
             if total_val_loss is not None:
@@ -485,19 +822,36 @@ def train_z2x_decoders(
         history.append({
             "epoch": epoch,
             "train_loss": total_train_loss,
-            "val_loss": total_val_loss if total_val_loss is not None else None
+            "mixup_loss": total_mixup_loss if total_mixup_loss > 0.0 else None,
+            "val_loss": total_val_loss if total_val_loss is not None else None,
+            "val_loss_minority": val_loss_minority,
+            "val_loss_majority": val_loss_majority,
         })
 
         if (log_every is not None) and (log_every > 0) and (epoch % log_every == 0):
             if show_progress and hasattr(epoch_iter, 'set_postfix'):
+                postfix = {
+                    'train': f"{total_train_loss:.4f}",
+                }
+                if total_mixup_loss > 0.0:
+                    postfix['mix'] = f"{total_mixup_loss:.4f}"
                 if total_val_loss is not None:
-                    epoch_iter.set_postfix({
-                        'train': f"{total_train_loss:.4f}",
-                        'val': f"{total_val_loss:.4f}",
-                        'best': f"{best_val if best_val!=float('inf') else float('nan'):.4f}"
-                    })
-                else:
-                    logger.info(f"[Z2X] Epoch {epoch:03d}/{epochs} | train_loss={total_train_loss:.4f}")
+                    postfix['val'] = f"{total_val_loss:.4f}"
+                    postfix['best'] = (
+                        f"{best_val:.4f}" if best_val != float('inf') else "nan"
+                    )
+                if val_loss_minority is not None:
+                    postfix['val_min'] = f"{val_loss_minority:.4f}"
+                epoch_iter.set_postfix(postfix)
+            else:
+                msg = f"[Z2X] Epoch {epoch:03d}/{epochs} | train={total_train_loss:.4f}"
+                if total_mixup_loss > 0.0:
+                    msg += f" | mixup={total_mixup_loss:.4f}"
+                if total_val_loss is not None:
+                    msg += f" | val={total_val_loss:.4f}"
+                if val_loss_minority is not None:
+                    msg += f" | val_min={val_loss_minority:.4f}"
+                logger.info(msg)
 
         if progress_callback is not None:
             progress_callback(
@@ -573,176 +927,86 @@ def load_z2x_decoders(model, data, node_types=None, device=None,
     return dec
 
 # ============================================================
-# 4) SMOTE en espacio z (corregido: semillas NumPy + random)
+# 4) SMOTE en espacio z — helper canónico (Eq. 4 del paper)
 # ============================================================
-def _knn_torch_chunked_device(
-    X: torch.Tensor,
+def _smote_in_z_space(
+    z: torch.Tensor,
+    y: torch.Tensor,
+    minority_class: int,
     k: int,
+    n_samples: int,
+    rng: np.random.RandomState,
     *,
-    metric: str = "cosine",
-    q_block: int = 2048,
-    r_block: int = 2048,
+    return_renormalized: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Chunked kNN on the same device as X (GPU/MPS/CPU)."""
-    assert metric in {"cosine", "euclidean"}
-    Xd = X.detach().contiguous()
-    N, _ = Xd.shape
-    k1 = k + 1
+    """
+    Interpolación SMOTE en el espacio de embeddings (Zhao et al. 2021, Eq. 4):
 
-    top_val = torch.full((N, k1), float("-inf"), device=Xd.device)
-    top_idx = torch.full((N, k1), -1, dtype=torch.long, device=Xd.device)
+        z_syn = (1 - α)·z_a + α·z_b,   α ~ U[0, 1]
 
-    if metric == "cosine":
-        Xn = torch.nn.functional.normalize(Xd, p=2.0, dim=1)
-        for q0 in range(0, N, q_block):
-            q1 = min(N, q0 + q_block)
-            Q = Xn[q0:q1]
-            cur_val = top_val[q0:q1]
-            cur_idx = top_idx[q0:q1]
-            for r0 in range(0, N, r_block):
-                r1 = min(N, r0 + r_block)
-                R = Xn[r0:r1]
-                sim = Q @ R.T
-                cand_val = torch.cat([cur_val, sim], dim=1)
-                cand_idx = torch.cat(
-                    [cur_idx, torch.arange(r0, r1, device=Xd.device).expand(q1 - q0, -1)],
-                    dim=1,
-                )
-                new_val, ord_idx = torch.topk(cand_val, k1, largest=True, dim=1)
-                cur_val = new_val
-                cur_idx = torch.gather(cand_idx, 1, ord_idx)
-                del sim, cand_val, cand_idx, new_val, ord_idx
-            top_val[q0:q1] = cur_val
-            top_idx[q0:q1] = cur_idx
-        row_ids = torch.arange(N, device=Xd.device).view(-1, 1).expand(-1, k1)
-        cur_val = top_val.clone()
-        cur_val[top_idx == row_ids] = float("-inf")
-        final_val, ord_idx = torch.topk(cur_val, k, largest=True, dim=1)
-        final_idx = torch.gather(top_idx, 1, ord_idx)
-        dist = 1.0 - final_val.clamp(-1, 1)
-        return final_idx.long(), dist.float()
+    donde z_a es un nodo minoritario aleatorio y z_b uno de sus k vecinos
+    minoritarios más cercanos (distancia coseno).
 
-    X2 = (Xd * Xd).sum(dim=1, keepdim=True)
-    for q0 in range(0, N, q_block):
-        q1 = min(N, q0 + q_block)
-        Q = Xd[q0:q1]
-        Q2 = X2[q0:q1]
-        cur_val = top_val[q0:q1]
-        cur_idx = top_idx[q0:q1]
-        for r0 in range(0, N, r_block):
-            r1 = min(N, r0 + r_block)
-            R = Xd[r0:r1]
-            R2 = X2[r0:r1].T
-            d2 = Q2 + R2 - 2.0 * (Q @ R.T)
-            score = -d2
-            cand_val = torch.cat([cur_val, score], dim=1)
-            cand_idx = torch.cat(
-                [cur_idx, torch.arange(r0, r1, device=Xd.device).expand(q1 - q0, -1)],
-                dim=1,
-            )
-            new_val, ord_idx = torch.topk(cand_val, k1, largest=True, dim=1)
-            cur_val = new_val
-            cur_idx = torch.gather(cand_idx, 1, ord_idx)
-            del d2, score, cand_val, cand_idx, new_val, ord_idx
-        top_val[q0:q1] = cur_val
-        top_idx[q0:q1] = cur_idx
-    row_ids = torch.arange(N, device=Xd.device).view(-1, 1).expand(-1, k1)
-    cur_val = top_val.clone()
-    cur_val[top_idx == row_ids] = float("-inf")
-    final_val, ord_idx = torch.topk(cur_val, k, largest=True, dim=1)
-    final_idx = torch.gather(top_idx, 1, ord_idx)
-    dist2 = -final_val
-    dist = torch.sqrt(torch.clamp_min(dist2, 0.0))
-    return final_idx.long(), dist.float()
+    Si `return_renormalized=True`, los z sintéticos se proyectan de vuelta a la
+    hiperesfera unitaria via L2-normalización para coincidir con la distribución
+    en la que el encoder fue entrenado (`get_embeddings_minibatch` siempre
+    normaliza, así que el decoder z->x espera embeddings unitarios).
 
+    Devuelve `(syn_z [n_samples, d], syn_labels [n_samples])`. Si no hay
+    suficientes minoritarios para hacer kNN, devuelve tensores vacíos.
+    """
+    if z.dim() != 2:
+        raise ValueError(f"_smote_in_z_space espera z de shape [N,d], recibió {tuple(z.shape)}")
+    if n_samples <= 0:
+        return (
+            torch.empty(0, z.size(1), device=z.device, dtype=z.dtype),
+            torch.empty(0, dtype=y.dtype, device=y.device),
+        )
 
-def _simple_smote_from_knn_device(
-    pos_emb: torch.Tensor,
-    idx: torch.Tensor,
-    num_new: int,
-    *,
-    alpha: float = 0.5,
-) -> torch.Tensor:
-    N, d = pos_emb.shape
-    if num_new <= 0:
-        return torch.empty((0, d), dtype=pos_emb.dtype, device=pos_emb.device)
-    base = torch.randint(0, N, (num_new,), device=pos_emb.device)
-    nbrs = torch.randint(0, idx.size(1), (num_new,), device=pos_emb.device)
-    j = idx[base, nbrs]
-    X = pos_emb.detach()
-    synth = (1 - alpha) * X[base] + alpha * X[j]
-    return synth
-
-
-def smote_nodes(
-    z,
-    y,
-    minority_class=1,
-    k=5,
-    n_samples=100,
-    random_state=SEED,
-    *,
-    force_cpu: bool = True,
-    gpu_knn_max_n: int = 5000,
-    gpu_knn_block: int = 2048,
-):
-    if random_state is not None:
-        torch.manual_seed(random_state)
-        np.random.seed(random_state)
-        random.seed(random_state)
-
-    minority_mask = (y == minority_class)
+    minority_mask = (y == int(minority_class))
     pos_emb = z[minority_mask]
+    n_pos = pos_emb.size(0)
 
-    if pos_emb.shape[0] < k or pos_emb.shape[0] == 0:
-        logger.warning(f"Warning: # of minority samples ({pos_emb.shape[0]}) < k ({k}). Cannot apply SMOTE.")
-        return torch.empty(0, pos_emb.shape[1], device=z.device), torch.empty(0, dtype=torch.long, device=y.device), None
+    if n_pos < 2:
+        logger.warning(
+            f"[GraphSMOTE] Solo {n_pos} muestra(s) de la clase minoritaria {minority_class}; "
+            "no se puede interpolar."
+        )
+        return (
+            torch.empty(0, z.size(1), device=z.device, dtype=z.dtype),
+            torch.empty(0, dtype=y.dtype, device=y.device),
+        )
 
-    # --- k-NN (CPU cache or device, depending on toggle) ---
-    extra = {
-        "dataset": "unknown",  # placeholder for caching signature
-        "seed": int(random_state if random_state is not None else 0),
-        "version": "v1",
-    }
-    cache_dir = os.path.join(".", "cache", "graphsmote")
+    k_eff = min(int(k), n_pos - 1)
+    if k_eff < int(k):
+        logger.warning(
+            f"[GraphSMOTE] k_eff={k_eff} < k={k} (solo {n_pos} muestras minoritarias)."
+        )
 
-    use_device_knn = (
-        (not force_cpu)
-        and pos_emb.device.type != "cpu"
-        and pos_emb.shape[0] <= int(gpu_knn_max_n)
+    pos_cpu = pos_emb.detach().cpu().to(torch.float32).numpy()
+    nbrs = NearestNeighbors(n_neighbors=k_eff + 1, metric="cosine").fit(pos_cpu)
+    nbr_idx = nbrs.kneighbors(pos_cpu, return_distance=False)[:, 1:]  # quitar self
+
+    base = rng.randint(0, n_pos, size=int(n_samples))
+    nbr_choice = rng.randint(0, k_eff, size=int(n_samples))
+    j = nbr_idx[base, nbr_choice]
+    alpha = rng.random_sample(size=int(n_samples)).astype(np.float32)
+
+    base_t = torch.from_numpy(base).long().to(z.device)
+    j_t = torch.from_numpy(j).long().to(z.device)
+    alpha_t = torch.from_numpy(alpha).to(z.device).unsqueeze(1)
+
+    z_a = pos_emb.index_select(0, base_t)
+    z_b = pos_emb.index_select(0, j_t)
+    syn_z = (1.0 - alpha_t) * z_a + alpha_t * z_b
+
+    if return_renormalized:
+        syn_z = F.normalize(syn_z, p=2, dim=1, eps=1e-12)
+
+    syn_labels = torch.full(
+        (int(n_samples),), int(minority_class), dtype=y.dtype, device=y.device
     )
-    idx = None
-    if use_device_knn:
-        try:
-            idx, _ = _knn_torch_chunked_device(
-                pos_emb, k, metric="cosine", q_block=int(gpu_knn_block), r_block=int(gpu_knn_block)
-            )
-            synthetic_features = _simple_smote_from_knn_device(
-                pos_emb, idx, num_new=n_samples, alpha=0.5
-            )
-            synthetic_features = synthetic_features.to(device=z.device, dtype=z.dtype)
-        except Exception as e:
-            logger.warning(f"[GraphSMOTE] GPU kNN failed ({e}); falling back to CPU.")
-            idx = None
-
-    if idx is None:
-        idx, _ = get_knn_cached(
-            pos_emb=pos_emb.to("cpu"),
-            k=k,
-            cache_dir=cache_dir,
-            extra_params=extra,
-            metric="cosine",
-        )
-        # Generar sintéticos en CPU y mover al device del modelo
-        synthetic_features = simple_smote_from_knn(
-            pos_emb.to("cpu"), idx, num_new=n_samples, alpha=0.5
-        )
-        synthetic_features = synthetic_features.to(device=z.device, dtype=z.dtype)
-    # --- Fin k-NN ---
-    
-    synthetic_labels = torch.full((n_samples,), minority_class, dtype=torch.long, device=y.device)
-    
-    return synthetic_features, synthetic_labels, None
+    return syn_z, syn_labels
 
 # ============================================================
 # 5) GraphSMOTE (integrado con decodificadores z->x y edge generator)
@@ -842,13 +1106,14 @@ def run_graphsmote(
             z_smote = z_node
             y_smote = y_node
 
-        syn_z, syn_labels, minority_indices = smote_nodes(
+        rng = np.random.RandomState(int(random_state) if random_state is not None else SEED)
+        syn_z, syn_labels = _smote_in_z_space(
             z_smote, y_smote,
-            minority_class=minority_class,
-            k=k_smote,
-            n_samples=n_samples,
-            random_state=random_state,
-            force_cpu=bool(force_cpu),
+            minority_class=int(minority_class),
+            k=int(k_smote),
+            n_samples=int(n_samples),
+            rng=rng,
+            return_renormalized=True,  # match decoder training distribution
         )
 
         if syn_z.numel() == 0:
@@ -995,7 +1260,7 @@ def run_graphsmote(
                 _safe_clean_edges(augmented_data[rel_type], augmented_data[node_type].num_nodes, augmented_data[node_type].num_nodes)
         
         # Cleanup intermediate tensors from the loop
-        del syn_z, syn_x, syn_labels, minority_indices, z_node, y_node
+        del syn_z, syn_x, syn_labels, z_node, y_node
         if 'z_syn_pm' in locals() and 'z_syn_pm' in vars(): del z_syn_pm
 
 
@@ -1095,14 +1360,19 @@ def compute_train_embeddings(model, data: HeteroData, device, num_neighbors, bat
         # This case should ideally not be hit if train_nodes is not empty
         z_dict = {node_type: torch.empty(0, model.hidden_channels * model.num_heads, device='cpu')}
     else:
-        z_dict = {node_type: torch.cat(z_list, dim=0)}
+        z_cat = torch.cat(z_list, dim=0)
+        # L2-normalizar para coincidir con get_embeddings_minibatch (el decoder z->x
+        # se entrena sobre embeddings unitarios; mezclar normalizados y no normalizados
+        # en ramas distintas del pipeline produce desajuste de distribución).
+        z_cat = F.normalize(z_cat, p=2, dim=1, eps=1e-12)
+        z_dict = {node_type: z_cat}
 
     # We only care about the target node type's embeddings for this function's purpose
     final_z_dict = {node_type: z_dict.get(node_type)}
-    
+
     if device.type == 'cuda':
         torch.cuda.empty_cache()
-        
+
     return final_z_dict
 
 # 2.3. Síntesis de nodos y actualización de masks (modo agnóstico)
@@ -1119,77 +1389,62 @@ def _synthesize_minority_nodes_from_embeddings(
     """
     Devuelve: dict con tensores nuevos para 'pm'.x, .y y un índice booleano de nuevos nodos.
     Asume binario y que la clase positiva es 1.
+
+    Implementa la Eq. 4 del paper vía `_smote_in_z_space` con α~U[0,1] y
+    re-normalización L2 de los embeddings sintéticos para que la entrada al
+    decoder z->x viva en la misma hiperesfera unitaria que vio en el entrenamiento.
     """
-    y = data['pm'].y.cpu().numpy().astype(int)
-    train_mask = data['pm'].train_mask.cpu().numpy().astype(bool)
-    y_train = y[train_mask]
-    n_train = y_train.shape[0]
-    
+    y_full = data['pm'].y
+    train_mask = data['pm'].train_mask
+    if y_full.dim() == 0 or train_mask.numel() == 0:
+        logger.warning("El conjunto de entrenamiento está vacío. No se puede aplicar SMOTE.")
+        return None
+
+    y_train = y_full[train_mask].to(z_pm.device)
+    n_train = int(y_train.numel())
+
     if n_train == 0:
         logger.warning("El conjunto de entrenamiento está vacío. No se puede aplicar SMOTE.")
         return None
 
-    n_pos = y_train.sum()
+    n_pos = int((y_train == 1).sum().item())
     n_target_pos = int(np.ceil(target_pos_ratio * n_train))
     n_to_add = max(0, n_target_pos - n_pos)
-    
+
     if n_to_add == 0:
         logger.info("El ratio de positivos ya es igual o mayor al objetivo. No se añaden nodos.")
         return None
 
-    # Get embeddings of training nodes
-    z_train = z_pm
-    
-    # Get indices of minority class samples IN THE TRAINING SET
-    minority_idx_in_train = np.where(y_train == 1)[0]
-    
-    if len(minority_idx_in_train) == 0:
-        logger.warning("No se encontraron muestras de clase minoritaria en el conjunto de entrenamiento. No se puede aplicar SMOTE.")
-        return None
-    
-    if len(minority_idx_in_train) < k:
-        logger.warning(f"Número de muestras minoritarias ({len(minority_idx_in_train)}) es menor que k ({k}). Se usará k={len(minority_idx_in_train)}.")
-        k = len(minority_idx_in_train)
+    # z_pm viene de compute_train_embeddings (alineado con train_mask).
+    # Renormalizar para coherencia con get_embeddings_minibatch (decoder fue entrenado
+    # sobre embeddings unitarios).
+    z_train = F.normalize(z_pm, p=2, dim=1, eps=1e-12)
 
-    # Get embeddings of only the minority samples
-    z_train_minority = z_train[minority_idx_in_train]
-    
-    # Fit NearestNeighbors on minority samples
-    nbrs = NearestNeighbors(n_neighbors=k).fit(z_train_minority.numpy())
-    indices = nbrs.kneighbors(z_train_minority.numpy(), return_distance=False)
+    syn_z, syn_labels = _smote_in_z_space(
+        z_train.to(z_pm.device),
+        y_train,
+        minority_class=1,
+        k=int(k),
+        n_samples=int(n_to_add),
+        rng=rng,
+        return_renormalized=True,
+    )
 
-    syn_z_list = []
-    for _ in range(n_to_add):
-        # 1. Choose a random minority sample (index into the minority array)
-        base_idx = rng.choice(len(minority_idx_in_train))
-        
-        # 2. Choose one of its k-nearest neighbors (index into the minority array)
-        neighbor_relative_idx = rng.choice(indices[base_idx])
-
-        # 3. Get the embeddings of the sample and its neighbor
-        base_z = z_train_minority[base_idx]
-        neighbor_z = z_train_minority[neighbor_relative_idx]
-
-        # 4. Create synthetic sample
-        alpha = rng.rand()
-        z_syn = alpha * base_z + (1 - alpha) * neighbor_z
-        syn_z_list.append(z_syn.unsqueeze(0))
-
-    if not syn_z_list:
+    if syn_z.numel() == 0:
         return None
 
-    z_syn = torch.cat(syn_z_list, dim=0).to(device)
+    syn_z = syn_z.to(device)
 
     # Decode back to feature space
     with torch.no_grad():
-        x_syn = z2x_decoders.project_one('pm', z_syn).cpu()
+        x_syn = z2x_decoders.project_one('pm', syn_z).cpu()
 
-    y_syn = torch.ones((n_to_add,), dtype=data['pm'].y.dtype)
-    
+    y_syn = syn_labels.to(dtype=data['pm'].y.dtype, device='cpu')
+
     return {
         'x_syn': x_syn,
         'y_syn': y_syn,
-        'n_new': n_to_add
+        'n_new': int(syn_z.size(0)),
     }
 
 # 2.4. Generación de aristas para sintéticos (usando tu edge generator)

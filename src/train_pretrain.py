@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
-from src.graphsmote import compute_epoch_embeddings
+from src.graphsmote import compute_epoch_embeddings, evaluate_edge_generator_auc
 from src.config import DEBUG
 from src.config import (
     GRAPHSMOTE_MODE, TARGET_POS_RATIO, GRAPHSMOTE_K,
@@ -373,7 +373,8 @@ def pretrain_edge_generator(
     criterion: torch.nn.Module,
     pretrain_epochs: int = 10,
     device: Optional[torch.device] = None,
-    writer=None
+    writer=None,
+    report_path: Optional[str] = None,
 ) -> None:
     """
     Rutina ligera de preentrenamiento:
@@ -395,6 +396,21 @@ def pretrain_edge_generator(
         else:
             logger.warning("No compute_epoch_embeddings available; skipping pretrain_edge_generator.")
             return
+
+    # --- Baseline AUC (debe rondar 0.5 con S inicializado pequeño) ---
+    try:
+        baseline = evaluate_edge_generator_auc(edge_gen, z_dict, data.edge_index_dict)
+        macro = baseline.get('_macro')
+        if macro is not None:
+            logger.info(
+                f"[EdgeGen eval] baseline (epoch 0): macro AUC={macro['auc']:.3f} "
+                f"AP={macro['ap']:.3f} sobre {macro['n_relations']} relación(es)"
+            )
+            if writer is not None:
+                writer.add_scalar('EdgeGen/AUC_macro', macro['auc'], 0)
+                writer.add_scalar('EdgeGen/AP_macro', macro['ap'], 0)
+    except Exception as exc:
+        logger.warning(f"[EdgeGen eval] baseline AUC falló: {exc}")
 
     edge_gen.train()
 
@@ -445,3 +461,50 @@ def pretrain_edge_generator(
         logger.info(f"[EdgeGen pretrain] Epoch {epoch:03d} | Loss {total_loss:.4f}")
         if writer is not None:
             writer.add_scalar('Loss/pretrain_edge_gen', total_loss, epoch)
+
+    # --- AUC final por relación + macro ---
+    try:
+        edge_gen.eval()
+        report = evaluate_edge_generator_auc(edge_gen, z_dict, data.edge_index_dict)
+        for key, m in report.items():
+            if key == '_macro':
+                continue
+            logger.info(
+                f"[EdgeGen eval] {key}: AUC={m['auc']:.3f} AP={m['ap']:.3f} "
+                f"(n_pos={m['n_pos']}, n_neg={m['n_neg']})"
+            )
+        macro = report.get('_macro')
+        if macro is not None:
+            logger.info(
+                f"[EdgeGen eval] post-pretrain: macro AUC={macro['auc']:.3f} "
+                f"AP={macro['ap']:.3f}"
+            )
+            if writer is not None:
+                writer.add_scalar('EdgeGen/AUC_macro', macro['auc'], int(pretrain_epochs))
+                writer.add_scalar('EdgeGen/AP_macro', macro['ap'], int(pretrain_epochs))
+            if macro['auc'] < 0.6:
+                logger.warning(
+                    f"[EdgeGen eval] AUC macro={macro['auc']:.3f} < 0.6; el generador "
+                    "no aprendió señal de aristas — los sintéticos quedarán mal "
+                    "conectados. Considera subir PRETRAIN_EDGE_EPOCHS o lambda_edge."
+                )
+
+        # Persistir reporte para que la UI/Streamlit lo renderice.
+        if report_path:
+            try:
+                import json as _json
+                os.makedirs(os.path.dirname(report_path), exist_ok=True)
+                payload = {
+                    "pretrain_epochs": int(pretrain_epochs),
+                    "per_relation": {
+                        k: v for k, v in report.items() if k != "_macro"
+                    },
+                    "macro": report.get("_macro"),
+                }
+                with open(report_path, "w") as f:
+                    _json.dump(payload, f, indent=2)
+                logger.info(f"[EdgeGen eval] reporte guardado en {report_path}")
+            except Exception as exc:
+                logger.warning(f"[EdgeGen eval] no se pudo guardar el reporte: {exc}")
+    except Exception as exc:
+        logger.warning(f"[EdgeGen eval] AUC final falló: {exc}")
