@@ -927,6 +927,230 @@ def load_z2x_decoders(model, data, node_types=None, device=None,
     return dec
 
 # ============================================================
+# 3.5) Decoder de atributos de arista para SMOTE
+# ============================================================
+class RelEdgeAttrDecoder(torch.nn.Module):
+    """
+    Un MLP por tipo de relación que mapea [z_src ⊕ z_dst] → edge_attr.
+
+    Entrenado con aristas reales como supervisión, permite reemplazar el
+    zero-fill (o delta truncado) que aplicaba GraphSMOTE a las aristas
+    sintéticas. Esto cierra el gap donde una fracción del vector de
+    edge_attr quedaba en cero porque la dimensión del delta de features
+    (`delta_feature_idx`) era menor que `edge_attr_dim`.
+    """
+
+    def __init__(
+        self,
+        rels,
+        z_dim_dict: Dict[str, int],
+        edge_attr_dim: int,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.edge_attr_dim = int(edge_attr_dim)
+        self.heads = torch.nn.ModuleDict()
+        for (src, rel, dst) in rels:
+            key = f"{src}:{rel}:{dst}"
+            in_dim = int(z_dim_dict[src]) + int(z_dim_dict[dst])
+            self.heads[key] = torch.nn.Sequential(
+                torch.nn.Linear(in_dim, hidden_dim),
+                torch.nn.GELU(),
+                torch.nn.Linear(hidden_dim, hidden_dim),
+                torch.nn.GELU(),
+                torch.nn.Linear(hidden_dim, edge_attr_dim),
+            )
+
+    def forward(self, z_src: torch.Tensor, z_dst: torch.Tensor, key: str) -> torch.Tensor:
+        x = torch.cat([z_src, z_dst], dim=-1)
+        return self.heads[key](x)
+
+    @torch.no_grad()
+    def predict(self, z_src: torch.Tensor, z_dst: torch.Tensor, key: str) -> torch.Tensor:
+        was_training = self.training
+        self.eval()
+        out = self.forward(z_src, z_dst, key)
+        if was_training:
+            self.train()
+        return out
+
+
+def train_edge_attr_decoders(
+    model,
+    data: HeteroData,
+    *,
+    device=None,
+    epochs: int = 30,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    hidden_dim: int = 128,
+    batch_size: int = 4096,
+    val_split: float = 0.1,
+    save_dir: str = os.path.join(RESULTADOS_DIR, "edge_attr_decoders"),
+    seed: int = 0,
+    num_neighbors=NUM_NEIGHBORS,
+    show_progress: bool = True,
+) -> Optional[RelEdgeAttrDecoder]:
+    """
+    Entrena `RelEdgeAttrDecoder` por tipo de relación usando aristas reales.
+
+    Solo se usan aristas cuyo nodo origen pertenece a `train_mask` (si existe)
+    y que NO son sintéticas (en caso de un grafo ya aumentado se ignoran las
+    `is_synthetic` para evitar que el decoder aprenda de sus propias
+    predicciones).
+
+    Devuelve el decoder en modo eval o `None` si no hay aristas con
+    `edge_attr` o no se cumple ningún tipo entrenable.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    if device is None:
+        device = next(model.parameters()).device
+
+    # 1) Embeddings z para todos los tipos de nodo
+    z_dict = get_embeddings_minibatch(model, data, num_neighbors=num_neighbors)
+    z_dim_dict = {ntype: int(z.shape[1]) for ntype, z in z_dict.items()}
+
+    # 2) Detect edge_attr_dim: primer edge_type con edge_attr no vacío
+    edge_attr_dim = None
+    for et in data.edge_types:
+        e_store = data[et]
+        if hasattr(e_store, "edge_attr") and e_store.edge_attr is not None and e_store.edge_attr.numel() > 0:
+            edge_attr_dim = int(e_store.edge_attr.shape[1]) if e_store.edge_attr.dim() > 1 else 1
+            break
+    if edge_attr_dim is None:
+        logger.info("[EdgeAttrDec] grafo sin edge_attr; saltando entrenamiento.")
+        return None
+
+    decoder = RelEdgeAttrDecoder(
+        data.edge_types, z_dim_dict, edge_attr_dim, hidden_dim=hidden_dim
+    ).to(device)
+    opt = torch.optim.AdamW(decoder.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = torch.nn.HuberLoss()
+
+    # 3) Construir splits train/val por tipo de relación
+    rng = np.random.RandomState(seed)
+    per_rel: Dict[str, Dict[str, torch.Tensor]] = {}
+    for (src, rel, dst) in data.edge_types:
+        e_store = data[(src, rel, dst)]
+        if not hasattr(e_store, "edge_attr") or e_store.edge_attr is None or e_store.edge_attr.numel() == 0:
+            continue
+        ei = e_store.edge_index.cpu()
+        ea = e_store.edge_attr.cpu().float()
+        if ea.dim() == 1:
+            ea = ea.unsqueeze(1)
+
+        # Filtros: train_mask del origen + excluir sintéticos si el grafo está aumentado
+        mask = torch.ones(ei.shape[1], dtype=torch.bool)
+        if hasattr(data[src], "train_mask"):
+            mask = mask & data[src].train_mask.cpu()[ei[0]]
+        if hasattr(data[src], "is_synthetic"):
+            mask = mask & (~data[src].is_synthetic.cpu()[ei[0]])
+        if hasattr(data[dst], "is_synthetic"):
+            mask = mask & (~data[dst].is_synthetic.cpu()[ei[1]])
+
+        ei_filt = ei[:, mask]
+        ea_filt = ea[mask]
+        n = ei_filt.shape[1]
+        if n == 0:
+            continue
+
+        idx = rng.permutation(n)
+        n_val = max(1, int(round(n * val_split)))
+        val_sel = torch.from_numpy(idx[:n_val])
+        tr_sel = torch.from_numpy(idx[n_val:])
+
+        key = f"{src}:{rel}:{dst}"
+        per_rel[key] = {
+            "ei_train": ei_filt[:, tr_sel].to(device),
+            "ea_train": ea_filt[tr_sel].to(device),
+            "ei_val": ei_filt[:, val_sel].to(device),
+            "ea_val": ea_filt[val_sel].to(device),
+            "z_src_full": z_dict[src].to(device),
+            "z_dst_full": z_dict[dst].to(device),
+            "n_train": int(tr_sel.numel()),
+            "n_val": int(val_sel.numel()),
+        }
+
+    if not per_rel:
+        logger.info("[EdgeAttrDec] no hay aristas reales filtrables; saltando entrenamiento.")
+        return None
+
+    history: List[Dict[str, float]] = []
+    iter_range = range(epochs)
+    if show_progress:
+        iter_range = tqdm(iter_range, desc="EdgeAttrDec")
+
+    last_val_per_rel: Dict[str, float] = {}
+
+    for ep in iter_range:
+        decoder.train()
+        train_losses_ep: List[float] = []
+        for key, store in per_rel.items():
+            ei = store["ei_train"]
+            ea = store["ea_train"]
+            n = ei.shape[1]
+            if n == 0:
+                continue
+            order = torch.randperm(n, device=device)
+            for s in range(0, n, batch_size):
+                b = order[s:s + batch_size]
+                z_src_b = store["z_src_full"][ei[0, b]]
+                z_dst_b = store["z_dst_full"][ei[1, b]]
+                pred = decoder(z_src_b, z_dst_b, key)
+                target = ea[b]
+                if target.dtype != pred.dtype:
+                    target = target.to(pred.dtype)
+                loss = loss_fn(pred, target)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                train_losses_ep.append(float(loss.item()))
+
+        # Validación
+        decoder.eval()
+        val_losses_ep: List[float] = []
+        with torch.no_grad():
+            for key, store in per_rel.items():
+                ei_v = store["ei_val"]
+                ea_v = store["ea_val"]
+                if ei_v.shape[1] == 0:
+                    continue
+                z_src_v = store["z_src_full"][ei_v[0]]
+                z_dst_v = store["z_dst_full"][ei_v[1]]
+                pred_v = decoder(z_src_v, z_dst_v, key)
+                target_v = ea_v.to(pred_v.dtype)
+                vl = float(loss_fn(pred_v, target_v).item())
+                val_losses_ep.append(vl)
+                last_val_per_rel[key] = vl
+
+        if train_losses_ep or val_losses_ep:
+            entry = {
+                "epoch": int(ep),
+                "train_loss": float(np.mean(train_losses_ep)) if train_losses_ep else 0.0,
+                "val_loss": float(np.mean(val_losses_ep)) if val_losses_ep else 0.0,
+            }
+            history.append(entry)
+            if show_progress:
+                iter_range.set_postfix({
+                    "train": f"{entry['train_loss']:.4f}",
+                    "val": f"{entry['val_loss']:.4f}",
+                })
+
+    # 4) Persistir pesos y diagnóstico
+    try:
+        import json as _json
+        torch.save(decoder.state_dict(), os.path.join(save_dir, "edge_attr_decoder.pt"))
+        with open(os.path.join(save_dir, "history.json"), "w") as f:
+            _json.dump(history, f, indent=2)
+        with open(os.path.join(save_dir, "val_loss_by_rel.json"), "w") as f:
+            _json.dump({k: float(v) for k, v in last_val_per_rel.items()}, f, indent=2)
+    except Exception as exc:
+        logger.warning(f"[EdgeAttrDec] persistencia falló: {exc}")
+
+    decoder.eval()
+    return decoder
+
+# ============================================================
 # 4) SMOTE en espacio z — helper canónico (Eq. 4 del paper)
 # ============================================================
 def _smote_in_z_space(
@@ -1457,9 +1681,15 @@ def _generate_edges_for_synthetics(
     node_type='pm',
     topK=10,
     force_cpu: bool = True,
+    edge_attr_decoder: Optional["RelEdgeAttrDecoder"] = None,
 ):
     """
     Para cada sintético, conecta con topK reales/vecinos probables por cada relación que involucre 'pm'.
+
+    Si `edge_attr_decoder` se pasa, los atributos de las nuevas aristas se generan
+    desde [z_src, z_dst] vía el decoder entrenado con aristas reales (recomendado).
+    Sin decoder, cae al cómputo delta entre features de nodos (legacy) y, ante
+    fallo, a ceros — lo que sesgaba al modelo cuando edge_attr_dim > delta_dim.
     """
     if edge_gen is None:
         return  # si no tienes generador, puedes conectar heurísticamente por k-NN en z
@@ -1525,39 +1755,61 @@ def _generate_edges_for_synthetics(
                 # solo real -> sintético
                 new_ei = torch.stack([dst_sel.flatten(), src_sel.flatten()], dim=0)
 
-            # Build edge attributes from node features (dst_x - src_x),
-            # mirroring how base edges were created. This leverages that
-            # synthetic node features were decoded from embeddings.
+            # Construye atributos de las nuevas aristas. Prioridad:
+            #   1. RelEdgeAttrDecoder (si fue pasado): predice [E, edge_attr_dim]
+            #      desde [z_src ⊕ z_dst]. Cubre el ancho completo de edge_attr.
+            #   2. Delta de features (legacy): dst_x - src_x truncado/padeado a
+            #      edge_attr_dim. Si delta_dim < edge_attr_dim, los faltantes
+            #      quedaban en cero — gap conocido que el decoder cierra.
+            #   3. Zeros, si todo falla.
             new_ea = None
-            try:
-                src_x_store = aug_data[src].x
-                dst_x_store = aug_data[dst].x
-                base_device = src_x_store.device
-                if dst_x_store.device != base_device:
-                    dst_x_store = dst_x_store.to(base_device)
-                new_ei = new_ei.to(base_device)
-                src_x = src_x_store.index_select(0, new_ei[0].long())
-                dst_x = dst_x_store.index_select(0, new_ei[1].long())
-                delta_idx = _resolve_delta_feature_idx(aug_data, base_device)
-                ea = _delta_from_node_features(src_x, dst_x, delta_idx)
+            base_device = aug_data[src].x.device
+            new_ei = new_ei.to(base_device)
 
-                # Align dtype and dimensionality with existing edge_attr (if any)
-                if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
-                    edge_attr_dim = e_store.edge_attr.shape[1] if e_store.edge_attr.dim() > 1 else 1
-                    if ea.dim() == 1:
-                        ea = ea.unsqueeze(1)
-                    if ea.size(1) > edge_attr_dim:
-                        ea = ea[:, :edge_attr_dim]
-                    elif ea.size(1) < edge_attr_dim:
-                        pad = torch.zeros(ea.size(0), edge_attr_dim - ea.size(1), device=ea.device, dtype=ea.dtype)
-                        ea = torch.cat([ea, pad], dim=1)
-                    ea = ea.to(dtype=e_store.edge_attr.dtype, device=base_device)
-                new_ea = ea
-            except Exception:
-                # Fallback: if something goes wrong, preserve previous behavior (zeros)
-                if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
-                    edge_attr_dim = e_store.edge_attr.shape[1] if e_store.edge_attr.dim() > 1 else 1
-                    new_ea = torch.zeros((new_ei.shape[1], edge_attr_dim), dtype=e_store.edge_attr.dtype, device=new_ei.device)
+            # Ruta 1: decoder de edge_attr
+            if edge_attr_decoder is not None and key in edge_attr_decoder.heads:
+                try:
+                    z_src_e = z[new_ei[0].long()]
+                    z_dst_e = z[new_ei[1].long()]
+                    ea = edge_attr_decoder.predict(z_src_e, z_dst_e, key)
+                    if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
+                        ea = ea.to(dtype=e_store.edge_attr.dtype, device=base_device)
+                    new_ea = ea
+                except Exception as exc:
+                    logger.warning(
+                        f"[SMOTE] edge_attr_decoder falló para '{key}' "
+                        f"({type(exc).__name__}: {exc}); usando ruta delta."
+                    )
+                    new_ea = None
+
+            # Ruta 2: delta legacy (dst_x - src_x)
+            if new_ea is None:
+                try:
+                    src_x_store = aug_data[src].x
+                    dst_x_store = aug_data[dst].x
+                    if dst_x_store.device != base_device:
+                        dst_x_store = dst_x_store.to(base_device)
+                    src_x = src_x_store.index_select(0, new_ei[0].long())
+                    dst_x = dst_x_store.index_select(0, new_ei[1].long())
+                    delta_idx = _resolve_delta_feature_idx(aug_data, base_device)
+                    ea = _delta_from_node_features(src_x, dst_x, delta_idx)
+
+                    if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
+                        edge_attr_dim = e_store.edge_attr.shape[1] if e_store.edge_attr.dim() > 1 else 1
+                        if ea.dim() == 1:
+                            ea = ea.unsqueeze(1)
+                        if ea.size(1) > edge_attr_dim:
+                            ea = ea[:, :edge_attr_dim]
+                        elif ea.size(1) < edge_attr_dim:
+                            pad = torch.zeros(ea.size(0), edge_attr_dim - ea.size(1), device=ea.device, dtype=ea.dtype)
+                            ea = torch.cat([ea, pad], dim=1)
+                        ea = ea.to(dtype=e_store.edge_attr.dtype, device=base_device)
+                    new_ea = ea
+                except Exception:
+                    # Ruta 3: ceros explícitos (último recurso).
+                    if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
+                        edge_attr_dim = e_store.edge_attr.shape[1] if e_store.edge_attr.dim() > 1 else 1
+                        new_ea = torch.zeros((new_ei.shape[1], edge_attr_dim), dtype=e_store.edge_attr.dtype, device=new_ei.device)
             
             if hasattr(e_store, 'edge_index') and e_store.edge_index.numel() > 0:
                 edge_index_base = e_store.edge_index
@@ -1592,6 +1844,7 @@ def augment_graph_offline_once(
     save_path: str = None,
     seed: int = 0,
     num_neighbors=EMB_NUM_NEIGHBORS,
+    edge_attr_decoder: Optional["RelEdgeAttrDecoder"] = None,
 ):
     rng = np.random.RandomState(seed)
     try:
@@ -1655,7 +1908,14 @@ def augment_graph_offline_once(
     aug['pm'].is_synthetic = torch.cat([aug['pm'].is_synthetic, new_synthetic_flag])
 
     # 4) Conecta aristas para sintéticos
-    _generate_edges_for_synthetics(model=model, aug_data=aug, edge_gen=edge_gen, device=device, topK=GRAPHSMOTE_K)
+    _generate_edges_for_synthetics(
+        model=model,
+        aug_data=aug,
+        edge_gen=edge_gen,
+        device=device,
+        topK=GRAPHSMOTE_K,
+        edge_attr_decoder=edge_attr_decoder,
+    )
 
     # 5) Limpieza y coalesce
     _coalesce_and_align_all_edges(aug)
@@ -1683,6 +1943,7 @@ def refresh_synthetics_online(
     edge_gen=None,
     seed: int = 0,
     num_neighbors=EMB_NUM_NEIGHBORS,
+    edge_attr_decoder: Optional["RelEdgeAttrDecoder"] = None,
 ):
     """
     Parte siempre del grafo BASE (solo reales) y vuelve a sintetizar,
@@ -1699,6 +1960,7 @@ def refresh_synthetics_online(
         save_path=None,
         seed=seed,
         num_neighbors=num_neighbors,
+        edge_attr_decoder=edge_attr_decoder,
     )
     return augmented, registry
 def _first_hop_neighbors_of_accidents(

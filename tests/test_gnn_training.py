@@ -522,6 +522,124 @@ def test_run_gat_training_can_fallback_to_val_loss_monitor(tmp_path, monkeypatch
     assert meta["best_epoch"] == 2
 
 
+def test_run_gat_training_honors_manual_stop_after_checkpoint(tmp_path, monkeypatch):
+    loaded_obj = {"data": _make_small_training_graph(), "filename": "demo_graph.pt"}
+    _write_fast_hparams(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    test_criteria, _ = _install_fast_training_mocks(
+        monkeypatch,
+        tmp_path,
+        val_losses=[0.90, 0.80, 0.70, 0.60, 0.50],
+        prob_sequences=[
+            [0.9, 0.2],
+            [0.8, 0.3],
+            [0.1, 0.95],
+            [0.05, 0.98],
+            [0.1, 0.9],
+        ],
+    )
+
+    gnn_main.run_gat_training(
+        loaded_obj,
+        force_use_graphsmote=False,
+        early_stop=False,
+        max_epochs=5,
+        save_state_path=str(checkpoint_path),
+        should_stop=lambda: len(test_criteria) >= 2,
+    )
+
+    assert len(test_criteria) == 2
+    saved_ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert saved_ckpt["epoch"] == 2
+    assert saved_ckpt["last_val_loss"] == pytest.approx(0.80)
+
+
+def test_run_gat_training_runs_requested_test_and_continues(tmp_path, monkeypatch):
+    loaded_obj = {"data": _make_small_training_graph(), "filename": "demo_graph.pt"}
+    _write_fast_hparams(tmp_path)
+    _install_fast_training_mocks(
+        monkeypatch,
+        tmp_path,
+        val_losses=[0.90],
+        prob_sequences=[[0.9, 0.2]],
+    )
+
+    val_calls = 0
+    test_calls = 0
+    test_requested = False
+
+    def fake_test(*args, masks=None, threshold=None, **kwargs):
+        del args, kwargs
+        nonlocal val_calls, test_calls
+        y_true = torch.tensor([0, 1], dtype=torch.long)
+        if masks == ["test_mask"]:
+            test_calls += 1
+            assert threshold is None or isinstance(float(threshold), float)
+            return {
+                "test_mask": {
+                    "true": y_true,
+                    "probs": torch.tensor([[0.9, 0.1], [0.2, 0.8]], dtype=torch.float32),
+                    "report": {
+                        "Accidente (1)": {
+                            "f1-score": 0.80,
+                            "precision": 0.75,
+                            "recall": 0.86,
+                        },
+                        "macro avg": {"f1-score": 0.82},
+                        "accuracy": 0.85,
+                    },
+                    "cm": [[1, 0], [0, 1]],
+                    "auc": 0.90,
+                    "auprc": 0.88,
+                    "mcc": 0.70,
+                    "far": 0.05,
+                }
+            }
+
+        val_calls += 1
+        f1_report = 0.20 + 0.10 * val_calls
+        return {
+            "val_mask": {
+                "true": y_true,
+                "probs": torch.tensor([[0.9, 0.1], [0.2, 0.8]], dtype=torch.float32),
+                "report": {
+                    "Accidente (1)": {
+                        "f1-score": f1_report,
+                        "precision": f1_report,
+                        "recall": f1_report,
+                    },
+                    "macro avg": {"f1-score": f1_report},
+                    "accuracy": f1_report,
+                },
+                "cm": [[1, 0], [0, 1]],
+                "auc": f1_report,
+                "auprc": f1_report,
+                "mcc": f1_report,
+                "loss": 1.0 - 0.1 * val_calls,
+            }
+        }
+
+    def should_test():
+        nonlocal test_requested
+        if val_calls >= 2 and not test_requested:
+            test_requested = True
+            return True
+        return False
+
+    monkeypatch.setattr(gnn_main, "test", fake_test)
+
+    gnn_main.run_gat_training(
+        loaded_obj,
+        force_use_graphsmote=False,
+        early_stop=False,
+        max_epochs=4,
+        should_test=should_test,
+    )
+
+    assert val_calls == 4
+    assert test_calls == 1
+
+
 def test_run_gat_training_resumes_old_val_loss_checkpoint_with_new_monitor(tmp_path, monkeypatch):
     data = _make_small_training_graph()
     loaded_obj = {"data": data, "filename": "demo_graph.pt"}

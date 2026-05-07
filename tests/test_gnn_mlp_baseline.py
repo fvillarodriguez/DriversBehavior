@@ -583,6 +583,105 @@ def test_gnn_checkpoint_comparison_evaluates_val_and_test(tmp_path: Path, monkey
     assert eval_calls[-1]["calibration_model"] is platt_model
 
 
+def test_perform_model_evaluation_final_call_uses_only_test_mask(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from src import graph_builder_app as app
+    from src import gnn_main
+
+    data = _make_graph()
+    model_path = tmp_path / "gat_model_BEST_fake.pt"
+    model_path.write_bytes(b"fake")
+    calls = []
+
+    class _FakeProgress:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def update(self, *args, **kwargs):
+            pass
+
+        def fail(self, *args, **kwargs):
+            pass
+
+        def complete(self, *args, **kwargs):
+            pass
+
+    class _FakeSt:
+        session_state = {}
+
+        def caption(self, *args, **kwargs):
+            pass
+
+        def warning(self, *args, **kwargs):
+            pass
+
+        def error(self, *args, **kwargs):
+            pass
+
+        def exception(self, *args, **kwargs):
+            pass
+
+    class _FakeModel:
+        def load_state_dict(self, state_dict, strict=True):
+            self.loaded = (state_dict, strict)
+            return [], []
+
+        def eval(self):
+            return self
+
+    def fake_result(name):
+        return {
+            name: {
+                "true": torch.tensor([0, 1], dtype=torch.long),
+                "probs": torch.tensor([[0.8, 0.2], [0.2, 0.8]], dtype=torch.float32),
+                "report": {"accuracy": 1.0},
+                "cm": np.array([[1, 0], [0, 1]], dtype=int),
+            }
+        }
+
+    def fake_test(model, graph_data, **kwargs):
+        calls.append(kwargs)
+        mask_name = kwargs.get("mask_name")
+        if mask_name in {"val_calib", "val_threshold"}:
+            return fake_result(mask_name)
+        assert kwargs.get("masks") == ["test_mask"]
+        return {}
+
+    monkeypatch.setattr(app, "st", _FakeSt())
+    monkeypatch.setattr(app, "_GNNGraphEvaluationProgress", _FakeProgress)
+    monkeypatch.setattr(app, "_load_hparams_for_model", lambda path: {})
+    monkeypatch.setattr(app.torch, "load", lambda *args, **kwargs: {"weight": torch.ones(1)})
+    monkeypatch.setattr(app, "_check_model_graph_compat", lambda *args, **kwargs: (True, None))
+    monkeypatch.setattr(
+        app,
+        "_split_val_mask_for_calibration_threshold",
+        lambda *args, **kwargs: {
+            "calib_idx": torch.tensor([4, 5], dtype=torch.long),
+            "threshold_idx": torch.tensor([4, 5], dtype=torch.long),
+        },
+    )
+    monkeypatch.setattr(app, "_select_threshold_for_far_target", lambda *args, **kwargs: (0.5, {}))
+    monkeypatch.setattr(gnn_main, "_build_gnn_model", lambda **kwargs: _FakeModel())
+    monkeypatch.setattr(gnn_main, "test", fake_test)
+    monkeypatch.setattr(gnn_main, "AUTOCALIBRATE_PROBS", False)
+
+    app._perform_model_evaluation(
+        model_path=str(model_path),
+        graph_data=data,
+        device="cpu",
+        threshold_strategy="far",
+        masks=["val_mask", "test_mask"],
+        batch_size=4,
+    )
+
+    assert [call.get("mask_name") for call in calls[:2]] == ["val_calib", "val_threshold"]
+    final_calls = [call for call in calls if call.get("mask_name") is None]
+    assert final_calls
+    assert final_calls[-1]["masks"] == ["test_mask"]
+
+
 def test_render_graph_builder_includes_comparison_tab(monkeypatch):
     from src import graph_builder_app as app
 
@@ -614,6 +713,7 @@ def test_render_graph_builder_includes_comparison_tab(monkeypatch):
     monkeypatch.setattr(app, "_render_feature_selection_tab", lambda: called.append("selection"))
     monkeypatch.setattr(app, "_render_in_memory_graph", lambda: called.append("graph"))
     monkeypatch.setattr(app, "_render_network_tab", lambda: called.append("network"))
+    monkeypatch.setattr(app, "_render_network_builder_tab", lambda: called.append("network_builder"))
     monkeypatch.setattr(app, "_render_optimization_tab", lambda: called.append("optimization"))
     monkeypatch.setattr(app, "_render_balance_tab", lambda: called.append("balance"))
     monkeypatch.setattr(app, "_render_training_tab", lambda: called.append("training"))

@@ -334,6 +334,42 @@ def _render_gnn_live_line_chart(container, chart_df: pd.DataFrame) -> None:
         container.line_chart(chart_df, width="stretch")
 
 
+def _request_gnn_training_stop(
+    stop_flag_path: str,
+    stop_state_key: Optional[str] = None,
+) -> None:
+    try:
+        path = Path(stop_flag_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(datetime.now().isoformat(), encoding="utf-8")
+        if stop_state_key:
+            st.session_state[stop_state_key] = True
+        st.warning(
+            "Parada solicitada. El entrenamiento se detendra al finalizar el epoch actual "
+            "y conservara el checkpoint para retomarlo."
+        )
+    except Exception as exc:
+        st.error(f"No se pudo solicitar la parada: {exc}")
+
+
+def _request_gnn_training_test(
+    test_flag_path: str,
+    test_state_key: Optional[str] = None,
+) -> None:
+    try:
+        path = Path(test_flag_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(datetime.now().isoformat(), encoding="utf-8")
+        if test_state_key:
+            st.session_state[test_state_key] = True
+        st.info(
+            "Test intermedio solicitado. Se ejecutara al finalizar el epoch actual "
+            "usando el mejor checkpoint del entrenamiento y luego continuara."
+        )
+    except Exception as exc:
+        st.error(f"No se pudo solicitar el test intermedio: {exc}")
+
+
 def _has_streamlit_script_context() -> bool:
     if get_script_run_ctx is None:
         return True
@@ -2302,6 +2338,70 @@ def _infer_edge_dim_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Opti
             return int(tensor.shape[1])
     return None
 
+
+def _parse_checkpoint_edge_type_key(raw_key: object) -> Optional[Tuple[str, str, str]]:
+    text = str(raw_key or "").strip()
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1]
+    separator = "___" if "___" in text else "__" if "__" in text else None
+    if separator is None:
+        return None
+    parts = text.split(separator)
+    if len(parts) != 3 or any(not part for part in parts):
+        return None
+    return (parts[0], parts[1], parts[2])
+
+
+def _infer_edge_types_from_state_dict(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+) -> Tuple[Tuple[str, str, str], ...]:
+    if not isinstance(state_dict, dict):
+        return tuple()
+    edge_types: List[Tuple[str, str, str]] = []
+    seen = set()
+    for key in state_dict.keys():
+        match = re.match(r"^convs\.\d+\.convs\.([^.]+)\.", str(key))
+        if not match:
+            continue
+        edge_type = _parse_checkpoint_edge_type_key(match.group(1))
+        if edge_type is None or edge_type in seen:
+            continue
+        seen.add(edge_type)
+        edge_types.append(edge_type)
+    return tuple(edge_types)
+
+
+def _edge_type_display(edge_type: Tuple[str, str, str]) -> str:
+    return f"({edge_type[0]}, {edge_type[1]}, {edge_type[2]})"
+
+
+def _resolve_checkpoint_edge_types_for_model(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+    graph_data: HeteroData,
+) -> Optional[Tuple[Tuple[str, str, str], ...]]:
+    checkpoint_edge_types = _infer_edge_types_from_state_dict(state_dict)
+    if checkpoint_edge_types:
+        return checkpoint_edge_types
+    try:
+        graph_edge_types = tuple(tuple(edge_type) for edge_type in graph_data.edge_types)
+    except Exception:
+        graph_edge_types = tuple()
+    return graph_edge_types or None
+
+
+def _test_only_eval_masks(
+    graph_data: HeteroData,
+    *,
+    node_type: str = "pm",
+) -> List[str]:
+    try:
+        test_mask = graph_data[node_type].test_mask
+        if torch.is_tensor(test_mask) and bool(test_mask.sum().item() > 0):
+            return ["test_mask"]
+    except Exception:
+        pass
+    return []
+
 def _check_model_graph_compat(
     model_path: str,
     graph_data: HeteroData,
@@ -2330,6 +2430,28 @@ def _check_model_graph_compat(
         expected_in = _infer_in_channels_from_state_dict(state_dict)
     if expected_edge is None and state_dict is not None:
         expected_edge = _infer_edge_dim_from_state_dict(state_dict)
+
+    expected_edge_types = _infer_edge_types_from_state_dict(state_dict)
+    if expected_edge_types:
+        try:
+            current_edge_types = {
+                tuple(edge_type) for edge_type in getattr(graph_data, "edge_types", [])
+            }
+        except Exception:
+            current_edge_types = set()
+        missing_edge_types = [
+            edge_type
+            for edge_type in expected_edge_types
+            if edge_type not in current_edge_types
+        ]
+        if missing_edge_types:
+            expected_text = ", ".join(
+                _edge_type_display(edge_type) for edge_type in missing_edge_types
+            )
+            return False, (
+                "El checkpoint fue entrenado con relaciones que no existen en el grafo actual: "
+                f"{expected_text}. Cargue el mismo grafo usado para entrenar o reentrene el modelo."
+            )
 
     try:
         current_in = int(graph_data[node_type].x.shape[1])
@@ -2942,6 +3064,10 @@ def _evaluate_gnn_checkpoint_for_comparison(
             if checkpoint_temporal_kind is not None
             else graph_num_nodes
         )
+        model_edge_types = _resolve_checkpoint_edge_types_for_model(
+            state_dict,
+            graph_data,
+        )
         model = graph_main._build_gnn_model(
             in_channels=int(graph_data[node_type].x.shape[1]),
             hidden_channels=hidden_channels,
@@ -2963,6 +3089,7 @@ def _evaluate_gnn_checkpoint_for_comparison(
                 checkpoint_temporal_kind is not None
                 or _gnn_variant_requires_sequence_index(gnn_variant)
             ),
+            edge_types=model_edge_types,
         )
         model.load_state_dict(state_dict, strict=True)
         model.eval()
@@ -5196,6 +5323,18 @@ def _evaluate_gnn_model_far_target(
         state_dict = state_dict.get("model_state") or state_dict.get("state_dict")
     elif isinstance(state_dict, torch.nn.Module):
         state_dict = state_dict.state_dict()
+    if not isinstance(state_dict, dict):
+        raise TypeError("El checkpoint no contiene state_dict evaluable.")
+
+    is_ok, msg = _check_model_graph_compat(
+        model_path,
+        graph_data,
+        node_type=node_type,
+        meta=meta,
+        state_dict=state_dict,
+    )
+    if not is_ok:
+        raise ValueError(str(msg or "Checkpoint incompatible con el grafo actual."))
 
     arch = _infer_arch_from_state_dict(state_dict)
     h_channels = int(meta.get("hidden_channels", arch["hidden_channels"]))
@@ -5227,6 +5366,10 @@ def _evaluate_gnn_model_far_target(
         if checkpoint_temporal_kind is not None
         else graph_num_nodes
     )
+    model_edge_types = _resolve_checkpoint_edge_types_for_model(
+        state_dict,
+        graph_data,
+    )
     model = graph_main._build_gnn_model(
         in_channels=int(graph_data[node_type].x.shape[1]),
         hidden_channels=int(h_channels),
@@ -5248,6 +5391,7 @@ def _evaluate_gnn_model_far_target(
             checkpoint_temporal_kind is not None
             or _gnn_variant_requires_sequence_index(gnn_variant)
         ),
+        edge_types=model_edge_types,
     )
     if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
         raise ValueError(
@@ -7264,100 +7408,81 @@ def _run_optuna_search(
                 return train_idx
             return seeds
 
-        def _resolve_sampler_seed_idx(
-            graph_cpu_local: HeteroData,
-            *,
-            base_seed_idx: Optional[torch.Tensor],
-            epoch_seed: int,
-            epoch_num: int,
-        ) -> Optional[torch.Tensor]:
-            seed_pool = _effective_seed_pool(
-                graph_cpu_local,
-                base_seed_idx=base_seed_idx,
+            def _build_train_loader_from_sampler(
+                graph_cpu_local: HeteroData,
+                *,
+                base_seed_idx: Optional[torch.Tensor],
+                epoch_seed: int,
+                epoch_num: int,
+            ) -> Tuple[object, Optional[torch.Tensor]]:
+                seed_pool = _effective_seed_pool(
+                    graph_cpu_local,
+                    base_seed_idx=base_seed_idx,
+                )
+                num_neighbors_cfg = {
+                    edge_type: neighbor_profile
+                    for edge_type in graph_cpu_local.edge_types
+                }
+                if train_sampler_mode != "neighbor":
+                    native_cfg = {
+                        "train_sampler_mode": str(train_sampler_mode),
+                        "cluster_gcn_num_parts": int(cluster_gcn_num_parts),
+                        "cluster_gcn_parts_per_epoch": int(cluster_gcn_parts_per_epoch),
+                        "graphsaint_mode": str(graphsaint_mode),
+                        "graphsaint_batch_size": int(graphsaint_batch_size),
+                        "graphsaint_num_steps": int(graphsaint_num_steps),
+                        "graphsaint_walk_length": int(graphsaint_walk_length),
+                        "deterministic_sampling": True,
+                        "sampling_seed": int(epoch_seed) + int(epoch_num) * 9973,
+                    }
+                    native_loader, native_error = graph_main._build_native_sampler_loader(
+                        graph_cpu=graph_cpu_local,
+                        sampler_config=native_cfg,
+                        batch_size=int(batch_size_candidate),
+                        sampling_seed=int(epoch_seed) + int(epoch_num) * 9973,
+                        base_seeds=seed_pool,
+                        num_neighbors_cfg=num_neighbors_cfg,
+                        deterministic=True,
+                    )
+                    if native_loader is None:
+                        raise RuntimeError(
+                            f"No se pudo construir loader nativo para {train_sampler_mode}: "
+                            f"{native_error or 'error desconocido'}"
+                        )
+                    return native_loader, seed_pool
+
+                input_nodes_obj: object
+                if seed_pool is not None and seed_pool.numel() > 0:
+                    input_nodes_obj = ("pm", seed_pool)
+                else:
+                    input_nodes_obj = ("pm", graph_cpu_local["pm"].train_mask)
+                loader_obj = NeighborLoader(
+                    graph_cpu_local,
+                    input_nodes=input_nodes_obj,
+                    num_neighbors=num_neighbors_cfg,
+                    batch_size=batch_size_candidate,
+                    shuffle=True,
+                )
+                return loader_obj, seed_pool
+
+            train_loader, active_seed_idx = _build_train_loader_from_sampler(
+                train_graph_cpu,
+                base_seed_idx=seed_idx,
+                epoch_seed=trial_seed,
+                epoch_num=1,
             )
-            if seed_pool.numel() == 0:
-                return None
-            if train_sampler_mode == "neighbor":
-                return seed_pool
-
-            pm_view = graph_main._build_pm_homogeneous_view(
-                graph_cpu_local, node_type="pm"
+            trial.set_user_attr(
+                "sampler_impl",
+                str(getattr(train_loader, "sampler_impl", "neighbor_native")),
             )
-            if pm_view is None:
-                return seed_pool
-
-            if train_sampler_mode == "cluster_gcn":
-                return graph_main._cluster_gcn_seed_order(
-                    pm_view,
-                    seed_pool,
-                    num_parts=int(cluster_gcn_num_parts),
-                    clusters_per_epoch=int(cluster_gcn_parts_per_epoch),
-                    deterministic=True,
-                    seed=int(epoch_seed),
-                    epoch=int(epoch_num),
-                ).cpu()
-
-            if train_sampler_mode == "graphsaint":
-                return graph_main._graphsaint_seed_sample(
-                    pm_view,
-                    seed_pool,
-                    mode=str(graphsaint_mode),
-                    batch_size=max(1, int(graphsaint_batch_size)),
-                    num_steps=max(1, int(graphsaint_num_steps)),
-                    walk_length=max(1, int(graphsaint_walk_length)),
-                    deterministic=True,
-                    seed=int(epoch_seed),
-                    epoch=int(epoch_num),
-                ).cpu()
-
-            return seed_pool
-
-        def _build_train_loader_from_sampler(
-            graph_cpu_local: HeteroData,
-            *,
-            base_seed_idx: Optional[torch.Tensor],
-            epoch_seed: int,
-            epoch_num: int,
-        ) -> Tuple[object, Optional[torch.Tensor]]:
-            sampler_seed_idx = _resolve_sampler_seed_idx(
-                graph_cpu_local,
-                base_seed_idx=base_seed_idx,
-                epoch_seed=epoch_seed,
-                epoch_num=epoch_num,
+            _mem_snapshot(
+                f"trial_{trial.number}_loader_ready",
+                extra=(
+                    f"batch={batch_size_candidate}, steps={len(train_loader)}, "
+                    f"seed_count={int(active_seed_idx.numel()) if active_seed_idx is not None else 'all'}, "
+                    f"sampler_impl={getattr(train_loader, 'sampler_impl', 'neighbor_native')}"
+                ),
             )
-            input_nodes_obj: object
-            if sampler_seed_idx is not None and sampler_seed_idx.numel() > 0:
-                input_nodes_obj = ("pm", sampler_seed_idx)
-            else:
-                input_nodes_obj = ("pm", graph_cpu_local["pm"].train_mask)
-
-            num_neighbors_cfg = {
-                edge_type: neighbor_profile
-                for edge_type in graph_cpu_local.edge_types
-            }
-            shuffle_flag = False if train_sampler_mode == "cluster_gcn" else True
-            loader_obj = NeighborLoader(
-                graph_cpu_local,
-                input_nodes=input_nodes_obj,
-                num_neighbors=num_neighbors_cfg,
-                batch_size=batch_size_candidate,
-                shuffle=bool(shuffle_flag),
-            )
-            return loader_obj, sampler_seed_idx
-
-        train_loader, active_seed_idx = _build_train_loader_from_sampler(
-            train_graph_cpu,
-            base_seed_idx=seed_idx,
-            epoch_seed=trial_seed,
-            epoch_num=1,
-        )
-        _mem_snapshot(
-            f"trial_{trial.number}_loader_ready",
-            extra=(
-                f"batch={batch_size_candidate}, steps={len(train_loader)}, "
-                f"seed_count={int(active_seed_idx.numel()) if active_seed_idx is not None else 'all'}"
-            ),
-        )
         try:
             scheduler = graph_main._build_lr_scheduler(
                 optimizer,
@@ -15711,10 +15836,10 @@ def _render_training_tab() -> None:
         if fidelity_target_sampler == "Cluster-GCN (nativo)":
             st.session_state["gnn_train_cluster_parts"] = 64
             st.session_state["gnn_train_cluster_parts_epoch"] = 0
-            st.session_state["gnn_train_graphsaint_mode"] = "Node"
-            st.session_state["gnn_train_graphsaint_batch"] = 2048
-            st.session_state["gnn_train_graphsaint_steps"] = 8
-            st.session_state["gnn_train_graphsaint_walk"] = 2
+            st.session_state["gnn_train_graphsaint_mode"] = "Random Walk"
+            st.session_state["gnn_train_graphsaint_batch"] = 4096
+            st.session_state["gnn_train_graphsaint_steps"] = 16
+            st.session_state["gnn_train_graphsaint_walk"] = 3
         elif fidelity_target_sampler == "GraphSAINT (nativo)":
             st.session_state["gnn_train_graphsaint_mode"] = "Random Walk"
             st.session_state["gnn_train_graphsaint_batch"] = 4096
@@ -15725,10 +15850,10 @@ def _render_training_tab() -> None:
         else:
             st.session_state["gnn_train_cluster_parts"] = 64
             st.session_state["gnn_train_cluster_parts_epoch"] = 0
-            st.session_state["gnn_train_graphsaint_mode"] = "Node"
-            st.session_state["gnn_train_graphsaint_batch"] = 2048
-            st.session_state["gnn_train_graphsaint_steps"] = 8
-            st.session_state["gnn_train_graphsaint_walk"] = 2
+            st.session_state["gnn_train_graphsaint_mode"] = "Random Walk"
+            st.session_state["gnn_train_graphsaint_batch"] = 4096
+            st.session_state["gnn_train_graphsaint_steps"] = 16
+            st.session_state["gnn_train_graphsaint_walk"] = 3
         st.session_state["gnn_train_eval_neighbors_mode"] = "Exhaustive (-1 por capa, más fiel)"
         st.session_state["gnn_train_eval_neighbors_custom"] = "15,10"
         st.rerun()
@@ -15743,7 +15868,7 @@ def _render_training_tab() -> None:
         list(sampler_options.keys()),
         key="gnn_train_sampler_mode",
         help=(
-            "Define cómo se eligen semillas PM por época, usando samplers nativos de PyG. "
+            "Define cómo se construyen los batches de entrenamiento con samplers nativos de PyG. "
             "NeighborLoader: baseline rápido. "
             "Cluster-GCN: usa `ClusterData/ClusterLoader` para particionar y muestrear por clústeres. "
             "GraphSAINT: usa `GraphSAINT*Sampler` para muestreo estocástico de nodos/aristas/caminatas."
@@ -15815,15 +15940,21 @@ def _render_training_tab() -> None:
                 )
             )
 
-    graphsaint_mode_train = "node"
-    graphsaint_batch_size_train = 2048
-    graphsaint_num_steps_train = 8
-    graphsaint_walk_length_train = 2
+    graphsaint_mode_train = "random_walk"
+    graphsaint_batch_size_train = 4096
+    graphsaint_num_steps_train = 16
+    graphsaint_walk_length_train = 3
     if train_sampler_mode == "graphsaint":
         saint_mode_map = {"Node": "node", "Edge": "edge", "Random Walk": "random_walk"}
+        default_saint_label = str(
+            st.session_state.get("gnn_train_graphsaint_mode", "Random Walk")
+        )
+        if default_saint_label not in saint_mode_map:
+            default_saint_label = "Random Walk"
         graphsaint_mode_label = st.selectbox(
             "GraphSAINT modo",
             list(saint_mode_map.keys()),
+            index=list(saint_mode_map.keys()).index(default_saint_label),
             key="gnn_train_graphsaint_mode",
             help=(
                 "Node: samplea nodos. Edge: samplea aristas. "
@@ -15838,7 +15969,7 @@ def _render_training_tab() -> None:
                 st.number_input(
                     "GraphSAINT batch_size",
                     min_value=64,
-                    value=int(st.session_state.get("gnn_train_graphsaint_batch", 2048)),
+                    value=int(st.session_state.get("gnn_train_graphsaint_batch", 4096)),
                     step=64,
                     key="gnn_train_graphsaint_batch",
                     help="Tamaño de muestra por paso de GraphSAINT (nodos/aristas según el modo).",
@@ -15848,10 +15979,10 @@ def _render_training_tab() -> None:
                 st.number_input(
                     "GraphSAINT num_steps",
                     min_value=1,
-                    value=int(st.session_state.get("gnn_train_graphsaint_steps", 8)),
+                    value=int(st.session_state.get("gnn_train_graphsaint_steps", 16)),
                     step=1,
                     key="gnn_train_graphsaint_steps",
-                    help="Número de submuestras GraphSAINT por época para construir seeds.",
+                    help="Número de submuestras GraphSAINT nativas por época.",
                 )
             )
         with col_saint_b:
@@ -15859,7 +15990,7 @@ def _render_training_tab() -> None:
                 st.number_input(
                     "GraphSAINT walk_length",
                     min_value=1,
-                    value=int(st.session_state.get("gnn_train_graphsaint_walk", 2)),
+                    value=int(st.session_state.get("gnn_train_graphsaint_walk", 3)),
                     step=1,
                     key="gnn_train_graphsaint_walk",
                     disabled=graphsaint_mode_train != "random_walk",
@@ -15978,6 +16109,10 @@ def _render_training_tab() -> None:
 
     use_graphsmote_effective = bool(use_graphsmote_train)
     training_checkpoint_path = None
+    training_stop_flag_path = None
+    training_stop_state_key = None
+    training_test_flag_path = None
+    training_test_state_key = None
     training_pending = False
     training_details = ""
     training_status = {}
@@ -16002,6 +16137,10 @@ def _render_training_tab() -> None:
         ckpt_dir = Path(RESULTADOS_DIR) / "gnn_train_checkpoints" / f"{variant_tag}_{config_hash}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         training_checkpoint_path = ckpt_dir / "checkpoint.pt"
+        training_stop_flag_path = ckpt_dir / "stop.request"
+        training_stop_state_key = f"gnn_train_stop_requested_{config_hash}"
+        training_test_flag_path = ckpt_dir / "test.request"
+        training_test_state_key = f"gnn_train_test_requested_{config_hash}"
         if training_checkpoint_path.exists():
             try:
                 ckpt = torch.load(training_checkpoint_path, map_location="cpu", weights_only=False)
@@ -16082,6 +16221,38 @@ def _render_training_tab() -> None:
     if training_details:
         st.info(training_details)
 
+    active_stop_flag_path = st.session_state.get("gnn_train_active_stop_flag_path")
+    active_stop_state_key = st.session_state.get("gnn_train_active_stop_state_key")
+    active_test_flag_path = st.session_state.get("gnn_train_active_test_flag_path")
+    active_test_state_key = st.session_state.get("gnn_train_active_test_state_key")
+    if active_stop_flag_path or active_test_flag_path:
+        active_cols = st.columns([0.50, 0.25, 0.25])
+        active_cols[0].caption(
+            "Entrenamiento GNN activo: las acciones se aplican al cerrar el epoch actual."
+        )
+        with active_cols[1]:
+            if active_test_flag_path and st.button(
+                "Testear activo",
+                key="gnn_train_test_active_button",
+                type="secondary",
+                help="Evalua el BEST actual en test_mask y luego continua entrenando.",
+            ):
+                _request_gnn_training_test(
+                    str(active_test_flag_path),
+                    str(active_test_state_key) if active_test_state_key else None,
+                )
+        with active_cols[2]:
+            if active_stop_flag_path and st.button(
+                "Detener entrenamiento activo",
+                key="gnn_train_stop_active_button",
+                type="secondary",
+                help="Solicita una parada ordenada y conserva el checkpoint para continuar despues.",
+            ):
+                _request_gnn_training_stop(
+                    str(active_stop_flag_path),
+                    str(active_stop_state_key) if active_stop_state_key else None,
+                )
+
     col_run_train, col_reset_train = st.columns([1, 1])
     with col_run_train:
         train_label = "Continuar entrenamiento" if training_pending else "Entrenar modelo GNN"
@@ -16105,6 +16276,25 @@ def _render_training_tab() -> None:
         except Exception as exc:
             st.error(f"No se pudo cargar el entrenador GNN: {exc}")
             return
+
+        if training_stop_flag_path is not None:
+            try:
+                training_stop_flag_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            st.session_state["gnn_train_active_stop_flag_path"] = str(training_stop_flag_path)
+            if training_stop_state_key:
+                st.session_state[training_stop_state_key] = False
+                st.session_state["gnn_train_active_stop_state_key"] = training_stop_state_key
+        if training_test_flag_path is not None:
+            try:
+                training_test_flag_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            st.session_state["gnn_train_active_test_flag_path"] = str(training_test_flag_path)
+            if training_test_state_key:
+                st.session_state[training_test_state_key] = False
+                st.session_state["gnn_train_active_test_state_key"] = training_test_state_key
 
         progress_bar = st.progress(0)
         progress_text = st.empty()
@@ -16145,6 +16335,31 @@ def _render_training_tab() -> None:
         metric_batch_edge.metric("Batch Edge", "N/A")
         metric_batch_l2.metric("Batch L2_Att", "N/A")
         metric_batch_lr.metric("Batch LR", "N/A")
+        action_cols = live_container.columns([0.50, 0.25, 0.25])
+        action_status = action_cols[0].empty()
+        action_status.caption("Acciones manuales disponibles al cierre del epoch actual.")
+        with action_cols[1]:
+            if training_test_flag_path is not None and st.button(
+                "Testear",
+                key=f"{training_test_state_key}_live_button",
+                type="secondary",
+                help="Evalua el mejor checkpoint actual en test_mask y continua entrenando.",
+            ):
+                _request_gnn_training_test(
+                    str(training_test_flag_path),
+                    training_test_state_key,
+                )
+        with action_cols[2]:
+            if training_stop_flag_path is not None and st.button(
+                "Detener entrenamiento",
+                key=f"{training_stop_state_key}_live_button",
+                type="secondary",
+                help="Guarda el checkpoint del epoch actual y permite continuar mas adelante.",
+            ):
+                _request_gnn_training_stop(
+                    str(training_stop_flag_path),
+                    training_stop_state_key,
+                )
 
         charts_container = st.container()
         charts_container.caption("Curvas en vivo")
@@ -16159,6 +16374,9 @@ def _render_training_tab() -> None:
         chart_lr = charts_container.empty()
         charts_container.caption("Conteo sinteticos (GraphSMOTE)")
         chart_synth = charts_container.empty()
+
+        live_test_container = st.container()
+        live_test_placeholder = live_test_container.empty()
 
         # Placeholder for evaluation results (to be rendered ABOVE logs)
         eval_results_placeholder = st.container()
@@ -16184,6 +16402,8 @@ def _render_training_tab() -> None:
             "last_chart_update": 0.0,
             "has_json": False,
             "current_epoch": None,
+            "stopped_by_user": False,
+            "test_results": [],
         }
 
         def _update_charts() -> None:
@@ -16204,11 +16424,77 @@ def _render_training_tab() -> None:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
             if "lr" in df.columns and df["lr"].notna().any():
-                chart_lr.line_chart(df[["lr"]].rename(columns={"lr": "Learning rate"}))
+                _render_gnn_live_line_chart(
+                    chart_lr,
+                    df[["lr"]].rename(columns={"lr": "Learning rate"}),
+                )
 
             if "smote_synth_count" in df.columns and df["smote_synth_count"].notna().any():
-                chart_synth.line_chart(
-                    df[["smote_synth_count"]].rename(columns={"smote_synth_count": "Sinteticos"})
+                _render_gnn_live_line_chart(
+                    chart_synth,
+                    df[["smote_synth_count"]].rename(
+                        columns={"smote_synth_count": "Sinteticos"}
+                    ),
+                )
+
+        def _render_live_test_results() -> None:
+            rows = list(live_state.get("test_results") or [])
+            if not rows:
+                return
+            display_rows = []
+            for row in rows[-5:]:
+                display_rows.append(
+                    {
+                        "epoch": row.get("epoch"),
+                        "best_epoch": row.get("best_epoch"),
+                        "Accuracy": row.get("accuracy"),
+                        "Recall": row.get("recall"),
+                        "Precision": row.get("precision"),
+                        "F1_macro": row.get("f1_macro"),
+                        "AUPRC": row.get("auprc"),
+                        "MCC": row.get("mcc"),
+                        "FAR": row.get("far"),
+                        "threshold": row.get("threshold"),
+                    }
+                )
+            result_df = pd.DataFrame(display_rows)
+            with live_test_placeholder.container():
+                st.markdown("#### Test intermedio en test_mask")
+                st.caption(
+                    "Resultados calculados con el mejor checkpoint disponible del entrenamiento actual."
+                )
+                st.dataframe(result_df, width="stretch")
+                last = rows[-1]
+                metric_cols_test = st.columns(6)
+                metric_cols_test[0].metric(
+                    "Accuracy",
+                    f"{float(last.get('accuracy')):.4f}"
+                    if last.get("accuracy") is not None else "N/A",
+                )
+                metric_cols_test[1].metric(
+                    "Recall",
+                    f"{float(last.get('recall')):.4f}"
+                    if last.get("recall") is not None else "N/A",
+                )
+                metric_cols_test[2].metric(
+                    "Precision",
+                    f"{float(last.get('precision')):.4f}"
+                    if last.get("precision") is not None else "N/A",
+                )
+                metric_cols_test[3].metric(
+                    "F1_macro",
+                    f"{float(last.get('f1_macro')):.4f}"
+                    if last.get("f1_macro") is not None else "N/A",
+                )
+                metric_cols_test[4].metric(
+                    "AUPRC",
+                    f"{float(last.get('auprc')):.4f}"
+                    if last.get("auprc") is not None else "N/A",
+                )
+                metric_cols_test[5].metric(
+                    "MCC",
+                    f"{float(last.get('mcc')):.4f}"
+                    if last.get("mcc") is not None else "N/A",
                 )
 
         def _handle_training_event(payload: dict) -> None:
@@ -16223,6 +16509,45 @@ def _render_training_tab() -> None:
                 return
             if event in {"epoch", "train_end", "train_batch"}:
                 live_state["has_json"] = True
+
+            if event == "stop_requested":
+                live_state["stopped_by_user"] = True
+                action_status.caption(
+                    "Parada recibida. Checkpoint guardado; puedes evaluar y continuar despues."
+                )
+                progress_text.caption(
+                    f"Entrenamiento detenido por solicitud manual en epoch {payload.get('epoch', '-')}"
+                )
+                return
+
+            if event == "test_start":
+                action_status.caption(
+                    "Test intermedio en curso con el mejor checkpoint actual."
+                )
+                progress_text.caption(
+                    f"Testeando BEST en test_mask al cierre del epoch {payload.get('epoch', '-')}"
+                )
+                return
+
+            if event == "test_result":
+                live_state["test_results"].append(dict(payload))
+                action_status.caption(
+                    "Test intermedio completado; el entrenamiento continua."
+                )
+                progress_text.caption(
+                    f"Test intermedio listo en epoch {payload.get('epoch', '-')}; continua entrenamiento."
+                )
+                _render_live_test_results()
+                return
+
+            if event == "test_error":
+                action_status.caption(
+                    f"No se pudo ejecutar el test intermedio: {payload.get('error', '-')}"
+                )
+                progress_text.caption(
+                    f"Test intermedio fallido en epoch {payload.get('epoch', '-')}; continua entrenamiento."
+                )
+                return
 
             if event == "train_start":
                 total = payload.get("total") or 0
@@ -16387,6 +16712,8 @@ def _render_training_tab() -> None:
                 return
 
             if event == "train_end":
+                if payload.get("stopped_by_user"):
+                    live_state["stopped_by_user"] = True
                 _update_charts()
 
         json_handler = StreamlitJSONLogHandler(_handle_training_event, scope="gnn_training")
@@ -16431,6 +16758,36 @@ def _render_training_tab() -> None:
             ram_mb = _get_ram_mb()
             if ram_mb is not None:
                 metric_ram.metric("RAM (MB)", f"{ram_mb:.1f}")
+
+        def _should_stop_training() -> bool:
+            if training_stop_state_key and st.session_state.get(training_stop_state_key):
+                return True
+            if training_stop_flag_path is None:
+                return False
+            try:
+                return training_stop_flag_path.exists()
+            except Exception:
+                return False
+
+        def _consume_test_training_request() -> bool:
+            requested = False
+            if training_test_state_key and st.session_state.get(training_test_state_key):
+                requested = True
+            if training_test_flag_path is not None:
+                try:
+                    requested = requested or training_test_flag_path.exists()
+                except Exception:
+                    pass
+            if not requested:
+                return False
+            if training_test_state_key:
+                st.session_state[training_test_state_key] = False
+            if training_test_flag_path is not None:
+                try:
+                    training_test_flag_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return True
 
         pm_index_ref = st.session_state.get("loaded_graph", {}).get("pm_index")
         split_info = None
@@ -16580,6 +16937,8 @@ def _render_training_tab() -> None:
                         eval_neighbors_mode=str(eval_neighbors_mode_train),
                         eval_num_neighbors=eval_num_neighbors_train,
                         checkpoint_metric=str(checkpoint_metric_train),
+                        should_stop=_should_stop_training,
+                        should_test=_consume_test_training_request,
                     )
             except Exception as exc:
                 exc_text = str(exc).strip() or repr(exc)
@@ -16604,6 +16963,31 @@ def _render_training_tab() -> None:
                 builtins.input = original_input
                 root_logger.removeHandler(log_handler)
                 root_logger.removeHandler(json_handler)
+                st.session_state.pop("gnn_train_active_stop_flag_path", None)
+                st.session_state.pop("gnn_train_active_stop_state_key", None)
+                st.session_state.pop("gnn_train_active_test_flag_path", None)
+                st.session_state.pop("gnn_train_active_test_state_key", None)
+                if training_stop_state_key:
+                    st.session_state[training_stop_state_key] = False
+                if training_test_state_key:
+                    st.session_state[training_test_state_key] = False
+                if training_stop_flag_path is not None:
+                    try:
+                        training_stop_flag_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                if training_test_flag_path is not None:
+                    try:
+                        training_test_flag_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        training_was_stopped = bool(live_state.get("stopped_by_user"))
+        if training_was_stopped and training_checkpoint_path is not None:
+            st.warning(
+                "Entrenamiento detenido por solicitud manual. "
+                f"Checkpoint disponible para continuar: {training_checkpoint_path}"
+            )
 
         model_path = _select_latest_gat_model(
             use_graphsmote=use_graphsmote_effective, graph_obj=graph_obj
@@ -16625,6 +17009,7 @@ def _render_training_tab() -> None:
                      "training": {
                          "model_path": str(model_path),
                          "epochs": max_epochs_train, 
+                         "stopped_by_user": bool(training_was_stopped),
                          "network_config": hp_choice,
                          "sampler_mode": train_sampler_mode,
                          "deterministic_sampling": bool(deterministic_sampling_train),
@@ -16644,12 +17029,22 @@ def _render_training_tab() -> None:
             # -------------------
             
             if use_notify:
-                 if notification_system.send_notification_email("Entrenamiento GNN Finalizado", entry):
+                 subject = (
+                     "Entrenamiento GNN Detenido"
+                     if training_was_stopped
+                     else "Entrenamiento GNN Finalizado"
+                 )
+                 if notification_system.send_notification_email(subject, entry):
                      st.toast("Notificación enviada por email.", icon="📧")
                  else:
                      st.warning("No se pudo enviar la notificación por email.")
 
-            st.success(f"Entrenamiento finalizado. Modelo: {os.path.basename(model_path)}")
+            if training_was_stopped:
+                st.info(
+                    f"Entrenamiento detenido. Modelo BEST disponible: {os.path.basename(model_path)}"
+                )
+            else:
+                st.success(f"Entrenamiento finalizado. Modelo: {os.path.basename(model_path)}")
             
             # EVALUACIÓN AUTOMÁTICA (Enviada al placeholder superior)
             if auto_eval:
@@ -17039,7 +17434,8 @@ def _perform_model_evaluation(
 
     node_type = "pm"
     eval_batch_size = int(batch_size or BATCH_SIZE)
-    eval_masks = masks or _list_available_masks(graph_data, node_type=node_type)
+    requested_masks = masks or _list_available_masks(graph_data, node_type=node_type)
+    eval_masks = _test_only_eval_masks(graph_data, node_type=node_type)
     progress_ui = _GNNGraphEvaluationProgress(
         model_path=str(model_path),
         device=device,
@@ -17055,6 +17451,24 @@ def _perform_model_evaluation(
     
     # Detalle de lo que se evalúa
     st.caption(f"Evaluando modelo: {os.path.basename(model_path)} en dispositivo: {device}")
+    if not eval_masks:
+        progress_ui.fail(
+            "Evaluación bloqueada",
+            detail="No se encontró test_mask no vacío para la evaluación final.",
+        )
+        st.warning("No se encontró `test_mask` no vacío para evaluar el modelo entrenado.")
+        return
+    ignored_masks = [
+        str(mask)
+        for mask in requested_masks
+        if str(mask) != "test_mask"
+    ]
+    if ignored_masks:
+        st.caption(
+            "La evaluación final se limita a `test_mask`; "
+            f"{', '.join(ignored_masks)} solo se ignora como split final. "
+            "`val_mask` puede usarse internamente para calibración."
+        )
 
     try:
         # Cargar pesos
@@ -17071,6 +17485,13 @@ def _perform_model_evaluation(
             state_dict = state_dict.get("model_state") or state_dict.get("state_dict")
         elif isinstance(state_dict, torch.nn.Module):
              state_dict = state_dict.state_dict()
+        if not isinstance(state_dict, dict):
+            progress_ui.fail(
+                "Checkpoint no evaluable",
+                detail="El archivo no contiene un state_dict compatible.",
+            )
+            st.error("El checkpoint no contiene `state_dict` evaluable.")
+            return
         progress_ui.update(
             0.12,
             "Checkpoint cargado",
@@ -17150,13 +17571,20 @@ def _perform_model_evaluation(
             if checkpoint_temporal_kind is not None
             else graph_num_nodes
         )
+        model_edge_types = _resolve_checkpoint_edge_types_for_model(
+            state_dict,
+            graph_data,
+        )
         
         # Instanciar
         progress_ui.update(
             0.34,
             "Instanciando modelo GNN",
             step_id="model_build_start",
-            detail=f"variant={gnn_variant} | hidden={h_channels} | layers={h_layers} | heads={h_heads}",
+            detail=(
+                f"variant={gnn_variant} | hidden={h_channels} | layers={h_layers} "
+                f"| heads={h_heads} | edge_types={len(model_edge_types or [])}"
+            ),
             event_type="model_build_start",
         )
         model = graph_main._build_gnn_model(
@@ -17180,6 +17608,7 @@ def _perform_model_evaluation(
                 checkpoint_temporal_kind is not None
                 or _gnn_variant_requires_sequence_index(gnn_variant)
             ),
+            edge_types=model_edge_types,
         )
         if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
             progress_ui.fail(
@@ -17582,7 +18011,7 @@ def _perform_model_evaluation(
                 graph_data,
                 node_type=node_type,
                 threshold=eval_threshold,
-                masks=eval_masks if masks is not None else None,
+                masks=eval_masks,
                 batch_size=eval_batch_size,
                 num_neighbors=num_neighbors,
                 calibration_model=platt_model,
@@ -17789,21 +18218,17 @@ def _render_evaluation_tab() -> None:
     if not available_masks:
         st.warning("No se encontraron máscaras en el grafo para evaluar.")
         return
-
-    default_masks = ["test_mask"] if "test_mask" in available_masks else available_masks
-    selected_masks = st.multiselect(
-        "Máscaras a evaluar",
-        options=available_masks,
-        default=default_masks,
-        key="gnn_eval_masks",
+    selected_masks = _test_only_eval_masks(graph_data, node_type=node_type)
+    if not selected_masks:
+        st.warning("No se encontró `test_mask` no vacío para evaluar el modelo entrenado.")
+        return
+    st.caption(
+        "Evaluación final fija: `test_mask`. "
+        "`val_mask` solo se usa internamente para calibración de umbral/probabilidad cuando corresponde."
     )
 
-    if not selected_masks:
-        st.warning("Seleccione al menos una máscara para evaluar.")
-        return
-
     mask_counts = {}
-    for m in selected_masks:
+    for m in ["test_mask"]:
         try:
             mask_counts[m] = int(graph_data[node_type][m].sum().item())
         except Exception:
@@ -18052,19 +18477,19 @@ SAMPLER_NEIGHBOR_PROFILE_PRESETS: Tuple[Tuple[str, Tuple[int, ...]], ...] = (
     ("wide", (30, 20)),
 )
 SAMPLER_CLUSTER_GCN_PROFILE_PRESETS: Tuple[Tuple[str, Tuple[int, int]], ...] = (
-    ("compact", (64, 0)),
-    ("focused", (64, 4)),
-    ("broad", (128, 0)),
-    ("wide", (128, 4)),
+    ("highway_stable", (64, 0)),
+    ("highway_broad", (32, 0)),
+    ("highway_local", (128, 0)),
+    ("highway_probe", (64, 16)),
 )
 SAMPLER_GRAPHSAINT_PROFILE_PRESETS: Tuple[
     Tuple[str, Tuple[str, int, int, int]],
     ...,
 ] = (
-    ("compact", ("node", 1024, 4, 2)),
-    ("focused", ("edge", 1024, 4, 2)),
-    ("broad", ("node", 2048, 8, 4)),
-    ("wide", ("random_walk", 2048, 8, 4)),
+    ("highway_rw_stable", ("random_walk", 4096, 16, 3)),
+    ("highway_node_stable", ("node", 4096, 16, 1)),
+    ("highway_edge_stable", ("edge", 4096, 16, 1)),
+    ("highway_rw_broad", ("random_walk", 8192, 12, 3)),
 )
 
 
@@ -19091,14 +19516,6 @@ def _build_sampler_memory_loader(
     batch_size: int,
     sampling_seed: int,
 ) -> Tuple[Optional[object], Optional[str]]:
-    from torch_geometric.loader import (
-        ClusterData,
-        ClusterLoader,
-        GraphSAINTEdgeSampler,
-        GraphSAINTNodeSampler,
-        GraphSAINTRandomWalkSampler,
-        NeighborLoader,
-    )
     from src import gnn_main as graph_main
 
     if "pm" not in graph_cpu.node_types:
@@ -19109,319 +19526,18 @@ def _build_sampler_memory_loader(
     base_seeds = graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1).cpu()
     if base_seeds.numel() == 0:
         return None, "No hay semillas de train disponibles."
-
-    def _pm_induced_hetero_batch(pm_nodes_raw: torch.Tensor) -> Tuple[Optional[HeteroData], Optional[str]]:
-        if not torch.is_tensor(pm_nodes_raw):
-            pm_nodes = torch.as_tensor(pm_nodes_raw, dtype=torch.long)
-        else:
-            pm_nodes = pm_nodes_raw.long()
-        pm_nodes = pm_nodes.view(-1).cpu()
-        if pm_nodes.numel() == 0:
-            return None, "Subgrafo nativo sin nodos PM."
-
-        total_pm = int(getattr(graph_cpu["pm"], "num_nodes", graph_cpu["pm"].x.size(0)))
-        filtered: List[int] = []
-        seen_nodes = set()
-        for raw in pm_nodes.tolist():
-            idx = int(raw)
-            if idx < 0 or idx >= total_pm:
-                continue
-            if idx in seen_nodes:
-                continue
-            seen_nodes.add(idx)
-            filtered.append(idx)
-        if not filtered:
-            return None, "Subgrafo nativo no contiene nodos PM válidos."
-        pm_nodes = torch.as_tensor(filtered, dtype=torch.long)
-
-        train_mask_full = getattr(graph_cpu["pm"], "train_mask", None)
-        if not torch.is_tensor(train_mask_full) or train_mask_full.numel() < total_pm:
-            return None, "train_mask inválida para supervisión del sampler nativo."
-        train_mask_full = train_mask_full.detach().cpu().bool()
-        supervised_mask = train_mask_full[pm_nodes]
-        supervised_count = int(supervised_mask.sum().item())
-        if supervised_count <= 0:
-            return None, "Subgrafo nativo sin nodos PM de train supervisados."
-        if supervised_count < int(pm_nodes.numel()):
-            pm_nodes = torch.cat(
-                [pm_nodes[supervised_mask], pm_nodes[~supervised_mask]],
-                dim=0,
-            )
-
-        out = HeteroData()
-        out["pm"].x = graph_cpu["pm"].x[pm_nodes].cpu()
-        if hasattr(graph_cpu["pm"], "y") and graph_cpu["pm"].y is not None:
-            out["pm"].y = graph_cpu["pm"].y[pm_nodes].cpu()
-        for mask_name in ("train_mask", "val_mask", "test_mask", "is_synthetic", "sequence_mask"):
-            try:
-                mask_val = getattr(graph_cpu["pm"], mask_name)
-            except Exception:
-                mask_val = None
-            if torch.is_tensor(mask_val) and mask_val.size(0) >= total_pm:
-                out["pm"][mask_name] = mask_val[pm_nodes].cpu()
-        out["pm"].num_nodes = int(pm_nodes.numel())
-        out["pm"].n_id = pm_nodes.clone()
-        out["pm"].batch_size = int(supervised_count)
-        supervised_batch_mask = torch.zeros(int(pm_nodes.numel()), dtype=torch.bool)
-        supervised_batch_mask[:supervised_count] = True
-        out["pm"].supervised_mask = supervised_batch_mask
-
-        g2l = torch.full((total_pm,), -1, dtype=torch.long)
-        g2l[pm_nodes] = torch.arange(pm_nodes.numel(), dtype=torch.long)
-
-        pm_edge_types = [
-            edge_type
-            for edge_type in graph_cpu.edge_types
-            if edge_type[0] == "pm" and edge_type[2] == "pm"
-        ]
-        for edge_type in pm_edge_types:
-            edge_index = getattr(graph_cpu[edge_type], "edge_index", None)
-            if edge_index is None:
-                continue
-            edge_index_cpu = edge_index.long().cpu()
-            if edge_index_cpu.numel() == 0:
-                out[edge_type].edge_index = torch.zeros((2, 0), dtype=torch.long)
-                continue
-            src_local = g2l[edge_index_cpu[0]]
-            dst_local = g2l[edge_index_cpu[1]]
-            keep = (src_local >= 0) & (dst_local >= 0)
-            edge_local = torch.stack([src_local[keep], dst_local[keep]], dim=0)
-            out[edge_type].edge_index = edge_local
-
-            edge_attr = getattr(graph_cpu[edge_type], "edge_attr", None)
-            if edge_attr is None:
-                continue
-            edge_attr_cpu = edge_attr.cpu()
-            if edge_attr_cpu.size(0) == edge_index_cpu.size(1):
-                out[edge_type].edge_attr = edge_attr_cpu[keep]
-            elif edge_attr_cpu.dim() >= 2:
-                out[edge_type].edge_attr = torch.zeros(
-                    (int(edge_local.size(1)), int(edge_attr_cpu.size(1))),
-                    dtype=edge_attr_cpu.dtype,
-                )
-
-        # Asegura relaciones esperadas por HeteroGAT aun cuando no haya aristas.
-        for req_edge_type in (
-            ("pm", "spatial", "pm"),
-            ("pm", "temporal", "pm"),
-            ("pm", "spatial_back", "pm"),
-            ("pm", "st_fwd", "pm"),
-        ):
-            if req_edge_type not in out.edge_types:
-                out[req_edge_type].edge_index = torch.zeros((2, 0), dtype=torch.long)
-
-        return out, None
-
-    class _NativeSamplerAsHeteroLoader:
-        def __init__(
-            self,
-            *,
-            base_loader: object,
-            max_batches: Optional[int],
-            deterministic_sampling: bool,
-            sampling_seed_value: int,
-        ) -> None:
-            self.base_loader = base_loader
-            self.max_batches = (
-                int(max_batches)
-                if max_batches is not None and int(max_batches) > 0
-                else None
-            )
-            self.deterministic_sampling = bool(deterministic_sampling)
-            self.sampling_seed_value = int(sampling_seed_value)
-            self.seen = 0
-
-        def __len__(self) -> int:
-            base_len = 0
-            try:
-                base_len = int(len(self.base_loader))
-            except Exception:
-                base_len = 0
-            if self.max_batches is None:
-                return max(1, int(base_len)) if base_len > 0 else 1
-            if base_len <= 0:
-                return max(1, int(self.max_batches))
-            return max(1, min(int(base_len), int(self.max_batches)))
-
-        def __iter__(self):
-            self.seen = 0
-            prev_cpu_state = torch.random.get_rng_state()
-            if self.deterministic_sampling:
-                torch.manual_seed(int(self.sampling_seed_value))
-            base_it = iter(self.base_loader)
-            try:
-                for sampled in base_it:
-                    if self.max_batches is not None and self.seen >= int(self.max_batches):
-                        break
-                    pm_nodes = getattr(sampled, "orig_nid", None)
-                    if pm_nodes is None:
-                        pm_nodes = getattr(sampled, "n_id", None)
-                    if pm_nodes is None:
-                        continue
-                    hetero_batch, _ = _pm_induced_hetero_batch(pm_nodes)
-                    if hetero_batch is None:
-                        continue
-                    self.seen += 1
-                    yield hetero_batch
-            finally:
-                _shutdown_torch_loader_iterator(base_it)
-                if self.deterministic_sampling:
-                    try:
-                        torch.random.set_rng_state(prev_cpu_state)
-                    except Exception:
-                        pass
-
-    cfg = dict(sampler_config or {})
-    mode_raw = str(cfg.get("train_sampler_mode", "neighbor")).strip().lower()
-    mode = {
-        "neighborloader": "neighbor",
-        "neighbor": "neighbor",
-        "cluster_gcn": "cluster_gcn",
-        "clustergcn": "cluster_gcn",
-        "graphsaint": "graphsaint",
-    }.get(mode_raw.replace("-", "_"), "neighbor")
-    deterministic = _metric_bool(cfg.get("deterministic_sampling"), default=True)
-    seed = int(_metric_float(cfg.get("sampling_seed")) or int(sampling_seed))
-    seeds = base_seeds
-
-    try:
-        num_neighbors_cfg = graph_main._resolve_num_neighbors(
-            cfg.get("num_neighbors"),
-            NUM_NEIGHBORS,
-            graph_cpu.edge_types,
-        )
-    except Exception:
-        num_neighbors_cfg = NUM_NEIGHBORS
-
-    if mode in {"cluster_gcn", "graphsaint"}:
-        try:
-            pm_view = graph_main._build_pm_homogeneous_view(graph_cpu, node_type="pm")
-        except Exception:
-            pm_view = None
-        if pm_view is None:
-            return None, "No se pudo construir vista homogénea PM para sampler nativo."
-
-        if mode == "cluster_gcn":
-            try:
-                num_parts = max(2, int(cfg.get("cluster_gcn_num_parts", 64)))
-                parts_per_epoch = int(cfg.get("cluster_gcn_parts_per_epoch", 0))
-                cluster_data = ClusterData(
-                    pm_view,
-                    num_parts=int(num_parts),
-                    recursive=False,
-                    log=False,
-                )
-                avg_nodes_per_part = max(
-                    1,
-                    int(math.ceil(float(int(pm_view.num_nodes)) / float(int(num_parts)))),
-                )
-                target_nodes = max(1, int(batch_size))
-                parts_per_batch = max(
-                    1,
-                    int(round(float(target_nodes) / float(avg_nodes_per_part))),
-                )
-                parts_per_batch = max(1, min(int(parts_per_batch), int(num_parts)))
-                cluster_loader = ClusterLoader(
-                    cluster_data,
-                    batch_size=int(parts_per_batch),
-                    shuffle=not bool(deterministic),
-                )
-                max_cluster_batches = None
-                if int(parts_per_epoch) > 0:
-                    max_cluster_batches = max(
-                        1,
-                        int(math.ceil(float(int(parts_per_epoch)) / float(int(parts_per_batch)))),
-                    )
-                native_loader = _NativeSamplerAsHeteroLoader(
-                    base_loader=cluster_loader,
-                    max_batches=max_cluster_batches,
-                    deterministic_sampling=bool(deterministic),
-                    sampling_seed_value=int(seed),
-                )
-                setattr(native_loader, "sampler_impl", "cluster_gcn_native")
-                setattr(native_loader, "native_parts_per_batch", int(parts_per_batch))
-                return native_loader, None
-            except Exception as exc:
-                return None, f"Cluster-GCN nativo falló: {exc}"
-
-        try:
-            saint_mode = str(cfg.get("graphsaint_mode", "node")).strip().lower().replace("-", "_")
-            profile_batch_size = int(cfg.get("graphsaint_batch_size", 0))
-            if profile_batch_size > 0:
-                scale = float(max(1, int(batch_size))) / float(max(1, int(BATCH_SIZE)))
-                effective_saint_batch = max(1, int(round(float(profile_batch_size) * scale)))
-            else:
-                effective_saint_batch = max(1, int(batch_size))
-            effective_saint_batch = min(
-                int(max(1, int(pm_view.num_nodes))),
-                int(effective_saint_batch),
-            )
-            saint_steps = max(1, int(cfg.get("graphsaint_num_steps", 8)))
-            saint_walk = max(1, int(cfg.get("graphsaint_walk_length", 2)))
-
-            if saint_mode == "edge":
-                saint_loader = GraphSAINTEdgeSampler(
-                    pm_view,
-                    batch_size=int(effective_saint_batch),
-                    num_steps=int(saint_steps),
-                    log=False,
-                )
-            elif saint_mode in {"random_walk", "randomwalk", "rw"}:
-                saint_loader = GraphSAINTRandomWalkSampler(
-                    pm_view,
-                    batch_size=int(effective_saint_batch),
-                    walk_length=int(saint_walk),
-                    num_steps=int(saint_steps),
-                    log=False,
-                )
-            else:
-                saint_loader = GraphSAINTNodeSampler(
-                    pm_view,
-                    batch_size=int(effective_saint_batch),
-                    num_steps=int(saint_steps),
-                    log=False,
-                )
-            native_loader = _NativeSamplerAsHeteroLoader(
-                base_loader=saint_loader,
-                max_batches=None,
-                deterministic_sampling=bool(deterministic),
-                sampling_seed_value=int(seed),
-            )
-            setattr(native_loader, "sampler_impl", f"graphsaint_native_{saint_mode}")
-            setattr(native_loader, "native_graphsaint_batch_size", int(effective_saint_batch))
-            return native_loader, None
-        except Exception as exc:
-            return None, f"GraphSAINT nativo falló: {exc}"
-
-    if not torch.is_tensor(seeds):
-        seeds = torch.as_tensor(seeds, dtype=torch.long)
-    seeds = seeds.view(-1).cpu()
-    if seeds.numel() == 0:
-        seeds = base_seeds
-
-    try:
-        loader_gen = None
-        if deterministic:
-            loader_gen = torch.Generator(device="cpu")
-            loader_gen.manual_seed(int(seed))
-        shuffle_flag = False if mode == "cluster_gcn" else True
-        loader = NeighborLoader(
-            graph_cpu,
-            input_nodes=("pm", seeds),
-            num_neighbors=num_neighbors_cfg,
-            batch_size=max(1, int(batch_size)),
-            shuffle=bool(shuffle_flag),
-            generator=loader_gen,
-            num_workers=0,
-            persistent_workers=False,
-        )
-        try:
-            setattr(loader, "sampler_impl", "neighbor_native")
-        except Exception:
-            pass
-    except Exception as exc:
-        return None, str(exc)
-    return loader, None
+    return graph_main._build_native_sampler_loader(
+        graph_cpu=graph_cpu,
+        sampler_config=sampler_config,
+        batch_size=int(batch_size),
+        sampling_seed=int(sampling_seed),
+        base_seeds=base_seeds,
+        deterministic=_metric_bool(
+            dict(sampler_config or {}).get("deterministic_sampling"),
+            default=True,
+        ),
+        scale_graphsaint_batch_with_loader_batch=True,
+    )
 
 
 def _probe_sampler_memory_usage_subprocess(
@@ -26344,28 +26460,28 @@ def _search_space_signature_from_state() -> str:
         "sampler_modes": list(_get_state("gnn_optuna_sampler_modes", ["neighbor"])),
         "cluster_gcn_num_parts": [
             v.strip()
-            for v in str(_get_state("gnn_optuna_cluster_num_parts", "64,128")).split(",")
+            for v in str(_get_state("gnn_optuna_cluster_num_parts", "32,64,128")).split(",")
             if v.strip()
         ],
         "cluster_gcn_parts_per_epoch": [
             v.strip()
-            for v in str(_get_state("gnn_optuna_cluster_parts_per_epoch", "0,4")).split(",")
+            for v in str(_get_state("gnn_optuna_cluster_parts_per_epoch", "0,16")).split(",")
             if v.strip()
         ],
         "graphsaint_modes": list(_get_state("gnn_optuna_graphsaint_modes", ["node", "edge", "random_walk"])),
         "graphsaint_batch_sizes": [
             v.strip()
-            for v in str(_get_state("gnn_optuna_graphsaint_batch_sizes", "1024,2048")).split(",")
+            for v in str(_get_state("gnn_optuna_graphsaint_batch_sizes", "4096,8192")).split(",")
             if v.strip()
         ],
         "graphsaint_num_steps": [
             v.strip()
-            for v in str(_get_state("gnn_optuna_graphsaint_num_steps", "4,8")).split(",")
+            for v in str(_get_state("gnn_optuna_graphsaint_num_steps", "12,16")).split(",")
             if v.strip()
         ],
         "graphsaint_walk_lengths": [
             v.strip()
-            for v in str(_get_state("gnn_optuna_graphsaint_walk_lengths", "2,4")).split(",")
+            for v in str(_get_state("gnn_optuna_graphsaint_walk_lengths", "1,3")).split(",")
             if v.strip()
         ],
     }
@@ -26463,13 +26579,13 @@ def _collect_optuna_ray_settings(
         if key and key not in sampler_modes:
             sampler_modes.append(key)
     cluster_num_parts = _parse_int_options(
-        str(_get_state("gnn_optuna_cluster_num_parts", "64,128")),
-        [64, 128],
+        str(_get_state("gnn_optuna_cluster_num_parts", "32,64,128")),
+        [32, 64, 128],
         min_value=2,
     )
     cluster_parts_per_epoch = _parse_int_options(
-        str(_get_state("gnn_optuna_cluster_parts_per_epoch", "0,4")),
-        [0, 4],
+        str(_get_state("gnn_optuna_cluster_parts_per_epoch", "0,16")),
+        [0, 16],
         min_value=0,
     )
     raw_graphsaint_modes = _get_state(
@@ -26484,18 +26600,18 @@ def _collect_optuna_ray_settings(
         if parsed_mode not in graphsaint_modes:
             graphsaint_modes.append(parsed_mode)
     graphsaint_batch_sizes = _parse_int_options(
-        str(_get_state("gnn_optuna_graphsaint_batch_sizes", "1024,2048")),
-        [1024, 2048],
+        str(_get_state("gnn_optuna_graphsaint_batch_sizes", "4096,8192")),
+        [4096, 8192],
         min_value=1,
     )
     graphsaint_num_steps = _parse_int_options(
-        str(_get_state("gnn_optuna_graphsaint_num_steps", "4,8")),
-        [4, 8],
+        str(_get_state("gnn_optuna_graphsaint_num_steps", "12,16")),
+        [12, 16],
         min_value=1,
     )
     graphsaint_walk_lengths = _parse_int_options(
-        str(_get_state("gnn_optuna_graphsaint_walk_lengths", "2,4")),
-        [2, 4],
+        str(_get_state("gnn_optuna_graphsaint_walk_lengths", "1,3")),
+        [1, 3],
         min_value=1,
     )
     if not neighbor_choices:
@@ -27442,13 +27558,13 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             for name, _ in SAMPLER_CLUSTER_GCN_PROFILE_PRESETS
         ):
             legacy_parts = _parse_int_options(
-                str(st.session_state.get("gnn_optuna_cluster_num_parts", "64,128")),
-                [64, 128],
+                str(st.session_state.get("gnn_optuna_cluster_num_parts", "32,64,128")),
+                [32, 64, 128],
                 min_value=2,
             )
             legacy_parts_epoch = _parse_int_options(
-                str(st.session_state.get("gnn_optuna_cluster_parts_per_epoch", "0,4")),
-                [0, 4],
+                str(st.session_state.get("gnn_optuna_cluster_parts_per_epoch", "0,16")),
+                [0, 16],
                 min_value=0,
             )
             legacy_pairs: List[Tuple[int, int]] = []
@@ -27501,18 +27617,18 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
                 if parsed_mode not in legacy_modes:
                     legacy_modes.append(parsed_mode)
             legacy_batches = _parse_int_options(
-                str(st.session_state.get("gnn_optuna_graphsaint_batch_sizes", "1024,2048")),
-                [1024, 2048],
+                str(st.session_state.get("gnn_optuna_graphsaint_batch_sizes", "4096,8192")),
+                [4096, 8192],
                 min_value=1,
             )
             legacy_steps = _parse_int_options(
-                str(st.session_state.get("gnn_optuna_graphsaint_num_steps", "4,8")),
-                [4, 8],
+                str(st.session_state.get("gnn_optuna_graphsaint_num_steps", "12,16")),
+                [12, 16],
                 min_value=1,
             )
             legacy_walks = _parse_int_options(
-                str(st.session_state.get("gnn_optuna_graphsaint_walk_lengths", "2,4")),
-                [2, 4],
+                str(st.session_state.get("gnn_optuna_graphsaint_walk_lengths", "1,3")),
+                [1, 3],
                 min_value=1,
             )
             legacy_profiles: List[Tuple[str, int, int, int]] = []
@@ -27930,13 +28046,13 @@ def _render_ray_tune_tab() -> None:
         if key and key not in sampler_modes:
             sampler_modes.append(key)
     cluster_num_parts = _parse_int_options(
-        str(_get_state("gnn_optuna_cluster_num_parts", "64,128")),
-        [64, 128],
+        str(_get_state("gnn_optuna_cluster_num_parts", "32,64,128")),
+        [32, 64, 128],
         min_value=2,
     )
     cluster_parts_per_epoch = _parse_int_options(
-        str(_get_state("gnn_optuna_cluster_parts_per_epoch", "0,4")),
-        [0, 4],
+        str(_get_state("gnn_optuna_cluster_parts_per_epoch", "0,16")),
+        [0, 16],
         min_value=0,
     )
     raw_graphsaint_modes = _get_state(
@@ -27951,18 +28067,18 @@ def _render_ray_tune_tab() -> None:
         if parsed_mode not in graphsaint_modes:
             graphsaint_modes.append(parsed_mode)
     graphsaint_batch_sizes = _parse_int_options(
-        str(_get_state("gnn_optuna_graphsaint_batch_sizes", "1024,2048")),
-        [1024, 2048],
+        str(_get_state("gnn_optuna_graphsaint_batch_sizes", "4096,8192")),
+        [4096, 8192],
         min_value=1,
     )
     graphsaint_num_steps = _parse_int_options(
-        str(_get_state("gnn_optuna_graphsaint_num_steps", "4,8")),
-        [4, 8],
+        str(_get_state("gnn_optuna_graphsaint_num_steps", "12,16")),
+        [12, 16],
         min_value=1,
     )
     graphsaint_walk_lengths = _parse_int_options(
-        str(_get_state("gnn_optuna_graphsaint_walk_lengths", "2,4")),
-        [2, 4],
+        str(_get_state("gnn_optuna_graphsaint_walk_lengths", "1,3")),
+        [1, 3],
         min_value=1,
     )
 

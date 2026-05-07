@@ -16,10 +16,11 @@ from src.gnn_mps_scatter import install_gnn_mps_scatter_policy
 
 install_gnn_mps_scatter_policy()
 
-from torch_geometric.data import Data
+from torch_geometric.data import Data, HeteroData
 from torch_geometric.loader import (
     NeighborLoader,
     ClusterData,
+    ClusterLoader,
     GraphSAINTNodeSampler,
     GraphSAINTEdgeSampler,
     GraphSAINTRandomWalkSampler,
@@ -60,7 +61,8 @@ from src.train_pretrain import train_minibatch, pretrain_edge_generator
 from src.gat_model import HeteroGAT, HeteroGATWithEdgeEncoder, HeteroEdgeAware
 from src.temporal_head import TemporalAggregator
 from src.temporal_heads import TemporalGRUHead, TemporalTransformerHead, TemporalAttnPoolHead
-from src.graphsmote import (RelEdgeGen,train_z2x_decoders,augment_graph_offline_once, refresh_synthetics_online, compute_epoch_embeddings)
+from src.graphsmote import (RelEdgeGen, train_z2x_decoders, train_edge_attr_decoders,
+                            augment_graph_offline_once, refresh_synthetics_online, compute_epoch_embeddings)
 from src.imgagn import ImGAGNConfig, train_imgagn
 from src.optimizers import get_optimizer_cls
 from src.config import (SEED,DT_MINUTES,MAX_EPOCHS,EARLY_STOPPING_PATIENCE,EARLY_STOPPING_MIN_DELTA,RESULTADOS_DIR,
@@ -114,6 +116,133 @@ def _emit_training_event(event: str, run_id: str, **payload) -> None:
         logger.info(json.dumps(data))
     except Exception:
         pass
+
+
+def _training_stop_requested(should_stop: Optional[Callable[[], bool]]) -> bool:
+    if should_stop is None:
+        return False
+    try:
+        return bool(should_stop())
+    except Exception as exc:
+        logger.warning(f"No se pudo consultar solicitud de parada: {exc}")
+        return False
+
+
+def _training_test_requested(should_test: Optional[Callable[[], bool]]) -> bool:
+    if should_test is None:
+        return False
+    try:
+        return bool(should_test())
+    except Exception as exc:
+        logger.warning(f"No se pudo consultar solicitud de test intermedio: {exc}")
+        return False
+
+
+def _summarize_binary_test_result(
+    result: Dict[str, object],
+    *,
+    epoch: int,
+    best_epoch: int,
+    threshold: Optional[float],
+    checkpoint_path: Optional[str],
+) -> Dict[str, object]:
+    report = result.get("report") or {}
+    pos_report = report.get("Accidente (1)", {}) if isinstance(report, dict) else {}
+    macro_report = report.get("macro avg", {}) if isinstance(report, dict) else {}
+    far_value = result.get("far")
+    if far_value is None:
+        far_value = result.get("false_alarm_ratio")
+    summary = {
+        "epoch": int(epoch),
+        "best_epoch": int(best_epoch),
+        "checkpoint_path": checkpoint_path,
+        "threshold": float(threshold) if threshold is not None else None,
+        "accuracy": report.get("accuracy") if isinstance(report, dict) else None,
+        "precision": pos_report.get("precision") if isinstance(pos_report, dict) else None,
+        "recall": pos_report.get("recall") if isinstance(pos_report, dict) else None,
+        "f1_pos": pos_report.get("f1-score") if isinstance(pos_report, dict) else None,
+        "f1_macro": macro_report.get("f1-score") if isinstance(macro_report, dict) else None,
+        "auprc": result.get("auprc"),
+        "auc": result.get("auc"),
+        "mcc": result.get("mcc"),
+        "far": far_value,
+        "cm": result.get("cm"),
+    }
+    return _json_clean(_json_safe(summary))
+
+
+def _test_best_checkpoint_during_training(
+    *,
+    model,
+    best_checkpoint_path: str,
+    base_graph,
+    node_type: str,
+    batch_size: int,
+    num_neighbors,
+    threshold: Optional[float],
+    device: torch.device,
+    epoch: int,
+    best_epoch: int,
+) -> Dict[str, object]:
+    if not best_checkpoint_path or not os.path.exists(best_checkpoint_path):
+        raise FileNotFoundError(
+            f"No existe checkpoint BEST para test intermedio: {best_checkpoint_path}"
+        )
+
+    was_training = bool(model.training)
+    previous_checkpointing = getattr(model, "use_checkpointing", None)
+    current_state = {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+    try:
+        best_state = torch.load(best_checkpoint_path, map_location="cpu", weights_only=False)
+        if isinstance(best_state, dict) and (
+            "model_state" in best_state or "state_dict" in best_state
+        ):
+            best_state = best_state.get("model_state") or best_state.get("state_dict")
+        elif isinstance(best_state, torch.nn.Module):
+            best_state = best_state.state_dict()
+        if not isinstance(best_state, dict):
+            raise TypeError("El checkpoint BEST no contiene un state_dict evaluable.")
+
+        if previous_checkpointing is not None:
+            model.use_checkpointing = False
+        model.load_state_dict(best_state, strict=True)
+        model.to(device)
+        results = test(
+            model,
+            base_graph,
+            node_type=node_type,
+            batch_size=batch_size,
+            masks=["test_mask"],
+            threshold=threshold,
+            num_neighbors=num_neighbors,
+        )
+        if not results or "test_mask" not in results:
+            raise RuntimeError("No se obtuvieron resultados sobre test_mask.")
+        return _summarize_binary_test_result(
+            results["test_mask"],
+            epoch=int(epoch),
+            best_epoch=int(best_epoch),
+            threshold=threshold,
+            checkpoint_path=str(best_checkpoint_path),
+        )
+    finally:
+        try:
+            model.load_state_dict(current_state, strict=True)
+            model.to(device)
+            if was_training:
+                model.train()
+            else:
+                model.eval()
+            if previous_checkpointing is not None:
+                model.use_checkpointing = previous_checkpointing
+        finally:
+            del current_state
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 # --- Helpers: model path discovery with variant tags ---
 def _has_imgagn(loaded_obj) -> bool:
@@ -851,6 +980,387 @@ def _build_pm_homogeneous_view(graph, node_type: str = "pm") -> Optional[Data]:
     except Exception:
         return None
 
+def _shutdown_torch_loader_iterator(iterator: object) -> None:
+    if iterator is None:
+        return
+    try:
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+    except Exception:
+        pass
+
+def _coerce_pm_node_ids(raw_nodes: object, total_nodes: int) -> torch.Tensor:
+    if torch.is_tensor(raw_nodes):
+        node_ids = raw_nodes.detach().long().view(-1).cpu()
+    else:
+        node_ids = torch.as_tensor(raw_nodes, dtype=torch.long).view(-1).cpu()
+    if node_ids.numel() == 0:
+        return node_ids
+
+    filtered: List[int] = []
+    seen = set()
+    upper = int(total_nodes)
+    for raw in node_ids.tolist():
+        idx = int(raw)
+        if idx < 0 or idx >= upper or idx in seen:
+            continue
+        seen.add(idx)
+        filtered.append(idx)
+    return torch.as_tensor(filtered, dtype=torch.long)
+
+def _pm_induced_hetero_batch(
+    graph_cpu: HeteroData,
+    pm_nodes_raw: object,
+    *,
+    supervised_nodes: torch.Tensor,
+    node_type: str = "pm",
+) -> Tuple[Optional[HeteroData], Optional[str]]:
+    if node_type not in graph_cpu.node_types:
+        return None, f"No se encontró tipo de nodo '{node_type}'."
+    try:
+        total_pm = int(getattr(graph_cpu[node_type], "num_nodes", graph_cpu[node_type].x.size(0)))
+    except Exception:
+        return None, f"No se pudo resolver num_nodes para '{node_type}'."
+
+    pm_nodes = _coerce_pm_node_ids(pm_nodes_raw, total_pm)
+    if pm_nodes.numel() == 0:
+        return None, "Subgrafo nativo sin nodos PM válidos."
+
+    seed_nodes = _coerce_pm_node_ids(supervised_nodes, total_pm)
+    if seed_nodes.numel() == 0:
+        return None, "No hay semillas supervisadas para el sampler nativo."
+    seed_mask = torch.zeros(total_pm, dtype=torch.bool)
+    seed_mask[seed_nodes] = True
+    supervised_mask = seed_mask[pm_nodes]
+    supervised_count = int(supervised_mask.sum().item())
+    if supervised_count <= 0:
+        return None, "Subgrafo nativo sin nodos PM supervisados."
+
+    if supervised_count < int(pm_nodes.numel()):
+        pm_nodes = torch.cat([pm_nodes[supervised_mask], pm_nodes[~supervised_mask]], dim=0)
+
+    out = HeteroData()
+    pm_store = graph_cpu[node_type]
+    out[node_type].x = pm_store.x[pm_nodes].cpu()
+    if hasattr(pm_store, "y") and pm_store.y is not None:
+        out[node_type].y = pm_store.y[pm_nodes].cpu()
+
+    copied_node_attrs = {"x", "y"}
+    try:
+        node_items = list(pm_store.items())
+    except Exception:
+        node_items = []
+    for attr_name, attr_value in node_items:
+        if attr_name in copied_node_attrs:
+            continue
+        if torch.is_tensor(attr_value) and attr_value.size(0) >= total_pm:
+            out[node_type][attr_name] = attr_value[pm_nodes].cpu()
+
+    out[node_type].num_nodes = int(pm_nodes.numel())
+    out[node_type].n_id = pm_nodes.clone()
+    out[node_type].batch_size = int(supervised_count)
+    supervised_batch_mask = torch.zeros(int(pm_nodes.numel()), dtype=torch.bool)
+    supervised_batch_mask[:supervised_count] = True
+    out[node_type].supervised_mask = supervised_batch_mask
+
+    global_to_local = torch.full((total_pm,), -1, dtype=torch.long)
+    global_to_local[pm_nodes] = torch.arange(pm_nodes.numel(), dtype=torch.long)
+
+    pm_edge_types = [
+        edge_type
+        for edge_type in graph_cpu.edge_types
+        if edge_type[0] == node_type and edge_type[2] == node_type
+    ]
+    for edge_type in pm_edge_types:
+        edge_index = getattr(graph_cpu[edge_type], "edge_index", None)
+        if edge_index is None:
+            out[edge_type].edge_index = torch.zeros((2, 0), dtype=torch.long)
+            continue
+
+        edge_index_cpu = edge_index.long().cpu()
+        edge_attr = getattr(graph_cpu[edge_type], "edge_attr", None)
+        if edge_index_cpu.numel() == 0:
+            out[edge_type].edge_index = torch.zeros((2, 0), dtype=torch.long)
+            if torch.is_tensor(edge_attr) and edge_attr.dim() >= 2:
+                out[edge_type].edge_attr = torch.zeros(
+                    (0, int(edge_attr.size(1))),
+                    dtype=edge_attr.dtype,
+                )
+            continue
+
+        src_local = global_to_local[edge_index_cpu[0]]
+        dst_local = global_to_local[edge_index_cpu[1]]
+        keep = (src_local >= 0) & (dst_local >= 0)
+        local_edge_index = torch.stack([src_local[keep], dst_local[keep]], dim=0)
+        out[edge_type].edge_index = local_edge_index
+
+        if not torch.is_tensor(edge_attr):
+            continue
+        edge_attr_cpu = edge_attr.cpu()
+        if edge_attr_cpu.size(0) == edge_index_cpu.size(1):
+            out[edge_type].edge_attr = edge_attr_cpu[keep]
+        elif edge_attr_cpu.dim() >= 2:
+            out[edge_type].edge_attr = torch.zeros(
+                (int(local_edge_index.size(1)), int(edge_attr_cpu.size(1))),
+                dtype=edge_attr_cpu.dtype,
+            )
+
+    try:
+        out.graph_metadata = dict(getattr(graph_cpu, "graph_metadata", {}) or {})
+    except Exception:
+        pass
+    return out, None
+
+class _NativeSamplerAsHeteroLoader:
+    def __init__(
+        self,
+        *,
+        base_loader: object,
+        graph_cpu: HeteroData,
+        supervised_nodes: torch.Tensor,
+        max_batches: Optional[int],
+        deterministic_sampling: bool,
+        sampling_seed_value: int,
+        sampler_impl: str,
+        node_type: str = "pm",
+    ) -> None:
+        self.base_loader = base_loader
+        self.graph_cpu = graph_cpu
+        self.supervised_nodes = supervised_nodes.detach().cpu().long().view(-1)
+        self.max_batches = (
+            int(max_batches)
+            if max_batches is not None and int(max_batches) > 0
+            else None
+        )
+        self.deterministic_sampling = bool(deterministic_sampling)
+        self.sampling_seed_value = int(sampling_seed_value)
+        self.sampler_impl = str(sampler_impl)
+        self.node_type = str(node_type)
+        self.seen = 0
+
+    def __len__(self) -> int:
+        try:
+            base_len = int(len(self.base_loader))
+        except Exception:
+            base_len = 0
+        if self.max_batches is None:
+            return max(1, base_len) if base_len > 0 else 1
+        if base_len <= 0:
+            return max(1, int(self.max_batches))
+        return max(1, min(base_len, int(self.max_batches)))
+
+    def __iter__(self):
+        self.seen = 0
+        prev_cpu_state = torch.random.get_rng_state()
+        if self.deterministic_sampling:
+            torch.manual_seed(int(self.sampling_seed_value))
+        base_it = iter(self.base_loader)
+        try:
+            for sampled in base_it:
+                if self.max_batches is not None and self.seen >= int(self.max_batches):
+                    break
+                pm_nodes = getattr(sampled, "orig_nid", None)
+                if pm_nodes is None:
+                    pm_nodes = getattr(sampled, "n_id", None)
+                if pm_nodes is None:
+                    continue
+                hetero_batch, _ = _pm_induced_hetero_batch(
+                    self.graph_cpu,
+                    pm_nodes,
+                    supervised_nodes=self.supervised_nodes,
+                    node_type=self.node_type,
+                )
+                if hetero_batch is None:
+                    continue
+                self.seen += 1
+                yield hetero_batch
+        finally:
+            _shutdown_torch_loader_iterator(base_it)
+            if self.deterministic_sampling:
+                try:
+                    torch.random.set_rng_state(prev_cpu_state)
+                except Exception:
+                    pass
+
+def _normalize_train_sampler_mode(value: object) -> str:
+    key = str(value or "neighbor").strip().lower().replace("-", "_")
+    return {
+        "neighbor": "neighbor",
+        "neighborloader": "neighbor",
+        "cluster_gcn": "cluster_gcn",
+        "clustergcn": "cluster_gcn",
+        "graphsaint": "graphsaint",
+    }.get(key, "neighbor")
+
+def _build_native_sampler_loader(
+    *,
+    graph_cpu: HeteroData,
+    sampler_config: Dict[str, object],
+    batch_size: int,
+    sampling_seed: int,
+    base_seeds: Optional[torch.Tensor] = None,
+    num_neighbors_cfg: Optional[object] = None,
+    deterministic: Optional[bool] = None,
+    node_type: str = "pm",
+    scale_graphsaint_batch_with_loader_batch: bool = False,
+) -> Tuple[Optional[object], Optional[str]]:
+    if node_type not in graph_cpu.node_types:
+        return None, f"No se encontró tipo de nodo '{node_type}'."
+    if not hasattr(graph_cpu[node_type], "train_mask"):
+        return None, f"No se encontró train_mask para '{node_type}'."
+
+    cfg = dict(sampler_config or {})
+    mode = _normalize_train_sampler_mode(cfg.get("train_sampler_mode", "neighbor"))
+    if deterministic is None:
+        deterministic = _safe_bool(cfg.get("deterministic_sampling"), True)
+    seed = int(_safe_cast(cfg.get("sampling_seed"), int, int(sampling_seed)))
+
+    if base_seeds is None:
+        base_seeds = graph_cpu[node_type].train_mask.nonzero(as_tuple=False).view(-1).cpu()
+    else:
+        base_seeds = base_seeds.detach().cpu().long().view(-1)
+    if base_seeds.numel() == 0:
+        return None, "No hay semillas de train disponibles."
+
+    try:
+        resolved_neighbors = (
+            num_neighbors_cfg
+            if num_neighbors_cfg is not None
+            else _resolve_num_neighbors(cfg.get("num_neighbors"), NUM_NEIGHBORS, graph_cpu.edge_types)
+        )
+    except Exception:
+        resolved_neighbors = NUM_NEIGHBORS
+
+    if mode == "neighbor":
+        try:
+            loader_gen = None
+            if bool(deterministic):
+                loader_gen = torch.Generator(device="cpu")
+                loader_gen.manual_seed(int(seed))
+            loader = NeighborLoader(
+                graph_cpu,
+                input_nodes=(node_type, base_seeds),
+                num_neighbors=resolved_neighbors,
+                batch_size=max(1, int(batch_size)),
+                shuffle=True,
+                generator=loader_gen,
+            )
+            try:
+                setattr(loader, "sampler_impl", "neighbor_native")
+            except Exception:
+                pass
+            return loader, None
+        except Exception as exc:
+            return None, str(exc)
+
+    pm_view = _build_pm_homogeneous_view(graph_cpu, node_type=node_type)
+    if pm_view is None:
+        return None, "No se pudo construir vista homogénea PM para sampler nativo."
+
+    if mode == "cluster_gcn":
+        try:
+            num_parts = max(2, int(cfg.get("cluster_gcn_num_parts", 64)))
+            parts_per_epoch = int(cfg.get("cluster_gcn_parts_per_epoch", 0))
+            cluster_data = ClusterData(
+                pm_view,
+                num_parts=int(num_parts),
+                recursive=False,
+                log=False,
+            )
+            avg_nodes_per_part = max(
+                1,
+                int(math.ceil(float(int(pm_view.num_nodes)) / float(int(num_parts)))),
+            )
+            target_nodes = max(1, int(batch_size))
+            parts_per_batch = max(
+                1,
+                int(round(float(target_nodes) / float(avg_nodes_per_part))),
+            )
+            parts_per_batch = max(1, min(int(parts_per_batch), int(num_parts)))
+            cluster_loader = ClusterLoader(
+                cluster_data,
+                batch_size=int(parts_per_batch),
+                shuffle=not bool(deterministic),
+            )
+            max_cluster_batches = None
+            if int(parts_per_epoch) > 0:
+                max_cluster_batches = max(
+                    1,
+                    int(math.ceil(float(int(parts_per_epoch)) / float(int(parts_per_batch)))),
+                )
+            native_loader = _NativeSamplerAsHeteroLoader(
+                base_loader=cluster_loader,
+                graph_cpu=graph_cpu,
+                supervised_nodes=base_seeds,
+                max_batches=max_cluster_batches,
+                deterministic_sampling=bool(deterministic),
+                sampling_seed_value=int(seed),
+                sampler_impl="cluster_gcn_native",
+                node_type=node_type,
+            )
+            setattr(native_loader, "native_parts_per_batch", int(parts_per_batch))
+            return native_loader, None
+        except Exception as exc:
+            return None, f"Cluster-GCN nativo falló: {exc}"
+
+    try:
+        saint_mode = str(cfg.get("graphsaint_mode", "node")).strip().lower().replace("-", "_")
+        profile_batch_size = int(cfg.get("graphsaint_batch_size", 0))
+        if profile_batch_size > 0:
+            if bool(scale_graphsaint_batch_with_loader_batch):
+                scale = float(max(1, int(batch_size))) / float(max(1, int(BATCH_SIZE)))
+                effective_saint_batch = max(1, int(round(float(profile_batch_size) * scale)))
+            else:
+                effective_saint_batch = int(profile_batch_size)
+        else:
+            effective_saint_batch = max(1, int(batch_size))
+        effective_saint_batch = min(
+            int(max(1, int(pm_view.num_nodes))),
+            int(effective_saint_batch),
+        )
+        saint_steps = max(1, int(cfg.get("graphsaint_num_steps", 8)))
+        saint_walk = max(1, int(cfg.get("graphsaint_walk_length", 2)))
+
+        if saint_mode == "edge":
+            saint_loader = GraphSAINTEdgeSampler(
+                pm_view,
+                batch_size=int(effective_saint_batch),
+                num_steps=int(saint_steps),
+                log=False,
+            )
+        elif saint_mode in {"random_walk", "randomwalk", "rw"}:
+            saint_mode = "random_walk"
+            saint_loader = GraphSAINTRandomWalkSampler(
+                pm_view,
+                batch_size=int(effective_saint_batch),
+                walk_length=int(saint_walk),
+                num_steps=int(saint_steps),
+                log=False,
+            )
+        else:
+            saint_mode = "node"
+            saint_loader = GraphSAINTNodeSampler(
+                pm_view,
+                batch_size=int(effective_saint_batch),
+                num_steps=int(saint_steps),
+                log=False,
+            )
+        native_loader = _NativeSamplerAsHeteroLoader(
+            base_loader=saint_loader,
+            graph_cpu=graph_cpu,
+            supervised_nodes=base_seeds,
+            max_batches=None,
+            deterministic_sampling=bool(deterministic),
+            sampling_seed_value=int(seed),
+            sampler_impl=f"graphsaint_native_{saint_mode}",
+            node_type=node_type,
+        )
+        setattr(native_loader, "native_graphsaint_batch_size", int(effective_saint_batch))
+        return native_loader, None
+    except Exception as exc:
+        return None, f"GraphSAINT nativo falló: {exc}"
+
 def _cluster_gcn_seed_order(
     pm_view: Data,
     base_seeds: torch.Tensor,
@@ -1114,14 +1624,39 @@ def run_gnn_anomaly_pipeline(loaded_obj):
     mask_key = 'val_mask' if 'val_mask' in initial else 'train_mask'
     y_true_val = initial[mask_key]['true'].cpu().numpy().ravel()
     y_prob1_val_raw = initial[mask_key]['probs'][:, 1].cpu().numpy().ravel()
-    y_prob1_val, platt_model = _platt_scale_probabilities(y_true_val, y_prob1_val_raw)
 
-    # Elegir umbral por F_beta
-    tau, info = pick_threshold_from_val(y_true_val, y_prob1_val, mode="fbeta", beta=float(F_BETA_THRESHOLD))
+    # Split VAL en val_thr (selección de umbral) y val_cal (fit Platt) — 50/50.
+    # Evita el sesgo optimista de usar el mismo subconjunto para calibrar y
+    # elegir el threshold; las métricas finales se reportan sobre TEST.
+    if mask_key == 'val_mask' and y_true_val.size >= 4:
+        idx_thr, idx_cal = _split_val_for_thr_cal(y_true_val.size, seed=int(SEED))
+        y_true_cal = y_true_val[idx_cal]
+        y_prob1_cal_raw = y_prob1_val_raw[idx_cal]
+        # 1) Fit Platt en val_cal
+        _, platt_model = _platt_scale_probabilities(y_true_cal, y_prob1_cal_raw)
+        # 2) Aplica Platt y elige umbral en val_thr
+        y_true_thr = y_true_val[idx_thr]
+        y_prob1_thr_raw = y_prob1_val_raw[idx_thr]
+        y_prob1_thr = _apply_platt_model(y_prob1_thr_raw, platt_model)
+        tau, info = pick_threshold_from_val(y_true_thr, y_prob1_thr, mode="fbeta", beta=float(F_BETA_THRESHOLD))
+        # Curva PR en val (sobre val_thr para coherencia con la selección).
+        try:
+            pr_curve_path = os.path.splitext(best_model_path)[0] + "_pr_curve_val.json"
+            _save_pr_curve_artifact(y_true_thr, y_prob1_thr, pr_curve_path)
+        except Exception:
+            pass
+    else:
+        # Fallback: si no hay val_mask suficiente, mantén el comportamiento legacy.
+        y_prob1_val, platt_model = _platt_scale_probabilities(y_true_val, y_prob1_val_raw)
+        tau, info = pick_threshold_from_val(y_true_val, y_prob1_val, mode="fbeta", beta=float(F_BETA_THRESHOLD))
     print(f"🔧 Umbral seleccionado (Fβ, β={F_BETA_THRESHOLD}): tau={tau:.6f} → P={info.get('precision', float('nan')):.3f}, R={info.get('recall', float('nan')):.3f}")
 
-    # Pase final con umbral
-    final = test(model, data, node_type='pm', threshold=tau, calibration_model=platt_model)
+    # Pase final con umbral + IC bootstrap sobre los splits (clave para clase rara).
+    final = test(
+        model, data, node_type='pm',
+        threshold=tau, calibration_model=platt_model,
+        compute_bootstrap_ci=True, bootstrap_n=1000, bootstrap_seed=int(SEED),
+    )
     if not final:
         print("❌ Test final vacío.")
         return
@@ -1944,6 +2479,162 @@ def pick_threshold_from_val(y_true_val, y_prob1_val, *, mode="fbeta", beta=0.5, 
     return tau, {"precision": float(prec_[i]), "recall": float(rec_[i]), "fbeta": float(fbeta[i])}
 
 
+def _split_val_for_thr_cal(n_val: int, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Splits indices [0, n_val) en dos subsets disjuntos 50/50 de forma determinista.
+
+    Devuelve (idx_thr, idx_cal) — el primero para selección de umbral, el segundo
+    para fit de Platt. Evita el doble uso de val que sesga las métricas finales
+    cuando umbral y calibración se eligen sobre el mismo conjunto.
+    """
+    rng = np.random.RandomState(int(seed))
+    perm = rng.permutation(int(n_val))
+    n_cal = int(n_val) // 2
+    return perm[n_cal:], perm[:n_cal]  # (thr_idx, cal_idx)
+
+
+def _compute_recall_precision_at_k(
+    y_true,
+    y_prob,
+    k_values=(50, 100, 500, 1000),
+) -> Dict[str, Optional[float]]:
+    """
+    Recall@K y Precision@K para clasificación binaria.
+
+    Útil para clase rara: mide cuántos positivos atrapas en los top-K candidatos
+    (ranking-aware), independiente del umbral de decisión.
+    """
+    y_true_np = np.asarray(y_true.detach().cpu() if torch.is_tensor(y_true) else y_true).astype(int).ravel()
+    y_prob_np = np.asarray(y_prob.detach().cpu() if torch.is_tensor(y_prob) else y_prob).astype(float).ravel()
+    out: Dict[str, Optional[float]] = {}
+    n_total = int(y_true_np.size)
+    n_pos = int(y_true_np.sum())
+    if n_total == 0 or n_pos == 0:
+        for k in k_values:
+            out[f"recall@{k}"] = None
+            out[f"precision@{k}"] = None
+        return out
+
+    order = np.argsort(-y_prob_np)
+    sorted_true = y_true_np[order]
+    cumsum_true = np.cumsum(sorted_true)
+    for k in k_values:
+        k_eff = min(int(k), n_total)
+        if k_eff < 1:
+            out[f"recall@{k}"] = None
+            out[f"precision@{k}"] = None
+            continue
+        tp_at_k = int(cumsum_true[k_eff - 1])
+        out[f"recall@{k}"] = float(tp_at_k / n_pos)
+        out[f"precision@{k}"] = float(tp_at_k / k_eff)
+    return out
+
+
+def _bootstrap_metric_ci(
+    y_true,
+    y_prob,
+    threshold: float,
+    *,
+    n_bootstrap: int = 1000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> Dict[str, Optional[object]]:
+    """
+    IC bootstrap (95% por defecto) para F1, F0.5, AUPRC, Recall y Precision (clase 1).
+
+    Submuestrea con reemplazo `n_bootstrap` veces y computa percentiles
+    [alpha/2, 1-alpha/2]. Crucial cuando el test set tiene pocos positivos
+    (~39 con 0.3% de prevalencia): los puntos individuales tienen varianza alta.
+    """
+    y_true_np = np.asarray(y_true.detach().cpu() if torch.is_tensor(y_true) else y_true).astype(int).ravel()
+    y_prob_np = np.asarray(y_prob.detach().cpu() if torch.is_tensor(y_prob) else y_prob).astype(float).ravel()
+    n = int(y_true_np.size)
+    out_keys = ("f1_ci", "f05_ci", "auprc_ci", "recall_ci", "precision_ci")
+    if n == 0 or int(y_true_np.sum()) == 0:
+        return {k: None for k in out_keys} | {"n_bootstrap_effective": 0}
+
+    rng = np.random.RandomState(int(seed))
+    f1s: List[float] = []
+    f05s: List[float] = []
+    auprcs: List[float] = []
+    recalls: List[float] = []
+    precisions: List[float] = []
+    for _ in range(int(n_bootstrap)):
+        idx = rng.randint(0, n, size=n)
+        yt = y_true_np[idx]
+        yp = y_prob_np[idx]
+        n_pos_b = int(yt.sum())
+        if n_pos_b == 0 or n_pos_b == n:
+            continue  # muestra degenerada; saltar
+        pred = (yp >= float(threshold)).astype(int)
+        tp = int(((pred == 1) & (yt == 1)).sum())
+        fp = int(((pred == 1) & (yt == 0)).sum())
+        fn = int(((pred == 0) & (yt == 1)).sum())
+        P = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+        R = tp / max(tp + fn, 1)
+        if (P + R) > 0:
+            F1 = 2 * P * R / (P + R)
+            denom_05 = 0.25 * P + R
+            F05 = 1.25 * P * R / denom_05 if denom_05 > 0 else 0.0
+        else:
+            F1 = 0.0
+            F05 = 0.0
+        try:
+            ap = float(average_precision_score(yt, yp))
+        except Exception:
+            continue
+        f1s.append(F1)
+        f05s.append(F05)
+        auprcs.append(ap)
+        recalls.append(R)
+        precisions.append(P)
+
+    if not f1s:
+        return {k: None for k in out_keys} | {"n_bootstrap_effective": 0}
+
+    lo_pct = 100.0 * (alpha / 2.0)
+    hi_pct = 100.0 * (1.0 - alpha / 2.0)
+
+    def _pair(arr: List[float]) -> tuple:
+        return (float(np.percentile(arr, lo_pct)), float(np.percentile(arr, hi_pct)))
+
+    return {
+        "f1_ci": _pair(f1s),
+        "f05_ci": _pair(f05s),
+        "auprc_ci": _pair(auprcs),
+        "recall_ci": _pair(recalls),
+        "precision_ci": _pair(precisions),
+        "n_bootstrap_effective": len(f1s),
+        "alpha": float(alpha),
+    }
+
+
+def _save_pr_curve_artifact(y_true, y_prob, save_path: str) -> bool:
+    """Guarda la curva precision-recall completa como JSON: precision/recall/threshold arrays."""
+    try:
+        y_true_np = np.asarray(y_true.detach().cpu() if torch.is_tensor(y_true) else y_true).astype(int).ravel()
+        y_prob_np = np.asarray(y_prob.detach().cpu() if torch.is_tensor(y_prob) else y_prob).astype(float).ravel()
+        if y_true_np.size == 0 or int(y_true_np.sum()) == 0:
+            return False
+        prec, rec, thr = precision_recall_curve(y_true_np, y_prob_np)
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        with open(save_path, "w") as fh:
+            json.dump(
+                {
+                    "precision": [float(v) for v in prec.tolist()],
+                    "recall": [float(v) for v in rec.tolist()],
+                    "thresholds": [float(v) for v in thr.tolist()],
+                    "n_positives": int(y_true_np.sum()),
+                    "n_total": int(y_true_np.size),
+                },
+                fh,
+            )
+        return True
+    except Exception as exc:
+        logger.warning(f"No se pudo guardar pr_curve: {exc}")
+        return False
+
+
 def _compute_binary_eval_extras(y_true, y_pred, y_prob) -> Dict[str, Optional[float]]:
     """Return operational binary metrics that are not in classification_report."""
     extras: Dict[str, Optional[float]] = {
@@ -2000,6 +2691,13 @@ def test(
     num_neighbors=None,
     criterion=None,
     progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    *,
+    compute_at_k: bool = True,
+    at_k_values: tuple = (50, 100, 500, 1000),
+    compute_bootstrap_ci: bool = False,
+    bootstrap_n: int = 1000,
+    bootstrap_alpha: float = 0.05,
+    bootstrap_seed: int = 0,
 ):
     """
     Evalúa el rendimiento de un modelo usando mini-batches para evitar OOM.
@@ -2201,6 +2899,32 @@ def test(
         mcc = _safe_matthews_corrcoef(y_true, y_pred)
 
         extra_metrics = _compute_binary_eval_extras(y_true, y_pred, y_prob)
+
+        # Métricas ranking-aware útiles para clase rara (~0.3%): cuántos positivos
+        # quedan en el top-K. Independiente del umbral.
+        at_k_metrics: Dict[str, Optional[float]] = {}
+        if compute_at_k and num_classes == 2 and len(torch.unique(y_true)) > 1:
+            at_k_metrics = _compute_recall_precision_at_k(
+                y_true, y_prob[:, 1], k_values=at_k_values
+            )
+
+        # IC bootstrap (off por defecto: costoso). Útil al final, no por época.
+        ci_metrics: Optional[Dict[str, object]] = None
+        if (
+            compute_bootstrap_ci
+            and num_classes == 2
+            and len(torch.unique(y_true)) > 1
+            and threshold is not None
+        ):
+            ci_metrics = _bootstrap_metric_ci(
+                y_true,
+                y_prob[:, 1],
+                threshold=float(threshold),
+                n_bootstrap=int(bootstrap_n),
+                alpha=float(bootstrap_alpha),
+                seed=int(bootstrap_seed),
+            )
+
         results[mask_name] = {
             'report': report,
             'cm': cm,
@@ -2214,6 +2938,9 @@ def test(
             'far': extra_metrics.get("far"),
             'brier_score': extra_metrics.get("brier_score"),
             'brier': extra_metrics.get("brier"),
+            'recall_at_k': {k: at_k_metrics.get(f"recall@{k}") for k in at_k_values} if at_k_metrics else {},
+            'precision_at_k': {k: at_k_metrics.get(f"precision@{k}") for k in at_k_values} if at_k_metrics else {},
+            'ci_95': ci_metrics,
             'node_idx': node_indices,  # para exportar claves
         }
         if criterion is not None and loss_count > 0:
@@ -2233,36 +2960,101 @@ def test(
         
     return results
 
+def _fmt_ci(ci_pair) -> str:
+    """Formatea (lo, hi) como '[lo, hi]' a 3 decimales; '—' si no hay CI."""
+    if ci_pair is None:
+        return "—"
+    try:
+        lo, hi = float(ci_pair[0]), float(ci_pair[1])
+        return f"[{lo:.3f}, {hi:.3f}]"
+    except Exception:
+        return "—"
+
+
 def print_evaluation_report(results, dataset_name):
     """
     Imprime un reporte de evaluación formateado a partir de los resultados de la función test.
+
+    Incluye, cuando están presentes:
+      - Métricas por clase + globales (clásicas).
+      - IC 95% bootstrap (si test() se llamó con compute_bootstrap_ci=True).
+      - Recall@K y Precision@K (siempre que compute_at_k=True).
+      - FAR / Brier para diagnóstico operacional.
     """
     report = results['report']
     cm = results['cm']
-    
+    ci = results.get('ci_95')
+    rec_at_k = results.get('recall_at_k') or {}
+    prec_at_k = results.get('precision_at_k') or {}
+
     print(f"--- Reporte de Evaluación: Conjunto de {dataset_name} ---")
     print(f"Clase 'No Accidente (0)':")
     print(f"  - Precisión: {report['No Accidente (0)']['precision']:.4f}")
     print(f"  - Recall:    {report['No Accidente (0)']['recall']:.4f}")
     print(f"  - F1-Score:  {report['No Accidente (0)']['f1-score']:.4f}")
-    
-    print(f"Clase 'Accidente (1)':")
-    print(f"  - Precisión: {report['Accidente (1)']['precision']:.4f}")
-    print(f"  - Recall:    {report['Accidente (1)']['recall']:.4f}")
-    print(f"  - F1-Score:  {report['Accidente (1)']['f1-score']:.4f}")
 
-    print("Globales:")    
-    print(f"  - Accuracy:  {report['accuracy']:.4f}")    
-    print(f"  - Precision: {report['macro avg']['precision']:.4f}")    
-    print(f"  - Recall:    {report['macro avg']['recall']:.4f}")    
+    p1 = float(report['Accidente (1)']['precision'])
+    r1 = float(report['Accidente (1)']['recall'])
+    f1_1 = float(report['Accidente (1)']['f1-score'])
+    print(f"Clase 'Accidente (1)':")
+    if ci is not None:
+        print(f"  - Precisión: {p1:.4f}  IC95={_fmt_ci(ci.get('precision_ci'))}")
+        print(f"  - Recall:    {r1:.4f}  IC95={_fmt_ci(ci.get('recall_ci'))}")
+        print(f"  - F1-Score:  {f1_1:.4f}  IC95={_fmt_ci(ci.get('f1_ci'))}")
+        f05_ci = ci.get('f05_ci')
+        if f05_ci is not None:
+            print(f"  - F0.5 IC95: {_fmt_ci(f05_ci)}")
+    else:
+        print(f"  - Precisión: {p1:.4f}")
+        print(f"  - Recall:    {r1:.4f}")
+        print(f"  - F1-Score:  {f1_1:.4f}")
+
+    print("Globales:")
+    print(f"  - Accuracy:  {report['accuracy']:.4f}")
+    print(f"  - Precision: {report['macro avg']['precision']:.4f}")
+    print(f"  - Recall:    {report['macro avg']['recall']:.4f}")
     print(f"  - F1-Score:  {report['macro avg']['f1-score']:.4f}")
     print(f"  - F1-Macro: {results.get('f1_macro', 0.0):.4f}")
-    print(f"  - AUC: {results.get('auc') or 0.0:.4f}")
-    print(f"  - AUPRC (clase 1): {results.get('auprc') or 0.0:.4f}")
+    auprc_val = results.get('auprc') or 0.0
+    auc_val = results.get('auc') or 0.0
+    if ci is not None:
+        print(f"  - AUC:       {auc_val:.4f}")
+        print(f"  - AUPRC (clase 1): {auprc_val:.4f}  IC95={_fmt_ci(ci.get('auprc_ci'))}")
+    else:
+        print(f"  - AUC: {auc_val:.4f}")
+        print(f"  - AUPRC (clase 1): {auprc_val:.4f}")
     print(f"  - MCC: {results.get('mcc') or 0.0:.4f}")
-    
-    print("Matriz de Confusión:")    
-    print(cm)    
+
+    far_val = results.get('false_alarm_ratio') or results.get('far')
+    if far_val is not None:
+        print(f"  - FAR: {float(far_val):.4f}")
+    brier_val = results.get('brier_score') or results.get('brier')
+    if brier_val is not None:
+        print(f"  - Brier: {float(brier_val):.4f}")
+
+    # Ranking-aware @K (clave para clase rara): cuántos positivos hay en el top-K.
+    if rec_at_k:
+        ks = sorted(int(k) for k in rec_at_k.keys() if rec_at_k.get(k) is not None)
+        if ks:
+            print("Ranking @K (clase 1):")
+            header = "  K        " + " ".join(f"{k:>8}" for k in ks)
+            row_r = "  Recall   " + " ".join(
+                f"{rec_at_k.get(k):>8.4f}" if rec_at_k.get(k) is not None else "    —   "
+                for k in ks
+            )
+            row_p = "  Precision" + " ".join(
+                f"{prec_at_k.get(k):>8.4f}" if prec_at_k.get(k) is not None else "    —   "
+                for k in ks
+            )
+            print(header)
+            print(row_r)
+            print(row_p)
+
+    if ci is not None and ci.get("n_bootstrap_effective"):
+        print(f"  (IC95 bootstrap: N={ci['n_bootstrap_effective']} resamples efectivos)")
+
+    print("Matriz de Confusión:")
+    print(cm)
     print("--------------------------------------------------")
 
 def _calculate_graph_hash(graph_filename=None, graph_path=None):
@@ -2451,6 +3243,8 @@ def run_gat_training(
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
     checkpoint_metric: Optional[str] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    should_test: Optional[Callable[[], bool]] = None,
 ):
     """
     Entrenamiento GAT completo con:
@@ -2826,6 +3620,7 @@ def run_gat_training(
 
     # --- Pre-entrenamiento de decodificadores si se usa GraphSMOTE ---
     z2x_decoders = None
+    edge_attr_decoder = None
     if use_graphsmote and enable_graphsmote_augment:
         logger.info("Entrenando decodificadores z->x para la aumentación...")
         model.use_checkpointing = False
@@ -2838,9 +3633,32 @@ def run_gat_training(
             save_dir=z2x_run_dir,
             progress_callback=progress_callback,
         )
+        # Decoder de atributos de arista: cierra el gap del zero-fill parcial
+        # cuando edge_attr_dim > delta_feature_idx en GraphSMOTE.
+        try:
+            edge_attr_run_dir = os.path.join(
+                os.path.dirname(z2x_run_dir),
+                "edge_attr_decoders",
+                os.path.basename(z2x_run_dir),
+            )
+            logger.info("Entrenando decodificador edge_attr para aristas sintéticas...")
+            edge_attr_decoder = train_edge_attr_decoders(
+                model,
+                data,
+                device=device,
+                epochs=DECODER_EPOCHS,
+                num_neighbors=smote_num_neighbors,
+                save_dir=edge_attr_run_dir,
+                seed=GS_SEED,
+                show_progress=False,
+            )
+        except Exception as exc:
+            logger.warning(f"No se pudo entrenar edge_attr_decoder: {exc}; SMOTE caerá a delta legacy.")
+            edge_attr_decoder = None
         model.use_checkpointing = True
     elif use_graphsmote and not enable_graphsmote_augment:
         z2x_decoders = None
+        edge_attr_decoder = None
 
     if train_decoders_only:
         if use_graphsmote:
@@ -2974,6 +3792,7 @@ def run_gat_training(
                 save_path=SAVE_AUG_GRAPH_PATH,
                 seed=GS_SEED,
                 num_neighbors=smote_num_neighbors,
+                edge_attr_decoder=edge_attr_decoder,
             )
             model.use_checkpointing = True
             train_graph = aug_data.to(device)
@@ -2999,31 +3818,10 @@ def run_gat_training(
         train_graph = data
         base_graph = data
 
-    # 9) Loader y Scheduler
-    pm_view_cache = {"key": None, "view": None}
-
-    def _pm_view_for_graph(graph_to_load):
-        try:
-            key = (
-                int(graph_to_load["pm"].num_nodes),
-                tuple(
-                    int(graph_to_load[edge_type].edge_index.size(1))
-                    for edge_type in graph_to_load.edge_types
-                    if edge_type[0] == "pm" and edge_type[2] == "pm"
-                ),
-            )
-        except Exception:
-            key = None
-        if key is not None and pm_view_cache.get("key") == key:
-            return pm_view_cache.get("view")
-        view = _build_pm_homogeneous_view(graph_to_load, node_type="pm")
-        pm_view_cache["key"] = key
-        pm_view_cache["view"] = view
-        return view
-
-    def _epoch_seed_generator(epoch_idx: int, offset: int = 0) -> Optional[torch.Generator]:
-        if not deterministic_sampling_resolved:
-            return None
+        # 9) Loader y Scheduler
+        def _epoch_seed_generator(epoch_idx: int, offset: int = 0) -> Optional[torch.Generator]:
+            if not deterministic_sampling_resolved:
+                return None
         gen = torch.Generator(device="cpu")
         gen.manual_seed(int(sampling_seed_resolved) + int(epoch_idx) * 9973 + int(offset))
         return gen
@@ -3053,42 +3851,9 @@ def run_gat_training(
                 topk_hard=topk_hard,
                 generator=_epoch_seed_generator(epoch_idx, offset=11),
             )
-        return graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1)
+            return graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1)
 
-    def _apply_sampler_mode(graph_cpu, base_seeds: torch.Tensor, epoch_idx: int) -> torch.Tensor:
-        if base_seeds.numel() == 0:
-            return base_seeds
-        if train_sampler_mode_resolved == "neighbor":
-            return base_seeds
-        pm_view = _pm_view_for_graph(graph_cpu)
-        if pm_view is None:
-            logger.warning("No hay vista homogénea PM para sampler alternativo. Se usará NeighborLoader.")
-            return base_seeds
-        if train_sampler_mode_resolved == "cluster_gcn":
-            return _cluster_gcn_seed_order(
-                pm_view,
-                base_seeds,
-                num_parts=cluster_gcn_num_parts_resolved,
-                clusters_per_epoch=cluster_gcn_parts_per_epoch_resolved,
-                deterministic=deterministic_sampling_resolved,
-                seed=sampling_seed_resolved,
-                epoch=epoch_idx,
-            )
-        if train_sampler_mode_resolved == "graphsaint":
-            return _graphsaint_seed_sample(
-                pm_view,
-                base_seeds,
-                mode=graphsaint_mode_resolved,
-                batch_size=graphsaint_batch_size_resolved,
-                num_steps=graphsaint_num_steps_resolved,
-                walk_length=graphsaint_walk_length_resolved,
-                deterministic=deterministic_sampling_resolved,
-                seed=sampling_seed_resolved,
-                epoch=epoch_idx,
-            )
-        return base_seeds
-
-    def create_loader(
+        def create_loader(
         graph_to_load,
         use_undersampling=False,
         pos_to_neg_ratio=3.0,
@@ -3097,42 +3862,65 @@ def run_gat_training(
         device=None,
         topk_hard=None,
         epoch_idx: int = 1,
-    ):
-        """
-        Construye loader por época con soporte de:
-        - undersampling de semillas (random/hard)
-        - sampler alternativo (neighbor/cluster_gcn/graphsaint) sobre semillas PM
-        - determinismo opcional (seed controlado por época)
-        """
-        graph_cpu = graph_to_load.cpu()
-        base_seeds = _resolve_base_seeds(
+        ):
+            """
+            Construye loader por época con soporte de:
+            - undersampling de semillas (random/hard)
+            - sampler nativo completo para cluster_gcn/graphsaint
+            - determinismo opcional (seed controlado por época)
+            """
+            graph_cpu = graph_to_load.cpu()
+            base_seeds = _resolve_base_seeds(
             graph_cpu,
             use_undersampling=bool(use_undersampling),
             strategy=str(strategy),
             model=model,
             device=device,
             topk_hard=topk_hard,
-            epoch_idx=int(epoch_idx),
-            pos_to_neg_ratio=float(pos_to_neg_ratio),
-        )
-        seeds = _apply_sampler_mode(graph_cpu, base_seeds, int(epoch_idx))
-        if seeds.numel() == 0:
-            seeds = base_seeds
-        input_nodes = ('pm', seeds)
+                epoch_idx=int(epoch_idx),
+                pos_to_neg_ratio=float(pos_to_neg_ratio),
+            )
 
-        try:
-            num_neighbors_cfg = loader_num_neighbors
-        except Exception:
-            num_neighbors_cfg = NUM_NEIGHBORS
+            try:
+                num_neighbors_cfg = loader_num_neighbors
+            except Exception:
+                num_neighbors_cfg = NUM_NEIGHBORS
 
-        loader_gen = _epoch_seed_generator(int(epoch_idx), offset=101)
-        shuffle_batches = True
-        if train_sampler_mode_resolved == "cluster_gcn":
-            # Preserva vecindad por partición para acercar comportamiento Cluster-GCN.
-            shuffle_batches = False
+            if train_sampler_mode_resolved != "neighbor":
+                native_cfg = {
+                    "train_sampler_mode": str(train_sampler_mode_resolved),
+                    "cluster_gcn_num_parts": int(cluster_gcn_num_parts_resolved),
+                    "cluster_gcn_parts_per_epoch": int(cluster_gcn_parts_per_epoch_resolved),
+                    "graphsaint_mode": str(graphsaint_mode_resolved),
+                    "graphsaint_batch_size": int(graphsaint_batch_size_resolved),
+                    "graphsaint_num_steps": int(graphsaint_num_steps_resolved),
+                    "graphsaint_walk_length": int(graphsaint_walk_length_resolved),
+                    "deterministic_sampling": bool(deterministic_sampling_resolved),
+                    "sampling_seed": int(sampling_seed_resolved) + int(epoch_idx) * 9973,
+                }
+                native_loader, native_error = _build_native_sampler_loader(
+                    graph_cpu=graph_cpu,
+                    sampler_config=native_cfg,
+                    batch_size=int(batch_size_hp),
+                    sampling_seed=int(sampling_seed_resolved) + int(epoch_idx) * 9973,
+                    base_seeds=base_seeds,
+                    num_neighbors_cfg=num_neighbors_cfg,
+                    deterministic=bool(deterministic_sampling_resolved),
+                )
+                if native_loader is None:
+                    raise RuntimeError(
+                        f"No se pudo construir loader nativo para {train_sampler_mode_resolved}: "
+                        f"{native_error or 'error desconocido'}"
+                    )
+                return native_loader
 
-        return NeighborLoader(
-            graph_cpu,
+            input_nodes = ('pm', base_seeds)
+
+            loader_gen = _epoch_seed_generator(int(epoch_idx), offset=101)
+            shuffle_batches = True
+
+            return NeighborLoader(
+                graph_cpu,
             input_nodes=input_nodes,
             num_neighbors=num_neighbors_cfg,
             batch_size=batch_size_hp,
@@ -3188,7 +3976,9 @@ def run_gat_training(
         )
 
     train_loader = rebuild_train_loader(train_graph, epoch_idx=1)
-    
+    train_sampler_impl = str(getattr(train_loader, "sampler_impl", "neighbor_native"))
+    best_params["sampler_impl"] = train_sampler_impl
+
     max_epochs = int(max_epochs) if max_epochs is not None else int(MAX_EPOCHS)
     objective_metric = _normalize_objective_metric(best_params.get("objective_metric", "F1"))
     objective_beta_default = 0.5 if objective_metric == "F0.5" else 1.0
@@ -3239,9 +4029,10 @@ def run_gat_training(
         num_neighbors=loader_num_neighbors,
         smote_every_n_epochs=int(smote_every_override),
         target_pos_ratio=float(target_pos_ratio_override),
-        accumulation_steps=int(accumulation_steps),
-        train_sampler_mode=str(train_sampler_mode_resolved),
-        deterministic_sampling=bool(deterministic_sampling_resolved),
+            accumulation_steps=int(accumulation_steps),
+            train_sampler_mode=str(train_sampler_mode_resolved),
+            sampler_impl=str(train_sampler_impl),
+            deterministic_sampling=bool(deterministic_sampling_resolved),
         sampling_seed=int(sampling_seed_resolved),
         disable_hard_undersampling=bool(disable_hard_undersampling_resolved),
         cluster_gcn_num_parts=int(cluster_gcn_num_parts_resolved),
@@ -3459,7 +4250,16 @@ def run_gat_training(
         )
 
     stopped_early = False
+    stopped_by_user = False
+    last_completed_epoch = int(start_epoch) - 1
     for epoch in range(start_epoch, max_epochs + 1):
+        if _training_stop_requested(should_stop):
+            logger.info(
+                "Stop requested before epoch %d; preserving last checkpoint.",
+                epoch,
+            )
+            stopped_by_user = True
+            break
         epoch_start_time = time.time()
         if use_undersampling or train_sampler_mode_resolved != "neighbor":
             strategy_now = undersampling_strategy
@@ -3478,6 +4278,7 @@ def run_gat_training(
                 edge_gen=edge_gen,
                 seed=GS_SEED + epoch,
                 num_neighbors=smote_num_neighbors,
+                edge_attr_decoder=edge_attr_decoder,
             )
             model.use_checkpointing = True
             train_graph = aug_data.to(device)
@@ -3960,6 +4761,86 @@ def run_gat_training(
             except Exception as exc:
                 logger.warning(f"No se pudo guardar checkpoint: {exc}")
 
+        last_completed_epoch = int(epoch)
+
+        if _training_test_requested(should_test):
+            best_checkpoint_for_test = None
+            for candidate_path in (best_model_path_unique, best_model_path):
+                try:
+                    if candidate_path and os.path.exists(candidate_path):
+                        best_checkpoint_for_test = str(candidate_path)
+                        break
+                except Exception:
+                    continue
+            test_threshold = None
+            try:
+                if best_val_tau is not None and math.isfinite(float(best_val_tau)):
+                    test_threshold = float(best_val_tau)
+            except Exception:
+                test_threshold = None
+            _emit_training_event(
+                "test_start",
+                run_id,
+                epoch=int(epoch),
+                total=int(max_epochs),
+                best_epoch=int(best_epoch),
+                checkpoint_path=best_checkpoint_for_test,
+                threshold=test_threshold,
+            )
+            try:
+                if best_checkpoint_for_test is None:
+                    raise FileNotFoundError(
+                        "Aun no hay checkpoint BEST disponible para test intermedio."
+                    )
+                test_summary = _test_best_checkpoint_during_training(
+                    model=model,
+                    best_checkpoint_path=best_checkpoint_for_test,
+                    base_graph=base_graph,
+                    node_type="pm",
+                    batch_size=int(batch_size_hp),
+                    num_neighbors=eval_neighbors_cfg,
+                    threshold=test_threshold,
+                    device=device,
+                    epoch=int(epoch),
+                    best_epoch=int(best_epoch),
+                )
+                _emit_training_event(
+                    "test_result",
+                    run_id,
+                    total=int(max_epochs),
+                    **test_summary,
+                )
+            except Exception as exc:
+                logger.warning(f"No se pudo ejecutar test intermedio: {exc}")
+                _emit_training_event(
+                    "test_error",
+                    run_id,
+                    epoch=int(epoch),
+                    total=int(max_epochs),
+                    best_epoch=int(best_epoch),
+                    checkpoint_path=best_checkpoint_for_test,
+                    error=str(exc),
+                )
+
+        if _training_stop_requested(should_stop):
+            logger.info(
+                "Stop requested after epoch %d; checkpoint preserved at %s.",
+                epoch,
+                save_state_path or "<sin checkpoint path>",
+            )
+            stopped_by_user = True
+            _emit_training_event(
+                "stop_requested",
+                run_id,
+                epoch=int(epoch),
+                total=int(max_epochs),
+                graph_hash=graph_hash,
+                graph_file_hash=graph_file_hash,
+                graph_hash_source=graph_hash_source,
+                checkpoint_path=str(save_state_path) if save_state_path else None,
+            )
+            break
+
         if early_stop_enabled and patience_counter >= patience:
             logger.info(
                 "Early stopping at epoch %d by %s (best=%g, last=%g, patience=%d, min_delta=%g).",
@@ -3984,7 +4865,7 @@ def run_gat_training(
     
     if writer is not None:
         writer.close()
-    epochs_run = int(epoch) if "epoch" in locals() else 0
+    epochs_run = max(int(last_completed_epoch), 0)
     _emit_training_event(
         "train_end",
         run_id,
@@ -4011,13 +4892,23 @@ def run_gat_training(
         graph_file_hash=graph_file_hash,
         graph_hash_source=graph_hash_source,
         stopped_early=stopped_early,
+        stopped_by_user=stopped_by_user,
     )
-    logger.info(
-        f"Training finished. Best {monitor_metric}: {best_monitor_value:.6f} "
-        f"(best_val_loss={best_val_loss:.6f}) "
-        f"({objective_metric} ref={best_val_objective_score:.4f}) "
-        f"(F1 ref={best_val_f1:.4f}) at epoch {best_epoch}."
-    )
+    if stopped_by_user:
+        logger.info(
+            f"Training stopped by user after {epochs_run} epochs. "
+            f"Best {monitor_metric}: {best_monitor_value:.6f} "
+            f"(best_val_loss={best_val_loss:.6f}) "
+            f"({objective_metric} ref={best_val_objective_score:.4f}) "
+            f"(F1 ref={best_val_f1:.4f}) at epoch {best_epoch}."
+        )
+    else:
+        logger.info(
+            f"Training finished. Best {monitor_metric}: {best_monitor_value:.6f} "
+            f"(best_val_loss={best_val_loss:.6f}) "
+            f"({objective_metric} ref={best_val_objective_score:.4f}) "
+            f"(F1 ref={best_val_f1:.4f}) at epoch {best_epoch}."
+        )
 
 def pick_tau_fbeta(y_true, y_prob, beta=0.5):
     prec, rec, thr = precision_recall_curve(y_true, y_prob)
@@ -5138,7 +6029,16 @@ def run_gat_testing(loaded_obj):
 
         y_true_val = initial_results[mask_key]['true'].cpu().numpy().ravel()
         y_prob1_val_raw = initial_results[mask_key]['probs'][:, 1].cpu().numpy().ravel()
-        y_prob1_val, platt_model = _platt_scale_probabilities(y_true_val, y_prob1_val_raw)
+
+        # Split val_mask 50/50: val_cal para fit Platt, val_thr para selección
+        # del umbral. Evita el doble uso del mismo subconjunto que sesga métricas.
+        if y_true_val.size >= 4:
+            idx_thr, idx_cal = _split_val_for_thr_cal(y_true_val.size, seed=int(SEED))
+            _, platt_model = _platt_scale_probabilities(y_true_val[idx_cal], y_prob1_val_raw[idx_cal])
+            y_true_val = y_true_val[idx_thr]
+            y_prob1_val = _apply_platt_model(y_prob1_val_raw[idx_thr], platt_model)
+        else:
+            y_prob1_val, platt_model = _platt_scale_probabilities(y_true_val, y_prob1_val_raw)
 
         # --- Calibración por Prior Shift (Opcional) ---
         apply_prior_shift = input("¿Desea aplicar calibración por prior shift? (s/n, default: n): ").strip().lower()
@@ -5164,8 +6064,21 @@ def run_gat_testing(loaded_obj):
             tau, info = pick_threshold_from_val(y_true_val, y_prob1_val, mode="fbeta", beta=0.5)
             print(f"🔧 Umbral seleccionado en validación: tau={tau:.6f}  -> P={info.get('precision', float('nan')):.3f}, R={info.get('recall', float('nan')):.3f}")
 
-    # 3) Pase final con ese umbral aplicado en TODOS los splits
-    final_results = test(model, data, node_type='pm', threshold=tau, calibration_model=platt_model)
+        # Persistir curva PR (val_thr) para análisis posterior.
+        try:
+            best_path_for_artifact = locals().get('best_model_path')
+            if best_path_for_artifact:
+                pr_path = os.path.splitext(str(best_path_for_artifact))[0] + "_pr_curve_val.json"
+                _save_pr_curve_artifact(y_true_val, y_prob1_val, pr_path)
+        except Exception:
+            pass
+
+    # 3) Pase final con ese umbral aplicado en TODOS los splits + IC bootstrap.
+    final_results = test(
+        model, data, node_type='pm',
+        threshold=tau, calibration_model=platt_model,
+        compute_bootstrap_ci=True, bootstrap_n=1000, bootstrap_seed=int(SEED),
+    )
     
     if not final_results:
         print("El test no produjo resultados. Verifique las máscaras de datos en el grafo.")

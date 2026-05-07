@@ -1,7 +1,10 @@
 import torch
 from torch_geometric.data import HeteroData
 
+from src import gnn_main
 from src.graph_builder_app import (
+    SAMPLER_CLUSTER_GCN_PROFILE_PRESETS,
+    SAMPLER_GRAPHSAINT_PROFILE_PRESETS,
     _advance_batch_index_by_jump,
     _adaptive_probe_jump,
     _build_sampler_memory_loader,
@@ -10,6 +13,7 @@ from src.graph_builder_app import (
     _resolve_probe_loader_limit,
     _select_best_sampler_memory_row,
 )
+from src.train_pretrain import train_minibatch
 
 
 def test_memory_budget_bytes_uses_fraction():
@@ -122,10 +126,29 @@ def _make_probe_graph() -> HeteroData:
     src = torch.randint(0, n_nodes, (400,))
     dst = torch.randint(0, n_nodes, (400,))
     graph[("pm", "spatial", "pm")].edge_index = torch.stack([src, dst], dim=0)
+    graph[("pm", "spatial", "pm")].edge_attr = torch.randn(src.numel(), 3)
     graph[("pm", "temporal", "pm")].edge_index = torch.stack([src, dst], dim=0)
+    graph[("pm", "temporal", "pm")].edge_attr = torch.randn(src.numel(), 3)
     graph[("pm", "spatial_back", "pm")].edge_index = torch.stack([dst, src], dim=0)
+    graph[("pm", "spatial_back", "pm")].edge_attr = torch.randn(src.numel(), 3)
     graph[("pm", "st_fwd", "pm")].edge_index = torch.stack([src, dst], dim=0)
+    graph[("pm", "st_fwd", "pm")].edge_attr = torch.randn(src.numel(), 3)
     return graph
+
+
+def test_highway_sampler_profile_presets_are_graph_specific():
+    assert dict(SAMPLER_CLUSTER_GCN_PROFILE_PRESETS) == {
+        "highway_stable": (64, 0),
+        "highway_broad": (32, 0),
+        "highway_local": (128, 0),
+        "highway_probe": (64, 16),
+    }
+    assert dict(SAMPLER_GRAPHSAINT_PROFILE_PRESETS) == {
+        "highway_rw_stable": ("random_walk", 4096, 16, 3),
+        "highway_node_stable": ("node", 4096, 16, 1),
+        "highway_edge_stable": ("edge", 4096, 16, 1),
+        "highway_rw_broad": ("random_walk", 8192, 12, 3),
+    }
 
 
 def test_build_sampler_memory_loader_cluster_gcn_is_native():
@@ -186,3 +209,88 @@ def test_native_sampler_batch_supervises_train_nodes_only():
     assert graph["pm"].train_mask[supervised].all()
     assert batch["pm"].train_mask[: batch["pm"].batch_size].all()
     assert not batch["pm"].val_mask[: batch["pm"].batch_size].any()
+
+
+def test_native_sampler_batch_preserves_edge_attr_alignment():
+    graph = _make_probe_graph()
+    loader, err = _build_sampler_memory_loader(
+        graph_cpu=graph,
+        sampler_config={
+            "train_sampler_mode": "cluster_gcn",
+            "cluster_gcn_num_parts": 4,
+            "cluster_gcn_parts_per_epoch": 0,
+        },
+        batch_size=128,
+        sampling_seed=42,
+    )
+
+    assert err is None
+    batch = next(iter(loader))
+    aligned_edge_types = 0
+    for edge_type in batch.edge_types:
+        edge_attr = getattr(batch[edge_type], "edge_attr", None)
+        if edge_attr is None:
+            continue
+        aligned_edge_types += 1
+        assert edge_attr.size(0) == batch[edge_type].edge_index.size(1)
+        assert edge_attr.size(1) == 3
+    assert aligned_edge_types >= 1
+
+
+class _ToyHeteroClassifier(torch.nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.lin = torch.nn.Linear(in_channels, out_channels)
+
+    def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
+        logits = {"pm": self.lin(x_dict["pm"])}
+        embeddings = {"pm": x_dict["pm"]}
+        return logits, embeddings, {}
+
+
+def test_train_minibatch_accepts_native_cluster_and_graphsaint_loaders():
+    for sampler_config in (
+        {
+            "train_sampler_mode": "cluster_gcn",
+            "cluster_gcn_num_parts": 4,
+            "cluster_gcn_parts_per_epoch": 0,
+        },
+        {
+            "train_sampler_mode": "graphsaint",
+            "graphsaint_mode": "node",
+            "graphsaint_batch_size": 64,
+            "graphsaint_num_steps": 2,
+            "graphsaint_walk_length": 1,
+        },
+    ):
+        graph = _make_probe_graph()
+        base_seeds = graph["pm"].train_mask.nonzero(as_tuple=False).view(-1)
+        loader, err = gnn_main._build_native_sampler_loader(
+            graph_cpu=graph,
+            sampler_config=sampler_config,
+            batch_size=64,
+            sampling_seed=42,
+            base_seeds=base_seeds,
+            deterministic=True,
+        )
+        assert err is None
+        assert loader is not None
+        assert loader.__class__.__name__ != "NeighborLoader"
+
+        model = _ToyHeteroClassifier(in_channels=8, out_channels=2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        criterion = torch.nn.CrossEntropyLoss()
+
+        avg_loss, avg_cls_loss, avg_edge_loss, avg_l2_att_loss = train_minibatch(
+            model,
+            loader,
+            optimizer,
+            criterion,
+            device=torch.device("cpu"),
+            accumulation_steps=1,
+        )
+
+        assert avg_loss >= 0.0
+        assert avg_cls_loss >= 0.0
+        assert avg_edge_loss == 0.0
+        assert avg_l2_att_loss == 0.0
