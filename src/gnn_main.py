@@ -3818,10 +3818,10 @@ def run_gat_training(
         train_graph = data
         base_graph = data
 
-        # 9) Loader y Scheduler
-        def _epoch_seed_generator(epoch_idx: int, offset: int = 0) -> Optional[torch.Generator]:
-            if not deterministic_sampling_resolved:
-                return None
+    # 9) Loader y Scheduler
+    def _epoch_seed_generator(epoch_idx: int, offset: int = 0) -> Optional[torch.Generator]:
+        if not deterministic_sampling_resolved:
+            return None
         gen = torch.Generator(device="cpu")
         gen.manual_seed(int(sampling_seed_resolved) + int(epoch_idx) * 9973 + int(offset))
         return gen
@@ -3851,9 +3851,9 @@ def run_gat_training(
                 topk_hard=topk_hard,
                 generator=_epoch_seed_generator(epoch_idx, offset=11),
             )
-            return graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1)
+        return graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1)
 
-        def create_loader(
+    def create_loader(
         graph_to_load,
         use_undersampling=False,
         pos_to_neg_ratio=3.0,
@@ -3862,65 +3862,65 @@ def run_gat_training(
         device=None,
         topk_hard=None,
         epoch_idx: int = 1,
-        ):
-            """
-            Construye loader por época con soporte de:
-            - undersampling de semillas (random/hard)
-            - sampler nativo completo para cluster_gcn/graphsaint
-            - determinismo opcional (seed controlado por época)
-            """
-            graph_cpu = graph_to_load.cpu()
-            base_seeds = _resolve_base_seeds(
+    ):
+        """
+        Construye loader por época con soporte de:
+        - undersampling de semillas (random/hard)
+        - sampler nativo completo para cluster_gcn/graphsaint
+        - determinismo opcional (seed controlado por época)
+        """
+        graph_cpu = graph_to_load.cpu()
+        base_seeds = _resolve_base_seeds(
             graph_cpu,
             use_undersampling=bool(use_undersampling),
             strategy=str(strategy),
             model=model,
             device=device,
             topk_hard=topk_hard,
-                epoch_idx=int(epoch_idx),
-                pos_to_neg_ratio=float(pos_to_neg_ratio),
+            epoch_idx=int(epoch_idx),
+            pos_to_neg_ratio=float(pos_to_neg_ratio),
+        )
+
+        try:
+            num_neighbors_cfg = loader_num_neighbors
+        except Exception:
+            num_neighbors_cfg = NUM_NEIGHBORS
+
+        if train_sampler_mode_resolved != "neighbor":
+            native_cfg = {
+                "train_sampler_mode": str(train_sampler_mode_resolved),
+                "cluster_gcn_num_parts": int(cluster_gcn_num_parts_resolved),
+                "cluster_gcn_parts_per_epoch": int(cluster_gcn_parts_per_epoch_resolved),
+                "graphsaint_mode": str(graphsaint_mode_resolved),
+                "graphsaint_batch_size": int(graphsaint_batch_size_resolved),
+                "graphsaint_num_steps": int(graphsaint_num_steps_resolved),
+                "graphsaint_walk_length": int(graphsaint_walk_length_resolved),
+                "deterministic_sampling": bool(deterministic_sampling_resolved),
+                "sampling_seed": int(sampling_seed_resolved) + int(epoch_idx) * 9973,
+            }
+            native_loader, native_error = _build_native_sampler_loader(
+                graph_cpu=graph_cpu,
+                sampler_config=native_cfg,
+                batch_size=int(batch_size_hp),
+                sampling_seed=int(sampling_seed_resolved) + int(epoch_idx) * 9973,
+                base_seeds=base_seeds,
+                num_neighbors_cfg=num_neighbors_cfg,
+                deterministic=bool(deterministic_sampling_resolved),
             )
-
-            try:
-                num_neighbors_cfg = loader_num_neighbors
-            except Exception:
-                num_neighbors_cfg = NUM_NEIGHBORS
-
-            if train_sampler_mode_resolved != "neighbor":
-                native_cfg = {
-                    "train_sampler_mode": str(train_sampler_mode_resolved),
-                    "cluster_gcn_num_parts": int(cluster_gcn_num_parts_resolved),
-                    "cluster_gcn_parts_per_epoch": int(cluster_gcn_parts_per_epoch_resolved),
-                    "graphsaint_mode": str(graphsaint_mode_resolved),
-                    "graphsaint_batch_size": int(graphsaint_batch_size_resolved),
-                    "graphsaint_num_steps": int(graphsaint_num_steps_resolved),
-                    "graphsaint_walk_length": int(graphsaint_walk_length_resolved),
-                    "deterministic_sampling": bool(deterministic_sampling_resolved),
-                    "sampling_seed": int(sampling_seed_resolved) + int(epoch_idx) * 9973,
-                }
-                native_loader, native_error = _build_native_sampler_loader(
-                    graph_cpu=graph_cpu,
-                    sampler_config=native_cfg,
-                    batch_size=int(batch_size_hp),
-                    sampling_seed=int(sampling_seed_resolved) + int(epoch_idx) * 9973,
-                    base_seeds=base_seeds,
-                    num_neighbors_cfg=num_neighbors_cfg,
-                    deterministic=bool(deterministic_sampling_resolved),
+            if native_loader is None:
+                raise RuntimeError(
+                    f"No se pudo construir loader nativo para {train_sampler_mode_resolved}: "
+                    f"{native_error or 'error desconocido'}"
                 )
-                if native_loader is None:
-                    raise RuntimeError(
-                        f"No se pudo construir loader nativo para {train_sampler_mode_resolved}: "
-                        f"{native_error or 'error desconocido'}"
-                    )
-                return native_loader
+            return native_loader
 
-            input_nodes = ('pm', base_seeds)
+        input_nodes = ('pm', base_seeds)
 
-            loader_gen = _epoch_seed_generator(int(epoch_idx), offset=101)
-            shuffle_batches = True
+        loader_gen = _epoch_seed_generator(int(epoch_idx), offset=101)
+        shuffle_batches = True
 
-            return NeighborLoader(
-                graph_cpu,
+        return NeighborLoader(
+            graph_cpu,
             input_nodes=input_nodes,
             num_neighbors=num_neighbors_cfg,
             batch_size=batch_size_hp,
