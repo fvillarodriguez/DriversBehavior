@@ -4973,8 +4973,6 @@ def _train_gnn_with_best_params(
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
     checkpoint_metric: Optional[str] = None,
-    seed_balance_mode: Optional[str] = None,
-    seed_positive_ratio: Optional[float] = None,
 ) -> Optional[str]:
     try:
         from src import gnn_main as graph_main
@@ -5053,8 +5051,6 @@ def _train_gnn_with_best_params(
             eval_neighbors_mode=eval_neighbors_mode,
             eval_num_neighbors=eval_num_neighbors,
             checkpoint_metric=checkpoint_metric,
-            seed_balance_mode=seed_balance_mode,
-            seed_positive_ratio=seed_positive_ratio,
         )
     finally:
         builtins.input = original_input
@@ -5470,8 +5466,6 @@ def _network_config_to_hparams(
         "batch_size": int(cfg.get("batch_size", 512)),
         "num_neighbors": json.dumps(cfg.get("num_neighbors", [15, 10])),
         "checkpoint_metric": str(cfg.get("checkpoint_metric", "val_auprc")),
-        "seed_balance_mode": str(cfg.get("seed_balance_mode", "positive_ratio")),
-        "seed_positive_ratio": float(cfg.get("seed_positive_ratio", 0.10)),
         "use_graphsmote": bool(use_graphsmote),
         "value": 0.0,
     }
@@ -6395,51 +6389,6 @@ def _run_optuna_search(
         chosen = rng.choice(train_idx.numpy(), size=max_train_nodes, replace=False)
         return torch.from_numpy(chosen)
 
-    def _positive_ratio_train_seeds(
-        data_obj: HeteroData,
-        *,
-        seed: int,
-    ) -> torch.Tensor:
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(int(seed))
-        return graph_main.make_epoch_seeds(
-            data_obj.cpu(),
-            node_type="pm",
-            strategy="random",
-            generator=gen,
-            target_positive_ratio=float(seed_positive_ratio),
-        ).cpu()
-
-    def _cap_seed_pool(
-        data_obj: HeteroData,
-        seeds: torch.Tensor,
-        *,
-        max_train_nodes: int,
-        seed: int,
-    ) -> torch.Tensor:
-        seeds = seeds.view(-1).cpu()
-        if max_train_nodes <= 0 or seeds.numel() <= max_train_nodes:
-            return seeds
-        y_cpu = data_obj["pm"].y.detach().cpu()
-        pos_seeds = seeds[y_cpu[seeds] == 1]
-        neg_seeds = seeds[y_cpu[seeds] == 0]
-        if pos_seeds.numel() >= int(max_train_nodes):
-            return pos_seeds
-        neg_keep_count = int(max_train_nodes) - int(pos_seeds.numel())
-        if neg_keep_count <= 0 or neg_seeds.numel() == 0:
-            return pos_seeds
-        rng = np.random.RandomState(int(seed))
-        neg_np = neg_seeds.numpy()
-        chosen_neg = rng.choice(
-            neg_np,
-            size=min(int(neg_keep_count), int(neg_seeds.numel())),
-            replace=False,
-        )
-        capped = torch.cat([pos_seeds, torch.from_numpy(chosen_neg).long()], dim=0)
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(int(seed) + 31)
-        return capped[torch.randperm(capped.numel(), generator=gen)]
-
     def _sample_mask_seeds(
         data_obj: HeteroData,
         mask_attr: str,
@@ -6477,14 +6426,6 @@ def _run_optuna_search(
         (objective_settings or {}).get("gnn_variant", GNN_VARIANT)
     )
     _validate_temporal_sequence_requirement(gnn_variant_fixed, sequence_index)
-    seed_positive_ratio = float(
-        getattr(graph_main, "_coerce_seed_positive_ratio")(
-            search_space.get(
-                "seed_positive_ratio",
-                (objective_settings or {}).get("seed_positive_ratio", 0.10),
-            )
-        )
-    )
 
     # En Optuna sin balanceo, fuerza el grafo a CPU para evitar duplicados MPS/CUDA.
     if not (use_graphsmote or use_imgagn):
@@ -7171,19 +7112,11 @@ def _run_optuna_search(
 
         _mem_snapshot(f"trial_{trial.number}_before_loader")
         train_graph_cpu = _to_cpu_if_needed(train_graph)
-        seed_idx = _positive_ratio_train_seeds(train_graph_cpu, seed=trial_seed)
-        seed_idx = _cap_seed_pool(
-            train_graph_cpu,
-            seed_idx,
-            max_train_nodes=max_train_nodes,
-            seed=trial_seed,
-        )
-        seed_summary = graph_main._seed_subset_summary(train_graph_cpu, seed_idx, node_type="pm")
-        trial.set_user_attr("seed_balance_mode", "positive_ratio")
-        trial.set_user_attr("seed_positive_ratio", float(seed_positive_ratio))
-        for seed_attr, seed_value in seed_summary.items():
-            trial.set_user_attr(seed_attr, seed_value)
+        seed_idx = None
         if max_train_nodes > 0:
+            seed_idx = _sample_train_seeds(
+                train_graph_cpu, max_train_nodes=max_train_nodes, seed=trial_seed
+            )
             # Guardamos el subset en el CSV de Optuna para reproducibilidad y trazabilidad.
             # Esto permite comparar trials con el mismo conjunto de seeds y reducir varianza.
             trial.set_user_attr("train_seed", int(trial_seed))
@@ -7198,7 +7131,7 @@ def _run_optuna_search(
                 seed_idx.tolist() if seed_idx is not None else [],
             )
         else:
-            trial.set_user_attr("train_subset_mode", "positive_ratio_full_train")
+            trial.set_user_attr("train_subset_mode", "full")
 
         def _effective_seed_pool(
             graph_cpu_local: HeteroData,
@@ -7356,15 +7289,9 @@ def _run_optuna_search(
                         )
                         train_graph = aug_data
                         train_graph_cpu = _to_cpu_if_needed(train_graph)
-                        if not fixed_train_subset:
-                            seed_idx = _positive_ratio_train_seeds(
-                                train_graph_cpu, seed=trial_seed + epoch
-                            )
-                            seed_idx = _cap_seed_pool(
-                                train_graph_cpu,
-                                seed_idx,
-                                max_train_nodes=max_train_nodes,
-                                seed=trial_seed + epoch,
+                        if not fixed_train_subset and max_train_nodes > 0:
+                            seed_idx = _sample_train_seeds(
+                                train_graph_cpu, max_train_nodes=max_train_nodes, seed=trial_seed + epoch
                             )
                         train_loader, active_seed_idx = _build_train_loader_from_sampler(
                             train_graph_cpu,
@@ -7372,15 +7299,9 @@ def _run_optuna_search(
                             epoch_seed=trial_seed,
                             epoch_num=epoch,
                         )
-                elif (not fixed_train_subset) and sample_each_epoch:
-                    seed_idx = _positive_ratio_train_seeds(
-                        train_graph_cpu, seed=trial_seed + epoch
-                    )
-                    seed_idx = _cap_seed_pool(
-                        train_graph_cpu,
-                        seed_idx,
-                        max_train_nodes=max_train_nodes,
-                        seed=trial_seed + epoch,
+                elif (not fixed_train_subset) and sample_each_epoch and max_train_nodes > 0:
+                    seed_idx = _sample_train_seeds(
+                        train_graph_cpu, max_train_nodes=max_train_nodes, seed=trial_seed + epoch
                     )
                     train_loader, active_seed_idx = _build_train_loader_from_sampler(
                         train_graph_cpu,
@@ -15656,21 +15577,6 @@ def _render_training_tab() -> None:
             "Útil para comparar de forma más limpia el efecto puro del sampler."
         ),
     )
-    seed_positive_ratio_train = float(
-        st.slider(
-            "Ratio positivo objetivo en seeds train",
-            min_value=0.05,
-            max_value=0.10,
-            value=float(st.session_state.get("gnn_train_seed_positive_ratio", 0.10)),
-            step=0.01,
-            format="%.2f",
-            key="gnn_train_seed_positive_ratio",
-            help=(
-                "Balancea solo las semillas de entrenamiento. "
-                "Val/test y vecinos permanecen con prevalencia natural."
-            ),
-        )
-    )
 
     cluster_gcn_num_parts_train = 64
     cluster_gcn_parts_per_epoch_train = 0
@@ -16504,8 +16410,6 @@ def _render_training_tab() -> None:
                         eval_neighbors_mode=str(eval_neighbors_mode_train),
                         eval_num_neighbors=eval_num_neighbors_train,
                         checkpoint_metric=str(checkpoint_metric_train),
-                        seed_balance_mode="positive_ratio",
-                        seed_positive_ratio=float(seed_positive_ratio_train),
                     )
             except Exception as exc:
                 exc_text = str(exc).strip() or repr(exc)
@@ -16556,8 +16460,6 @@ def _render_training_tab() -> None:
                          "deterministic_sampling": bool(deterministic_sampling_train),
                          "sampling_seed": int(sampling_seed_train),
                          "disable_hard_undersampling": bool(disable_hard_undersampling_train),
-                         "seed_balance_mode": "positive_ratio",
-                         "seed_positive_ratio": float(seed_positive_ratio_train),
                          "eval_neighbors_mode": eval_neighbors_mode_train,
                          "eval_num_neighbors": eval_num_neighbors_train,
                      },
@@ -22123,7 +22025,7 @@ def _gnn_builder_render_preview(
             {
                 "bloque": idx,
                 "tipo": block.conv_type,
-                "in": dim_in,
+                "in": str(dim_in),
                 "hidden/head": block.hidden_channels,
                 "heads": block.num_heads,
                 "out": dim_out,
@@ -22196,7 +22098,12 @@ def _render_network_builder_tab() -> None:
         st.info("Puedes diseñar sin grafo cargado. Carga un grafo en la pestaña Graph para validar dimensiones y secuencias.")
 
     _gnn_builder_render_library_controls()
-    arch = _gnn_builder_render_editor()
+    # Editor visual basado en streamlit-flow. Mantiene el contrato del editor
+    # antiguo (`_gnn_builder_render_editor`): lee/escribe las mismas keys de
+    # session_state y devuelve un `NetworkArchitecture`. El editor por
+    # acordeón sigue disponible en el módulo por si hace falta revertir.
+    from src.gnn_network_builder_canvas import render_canvas_editor
+    arch = render_canvas_editor(graph_info=graph_info)
     _gnn_builder_render_preview(arch, graph_info)
 
     col_save, col_use, col_export = st.columns(3)
@@ -22736,10 +22643,6 @@ def _run_gnn_architecture_pilot_experiment(
                         eval_neighbors_mode=str(best_params.get("eval_neighbors_mode", "same")),
                         eval_num_neighbors=best_params.get("eval_num_neighbors"),
                         checkpoint_metric=str(best_params.get("checkpoint_metric", "val_auprc")),
-                        seed_balance_mode=str(best_params.get("seed_balance_mode", "positive_ratio")),
-                        seed_positive_ratio=float(
-                            _metric_float(best_params.get("seed_positive_ratio")) or 0.10
-                        ),
                     )
                 except Exception as exc:
                     train_error = str(exc)
@@ -23100,10 +23003,6 @@ def _run_gnn_best_variant_experiment(
                             early_stop=bool(early_stop_train),
                             early_stop_patience=int(early_patience_train),
                             early_stop_min_delta=float(early_min_delta_train),
-                            seed_balance_mode=str(best_params.get("seed_balance_mode", "positive_ratio")),
-                            seed_positive_ratio=float(
-                                _metric_float(best_params.get("seed_positive_ratio")) or 0.10
-                            ),
                         )
                     except Exception as exc:
                         train_error = str(exc)
@@ -25015,10 +24914,6 @@ def _render_gnn_experiments_tab() -> None:
                                                 early_stop=bool(early_stop_train),
                                                 early_stop_patience=int(early_patience_train),
                                                 early_stop_min_delta=float(early_min_delta_train),
-                                                seed_balance_mode=str(best_params.get("seed_balance_mode", "positive_ratio")),
-                                                seed_positive_ratio=float(
-                                                    _metric_float(best_params.get("seed_positive_ratio")) or 0.10
-                                                ),
                                             )
                                         except Exception as exc:
                                             train_error = str(exc)
@@ -25228,10 +25123,6 @@ def _render_gnn_experiments_tab() -> None:
                                         early_stop=bool(early_stop_train),
                                         early_stop_patience=int(early_patience_train),
                                         early_stop_min_delta=float(early_min_delta_train),
-                                        seed_balance_mode=str(best_params.get("seed_balance_mode", "positive_ratio")),
-                                        seed_positive_ratio=float(
-                                            _metric_float(best_params.get("seed_positive_ratio")) or 0.10
-                                        ),
                                     )
                                 except Exception as exc:
                                     train_error = str(exc)
@@ -25680,8 +25571,6 @@ def _render_network_tab() -> None:
         "final_lambda_H": float(final_lambda_H),
         "batch_size": int(batch_size),
         "checkpoint_metric": str(existing_cfg.get("checkpoint_metric", "val_auprc")),
-        "seed_balance_mode": "positive_ratio",
-        "seed_positive_ratio": float(st.session_state.get("gnn_train_seed_positive_ratio", 0.10)),
     }
 
     st.session_state["gnn_network_config"] = config_payload
@@ -26403,11 +26292,6 @@ def _collect_optuna_ray_settings(
     imgagn_alpha_max = float(_get_state("imgagn_areg_max", 1e-3)) if use_imgagn_search else 0.0
     imgagn_beta_min = float(_get_state("imgagn_breg_min", 1e-6)) if use_imgagn_search else 0.0
     imgagn_beta_max = float(_get_state("imgagn_breg_max", 1e-3)) if use_imgagn_search else 0.0
-    seed_positive_ratio_optuna = max(
-        0.05,
-        min(0.10, float(_get_state("gnn_seed_positive_ratio", 0.10))),
-    )
-
     search_space = {
         "hidden_channels": {"min": hidden_min, "max": hidden_max, "step": hidden_step},
         "num_heads": {"min": heads_min, "max": heads_max, "step": heads_step},
@@ -26451,8 +26335,6 @@ def _collect_optuna_ray_settings(
         "imgagn_lr_d": {"min": imgagn_lr_d_min, "max": imgagn_lr_d_max},
         "imgagn_alpha_reg": {"min": imgagn_alpha_min, "max": imgagn_alpha_max},
         "imgagn_beta_reg": {"min": imgagn_beta_min, "max": imgagn_beta_max},
-        "seed_balance_mode": "positive_ratio",
-        "seed_positive_ratio": seed_positive_ratio_optuna,
     }
 
     n_trials = int(_get_state("gnn_optuna_trials", N_TRIALS))
@@ -26483,7 +26365,6 @@ def _collect_optuna_ray_settings(
         "metric": _get_state("gnn_optuna_metric", "AUPRC"),
         "threshold_beta": float(_get_state("gnn_optuna_beta", 1.0)),
         "device": get_auto_device(),
-        "seed_positive_ratio": seed_positive_ratio_optuna,
     }
 
     payload = {
@@ -26654,19 +26535,6 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
     if full_graph_mode:
         sample_train_nodes = 0
         sample_val_nodes = 0
-    st.slider(
-        "Ratio positivo objetivo en seeds train",
-        min_value=0.05,
-        max_value=0.10,
-        value=float(st.session_state.get("gnn_seed_positive_ratio", 0.10)),
-        step=0.01,
-        format="%.2f",
-        key="gnn_seed_positive_ratio",
-        help=(
-            "Balancea solo las semillas de entrenamiento. "
-            "Los vecinos/subgrafos y val/test mantienen prevalencia natural."
-        ),
-    )
 
     st.markdown("### Estrategia de Balanceo")
     balancing_strategy = st.radio(

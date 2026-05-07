@@ -18,42 +18,6 @@ from src.graph_builder_app import _infer_edge_feature_dim
 from src import gnn_main
 from src.train_pretrain import train_minibatch
 
-
-def test_make_epoch_seeds_targets_positive_ratio_for_rare_train_labels():
-    HeteroData = pytest.importorskip("torch_geometric.data").HeteroData
-    graph = HeteroData()
-    n_nodes = 1000
-    graph["pm"].y = torch.zeros(n_nodes, dtype=torch.long)
-    graph["pm"].y[:3] = 1
-    graph["pm"].train_mask = torch.zeros(n_nodes, dtype=torch.bool)
-    graph["pm"].train_mask[:n_nodes] = True
-
-    gen1 = torch.Generator(device="cpu")
-    gen1.manual_seed(123)
-    gen2 = torch.Generator(device="cpu")
-    gen2.manual_seed(123)
-
-    seeds1 = gnn_main.make_epoch_seeds(
-        graph,
-        node_type="pm",
-        strategy="random",
-        generator=gen1,
-        target_positive_ratio=0.10,
-    )
-    seeds2 = gnn_main.make_epoch_seeds(
-        graph,
-        node_type="pm",
-        strategy="random",
-        generator=gen2,
-        target_positive_ratio=0.10,
-    )
-
-    assert torch.equal(seeds1, seeds2)
-    assert bool(graph["pm"].train_mask[seeds1].all())
-    y_seed = graph["pm"].y[seeds1]
-    assert int((y_seed == 1).sum().item()) == 3
-    assert float((y_seed == 1).float().mean().item()) == pytest.approx(0.10, abs=0.015)
-
 def test_gat_model_training_step(dummy_graph_data):
     """
     Test Goal: Verify that the GNN model can perform a complete training step:

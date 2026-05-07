@@ -78,12 +78,6 @@ from src.anomaly import run_anomaly_pipeline
 sequence_index_global = None
 sequence_config_global = None
 
-SEED_BALANCE_MODE_POSITIVE_RATIO = "positive_ratio"
-DEFAULT_SEED_POSITIVE_RATIO = 0.10
-MIN_RECOMMENDED_SEED_POSITIVE_RATIO = 0.05
-MAX_RECOMMENDED_SEED_POSITIVE_RATIO = 0.10
-
-
 def _json_safe(obj):
     if isinstance(obj, dict):
         return {str(k): _json_safe(v) for k, v in obj.items()}
@@ -1593,51 +1587,13 @@ warnings.filterwarnings(
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-def _coerce_seed_positive_ratio(value, default: float = DEFAULT_SEED_POSITIVE_RATIO) -> float:
-    try:
-        ratio = float(value)
-    except Exception:
-        ratio = float(default)
-    if not math.isfinite(ratio):
-        ratio = float(default)
-    return float(min(max(ratio, MIN_RECOMMENDED_SEED_POSITIVE_RATIO), MAX_RECOMMENDED_SEED_POSITIVE_RATIO))
-
-def _seed_subset_summary(g, seeds: Optional[torch.Tensor], node_type: str = "pm") -> Dict[str, object]:
-    summary = {
-        "seed_positive_count": 0,
-        "seed_negative_count": 0,
-        "seed_positive_ratio_effective": 0.0,
-    }
-    try:
-        if seeds is None:
-            return summary
-        seeds_cpu = seeds.detach().cpu().long()
-        if seeds_cpu.numel() == 0:
-            return summary
-        y_seed = g[node_type].y.detach().cpu()[seeds_cpu]
-        pos_count = int((y_seed == 1).sum().item())
-        neg_count = int((y_seed == 0).sum().item())
-        total = pos_count + neg_count
-        summary.update(
-            {
-                "seed_positive_count": pos_count,
-                "seed_negative_count": neg_count,
-                "seed_positive_ratio_effective": float(pos_count / total) if total else 0.0,
-            }
-        )
-    except Exception:
-        pass
-    return summary
-
 def make_epoch_seeds(g, node_type='pm', pos_to_neg_ratio=3.0, strategy='random',
-                     model=None, device=None, topk_hard=None, generator: Optional[torch.Generator] = None,
-                     target_positive_ratio: Optional[float] = None):
+                     model=None, device=None, topk_hard=None, generator: Optional[torch.Generator] = None):
     """
     Devuelve índices (semillas) para entrenar esta época: todos los positivos + un subconjunto de negativos.
     - strategy = 'random'   → negativos al azar
     - strategy = 'hard'     → negativos más 'difíciles' (p predicha alta para clase 1)
       Requiere model y device; topk_hard puede ser None (usa ratio) o un entero.
-    - target_positive_ratio → fija la prevalencia positiva de semillas, sin tocar el grafo.
     """
     y = g[node_type].y.cpu()
     tr = g[node_type].train_mask.cpu().bool()
@@ -1645,16 +1601,12 @@ def make_epoch_seeds(g, node_type='pm', pos_to_neg_ratio=3.0, strategy='random',
     pos_idx = torch.nonzero(tr & (y == 1), as_tuple=True)[0]
     neg_idx = torch.nonzero(tr & (y == 0), as_tuple=True)[0]
 
-    if pos_idx.numel() == 0 or neg_idx.numel() == 0:
-        # sin ambas clases no hay balance seguro; usa todos los train.
+    if pos_idx.numel() == 0:
+        # sin positivos → usa todos los train
         return torch.nonzero(tr, as_tuple=True)[0]
 
     # cuántos negativos mantener
-    if target_positive_ratio is not None:
-        target_ratio = _coerce_seed_positive_ratio(target_positive_ratio)
-        n_neg_keep = int(math.ceil(float(pos_idx.numel()) * (1.0 - target_ratio) / target_ratio))
-        n_neg_keep = min(max(n_neg_keep, 1), int(neg_idx.numel()))
-    elif topk_hard is not None:
+    if topk_hard is not None:
         n_neg_keep = min(int(topk_hard), neg_idx.numel())
     else:
         n_neg_keep = min(int(pos_idx.numel() * float(pos_to_neg_ratio)), neg_idx.numel())
@@ -2489,8 +2441,6 @@ def run_gat_training(
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
     checkpoint_metric: Optional[str] = None,
-    seed_balance_mode: Optional[str] = None,
-    seed_positive_ratio: Optional[float] = None,
 ):
     """
     Entrenamiento GAT completo con:
@@ -2673,19 +2623,6 @@ def run_gat_training(
         if disable_hard_undersampling is not None
         else best_params.get("disable_hard_undersampling", False)
     )
-    seed_balance_mode_resolved = str(
-        seed_balance_mode
-        if seed_balance_mode is not None
-        else best_params.get("seed_balance_mode", SEED_BALANCE_MODE_POSITIVE_RATIO)
-        or SEED_BALANCE_MODE_POSITIVE_RATIO
-    ).strip().lower()
-    if seed_balance_mode_resolved not in {SEED_BALANCE_MODE_POSITIVE_RATIO, "none", "disabled", "natural"}:
-        seed_balance_mode_resolved = SEED_BALANCE_MODE_POSITIVE_RATIO
-    seed_positive_ratio_resolved = _coerce_seed_positive_ratio(
-        seed_positive_ratio
-        if seed_positive_ratio is not None
-        else best_params.get("seed_positive_ratio", DEFAULT_SEED_POSITIVE_RATIO)
-    )
 
     cluster_gcn_num_parts_resolved = int(
         _safe_cast(
@@ -2747,12 +2684,6 @@ def run_gat_training(
     best_params["deterministic_sampling"] = bool(deterministic_sampling_resolved)
     best_params["sampling_seed"] = int(sampling_seed_resolved)
     best_params["disable_hard_undersampling"] = bool(disable_hard_undersampling_resolved)
-    best_params["seed_balance_mode"] = (
-        SEED_BALANCE_MODE_POSITIVE_RATIO
-        if seed_balance_mode_resolved == SEED_BALANCE_MODE_POSITIVE_RATIO
-        else "none"
-    )
-    best_params["seed_positive_ratio"] = float(seed_positive_ratio_resolved)
     best_params["cluster_gcn_num_parts"] = int(cluster_gcn_num_parts_resolved)
     best_params["cluster_gcn_parts_per_epoch"] = int(cluster_gcn_parts_per_epoch_resolved)
     best_params["graphsaint_mode"] = str(graphsaint_mode_resolved)
@@ -2763,15 +2694,13 @@ def run_gat_training(
     best_params["eval_num_neighbors"] = eval_num_neighbors_resolved
 
     logger.info(
-        "Sampling config | mode=%s | deterministic=%s | seed=%d | disable_hard=%s | seed_balance=%s | seed_pos_ratio=%.3f | "
+        "Sampling config | mode=%s | deterministic=%s | seed=%d | disable_hard=%s | "
         "cluster_parts=%d | cluster_parts_epoch=%d | saint_mode=%s | saint_batch=%d | saint_steps=%d | saint_walk=%d | "
         "eval_neighbors_mode=%s | eval_num_neighbors=%s",
         train_sampler_mode_resolved,
         deterministic_sampling_resolved,
         sampling_seed_resolved,
         disable_hard_undersampling_resolved,
-        best_params["seed_balance_mode"],
-        seed_positive_ratio_resolved,
         cluster_gcn_num_parts_resolved,
         cluster_gcn_parts_per_epoch_resolved,
         graphsaint_mode_resolved,
@@ -3079,7 +3008,6 @@ def run_gat_training(
         topk_hard,
         epoch_idx: int,
         pos_to_neg_ratio: float,
-        target_positive_ratio: Optional[float],
     ) -> torch.Tensor:
         if use_undersampling:
             strategy_effective = str(strategy)
@@ -3094,15 +3022,6 @@ def run_gat_training(
                 device=device if strategy_effective == "hard" else None,
                 topk_hard=topk_hard,
                 generator=_epoch_seed_generator(epoch_idx, offset=11),
-                target_positive_ratio=target_positive_ratio,
-            )
-        if target_positive_ratio is not None:
-            return make_epoch_seeds(
-                graph_cpu,
-                node_type="pm",
-                strategy="random",
-                generator=_epoch_seed_generator(epoch_idx, offset=11),
-                target_positive_ratio=target_positive_ratio,
             )
         return graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1)
 
@@ -3148,7 +3067,6 @@ def run_gat_training(
         device=None,
         topk_hard=None,
         epoch_idx: int = 1,
-        target_positive_ratio: Optional[float] = None,
     ):
         """
         Construye loader por época con soporte de:
@@ -3166,11 +3084,7 @@ def run_gat_training(
             topk_hard=topk_hard,
             epoch_idx=int(epoch_idx),
             pos_to_neg_ratio=float(pos_to_neg_ratio),
-            target_positive_ratio=target_positive_ratio,
         )
-        if epoch_idx == 1:
-            seed_summary = _seed_subset_summary(graph_cpu, base_seeds, node_type="pm")
-            best_params.update(seed_summary)
         seeds = _apply_sampler_mode(graph_cpu, base_seeds, int(epoch_idx))
         if seeds.numel() == 0:
             seeds = base_seeds
@@ -3201,15 +3115,6 @@ def run_gat_training(
     use_undersampling = bool(raw_undersample) if not auto_enable_hard else False
     pos_to_neg_ratio = float(_safe_cast(best_params.get('pos_to_neg_ratio'), float, 3.0))
     undersampling_strategy = str(best_params.get('undersampling_strategy', 'random'))
-    target_seed_positive_ratio = (
-        seed_positive_ratio_resolved
-        if seed_balance_mode_resolved == SEED_BALANCE_MODE_POSITIVE_RATIO
-        else None
-    )
-    if target_seed_positive_ratio is not None:
-        use_undersampling = True
-        if undersampling_strategy not in {"random", "hard"}:
-            undersampling_strategy = "random"
     if disable_hard_undersampling_resolved and undersampling_strategy == 'hard':
         undersampling_strategy = 'random'
     topk_hard = best_params.get('topk_hard', None)
@@ -3227,13 +3132,12 @@ def run_gat_training(
                 pos_ratio_train = 0.0
         except Exception:
             pos_ratio_train = 0.0
-        rare_threshold = float(target_seed_positive_ratio or 0.2)
-        if pos_ratio_train < rare_threshold:
+        if pos_ratio_train < 0.2:
             use_undersampling = True
             undersampling_strategy = 'hard'
             best_params['undersample'] = True
             best_params['undersampling_strategy'] = 'hard'
-            if topk_hard is None and target_seed_positive_ratio is None:
+            if topk_hard is None:
                 try:
                     pos_count = int((data['pm'].y[train_mask] == 1).sum().item())
                     topk_hard = max(int(pos_count * pos_to_neg_ratio), 128)
@@ -3251,7 +3155,6 @@ def run_gat_training(
             device=device if effective_strategy == 'hard' else None,
             topk_hard=topk_hard,
             epoch_idx=int(epoch_idx),
-            target_positive_ratio=target_seed_positive_ratio,
         )
 
     train_loader = rebuild_train_loader(train_graph, epoch_idx=1)
