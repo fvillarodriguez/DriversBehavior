@@ -3008,11 +3008,10 @@ def _comparison_tau_from_val_result(
 
 
 def _checkpoint_tau_from_meta(meta: Mapping[str, object]) -> Optional[float]:
-    for key in ("best_val_tau", "best_tau", "tau"):
-        value = _coerce_optional_float(meta.get(key))
-        if value is not None:
-            return value
-    return None
+    value = _coerce_optional_float(meta.get("best_val_tau"))
+    if value is None or value < 0.0 or value > 1.0:
+        return None
+    return value
 
 
 def _f05_from_precision_recall(precision: object, recall: object) -> Optional[float]:
@@ -5692,7 +5691,9 @@ def _evaluate_gnn_model_far_target(
         pm_index,
         node_type=node_type,
     )
-    tau = float(meta.get("best_tau", 0.5))
+    tau = _checkpoint_tau_from_meta(meta)
+    if tau is None:
+        tau = 0.5
     calib_info: Dict[str, object] = {}
     calib_results = graph_main.test(
         model,
@@ -7985,7 +7986,7 @@ def _run_optuna_search(
         )
 
         best_score = -1e9
-        best_tau = 0.5
+        best_val_tau = 0.5
         best_epoch = 0
         best_val_metrics: Dict[str, object] = {}
 
@@ -8211,7 +8212,7 @@ def _run_optuna_search(
 
                 if score > best_score:
                     best_score = score
-                    best_tau = tau
+                    best_val_tau = tau
                     best_epoch = epoch
                     best_val_metrics = {
                         "val_f1": metrics.get("f1"),
@@ -8252,7 +8253,7 @@ def _run_optuna_search(
             _mem_snapshot(f"trial_{trial.number}_cleanup")
 
         trial.set_user_attr("best_metric", best_score)
-        trial.set_user_attr("best_tau", float(best_tau))
+        trial.set_user_attr("best_val_tau", float(best_val_tau))
         trial.set_user_attr("best_epoch", int(best_epoch))
         for metric_name, metric_value in best_val_metrics.items():
             trial.set_user_attr(metric_name, metric_value)
@@ -8854,7 +8855,7 @@ def _run_ray_tune_search(
                 "use_relation_self_loops",
                 "edge_encoder_per_type",
                 "edge_encoder_mode",
-                "best_tau",
+                "best_val_tau",
                 "best_epoch",
                 "best_metric",
             ):
@@ -8923,7 +8924,7 @@ def _run_ray_tune_search(
             "graphsaint_walk_length",
             "use_checkpointing",
             "lr_scheduler",
-            "best_tau",
+            "best_val_tau",
             "best_epoch",
             "best_metric",
         ):
@@ -18769,9 +18770,8 @@ def _perform_model_evaluation(
                     m_res.pop("true", None)
 
         if eval_threshold is None:
-            try:
-                eval_threshold = float(meta.get("best_tau", 0.5))
-            except Exception:
+            eval_threshold = _checkpoint_tau_from_meta(meta)
+            if eval_threshold is None:
                 eval_threshold = 0.5
             progress_ui.update(
                 0.58,
@@ -19131,9 +19131,8 @@ def _render_evaluation_tab() -> None:
         if meta:
             st.metric("Best Val F1", f"{meta.get('best_val_f1') or 0.0:.4f}")
             st.metric("Best Val AUPRC", f"{meta.get('best_val_auprc') or 0.0:.4f}")
-            try:
-                tau_label = float(meta.get("best_tau", 0.5))
-            except Exception:
+            tau_label = _checkpoint_tau_from_meta(meta)
+            if tau_label is None:
                 tau_label = 0.5
             st.caption(f"Umbral optimo detectado (tau): {tau_label:.6f}")
 
@@ -19235,9 +19234,8 @@ def _render_evaluation_tab() -> None:
             "Considere limitar el numero de nodos por mascara."
         )
 
-    try:
-        tau_default = float(meta.get("best_tau", 0.5))
-    except Exception:
+    tau_default = _checkpoint_tau_from_meta(meta)
+    if tau_default is None:
         tau_default = 0.5
 
     threshold_mode = st.selectbox(
@@ -23914,7 +23912,7 @@ def _run_gnn_architecture_pilot_experiment(
                         "objective_metric": objective_metric,
                         "optuna_best_value": best_params.get("value"),
                         "optuna_best_epoch": best_params.get("best_epoch"),
-                        "optuna_best_tau": best_params.get("best_tau"),
+                        "optuna_best_val_tau": best_params.get("best_val_tau"),
                         "optuna_best_path": result.get("best_path"),
                         "optuna_full_path": result.get("full_path"),
                         "optuna_range_analysis": result.get("range_analysis"),
@@ -24453,7 +24451,7 @@ def _run_gnn_best_variant_experiment(
                         "objective_metric": objective_metric,
                         "optuna_best_value": best_params.get("value"),
                         "optuna_best_epoch": best_params.get("best_epoch"),
-                        "optuna_best_tau": best_params.get("best_tau"),
+                        "optuna_best_val_tau": best_params.get("best_val_tau"),
                         "optuna_best_path": result.get("best_path"),
                         "optuna_full_path": result.get("full_path"),
                         "optuna_range_analysis": range_analysis,
@@ -26358,7 +26356,7 @@ def _render_gnn_experiments_tab() -> None:
                                             "param_importance": importances_used,
                                             "best_value": best_params.get("value"),
                                             "best_epoch": best_params.get("best_epoch"),
-                                            "best_tau": best_params.get("best_tau"),
+                                            "best_val_tau": best_params.get("best_val_tau"),
                                             "best_path": result.get("best_path"),
                                             "full_path": result.get("full_path"),
                                             "range_analysis": range_analysis,
@@ -26559,7 +26557,7 @@ def _render_gnn_experiments_tab() -> None:
                                     "objective_metric": objective_metric,
                                     "optuna_best_value": best_params.get("value"),
                                     "optuna_best_epoch": best_params.get("best_epoch"),
-                                    "optuna_best_tau": best_params.get("best_tau"),
+                                    "optuna_best_val_tau": best_params.get("best_val_tau"),
                                     "optuna_best_path": result.get("best_path"),
                                     "optuna_full_path": result.get("full_path"),
                                     "optuna_range_analysis": range_analysis,

@@ -33,6 +33,7 @@ from src.graph_builder_app import (
     _resolve_graph_hash_for_loaded_graph,
     _default_gnn_objective_metrics,
     _split_val_mask_for_calibration_threshold,
+    _checkpoint_tau_from_meta,
     PMIndex,
 )
 
@@ -370,6 +371,14 @@ def test_val_mask_split_rejects_single_class_side():
 
     with pytest.raises(ValueError, match="ambas clases"):
         _split_val_mask_for_calibration_threshold(data, pm_index)
+
+
+def test_checkpoint_tau_from_meta_requires_canonical_best_val_tau():
+    assert _checkpoint_tau_from_meta({"best_val_tau": 0.37}) == pytest.approx(0.37)
+    assert _checkpoint_tau_from_meta({"best_tau": 0.82, "tau": 0.74}) is None
+    assert _checkpoint_tau_from_meta({"best_val_tau": -0.1}) is None
+    assert _checkpoint_tau_from_meta({"best_val_tau": 1.1}) is None
+    assert _checkpoint_tau_from_meta({"best_val_tau": float("nan")}) is None
 
 
 def test_gnn_objective_defaults_focus_on_extreme_imbalance_metrics():

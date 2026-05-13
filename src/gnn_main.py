@@ -5270,7 +5270,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
         batch_scheduler = scheduler if _lr_scheduler_steps_per_batch(lr_scheduler) else None
 
         best_f05 = -1.0
-        best_tau = 0.5
+        best_val_tau = 0.5
         best_epoch = 0
 
         # --- Loop de Entrenamiento y Validación ---
@@ -5337,7 +5337,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
 
                 if f05 > best_f05:
                     best_f05 = f05
-                    best_tau = tau
+                    best_val_tau = tau
                     best_epoch = epoch
                 
                 # Sanity Check
@@ -5346,7 +5346,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
                     return best_f05 * 0.7 
 
         trial.set_user_attr("best_f0.5", best_f05)
-        trial.set_user_attr("best_tau", best_tau)
+        trial.set_user_attr("best_val_tau", best_val_tau)
         trial.set_user_attr("best_epoch", best_epoch)
         
         return best_f05
@@ -6106,12 +6106,12 @@ def run_gat_testing(loaded_obj):
     # 5.a) Determinar el umbral de decisión (tau)
     tau = None
     platt_model = None
-    if 'best_tau' in best_params:
-        tau = best_params['best_tau']
+    if 'best_val_tau' in best_params:
+        tau = best_params['best_val_tau']
         print(f"ℹ️ Usando umbral (tau) pre-calculado de Optuna: {tau:.6f}")
 
     if tau is None:
-        print("▶️ No se encontró `best_tau` en los hiperparámetros. Calculando umbral óptimo desde la validación...")
+        print("▶️ No se encontró `best_val_tau` en los hiperparámetros. Calculando umbral óptimo desde la validación...")
         # 1) Pase inicial para recolectar probabilidades en validación
         initial_results = test(model, data, node_type='pm', threshold=None, masks=['val_mask', 'train_mask'])
 

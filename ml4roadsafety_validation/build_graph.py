@@ -52,6 +52,12 @@ def _torch_load(path: Path) -> object:
         return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         return torch.load(path, map_location="cpu")
+    except Exception as exc:
+        if exc.__class__.__name__ != "UnpicklingError":
+            raise
+        # Official ML4RoadSafety feature files contain numpy scalar metadata
+        # that is not allowlisted by PyTorch's weights_only loader.
+        return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def _as_aligned_vector(values: torch.Tensor, length: int, *, fill: float = 0.0) -> torch.Tensor:

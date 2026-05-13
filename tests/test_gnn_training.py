@@ -1,5 +1,6 @@
 
 import json
+import logging
 import math
 import hashlib
 import pytest
@@ -289,6 +290,83 @@ def test_train_minibatch_reports_unscaled_loss_with_accumulation():
     assert cls_loss == pytest.approx(math.log(2), rel=1e-5)
     assert edge_loss == pytest.approx(0.0)
     assert l2_loss == pytest.approx(0.0)
+
+
+def test_train_minibatch_amp_skips_step_when_no_scaled_backward(caplog):
+    HeteroData = pytest.importorskip("torch_geometric.data").HeteroData
+    data = HeteroData()
+    data["pm"].x = torch.zeros(4, 2)
+    data["pm"].y = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+    data["pm"].batch_size = 4
+    data["pm"].n_id = torch.arange(4)
+    data["pm", "spatial", "pm"].edge_index = torch.empty((2, 0), dtype=torch.long)
+
+    class ConstantLogitModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.zeros(2))
+
+        def forward(self, x_dict, edge_index_dict, edge_attr_dict):
+            del edge_index_dict, edge_attr_dict
+            logits = self.bias.expand(x_dict["pm"].shape[0], -1)
+            return {"pm": logits}, {"pm": logits}, {}
+
+    class NaNCriterion(torch.nn.Module):
+        def forward(self, logits, target):
+            del target
+            return logits.sum() * torch.tensor(float("nan"), device=logits.device)
+
+    class StrictFakeScaler:
+        def __init__(self):
+            self.calls = []
+
+        def scale(self, loss):
+            self.calls.append("scale")
+            return loss
+
+        def unscale_(self, optimizer):
+            del optimizer
+            self.calls.append("unscale")
+
+        def step(self, optimizer):
+            self.calls.append("step")
+            if "scale" not in self.calls:
+                raise AssertionError("scaler.step() called before scaler.scale()")
+            optimizer.step()
+
+        def update(self):
+            self.calls.append("update")
+
+    class FakeScheduler:
+        def __init__(self):
+            self.step_calls = 0
+
+        def step(self):
+            self.step_calls += 1
+
+        def get_last_lr(self):
+            return [0.1]
+
+    model = ConstantLogitModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scaler = StrictFakeScaler()
+    scheduler = FakeScheduler()
+
+    with caplog.at_level(logging.WARNING, logger="src.train_pretrain"):
+        train_minibatch(
+            model,
+            [data],
+            optimizer,
+            NaNCriterion(),
+            use_amp=True,
+            scaler=scaler,
+            scheduler=scheduler,
+            accumulation_steps=1,
+        )
+
+    assert scaler.calls == []
+    assert scheduler.step_calls == 0
+    assert "skipping optimizer step" in caplog.text
 
 
 def _make_small_training_graph():

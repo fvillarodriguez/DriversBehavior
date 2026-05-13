@@ -135,6 +135,8 @@ def train_minibatch(
     if DEBUG:
         logger.info(f"[train_minibatch] Epoch {epoch}: Gradientes iniciales puestos a cero.")
 
+    accumulated_backward_batches = 0
+
     for i, batch in enumerate(progress_bar):
         if DEBUG:
             logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Iniciando procesamiento de batch.")
@@ -266,6 +268,7 @@ def train_minibatch(
                     grad_fn_info = loss_for_backward.grad_fn.__class__.__name__ if loss_for_backward.grad_fn else 'None'
                     logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Antes de backward (AMP). Loss grad_fn: {grad_fn_info}")
                 scaler.scale(loss_for_backward).backward()
+                accumulated_backward_batches += 1
                 if DEBUG:
                     logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Después de backward (AMP).")
             else:
@@ -279,6 +282,7 @@ def train_minibatch(
                     grad_fn_info = loss_for_backward.grad_fn.__class__.__name__ if loss_for_backward.grad_fn else 'None'
                     logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Antes de backward. Loss grad_fn: {grad_fn_info}")
                 loss_for_backward.backward()
+                accumulated_backward_batches += 1
                 if DEBUG:
                     logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Después de backward.")
             else:
@@ -288,20 +292,30 @@ def train_minibatch(
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(loader):
             if DEBUG:
                 logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Realizando paso de optimización.")
-            if use_amp and scaler is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
-                if edge_gen: torch.nn.utils.clip_grad_norm_(edge_gen.parameters(), grad_clip_value)
-                scaler.step(optimizer)
-                scaler.update()
+            optimizer_stepped = False
+            if accumulated_backward_batches > 0:
+                if use_amp and scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
+                    if edge_gen: torch.nn.utils.clip_grad_norm_(edge_gen.parameters(), grad_clip_value)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
+                    if edge_gen: torch.nn.utils.clip_grad_norm_(edge_gen.parameters(), grad_clip_value)
+                    optimizer.step()
+                optimizer_stepped = True
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
-                if edge_gen: torch.nn.utils.clip_grad_norm_(edge_gen.parameters(), grad_clip_value)
-                optimizer.step()
+                logger.warning(
+                    "No finite loss produced a backward pass in this accumulation window; "
+                    "skipping optimizer step."
+                )
 
             optimizer.zero_grad(set_to_none=True)
+            accumulated_backward_batches = 0
             if DEBUG:
                 logger.info(f"[train_minibatch] Epoch {epoch}, Batch {i}: Gradientes puestos a cero después del paso.")
-            if scheduler is not None:
+            if scheduler is not None and optimizer_stepped:
                 scheduler.step()
 
         if torch.isfinite(raw_loss):

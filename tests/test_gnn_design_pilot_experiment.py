@@ -152,7 +152,7 @@ def test_architecture_pilot_runs_optuna_on_pilot_and_full_train_on_original(
                 "val_auc": 0.7,
                 "val_mcc": 0.1,
                 "val_loss": 0.9,
-                "best_tau": 0.6,
+                "best_val_tau": 0.6,
                 "best_epoch": 2,
             },
             "best_path": str(tmp_path / "pilot_hparams.csv"),
