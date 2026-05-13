@@ -34,190 +34,476 @@
       </div>
     </header>
 
-    <h3 class="reveal">Objetivo</h3>
-    <p class="reveal">El módulo agrupa conductores —identificados por su matrícula— según indicadores de comportamiento observados en los registros de detección (<code>flujos</code>). Los grupos se usan para análisis exploratorio y para construir variables agregadas por pórtico e intervalo que alimentan los modelos posteriores.</p>
+    <h3 class="reveal">Objetivo y alcance</h3>
+    <p class="reveal">El módulo de <em>clustering</em> agrupa conductores, identificados por matrícula, a partir de indicadores conductuales extraídos de los registros de detección vehicular (<code>flujos</code>). La salida cumple dos roles: primero, habilita análisis exploratorio de perfiles de conducción; segundo, produce etiquetas y probabilidades de pertenencia que se agregan por pórtico e intervalo para alimentar predicción de accidentes, drift detection y escenarios posteriores de simulación.</p>
+    <p class="reveal">En la documentación LaTeX, el capítulo de clustering y el detalle de ingeniería de variables estaban separados. En la documentación web se consolidan aquí porque ambos describen un único contrato metodológico: transformar eventos crudos \((t,p,\ell,v,\text{plate})\) en un vector por conductor, entrenar modelos de agrupamiento y proyectar esas agrupaciones hacia variables macro de tráfico.</p>
 
-    <h3 class="reveal">Datos y preprocesamiento</h3>
-    <p class="reveal">Se parte de observaciones \( r_j = (t_j, p_j, \ell_j, v_j, \text{plate}_j) \) con tiempo, pórtico, carril, velocidad y matrícula. La normalización pasa la matrícula a mayúsculas, descarta valores inválidos (<code>""</code>, <code>nan</code>, <code>null</code>, <code>none</code>) y filtra largos fuera de \([5,6]\). Los carriles se restringen a \(\ell\in\{1,2,3\}\) y se eliminan duplicados exactos por la llave \((\text{plate}, p, \ell, t)\).</p>
+    <h3 class="reveal">Mapa operacional</h3>
+    <table class="lab-table reveal">
+      <caption><strong>Flujo auditable del módulo.</strong> Cada etapa produce un estado persistible o una decisión metodológica.</caption>
+      <thead><tr><th>Etapa</th><th>Función o módulo</th><th>Contrato técnico</th><th>Artefacto principal</th></tr></thead>
+      <tbody>
+        <tr><td>Lectura de flujos</td><td><code>src/utils.py</code>, <code>load_flujos*</code></td><td>Carga registros de detección con timestamp, pórtico, carril, velocidad y matrícula.</td><td><code>Datos/flujos.duckdb</code></td></tr>
+        <tr><td>Limpieza</td><td><code>clean_flujos_for_clustering</code></td><td>Normaliza matrícula, filtra carriles válidos, deduplica y trata outliers de velocidad.</td><td>DataFrame limpio por evento</td></tr>
+        <tr><td>Variables por patente</td><td><code>Clusterization</code></td><td>Calcula velocidad, exceso de velocidad, headway, TTC, conflicto, carriles, cambios y actividad.</td><td><code>cluster_features*.duckdb</code></td></tr>
+        <tr><td>Preparación ML</td><td><code>_prepare_cluster_features</code>, <code>StandardScaler</code></td><td>Selecciona columnas numéricas, elimina NaN/inf y estandariza con z-score.</td><td>Matriz escalada \(Z\)</td></tr>
+        <tr><td>Clustering estático</td><td><code>assign_clusters_kmeans</code>, <code>assign_clusters_gmm</code>, HDBSCAN UI</td><td>Entrena K-means, GMM o HDBSCAN y persiste etiquetas por matrícula.</td><td><code>cluster_*_kK.csv</code></td></tr>
+        <tr><td>GMM dinámico</td><td><code>run_dynamic_gmm_clustering</code></td><td>Recalcula features por ventana, aplica GMM histórico fijo y mide estabilidad de membresía.</td><td><code>dynamic_gmm_*.duckdb</code></td></tr>
+        <tr><td>Features macro</td><td><code>src/cluster_accident_app.py</code></td><td>Agrega clusters por pórtico/intervalo con membresía dura o suave.</td><td>Columnas <code>cluster_*</code> en datasets de predicción</td></tr>
+      </tbody>
+    </table>
 
-    <p class="reveal">Para el tratamiento de atípicos en velocidad, por cada grupo \((p,\ell)\) se calculan cuantiles \(q_\alpha\) y \(q_\beta\), y según el modo se aplica winsorización \(v\leftarrow\min(\max(v,q_\alpha),q_\beta)\), filtrado duro, o nada.</p>
-
-    <h3 class="reveal">Ingeniería de features por conductor</h3>
-    <p class="reveal">Se construye un vector \(x_i\in\mathbb{R}^d\) agregando sobre las pasadas del conductor \(i\). Los artefactos se guardan en <code>Resultados/cluster_features*.duckdb</code> (tabla <code>cluster_features</code>).</p>
-
-    <h4 class="reveal">Conteos, velocidad media y uso de carril</h4>
+    <h3 class="reveal">Datos de entrada y unidad observacional</h3>
+    <p class="reveal">La unidad elemental es una pasada de vehículo por pórtico. Para \(N\) registros, cada evento se representa como:</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ N_i = \sum_{j=1}^{N}\mathbf{1}[\text{plate}_j=i],\quad \overline{v}_i = \frac{1}{N_i}\sum_{j:\text{plate}_j=i} v_j,\quad \pi_{i,k} = \frac{1}{N_i}\sum_{j:\text{plate}_j=i}\mathbf{1}[\ell_j=k] \]</div>
+      <div class="formula">\[ r_j=(t_j,p_j,\ell_j,v_j,\mathrm{plate}_j),\qquad j=1,\dots,N. \]</div>
       <div class="num">(1.1)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>N<sub>i</sub></dt><dd>Pasadas totales del conductor <em>i</em> (cardinalidad de su historial).</dd>
-          <dt>v̄<sub>i</sub></dt><dd>Velocidad media del conductor sobre todas sus pasadas.</dd>
-          <dt>π<sub>i,k</sub></dt><dd>Proporción de pasadas del conductor <em>i</em> en el carril <em>k</em> (uso de carril).</dd>
+          <dt>t<sub>j</sub></dt><dd>Timestamp de la detección.</dd>
+          <dt>p<sub>j</sub></dt><dd>Pórtico o estación AVI.</dd>
+          <dt>ℓ<sub>j</sub></dt><dd>Carril observado, restringido a 1, 2 o 3.</dd>
+          <dt>v<sub>j</sub></dt><dd>Velocidad de la pasada, en km/h.</dd>
+          <dt>plate<sub>j</sub></dt><dd>Matrícula normalizada del vehículo.</dd>
         </dl>
         <h5>Implementación</h5>
-        <span class="impl">src/clustering.py · Clusterization (lines 413–476)</span>
+        <span class="impl">src/clustering.py · clean_flujos_for_clustering</span>
       </aside>
     </div>
 
-    <h4 class="reveal">Velocidad relativa</h4>
-    <p class="reveal">Sobre intervalos de 5 minutos por pórtico se define una velocidad media de referencia \( \overline{v}_{p,\tau} \). Para cada pasada, \( \rho_j = v_j/\overline{v}_{p_j,\lfloor t_j\rfloor_{5\text{min}}} \), y por conductor \( \overline{\rho}_i = \frac{1}{|\mathcal{J}_i|}\sum_{j\in\mathcal{J}_i}\rho_j \).</p>
-
-    <h4 class="reveal">Headway</h4>
-    <p class="reveal">Por grupo \((p,\ell)\) ordenado por \((t,\text{plate})\): \( h_j = t_j - t_{j-1} \) en segundos. Headways mayores que \(h_{\max}=60\,\text{s}\) se tratan como faltantes.</p>
+    <h3 class="reveal">Preprocesamiento de datos</h3>
+    <p class="reveal">La limpieza es parte del contrato científico porque define qué observaciones son válidas para construir perfiles de conducción. La matrícula se normaliza con <code>normalize_plate_series</code>, removiendo caracteres no alfanuméricos, convirtiendo a mayúsculas y descartando valores inválidos como <code>""</code>, <code>nan</code>, <code>null</code> o <code>none</code>. En la implementación sólo se conservan matrículas con largo entre 5 y 6 caracteres.</p>
+    <p class="reveal">El carril se convierte a numérico y se restringe a \(\ell\in\{1,2,3\}\). La deduplicación usa la llave \((\mathrm{plate},p,\ell,t)\). Si hay duplicados con velocidades distintas, se ordena de forma estable y se conserva una observación determinística, evitando que el resultado dependa del orden accidental del archivo.</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \overline{h}_i = \frac{1}{|\mathcal{H}_i|}\sum_{j\in\mathcal{H}_i} h_j,\qquad \mathcal{H}_i=\{j:\text{plate}_j=i,\ 0&lt;h_j\le h_{\max}\} \]</div>
+      <div class="formula">\[ v_j^{\star}=\min\{\max(v_j,q_{\alpha,p,\ell}),q_{\beta,p,\ell}\},\qquad \alpha=0.01,\ \beta=0.99\ \text{por defecto}. \]</div>
       <div class="num">(1.2)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>h̄<sub>i</sub></dt><dd>Headway medio (separación temporal con el vehículo previo) por conductor.</dd>
-          <dt>ℋ<sub>i</sub></dt><dd>Conjunto de pasadas del conductor con headway válido (positivo y menor a 60 s).</dd>
-          <dt>h<sub>max</sub></dt><dd>Umbral de validez del headway, fijado en 60 s.</dd>
+          <dt>v<sup>*</sup><sub>j</sub></dt><dd>Velocidad winsorizada.</dd>
+          <dt>q<sub>α,p,ℓ</sub>, q<sub>β,p,ℓ</sub></dt><dd>Cuantiles de velocidad calculados dentro del grupo pórtico-carril.</dd>
         </dl>
-        <h5>Implementación</h5>
-        <span class="impl">src/clustering.py · Clusterization (lines 544–553)</span>
+        <h5>Modos</h5>
+        <dl>
+          <dt><code>winsorize</code></dt><dd>Recorta valores extremos dentro de los cuantiles.</dd>
+          <dt><code>filter</code></dt><dd>Descarta observaciones fuera del rango.</dd>
+          <dt><code>none</code></dt><dd>No altera velocidades.</dd>
+        </dl>
       </aside>
     </div>
 
-    <h4 class="reveal">TTC y tasa de conflictos</h4>
-    <p class="reveal">Para cada pasada con vehículo previo en el mismo \((p,\ell)\), se define \(\Delta v_j=v_j-v_{j-1}\). Sólo en cierres (\(\Delta v_j&gt;0\)) existe un TTC finito: \( \mathrm{TTC}_j = h_j v_j / \Delta v_j \). Por pórtico existe un umbral \(\tau_p\) (<code>TTC_MAX_BY_PORTICO</code>). La tasa por conductor usa como denominador todos los pares con headway válido y velocidad previa observada; los no cierres aportan cero:</p>
+    <h3 class="reveal">Detalle de variables conductuales</h3>
+    <p class="reveal">Para cada matrícula \(i\), el módulo construye un vector \(x_i\in\mathbb{R}^d\). Las columnas por defecto incluyen <code>avg_speed_kmh</code>, <code>exceso_velocidad</code>, <code>avg_relative_speed</code>, <code>avg_headway_s</code>, <code>conflict_rate</code>, <code>lane_prop_1</code>, <code>lane_prop_2</code> y <code>lane_change_rate</code>. <code>lane_prop_3</code> se calcula pero es redundante frente a las otras proporciones y normalmente se omite en entrenamiento.</p>
+
+    <table class="lab-table reveal">
+      <caption><strong>Familias de variables conductuales.</strong> Todas se calculan desde eventos limpios y se agregan a nivel matrícula.</caption>
+      <thead><tr><th>Familia</th><th>Columnas principales</th><th>Interpretación</th><th>Riesgo metodológico</th></tr></thead>
+      <tbody>
+        <tr><td>Volumen</td><td><code>total_passes</code></td><td>Soporte estadístico del perfil.</td><td>Matrículas con pocas pasadas son inestables.</td></tr>
+        <tr><td>Velocidad</td><td><code>avg_speed_kmh</code>, <code>exceso_velocidad</code></td><td>Nivel medio de velocidad y fracción de eventos sobre el máximo del pórtico.</td><td>Depende del mapa <code>Porticos.csv</code> o fallback de velocidad máxima.</td></tr>
+        <tr><td>Velocidad relativa</td><td><code>avg_relative_speed</code></td><td>Velocidad del conductor respecto del flujo local de 5 minutos.</td><td>Requiere suficiente densidad por pórtico-intervalo.</td></tr>
+        <tr><td>Interacción</td><td><code>avg_headway_s</code>, <code>conflict_rate</code></td><td>Separación temporal y frecuencia de cierres peligrosos con el vehículo previo.</td><td>Muy sensible al orden temporal por pórtico-carril.</td></tr>
+        <tr><td>Carril</td><td><code>lane_prop_*</code>, <code>lane_changes</code>, <code>lane_change_rate</code></td><td>Preferencia de pista y variabilidad lateral aproximada.</td><td>La tasa asume continuidad entre pasadas observadas.</td></tr>
+        <tr><td>Actividad</td><td><code>n_days_active</code>, <code>n_weeks_active</code>, <code>n_months_active</code>, <code>n_years_active</code></td><td>Persistencia temporal de la matrícula.</td><td>Meses se cuentan como pares año-mes; 2024-01 y 2025-01 son distintos.</td></tr>
+      </tbody>
+    </table>
+
+    <h4 class="reveal">Conteos, velocidad media y uso de carril</h4>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \mathrm{conflict\_rate}_i = \frac{\sum_{j\in\mathcal{K}_i}\mathbf{1}[\Delta v_j&gt;0\ \land\ \mathrm{TTC}_j&lt;\tau_{p_j}]}{|\mathcal{K}_i|},\qquad \mathcal{K}_i=\{j:\text{plate}_j=i,\ h_j&gt;0,\ v_{j-1}\ \text{definida}\} \]</div>
+      <div class="formula">\[
+        N_i=\sum_{j=1}^{N}\mathbf{1}[\mathrm{plate}_j=i],\qquad
+        \overline v_i=\frac{1}{N_i}\sum_{j:\mathrm{plate}_j=i}v_j,\qquad
+        \pi_{i,k}=\frac{1}{N_i}\sum_{j:\mathrm{plate}_j=i}\mathbf{1}[\ell_j=k].
+      \]</div>
       <div class="num">(1.3)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>TTC<sub>j</sub></dt><dd>Time-to-collision en la pasada <em>j</em>; sólo se calcula cuando hay cierre (Δv &gt; 0).</dd>
-          <dt>τ<sub>p</sub></dt><dd>Umbral por pórtico desde la constante <code>TTC_MAX_BY_PORTICO</code>.</dd>
-          <dt>𝒦<sub>i</sub></dt><dd>Pares consecutivos del conductor con headway positivo y velocidad previa observada.</dd>
+          <dt>N<sub>i</sub></dt><dd>Número de pasadas de la matrícula \(i\).</dd>
+          <dt>v̄<sub>i</sub></dt><dd>Velocidad promedio histórica.</dd>
+          <dt>π<sub>i,k</sub></dt><dd>Proporción de uso del carril \(k\in\{1,2,3\}\).</dd>
         </dl>
         <h5>Implementación</h5>
-        <span class="impl">src/clustering.py · Clusterization (lines 557–590)</span>
+        <span class="impl">src/clustering.py · Clusterization</span>
       </aside>
     </div>
-    <p class="reveal">En la implementación, \(\mathrm{TTC}_j\) se acota por arriba a \(\tau_{p_j}\) para evitar valores extremos.</p>
 
-    <h4 class="reveal">Cambios de carril y actividad</h4>
-    <p class="reveal">Se cuentan cambios de carril ordenando por conductor y tiempo: \(\mathrm{lane\_changes}_i = \sum_{m=2}^{N_i}\mathbf{1}[\ell_{i,m}\neq\ell_{i,m-1}]\) y su tasa. La actividad temporal incluye conteos de días, semanas y meses activos.</p>
+    <h4 class="reveal">Exceso de velocidad</h4>
+    <p class="reveal">El módulo consulta <code>load_portico_maxspeed_map</code> y estima la proporción de eventos donde \(v_j\) excede la velocidad máxima del pórtico. Si no existe un límite válido, la columna se rellena defensivamente con cero y, cuando <code>include_counts=True</code>, se conserva <code>speed_limit_count</code> para auditar cuántos eventos tuvieron denominador real.</p>
 
-    <h4 class="reveal">Ponderación mensual (opcional)</h4>
+    <h4 class="reveal">Velocidad relativa indexada</h4>
+    <p class="reveal">Para controlar por régimen local de tráfico, no se compara la velocidad cruda contra un promedio global. Se calcula una velocidad de referencia por pórtico y ventana de 5 minutos:</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \overline{x}_i = \frac{\sum_m N_{i,m}\,x_{i,m}}{\sum_m N_{i,m}} \]</div>
+      <div class="formula">\[
+        \overline v_{p,\tau}=\frac{1}{|\mathcal{I}_{p,\tau}|}\sum_{j\in\mathcal{I}_{p,\tau}}v_j,\qquad
+        \rho_j=\frac{v_j}{\overline v_{p_j,\lfloor t_j\rfloor_{5\mathrm{min}}}},\qquad
+        \overline\rho_i=\frac{1}{|\mathcal{J}_i|}\sum_{j\in\mathcal{J}_i}\rho_j.
+      \]</div>
       <div class="num">(1.4)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>x̄<sub>i</sub></dt><dd>Estadístico consolidado del conductor por ponderación mensual.</dd>
-          <dt>x<sub>i,m</sub></dt><dd>Valor del estadístico en el mes <em>m</em>.</dd>
-          <dt>N<sub>i,m</sub></dt><dd>Pasadas del conductor en el mes <em>m</em> — actúa como peso.</dd>
+          <dt>ρ<sub>j</sub></dt><dd>Velocidad relativa de la pasada \(j\).</dd>
+          <dt>ρ̄<sub>i</sub></dt><dd>Velocidad relativa promedio del conductor.</dd>
+          <dt>𝓘<sub>p,τ</sub></dt><dd>Eventos del pórtico \(p\) en el bin temporal \(\tau\).</dd>
         </dl>
-        <h5>Implementación</h5>
-        <span class="impl">src/clustering.py · Clusterization (lines 629–665)</span>
+        <h5>Lectura</h5>
+        <dl>
+          <dt>\(\rho_j\gt 1\)</dt><dd>El conductor circula más rápido que el flujo local.</dd>
+          <dt>\(\rho_j\lt 1\)</dt><dd>El conductor circula más lento que el flujo local.</dd>
+        </dl>
       </aside>
     </div>
 
-    <h3 class="reveal">Métodos de clustering</h3>
-    <p class="reveal">Antes de clusterizar se aplica z-score con <code>StandardScaler</code>. Se comparan tres familias:</p>
-    <ul class="reveal">
-      <li><strong>K-means</strong>: minimiza \(\sum_i \lVert x_i-\mu_{c_i}\rVert^2\). La selección de \(K\) se guía por Silhouette, Davies–Bouldin y Calinski–Harabasz.</li>
-      <li><strong>GMM</strong>: \(p(x)=\sum_{k=1}^K\pi_k\mathcal{N}(x\mid\mu_k,\Sigma_k)\) con EM; \(K\) se elige por AIC/BIC.</li>
-      <li><strong>HDBSCAN</strong>: jerarquía basada en densidad con <code>min_cluster_size</code> y <code>min_samples</code>; las observaciones ruidosas reciben etiqueta \(-1\).</li>
-    </ul>
-
-    <div class="lab-callout reveal">
-      <div class="label">Frecuentes vs. raros</div>
-      <p>Para robustez, el modelo puede entrenarse sólo con conductores frecuentes (\(N_i\ge N_{\min}\)). A los raros se les asigna etiqueta por distancia al centroide (K‑means) o por posterior máxima (GMM); si la confianza cae bajo el umbral, se marcan como desconocidos (\(-1\)) y se guarda <code>confidence_score</code> junto a <code>is_rare</code>.</p>
-    </div>
-
-    <h3 class="reveal">Variables agregadas por pórtico e intervalo</h3>
-    <p class="reveal">A partir de la tabla <code>plate → cluster_label</code>, para cada \((p,\tau,c)\):</p>
+    <h4 class="reveal">Headway</h4>
+    <p class="reveal">El <em>headway</em> exige orden temporal estricto. Se agrupa por pórtico y carril y se aplica <code>shift(1)</code> para recuperar el vehículo precedente. En modo mensual, el grupo también incluye el mes, de forma que los bordes entre meses no generen interacciones artificiales.</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ n_{p,\tau,c} = \#\{j:\,p_j=p,\ \lfloor t_j\rfloor_\Delta=\tau,\ \text{cluster}(\text{plate}_j)=c\},\qquad \mathrm{share}_{p,\tau,c} = \frac{n_{p,\tau,c}}{\sum_{c'}n_{p,\tau,c'}} \]</div>
+      <div class="formula">\[
+        \begin{aligned}
+        h_j &= t_j-t_{j-1},\\
+        \overline h_i &= \frac{1}{|\mathcal{H}_i|}\sum_{j\in\mathcal{H}_i}h_j,\\
+        \mathcal{H}_i &= \{j:\mathrm{plate}_j=i,\ 0\lt h_j\le h_{\max}\}.
+        \end{aligned}
+      \]</div>
       <div class="num">(1.5)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>n<sub>p,τ,c</sub></dt><dd>Conteo de detecciones del cluster <em>c</em> en pórtico <em>p</em> e intervalo τ.</dd>
-          <dt>share<sub>p,τ,c</sub></dt><dd>Proporción del cluster <em>c</em> en el mix de la celda (p,τ).</dd>
-          <dt>Δ</dt><dd>Tamaño del bin temporal (típicamente 5 min).</dd>
+          <dt>h<sub>max</sub></dt><dd>Umbral de interacción cercana, por defecto 60 segundos.</dd>
+          <dt>𝓗<sub>i</sub></dt><dd>Eventos con headway válido para la matrícula \(i\).</dd>
         </dl>
         <h5>Implementación</h5>
-        <span class="impl">src/clustering.py · _add_soft_entropy</span>
+        <span class="impl">src/clustering.py · Clusterization · headway_group_cols</span>
       </aside>
     </div>
-    <p class="reveal">Opcionalmente se derivan flujo, velocidad media, densidad, diferencias temporales, y la entropía de mezcla \( H_{p,\tau} = -\sum_c \mathrm{share}_{p,\tau,c}\log\mathrm{share}_{p,\tau,c} \).</p>
 
-    <h3 class="reveal">Detalle de variables conductuales</h3>
-    <p class="reveal">El detalle que antes estaba separado como capítulo 05 queda integrado aquí porque estas variables son parte del vector de clustering por conductor.</p>
-
-    <h4 class="reveal">Preprocesamiento operativo</h4>
-    <ol class="reveal">
-      <li>Normalización de patentes: alfanuméricas, mayúsculas, largo en \([5,6]\); se filtran <code>NULL</code>, <code>NAN</code>.</li>
-      <li>Filtrado de carriles a \(\{1,2,3\}\).</li>
-      <li>Deduplicación por \((\text{plate},p,\ell,t)\).</li>
-      <li>Winsorización de velocidad por \((p,\ell)\), si está habilitada, usando los cuantiles configurados.</li>
-    </ol>
-
-    <h4 class="reveal">Velocidad relativa indexada</h4>
+    <h4 class="reveal">TTC, umbrales y tasa de conflicto</h4>
+    <p class="reveal">El TTC sólo se define para cierres, es decir, cuando el vehículo actual viaja más rápido que el precedente en el mismo pórtico-carril. El umbral puede ser dinámico por pórtico (<code>TTC_MAX_BY_PORTICO</code>) o fijo para todos los pórticos (<code>DEFAULT_FIXED_TTC_SECONDS=1.5</code> por defecto).</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ v_{\text{rel},j} = \frac{v_j}{\overline{v}_{p_j,\lfloor t_j\rfloor_{5\text{min}}}} \]</div>
+      <div class="formula">\[
+        \begin{aligned}
+        \Delta v_j &= v_j-v_{j-1},\\
+        \mathrm{TTC}_j &= \frac{h_jv_j}{\Delta v_j}\quad(\Delta v_j&gt;0),\\
+        \theta_j &= \begin{cases}
+          \tau_{p_j}, & \text{modo dinámico},\\
+          \tau_{\mathrm{fixed}}, & \text{modo fijo}.
+        \end{cases}
+        \end{aligned}
+      \]</div>
       <div class="num">(1.6)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>v<sub>rel,j</sub></dt><dd>Velocidad de la pasada <em>j</em> normalizada por la velocidad media de su pórtico e intervalo.</dd>
-          <dt>v̄<sub>p,τ</sub></dt><dd>Velocidad media por pórtico en el bin de 5 minutos.</dd>
+          <dt>Δv<sub>j</sub></dt><dd>Diferencia entre velocidad actual y velocidad precedente.</dd>
+          <dt>θ<sub>j</sub></dt><dd>Umbral TTC efectivo de la observación.</dd>
         </dl>
-        <h5>Implementación</h5>
-        <span class="impl">src/clustering.py · Clusterization (lines 489–492)</span>
+        <h5>Metadata</h5>
+        <span class="impl">build_ttc_feature_metadata · cluster_features_meta</span>
       </aside>
     </div>
-
-    <h4 class="reveal">Evento TTC e indicador de conflicto</h4>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \mathrm{TTC}_j = \frac{h_j\,v_j}{v_j-v_{j-1}}\quad(\text{si }v_j&gt;v_{j-1}),\qquad c_j=\mathbf{1}\left[v_j&gt;v_{j-1}\ \land\ \mathrm{TTC}_j&lt;\tau_{p_j}\right] \]</div>
+      <div class="formula">\[
+        \begin{aligned}
+        \mathrm{conflict\_rate}_i &=
+        \frac{\sum_{j\in\mathcal{K}_i}\mathbf{1}[\Delta v_j&gt;0\ \land\ \mathrm{TTC}_j&lt;\tau_{p_j}]}
+        {|\mathcal{K}_i|},\\
+        \mathcal{K}_i &= \{j:\mathrm{plate}_j=i,\ 0&lt;h_j\le h_{\max},\ v_{j-1}\ \text{definida}\}.
+        \end{aligned}
+      \]</div>
       <div class="num">(1.7)</div>
       <aside class="eq-inspector">
-        <h5>Variables</h5>
+        <h5>Decisión de diseño</h5>
         <dl>
-          <dt>c<sub>j</sub></dt><dd>Indicador binario de conflicto para la pasada <em>j</em>.</dd>
-          <dt>v<sub>j-1</sub></dt><dd>Velocidad del vehículo previo en el mismo pórtico y carril.</dd>
-          <dt>τ<sub>p</sub></dt><dd>Umbral TTC por pórtico o valor fijo, según la configuración activa.</dd>
+          <dt>Denominador</dt><dd>Incluye pares con headway válido y velocidad previa; los no cierres aportan cero.</dd>
+          <dt>Recorte</dt><dd>El TTC se acota por arriba al umbral efectivo para evitar extremos.</dd>
         </dl>
-        <h5>Implementación</h5>
-        <span class="impl">src/clustering.py · Clusterization (lines 557–590)</span>
       </aside>
     </div>
 
-    <h4 class="reveal">Agregación y consolidación por patente</h4>
-    <p class="reveal">Por conductor se agregan velocidad media, velocidad relativa, headway, tasa de conflicto, uso de carril, tasa de cambio de carril y actividad temporal. Cuando se usa ponderación mensual, cada estadístico mensual se pondera por el volumen observado del mes.</p>
+    <h4 class="reveal">Cambios de carril</h4>
+    <p class="reveal">El cambio de carril se estima ordenando pasadas por matrícula y timestamp. Esta métrica es aproximada, porque los pórticos son observaciones discretas y no una trayectoria continua; aun así captura variabilidad lateral observada entre detecciones consecutivas.</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ X_{i,\mathrm{final}} = \frac{\sum_m X_{i,m}\,N_{i,m}}{\sum_m N_{i,m}} \]</div>
+      <div class="formula">\[
+        \begin{aligned}
+        \mathrm{lane\_changes}_i &= \sum_{m=2}^{N_i}\mathbf{1}[\ell_{i,m}\ne\ell_{i,m-1}],\\
+        \mathrm{lane\_change\_rate}_i &= \frac{\mathrm{lane\_changes}_i}{\max(N_i-1,1)}.
+        \end{aligned}
+      \]</div>
       <div class="num">(1.8)</div>
+      <aside class="eq-inspector">
+        <h5>Implementación</h5>
+        <span class="impl">Clusterization · ordered.groupby(key_cols)[LANE_CLEAN_COL].shift()</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Actividad temporal</h4>
+    <p class="reveal">Además de comportamiento, se mide persistencia histórica: <code>n_days_active</code>, <code>n_weeks_active</code>, <code>n_months_active</code> y <code>n_years_active</code>. Estas columnas se usan para separar conductores frecuentes y para seleccionar patentes prevalentes en GMM dinámico. Los meses se cuentan como pares calendario año-mes.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        n_i^{(\mathrm{days})} &= |\{\lfloor t_j\rfloor_{\mathrm{día}}:\mathrm{plate}_j=i\}|,\\
+        n_i^{(\mathrm{weeks})} &= |\{\lfloor t_j\rfloor_{\mathrm{semana}}:\mathrm{plate}_j=i\}|,\\
+        n_i^{(\mathrm{months})} &= |\{\lfloor t_j\rfloor_{\mathrm{mes}}:\mathrm{plate}_j=i\}|.
+        \end{aligned}
+      \]</div>
+      <div class="num">(1.9)</div>
+      <aside class="eq-inspector">
+        <h5>Uso posterior</h5>
+        <span class="impl">split_frequent_drivers · build_prevalent_plate_selection</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Ponderación mensual</h4>
+    <p class="reveal">Cuando <code>monthly_weighting=True</code>, las variables se calculan por matrícula-mes y luego se consolidan ponderando por la cantidad de pasadas del mes. Esto evita que meses con muy pocas observaciones tengan el mismo peso que meses de alta actividad.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \overline{x}_i=\frac{\sum_m N_{i,m}x_{i,m}}{\sum_m N_{i,m}}.
+      \]</div>
+      <div class="num">(1.10)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>X<sub>i,final</sub></dt><dd>Estadístico consolidado del conductor por ponderación mensual.</dd>
-          <dt>X<sub>i,m</sub></dt><dd>Valor mensual del estadístico.</dd>
-          <dt>N<sub>i,m</sub></dt><dd>Pasadas del conductor en el mes <em>m</em>.</dd>
+          <dt>x<sub>i,m</sub></dt><dd>Estadístico de la matrícula \(i\) en el mes \(m\).</dd>
+          <dt>N<sub>i,m</sub></dt><dd>Pasadas de la matrícula durante ese mes.</dd>
         </dl>
-        <h5>Implementación</h5>
-        <span class="impl">src/clustering.py · _monthly_weighted_average</span>
       </aside>
     </div>
-    <p class="reveal">La lógica vive en <code>src/clustering.py</code>. <code>clean_flujos_for_clustering</code> realiza la preparación y <code>Clusterization</code> orquesta métricas simples, velocidad relativa, interacciones con <em>shift</em> vectorizado, cambios de carril y ponderación mensual.</p>
+
+    <h3 class="reveal">Preparación de datos para clustering</h3>
+    <p class="reveal">El usuario selecciona columnas numéricas de features. Antes de entrenar, se convierten a numérico, se reemplazan infinitos por NaN y se descartan filas incompletas. Luego se aplica z-score con <code>sklearn.preprocessing.StandardScaler</code>. Si se entrena sólo con conductores frecuentes, el escalador se ajusta sobre ese subconjunto y se aplica al resto.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        z_{i,f}=\frac{x_{i,f}-\mu_f}{\sigma_f}.
+      \]</div>
+      <div class="num">(1.11)</div>
+      <aside class="eq-inspector">
+        <h5>Implementación</h5>
+        <span class="impl">_prepare_cluster_features · _scale_cluster_features</span>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Métodos de clustering</h3>
+    <table class="lab-table reveal">
+      <caption><strong>Familias de modelos.</strong> La UI permite comparar métodos con supuestos geométricos distintos.</caption>
+      <thead><tr><th>Método</th><th>Objetivo</th><th>Selección / diagnóstico</th><th>Salida</th></tr></thead>
+      <tbody>
+        <tr><td>K-means</td><td>Minimizar dispersión intra-cluster sobre variables escaladas.</td><td>Silhouette, Davies-Bouldin, Calinski-Harabasz; opcional <code>MiniBatchKMeans</code>.</td><td>Etiqueta dura, distancia a centroide, confianza.</td></tr>
+        <tr><td>GMM</td><td>Modelar densidad como mezcla gaussiana con EM.</td><td>AIC/BIC por \(K\), covarianza configurable, posteriores <code>cluster_prob_*</code>.</td><td>Etiqueta dura, probabilidad máxima, entropía suave.</td></tr>
+        <tr><td>HDBSCAN</td><td>Extraer clusters estables en una jerarquía de densidad.</td><td><code>min_cluster_size</code>, <code>min_samples</code>, conteo de ruido.</td><td>Etiqueta, con ruido codificado como \(-1\).</td></tr>
+      </tbody>
+    </table>
+
+    <h4 class="reveal">K-means</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        \min_{\{c_i\},\{\mu_k\}}\;&\sum_{i=1}^{n}\lVert z_i-\mu_{c_i}\rVert^2,\\
+        s(i)&=\frac{b(i)-a(i)}{\max(a(i),b(i))}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(1.12)</div>
+      <aside class="eq-inspector">
+        <h5>Métricas</h5>
+        <dl>
+          <dt>Silhouette</dt><dd>Separación relativa entre cluster asignado y cluster vecino.</dd>
+          <dt>Davies-Bouldin</dt><dd>Razón entre dispersión interna y separación externa; menor es mejor.</dd>
+          <dt>Calinski-Harabasz</dt><dd>Razón entre dispersión inter-cluster e intra-cluster; mayor es mejor.</dd>
+        </dl>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Gaussian Mixture Models</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        p(z)&=\sum_{k=1}^{K}\pi_k\mathcal{N}(z\mid\mu_k,\Sigma_k),\\
+        \mathrm{AIC}&=-2\log L+2p,\\
+        \mathrm{BIC}&=-2\log L+p\log n.
+        \end{aligned}
+      \]</div>
+      <div class="num">(1.13)</div>
+      <aside class="eq-inspector">
+        <h5>Implementación</h5>
+        <span class="impl">compute_gmm_metrics · fit_gmm_cluster_model · assign_clusters_gmm</span>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        r_{i,k}=p(z_i=k\mid x_i),\qquad
+        \hat c_i=\begin{cases}
+          \arg\max_k r_{i,k}, & \max_k r_{i,k}\ge\gamma,\\
+          -1, & \text{en otro caso}.
+        \end{cases}
+      \]</div>
+      <div class="num">(1.14)</div>
+      <aside class="eq-inspector">
+        <h5>Columnas</h5>
+        <dl>
+          <dt><code>cluster_prob_*</code></dt><dd>Responsabilidades posteriores exportables.</dd>
+          <dt><code>confidence_score</code></dt><dd>Probabilidad posterior máxima.</dd>
+          <dt><code>soft_entropy</code></dt><dd>Entropía normalizada de la membresía suave.</dd>
+        </dl>
+      </aside>
+    </div>
 
     <div class="lab-callout sage reveal">
-      <div class="label">Próximamente · Resultados interactivos</div>
-      <p>Esta sección incluirá un explorador dinámico de clusters: silhouette por <em>K</em>, comparación AIC/BIC entre familias, y mapa de calor de <code>share<sub>p,τ,c</sub></code> por corredor. Los datos se cargarán desde <code>Resultados/cluster_features*.duckdb</code>.</p>
+      <div class="label">Frecuentes vs. raros</div>
+      <p><code>split_frequent_drivers</code> separa matrículas con suficiente soporte usando <code>total_passes</code>, <code>n_days_active</code>, <code>n_weeks_active</code> y <code>n_months_active</code> cuando están disponibles. K-means asigna raros por distancia al centroide y umbral percentil; GMM asigna raros por probabilidad posterior máxima. Si la confianza no alcanza el umbral, la etiqueta queda como desconocida (\(-1\)).</p>
     </div>
+
+    <h3 class="reveal">GMM con clusters dinámicos</h3>
+    <p class="reveal">El experimento de GMM dinámico pregunta si la membresía aprendida desde el historial se mantiene o cambia cuando sólo se observa comportamiento reciente. El modelo base se entrena una vez sobre las features históricas cargadas; luego cada ventana recalcula <code>Clusterization</code> desde <code>flujos</code>, transforma con el escalador histórico y predice con el GMM fijo. No se reentrena el modelo dentro de cada ventana.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        W_s&=[d_s,d_s+x\ \mathrm{días}),\\
+        d_{s+1}&=d_s+1\ \mathrm{día},\\
+        r_{i,s,k}&=p(z=k\mid S(x_{i,s})).
+        \end{aligned}
+      \]</div>
+      <div class="num">(1.15)</div>
+      <aside class="eq-inspector">
+        <h5>Implementación</h5>
+        <span class="impl">build_dynamic_gmm_windows · run_dynamic_gmm_clustering</span>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \hat c_{i,s}=\begin{cases}
+          \arg\max_k r_{i,s,k}, & \max_k r_{i,s,k}\ge\gamma\ \land\ N_{i,s}\ge N_{\min},\\
+          -1, & \text{en otro caso}.
+        \end{cases}
+      \]</div>
+      <div class="num">(1.16)</div>
+      <aside class="eq-inspector">
+        <h5>Estados</h5>
+        <dl>
+          <dt><code>assigned</code></dt><dd>Ventana con soporte y confianza suficientes.</dd>
+          <dt><code>low_confidence</code></dt><dd>Posterior máxima bajo \(\gamma\).</dd>
+          <dt><code>low_support</code></dt><dd>Menos de <code>min_window_passes</code> en la ventana.</dd>
+        </dl>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Variante prevalente</h4>
+    <p class="reveal">La variante <em>GMM dinámico prevalente</em> mantiene el mismo entrenamiento histórico, pero limita la asignación a una fracción exacta de matrículas más persistentes. Las patentes se ordenan por <code>n_months_active</code> descendente, <code>n_years_active</code> descendente, <code>total_passes</code> descendente y <code>plate</code> ascendente.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        n_{\mathrm{prev}}=\max\left(1,\left\lceil n_{\mathrm{plates}}\frac{q}{100}\right\rceil\right).
+      \]</div>
+      <div class="num">(1.17)</div>
+      <aside class="eq-inspector">
+        <h5>Metadata</h5>
+        <span class="impl">assignment_scope · prevalent_fraction_pct · prevalent_plate_hash</span>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Métricas de estabilidad</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        \mathrm{stability}_i&=1-\frac{\sum_{s=2}^{m_i}\mathbf{1}[\hat c_{i,s}\ne\hat c_{i,s-1}]}{m_i-1},\\
+        H_{i,s}&=-\frac{1}{\log K}\sum_{k=1}^{K}r_{i,s,k}\log r_{i,s,k}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(1.18)</div>
+      <aside class="eq-inspector">
+        <h5>Salidas</h5>
+        <dl>
+          <dt><code>stability_score</code></dt><dd>Persistencia de etiqueta entre ventanas asignadas.</dd>
+          <dt><code>change_rate</code></dt><dd>Complemento de estabilidad.</dd>
+          <dt><code>mean_soft_entropy</code></dt><dd>Incertidumbre promedio de membresía.</dd>
+        </dl>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Variables agregadas por pórtico e intervalo</h3>
+    <p class="reveal">Las etiquetas de clustering también se proyectan a variables macro. A partir de una tabla <code>plate</code> \(\rightarrow\) <code>cluster_label</code>, cada celda pórtico-intervalo-cluster puede agregarse con membresía dura o suave. La membresía suave usa <code>cluster_prob_*</code> cuando el archivo proviene de GMM estático o dinámico.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        n_{p,\tau,c}&=\#\{j:p_j=p,\lfloor t_j\rfloor_{\Delta}=\tau,\mathrm{cluster}(\mathrm{plate}_j)=c\},\\
+        w_{p,\tau,c}&=\sum_{j:p_j=p,\lfloor t_j\rfloor_{\Delta}=\tau}r_{j,c}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(1.19)</div>
+      <aside class="eq-inspector">
+        <h5>Modos</h5>
+        <dl>
+          <dt>Duro</dt><dd>Cuenta etiquetas discretas.</dd>
+          <dt>Suave</dt><dd>Suma responsabilidades GMM y conserva aporte de conductores raros.</dd>
+        </dl>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        \mathrm{share}_{p,\tau,c}&=\frac{m_{p,\tau,c}}{\sum_{c'}m_{p,\tau,c'}},\\
+        \mathrm{flow}_{p,\tau,c}&=m_{p,\tau,c}\frac{60}{\Delta}\frac{1}{L},\\
+        H_{p,\tau}&=-\sum_c\mathrm{share}_{p,\tau,c}\log\mathrm{share}_{p,\tau,c}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(1.20)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>m</dt><dd>\(n\) en modo duro o \(w\) en modo suave.</dd>
+          <dt>L</dt><dd>Número de carriles o factor de normalización operacional.</dd>
+          <dt>H<sub>p,τ</sub></dt><dd>Entropía de mezcla de clusters en la celda.</dd>
+        </dl>
+        <h5>Implementación</h5>
+        <span class="impl">src/cluster_accident_app.py · dynamic_gmm cluster features</span>
+      </aside>
+    </div>
+    <p class="reveal">Además de participación, el pipeline puede derivar flujo por hora, velocidad media por cluster, densidad \(\mathrm{flow}/\overline v\), diferencias temporales de velocidad/densidad y diagnósticos de alineación cuando se usan asignaciones dinámicas.</p>
+
+    <h3 class="reveal">Persistencia y artefactos</h3>
+    <table class="lab-table reveal">
+      <caption><strong>Artefactos de salida.</strong> Permiten reproducir features, modelos, asignaciones y agregaciones posteriores.</caption>
+      <thead><tr><th>Artefacto</th><th>Contenido</th><th>Uso posterior</th></tr></thead>
+      <tbody>
+        <tr><td><code>Resultados/cluster_features*.duckdb</code></td><td>Tabla <code>cluster_features</code> y metadata en <code>cluster_features_meta</code>.</td><td>Entrenamiento estático, GMM dinámico y auditoría de TTC.</td></tr>
+        <tr><td><code>cluster_kmeans_kK.csv</code></td><td>Etiquetas K-means, distancia a centroide, confianza, rareza.</td><td>Features macro con membresía dura.</td></tr>
+        <tr><td><code>cluster_gmm_kK.csv</code></td><td>Etiquetas GMM, <code>confidence_score</code>, <code>cluster_prob_*</code> opcional y <code>soft_entropy</code>.</td><td>Agregación dura o suave.</td></tr>
+        <tr><td><code>cluster_hdbscan.csv</code></td><td>Etiquetas de densidad y ruido \(-1\).</td><td>Análisis exploratorio y comparación.</td></tr>
+        <tr><td><code>cluster_summary*.csv</code></td><td>Centroides/resúmenes por cluster.</td><td>Interpretación de perfiles.</td></tr>
+        <tr><td><code>cluster_descriptive*.csv</code></td><td>Estadísticos descriptivos por cluster.</td><td>Validación académica de grupos.</td></tr>
+        <tr><td><code>dynamic_gmm_*.joblib</code></td><td>GMM histórico, escalador y metadatos.</td><td>Reuso de modelo y trazabilidad.</td></tr>
+        <tr><td><code>dynamic_gmm_*.duckdb</code></td><td><code>dynamic_assignments</code>, <code>dynamic_window_summary</code>, <code>dynamic_metadata</code>, checkpoints y eventos.</td><td>Estabilidad temporal, resume y features macro causales.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Auditoría técnica</h3>
+    <div class="lab-callout sage reveal">
+      <div class="label">Fortalezas implementadas</div>
+      <ul>
+        <li>La limpieza de matrícula, carril, timestamp y velocidad ocurre antes de cualquier agregación.</li>
+        <li>Headway y TTC se calculan con ordenamiento estable y comparación sólo dentro del mismo pórtico-carril.</li>
+        <li>El modo TTC queda persistido en metadata, incluyendo mapa dinámico o umbral fijo.</li>
+        <li>Las responsabilidades GMM permiten membresía suave y evitan descartar información de conductores raros.</li>
+        <li>GMM dinámico usa modelo histórico fijo y ventanas recalculadas, separando deriva conductual de reentrenamiento.</li>
+        <li>La selección prevalente usa ranking determinístico y hash de patentes para validar checkpoints.</li>
+      </ul>
+    </div>
+    <div class="lab-callout rust reveal">
+      <div class="label">Riesgos metodológicos</div>
+      <ul>
+        <li><code>lane_change_rate</code> aproxima cambios entre detecciones discretas; no observa maniobras continuas.</li>
+        <li>Headway y conflicto dependen de calidad temporal y de que el vehículo precedente haya sido capturado.</li>
+        <li>El umbral TTC dinámico es empírico por pórtico; debe reportarse junto con resultados.</li>
+        <li>Comparaciones de clusters sólo son válidas con mismas features, escalador, \(K\), filtros de frecuentes y periodo histórico.</li>
+        <li>La agregación suave requiere que <code>cluster_prob_*</code> provenga de un modelo compatible con el periodo evaluado.</li>
+      </ul>
+    </div>
+
+    <h3 class="reveal">Archivos clave</h3>
+    <p class="reveal"><strong>Código:</strong> <code>src/clustering.py</code>, <code>src/clustering_tabs_app.py</code>, <code>src/cluster_accident_app.py</code>, <code>src/utils.py</code>. <strong>LaTeX de referencia:</strong> <code>docs/sections/clustering_es.tex</code>, <code>docs/sections/clustering_features_detail_es.tex</code>. <strong>Pruebas esperadas:</strong> suite de clustering, feature engineering y rutas de agregación macro cuando se cambie la lógica.</p>
 
   </section>
 
   <footer class="lab-coda">
-    <span>Capítulo § 1 · 8 ecuaciones · 2 callouts</span>
+    <span>Capítulo § 1 · 20 ecuaciones · 4 tablas · 3 callouts</span>
     <span>Compilado desde <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/clustering_es.tex</code> + <code style="font-family:var(--font-mono);font-size:11.5px;">clustering_features_detail_es.tex</code></span>
   </footer>
 
@@ -225,10 +511,11 @@
 
 <aside class="lab-margin" aria-label="Notas al margen">
   <div class="pinned">
-    <span class="label">Inspector</span>
-    <p>Pasa el cursor sobre cualquier ecuación numerada para abrir el panel con definiciones y la referencia exacta al código que la implementa.</p>
-    <p><strong>Convención.</strong> Los nombres entre <code style="font-family:var(--font-mono);font-size:11.5px;">monospace</code> referencian funciones, constantes o tablas reales del repositorio.</p>
-    <p><strong>Pórtico.</strong> En este texto, <em>pórtico</em> designa una estación de detección AVI con uno o más carriles instrumentados.</p>
+    <span class="label">Patente como unidad</span>
+    <p>El clustering se entrena por matrícula, no por evento. Cada vector resume historia, interacción, carril y actividad.</p>
+    <p><strong>TTC.</strong> Puede operar con mapa dinámico por pórtico o con umbral fijo. Esa decisión cambia la tasa de conflicto.</p>
+    <p><strong>GMM.</strong> Cuando existen <code style="font-family:var(--font-mono);font-size:11.5px;">cluster_prob_*</code>, las etapas posteriores pueden usar membresía suave.</p>
+    <p><strong>Dinámico.</strong> Las ventanas no reentrenan el modelo: miden cambio de comportamiento respecto del GMM histórico.</p>
   </div>
 </aside>
 

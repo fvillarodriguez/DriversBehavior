@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>§ 3 · NLP on severity</title>
+<title>§ 3 · NLP severity</title>
 <link rel="stylesheet" href="{{CSS_HREF}}" />
 <script>
   window.MathJax = {
@@ -24,95 +24,353 @@
     <header class="lab-section-head" data-stagger>
       <div class="num reveal">03</div>
       <div>
-        <span class="meta reveal">Chapter · Multimodal replication</span>
-        <h2 class="reveal">NLP on severity replication</h2>
+        <span class="meta reveal">Chapter · Multimodal severity</span>
+        <h2 class="reveal">NLP severity modelling</h2>
       </div>
     </header>
 
-    <h3 class="reveal">Purpose</h3>
-    <p class="reveal">The pipeline in <code>src/nlp_severity_app.py</code> reproduces the ablation study from <code>NLP/Latex/main.tex</code> with three models:</p>
-    <ul class="reveal">
-      <li><strong>M1</strong>: flow variables only.</li>
-      <li><strong>M2</strong>: narrative embeddings only.</li>
-      <li><strong>M3</strong>: fused multimodal representation.</li>
-    </ul>
-    <p class="reveal">The entry point is <code>run_paper_replication</code>. The code adds reproducibility controls absent from the manuscript: three paths (<code>frozen</code>, <code>raw</code>, <code>update_embeddings</code>), checkpoint resume, strict comparison between paths, and conditional asset promotion to LaTeX.</p>
+    <h3 class="reveal">Objective and scientific contract</h3>
+    <p class="reveal">This chapter models crash severity with a tabular-multimodal architecture that combines observed traffic conditions around the event and semantic representations extracted from the crash narrative. The task does not predict occurrence, as in chapter 2; it starts from already identified events and estimates a binary severity label <code>severity_target</code>, where the positive class is <strong>MARC</strong> and the negative class is <strong>No-MARC</strong>.</p>
+    <p class="reveal">The implementation is concentrated in <code>src/nlp_severity_app.py</code>. The chapter protocol compares three input families: <strong>M1</strong>, flow variables only; <strong>M2</strong>, textual embeddings only; and <strong>M3</strong>, fused flow and text. The methodological contribution is to separate precisely what signal comes from traffic, what signal comes from the textual description, and how much early multimodal fusion improves classification under the same holdout, feature-selection grid and model family.</p>
 
-    <h3 class="reveal">Locked protocol</h3>
-    <p class="reveal">Constants such as <code>PAPER_PROTOCOL</code>, <code>PAPER_EXPECTED_COUNTS</code>, <code>PAPER_K_GRID</code> and <code>PAPER_VALIDATION_ALPHA</code> fix:</p>
-    <ul class="reveal">
-      <li>Binary target <code>severity_target</code>, temporal holdout with <code>test_size=0.2</code>, <code>random_state=42</code>.</li>
-      <li>Expected counts: 2,070 rows, 432 flow variables, 200 embedding variables, 632 total; split 1,656/414.</li>
-      <li>\(k\) grid in <em>manual</em> mode: \( k\in\{10,15,20,25,30,40,50,70,100,150,200,250,300,350,400,432\} \).</li>
-      <li>Validation score \(\mathrm{Score}_{val} = \alpha F1_{global} + (1-\alpha)(1-\mathrm{FNRate})\) with \(\alpha=0.3\), \(\varepsilon=0.001\).</li>
-      <li>Inner/outer CV folds configurable (5 by default).</li>
-    </ul>
-
-    <h3 class="reveal">Execution stages</h3>
-    <ol class="reveal">
-      <li><strong>Context</strong>: fingerprints of the frozen dataset <code>resultado.pkl</code>, the raw source, the fine-tuned Transformer and the protocol; derived into <code>computed_run_id</code>.</li>
-      <li><strong>Resume / load / start</strong>: the code inspects <code>Resultados/nlp_in_severity/paper_replication/&lt;run_id&gt;/</code>. If <em>completed</em>, the payload is loaded; if <em>running</em> or <em>failed</em>, it resumes; if no checkpoint, a fresh manifest is created.</li>
-      <li><strong>Frozen path</strong>: loads <code>resultado.pkl</code>, normalises columns and validates against locked expectations.</li>
-      <li><strong>Raw path</strong>: rebuilds from source events, generates flow features, filters by AVI coverage, builds <code>text_bert</code>, resolves the Transformer, extracts embeddings (method <code>transformer_finetuned</code>, <code>max_length=128</code>, <code>batch=16</code>, projection <code>cls</code>), ranks dimensions with RF and keeps the top-200 to assemble the 632-variable dataset.</li>
-      <li><strong>Modalities M1/M2/M3</strong>: per model, variables are resolved, median-imputed, ranked pre-SMOTE and \(k\) is searched with nested CV; \(k^\ast\) is chosen by best <code>validation_score</code> (ties broken by smallest \(k\)).</li>
-      <li><strong>Nested CV and final fit</strong>: stratified outer/inner folds; SMOTE is applied inside the inner search (<code>sampling_strategy</code>, <code>k_neighbors</code>), not directly on the outer fold.</li>
-      <li><strong>Per-path consolidation</strong>: comparative table per model, per-class metrics, unified predictions over the same test IDs and the \(k\) table for M3.</li>
-      <li><strong>update_embeddings path (optional)</strong>: replaces embedding columns on the frozen dataset leaving flow intact.</li>
-      <li><strong>frozen/raw comparison</strong>: discrete quantities must match exactly; numeric metrics may differ by at most \(0.001\). If raw is blocked or the comparison fails, the whole replication is <code>blocked</code>.</li>
-      <li><strong>Staging and LaTeX promotion</strong>: <code>accuracy_vs_k.png</code>, <code>f1_score_vs_k.png</code>, <code>false_negatives_pct_vs_k.png</code>, <code>validation_score_vs_k.png</code>, <code>metrics.png</code>, <code>gridsearch_k.tex</code> and <code>metricas_modelos.tex</code> are produced. Promotion only happens if the comparison passes.</li>
-    </ol>
-
-    <h3 class="reveal">XGBoost tuning profiles</h3>
     <table class="lab-table reveal">
-      <caption><strong>Table 3.1.</strong> Search spaces by profile.</caption>
-      <thead>
-        <tr><th>Profile</th><th><code>max_depth</code></th><th><code>learning_rate</code></th><th><code>n_estimators</code></th><th><code>subsample</code> / <code>colsample_bytree</code></th></tr>
-      </thead>
+      <caption><strong>Operational map for the chapter.</strong> Each row connects the methodological contract to a real function, constant or artifact in the repository.</caption>
+      <thead><tr><th>Stage</th><th>Implementation</th><th>Technical decision</th><th>Auditable output</th></tr></thead>
       <tbody>
-        <tr><td>Fast (def.)</td><td>\(\{3,5\}\)</td><td>\(\{0.05,0.1\}\)</td><td>\(\{150,300\}\)</td><td>\(\{0.8,1.0\}\)</td></tr>
-        <tr><td>Wide</td><td>\(\{3,5,7\}\)</td><td>\(\{0.03,0.05,0.1\}\)</td><td>\(\{150,300,500\}\)</td><td>\(\{0.8,1.0\}\)</td></tr>
-        <tr><td>GridSearch</td><td>\(\{3,5,7,10,15,20\}\)</td><td>\(\{0.01,0.05,0.1\}\)</td><td>\(\{100,250,500,750,1000\}\)</td><td>\(\{0.5,0.8,1.0\}\)</td></tr>
+        <tr><td>Run context</td><td><code>_paper_build_execution_context</code>, <code>PAPER_PROTOCOL</code></td><td>Fingerprints frozen dataset, raw source, Transformer model and active protocol.</td><td><code>computed_run_id</code>, protocol snapshot</td></tr>
+        <tr><td>Frozen dataset</td><td><code>_ensure_paper_dataset_columns</code>, <code>_paper_dataset_validation_report</code></td><td>Validates columns, counts, split and classes against <code>PAPER_EXPECTED_COUNTS</code>.</td><td><code>dataset_validation.json</code></td></tr>
+        <tr><td>Raw build</td><td><code>_paper_build_raw_dataset</code>, <code>build_severity_feature_dataset</code></td><td>Rebuilds flow, coverage, text, embeddings and the top-200 textual dimensions.</td><td>Wide dataset with 632 variables</td></tr>
+        <tr><td>Modalities</td><td><code>_paper_run_route</code>, <code>_paper_build_model_result</code></td><td>Runs M1, M2 and M3 with the same split, ranking and evaluation.</td><td>Model summary, test predictions</td></tr>
+        <tr><td>Nested validation</td><td><code>_paper_nested_xgb_validation</code>, <code>_paper_optimize_xgb_model</code></td><td>Selects XGBoost and SMOTE hyperparameters inside the inner fold.</td><td>Curves by \(k\), best parameters</td></tr>
+        <tr><td>Route comparison</td><td><code>_paper_compare_routes</code></td><td>Compares exact discrete outputs and numeric metrics with tolerance 0.001.</td><td><code>compare/summary.json</code>, <code>diff.csv</code></td></tr>
+        <tr><td>Documentation export</td><td><code>_paper_stage_latex_candidates</code>, <code>_paper_promote_latex_assets</code></td><td>Promotes tables and figures only when checks pass.</td><td><code>gridsearch_k.tex</code>, <code>metricas_modelos.tex</code>, PNG</td></tr>
       </tbody>
     </table>
-    <p class="reveal">Regularisation (<code>min_child_weight</code>, <code>gamma</code>, <code>reg_alpha</code>, <code>reg_lambda</code>) is only included when <code>use_regularization</code> is on. Backend can be <code>gridsearch</code> (GridSearchCV) or <code>optuna</code> (24 trials by default).</p>
 
-    <h3 class="reveal">Contrast with the manuscript</h3>
-    <ul class="reveal">
-      <li>The Spanish BERT Transformer is not retrained in the replication; the latest compatible fine-tune is reused from the registry.</li>
-      <li>Reduction is fixed operationally to <em>top-200</em>, not a generic \(p\).</li>
-      <li>RF ranking is applied per modality (one for M1, M2 and M3) over pre-SMOTE data to avoid leakage.</li>
-      <li>The paper reports the M3 grid, but the code searches \(k\) for all three modalities.</li>
-      <li><code>false_negative_rate_positive_class</code> in <code>_classification_metrics</code> is computed as \(\mathrm{FN}/N\) (not \(\mathrm{FN}/P\)).</li>
-      <li>SMOTE is jointly optimised with XGBoost inside <code>_paper_optimize_xgb_model</code>, not as a previous step.</li>
-      <li>The holdout is temporal (<code>split_mode="Temporal"</code>); stratified is the fallback.</li>
-      <li>The \(k^\ast\) rule changed to "best score" instead of marginal benefit.</li>
-      <li>Three profiles exist (<em>Fast</em>, <em>Wide</em>, <em>Original GridSearch</em>) and two backends.</li>
-    </ul>
+    <h3 class="reveal">Observational unit and target</h3>
+    <p class="reveal">The observational unit is crash \(i\), not a portico-time cell. Each record combines temporal and spatial event attributes, a severity label, flow variables extracted around <code>accidente_time</code>, and a normalized text field <code>text_bert</code> built from fields such as kilometre, axis, carriageway, subtype and description. This definition turns severity into an event-level multimodal classification problem.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \mathcal{D}=\{(a_i,t_i,\ell_i,y_i,x_i^{flow},x_i^{text})\}_{i=1}^{n}.
+      \]</div>
+      <div class="num">(3.1)</div>
+      <aside class="eq-inspector">
+        <h5>Interpretation</h5>
+        <dl>
+          <dt>\(a_i\)</dt><dd>Crash identifier used to compare predictions across routes.</dd>
+          <dt>\(t_i\)</dt><dd>Event datetime, used by the temporal holdout.</dd>
+          <dt>\(\ell_i\)</dt><dd>Operational location: kilometre, axis and carriageway when available.</dd>
+          <dt>\(y_i\)</dt><dd><code>severity_target</code>, binary: 0 = No-MARC, 1 = MARC.</dd>
+          <dt>\(x_i^{flow}\)</dt><dd>Traffic variables around the crash.</dd>
+          <dt>\(x_i^{text}\)</dt><dd>Semantic representation of the narrative.</dd>
+        </dl>
+      </aside>
+    </div>
 
-    <h3 class="reveal">Checkpoint structure and reading order</h3>
-    <p class="reveal">Under <code>Resultados/nlp_in_severity/paper_replication/&lt;run_id&gt;/</code> live <code>manifest.json</code>, <code>live_status.json</code>, <code>live_events.jsonl</code> and the subdirectories <code>frozen/</code>, <code>raw_build/</code>, <code>raw/</code>, <code>update_emb_build/</code>, <code>update_emb/</code>, <code>compare/</code> and <code>export/</code>.</p>
-    <p class="reveal">When auditing a run the recommended order is: <code>manifest.json</code> → <code>frozen/dataset_validation.json</code> and <code>raw/summary.json</code> → <code>compare/summary.json</code> and <code>compare/diff.csv</code> → <code>export/payload.json</code> and the promoted assets.</p>
+    <table class="lab-table reveal">
+      <caption><strong>Locked protocol counts.</strong> Dataset validation fails if the frozen dataset does not meet these values under the temporal split.</caption>
+      <thead><tr><th>Quantity</th><th>Expected value</th><th>Protocol role</th></tr></thead>
+      <tbody>
+        <tr><td>Rows</td><td class="num">2,070</td><td>Crashes with usable coverage and label.</td></tr>
+        <tr><td>Flow variables</td><td class="num">432</td><td>\(X^{flow}\) block used by M1 and M3.</td></tr>
+        <tr><td>Embedding variables</td><td class="num">200</td><td>\(X^{emb}\) block selected by ranking for M2 and M3.</td></tr>
+        <tr><td>Total variables</td><td class="num">632</td><td>Final concatenation \(X=[X^{flow},X^{emb}]\).</td></tr>
+        <tr><td>Train/test</td><td class="num">1,656 / 414</td><td>Temporal holdout with <code>test_size=0.2</code>.</td></tr>
+        <tr><td>Train classes</td><td>425 No-MARC / 1,231 MARC</td><td>Base for CV, SMOTE and feature ranking.</td></tr>
+        <tr><td>Test classes</td><td>44 No-MARC / 370 MARC</td><td>Fixed basis for final metrics.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        y_i=
+        \begin{cases}
+        1, & \text{if the event belongs to MARC},\\
+        0, & \text{if the event belongs to No\text{-}MARC}.
+        \end{cases}
+      \]</div>
+      <div class="num">(3.2)</div>
+      <aside class="eq-inspector">
+        <h5>Contract</h5>
+        <p>The target must be binary and both classes must appear in train and test. If the temporal split does not preserve both classes, the implementation falls back to a stratified split and records the applied mode.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Flow variables around the crash</h3>
+    <p class="reveal">The raw route rebuilds traffic variables from the flow database. For each crash it queries one-minute windows before and after the event, with five windows in each direction by default. The route computes <code>flow</code>, <code>speed_mean</code>, <code>speed_std</code> and <code>density</code>; it then assembles a wide matrix by crash and adds temporal deltas when <code>include_deltas=True</code>.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        W_i=\{[t_i+m\Delta,t_i+(m+1)\Delta):m=-5,\ldots,4\},\qquad \Delta=1\text{ minute}.
+      \]</div>
+      <div class="num">(3.3)</div>
+      <aside class="eq-inspector">
+        <h5>Implementation</h5>
+        <span class="impl">build_severity_feature_dataset(windows_before=5, windows_after=5, window_size_minutes=1)</span>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        q_{i,m}=\#\{r_j:t_j\in W_{i,m}\},\qquad
+        \overline v_{i,m}=\frac{1}{q_{i,m}}\sum_{j:t_j\in W_{i,m}} v_j.
+      \]</div>
+      <div class="num">(3.4)</div>
+      <aside class="eq-inspector">
+        <h5>Reading</h5>
+        <p>Flow and speed summarize local exposure and kinematic intensity near the crash.</p>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \Delta z_{i,m}=z_{i,m}-z_{i,m-1},\qquad z\in\{\overline v,\rho,q\}.
+      \]</div>
+      <div class="num">(3.5)</div>
+      <aside class="eq-inspector">
+        <h5>Deltas</h5>
+        <p>Temporal differences encode abrupt traffic-regime changes before or after the event.</p>
+      </aside>
+    </div>
+
+    <table class="lab-table reveal">
+      <caption><strong>Flow variable families.</strong> The final dataset retains 432 numeric columns from this family.</caption>
+      <thead><tr><th>Family</th><th>Typical columns</th><th>Captured signal</th></tr></thead>
+      <tbody>
+        <tr><td>Volume</td><td><code>flow_*</code></td><td>Local vehicular exposure around the crash.</td></tr>
+        <tr><td>Mean speed</td><td><code>speed_mean_*</code></td><td>Dominant kinematic regime per window.</td></tr>
+        <tr><td>Dispersion</td><td><code>speed_std_*</code></td><td>Instantaneous heterogeneity and possible instability.</td></tr>
+        <tr><td>Density</td><td><code>density_*</code></td><td>Approximate segment occupancy.</td></tr>
+        <tr><td>Temporal change</td><td><code>delta_*</code></td><td>Regime transitions before/after the event.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Narrative text and embeddings</h3>
+    <p class="reveal">The textual signal comes from <code>text_bert</code>, a compact crash narrative. The implementation uses the latest compatible fine-tuned Transformer registered in the system, loads tokenizer and encoder through <code>AutoTokenizer</code> and <code>AutoModel</code>, and extracts representations from the <code>[CLS]</code> token. In this route, text is cleaned with <code>fillna("")</code>, conversion to string and <code>str.strip()</code>; the step does not force lowercase because the Transformer encoder preserves case and subword context.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        s_i=\mathrm{concat}(\mathrm{km}_i,\mathrm{axis}_i,\mathrm{carriageway}_i,\mathrm{subtype}_i,\mathrm{description}_i).
+      \]</div>
+      <div class="num">(3.6)</div>
+      <aside class="eq-inspector">
+        <h5>Column</h5>
+        <span class="impl">text_bert</span>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        H_i=f_{\theta}(s_i),\qquad e_i=H_i[\mathrm{CLS}]\in\mathbb{R}^{d}.
+      \]</div>
+      <div class="num">(3.7)</div>
+      <aside class="eq-inspector">
+        <h5>Parameters</h5>
+        <p><code>method="transformer_finetuned"</code>, <code>transformer_max_length=128</code>, <code>transformer_batch_size=16</code>, <code>transformer_projection="cls"</code>.</p>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        J_{200}=\operatorname*{arg\,top}_{J:|J|=200}\ I_j^{RF},\qquad x_i^{emb}=e_{i,J_{200}}.
+      \]</div>
+      <div class="num">(3.8)</div>
+      <aside class="eq-inspector">
+        <h5>Selection</h5>
+        <p><code>_select_top_embedding_features</code> keeps the 200 textual dimensions with highest Random Forest importance.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Three input modalities</h3>
+    <p class="reveal">The central comparison is implemented as a block-level feature ablation. M1 measures what flow can explain without text; M2 measures what text can explain without traffic; M3 measures early fusion of both spaces. The three modalities use the same classifier family, target and test IDs so that metrics remain comparable.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        X^{M1}=X^{flow},\qquad X^{M2}=X^{emb},\qquad X^{M3}=[X^{flow}\Vert X^{emb}].
+      \]</div>
+      <div class="num">(3.9)</div>
+      <aside class="eq-inspector">
+        <h5>Constant</h5>
+        <span class="impl">PAPER_PROTOCOL["feature_groups"] = {"M1": "Solo flujo", "M2": "Solo embeddings", "M3": "Todo"}</span>
+      </aside>
+    </div>
+
+    <table class="lab-table reveal">
+      <caption><strong>Evaluated modalities.</strong> All are trained with XGBoost and evaluated on the same holdout.</caption>
+      <thead><tr><th>Model</th><th>Available variables</th><th>Maximum \(k\)</th><th>Scientific question</th></tr></thead>
+      <tbody>
+        <tr><td>M1</td><td>432 flow variables</td><td class="num">432</td><td>Is severity explained by the traffic state?</td></tr>
+        <tr><td>M2</td><td>200 selected embeddings</td><td class="num">200</td><td>Does the crash narrative contain sufficient signal?</td></tr>
+        <tr><td>M3</td><td>432 flow + 200 embeddings</td><td class="num">632</td><td>Does multimodal fusion improve discrimination?</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Temporal split and leakage prevention</h3>
+    <p class="reveal">By default, crashes are ordered by <code>accidente_time</code> and the final 20% is reserved as test. The temporal split prevents future events from influencing training. If the temporal cut does not contain both classes in train and test, <code>_prepare_holdout_split_with_ids</code> uses a stratified split with <code>random_state=42</code> and records it in metadata.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \mathcal{D}_{train}=\{i:t_i\lt T_{0.8}\},\qquad
+        \mathcal{D}_{test}=\{i:t_i\ge T_{0.8}\}.
+      \]</div>
+      <div class="num">(3.10)</div>
+      <aside class="eq-inspector">
+        <h5>Invariant</h5>
+        <p>Test never receives test-fitted imputation, SMOTE, or ranking recalculated with test information.</p>
+      </aside>
+    </div>
+    <div class="lab-callout ochre reveal">
+      <div class="label">Anti-leakage rule</div>
+      <p>Median imputation, Random Forest ranking and SMOTE are fit only on the training block or the corresponding inner fold. Test is transformed with previously learned parameters and remains real.</p>
+    </div>
+
+    <h3 class="reveal">Feature ranking and \(k\) grid</h3>
+    <p class="reveal">Before XGBoost training, the pipeline computes a modality-specific feature ranking. For each \(k\), the model uses the \(k\) highest-importance columns, clipped automatically when the modality has fewer variables than requested. The manual grid preserves the protocol values, while interval mode enables dense sweeps controlled by step size.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        S_k=\operatorname*{arg\,top}_{S:|S|=k}\ I_j^{RF},\qquad X_k=X[:,S_k].
+      \]</div>
+      <div class="num">(3.11)</div>
+      <aside class="eq-inspector">
+        <h5>Order</h5>
+        <p>The ranking is computed before SMOTE, so feature selection does not observe synthetic rows.</p>
+      </aside>
+    </div>
+
+    <table class="lab-table reveal">
+      <caption><strong>Feature-selection grids.</strong> The implementation supports manual and interval modes.</caption>
+      <thead><tr><th>Mode</th><th>Values</th><th>Recommended use</th></tr></thead>
+      <tbody>
+        <tr><td>Manual</td><td>\(\{10,15,20,25,30,40,50,70,100,150,200,250,300,350,400,432\}\)</td><td>Main comparison and compatibility with the historical protocol.</td></tr>
+        <tr><td>Interval</td><td>Steps \(\{5,10,25,50,100\}\), with configurable minimum and maximum</td><td>Fine exploration when \(k^\ast\) stability needs review.</td></tr>
+      </tbody>
+    </table>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        k^\ast=\min\left\{k:\mathrm{Score}(k)=\max_{k'\in\mathcal{K}}\mathrm{Score}(k')\right\}.
+      \]</div>
+      <div class="num">(3.12)</div>
+      <aside class="eq-inspector">
+        <h5>Tie break</h5>
+        <p><code>_paper_select_k_from_search</code> sorts by descending score and then ascending \(k\); it chooses the smallest \(k\) among ties.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">XGBoost, SMOTE and nested cross-validation</h3>
+    <p class="reveal">The model family is fixed to XGBoost. For each modality and each \(k\), training uses nested cross-validation with stratified outer and inner folds. The inner fold optimizes XGBoost hyperparameters and SMOTE parameters; the best model is then fit on the balanced outer-training fold and evaluated on the untouched outer-validation fold.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \hat f_{k,\lambda,\gamma}=
+        \operatorname*{arg\,max}_{\lambda,\gamma}
+        \mathrm{CV}_{inner}\bigl(f_{\lambda},\mathrm{SMOTE}_{\gamma}(X^{train}_k,y^{train})\bigr).
+      \]</div>
+      <div class="num">(3.13)</div>
+      <aside class="eq-inspector">
+        <h5>Parameters</h5>
+        <p>\(\lambda\) denotes XGBoost hyperparameters; \(\gamma\) groups SMOTE <code>sampling_strategy</code> and <code>k_neighbors</code>.</p>
+      </aside>
+    </div>
+
+    <table class="lab-table reveal">
+      <caption><strong>XGBoost tuning profiles.</strong> The grids can be expanded with regularization when <code>use_regularization=True</code>.</caption>
+      <thead><tr><th>Profile</th><th><code>max_depth</code></th><th><code>learning_rate</code></th><th><code>n_estimators</code></th><th><code>subsample</code> / <code>colsample_bytree</code></th><th>SMOTE</th></tr></thead>
+      <tbody>
+        <tr><td>Fast</td><td>\(\{3,5\}\)</td><td>\(\{0.05,0.1\}\)</td><td>\(\{150,300\}\)</td><td>\(\{0.8,1.0\}\)</td><td>\(\{0.8,1.0\}\) × \(\{1,3,5\}\)</td></tr>
+        <tr><td>Wide</td><td>\(\{3,5,7\}\)</td><td>\(\{0.03,0.05,0.1\}\)</td><td>\(\{150,300,500\}\)</td><td>\(\{0.8,1.0\}\)</td><td>\(\{0.6,0.8,1.0\}\) × \(\{1,3,5,7\}\)</td></tr>
+        <tr><td>Original GridSearch</td><td>\(\{3,5,7,10,15,20\}\)</td><td>\(\{0.01,0.05,0.1\}\)</td><td>\(\{100,250,500,750,1000\}\)</td><td>\(\{0.5,0.8,1.0\}\)</td><td>\(\{0.6,0.8,1.0\}\) × \(\{1,3,5,7\}\)</td></tr>
+      </tbody>
+    </table>
+    <p class="reveal">The optimization backend can be <code>gridsearch</code> or <code>optuna</code>. Under Optuna, <code>PAPER_OPTUNA_TRIALS_DEFAULT</code> sets 24 trials by default. CV folds accept values from 2 to 10 and default to 5.</p>
+
+    <h3 class="reveal">Metrics, selection score and clinical reading</h3>
+    <p class="reveal">Final metrics are computed by <code>_classification_metrics</code>. Besides accuracy, precision, recall, F1, balanced F1, MCC and ROC-AUC, the pipeline records the confusion matrix, per-class metrics and false negatives for the positive class. In this implementation, <code>false_negative_rate_positive_class</code> is defined as MARC false negatives divided by the total evaluated set size, not by the positive support.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \mathrm{F1}=\frac{2\,\mathrm{Precision}\,\mathrm{Recall}}{\mathrm{Precision}+\mathrm{Recall}},
+        \qquad
+        \mathrm{FNRate}_{MARC}=\frac{\mathrm{FN}_{MARC}}{N}.
+      \]</div>
+      <div class="num">(3.14)</div>
+      <aside class="eq-inspector">
+        <h5>Important</h5>
+        <p>The denominator of <code>FNRate</code> is \(N\), the total number of evaluated rows. This convention yields a smaller numeric value than \(\mathrm{FN}/P\).</p>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \mathrm{Score}_{val}=
+        \begin{cases}
+        \mathrm{best\_score}_{CV}, & \text{if GridSearchCV or Optuna provides it},\\
+        \mathrm{F1}, & \text{if no internal score is available}.
+        \end{cases}
+      \]</div>
+      <div class="num">(3.15)</div>
+      <aside class="eq-inspector">
+        <h5>Current implementation</h5>
+        <p><code>_paper_validation_score</code> prioritizes <code>best_cv_score</code>. The constant <code>PAPER_VALIDATION_ALPHA=0.3</code> remains persisted in the protocol, but it does not drive selection when an internal score exists.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Execution routes and checkpoints</h3>
+    <p class="reveal">Execution is designed to be resumable. Each run creates a central manifest, live status and a JSONL event log. The <code>frozen</code>, <code>raw</code> and <code>update_embeddings</code> routes produce their own subdirectories, making it possible to distinguish evaluation of the frozen dataset, reconstruction from original sources and optional embedding refresh while keeping flow variables fixed.</p>
+    <table class="lab-table reveal">
+      <caption><strong>Execution routes.</strong> All share the same protocol and can be inspected through checkpoints.</caption>
+      <thead><tr><th>Route</th><th>Input</th><th>Guarantee</th><th>Main artifacts</th></tr></thead>
+      <tbody>
+        <tr><td><code>frozen</code></td><td><code>NLP/Dataframes/resultado.pkl</code></td><td>Evaluates the locked snapshot with expected counts.</td><td><code>dataset_validation.json</code>, M1/M2/M3 results</td></tr>
+        <tr><td><code>raw</code></td><td>Source events, flow DuckDB and registered Transformer</td><td>Rebuilds features from scratch and compares against frozen.</td><td><code>raw_build/*</code>, <code>raw/summary.json</code></td></tr>
+        <tr><td><code>update_embeddings</code></td><td>Frozen dataset + active Transformer</td><td>Re-extracts embeddings without modifying flow variables.</td><td><code>update_emb_build/*</code>, <code>update_emb/summary.json</code></td></tr>
+        <tr><td><code>compare</code></td><td>Completed route results</td><td>Blocks discrepancies outside tolerance.</td><td><code>summary.json</code>, <code>diff.csv</code></td></tr>
+        <tr><td><code>export</code></td><td>Route approved for documentation</td><td>Prepares LaTeX tables and figures.</td><td><code>payload.json</code>, tables and PNG</td></tr>
+      </tbody>
+    </table>
 
     <div class="lab-callout sage reveal">
-      <div class="label">Coming soon · Interactive comparator</div>
-      <p>This section will incorporate a frozen/raw comparator that loads <code>compare/diff.csv</code>, will display per-<em>k</em> validation curves for M1/M2/M3 with live data, and a visual diff of promoted assets.</p>
+      <div class="label">Run reading order</div>
+      <p>Review <code>manifest.json</code> first; then <code>frozen/dataset_validation.json</code> and <code>raw/summary.json</code>; next <code>compare/summary.json</code> and <code>compare/diff.csv</code>; finally <code>export/payload.json</code> and promoted assets. The physical directory lives under <code>Resultados/nlp_in_severity/.../&lt;run_id&gt;/</code>.</p>
+    </div>
+
+    <h3 class="reveal">Route comparison and documentation promotion</h3>
+    <p class="reveal">Route comparison separates discrete quantities from continuous metrics. Discrete quantities, such as number of rows, variables, classes and splits, must match exactly. Numeric metrics accept an absolute tolerance of 0.001, defined by <code>PAPER_COMPARISON_TOLERANCE</code>. If comparison fails, export is blocked so documentation cannot show results without traceability.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        |m_{raw}-m_{frozen}|\le 0.001.
+      \]</div>
+      <div class="num">(3.16)</div>
+      <aside class="eq-inspector">
+        <h5>Tolerance</h5>
+        <p>The tolerance applies to continuous metrics. Counts, classes, model names and artifact availability are compared exactly.</p>
+      </aside>
+    </div>
+    <p class="reveal">Documentation assets include <code>accuracy_vs_k.png</code>, <code>f1_score_vs_k.png</code>, <code>false_negatives_pct_vs_k.png</code>, <code>validation_score_vs_k.png</code>, <code>metrics.png</code>, <code>gridsearch_k.tex</code> and <code>metricas_modelos.tex</code>. Promotion is not a blind copy: it depends on manifest state, route-comparison status and the presence of candidate files.</p>
+
+    <h3 class="reveal">Methodological audit against the manuscript</h3>
+    <p class="reveal">The implementation preserves the experimental structure of the manuscript, while adding engineering decisions needed to make the protocol executable, resumable and verifiable. The following differences must remain explicit in the documentation because they affect interpretation, reproducibility and result comparison.</p>
+    <ul class="reveal">
+      <li>The Transformer encoder is not trained inside this execution; the latest compatible fine-tune in the registry is reused and its encoder representation is extracted.</li>
+      <li>The Transformer route does not force lowercase; lowercasing is restricted to alternative TF-IDF-style paths.</li>
+      <li>Textual reduction is fixed to the top-200 dimensions by Random Forest ranking, instead of leaving an abstract dimension \(p\).</li>
+      <li>Feature ranking is modality-specific and happens before SMOTE.</li>
+      <li>The \(k\) search runs for M1, M2 and M3, not only for the fused modality.</li>
+      <li>SMOTE is optimized inside the inner search together with XGBoost; it is not applied as a global preprocessing step.</li>
+      <li>The preferred holdout is temporal; stratified splitting is used only as a fallback when the temporal cut does not preserve both classes.</li>
+      <li>\(k^\ast\) selection uses the best observed score with the smallest-\(k\) tie break, not a marginal-gain rule.</li>
+      <li>Search profiles and the Optuna backend control computational cost without changing experiment semantics.</li>
+      <li>Routes, checkpoints and tolerance-based comparison are software safeguards; they do not change the statistical hypothesis, but they increase traceability.</li>
+    </ul>
+
+    <div class="lab-callout rust reveal">
+      <div class="label">Residual risks</div>
+      <p>No-MARC is the minority class, so aggregate metrics can hide clinically relevant errors. Interpretation should prioritize per-class metrics, MARC false negatives, the confusion matrix and \(k^\ast\) stability across modalities.</p>
     </div>
 
   </section>
 
   <footer class="lab-coda">
-    <span>Chapter § 3 · 1 table · 10 stages</span>
-    <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/nlp_severity_replication_en.tex</code></span>
+    <span>Chapter § 3 · 7 tables · 16 equations</span>
+    <span>Methodological source: LaTeX § 3 + <code style="font-family:var(--font-mono);font-size:11.5px;">src/nlp_severity_app.py</code></span>
   </footer>
 
 </main>
 
-<aside class="lab-margin" aria-label="Marginalia">
+<aside class="lab-margin" aria-label="Margin notes">
   <div class="pinned">
-    <span class="label">Replication</span>
-    <p>The protocol is locked by constants (<code style="font-family:var(--font-mono);font-size:11.5px;">PAPER_*</code>) — any change to seeds, splits or counts invalidates the run. Dataset <em>fingerprints</em> guard reproducibility.</p>
-    <p><strong>Three paths.</strong> <em>frozen</em> (immutable snapshot), <em>raw</em> (rebuild from source) and <em>update_embeddings</em> (re-extract embeddings on frozen flow).</p>
-    <p><strong>SMOTE.</strong> Only inside the inner search of the nested CV — never on the outer fold.</p>
+    <span class="label">NLP severity</span>
+    <p>The protocol is fixed by <code style="font-family:var(--font-mono);font-size:11.5px;">PAPER_*</code> constants: temporal split, expected counts, \(k\) grid, tolerance and XGBoost family.</p>
+    <p><strong>Three signals.</strong> M1 measures flow, M2 measures text and M3 measures early fusion. All share test IDs.</p>
+    <p><strong>SMOTE.</strong> It appears only inside train or the inner CV fold; it never alters external validation or test.</p>
   </div>
 </aside>
 

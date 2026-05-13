@@ -7,7 +7,12 @@
 <link rel="stylesheet" href="{{CSS_HREF}}" />
 <script>
   window.MathJax = {
-    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true, tags: 'none' },
+    tex: {
+      inlineMath: [['\\(', '\\)']],
+      displayMath: [['\\[', '\\]']],
+      processEscapes: true,
+      tags: 'none'
+    },
     options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
     svg: { fontCache: 'global' }
   };
@@ -24,153 +29,405 @@
     <header class="lab-section-head" data-stagger>
       <div class="num reveal">02</div>
       <div>
-        <span class="meta reveal">Chapter · Supervised prediction</span>
+        <span class="meta reveal">Chapter · Supervised prediction with operational horizon</span>
         <h2 class="reveal">Accident prediction</h2>
       </div>
     </header>
 
-    <h3 class="reveal">Goal and sources</h3>
-    <p class="reveal">Build and evaluate models that predict the occurrence of an accident at a gantry, from aggregated flow variables and, optionally, variables derived from driver clusters. Flows are stored in DuckDB. Accidents come from event files filtered by type <em>Accident</em> and <em>Road</em>, with <code>accidente_time</code> and a mapping to nearby gantries via <code>Datos/Porticos.csv</code>; the assigned gantry is stored as <code>ultimo_portico</code>.</p>
+    <h3 class="reveal">Objective and methodological contract</h3>
+    <p class="reveal">The accident-prediction module builds supervised models that estimate, for each gantry \(p\) and temporal interval \(\tau\), the probability that an accident will occur in the next interval. The decision unit is not an individual vehicle, but the aggregated gantry-time cell. This turns high-frequency vehicle detections and, optionally, clustering-derived driver profiles into operational alerts evaluated by sensitivity, false alarms, and cost.</p>
+    <p class="reveal">The LaTeX documentation defines the scientific contract of the chapter: data sources, discretization, feature engineering, one-interval lead-time target, temporal split, imbalance, models, calibration, Optuna, experiments, and XAI. The web documentation preserves that scope and adds the implementation references that support each decision.</p>
 
-    <h3 class="reveal">Temporal discretisation</h3>
+    <table class="lab-table reveal">
+      <caption><strong>Operational map of the chapter.</strong> The section spans raw detections to persisted explainable bundles.</caption>
+      <thead><tr><th>Stage</th><th>Main implementation</th><th>Technical contract</th><th>Output</th></tr></thead>
+      <tbody>
+        <tr><td>Accident events</td><td><code>src/utils.py::process_accidentes_df</code></td><td>Filters accidents, normalizes carriageway/subtype, builds <code>accidente_time</code>, duration, severity, and adjacent gantries.</td><td>Accidents with <code>ultimo_portico</code></td></tr>
+        <tr><td>Flow features</td><td><code>src/utils.py::compute_flow_features</code>, <code>src/features.py::compute_pm_features</code></td><td>Aggregates detections by gantry, interval, and vehicle category.</td><td><code>accident_flow_features_*</code></td></tr>
+        <tr><td>Cluster features</td><td><code>src/utils.py::compute_cluster_features</code></td><td>Projects labels or <code>cluster_prob_*</code> probabilities into gantry-interval variables.</td><td><code>accident_cluster_features_*</code></td></tr>
+        <tr><td>Supervised target</td><td><code>src/utils.py::add_accident_target</code></td><td>Labels the interval preceding the accident to encode anticipatory prediction.</td><td>Dataset with <code>target</code></td></tr>
+        <tr><td>Training</td><td><code>src/model_training.py::train_model_with_protocol</code></td><td>Temporal split, score calibration, threshold selection, and test evaluation.</td><td>Metrics, confusion matrix, and model</td></tr>
+        <tr><td>Search and experiments</td><td><code>src/experiments_logic.py::ExperimentsRunner</code></td><td>Optuna, controlled sweeps, checkpoints, and Base/Cluster comparisons.</td><td><code>optuna_*.json</code>, <code>controlled_*.csv</code></td></tr>
+        <tr><td>Explainability</td><td><code>src/model_xai.py</code></td><td>Saves bundles and computes global, family-level, and local SHAP.</td><td><code>model_history/&lt;run_id&gt;/...</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Data sources and observation unit</h3>
+    <p class="reveal">Vehicle detections come from <code>flujos</code>, persisted in DuckDB and queried by time range. Each record contains at least timestamp, gantry, vehicle category, speed, and, when clusters are used, license plate. Accidents come from event files filtered by type <em>Accident</em> and expressway; their location is assigned to nearby gantries using <code>Datos/Porticos.csv</code>.</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \tau(t) = \left\lfloor \frac{t}{\Delta}\right\rfloor\Delta \]</div>
+      <div class="formula">\[
+        r_j=(t_j,p_j,c_j,v_j,\mathrm{plate}_j),\qquad j=1,\dots,N.
+      \]</div>
       <div class="num">(2.1)</div>
       <aside class="eq-inspector">
-        <h5>Variables</h5>
+        <h5>Interpretation</h5>
         <dl>
-          <dt>τ(t)</dt><dd>Temporal bin of size Δ that contains instant <em>t</em>.</dd>
-          <dt>Δ</dt><dd>Bin size (configurable, typically 5 min).</dd>
+          <dt>\(t_j\)</dt><dd>Detection timestamp.</dd>
+          <dt>\(p_j\)</dt><dd>Gantry or AVI station.</dd>
+          <dt>\(c_j\)</dt><dd>Remapped vehicle category, for example light/heavy.</dd>
+          <dt>\(v_j\)</dt><dd>Observed speed.</dd>
+          <dt>\(\mathrm{plate}_j\)</dt><dd>License plate, required only for cluster joins.</dd>
         </dl>
-        <h5>Implementation</h5>
-        <span class="impl">src/features.py · compute_pm_features (temporal bucketing)</span>
       </aside>
     </div>
-    <p class="reveal">Variables are aggregated by pair \((p,\tau)\).</p>
 
-    <h3 class="reveal">Macro flow features</h3>
+    <h3 class="reveal">Temporal discretization</h3>
+    <p class="reveal">Time is discretized into intervals of size \(\Delta\) minutes. All supervised variables are computed over the composite key \((p,\tau)\), where \(\tau\) is the interval start. In implementation, <code>compute_flow_features</code> uses <code>dt.truncate(f"{interval_minutes}m")</code>; <code>compute_pm_features</code> uses an equivalent integer minute index.</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ n_{p,\tau,c}=\#\{\text{detections in }(p,\tau,c)\},\qquad \overline{v}_{p,\tau,c}=\frac{1}{n_{p,\tau,c}}\sum v \]</div>
+      <div class="formula">\[
+        \tau(t)=\left\lfloor \frac{t}{\Delta}\right\rfloor \Delta.
+      \]</div>
       <div class="num">(2.2)</div>
       <aside class="eq-inspector">
-        <h5>Variables</h5>
-        <dl>
-          <dt>n<sub>p,τ,c</sub></dt><dd>Detection count of category <em>c</em> in (p, τ).</dd>
-          <dt>v̄<sub>p,τ,c</sub></dt><dd>Mean speed observed in the cell.</dd>
-        </dl>
-        <h5>Implementation</h5>
-        <span class="impl">src/features.py · compute_pm_features</span>
+        <h5>Contract</h5>
+        <p>The granularity \(\Delta\) must be identical for flow features, cluster features, and target; otherwise the join by <code>(portico, interval_start)</code> is invalid.</p>
       </aside>
     </div>
+
+    <h3 class="reveal">Flow feature engineering</h3>
+    <p class="reveal">For each gantry \(p\), interval \(\tau\), and category \(c\), the pipeline computes counts, speeds, and traffic transformations. The app-level implementation persists <code>flow_*</code>, <code>speed_*</code>, <code>speed_std_*</code>, <code>density_*</code>, <code>delta_speed_*</code>, and <code>delta_density_*</code>. The Polars implementation in <code>compute_pm_features</code> also adds robust speed-distribution metrics: mean, standard deviation, harmonic speed, median, quartiles, IQR, MAD, coefficient of variation, skewness, kurtosis, outlier rate, total flow, heavy-vehicle proportion, total density, congestion index, and <code>vc_ratio</code>.</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ q_{p,\tau,c}=\frac{60}{\Delta}\frac{n_{p,\tau,c}}{L},\qquad k_{p,\tau,c}=\frac{q_{p,\tau,c}}{\overline{v}_{p,\tau,c}} \]</div>
+      <div class="formula">\[
+        \begin{aligned}
+        n_{p,\tau,c}&=\#\{j:p_j=p,\tau(t_j)=\tau,c_j=c\},\\
+        \overline v_{p,\tau,c}&=\frac{1}{n_{p,\tau,c}}\sum_{j:p_j=p,\tau(t_j)=\tau,c_j=c} v_j.
+        \end{aligned}
+      \]</div>
       <div class="num">(2.3)</div>
       <aside class="eq-inspector">
-        <h5>Variables</h5>
-        <dl>
-          <dt>q<sub>p,τ,c</sub></dt><dd>Flow (vehicles/hour) normalised by Δ and by the number of lanes <em>L</em>.</dd>
-          <dt>k<sub>p,τ,c</sub></dt><dd>Fundamental density flow / speed.</dd>
-          <dt>L</dt><dd>Number of gantry lanes.</dd>
-        </dl>
-        <h5>Implementation</h5>
-        <span class="impl">src/features.py · compute_pm_features (flow/density)</span>
+        <h5>Columns</h5>
+        <span class="impl">flow_count · speed_mean · speed_std</span>
       </aside>
     </div>
-    <p class="reveal">Optionally, per-gantry first differences \( \Delta\overline{v} \) and \( \Delta k \) are added, producing a wide matrix with columns <code>flow_&lt;cat&gt;</code>, <code>speed_&lt;cat&gt;</code>, <code>density_&lt;cat&gt;</code>, etc.</p>
-
-    <h3 class="reveal">Cluster variables (optional)</h3>
-    <p class="reveal">If the table <code>plate → cluster_label</code> exists, detections are joined with their cluster \(\kappa\) and aggregated by \((p,\tau,\kappa)\). The mix entropy \( H_{p,\tau}=-\sum_\kappa\mathrm{share}_{p,\tau,\kappa}\log\mathrm{share}_{p,\tau,\kappa} \) is also added. They are stored as <code>cluster_share_*</code>, <code>cluster_flow_*</code>, <code>cluster_speed_*</code>, etc.</p>
-
-    <h3 class="reveal">Target definition</h3>
-    <p class="reveal">An accident at \((t_a,p_a)\) is labelled at the previous interval: \( \tau_a = \tau(t_a) - \Delta \), with</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ y_{p,\tau} = \begin{cases} 1, & \text{if there is an accident with }(p_a,\tau_a)=(p,\tau) \\ 0, & \text{otherwise} \end{cases} \]</div>
+      <div class="formula">\[
+        \begin{aligned}
+        q_{p,\tau,c}&=\frac{60}{\Delta}\frac{n_{p,\tau,c}}{L},\\
+        k_{p,\tau,c}&=\frac{q_{p,\tau,c}}{\overline v_{p,\tau,c}}.
+        \end{aligned}
+      \]</div>
       <div class="num">(2.4)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>y<sub>p,τ</sub></dt><dd>Binary target "an accident will happen in the next interval".</dd>
-          <dt>τ<sub>a</sub></dt><dd>Bin preceding the accident (one-Δ lead time).</dd>
+          <dt>\(q\)</dt><dd>Hourly flow normalized by lanes.</dd>
+          <dt>\(k\)</dt><dd>Approximate macroscopic density.</dd>
+          <dt>\(L\)</dt><dd>Number of lanes used for normalization.</dd>
         </dl>
-        <h5>Implementation</h5>
-        <span class="impl">src/drift_detection_app.py · _add_interval_accident_target</span>
       </aside>
     </div>
-    <p class="reveal">Hence \( y_{p,\tau}=1 \) means "an accident will happen in the next interval".</p>
-
-    <h3 class="reveal">Split, imbalance and models</h3>
-    <p class="reveal">To avoid temporal leakage, the split is chronological by <code>interval_start</code>: the final stretch is the test set (<code>test_size</code>). Inside the train/val block, validation is isolated with <code>val_size</code>. Imbalance is handled with class weighting (<code>class_weight="balanced"</code> in RF) or SMOTE applied only on training (synthetic rows marked <code>synthetic=True</code>).</p>
-    <p class="reveal">Three families are considered: <strong>Random Forest</strong>, <strong>XGBoost</strong> and <strong>SVM</strong> (with <code>StandardScaler</code> and probabilistic output). Each model produces a score \(s(x)\).</p>
-
-    <h3 class="reveal">FAR-constrained threshold calibration</h3>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \mathrm{FAR}=\frac{FP}{FP+TN},\qquad \mathrm{Sens}=\frac{TP}{TP+FN} \]</div>
+      <div class="formula">\[
+        \begin{aligned}
+        \Delta \overline v_{p,\tau,c}&=\overline v_{p,\tau,c}-\overline v_{p,\tau-\Delta,c},\\
+        \Delta k_{p,\tau,c}&=k_{p,\tau,c}-k_{p,\tau-\Delta,c}.
+        \end{aligned}
+      \]</div>
       <div class="num">(2.5)</div>
       <aside class="eq-inspector">
-        <h5>Variables</h5>
-        <dl>
-          <dt>FAR</dt><dd>False Alarm Rate — fraction of non-events classified as events.</dd>
-          <dt>Sens</dt><dd>Sensitivity / positive recall.</dd>
-        </dl>
-        <h5>Implementation</h5>
-        <span class="impl">src/drift_detection_app.py · compute_classification_metrics</span>
+        <h5>Use</h5>
+        <p>First differences encode local accelerations or degradations of the traffic regime within each gantry-category time series.</p>
+      </aside>
+    </div>
+
+    <table class="lab-table reveal">
+      <caption><strong>Flow-variable families.</strong> Final columns are materialized in wide format by vehicle category.</caption>
+      <thead><tr><th>Family</th><th>Typical columns</th><th>Operational reading</th></tr></thead>
+      <tbody>
+        <tr><td>Volume</td><td><code>flow_*</code>, <code>flujo_total</code></td><td>Vehicle exposure intensity by gantry and interval.</td></tr>
+        <tr><td>Speed</td><td><code>speed_*</code>, <code>velocidad_media_*</code>, <code>v_armonica</code></td><td>Average kinematic condition and representative speed.</td></tr>
+        <tr><td>Dispersion</td><td><code>speed_std_*</code>, <code>velocidad_iqr_*</code>, <code>velocidad_mad_*</code>, <code>velocidad_cv_*</code></td><td>Speed heterogeneity, a proxy for local instability.</td></tr>
+        <tr><td>Density</td><td><code>density_*</code>, <code>densidad_total</code></td><td>Approximate segment occupancy from flow/speed.</td></tr>
+        <tr><td>Dynamics</td><td><code>delta_speed_*</code>, <code>delta_density_*</code></td><td>Immediate temporal changes that may anticipate perturbations.</td></tr>
+        <tr><td>Composition</td><td><code>prop_pesados</code>, <code>vc_ratio</code>, <code>indice_congestion</code></td><td>Vehicle mix, relative saturation, and aggregate congestion.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Aggregated cluster variables</h3>
+    <p class="reveal">When a <code>plate → cluster_label</code> table is available, the system joins each detection with the vehicle's behavioural profile and aggregates by \((p,\tau,\kappa)\). In hard mode, membership is a discrete label. In soft mode, if the file contains <code>cluster_prob_*</code> columns, each vehicle contributes partially to all clusters according to posterior probabilities; this preserves information for rare drivers or uncertain assignments.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        n_{p,\tau,\kappa}&=\#\{j:p_j=p,\tau(t_j)=\tau,\hat c_j=\kappa\},\\
+        \mathrm{share}_{p,\tau,\kappa}&=\frac{n_{p,\tau,\kappa}}{\sum_{\kappa'}n_{p,\tau,\kappa'}}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(2.6)</div>
+      <aside class="eq-inspector">
+        <h5>Hard mode</h5>
+        <span class="impl">cluster_label · cluster_share_* · cluster_flow_*</span>
       </aside>
     </div>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \theta = \arg\max_{\theta:\mathrm{FAR}(\theta)\le \alpha}\mathrm{Sens}(\theta) \]</div>
-      <div class="num">(2.6)</div>
+      <div class="formula">\[
+        \begin{aligned}
+        w_{p,\tau,\kappa}&=\sum_{j:p_j=p,\tau(t_j)=\tau} r_{j,\kappa},\\
+        \mathrm{share}_{p,\tau,\kappa}&=\frac{w_{p,\tau,\kappa}}{N_{p,\tau}},\\
+        \overline v_{p,\tau,\kappa}^{\,soft}&=\frac{\sum_j r_{j,\kappa}v_j}{\sum_j r_{j,\kappa}}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(2.7)</div>
       <aside class="eq-inspector">
-        <h5>Variables</h5>
-        <dl>
-          <dt>θ</dt><dd>Optimal threshold over the score s(x).</dd>
-          <dt>α</dt><dd>Maximum admissible FAR (per-experiment configuration).</dd>
-        </dl>
-        <h5>Implementation</h5>
-        <span class="impl">src/drift_detection_app.py · youden_threshold</span>
+        <h5>Soft mode</h5>
+        <p><code>compute_cluster_features</code> detects <code>cluster_prob_*</code>, melts to long format, and sums membership weights.</p>
       </aside>
     </div>
-    <p class="reveal">On test we report Accuracy, Precision, Recall, F1, FAR, Sens and ROC-AUC alongside the confusion matrix.</p>
-
-    <h3 class="reveal">Feature selection and Optuna</h3>
-    <p class="reveal">An importance ranking from Random Forest orders the variables. Optuna optimises model and SMOTE hyperparameters: on each trial SMOTE is applied to train, the model is fit, the threshold is calibrated under the FAR constraint on validation, and the result is evaluated (e.g. F1).</p>
-
-    <h3 class="reveal">Cluster effect: Base vs. Base+Cluster</h3>
-    <p class="reveal">To quantify the cluster contribution, two scenarios are compared for \(K=5,10,\dots\):</p>
-    <ul class="reveal">
-      <li><strong>Base</strong>: top-\(K\) ranking variables without clusters.</li>
-      <li><strong>Base+Cluster</strong>: top-\(K\) of the combined ranking.</li>
-    </ul>
-
-    <h3 class="reveal">Artefacts and XAI</h3>
-    <p class="reveal">The pipeline produces, under <code>Resultados/</code>, CSV/DuckDB feature stores, balanced datasets, Optuna outputs, iterative experiments and reproducible bundles <code>model_history/&lt;run_id&gt;/&lt;strategy&gt;/</code> with <code>model.joblib</code>, <code>manifest.json</code>, <code>background.parquet</code> and <code>explain_rows.parquet</code>.</p>
-
-    <div class="lab-callout sage reveal">
-      <div class="label">Reproducible bundle</div>
-      <p>The <code>manifest.json</code> persists model, hyperparameters, columns, metrics, calibrated threshold, final split, exact provenance of <em>flow features</em> and cluster variables, selection, and whether balancing was used. With this, the <em>History</em> tab reopens the explanation without recomputing features.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        H_{p,\tau}=-\sum_{\kappa}\mathrm{share}_{p,\tau,\kappa}\log(\mathrm{share}_{p,\tau,\kappa}).
+      \]</div>
+      <div class="num">(2.8)</div>
+      <aside class="eq-inspector">
+        <h5>Interpretation</h5>
+        <p>Entropy measures behavioural mixing within an interval: high values indicate coexistence of several driving profiles.</p>
+      </aside>
     </div>
 
-    <p class="reveal">Explainability is computed with SHAP over two persisted subsets: up to 128 real training rows as background and up to 64 test rows enriched with representative cases (highest score, strong TP, strong FP, relevant FN). We report a global ranking by \(\mathrm{mean}(|\mathrm{SHAP}|)\), Base vs. Cluster aggregation, a cluster-specific top, and local cases. Tree models use <code>TreeExplainer</code>; SVM uses <code>KernelExplainer</code> over the positive probability.</p>
+    <h3 class="reveal">Target definition with lead time</h3>
+    <p class="reveal">The target does not mark the accident interval itself, but the immediately preceding interval. This imposes a predictive semantics: \(y_{p,\tau}=1\) means that cell \((p,\tau)\) precedes an accident in the next interval. In code, <code>add_accident_target</code> floors <code>accidente_time</code> to <code>interval_minutes</code> and subtracts \(\Delta\).</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \tau_a=\tau(t_a)-\Delta.
+      \]</div>
+      <div class="num">(2.9)</div>
+      <aside class="eq-inspector">
+        <h5>Lead time</h5>
+        <p>If the accident happens in interval \(\tau(t_a)\), the positive training example is \(\tau(t_a)-\Delta\).</p>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        y_{p,\tau}=
+        \begin{cases}
+        1, & \text{if there exists an accident with }(p_a,\tau_a)=(p,\tau),\\
+        0, & \text{otherwise}.
+        \end{cases}
+      \]</div>
+      <div class="num">(2.10)</div>
+      <aside class="eq-inspector">
+        <h5>Contract</h5>
+        <p>The join is performed by <code>portico</code> and <code>interval_start</code>. Accidents without assigned gantry are excluded before target construction.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Dataset construction and temporal split</h3>
+    <p class="reveal">The final dataset contains one row per \((p,\tau)\), numerical variables, and <code>target</code>. First, macro flow variables are computed; then, if clusters exist, they are joined by <code>(portico, interval_start)</code>; finally, the target is added. To avoid temporal leakage, the split is ordered by <code>interval_start</code>; the final block is reserved for test and, in the conservative protocol, the preceding training block is split again for validation.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        \mathcal{D}_{train}&=\{(x_i,y_i):t_i\lt T_{val}\},\\
+        \mathcal{D}_{val}&=\{(x_i,y_i):T_{val}\le t_i\lt T_{test}\},\\
+        \mathcal{D}_{test}&=\{(x_i,y_i):t_i\ge T_{test}\}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(2.11)</div>
+      <aside class="eq-inspector">
+        <h5>Invariant</h5>
+        <p>Validation and test contain only real rows; synthetic SMOTE rows, when present, stay in training.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Class imbalance</h3>
+    <p class="reveal">Accident occurrence is rare. The app supports three training modes: no internal balancing, class weighting, and internal SMOTE. Weighting uses <code>class_weight="balanced"</code> for Random Forest/SVM, automatic <code>scale_pos_weight</code> for XGBoost, and <code>pos_weight</code> for the neural network. SMOTE is applied only inside the training set or temporal fold, never on validation or test. Legacy balanced datasets from the <em>Balance</em> tab mark rows with <code>synthetic=True</code> to prevent double SMOTE.</p>
+    <div class="lab-callout ochre reveal">
+      <div class="label">Anti-leakage rule</div>
+      <p>Threshold calibration must see only real validation/OOF scores. If a dataset contains synthetic rows, <code>split_train_val_for_threshold</code> separates validation from real rows and concatenates synthetic rows only into the final train block.</p>
+    </div>
+
+    <h3 class="reveal">Available models</h3>
+    <p class="reveal">The <em>Models</em> tab trains three feature families: <strong>Base</strong> (flow only), <strong>Cluster</strong> (only <code>cluster_*</code> columns), and <strong>Base + Cluster</strong> (both). The output measures whether aggregated behavioural profiles add predictive signal beyond macroscopic traffic variables.</p>
+    <table class="lab-table reveal">
+      <caption><strong>Implemented supervised models.</strong> All produce a score \(s(x)\) that can then be calibrated.</caption>
+      <thead><tr><th>Model</th><th>Implementation</th><th>Parameters or protection</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td>Random Forest</td><td><code>RandomForestClassifier</code></td><td><code>n_estimators</code>, depth, leaves, <code>max_features</code>, <code>n_jobs</code>, <code>class_weight</code>.</td><td>Robust tabular baseline and feature importance.</td></tr>
+        <tr><td>Balanced Random Forest</td><td><code>imblearn.ensemble</code></td><td>Internal balanced undersampling; requires <code>imbalanced-learn</code>.</td><td>Native alternative for extreme imbalance.</td></tr>
+        <tr><td>XGBoost</td><td><code>xgboost.XGBClassifier</code></td><td><code>binary:logistic</code> objective, regularization, <code>scale_pos_weight</code>, <code>n_jobs</code>.</td><td>Strong nonlinear model with bias-variance control.</td></tr>
+        <tr><td>SVM</td><td><code>MLXAcceleratedSVMClassifier</code></td><td>Scales scores, orients sign for the objective, and supports kernels/RFF.</td><td>Margin-based comparison; sensitive to scaling and calibration.</td></tr>
+        <tr><td>Neural Network</td><td>PyTorch MLP in <code>Pipeline(StandardScaler, MLP)</code></td><td><code>early stopping</code>, <code>pos_weight</code>, dropout, batch norm, MPS/CUDA/CPU.</td><td>Flexible tabular model for nonlinear interactions.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Scores, calibration, and operational threshold</h3>
+    <p class="reveal">Each model produces a score \(s(x)\). Before selecting the threshold, the score can be calibrated with three methods: no calibration, Platt sigmoid scaling, or isotonic regression. For SVM, if score orientation reverses the positive class, <code>orient_scores_for_objective</code> multiplies it by \(-1\) before calibration.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        s_i&=f_\theta(x_i),\\
+        \tilde s_i&=g(s_i),\qquad g\in\{\mathrm{id},\sigma(a s+b),g_{\mathrm{iso}}\}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(2.12)</div>
+      <aside class="eq-inspector">
+        <h5>Implementation</h5>
+        <span class="impl">fit_score_calibrator · ScoreCalibrator · orient_scores_for_objective</span>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \mathrm{FAR}=\frac{FP}{FP+TN},\qquad
+        \mathrm{Sens}=\frac{TP}{TP+FN}.
+      \]</div>
+      <div class="num">(2.13)</div>
+      <aside class="eq-inspector">
+        <h5>Operational metric</h5>
+        <p>FAR measures false alerts among non-events; sensitivity measures accident capture.</p>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \theta^\star=\arg\max_{\theta:\mathrm{FAR}(\theta)\le\alpha}\mathrm{Sens}(\theta),\qquad
+        \hat y_i=\mathbf{1}[\tilde s_i\ge\theta^\star].
+      \]</div>
+      <div class="num">(2.14)</div>
+      <aside class="eq-inspector">
+        <h5>Function</h5>
+        <span class="impl">select_threshold_for_metric · select_threshold_for_far</span>
+      </aside>
+    </div>
+    <p class="reveal">Besides FAR, the threshold selector supports <strong>F1</strong>, <strong>Balanced F1</strong>, <strong>MCC</strong>, <strong>Recall@N alerts/day</strong>, and <strong>operational cost</strong>. PR-AUC and ROC-AUC are ranking metrics; when they are used as the threshold criterion, the operational threshold remains 0.5 because they do not define a cutoff by themselves.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        F1&=\frac{2TP}{2TP+FP+FN},\\
+        \mathrm{MCC}&=\frac{TP\,TN-FP\,FN}{\sqrt{(TP+FP)(TP+FN)(TN+FP)(TN+FN)}}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(2.15)</div>
+      <aside class="eq-inspector">
+        <h5>Catalog</h5>
+        <p><code>THRESHOLD_OBJECTIVE_LABELS</code> and <code>OPTUNA_OBJECTIVE_LABELS</code> separate the threshold objective from the search objective.</p>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        \mathrm{alerts/day}&=\frac{TP+FP}{\mathrm{days}},\\
+        \mathrm{cost}&=c_{FN}FN+c_{FP}FP.
+        \end{aligned}
+      \]</div>
+      <div class="num">(2.16)</div>
+      <aside class="eq-inspector">
+        <h5>Operation</h5>
+        <p>This supports model comparison under an alert budget or asymmetric cost between missed and excess detections.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Evaluation protocols</h3>
+    <p class="reveal">The <strong>conservative</strong> protocol trains on <code>train</code>, fits score calibrator and threshold on <code>validation</code>, and evaluates once on <code>test</code>. The <strong>robust</strong> protocol merges <code>train+validation</code>, generates OOF scores with temporal folds, calibrates score and threshold on OOF, retrains on all <code>train+validation</code>, and evaluates on test.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        \mathcal{S}_{OOF}&=\{(y_i,\tilde s_i): i\in V_m,\ m=1,\dots,M\},\\
+        \theta^\star&=\operatorname{SelectThreshold}(\mathcal{S}_{OOF}),\\
+        f^\star&=\operatorname{Fit}(\mathcal{D}_{train}\cup\mathcal{D}_{val}).
+        \end{aligned}
+      \]</div>
+      <div class="num">(2.17)</div>
+      <aside class="eq-inspector">
+        <h5>Fallback</h5>
+        <p>If no valid temporal folds with two classes exist, the code falls back to the conservative protocol and records a note in the result.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Evaluation metrics</h3>
+    <p class="reveal">On test, the system reports accuracy, precision, recall, sensitivity, specificity, FAR, ROC-AUC, PR-AUC, Brier score, F1, Balanced F1, class-wise F1, MCC, false negatives, false positives, true positives, true negatives, positive support, positive capture, FN rate, alerts per day, false alarms per day, approximate event recall, operational cost, cost per day, recall under alert budget, and the confusion matrix.</p>
+    <table class="lab-table reveal">
+      <caption><strong>Key metrics.</strong> Ranking, classification, and operational metrics play different roles.</caption>
+      <thead><tr><th>Family</th><th>Metrics</th><th>Correct use</th></tr></thead>
+      <tbody>
+        <tr><td>Ranking</td><td>ROC-AUC, PR-AUC</td><td>Compare score ordering; they do not fix an operational threshold by themselves.</td></tr>
+        <tr><td>Classification</td><td>F1, Balanced F1, MCC, confusion matrix</td><td>Evaluate binary predictions after selecting \(\theta\).</td></tr>
+        <tr><td>Operation</td><td>FAR, sensitivity, alerts/day, cost</td><td>Translate the model into alert constraints in a road-management system.</td></tr>
+        <tr><td>Event</td><td><code>event_recall_approx</code></td><td>Groups positives temporally to approximate event capture, not only row capture.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Optuna tab</h3>
+    <p class="reveal">The <em>Optuna</em> tab uses the active feature selection and creates three configurations: <strong>Base</strong>, <strong>Cluster</strong>, and <strong>Base + Cluster</strong>. For each configuration, it runs variants without internal balancing and, when <code>imbalanced-learn</code> is available, variants with SMOTE. Search uses <code>TPESampler</code>, optional <code>MedianPruner</code> pruning, <code>n_jobs</code> for parallel trials, and separate controls for Random Forest/XGBoost internal parallelism.</p>
+    <p class="reveal">Optuna can tune Random Forest, Balanced Random Forest, XGBoost, SVM, and Neural Network hyperparameters; it can also optimize <code>top_k</code>, using a ranking computed on real train data by Random Forest or mutual information. The Optuna objective metric is chosen from a catalog that includes <code>f1</code>, <code>roc_auc</code>, <code>pr_auc</code>, <code>balanced_f1</code>, <code>mcc</code>, <code>brier_score</code>, <code>recall_at_alerts_per_day</code>, <code>operational_cost</code>, and Pareto multiobjective variants in calibration experiments.</p>
+    <div class="lab-callout sage reveal">
+      <div class="label">Objective separation</div>
+      <p>The Optuna objective selects hyperparameters and, optionally, the number of variables. The threshold objective selects the operational cutoff. This separation avoids confusing good PR-AUC/ROC-AUC ranking with an acceptable operational threshold.</p>
+    </div>
+    <p class="reveal">Results are persisted in <code>Resultados/optuna_*.json</code> and <code>Resultados/optuna_*trials.csv</code>. The JSON stores <code>dataset_fingerprint</code>, selected variables, <code>feature_cols</code>, <code>search_space</code>, <code>optuna_settings</code>, and results grouped by model, <code>by_balance_mode</code>, and <code>by_calibration_method</code>. The canonical in-memory view is <code>optuna_results_store</code>; <code>_get_active_optuna_best()</code> prefers SMOTE when available and respects the active calibration.</p>
+
+    <h3 class="reveal">Models tab</h3>
+    <p class="reveal">The <em>Models</em> tab trains Base, Cluster, and Base + Cluster with independent parameters. Before execution, <code>_apply_optuna_model_params_to_state(...)</code> attempts to apply the best Optuna hyperparameters to each group. The match requires the same model, balance mode, and calibration, unless the user enables calibration fallback. If the feature source is an explicit Optuna batch, Models can retrain all real subruns from the batch while preserving traceability.</p>
+    <p class="reveal">At completion, the tab shows metrics by protocol, deltas against Base, confusion matrices, training curves when available, and records the run in <code>Resultados/experiment_history.jsonl</code> and <code>Resultados/model_history/</code>. The Base + Cluster strategy can persist a reproducible XAI bundle.</p>
+
+    <h3 class="reveal">Experiments tab</h3>
+    <p class="reveal">The <em>Experiments</em> tab supports execution, review, and import of experiments. New modes cover feature sampling, sample-size search, best highway segment, optimal segment + \(K\) mix, score + threshold calibration, and controlled comparison over a frozen temporal split. Experiments use checkpoints, live SQLite databases, and ZIP export/import so long runs can be paused, resumed, and audited.</p>
+    <table class="lab-table reveal">
+      <caption><strong>Documented experiments.</strong> All preserve protocol metadata and parameters.</caption>
+      <thead><tr><th>Experiment</th><th>Question</th><th>Artifacts</th></tr></thead>
+      <tbody>
+        <tr><td>Features sampler</td><td>How much does Base + Cluster add as top-\(K\) varies?</td><td><code>experiments_results_*.csv</code></td></tr>
+        <tr><td>Find sample sizes</td><td>Which ranges have enough positives?</td><td>Feasibility and support tables.</td></tr>
+        <tr><td>Best highway section</td><td>Which segment maximizes performance under the controlled protocol?</td><td><code>best_highway_section_controlled_*.csv</code></td></tr>
+        <tr><td>Best mix Highway section &amp; K</td><td>Which segment-\(K\) combination dominates?</td><td>Grids by segment and \(K\).</td></tr>
+        <tr><td>Score + threshold calibration</td><td>Which objective, calibration, threshold, and balance combination is best?</td><td><code>calibration_experiment_runs/</code></td></tr>
+        <tr><td>Controlled comparison</td><td>How do models, feature sets, balance modes, and protocols compare on a frozen split?</td><td><code>controlled_comparison_*.csv</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Persisted artifacts</h3>
+    <table class="lab-table reveal">
+      <caption><strong>Reproducible outputs in <code>Resultados/</code>.</strong> Names include timestamp or run suffix.</caption>
+      <thead><tr><th>Artifact</th><th>Content</th><th>Later use</th></tr></thead>
+      <tbody>
+        <tr><td><code>accident_flow_features_*.csv/.duckdb</code></td><td>Flow variables by gantry and interval.</td><td>Base and Base + Cluster training.</td></tr>
+        <tr><td><code>accident_cluster_features_*.csv</code></td><td><code>cluster_share_*</code>, <code>cluster_flow_*</code>, <code>cluster_speed_*</code>, entropy, and derivatives.</td><td>Cluster and Base + Cluster training.</td></tr>
+        <tr><td><code>accident_balanced*_base.csv</code>, <code>*cluster_only.csv</code>, <code>*base_cluster.csv</code></td><td>Legacy balanced datasets with <code>synthetic=True</code>.</td><td>Controlled reuse without double SMOTE.</td></tr>
+        <tr><td><code>optuna_*.json</code>, <code>optuna_*trials.csv</code></td><td>Best hyperparameters, trials, and search metadata.</td><td>Transfer to Models and audit.</td></tr>
+        <tr><td><code>experiment_live_*.sqlite</code></td><td><code>meta</code>, <code>results</code>, and <code>best</code> tables.</td><td>Tracking long experiments.</td></tr>
+        <tr><td><code>experiment_history.jsonl</code></td><td>Run history by stage.</td><td>Leaderboard and UI traceability.</td></tr>
+        <tr><td><code>model_history/&lt;run_id&gt;/&lt;strategy&gt;/</code></td><td><code>model.joblib</code>, <code>manifest.json</code>, <code>background.parquet</code>, <code>explain_rows.parquet</code>.</td><td>Reopening and explaining XAI runs.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">XAI for Base + Cluster</h3>
+    <p class="reveal">When the Base + Cluster strategy finishes, the system can save a reproducible bundle under <code>Resultados/model_history/</code>. The <code>manifest.json</code> records model, hyperparameters, columns, metrics, calibrated threshold, final split, flow-feature provenance, exact cluster-feature provenance, variable selection, and balance mode. This lets the History tab reopen the explanation without recomputing features or manually reloading cluster files.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \begin{aligned}
+        I_j&=\frac{1}{m}\sum_{i=1}^{m}|\phi_{ij}|,\\
+        C_g&=\frac{\sum_{j\in g}I_j}{\sum_{\ell}I_\ell},\qquad g\in\{\mathrm{Base},\mathrm{Cluster}\}.
+        \end{aligned}
+      \]</div>
+      <div class="num">(2.18)</div>
+      <aside class="eq-inspector">
+        <h5>SHAP</h5>
+        <p>\(I_j\) is global feature importance and \(C_g\) quantifies the explanatory share attributed to Base or Cluster variables.</p>
+      </aside>
+    </div>
+    <p class="reveal">The bundle persists up to 128 real training rows as background and up to 64 test rows for explanation, enriched with representative cases: highest score, strong true positive, strong false positive, and relevant false negative. Random Forest and XGBoost use <code>TreeExplainer</code>; SVM and other models use <code>KernelExplainer</code> over positive-class probability. If SHAP fails or the run predates the bundle format, the UI reports XAI as unavailable without invalidating the rest of the history.</p>
 
     <div class="lab-callout sage reveal">
-      <div class="label">Coming soon · Interactive results</div>
-      <p>This section will include dynamic FAR vs Sens curves, α sliders to recalibrate the threshold live, and a per-<code>run_id</code> SHAP explorer that loads from <code>model_history/</code>.</p>
+      <div class="label">Scientific reading</div>
+      <p>The academic value of the Base vs. Base + Cluster comparison depends on three invariants: same temporal split, same threshold objective, and same balance policy. If those invariants change, metric differences no longer isolate the contribution of clusters.</p>
+    </div>
+
+    <div class="lab-callout ochre reveal">
+      <div class="label">Controlled methodological risks</div>
+      <p>The pipeline controls temporal leakage with chronological splits, prevents SMOTE outside train, separates ranking from threshold, and stores dataset fingerprints so Optuna is not reused on incompatible data. Main residual risks are low positive counts by segment, lead-time sensitivity to \(\Delta\), and dependence on accident-to-gantry mapping quality.</p>
     </div>
 
   </section>
 
   <footer class="lab-coda">
-    <span>Chapter § 2 · 6 equations</span>
-    <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/accident_prediction_en.tex</code></span>
+    <span>Chapter § 2 · 18 equations · 5 tables · 4 callouts</span>
+    <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/accident_prediction_en.tex</code> + implementation in <code style="font-family:var(--font-mono);font-size:11.5px;">src/</code></span>
   </footer>
 
 </main>
 
 <aside class="lab-margin" aria-label="Marginalia">
   <div class="pinned">
-    <span class="label">FAR</span>
-    <p>False Alarm Rate is the main operational metric: how many alerts are issued without an actual accident. A real-time warning system requires low FAR even at the cost of sensitivity.</p>
-    <p><strong>Temporal leakage.</strong> All splits are by time, never random — the model must not see the future.</p>
-    <p><strong>SMOTE.</strong> Train only. Synthetic rows are flagged <code style="font-family:var(--font-mono);font-size:11.5px;">synthetic=True</code> to be auditable.</p>
+    <span class="label">Governing principle</span>
+    <p>The model does not predict “historical accidents”; it predicts risk in the interval preceding the accident. Lead-time semantics are the center of the chapter.</p>
+    <p><strong>Threshold.</strong> Low FAR is an operational constraint, not merely a reporting metric.</p>
+    <p><strong>Fair comparison.</strong> Base, Cluster, and Base + Cluster are comparable only when they share split, calibration, balance, and protocol.</p>
   </div>
 </aside>
 

@@ -1,5 +1,6 @@
 import sys as _sys
 import warnings
+from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch.nn import LayerNorm, Linear, ModuleList
@@ -69,6 +70,114 @@ def _edge_type_module_key(edge_type):
     return str(edge_type)
 
 
+def _resolve_per_type_int(spec, edge_types, default):
+    """Return dict {edge_type: int} from either a scalar, a dict (by tuple or by
+    serialized key), or None. Missing entries fall back to `default`."""
+    if isinstance(spec, dict):
+        normalized = {}
+        for k, v in spec.items():
+            if isinstance(k, tuple) and len(k) == 3:
+                key = k
+            else:
+                parsed = None
+                txt = str(k)
+                for sep in ("___", "__"):
+                    if sep in txt:
+                        parts = txt.split(sep)
+                        if len(parts) == 3 and all(parts):
+                            parsed = tuple(parts)
+                            break
+                key = parsed if parsed is not None else k
+            try:
+                normalized[key] = int(v) if v is not None else None
+            except Exception:
+                normalized[key] = None
+        out = {}
+        for et in edge_types:
+            val = normalized.get(et, None)
+            if val is None:
+                val = normalized.get(_edge_type_module_key(et), None)
+            out[et] = int(val) if val is not None else int(default or 0)
+        return out
+    if spec is None:
+        return {et: int(default or 0) for et in edge_types}
+    try:
+        scalar = int(spec)
+    except Exception:
+        scalar = int(default or 0)
+    return {et: scalar for et in edge_types}
+
+
+def _resolve_per_type_str(spec, edge_types, default):
+    """Same shape contract as `_resolve_per_type_int`, but for string values
+    (e.g. `edge_encoder_kinds`). Missing entries fall back to `default`."""
+    default_str = str(default or "")
+    if isinstance(spec, dict):
+        normalized = {}
+        for k, v in spec.items():
+            if isinstance(k, tuple) and len(k) == 3:
+                key = k
+            else:
+                parsed = None
+                txt = str(k)
+                for sep in ("___", "__"):
+                    if sep in txt:
+                        parts = txt.split(sep)
+                        if len(parts) == 3 and all(parts):
+                            parsed = tuple(parts)
+                            break
+                key = parsed if parsed is not None else k
+            normalized[key] = (str(v).strip().lower() if v is not None else None)
+        out = {}
+        for et in edge_types:
+            val = normalized.get(et, None)
+            if val is None:
+                val = normalized.get(_edge_type_module_key(et), None)
+            out[et] = (val if val else default_str)
+        return out
+    if spec is None:
+        return {et: default_str for et in edge_types}
+    scalar = str(spec).strip().lower()
+    return {et: (scalar or default_str) for et in edge_types}
+
+
+def _resolve_per_type_float(spec, edge_types, default):
+    """Like _resolve_per_type_int for float-valued parameters (e.g. dropout)."""
+    if isinstance(spec, dict):
+        normalized = {}
+        for k, v in spec.items():
+            if isinstance(k, tuple) and len(k) == 3:
+                key = k
+            else:
+                parsed = None
+                txt = str(k)
+                for sep in ("___", "__"):
+                    if sep in txt:
+                        parts = txt.split(sep)
+                        if len(parts) == 3 and all(parts):
+                            parsed = tuple(parts)
+                            break
+                key = parsed if parsed is not None else k
+            try:
+                normalized[key] = float(v) if v is not None else None
+            except Exception:
+                normalized[key] = None
+        out = {}
+        for et in edge_types:
+            val = normalized.get(et, None)
+            if val is None:
+                val = normalized.get(_edge_type_module_key(et), None)
+            out[et] = float(val) if val is not None else float(default or 0.0)
+        return out
+    if spec is None:
+        return {et: float(default or 0.0) for et in edge_types}
+    try:
+        scalar = float(spec)
+    except Exception:
+        scalar = float(default or 0.0)
+    return {et: scalar for et in edge_types}
+
+
 # Edge types por defecto si no se pasa el parámetro al constructor.
 # Mantiene compatibilidad con grafos legacy que tenían 4 relaciones (incluido st_fwd).
 # Para grafos nuevos (3 relaciones), pasar edge_types=tuple(data.edge_types) desde fuera.
@@ -81,7 +190,12 @@ DEFAULT_EDGE_TYPES = (
 
 
 class EdgeAttrEncoder(torch.nn.Module):
-    """Small MLP to learn a task-adapted representation of raw edge attributes."""
+    """Small MLP to learn a task-adapted representation of raw edge attributes.
+
+    Es el encoder por defecto (`kind="mlp"`). Otros tipos comparten la misma
+    interfaz `(in_dim, hidden_dim, out_dim, dropout)` → `forward(edge_attr) ->
+    (E, out_dim)` para que el registry los pueda intercambiar sin tocar el GAT.
+    """
 
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0):
         super().__init__()
@@ -100,10 +214,136 @@ class EdgeAttrEncoder(torch.nn.Module):
         return self.net(edge_attr)
 
 
+class MLPResidualEncoder(torch.nn.Module):
+    """MLP + skip-connection. La proyección residual es lineal cuando
+    `in_dim != out_dim` (no se puede sumar directo el raw)."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.mlp = torch.nn.Sequential(
+            Linear(in_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            Linear(hidden_dim, out_dim),
+        )
+        self.skip = Linear(in_dim, out_dim)
+
+    def forward(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        if edge_attr is None:
+            return edge_attr
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.view(-1, 1)
+        return self.mlp(edge_attr) + self.skip(edge_attr)
+
+
+class LayerNormMLPEncoder(torch.nn.Module):
+    """LayerNorm sobre `edge_attr` raw, luego MLP. Útil cuando las features
+    tienen escalas muy distintas (delta-features vs `dist_km` vs gradientes)."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm = LayerNorm(in_dim)
+        self.net = torch.nn.Sequential(
+            Linear(in_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        if edge_attr is None:
+            return edge_attr
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.view(-1, 1)
+        return self.net(self.norm(edge_attr))
+
+
+class Time2VecEncoder(torch.nn.Module):
+    """Time2Vec aplicado feature-wise sobre `edge_attr`.
+
+    Para cada feature de entrada `x_i` produce `[w_i*x_i + b_i, sin(w_{i,1}*x_i
+    + b_{i,1}), …, sin(w_{i,k-1}*x_i + b_{i,k-1})]` (un componente lineal +
+    `k-1` periódicos), y luego una proyección lineal a `out_dim`.
+
+    `hidden_dim` se interpreta como `k` (número de componentes Time2Vec por
+    feature). El encoding total intermedio es `in_dim * k` antes de proyectar.
+    Diseñado para variables continuas con estacionalidad o magnitudes muy
+    variables (p.ej. `dt`).
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0):
+        super().__init__()
+        k = max(1, int(hidden_dim))
+        self.in_dim = int(in_dim)
+        self.k = k
+        # Componente lineal por feature.
+        self.linear_w = torch.nn.Parameter(torch.randn(self.in_dim))
+        self.linear_b = torch.nn.Parameter(torch.zeros(self.in_dim))
+        # Componentes periódicos: (in_dim, k-1).
+        if k > 1:
+            self.freq_w = torch.nn.Parameter(torch.randn(self.in_dim, k - 1) * 0.1)
+            self.freq_b = torch.nn.Parameter(torch.zeros(self.in_dim, k - 1))
+        else:
+            # Registramos buffers vacíos para mantener la firma del state_dict
+            # estable y simplificar la inferencia de `kind` desde checkpoint.
+            self.register_parameter("freq_w", None)
+            self.register_parameter("freq_b", None)
+        self.proj = Linear(self.in_dim * k, out_dim)
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        if edge_attr is None:
+            return edge_attr
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.view(-1, 1)
+        # x: (E, in_dim)
+        linear_part = self.linear_w * edge_attr + self.linear_b  # (E, in_dim)
+        if self.freq_w is None:
+            combined = linear_part
+        else:
+            # (E, in_dim, 1) * (in_dim, k-1) -> (E, in_dim, k-1)
+            sin_part = torch.sin(
+                edge_attr.unsqueeze(-1) * self.freq_w + self.freq_b
+            )
+            combined = torch.cat([linear_part.unsqueeze(-1), sin_part], dim=-1)
+            combined = combined.reshape(edge_attr.shape[0], self.in_dim * self.k)
+        return self.dropout(self.proj(combined))
+
+
+# Registry de tipos de encoder por arista. Las claves se sirven a la UI y se
+# serializan en `edge_encoder_per_type[<et>]["kind"]`.
+EDGE_ENCODER_REGISTRY = {
+    "mlp": EdgeAttrEncoder,
+    "mlp_residual": MLPResidualEncoder,
+    "layernorm_mlp": LayerNormMLPEncoder,
+    "time2vec": Time2VecEncoder,
+}
+
+
+def _build_edge_encoder(
+    kind: Optional[str],
+    in_dim: int,
+    hidden_dim: int,
+    out_dim: int,
+    dropout: float = 0.0,
+) -> torch.nn.Module:
+    """Factory: devuelve el encoder según `kind`. Si el nombre es desconocido
+    cae al MLP por defecto (no rompe checkpoints con encoders que no estén en
+    este build)."""
+    normalized = str(kind or "mlp").strip().lower()
+    cls = EDGE_ENCODER_REGISTRY.get(normalized, EdgeAttrEncoder)
+    return cls(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim, dropout=float(dropout))
+
+
 class HeteroGAT(torch.nn.Module):
     """
     Modelo GAT Heterogéneo optimizado con HeteroConv, checkpointing y recuperación de atención.
     Soporta un número dinámico de capas.
+
+    `edge_feature_dim` puede ser un int (mismo edge_dim para todas las relaciones,
+    comportamiento legacy) o, vía `edge_feature_dims`, un dict {edge_type: int}
+    que asigna edge_dim distinto por tipo de arista. Esto permite que cada relación
+    consuma sus propias features sin necesidad de padding con ceros.
     """
     def __init__(
         self,
@@ -120,6 +360,7 @@ class HeteroGAT(torch.nn.Module):
         use_residual=False,
         use_relation_self_loops=True,
         edge_types=None,
+        edge_feature_dims=None,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -127,12 +368,26 @@ class HeteroGAT(torch.nn.Module):
         self.dropout = dropout
         self.use_checkpointing = use_checkpointing
         self.num_layers = num_layers
-        self.edge_feature_dim = edge_feature_dim
         self.use_residual = bool(use_residual)
         self.use_relation_self_loops = bool(use_relation_self_loops)
         # Edge types: si no se especifican, usa los 4 legacy (compat). Para grafos
         # nuevos (3 relaciones) pasar edge_types=tuple(data.edge_types).
         self.edge_types_list = [tuple(et) for et in (edge_types if edge_types is not None else DEFAULT_EDGE_TYPES)]
+
+        # Per-type edge_dim: si se pasa edge_feature_dims, cada relación recibe su
+        # propio edge_dim. Si no, todas comparten edge_feature_dim (legacy).
+        self.edge_feature_dims_per_type = _resolve_per_type_int(
+            edge_feature_dims, self.edge_types_list, default=edge_feature_dim
+        )
+        # Compat: `edge_feature_dim` (scalar) sigue exponiéndose; cuando hay
+        # heterogeneidad lo dejamos como el máximo (lo usan helpers externos como
+        # el visualizador torchview para construir tensores dummy).
+        try:
+            self.edge_feature_dim = int(
+                max(self.edge_feature_dims_per_type.values()) if self.edge_feature_dims_per_type else (edge_feature_dim or 0)
+            )
+        except Exception:
+            self.edge_feature_dim = int(edge_feature_dim or 0)
 
         self.convs = ModuleList()
         self.norms = ModuleList()
@@ -147,7 +402,7 @@ class HeteroGAT(torch.nn.Module):
                     hidden_channels,
                     heads=num_heads,
                     add_self_loops=self.use_relation_self_loops,
-                    edge_dim=edge_feature_dim,
+                    edge_dim=int(self.edge_feature_dims_per_type.get(et, edge_feature_dim) or 0),
                 )
                 for et in self.edge_types_list
             }
@@ -196,21 +451,22 @@ class HeteroGAT(torch.nn.Module):
             if self.use_checkpointing and self.training:
                 def _checkpointed_block(x_pm_tensor, x_dict_cap=x_dict, conv_cap=conv, norm_cap=norm, residual_cap=residual, edge_index_dict_cap=edge_index_dict, edge_attr_dict_cap=edge_attr_dict):
                     tmp_x_dict = {**x_dict_cap, 'pm': x_pm_tensor}
-                    
+
                     active_edge_types = conv_cap.convs.keys()
                     active_eid = {k: v for k, v in edge_index_dict_cap.items() if k in active_edge_types}
                     # Rellena atributos de aristas faltantes si edge_dim > 0
                     active_ead = {}
                     for k in active_edge_types:
+                        k_dim = int(self.edge_feature_dims_per_type.get(k, self.edge_feature_dim) or 0)
                         if k in edge_attr_dict_cap and edge_attr_dict_cap[k] is not None:
                             ea = edge_attr_dict_cap[k]
                             if k in active_eid:
                                 num_e = active_eid[k].shape[1]
                                 if ea.size(0) != num_e:
-                                    if self.edge_feature_dim and self.edge_feature_dim > 0:
+                                    if k_dim > 0:
                                         ref = next(iter(x_dict_cap.values()))
                                         ea = torch.zeros(
-                                            (num_e, self.edge_feature_dim),
+                                            (num_e, k_dim),
                                             dtype=ref.dtype,
                                             device=ref.device,
                                         )
@@ -226,11 +482,11 @@ class HeteroGAT(torch.nn.Module):
                             if ea is not None:
                                 active_ead[k] = ea
                         else:
-                            if self.edge_feature_dim and self.edge_feature_dim > 0 and k in active_eid:
+                            if k_dim > 0 and k in active_eid:
                                 num_e = active_eid[k].shape[1]
                                 ref = next(iter(x_dict_cap.values()))
-                                active_ead[k] = torch.zeros((num_e, self.edge_feature_dim), dtype=ref.dtype, device=ref.device)
-                            # si edge_feature_dim==0, GATConv ignora edge_attr
+                                active_ead[k] = torch.zeros((num_e, k_dim), dtype=ref.dtype, device=ref.device)
+                            # si edge_dim==0, GATConv ignora edge_attr
                     
                     out_dict = conv_cap(tmp_x_dict, active_eid, active_ead)
                     
@@ -252,15 +508,16 @@ class HeteroGAT(torch.nn.Module):
                     # Rellenar atributos de aristas faltantes
                     active_ead = {}
                     for k in active_edge_types:
+                        k_dim = int(self.edge_feature_dims_per_type.get(k, self.edge_feature_dim) or 0)
                         if k in ead and ead[k] is not None:
                             ea = ead[k]
                             if k in active_eid:
                                 num_e = active_eid[k].shape[1]
                                 if ea.size(0) != num_e:
-                                    if self.edge_feature_dim and self.edge_feature_dim > 0:
+                                    if k_dim > 0:
                                         ref = next(iter(xd.values()))
                                         ea = torch.zeros(
-                                            (num_e, self.edge_feature_dim),
+                                            (num_e, k_dim),
                                             dtype=ref.dtype,
                                             device=ref.device,
                                         )
@@ -276,10 +533,10 @@ class HeteroGAT(torch.nn.Module):
                             if ea is not None:
                                 active_ead[k] = ea
                         else:
-                            if self.edge_feature_dim and self.edge_feature_dim > 0 and k in active_eid:
+                            if k_dim > 0 and k in active_eid:
                                 num_e = active_eid[k].shape[1]
                                 ref = next(iter(xd.values()))
-                                active_ead[k] = torch.zeros((num_e, self.edge_feature_dim), dtype=ref.dtype, device=ref.device)
+                                active_ead[k] = torch.zeros((num_e, k_dim), dtype=ref.dtype, device=ref.device)
                     return conv(xd, active_eid, active_ead)
                 
                 residual_input_pm = x_dict.get('pm')
@@ -327,6 +584,12 @@ class HeteroGATWithEdgeEncoder(HeteroGAT):
     """
     HeteroGAT variant that first maps raw edge attributes through an MLP encoder.
     The encoded edge attributes are then consumed by GAT attention.
+
+    Cada tipo de arista tiene su propio `EdgeAttrEncoder` con hiperparámetros
+    potencialmente distintos. Cualquiera de los parámetros (`edge_feature_dims`,
+    `edge_encoder_hidden_dims`, `edge_encoded_dims`, `edge_encoder_dropouts`)
+    acepta un escalar (mismo valor para todos los tipos, comportamiento legacy)
+    o un dict {edge_type: valor} para configurar por tipo.
     """
 
     def __init__(
@@ -347,43 +610,90 @@ class HeteroGATWithEdgeEncoder(HeteroGAT):
         use_residual=False,
         use_relation_self_loops=True,
         edge_types=None,
+        edge_feature_dims=None,
+        edge_encoder_hidden_dims=None,
+        edge_encoded_dims=None,
+        edge_encoder_dropouts=None,
+        edge_encoder_kinds=None,
+        edge_encoder_kind="mlp",
     ):
-        raw_edge_dim = int(edge_feature_dim or 0)
-        encoded_edge_dim = int(edge_encoded_dim if edge_encoded_dim is not None else raw_edge_dim)
+        raw_edge_dim_scalar = int(edge_feature_dim or 0)
+        encoded_edge_dim_scalar = int(
+            edge_encoded_dim if edge_encoded_dim is not None else raw_edge_dim_scalar
+        )
+
+        et_list = [tuple(et) for et in (edge_types if edge_types is not None else DEFAULT_EDGE_TYPES)]
+
+        # Per-type raw / encoded / hidden / dropout. Si el dict no se pasa, todos
+        # los tipos comparten el escalar (comportamiento legacy).
+        raw_dims = _resolve_per_type_int(edge_feature_dims, et_list, default=raw_edge_dim_scalar)
+        encoded_dims = _resolve_per_type_int(edge_encoded_dims, et_list, default=encoded_edge_dim_scalar)
+        hidden_dims = _resolve_per_type_int(
+            edge_encoder_hidden_dims,
+            et_list,
+            default=(
+                edge_encoder_hidden_dim
+                if edge_encoder_hidden_dim is not None
+                else max(raw_edge_dim_scalar, encoded_edge_dim_scalar, 8)
+            ),
+        )
+        dropouts = _resolve_per_type_float(
+            edge_encoder_dropouts, et_list, default=float(edge_encoder_dropout or 0.0)
+        )
+        kinds = _resolve_per_type_str(
+            edge_encoder_kinds, et_list, default=str(edge_encoder_kind or "mlp")
+        )
+
+        # La GATConv subyacente debe ver el edge_dim *codificado* por tipo.
         super().__init__(
             in_channels=in_channels,
             hidden_channels=hidden_channels,
             out_channels=out_channels,
             num_heads=num_heads,
             dropout=dropout,
-            edge_feature_dim=encoded_edge_dim,
+            edge_feature_dim=encoded_edge_dim_scalar,
             num_layers=num_layers,
             use_checkpointing=use_checkpointing,
             aggr1=aggr1,
             aggr2=aggr2,
             use_residual=use_residual,
             use_relation_self_loops=use_relation_self_loops,
-            edge_types=edge_types,
+            edge_types=et_list,
+            edge_feature_dims=encoded_dims,
         )
-        self.raw_edge_feature_dim = raw_edge_dim
-        self.encoded_edge_feature_dim = encoded_edge_dim
+
+        self.raw_edge_feature_dim = raw_edge_dim_scalar
+        self.encoded_edge_feature_dim = encoded_edge_dim_scalar
         self.edge_encoder_hidden_dim = int(
             edge_encoder_hidden_dim
             if edge_encoder_hidden_dim is not None
-            else max(raw_edge_dim, encoded_edge_dim, 8)
+            else max(raw_edge_dim_scalar, encoded_edge_dim_scalar, 8)
         )
+        # Diccionarios por tipo (para introspección/serialización).
+        self.raw_edge_feature_dims_per_type = dict(raw_dims)
+        self.encoded_edge_feature_dims_per_type = dict(encoded_dims)
+        self.edge_encoder_hidden_dims_per_type = dict(hidden_dims)
+        self.edge_encoder_dropouts_per_type = dict(dropouts)
+        self.edge_encoder_kinds_per_type = dict(kinds)
+
         self.edge_attr_encoders = torch.nn.ModuleDict()
-        if raw_edge_dim > 0 and encoded_edge_dim > 0:
-            try:
-                edge_types = list(self.convs[0].convs.keys())
-            except Exception:
-                edge_types = []
-            for edge_type in edge_types:
-                self.edge_attr_encoders[_edge_type_module_key(edge_type)] = EdgeAttrEncoder(
-                    in_dim=raw_edge_dim,
-                    hidden_dim=self.edge_encoder_hidden_dim,
-                    out_dim=encoded_edge_dim,
-                    dropout=float(edge_encoder_dropout),
+        try:
+            module_edge_types = list(self.convs[0].convs.keys())
+        except Exception:
+            module_edge_types = list(et_list)
+        for edge_type in module_edge_types:
+            in_dim_et = int(raw_dims.get(edge_type, raw_edge_dim_scalar) or 0)
+            out_dim_et = int(encoded_dims.get(edge_type, encoded_edge_dim_scalar) or 0)
+            hidden_et = int(hidden_dims.get(edge_type, self.edge_encoder_hidden_dim) or 0)
+            dropout_et = float(dropouts.get(edge_type, edge_encoder_dropout) or 0.0)
+            kind_et = str(kinds.get(edge_type, "mlp") or "mlp")
+            if in_dim_et > 0 and out_dim_et > 0:
+                self.edge_attr_encoders[_edge_type_module_key(edge_type)] = _build_edge_encoder(
+                    kind=kind_et,
+                    in_dim=in_dim_et,
+                    hidden_dim=hidden_et,
+                    out_dim=out_dim_et,
+                    dropout=dropout_et,
                 )
 
     def _encode_edge_attr_dict(self, edge_attr_dict):
@@ -409,6 +719,8 @@ class HeteroEdgeAware(torch.nn.Module):
     """
     Alternative hetero GNN that swaps GATConv for TransformerConv while keeping
     the same output contract as HeteroGAT.
+
+    Soporta `edge_feature_dims` per-type (mismo contrato que HeteroGAT).
     """
 
     def __init__(
@@ -426,6 +738,7 @@ class HeteroEdgeAware(torch.nn.Module):
         use_residual=False,
         use_relation_self_loops=True,
         edge_types=None,
+        edge_feature_dims=None,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -433,10 +746,19 @@ class HeteroEdgeAware(torch.nn.Module):
         self.dropout = dropout
         self.use_checkpointing = use_checkpointing
         self.num_layers = num_layers
-        self.edge_feature_dim = edge_feature_dim
         self.use_residual = bool(use_residual)
         self.use_relation_self_loops = bool(use_relation_self_loops)
         self.edge_types_list = [tuple(et) for et in (edge_types if edge_types is not None else DEFAULT_EDGE_TYPES)]
+
+        self.edge_feature_dims_per_type = _resolve_per_type_int(
+            edge_feature_dims, self.edge_types_list, default=edge_feature_dim
+        )
+        try:
+            self.edge_feature_dim = int(
+                max(self.edge_feature_dims_per_type.values()) if self.edge_feature_dims_per_type else (edge_feature_dim or 0)
+            )
+        except Exception:
+            self.edge_feature_dim = int(edge_feature_dim or 0)
 
         self.convs = ModuleList()
         self.norms = ModuleList()
@@ -450,7 +772,7 @@ class HeteroEdgeAware(torch.nn.Module):
                     hidden_channels,
                     heads=num_heads,
                     dropout=dropout,
-                    edge_dim=edge_feature_dim,
+                    edge_dim=int(self.edge_feature_dims_per_type.get(et, edge_feature_dim) or 0),
                 )
                 for et in self.edge_types_list
             }

@@ -136,6 +136,7 @@ def _run_optuna_memory_check(tmp_path, monkeypatch, *, use_checkpointing: bool) 
         "metric": "F1",
         "threshold_beta": 1.0,
         "device": "cpu",
+        "gnn_variant": "gat_snapshot",
     }
 
     # Track RSS after each trial via Optuna callback.

@@ -423,7 +423,26 @@ def _build_gnn_model(
     use_relation_self_loops: bool = True,
     require_temporal_head: bool = False,
     edge_types=None,
+    edge_feature_dims=None,
+    edge_encoder_hidden_dims=None,
+    edge_encoded_dims=None,
+    edge_encoder_dropouts=None,
+    edge_encoder_kinds=None,
 ):
+    """
+    `edge_feature_dim` (scalar) sigue siendo el contrato legacy.
+    `edge_feature_dims` (dict {edge_type: int}) permite que cada relación tenga
+    su propio `in_dim` raw — necesario tras eliminar el zero-padding entre
+    aristas temporales y espaciales.
+
+    `edge_encoder_hidden_dims`, `edge_encoded_dims`, `edge_encoder_dropouts`
+    soportan el mismo contrato escalar-o-dict para hiperparámetros por tipo.
+
+    `edge_encoder_kinds` (string o dict {edge_type: kind}) selecciona la clase
+    del encoder por arista. Valores válidos: "mlp" (default), "mlp_residual",
+    "layernorm_mlp", "time2vec". Permite, p.ej., usar Time2Vec solo en la
+    arista temporal y LayerNormMLP en las espaciales.
+    """
     variant_cfg = _parse_gnn_variant(gnn_variant)
     model_kwargs = dict(
         in_channels=in_channels,
@@ -439,6 +458,7 @@ def _build_gnn_model(
         use_residual=bool(use_residual),
         use_relation_self_loops=bool(use_relation_self_loops),
         edge_types=tuple(tuple(et) for et in edge_types) if edge_types is not None else None,
+        edge_feature_dims=edge_feature_dims,
     )
 
     if variant_cfg["encoder_kind"] == "edge_aware":
@@ -446,11 +466,18 @@ def _build_gnn_model(
     elif variant_cfg["use_edge_mlp"]:
         raw_edge_dim = int(edge_feature_dim or 0)
         edge_hidden = max(8, raw_edge_dim * 2) if raw_edge_dim > 0 else 8
+        # Si `edge_encoded_dims` no se especifica, igualamos al raw por tipo
+        # (es el comportamiento histórico aplicado por relación).
+        default_encoded_dims = edge_feature_dims if edge_encoded_dims is None else edge_encoded_dims
         model = HeteroGATWithEdgeEncoder(
             **model_kwargs,
             edge_encoder_hidden_dim=edge_hidden,
             edge_encoded_dim=raw_edge_dim,
             edge_encoder_dropout=float(dropout) * 0.5,
+            edge_encoder_hidden_dims=edge_encoder_hidden_dims,
+            edge_encoded_dims=default_encoded_dims,
+            edge_encoder_dropouts=edge_encoder_dropouts,
+            edge_encoder_kinds=edge_encoder_kinds,
         )
     else:
         model = HeteroGAT(**model_kwargs)
@@ -744,21 +771,78 @@ def _gather_gat_models_listing() -> list[dict]:
     return out
 
 def _detect_edge_feature_dim(data, node_type: str = 'pm') -> int:
-    """Infer the dimensionality of edge attributes for the given node type."""
+    """Infer the maximum edge attribute width across relations. Mantiene el
+    contrato escalar legacy; para la versión por tipo usar
+    `_detect_edge_feature_dims`."""
+    best = 0
     try:
-        spatial_key = (node_type, 'spatial', node_type)
         if hasattr(data, 'edge_types'):
-            if spatial_key in data.edge_types:
-                edge_attr = getattr(data[spatial_key], 'edge_attr', None)
-                if edge_attr is not None:
-                    return int(edge_attr.shape[1])
             for edge_type in data.edge_types:
                 edge_attr = getattr(data[edge_type], 'edge_attr', None)
                 if edge_attr is not None:
-                    return int(edge_attr.shape[1])
+                    best = max(best, int(edge_attr.shape[1]))
     except Exception:
         pass
-    return 0
+    return int(best)
+
+
+def _detect_edge_feature_dims(data) -> dict:
+    """Per-edge-type raw `in_dim` map. Aristas sin `edge_attr` reportan 0."""
+    dims: dict = {}
+    if not hasattr(data, 'edge_types'):
+        return dims
+    for edge_type in data.edge_types:
+        attr = getattr(data[edge_type], 'edge_attr', None)
+        if attr is None:
+            dims[tuple(edge_type)] = 0
+        elif attr.dim() > 1:
+            dims[tuple(edge_type)] = int(attr.shape[1])
+        else:
+            dims[tuple(edge_type)] = 1
+    return dims
+
+
+def _parse_edge_encoder_per_type(spec) -> dict:
+    """Convert `edge_encoder_per_type` (que llega como JSON-string desde el
+    CSV o como dict desde Python) en cuatro mapas `{edge_type: value}` para
+    pasar a `_build_gnn_model` como `edge_encoder_hidden_dims`,
+    `edge_encoded_dims`, `edge_encoder_dropouts`, `edge_encoder_kinds`."""
+    if not spec:
+        return {}
+    if isinstance(spec, str):
+        try:
+            spec = json.loads(spec)
+        except Exception:
+            return {}
+    if not isinstance(spec, dict):
+        return {}
+    hidden_dims, encoded_dims, dropouts, kinds = {}, {}, {}, {}
+    for key, cfg in spec.items():
+        if not isinstance(cfg, dict):
+            continue
+        # Aceptar tanto tuple-keys como strings tipo "('pm', 'temporal', 'pm')".
+        parsed_key = key
+        if isinstance(key, str) and key.startswith("("):
+            try:
+                parts = [p.strip().strip("'").strip('"') for p in key.strip("()").split(",") if p.strip()]
+                if len(parts) == 3:
+                    parsed_key = tuple(parts)
+            except Exception:
+                parsed_key = key
+        if "hidden_dim" in cfg and cfg["hidden_dim"] is not None:
+            hidden_dims[parsed_key] = int(cfg["hidden_dim"])
+        if "encoded_dim" in cfg and cfg["encoded_dim"] is not None:
+            encoded_dims[parsed_key] = int(cfg["encoded_dim"])
+        if "dropout" in cfg and cfg["dropout"] is not None:
+            dropouts[parsed_key] = float(cfg["dropout"])
+        if "kind" in cfg and cfg["kind"] is not None:
+            kinds[parsed_key] = str(cfg["kind"]).strip().lower()
+    return {
+        "edge_encoder_hidden_dims": hidden_dims or None,
+        "edge_encoded_dims": encoded_dims or None,
+        "edge_encoder_dropouts": dropouts or None,
+        "edge_encoder_kinds": kinds or None,
+    }
 
 def _resolve_num_neighbors(value, default_value, edge_types) -> dict:
     """Return a NeighborLoader num_neighbors dict based on config/best_params."""
@@ -1578,10 +1662,12 @@ def run_gnn_anomaly_pipeline(loaded_obj):
     # Instanciar modelo con la arquitectura del modelo elegido
     num_classes = 2
     edge_feature_dim = _detect_edge_feature_dim(data, node_type='pm')
+    edge_feature_dims_per_type = _detect_edge_feature_dims(data)
     in_channels = data['pm'].x.shape[1]
     arch = chosen['arch']
     meta = chosen['meta']
     chosen_gnn_variant = meta.get('gnn_variant', GNN_VARIANT)
+    encoder_overrides = _parse_edge_encoder_per_type(meta.get('edge_encoder_per_type'))
     model = _build_gnn_model(
         in_channels=in_channels,
         hidden_channels=int(arch.get('hidden_channels') or meta.get('hidden_channels', 32)),
@@ -1601,6 +1687,8 @@ def run_gnn_anomaly_pipeline(loaded_obj):
         use_relation_self_loops=_safe_bool(meta.get("use_relation_self_loops"), True),
         require_temporal_head=_variant_has_temporal_head(chosen_gnn_variant),
         edge_types=tuple(data.edge_types) if hasattr(data, 'edge_types') else None,
+        edge_feature_dims=edge_feature_dims_per_type,
+        **encoder_overrides,
     )
 
     # Cargar pesos (elige el modelo correspondiente a la variante seleccionada)
@@ -3551,8 +3639,10 @@ def run_gat_training(
 
     # 4) Modelo y optimizador
     num_classes = len(torch.unique(data['pm'].y))
-    
+
     edge_feature_dim = _detect_edge_feature_dim(data, node_type='pm')
+    edge_feature_dims_per_type = _detect_edge_feature_dims(data)
+    encoder_overrides = _parse_edge_encoder_per_type(best_params.get('edge_encoder_per_type'))
 
     in_channels = data['pm'].x.shape[1]
     gnn_variant = best_params.get('gnn_variant', GNN_VARIANT)
@@ -3575,6 +3665,8 @@ def run_gat_training(
         use_relation_self_loops=_safe_bool(best_params.get("use_relation_self_loops"), True),
         require_temporal_head=_variant_has_temporal_head(gnn_variant),
         edge_types=tuple(data.edge_types) if hasattr(data, 'edge_types') else None,
+        edge_feature_dims=edge_feature_dims_per_type,
+        **encoder_overrides,
     )
     temporal_module = getattr(model, 'temporal_head', None)
 
@@ -5083,6 +5175,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
         # --- Construcción del Modelo ---
         num_classes = 2
         edge_feature_dim = _detect_edge_feature_dim(data, node_type='pm')
+        edge_feature_dims_per_type = _detect_edge_feature_dims(data)
         in_channels = data['pm'].x.shape[1]
 
         model = _build_gnn_model(
@@ -5104,6 +5197,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             use_relation_self_loops=use_relation_self_loops,
             require_temporal_head=_variant_has_temporal_head(gnn_variant),
             edge_types=tuple(data.edge_types) if hasattr(data, 'edge_types') else None,
+            edge_feature_dims=edge_feature_dims_per_type,
         )
         temporal_module = getattr(model, 'temporal_head', None)
 
@@ -5958,6 +6052,8 @@ def run_gat_testing(loaded_obj):
 
     print("▶️ Instanciando modelo GAT heterogéneo...")
     edge_feature_dim = _detect_edge_feature_dim(data, node_type='pm')
+    edge_feature_dims_per_type = _detect_edge_feature_dims(data)
+    encoder_overrides = _parse_edge_encoder_per_type(best_params.get('edge_encoder_per_type'))
 
     in_channels = data['pm'].x.shape[1]
     gnn_variant = best_params.get('gnn_variant', GNN_VARIANT)
@@ -5980,6 +6076,8 @@ def run_gat_testing(loaded_obj):
         use_relation_self_loops=_safe_bool(best_params.get("use_relation_self_loops"), True),
         require_temporal_head=_variant_has_temporal_head(gnn_variant),
         edge_types=tuple(data.edge_types) if hasattr(data, 'edge_types') else None,
+        edge_feature_dims=edge_feature_dims_per_type,
+        **encoder_overrides,
     )
 
     # 4. Cargar el estado del modelo entrenado

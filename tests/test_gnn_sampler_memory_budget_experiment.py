@@ -1,8 +1,12 @@
+import json
+
 import torch
 from torch_geometric.data import HeteroData
 
 from src import gnn_main
 from src.graph_builder_app import (
+    _coerce_optuna_neighbor_choices,
+    _default_optuna_neighbor_profiles,
     SAMPLER_CLUSTER_GCN_PROFILE_PRESETS,
     SAMPLER_GRAPHSAINT_PROFILE_PRESETS,
     _advance_batch_index_by_jump,
@@ -149,6 +153,34 @@ def test_highway_sampler_profile_presets_are_graph_specific():
         "highway_edge_stable": ("edge", 4096, 16, 1),
         "highway_rw_broad": ("random_walk", 8192, 12, 3),
     }
+
+
+def test_optuna_neighbor_profile_defaults_include_asymmetric():
+    profiles = _default_optuna_neighbor_profiles()
+    choices = _coerce_optuna_neighbor_choices(None, list(profiles.keys()))
+
+    assert "asymmetric" in profiles
+    assert "asymmetric" in choices
+    assert profiles["asymmetric"] == {
+        "temporal": [25, 25],
+        "spatial": [3, 3],
+        "spatial_back": [3, 3],
+    }
+
+
+def test_optuna_asymmetric_neighbor_profile_resolves_per_edge_type():
+    profile_json = json.dumps(_default_optuna_neighbor_profiles()["asymmetric"])
+    edge_types = [
+        ("pm", "temporal", "pm"),
+        ("pm", "spatial", "pm"),
+        ("pm", "spatial_back", "pm"),
+    ]
+
+    resolved = gnn_main._resolve_num_neighbors(profile_json, [15, 10], edge_types)
+
+    assert resolved[("pm", "temporal", "pm")] == [25, 25]
+    assert resolved[("pm", "spatial", "pm")] == [3, 3]
+    assert resolved[("pm", "spatial_back", "pm")] == [3, 3]
 
 
 def test_build_sampler_memory_loader_cluster_gcn_is_native():

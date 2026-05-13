@@ -37,11 +37,11 @@ class SectionDef:
 
 SECTIONS: tuple[SectionDef, ...] = (
     SectionDef("hero",                    "Inicio",                 "Home",                 "Resumen y guía",                  "Overview and guide",                  2100),
-    SectionDef("01_clustering",           "§ 1 · Clustering",       "§ 1 · Clustering",     "Agrupación de conductores",       "Driver behaviour grouping",           7600),
-    SectionDef("02_accident_prediction",  "§ 2 · Predicción",       "§ 2 · Prediction",     "Modelos supervisados",            "Supervised models",                   5400),
-    SectionDef("03_nlp_severity",         "§ 3 · NLP severidad",    "§ 3 · NLP severity",   "Réplica del estudio NLP",         "NLP study replication",               5200),
+    SectionDef("01_clustering",           "§ 1 · Clustering",       "§ 1 · Clustering",     "Agrupación de conductores",       "Driver behaviour grouping",          22000),
+    SectionDef("02_accident_prediction",  "§ 2 · Predicción",       "§ 2 · Prediction",     "Modelos supervisados",            "Supervised models",                  17000),
+    SectionDef("03_nlp_severity",         "§ 3 · NLP severidad",    "§ 3 · NLP severity",   "Modelado multimodal de severidad", "Multimodal severity modelling",       19000),
     SectionDef("04_drift_detection",      "§ 4 · Drift detection",  "§ 4 · Drift detection","Recalibración batch vs adaptiva", "Batch vs adaptive recalibration",     8800),
-    SectionDef("06_gnn_pipeline",         "§ 6 · Graph Neural Network", "§ 6 · Graph Neural Network", "Grafo espacio-temporal", "Spatio-temporal graph",               7600),
+    SectionDef("06_gnn_pipeline",         "§ 6 · Graph Neural Network", "§ 6 · Graph Neural Network", "Grafo espacio-temporal", "Spatio-temporal graph",              18000),
     SectionDef("07_mairl",                "§ 7 · MA-AIRL",          "§ 7 · MA-AIRL",        "Multi-agent adversarial IRL",     "Multi-agent adversarial IRL",         3500),
 )
 

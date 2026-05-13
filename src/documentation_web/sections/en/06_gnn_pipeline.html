@@ -34,142 +34,342 @@
 
     <h3 class="reveal">Conceptual map</h3>
     <ol class="reveal">
-      <li>Base data: gantries, flows and accidents (<code>src/utils.py</code>).</li>
-      <li>Feature engineering: snapshot/flow (<code>src/snapshot_pipeline.py</code>, <code>src/features.py</code>).</li>
-      <li>Manual / guided feature selection and persistence.</li>
-      <li>Graph: <code>pm</code> nodes, <code>temporal</code>/<code>spatial</code>/<code>st_fwd</code> edges and attributes.</li>
-      <li>Training: HeteroGAT + TemporalAggregator (optional).</li>
-      <li>Balancing: GraphSMOTE and/or ImGAGN.</li>
-      <li>Evaluation: F1, AUC, AUPRC, MCC and thresholds.</li>
-      <li>Artefacts: models, <code>_hparams.json</code> sidecars, augmented graphs and <code>gnn_history.jsonl</code>.</li>
+      <li><strong>Base data.</strong> Gantries, flows, and accidents are loaded and normalized through <code>src/utils.py</code>.</li>
+      <li><strong>Feature engineering.</strong> Snapshot and 5-minute flow features are generated from <code>src/snapshot_pipeline.py</code> and <code>src/features.py</code>.</li>
+      <li><strong>Feature selection.</strong> The UI supports manual/guided selection, persisted lists, and explicit control of <code>pm.x</code> dimensionality.</li>
+      <li><strong>Graph.</strong> The PyG object uses <code>pm</code> nodes, <code>temporal</code>, <code>spatial</code>, <code>st_fwd</code> relations, and edge attributes.</li>
+      <li><strong>Model.</strong> The base encoder is HeteroGAT; it can be combined with temporal heads and edge-aware variants.</li>
+      <li><strong>Balancing.</strong> GraphSMOTE adds nodes in embedding space and decodes them back to features; ImGAGN generates nodes adversarially.</li>
+      <li><strong>Evaluation.</strong> F1, F0.5, AUC, AUPRC, MCC, FAR, thresholds, and optional calibration are reported.</li>
+      <li><strong>Artifacts.</strong> Models, <code>_hparams.json</code> sidecars, augmented graphs, semantic hashes, and <code>gnn_history.jsonl</code> are persisted.</li>
     </ol>
+
+    <h3 class="reveal">Tab-by-tab pipeline</h3>
+    <table class="lab-table reveal">
+      <caption><strong>Operational UI contract.</strong> Each tab changes an auditable pipeline state.</caption>
+      <thead><tr><th>Tab</th><th>Main function</th><th>Output or methodological implication</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Events</strong></td><td><code>_render_events_tab</code></td><td>Loads accidents, normalizes timestamps/columns, preserves the event universe, and enables Black Spot reports.</td></tr>
+        <tr><td><strong>Feature Engineering</strong></td><td><code>_render_feature_engineering</code></td><td>Generates or loads <code>pm</code> features; temporal resolution is governed by <code>DT_MINUTES</code> and snapshot/flow configuration.</td></tr>
+        <tr><td><strong>Feature Explorer</strong></td><td><code>render_feature_explorer</code></td><td>Inspects outliers, descriptive statistics, and variable distributions before graph construction.</td></tr>
+        <tr><td><strong>Feature Selection</strong></td><td><code>_render_feature_selection_tab</code></td><td>Defines the GNN input space and the final dimensionality of <code>pm.x</code>.</td></tr>
+        <tr><td><strong>Graph</strong></td><td><code>_render_create_graph</code>, <code>_render_load_graph</code></td><td>Builds/loads <code>HeteroData</code>, creates purged masks, normalizes using train only, and saves <code>Resultados/highway_graph_*.pt</code>.</td></tr>
+        <tr><td><strong>Visual Graph</strong></td><td><code>render_visual_graph_tab</code></td><td>Supports topological QA: degrees, subgraphs, connectivity, and relation consistency.</td></tr>
+        <tr><td><strong>Network</strong></td><td><code>_render_network_tab</code></td><td>Sets architecture: <code>hidden_channels</code>, <code>num_heads</code>, <code>dropout</code>, <code>num_layers</code>, <code>aggr1/aggr2</code>, and checkpointing.</td></tr>
+        <tr><td><strong>Optuna</strong></td><td><code>_render_optuna_tab</code></td><td>Runs HPO and persists <code>optuna_hyperparams_*.csv</code> for later auto-selection.</td></tr>
+        <tr><td><strong>Balance</strong></td><td><code>_render_balance_tab</code></td><td>Creates balanced graphs with GraphSMOTE or ImGAGN; synthetic nodes are flagged with <code>is_synthetic</code>.</td></tr>
+        <tr><td><strong>Training</strong></td><td><code>_render_training_tab</code></td><td>Runs <code>run_gat_training</code>, validation-loss early stopping, and <code>BEST</code> checkpointing.</td></tr>
+        <tr><td><strong>Evaluation</strong></td><td><code>_render_evaluation_tab</code></td><td>Loads models, computes metrics, selects threshold, and calibrates probabilities when enabled.</td></tr>
+        <tr><td><strong>History / Experiments</strong></td><td><code>_render_history_tab</code>, <code>_render_gnn_experiments_tab</code></td><td>Registers runs, exports ZIP bundles, and enables reproducible experiment batches.</td></tr>
+      </tbody>
+    </table>
 
     <h3 class="reveal">Graph data model</h3>
-    <ul class="reveal">
-      <li><strong>Node</strong>: <code>pm</code> (gantry-minute), with <code>pm.y</code> and <code>pm.is_accident_pm</code>.</li>
-      <li><strong>Edges</strong>: <code>temporal</code> \(P_{i,t}\to P_{i,t+1}\); <code>spatial</code> \(P_{i,t}\to P_{i+1,t}\); <code>st_fwd</code> optional; <code>spatial_back</code> optional.</li>
-      <li><strong>Attributes</strong>: \( \Delta x \) between target and source; extras on <code>spatial</code> (gradients, shock, distance); <code>temporal</code> and <code>st_fwd</code> are zero-padded.</li>
-      <li><strong>Masks</strong>: <code>train/val/test_mask</code> with temporal cut and <code>sequence_mask</code>.</li>
-    </ul>
+    <p class="reveal">The Streamlit builder saves a <code>torch_geometric.data.HeteroData</code> graph. The primary node type is <code>pm</code>, interpreted as gantry-minute. Its central tensors are <code>pm.x</code>, <code>pm.y</code>, <code>pm.is_accident_pm</code>, <code>train_mask</code>, <code>val_mask</code>, <code>test_mask</code>, and <code>sequence_mask</code>. The <code>.pt</code> payload also persists <code>metadata</code>, <code>edge_config</code>, <code>normalization</code>, <code>sequence_index</code>, <code>sequence_config</code>, and <code>graph_hash</code>.</p>
 
-    <h3 class="reveal">HeteroGAT and variants</h3>
-    <p class="reveal">The base model is <code>src/gat_model.py::HeteroGAT</code>: <code>HeteroConv</code> layers with <code>GATConvSaveAlpha</code>, <code>aggr1</code> and <code>aggr2</code> aggregations, attentions captured under <code>XAI=1</code> used for \(L^2\) regularisation, batch-wise <code>edge_attr</code> validation and optional <em>gradient checkpointing</em>.</p>
-    <p class="reveal">Variant registration is controlled by <code>GNN_VARIANT</code> and <code>GNN_TEMPORAL_CACHE_STRATEGY</code>, materialised in <code>_build_gnn_model</code>, <code>_build_temporal_head_for_variant</code> and <code>_prime_temporal_cache_if_needed</code>. Registered variants:</p>
-    <ol class="reveal">
-      <li><code>gat_snapshot</code> (baseline).</li>
-      <li><code>gat_gru</code>, <code>gat_transformer</code>, <code>gat_attnpool</code> (temporal heads).</li>
-      <li><code>gat_edge_mlp</code>, <code>gat_edge_mlp_gru</code>, <code>gat_edge_mlp_transformer</code> (edge encoder + head).</li>
-      <li><code>gnn_edge_aware</code>, <code>gnn_edge_aware_gru</code>, <code>gnn_edge_aware_transformer</code> (<code>TransformerConv</code>).</li>
-    </ol>
+    <table class="lab-table reveal">
+      <caption><strong>Main relations.</strong> All connect <code>pm</code> nodes, but they encode different mechanisms.</caption>
+      <thead><tr><th>Relation</th><th>Definition</th><th>Semantics</th><th>Attributes</th></tr></thead>
+      <tbody>
+        <tr><td><code>temporal</code></td><td>\(P_{i,t}\to P_{i,t+1}\)</td><td>Local persistence at the same gantry.</td><td>\(\Delta x\) block; physical channels are zero-filled.</td></tr>
+        <tr><td><code>spatial</code></td><td>\(P_{i,t}\to P_{i+1,t}\)</td><td>Downstream propagation at the same timestamp.</td><td>\(\Delta x\), distance, gradients, shock-wave features, and congestion indicators.</td></tr>
+        <tr><td><code>st_fwd</code></td><td>\(P_{i,t}\to P_{i+1,t+1}\)</td><td>Experimental space-time propagation.</td><td>Gradients between the current gantry and next gantry in the next bin.</td></tr>
+        <tr><td><code>spatial_back</code></td><td>Reverse of <code>spatial</code></td><td>Spatial diffusion in the opposite direction when enabled.</td><td>Directional gradients are recomputed, not simply copied.</td></tr>
+      </tbody>
+    </table>
 
-    <h4 class="reveal">"Five minutes before" labelling</h4>
+    <p class="reveal">The first <code>edge_attr</code> block is the destination-source difference over selected delta columns. In Snapshot mode, the compact default tries to use <code>speed_mean</code>, <code>speed_harmonic</code>, <code>flow_total</code>, <code>slow_pct</code>, and <code>speed_std</code> when present; manual selections are preserved. The second block adds physical channels: distance, flow gradient, density gradient, speed gradient, shock-wave speed, shock indicator, and, in Snapshot mode, <code>slow_pct</code> gradient.</p>
+
+    <p class="reveal"><code>_build_raw_global_edge_features</code> separates feature families. In <em>classic</em> mode it preserves \(q=\texttt{flujo_total}\), \(k=\texttt{densidad_total}\), \(v=\texttt{v_armonica}\), and \(\pi=\texttt{prop_pesados}\). In <em>snapshot</em> mode it uses \(q=\texttt{flow_total}\), \(v=\texttt{speed_harmonic}\) with fallback to <code>speed_mean</code>, \(k=q/\max(v,\epsilon)\) as a density proxy, \(\pi=\texttt{mix_cat_2}\) with fallback to <code>flow_cat_2/flow_total</code>, and \(s=\texttt{slow_pct}\) with zero fallback.</p>
+
+    <h4 class="reveal">Temporal labeling and purged split</h4>
     <div class="lab-eq has-inspector reveal">
       <div class="formula">\[ \text{positive interval} = (t+\gamma,\ t+\gamma+H] \]</div>
       <div class="num">(6.1)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>γ</dt><dd>Guard band (anti-leakage): minutes between the observed bin and the start of the positive interval.</dd>
-          <dt>H</dt><dd>Horizon: length of the interval where the accident is considered.</dd>
+          <dt>γ</dt><dd>Guard band between the observed bin and the start of the positive window.</dd>
+          <dt>H</dt><dd>Future horizon where the accident is considered.</dd>
         </dl>
         <h5>Implementation</h5>
-        <span class="impl">src/graph.py · build_graph (SequenceConfig labelling)</span>
+        <span class="impl">src/graph_builder_app.py · _label_lookahead_minutes</span>
       </aside>
     </div>
-    <p class="reveal">Recommended protocol: <code>GUARD_BAND_MINUTES=5</code> and <code>HORIZON_MINUTES=5</code> (or 10–20 for windowed risk).</p>
+    <p class="reveal">For Snapshot features, <code>_label_lookahead_minutes</code> returns \(\gamma+H\); for flow features it returns the step \(\Delta t\). That value is the embargo used by the split. Cutoffs are computed from the full feature timeline, <code>df_pm["ts_min"].unique()</code>, not from accident timestamps, preventing target-conditioned splits.</p>
 
-    <div class="lab-callout sage reveal">
-      <div class="label">Temporal cache</div>
-      <p><em>incremental</em> keeps a per-batch cache (cheaper, sampler-dependent); <em>global_epoch</em> performs a full forward per epoch for consistent sequences. For scientific work <em>global_epoch</em> is recommended.</p>
-    </div>
-
-    <h3 class="reveal">Training and loss</h3>
-    <p class="reveal"><code>train_minibatch</code> in <code>src/train_pretrain.py</code> classifies on <code>pm</code> (first <code>batch_size</code> from <code>NeighborLoader</code>) with</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \mathcal{L} = \mathcal{L}_{\text{cls}} + \lambda_{\text{edge}}\mathcal{L}_{\text{edge}} + \lambda_{\text{att}}\mathcal{L}_{\text{att}} \]</div>
+      <div class="formula">\[
+      \begin{aligned}
+      \mathrm{train}(t) &\Leftrightarrow t+L\le c_{\mathrm{train}},\\
+      \mathrm{val}(t) &\Leftrightarrow c_{\mathrm{train}}\lt t\ \land\ t+L\le c_{\mathrm{val}},\\
+      \mathrm{test}(t) &\Leftrightarrow t>c_{\mathrm{val}}.
+      \end{aligned}
+      \]</div>
       <div class="num">(6.2)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>ℒ<sub>cls</sub></dt><dd>Main binary classification loss on <code>pm</code>.</dd>
-          <dt>ℒ<sub>edge</sub></dt><dd>Edge reconstruction with negative sampling (when <code>edge_gen</code> is on).</dd>
-          <dt>ℒ<sub>att</sub></dt><dd>L² regularisation over captured attentions (XAI=1).</dd>
-          <dt>λ<sub>edge</sub>, λ<sub>att</sub></dt><dd>Coefficients tuned by Optuna.</dd>
+          <dt>L</dt><dd><code>label_lookahead_minutes</code>, used as embargo.</dd>
+          <dt>c<sub>train</sub>, c<sub>val</sub></dt><dd>Temporal cutoffs computed from the full feature timeline.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/graph_builder_app.py · _compute_temporal_split_masks</span>
+      </aside>
+    </div>
+    <p class="reveal">The resulting masks are intersected with <code>sequence_mask</code>. If train, validation, or test becomes empty after embargo, graph construction stops and asks for a wider temporal range or different split ratios. Training, Optuna, Ray Tune, and Experiments reapply the contract with <code>_apply_temporal_split_to_graph</code>; legacy graphs without <code>label_lookahead_minutes</code> load with zero embargo and a warning.</p>
+
+    <h4 class="reveal">Normalization and reproducible payload</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ x'_{u,f}=\frac{x_{u,f}-\mu_f}{\sigma_f} \]</div>
+      <div class="num">(6.3)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>μ<sub>f</sub>, σ<sub>f</sub></dt><dd>Mean and standard deviation computed only from purged training nodes.</dd>
+        </dl>
+        <h5>Implementation</h5>
+        <span class="impl">src/graph_builder_app.py · _compute_normalization_stats_from_train</span>
+      </aside>
+    </div>
+    <p class="reveal">Physical edge channels are not derived from the normalized matrix: they use a raw copy captured before node z-scoring. Saved metadata records <code>schema_version</code>, feature configuration, selected segment, time filter, event source, <code>dt</code>, lookahead, cutoffs, split counts, seed, selected columns, normalization, <code>edge_config</code>, <code>edge_feature_sources</code>, and <code>graph_hash</code>. The hash is computed by <code>_compute_graph_semantic_hash</code> from features, labels, masks, indices, edges, attributes, and metadata.</p>
+
+    <h3 class="reveal">GNN architecture</h3>
+    <p class="reveal">The base model is <code>src/gat_model.py::HeteroGAT</code>: <code>HeteroConv</code> blocks with <code>GATConvSaveAlpha</code>, <code>aggr1</code> and <code>aggr2</code> aggregations, attention capture when <code>XAI=1</code>, batch-wise <code>edge_attr</code> validation, and optional <em>gradient checkpointing</em> to reduce memory through recomputation.</p>
+    <p class="reveal">Variant registration is controlled by <code>GNN_VARIANT</code> and <code>GNN_TEMPORAL_CACHE_STRATEGY</code> in <code>src/config.py</code>, and materialized through <code>_build_gnn_model</code>, <code>_build_temporal_head_for_variant</code>, and <code>_prime_temporal_cache_if_needed</code>. The design separates spatial encoder, temporal head, and cache protocol.</p>
+
+    <table class="lab-table reveal">
+      <caption><strong>Implemented variants.</strong> They share graph, temporal split, and <code>SequenceIndex</code>.</caption>
+      <thead><tr><th>Variant</th><th>Encoder</th><th>Temporal component</th><th>Recommended use</th></tr></thead>
+      <tbody>
+        <tr><td><code>gat_snapshot</code></td><td><code>HeteroGAT</code></td><td>None</td><td>Spatial baseline.</td></tr>
+        <tr><td><code>gat_gru</code></td><td><code>HeteroGAT</code></td><td><code>TemporalGRUHead</code></td><td>Compact spatio-temporal baseline.</td></tr>
+        <tr><td><code>gat_transformer</code></td><td><code>HeteroGAT</code></td><td><code>TemporalTransformerHead</code></td><td>Temporal dependency modeling via self-attention.</td></tr>
+        <tr><td><code>gat_attnpool</code></td><td><code>HeteroGAT</code></td><td><code>TemporalAttnPoolHead</code></td><td>Lightweight temporal ablation.</td></tr>
+        <tr><td><code>gat_edge_mlp</code></td><td><code>HeteroGATWithEdgeEncoder</code></td><td>None</td><td>Isolate the effect of encoding <code>edge_attr</code>.</td></tr>
+        <tr><td><code>gat_edge_mlp_gru</code> / <code>gat_edge_mlp_transformer</code></td><td>GAT + edge MLP</td><td>GRU or Transformer</td><td>Combine physical edges and temporal memory.</td></tr>
+        <tr><td><code>gnn_edge_aware</code></td><td><code>HeteroEdgeAware</code> with <code>TransformerConv</code></td><td>None</td><td>Attention explicitly conditioned on edges.</td></tr>
+        <tr><td><code>gnn_edge_aware_gru</code> / <code>gnn_edge_aware_transformer</code></td><td>Edge-aware</td><td>GRU or Transformer</td><td>Advanced experimental matrix.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="lab-callout sage reveal">
+      <div class="label">Temporal cache</div>
+      <p><code>incremental</code> keeps a batch-wise cache: cheaper, but more sampler-dependent. <code>global_epoch</code> performs one global forward per epoch with <code>compute_epoch_embeddings</code>; for scientific comparisons it is recommended because sequences share the same embedding reference.</p>
+    </div>
+    <p class="reveal">Temporal heads reuse <code>TemporalAggregator</code>, <code>update_cache(...)</code>, and <code>_build_sequence_batch(...)</code> to reconstruct \([B,L,D]\) tensors from <code>sequence_rows</code>. This allows switching among GRU, Transformer, or attention pooling without changing the <code>train_minibatch</code> contract or model <code>forward</code> signature.</p>
+    <p class="reveal">For rare events, scientific comparison should prioritize PR-AUC/AUPRC, then ROC-AUC as a reference, Recall@target FAR/FPR for operational constraints, and MCC for robustness under extreme asymmetry. Variants persist <code>gnn_variant</code> and <code>variant_tag</code> in checkpoints, sidecars, and Optuna CSVs to prevent mixing incompatible architectures.</p>
+
+    <h3 class="reveal">Training and optimization</h3>
+    <p class="reveal">The entry point is <code>src/gnn_main.py::run_gat_training</code>. The flow selects device with <code>get_auto_device()</code> (MPS, CUDA, or CPU), loads <code>loaded_obj["data"]</code>, may run automatic ImGAGN, detects GraphSMOTE and existing synthetics, loads or runs HPO, builds the model with <code>_build_gnn_model</code>, trains <code>z2x</code> decoders if GraphSMOTE is active, attaches <code>RelEdgeGen</code>, selects CrossEntropy/FocalLoss, uses <code>OneCycleLR</code>, and runs mini-batches with early stopping.</p>
+
+    <h4 class="reveal">Mini-batch loss</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathcal{L}=\mathcal{L}_{cls}+\lambda_H\mathcal{L}_{H}+\lambda_{edge}\mathcal{L}_{edge}+\lambda_{att}\mathcal{L}_{att} \]</div>
+      <div class="num">(6.4)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>ℒ<sub>cls</sub></dt><dd>Binary classification loss on seed <code>pm</code> nodes.</dd>
+          <dt>ℒ<sub>H</sub></dt><dd>Probability entropy regularizer governed by <code>lambda_H</code>.</dd>
+          <dt>ℒ<sub>edge</sub></dt><dd>Edge reconstruction with real positives and sampled negatives.</dd>
+          <dt>ℒ<sub>att</sub></dt><dd>L² regularization on attentions captured with <code>XAI=1</code>.</dd>
         </dl>
         <h5>Implementation</h5>
         <span class="impl">src/train_pretrain.py · train_minibatch</span>
       </aside>
     </div>
-    <p class="reveal">\(\mathcal{L}_{\text{edge}}\) is reconstruction with negative sampling (if <code>edge_gen</code> is set). \(\mathcal{L}_{\text{att}}\) is \(L^2\) over attentions when <code>XAI=1</code>. The loop uses gradient accumulation (<code>accumulation_steps=2</code>), <code>grad_clip</code>, <code>OneCycleLR</code> and AMP on CUDA.</p>
-    <p class="reveal">Gradient accumulation now scales only the backward pass: <code>loss_for_backward = raw_loss / accumulation_steps</code>. Reported <code>train_loss</code> and batch events aggregate the unscaled <code>raw_loss</code>, so the training-loss curve remains comparable when the accumulation factor changes.</p>
+    <p class="reveal">Gradient accumulation scales only the backward pass: <code>loss_for_backward = raw_loss / accumulation_steps</code>. Live events and <code>train_loss</code> aggregate unscaled <code>raw_loss</code>, so the reported curve remains comparable when <code>accumulation_steps</code> changes. The loop also uses <code>grad_clip</code> and AMP on CUDA.</p>
 
     <h4 class="reveal">Validation-loss monitor and BEST checkpoint</h4>
-    <p class="reveal">Final training in <code>Graph Neural Networks &gt; Training</code> selects <code>BEST</code> and triggers early stopping by minimum validation loss. F1, F0.5, AUPRC, FAR and MCC remain diagnostic metrics for audit, threshold analysis and operational reporting, but they no longer reset patience or decide the final checkpoint.</p>
+    <p class="reveal">Final training in <code>Graph Neural Networks &gt; Training</code> selects <code>BEST</code> by minimum validation loss. F1, F0.5, AUPRC, FAR, and MCC remain diagnostic metrics for audit and threshold analysis, but they no longer reset patience or decide the final checkpoint.</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \mathcal{L}_{\text{val}}^{(e)} = \frac{1}{Z_V}\sum_{i\in V}\ell(f_{\theta_e}(x_i,G), y_i) \]</div>
-      <div class="num">(6.3)</div>
+      <div class="formula">\[
+      \mathcal{L}_{val}^{(e)}
+      =
+      \frac{1}{Z_V}\sum_{i\in V}\ell(f_{\theta_e}(x_i,G),y_i)
+      \]</div>
+      <div class="num">(6.5)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>V</dt><dd>Validation nodes from <code>val_mask</code>; training aborts if this split is absent or empty.</dd>
-          <dt>ℓ</dt><dd>The active criterion passed to <code>test(..., criterion=criterion)</code>.</dd>
-          <dt>Z<sub>V</sub></dt><dd>Valid-node count, or effective class-weight denominator for weighted cross entropy.</dd>
+          <dt>V</dt><dd>Validation nodes from <code>val_mask</code>.</dd>
+          <dt>ℓ</dt><dd>Active criterion passed to <code>test(..., criterion=criterion)</code>.</dd>
+          <dt>Z<sub>V</sub></dt><dd>Valid-node count or effective class-weight denominator.</dd>
         </dl>
         <h5>Implementation</h5>
         <span class="impl">src/gnn_main.py · _update_val_loss_monitor</span>
       </aside>
     </div>
-    <p class="reveal">A new best epoch requires <code>best_val_loss - val_loss &gt; early_stop_min_delta</code>. Otherwise <code>patience_counter</code> increases, and training stops once it reaches <code>early_stop_patience</code>. The sidecar records <code>monitor_metric="val_loss"</code>, <code>monitor_mode="min"</code>, <code>best_val_loss</code>, <code>best_epoch</code> and the classification metrics measured at that same epoch.</p>
-    <div class="lab-callout sage reveal">
-      <div class="label">Selection contract</div>
-      <p>Optuna/HPO keeps its configured <code>objective_metric</code>. The loss-based monitor applies to the final Training tab only, where it acts as a held-out empirical-risk criterion. Older resume checkpoints without <code>best_val_loss</code> restore weights and optimizer state but restart the new monitor from infinity with zero patience.</p>
-    </div>
-
-    <h3 class="reveal">GraphSMOTE</h3>
-    <ol class="reveal">
-      <li>Per-minibatch \(\ell^2\)-normalised embeddings.</li>
-      <li>SMOTE in embedding space: \( \mathbf{z}_{\text{syn}} = (1-\alpha)\mathbf{z}_i + \alpha\mathbf{z}_j \), \(\alpha\sim U(0,1)\).</li>
-      <li>Per-node-type \(z\to x\) decoders with SmoothL1/MSE and early stopping.</li>
-      <li>Insertion of synthetic nodes respecting <code>train/val/test_mask</code>.</li>
-      <li>Edge generation with <code>RelEdgeGen</code>; real candidates via <code>GRAPHSMOTE_CONECT</code> and direction via <code>BIDIRECCTION</code>.</li>
-    </ol>
-
-    <h3 class="reveal">ImGAGN</h3>
-    <p class="reveal">Generates synthetic nodes as convex combinations of training minority nodes. Defines the synthetic count by:</p>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \lambda_1 = \frac{n_{\min}+n_g}{n_{\text{maj}}}\ \Rightarrow\ n_g = \max(0,\ \lambda_1 n_{\text{maj}} - n_{\min}) \]</div>
-      <div class="num">(6.4)</div>
+      <div class="formula">\[
+      b_0=+\infty,\qquad
+      \mathrm{isBest}_e \Longleftrightarrow
+      (b_{e-1}-\mathcal{L}_{val}^{(e)})>\delta
+      \]</div>
+      <div class="num">(6.6)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>n<sub>min</sub>, n<sub>maj</sub></dt><dd>Real minority and majority training nodes.</dd>
-          <dt>n<sub>g</sub></dt><dd>Synthetic nodes to generate to reach target ratio λ₁.</dd>
-          <dt>λ<sub>1</sub></dt><dd>Final target minority/majority ratio (configurable).</dd>
+          <dt>b<sub>e-1</sub></dt><dd>Previous <code>best_val_loss</code>.</dd>
+          <dt>δ</dt><dd><code>early_stop_min_delta</code>.</dd>
         </dl>
         <h5>Implementation</h5>
-        <span class="impl">src/imgagn.py · train_imgagn</span>
+        <span class="impl">src/gnn_main.py · monitor_metric="val_loss"</span>
       </aside>
     </div>
-    <p class="reveal">The generator produces weights \(T=\mathrm{softmax}(G(z))\) and features \(X_g = T X_{\min}\). The GCN discriminator combines two heads (real/fake and minority/majority) plus <code>_mm_separation</code>. Per epoch: noise sampling → synthetic build without gradients → discriminator training for \(d_{\text{steps}}\) minibatches → recompute \(X_g\) with gradients and optimise \(G\) minimising \(\mathcal{L}_G = \mathcal{L}_{rf} + \mathcal{L}_{mi} + \mathcal{L}_{di}\).</p>
-
-    <h3 class="reveal">Optuna and evaluation</h3>
-    <p class="reveal"><code>objective</code> maximises validation F0.5 (precision-priority), searches <code>hidden_channels</code>, <code>num_heads</code>, <code>dropout</code>, <code>num_layers</code> and <code>aggr1/aggr2</code>. With GraphSMOTE it tunes <code>smote_k</code>, <code>target_pos_ratio</code>, <code>smote_every_n_epochs</code> and <code>lambda_edge</code>. Without GraphSMOTE it uses <code>FocalLoss</code> with <code>focal_alpha</code> and <code>focal_gamma</code>. Seed sampling can be re-sampled per epoch, fixed per trial, or load the full graph.</p>
-    <p class="reveal">Evaluation: F1, AUC, AUPRC, MCC; threshold \(\tau\) chosen with <code>pick_tau_fbeta</code>; optional Platt calibration (<code>AUTOCALIBRATE_PROBS</code>); <code>_hparams.json</code> sidecar and graph hash (<code>_calculate_graph_hash</code>) for traceability.</p>
-
-    <div class="lab-callout rust reveal">
-      <div class="label">Audited risks</div>
-      <p>Manual balancing leakage (mitigated: <code>run_graphsmote</code> restricts embeddings and minority pool to <code>train_mask</code>); <code>BIDIRECCTION</code> dependence in message diffusion; configurable <code>accumulation_steps</code> requires per-hardware tuning; using GraphSMOTE/ImGAGN disables class weights and validation metrics must be monitored.</p>
-    </div>
-
+    <p class="reveal">If validation loss improves, patience resets and <code>gat_model_BEST*.pt</code> is written; otherwise <code>patience_counter</code> increases until <code>early_stop_patience</code>. The sidecar records <code>monitor_metric="val_loss"</code>, <code>monitor_mode="min"</code>, <code>best_val_loss</code>, <code>best_epoch</code>, and diagnostic metrics from that epoch. On resume, checkpoints with <code>best_val_loss</code> restore monitor and patience; older checkpoints restore weights/optimizer but restart the monitor from \(+\infty\).</p>
     <div class="lab-callout sage reveal">
-      <div class="label">Coming soon · Graph visualisation</div>
-      <p>This section will include an interactive gantry-minute graph explorer with minority-node highlighting, a GraphSMOTE vs ImGAGN comparator, and a per-layer attention viewer loaded from the XAI sidecars.</p>
+      <div class="label">Selection contract</div>
+      <p>Optuna keeps its configured <code>objective_metric</code>. Only final training uses validation loss for early stopping and <code>BEST</code>. This separates hyperparameter search, model selection, and operational reporting.</p>
     </div>
+
+    <h3 class="reveal">GraphSMOTE: modifications to the original architecture</h3>
+    <p class="reveal"><strong>Main module:</strong> <code>src/graphsmote.py</code>. <strong>Integration:</strong> <code>src/gnn_main.py</code>, <code>src/train_pretrain.py</code>, <code>src/graph_builder_app.py</code>, and <code>src/config.py</code>. Zhao, Zhang, and Wang formulate GraphSMOTE for transductive semi-supervised classification on a homogeneous graph \(G=\{V,A,F\}\), with one adjacency matrix \(A\), node features \(F\), a GraphSAGE extractor, embedding-space SMOTE, a bilinear edge generator, and loss \(L_{node}+\lambda L_{edge}\). The local pipeline requires re-specification because it operates on a temporal, relational gantry-minute graph with physical edge attributes, purged chronological splits, and extremely low positive prevalence.</p>
+
+    <h4 class="reveal">Change 1 · From homogeneous graph to <code>HeteroData</code></h4>
+    <p class="reveal">The original formulation operates on \(A\in\mathbb{R}^{n\times n}\). Here, typed <code>pm</code>\(\to\)<code>pm</code> relations are preserved: <code>spatial</code>, <code>temporal</code>, <code>st_fwd</code>, and, when enabled, <code>spatial_back</code>. Therefore <code>RelEdgeGen</code> does not learn one global \(S\), but one matrix \(S_r\) per relation.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ s_r(u,v)=\mathbf{z}_u^\top S_r\mathbf{z}_v,\qquad r=(\texttt{src},\texttt{rel},\texttt{dst}) \]</div>
+      <div class="num">(6.7)</div>
+      <aside class="eq-inspector">
+        <h5>Rationale</h5>
+        <p>A temporal edge and a downstream spatial edge encode different causal mechanisms; sharing \(S\) would mix semantics.</p>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Change 2 · Heterogeneous and temporal extractor</h4>
+    <p class="reveal">GraphSMOTE is no longer tied to fixed GraphSAGE. It uses the active GNN variant: <code>HeteroGAT</code>, <code>HeteroGATWithEdgeEncoder</code>, <code>HeteroEdgeAware</code>, and GRU/Transformer/attention-pooling heads. Embeddings come from <code>get_embeddings_minibatch</code> or <code>compute_train_embeddings</code>, pass <code>edge_attr_dict</code>, and are node-wise \(\ell_2\)-normalized, giving k-NN and decoders a spherical geometry.</p>
+
+    <h4 class="reveal">Change 3 · Training-only SMOTE</h4>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathbf{z}_{syn}=(1-\alpha)\mathbf{z}_i+\alpha\mathbf{z}_j,\qquad \alpha\sim U(0,1) \]</div>
+      <div class="num">(6.8)</div>
+      <aside class="eq-inspector">
+        <h5>Local restriction</h5>
+        <p>Nodes \(i,j\) must belong to the <code>train_mask</code> minority pool.</p>
+      </aside>
+    </div>
+    <p class="reveal">The interpolation preserves the paper equation, but the eligible set is restricted to <code>train_mask</code>. <code>compute_train_embeddings</code> is used during training, and <code>run_graphsmote</code> also filters manual balancing. Validation and test never participate in k-NN or synthesis, preventing temporal leakage under purged chronological masks.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ n_{new}=\max\{0,\lceil r\,N_{train}\rceil-n_+\} \]</div>
+      <div class="num">(6.9)</div>
+      <aside class="eq-inspector">
+        <h5>Variables</h5>
+        <dl>
+          <dt>r</dt><dd><code>TARGET_POS_RATIO</code> or <code>target_pos_ratio</code>.</dd>
+          <dt>N<sub>train</sub></dt><dd>Training nodes.</dd>
+          <dt>n<sub>+</sub></dt><dd>Real positive training nodes.</dd>
+        </dl>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Change 4 · \(z\to x\) decoders</h4>
+    <p class="reveal">The paper classifies directly in \(\tilde{H}\). The local pipeline requires a PyG graph with <code>pm.x</code>; therefore <code>Z2XDecoders</code> was added, one MLP per node type reconstructing features from synthetic embeddings.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathbf{x}_{syn}=f_{\tau}(\mathbf{z}_{syn}) \]</div>
+      <div class="num">(6.10)</div>
+      <aside class="eq-inspector">
+        <h5>Training</h5>
+        <p><code>train_z2x_decoders</code> uses SmoothL1/MSE, validation, early stopping, exclusion of <code>is_synthetic</code>, and minority mixup in \(z\) and \(x\).</p>
+      </aside>
+    </div>
+
+    <h4 class="reveal">Change 5 · Synthetic edge attributes</h4>
+    <p class="reveal">Original GraphSMOTE predicts only link existence; here every edge may carry <code>edge_attr</code>. Two paths were added: <code>RelEdgeAttrDecoder</code>, learning \([\mathbf{z}_{src}\Vert\mathbf{z}_{dst}]\mapsto\mathbf{e}_{src,dst}\) from real training edges, and a deterministic fallback \(\Delta x=x_{dst}-x_{src}\), restricted by <code>delta_feature_idx</code> when available and truncated/padded to the real dimensionality. <code>_safe_clean_edges</code> applies <code>remove_self_loops</code> and <code>coalesce</code> while preserving attributes if they remain aligned.</p>
+
+    <h4 class="reveal">Change 6 · Top-K connectivity and direction</h4>
+    <p class="reveal">The paper proposes a global threshold \(\eta\) or soft edges over \(E_{v',u}\). For gantry-minute graphs this is quadratic and hard to audit. The implementation predicts <em>top-K</em> neighbors and restricts candidates through <code>GRAPHSMOTE_CONECT</code>: value 1 uses real candidates inside <code>train_mask</code>; value 0 uses one-hop neighbors of real training accidents. <code>BIDIRECCTION=1</code> adds real\(\leftrightarrow\)synthetic edges; <code>BIDIRECCTION=0</code> adds only real\(\to\)synthetic edges. The directed default avoids synthetic nodes injecting artificial evidence into real validation/test nodes.</p>
+
+    <h4 class="reveal">Change 7 · Offline and online modes</h4>
+    <p class="reveal"><code>augment_graph_offline_once</code> creates one augmented graph; <code>refresh_synthetics_online</code> always returns to the real base graph and regenerates every <code>SMOTE_EVERY_N_EPOCHS</code>; <code>none</code> disables augmentation. Online mode replaces previous synthetics instead of accumulating them, avoiding uncontrolled growth, distribution drift, and training on samples produced by older model states.</p>
+
+    <h4 class="reveal">Change 8 · Loss, class weights, and diagnostics</h4>
+    <p class="reveal"><code>train_minibatch</code> trains <code>RelEdgeGen</code> with real positive edges from the batch and sampled negatives. <code>pretrain_edge_generator</code> uses BCE and reports AUC/AP by relation. When GraphSMOTE is active, class weights and <code>focal_alpha</code> are disabled to avoid correcting imbalance twice; without GraphSMOTE, <code>CrossEntropyLoss</code> uses tempered weights \(\sqrt{1/n_c}\), more stable than \(1/n_c\) under near-zero prevalence.</p>
+
+    <h4 class="reveal">Change 9 · Traceability</h4>
+    <p class="reveal">Synthetics are appended to <code>pm.x</code> and <code>pm.y</code>, added only to <code>train_mask</code>, excluded from <code>val_mask</code> and <code>test_mask</code>, marked with <code>is_synthetic=True</code>, and marked <code>is_accident_pm=False</code>. The last flag separates a positive synthetic training sample from an observed crash. The pipeline persists <code>z2x</code> decoders, <code>edge_gen_auc.json</code>, augmented graphs, hparams tagged with <code>_GraphSMOTE</code>, <code>graph_hash</code>, and synthetic counts in TensorBoard/Streamlit.</p>
+
+    <h3 class="reveal">ImGAGN: adversarial generation</h3>
+    <p class="reveal"><strong>Module:</strong> <code>src/imgagn.py</code>. ImGAGN homogenizes <code>HeteroData</code> toward target <code>pm</code>, preserving <code>edge_attr</code> and <code>delta_feature_idx</code> when present, and generates synthetic nodes as convex combinations of minority training nodes.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+      \lambda_1=\frac{n_{\min}+n_g}{n_{\mathrm{maj}}}
+      \quad\Rightarrow\quad
+      n_g=\max(0,\lambda_1 n_{\mathrm{maj}}-n_{\min})
+      \]</div>
+      <div class="num">(6.11)</div>
+      <aside class="eq-inspector">
+        <h5>Scale control</h5>
+        <p><code>max_new_nodes</code> caps \(n_g\) to avoid OOM.</p>
+      </aside>
+    </div>
+    <p class="reveal"><code>ImGAGNGenerator</code> receives noise \(\mathbf{z}\sim\mathcal{N}(0,I)\), produces logits over minority nodes, computes \(T=\mathrm{softmax}(G(z))\), and synthetic features \(X_g=TX_{\min}\). Edges are created by top-K links to real minority nodes. <code>ImGAGNDiscriminator</code> combines a real/fake head, a minority/majority head, and <code>_mm_separation</code> to push minority and majority means apart.</p>
+    <p class="reveal">Each epoch samples noise, builds synthetics without gradients, trains the discriminator for <code>d_steps</code> mini-batches, recomputes \(X_g\) with gradients, and optimizes the generator.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathcal{L}_G=\mathcal{L}_{rf}+\mathcal{L}_{mi}+\mathcal{L}_{di} \]</div>
+      <div class="num">(6.12)</div>
+      <aside class="eq-inspector">
+        <h5>Terms</h5>
+        <dl>
+          <dt>ℒ<sub>rf</sub></dt><dd>Pushes synthetics toward real.</dd>
+          <dt>ℒ<sub>mi</sub></dt><dd>Pushes synthetics toward minority.</dd>
+          <dt>ℒ<sub>di</sub></dt><dd>Pulls embeddings toward minority centroids.</dd>
+        </dl>
+      </aside>
+    </div>
+    <p class="reveal">Scalability uses <code>NeighborLoader</code> when available and falls back to full-batch otherwise. The final rebuilt graph returns <code>x_aug</code>, <code>edge_index_aug</code>, <code>edge_attr_aug</code>, and the generated-node block.</p>
+
+    <h3 class="reveal">Optuna, evaluation, and artifacts</h3>
+    <p class="reveal"><code>src/gnn_main.py::objective</code> maximizes validation F0.5, prioritizing precision. The space includes <code>hidden_channels</code>, <code>num_heads</code>, <code>dropout</code>, <code>num_layers</code>, <code>aggr1/aggr2</code>, and Adam/AdamW/RAdam optimizers. With GraphSMOTE it adds <code>smote_k</code>, <code>target_pos_ratio</code>, <code>smote_every_n_epochs</code>, and <code>lambda_edge</code>; without GraphSMOTE it searches <code>focal_alpha</code> and <code>focal_gamma</code>.</p>
+    <ul class="reveal">
+      <li><strong>Seed sampling.</strong> It may resample seeds per epoch, fix one subset per trial, or load the full graph into memory with <code>sample_train_nodes=0</code> and <code>sample_val_nodes=0</code>.</li>
+      <li><strong>Evaluation.</strong> <code>test</code> computes loss when a criterion is supplied, plus F1, AUC, AUPRC, MCC, and confusion matrix.</li>
+      <li><strong>Threshold.</strong> <code>pick_tau_fbeta</code> searches \(\tau\) on validation.</li>
+      <li><strong>Calibration.</strong> <code>AUTOCALIBRATE_PROBS</code> enables Platt scaling.</li>
+      <li><strong>Persistence.</strong> <code>gat_model_BEST*.pt</code>, <code>GraphSMOTE_embeddings_model*.pt</code>, <code>_hparams.json</code>, hashes, and split metadata are saved.</li>
+    </ul>
+
+    <h3 class="reveal">Technical audit</h3>
+    <div class="lab-callout sage reveal">
+      <div class="label">Implemented strengths</div>
+      <ul>
+        <li>Purged temporal split from the full feature timeline, not from positive timestamps.</li>
+        <li>Normalization estimated only on purged training nodes.</li>
+        <li>Physical edge channels computed from raw traffic magnitudes before z-scoring.</li>
+        <li>Payloads with self-contained metadata and semantic hash.</li>
+        <li>GraphSMOTE uses train embeddings and preserves synthetic-node traceability.</li>
+        <li><code>NeighborLoader</code>, cleaning/coalesce, and sidecars reduce operational risk and improve reproducibility.</li>
+        <li><code>BEST</code> checkpoint selected by validation loss, separated from threshold-dependent metrics.</li>
+      </ul>
+    </div>
+    <div class="lab-callout rust reveal">
+      <div class="label">Critical risks</div>
+      <ul>
+        <li>Legacy graphs without <code>label_lookahead_minutes</code> use zero embargo on re-split; rebuild them for strict evaluation.</li>
+        <li>Short temporal ranges may empty train/val/test under strict embargo.</li>
+        <li>The strict contract documented here applies to the Streamlit builder; <code>src/graph.py</code> should be audited separately if used as a paper-grade generator.</li>
+        <li><code>BIDIRECCTION</code> changes message diffusion and must be reported in comparisons.</li>
+        <li><code>val_loss</code> is comparable only when split, criterion, weights, variant, and <code>graph_hash</code> are fixed.</li>
+      </ul>
+    </div>
+
+    <h3 class="reveal">Recommendations and references</h3>
+    <ol class="reveal">
+      <li><strong>Implemented.</strong> Use the full feature timeline and label-window embargo for <code>train/val/test</code>.</li>
+      <li><strong>Implemented.</strong> Compute z-score only with purged train and edge channels from raw traffic.</li>
+      <li><strong>Implemented.</strong> Persist reproducibility metadata and <code>graph_hash</code> in the <code>.pt</code> payload.</li>
+      <li><strong>Implemented.</strong> Restrict manual GraphSMOTE to <code>train_mask</code>.</li>
+      <li><strong>Implemented.</strong> Expose <code>accumulation_steps</code> and select <code>BEST</code> by <code>val_loss</code>.</li>
+      <li><strong>Pending/decision.</strong> Keep <code>BIDIRECCTION</code> unchanged for now, but evaluate its AUPRC/F1 impact if changed.</li>
+      <li><strong>Pending/decision.</strong> Decide whether <code>src/graph.py</code> should migrate to the Streamlit builder's strict contract.</li>
+    </ol>
+    <p class="reveal"><strong>Key files:</strong> <code>src/graph_builder_app.py</code>, <code>src/graph.py</code>, <code>src/gat_model.py</code>, <code>src/temporal_head.py</code>, <code>src/temporal_heads.py</code>, <code>src/gnn_main.py</code>, <code>src/train_pretrain.py</code>, <code>src/graphsmote.py</code>, <code>src/imgagn.py</code>, <code>src/config.py</code>. <strong>Tests:</strong> <code>tests/test_gnn_pipeline.py</code> and <code>tests/test_gnn_training.py</code>.</p>
 
   </section>
 
   <footer class="lab-coda">
-    <span>Chapter § 6 · 4 equations · 4 callouts</span>
+    <span>Chapter § 6 · 12 equations · 2 tables · 4 callouts</span>
     <span>Compiled from <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/gnn_pipeline_audit_en.tex</code></span>
   </footer>
 
@@ -179,8 +379,9 @@
   <div class="pinned">
     <span class="label">Gantry-minute</span>
     <p>Graph nodes are not gantries but <em>(gantry, minute)</em>: each temporal bin is a distinct node. This models evolution without external recurrent networks.</p>
-    <p><strong>Guard band.</strong> Separates the observed bin from the positive interval to prevent leakage: the model must not see the accident in its own features.</p>
-    <p><strong>Balancing.</strong> GraphSMOTE interpolates in embedding space; ImGAGN synthesises via a GAN with a dual GCN discriminator.</p>
+    <p><strong>Embargo.</strong> The purged split uses label lookahead to prevent validation/test from contaminating train.</p>
+    <p><strong>Balancing.</strong> GraphSMOTE interpolates in embeddings and returns to <code style="font-family:var(--font-mono);font-size:11.5px;">pm.x</code>; ImGAGN uses generator/discriminator training.</p>
+    <p><strong>Selection.</strong> The final <code style="font-family:var(--font-mono);font-size:11.5px;">BEST</code> checkpoint is decided by <code style="font-family:var(--font-mono);font-size:11.5px;">val_loss</code>, not F1/F0.5.</p>
   </div>
 </aside>
 

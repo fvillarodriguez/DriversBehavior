@@ -133,6 +133,10 @@ HISTORY_PATH = Path(RESULTADOS_DIR) / "gnn_history.jsonl"
 GNN_OPTUNA_LIVE_DIR = Path(RESULTADOS_DIR) / "gnn_optuna_live"
 GNN_EVAL_LIVE_DIR = Path(RESULTADOS_DIR) / "gnn_eval_live"
 GNN_NETWORK_LIBRARY_DIR = Path(RESULTADOS_DIR) / "gnn_network_architectures"
+# Copia estable de la última configuración guardada desde el tab Network. Los
+# `network_config_<timestamp>.json` quedan como historial; este archivo es el
+# que se relee al volver a abrir la app para restaurar la selección del usuario.
+GNN_NETWORK_CONFIG_LATEST_PATH = Path(RESULTADOS_DIR) / "network_config_latest.json"
 GNN_LR_SCHEDULER_LABELS: Dict[str, str] = {
     "one_cycle": "OneCycleLR",
     "cosine_warm_restarts": "CosineAnnealingWarmRestarts",
@@ -2318,14 +2322,173 @@ def _list_event_files() -> list:
 
 
 def _infer_edge_feature_dim(graph_data: HeteroData) -> int:
+    """Maximum raw feature dim across edge types (compat: legacy callers usaban
+    un único escalar). Para el dim por tipo usar `_infer_edge_feature_dims`."""
+    best = 0
     for edge_type in graph_data.edge_types:
         store = graph_data[edge_type]
         if hasattr(store, "edge_attr") and store.edge_attr is not None:
             edge_attr = store.edge_attr
             if edge_attr.dim() > 1:
-                return int(edge_attr.shape[1])
-            return 1
-    return 0
+                best = max(best, int(edge_attr.shape[1]))
+            else:
+                best = max(best, 1)
+    return int(best)
+
+
+def _infer_edge_feature_dims(
+    graph_data: HeteroData,
+) -> Dict[Tuple[str, str, str], int]:
+    """Return `{edge_type: raw_feature_dim}` for each relation in the graph.
+    Edge types sin `edge_attr` o vacías reportan 0."""
+    dims: Dict[Tuple[str, str, str], int] = {}
+    for edge_type in graph_data.edge_types:
+        store = graph_data[edge_type]
+        attr = getattr(store, "edge_attr", None)
+        if attr is None:
+            dims[tuple(edge_type)] = 0
+            continue
+        if attr.dim() > 1:
+            dims[tuple(edge_type)] = int(attr.shape[1])
+        else:
+            dims[tuple(edge_type)] = 1
+    return dims
+
+
+def _infer_edge_encoder_kinds_from_state_dict(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+) -> Dict[Tuple[str, str, str], str]:
+    """Detecta el *tipo* de encoder por arista mirando qué parámetros existen:
+
+    - `time2vec`     → `edge_attr_encoders.<key>.linear_w` (Parameter 1-d).
+    - `layernorm_mlp`→ `edge_attr_encoders.<key>.norm.weight` (LayerNorm).
+    - `mlp_residual` → `edge_attr_encoders.<key>.skip.weight` (Linear skip).
+    - `mlp`          → cae si solo aparece `edge_attr_encoders.<key>.net.0.weight`.
+
+    Si el checkpoint no es de un `HeteroGATWithEdgeEncoder`, devuelve {}.
+    """
+    if not isinstance(state_dict, dict):
+        return {}
+    keys = list(state_dict.keys())
+    detected: Dict[Tuple[str, str, str], str] = {}
+    enc_keys: set = set()
+    for key in keys:
+        if not key.startswith("edge_attr_encoders."):
+            continue
+        try:
+            enc_key = key.split(".")[1]
+        except IndexError:
+            continue
+        et = _parse_checkpoint_edge_type_key(enc_key)
+        if et is None:
+            continue
+        enc_keys.add((enc_key, et))
+    for enc_key, et in enc_keys:
+        prefix = f"edge_attr_encoders.{enc_key}."
+        has_time2vec = (prefix + "linear_w") in state_dict
+        has_layernorm = (prefix + "norm.weight") in state_dict
+        has_residual = (prefix + "skip.weight") in state_dict
+        if has_time2vec:
+            detected[et] = "time2vec"
+        elif has_layernorm:
+            detected[et] = "layernorm_mlp"
+        elif has_residual:
+            detected[et] = "mlp_residual"
+        else:
+            detected[et] = "mlp"
+    return detected
+
+
+def _infer_edge_feature_dims_from_state_dict(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+) -> Dict[Tuple[str, str, str], int]:
+    """Detecta el `in_dim` raw por tipo de arista en el checkpoint, agnóstico
+    al tipo de encoder.
+
+    Inspecciona, en orden:
+      - `edge_attr_encoders.<key>.linear_w.shape[0]`  → Time2Vec (in_dim).
+      - `edge_attr_encoders.<key>.norm.weight.shape[0]` → LayerNormMLP.
+      - `edge_attr_encoders.<key>.skip.weight.shape[1]` → MLPResidual.
+      - `edge_attr_encoders.<key>.mlp.0.weight.shape[1]` → MLPResidual fallback.
+      - `edge_attr_encoders.<key>.net.0.weight.shape[1]` → MLP/LayerNormMLP.
+      - Fallback sin encoder: `convs.*.lin_edge.weight.shape[1]`.
+    """
+    if not isinstance(state_dict, dict):
+        return {}
+    dims: Dict[Tuple[str, str, str], int] = {}
+    # Patrones por tipo de encoder.
+    patterns = [
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.linear_w$"), 0),
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.norm\.weight$"), 0),
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.skip\.weight$"), 1),
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.mlp\.0\.weight$"), 1),
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.net\.0\.weight$"), 1),
+    ]
+    for key, tensor in state_dict.items():
+        text = str(key)
+        for pat, dim_idx in patterns:
+            match = pat.match(text)
+            if not match:
+                continue
+            et = _parse_checkpoint_edge_type_key(match.group(1))
+            if et is None:
+                break
+            try:
+                dims.setdefault(et, int(tensor.shape[dim_idx]))
+            except Exception:
+                pass
+            break
+    if dims:
+        return dims
+    # Fallback para checkpoints sin encoder MLP: usar el peso lin_edge de GATConv.
+    conv_pat = re.compile(r"^convs\.\d+\.convs\.([^.]+)\.lin_edge\.weight$")
+    for key, tensor in state_dict.items():
+        match = conv_pat.match(str(key))
+        if not match:
+            continue
+        edge_type = _parse_checkpoint_edge_type_key(match.group(1))
+        if edge_type is None:
+            continue
+        try:
+            dims.setdefault(edge_type, int(tensor.shape[1]))
+        except Exception:
+            continue
+    return dims
+
+
+def _infer_edge_encoded_dims_from_state_dict(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+) -> Dict[Tuple[str, str, str], int]:
+    """Encoded edge_dim por tipo (output del encoder = input al GATConv). Para
+    cada `kind` se mira la última proyección lineal del encoder:
+      - mlp / layernorm_mlp: `net.3.weight.shape[0]`
+      - mlp_residual:        `mlp.3.weight.shape[0]` (o `skip.weight.shape[0]`)
+      - time2vec:            `proj.weight.shape[0]`
+    """
+    if not isinstance(state_dict, dict):
+        return {}
+    dims: Dict[Tuple[str, str, str], int] = {}
+    patterns = [
+        re.compile(r"^edge_attr_encoders\.([^.]+)\.proj\.weight$"),
+        re.compile(r"^edge_attr_encoders\.([^.]+)\.mlp\.3\.weight$"),
+        re.compile(r"^edge_attr_encoders\.([^.]+)\.net\.3\.weight$"),
+        re.compile(r"^edge_attr_encoders\.([^.]+)\.skip\.weight$"),
+    ]
+    for key, tensor in state_dict.items():
+        text = str(key)
+        for pat in patterns:
+            match = pat.match(text)
+            if not match:
+                continue
+            et = _parse_checkpoint_edge_type_key(match.group(1))
+            if et is None:
+                break
+            try:
+                dims.setdefault(et, int(tensor.shape[0]))
+            except Exception:
+                pass
+            break
+    return dims
 
 def _infer_in_channels_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Optional[int]:
     for key, tensor in state_dict.items():
@@ -2388,6 +2551,45 @@ def _resolve_checkpoint_edge_types_for_model(
     except Exception:
         graph_edge_types = tuple()
     return graph_edge_types or None
+
+
+def _resolve_edge_feature_dims_for_model(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+    graph_data: HeteroData,
+) -> Optional[Dict[Tuple[str, str, str], int]]:
+    """Combine: si el checkpoint tiene encoders por tipo, usar esos `in_dim`
+    (necesario para `strict=True` load); en caso contrario inferir desde el
+    grafo. Para variantes sin encoder MLP (GATConv directo) este resultado
+    sigue siendo válido porque también se usa como `edge_dim` del GATConv."""
+    dims: Dict[Tuple[str, str, str], int] = {}
+    try:
+        dims.update(_infer_edge_feature_dims(graph_data))
+    except Exception:
+        dims = {}
+    ckpt_dims = _infer_edge_feature_dims_from_state_dict(state_dict)
+    if ckpt_dims:
+        for et, dim in ckpt_dims.items():
+            dims[tuple(et)] = int(dim)
+    return dims or None
+
+
+def _resolve_edge_encoded_dims_for_model(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+) -> Optional[Dict[Tuple[str, str, str], int]]:
+    """Encoded dims (input al GATConv) inferidas del checkpoint para variantes
+    con encoder MLP. Devuelve None si no aplica."""
+    ckpt_dims = _infer_edge_encoded_dims_from_state_dict(state_dict)
+    return ckpt_dims or None
+
+
+def _resolve_edge_encoder_kinds_for_model(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+) -> Optional[Dict[Tuple[str, str, str], str]]:
+    """Per-type encoder *kind* inferido del checkpoint. Permite reconstruir
+    modelos donde, p.ej., la arista temporal usaba `time2vec` mientras las
+    espaciales usaban `layernorm_mlp`. Devuelve None si no aplica."""
+    kinds = _infer_edge_encoder_kinds_from_state_dict(state_dict)
+    return kinds or None
 
 
 def _test_only_eval_masks(
@@ -2468,7 +2670,19 @@ def _check_model_graph_compat(
             "El modelo fue entrenado con un número distinto de features. "
             f"Checkpoint in_channels={int(expected_in)} vs grafo actual in_channels={int(current_in)}."
         )
-    if expected_edge is not None and current_edge is not None and int(expected_edge) != int(current_edge):
+    # Con dims por tipo el escalar deja de ser un signal fiable: el checkpoint
+    # puede tener distintos `in_dim` por relación y el `max` calculado para
+    # `_infer_edge_feature_dim` no tiene por qué coincidir. La incompatibilidad
+    # real (encoder weight shape mismatch) la detectará `load_state_dict` con
+    # strict=True después; aquí solo cortamos cuando el checkpoint era un único
+    # escalar (sin encoders por tipo) y ese escalar no encaja.
+    ckpt_dims_per_type = _infer_edge_feature_dims_from_state_dict(state_dict)
+    if (
+        not ckpt_dims_per_type
+        and expected_edge is not None
+        and current_edge is not None
+        and int(expected_edge) > int(current_edge)
+    ):
         return False, (
             "El modelo fue entrenado con un número distinto de edge features. "
             f"Checkpoint edge_feature_dim={int(expected_edge)} vs grafo actual edge_feature_dim={int(current_edge)}."
@@ -3091,6 +3305,9 @@ def _evaluate_gnn_checkpoint_for_comparison(
                 or _gnn_variant_requires_sequence_index(gnn_variant)
             ),
             edge_types=model_edge_types,
+            edge_feature_dims=_resolve_edge_feature_dims_for_model(state_dict, graph_data),
+            edge_encoded_dims=_resolve_edge_encoded_dims_for_model(state_dict),
+            edge_encoder_kinds=_resolve_edge_encoder_kinds_for_model(state_dict),
         )
         model.load_state_dict(state_dict, strict=True)
         model.eval()
@@ -5442,6 +5659,9 @@ def _evaluate_gnn_model_far_target(
             or _gnn_variant_requires_sequence_index(gnn_variant)
         ),
         edge_types=model_edge_types,
+        edge_feature_dims=_resolve_edge_feature_dims_for_model(state_dict, graph_data),
+        edge_encoded_dims=_resolve_edge_encoded_dims_for_model(state_dict),
+        edge_encoder_kinds=_resolve_edge_encoder_kinds_for_model(state_dict),
     )
     if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
         raise ValueError(
@@ -5744,30 +5964,31 @@ def _network_config_to_hparams(
     cfg: Dict[str, object], *, use_graphsmote: bool
 ) -> Dict[str, object]:
     # Defaults alineados con RECOMMENDED_NETWORK_DEFAULTS para clase rara (~0.3%):
-    # FocalLoss(α=0.95), hidden=96, dropout=0.2, aggr=sum, num_neighbors asimétrico.
+    # FocalLoss(α=0.75, γ=1.5), hidden=48, dropout=0.35, lr=1e-4, wd=5e-3,
+    # scheduler=plateau_restart. Calibración v2 para evitar overfit de epoch-1.
     params: Dict[str, object] = {
         "gnn_variant": _normalize_ui_gnn_variant(cfg.get("gnn_variant", GNN_VARIANT)),
-        "hidden_channels": int(cfg.get("hidden_channels", 96)),
+        "hidden_channels": int(cfg.get("hidden_channels", 48)),
         "num_heads": int(cfg.get("num_heads", 4)),
         "num_layers": int(cfg.get("num_layers", 2)),
-        "dropout": float(cfg.get("dropout", 0.2)),
+        "dropout": float(cfg.get("dropout", 0.35)),
         "aggr1": cfg.get("aggr1", "sum"),
         "aggr2": cfg.get("aggr2", "sum"),
         "use_checkpointing": bool(cfg.get("use_checkpointing", False)),
         "use_residual": _coerce_bool(cfg.get("use_residual"), True),
         "use_relation_self_loops": _coerce_bool(cfg.get("use_relation_self_loops"), False),
         "optimizer": cfg.get("optimizer", "AdamW"),
-        "lr_scheduler": cfg.get("lr_scheduler", "one_cycle"),
-        "lr": float(cfg.get("lr", 3e-4)),
-        "weight_decay": float(cfg.get("weight_decay", 1e-4)),
+        "lr_scheduler": cfg.get("lr_scheduler", "plateau_restart"),
+        "lr": float(cfg.get("lr", 1e-4)),
+        "weight_decay": float(cfg.get("weight_decay", 5e-3)),
         "lambda_l2_att": float(cfg.get("lambda_l2_att", 1e-4)),
         "lambda_H_mode": cfg.get("lambda_H_mode", "fixed"),
         "lambda_H_fixed": float(cfg.get("lambda_H_fixed", 1e-4)),
         "initial_lambda_H": float(cfg.get("initial_lambda_H", 1e-4)),
         "final_lambda_H": float(cfg.get("final_lambda_H", 1e-2)),
         "loss_type": cfg.get("loss_type", "FocalLoss"),
-        "focal_gamma": float(cfg.get("focal_gamma", 2.0)),
-        "focal_alpha": float(cfg.get("focal_alpha", 0.95)),
+        "focal_gamma": float(cfg.get("focal_gamma", 1.5)),
+        "focal_alpha": float(cfg.get("focal_alpha", 0.75)),
         "batch_size": int(cfg.get("batch_size", 512)),
         # JSON-serializa lista plana o dict por relación; _resolve_num_neighbors
         # en gnn_main.py mapea dict (string keys) → tuple (edge_type) automáticamente.
@@ -5776,6 +5997,15 @@ def _network_config_to_hparams(
         "use_graphsmote": bool(use_graphsmote),
         "value": 0.0,
     }
+    # Per-type edge encoder overrides (C). Serializado como JSON para sobrevivir
+    # al pasaje por CSV; los consumidores lo deserializan a un dict
+    # {edge_type_str: {hidden_dim, encoded_dim, dropout, in_dim}}.
+    encoder_per_type = cfg.get("edge_encoder_per_type") or {}
+    if encoder_per_type:
+        try:
+            params["edge_encoder_per_type"] = json.dumps(encoder_per_type)
+        except Exception:
+            pass
     if use_graphsmote:
         params.update(
             {
@@ -6271,6 +6501,150 @@ def _validate_temporal_sequence_requirement(
         sequence_index
     ):
         _raise_temporal_sequence_missing(variant)
+
+
+def _suggest_bool_or_fixed(
+    trial: object,
+    name: str,
+    value: object,
+    default: bool,
+) -> bool:
+    if isinstance(value, (list, tuple, set)):
+        choices: List[bool] = []
+        for item in value:
+            parsed = _coerce_bool(item, default)
+            if parsed not in choices:
+                choices.append(parsed)
+        if len(choices) > 1:
+            return bool(trial.suggest_categorical(name, choices))
+        if choices:
+            return bool(choices[0])
+    return bool(_coerce_bool(value, default))
+
+
+def _suggest_edge_encoder_params_for_trial(
+    trial: object,
+    *,
+    edge_encoder_space: Optional[Mapping[str, object]],
+    edge_feature_dims_per_type: Mapping[Tuple[str, str, str], int],
+) -> Tuple[
+    Optional[Dict[Tuple[str, str, str], int]],
+    Optional[Dict[Tuple[str, str, str], int]],
+    Optional[Dict[Tuple[str, str, str], float]],
+    Optional[Dict[Tuple[str, str, str], str]],
+    Dict[str, Dict[str, object]],
+]:
+    if not edge_encoder_space:
+        return None, None, None, None, {}
+
+    def _suggest_int_cfg(name: str, cfg: Mapping[str, object]) -> int:
+        return int(
+            trial.suggest_int(
+                name,
+                int(cfg["min"]),
+                int(cfg["max"]),
+                step=max(1, int(cfg.get("step", 1))),
+            )
+        )
+
+    def _suggest_float_cfg(name: str, cfg: Mapping[str, object]) -> float:
+        return float(
+            trial.suggest_float(
+                name,
+                float(cfg["min"]),
+                float(cfg["max"]),
+                step=float(cfg.get("step", 0.05)),
+            )
+        )
+
+    hidden_dims: Dict[Tuple[str, str, str], int] = {}
+    encoded_dims: Dict[Tuple[str, str, str], int] = {}
+    dropouts: Dict[Tuple[str, str, str], float] = {}
+    kinds: Dict[Tuple[str, str, str], str] = {}
+    metadata: Dict[str, Dict[str, object]] = {}
+
+    mode = str(edge_encoder_space.get("mode") or "shared")
+    if mode == "per_type":
+        per_type = edge_encoder_space.get("per_type") or {}
+        if not isinstance(per_type, Mapping):
+            per_type = {}
+        for edge_type, raw_dim in edge_feature_dims_per_type.items():
+            edge_key = _edge_type_search_key(edge_type)
+            fallback = _default_edge_encoder_search_spec(raw_dim)
+            cfg = per_type.get(edge_key, fallback)
+            if not isinstance(cfg, Mapping):
+                cfg = fallback
+            kind_choices = _coerce_edge_encoder_kind_choices(
+                cfg.get("kind_choices", fallback["kind_choices"])
+            )
+            kind = str(
+                trial.suggest_categorical(
+                    f"edge_encoder_kind__{edge_key}",
+                    kind_choices,
+                )
+            )
+            hidden = _suggest_int_cfg(
+                f"edge_encoder_hidden_dim__{edge_key}",
+                cfg.get("hidden_dim", fallback["hidden_dim"]),
+            )
+            encoded = _suggest_int_cfg(
+                f"edge_encoded_dim__{edge_key}",
+                cfg.get("encoded_dim", fallback["encoded_dim"]),
+            )
+            dropout = _suggest_float_cfg(
+                f"edge_encoder_dropout__{edge_key}",
+                cfg.get("dropout", fallback["dropout"]),
+            )
+            hidden_dims[edge_type] = hidden
+            encoded_dims[edge_type] = encoded
+            dropouts[edge_type] = dropout
+            kinds[edge_type] = kind
+            metadata[edge_key] = {
+                "in_dim": int(raw_dim or 0),
+                "kind": kind,
+                "hidden_dim": int(hidden),
+                "encoded_dim": int(encoded),
+                "dropout": float(dropout),
+            }
+        return hidden_dims, encoded_dims, dropouts, kinds, metadata
+
+    fallback = _default_edge_encoder_search_spec(
+        max([int(v or 0) for v in edge_feature_dims_per_type.values()] or [0])
+    )
+    kind = str(
+        trial.suggest_categorical(
+            "edge_encoder_kind",
+            _coerce_edge_encoder_kind_choices(
+                edge_encoder_space.get("kind_choices", fallback["kind_choices"])
+            ),
+        )
+    )
+    hidden = _suggest_int_cfg(
+        "edge_encoder_hidden_dim",
+        edge_encoder_space.get("hidden_dim", fallback["hidden_dim"]),
+    )
+    encoded = _suggest_int_cfg(
+        "edge_encoded_dim",
+        edge_encoder_space.get("encoded_dim", fallback["encoded_dim"]),
+    )
+    dropout = _suggest_float_cfg(
+        "edge_encoder_dropout",
+        edge_encoder_space.get("dropout", fallback["dropout"]),
+    )
+    for edge_type, raw_dim in edge_feature_dims_per_type.items():
+        edge_key = _edge_type_search_key(edge_type)
+        hidden_dims[edge_type] = int(hidden)
+        encoded_dims[edge_type] = int(encoded)
+        dropouts[edge_type] = float(dropout)
+        kinds[edge_type] = kind
+        metadata[edge_key] = {
+            "in_dim": int(raw_dim or 0),
+            "kind": kind,
+            "hidden_dim": int(hidden),
+            "encoded_dim": int(encoded),
+            "dropout": float(dropout),
+        }
+    return hidden_dims, encoded_dims, dropouts, kinds, metadata
 
 
 def _default_gnn_objective_metrics() -> List[str]:
@@ -6898,13 +7272,17 @@ def _run_optuna_search(
         torch.manual_seed(trial_seed)
         np.random.seed(trial_seed)
         trial.set_user_attr("gnn_variant", gnn_variant_fixed)
-        use_residual = _coerce_bool(
+        use_residual = _suggest_bool_or_fixed(
+            trial,
+            "use_residual",
             search_space.get("use_residual", True),
-            True,
+            default=True,
         )
-        use_relation_self_loops = _coerce_bool(
+        use_relation_self_loops = _suggest_bool_or_fixed(
+            trial,
+            "use_relation_self_loops",
             search_space.get("use_relation_self_loops", False),
-            False,
+            default=False,
         )
         trial.set_user_attr("use_residual", bool(use_residual))
         trial.set_user_attr("use_relation_self_loops", bool(use_relation_self_loops))
@@ -6983,7 +7361,9 @@ def _run_optuna_search(
         neighbor_choice = trial.suggest_categorical(
             "num_neighbors_choice", list(search_space["neighbor_choices"])
         )
-        neighbor_profile = search_space["neighbor_profiles"][neighbor_choice]
+        neighbor_profile = _clone_optuna_neighbor_profile(
+            search_space["neighbor_profiles"][neighbor_choice]
+        )
         if debug_flag:
             logger.info(f"[NEIGHBOR] trial={trial.number} profile={neighbor_choice} num_neighbors={neighbor_profile}")
 
@@ -7333,7 +7713,14 @@ def _run_optuna_search(
             int(batch_cfg["max"]),
             step=int(batch_cfg["step"]),
         )
-        trial.set_user_attr("num_neighbors", neighbor_profile)
+        trial.set_user_attr(
+            "num_neighbors",
+            (
+                _format_optuna_neighbor_profile(neighbor_profile)
+                if isinstance(neighbor_profile, Mapping)
+                else neighbor_profile
+            ),
+        )
         trial.set_user_attr("train_sampler_mode", str(train_sampler_mode))
         trial.set_user_attr("cluster_gcn_num_parts", int(cluster_gcn_num_parts))
         trial.set_user_attr(
@@ -7351,6 +7738,27 @@ def _run_optuna_search(
 
         num_classes = 2
         edge_feature_dim = _infer_edge_feature_dim(data)
+        edge_feature_dims_per_type = _infer_edge_feature_dims(data)
+        (
+            edge_encoder_hidden_dims,
+            edge_encoded_dims,
+            edge_encoder_dropouts,
+            edge_encoder_kinds,
+            edge_encoder_per_type,
+        ) = _suggest_edge_encoder_params_for_trial(
+            trial,
+            edge_encoder_space=search_space.get("edge_encoder"),
+            edge_feature_dims_per_type=edge_feature_dims_per_type,
+        )
+        if edge_encoder_per_type:
+            trial.set_user_attr(
+                "edge_encoder_per_type",
+                json.dumps(edge_encoder_per_type, sort_keys=True),
+            )
+            trial.set_user_attr(
+                "edge_encoder_mode",
+                str((search_space.get("edge_encoder") or {}).get("mode") or "shared"),
+            )
         in_channels = data["pm"].x.shape[1]
 
         model = graph_main._build_gnn_model(
@@ -7371,6 +7779,11 @@ def _run_optuna_search(
             use_residual=use_residual,
             use_relation_self_loops=use_relation_self_loops,
             require_temporal_head=_gnn_variant_requires_sequence_index(gnn_variant_fixed),
+            edge_feature_dims=edge_feature_dims_per_type,
+            edge_encoder_hidden_dims=edge_encoder_hidden_dims,
+            edge_encoded_dims=edge_encoded_dims,
+            edge_encoder_dropouts=edge_encoder_dropouts,
+            edge_encoder_kinds=edge_encoder_kinds,
         )
         temporal_module = getattr(model, "temporal_head", None)
 
@@ -7458,81 +7871,82 @@ def _run_optuna_search(
                 return train_idx
             return seeds
 
-            def _build_train_loader_from_sampler(
-                graph_cpu_local: HeteroData,
-                *,
-                base_seed_idx: Optional[torch.Tensor],
-                epoch_seed: int,
-                epoch_num: int,
-            ) -> Tuple[object, Optional[torch.Tensor]]:
-                seed_pool = _effective_seed_pool(
-                    graph_cpu_local,
-                    base_seed_idx=base_seed_idx,
-                )
-                num_neighbors_cfg = {
-                    edge_type: neighbor_profile
-                    for edge_type in graph_cpu_local.edge_types
+        def _build_train_loader_from_sampler(
+            graph_cpu_local: HeteroData,
+            *,
+            base_seed_idx: Optional[torch.Tensor],
+            epoch_seed: int,
+            epoch_num: int,
+        ) -> Tuple[object, Optional[torch.Tensor]]:
+            seed_pool = _effective_seed_pool(
+                graph_cpu_local,
+                base_seed_idx=base_seed_idx,
+            )
+            num_neighbors_cfg = graph_main._resolve_num_neighbors(
+                neighbor_profile,
+                NUM_NEIGHBORS,
+                graph_cpu_local.edge_types,
+            )
+            if train_sampler_mode != "neighbor":
+                native_cfg = {
+                    "train_sampler_mode": str(train_sampler_mode),
+                    "cluster_gcn_num_parts": int(cluster_gcn_num_parts),
+                    "cluster_gcn_parts_per_epoch": int(cluster_gcn_parts_per_epoch),
+                    "graphsaint_mode": str(graphsaint_mode),
+                    "graphsaint_batch_size": int(graphsaint_batch_size),
+                    "graphsaint_num_steps": int(graphsaint_num_steps),
+                    "graphsaint_walk_length": int(graphsaint_walk_length),
+                    "deterministic_sampling": True,
+                    "sampling_seed": int(epoch_seed) + int(epoch_num) * 9973,
                 }
-                if train_sampler_mode != "neighbor":
-                    native_cfg = {
-                        "train_sampler_mode": str(train_sampler_mode),
-                        "cluster_gcn_num_parts": int(cluster_gcn_num_parts),
-                        "cluster_gcn_parts_per_epoch": int(cluster_gcn_parts_per_epoch),
-                        "graphsaint_mode": str(graphsaint_mode),
-                        "graphsaint_batch_size": int(graphsaint_batch_size),
-                        "graphsaint_num_steps": int(graphsaint_num_steps),
-                        "graphsaint_walk_length": int(graphsaint_walk_length),
-                        "deterministic_sampling": True,
-                        "sampling_seed": int(epoch_seed) + int(epoch_num) * 9973,
-                    }
-                    native_loader, native_error = graph_main._build_native_sampler_loader(
-                        graph_cpu=graph_cpu_local,
-                        sampler_config=native_cfg,
-                        batch_size=int(batch_size_candidate),
-                        sampling_seed=int(epoch_seed) + int(epoch_num) * 9973,
-                        base_seeds=seed_pool,
-                        num_neighbors_cfg=num_neighbors_cfg,
-                        deterministic=True,
-                    )
-                    if native_loader is None:
-                        raise RuntimeError(
-                            f"No se pudo construir loader nativo para {train_sampler_mode}: "
-                            f"{native_error or 'error desconocido'}"
-                        )
-                    return native_loader, seed_pool
-
-                input_nodes_obj: object
-                if seed_pool is not None and seed_pool.numel() > 0:
-                    input_nodes_obj = ("pm", seed_pool)
-                else:
-                    input_nodes_obj = ("pm", graph_cpu_local["pm"].train_mask)
-                loader_obj = NeighborLoader(
-                    graph_cpu_local,
-                    input_nodes=input_nodes_obj,
-                    num_neighbors=num_neighbors_cfg,
-                    batch_size=batch_size_candidate,
-                    shuffle=True,
+                native_loader, native_error = graph_main._build_native_sampler_loader(
+                    graph_cpu=graph_cpu_local,
+                    sampler_config=native_cfg,
+                    batch_size=int(batch_size_candidate),
+                    sampling_seed=int(epoch_seed) + int(epoch_num) * 9973,
+                    base_seeds=seed_pool,
+                    num_neighbors_cfg=num_neighbors_cfg,
+                    deterministic=True,
                 )
-                return loader_obj, seed_pool
+                if native_loader is None:
+                    raise RuntimeError(
+                        f"No se pudo construir loader nativo para {train_sampler_mode}: "
+                        f"{native_error or 'error desconocido'}"
+                    )
+                return native_loader, seed_pool
 
-            train_loader, active_seed_idx = _build_train_loader_from_sampler(
-                train_graph_cpu,
-                base_seed_idx=seed_idx,
-                epoch_seed=trial_seed,
-                epoch_num=1,
+            input_nodes_obj: object
+            if seed_pool is not None and seed_pool.numel() > 0:
+                input_nodes_obj = ("pm", seed_pool)
+            else:
+                input_nodes_obj = ("pm", graph_cpu_local["pm"].train_mask)
+            loader_obj = NeighborLoader(
+                graph_cpu_local,
+                input_nodes=input_nodes_obj,
+                num_neighbors=num_neighbors_cfg,
+                batch_size=batch_size_candidate,
+                shuffle=True,
             )
-            trial.set_user_attr(
-                "sampler_impl",
-                str(getattr(train_loader, "sampler_impl", "neighbor_native")),
-            )
-            _mem_snapshot(
-                f"trial_{trial.number}_loader_ready",
-                extra=(
-                    f"batch={batch_size_candidate}, steps={len(train_loader)}, "
-                    f"seed_count={int(active_seed_idx.numel()) if active_seed_idx is not None else 'all'}, "
-                    f"sampler_impl={getattr(train_loader, 'sampler_impl', 'neighbor_native')}"
-                ),
-            )
+            return loader_obj, seed_pool
+
+        train_loader, active_seed_idx = _build_train_loader_from_sampler(
+            train_graph_cpu,
+            base_seed_idx=seed_idx,
+            epoch_seed=trial_seed,
+            epoch_num=1,
+        )
+        trial.set_user_attr(
+            "sampler_impl",
+            str(getattr(train_loader, "sampler_impl", "neighbor_native")),
+        )
+        _mem_snapshot(
+            f"trial_{trial.number}_loader_ready",
+            extra=(
+                f"batch={batch_size_candidate}, steps={len(train_loader)}, "
+                f"seed_count={int(active_seed_idx.numel()) if active_seed_idx is not None else 'all'}, "
+                f"sampler_impl={getattr(train_loader, 'sampler_impl', 'neighbor_native')}"
+            ),
+        )
         try:
             scheduler = graph_main._build_lr_scheduler(
                 optimizer,
@@ -8166,6 +8580,16 @@ def _run_ray_tune_search(
             except Exception:
                 return tune.choice([float(min_v)])
 
+        def _bool_choices(value: object, fallback: bool) -> List[bool]:
+            if isinstance(value, (list, tuple, set)):
+                choices: List[bool] = []
+                for item in value:
+                    parsed = _coerce_bool(item, fallback)
+                    if parsed not in choices:
+                        choices.append(parsed)
+                return choices or [fallback]
+            return [_coerce_bool(value, fallback)]
+
         hidden_cfg = search_space["hidden_channels"]
         num_heads_cfg = search_space["num_heads"]
         num_layers_cfg = search_space["num_layers"]
@@ -8187,6 +8611,15 @@ def _run_ray_tune_search(
             "aggr1": _choice(search_space["aggr1"]),
             "aggr2": _choice(search_space["aggr2"]),
             "use_checkpointing": _choice(search_space["use_checkpointing"]),
+            "use_residual": _choice(
+                _bool_choices(search_space.get("use_residual", [True]), True)
+            ),
+            "use_relation_self_loops": _choice(
+                _bool_choices(
+                    search_space.get("use_relation_self_loops", [False]),
+                    False,
+                )
+            ),
             "num_neighbors_choice": _choice(search_space["neighbor_choices"]),
             "train_sampler_mode": _choice(search_space["sampler_modes"]),
             "cluster_gcn_num_parts": _choice(search_space["cluster_gcn_num_parts"]),
@@ -8221,6 +8654,58 @@ def _run_ray_tune_search(
             )),
             "batch_size": _choice(_int_choices(batch_cfg["min"], batch_cfg["max"], batch_cfg["step"])),
         }
+
+        edge_encoder_space = search_space.get("edge_encoder")
+        if isinstance(edge_encoder_space, Mapping):
+            if str(edge_encoder_space.get("mode") or "shared") == "per_type":
+                per_type = edge_encoder_space.get("per_type") or {}
+                if isinstance(per_type, Mapping):
+                    for edge_key, cfg in per_type.items():
+                        if not isinstance(cfg, Mapping):
+                            continue
+                        hidden_cfg = cfg.get("hidden_dim", {})
+                        encoded_cfg = cfg.get("encoded_dim", {})
+                        dropout_cfg = cfg.get("dropout", {})
+                        ray_space[f"edge_encoder_kind__{edge_key}"] = _choice(
+                            _coerce_edge_encoder_kind_choices(cfg.get("kind_choices"))
+                        )
+                        ray_space[f"edge_encoder_hidden_dim__{edge_key}"] = _choice(
+                            _int_choices(
+                                hidden_cfg["min"],
+                                hidden_cfg["max"],
+                                hidden_cfg["step"],
+                            )
+                        )
+                        ray_space[f"edge_encoded_dim__{edge_key}"] = _choice(
+                            _int_choices(
+                                encoded_cfg["min"],
+                                encoded_cfg["max"],
+                                encoded_cfg["step"],
+                            )
+                        )
+                        ray_space[f"edge_encoder_dropout__{edge_key}"] = _choice(
+                            _float_choices(
+                                dropout_cfg["min"],
+                                dropout_cfg["max"],
+                                dropout_cfg["step"],
+                            )
+                        )
+            else:
+                hidden_cfg = edge_encoder_space.get("hidden_dim", {})
+                encoded_cfg = edge_encoder_space.get("encoded_dim", {})
+                dropout_cfg = edge_encoder_space.get("dropout", {})
+                ray_space["edge_encoder_kind"] = _choice(
+                    _coerce_edge_encoder_kind_choices(edge_encoder_space.get("kind_choices"))
+                )
+                ray_space["edge_encoder_hidden_dim"] = _choice(
+                    _int_choices(hidden_cfg["min"], hidden_cfg["max"], hidden_cfg["step"])
+                )
+                ray_space["edge_encoded_dim"] = _choice(
+                    _int_choices(encoded_cfg["min"], encoded_cfg["max"], encoded_cfg["step"])
+                )
+                ray_space["edge_encoder_dropout"] = _choice(
+                    _float_choices(dropout_cfg["min"], dropout_cfg["max"], dropout_cfg["step"])
+                )
 
         if not use_graphsmote:
             ray_space["focal_alpha"] = _choice(_float_choices(
@@ -8349,6 +8834,10 @@ def _run_ray_tune_search(
                 "graphsaint_walk_length",
                 "use_checkpointing",
                 "lr_scheduler",
+                "use_residual",
+                "use_relation_self_loops",
+                "edge_encoder_per_type",
+                "edge_encoder_mode",
                 "best_tau",
                 "best_epoch",
                 "best_metric",
@@ -8894,6 +9383,7 @@ def _run_gnn_gradient_importance(
     }
 
     edge_feature_dim = _infer_edge_feature_dim(graph_data)
+    edge_feature_dims_per_type = _infer_edge_feature_dims(graph_data)
     model = HeteroGAT(
         in_channels=num_features,
         hidden_channels=int(hidden_channels),
@@ -8905,6 +9395,7 @@ def _run_gnn_gradient_importance(
         aggr1="sum",
         aggr2="sum",
         use_checkpointing=False,
+        edge_feature_dims=edge_feature_dims_per_type,
     ).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -11511,6 +12002,7 @@ def _render_optimization_tab() -> None:
 
     pending = False
     pending_details = ""
+    selected_gnn_variant = _get_optuna_selected_gnn_variant()
     objective_metric = str(st.session_state.get("gnn_optuna_metric", "AUPRC"))
     n_trials = int(st.session_state.get("gnn_optuna_trials", N_TRIALS))
     balancing_strategy = str(
@@ -11522,6 +12014,7 @@ def _render_optimization_tab() -> None:
             graph_obj=graph_obj,
             balancing_strategy=balancing_strategy,
             objective_metric=objective_metric,
+            gnn_variant=selected_gnn_variant,
             space_signature=space_signature,
         )
         pending, done_trials = _optuna_study_pending(
@@ -11536,6 +12029,7 @@ def _render_optimization_tab() -> None:
             graph_obj=graph_obj,
             balancing_strategy=balancing_strategy,
             objective_metric=objective_metric,
+            gnn_variant=selected_gnn_variant,
             space_signature=space_signature,
         )
         storage_dir = Path(RESULTADOS_DIR).resolve() / "ray_tune" / f"raytune_{study_name}"
@@ -11575,6 +12069,7 @@ def _render_optimization_tab() -> None:
                     graph_obj=graph_obj,
                     balancing_strategy=balancing_strategy,
                     objective_metric=objective_metric,
+                    gnn_variant=selected_gnn_variant,
                     space_signature=_search_space_signature_from_state(),
                 )
                 optuna.delete_study(study_name=study_name, storage=storage_url)
@@ -11596,6 +12091,7 @@ def _render_optimization_tab() -> None:
                 graph_obj=graph_obj,
                 balancing_strategy=balancing_strategy,
                 objective_metric=objective_metric,
+                gnn_variant=selected_gnn_variant,
                 space_signature=_search_space_signature_from_state(),
             )
             storage_dir = Path(RESULTADOS_DIR).resolve() / "ray_tune" / f"raytune_{study_name}"
@@ -14368,6 +14864,9 @@ def _render_balance_tab() -> None:
                     aggr1=h_aggr1,
                     aggr2=h_aggr2,
                     use_checkpointing=False,
+                    edge_feature_dims=_resolve_edge_feature_dims_for_model(
+                        state_dict, graph_data
+                    ),
                 )
                 missing, unexpected = model.load_state_dict(
                     state_dict, strict=True
@@ -15010,6 +15509,12 @@ def _get_ui_selected_gnn_variant() -> str:
     return _normalize_ui_gnn_variant(GNN_VARIANT)
 
 
+def _get_optuna_selected_gnn_variant() -> str:
+    return _normalize_ui_gnn_variant(
+        st.session_state.get("gnn_optuna_gnn_variant") or _get_ui_selected_gnn_variant()
+    )
+
+
 def _gnn_variant_ui_labels() -> Dict[str, str]:
     return {
         "gat_snapshot": "gat_snapshot (baseline espacial)",
@@ -15056,6 +15561,375 @@ def _describe_gnn_variant(variant: Optional[object]) -> Dict[str, str]:
         "uses_edge_mlp": "yes" if uses_edge_mlp else "no",
         "is_edge_aware": "yes" if is_edge_aware else "no",
     }
+
+
+EDGE_ENCODER_KIND_OPTIONS = ["mlp", "mlp_residual", "layernorm_mlp", "time2vec"]
+
+
+# Metadata orientativa para la UI: cada entrada describe el encoder, su
+# fórmula, costo relativo de parámetros, cuándo usarlo y cuándo evitarlo.
+EDGE_ENCODER_KIND_INFO: Dict[str, Dict[str, str]] = {
+    "mlp": {
+        "label": "MLP (baseline)",
+        "summary": "Baseline. No asume nada sobre la estructura de las features.",
+        "formula": "Linear(in→h) → ReLU → Dropout → Linear(h→out)",
+        "params": "Bajo (~2·in·h + 2·h·out)",
+        "use_when": (
+            "Default seguro. Punto de partida cuando no tienes evidencia para "
+            "elegir algo más específico."
+        ),
+        "avoid_when": (
+            "Si las features mezclan escalas muy distintas o son periódicas — "
+            "otros encoders modelan eso mejor."
+        ),
+    },
+    "mlp_residual": {
+        "label": "MLP + Residual (skip)",
+        "summary": "MLP con skip lineal — el MLP solo aprende el delta sobre la señal cruda.",
+        "formula": "MLP(x) + Linear_skip(x → out)",
+        "params": "Medio (+ in·out vs. mlp)",
+        "use_when": (
+            "Features crudas ya informativas y/o muchas (≥ 8). Útil cuando "
+            "quieres que el modelo pueda «pasar» la señal sin pelearla. "
+            "Buen candidato para aristas espaciales con varias features."
+        ),
+        "avoid_when": (
+            "Cuando in_dim es muy chico (3-5); el skip casi no aporta y solo "
+            "añade parámetros."
+        ),
+    },
+    "layernorm_mlp": {
+        "label": "LayerNorm + MLP",
+        "summary": "LayerNorm sobre raw edge_attr antes del MLP. Estabiliza cuando hay escalas mixtas.",
+        "formula": "MLP(LayerNorm(x))",
+        "params": "Bajo (+ 2·in vs. mlp)",
+        "use_when": (
+            "Features con escalas muy distintas (p. ej. delta-features ≈ ±10, "
+            "`dist_km` ≈ 0-50, gradientes ≈ ±100). Suele converger más rápido "
+            "y dar AUPRC más estable."
+        ),
+        "avoid_when": (
+            "Cuando las features ya están normalizadas en construcción del "
+            "grafo — la LayerNorm sobra y añade ruido."
+        ),
+    },
+    "time2vec": {
+        "label": "Time2Vec (periódico)",
+        "summary": (
+            "Codificación periódica feature-wise. `hidden_dim` se interpreta "
+            "como k (número de componentes; típico 4-8)."
+        ),
+        "formula": "[w·x + b, sin(w₁·x + φ₁), …, sin(w_{k-1}·x + φ_{k-1})] → Linear(in·k → out)",
+        "params": "Alto (~ in·k·out, crece con k)",
+        "use_when": (
+            "Features continuas con estacionalidad o magnitudes muy variables, "
+            "principalmente `dt` en la arista temporal. Captura la "
+            "periodicidad que MLP ignora."
+        ),
+        "avoid_when": (
+            "Para features físicas no periódicas (km, gradientes). Aumenta "
+            "parámetros sin beneficio y puede sobreajustar."
+        ),
+    },
+}
+
+
+# Heurísticas de qué encoder casa mejor con cada tipo de arista. Si el usuario
+# elige otra cosa lo respetamos — esto es solo orientación.
+EDGE_ENCODER_RECOMMENDATION_BY_RELATION: Dict[str, Tuple[str, str]] = {
+    "temporal": (
+        "time2vec",
+        "Solo lleva `delta_features` con `dt` implícito; Time2Vec captura "
+        "estacionalidad que MLP ignora.",
+    ),
+    "spatial": (
+        "layernorm_mlp",
+        "Mezcla `delta_features` con features físicas de escalas distintas "
+        "(km, gradientes); LayerNorm estabiliza.",
+    ),
+    "spatial_back": (
+        "layernorm_mlp",
+        "Misma física que `spatial`, distinta dirección.",
+    ),
+    "st_fwd": (
+        "mlp_residual",
+        "Combina componentes espaciales y temporales; el skip preserva la "
+        "señal cruda sin sacrificar capacidad.",
+    ),
+}
+
+
+def _edge_encoder_kind_help_markdown() -> str:
+    """Bloque markdown con la guía completa de los 4 encoders. Lo usamos
+    dentro del expander avanzado para que el usuario tenga toda la info a un
+    click sin abandonar la pestaña."""
+    lines = ["**Guía de selección — encoders por tipo de arista**", ""]
+    for kind in EDGE_ENCODER_KIND_OPTIONS:
+        info = EDGE_ENCODER_KIND_INFO.get(kind)
+        if not info:
+            continue
+        lines.append(f"### `{kind}` — {info['label']}")
+        lines.append(info["summary"])
+        lines.append("")
+        lines.append(f"- **Fórmula:** `{info['formula']}`")
+        lines.append(f"- **Parámetros:** {info['params']}")
+        lines.append(f"- **Cuándo usarlo:** {info['use_when']}")
+        lines.append(f"- **Evítalo cuando:** {info['avoid_when']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _edge_encoder_recommendation(
+    relation_name: str, current_kind: str
+) -> Optional[str]:
+    """Devuelve una caption corta para una relación dada, indicando el kind
+    recomendado y por qué. Si el usuario ya eligió el recomendado, lo confirma
+    en lugar de sugerir."""
+    rec = EDGE_ENCODER_RECOMMENDATION_BY_RELATION.get(str(relation_name).lower())
+    if not rec:
+        return None
+    recommended, reason = rec
+    if str(current_kind).lower() == recommended:
+        return f"OK: `{recommended}` suele ser la mejor opción aquí — {reason}"
+    return f"Sugerencia: `{recommended}` suele rendir mejor para `{relation_name}` — {reason}"
+
+
+def _edge_type_search_key(edge_type: object) -> str:
+    if isinstance(edge_type, tuple) and len(edge_type) == 3:
+        raw = "__".join(str(part) for part in edge_type)
+    else:
+        raw = str(edge_type)
+    return re.sub(r"[^A-Za-z0-9_]+", "_", raw).strip("_") or "edge"
+
+
+def _edge_type_display_label(edge_type: object) -> str:
+    if isinstance(edge_type, tuple) and len(edge_type) >= 2:
+        return str(edge_type[1])
+    return str(edge_type)
+
+
+def _default_edge_encoder_search_spec(in_dim: object = 0) -> Dict[str, object]:
+    try:
+        raw_dim = max(1, int(in_dim or 0))
+    except Exception:
+        raw_dim = 1
+    hidden_default = max(8, raw_dim * 2)
+    encoded_default = max(1, raw_dim)
+    return {
+        "kind_choices": list(EDGE_ENCODER_KIND_OPTIONS),
+        "hidden_dim": {
+            "min": max(4, raw_dim),
+            "max": max(hidden_default, raw_dim * 4),
+            "step": 4,
+        },
+        "encoded_dim": {
+            "min": 1,
+            "max": max(encoded_default, raw_dim * 2, 8),
+            "step": 1,
+        },
+        "dropout": {"min": 0.0, "max": 0.35, "step": 0.05},
+    }
+
+
+def _coerce_edge_encoder_kind_choices(value: object) -> List[str]:
+    if not isinstance(value, (list, tuple, set)):
+        value = [value] if value is not None else []
+    choices: List[str] = []
+    for item in value:
+        text = str(item).strip().lower()
+        if text in EDGE_ENCODER_KIND_OPTIONS and text not in choices:
+            choices.append(text)
+    return choices or ["mlp"]
+
+
+def _coerce_range_spec(
+    *,
+    min_value: object,
+    max_value: object,
+    step: object,
+    fallback: Mapping[str, object],
+    cast: Callable[[object], Any],
+    absolute_min: Optional[float] = None,
+    absolute_max: Optional[float] = None,
+) -> Dict[str, object]:
+    def _cast_or_default(value: object, key: str) -> Any:
+        try:
+            return cast(value)
+        except Exception:
+            return cast(fallback[key])
+
+    lo = _cast_or_default(min_value, "min")
+    hi = _cast_or_default(max_value, "max")
+    stp = _cast_or_default(step, "step")
+    if absolute_min is not None:
+        lo = max(lo, cast(absolute_min))
+        hi = max(hi, cast(absolute_min))
+    if absolute_max is not None:
+        lo = min(lo, cast(absolute_max))
+        hi = min(hi, cast(absolute_max))
+    if hi < lo:
+        lo, hi = hi, lo
+    if stp <= 0:
+        stp = _cast_or_default(fallback.get("step", 1), "step")
+    return {"min": lo, "max": hi, "step": stp}
+
+
+def _collect_optuna_edge_encoder_search_space(
+    get_state: Callable[[str, object], object],
+    graph_data: HeteroData,
+    selected_variant: object,
+) -> Optional[Dict[str, object]]:
+    if _describe_gnn_variant(selected_variant).get("uses_edge_mlp") != "yes":
+        return None
+    edge_dims = _infer_edge_feature_dims(graph_data)
+    if not edge_dims:
+        return {
+            "mode": "shared",
+            "kind_choices": ["mlp"],
+            **_default_edge_encoder_search_spec(0),
+            "per_type": {},
+        }
+
+    raw_mode = str(
+        get_state("gnn_optuna_edge_encoder_mode", "Por tipo de arista")
+    ).strip().lower()
+    mode = "shared" if raw_mode.startswith("comp") else "per_type"
+
+    if mode == "shared":
+        fallback = _default_edge_encoder_search_spec(
+            max(int(v or 0) for v in edge_dims.values())
+        )
+        return {
+            "mode": "shared",
+            "kind_choices": _coerce_edge_encoder_kind_choices(
+                get_state(
+                    "gnn_optuna_edge_kind_choices",
+                    fallback["kind_choices"],
+                )
+            ),
+            "hidden_dim": _coerce_range_spec(
+                min_value=get_state(
+                    "gnn_optuna_edge_hidden_min",
+                    fallback["hidden_dim"]["min"],
+                ),
+                max_value=get_state(
+                    "gnn_optuna_edge_hidden_max",
+                    fallback["hidden_dim"]["max"],
+                ),
+                step=get_state(
+                    "gnn_optuna_edge_hidden_step",
+                    fallback["hidden_dim"]["step"],
+                ),
+                fallback=fallback["hidden_dim"],
+                cast=int,
+                absolute_min=1,
+            ),
+            "encoded_dim": _coerce_range_spec(
+                min_value=get_state(
+                    "gnn_optuna_edge_encoded_min",
+                    fallback["encoded_dim"]["min"],
+                ),
+                max_value=get_state(
+                    "gnn_optuna_edge_encoded_max",
+                    fallback["encoded_dim"]["max"],
+                ),
+                step=get_state(
+                    "gnn_optuna_edge_encoded_step",
+                    fallback["encoded_dim"]["step"],
+                ),
+                fallback=fallback["encoded_dim"],
+                cast=int,
+                absolute_min=1,
+            ),
+            "dropout": _coerce_range_spec(
+                min_value=get_state(
+                    "gnn_optuna_edge_dropout_min",
+                    fallback["dropout"]["min"],
+                ),
+                max_value=get_state(
+                    "gnn_optuna_edge_dropout_max",
+                    fallback["dropout"]["max"],
+                ),
+                step=get_state(
+                    "gnn_optuna_edge_dropout_step",
+                    fallback["dropout"]["step"],
+                ),
+                fallback=fallback["dropout"],
+                cast=float,
+                absolute_min=0.0,
+                absolute_max=0.9,
+            ),
+            "per_type": {},
+        }
+
+    per_type: Dict[str, Dict[str, object]] = {}
+    for edge_type, in_dim in edge_dims.items():
+        edge_key = _edge_type_search_key(edge_type)
+        fallback = _default_edge_encoder_search_spec(in_dim)
+        per_type[edge_key] = {
+            "edge_type": tuple(edge_type) if isinstance(edge_type, tuple) else edge_type,
+            "label": _edge_type_display_label(edge_type),
+            "in_dim": int(in_dim or 0),
+            "kind_choices": _coerce_edge_encoder_kind_choices(
+                get_state(
+                    f"gnn_optuna_edge_kind_choices_{edge_key}",
+                    fallback["kind_choices"],
+                )
+            ),
+            "hidden_dim": _coerce_range_spec(
+                min_value=get_state(
+                    f"gnn_optuna_edge_{edge_key}_hidden_min",
+                    fallback["hidden_dim"]["min"],
+                ),
+                max_value=get_state(
+                    f"gnn_optuna_edge_{edge_key}_hidden_max",
+                    fallback["hidden_dim"]["max"],
+                ),
+                step=get_state(
+                    f"gnn_optuna_edge_{edge_key}_hidden_step",
+                    fallback["hidden_dim"]["step"],
+                ),
+                fallback=fallback["hidden_dim"],
+                cast=int,
+                absolute_min=1,
+            ),
+            "encoded_dim": _coerce_range_spec(
+                min_value=get_state(
+                    f"gnn_optuna_edge_{edge_key}_encoded_min",
+                    fallback["encoded_dim"]["min"],
+                ),
+                max_value=get_state(
+                    f"gnn_optuna_edge_{edge_key}_encoded_max",
+                    fallback["encoded_dim"]["max"],
+                ),
+                step=get_state(
+                    f"gnn_optuna_edge_{edge_key}_encoded_step",
+                    fallback["encoded_dim"]["step"],
+                ),
+                fallback=fallback["encoded_dim"],
+                cast=int,
+                absolute_min=1,
+            ),
+            "dropout": _coerce_range_spec(
+                min_value=get_state(
+                    f"gnn_optuna_edge_{edge_key}_dropout_min",
+                    fallback["dropout"]["min"],
+                ),
+                max_value=get_state(
+                    f"gnn_optuna_edge_{edge_key}_dropout_max",
+                    fallback["dropout"]["max"],
+                ),
+                step=get_state(
+                    f"gnn_optuna_edge_{edge_key}_dropout_step",
+                    fallback["dropout"]["step"],
+                ),
+                fallback=fallback["dropout"],
+                cast=float,
+                absolute_min=0.0,
+                absolute_max=0.9,
+            ),
+        }
+    return {"mode": "per_type", "per_type": per_type}
 
 
 def _render_gnn_variant_selector(
@@ -17658,6 +18532,9 @@ def _perform_model_evaluation(
                 or _gnn_variant_requires_sequence_index(gnn_variant)
             ),
             edge_types=model_edge_types,
+            edge_feature_dims=_resolve_edge_feature_dims_for_model(state_dict, graph_data),
+            edge_encoded_dims=_resolve_edge_encoded_dims_for_model(state_dict),
+            edge_encoder_kinds=_resolve_edge_encoder_kinds_for_model(state_dict),
         )
         if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
             progress_ui.fail(
@@ -18525,6 +19402,23 @@ SAMPLER_NEIGHBOR_PROFILE_PRESETS: Tuple[Tuple[str, Tuple[int, ...]], ...] = (
     ("broad", (25, 15, 10)),
     ("wide", (30, 20)),
 )
+GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS: Tuple[Tuple[str, object], ...] = (
+    ("compact", (15, 10)),
+    ("focused", (10, 5)),
+    ("broad", (25, 15, 10)),
+    ("wide", (30, 20)),
+    (
+        "asymmetric",
+        {
+            "temporal": (25, 25),
+            "spatial": (3, 3),
+            "spatial_back": (3, 3),
+        },
+    ),
+)
+GNN_OPTUNA_NEIGHBOR_PROFILE_LABELS: Dict[str, str] = {
+    "asymmetric": "asimétrico",
+}
 SAMPLER_CLUSTER_GCN_PROFILE_PRESETS: Tuple[Tuple[str, Tuple[int, int]], ...] = (
     ("highway_stable", (64, 0)),
     ("highway_broad", (32, 0)),
@@ -18540,6 +19434,140 @@ SAMPLER_GRAPHSAINT_PROFILE_PRESETS: Tuple[
     ("highway_edge_stable", ("edge", 4096, 16, 1)),
     ("highway_rw_broad", ("random_walk", 8192, 12, 3)),
 )
+
+
+def _clone_optuna_neighbor_profile(profile: object) -> object:
+    if isinstance(profile, Mapping):
+        return {
+            str(key): _coerce_neighbor_profile(value, fallback=[15, 10])
+            for key, value in profile.items()
+        }
+    return _coerce_neighbor_profile(profile, fallback=[15, 10])
+
+
+def _default_optuna_neighbor_profiles() -> Dict[str, object]:
+    return {
+        name: _clone_optuna_neighbor_profile(profile)
+        for name, profile in GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS
+    }
+
+
+def _optuna_neighbor_profile_names() -> List[str]:
+    return [name for name, _ in GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS]
+
+
+def _optuna_neighbor_profile_label(name: str) -> str:
+    return GNN_OPTUNA_NEIGHBOR_PROFILE_LABELS.get(str(name), str(name))
+
+
+def _format_optuna_neighbor_profile(profile: object) -> str:
+    normalized = _clone_optuna_neighbor_profile(profile)
+    if isinstance(normalized, Mapping):
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+    return ",".join(str(int(v)) for v in normalized)
+
+
+def _parse_optuna_neighbor_profile_value(value: object, fallback: object) -> object:
+    fallback_norm = _clone_optuna_neighbor_profile(fallback)
+    raw = value
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if not txt:
+            return fallback_norm
+        try:
+            raw = json.loads(txt)
+        except Exception:
+            raw = txt
+
+    if isinstance(fallback_norm, Mapping):
+        if not isinstance(raw, Mapping):
+            return fallback_norm
+        parsed: Dict[str, List[int]] = {}
+        for rel_name, default_profile in fallback_norm.items():
+            parsed[str(rel_name)] = _coerce_neighbor_profile(
+                raw.get(rel_name),
+                fallback=default_profile,
+            )
+        for rel_name, profile in raw.items():
+            rel_key = str(rel_name)
+            if rel_key in parsed:
+                continue
+            parsed[rel_key] = _coerce_neighbor_profile(profile, fallback=[15, 10])
+        return parsed
+
+    return _coerce_neighbor_profile(raw, fallback=fallback_norm)
+
+
+def _coerce_optuna_neighbor_choices(
+    value: object,
+    profile_names: Sequence[str],
+) -> List[str]:
+    names = [str(name) for name in profile_names]
+    if value is None:
+        return list(names)
+    raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+    choices: List[str] = []
+    for raw in raw_values:
+        name = str(raw)
+        if name in names and name not in choices:
+            choices.append(name)
+    return choices if choices else list(names)
+
+
+def _collect_optuna_neighbor_profiles_from_state(
+    get_state: Callable[[str, object], object],
+) -> Dict[str, object]:
+    profiles: Dict[str, object] = {}
+    for name, default_profile in GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS:
+        default_text = _format_optuna_neighbor_profile(default_profile)
+        raw = get_state(
+            f"gnn_optuna_neighbor_profile_{name}",
+            get_state(f"gnn_optuna_neighbor_{name}", default_text),
+        )
+        profiles[name] = _parse_optuna_neighbor_profile_value(raw, default_profile)
+    return profiles
+
+
+def _render_optuna_neighbor_profiles_controls(
+    *,
+    key_prefix: str,
+) -> Dict[str, object]:
+    profile_map: Dict[str, object] = {}
+    profile_names = _optuna_neighbor_profile_names()
+    with st.expander("Perfiles de vecinos", expanded=True):
+        st.caption(
+            "Define perfiles para NeighborLoader. Los perfiles planos usan una "
+            "lista por capa; el perfil asimétrico usa JSON por relación."
+        )
+        for name, default_profile in GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS:
+            default_txt = _format_optuna_neighbor_profile(default_profile)
+            profile_txt = st.text_input(
+                _optuna_neighbor_profile_label(name),
+                value=default_txt,
+                key=f"{key_prefix}_neighbor_profile_{name}",
+                help=(
+                    "JSON con claves de relación: temporal, spatial y spatial_back."
+                    if isinstance(_clone_optuna_neighbor_profile(default_profile), Mapping)
+                    else None
+                ),
+            )
+            profile_map[name] = _parse_optuna_neighbor_profile_value(
+                profile_txt,
+                default_profile,
+            )
+        enabled_profiles = st.multiselect(
+            "Perfiles habilitados",
+            options=profile_names,
+            default=profile_names,
+            format_func=_optuna_neighbor_profile_label,
+            key=f"{key_prefix}_neighbor_profiles_enabled",
+            help="Selecciona qué perfiles entran al grid de Optuna.",
+        )
+    return {
+        name: profile_map[name]
+        for name in enabled_profiles
+        if name in profile_map
+    }
 
 
 def _render_sampler_neighbor_profiles_controls(
@@ -19794,6 +20822,7 @@ def _probe_sampler_memory_usage(
             num_nodes=int(getattr(graph_data["pm"], "num_nodes", graph_data["pm"].x.shape[0])),
             device=device,
             require_temporal_head=_gnn_variant_requires_sequence_index(gnn_variant),
+            edge_feature_dims=_infer_edge_feature_dims(graph_data),
         )
         model.train()
 
@@ -23781,6 +24810,19 @@ def _render_gnn_experiments_tab() -> None:
             )
 
         st.markdown("### Muestreo de Datos (Graph Sampling)")
+        with st.expander("Como interpretar estos controles", expanded=False):
+            st.markdown(
+                "- Aqui **seed** significa nodo PM raiz/objetivo usado para "
+                "armar mini-batches con vecinos; no es una semilla aleatoria.\n"
+                "- **Max seeds train por trial** limita cuantos nodos de "
+                "`train_mask` aportan perdida de entrenamiento en cada trial. "
+                "El grafo sigue disponible para traer vecinos. `0` usa todo train.\n"
+                "- **Max seeds val para evaluacion** limita cuantos nodos de "
+                "`val_mask` calculan el score de Optuna. `0` usa todo val.\n"
+                "- **Fijar subset de validacion por trial** reutiliza el mismo "
+                "subset de validacion en todas las evaluaciones de ese trial; "
+                "reduce ruido interno y estabiliza el pruning."
+            )
         prev_fixed_train = bool(st.session_state.get("gnn_exp_fixed_train", False))
         prev_sample_each = bool(
             st.session_state.get("gnn_exp_sample_each_epoch", True)
@@ -23838,7 +24880,11 @@ def _render_gnn_experiments_tab() -> None:
             value=False,
             key="gnn_exp_fixed_val",
             disabled=full_graph_mode,
-            help="Usa el mismo subset de validacion durante todo el trial.",
+            help=(
+                "Si Max seeds val > 0, usa el mismo subset de validacion en "
+                "cada evaluacion del trial. No fija el mismo subset entre "
+                "trials distintos."
+            ),
         )
         col_s1, col_s2 = st.columns(2)
         with col_s1:
@@ -23849,6 +24895,11 @@ def _render_gnn_experiments_tab() -> None:
                 step=1000,
                 key="gnn_exp_sample_train",
                 disabled=full_graph_mode,
+                help=(
+                    "Limite de nodos PM raiz tomados desde train_mask para "
+                    "entrenar cada trial. El loader aun trae sus vecinos. "
+                    "Usa 0 para entrenar con todo train."
+                ),
             )
         with col_s2:
             sample_val_nodes = st.number_input(
@@ -23858,6 +24909,11 @@ def _render_gnn_experiments_tab() -> None:
                 step=500,
                 key="gnn_exp_sample_val",
                 disabled=full_graph_mode,
+                help=(
+                    "Limite de nodos PM raiz tomados desde val_mask para "
+                    "calcular el score de Optuna. Usa 0 para evaluar con todo "
+                    "val. El muestreo intenta mantener ambas clases."
+                ),
             )
         if full_graph_mode:
             sample_train_nodes = 0
@@ -24461,50 +25517,10 @@ def _render_gnn_experiments_tab() -> None:
                 key="gnn_exp_aggr2",
             )
 
-        with st.expander("Perfiles de vecinos"):
-            st.caption(
-                "Define perfiles para NeighborLoader. Cada perfil es una lista por capa."
-            )
-
-            def _parse_int_list(text: str, fallback: List[int]) -> List[int]:
-                try:
-                    items = [int(v.strip()) for v in text.split(",") if v.strip()]
-                    return items or fallback
-                except Exception:
-                    return fallback
-
-            profile_compact = st.text_input(
-                "compact",
-                value="15,10",
-                key="gnn_exp_neighbor_compact",
-            )
-            profile_focused = st.text_input(
-                "focused",
-                value="10,5",
-                key="gnn_exp_neighbor_focused",
-            )
-            profile_broad = st.text_input(
-                "broad",
-                value="25,15,10",
-                key="gnn_exp_neighbor_broad",
-            )
-            profile_wide = st.text_input(
-                "wide",
-                value="30,20",
-                key="gnn_exp_neighbor_wide",
-            )
-            neighbor_profiles = {
-                "compact": _parse_int_list(profile_compact, [15, 10]),
-                "focused": _parse_int_list(profile_focused, [10, 5]),
-                "broad": _parse_int_list(profile_broad, [25, 15, 10]),
-                "wide": _parse_int_list(profile_wide, [30, 20]),
-            }
-            neighbor_choices = st.multiselect(
-                "Perfiles habilitados",
-                list(neighbor_profiles.keys()),
-                default=list(neighbor_profiles.keys()),
-                key="gnn_exp_neighbor_choices",
-            )
+        neighbor_profiles = _render_optuna_neighbor_profiles_controls(
+            key_prefix="gnn_exp",
+        )
+        neighbor_choices = list(neighbor_profiles.keys())
 
         with st.expander("Optimizador"):
             col_lr, col_wd = st.columns(2)
@@ -25605,18 +26621,26 @@ def _render_gnn_experiments_tab() -> None:
                     st.warning(f"No se pudo guardar en historial: {exc}")
 
 
-# Defaults recomendados para predicción de clase rara (~0.3% positivos):
+# Defaults recomendados para predicción de clase rara (~0.3% positivos, ~258 muestras).
+# Calibración v2: pensada para evitar overfitting de epoch-1 con un ratio
+# params/positivos < 2000:1.
 #   - Variante con edge MLP encoder y head temporal GRU (aprovecha edge_attr 12-dim).
 #   - 2 capas: evita oversmoothing (clase rara se diluye con +profundidad).
-#   - hidden=96, heads=4, dropout=0.2: capacidad razonable sin overfit en ~258 positivos.
-#   - FocalLoss con alpha=0.95 calibrado al desbalance.
+#   - hidden=48, heads=4, dropout=0.35: capacidad moderada (~400k params totales)
+#     en lugar de 1.5M; reduce drásticamente el riesgo de memorización.
+#   - FocalLoss(alpha=0.75, gamma=1.5): menos agresiva que (0.95, 2.0); el peso
+#     extremo sobre positivos generaba gradientes ~400x desbalanceados.
+#   - lr=1e-4 + weight_decay=5e-3: más conservador y con regularización L2 fuerte.
+#   - scheduler plateau_restart (ReduceLROnPlateau): baja LR cuando val deja de
+#     mejorar; one_cycle no encaja porque su warmup sube el LR justo cuando ya
+#     deberíamos estar bajándolo.
 #   - Vecindario asimétrico: temporal denso, spatial reducido (4 pórticos en cadena).
 RECOMMENDED_NETWORK_DEFAULTS: Dict[str, object] = {
     "gnn_variant": "gat_edge_mlp_gru",
-    "hidden_channels": 96,
+    "hidden_channels": 48,
     "num_heads": 4,
     "num_layers": 2,
-    "dropout": 0.2,
+    "dropout": 0.35,
     "aggr1": "sum",
     "aggr2": "sum",
     "use_checkpointing": False,
@@ -25629,12 +26653,12 @@ RECOMMENDED_NETWORK_DEFAULTS: Dict[str, object] = {
         "spatial_back": [3, 3],
     },
     "optimizer": "AdamW",
-    "lr_scheduler": "one_cycle",
-    "lr": 3e-4,
-    "weight_decay": 1e-4,
+    "lr_scheduler": "plateau_restart",
+    "lr": 1e-4,
+    "weight_decay": 5e-3,
     "loss_type": "FocalLoss",
-    "focal_gamma": 2.0,
-    "focal_alpha": 0.95,
+    "focal_gamma": 1.5,
+    "focal_alpha": 0.75,
     "lambda_l2_att": 1e-4,
     "lambda_H_mode": "fixed",
     "lambda_H_fixed": 1e-4,
@@ -25644,8 +26668,36 @@ RECOMMENDED_NETWORK_DEFAULTS: Dict[str, object] = {
 }
 
 
+def _load_persisted_network_config() -> Optional[Dict[str, object]]:
+    """Lee `network_config_latest.json` si existe.
+
+    El botón "Guardar configuracion" del tab Network escribe esta copia estable
+    además del snapshot con timestamp. Al recargar la app, `session_state` está
+    vacío y los widgets caerían a `RECOMMENDED_NETWORK_DEFAULTS`; esta función
+    permite restaurar la última selección del usuario.
+    """
+    path = GNN_NETWORK_CONFIG_LATEST_PATH
+    try:
+        if path.exists():
+            with open(path, "r") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        return None
+    return None
+
+
 def _render_network_tab() -> None:
     st.subheader("Network (GNN)")
+
+    # Restaura la última configuración persistida si la sesión todavía no la
+    # tiene cargada (caso típico: el usuario cierra la app y la vuelve a abrir).
+    if "gnn_network_config" not in st.session_state:
+        persisted = _load_persisted_network_config()
+        if persisted:
+            st.session_state["gnn_network_config"] = persisted
+            st.session_state["gnn_network_config_path"] = str(GNN_NETWORK_CONFIG_LATEST_PATH)
 
     loaded_graph = st.session_state.get("loaded_graph")
     if loaded_graph is None:
@@ -25698,9 +26750,11 @@ def _render_network_tab() -> None:
             "Cargar defaults recomendados (clase rara ~0.3%)",
             key="gnn_net_load_recommended",
             help=(
-                "Pre-rellena: gat_edge_mlp_gru, hidden=96, heads=4, layers=2, "
-                "dropout=0.2, FocalLoss(α=0.95), num_neighbors asimétrico por tipo "
-                "de arista (temporal denso, spatial reducido)."
+                "Pre-rellena: gat_edge_mlp_gru, hidden=48, heads=4, layers=2, "
+                "dropout=0.35, lr=1e-4, weight_decay=5e-3, FocalLoss(α=0.75, γ=1.5), "
+                "scheduler=plateau_restart, num_neighbors asimétrico por tipo de "
+                "arista (temporal denso, spatial reducido). Calibrado para evitar "
+                "overfit de epoch-1 con clase rara (~0.3%)."
             ),
         ):
             new_cfg = dict(RECOMMENDED_NETWORK_DEFAULTS)
@@ -26014,6 +27068,163 @@ def _render_network_tab() -> None:
         or "GraphSMOTE" in str(balanced_graph_ref.get("source", ""))
     )
 
+    # --- Edge encoder por tipo de arista (C) ----------------------------------
+    # Cada relación tiene su propio `EdgeAttrEncoder`. Por defecto los hparams
+    # se derivan del `in_dim` raw real del grafo (lo que evita el zero-padding
+    # legacy). El usuario puede sobreescribir el *tipo* de encoder y sus
+    # hiperparámetros por tipo.
+    edge_feature_dims_by_type = _infer_edge_feature_dims(graph_data)
+    edge_encoder_overrides: Dict[str, Dict[str, object]] = {}
+    if variant_spec["uses_edge_mlp"] == "yes":
+        existing_overrides = (existing_cfg or {}).get("edge_encoder_per_type", {}) or {}
+        with st.expander(
+            "Edge encoders por tipo de arista (avanzado)",
+            expanded=False,
+        ):
+            st.caption(
+                "Cada relación tiene su propio encoder, y puedes elegir el **tipo** "
+                "de transformación por relación. Tras quitar el zero-padding del "
+                "grafo, `in_dim` también puede diferir: la temporal solo lleva "
+                "`delta_features` y las espaciales también incluyen las features físicas."
+            )
+
+            # Tabla compacta de referencia: una fila por encoder con qué hace,
+            # complejidad y cuándo encaja. La versión markdown larga queda en
+            # un sub-expander para no abrumar.
+            reference_df = pd.DataFrame(
+                [
+                    {
+                        "kind": kind,
+                        "label": info["label"],
+                        "fórmula": info["formula"],
+                        "params": info["params"],
+                        "cuándo usarlo": info["use_when"],
+                        "evitarlo cuando": info["avoid_when"],
+                    }
+                    for kind, info in EDGE_ENCODER_KIND_INFO.items()
+                ]
+            )
+            st.markdown("**Referencia rápida de los 4 encoders**")
+            st.dataframe(reference_df, width="stretch", hide_index=True)
+            with st.expander(
+                "Guía detallada de selección", expanded=False
+            ):
+                st.markdown(_edge_encoder_kind_help_markdown())
+                st.caption(
+                    "Heurísticas por relación (orientativas, puedes ignorarlas):"
+                )
+                heur_rows = []
+                for rel_name, (rec_kind, rec_reason) in (
+                    EDGE_ENCODER_RECOMMENDATION_BY_RELATION.items()
+                ):
+                    heur_rows.append(
+                        {
+                            "relación": rel_name,
+                            "encoder sugerido": rec_kind,
+                            "motivo": rec_reason,
+                        }
+                    )
+                st.dataframe(
+                    pd.DataFrame(heur_rows), width="stretch", hide_index=True
+                )
+
+            st.markdown("---")
+            st.markdown("**Configuración por tipo de arista**")
+            for et, in_dim_et in edge_feature_dims_by_type.items():
+                rel_label = et[1] if isinstance(et, tuple) and len(et) >= 2 else str(et)
+                et_key = str(et)
+                prior = existing_overrides.get(et_key, {}) or {}
+                default_kind_raw = str(prior.get("kind", "mlp") or "mlp").strip().lower()
+                if default_kind_raw not in EDGE_ENCODER_KIND_OPTIONS:
+                    default_kind_raw = "mlp"
+                default_encoded = int(prior.get("encoded_dim", in_dim_et or 0))
+                default_hidden = int(
+                    prior.get(
+                        "hidden_dim",
+                        max(8, (in_dim_et or 0) * 2) if (in_dim_et or 0) > 0 else 8,
+                    )
+                )
+                default_dropout = float(prior.get("dropout", float(dropout) * 0.5))
+                st.markdown(f"**`{rel_label}`** — in_dim raw = `{int(in_dim_et)}`")
+                col_k, col_h, col_e, col_d = st.columns([0.30, 0.23, 0.23, 0.24])
+                with col_k:
+                    enc_kind_et = st.selectbox(
+                        f"kind[{rel_label}]",
+                        options=EDGE_ENCODER_KIND_OPTIONS,
+                        index=EDGE_ENCODER_KIND_OPTIONS.index(default_kind_raw),
+                        format_func=lambda k: (
+                            f"{k} — {EDGE_ENCODER_KIND_INFO[k]['label']}"
+                            if k in EDGE_ENCODER_KIND_INFO else k
+                        ),
+                        help=(
+                            EDGE_ENCODER_KIND_INFO.get(default_kind_raw, {}).get(
+                                "summary", ""
+                            )
+                        ),
+                        key=f"gnn_net_edge_kind_{rel_label}",
+                    )
+                with col_h:
+                    is_t2v = (enc_kind_et == "time2vec")
+                    hidden_label = (
+                        f"k(Time2Vec)[{rel_label}]" if is_t2v else f"hidden[{rel_label}]"
+                    )
+                    enc_hidden_et = st.number_input(
+                        hidden_label,
+                        min_value=1 if is_t2v else 4,
+                        max_value=512,
+                        value=int(default_hidden),
+                        step=1 if is_t2v else 4,
+                        help=(
+                            "k = número de componentes Time2Vec por feature "
+                            "(linear + k-1 periódicos). Típico 4-8."
+                            if is_t2v
+                            else "Tamaño de la capa oculta del MLP."
+                        ),
+                        key=f"gnn_net_edge_hidden_{rel_label}",
+                    )
+                with col_e:
+                    enc_out_et = st.number_input(
+                        f"encoded[{rel_label}]",
+                        min_value=1,
+                        max_value=512,
+                        value=int(max(default_encoded, 1)),
+                        step=1,
+                        help="Dimensión del edge_attr que recibe GATConv.",
+                        key=f"gnn_net_edge_encoded_{rel_label}",
+                    )
+                with col_d:
+                    enc_drop_et = st.number_input(
+                        f"dropout[{rel_label}]",
+                        min_value=0.0,
+                        max_value=0.9,
+                        value=float(max(0.0, min(default_dropout, 0.9))),
+                        step=0.05,
+                        help="Dropout dentro del encoder.",
+                        key=f"gnn_net_edge_dropout_{rel_label}",
+                    )
+
+                # Resumen + sugerencia dinámica por relación.
+                kind_info = EDGE_ENCODER_KIND_INFO.get(enc_kind_et, {})
+                if kind_info:
+                    st.caption(
+                        f"`{enc_kind_et}` · {kind_info['summary']} "
+                        f"Fórmula: `{kind_info['formula']}`."
+                    )
+                recommendation = _edge_encoder_recommendation(rel_label, enc_kind_et)
+                if recommendation:
+                    if recommendation.startswith("OK"):
+                        st.success(recommendation)
+                    else:
+                        st.info(recommendation)
+
+                edge_encoder_overrides[et_key] = {
+                    "in_dim": int(in_dim_et),
+                    "kind": str(enc_kind_et),
+                    "hidden_dim": int(enc_hidden_et),
+                    "encoded_dim": int(enc_out_et),
+                    "dropout": float(enc_drop_et),
+                }
+
     config_payload = {
         "gnn_variant": str(selected_variant),
         "hidden_channels": int(hidden_channels),
@@ -26040,6 +27251,7 @@ def _render_network_tab() -> None:
         "final_lambda_H": float(final_lambda_H),
         "batch_size": int(batch_size),
         "checkpoint_metric": str(existing_cfg.get("checkpoint_metric", "val_auprc")),
+        "edge_encoder_per_type": edge_encoder_overrides,
     }
 
     st.session_state["gnn_network_config"] = config_payload
@@ -26053,6 +27265,10 @@ def _render_network_tab() -> None:
             )
             try:
                 with open(out_path, "w") as fh:
+                    json.dump(config_payload, fh, indent=2)
+                # Copia estable que se relee al reabrir la app (ver
+                # `_load_persisted_network_config`).
+                with open(GNN_NETWORK_CONFIG_LATEST_PATH, "w") as fh:
                     json.dump(config_payload, fh, indent=2)
                 st.session_state["gnn_network_config_path"] = out_path
                 st.success("Configuracion guardada.")
@@ -26075,15 +27291,24 @@ def _render_network_tab() -> None:
     layer_rows = []
     emb_dim = hidden_channels * num_heads
     if variant_spec["uses_edge_mlp"] == "yes":
-        layer_rows.append(
-            {
-                "layer": "edge_attr",
-                "type": "EdgeAttrEncoder (MLP)",
-                "heads": "-",
-                "hidden": int(edge_feature_dim),
-                "emb_dim": int(edge_feature_dim),
-            }
-        )
+        # Una fila por tipo de arista, reflejando que hay un encoder
+        # independiente (con sus propios pesos y posiblemente su propio
+        # *tipo* — mlp / mlp_residual / layernorm_mlp / time2vec) por relación.
+        for et, in_dim_et in edge_feature_dims_by_type.items():
+            rel_label = et[1] if isinstance(et, tuple) and len(et) >= 2 else str(et)
+            override = (edge_encoder_overrides or {}).get(str(et), {})
+            hidden_et = int(override.get("hidden_dim", max(8, (in_dim_et or 0) * 2) if (in_dim_et or 0) > 0 else 8))
+            encoded_et = int(override.get("encoded_dim", in_dim_et or 0))
+            kind_et = str(override.get("kind", "mlp"))
+            layer_rows.append(
+                {
+                    "layer": f"edge_attr[{rel_label}]",
+                    "type": f"EdgeEncoder ({kind_et})",
+                    "heads": "-",
+                    "hidden": hidden_et,
+                    "emb_dim": encoded_et,
+                }
+            )
     for idx in range(1, int(num_layers) + 1):
         layer_rows.append(
             {
@@ -26128,13 +27353,26 @@ def _render_network_tab() -> None:
         "node [shape=box style=\"rounded,filled\" fillcolor=\"#E8F1FF\" color=\"#2C3E50\" fontname=\"Helvetica\"];",
         f"input [label=\"Input\\nF={in_channels}\"];",
     ]
+    # Caja edge_attr y EdgeAttrEncoder por tipo de arista, para reflejar que
+    # cada relación tiene su propio MLP con `in_dim` y pesos distintos.
+    edge_mlp_node_ids: List[Tuple[str, str]] = []
     if variant_spec["uses_edge_mlp"] == "yes":
-        dot_lines.append(
-            f"edgeattr [label=\"edge_attr\\nD={edge_feature_dim}\" fillcolor=\"#FFF4E5\"];"
-        )
-        dot_lines.append(
-            "edge_mlp [label=\"EdgeAttrEncoder\\nMLP\" fillcolor=\"#FFF4E5\"];"
-        )
+        def _safe_id(name: str) -> str:
+            return re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+        for et, in_dim_et in edge_feature_dims_by_type.items():
+            rel_label = et[1] if isinstance(et, tuple) and len(et) >= 2 else str(et)
+            override = (edge_encoder_overrides or {}).get(str(et), {})
+            encoded_et = int(override.get("encoded_dim", in_dim_et or 0))
+            kind_et = str(override.get("kind", "mlp"))
+            attr_id = f"edgeattr_{_safe_id(rel_label)}"
+            mlp_id = f"edge_mlp_{_safe_id(rel_label)}"
+            dot_lines.append(
+                f"{attr_id} [label=\"edge_attr[{rel_label}]\\nD={int(in_dim_et)}\" fillcolor=\"#FFF4E5\"];"
+            )
+            dot_lines.append(
+                f"{mlp_id} [label=\"EdgeEncoder[{rel_label}]\\n{kind_et} -> D={encoded_et}\" fillcolor=\"#FFF4E5\"];"
+            )
+            edge_mlp_node_ids.append((attr_id, mlp_id))
     for idx in range(1, int(num_layers) + 1):
         dot_lines.append(
             f"layer{idx} [label=\"{variant_spec['conv_type']} {idx}\\nheads={num_heads}\\nhidden={hidden_channels}\\nemb={emb_dim}\"];"
@@ -26147,8 +27385,9 @@ def _render_network_tab() -> None:
     dot_lines.append(f"output [label=\"Output\\nclasses={num_classes}\"];")
     dot_lines.append("input -> layer1;")
     if variant_spec["uses_edge_mlp"] == "yes":
-        dot_lines.append("edgeattr -> edge_mlp;")
-        dot_lines.append("edge_mlp -> layer1 [style=dashed color=\"#B9770E\"];")
+        for attr_id, mlp_id in edge_mlp_node_ids:
+            dot_lines.append(f"{attr_id} -> {mlp_id};")
+            dot_lines.append(f"{mlp_id} -> layer1 [style=dashed color=\"#B9770E\"];")
     if int(num_layers) > 1:
         for idx in range(1, int(num_layers)):
             dot_lines.append(f"layer{idx} -> layer{idx+1};")
@@ -26358,6 +27597,7 @@ def _compute_optuna_study_name(
     graph_obj: Dict[str, object],
     balancing_strategy: str,
     objective_metric: str,
+    gnn_variant: Optional[object] = None,
     space_signature: Optional[str] = None,
 ) -> Tuple[str, str]:
     from src import gnn_main as graph_main
@@ -26365,7 +27605,11 @@ def _compute_optuna_study_name(
     use_graphsmote_search = (balancing_strategy == "Opt. balance con GraphSMOTE")
     use_imgagn_search = (balancing_strategy == "Opt. balance con ImGAGN")
     graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
-    variant_tag = graph_main._variant_tags(use_graphsmote_search, graph_obj)
+    variant_tag = graph_main._variant_tags(
+        use_graphsmote_search,
+        graph_obj,
+        gnn_variant=_normalize_ui_gnn_variant(gnn_variant),
+    )
     if use_imgagn_search:
         if "_Base" in variant_tag:
             variant_tag = variant_tag.replace("_Base", "")
@@ -26486,7 +27730,16 @@ def _search_space_signature_from_state() -> str:
         "aggr1": list(_get_state("gnn_optuna_aggr1", ["sum", "mean"])),
         "aggr2": list(_get_state("gnn_optuna_aggr2", ["sum", "mean"])),
         "use_checkpointing": list(_get_state("gnn_optuna_checkpoint", [False, True])),
-        "neighbor_choices": list(_get_state("gnn_optuna_neighbor_choices", ["compact", "focused", "broad", "wide"])),
+        "use_residual": list(_get_state("gnn_optuna_use_residual", [True])),
+        "use_relation_self_loops": list(
+            _get_state("gnn_optuna_relation_self_loops", [False])
+        ),
+        "neighbor_choices": list(
+            _get_state(
+                "gnn_optuna_neighbor_choices",
+                _optuna_neighbor_profile_names(),
+            )
+        ),
         "lambda_H_mode": list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"])),
         "loss_type": list(_get_state("gnn_optuna_loss_type", ["CrossEntropy", "FocalLoss"])),
         "optimizers": list(_get_state("gnn_optuna_optimizers", ["AdamW", "Lion"])),
@@ -26560,11 +27813,24 @@ def _collect_optuna_ray_settings(
         except Exception:
             return fallback
 
+    def _parse_bool_choices(value: object, fallback: Sequence[bool]) -> List[bool]:
+        if not isinstance(value, (list, tuple, set)):
+            value = [value] if value is not None else []
+        choices: List[bool] = []
+        for item in value:
+            parsed = _coerce_bool(item, bool(fallback[0] if fallback else False))
+            if parsed not in choices:
+                choices.append(parsed)
+        if not choices:
+            choices = [bool(v) for v in fallback]
+        return choices or [False]
+
     errors: List[str] = []
 
     balancing_strategy = str(_get_state("gnn_balancing_strategy", "Sin balancear"))
     use_graphsmote_search = (balancing_strategy == "Opt. balance con GraphSMOTE")
     use_imgagn_search = (balancing_strategy == "Opt. balance con ImGAGN")
+    selected_gnn_variant = _get_optuna_selected_gnn_variant()
 
     train_ratio = int(_get_state("gnn_optuna_split_train", TRAIN_RATIO))
     val_ratio = int(_get_state("gnn_optuna_split_val", VAL_RATIO))
@@ -26591,13 +27857,11 @@ def _collect_optuna_ray_settings(
         _error_temporal_split_required()
         return
 
-    neighbor_profiles = {
-        "compact": _parse_int_list(str(_get_state("gnn_optuna_neighbor_compact", "15,10")), [15, 10]),
-        "focused": _parse_int_list(str(_get_state("gnn_optuna_neighbor_focused", "10,5")), [10, 5]),
-        "broad": _parse_int_list(str(_get_state("gnn_optuna_neighbor_broad", "25,15,10")), [25, 15, 10]),
-        "wide": _parse_int_list(str(_get_state("gnn_optuna_neighbor_wide", "30,20")), [30, 20]),
-    }
-    neighbor_choices = list(_get_state("gnn_optuna_neighbor_choices", list(neighbor_profiles.keys())))
+    neighbor_profiles = _collect_optuna_neighbor_profiles_from_state(_get_state)
+    neighbor_choices = _coerce_optuna_neighbor_choices(
+        _get_state("gnn_optuna_neighbor_choices", list(neighbor_profiles.keys())),
+        list(neighbor_profiles.keys()),
+    )
     aggr1 = list(_get_state("gnn_optuna_aggr1", ["sum", "mean"]))
     aggr2 = list(_get_state("gnn_optuna_aggr2", ["sum", "mean"]))
     loss_types = list(_get_state("gnn_optuna_loss_type", ["CrossEntropy", "FocalLoss"]))
@@ -26611,6 +27875,19 @@ def _collect_optuna_ray_settings(
         if str(value) in GNN_LR_SCHEDULER_LABELS
     ]
     checkpoint_choices = list(_get_state("gnn_optuna_checkpoint", [False, True]))
+    use_residual_choices = _parse_bool_choices(
+        _get_state("gnn_optuna_use_residual", [True]),
+        [True],
+    )
+    use_relation_self_loops_choices = _parse_bool_choices(
+        _get_state("gnn_optuna_relation_self_loops", [False]),
+        [False],
+    )
+    edge_encoder_space = _collect_optuna_edge_encoder_search_space(
+        _get_state,
+        graph_data,
+        selected_gnn_variant,
+    )
     lambda_H_modes = list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"]))
     sampler_alias = {
         "neighborloader": "neighbor",
@@ -26675,10 +27952,21 @@ def _collect_optuna_ray_settings(
         errors.append("Seleccione al menos un lr_scheduler.")
     if not checkpoint_choices:
         errors.append("Seleccione al menos un valor para use_checkpointing.")
+    if not use_residual_choices:
+        errors.append("Seleccione al menos un valor para use_residual.")
+    if not use_relation_self_loops_choices:
+        errors.append("Seleccione al menos un valor para use_relation_self_loops.")
     if not lambda_H_modes:
         errors.append("Seleccione al menos un lambda_H_mode.")
     if not sampler_modes:
         errors.append("Seleccione al menos un sampler de entrenamiento (NeighborLoader / Cluster-GCN / GraphSAINT).")
+    if _gnn_variant_requires_sequence_index(selected_gnn_variant) and not _has_valid_sequence_index(
+        graph_obj.get("sequence_index")
+    ):
+        errors.append(
+            "La variante GNN seleccionada requiere SequenceIndex. "
+            "Cargue o construya un grafo temporal antes de ejecutar Optuna/Ray."
+        )
     if "cluster_gcn" in sampler_modes and not cluster_num_parts:
         errors.append("Configure al menos un valor para Cluster-GCN num_parts.")
     if "cluster_gcn" in sampler_modes and not cluster_parts_per_epoch:
@@ -26692,22 +27980,31 @@ def _collect_optuna_ray_settings(
     if "graphsaint" in sampler_modes and "random_walk" in graphsaint_modes and not graphsaint_walk_lengths:
         errors.append("Configure al menos un walk_length para GraphSAINT Random Walk.")
 
+    # Espacio de búsqueda v2 (Acción 6): rangos estrechados para clase rara (~0.3%).
+    # Rationale: evitar zonas que reproducen el overfit de epoch-1.
+    #   - hidden_max bajado de 128 → 96 (capacidad excesiva memoriza 258 positivos).
+    #   - layers_max bajado de 5 → 3 (>3 capas ⇒ oversmoothing).
+    #   - dropout_min subido de 0.05 → 0.2 (regularización mínima razonable).
+    #   - lr_max bajado de 1e-2 → 3e-4 (LR alto + FocalLoss agresiva ⇒ inestabilidad).
+    #   - wd_min subido de 1e-6 → 1e-4, wd_max subido de 5e-3 → 1e-2 (regularización fuerte).
+    #   - focal_alpha_max bajado de 0.95 → 0.85 (α=0.95 da gradiente ~400x desbalanceado).
+    #   - focal_gamma_max bajado de 3.0 → 2.0 (γ>2 amplifica ruido en positivos difíciles).
     hidden_min = int(_get_state("gnn_optuna_hidden_min", 32))
-    hidden_max = int(_get_state("gnn_optuna_hidden_max", 128))
-    hidden_step = int(_get_state("gnn_optuna_hidden_step", 32))
+    hidden_max = int(_get_state("gnn_optuna_hidden_max", 96))
+    hidden_step = int(_get_state("gnn_optuna_hidden_step", 16))
     heads_min = int(_get_state("gnn_optuna_heads_min", 2))
     heads_max = int(_get_state("gnn_optuna_heads_max", 8))
     heads_step = int(_get_state("gnn_optuna_heads_step", 2))
     layers_min = int(_get_state("gnn_optuna_layers_min", 2))
-    layers_max = int(_get_state("gnn_optuna_layers_max", 5))
+    layers_max = int(_get_state("gnn_optuna_layers_max", 3))
     layers_step = int(_get_state("gnn_optuna_layers_step", 1))
-    dropout_min = float(_get_state("gnn_optuna_dropout_min", 0.05))
-    dropout_max = float(_get_state("gnn_optuna_dropout_max", 0.6))
+    dropout_min = float(_get_state("gnn_optuna_dropout_min", 0.2))
+    dropout_max = float(_get_state("gnn_optuna_dropout_max", 0.5))
     dropout_step = float(_get_state("gnn_optuna_dropout_step", 0.05))
     lr_min = float(_get_state("gnn_optuna_lr_min", 5e-5))
-    lr_max = float(_get_state("gnn_optuna_lr_max", 1e-2))
-    wd_min = float(_get_state("gnn_optuna_wd_min", 1e-6))
-    wd_max = float(_get_state("gnn_optuna_wd_max", 5e-3))
+    lr_max = float(_get_state("gnn_optuna_lr_max", 3e-4))
+    wd_min = float(_get_state("gnn_optuna_wd_min", 1e-4))
+    wd_max = float(_get_state("gnn_optuna_wd_max", 1e-2))
     lambda_l2_min = float(_get_state("gnn_optuna_l2_min", 1e-4))
     lambda_l2_max = float(_get_state("gnn_optuna_l2_max", 1e-1))
     lambda_H_min = float(_get_state("gnn_optuna_lambda_fixed_min", 1e-4))
@@ -26717,10 +28014,10 @@ def _collect_optuna_ray_settings(
     lambda_final_min = float(_get_state("gnn_optuna_lambda_final_min", 1e-2))
     lambda_final_max = float(_get_state("gnn_optuna_lambda_final_max", 5e-2))
     focal_gamma_min = float(_get_state("gnn_optuna_fg_min", 1.0))
-    focal_gamma_max = float(_get_state("gnn_optuna_fg_max", 3.0))
-    focal_gamma_step = float(_get_state("gnn_optuna_fg_step", 0.1))
+    focal_gamma_max = float(_get_state("gnn_optuna_fg_max", 2.0))
+    focal_gamma_step = float(_get_state("gnn_optuna_fg_step", 0.25))
     focal_alpha_min = float(_get_state("gnn_optuna_fa_min", 0.5))
-    focal_alpha_max = float(_get_state("gnn_optuna_fa_max", 0.95))
+    focal_alpha_max = float(_get_state("gnn_optuna_fa_max", 0.85))
     focal_alpha_step = float(_get_state("gnn_optuna_fa_step", 0.05))
     batch_min = int(_get_state("gnn_optuna_batch_min", 128))
     batch_max = int(_get_state("gnn_optuna_batch_max", 128))
@@ -26769,6 +28066,8 @@ def _collect_optuna_ray_settings(
         "aggr1": aggr1,
         "aggr2": aggr2,
         "use_checkpointing": checkpoint_choices,
+        "use_residual": use_residual_choices,
+        "use_relation_self_loops": use_relation_self_loops_choices,
         "neighbor_profiles": neighbor_profiles,
         "neighbor_choices": neighbor_choices,
         "sampler_modes": sampler_modes,
@@ -26805,6 +28104,8 @@ def _collect_optuna_ray_settings(
         "imgagn_alpha_reg": {"min": imgagn_alpha_min, "max": imgagn_alpha_max},
         "imgagn_beta_reg": {"min": imgagn_beta_min, "max": imgagn_beta_max},
     }
+    if edge_encoder_space:
+        search_space["edge_encoder"] = edge_encoder_space
 
     n_trials = int(_get_state("gnn_optuna_trials", N_TRIALS))
     num_epochs = int(_get_state("gnn_optuna_epochs", NUM_EPOCHS_OPTUNA))
@@ -26834,6 +28135,7 @@ def _collect_optuna_ray_settings(
         "metric": _get_state("gnn_optuna_metric", "AUPRC"),
         "threshold_beta": float(_get_state("gnn_optuna_beta", 1.0)),
         "device": get_auto_device(),
+        "gnn_variant": selected_gnn_variant,
     }
 
     payload = {
@@ -26920,6 +28222,19 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
         "Controla el submuestreo de seeds en entrenamiento y validacion para "
         "evitar sobrecarga de memoria."
     )
+    with st.expander("Como interpretar estos controles", expanded=False):
+        st.markdown(
+            "- Aqui **seed** significa nodo PM raiz/objetivo usado para armar "
+            "mini-batches con vecinos; no es una semilla aleatoria.\n"
+            "- **Max seeds train por trial** limita cuantos nodos de "
+            "`train_mask` aportan perdida de entrenamiento en cada trial. "
+            "El grafo sigue disponible para traer vecinos. `0` usa todo train.\n"
+            "- **Max seeds val para evaluacion** limita cuantos nodos de "
+            "`val_mask` calculan el score de Optuna. `0` usa todo val.\n"
+            "- **Fijar subset de validacion por trial** reutiliza el mismo "
+            "subset de validacion en todas las evaluaciones de ese trial; "
+            "reduce ruido interno y estabiliza el pruning."
+        )
     sampling_mode_options = [
         "Resamplear seeds por epoch",
         "Fijar subset de entrenamiento por trial (reduce varianza)",
@@ -26975,8 +28290,12 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
         value=False,
         key="gnn_optuna_fixed_val",
         disabled=full_graph_mode,
-        help="Si se activa, se usa el mismo subset de validacion en cada evaluacion del trial. "
-             "Reduce varianza en el score y mejora comparabilidad. Se registra en el CSV de Optuna.",
+        help=(
+            "Si Max seeds val > 0, usa el mismo subset de validacion en cada "
+            "evaluacion del trial. Reduce varianza en el score y estabiliza "
+            "el pruning. No fija el mismo subset entre trials distintos. Se "
+            "registra en el CSV de Optuna."
+        ),
     )
     st.caption(
         "Tip: usa resampleo por epoch para medir robustez; usa subset fijo para "
@@ -26991,6 +28310,11 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             step=1000,
             key="gnn_optuna_sample_train",
             disabled=full_graph_mode,
+            help=(
+                "Limite de nodos PM raiz tomados desde train_mask para "
+                "entrenar cada trial. El loader aun trae sus vecinos. Usa 0 "
+                "para entrenar con todo train."
+            ),
         )
     with col_s2:
         sample_val_nodes = st.number_input(
@@ -27000,6 +28324,11 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             step=500,
             key="gnn_optuna_sample_val",
             disabled=full_graph_mode,
+            help=(
+                "Limite de nodos PM raiz tomados desde val_mask para calcular "
+                "el score de Optuna. Usa 0 para evaluar con todo val. El "
+                "muestreo intenta mantener ambas clases."
+            ),
         )
     if full_graph_mode:
         sample_train_nodes = 0
@@ -27389,7 +28718,9 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             help="Agrupa variables relacionadas para muestrearlas juntas en cada trial.",
         )
 
-    st.markdown("**Espacio de busqueda**")
+    st.markdown("**Espacio de búsqueda**")
+    selected_gnn_variant = _render_optuna_gnn_variant_selector(graph_obj=graph_obj)
+    selected_variant_spec = _describe_gnn_variant(selected_gnn_variant)
     with st.expander("Arquitectura"):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -27492,6 +28823,20 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
                 default=[False, True],
                 key="gnn_optuna_checkpoint",
             )
+            use_residual_choices = st.multiselect(
+                "use_residual opciones",
+                [False, True],
+                default=[True],
+                key="gnn_optuna_use_residual",
+                help="Optimiza si cada capa GNN usa conexiones residuales.",
+            )
+            use_relation_self_loops_choices = st.multiselect(
+                "use_relation_self_loops opciones",
+                [False, True],
+                default=[False],
+                key="gnn_optuna_relation_self_loops",
+                help="Optimiza si se añaden self-loops por relación cuando la capa lo soporta.",
+            )
         aggr_choices = ["sum", "mean"]
         aggr1 = st.multiselect(
             "aggr1 opciones",
@@ -27506,16 +28851,154 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             key="gnn_optuna_aggr2",
         )
 
+        if selected_variant_spec["uses_edge_mlp"] == "yes":
+            st.markdown("**EdgeAttrEncoder (GAT + MLP aristas)**")
+            st.caption(
+                "Estos hiperparámetros se activan solo para variantes `gat_edge_mlp*`. "
+                "Optuna/Ray los guarda como `edge_encoder_per_type` para reconstruir "
+                "el modelo ganador en Training."
+            )
+            edge_dims = _infer_edge_feature_dims(graph_data)
+            if not edge_dims:
+                st.warning(
+                    "El grafo no expone `edge_attr`; el EdgeAttrEncoder no tendrá "
+                    "features de arista que transformar."
+                )
+            edge_mode = st.radio(
+                "Modo edge encoder",
+                ["Por tipo de arista", "Compartido"],
+                index=0,
+                horizontal=True,
+                key="gnn_optuna_edge_encoder_mode",
+                help=(
+                    "Por tipo optimiza kind/hidden/encoded/dropout para cada relación. "
+                    "Compartido usa un único set de hiperparámetros para todas."
+                ),
+            )
+
+            def _render_edge_range_controls(prefix: str, spec: Mapping[str, object]) -> None:
+                hidden_cfg = spec["hidden_dim"]
+                encoded_cfg = spec["encoded_dim"]
+                dropout_cfg = spec["dropout"]
+                c_h1, c_h2, c_h3 = st.columns(3)
+                with c_h1:
+                    st.number_input(
+                        "edge hidden min",
+                        min_value=1,
+                        value=int(hidden_cfg["min"]),
+                        step=1,
+                        key=f"{prefix}_hidden_min",
+                    )
+                with c_h2:
+                    st.number_input(
+                        "edge hidden max",
+                        min_value=1,
+                        value=int(hidden_cfg["max"]),
+                        step=1,
+                        key=f"{prefix}_hidden_max",
+                    )
+                with c_h3:
+                    st.number_input(
+                        "edge hidden step",
+                        min_value=1,
+                        value=int(hidden_cfg["step"]),
+                        step=1,
+                        key=f"{prefix}_hidden_step",
+                    )
+                c_e1, c_e2, c_e3 = st.columns(3)
+                with c_e1:
+                    st.number_input(
+                        "edge encoded min",
+                        min_value=1,
+                        value=int(encoded_cfg["min"]),
+                        step=1,
+                        key=f"{prefix}_encoded_min",
+                    )
+                with c_e2:
+                    st.number_input(
+                        "edge encoded max",
+                        min_value=1,
+                        value=int(encoded_cfg["max"]),
+                        step=1,
+                        key=f"{prefix}_encoded_max",
+                    )
+                with c_e3:
+                    st.number_input(
+                        "edge encoded step",
+                        min_value=1,
+                        value=int(encoded_cfg["step"]),
+                        step=1,
+                        key=f"{prefix}_encoded_step",
+                    )
+                c_d1, c_d2, c_d3 = st.columns(3)
+                with c_d1:
+                    st.number_input(
+                        "edge dropout min",
+                        min_value=0.0,
+                        max_value=0.9,
+                        value=float(dropout_cfg["min"]),
+                        step=0.05,
+                        key=f"{prefix}_dropout_min",
+                    )
+                with c_d2:
+                    st.number_input(
+                        "edge dropout max",
+                        min_value=0.0,
+                        max_value=0.9,
+                        value=float(dropout_cfg["max"]),
+                        step=0.05,
+                        key=f"{prefix}_dropout_max",
+                    )
+                with c_d3:
+                    st.number_input(
+                        "edge dropout step",
+                        min_value=0.01,
+                        max_value=0.5,
+                        value=float(dropout_cfg["step"]),
+                        step=0.01,
+                        key=f"{prefix}_dropout_step",
+                    )
+
+            if edge_mode == "Compartido":
+                shared_spec = _default_edge_encoder_search_spec(
+                    max([int(v or 0) for v in edge_dims.values()] or [0])
+                )
+                st.multiselect(
+                    "edge_encoder_kind opciones",
+                    EDGE_ENCODER_KIND_OPTIONS,
+                    default=list(shared_spec["kind_choices"]),
+                    key="gnn_optuna_edge_kind_choices",
+                    help="Tipo de encoder para transformar edge_attr antes de GATConv.",
+                )
+                _render_edge_range_controls("gnn_optuna_edge", shared_spec)
+            else:
+                for edge_type, in_dim in edge_dims.items():
+                    edge_key = _edge_type_search_key(edge_type)
+                    rel_label = _edge_type_display_label(edge_type)
+                    spec = _default_edge_encoder_search_spec(in_dim)
+                    st.markdown(
+                        f"**edge_attr[{rel_label}]** · in_dim raw = `{int(in_dim or 0)}`"
+                    )
+                    st.multiselect(
+                        f"edge_encoder_kind opciones [{rel_label}]",
+                        EDGE_ENCODER_KIND_OPTIONS,
+                        default=list(spec["kind_choices"]),
+                        key=f"gnn_optuna_edge_kind_choices_{edge_key}",
+                        help="Tipos candidatos para esta relación.",
+                    )
+                    _render_edge_range_controls(
+                        f"gnn_optuna_edge_{edge_key}",
+                        spec,
+                    )
+
     # Compatibilidad: migra claves legacy de perfiles hacia la UI nueva
     # sin perder la integración con el payload existente de Optuna/Ray.
-    neighbor_profile_names = [
-        name for name, _ in SAMPLER_NEIGHBOR_PROFILE_PRESETS
-    ]
-    for name, default_profile in SAMPLER_NEIGHBOR_PROFILE_PRESETS:
+    neighbor_profile_names = _optuna_neighbor_profile_names()
+    for name, default_profile in GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS:
         ui_key = f"gnn_optuna_neighbor_profile_{name}"
         legacy_key = f"gnn_optuna_neighbor_{name}"
         if ui_key not in st.session_state:
-            default_txt = ",".join(str(int(v)) for v in default_profile)
+            default_txt = _format_optuna_neighbor_profile(default_profile)
             st.session_state[ui_key] = str(
                 st.session_state.get(legacy_key, default_txt)
             )
@@ -27534,30 +29017,40 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
         st.session_state["gnn_optuna_neighbor_profiles_enabled"] = (
             enabled_clean if enabled_clean else list(neighbor_profile_names)
         )
+    migration_flag = "gnn_optuna_neighbor_asymmetric_default_migrated"
+    enabled_clean = _coerce_optuna_neighbor_choices(
+        st.session_state.get("gnn_optuna_neighbor_profiles_enabled"),
+        neighbor_profile_names,
+    )
+    if not st.session_state.get(migration_flag, False):
+        if "asymmetric" in neighbor_profile_names and "asymmetric" not in enabled_clean:
+            enabled_clean.append("asymmetric")
+        st.session_state[migration_flag] = True
+    st.session_state["gnn_optuna_neighbor_profiles_enabled"] = enabled_clean
 
-    neighbor_profiles_selected = _render_sampler_neighbor_profiles_controls(
+    neighbor_profiles_selected = _render_optuna_neighbor_profiles_controls(
         key_prefix="gnn_optuna",
     )
     enabled_neighbor_profiles = st.session_state.get(
         "gnn_optuna_neighbor_profiles_enabled",
         neighbor_profile_names,
     )
-    if not isinstance(enabled_neighbor_profiles, (list, tuple)):
-        enabled_neighbor_profiles = [enabled_neighbor_profiles]
-    enabled_neighbor_profiles = [
-        str(name)
-        for name in enabled_neighbor_profiles
-        if str(name) in neighbor_profile_names
-    ]
+    enabled_neighbor_profiles = _coerce_optuna_neighbor_choices(
+        enabled_neighbor_profiles,
+        neighbor_profile_names,
+    )
     st.session_state["gnn_optuna_neighbor_choices"] = enabled_neighbor_profiles
-    for name, default_profile in SAMPLER_NEIGHBOR_PROFILE_PRESETS:
+    for name, default_profile in GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS:
         raw_txt = st.session_state.get(
             f"gnn_optuna_neighbor_profile_{name}",
-            ",".join(str(int(v)) for v in default_profile),
+            _format_optuna_neighbor_profile(default_profile),
         )
-        parsed_profile = _coerce_neighbor_profile(raw_txt, fallback=list(default_profile))
-        st.session_state[f"gnn_optuna_neighbor_{name}"] = ",".join(
-            str(int(v)) for v in parsed_profile
+        parsed_profile = _parse_optuna_neighbor_profile_value(
+            raw_txt,
+            default_profile,
+        )
+        st.session_state[f"gnn_optuna_neighbor_{name}"] = (
+            _format_optuna_neighbor_profile(parsed_profile)
         )
     if not neighbor_profiles_selected:
         st.warning("Debe seleccionar al menos un perfil de vecinos.")
@@ -27967,6 +29460,52 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
     if not show_run_controls:
         return
 
+
+def _render_optuna_gnn_variant_selector(
+    *,
+    graph_obj: Optional[Dict[str, object]] = None,
+) -> str:
+    options = _supported_gnn_variants()
+    labels = _gnn_variant_ui_labels()
+    current = _get_optuna_selected_gnn_variant()
+    index = options.index(current) if current in options else 0
+    selected = st.selectbox(
+        "Variante GNN del experimento",
+        options,
+        index=index,
+        key="gnn_optuna_gnn_variant",
+        format_func=lambda value: labels.get(str(value), str(value)),
+        help=(
+            "Define la arquitectura GNN fija que optimizará este estudio. "
+            "Valores esperados: una de las variantes soportadas "
+            "(snapshot, GRU, Transformer, edge-MLP o edge-aware). "
+            "La elección cambia el modelo construido, el nombre del estudio, "
+            "los CSV guardados y los metadatos de Optuna; no se muestrea como "
+            "hiperparámetro dentro de un mismo study. Las variantes temporales "
+            "requieren un SequenceIndex válido en el grafo."
+        ),
+    )
+    selected_variant = _normalize_ui_gnn_variant(selected)
+    st.session_state["gnn_ui_variant"] = selected_variant
+    desc = _describe_gnn_variant(selected_variant)
+    st.caption(
+        "Variante activa: "
+        f"{selected_variant} | encoder={desc['spatial_encoder']} | "
+        f"head temporal={desc['temporal_label']} | "
+        f"aristas={desc['edge_processing']}"
+    )
+    if (
+        graph_obj is not None
+        and _gnn_variant_requires_sequence_index(selected_variant)
+        and not _has_valid_sequence_index(graph_obj.get("sequence_index"))
+    ):
+        st.warning(
+            "La variante seleccionada requiere SequenceIndex. Esta corrida se "
+            "bloqueará hasta cargar o construir un grafo con secuencias temporales."
+        )
+    return selected_variant
+
+
 def _render_ray_tune_tab() -> None:
     st.subheader("Ray Tune (Balance + Training)")
 
@@ -28057,13 +29596,23 @@ def _render_ray_tune_tab() -> None:
         except Exception:
             return fallback
 
-    neighbor_profiles = {
-        "compact": _parse_int_list(str(_get_state("gnn_optuna_neighbor_compact", "15,10")), [15, 10]),
-        "focused": _parse_int_list(str(_get_state("gnn_optuna_neighbor_focused", "10,5")), [10, 5]),
-        "broad": _parse_int_list(str(_get_state("gnn_optuna_neighbor_broad", "25,15,10")), [25, 15, 10]),
-        "wide": _parse_int_list(str(_get_state("gnn_optuna_neighbor_wide", "30,20")), [30, 20]),
-    }
-    neighbor_choices = list(_get_state("gnn_optuna_neighbor_choices", list(neighbor_profiles.keys())))
+    def _parse_bool_choices(value: object, fallback: Sequence[bool]) -> List[bool]:
+        if not isinstance(value, (list, tuple, set)):
+            value = [value] if value is not None else []
+        choices: List[bool] = []
+        for item in value:
+            parsed = _coerce_bool(item, bool(fallback[0] if fallback else False))
+            if parsed not in choices:
+                choices.append(parsed)
+        if not choices:
+            choices = [bool(v) for v in fallback]
+        return choices or [False]
+
+    neighbor_profiles = _collect_optuna_neighbor_profiles_from_state(_get_state)
+    neighbor_choices = _coerce_optuna_neighbor_choices(
+        _get_state("gnn_optuna_neighbor_choices", list(neighbor_profiles.keys())),
+        list(neighbor_profiles.keys()),
+    )
 
     aggr1 = list(_get_state("gnn_optuna_aggr1", ["sum", "mean"]))
     aggr2 = list(_get_state("gnn_optuna_aggr2", ["sum", "mean"]))
@@ -28078,6 +29627,20 @@ def _render_ray_tune_tab() -> None:
         if str(value) in GNN_LR_SCHEDULER_LABELS
     ]
     checkpoint_choices = list(_get_state("gnn_optuna_checkpoint", [False, True]))
+    use_residual_choices = _parse_bool_choices(
+        _get_state("gnn_optuna_use_residual", [True]),
+        [True],
+    )
+    use_relation_self_loops_choices = _parse_bool_choices(
+        _get_state("gnn_optuna_relation_self_loops", [False]),
+        [False],
+    )
+    selected_gnn_variant = _get_optuna_selected_gnn_variant()
+    edge_encoder_space = _collect_optuna_edge_encoder_search_space(
+        _get_state,
+        graph_data,
+        selected_gnn_variant,
+    )
     lambda_H_modes = list(_get_state("gnn_optuna_lambda_mode", ["fixed", "dynamic"]))
     sampler_alias = {
         "neighborloader": "neighbor",
@@ -28205,27 +29768,29 @@ def _render_ray_tune_tab() -> None:
         return
 
     # --- Construir search_space desde Optuna ---
+    # Espacio v2 (Acción 6): rangos estrechados para clase rara (~0.3%).
+    # Ver _collect_optuna_ray_settings() para el rationale completo.
     hidden_min = int(_get_state("gnn_optuna_hidden_min", 32))
-    hidden_max = int(_get_state("gnn_optuna_hidden_max", 128))
-    hidden_step = int(_get_state("gnn_optuna_hidden_step", 32))
+    hidden_max = int(_get_state("gnn_optuna_hidden_max", 96))
+    hidden_step = int(_get_state("gnn_optuna_hidden_step", 16))
 
     heads_min = int(_get_state("gnn_optuna_heads_min", 2))
     heads_max = int(_get_state("gnn_optuna_heads_max", 8))
     heads_step = int(_get_state("gnn_optuna_heads_step", 2))
 
     layers_min = int(_get_state("gnn_optuna_layers_min", 2))
-    layers_max = int(_get_state("gnn_optuna_layers_max", 5))
+    layers_max = int(_get_state("gnn_optuna_layers_max", 3))
     layers_step = int(_get_state("gnn_optuna_layers_step", 1))
 
-    dropout_min = float(_get_state("gnn_optuna_dropout_min", 0.05))
-    dropout_max = float(_get_state("gnn_optuna_dropout_max", 0.6))
+    dropout_min = float(_get_state("gnn_optuna_dropout_min", 0.2))
+    dropout_max = float(_get_state("gnn_optuna_dropout_max", 0.5))
     dropout_step = float(_get_state("gnn_optuna_dropout_step", 0.05))
 
     lr_min = float(_get_state("gnn_optuna_lr_min", 5e-5))
-    lr_max = float(_get_state("gnn_optuna_lr_max", 1e-2))
+    lr_max = float(_get_state("gnn_optuna_lr_max", 3e-4))
 
-    wd_min = float(_get_state("gnn_optuna_wd_min", 1e-6))
-    wd_max = float(_get_state("gnn_optuna_wd_max", 5e-3))
+    wd_min = float(_get_state("gnn_optuna_wd_min", 1e-4))
+    wd_max = float(_get_state("gnn_optuna_wd_max", 1e-2))
 
     lambda_l2_min = float(_get_state("gnn_optuna_l2_min", 1e-4))
     lambda_l2_max = float(_get_state("gnn_optuna_l2_max", 1e-1))
@@ -28238,10 +29803,10 @@ def _render_ray_tune_tab() -> None:
     lambda_final_max = float(_get_state("gnn_optuna_lambda_final_max", 5e-2))
 
     focal_gamma_min = float(_get_state("gnn_optuna_fg_min", 1.0))
-    focal_gamma_max = float(_get_state("gnn_optuna_fg_max", 3.0))
-    focal_gamma_step = float(_get_state("gnn_optuna_fg_step", 0.1))
+    focal_gamma_max = float(_get_state("gnn_optuna_fg_max", 2.0))
+    focal_gamma_step = float(_get_state("gnn_optuna_fg_step", 0.25))
     focal_alpha_min = float(_get_state("gnn_optuna_fa_min", 0.5))
-    focal_alpha_max = float(_get_state("gnn_optuna_fa_max", 0.95))
+    focal_alpha_max = float(_get_state("gnn_optuna_fa_max", 0.85))
     focal_alpha_step = float(_get_state("gnn_optuna_fa_step", 0.05))
 
     batch_min = int(_get_state("gnn_optuna_batch_min", 128))
@@ -28292,6 +29857,8 @@ def _render_ray_tune_tab() -> None:
         "aggr1": aggr1,
         "aggr2": aggr2,
         "use_checkpointing": checkpoint_choices,
+        "use_residual": use_residual_choices,
+        "use_relation_self_loops": use_relation_self_loops_choices,
         "neighbor_profiles": neighbor_profiles,
         "neighbor_choices": neighbor_choices,
         "sampler_modes": sampler_modes,
@@ -28328,6 +29895,8 @@ def _render_ray_tune_tab() -> None:
         "imgagn_alpha_reg": {"min": imgagn_alpha_min, "max": imgagn_alpha_max},
         "imgagn_beta_reg": {"min": imgagn_beta_min, "max": imgagn_beta_max},
     }
+    if edge_encoder_space:
+        search_space["edge_encoder"] = edge_encoder_space
 
     optuna_settings = {
         "n_trials": n_trials,
@@ -28353,6 +29922,7 @@ def _render_ray_tune_tab() -> None:
         "metric": _get_state("gnn_optuna_metric", "AUPRC"),
         "threshold_beta": float(_get_state("gnn_optuna_beta", 1.0)),
         "device": optuna_device,
+        "gnn_variant": selected_gnn_variant,
     }
 
     with st.spinner("Ejecutando Ray Tune..."):
@@ -29949,6 +31519,12 @@ def _render_create_graph():
             EXTRA_SPATIAL = len(selected_physical_features)
 
             # Temporal
+            # Las aristas temporales no usan features físicas (solo el delta
+            # entre dos snapshots del mismo pórtico). Antes hacíamos
+            # zero-padding con EXTRA_SPATIAL columnas para que el `edge_dim` del
+            # GATConv fuese homogéneo entre relaciones; ahora cada relación
+            # tiene su propio `EdgeAttrEncoder` con `in_dim` por tipo, así que
+            # el padding deja de ser necesario.
             temporal_attr = None
             temporal_src, temporal_dst = [], []
             if build_temporal:
@@ -29967,10 +31543,7 @@ def _render_create_graph():
                     feat_mat_delta[temporal_dst]
                     - feat_mat_delta[temporal_src]
                 )
-                temporal_attr = np.concatenate(
-                    [delta, np.zeros((len(delta), EXTRA_SPATIAL))],
-                    axis=1,
-                )
+                temporal_attr = np.asarray(delta, dtype=float)
 
                 data[("pm", "temporal", "pm")].edge_index = torch.tensor(
                     [temporal_src, temporal_dst], dtype=torch.long
@@ -30193,18 +31766,44 @@ def _render_create_graph():
             pm_map = df_pm.set_index([portico_col, 'ts_min'])['node_idx'].to_dict()
             pm_rev = {v: k for k, v in pm_map.items()}
             pm_index = PMIndex(pm_map, pm_rev)
-            edge_config = {
-                "physical_features": selected_physical_features
+            # Esquema por tipo: cada relación puede tener su propio set de
+            # features (sin padding). La temporal solo lleva `delta_features`;
+            # las espaciales llevan `delta_features + physical_features`.
+            _delta_cols = (
+                list(delta_feature_cols) if 'delta_feature_cols' in locals() else []
+            )
+            _phys_cols = (
+                list(selected_physical_features)
                 if 'selected_physical_features' in locals()
-                else [],
-                "delta_features": delta_feature_cols
-                if 'delta_feature_cols' in locals()
-                else [],
+                else []
+            )
+            edge_attr_schema_per_type: Dict[str, List[str]] = {}
+            edge_feature_dims_per_type: Dict[str, int] = {}
+            for et in data.edge_types:
+                rel = et[1] if isinstance(et, tuple) and len(et) >= 2 else str(et)
+                if rel == "temporal":
+                    schema = list(_delta_cols)
+                else:
+                    schema = list(_delta_cols) + list(_phys_cols)
+                edge_attr_schema_per_type[str(et)] = schema
+                store_attr = getattr(data[et], "edge_attr", None)
+                if store_attr is not None and store_attr.dim() > 1:
+                    edge_feature_dims_per_type[str(et)] = int(store_attr.shape[1])
+                else:
+                    edge_feature_dims_per_type[str(et)] = len(schema)
+
+            edge_config = {
+                "physical_features": _phys_cols,
+                "delta_features": _delta_cols,
                 "raw_feature_family": raw_feature_family
                 if 'raw_feature_family' in locals()
                 else "classic",
-                "edge_attr_schema": list(delta_feature_cols)
-                + list(selected_physical_features),
+                # `edge_attr_schema` se mantiene como unión (compatibilidad con
+                # consumidores legacy); la versión por tipo está en
+                # `edge_attr_schema_per_type`.
+                "edge_attr_schema": list(_delta_cols) + list(_phys_cols),
+                "edge_attr_schema_per_type": edge_attr_schema_per_type,
+                "edge_feature_dims_per_type": edge_feature_dims_per_type,
                 "edge_feature_sources": edge_feature_sources
                 if 'edge_feature_sources' in locals()
                 else {},

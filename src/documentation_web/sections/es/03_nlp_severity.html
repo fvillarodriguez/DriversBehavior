@@ -24,95 +24,353 @@
     <header class="lab-section-head" data-stagger>
       <div class="num reveal">03</div>
       <div>
-        <span class="meta reveal">Capítulo · Réplica multimodal</span>
-        <h2 class="reveal">Réplica NLP en severidad</h2>
+        <span class="meta reveal">Capítulo · Severidad multimodal</span>
+        <h2 class="reveal">NLP en severidad</h2>
       </div>
     </header>
 
-    <h3 class="reveal">Propósito</h3>
-    <p class="reveal">El pipeline de <code>src/nlp_severity_app.py</code> reproduce el estudio de ablación de <code>NLP/Latex/main.tex</code> con tres modelos:</p>
-    <ul class="reveal">
-      <li><strong>M1</strong>: solo variables de flujo.</li>
-      <li><strong>M2</strong>: solo embeddings narrativos.</li>
-      <li><strong>M3</strong>: representación multimodal fusionada.</li>
-    </ul>
-    <p class="reveal">La entrada es <code>run_paper_replication</code>. El código añade controles de reproducibilidad que no aparecen en el manuscrito: tres rutas (<code>frozen</code>, <code>raw</code>, <code>update_embeddings</code>), reanudación por checkpoints, comparación estricta entre rutas y promoción condicionada de assets a LaTeX.</p>
+    <h3 class="reveal">Objetivo y contrato científico</h3>
+    <p class="reveal">El capítulo modela la severidad de accidentes mediante una arquitectura tabular-multimodal que combina condiciones de tráfico observadas alrededor del evento y representaciones semánticas extraídas desde la narrativa textual del accidente. La tarea no predice ocurrencia, como en el capítulo 2; toma eventos ya identificados y estima una etiqueta binaria de severidad <code>severity_target</code>, donde la clase positiva corresponde a <strong>MARC</strong> y la negativa a <strong>No-MARC</strong>.</p>
+    <p class="reveal">La implementación se concentra en <code>src/nlp_severity_app.py</code>. El protocolo del capítulo compara tres familias de entrada: <strong>M1</strong>, sólo variables de flujo; <strong>M2</strong>, sólo embeddings textuales; y <strong>M3</strong>, fusión de flujo y texto. La contribución metodológica es separar con precisión qué señal aporta el tráfico, qué señal aporta la descripción textual y cuánto mejora la combinación de ambas bajo el mismo holdout, la misma grilla de selección de variables y la misma familia de modelo.</p>
 
-    <h3 class="reveal">Protocolo bloqueado</h3>
-    <p class="reveal">Constantes como <code>PAPER_PROTOCOL</code>, <code>PAPER_EXPECTED_COUNTS</code>, <code>PAPER_K_GRID</code> y <code>PAPER_VALIDATION_ALPHA</code> fijan:</p>
-    <ul class="reveal">
-      <li>Target binario <code>severity_target</code>, holdout temporal con <code>test_size=0.2</code>, <code>random_state=42</code>.</li>
-      <li>Conteos esperados: 2.070 filas, 432 variables de flujo, 200 de embedding, 632 totales; split 1.656/414.</li>
-      <li>Grilla de \(k\) en modo <em>manual</em>: \( k\in\{10,15,20,25,30,40,50,70,100,150,200,250,300,350,400,432\} \).</li>
-      <li>Puntaje de validación \(\mathrm{Score}_{val} = \alpha F1_{global} + (1-\alpha)(1-\mathrm{FNRate})\) con \(\alpha=0.3\), \(\varepsilon=0.001\).</li>
-      <li>Folds CV interno/externo configurables (por defecto 5).</li>
-    </ul>
-
-    <h3 class="reveal">Etapas de ejecución</h3>
-    <ol class="reveal">
-      <li><strong>Contexto</strong>: fingerprints del dataset congelado <code>resultado.pkl</code>, de la fuente raw, del Transformer fine-tuneado y del protocolo; se derivan a <code>computed_run_id</code>.</li>
-      <li><strong>Reanudar / cargar / comenzar</strong>: el código inspecciona <code>Resultados/nlp_in_severity/paper_replication/&lt;run_id&gt;/</code>. Si está <em>completed</em>, se carga el payload; si está <em>running</em> o <em>failed</em>, se retoma; si no existe checkpoint, se crea un manifest nuevo.</li>
-      <li><strong>Ruta congelada</strong>: carga <code>resultado.pkl</code>, normaliza columnas y ejecuta la validación contra las expectativas bloqueadas.</li>
-      <li><strong>Ruta raw</strong>: reconstruye desde eventos fuente, genera features de flujo, filtra por cobertura AVI, construye texto <code>text_bert</code>, resuelve el Transformer, extrae embeddings (método <code>transformer_finetuned</code>, <code>max_length=128</code>, <code>batch=16</code>, proyección <code>cls</code>), rankea dimensiones con RF y conserva las top-200 para ensamblar el dataset de 632 variables.</li>
-      <li><strong>Modalidades M1/M2/M3</strong>: para cada modelo se resuelven variables, se imputa por mediana, se rankea pre-SMOTE y se busca \(k\) con validación cruzada anidada; \(k^\ast\) se elige por mejor <code>validation_score</code> (desempate por el \(k\) más pequeño).</li>
-      <li><strong>Nested CV y ajuste final</strong>: folds externos e internos estratificados; SMOTE se aplica dentro de la búsqueda interna (<code>sampling_strategy</code>, <code>k_neighbors</code>), no directamente sobre el fold externo.</li>
-      <li><strong>Consolidación por ruta</strong>: tabla comparativa por modelo, métricas por clase, predicciones unificadas sobre los mismos IDs de test y la tabla de \(k\) para M3.</li>
-      <li><strong>Ruta update_embeddings (opcional)</strong>: reemplaza columnas de embedding sobre el dataset congelado dejando flujo intacto.</li>
-      <li><strong>Comparación frozen/raw</strong>: cantidades discretas coinciden exactamente; métricas numéricas pueden diferir a lo sumo \(0.001\). Si la raw queda bloqueada o la comparación falla, toda la réplica queda <code>blocked</code>.</li>
-      <li><strong>Staging y promoción LaTeX</strong>: se generan <code>accuracy_vs_k.png</code>, <code>f1_score_vs_k.png</code>, <code>false_negatives_pct_vs_k.png</code>, <code>validation_score_vs_k.png</code>, <code>metrics.png</code>, <code>gridsearch_k.tex</code> y <code>metricas_modelos.tex</code>. La promoción sólo ocurre si la comparación aprueba.</li>
-    </ol>
-
-    <h3 class="reveal">Perfiles de tuning XGBoost</h3>
     <table class="lab-table reveal">
-      <caption><strong>Tabla 3.1.</strong> Espacios de búsqueda por perfil.</caption>
-      <thead>
-        <tr><th>Perfil</th><th><code>max_depth</code></th><th><code>learning_rate</code></th><th><code>n_estimators</code></th><th><code>subsample</code> / <code>colsample_bytree</code></th></tr>
-      </thead>
+      <caption><strong>Mapa operacional del capítulo.</strong> Cada fila conecta el contrato metodológico con una función, constante o artefacto real del repositorio.</caption>
+      <thead><tr><th>Etapa</th><th>Implementación</th><th>Decisión técnica</th><th>Salida auditable</th></tr></thead>
       <tbody>
-        <tr><td>Rápida (def.)</td><td>\(\{3,5\}\)</td><td>\(\{0.05,0.1\}\)</td><td>\(\{150,300\}\)</td><td>\(\{0.8,1.0\}\)</td></tr>
-        <tr><td>Amplia</td><td>\(\{3,5,7\}\)</td><td>\(\{0.03,0.05,0.1\}\)</td><td>\(\{150,300,500\}\)</td><td>\(\{0.8,1.0\}\)</td></tr>
-        <tr><td>GridSearch</td><td>\(\{3,5,7,10,15,20\}\)</td><td>\(\{0.01,0.05,0.1\}\)</td><td>\(\{100,250,500,750,1000\}\)</td><td>\(\{0.5,0.8,1.0\}\)</td></tr>
+        <tr><td>Contexto de corrida</td><td><code>_paper_build_execution_context</code>, <code>PAPER_PROTOCOL</code></td><td>Firma dataset congelado, fuente raw, modelo Transformer y protocolo activo.</td><td><code>computed_run_id</code>, snapshot de protocolo</td></tr>
+        <tr><td>Dataset congelado</td><td><code>_ensure_paper_dataset_columns</code>, <code>_paper_dataset_validation_report</code></td><td>Valida columnas, conteos, split y clases contra <code>PAPER_EXPECTED_COUNTS</code>.</td><td><code>dataset_validation.json</code></td></tr>
+        <tr><td>Construcción raw</td><td><code>_paper_build_raw_dataset</code>, <code>build_severity_feature_dataset</code></td><td>Reconstruye flujo, cobertura, texto, embeddings y top-200 dimensiones textuales.</td><td>Dataset ancho de 632 variables</td></tr>
+        <tr><td>Modalidades</td><td><code>_paper_run_route</code>, <code>_paper_build_model_result</code></td><td>Ejecuta M1, M2 y M3 con igual split, ranking y evaluación.</td><td>Resumen por modelo, predicciones test</td></tr>
+        <tr><td>Validación anidada</td><td><code>_paper_nested_xgb_validation</code>, <code>_paper_optimize_xgb_model</code></td><td>Selecciona hiperparámetros de XGBoost y SMOTE dentro del fold interno.</td><td>Curvas por \(k\), mejores parámetros</td></tr>
+        <tr><td>Comparación de rutas</td><td><code>_paper_compare_routes</code></td><td>Contrasta salidas discretas exactas y métricas numéricas con tolerancia 0.001.</td><td><code>compare/summary.json</code>, <code>diff.csv</code></td></tr>
+        <tr><td>Exportación documental</td><td><code>_paper_stage_latex_candidates</code>, <code>_paper_promote_latex_assets</code></td><td>Promueve tablas y figuras sólo si las verificaciones aprueban.</td><td><code>gridsearch_k.tex</code>, <code>metricas_modelos.tex</code>, PNG</td></tr>
       </tbody>
     </table>
-    <p class="reveal">La regularización (<code>min_child_weight</code>, <code>gamma</code>, <code>reg_alpha</code>, <code>reg_lambda</code>) sólo se incluye cuando <code>use_regularization</code> está activo. El backend puede ser <code>gridsearch</code> (GridSearchCV) u <code>optuna</code> (24 trials por defecto).</p>
 
-    <h3 class="reveal">Contraste con el manuscrito</h3>
-    <ul class="reveal">
-      <li>El Transformer BERT en español no se reentrena en la reproducción; se reutiliza el último fine-tuneado compatible del registry.</li>
-      <li>La reducción se fija operacionalmente a <em>top-200</em>, no a una dimensión \(p\) genérica.</li>
-      <li>El ranking con RF se aplica por modalidad (uno por M1, M2 y M3) y sobre datos pre-SMOTE para evitar filtración.</li>
-      <li>El paper reporta la grilla de M3, pero el código busca \(k\) para las tres modalidades.</li>
-      <li><code>false_negative_rate_positive_class</code> en <code>_classification_metrics</code> se calcula como \(\mathrm{FN}/N\) (no como \(\mathrm{FN}/P\)).</li>
-      <li>SMOTE se optimiza conjuntamente con XGBoost dentro de <code>_paper_optimize_xgb_model</code>, no como paso previo.</li>
-      <li>El holdout es temporal (<code>split_mode="Temporal"</code>); el estratificado queda como fallback.</li>
-      <li>La regla de \(k^\ast\) cambió a «mejor puntaje» en lugar de beneficio marginal.</li>
-      <li>Existen tres perfiles (<em>Rápida</em>, <em>Amplia</em>, <em>GridSearch original</em>) y dos backends.</li>
-    </ul>
+    <h3 class="reveal">Unidad observacional y variable objetivo</h3>
+    <p class="reveal">La unidad observacional es el accidente \(i\), no una celda pórtico-tiempo. Cada registro combina atributos temporales y espaciales del evento, una etiqueta de severidad, variables de flujo extraídas en ventanas alrededor de <code>accidente_time</code> y un texto normalizado <code>text_bert</code> construido desde campos como kilómetro, eje, calzada, subtipo y descripción. Esta definición permite evaluar severidad como problema de clasificación multimodal por evento.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \mathcal{D}=\{(a_i,t_i,\ell_i,y_i,x_i^{flow},x_i^{text})\}_{i=1}^{n}.
+      \]</div>
+      <div class="num">(3.1)</div>
+      <aside class="eq-inspector">
+        <h5>Interpretación</h5>
+        <dl>
+          <dt>\(a_i\)</dt><dd>Identificador del accidente, usado para comparar predicciones entre rutas.</dd>
+          <dt>\(t_i\)</dt><dd>Fecha-hora del evento, base del holdout temporal.</dd>
+          <dt>\(\ell_i\)</dt><dd>Localización operacional: kilómetro, eje y calzada cuando existen.</dd>
+          <dt>\(y_i\)</dt><dd><code>severity_target</code>, binaria: 0 = No-MARC, 1 = MARC.</dd>
+          <dt>\(x_i^{flow}\)</dt><dd>Variables de tráfico alrededor del accidente.</dd>
+          <dt>\(x_i^{text}\)</dt><dd>Representación semántica de la narrativa.</dd>
+        </dl>
+      </aside>
+    </div>
 
-    <h3 class="reveal">Estructura de checkpoints y lectura</h3>
-    <p class="reveal">Bajo <code>Resultados/nlp_in_severity/paper_replication/&lt;run_id&gt;/</code> conviven <code>manifest.json</code>, <code>live_status.json</code>, <code>live_events.jsonl</code> y los subdirectorios <code>frozen/</code>, <code>raw_build/</code>, <code>raw/</code>, <code>update_emb_build/</code>, <code>update_emb/</code>, <code>compare/</code> y <code>export/</code>.</p>
-    <p class="reveal">Al revisar una corrida el orden recomendado es: <code>manifest.json</code> → <code>frozen/dataset_validation.json</code> y <code>raw/summary.json</code> → <code>compare/summary.json</code> y <code>compare/diff.csv</code> → <code>export/payload.json</code> y los assets promovidos.</p>
+    <table class="lab-table reveal">
+      <caption><strong>Conteos bloqueados del protocolo.</strong> La validación falla si el dataset congelado no respeta estos valores bajo split temporal.</caption>
+      <thead><tr><th>Magnitud</th><th>Valor esperado</th><th>Uso en el protocolo</th></tr></thead>
+      <tbody>
+        <tr><td>Filas</td><td class="num">2.070</td><td>Número de accidentes con cobertura y etiqueta utilizable.</td></tr>
+        <tr><td>Variables de flujo</td><td class="num">432</td><td>Bloque \(X^{flow}\) usado por M1 y M3.</td></tr>
+        <tr><td>Variables de embedding</td><td class="num">200</td><td>Bloque \(X^{emb}\) seleccionado por ranking para M2 y M3.</td></tr>
+        <tr><td>Variables totales</td><td class="num">632</td><td>Concatenación final \(X=[X^{flow},X^{emb}]\).</td></tr>
+        <tr><td>Train/test</td><td class="num">1.656 / 414</td><td>Holdout temporal con <code>test_size=0.2</code>.</td></tr>
+        <tr><td>Clases train</td><td>425 No-MARC / 1.231 MARC</td><td>Base para CV, SMOTE y ranking de variables.</td></tr>
+        <tr><td>Clases test</td><td>44 No-MARC / 370 MARC</td><td>Base fija para las métricas finales.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        y_i=
+        \begin{cases}
+        1, & \text{si el evento pertenece a la categoría MARC},\\
+        0, & \text{si el evento pertenece a No\text{-}MARC}.
+        \end{cases}
+      \]</div>
+      <div class="num">(3.2)</div>
+      <aside class="eq-inspector">
+        <h5>Contrato</h5>
+        <p>La variable objetivo debe ser binaria y contener ambas clases en train y test. Si el split temporal no conserva ambas clases, la implementación cae al split estratificado y registra el modo aplicado.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Variables de flujo alrededor del accidente</h3>
+    <p class="reveal">La ruta raw reconstruye variables de tráfico desde la base de flujos. Para cada accidente se consultan ventanas de un minuto antes y después del evento, con cinco ventanas hacia cada lado por defecto. Sobre esas ventanas se calculan <code>flow</code>, <code>speed_mean</code>, <code>speed_std</code> y <code>density</code>; luego se ensambla una matriz ancha por accidente y se agregan deltas temporales cuando <code>include_deltas=True</code>.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        W_i=\{[t_i+m\Delta,t_i+(m+1)\Delta):m=-5,\ldots,4\},\qquad \Delta=1\text{ minuto}.
+      \]</div>
+      <div class="num">(3.3)</div>
+      <aside class="eq-inspector">
+        <h5>Implementación</h5>
+        <span class="impl">build_severity_feature_dataset(windows_before=5, windows_after=5, window_size_minutes=1)</span>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        q_{i,m}=\#\{r_j:t_j\in W_{i,m}\},\qquad
+        \overline v_{i,m}=\frac{1}{q_{i,m}}\sum_{j:t_j\in W_{i,m}} v_j.
+      \]</div>
+      <div class="num">(3.4)</div>
+      <aside class="eq-inspector">
+        <h5>Lectura</h5>
+        <p>El flujo y la velocidad resumen exposición e intensidad cinemática local en el entorno temporal del accidente.</p>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \Delta z_{i,m}=z_{i,m}-z_{i,m-1},\qquad z\in\{\overline v,\rho,q\}.
+      \]</div>
+      <div class="num">(3.5)</div>
+      <aside class="eq-inspector">
+        <h5>Deltas</h5>
+        <p>Las diferencias temporales codifican cambios abruptos de régimen de tráfico antes o después del evento.</p>
+      </aside>
+    </div>
+
+    <table class="lab-table reveal">
+      <caption><strong>Familias de variables de flujo.</strong> El dataset final conserva 432 columnas numéricas de esta familia.</caption>
+      <thead><tr><th>Familia</th><th>Columnas típicas</th><th>Señal que captura</th></tr></thead>
+      <tbody>
+        <tr><td>Volumen</td><td><code>flow_*</code></td><td>Exposición vehicular local alrededor del accidente.</td></tr>
+        <tr><td>Velocidad media</td><td><code>speed_mean_*</code></td><td>Régimen cinemático dominante por ventana.</td></tr>
+        <tr><td>Dispersión</td><td><code>speed_std_*</code></td><td>Heterogeneidad instantánea y posible inestabilidad.</td></tr>
+        <tr><td>Densidad</td><td><code>density_*</code></td><td>Ocupación aproximada del tramo.</td></tr>
+        <tr><td>Cambio temporal</td><td><code>delta_*</code></td><td>Transiciones de régimen antes/después del evento.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Texto narrativo y embeddings</h3>
+    <p class="reveal">La señal textual se obtiene desde <code>text_bert</code>, una narrativa compacta del accidente. La implementación usa el último Transformer fine-tuneado compatible registrado, carga tokenizer y encoder con <code>AutoTokenizer</code> y <code>AutoModel</code>, y extrae representaciones mediante el token <code>[CLS]</code>. En esta ruta el texto se limpia con <code>fillna("")</code>, conversión a string y <code>str.strip()</code>; el paso no fuerza minúsculas, porque el encoder Transformer conserva información de mayúsculas y contexto subword.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        s_i=\mathrm{concat}(\mathrm{km}_i,\mathrm{eje}_i,\mathrm{calzada}_i,\mathrm{subtipo}_i,\mathrm{descripcion}_i).
+      \]</div>
+      <div class="num">(3.6)</div>
+      <aside class="eq-inspector">
+        <h5>Columna</h5>
+        <span class="impl">text_bert</span>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        H_i=f_{\theta}(s_i),\qquad e_i=H_i[\mathrm{CLS}]\in\mathbb{R}^{d}.
+      \]</div>
+      <div class="num">(3.7)</div>
+      <aside class="eq-inspector">
+        <h5>Parámetros</h5>
+        <p><code>method="transformer_finetuned"</code>, <code>transformer_max_length=128</code>, <code>transformer_batch_size=16</code>, <code>transformer_projection="cls"</code>.</p>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        J_{200}=\operatorname*{arg\,top}_{J:|J|=200}\ I_j^{RF},\qquad x_i^{emb}=e_{i,J_{200}}.
+      \]</div>
+      <div class="num">(3.8)</div>
+      <aside class="eq-inspector">
+        <h5>Selección</h5>
+        <p><code>_select_top_embedding_features</code> conserva las 200 dimensiones textuales de mayor importancia según ranking Random Forest.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Tres modalidades de entrada</h3>
+    <p class="reveal">La comparación central se implementa como ablación por bloques de variables. M1 mide qué logra el flujo sin texto; M2 mide qué logra el texto sin tráfico; M3 mide la fusión temprana de ambos espacios. Las tres modalidades usan la misma familia de clasificador, el mismo target y el mismo conjunto de IDs de test para que las métricas sean comparables.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        X^{M1}=X^{flow},\qquad X^{M2}=X^{emb},\qquad X^{M3}=[X^{flow}\Vert X^{emb}].
+      \]</div>
+      <div class="num">(3.9)</div>
+      <aside class="eq-inspector">
+        <h5>Constante</h5>
+        <span class="impl">PAPER_PROTOCOL["feature_groups"] = {"M1": "Solo flujo", "M2": "Solo embeddings", "M3": "Todo"}</span>
+      </aside>
+    </div>
+
+    <table class="lab-table reveal">
+      <caption><strong>Modalidades evaluadas.</strong> Todas se entrenan con XGBoost y se evalúan sobre el mismo holdout.</caption>
+      <thead><tr><th>Modelo</th><th>Variables disponibles</th><th>Cap máximo de \(k\)</th><th>Pregunta científica</th></tr></thead>
+      <tbody>
+        <tr><td>M1</td><td>432 variables de flujo</td><td class="num">432</td><td>¿La severidad queda explicada por el estado de tráfico?</td></tr>
+        <tr><td>M2</td><td>200 embeddings seleccionados</td><td class="num">200</td><td>¿La narrativa del accidente contiene señal suficiente?</td></tr>
+        <tr><td>M3</td><td>432 flujo + 200 embeddings</td><td class="num">632</td><td>¿La fusión multimodal mejora la discriminación?</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="reveal">Split temporal y prevención de fuga</h3>
+    <p class="reveal">El modo por defecto ordena los accidentes por <code>accidente_time</code> y reserva el 20% final como test. La separación temporal evita que eventos futuros influyan en entrenamiento. Si el corte temporal no contiene ambas clases en train y test, <code>_prepare_holdout_split_with_ids</code> usa un split estratificado con <code>random_state=42</code> y lo registra en la metadata.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \mathcal{D}_{train}=\{i:t_i\lt T_{0.8}\},\qquad
+        \mathcal{D}_{test}=\{i:t_i\ge T_{0.8}\}.
+      \]</div>
+      <div class="num">(3.10)</div>
+      <aside class="eq-inspector">
+        <h5>Invariante</h5>
+        <p>El test nunca recibe imputación aprendida sobre test, SMOTE ni ranking recalculado con información del test.</p>
+      </aside>
+    </div>
+    <div class="lab-callout ochre reveal">
+      <div class="label">Regla antileakage</div>
+      <p>La imputación por mediana, el ranking Random Forest y SMOTE se ajustan usando sólo el bloque de entrenamiento o el fold interno correspondiente. El test se transforma con parámetros aprendidos previamente y permanece real.</p>
+    </div>
+
+    <h3 class="reveal">Ranking de variables y grilla de \(k\)</h3>
+    <p class="reveal">Antes de entrenar XGBoost se calcula un ranking de variables por modalidad. Para cada \(k\), el modelo utiliza las \(k\) columnas de mayor importancia, con recorte automático si la modalidad tiene menos variables que el valor solicitado. La grilla manual conserva los valores del protocolo, y el modo por intervalo permite barridos densos controlados por paso.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        S_k=\operatorname*{arg\,top}_{S:|S|=k}\ I_j^{RF},\qquad X_k=X[:,S_k].
+      \]</div>
+      <div class="num">(3.11)</div>
+      <aside class="eq-inspector">
+        <h5>Orden</h5>
+        <p>El ranking se calcula antes de aplicar SMOTE, de modo que la selección de variables no observe filas sintéticas.</p>
+      </aside>
+    </div>
+
+    <table class="lab-table reveal">
+      <caption><strong>Grillas de selección de variables.</strong> La implementación admite modo manual y modo por intervalo.</caption>
+      <thead><tr><th>Modo</th><th>Valores</th><th>Uso recomendado</th></tr></thead>
+      <tbody>
+        <tr><td>Manual</td><td>\(\{10,15,20,25,30,40,50,70,100,150,200,250,300,350,400,432\}\)</td><td>Comparación principal y compatibilidad con el protocolo histórico.</td></tr>
+        <tr><td>Intervalo</td><td>Pasos \(\{5,10,25,50,100\}\), con mínimo y máximo configurables</td><td>Exploración fina cuando se necesita revisar estabilidad de \(k^\ast\).</td></tr>
+      </tbody>
+    </table>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        k^\ast=\min\left\{k:\mathrm{Score}(k)=\max_{k'\in\mathcal{K}}\mathrm{Score}(k')\right\}.
+      \]</div>
+      <div class="num">(3.12)</div>
+      <aside class="eq-inspector">
+        <h5>Desempate</h5>
+        <p><code>_paper_select_k_from_search</code> ordena por puntaje descendente y luego por \(k\) ascendente; elige el menor \(k\) entre empates.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">XGBoost, SMOTE y validación cruzada anidada</h3>
+    <p class="reveal">La familia de modelo está fijada a XGBoost. Para cada modalidad y cada \(k\), el entrenamiento usa validación cruzada anidada con folds externos e internos estratificados. En el fold interno se optimizan hiperparámetros de XGBoost y parámetros de SMOTE; luego se entrena el mejor modelo sobre el fold externo de entrenamiento balanceado y se evalúa sobre el fold externo de validación sin alterar.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \hat f_{k,\lambda,\gamma}=
+        \operatorname*{arg\,max}_{\lambda,\gamma}
+        \mathrm{CV}_{inner}\bigl(f_{\lambda},\mathrm{SMOTE}_{\gamma}(X^{train}_k,y^{train})\bigr).
+      \]</div>
+      <div class="num">(3.13)</div>
+      <aside class="eq-inspector">
+        <h5>Parámetros</h5>
+        <p>\(\lambda\) representa hiperparámetros de XGBoost; \(\gamma\) agrupa <code>sampling_strategy</code> y <code>k_neighbors</code> de SMOTE.</p>
+      </aside>
+    </div>
+
+    <table class="lab-table reveal">
+      <caption><strong>Perfiles de tuning XGBoost.</strong> Los grids pueden ampliarse con regularización si <code>use_regularization=True</code>.</caption>
+      <thead><tr><th>Perfil</th><th><code>max_depth</code></th><th><code>learning_rate</code></th><th><code>n_estimators</code></th><th><code>subsample</code> / <code>colsample_bytree</code></th><th>SMOTE</th></tr></thead>
+      <tbody>
+        <tr><td>Rápida</td><td>\(\{3,5\}\)</td><td>\(\{0.05,0.1\}\)</td><td>\(\{150,300\}\)</td><td>\(\{0.8,1.0\}\)</td><td>\(\{0.8,1.0\}\) × \(\{1,3,5\}\)</td></tr>
+        <tr><td>Amplia</td><td>\(\{3,5,7\}\)</td><td>\(\{0.03,0.05,0.1\}\)</td><td>\(\{150,300,500\}\)</td><td>\(\{0.8,1.0\}\)</td><td>\(\{0.6,0.8,1.0\}\) × \(\{1,3,5,7\}\)</td></tr>
+        <tr><td>GridSearch original</td><td>\(\{3,5,7,10,15,20\}\)</td><td>\(\{0.01,0.05,0.1\}\)</td><td>\(\{100,250,500,750,1000\}\)</td><td>\(\{0.5,0.8,1.0\}\)</td><td>\(\{0.6,0.8,1.0\}\) × \(\{1,3,5,7\}\)</td></tr>
+      </tbody>
+    </table>
+    <p class="reveal">El backend de optimización puede ser <code>gridsearch</code> o <code>optuna</code>. En Optuna, <code>PAPER_OPTUNA_TRIALS_DEFAULT</code> fija 24 pruebas por defecto. Los folds de CV aceptan valores de 2 a 10 y el valor por defecto es 5.</p>
+
+    <h3 class="reveal">Métricas, score de selección y lectura clínica</h3>
+    <p class="reveal">Las métricas finales se calculan con <code>_classification_metrics</code>. Además de accuracy, precision, recall, F1, balanced F1, MCC y ROC-AUC, se registra la matriz de confusión, métricas por clase y falsos negativos de la clase positiva. En esta implementación, <code>false_negative_rate_positive_class</code> se define como falsos negativos MARC divididos por el tamaño total del conjunto evaluado, no por el soporte positivo.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \mathrm{F1}=\frac{2\,\mathrm{Precision}\,\mathrm{Recall}}{\mathrm{Precision}+\mathrm{Recall}},
+        \qquad
+        \mathrm{FNRate}_{MARC}=\frac{\mathrm{FN}_{MARC}}{N}.
+      \]</div>
+      <div class="num">(3.14)</div>
+      <aside class="eq-inspector">
+        <h5>Importante</h5>
+        <p>El denominador de <code>FNRate</code> es \(N\), cantidad total de filas evaluadas. Esta convención reduce el valor numérico frente a \(\mathrm{FN}/P\).</p>
+      </aside>
+    </div>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        \mathrm{Score}_{val}=
+        \begin{cases}
+        \mathrm{best\_score}_{CV}, & \text{si GridSearchCV u Optuna lo entrega},\\
+        \mathrm{F1}, & \text{si no existe score interno disponible}.
+        \end{cases}
+      \]</div>
+      <div class="num">(3.15)</div>
+      <aside class="eq-inspector">
+        <h5>Implementación vigente</h5>
+        <p><code>_paper_validation_score</code> prioriza <code>best_cv_score</code>. La constante <code>PAPER_VALIDATION_ALPHA=0.3</code> queda persistida en el protocolo, pero no gobierna la selección cuando existe score interno.</p>
+      </aside>
+    </div>
+
+    <h3 class="reveal">Rutas de ejecución y checkpoints</h3>
+    <p class="reveal">La ejecución está diseñada para ser reanudable. Cada corrida crea un manifest central, un estado vivo y un log de eventos JSONL. Las rutas <code>frozen</code>, <code>raw</code> y <code>update_embeddings</code> producen subdirectorios propios, de modo que se puede distinguir entre la evaluación del dataset congelado, la reconstrucción desde fuentes originales y la actualización opcional de embeddings manteniendo fijas las variables de flujo.</p>
+    <table class="lab-table reveal">
+      <caption><strong>Rutas de ejecución.</strong> Todas comparten el mismo protocolo y pueden ser inspeccionadas por checkpoint.</caption>
+      <thead><tr><th>Ruta</th><th>Entrada</th><th>Qué garantiza</th><th>Artefactos principales</th></tr></thead>
+      <tbody>
+        <tr><td><code>frozen</code></td><td><code>NLP/Dataframes/resultado.pkl</code></td><td>Evalúa el snapshot bloqueado con conteos esperados.</td><td><code>dataset_validation.json</code>, resultados M1/M2/M3</td></tr>
+        <tr><td><code>raw</code></td><td>Eventos fuente, DuckDB de flujos y Transformer registrado</td><td>Reconstruye features desde cero y compara contra frozen.</td><td><code>raw_build/*</code>, <code>raw/summary.json</code></td></tr>
+        <tr><td><code>update_embeddings</code></td><td>Dataset congelado + Transformer activo</td><td>Re-extrae embeddings sin modificar variables de flujo.</td><td><code>update_emb_build/*</code>, <code>update_emb/summary.json</code></td></tr>
+        <tr><td><code>compare</code></td><td>Resultados de rutas terminadas</td><td>Bloquea discrepancias fuera de tolerancia.</td><td><code>summary.json</code>, <code>diff.csv</code></td></tr>
+        <tr><td><code>export</code></td><td>Ruta aprobada para documentación</td><td>Prepara tablas y figuras para LaTeX.</td><td><code>payload.json</code>, tablas y PNG</td></tr>
+      </tbody>
+    </table>
 
     <div class="lab-callout sage reveal">
-      <div class="label">Próximamente · Comparador interactivo</div>
-      <p>Esta sección incorporará un comparador frozen/raw que cargue <code>compare/diff.csv</code>, mostrará curvas de validación por <em>k</em> para M1/M2/M3 con datos vivos y un diff visual de assets promovidos.</p>
+      <div class="label">Orden de lectura de una corrida</div>
+      <p>Primero revisar <code>manifest.json</code>; luego <code>frozen/dataset_validation.json</code> y <code>raw/summary.json</code>; después <code>compare/summary.json</code> y <code>compare/diff.csv</code>; finalmente <code>export/payload.json</code> y los assets promovidos. El directorio físico se ubica bajo <code>Resultados/nlp_in_severity/.../&lt;run_id&gt;/</code>.</p>
+    </div>
+
+    <h3 class="reveal">Comparación de rutas y promoción documental</h3>
+    <p class="reveal">La comparación entre rutas separa cantidades discretas y métricas continuas. Las cantidades discretas, como número de filas, variables, clases y splits, deben coincidir exactamente. Las métricas numéricas aceptan una tolerancia absoluta de 0.001, definida por <code>PAPER_COMPARISON_TOLERANCE</code>. Si la comparación falla, la exportación queda bloqueada para impedir que la documentación muestre resultados no trazables.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[
+        |m_{raw}-m_{frozen}|\le 0.001.
+      \]</div>
+      <div class="num">(3.16)</div>
+      <aside class="eq-inspector">
+        <h5>Tolerancia</h5>
+        <p>La tolerancia aplica a métricas continuas. Conteos, clases, nombres de modelo y disponibilidad de artefactos se comparan de forma exacta.</p>
+      </aside>
+    </div>
+    <p class="reveal">Los assets documentales incluyen <code>accuracy_vs_k.png</code>, <code>f1_score_vs_k.png</code>, <code>false_negatives_pct_vs_k.png</code>, <code>validation_score_vs_k.png</code>, <code>metrics.png</code>, <code>gridsearch_k.tex</code> y <code>metricas_modelos.tex</code>. La promoción no es una copia ciega: depende del estado del manifest, del resultado de comparación y de la existencia de los archivos candidatos.</p>
+
+    <h3 class="reveal">Auditoría metodológica frente al manuscrito</h3>
+    <p class="reveal">La implementación conserva la estructura experimental del manuscrito, pero añade decisiones de ingeniería necesarias para hacer el protocolo ejecutable, reanudable y verificable. Las siguientes diferencias deben quedar explícitas en la documentación porque afectan interpretación, reproducibilidad y comparación de resultados.</p>
+    <ul class="reveal">
+      <li>El encoder Transformer no se entrena dentro de esta ejecución; se reutiliza el último fine-tune compatible registrado y se extrae su representación de encoder.</li>
+      <li>La ruta Transformer no fuerza minúsculas; el lowercasing queda restringido a rutas alternativas tipo TF-IDF.</li>
+      <li>La reducción textual se fija en top-200 dimensiones por ranking Random Forest, en lugar de dejar una dimensión abstracta \(p\).</li>
+      <li>El ranking de variables es específico por modalidad y ocurre antes de SMOTE.</li>
+      <li>La búsqueda de \(k\) se ejecuta para M1, M2 y M3, no sólo para la modalidad fusionada.</li>
+      <li>SMOTE se optimiza dentro de la búsqueda interna junto con XGBoost; no se aplica como preprocesamiento global.</li>
+      <li>El holdout preferido es temporal; el estratificado se usa sólo como fallback cuando el corte temporal no conserva ambas clases.</li>
+      <li>La selección de \(k^\ast\) usa mejor puntaje observado con desempate por menor \(k\), no una regla de beneficio marginal.</li>
+      <li>Existen perfiles de búsqueda y backend Optuna para controlar costo computacional sin cambiar la semántica del experimento.</li>
+      <li>Las rutas, checkpoints y comparación con tolerancia son salvaguardas de software; no modifican la hipótesis estadística, pero sí elevan trazabilidad.</li>
+    </ul>
+
+    <div class="lab-callout rust reveal">
+      <div class="label">Riesgos residuales</div>
+      <p>La clase No-MARC es minoritaria, por lo que métricas agregadas pueden ocultar errores clínicamente importantes. La interpretación debe priorizar métricas por clase, falsos negativos MARC, matriz de confusión y estabilidad de \(k^\ast\) entre modalidades.</p>
     </div>
 
   </section>
 
   <footer class="lab-coda">
-    <span>Capítulo § 3 · 1 tabla · 10 etapas</span>
-    <span>Compilado desde <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/nlp_severity_replication_es.tex</code></span>
+    <span>Capítulo § 3 · 7 tablas · 16 ecuaciones</span>
+    <span>Fuente metodológica: LaTeX § 3 + <code style="font-family:var(--font-mono);font-size:11.5px;">src/nlp_severity_app.py</code></span>
   </footer>
 
 </main>
 
 <aside class="lab-margin" aria-label="Notas al margen">
   <div class="pinned">
-    <span class="label">Réplica</span>
-    <p>El protocolo está bloqueado por constantes (<code style="font-family:var(--font-mono);font-size:11.5px;">PAPER_*</code>) — cualquier cambio en seeds, splits o conteos invalida la corrida. Los <em>fingerprints</em> del dataset blindan la reproducibilidad.</p>
-    <p><strong>Tres rutas.</strong> <em>frozen</em> (snapshot inmutable), <em>raw</em> (reconstruye desde fuente) y <em>update_embeddings</em> (re-extrae embeddings sobre flujo congelado).</p>
-    <p><strong>SMOTE.</strong> Sólo dentro de la búsqueda interna del nested CV — nunca sobre el fold externo.</p>
+    <span class="label">NLP severidad</span>
+    <p>El protocolo queda fijado por constantes <code style="font-family:var(--font-mono);font-size:11.5px;">PAPER_*</code>: split temporal, conteos esperados, grilla de \(k\), tolerancia y familia XGBoost.</p>
+    <p><strong>Tres señales.</strong> M1 mide flujo, M2 mide texto y M3 mide fusión temprana. Las tres comparten IDs de test.</p>
+    <p><strong>SMOTE.</strong> Sólo aparece dentro de train o del fold interno de CV; nunca altera validación externa ni test.</p>
   </div>
 </aside>
 
