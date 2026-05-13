@@ -60,7 +60,6 @@ from src.utils import (
     _slugify,
     buscar_columna,
     find_candidate_porticos,
-    load_accidentes,
     load_porticos,
     process_accidentes_df,
     reconstruct_portico_sequence,
@@ -2316,9 +2315,26 @@ def _list_event_files() -> list:
         return []
     candidates = []
     for path in DATA_DIR.glob("*.csv"):
-        if path.name.lower().startswith("eventos"):
+        lower_name = path.name.lower()
+        if lower_name.startswith(("eventos", "accidentes")):
             candidates.append(path)
     return sorted(candidates)
+
+
+def _read_event_csv(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, sep=None, engine="python", encoding="utf-8")
+    except UnicodeDecodeError:
+        return pd.read_csv(path, sep=None, engine="python", encoding="latin-1")
+
+
+def _process_event_files(
+    paths: Sequence[Path | str],
+    porticos_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    frames = [_read_event_csv(Path(path)) for path in paths]
+    raw_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return process_accidentes_df(raw_df, porticos_df, return_excluded=True)
 
 
 def _infer_edge_feature_dim(graph_data: HeteroData) -> int:
@@ -29999,28 +30015,9 @@ def _render_events_tab() -> None:
             st.error(f"No se pudieron cargar los porticos: {exc}")
             return
 
-        frames = []
-        for name in selected_names:
-            path = DATA_DIR / name
-            try:
-                frames.append(
-                    pd.read_csv(path, sep=None, engine="python", encoding="utf-8")
-                )
-            except UnicodeDecodeError:
-                frames.append(
-                    pd.read_csv(
-                        path, sep=None, engine="python", encoding="latin-1"
-                    )
-                )
-            except Exception as exc:
-                st.error(f"No se pudo leer {name}: {exc}")
-                return
-
-        raw_df = pd.concat(frames, ignore_index=True)
+        selected_paths = [DATA_DIR / name for name in selected_names]
         try:
-            acc_df, excluded = process_accidentes_df(
-                raw_df, porticos_df, return_excluded=True
-            )
+            acc_df, excluded = _process_event_files(selected_paths, porticos_df)
         except Exception as exc:
             st.error(f"No se pudieron procesar los eventos: {exc}")
             return
@@ -30719,28 +30716,34 @@ def _render_create_graph():
             ),
         )
 
-    sel_acc_file = None
+    selected_acc_files: List[str] = []
     if not use_events:
-        # Find available accident files
-        acc_files = []
-        try:
-            acc_files = sorted(
-                glob.glob(os.path.join("Datos", "Eventos*.csv"))
-            )
-        except Exception:
-            pass
+        acc_files = _list_event_files()
 
         if not acc_files:
             st.warning(
-                "No se encontraron archivos 'eventos*.csv' en la carpeta 'Datos'."
+                "No se encontraron archivos 'eventos*.csv' o "
+                "'accidentes*.csv' en la carpeta 'Datos'."
             )
-            sel_acc_file = None
         else:
-            # Default to selectbox
-            sel_acc_file = st.selectbox(
-                "Seleccione el archivo de Accidentes",
-                acc_files,
+            acc_path_by_name = {path.name: str(path) for path in acc_files}
+            selected_acc_names = st.multiselect(
+                "Seleccione archivo(s) de Accidentes",
+                list(acc_path_by_name.keys()),
+                default=list(acc_path_by_name.keys()),
                 format_func=os.path.basename,
+                key="gnn_graph_accident_files",
+                help=(
+                    "Puede seleccionar varios archivos anuales. Se concatenan "
+                    "antes de procesar accidentes y construir las etiquetas."
+                ),
+            )
+            selected_acc_files = [
+                acc_path_by_name[name] for name in selected_acc_names
+            ]
+            st.caption(
+                f"{len(selected_acc_files)} archivo(s) seleccionado(s) para "
+                "etiquetar accidentes."
             )
 
     # FEATURE CONFIG PREVIEW
@@ -30991,27 +30994,51 @@ def _render_create_graph():
             ):
                 st.error("No hay accidentes cargados en Eventos.")
                 return
-        elif not sel_acc_file:
-            st.error("Falta seleccionar archivo de accidentes.")
+        elif not selected_acc_files:
+            st.error("Falta seleccionar al menos un archivo de accidentes.")
             return
 
         # Auto-load Accidents if needed
         if not use_events:
+            selected_acc_signature = tuple(selected_acc_files)
+            loaded_acc_signature = tuple(
+                st.session_state.get("loaded_acc_paths") or []
+            )
             if (
                 st.session_state.df_acc is None
-                or st.session_state.get("loaded_acc_path") != sel_acc_file
+                or st.session_state.df_acc.empty
+                or loaded_acc_signature != selected_acc_signature
             ):
                 with st.spinner(
                     "Cargando accidentes desde "
-                    f"{os.path.basename(sel_acc_file)}..."
+                    f"{len(selected_acc_files)} archivo(s)..."
                 ):
-                    loaded_acc = load_accidentes(file_path=sel_acc_file)
-                    if loaded_acc is not None:
-                        st.session_state.df_acc = loaded_acc
-                        st.session_state.loaded_acc_path = sel_acc_file
-                    else:
+                    try:
+                        loaded_acc, excluded_acc = _process_event_files(
+                            selected_acc_files,
+                            st.session_state.df_port,
+                        )
+                    except Exception as exc:
+                        st.error(f"Falló la carga de accidentes: {exc}")
+                        return
+                    if loaded_acc is None:
                         st.error("Falló la carga de accidentes.")
                         return
+                    st.session_state.df_acc = loaded_acc
+                    st.session_state.accidents_df = loaded_acc
+                    st.session_state.loaded_acc_paths = list(selected_acc_files)
+                    st.session_state.loaded_acc_path = (
+                        selected_acc_files[0]
+                        if len(selected_acc_files) == 1
+                        else "__multi_events__"
+                    )
+                    st.session_state.accident_files = [
+                        os.path.basename(path) for path in selected_acc_files
+                    ]
+                    st.success(
+                        f"Accidentes procesados: {len(loaded_acc):,} | "
+                        f"Excluidos sin portico: {len(excluded_acc):,}"
+                    )
         
         # --- EXECUTION LOGIC (Ported from src/graph.py) ---
         status = st.empty()
@@ -31827,9 +31854,13 @@ def _render_create_graph():
                 if sequence_config is not None
                 else False,
             }
+            selected_event_files = [] if use_events else list(selected_acc_files)
             event_source = {
                 "use_events_tab": bool(use_events),
-                "selected_file": None if use_events else sel_acc_file,
+                "selected_file": selected_event_files[0]
+                if len(selected_event_files) == 1
+                else None,
+                "selected_files": selected_event_files,
                 "loaded_acc_path": st.session_state.get("loaded_acc_path"),
                 "event_files": list(st.session_state.get("accident_files", []) or []),
             }
