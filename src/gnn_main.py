@@ -38,17 +38,6 @@ from optuna import TrialPruned
 from optuna.exceptions import ExperimentalWarning
 import hashlib
 import shutil
-from src.legacy_utils import (
-    limpiar_pantalla,
-    load_graph,
-    visualize_acc_subgraph,
-    visualize_graph_overview,
-    export_graph_to_csv,
-    fusionar_grafos,
-    select_features,
-    menu_utilidades_csv,
-    load_flujos,
-)
 from src.visual import run_visual_server
 import json
 try:
@@ -58,6 +47,12 @@ except Exception:
 from src.graph import build_graph
 from src.features import compute_pm_features, compute_pm_features_streaming
 from src.train_pretrain import train_minibatch, pretrain_edge_generator
+from src.gnn_rl_sampler import (
+    RLTopPHeteroLoader,
+    RioGNNThresholdController,
+    pretrain_label_aware_similarity,
+    relation_max_degrees,
+)
 from src.gat_model import HeteroGAT, HeteroGATWithEdgeEncoder, HeteroEdgeAware
 from src.temporal_head import TemporalAggregator
 from src.temporal_heads import TemporalGRUHead, TemporalTransformerHead, TemporalAttnPoolHead
@@ -1275,6 +1270,10 @@ def _normalize_train_sampler_mode(value: object) -> str:
         "cluster_gcn": "cluster_gcn",
         "clustergcn": "cluster_gcn",
         "graphsaint": "graphsaint",
+        "rl_top_p": "rl_top_p",
+        "riognn": "rl_top_p",
+        "rio_gnn": "rl_top_p",
+        "rsrl": "rl_top_p",
     }.get(key, "neighbor")
 
 def _build_native_sampler_loader(
@@ -1315,6 +1314,58 @@ def _build_native_sampler_loader(
         )
     except Exception:
         resolved_neighbors = NUM_NEIGHBORS
+
+    if mode == "rl_top_p":
+        try:
+            controller = cfg.get("rl_sampler_controller")
+            if controller is None:
+                num_layers_cfg = int(_safe_cast(cfg.get("num_layers"), int, 2))
+                if isinstance(resolved_neighbors, dict):
+                    layer_lengths = [
+                        len(v)
+                        for v in resolved_neighbors.values()
+                        if isinstance(v, (list, tuple)) and len(v) > 0
+                    ]
+                    if layer_lengths:
+                        num_layers_cfg = max(layer_lengths)
+                elif isinstance(resolved_neighbors, (list, tuple)) and len(resolved_neighbors) > 0:
+                    num_layers_cfg = len(resolved_neighbors)
+                controller = RioGNNThresholdController(
+                    edge_types=[
+                        edge_type
+                        for edge_type in graph_cpu.edge_types
+                        if edge_type[0] == node_type and edge_type[2] == node_type
+                    ],
+                    num_layers=max(1, int(num_layers_cfg)),
+                    in_channels=int(graph_cpu[node_type].x.size(1)),
+                    max_degree_by_edge_type=relation_max_degrees(graph_cpu, node_type=node_type),
+                    action_space=str(cfg.get("rl_action_space", "discrete")),
+                    initial_p=float(_safe_cast(cfg.get("rl_initial_p"), float, 0.5)),
+                    min_p=float(_safe_cast(cfg.get("rl_min_p"), float, 0.05)),
+                    max_p=float(_safe_cast(cfg.get("rl_max_p"), float, 1.0)),
+                    min_keep=int(_safe_cast(cfg.get("rl_min_keep"), int, 1)),
+                    switch_patience=int(_safe_cast(cfg.get("rl_switch_patience"), int, 3)),
+                    backtracking=_safe_bool(cfg.get("rl_backtracking"), True),
+                    positive_only=_safe_bool(cfg.get("rl_positive_only"), True),
+                    secondary_reward_weight=float(_safe_cast(cfg.get("rl_secondary_reward_weight"), float, 0.25)),
+                    seed=int(seed),
+                )
+            loader = RLTopPHeteroLoader(
+                graph_cpu,
+                controller=controller,
+                input_nodes=base_seeds,
+                batch_size=max(1, int(batch_size)),
+                num_neighbors_cfg=resolved_neighbors,
+                node_type=node_type,
+                shuffle=True,
+                deterministic=bool(deterministic),
+                sampling_seed=int(seed),
+            )
+            setattr(loader, "sampler_impl", "rl_top_p_rsrl")
+            setattr(loader, "rl_sampler_controller", controller)
+            return loader, None
+        except Exception as exc:
+            return None, f"RioGNN top-p RL falló: {exc}"
 
     if mode == "neighbor":
         try:
@@ -1879,269 +1930,6 @@ def run_gnn_anomaly_pipeline(loaded_obj):
         variant_flags.append('Base')
     variant_msg = 'GAT ' + '+'.join(variant_flags)
     print(f"\n✅ Reporte GAT finalizado. Variante: {variant_msg}.")
-
-def _list_artifacts():
-    print("\n=== Artefactos en Resultados/ ===")
-    patterns = {
-        'GAT (variante)': ["gat_model_BEST*.pt"],
-        'XGBoost': ["xgb_best_model_*.json", "xgb_scaler_*.npz"],
-        'Transformer': ["transformer_ts_best_*.pt"],
-        'Anomalias': ["anomaly_best_model_*.joblib"],
-    }
-    # Utilizado para deduplicar alias de GAT y para anotar variantes
-    import re
-    unique_re = re.compile(r"^(gat_model_BEST(?:_[A-Za-z0-9]+)*)_\d{8}_\d{6}_[0-9a-fA-F]{8}\.pt$")
-    alias_re  = re.compile(r"^(gat_model_BEST(?:_[A-Za-z0-9]+)*)\.pt$")
-
-    for label, pats in patterns.items():
-        files = []
-        for pat in pats:
-            files.extend(glob.glob(os.path.join(RESULTADOS_DIR, pat)))
-        files = sorted(files, key=os.path.getmtime, reverse=True)
-
-        # Dedupe solo para GAT: ocultar alias sin timestamp si hay versión única equivalente
-        if label.startswith('GAT'):
-            base_from_unique: set[str] = set()
-            for f in files:
-                m = unique_re.match(os.path.basename(f))
-                if m:
-                    base_from_unique.add(m.group(1))
-            deduped = []
-            for f in files:
-                name = os.path.basename(f)
-                if unique_re.match(name):
-                    deduped.append(f)
-                    continue
-                m = alias_re.match(name)
-                if m and m.group(1) in base_from_unique:
-                    # Alias duplicado: ocultar
-                    continue
-                deduped.append(f)
-            files = deduped
-
-        print(f"\n[{label}] ({len(files)})")
-        for f in files[:20]:
-            try:
-                ts = datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M:%S')
-                size_mb = os.path.getsize(f)/1e6
-                line = f"  - {os.path.basename(f)}  ({size_mb:.2f} MB, {ts})"
-                # Para GAT, anotar variante/purpose si hay meta
-                if label.startswith('GAT') and f.endswith('.pt'):
-                    base, _ = os.path.splitext(f)
-                    meta_path = base + "_hparams.json"
-                    tag = None
-                    try:
-                        meta = {}
-                        if os.path.exists(meta_path):
-                            with open(meta_path, 'r') as fh:
-                                meta = json.load(fh)
-                        purpose = (meta.get('purpose') or '').lower()
-                        if purpose.startswith('anomaly'):
-                            tag = 'Anomalias'
-                        elif '_GraphSMOTE' in os.path.basename(f):
-                            tag = 'GraphSMOTE'
-                        else:
-                            tag = 'Base'
-                    except Exception:
-                        pass
-                    if tag:
-                        line += f" [{tag}]"
-                print(line)
-            except Exception:
-                print(f"  - {os.path.basename(f)}")
-
-def _show_alias_meta():
-    print("\n=== Metadatos (alias) ===")
-    # GAT
-    meta_gat = os.path.join(RESULTADOS_DIR, "gat_model_BEST_hparams.json")
-    if os.path.exists(meta_gat):
-        try:
-            with open(meta_gat, 'r') as f:
-                data = json.load(f)
-            print("[GAT]", {k: data.get(k) for k in ['best_val_f1','best_epoch','use_graphsmote','graphsmote_mode','graph_hash','git_commit']})
-        except Exception as e:
-            print(f"[GAT] no se pudo leer meta: {e}")
-    else:
-        print("[GAT] alias sin meta disponible")
-    # XGB
-    meta_xgb = os.path.join(RESULTADOS_DIR, "xgb_best_model_meta.json")
-    if os.path.exists(meta_xgb):
-        try:
-            with open(meta_xgb, 'r') as f:
-                data = json.load(f)
-            print("[XGB]", {k: data.get(k) for k in ['threshold','smote_ratio','smote_k']})
-        except Exception as e:
-            print(f"[XGB] no se pudo leer meta: {e}")
-    else:
-        print("[XGB] alias sin meta disponible")
-    # Transformer
-    meta_tr = os.path.join(RESULTADOS_DIR, "transformer_ts_best_meta.json")
-    if os.path.exists(meta_tr):
-        try:
-            with open(meta_tr, 'r') as f:
-                data = json.load(f)
-            print("[Transformer]", {k: data.get(k) for k in ['threshold','seq_len']})
-        except Exception as e:
-            print(f"[Transformer] no se pudo leer meta: {e}")
-    else:
-        print("[Transformer] alias sin meta disponible")
-    # Anomalías
-    alias_anom = os.path.join(RESULTADOS_DIR, "anomaly_best_model.joblib")
-    if joblib and os.path.exists(alias_anom):
-        try:
-            payload = joblib.load(alias_anom)
-            print("[Anomalias]", {k: payload.get(k) for k in ['algo','threshold']})
-        except Exception as e:
-            print(f"[Anomalias] no se pudo leer alias: {e}")
-    else:
-        print("[Anomalias] alias no disponible")
-
-def _archive_old_artifacts(method: str, keep: int):
-    os.makedirs(RESULTADOS_DIR, exist_ok=True)
-    archive_dir = os.path.join(RESULTADOS_DIR, 'archive')
-    os.makedirs(archive_dir, exist_ok=True)
-    method_map = {
-        'gat': ["gat_model_BEST*.pt"],
-        'xgb': ["xgb_best_model_*.json", "xgb_scaler_*.npz", "xgb_best_model_meta_*.json"],
-        'transformer': ["transformer_ts_best_*.pt", "transformer_ts_best_meta_*.json"],
-        'anomaly': ["anomaly_best_model_*.joblib"],
-    }
-    pats = method_map.get(method.lower())
-    if not pats:
-        print("❌ Método no reconocido. Opciones: gat, xgb, transformer, anomaly")
-        return
-    files = []
-    for pat in pats:
-        files.extend(glob.glob(os.path.join(RESULTADOS_DIR, pat)))
-    files = sorted(files, key=os.path.getmtime, reverse=True)
-    if len(files) <= keep:
-        print("No hay suficientes artefactos para archivar.")
-        return
-    to_move = files[keep:]
-    print(f"Archivar {len(to_move)} artefactos a 'archive/' (mantener {keep})? (s/n)")
-    ok = input("> ").strip().lower() in ('s','si','y','yes')
-    if not ok:
-        return
-    import shutil
-    for f in to_move:
-        try:
-            dest = os.path.join(archive_dir, os.path.basename(f))
-            shutil.move(f, dest)
-        except Exception as e:
-            print(f"⚠️ No se pudo archivar {os.path.basename(f)}: {e}")
-    print("✅ Archivado finalizado.")
-
-def artifacts_menu():
-    while True:
-        print("\n===== Gestor de Artefactos =====")
-        print("  [1] Listar artefactos (histórico)")
-        print("  [2] Ver meta de alias por método")
-        print("  [3] Archivar históricos (mantener N)")
-        print("  [4] Inicializar (borrar todos los artefactos/resultados)")
-        print("  [0] Volver")
-        choice = input("Elige una opción: ").strip()
-        if choice == '1':
-            _list_artifacts()
-        elif choice == '2':
-            _show_alias_meta()
-        elif choice == '3':
-            method = input("Método [gat|xgb|transformer|anomaly]: ").strip()
-            try:
-                keep = int(input("¿Cuántos artefactos recientes quieres mantener? (ej. 3): ").strip())
-            except Exception:
-                keep = 3
-            _archive_old_artifacts(method, keep)
-        elif choice == '4':
-            _initialize_artifacts()
-        elif choice == '0':
-            break
-        else:
-            print("❌ Opción no reconocida.")
-
-def _initialize_artifacts():
-    print("\n⚠️ Inicializar eliminará artefactos y resultados en 'Resultados/'.")
-    print("Esto NO toca la carpeta 'Datos/'.")
-    incl_graphs = input("¿Borrar también grafos guardados (highway_graph_*.pt)? (s/n): ").strip().lower() in ('s','si','y','yes')
-    print("Para confirmar, escribe exactamente: BORRAR TODO")
-    conf = input("> ").strip()
-    if conf != 'BORRAR TODO':
-        print("Operación cancelada.")
-        return
-    patterns = [
-        # GAT
-        "gat_model_BEST*.pt", "gat_model_BEST*_hparams.json", "gat_model_BEST_hparams.json",
-        # XGB
-        "xgb_best_model*.json", "xgb_scaler*.npz", "xgb_best_model_meta*.json",
-        # Transformer
-        "transformer_ts_best*.pt", "transformer_ts_best_meta*.json", "transformer_results_*.csv",
-        # Anomaly
-        "anomaly_best_model*.joblib", "results_anomaly_*.csv", "preds_anomaly_*.csv",
-        # GAT report outputs (nuevo y legacy)
-        "results_gat_report_*.csv", "preds_gat_report_*.csv",
-        "results_gnn_anomaly_*.csv", "preds_gnn_anomaly_*.csv",
-        # Baselines
-        "results_mlp_*.csv", "preds_mlp_*.csv",
-        "results_xgb_*.csv", "preds_xgb_*.csv",
-        # HPO
-        "optuna_hyperparams_*.csv", "optuna_full_study_*.csv",
-        "imgagn_hyperparams_*.csv", "imgagn_full_study_*.csv",
-        # ImGAGN augmented test/train graphs dumped under Resultados
-        "highway_graph_ImGAGN_*.pt", "graph_aug.pt",
-    ]
-    if incl_graphs:
-        patterns.extend(["highway_graph_*.pt"])  # incluir snapshots de grafo
-    total = 0
-    errors = 0
-    for pat in patterns:
-        files = glob.glob(os.path.join(RESULTADOS_DIR, pat))
-        for f in files:
-            try:
-                os.remove(f)
-                total += 1
-            except Exception as e:
-                errors += 1
-                print(f"⚠️ No se pudo eliminar {os.path.basename(f)}: {e}")
-    # Limpiar carpetas legacy/archive (solo contenidos conocidos)
-    for sub in ("legacy", "archive"):
-        subdir = os.path.join(RESULTADOS_DIR, sub)
-        if os.path.isdir(subdir):
-            try:
-                for root, _, files in os.walk(subdir):
-                    for fn in files:
-                        try:
-                            os.remove(os.path.join(root, fn))
-                            total += 1
-                        except Exception:
-                            errors += 1
-                # Intentar eliminar directorios vacíos
-                try:
-                    os.rmdir(subdir)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-    # Eliminar directorios auxiliares completos (decoders, runs, particiones y cache)
-    dirs_to_remove = [
-        os.path.join(RESULTADOS_DIR, 'z2x_decoders'),
-        os.path.join(RESULTADOS_DIR, 'runs_attention'),
-        os.path.join('.', 'cache', 'graphsmote'),
-    ]
-    # Particiones generadas por compute_pm_features_streaming
-    try:
-        parts = [d for d in os.listdir(RESULTADOS_DIR) if d.startswith('particiones_')]
-        for d in parts:
-            dirs_to_remove.append(os.path.join(RESULTADOS_DIR, d))
-    except Exception:
-        pass
-    for d in dirs_to_remove:
-        if os.path.isdir(d):
-            try:
-                shutil.rmtree(d)
-                total += 1
-            except Exception as e:
-                errors += 1
-                print(f"⚠️ No se pudo eliminar la carpeta {d}: {e}")
-    print(f"\n✅ Inicialización completada. Archivos eliminados: {total}. Errores: {errors}.")
 
 def run_gnn_anomaly_hpo_then_train(loaded_obj):
     """
@@ -3328,6 +3116,16 @@ def run_gat_training(
     graphsaint_batch_size: Optional[int] = None,
     graphsaint_num_steps: Optional[int] = None,
     graphsaint_walk_length: Optional[int] = None,
+    rl_action_space: Optional[str] = None,
+    rl_initial_p: Optional[float] = None,
+    rl_min_p: Optional[float] = None,
+    rl_max_p: Optional[float] = None,
+    rl_min_keep: Optional[int] = None,
+    rl_positive_only: Optional[bool] = None,
+    rl_similarity_pretrain_epochs: Optional[int] = None,
+    rl_lambda_simi: Optional[float] = None,
+    rl_switch_patience: Optional[int] = None,
+    rl_backtracking: Optional[bool] = None,
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
     checkpoint_metric: Optional[str] = None,
@@ -3511,6 +3309,10 @@ def run_gat_training(
         "cluster_gcn": "cluster_gcn",
         "clustergcn": "cluster_gcn",
         "graphsaint": "graphsaint",
+        "rl_top_p": "rl_top_p",
+        "riognn": "rl_top_p",
+        "rio_gnn": "rl_top_p",
+        "rsrl": "rl_top_p",
     }
     train_sampler_mode_resolved = sampler_aliases.get(sampler_key, "neighbor")
 
@@ -3571,6 +3373,51 @@ def run_gat_training(
         )
     )
 
+    rl_action_space_resolved = str(
+        rl_action_space if rl_action_space is not None else best_params.get("rl_action_space", "discrete")
+    ).strip().lower()
+    if rl_action_space_resolved in {"continuous", "actor", "actor_critic"}:
+        rl_action_space_resolved = "continuous_actor"
+    if rl_action_space_resolved not in {"discrete", "continuous_actor"}:
+        rl_action_space_resolved = "discrete"
+    rl_initial_p_resolved = float(
+        _safe_cast(rl_initial_p if rl_initial_p is not None else best_params.get("rl_initial_p"), float, 0.5)
+    )
+    rl_min_p_resolved = float(
+        _safe_cast(rl_min_p if rl_min_p is not None else best_params.get("rl_min_p"), float, 0.05)
+    )
+    rl_max_p_resolved = float(
+        _safe_cast(rl_max_p if rl_max_p is not None else best_params.get("rl_max_p"), float, 1.0)
+    )
+    rl_min_keep_resolved = int(
+        _safe_cast(rl_min_keep if rl_min_keep is not None else best_params.get("rl_min_keep"), int, 1)
+    )
+    rl_positive_only_resolved = bool(
+        rl_positive_only if rl_positive_only is not None else best_params.get("rl_positive_only", True)
+    )
+    rl_similarity_pretrain_epochs_resolved = int(
+        _safe_cast(
+            rl_similarity_pretrain_epochs
+            if rl_similarity_pretrain_epochs is not None
+            else best_params.get("rl_similarity_pretrain_epochs"),
+            int,
+            3,
+        )
+    )
+    rl_lambda_simi_resolved = float(
+        _safe_cast(rl_lambda_simi if rl_lambda_simi is not None else best_params.get("rl_lambda_simi"), float, 2.0)
+    )
+    rl_switch_patience_resolved = int(
+        _safe_cast(
+            rl_switch_patience if rl_switch_patience is not None else best_params.get("rl_switch_patience"),
+            int,
+            3,
+        )
+    )
+    rl_backtracking_resolved = bool(
+        rl_backtracking if rl_backtracking is not None else best_params.get("rl_backtracking", True)
+    )
+
     eval_mode_raw = eval_neighbors_mode if eval_neighbors_mode is not None else best_params.get("eval_neighbors_mode", "same")
     eval_mode_key = str(eval_mode_raw or "same").strip().lower().replace("-", "_")
     eval_mode_aliases = {
@@ -3596,6 +3443,16 @@ def run_gat_training(
     best_params["graphsaint_batch_size"] = int(graphsaint_batch_size_resolved)
     best_params["graphsaint_num_steps"] = int(graphsaint_num_steps_resolved)
     best_params["graphsaint_walk_length"] = int(graphsaint_walk_length_resolved)
+    best_params["rl_action_space"] = str(rl_action_space_resolved)
+    best_params["rl_initial_p"] = float(rl_initial_p_resolved)
+    best_params["rl_min_p"] = float(rl_min_p_resolved)
+    best_params["rl_max_p"] = float(rl_max_p_resolved)
+    best_params["rl_min_keep"] = int(rl_min_keep_resolved)
+    best_params["rl_positive_only"] = bool(rl_positive_only_resolved)
+    best_params["rl_similarity_pretrain_epochs"] = int(rl_similarity_pretrain_epochs_resolved)
+    best_params["rl_lambda_simi"] = float(rl_lambda_simi_resolved)
+    best_params["rl_switch_patience"] = int(rl_switch_patience_resolved)
+    best_params["rl_backtracking"] = bool(rl_backtracking_resolved)
     best_params["eval_neighbors_mode"] = str(eval_neighbors_mode_resolved)
     best_params["eval_num_neighbors"] = eval_num_neighbors_resolved
 
@@ -3798,14 +3655,69 @@ def run_gat_training(
             logger.warning("⚠️ train_decoders_only=True pero GraphSMOTE no está habilitado.")
         return
 
+    loader_num_neighbors = _resolve_num_neighbors(best_params.get('num_neighbors'), NUM_NEIGHBORS, data.edge_types)
+    batch_size_hp = int(_safe_cast(best_params.get('batch_size'), int, BATCH_SIZE))
+    target_pos_ratio_override = _safe_cast(best_params.get('target_pos_ratio'), float, TARGET_POS_RATIO)
+    smote_every_override = max(1, _safe_cast(best_params.get('smote_every_n_epochs'), int, SMOTE_EVERY_N_EPOCHS))
+
+    rl_sampler_controller = None
+    if train_sampler_mode_resolved == "rl_top_p":
+        rl_sampler_controller = RioGNNThresholdController(
+            edge_types=[
+                edge_type
+                for edge_type in data.edge_types
+                if edge_type[0] == "pm" and edge_type[2] == "pm"
+            ],
+            num_layers=int(best_params.get("num_layers", 2)),
+            in_channels=int(in_channels),
+            max_degree_by_edge_type=relation_max_degrees(data.cpu(), node_type="pm"),
+            action_space=str(rl_action_space_resolved),
+            initial_p=float(rl_initial_p_resolved),
+            min_p=float(rl_min_p_resolved),
+            max_p=float(rl_max_p_resolved),
+            min_keep=int(rl_min_keep_resolved),
+            switch_patience=int(rl_switch_patience_resolved),
+            backtracking=bool(rl_backtracking_resolved),
+            positive_only=bool(rl_positive_only_resolved),
+            secondary_reward_weight=0.25,
+            seed=int(sampling_seed_resolved),
+        ).to(device)
+        try:
+            simi_losses = pretrain_label_aware_similarity(
+                rl_sampler_controller,
+                data.cpu(),
+                node_type="pm",
+                device=device,
+                epochs=int(rl_similarity_pretrain_epochs_resolved),
+                positive_only=bool(rl_positive_only_resolved),
+            )
+            if writer is not None and simi_losses:
+                for pre_epoch, simi_loss in enumerate(simi_losses, start=1):
+                    writer.add_scalar("RLTopP/SimilarityPretrainLoss", simi_loss, pre_epoch)
+            logger.info(
+                "RioGNN top-p RL sampler habilitado | action_space=%s | p0=%.3f | min=%.3f | max=%.3f | min_keep=%d",
+                rl_action_space_resolved,
+                rl_initial_p_resolved,
+                rl_min_p_resolved,
+                rl_max_p_resolved,
+                rl_min_keep_resolved,
+            )
+        except Exception as exc:
+            logger.warning(f"No se pudo preentrenar scorer label-aware RL: {exc}")
+
     # Edge generator
     z_dim_dict = {ntype: int(best_params['hidden_channels']) * int(best_params['num_heads']) for ntype in data.node_types}
     edge_gen = RelEdgeGen(z_dim_dict, data.edge_types).to(device) if use_graphsmote else None
 
     optimizer_name = str(best_params.get('optimizer', 'Adam'))
     optimizer_cls = get_optimizer_cls(optimizer_name)
+    optimizer_params = list(model.parameters())
+    if edge_gen is not None:
+        optimizer_params += list(edge_gen.parameters())
+    if rl_sampler_controller is not None:
+        optimizer_params += list(rl_sampler_controller.parameters())
     optimizer = optimizer_cls(
-        model.parameters() if edge_gen is None else list(model.parameters()) + list(edge_gen.parameters()),
+        optimizer_params,
         lr=best_params['lr'],
         weight_decay=best_params['weight_decay']
     )
@@ -3987,6 +3899,16 @@ def run_gat_training(
                 "graphsaint_batch_size": int(graphsaint_batch_size_resolved),
                 "graphsaint_num_steps": int(graphsaint_num_steps_resolved),
                 "graphsaint_walk_length": int(graphsaint_walk_length_resolved),
+                "rl_sampler_controller": rl_sampler_controller,
+                "rl_action_space": str(rl_action_space_resolved),
+                "rl_initial_p": float(rl_initial_p_resolved),
+                "rl_min_p": float(rl_min_p_resolved),
+                "rl_max_p": float(rl_max_p_resolved),
+                "rl_min_keep": int(rl_min_keep_resolved),
+                "rl_positive_only": bool(rl_positive_only_resolved),
+                "rl_switch_patience": int(rl_switch_patience_resolved),
+                "rl_backtracking": bool(rl_backtracking_resolved),
+                "num_layers": int(best_params.get("num_layers", 2)),
                 "deterministic_sampling": bool(deterministic_sampling_resolved),
                 "sampling_seed": int(sampling_seed_resolved) + int(epoch_idx) * 9973,
             }
@@ -4133,6 +4055,12 @@ def run_gat_training(
         graphsaint_batch_size=int(graphsaint_batch_size_resolved),
         graphsaint_num_steps=int(graphsaint_num_steps_resolved),
         graphsaint_walk_length=int(graphsaint_walk_length_resolved),
+        rl_action_space=str(rl_action_space_resolved),
+        rl_initial_p=float(rl_initial_p_resolved),
+        rl_min_p=float(rl_min_p_resolved),
+        rl_max_p=float(rl_max_p_resolved),
+        rl_min_keep=int(rl_min_keep_resolved),
+        rl_lambda_simi=float(rl_lambda_simi_resolved) if rl_sampler_controller is not None else 0.0,
         eval_neighbors_mode=str(eval_neighbors_mode_resolved),
         eval_num_neighbors=eval_num_neighbors_resolved,
         objective_metric=str(objective_metric),
@@ -4178,6 +4106,11 @@ def run_gat_training(
                         optimizer.load_state_dict(ckpt["optimizer_state"])
                     if ckpt.get("scheduler_state"):
                         scheduler.load_state_dict(ckpt["scheduler_state"])
+                    if rl_sampler_controller is not None and ckpt.get("rl_sampler_state"):
+                        try:
+                            rl_sampler_controller.load_state_dict_serializable(ckpt.get("rl_sampler_state"))
+                        except Exception as exc:
+                            logger.warning(f"No se pudo restaurar estado RL top-p; se continúa en modo legacy: {exc}")
                     start_epoch = int(ckpt.get("epoch", 0)) + 1
                     try:
                         resume_best_val_loss = float(ckpt.get("best_val_loss"))
@@ -4411,11 +4344,18 @@ def run_gat_training(
                                   device=device, use_amp=use_amp, scaler=scaler,
                                   scheduler=batch_scheduler, writer=writer, epoch=epoch,
                                   lambda_H=current_lambda_H, node_type='pm',
-                                  edge_gen=edge_gen, lambda_edge=lambda_edge,
-                                  lambda_l2_att=lambda_l2_att,
-                                  suppress_missing_att_warning=suppress_missing_att_warning,
-                                  batch_callback=batch_event_cb,
-                                  accumulation_steps=accumulation_steps)
+                                          edge_gen=edge_gen, lambda_edge=lambda_edge,
+                                          lambda_l2_att=lambda_l2_att,
+                                          rl_sampler_controller=rl_sampler_controller,
+                                          lambda_simi=(
+                                              float(rl_lambda_simi_resolved)
+                                              if rl_sampler_controller is not None
+                                              else 0.0
+                                          ),
+                                          suppress_missing_att_warning=suppress_missing_att_warning,
+                                          batch_callback=batch_event_cb,
+                                          accumulation_steps=accumulation_steps,
+                                          loss_weight_mode=str(best_params.get('loss_weight_mode', 'uniform')))
         if writer is not None:
             writer.add_scalar("Loss/train", loss, epoch)
 
@@ -4581,6 +4521,40 @@ def run_gat_training(
                 except Exception:
                     pass
 
+        rl_update_payload = None
+        if rl_sampler_controller is not None:
+            try:
+                val_has_two_classes = False
+                try:
+                    val_has_two_classes = len(np.unique(y_true_val)) > 1
+                except Exception:
+                    val_has_two_classes = False
+                rl_signal = val_auprc if val_has_two_classes else None
+                rl_update_payload = rl_sampler_controller.update_after_validation(
+                    val_auprc=rl_signal,
+                    epoch=int(epoch),
+                )
+                rl_state_payload = rl_sampler_controller.state_dict_serializable()
+                best_params["rl_sampler_state"] = rl_state_payload
+                best_params["rl_thresholds"] = rl_state_payload.get("thresholds", {})
+                best_params["rl_reward_history"] = rl_state_payload.get("reward_history", [])
+                best_params["sampler_impl"] = "rl_top_p_rsrl"
+                if writer is not None:
+                    try:
+                        thresholds = list((rl_state_payload.get("thresholds") or {}).values())
+                        if thresholds:
+                            writer.add_scalar("RLTopP/MeanThreshold", float(np.mean(thresholds)), epoch)
+                        if isinstance(rl_update_payload, dict):
+                            writer.add_scalar(
+                                "RLTopP/PrimaryRewardDelta",
+                                float(rl_update_payload.get("primary_delta", 0.0) or 0.0),
+                                epoch,
+                            )
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.warning(f"No se pudo actualizar controlador RL top-p: {exc}")
+
         current_monitor_values = {
             "val_loss": val_loss,
             "val_f1": val_f1,
@@ -4664,6 +4638,22 @@ def run_gat_training(
                     'target_pos_ratio_used': float(target_pos_ratio_override),
                     'smote_every_n_epochs_used': int(smote_every_override),
                     'num_neighbors_effective': loader_num_neighbors,
+                    'sampler_impl': str(best_params.get("sampler_impl", train_sampler_impl)),
+                    'rl_sampler_state': (
+                        rl_sampler_controller.state_dict_serializable()
+                        if rl_sampler_controller is not None
+                        else None
+                    ),
+                    'rl_thresholds': (
+                        rl_sampler_controller.thresholds_serializable()
+                        if rl_sampler_controller is not None
+                        else None
+                    ),
+                    'rl_reward_history': (
+                        list(rl_sampler_controller.reward_history)
+                        if rl_sampler_controller is not None
+                        else None
+                    ),
                     'out_channels': int(num_classes),
                     'in_channels': int(in_channels),
                     'edge_feature_dim': int(edge_feature_dim),
@@ -4790,6 +4780,13 @@ def run_gat_training(
             lambda_edge=lambda_edge,
             lambda_l2_att=lambda_l2_att,
             train_sampler_mode=str(train_sampler_mode_resolved),
+            sampler_impl=str(best_params.get("sampler_impl", train_sampler_impl)),
+            rl_update=rl_update_payload,
+            rl_thresholds=(
+                rl_sampler_controller.thresholds_serializable()
+                if rl_sampler_controller is not None
+                else None
+            ),
             eval_neighbors_mode=str(eval_neighbors_mode_resolved),
             graph_hash=graph_hash,
             graph_file_hash=graph_file_hash,
@@ -4833,6 +4830,12 @@ def run_gat_training(
                     "objective_metric": str(objective_metric),
                     "objective_threshold_beta": float(objective_threshold_beta),
                     "train_sampler_mode": str(train_sampler_mode_resolved),
+                    "sampler_impl": str(best_params.get("sampler_impl", train_sampler_impl)),
+                    "rl_sampler_state": (
+                        rl_sampler_controller.state_dict_serializable()
+                        if rl_sampler_controller is not None
+                        else None
+                    ),
                     "deterministic_sampling": bool(deterministic_sampling_resolved),
                     "sampling_seed": int(sampling_seed_resolved),
                     "eval_neighbors_mode": str(eval_neighbors_mode_resolved),
@@ -5165,6 +5168,13 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             target_pos_ratio = TARGET_POS_RATIO
             smote_every_n_epochs = SMOTE_EVERY_N_EPOCHS
 
+        # Ponderación de la pérdida por distancia accidente→pórtico aguas arriba.
+        # "uniform": cada nodo positivo pesa 1.0 (status quo).
+        # "distance": peso = clip(1 - dist/5km, 0.2, 1.0) por nodo positivo.
+        loss_weight_mode = trial.suggest_categorical(
+            "loss_weight_mode", ["uniform", "distance"]
+        )
+
         batch_size_candidate = trial.suggest_int('batch_size', 512, 4096, step=512)
         # Si el perfil es dict, serializar como JSON para sobrevivir CSV roundtrip
         # (pandas convierte dicts a repr Python con comillas simples y json.loads falla).
@@ -5300,7 +5310,8 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
                 use_amp=False, scaler=None, scheduler=batch_scheduler, writer=None, epoch=epoch,
                 lambda_H=current_lambda_H, node_type='pm', edge_gen=edge_gen, lambda_edge=lambda_edge,
                 lambda_l2_att=lambda_l2_att,
-                accumulation_steps=accumulation_steps
+                accumulation_steps=accumulation_steps,
+                loss_weight_mode=loss_weight_mode,
             )
 
             # Validación periódica
@@ -6659,466 +6670,3 @@ def test_imgagn(loaded_obj):
     except Exception as e:
         logger.error(f"Error al aplicar el grafo ImGAGN (TEST): {e}")
         return loaded_obj
-
-def calculate_gini(alpha_h):
-    if alpha_h.numel() == 0:
-        return 0.0
-    # Ordenar atenciones y calcular sumas acumuladas
-    alpha_sorted = torch.sort(alpha_h).values
-    n = len(alpha_sorted)
-    cum_alpha = torch.cumsum(alpha_sorted, dim=0)
-    # Fórmula del Gini
-    return (n + 1 - 2 * torch.sum(cum_alpha) / cum_alpha[-1]) / n
-
-def menu_utilidades_grafos():    
-    limpiar_pantalla()
-    while True:        
-        print("===== Menú de Utilidades =====")        
-        print("  [1] Fusionar grafos")        
-        print("  [2] Selección de caracteristicas")        
-        print(f"  [3] Agregar flujos [{DT_MINUTES} min x pórtico]") 
-        print("  [4] Visualizar flujos agregados")
-        print("  [5] Utilidades CSVs")
-        print("  [6] Ejecutar Tests" )
-        print("  [7] Gestor de Artefactos" )       
-        print("")        
-        print("  [0] Volver al menú principal")
-        print("")        
-        choice = input("Elige una opción: ").strip()        
-        if choice == "1":                     
-            fusionar_grafos()
-        elif choice == "2":            
-            select_features()
-        elif choice == "3":
-            print("▶️ Selecciona archivo de Flujos")
-            try:
-                resp_stream = input("¿Desea procesar por partes (archivos muy grandes)? (s/n): ").strip().lower()
-            except Exception:
-                resp_stream = 'n'
-            if resp_stream in ('s','si','y','yes'):
-                # Modo streaming de baja memoria: lee el CSV a chunks, particiona por pórtico y agrega por partes
-                print(f"▶️ Procesamiento por partes (ventana {DT_MINUTES} min)")
-                pivot = compute_pm_features_streaming(None)
-                if pivot is not None:
-                    print(f"✅ Features calculadas en memoria: {len(pivot)} filas")
-                else:
-                    print("ℹ️ Features calculadas y guardadas en 'Resultados/'.")
-            else:
-                # Modo en memoria (recomendado para archivos pequeños o muestras)
-                df_flows = load_flujos()
-                print(f"▶️ Agregando flujos por segmento temporal de {DT_MINUTES} min x pórtico…")
-                compute_pm_features(df_flows)
-        elif choice == "4":
-            print("Lanzando la aplicación de visualización interactiva...")
-            print("Cuando termines, puedes usar el botón 'Finalizar' en la aplicación web o presionar Ctrl+C en esta terminal.")
-            input("Enter poara continuar....... ").strip()   
-            os.system("streamlit run src/visualization.py")
-            limpiar_pantalla()
-        elif choice == "5":
-            menu_utilidades_csv()
-        elif choice == "6":
-            print("Ejecutando tests con cobertura...")
-            os.system("pytest -v tests")
-        elif choice == "7":
-            artifacts_menu()
-        elif choice == "0":
-            limpiar_pantalla()            
-            break        
-        else:            
-            print("❌ Opción no reconocida.")
-
-def menu_baseline():
-    limpiar_pantalla()
-    while True:
-        print("===== Menú Baseline ======")
-        print("  [1] Multilayer Perceptron")
-        print("  [2] Transformer Series Temporales")
-        print("  [3] XGBoost")
-        print("  [4] Anomalias (tabular)")
-        print("")
-        print("  [5] Reportes de Evaluación")
-        print("")
-        print("  [0] Volver al menú principal")
-        print("")
-        choice = input("Elige una opción: ").strip()
-        if choice == "1":
-            run_mlp_tabular_pipeline()
-        elif choice == "2":
-            run_transformer_ts_pipeline()
-        elif choice == "3":
-            run_xgboost_pipeline()
-        elif choice == "4":
-            # Detección de anomalías tabular (pórtico-minuto y=1)
-            run_anomaly_pipeline()
-        elif choice == "5":
-            baseline_reports_menu()
-        elif choice == "0":
-            limpiar_pantalla()
-            break
-        else:
-            print("❌ Opción no reconocida.")
-
-def _print_table(rows, headers):
-    col_widths = [len(h) for h in headers]
-    for r in rows:
-        for i, cell in enumerate(r):
-            col_widths[i] = max(col_widths[i], len(str(cell)))
-    def fmt_row(row):
-        return " | ".join(str(c).ljust(col_widths[i]) for i, c in enumerate(row))
-    print(fmt_row(headers))
-    print("-+-".join("-" * w for w in col_widths))
-    for r in rows:
-        print(fmt_row(r))
-
-def _report_generic_results(pattern: Union[str, List[str]], model_label: str):
-    # Acepta uno o varios patrones y combina resultados
-    patterns = pattern if isinstance(pattern, (list, tuple)) else [pattern]
-    files = []
-    for pat in patterns:
-        files.extend(glob.glob(os.path.join(RESULTADOS_DIR, pat)))
-    files = sorted(set(files), key=os.path.getmtime)
-    if not files:
-        pats_txt = ", ".join(patterns)
-        print(f"❌ No se encontraron resultados para {model_label} (patrones: {pats_txt}).")
-        return
-    if len(files) == 1:
-        path = files[0]
-    else:
-        print(f"Archivos de resultados ({model_label}) disponibles:")
-        for i, f in enumerate(files, 1):
-            print(f"  [{i}] {os.path.basename(f)}")
-        try:
-            sel = input("Seleccione el número de archivo a mostrar (Enter para el último): ").strip()
-            if sel:
-                idx = int(sel) - 1
-                if not (0 <= idx < len(files)):
-                    raise ValueError
-                path = files[idx]
-            else:
-                path = files[-1]
-        except Exception:
-            path = files[-1]
-    print(f"\n▶️ Mostrando → {os.path.basename(path)}")
-    try:
-        df = pd.read_csv(path)
-    except Exception as e:
-        print(f"❌ No se pudo leer '{os.path.basename(path)}': {e}")
-        return
-
-    if 'split' in df.columns:
-        headers = [
-            'split','auroc','auprc','threshold','precision_1','recall_1','f1_1','accuracy','support_pos','support_neg'
-        ]
-        rows = []
-        for _, r in df.iterrows():
-            rows.append([
-                r.get('split', ''),
-                f"{r.get('auroc', float('nan')):.4f}" if pd.notna(r.get('auroc')) else 'NaN',
-                f"{r.get('auprc', float('nan')):.4f}" if pd.notna(r.get('auprc')) else 'NaN',
-                f"{r.get('threshold', float('nan')):.4f}" if pd.notna(r.get('threshold')) else 'NaN',
-                f"{r.get('precision_1', float('nan')):.4f}" if pd.notna(r.get('precision_1')) else 'NaN',
-                f"{r.get('recall_1', float('nan')):.4f}" if pd.notna(r.get('recall_1')) else 'NaN',
-                f"{r.get('f1_1', float('nan')):.4f}" if pd.notna(r.get('f1_1')) else 'NaN',
-                f"{r.get('accuracy', float('nan')):.4f}" if pd.notna(r.get('accuracy')) else 'NaN',
-                int(r.get('support_pos', 0)) if pd.notna(r.get('support_pos')) else 0,
-                int(r.get('support_neg', 0)) if pd.notna(r.get('support_neg')) else 0,
-            ])
-        _print_table(rows, headers)
-    else:
-        # Transformer summary file
-        def g(key):
-            v = df.iloc[0].get(key)
-            if pd.isna(v):
-                return 'NaN'
-            try:
-                return f"{float(v):.4f}"
-            except Exception:
-                return str(v)
-        rows = [
-            ['val', g('val_f1_acc_1'), g('val_precision_1'), g('val_recall_1'), g('val_accuracy')],
-            ['test', g('test_f1_acc_1'), g('test_precision_1'), g('test_recall_1'), g('test_accuracy')],
-        ]
-        headers = ['split','f1_1','precision_1','recall_1','accuracy']
-        _print_table(rows, headers)
-
-def _show_top_anomalies_from_preds(pred_pattern: Union[str, List[str]], label: str, score_col: str = 'anomaly_score'):
-    patterns = pred_pattern if isinstance(pred_pattern, (list, tuple)) else [pred_pattern]
-    files = []
-    for pat in patterns:
-        files.extend(glob.glob(os.path.join(RESULTADOS_DIR, pat)))
-    files = sorted(set(files), key=os.path.getmtime)
-    if not files:
-        pats_txt = ", ".join(patterns)
-        print(f"❌ No se encontraron predicciones para {label} (patrones: {pats_txt}).")
-        return
-    if len(files) == 1:
-        path = files[0]
-    else:
-        print(f"Archivos de predicciones ({label}) disponibles:")
-        for i, f in enumerate(files, 1):
-            print(f"  [{i}] {os.path.basename(f)}")
-        try:
-            sel = input("Seleccione el número de archivo a usar (Enter para el más reciente): ").strip()
-            if sel:
-                idx = int(sel) - 1
-                if not (0 <= idx < len(files)):
-                    raise ValueError
-                path = files[idx]
-            else:
-                path = files[-1]
-        except Exception:
-            path = files[-1]
-
-    print(f"\n▶️ Cargando → {os.path.basename(path)}")
-    try:
-        df = pd.read_csv(path)
-    except Exception as e:
-        print(f"❌ No se pudo leer '{os.path.basename(path)}': {e}")
-        return
-
-    # Filtros
-    splits = sorted(df['split'].dropna().astype(str).unique()) if 'split' in df.columns else []
-    chosen_split = None
-    if splits:
-        print("Splits disponibles:", ", ".join(splits))
-        s = input("Filtrar por split (Enter=Todos): ").strip()
-        if s and s in splits:
-            chosen_split = s
-            df = df[df['split'] == s].copy()
-
-    # Columnas esperadas
-    if score_col not in df.columns and 'prob1' in df.columns:
-        score_col = 'prob1'
-    if score_col not in df.columns:
-        print(f"❌ No se encontró la columna de score ('{score_col}').")
-        return
-
-    # Top-k
-    try:
-        k_str = input("Cantidad de top anomalías a mostrar (k, default: 20): ").strip()
-        k = int(k_str) if k_str else 20
-    except Exception:
-        k = 20
-
-    # Timestamp humano (si existe ts_min)
-    if 'ts_min' in df.columns:
-        try:
-            ts_series = pd.to_datetime(df['ts_min'], unit='m', origin='unix')
-            df['timestamp'] = ts_series.dt.strftime('%Y-%m-%d %H:%M')
-        except Exception:
-            pass
-
-    dft = df.sort_values(by=score_col, ascending=False).head(k)
-    headers = ['portico', 'ts_min']
-    if 'timestamp' in dft.columns:
-        headers.append('timestamp')
-    headers += ['y_true', score_col, 'y_pred']
-    rows = []
-    for _, r in dft.iterrows():
-        row = [
-            r.get('portico', ''),
-            r.get('ts_min', ''),
-        ]
-        if 'timestamp' in dft.columns:
-            row.append(r.get('timestamp', ''))
-        row += [
-            int(r.get('y_true', 0)) if pd.notna(r.get('y_true')) else '',
-            f"{float(r.get(score_col, float('nan'))):.6f}" if pd.notna(r.get(score_col)) else 'NaN',
-            int(r.get('y_pred', 0)) if pd.notna(r.get('y_pred')) else '',
-        ]
-        rows.append(row)
-    print(f"\nTop-{k} anomalías ({label})" + (f" [split={chosen_split}]" if chosen_split else ""))
-    _print_table(rows, headers)
-
-    # Exportar CSV con el Top-k
-    try:
-        os.makedirs(RESULTADOS_DIR, exist_ok=True)
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        import re as _re
-        label_slug = _re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
-        split_tag = chosen_split if chosen_split else 'all'
-        out_path = os.path.join(RESULTADOS_DIR, f"topk_{label_slug}_{split_tag}_{ts}.csv")
-        export_cols = []
-        for c in ['portico', 'ts_min', 'timestamp', 'y_true', score_col, 'y_pred', 'split']:
-            if c in dft.columns:
-                export_cols.append(c)
-        dft[export_cols].to_csv(out_path, index=False)
-        print(f"\n💾 Top-{k} exportado → {out_path}")
-    except Exception as e:
-        print(f"⚠️ No se pudo exportar el Top-{k}: {e}")
-
-def baseline_reports_menu():
-    while True:
-        print("\n===== Reportes Baseline ======")
-        print("  [1] Multilayer Perceptron")
-        print("  [2] Transformer Series Temporales")
-        print("  [3] XGBoost")
-        print("  [4] Anomalias (tabular)")
-        print("  [5] GAT (Resultados)")
-        print("  [6] Top-k Anomalias (tabular)")
-        print("  [7] GAT (Top-k)")
-        print("  [0] Volver")
-        choice = input("Elige una opción: ").strip()
-        if choice == '1':
-            _report_generic_results("results_mlp_*.csv", "MLP")
-        elif choice == '2':
-            _report_generic_results("transformer_results_*.csv", "Transformer")
-        elif choice == '3':
-            _report_generic_results("results_xgb_*.csv", "XGBoost")
-        elif choice == '4':
-            _report_generic_results("results_anomaly_*.csv", "Anomalias (tabular)")
-        elif choice == '5':
-            _report_generic_results([
-                "results_gnn_anomaly_*.csv",
-                "results_gat_report_*.csv",
-            ], "GAT (Resultados)")
-        elif choice == '6':
-            _show_top_anomalies_from_preds("preds_anomaly_*.csv", "Anomalias (tabular)", score_col='anomaly_score')
-        elif choice == '7':
-            _show_top_anomalies_from_preds([
-                "preds_gnn_anomaly_*.csv",
-                "preds_gat_report_*.csv",
-            ], "GAT (Top-k)", score_col='prob1')
-        elif choice == '0':
-            break
-        else:
-            print("❌ Opción no reconocida.")
-
-# --------------------------------------------------------------------------- #
-# MENU PRINCIPAL 
-# --------------------------------------------------------------------------- #
-
-def main():
-    
-    limpiar_pantalla()
-    loaded_obj = None
-    while True:
-        print("===== Menú ======")
-        print("   🛠️ Grafos")
-        print("  [1] Crear")
-        print("  [2] Cargar")
-        
-        if loaded_obj:
-            fname = loaded_obj.get('filename') if isinstance(loaded_obj, dict) else None
-            print("")
-            print(f"   🚀 Grafo: {fname or 'Ningún archivo (objeto en memoria)'}")
-            print("  [4] Visualizar subgrafo de accidente")
-            print("  [5] Exportar datos del grafo a CSV")
-            print("  [6] Información del grafo")
-            print("   ⚖️  GraphSMOTE")
-            print("  [7] Búsqueda de Hiperparámetros")
-            print("  [8] Entrenar GAT")
-            print("  [9] Test aumento")
-            print("   ⚖️  ImGAGN")
-            print("  [10] Búsqueda de Hiperparámetros")
-            print("  [11] Entrenar GAT")
-            print("  [13] Test aumento")
-            print("   🚨  Anomalias")
-            print("  [14] Búsqueda de Hiperparámetros")
-            print("  [15] Entrena GAT")
-            
-            
-            has_any_model = bool(glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt"))) or os.path.isfile(os.path.join(RESULTADOS_DIR, "gat_model_BEST.pt"))
-            if has_any_model:
-                print("")
-                print("   📊   Graph Attention Network (GAT)")
-                print("  [r]  Reporte")
-
-        print("")
-        print("  [v] Reporte visual")
-        print("  [b] Baseline")
-        print("  [u] Utilidades")
-        print("  [x] Salir")
-        print("")
-        if DEBUG:
-            print("===DEBUG MODE ON===")
-            print("")
-        choice = input("Elige una opción: ").strip()
-
-        if choice == "1":
-            new_graph_path = build_graph()
-            if new_graph_path:
-                print(f"✅ Grafo recién creado en: {new_graph_path}")
-                print("Cargando el nuevo grafo en memoria...")
-                try:
-                    # Selection automática de dispositivo
-                    device = get_auto_device()
-                    print(f"Usando dispositivo: {device}")
-                    loaded_obj = torch.load(new_graph_path, map_location=device, weights_only=False)
-                    loaded_obj['filename'] = os.path.basename(new_graph_path)
-                    print("---------------------------------------")
-                    print(f"✅ Grafo creado y cargado en memoria: {loaded_obj.get('filename', 'N/A')}")    
-                except Exception as e:
-                    print(f"❌ Error al cargar el grafo recién creado: {e}")
-                    loaded_obj = None
-        elif choice == "2":
-            result = load_graph()
-            if result:
-                loaded_obj = result
-                print(f"✅ Grafo cargado: {loaded_obj.get('filename', 'N/A')}")
-                print(loaded_obj['data'])
-        elif choice == "4" and loaded_obj:
-            visualize_acc_subgraph(loaded_obj)
-        elif choice == "5" and loaded_obj:
-            export_graph_to_csv(loaded_obj)
-        elif choice == "6" and loaded_obj:
-            visualize_graph_overview(loaded_obj)
-        elif choice == "8" and loaded_obj:
-            run_gat_training(loaded_obj)
-        elif choice == "r" and loaded_obj:
-            # Reporte unificado con detección automática (Anomalías/GraphSMOTE/ImGAGN)
-            run_gnn_anomaly_pipeline(loaded_obj)
-        elif choice == "7" and loaded_obj:
-            search_hyperparameters(loaded_obj)
-        elif choice == "9" and loaded_obj:
-            result = test_graphsmote(loaded_obj)
-            if result:
-                loaded_obj = result
-                print(f"✅ Grafo aumentado y cargado en memoria: {loaded_obj.get('filename', 'N/A')}")
-        elif choice == "10" and loaded_obj:
-            run_imgagn_hpo(loaded_obj)
-        elif choice == "11" and loaded_obj:
-            result = run_imgagn_pipeline(loaded_obj)
-            if result:
-                loaded_obj = result
-                print(f"✅ Grafo ImGAGN aumentado cargado en memoria: {loaded_obj.get('filename', 'N/A')}")
-        elif choice == "13" and loaded_obj:
-            result = test_imgagn(loaded_obj)
-            if result:
-                loaded_obj = result
-                print(f"✅ Grafo ImGAGN (TEST) aumentado cargado en memoria: {loaded_obj.get('filename', 'N/A')}")
-        elif choice == "15" and loaded_obj:
-            # Entrenamiento de GAT (modo anomalías). Pregunta GraphSMOTE internamente.
-            if isinstance(loaded_obj, dict):
-                loaded_obj['purpose'] = 'Anomaly'
-            run_gat_training(loaded_obj, purpose='Anomaly')
-        elif choice == "14" and loaded_obj:
-            run_gnn_anomaly_hpo_then_train(loaded_obj)
-        elif choice == "v":
-            # Lanza servidor dinámico del Reporte visual (logs y listas en vivo)
-            print("Lanzando servidor dinámico del Reporte visual (Ctrl+C para salir)…")
-            try:
-                run_visual_server(open_browser=True)
-            except Exception as e:
-                print(f"❌ Error al iniciar el Reporte visual dinámico: {e}")
-        elif choice == "b":
-            menu_baseline()
-        elif choice == "u":
-            menu_utilidades_grafos()
-        elif choice == "x":
-            limpiar_pantalla()
-            break
-        else:
-            print("❌ Opción no reconocida.")
-
-if __name__ == '__main__':
-    # Modo rápido: `python main.py -v` o `--visual` lanza el servidor visual
-    try:
-        args = sys.argv[1:]
-        if any(a in ('-v', '--visual') for a in args):
-            print("Lanzando servidor dinámico del Reporte visual (Ctrl+C para salir)…")
-            run_visual_server(open_browser=True)
-        else:
-            main()
-    except KeyboardInterrupt:
-        pass

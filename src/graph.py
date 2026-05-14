@@ -26,6 +26,7 @@ from src.snapshot_sequences import (
     SequenceConfig,
     build_sequence_index,
 )
+from src.portico_geometry import attach_portico_geometry
 from src.config import (
     FLOAT,
     DT_MINUTES,
@@ -110,6 +111,97 @@ def _save_normalization_stats(
     return out_path
 
 
+_DIST_TO_POST_OUTLIER_KM = 5.0
+
+# Ponderación de pérdida basada en la distancia accidente→pórtico aguas arriba.
+# La fórmula es: clip(1 - dist/D_MAX, FLOOR, 1.0). Negativos quedan en 1.0.
+# Con D_MAX=5 km, accidentes a 0 km pesan 1.0, a 4 km pesan 0.2, a ≥5 km pesan
+# el FLOOR=0.2 (no anulamos supervisión completamente).
+_LOSS_WEIGHT_D_MAX_KM = 5.0
+_LOSS_WEIGHT_FLOOR = 0.2
+
+
+def _compute_pm_loss_weight(
+    n_nodes: int, affected_pms: pd.DataFrame
+) -> torch.Tensor:
+    """
+    Calcula el vector de pesos por nodo PM para el modo "distance" de la
+    pérdida de clasificación.
+
+    - Negativos (sin accidente asignado): peso 1.0.
+    - Positivos: clip(1 - dist_to_post_km / D_MAX, FLOOR, 1.0). Si varios
+      accidentes mapean al mismo nodo (distintos ts_min o múltiples eventos),
+      tomamos el peso máximo (el más cercano gana).
+    - NaN en dist_to_post_km: peso 1.0 (no castigamos accidentes válidos por
+      falta de dato).
+    """
+    weights = torch.ones(int(n_nodes), dtype=torch.float32)
+    if affected_pms is None or affected_pms.empty:
+        return weights
+    if "dist_to_post_km" not in affected_pms.columns:
+        return weights
+
+    dist = pd.to_numeric(affected_pms["dist_to_post_km"], errors="coerce")
+    raw = 1.0 - (dist / _LOSS_WEIGHT_D_MAX_KM)
+    clipped = raw.clip(lower=_LOSS_WEIGHT_FLOOR, upper=1.0)
+    clipped = clipped.fillna(1.0)  # NaN dist → peso 1.0
+
+    by_node = (
+        pd.DataFrame(
+            {"node_idx": affected_pms["node_idx"].values, "w": clipped.values}
+        )
+        .groupby("node_idx")["w"]
+        .max()
+    )
+    if not by_node.empty:
+        idx_t = torch.as_tensor(by_node.index.to_numpy(), dtype=torch.long)
+        w_t = torch.as_tensor(by_node.to_numpy(), dtype=torch.float32)
+        weights.index_copy_(0, idx_t, w_t)
+    return weights
+
+
+def _report_accident_geometry(df_acc: pd.DataFrame) -> None:
+    """
+    Diagnóstico de calidad de etiqueta: muestra la distribución de la distancia
+    entre el accidente y el pórtico aguas arriba, y marca outliers (≥ 5 km).
+
+    Se imprime sólo si las columnas existen (las agrega process_accidentes_df).
+    """
+    if df_acc is None or df_acc.empty:
+        return
+    if "dist_to_post_km" not in df_acc.columns:
+        return
+
+    dist = pd.to_numeric(df_acc["dist_to_post_km"], errors="coerce").dropna()
+    if dist.empty:
+        print("  ℹ️ Sin datos de distancia accidente→pórtico aguas arriba.")
+        return
+
+    q50, q75, q90, q95, q_max = (dist.quantile(q) for q in (0.5, 0.75, 0.9, 0.95, 1.0))
+    n_outliers = int((dist >= _DIST_TO_POST_OUTLIER_KM).sum())
+    print("  📐 Distancia accidente → pórtico aguas arriba (km):")
+    print(
+        f"     mediana={q50:.2f}  q75={q75:.2f}  q90={q90:.2f}  q95={q95:.2f}  max={q_max:.2f}"
+    )
+    if n_outliers:
+        print(
+            f"     ⚠️ {n_outliers} accidente(s) a ≥{_DIST_TO_POST_OUTLIER_KM:.0f} km del pórtico aguas arriba "
+            "(considerar filtrar o ponderar)."
+        )
+
+    if "pos_relativa" in df_acc.columns:
+        pos = pd.to_numeric(df_acc["pos_relativa"], errors="coerce").dropna()
+        if not pos.empty:
+            close_to_post = int((pos <= 0.25).sum())
+            close_to_cerc = int((pos >= 0.75).sum())
+            print(
+                "     posición relativa en el tramo: "
+                f"≤0.25 (cerca del aguas-arriba)={close_to_post}, "
+                f"≥0.75 (cerca del aguas-abajo)={close_to_cerc}, "
+                f"total con pos_relativa válida={len(pos)}"
+            )
+
+
 def build_graph() -> Optional[str]:
     # 1) Cargar pórticos y accidentes
     print("\n▶️ Cargando datos base…\n")
@@ -190,6 +282,8 @@ def build_graph() -> Optional[str]:
     # NEW: Filter accidents based on selected porticos
     df_acc = df_acc[df_acc['ultimo_portico'].isin(porticos_a_incluir)].copy()
     print(f"✅ Se considerarán {len(df_acc)} accidentes en los pórticos seleccionados.")
+
+    _report_accident_geometry(df_acc)
 
     # 2) Elegir modo de obtención de features
     choice = input("¿Desea \n[1] Construir features desde cero, \n[2] Cargar features desde un CSV o \n[3] Cargar features usando una lista de features seleccionadas? \n Elija una opción [1/2/3]: ").strip()
@@ -412,6 +506,10 @@ def build_graph() -> Optional[str]:
     # --- 3a) Preprocesamiento y Normalización ---
     # 3a.1) Identificar las columnas de features
     portico_col = buscar_columna(df_pm, "portico")
+    # Inyectar geometría estática del pórtico (km_norm_eje, dist_to_upstream_km,
+    # one-hots de eje/calzada, etc.). El attach es idempotente: si el pipeline
+    # productor de df_pm ya las agregó, no las duplica.
+    df_pm = attach_portico_geometry(df_pm, df_port, portico_col=portico_col)
     feature_cols = [
         c for c in df_pm.columns
         if c not in [portico_col, "ts_min"]
@@ -633,6 +731,20 @@ def build_graph() -> Optional[str]:
         is_accident_pm[affected_indices] = True
     print(f"    · Accidentes totales={len(df_acc)}, mapeados a nodos PM={affected_pms['node_idx'].nunique() if not affected_pms.empty else 0}")
 
+    # Peso de pérdida por nodo, derivado de la distancia accidente→pórtico aguas
+    # arriba. El entrenamiento puede consumirlo (modo "distance") o ignorarlo
+    # (modo "uniform"); en el segundo caso el peso queda como diagnóstico.
+    pm_loss_weight = _compute_pm_loss_weight(len(df_pm), affected_pms)
+    pos_mask = pm_loss_weight < 1.0
+    if bool(pos_mask.any().item()):
+        nz = pm_loss_weight[pos_mask]
+        print(
+            "  ⚖️ pm_loss_weight (positivos): "
+            f"n={int(pos_mask.sum().item())} "
+            f"min={float(nz.min().item()):.2f} mediana={float(nz.median().item()):.2f} "
+            f"max={float(nz.max().item()):.2f}"
+        )
+
 
     # --- 5) Selección y Construcción de Aristas ---
     #print("\n▶️ Selección de tipos de aristas a construir...")
@@ -767,6 +879,7 @@ def build_graph() -> Optional[str]:
     data["pm"].x = pm_feats
     data["pm"].y = pm_y
     data["pm"].is_accident_pm = is_accident_pm
+    data["pm"].loss_weight = pm_loss_weight
 
     def _add(et, src, dst, attr):
         if not src: return

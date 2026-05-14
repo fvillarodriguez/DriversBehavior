@@ -104,6 +104,7 @@ from src.config import (
     get_device_diagnostics,
 )
 from src.features import compute_pm_features
+from src.portico_geometry import attach_portico_geometry
 from src.graph_visualization import render_visual_graph_tab
 from src.feature_explorer import render_feature_explorer
 from src.optimizers import get_optimizer_cls
@@ -5488,6 +5489,14 @@ def _train_gnn_with_best_params(
     graphsaint_batch_size: Optional[int] = None,
     graphsaint_num_steps: Optional[int] = None,
     graphsaint_walk_length: Optional[int] = None,
+    rl_action_space: Optional[str] = None,
+    rl_initial_p: Optional[float] = None,
+    rl_min_p: Optional[float] = None,
+    rl_max_p: Optional[float] = None,
+    rl_min_keep: Optional[int] = None,
+    rl_positive_only: Optional[bool] = None,
+    rl_similarity_pretrain_epochs: Optional[int] = None,
+    rl_lambda_simi: Optional[float] = None,
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
     checkpoint_metric: Optional[str] = None,
@@ -5566,6 +5575,14 @@ def _train_gnn_with_best_params(
             graphsaint_batch_size=graphsaint_batch_size,
             graphsaint_num_steps=graphsaint_num_steps,
             graphsaint_walk_length=graphsaint_walk_length,
+            rl_action_space=rl_action_space,
+            rl_initial_p=rl_initial_p,
+            rl_min_p=rl_min_p,
+            rl_max_p=rl_max_p,
+            rl_min_keep=rl_min_keep,
+            rl_positive_only=rl_positive_only,
+            rl_similarity_pretrain_epochs=rl_similarity_pretrain_epochs,
+            rl_lambda_simi=rl_lambda_simi,
             eval_neighbors_mode=eval_neighbors_mode,
             eval_num_neighbors=eval_num_neighbors,
             checkpoint_metric=checkpoint_metric,
@@ -6006,6 +6023,7 @@ def _network_config_to_hparams(
         "loss_type": cfg.get("loss_type", "FocalLoss"),
         "focal_gamma": float(cfg.get("focal_gamma", 1.5)),
         "focal_alpha": float(cfg.get("focal_alpha", 0.75)),
+        "loss_weight_mode": str(cfg.get("loss_weight_mode", "uniform")),
         "batch_size": int(cfg.get("batch_size", 512)),
         # JSON-serializa lista plana o dict por relación; _resolve_num_neighbors
         # en gnn_main.py mapea dict (string keys) → tuple (edge_type) automáticamente.
@@ -7396,6 +7414,14 @@ def _run_optuna_search(
         graphsaint_batch_size = 0
         graphsaint_num_steps = 0
         graphsaint_walk_length = 0
+        rl_action_space = "discrete"
+        rl_initial_p = 0.5
+        rl_min_p = 0.05
+        rl_max_p = 1.0
+        rl_min_keep = 1
+        rl_positive_only = True
+        rl_similarity_pretrain_epochs = 3
+        rl_lambda_simi = 2.0
         if train_sampler_mode == "cluster_gcn":
             cluster_gcn_num_parts = int(
                 trial.suggest_categorical(
@@ -7438,10 +7464,26 @@ def _run_optuna_search(
                 )
             else:
                 graphsaint_walk_length = 1
+        elif train_sampler_mode == "rl_top_p":
+            rl_action_space = str(
+                trial.suggest_categorical(
+                    "rl_action_space",
+                    list(search_space.get("rl_action_spaces", ["discrete", "continuous_actor"])),
+                )
+            )
+            if rl_action_space not in {"discrete", "continuous_actor"}:
+                rl_action_space = "discrete"
+            rl_initial_p = float(search_space.get("rl_initial_p", 0.5))
+            rl_min_p = float(search_space.get("rl_min_p", 0.05))
+            rl_max_p = float(search_space.get("rl_max_p", 1.0))
+            rl_min_keep = int(search_space.get("rl_min_keep", 1))
+            rl_positive_only = bool(search_space.get("rl_positive_only", True))
+            rl_similarity_pretrain_epochs = int(search_space.get("rl_similarity_pretrain_epochs", 3))
+            rl_lambda_simi = float(search_space.get("rl_lambda_simi", 2.0))
         if debug_flag:
             logger.info(
                 "[SAMPLER] trial=%s mode=%s cluster=(parts=%s,parts_epoch=%s) "
-                "graphsaint=(mode=%s,batch=%s,steps=%s,walk=%s)",
+                "graphsaint=(mode=%s,batch=%s,steps=%s,walk=%s) rl=(action=%s,p0=%s)",
                 trial.number,
                 train_sampler_mode,
                 cluster_gcn_num_parts,
@@ -7450,6 +7492,8 @@ def _run_optuna_search(
                 graphsaint_batch_size,
                 graphsaint_num_steps,
                 graphsaint_walk_length,
+                rl_action_space,
+                rl_initial_p,
             )
 
         lr_cfg = search_space["lr"]
@@ -7511,6 +7555,12 @@ def _run_optuna_search(
 
         loss_type = trial.suggest_categorical(
             "loss_type", list(search_space["loss_type"])
+        )
+        loss_weight_mode_choices = list(
+            search_space.get("loss_weight_mode", ["uniform"])
+        ) or ["uniform"]
+        loss_weight_mode = trial.suggest_categorical(
+            "loss_weight_mode", loss_weight_mode_choices
         )
         focal_gamma = None
         focal_alpha = None
@@ -7751,6 +7801,14 @@ def _run_optuna_search(
             "graphsaint_walk_length",
             int(graphsaint_walk_length),
         )
+        trial.set_user_attr("rl_action_space", str(rl_action_space))
+        trial.set_user_attr("rl_initial_p", float(rl_initial_p))
+        trial.set_user_attr("rl_min_p", float(rl_min_p))
+        trial.set_user_attr("rl_max_p", float(rl_max_p))
+        trial.set_user_attr("rl_min_keep", int(rl_min_keep))
+        trial.set_user_attr("rl_positive_only", bool(rl_positive_only))
+        trial.set_user_attr("rl_similarity_pretrain_epochs", int(rl_similarity_pretrain_epochs))
+        trial.set_user_attr("rl_lambda_simi", float(rl_lambda_simi))
         trial.set_user_attr("use_checkpointing", use_checkpointing_flag)
 
         num_classes = 2
@@ -7804,6 +7862,41 @@ def _run_optuna_search(
         )
         temporal_module = getattr(model, "temporal_head", None)
 
+        rl_sampler_controller = None
+        if train_sampler_mode == "rl_top_p":
+            from src.gnn_rl_sampler import (
+                RioGNNThresholdController,
+                pretrain_label_aware_similarity,
+                relation_max_degrees,
+            )
+
+            graph_for_rl = _to_cpu_if_needed(data)
+            rl_sampler_controller = RioGNNThresholdController(
+                edge_types=[
+                    edge_type
+                    for edge_type in graph_for_rl.edge_types
+                    if edge_type[0] == "pm" and edge_type[2] == "pm"
+                ],
+                num_layers=int(num_layers),
+                in_channels=int(in_channels),
+                max_degree_by_edge_type=relation_max_degrees(graph_for_rl, node_type="pm"),
+                action_space=str(rl_action_space),
+                initial_p=float(rl_initial_p),
+                min_p=float(rl_min_p),
+                max_p=float(rl_max_p),
+                min_keep=int(rl_min_keep),
+                positive_only=bool(rl_positive_only),
+                seed=int(trial_seed),
+            ).to(device)
+            pretrain_label_aware_similarity(
+                rl_sampler_controller,
+                graph_for_rl,
+                node_type="pm",
+                device=device,
+                epochs=int(rl_similarity_pretrain_epochs),
+                positive_only=bool(rl_positive_only),
+            )
+
         edge_gen = (
             RelEdgeGen(
                 {ntype: hidden_channels * num_heads for ntype in data.node_types},
@@ -7814,9 +7907,13 @@ def _run_optuna_search(
         )
 
         optimizer_cls = get_optimizer_cls(optimizer_name)
-        optimizer = optimizer_cls(
+        optimizer_params = (
             list(model.parameters())
-            + (list(edge_gen.parameters()) if edge_gen else []),
+            + (list(edge_gen.parameters()) if edge_gen else [])
+            + (list(rl_sampler_controller.parameters()) if rl_sampler_controller is not None else [])
+        )
+        optimizer = optimizer_cls(
+            optimizer_params,
             lr=lr,
             weight_decay=weight_decay,
         )
@@ -7913,6 +8010,14 @@ def _run_optuna_search(
                     "graphsaint_batch_size": int(graphsaint_batch_size),
                     "graphsaint_num_steps": int(graphsaint_num_steps),
                     "graphsaint_walk_length": int(graphsaint_walk_length),
+                    "rl_sampler_controller": rl_sampler_controller,
+                    "rl_action_space": str(rl_action_space),
+                    "rl_initial_p": float(rl_initial_p),
+                    "rl_min_p": float(rl_min_p),
+                    "rl_max_p": float(rl_max_p),
+                    "rl_min_keep": int(rl_min_keep),
+                    "rl_positive_only": bool(rl_positive_only),
+                    "num_layers": int(num_layers),
                     "deterministic_sampling": True,
                     "sampling_seed": int(epoch_seed) + int(epoch_num) * 9973,
                 }
@@ -8066,7 +8171,10 @@ def _run_optuna_search(
                     edge_gen=edge_gen,
                     lambda_edge=float(lambda_edge),
                     lambda_l2_att=float(lambda_l2_att),
+                    rl_sampler_controller=rl_sampler_controller,
+                    lambda_simi=float(rl_lambda_simi) if rl_sampler_controller is not None else 0.0,
                     accumulation_steps=accumulation_steps,
+                    loss_weight_mode=str(loss_weight_mode),
                 )
 
                 if epoch % eval_every != 0:
@@ -8189,6 +8297,20 @@ def _run_optuna_search(
                 metrics = _compute_binary_metrics_from_cm(cm)
                 auprc = float(val_results[val_key].get("auprc") or 0.0)
                 mcc = float(val_results[val_key].get("mcc") or 0.0)
+                if rl_sampler_controller is not None:
+                    try:
+                        rl_update = rl_sampler_controller.update_after_validation(
+                            val_auprc=auprc,
+                            epoch=int(epoch),
+                        )
+                        trial.set_user_attr(
+                            "rl_sampler_state",
+                            rl_sampler_controller.state_dict_serializable(),
+                        )
+                        trial.set_user_attr("rl_last_update", rl_update)
+                    except Exception as exc:
+                        if debug_flag:
+                            logger.warning(f"No se pudo actualizar RioGNN RL en Optuna: {exc}")
 
                 score = _score_from_metrics(
                     metrics, fbeta=float(fbeta), auprc=auprc, mcc=mcc
@@ -8645,6 +8767,7 @@ def _run_ray_tune_search(
             "graphsaint_batch_size": _choice(search_space["graphsaint_batch_sizes"]),
             "graphsaint_num_steps": _choice(search_space["graphsaint_num_steps"]),
             "graphsaint_walk_length": _choice(search_space["graphsaint_walk_lengths"]),
+            "rl_action_space": _choice(search_space.get("rl_action_spaces", ["discrete"])),
             "lr": _loguniform_or_choice(lr_cfg["min"], lr_cfg["max"]),
             "optimizer": _choice(search_space["optimizers"]),
             "lr_scheduler": _choice(search_space.get("lr_scheduler_choices", ["one_cycle"])),
@@ -8664,6 +8787,9 @@ def _run_ray_tune_search(
                 search_space["final_lambda_H"]["max"],
             ),
             "loss_type": _choice(search_space["loss_type"]),
+            "loss_weight_mode": _choice(
+                search_space.get("loss_weight_mode", ["uniform"]) or ["uniform"]
+            ),
             "focal_gamma": _choice(_float_choices(
                 focal_gamma_cfg["min"],
                 focal_gamma_cfg["max"],
@@ -8849,6 +8975,12 @@ def _run_ray_tune_search(
                 "graphsaint_batch_size",
                 "graphsaint_num_steps",
                 "graphsaint_walk_length",
+                "rl_action_space",
+                "rl_initial_p",
+                "rl_min_p",
+                "rl_max_p",
+                "rl_min_keep",
+                "rl_lambda_simi",
                 "use_checkpointing",
                 "lr_scheduler",
                 "use_residual",
@@ -8922,6 +9054,12 @@ def _run_ray_tune_search(
             "graphsaint_batch_size",
             "graphsaint_num_steps",
             "graphsaint_walk_length",
+            "rl_action_space",
+            "rl_initial_p",
+            "rl_min_p",
+            "rl_max_p",
+            "rl_min_keep",
+            "rl_lambda_simi",
             "use_checkpointing",
             "lr_scheduler",
             "best_val_tau",
@@ -11317,6 +11455,8 @@ def run_feature_generation_workflow(params):
                                 interactive=False,
                                 dt_minutes=dt_m,
                             )
+                            if feat_batch is not None and not _is_empty_frame(feat_batch):
+                                feat_batch = attach_portico_geometry(feat_batch, df_p)
                         
                         cluster_batch = None
                         if cluster_label_mode and cluster_labels_df is not None and not cluster_failed:
@@ -11696,6 +11836,11 @@ def run_feature_generation_workflow(params):
                     interactive=False,
                     dt_minutes=dt_m,
                 )
+                if df_pm is not None and not df_pm.empty:
+                    df_p_flow = st.session_state.get("df_port")
+                    if df_p_flow is None:
+                        df_p_flow = load_porticos()
+                    df_pm = attach_portico_geometry(df_pm, df_p_flow)
 
         elif str(source_choice).startswith("Cargar existentes") or _feature_config_is_duckdb(params):
             if _feature_config_is_duckdb(params):
@@ -16735,11 +16880,13 @@ def _render_training_tab() -> None:
         "NeighborLoader (nativo)",
         "Cluster-GCN (nativo)",
         "GraphSAINT (nativo)",
+        "RioGNN top-p RL",
     ]
     legacy_sampler_labels = {
         "NeighborLoader": "NeighborLoader (nativo)",
         "Cluster-GCN (seed partitions)": "Cluster-GCN (nativo)",
         "GraphSAINT (seed sampling)": "GraphSAINT (nativo)",
+        "RioGNN top-p RL": "RioGNN top-p RL",
     }
     legacy_fidelity = st.session_state.get("gnn_train_fidelity_target_sampler")
     if isinstance(legacy_fidelity, str) and legacy_fidelity in legacy_sampler_labels:
@@ -16802,6 +16949,7 @@ def _render_training_tab() -> None:
         "NeighborLoader (nativo)": "neighbor",
         "Cluster-GCN (nativo)": "cluster_gcn",
         "GraphSAINT (nativo)": "graphsaint",
+        "RioGNN top-p RL": "rl_top_p",
     }
     sampler_label = st.selectbox(
         "Sampler de entrenamiento",
@@ -16811,7 +16959,8 @@ def _render_training_tab() -> None:
             "Define cómo se construyen los batches de entrenamiento con samplers nativos de PyG. "
             "NeighborLoader: baseline rápido. "
             "Cluster-GCN: usa `ClusterData/ClusterLoader` para particionar y muestrear por clústeres. "
-            "GraphSAINT: usa `GraphSAINT*Sampler` para muestreo estocástico de nodos/aristas/caminatas."
+            "GraphSAINT: usa `GraphSAINT*Sampler` para muestreo estocástico de nodos/aristas/caminatas. "
+            "RioGNN top-p RL: filtra vecinos por similitud label-aware y thresholds RSRL por relación/capa."
         ),
     )
     train_sampler_mode = sampler_options[sampler_label]
@@ -16879,6 +17028,91 @@ def _render_training_tab() -> None:
                     ),
                 )
             )
+
+    rl_action_space_train = "discrete"
+    rl_initial_p_train = 0.5
+    rl_min_p_train = 0.05
+    rl_max_p_train = 1.0
+    rl_min_keep_train = 1
+    rl_positive_only_train = True
+    rl_similarity_pretrain_epochs_train = 3
+    rl_lambda_simi_train = 2.0
+    if train_sampler_mode == "rl_top_p":
+        rl_col_a, rl_col_b, rl_col_c = st.columns(3)
+        with rl_col_a:
+            rl_action_space_train = st.selectbox(
+                "RioGNN acción RSRL",
+                ["discrete", "continuous_actor"],
+                index=0,
+                key="gnn_train_rl_action_space",
+                help="`discrete` usa grilla recursiva; `continuous_actor` usa actor-critic PyTorch interno.",
+            )
+            rl_initial_p_train = float(
+                st.number_input(
+                    "RioGNN p inicial",
+                    min_value=0.01,
+                    max_value=1.0,
+                    value=float(st.session_state.get("gnn_train_rl_initial_p", 0.5)),
+                    step=0.05,
+                    key="gnn_train_rl_initial_p",
+                )
+            )
+        with rl_col_b:
+            rl_min_p_train = float(
+                st.number_input(
+                    "RioGNN p mínimo",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(st.session_state.get("gnn_train_rl_min_p", 0.05)),
+                    step=0.01,
+                    key="gnn_train_rl_min_p",
+                )
+            )
+            rl_max_p_train = float(
+                st.number_input(
+                    "RioGNN p máximo",
+                    min_value=0.01,
+                    max_value=1.0,
+                    value=float(st.session_state.get("gnn_train_rl_max_p", 1.0)),
+                    step=0.05,
+                    key="gnn_train_rl_max_p",
+                )
+            )
+        with rl_col_c:
+            rl_min_keep_train = int(
+                st.number_input(
+                    "RioGNN min_keep",
+                    min_value=0,
+                    value=int(st.session_state.get("gnn_train_rl_min_keep", 1)),
+                    step=1,
+                    key="gnn_train_rl_min_keep",
+                )
+            )
+            rl_similarity_pretrain_epochs_train = int(
+                st.number_input(
+                    "Pretrain similitud",
+                    min_value=0,
+                    value=int(st.session_state.get("gnn_train_rl_pretrain_epochs", 3)),
+                    step=1,
+                    key="gnn_train_rl_pretrain_epochs",
+                )
+            )
+        rl_positive_only_train = st.checkbox(
+            "RioGNN stats sólo positivos si existen",
+            value=bool(st.session_state.get("gnn_train_rl_positive_only", True)),
+            key="gnn_train_rl_positive_only",
+            help="Calcula las stats RL sobre centros positivos de train cuando hay positivos disponibles.",
+        )
+        rl_lambda_simi_train = float(
+            st.number_input(
+                "RioGNN lambda_simi",
+                min_value=0.0,
+                value=float(st.session_state.get("gnn_train_rl_lambda_simi", 2.0)),
+                step=0.25,
+                key="gnn_train_rl_lambda_simi",
+                help="Peso de la pérdida auxiliar label-aware sumada al loss de entrenamiento.",
+            )
+        )
 
     graphsaint_mode_train = "random_walk"
     graphsaint_batch_size_train = 4096
@@ -17874,6 +18108,14 @@ def _render_training_tab() -> None:
                         graphsaint_batch_size=int(graphsaint_batch_size_train),
                         graphsaint_num_steps=int(graphsaint_num_steps_train),
                         graphsaint_walk_length=int(graphsaint_walk_length_train),
+                        rl_action_space=str(rl_action_space_train),
+                        rl_initial_p=float(rl_initial_p_train),
+                        rl_min_p=float(rl_min_p_train),
+                        rl_max_p=float(rl_max_p_train),
+                        rl_min_keep=int(rl_min_keep_train),
+                        rl_positive_only=bool(rl_positive_only_train),
+                        rl_similarity_pretrain_epochs=int(rl_similarity_pretrain_epochs_train),
+                        rl_lambda_simi=float(rl_lambda_simi_train),
                         eval_neighbors_mode=str(eval_neighbors_mode_train),
                         eval_num_neighbors=eval_num_neighbors_train,
                         checkpoint_metric=str(checkpoint_metric_train),
@@ -19821,12 +20063,18 @@ def _sampler_config_label(config: Dict[str, object]) -> str:
             f"cluster_gcn|nn={prof_txt}|parts={int(config.get('cluster_gcn_num_parts', 0))}"
             f"|parts_epoch={int(config.get('cluster_gcn_parts_per_epoch', 0))}"
         )
-    else:
+    elif mode == "graphsaint":
         label = (
             f"graphsaint|nn={prof_txt}|mode={config.get('graphsaint_mode', 'node')}"
             f"|batch={int(config.get('graphsaint_batch_size', 0))}"
             f"|steps={int(config.get('graphsaint_num_steps', 0))}"
             f"|walk={int(config.get('graphsaint_walk_length', 0))}"
+        )
+    else:
+        label = (
+            f"rl_top_p|nn={prof_txt}|action={config.get('rl_action_space', 'discrete')}"
+            f"|p0={float(config.get('rl_initial_p', 0.5)):.2f}"
+            f"|min_keep={int(config.get('rl_min_keep', 1))}"
         )
     if repeat > 1:
         label = f"{label}|rep={repeat}"
@@ -19856,6 +20104,9 @@ def _build_sampler_fidelity_grid(
         "cluster_gcn": "cluster_gcn",
         "clustergcn": "cluster_gcn",
         "graphsaint": "graphsaint",
+        "rl_top_p": "rl_top_p",
+        "riognn": "rl_top_p",
+        "rsrl": "rl_top_p",
     }
     valid_modes: List[str] = []
     for mode in sampler_modes or []:
@@ -19915,6 +20166,49 @@ def _build_sampler_fidelity_grid(
                                 "graphsaint_walk_length": 0,
                             }
                         )
+                continue
+
+            if mode == "rl_top_p":
+                base_configs.append(
+                    {
+                        "train_sampler_mode": "rl_top_p",
+                        "num_neighbors": [int(v) for v in prof],
+                        "cluster_gcn_num_parts": 0,
+                        "cluster_gcn_parts_per_epoch": 0,
+                        "graphsaint_mode": "node",
+                        "graphsaint_batch_size": 0,
+                        "graphsaint_num_steps": 0,
+                        "graphsaint_walk_length": 0,
+                        "rl_action_space": "discrete",
+                        "rl_initial_p": 0.5,
+                        "rl_min_p": 0.05,
+                        "rl_max_p": 1.0,
+                        "rl_min_keep": 1,
+                        "rl_positive_only": True,
+                        "rl_similarity_pretrain_epochs": 3,
+                        "rl_lambda_simi": 2.0,
+                    }
+                )
+                base_configs.append(
+                    {
+                        "train_sampler_mode": "rl_top_p",
+                        "num_neighbors": [int(v) for v in prof],
+                        "cluster_gcn_num_parts": 0,
+                        "cluster_gcn_parts_per_epoch": 0,
+                        "graphsaint_mode": "node",
+                        "graphsaint_batch_size": 0,
+                        "graphsaint_num_steps": 0,
+                        "graphsaint_walk_length": 0,
+                        "rl_action_space": "continuous_actor",
+                        "rl_initial_p": 0.5,
+                        "rl_min_p": 0.05,
+                        "rl_max_p": 1.0,
+                        "rl_min_keep": 1,
+                        "rl_positive_only": True,
+                        "rl_similarity_pretrain_epochs": 3,
+                        "rl_lambda_simi": 2.0,
+                    }
+                )
                 continue
 
             saint_modes = [
@@ -21419,6 +21713,14 @@ def _materialize_sampler_hparams_variant(
     params["graphsaint_batch_size"] = int(cfg.get("graphsaint_batch_size", 0))
     params["graphsaint_num_steps"] = int(cfg.get("graphsaint_num_steps", 0))
     params["graphsaint_walk_length"] = int(cfg.get("graphsaint_walk_length", 0))
+    params["rl_action_space"] = cfg.get("rl_action_space", "discrete")
+    params["rl_initial_p"] = float(cfg.get("rl_initial_p", 0.5))
+    params["rl_min_p"] = float(cfg.get("rl_min_p", 0.05))
+    params["rl_max_p"] = float(cfg.get("rl_max_p", 1.0))
+    params["rl_min_keep"] = int(cfg.get("rl_min_keep", 1))
+    params["rl_positive_only"] = bool(cfg.get("rl_positive_only", True))
+    params["rl_similarity_pretrain_epochs"] = int(cfg.get("rl_similarity_pretrain_epochs", 3))
+    params["rl_lambda_simi"] = float(cfg.get("rl_lambda_simi", 2.0))
     params["eval_neighbors_mode"] = cfg.get("eval_neighbors_mode", "same")
     eval_raw = cfg.get("eval_num_neighbors")
     params["eval_num_neighbors"] = (
@@ -21475,7 +21777,7 @@ def _render_sampler_fidelity_experiment(
     with st.expander("¿Qué ajustas y qué efecto tiene?", expanded=False):
         st.markdown(
             "- `num_neighbors`: define cuántos vecinos toma por capa; valores más altos acercan a full-batch pero consumen más memoria.\n"
-            "- `train_sampler_mode`: `neighbor`, `cluster_gcn`, `graphsaint`; cambia cómo se muestrea el subgrafo de entrenamiento.\n"
+            "- `train_sampler_mode`: `neighbor`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia cómo se muestrea el subgrafo de entrenamiento.\n"
             "- `deterministic_sampling` + `sampling_seed`: estabiliza reproducibilidad del experimento.\n"
             "- `disable_hard_undersampling`: evita sesgo por hard-mining cuando buscas fidelidad al baseline.\n"
             "- `eval_neighbors_mode`: `exhaustive` evalúa con vecindario completo para comparar en condiciones cercanas a full-batch."
@@ -21584,6 +21886,7 @@ def _render_sampler_fidelity_experiment(
         "NeighborLoader": "neighbor",
         "Cluster-GCN": "cluster_gcn",
         "GraphSAINT": "graphsaint",
+        "RioGNN top-p RL": "rl_top_p",
     }
     selected_sampler_labels = st.multiselect(
         "Samplers a evaluar",
@@ -22093,6 +22396,16 @@ def _render_sampler_fidelity_experiment(
                         graphsaint_walk_length=int(
                             cfg.get("graphsaint_walk_length", 0)
                         ),
+                        rl_action_space=str(cfg.get("rl_action_space", "discrete")),
+                        rl_initial_p=float(cfg.get("rl_initial_p", 0.5)),
+                        rl_min_p=float(cfg.get("rl_min_p", 0.05)),
+                        rl_max_p=float(cfg.get("rl_max_p", 1.0)),
+                        rl_min_keep=int(cfg.get("rl_min_keep", 1)),
+                        rl_positive_only=bool(cfg.get("rl_positive_only", True)),
+                        rl_similarity_pretrain_epochs=int(
+                            cfg.get("rl_similarity_pretrain_epochs", 3)
+                        ),
+                        rl_lambda_simi=float(cfg.get("rl_lambda_simi", 2.0)),
                         eval_neighbors_mode=str(cfg.get("eval_neighbors_mode", "same")),
                         eval_num_neighbors=cfg.get("eval_num_neighbors"),
                     )
@@ -22155,6 +22468,12 @@ def _render_sampler_fidelity_experiment(
                 "graphsaint_batch_size": cfg.get("graphsaint_batch_size"),
                 "graphsaint_num_steps": cfg.get("graphsaint_num_steps"),
                 "graphsaint_walk_length": cfg.get("graphsaint_walk_length"),
+                "rl_action_space": cfg.get("rl_action_space"),
+                "rl_initial_p": cfg.get("rl_initial_p"),
+                "rl_min_p": cfg.get("rl_min_p"),
+                "rl_max_p": cfg.get("rl_max_p"),
+                "rl_min_keep": cfg.get("rl_min_keep"),
+                "rl_lambda_simi": cfg.get("rl_lambda_simi"),
                 "eval_neighbors_mode": cfg.get("eval_neighbors_mode"),
                 "eval_num_neighbors": cfg.get("eval_num_neighbors"),
                 "eval_num_neighbors_resolved": eval_neighbors,
@@ -22248,7 +22567,7 @@ def _render_sampler_memory_budget_experiment(
         st.markdown(
             "- `batch_size`: principal palanca de consumo de VRAM/Unified Memory por iteración.\n"
             "- `num_neighbors`: define expansión del subgrafo por capa; impacta memoria y latencia.\n"
-            "- `train_sampler_mode`: `neighbor`, `cluster_gcn`, `graphsaint`; cambia patrón de seeds/subgrafos.\n"
+            "- `train_sampler_mode`: `neighbor`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia patrón de seeds/subgrafos.\n"
             "- `backend`: permite perfilar explícitamente en `CUDA` o `MPS` (stack Apple/MLX vía PyTorch)."
         )
 
@@ -22376,12 +22695,14 @@ def _render_sampler_memory_budget_experiment(
     st.markdown("**Grid de muestreo**")
     st.caption(
         "Implementación del probe: Neighbor=`NeighborLoader`, "
-        "Cluster-GCN=`ClusterLoader` nativo, GraphSAINT=`GraphSAINT*Sampler` nativo."
+        "Cluster-GCN=`ClusterLoader` nativo, GraphSAINT=`GraphSAINT*Sampler` nativo, "
+        "RioGNN=`rl_top_p` label-aware."
     )
     sampler_labels = {
         "NeighborLoader": "neighbor",
         "Cluster-GCN": "cluster_gcn",
         "GraphSAINT": "graphsaint",
+        "RioGNN top-p RL": "rl_top_p",
     }
     selected_sampler_labels = st.multiselect(
         "Samplers a evaluar",
@@ -22566,6 +22887,9 @@ def _render_sampler_memory_budget_experiment(
             "graphsaint_batch_size",
             "graphsaint_num_steps",
             "graphsaint_walk_length",
+            "rl_action_space",
+            "rl_initial_p",
+            "rl_min_keep",
         ]
         st.dataframe(
             preview_df[preview_cols],
@@ -22811,6 +23135,12 @@ def _render_sampler_memory_budget_experiment(
                 "graphsaint_batch_size": selected_row.get("graphsaint_batch_size"),
                 "graphsaint_num_steps": selected_row.get("graphsaint_num_steps"),
                 "graphsaint_walk_length": selected_row.get("graphsaint_walk_length"),
+                "rl_action_space": selected_row.get("rl_action_space"),
+                "rl_initial_p": selected_row.get("rl_initial_p"),
+                "rl_min_p": selected_row.get("rl_min_p"),
+                "rl_max_p": selected_row.get("rl_max_p"),
+                "rl_min_keep": selected_row.get("rl_min_keep"),
+                "rl_lambda_simi": selected_row.get("rl_lambda_simi"),
                 "deterministic_sampling": selected_row.get("deterministic_sampling"),
                 "sampling_seed": selected_row.get("sampling_seed"),
             }
@@ -25661,6 +25991,17 @@ def _render_gnn_experiments_tab() -> None:
                 default=["CrossEntropy", "FocalLoss"],
                 key="gnn_exp_loss_type",
             )
+            loss_weight_modes = st.multiselect(
+                "loss_weight_mode",
+                ["uniform", "distance"],
+                default=["uniform", "distance"],
+                help=(
+                    "Ponderación por distancia accidente→pórtico aguas arriba. "
+                    "uniform = status quo (peso 1.0); "
+                    "distance = clip(1 − dist/5km, 0.2, 1.0)."
+                ),
+                key="gnn_exp_loss_weight_mode",
+            )
             col_fg, col_fa = st.columns(2)
             with col_fg:
                 focal_gamma_min = st.number_input(
@@ -25880,6 +26221,7 @@ def _render_gnn_experiments_tab() -> None:
                     "max": lambda_final_max,
                 },
                 "loss_type": loss_types,
+                "loss_weight_mode": loss_weight_modes or ["uniform"],
                 "focal_gamma": {
                     "min": focal_gamma_min,
                     "max": focal_gamma_max,
@@ -27001,6 +27343,19 @@ def _render_network_tab() -> None:
             ),
             key="gnn_net_loss",
         )
+        loss_weight_mode = st.selectbox(
+            "loss_weight_mode",
+            ["uniform", "distance"],
+            index=["uniform", "distance"].index(
+                str(existing_cfg.get("loss_weight_mode", "uniform"))
+            ),
+            help=(
+                "uniform: cada nodo positivo pesa 1.0 (status quo).\n"
+                "distance: peso = clip(1 - dist_accidente_pórtico/5km, 0.2, 1.0); "
+                "accidentes más cercanos al pórtico aguas arriba pesan más."
+            ),
+            key="gnn_net_loss_weight_mode",
+        )
     with col_opt3:
         lambda_l2_att = st.number_input(
             "lambda_l2_att",
@@ -27256,6 +27611,7 @@ def _render_network_tab() -> None:
         "lr": float(lr),
         "weight_decay": float(weight_decay),
         "loss_type": loss_type,
+        "loss_weight_mode": loss_weight_mode,
         "focal_gamma": float(focal_gamma),
         "focal_alpha": float(focal_alpha),
         "lambda_l2_att": float(lambda_l2_att),
@@ -27800,6 +28156,7 @@ def _search_space_signature_from_state() -> str:
             for v in str(_get_state("gnn_optuna_graphsaint_walk_lengths", "1,3")).split(",")
             if v.strip()
         ],
+        "rl_action_spaces": list(_get_state("gnn_optuna_rl_action_spaces", ["discrete", "continuous_actor"])),
     }
     raw = json.dumps(signature_payload, ensure_ascii=True, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
@@ -27909,6 +28266,9 @@ def _collect_optuna_ray_settings(
         "cluster_gcn": "cluster_gcn",
         "clustergcn": "cluster_gcn",
         "graphsaint": "graphsaint",
+        "rl_top_p": "rl_top_p",
+        "riognn": "rl_top_p",
+        "rsrl": "rl_top_p",
     }
     raw_sampler_modes = _get_state("gnn_optuna_sampler_modes", ["neighbor"])
     if not isinstance(raw_sampler_modes, (list, tuple)):
@@ -27972,8 +28332,13 @@ def _collect_optuna_ray_settings(
         errors.append("Seleccione al menos un valor para use_relation_self_loops.")
     if not lambda_H_modes:
         errors.append("Seleccione al menos un lambda_H_mode.")
+    rl_action_spaces = [
+        str(value)
+        for value in _get_state("gnn_optuna_rl_action_spaces", ["discrete", "continuous_actor"])
+        if str(value) in {"discrete", "continuous_actor"}
+    ] or ["discrete"]
     if not sampler_modes:
-        errors.append("Seleccione al menos un sampler de entrenamiento (NeighborLoader / Cluster-GCN / GraphSAINT).")
+        errors.append("Seleccione al menos un sampler de entrenamiento (NeighborLoader / Cluster-GCN / GraphSAINT / RioGNN).")
     if _gnn_variant_requires_sequence_index(selected_gnn_variant) and not _has_valid_sequence_index(
         graph_obj.get("sequence_index")
     ):
@@ -27993,6 +28358,8 @@ def _collect_optuna_ray_settings(
         errors.append("Configure al menos un valor para GraphSAINT num_steps.")
     if "graphsaint" in sampler_modes and "random_walk" in graphsaint_modes and not graphsaint_walk_lengths:
         errors.append("Configure al menos un walk_length para GraphSAINT Random Walk.")
+    if "rl_top_p" in sampler_modes and not rl_action_spaces:
+        errors.append("Seleccione al menos un action_space para RioGNN top-p RL.")
 
     # Espacio de búsqueda v2 (Acción 6): rangos estrechados para clase rara (~0.3%).
     # Rationale: evitar zonas que reproducen el overfit de epoch-1.
@@ -28091,6 +28458,14 @@ def _collect_optuna_ray_settings(
         "graphsaint_batch_sizes": graphsaint_batch_sizes,
         "graphsaint_num_steps": graphsaint_num_steps,
         "graphsaint_walk_lengths": graphsaint_walk_lengths,
+        "rl_action_spaces": rl_action_spaces,
+        "rl_initial_p": 0.5,
+        "rl_min_p": 0.05,
+        "rl_max_p": 1.0,
+        "rl_min_keep": 1,
+        "rl_positive_only": True,
+        "rl_similarity_pretrain_epochs": 3,
+        "rl_lambda_simi": 2.0,
         "lr": {"min": lr_min, "max": lr_max},
         "weight_decay": {"min": wd_min, "max": wd_max},
         "lambda_l2_att": {"min": lambda_l2_min, "max": lambda_l2_max},
@@ -29072,12 +29447,14 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
     with st.expander("Samplers de entrenamiento", expanded=True):
         st.caption(
             "Implementaciones nativas: Neighbor=`NeighborLoader`, "
-            "Cluster-GCN=`ClusterLoader`, GraphSAINT=`GraphSAINT*Sampler`."
+            "Cluster-GCN=`ClusterLoader`, GraphSAINT=`GraphSAINT*Sampler`, "
+            "RioGNN=`rl_top_p` label-aware."
         )
         sampler_label_to_mode = {
             "NeighborLoader (nativo)": "neighbor",
             "Cluster-GCN (nativo)": "cluster_gcn",
             "GraphSAINT (nativo)": "graphsaint",
+            "RioGNN top-p RL": "rl_top_p",
         }
         default_modes = st.session_state.get("gnn_optuna_sampler_modes", ["neighbor"])
         if not isinstance(default_modes, (list, tuple)):
@@ -29236,6 +29613,21 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             or not graphsaint_walk_lengths
         ):
             st.warning("Debe configurar al menos un perfil válido para GraphSAINT.")
+
+    if "rl_top_p" in selected_sampler_modes:
+        with st.expander("RioGNN top-p RL"):
+            rl_action_spaces = st.multiselect(
+                "Action spaces RioGNN",
+                ["discrete", "continuous_actor"],
+                default=st.session_state.get(
+                    "gnn_optuna_rl_action_spaces",
+                    ["discrete", "continuous_actor"],
+                ),
+                key="gnn_optuna_rl_action_spaces",
+                help="Optuna probará RSRL discreto y/o actor continuo acotado.",
+            )
+            if not rl_action_spaces:
+                st.warning("Debe seleccionar al menos un action_space para RioGNN top-p RL.")
 
     with st.expander("Optimizador"):
         col_lr, col_wd = st.columns(2)
@@ -29662,6 +30054,9 @@ def _render_ray_tune_tab() -> None:
         "cluster_gcn": "cluster_gcn",
         "clustergcn": "cluster_gcn",
         "graphsaint": "graphsaint",
+        "rl_top_p": "rl_top_p",
+        "riognn": "rl_top_p",
+        "rsrl": "rl_top_p",
     }
     raw_sampler_modes = _get_state("gnn_optuna_sampler_modes", ["neighbor"])
     if not isinstance(raw_sampler_modes, (list, tuple)):
@@ -29707,6 +30102,11 @@ def _render_ray_tune_tab() -> None:
         [1, 3],
         min_value=1,
     )
+    rl_action_spaces = [
+        str(value)
+        for value in _get_state("gnn_optuna_rl_action_spaces", ["discrete", "continuous_actor"])
+        if str(value) in {"discrete", "continuous_actor"}
+    ] or ["discrete"]
 
     if not neighbor_choices:
         st.error("Seleccione al menos un perfil de vecinos (Optuna).")
@@ -29749,6 +30149,9 @@ def _render_ray_tune_tab() -> None:
         return
     if "graphsaint" in sampler_modes and "random_walk" in graphsaint_modes and not graphsaint_walk_lengths:
         st.error("Configure GraphSAINT walk_length para modo Random Walk (Optuna).")
+        return
+    if "rl_top_p" in sampler_modes and not rl_action_spaces:
+        st.error("Seleccione al menos un action_space RioGNN top-p RL (Optuna).")
         return
 
     balancing_strategy = str(_get_state("gnn_balancing_strategy", "Sin balancear"))
@@ -29882,6 +30285,14 @@ def _render_ray_tune_tab() -> None:
         "graphsaint_batch_sizes": graphsaint_batch_sizes,
         "graphsaint_num_steps": graphsaint_num_steps,
         "graphsaint_walk_lengths": graphsaint_walk_lengths,
+        "rl_action_spaces": rl_action_spaces,
+        "rl_initial_p": 0.5,
+        "rl_min_p": 0.05,
+        "rl_max_p": 1.0,
+        "rl_min_keep": 1,
+        "rl_positive_only": True,
+        "rl_similarity_pretrain_epochs": 3,
+        "rl_lambda_simi": 2.0,
         "lr": {"min": lr_min, "max": lr_max},
         "weight_decay": {"min": wd_min, "max": wd_max},
         "lambda_l2_att": {"min": lambda_l2_min, "max": lambda_l2_max},

@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from src.portico_geometry import attach_portico_geometry_polars
+
 @dataclass
 class SnapshotConfig:
     """Configuration for snapshot feature generation."""
@@ -415,24 +417,25 @@ class SnapshotFeatureBuilder:
         include_window_features: bool = True,
         include_spatial_gradients: bool = True,
         include_temporal_encodings: bool = True,
+        include_portico_geometry: bool = True,
     ) -> Tuple[pl.DataFrame, GraphTopology]:
-        
+
         # 1. Base Discretization (Polars)
         # We need to ensure we implement the discrete logic correctly
         # Re-using the full function below
         base_features = self._discretize_polars(flujos_df)
-        
+
         # 2. Add Window Features
         if include_window_features:
             base_features = add_window_features_polars(
-                base_features, 
-                self.config, 
+                base_features,
+                self.config,
                 tracked_columns=tracked_columns
             )
-            
+
         # 3. Topology (Static)
         topology = build_static_topology(porticos_df, self.config)
-        
+
         # 4. Spatial Gradients
         if include_spatial_gradients:
             base_features = add_spatial_gradients_polars(
@@ -440,11 +443,18 @@ class SnapshotFeatureBuilder:
                 topology,
                 columns=gradient_columns
             )
-            
+
         # 5. Temporal
         if include_temporal_encodings:
             base_features = self._add_temporal_polars(base_features)
-            
+
+        # 6. Static pórtico geometry (km_norm_eje, dist_to_upstream_km, ...)
+        if include_portico_geometry:
+            base_features = attach_portico_geometry_polars(
+                base_features,
+                porticos_df,
+            )
+
         return base_features, topology
 
     def _discretize_polars(self, flujos_df: Union[pl.DataFrame, pl.LazyFrame]) -> pl.DataFrame:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Mapping
+from typing import Mapping
 
 import numpy as np
 import torch
@@ -80,6 +80,69 @@ def select_threshold_by_fbeta(
     return best_threshold
 
 
+def select_threshold_by_top_k(
+    y_prob: object,
+    *,
+    k: int,
+    default: float = 0.5,
+) -> float:
+    p = _to_numpy(y_prob).astype(float).reshape(-1)
+    if p.size == 0:
+        return float(default)
+    finite = p[np.isfinite(p)]
+    if finite.size == 0:
+        return float(default)
+    k = max(1, min(int(k), int(finite.size)))
+    return float(np.sort(finite)[::-1][k - 1])
+
+
+def score_diagnostics(y_true: object, y_prob: object) -> dict[str, float | int | None]:
+    y = _to_numpy(y_true).astype(int).reshape(-1)
+    p = _to_numpy(y_prob).astype(float).reshape(-1)
+    if y.size != p.size:
+        raise ValueError("y_true e y_prob deben tener el mismo largo.")
+    out: dict[str, float | int | None] = {
+        "score_n": int(p.size),
+        "score_min": None,
+        "score_q50": None,
+        "score_q90": None,
+        "score_q99": None,
+        "score_max": None,
+        "positive_score_min": None,
+        "positive_score_q50": None,
+        "positive_score_q90": None,
+        "positive_score_max": None,
+    }
+    if p.size == 0:
+        return out
+    finite = p[np.isfinite(p)]
+    if finite.size == 0:
+        return out
+    q = np.quantile(finite, [0.0, 0.5, 0.9, 0.99, 1.0])
+    out.update(
+        {
+            "score_min": float(q[0]),
+            "score_q50": float(q[1]),
+            "score_q90": float(q[2]),
+            "score_q99": float(q[3]),
+            "score_max": float(q[4]),
+        }
+    )
+    positive = p[y == 1]
+    positive = positive[np.isfinite(positive)]
+    if positive.size:
+        pq = np.quantile(positive, [0.0, 0.5, 0.9, 1.0])
+        out.update(
+            {
+                "positive_score_min": float(pq[0]),
+                "positive_score_q50": float(pq[1]),
+                "positive_score_q90": float(pq[2]),
+                "positive_score_max": float(pq[3]),
+            }
+        )
+    return out
+
+
 def classification_metrics(
     y_true: object,
     y_prob: object,
@@ -105,6 +168,7 @@ def classification_metrics(
     return {
         "n": n,
         "positives": positives,
+        "predicted_positives": int(pred.sum()),
         "prevalence": positives / max(n, 1),
         "auprc": safe_auprc(y, p),
         "auroc": safe_auroc(y, p),
@@ -117,6 +181,7 @@ def classification_metrics(
         "fp": fp,
         "tn": tn,
         "fn": fn,
+        **score_diagnostics(y, p),
     }
 
 
@@ -149,4 +214,3 @@ def flatten_metric_rows(
         row.update(dict(metrics))
         rows.append(row)
     return rows
-

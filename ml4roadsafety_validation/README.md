@@ -20,8 +20,9 @@ contract:
   segments sharing an endpoint inside the same month.
 - Relation `("pm", "temporal", "pm")`: same segment across consecutive months.
 - Node features are normalized with train-month statistics only.
-- Threshold selection is done on validation only; test is evaluated once with
-  that threshold.
+- Threshold selection is done on validation only. The primary pilot threshold
+  uses recall-aware F2 by default, and the output also reports F0.5/F1/F2,
+  fixed 0.5, and top-K threshold diagnostics so score drift cannot be hidden.
 
 The default pilot uses `MA` and months `2022-01 2022-02 2022-03`. To keep the
 first run practical, it caps the graph at 5000 road segments while preserving
@@ -48,7 +49,8 @@ Run the pilot:
 python ml4roadsafety_validation/run_pilot.py \
   --state MA \
   --months 2022-01 2022-02 2022-03 \
-  --max-epochs 30
+  --max-epochs 30 \
+  --threshold-beta 2.0
 ```
 
 If the automatic download fails, manually download `MA.zip` from Dataverse,
@@ -75,9 +77,11 @@ Generated files are ignored by git:
 - `ml4roadsafety_validation/data/`
 - `ml4roadsafety_validation/results/pilot_summary_*.json`
 - `ml4roadsafety_validation/results/pilot_metrics_*.csv`
+- `ml4roadsafety_validation/results/pilot_threshold_diagnostics_*.csv`
 
 The primary model-selection metric is validation AUCPR. The report also includes
-AUROC, precision, recall, F1, F0.5, split prevalence, and confusion counts.
+AUROC, precision, recall, F1, F0.5, split prevalence, score quantiles,
+predicted positives, confusion counts, and threshold-policy diagnostics.
 
 ## Tests
 
@@ -86,4 +90,3 @@ The tests use synthetic tensors and do not download ML4RoadSafety:
 ```bash
 pytest ml4roadsafety_validation/tests -q
 ```
-

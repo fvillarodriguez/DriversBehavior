@@ -34,6 +34,7 @@ if __package__ in (None, ""):
         classification_metrics,
         flatten_metric_rows,
         safe_auprc,
+        select_threshold_by_top_k,
         select_threshold_by_fbeta,
     )
 else:
@@ -51,6 +52,7 @@ else:
         classification_metrics,
         flatten_metric_rows,
         safe_auprc,
+        select_threshold_by_top_k,
         select_threshold_by_fbeta,
     )
 
@@ -89,17 +91,69 @@ def _probabilities_from_logits(logits: torch.Tensor) -> torch.Tensor:
     return F.softmax(logits, dim=-1)[:, 1]
 
 
-def _split_metric_bundle(data, probabilities: torch.Tensor, *, beta: float = 0.5) -> dict[str, Mapping[str, object]]:
+def _threshold_candidates(
+    y_val: torch.Tensor,
+    prob_val: torch.Tensor,
+    *,
+    primary_beta: float,
+) -> dict[str, float]:
+    val_positive_count = int(y_val.long().sum().item())
+    n_val = int(y_val.numel())
+    policies = {
+        "val_f0.5": select_threshold_by_fbeta(y_val, prob_val, beta=0.5),
+        "val_f1": select_threshold_by_fbeta(y_val, prob_val, beta=1.0),
+        "val_f2": select_threshold_by_fbeta(y_val, prob_val, beta=2.0),
+        "primary_fbeta": select_threshold_by_fbeta(y_val, prob_val, beta=primary_beta),
+        "fixed_0.5": 0.5,
+    }
+    if val_positive_count > 0:
+        policies["val_top_positive_count"] = select_threshold_by_top_k(
+            prob_val,
+            k=val_positive_count,
+        )
+    for k in (100, 500, 1000):
+        if n_val >= k:
+            policies[f"val_top_{k}"] = select_threshold_by_top_k(prob_val, k=k)
+    return {name: float(value) for name, value in policies.items()}
+
+
+def _split_metric_bundle(
+    data,
+    probabilities: torch.Tensor,
+    *,
+    beta: float = 2.0,
+) -> tuple[dict[str, Mapping[str, object]], dict[str, Mapping[str, Mapping[str, object]]]]:
     y = data["pm"].y.detach().cpu()
     probs = probabilities.detach().cpu()
     val_mask = data["pm"].val_mask.detach().cpu().bool()
-    threshold = select_threshold_by_fbeta(y[val_mask], probs[val_mask], beta=beta)
+    threshold_by_policy = _threshold_candidates(
+        y[val_mask],
+        probs[val_mask],
+        primary_beta=float(beta),
+    )
+    primary_policy = "primary_fbeta"
+    primary_threshold = threshold_by_policy[primary_policy]
 
     out: dict[str, Mapping[str, object]] = {}
+    diagnostics: dict[str, Mapping[str, Mapping[str, object]]] = {}
+    split_masks = {
+        split: getattr(data["pm"], f"{split}_mask").detach().cpu().bool()
+        for split in ("train", "val", "test")
+    }
     for split in ("train", "val", "test"):
-        mask = getattr(data["pm"], f"{split}_mask").detach().cpu().bool()
-        out[split] = classification_metrics(y[mask], probs[mask], threshold=threshold)
-    return out
+        mask = split_masks[split]
+        metrics = classification_metrics(y[mask], probs[mask], threshold=primary_threshold)
+        metrics["threshold_policy"] = primary_policy
+        metrics["threshold_beta"] = float(beta)
+        out[split] = metrics
+    for policy, threshold in threshold_by_policy.items():
+        diagnostics[policy] = {}
+        for split, mask in split_masks.items():
+            metrics = classification_metrics(y[mask], probs[mask], threshold=threshold)
+            metrics["threshold_policy"] = policy
+            metrics["threshold_beta"] = float(beta) if policy == "primary_fbeta" else None
+            diagnostics[policy][split] = metrics
+    return out, diagnostics
 
 
 def _clean_json(value):
@@ -135,6 +189,7 @@ def train_mlp(
     max_epochs: int,
     patience: int,
     lr: float,
+    threshold_beta: float,
 ) -> dict[str, object]:
     data_dev = data.clone().to(device)
     x = data_dev["pm"].x
@@ -176,12 +231,19 @@ def train_mlp(
     model.eval()
     with torch.no_grad():
         final_probs = _probabilities_from_logits(model(x)).detach().cpu()
-    metrics = _split_metric_bundle(data, final_probs)
+    metrics, threshold_diagnostics = _split_metric_bundle(
+        data,
+        final_probs,
+        beta=threshold_beta,
+    )
     return {
         "model": "mlp",
         "best_epoch": best_epoch,
         "best_val_auprc": best_val,
+        "primary_threshold_policy": "primary_fbeta",
+        "threshold_beta": float(threshold_beta),
         "metrics": metrics,
+        "threshold_diagnostics": threshold_diagnostics,
     }
 
 
@@ -205,6 +267,7 @@ def train_heterogat(
     max_epochs: int,
     patience: int,
     lr: float,
+    threshold_beta: float,
 ) -> dict[str, object]:
     data_dev = data.clone().to(device)
     y = data_dev["pm"].y.long()
@@ -265,12 +328,19 @@ def train_heterogat(
     with torch.no_grad():
         logits_dict, _, _ = model(data_dev.x_dict, data_dev.edge_index_dict, edge_attr_dict)
         final_probs = _probabilities_from_logits(logits_dict["pm"]).detach().cpu()
-    metrics = _split_metric_bundle(data, final_probs)
+    metrics, threshold_diagnostics = _split_metric_bundle(
+        data,
+        final_probs,
+        beta=threshold_beta,
+    )
     return {
         "model": "heterogat",
         "best_epoch": best_epoch,
         "best_val_auprc": best_val,
+        "primary_threshold_policy": "primary_fbeta",
+        "threshold_beta": float(threshold_beta),
         "metrics": metrics,
+        "threshold_diagnostics": threshold_diagnostics,
     }
 
 
@@ -284,6 +354,7 @@ def run_pilot(
     max_epochs: int,
     patience: int,
     lr: float,
+    threshold_beta: float,
     device_name: str,
     seed: int,
     skip_download: bool,
@@ -305,6 +376,7 @@ def run_pilot(
         max_epochs=max_epochs,
         patience=patience,
         lr=lr,
+        threshold_beta=threshold_beta,
     )
     heterogat = train_heterogat(
         data,
@@ -312,6 +384,7 @@ def run_pilot(
         max_epochs=max_epochs,
         patience=patience,
         lr=lr,
+        threshold_beta=threshold_beta,
     )
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -325,6 +398,7 @@ def run_pilot(
         "max_epochs": int(max_epochs),
         "patience": int(patience),
         "lr": float(lr),
+        "threshold_beta": float(threshold_beta),
         "seed": int(seed),
         "diagnostics": diagnostics,
         "models": {"mlp": mlp, "heterogat": heterogat},
@@ -335,10 +409,20 @@ def run_pilot(
     rows = []
     rows.extend(flatten_metric_rows("mlp", mlp["metrics"]))
     rows.extend(flatten_metric_rows("heterogat", heterogat["metrics"]))
+    diagnostic_rows = []
+    for model_name, result in (("mlp", mlp), ("heterogat", heterogat)):
+        for policy, split_metrics in result["threshold_diagnostics"].items():
+            policy_rows = flatten_metric_rows(model_name, split_metrics)
+            for row in policy_rows:
+                row["threshold_policy"] = policy
+            diagnostic_rows.extend(policy_rows)
     metrics_path = results_dir / f"pilot_metrics_{run_id}.csv"
     pd.DataFrame(rows).to_csv(metrics_path, index=False)
+    diagnostics_path = results_dir / f"pilot_threshold_diagnostics_{run_id}.csv"
+    pd.DataFrame(diagnostic_rows).to_csv(diagnostics_path, index=False)
     print(f"Resumen: {summary_path}")
     print(f"Metricas: {metrics_path}")
+    print(f"Diagnostico umbrales: {diagnostics_path}")
     return summary
 
 
@@ -352,6 +436,12 @@ def main() -> None:
     parser.add_argument("--max-epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--threshold-beta",
+        type=float,
+        default=2.0,
+        help="Beta del umbral principal F-beta; 2.0 prioriza recall para clase rara.",
+    )
     parser.add_argument("--device", default="cpu", help="cpu, cuda, mps o auto.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--skip-download", action="store_true")
@@ -365,6 +455,7 @@ def main() -> None:
         max_epochs=args.max_epochs,
         patience=args.patience,
         lr=args.lr,
+        threshold_beta=args.threshold_beta,
         device_name=args.device,
         seed=args.seed,
         skip_download=args.skip_download,

@@ -2009,10 +2009,12 @@ def process_accidentes_df(
             [
                 post["portico"] if post else None,
                 cerc["portico"] if cerc else None,
+                post["km_num"] if post else np.nan,
+                cerc["km_num"] if cerc else np.nan,
             ]
         )
 
-    df[["ultimo_portico", "proximo_portico"]] = df.apply(
+    df[["ultimo_portico", "proximo_portico", "km_post", "km_cerc"]] = df.apply(
         _get_porticos, axis=1, result_type="expand"
     )
     excluded = df[df["ultimo_portico"].isna()].copy()
@@ -2030,6 +2032,20 @@ def process_accidentes_df(
 
     df["ultimo_portico"] = df["ultimo_portico"].apply(_clean_portico_str)
     df["proximo_portico"] = df["proximo_portico"].apply(_clean_portico_str)
+
+    # Distancias accidente <-> pórticos vecinos en el mismo eje. El cálculo es
+    # robusto al reinicio de km entre ejes porque find_candidate_porticos
+    # filtra por (eje, calzada) antes de buscar candidatos.
+    acc_km_num = pd.to_numeric(df[km_col], errors="coerce")
+    df["dist_to_post_km"] = (acc_km_num - df["km_post"]).abs()
+    df["dist_to_cerc_km"] = (acc_km_num - df["km_cerc"]).abs()
+    # pos_relativa queda NaN si falta alguno de los dos vecinos (extremo de eje).
+    denom = df["dist_to_post_km"] + df["dist_to_cerc_km"]
+    df["pos_relativa"] = np.where(
+        denom > 0,
+        df["dist_to_post_km"] / denom,
+        np.nan,
+    )
 
     return (df, excluded) if return_excluded else df
 

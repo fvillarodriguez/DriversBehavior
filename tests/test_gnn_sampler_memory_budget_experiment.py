@@ -221,6 +221,28 @@ def test_build_sampler_memory_loader_graphsaint_is_native():
     assert loader.__class__.__name__ != "NeighborLoader"
 
 
+def test_build_sampler_memory_loader_rl_top_p_reports_impl():
+    graph = _make_probe_graph()
+    loader, err = _build_sampler_memory_loader(
+        graph_cpu=graph,
+        sampler_config={
+            "train_sampler_mode": "rl_top_p",
+            "rl_action_space": "discrete",
+            "rl_initial_p": 0.5,
+            "rl_min_p": 0.05,
+            "rl_max_p": 1.0,
+            "rl_min_keep": 1,
+            "num_layers": 2,
+        },
+        batch_size=64,
+        sampling_seed=42,
+    )
+    assert err is None
+    assert loader is not None
+    assert getattr(loader, "sampler_impl", "") == "rl_top_p_rsrl"
+    assert loader.__class__.__name__ != "NeighborLoader"
+
+
 def test_native_sampler_batch_supervises_train_nodes_only():
     graph = _make_probe_graph()
     loader, err = _build_sampler_memory_loader(
@@ -293,6 +315,12 @@ def test_train_minibatch_accepts_native_cluster_and_graphsaint_loaders():
             "graphsaint_batch_size": 64,
             "graphsaint_num_steps": 2,
             "graphsaint_walk_length": 1,
+        },
+        {
+            "train_sampler_mode": "rl_top_p",
+            "rl_action_space": "discrete",
+            "rl_initial_p": 0.5,
+            "num_layers": 2,
         },
     ):
         graph = _make_probe_graph()
