@@ -83,7 +83,7 @@ def _run_optuna_memory_check(tmp_path, monkeypatch, *, use_checkpointing: bool) 
     data["pm"].val_mask = val_mask
     data["pm"].test_mask = test_mask
 
-    for rel in ["spatial", "temporal", "spatial_back", "st_fwd"]:
+    for rel in ["spatial", "temporal", "st_fwd"]:
         eidx, eattr = _edge()
         data[("pm", rel, "pm")].edge_index = eidx
         data[("pm", rel, "pm")].edge_attr = eattr

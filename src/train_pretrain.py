@@ -108,6 +108,48 @@ def _apply_distance_weighting(
     return (per_sample * w).sum() / denom
 
 
+def _binary_ranking_loss(
+    logits_m: Tensor,
+    y_m: Tensor,
+    *,
+    mode: str = "pairwise_softplus",
+    margin: float = 0.1,
+    max_pairs: int = 4096,
+) -> Tensor:
+    """Auxiliary positive-vs-negative ranking loss over supervised batch seeds."""
+    mode_key = str(mode or "none").strip().lower().replace("-", "_")
+    if mode_key in {"", "none", "off", "disabled"}:
+        return torch.zeros((), device=logits_m.device, dtype=logits_m.dtype)
+    if logits_m.ndim != 2 or logits_m.size(-1) < 2:
+        return torch.zeros((), device=logits_m.device, dtype=logits_m.dtype)
+
+    pos_scores = logits_m[y_m == 1, 1]
+    neg_scores = logits_m[y_m == 0, 1]
+    if pos_scores.numel() == 0 or neg_scores.numel() == 0:
+        return torch.zeros((), device=logits_m.device, dtype=logits_m.dtype)
+
+    diffs = pos_scores[:, None] - neg_scores[None, :]
+    flat = diffs.reshape(-1)
+    try:
+        max_pairs_int = max(1, int(max_pairs))
+    except Exception:
+        max_pairs_int = 4096
+    if flat.numel() > max_pairs_int:
+        # Deterministic strided subsampling avoids creating a stochastic source
+        # unrelated to the configured training seed.
+        step = max(1, flat.numel() // max_pairs_int)
+        flat = flat[::step][:max_pairs_int]
+
+    if mode_key in {"pairwise_hinge", "hinge", "margin"}:
+        return F.relu(float(margin) - flat).mean()
+    if mode_key in {"topk_pairwise", "topk_softplus"}:
+        k = min(max(1, pos_scores.numel() * 4), neg_scores.numel())
+        hard_neg = torch.topk(neg_scores, k=int(k), largest=True).values
+        hard_diffs = pos_scores[:, None] - hard_neg[None, :]
+        return F.softplus(-hard_diffs.reshape(-1)).mean()
+    return F.softplus(-flat).mean()
+
+
 def _safe_get_logits(model, batch):
     """Compat: algunos modelos heterogéneos devuelven dict por tipo de nodo."""
     edge_attr_dict = {
@@ -142,6 +184,10 @@ def train_minibatch(
     rl_sampler_controller: Optional[torch.nn.Module] = None,
     lambda_simi: float = 0.0,
     loss_weight_mode: str = "uniform", # <-- "uniform" | "distance"
+    ranking_loss_mode: str = "none",
+    ranking_loss_weight: float = 0.0,
+    ranking_loss_margin: float = 0.1,
+    ranking_loss_max_pairs: int = 4096,
 ) -> Tuple[float, float, float, float]: # Agregado avg_edge_loss
     """
     Entrena una época completa sobre un loader (vecindad) y devuelve:
@@ -161,6 +207,7 @@ def train_minibatch(
     total_l2_att_loss = 0.0
     total_h_loss = 0.0
     total_simi_loss = 0.0
+    total_ranking_loss = 0.0
 
     if DEBUG:
         logger.info(f"[train_minibatch] Epoch {epoch}: Iniciando entrenamiento de minibatch.")
@@ -238,6 +285,16 @@ def train_minibatch(
                 )
             else:
                 cls_loss = criterion(logits_m, y_m)
+
+            ranking_loss = torch.tensor(0.0, device=pm_embeddings.device)
+            if ranking_loss_weight and float(ranking_loss_weight) > 0:
+                ranking_loss = _binary_ranking_loss(
+                    logits_m,
+                    y_m,
+                    mode=ranking_loss_mode,
+                    margin=float(ranking_loss_margin),
+                    max_pairs=int(ranking_loss_max_pairs),
+                )
 
             edge_loss = torch.tensor(0.0, device=pm_embeddings.device)
             if edge_gen is not None and lambda_edge > 0:
@@ -324,6 +381,7 @@ def train_minibatch(
 
             total_loss = (
                 cls_loss
+                + float(ranking_loss_weight) * ranking_loss
                 + lambda_H * h_loss
                 + lambda_edge * edge_loss
                 + lambda_l2_att * l2_att_loss
@@ -339,11 +397,12 @@ def train_minibatch(
                 l2_att_loss.detach(),
                 h_loss.detach(),
                 simi_loss.detach(),
+                ranking_loss.detach(),
             )
 
         if use_amp and scaler is not None:
             with torch.amp.autocast("cuda"):
-                raw_loss, cls_loss, edge_loss, l2_att_loss, h_loss, simi_loss = compute_loss()
+                raw_loss, cls_loss, edge_loss, l2_att_loss, h_loss, simi_loss, ranking_loss = compute_loss()
                 loss_for_backward = raw_loss / accumulation_steps
             
             if torch.isfinite(loss_for_backward):
@@ -358,7 +417,7 @@ def train_minibatch(
                 logger.warning("Loss is NaN, skipping backward pass.")
 
         else:
-            raw_loss, cls_loss, edge_loss, l2_att_loss, h_loss, simi_loss = compute_loss()
+            raw_loss, cls_loss, edge_loss, l2_att_loss, h_loss, simi_loss, ranking_loss = compute_loss()
             loss_for_backward = raw_loss / accumulation_steps
             if torch.isfinite(loss_for_backward):
                 if DEBUG:
@@ -412,10 +471,12 @@ def train_minibatch(
             total_l2_att_loss += float(l2_att_loss.item())
             total_h_loss += float(h_loss.item())
             total_simi_loss += float(simi_loss.item())
+            total_ranking_loss += float(ranking_loss.item())
 
         progress_bar.set_postfix({
             'Loss': f"{raw_loss.item():.4f}" if torch.isfinite(raw_loss) else "nan",
             'CLS': f"{cls_loss.item():.4f}" if torch.isfinite(cls_loss) else "nan",
+            'Rank': f"{ranking_loss.item():.4f}" if torch.isfinite(ranking_loss) else "nan",
             'H': f"{h_loss.item():.4f}" if torch.isfinite(h_loss) else "nan",
             'Simi': f"{simi_loss.item():.4f}" if torch.isfinite(simi_loss) else "nan",
             'Edge': f"{edge_loss.item():.4f}" if torch.isfinite(edge_loss) else "nan",
@@ -443,6 +504,7 @@ def train_minibatch(
                         train_edge_loss=float(edge_loss.item()) if torch.isfinite(edge_loss) else None,
                         train_l2_att_loss=float(l2_att_loss.item()) if torch.isfinite(l2_att_loss) else None,
                         train_simi_loss=float(simi_loss.item()) if torch.isfinite(simi_loss) else None,
+                        train_ranking_loss=float(ranking_loss.item()) if torch.isfinite(ranking_loss) else None,
                         lr=lr_value,
                     )
                 except Exception:
@@ -455,10 +517,12 @@ def train_minibatch(
     avg_l2_att_loss = total_l2_att_loss / n_batches
     avg_h_loss = total_h_loss / n_batches
     avg_simi_loss = total_simi_loss / n_batches
+    avg_ranking_loss = total_ranking_loss / n_batches
 
     if writer is not None:
         writer.add_scalar('Loss/Train_Total', avg_loss, epoch)
         writer.add_scalar('Loss/Train_CLS', avg_cls_loss, epoch)
+        writer.add_scalar('Loss/Train_Ranking', avg_ranking_loss, epoch)
         writer.add_scalar('Loss/Train_H', avg_h_loss, epoch)
         writer.add_scalar('Loss/Train_Similarity', avg_simi_loss, epoch)
         writer.add_scalar('Loss/Train_Edge', avg_edge_loss, epoch)

@@ -38,12 +38,14 @@ class GATConvSaveAlpha(GATConv):
             x_out, (eff_eidx, alpha) = out
             # Save attention weights for XAI/regularization
             self._alpha = alpha
+            self._alpha_edge_index = eff_eidx
             if return_attention_weights:
                 return x_out, (eff_eidx, alpha)
             else:
                 return x_out
         # Fallback: if upstream signature changes
         self._alpha = None
+        self._alpha_edge_index = None
         return out
 
 
@@ -57,10 +59,12 @@ class TransformerConvSaveAlpha(TransformerConv):
         if isinstance(out, tuple):
             x_out, (eff_eidx, alpha) = out
             self._alpha = alpha
+            self._alpha_edge_index = eff_eidx
             if return_attention_weights:
                 return x_out, (eff_eidx, alpha)
             return x_out
         self._alpha = None
+        self._alpha_edge_index = None
         return out
 
 
@@ -179,12 +183,11 @@ def _resolve_per_type_float(spec, edge_types, default):
 
 
 # Edge types por defecto si no se pasa el parámetro al constructor.
-# Mantiene compatibilidad con grafos legacy que tenían 4 relaciones (incluido st_fwd).
-# Para grafos nuevos (3 relaciones), pasar edge_types=tuple(data.edge_types) desde fuera.
+# Los grafos nuevos usan `spatial` bidireccional y no crean relacion inversa separada.
+# Grafos legacy con relaciones extra deben pasar edge_types=tuple(data.edge_types).
 DEFAULT_EDGE_TYPES = (
     ('pm', 'spatial', 'pm'),
     ('pm', 'temporal', 'pm'),
-    ('pm', 'spatial_back', 'pm'),
     ('pm', 'st_fwd', 'pm'),
 )
 
@@ -370,8 +373,8 @@ class HeteroGAT(torch.nn.Module):
         self.num_layers = num_layers
         self.use_residual = bool(use_residual)
         self.use_relation_self_loops = bool(use_relation_self_loops)
-        # Edge types: si no se especifican, usa los 4 legacy (compat). Para grafos
-        # nuevos (3 relaciones) pasar edge_types=tuple(data.edge_types).
+        # Edge types: si no se especifican, usa el contrato nuevo sin relacion inversa separada.
+        # Grafos legacy con relaciones extra deben pasar edge_types=tuple(data.edge_types).
         self.edge_types_list = [tuple(et) for et in (edge_types if edge_types is not None else DEFAULT_EDGE_TYPES)]
 
         # Per-type edge_dim: si se pasa edge_feature_dims, cada relación recibe su

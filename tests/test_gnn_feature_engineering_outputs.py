@@ -1,5 +1,6 @@
 import pandas as pd
 import polars as pl
+import pytest
 
 from src.features import compute_pm_features
 from src.snapshot_pipeline import (
@@ -85,10 +86,30 @@ def test_feature_engineering_outputs_have_positive_values() -> None:
     flows_pl = pl.from_pandas(flows)
     snapshot_df, _ = snap_builder.build(flows_pl, _make_porticos_df())
     flat_snapshot = flatten_snapshot_features(snapshot_df)
-    for col in ["speed_mean", "flow_total", "tod_sin", "tod_cos"]:
+    for col in [
+        "speed_mean",
+        "flow_total",
+        "flow_cat_1",
+        "flow_cat_2",
+        "speed_mean_cat_1",
+        "speed_mean_cat_2",
+        "density_cat_1",
+        "density_cat_2",
+        "tod_sin",
+        "tod_cos",
+    ]:
         assert col in flat_snapshot.columns
     assert flat_snapshot["speed_mean"].gt(0).any()
     assert flat_snapshot["flow_total"].gt(0).any()
+    p1_first_snapshot = (
+        flat_snapshot[flat_snapshot["portico"].astype(str) == "1"]
+        .sort_values("ts_min")
+        .iloc[0]
+    )
+    assert p1_first_snapshot["speed_mean_cat_1"] == pytest.approx(80.0)
+    assert p1_first_snapshot["speed_mean_cat_2"] == pytest.approx(70.0)
+    assert p1_first_snapshot["density_cat_1"] == pytest.approx(1.0 / 80.0)
+    assert p1_first_snapshot["density_cat_2"] == pytest.approx(1.0 / 70.0)
 
     cluster_labels = pd.DataFrame(
         {

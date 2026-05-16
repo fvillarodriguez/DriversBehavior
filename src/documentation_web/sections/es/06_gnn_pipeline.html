@@ -72,9 +72,8 @@
       <thead><tr><th>Relación</th><th>Definición</th><th>Semántica</th><th>Atributos</th></tr></thead>
       <tbody>
         <tr><td><code>temporal</code></td><td>\(P_{i,t}\to P_{i,t+1}\)</td><td>Persistencia local en el mismo pórtico.</td><td>Bloque \(\Delta x\); canales físicos rellenados con ceros.</td></tr>
-        <tr><td><code>spatial</code></td><td>\(P_{i,t}\to P_{i+1,t}\)</td><td>Propagación aguas abajo en el mismo instante.</td><td>\(\Delta x\), distancia, gradientes, onda de choque e indicadores de congestión.</td></tr>
+        <tr><td><code>spatial</code></td><td>\(P_{i,t}\leftrightarrow P_{i+1,t}\)</td><td>Propagación espacial bidireccional en el mismo instante.</td><td>\(\Delta x\), distancia, gradientes, onda de choque e indicadores de congestión recalculados por dirección.</td></tr>
         <tr><td><code>st_fwd</code></td><td>\(P_{i,t}\to P_{i+1,t+1}\)</td><td>Propagación espacio-temporal experimental.</td><td>Gradientes entre pórtico actual y pórtico siguiente en el próximo bin.</td></tr>
-        <tr><td><code>spatial_back</code></td><td>Inversa de <code>spatial</code></td><td>Difusión espacial en dirección opuesta cuando se habilita.</td><td>Gradientes direccionales recalculados, no simple copia.</td></tr>
       </tbody>
     </table>
 
@@ -228,7 +227,7 @@
     <p class="reveal"><strong>Módulo principal:</strong> <code>src/graphsmote.py</code>. <strong>Integración:</strong> <code>src/gnn_main.py</code>, <code>src/train_pretrain.py</code>, <code>src/graph_builder_app.py</code> y <code>src/config.py</code>. El paper de Zhao, Zhang y Wang formula GraphSMOTE para clasificación semi-supervisada transductiva en un grafo homogéneo \(G=\{V,A,F\}\), con una matriz \(A\), features \(F\), extractor GraphSAGE, SMOTE en embedding intermedio, generador bilineal de aristas y pérdida \(L_{node}+\lambda L_{edge}\). El pipeline local requiere una reespecificación porque trabaja con un grafo pórtico-minuto temporal, relacional, con atributos físicos, splits cronológicos purgados y prevalencia positiva extremadamente baja.</p>
 
     <h4 class="reveal">Cambio 1 · De grafo homogéneo a <code>HeteroData</code></h4>
-    <p class="reveal">La formulación original opera sobre \(A\in\mathbb{R}^{n\times n}\). Aquí se preservan relaciones tipadas <code>pm</code>\(\to\)<code>pm</code>: <code>spatial</code>, <code>temporal</code>, <code>st_fwd</code> y, cuando aplica, <code>spatial_back</code>. Por eso <code>RelEdgeGen</code> no aprende un único \(S\), sino una matriz \(S_r\) por relación.</p>
+    <p class="reveal">La formulación original opera sobre \(A\in\mathbb{R}^{n\times n}\). Aquí se preservan relaciones tipadas <code>pm</code>\(\to\)<code>pm</code>: <code>spatial</code>, <code>temporal</code> y <code>st_fwd</code>. Por eso <code>RelEdgeGen</code> no aprende un único \(S\), sino una matriz \(S_r\) por relación.</p>
     <div class="lab-eq has-inspector reveal">
       <div class="formula">\[ s_r(u,v)=\mathbf{z}_u^\top S_r\mathbf{z}_v,\qquad r=(\texttt{src},\texttt{rel},\texttt{dst}) \]</div>
       <div class="num">(6.7)</div>

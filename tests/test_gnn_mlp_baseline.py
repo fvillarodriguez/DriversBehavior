@@ -13,6 +13,21 @@ HeteroData = pytest.importorskip("torch_geometric.data").HeteroData
 from src.gnn_mlp_baseline import run_gnn_mlp_baselines
 
 
+METRIC_COLS = [
+    "auprc",
+    "auc",
+    "f1_at_tau_val",
+    "f05_at_tau_val",
+    "precision",
+    "recall",
+    "far",
+    "mcc",
+    "accuracy",
+    "brier_score",
+    "tau",
+]
+
+
 class _SequenceIndex:
     def __init__(self, sequence_rows, target_rows):
         self.sequence_rows = np.asarray(sequence_rows, dtype=np.int64)
@@ -46,7 +61,22 @@ def _make_graph(*, imbalanced: bool = False) -> HeteroData:
     return data
 
 
-def _run_fast(loaded_obj, baselines):
+def _make_sequence_index() -> _SequenceIndex:
+    return _SequenceIndex(
+        sequence_rows=[
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 4],
+            [4, 5],
+            [5, 6],
+            [6, 7],
+        ],
+        target_rows=[1, 2, 3, 4, 5, 6, 7],
+    )
+
+
+def _run_fast(loaded_obj, baselines, **kwargs):
     return run_gnn_mlp_baselines(
         loaded_obj,
         baselines=baselines,
@@ -59,7 +89,21 @@ def _run_fast(loaded_obj, baselines):
         device="cpu",
         save_dir=None,
         seed=123,
+        **kwargs,
     )
+
+
+def _assert_completed_metrics(df: pd.DataFrame, baselines: set[str]) -> pd.DataFrame:
+    completed = df[df["status"] == "completed"]
+    assert set(completed["baseline"]) == baselines
+    for baseline in baselines:
+        assert set(completed.loc[completed["baseline"] == baseline, "split"]) == {"val", "test"}
+    values = completed[METRIC_COLS].to_numpy(dtype=float)
+    assert np.isfinite(values).all()
+    for col in ("tp", "tn", "fp", "fn"):
+        assert col in completed.columns
+        assert np.isfinite(completed[col].to_numpy(dtype=float)).all()
+    return completed
 
 
 def test_mlp_current_baseline_runs_without_edges():
@@ -77,18 +121,7 @@ def test_mlp_current_baseline_runs_without_edges():
 
 def test_temporal_baseline_filters_by_target_masks():
     data = _make_graph()
-    seq = _SequenceIndex(
-        sequence_rows=[
-            [0, 1],
-            [1, 2],
-            [2, 3],
-            [3, 4],
-            [4, 5],
-            [5, 6],
-            [6, 7],
-        ],
-        target_rows=[1, 2, 3, 4, 5, 6, 7],
-    )
+    seq = _make_sequence_index()
 
     df = _run_fast({"data": data, "sequence_index": seq}, ("temporal",))
 
@@ -116,25 +149,95 @@ def test_imbalanced_baseline_metrics_are_finite():
 
     df = _run_fast({"data": data}, ("current",))
 
-    metric_cols = [
-        "auprc",
-        "auc",
-        "f1_at_tau_val",
-        "f05_at_tau_val",
-        "precision",
-        "recall",
-        "far",
-        "mcc",
-        "accuracy",
-        "brier_score",
-        "tau",
-    ]
     completed = df[df["status"] == "completed"]
-    values = completed[metric_cols].to_numpy(dtype=float)
+    values = completed[METRIC_COLS].to_numpy(dtype=float)
     assert np.isfinite(values).all()
     for col in ("tp", "tn", "fp", "fn"):
         assert col in completed.columns
         assert np.isfinite(completed[col].to_numpy(dtype=float)).all()
+
+
+def test_pr_threshold_selectors_use_unshifted_precision_recall_alignment():
+    from src import graph_builder_app as app
+    from src import gnn_main
+    import src.gnn_mlp_baseline as baseline_module
+    import src.mlp_tabular as mlp_tabular
+    import src.xgboost as xgb_module
+
+    y_true = np.array([0, 1, 1, 0], dtype=int)
+    y_prob = np.array([0.1, 0.7, 0.6, 0.2], dtype=float)
+    expected_tau = 0.6
+
+    assert baseline_module._pick_tau_fbeta(y_true, y_prob, beta=1.0) == pytest.approx(expected_tau)
+    assert mlp_tabular._pick_threshold_from_val(y_true, y_prob, beta=1.0)[0] == pytest.approx(expected_tau)
+    assert xgb_module._pick_threshold_from_val(y_true, y_prob, beta=1.0)[0] == pytest.approx(expected_tau)
+    assert gnn_main.pick_threshold_from_val(y_true, y_prob, beta=1.0)[0] == pytest.approx(expected_tau)
+    assert app._comparison_tau_from_val_result(
+        {
+            "true": torch.tensor(y_true, dtype=torch.long),
+            "probs": torch.tensor(np.column_stack([1.0 - y_prob, y_prob]), dtype=torch.float32),
+        }
+    ) == pytest.approx(expected_tau)
+
+
+def test_baseline_comparison_defaults_to_far_threshold_metadata():
+    pytest.importorskip("xgboost")
+    data = _make_graph()
+
+    df = _run_fast(
+        {"data": data},
+        ("current", "xgboost_current"),
+        threshold_strategy="far",
+        far_target=0.2,
+    )
+
+    completed = _assert_completed_metrics(df, {"current", "xgboost_current"})
+    assert set(completed["threshold_strategy"]) == {"far"}
+    assert completed["far_target"].astype(float).eq(0.2).all()
+    assert completed["tau_source"].astype(str).str.contains("far_target").all()
+    assert set(completed["threshold_mask_source"]) == {"val_mask"}
+
+
+def test_xgboost_baselines_run_on_current_and_temporal_features():
+    pytest.importorskip("xgboost")
+    data = _make_graph()
+    seq = _make_sequence_index()
+
+    df = _run_fast(
+        {"data": data, "sequence_index": seq},
+        ("xgboost_current", "xgboost_temporal"),
+    )
+
+    completed = _assert_completed_metrics(df, {"xgboost_current", "xgboost_temporal"})
+    assert set(completed["model_family"]) == {"xgboost"}
+    assert set(completed["feature_view"]) == {"current", "temporal"}
+    assert set(completed["model"]) == {"XGBoost actual", "XGBoost temporal"}
+
+
+def test_svm_baselines_run_on_current_and_temporal_features():
+    data = _make_graph()
+    seq = _make_sequence_index()
+
+    df = _run_fast(
+        {"data": data, "sequence_index": seq},
+        ("svm_current", "svm_temporal"),
+    )
+
+    completed = _assert_completed_metrics(df, {"svm_current", "svm_temporal"})
+    assert set(completed["model_family"]) == {"svm"}
+    assert set(completed["feature_view"]) == {"current", "temporal"}
+    assert set(completed["model"]) == {"SVM actual", "SVM temporal"}
+    assert completed["backend"].astype(str).str.len().gt(0).all()
+
+
+def test_tabular_temporal_baselines_skip_without_sequence_index():
+    data = _make_graph()
+
+    df = _run_fast({"data": data}, ("xgboost_temporal", "svm_temporal"))
+
+    assert set(df["baseline"]) == {"xgboost_temporal", "svm_temporal"}
+    assert (df["status"] == "skipped").all()
+    assert df["reason"].str.contains("sequence_index", case=False).all()
 
 
 def test_training_panel_runs_runner_and_exposes_saved_results(tmp_path: Path, monkeypatch):
@@ -284,6 +387,27 @@ def test_training_panel_runs_runner_and_exposes_saved_results(tmp_path: Path, mo
                     "fn": 0,
                     "brier_score": 0.2,
                     "tau": 0.4,
+                },
+                {
+                    "model": "MLP actual",
+                    "baseline": "current",
+                    "split": "test",
+                    "status": "completed",
+                    "auprc": 0.8,
+                    "auc": 0.9,
+                    "f1_at_tau_val": 0.6,
+                    "f05_at_tau_val": 0.7,
+                    "precision": 0.6,
+                    "recall": 0.6,
+                    "far": 0.05,
+                    "mcc": 0.3,
+                    "accuracy": 0.8,
+                    "tp": 1,
+                    "tn": 1,
+                    "fp": 0,
+                    "fn": 0,
+                    "brier_score": 0.1,
+                    "tau": 0.4,
                 }
             ]
         )
@@ -299,11 +423,21 @@ def test_training_panel_runs_runner_and_exposes_saved_results(tmp_path: Path, mo
     data = _make_graph()
     app._render_gnn_mlp_baseline_panel({"data": data}, data)
 
-    assert calls["kwargs"]["baselines"] == ("current", "temporal")
+    assert calls["kwargs"]["baselines"] == (
+        "current",
+        "temporal",
+        "xgboost_current",
+        "xgboost_temporal",
+        "svm_current",
+        "svm_temporal",
+    )
     assert calls["kwargs"]["graph_hash"] == "abc123"
+    assert calls["kwargs"]["threshold_strategy"] == "far"
+    assert calls["kwargs"]["far_target"] == pytest.approx(0.20)
     artifact_path = Path(fake_st.session_state["gnn_mlp_baseline_artifact_path"])
     assert artifact_path.exists()
     assert fake_st.dataframes
+    assert set(fake_st.dataframes[-1]["split"]) == {"test"}
     assert "gnn_mlp_baseline_results" in fake_st.session_state
 
 
@@ -361,6 +495,26 @@ def test_gnn_mlp_history_selectbox_uses_scalar_options(tmp_path: Path, monkeypat
                 "graph_hash": graph_hash,
                 "auprc": 0.7,
                 "auc": 0.8,
+            },
+            {
+                "model": "XGBoost actual",
+                "split": "test",
+                "status": "completed",
+                "graph_hash": graph_hash,
+                "auprc": 0.8,
+                "auc": 0.85,
+                "model_family": "xgboost",
+                "feature_view": "current",
+            },
+            {
+                "model": "SVM temporal",
+                "split": "test",
+                "status": "completed",
+                "graph_hash": graph_hash,
+                "auprc": 0.6,
+                "auc": 0.65,
+                "model_family": "svm",
+                "feature_view": "temporal",
             }
         ]
     )
@@ -480,7 +634,7 @@ def test_render_comparison_tab_uses_current_and_history_subtabs(monkeypatch):
     assert called == [("current", "Original"), ("history", "a" * 64)]
 
 
-def test_gnn_checkpoint_comparison_evaluates_val_and_test(tmp_path: Path, monkeypatch):
+def test_gnn_checkpoint_comparison_calibrates_on_val_and_reports_test_only(tmp_path: Path, monkeypatch):
     from src import graph_builder_app as app
     from src import gnn_main
 
@@ -531,17 +685,31 @@ def test_gnn_checkpoint_comparison_evaluates_val_and_test(tmp_path: Path, monkey
 
     def fake_test(model, graph_data, **kwargs):
         calls.append(kwargs)
-        if kwargs.get("threshold") is None:
-            return {"val_mask": fake_result([0, 1, 1, 0])}
-        return {
-            "val_mask": fake_result([0, 1, 1, 0]),
-            "test_mask": fake_result([0, 1, 0, 1]),
-        }
+        mask_name = kwargs.get("mask_name")
+        if mask_name == "val_calib":
+            return {"val_calib": fake_result([0, 1, 1, 0])}
+        if mask_name == "val_threshold":
+            return {"val_threshold": fake_result([0, 1, 1, 0])}
+        assert kwargs.get("masks") == ["test_mask"]
+        return {"test_mask": fake_result([0, 1, 0, 1])}
 
     platt_model = object()
 
     def fake_platt_scale(y_true, y_prob):
         return np.asarray(y_prob, dtype=float), platt_model
+
+    threshold_calls = []
+
+    def fake_select_threshold(y_true, y_prob, *, far_target, mode):
+        threshold_calls.append(
+            {
+                "y_true": np.asarray(y_true),
+                "y_prob": np.asarray(y_prob),
+                "far_target": far_target,
+                "mode": mode,
+            }
+        )
+        return 0.42, {"far": 0.1, "sens": 0.5}
 
     monkeypatch.setattr(app, "_load_hparams_for_model", lambda path: dict(meta))
     monkeypatch.setattr(app.torch, "load", lambda *args, **kwargs: {"weight": torch.ones(1)})
@@ -554,10 +722,23 @@ def test_gnn_checkpoint_comparison_evaluates_val_and_test(tmp_path: Path, monkey
     monkeypatch.setattr(app, "_resolve_gnn_variant_for_checkpoint", lambda *args: "gat_snapshot")
     monkeypatch.setattr(app, "_checkpoint_temporal_kind", lambda state_dict: None)
     monkeypatch.setattr(app, "_infer_edge_feature_dim", lambda graph_data: 0)
+    monkeypatch.setattr(
+        app,
+        "_split_val_mask_for_calibration_threshold",
+        lambda *args, **kwargs: {
+            "calib_idx": torch.tensor([4, 5], dtype=torch.long),
+            "threshold_idx": torch.tensor([4, 5], dtype=torch.long),
+            "calibration_mask_source": "val_calib",
+            "threshold_mask_source": "val_threshold",
+            "calib_count": 2,
+            "threshold_count": 2,
+        },
+    )
     monkeypatch.setattr(gnn_main, "_build_gnn_model", lambda **kwargs: _FakeModel())
     monkeypatch.setattr(gnn_main, "test", fake_test)
     monkeypatch.setattr(gnn_main, "AUTOCALIBRATE_PROBS", True)
     monkeypatch.setattr(gnn_main, "_platt_scale_probabilities", fake_platt_scale)
+    monkeypatch.setattr(app, "_select_threshold_for_far_target", fake_select_threshold)
 
     rows = app._evaluate_gnn_checkpoint_for_comparison(
         model_path=str(model_path),
@@ -568,7 +749,7 @@ def test_gnn_checkpoint_comparison_evaluates_val_and_test(tmp_path: Path, monkey
     )
 
     df = pd.DataFrame(rows)
-    assert set(df["split"]) == {"val", "test"}
+    assert set(df["split"]) == {"test"}
     assert (df["status"] == "completed").all()
     assert df.loc[df["split"] == "test", "auprc"].iloc[0] == pytest.approx(0.7)
     assert df.loc[df["split"] == "test", "tp"].iloc[0] == 2
@@ -577,9 +758,16 @@ def test_gnn_checkpoint_comparison_evaluates_val_and_test(tmp_path: Path, monkey
     assert df.loc[df["split"] == "test", "fn"].iloc[0] == 0
     assert df.loc[df["split"] == "test", "brier_score"].iloc[0] == pytest.approx(0.2)
     assert set(df["calibration_method"]) == {"platt_scaling"}
-    assert any(call.get("threshold") is None for call in calls)
-    eval_calls = [call for call in calls if call.get("threshold") is not None]
+    assert df.loc[df["split"] == "test", "tau"].iloc[0] == pytest.approx(0.42)
+    assert df.loc[df["split"] == "test", "tau_source"].iloc[0] == "val_threshold_far_target"
+    assert df.loc[df["split"] == "test", "threshold_strategy"].iloc[0] == "far"
+    assert df.loc[df["split"] == "test", "far_target"].iloc[0] == pytest.approx(0.20)
+    assert df.loc[df["split"] == "test", "calibration_mask_source"].iloc[0] == "val_calib"
+    assert threshold_calls and threshold_calls[0]["far_target"] == pytest.approx(0.20)
+    assert [call.get("mask_name") for call in calls[:2]] == ["val_calib", "val_threshold"]
+    eval_calls = [call for call in calls if call.get("masks") == ["test_mask"]]
     assert eval_calls and "test_mask" in eval_calls[-1]["masks"]
+    assert eval_calls[-1]["threshold"] == pytest.approx(0.42)
     assert eval_calls[-1]["calibration_model"] is platt_model
 
 
@@ -713,7 +901,6 @@ def test_render_graph_builder_includes_comparison_tab(monkeypatch):
     monkeypatch.setattr(app, "_render_feature_selection_tab", lambda: called.append("selection"))
     monkeypatch.setattr(app, "_render_in_memory_graph", lambda: called.append("graph"))
     monkeypatch.setattr(app, "_render_network_tab", lambda: called.append("network"))
-    monkeypatch.setattr(app, "_render_network_builder_tab", lambda: called.append("network_builder"))
     monkeypatch.setattr(app, "_render_optimization_tab", lambda: called.append("optimization"))
     monkeypatch.setattr(app, "_render_balance_tab", lambda: called.append("balance"))
     monkeypatch.setattr(app, "_render_training_tab", lambda: called.append("training"))
@@ -725,4 +912,6 @@ def test_render_graph_builder_includes_comparison_tab(monkeypatch):
 
     assert "Comparación" in fake_st.labels
     assert fake_st.labels.index("Comparación") > fake_st.labels.index("Training")
+    assert "Network Builder" not in fake_st.labels
     assert "comparison" in called
+    assert "network" in called

@@ -6,11 +6,12 @@ from datetime import datetime
 from itertools import cycle
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import matplotlib
 import matplotlib.pyplot as plt
 import networkx as nx
+import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
@@ -528,6 +529,349 @@ def build_subgraph_figure(
     return fig
 
 
+def _resolve_visual_graph_hash(loaded_obj: Dict[str, object]) -> Optional[str]:
+    for key in ("graph_hash", "hash"):
+        value = loaded_obj.get(key)
+        if value:
+            return str(value)
+    metadata = loaded_obj.get("metadata")
+    if isinstance(metadata, dict):
+        value = metadata.get("graph_hash") or metadata.get("hash")
+        if value:
+            return str(value)
+    data = loaded_obj.get("data")
+    for attr in ("graph_hash", "hash"):
+        value = getattr(data, attr, None)
+        if value:
+            return str(value)
+    return None
+
+
+def _xai_manifest_compatible(manifest: Dict[str, object], loaded_obj: Dict[str, object]) -> bool:
+    graph_hash = _resolve_visual_graph_hash(loaded_obj)
+    result_hash = manifest.get("graph_hash")
+    if graph_hash and result_hash and str(graph_hash) != str(result_hash):
+        return False
+    current_model = st.session_state.get("gnn_eval_model_path")
+    result_model = manifest.get("model_path")
+    if current_model and result_model and str(current_model) != str(result_model):
+        return False
+    return True
+
+
+def _load_xai_result_for_visual_graph(loaded_obj: Dict[str, object]) -> Tuple[Optional[object], str]:
+    session_result = st.session_state.get("gnn_xai_last_result")
+    if session_result is not None and hasattr(session_result, "edges_df") and hasattr(session_result, "nodes_df"):
+        if _xai_manifest_compatible(getattr(session_result, "manifest", {}) or {}, loaded_obj):
+            return session_result, "sesión actual"
+    try:
+        from src.gnn_xai import find_latest_gnn_xai_result, load_gnn_xai_result
+
+        result_dir = find_latest_gnn_xai_result(
+            graph_hash=_resolve_visual_graph_hash(loaded_obj),
+            model_path=st.session_state.get("gnn_eval_model_path"),
+        )
+        if result_dir is None:
+            result_dir = find_latest_gnn_xai_result()
+        if result_dir is None:
+            return None, ""
+        return load_gnn_xai_result(result_dir), str(result_dir)
+    except Exception as exc:
+        st.caption(f"No se pudo cargar XAI guardado: {exc}")
+        return None, ""
+
+
+def _filter_xai_edges(
+    edges_df: pd.DataFrame,
+    *,
+    relation: str,
+    layer: str,
+    attention_percentile: float,
+    error_type: str,
+    metric: str,
+) -> pd.DataFrame:
+    if edges_df is None or edges_df.empty:
+        return pd.DataFrame()
+    out = edges_df.copy()
+    if relation and relation != "Todas" and "relation" in out.columns:
+        out = out[out["relation"].astype(str) == str(relation)]
+    if layer and layer != "Todas" and "layer" in out.columns:
+        out = out[out["layer"].astype(str) == str(layer)]
+    if error_type and error_type != "Todos":
+        src = out.get("source_error_type")
+        dst = out.get("dest_error_type")
+        if src is not None and dst is not None:
+            out = out[(src.astype(str) == error_type) | (dst.astype(str) == error_type)]
+    att_col = metric if metric in {"mean_attention", "max_attention"} else "mean_attention"
+    if att_col in out.columns and not out.empty:
+        threshold = out[att_col].quantile(float(attention_percentile))
+        out = out[out[att_col] >= threshold]
+    return out.reset_index(drop=True)
+
+
+def _xai_node_color_values(nodes_df: pd.DataFrame, metric: str) -> Tuple[Dict[int, object], Dict[str, str]]:
+    if nodes_df is None or nodes_df.empty:
+        return {}, {}
+    lookup: Dict[int, object] = {}
+    palette = {
+        "TP": "#2e7d32",
+        "TN": "#607d8b",
+        "FP": "#f57c00",
+        "FN": "#c62828",
+        "unknown": "#9e9e9e",
+    }
+    if metric == "error_type":
+        for _, row in nodes_df.iterrows():
+            lookup[int(row["node_idx"])] = str(row.get("error_type", "unknown"))
+        return lookup, palette
+    for _, row in nodes_df.iterrows():
+        try:
+            lookup[int(row["node_idx"])] = float(row.get("prob1", np.nan))
+        except Exception:
+            lookup[int(row["node_idx"])] = np.nan
+    return lookup, palette
+
+
+def build_xai_graph_figure(
+    nodes_df: pd.DataFrame,
+    edges_df: pd.DataFrame,
+    *,
+    metric: str,
+    max_edges: int,
+    spring_iters: int = 80,
+) -> Optional[plt.Figure]:
+    if edges_df is None or edges_df.empty:
+        return None
+    sort_col = metric if metric in edges_df.columns and metric in {"mean_attention", "max_attention"} else "mean_attention"
+    plot_edges = edges_df.sort_values(sort_col, ascending=False).head(max(1, int(max_edges))).copy()
+    if plot_edges.empty:
+        return None
+
+    graph = nx.DiGraph()
+    for _, row in plot_edges.iterrows():
+        src = int(row["source_node_idx"])
+        dst = int(row["dest_node_idx"])
+        graph.add_node(src)
+        graph.add_node(dst)
+        graph.add_edge(
+            src,
+            dst,
+            relation=str(row.get("relation", "")),
+            mean_attention=float(row.get("mean_attention", 0.0) or 0.0),
+            max_attention=float(row.get("max_attention", 0.0) or 0.0),
+        )
+    if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
+        return None
+
+    pos = nx.spring_layout(graph, seed=SEED, iterations=int(spring_iters), weight="mean_attention")
+    fig, ax = plt.subplots(figsize=(12, 8))
+    color_values, palette = _xai_node_color_values(nodes_df, metric)
+    node_ids = list(graph.nodes())
+    if metric == "error_type":
+        node_colors = [palette.get(str(color_values.get(node, "unknown")), "#9e9e9e") for node in node_ids]
+    else:
+        numeric = np.array(
+            [
+                float(color_values.get(node, np.nan))
+                if color_values.get(node, np.nan) is not None
+                else np.nan
+                for node in node_ids
+            ]
+        )
+        node_colors = np.nan_to_num(numeric, nan=0.0)
+
+    edge_weights = np.array(
+        [float(graph.edges[edge].get("mean_attention", 0.0)) for edge in graph.edges()]
+    )
+    if edge_weights.size == 0:
+        edge_weights = np.array([1.0])
+    denom = max(float(edge_weights.max() - edge_weights.min()), 1e-9)
+    widths = 1.0 + 5.0 * ((edge_weights - edge_weights.min()) / denom)
+
+    nx.draw_networkx_edges(
+        graph,
+        pos,
+        ax=ax,
+        edge_color=edge_weights,
+        edge_cmap=plt.cm.magma,
+        width=widths,
+        arrows=True,
+        arrowsize=14,
+        alpha=0.82,
+        connectionstyle="arc3,rad=0.08",
+    )
+    nx.draw_networkx_nodes(
+        graph,
+        pos,
+        ax=ax,
+        node_color=node_colors,
+        cmap=plt.cm.viridis if metric != "error_type" else None,
+        node_size=360,
+        linewidths=0.8,
+        edgecolors="#263238",
+        alpha=0.95,
+    )
+    if graph.number_of_nodes() <= 80:
+        nx.draw_networkx_labels(graph, pos, ax=ax, font_size=8)
+
+    if metric == "error_type":
+        handles = [
+            matplotlib.lines.Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="w",
+                label=label,
+                markerfacecolor=color,
+                markersize=8,
+            )
+            for label, color in palette.items()
+            if label != "unknown" or any(color_values.get(node) == "unknown" for node in node_ids)
+        ]
+        ax.legend(handles=handles, loc="best", frameon=True)
+    else:
+        sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=plt.Normalize(vmin=0.0, vmax=1.0))
+        sm.set_array([])
+        fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02, label="prob1")
+    edge_sm = plt.cm.ScalarMappable(
+        cmap=plt.cm.magma,
+        norm=plt.Normalize(vmin=float(edge_weights.min()), vmax=float(edge_weights.max())),
+    )
+    edge_sm.set_array([])
+    fig.colorbar(edge_sm, ax=ax, fraction=0.03, pad=0.08, label="mean_attention")
+    ax.set_title("XAI GNN: atención de aristas + predicción por nodo")
+    ax.axis("off")
+    plt.tight_layout()
+    return fig
+
+
+def _render_xai_visual_graph_mode(loaded_obj: Dict[str, object]) -> None:
+    result, source = _load_xai_result_for_visual_graph(loaded_obj)
+    if result is None:
+        st.info("No hay resultados XAI guardados para visualizar. Ejecute Evaluación Modelo con XAI activado.")
+        return
+    nodes_df = getattr(result, "nodes_df", pd.DataFrame())
+    edges_df = getattr(result, "edges_df", pd.DataFrame())
+    summary_df = getattr(result, "summary_df", pd.DataFrame())
+    manifest = getattr(result, "manifest", {}) or {}
+    st.caption(
+        f"Resultado XAI: {source} | mask={manifest.get('mask_name', 'N/A')} "
+        f"| nodos={len(nodes_df):,} | aristas={len(edges_df):,}"
+    )
+    if edges_df.empty:
+        st.warning("El resultado XAI no contiene aristas relevantes.")
+        return
+
+    relations = (
+        ["Todas"] + sorted(edges_df["relation"].dropna().astype(str).unique().tolist())
+        if "relation" in edges_df
+        else ["Todas"]
+    )
+    layers = (
+        ["Todas"] + sorted(edges_df["layer"].dropna().astype(str).unique().tolist())
+        if "layer" in edges_df
+        else ["Todas"]
+    )
+    errors = ["Todos"]
+    for col in ("source_error_type", "dest_error_type"):
+        if col in edges_df:
+            errors.extend(edges_df[col].dropna().astype(str).unique().tolist())
+    errors = ["Todos"] + sorted({e for e in errors if e != "Todos"})
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        relation = st.selectbox(
+            "Relación",
+            relations,
+            key="viz_xai_relation",
+            help="Filtra aristas XAI por tipo de relación del grafo. Usar 'Todas' evita sesgar el análisis a una sola fuente.",
+        )
+    with col_b:
+        layer = st.selectbox(
+            "Capa",
+            layers,
+            key="viz_xai_layer",
+            help="Filtra por capa GNN ya calculada. Cambiarla no recalcula XAI; solo inspecciona capas guardadas.",
+        )
+    with col_c:
+        attention_percentile = st.slider(
+            "Percentil visual",
+            min_value=0.0,
+            max_value=0.99,
+            value=0.0,
+            step=0.01,
+            key="viz_xai_percentile",
+            help="Filtro adicional sobre las aristas ya calculadas. 0 muestra todo; valores altos conservan solo atención extrema.",
+        )
+    with col_d:
+        error_type = st.selectbox(
+            "Tipo de error",
+            errors,
+            key="viz_xai_error_type",
+            help="Muestra aristas conectadas a nodos TP/TN/FP/FN. Útil para auditoría; no debe leerse como causalidad.",
+        )
+
+    col_e, col_f, col_g = st.columns(3)
+    with col_e:
+        metric = st.selectbox(
+            "Métrica visual",
+            ["mean_attention", "max_attention", "prob1", "error_type"],
+            key="viz_xai_metric",
+            help="Controla color de nodos y orden de aristas. Atención escala aristas; prob1/error_type colorea nodos.",
+        )
+    with col_f:
+        max_edges = st.number_input(
+            "Máximo aristas",
+            min_value=10,
+            max_value=20000,
+            value=min(500, max(10, int(len(edges_df)))),
+            step=50,
+            key="viz_xai_max_edges",
+            help="Limita el número de aristas dibujadas y listadas. Valores altos pueden saturar el layout y ocultar patrones.",
+        )
+    with col_g:
+        spring_iters = st.slider(
+            "Layout iterations",
+            min_value=20,
+            max_value=250,
+            value=80,
+            step=10,
+            key="viz_xai_spring_iters",
+            help="Iteraciones del layout de red. Más iteraciones ordenan mejor grafos pequeños, pero pueden ralentizar grafos densos.",
+        )
+
+    filtered = _filter_xai_edges(
+        edges_df,
+        relation=str(relation),
+        layer=str(layer),
+        attention_percentile=float(attention_percentile),
+        error_type=str(error_type),
+        metric=str(metric),
+    )
+    if filtered.empty:
+        st.info("Sin aristas luego de aplicar filtros.")
+        return
+    fig = build_xai_graph_figure(
+        nodes_df,
+        filtered,
+        metric=str(metric),
+        max_edges=int(max_edges),
+        spring_iters=int(spring_iters),
+    )
+    if fig is not None:
+        st.pyplot(fig, clear_figure=True)
+
+    st.markdown("**Aristas relevantes**")
+    sort_col = str(metric) if str(metric) in filtered.columns else "mean_attention"
+    st.dataframe(
+        filtered.sort_values(sort_col, ascending=False).head(int(max_edges)),
+        width="stretch",
+    )
+    if not summary_df.empty:
+        st.markdown("**Resumen por relación**")
+        st.dataframe(summary_df, width="stretch")
+
+
 def render_visual_graph_tab(loaded_obj: Optional[Dict[str, object]] = None) -> None:
     st.subheader("Visual Graph")
 
@@ -709,6 +1053,17 @@ def render_visual_graph_tab(loaded_obj: Optional[Dict[str, object]] = None) -> N
                             st.dataframe(df_stats, width="stretch")
 
     st.markdown("---")
+    visual_mode = st.radio(
+        "Modo Visual Graph",
+        ["Subgraph", "XAI"],
+        horizontal=True,
+        key="viz_graph_mode",
+        help="Subgraph inspecciona conectividad local del grafo; XAI carga atención y predicciones guardadas tras Evaluación Modelo.",
+    )
+    if visual_mode == "XAI":
+        _render_xai_visual_graph_mode(loaded_obj)
+        return
+
     st.markdown("Subgraph visualization")
 
     candidates = _collect_pm_candidates(data)

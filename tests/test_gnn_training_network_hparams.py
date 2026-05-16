@@ -1,5 +1,7 @@
 import os
+from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 
 from src import graph_builder_app as app
@@ -41,6 +43,31 @@ def test_network_hparams_are_discoverable_for_training_prompt(tmp_path, monkeypa
 
     assert path in graph_filtered
     assert path in prompt_files
+
+
+def test_network_exports_sequence_length_from_loaded_graph_sequence_index():
+    sequence_index = SimpleNamespace(
+        sequence_rows=np.asarray(
+            [
+                [0, 1, 2, 3],
+                [1, 2, 3, 4],
+                [2, 3, 4, 5],
+            ],
+            dtype=np.int64,
+        ),
+        target_rows=np.asarray([3, 4, 5], dtype=np.int64),
+    )
+
+    seq_stats = app._graph_sequence_stats({"sequence_index": sequence_index})
+    params = app._network_config_to_hparams(
+        {"seq_length": seq_stats["sequence_length"]},
+        use_graphsmote=False,
+    )
+
+    assert seq_stats["sequence_length"] == 4
+    assert seq_stats["sequence_count"] == 3
+    assert seq_stats["source"] == "SequenceIndex"
+    assert params["seq_length"] == 4
 
 
 def test_graph_node_feature_preview_accepts_dataframe_columns_index():

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import builtins
 import copy
 import contextlib
 import gc
@@ -193,7 +192,7 @@ GNN_USE_RELATION_SELF_LOOPS_HELP = """
 Agrega auto-aristas por tipo de relacion en las capas GAT relacionales.
 
 Que hace: para cada relacion usada por la GNN, por ejemplo `spatial`,
-`temporal`, `spatial_back` o `st_fwd`, permite que cada nodo `pm` se envie un
+`temporal` o `st_fwd`, permite que cada nodo `pm` se envie un
 mensaje a si mismo dentro de ese mismo canal relacional. Asi, la atencion de una
 relacion no compara solo vecinos observados; tambien puede asignar peso al
 estado propio del nodo como si fuera una arista identidad de esa relacion.
@@ -296,6 +295,84 @@ def _build_gnn_live_training_chart_frames(
         if not chart_df.empty:
             frames[frame_key] = chart_df
     return frames
+
+
+def _load_gnn_training_history(
+    history_path: Optional[os.PathLike | str],
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Optional[str]]:
+    if not history_path:
+        return [], [], None
+    path = Path(history_path)
+    if not path.exists() or not path.is_file():
+        return [], [], None
+
+    metric_keys = {
+        "epoch",
+        "train_loss",
+        "val_loss",
+        "train_cls_loss",
+        "train_edge_loss",
+        "train_l2_att_loss",
+        "val_f1",
+        "val_f1_pos",
+        "val_f1_macro",
+        "val_precision_pos",
+        "val_recall_pos",
+        "val_accuracy",
+        "val_auc",
+        "val_auprc",
+        "val_mcc",
+        "val_far",
+        "val_f05",
+        "val_objective_score",
+        "best_val_loss",
+        "monitor_value",
+        "best_monitor_value",
+        "best_val_objective_score",
+        "val_tau",
+        "lr",
+        "smote_synth_count",
+    }
+    metrics_by_epoch: Dict[int, Dict[str, object]] = {}
+    test_results: List[Dict[str, object]] = []
+    run_id: Optional[str] = None
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return [], [], None
+
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            event = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(event, dict) or event.get("scope") != "gnn_training":
+            continue
+        if run_id is None and event.get("run_id"):
+            run_id = str(event.get("run_id"))
+        event_type = str(event.get("event") or "")
+        if event_type == "epoch":
+            try:
+                epoch = int(event.get("epoch"))
+            except Exception:
+                continue
+            metrics_by_epoch[epoch] = {
+                key: event.get(key)
+                for key in metric_keys
+                if key in event
+            }
+        elif event_type == "test_result":
+            test_results.append(dict(event))
+
+    metrics = [
+        metrics_by_epoch[epoch]
+        for epoch in sorted(metrics_by_epoch)
+    ]
+    return metrics, test_results, run_id
 
 
 def _render_gnn_live_line_chart(container, chart_df: pd.DataFrame) -> None:
@@ -2021,6 +2098,8 @@ SNAPSHOT_GROUP_OPTIONS = {
     "Velocidad base": "speed_stats",
     "Flujo total + slow pct": "flow_base",
     "Flow por categoria": "flow_cat",
+    "Velocidad por categoria": "speed_cat",
+    "Densidad por categoria": "density_cat",
     "Mix por categoria": "mix_cat",
     "Carriles": "lane_stats",
     "Ventanas / Lags / Pendientes": "window_features",
@@ -2221,6 +2300,10 @@ def _filter_snapshot_features(
         keep_cols.extend([c for c in SNAPSHOT_FLOW_COLUMNS if c in df_pm.columns])
     if "flow_cat" in group_set:
         keep_cols.extend([c for c in df_pm.columns if c.startswith("flow_cat_")])
+    if "speed_cat" in group_set:
+        keep_cols.extend([c for c in df_pm.columns if c.startswith("speed_mean_cat_")])
+    if "density_cat" in group_set:
+        keep_cols.extend([c for c in df_pm.columns if c.startswith("density_cat_")])
     if "mix_cat" in group_set:
         keep_cols.extend([c for c in df_pm.columns if c.startswith("mix_cat_")])
     if "lane_stats" in group_set:
@@ -2507,6 +2590,83 @@ def _infer_edge_encoded_dims_from_state_dict(
             break
     return dims
 
+
+def _infer_edge_encoder_hidden_dims_from_state_dict(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+) -> Dict[Tuple[str, str, str], int]:
+    """Hidden dim por tipo para encoders de `edge_attr`.
+
+    Es necesario para reconstruir checkpoints `gat_edge_mlp*` con `strict=True`:
+    el `hidden_dim` del encoder no se deduce de `in_dim`/`encoded_dim` y puede
+    venir de Optuna o de una configuración per-type.
+    """
+    if not isinstance(state_dict, dict):
+        return {}
+
+    feature_dims = _infer_edge_feature_dims_from_state_dict(state_dict)
+    candidates: Dict[Tuple[str, str, str], Tuple[int, int]] = {}
+
+    def _remember(
+        edge_type: Optional[Tuple[str, str, str]],
+        value: Optional[int],
+        *,
+        priority: int,
+    ) -> None:
+        if edge_type is None or value is None or int(value) <= 0:
+            return
+        prev = candidates.get(edge_type)
+        if prev is None or priority < prev[0]:
+            candidates[edge_type] = (int(priority), int(value))
+
+    direct_patterns = [
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.freq_w$"), "time2vec_freq"),
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.freq_b$"), "time2vec_freq"),
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.mlp\.0\.weight$"), "linear_out"),
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.net\.0\.weight$"), "linear_out"),
+    ]
+    fallback_patterns = [
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.proj\.weight$"), "time2vec_proj"),
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.mlp\.3\.weight$"), "linear_in"),
+        (re.compile(r"^edge_attr_encoders\.([^.]+)\.net\.3\.weight$"), "linear_in"),
+    ]
+
+    for key, tensor in state_dict.items():
+        text = str(key)
+        for pattern, mode in direct_patterns:
+            match = pattern.match(text)
+            if not match:
+                continue
+            edge_type = _parse_checkpoint_edge_type_key(match.group(1))
+            try:
+                if mode == "time2vec_freq" and tensor.dim() >= 2:
+                    _remember(edge_type, int(tensor.shape[1]) + 1, priority=0)
+                elif mode == "linear_out" and tensor.dim() >= 1:
+                    _remember(edge_type, int(tensor.shape[0]), priority=0)
+            except Exception:
+                pass
+            break
+
+    for key, tensor in state_dict.items():
+        text = str(key)
+        for pattern, mode in fallback_patterns:
+            match = pattern.match(text)
+            if not match:
+                continue
+            edge_type = _parse_checkpoint_edge_type_key(match.group(1))
+            try:
+                if mode == "time2vec_proj" and tensor.dim() >= 2:
+                    raw_dim = int(feature_dims.get(edge_type, 0) or 0)
+                    if raw_dim > 0 and int(tensor.shape[1]) % raw_dim == 0:
+                        _remember(edge_type, int(tensor.shape[1]) // raw_dim, priority=1)
+                elif mode == "linear_in" and tensor.dim() >= 2:
+                    _remember(edge_type, int(tensor.shape[1]), priority=1)
+            except Exception:
+                pass
+            break
+
+    return {edge_type: hidden for edge_type, (_, hidden) in candidates.items()}
+
+
 def _infer_in_channels_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Optional[int]:
     for key, tensor in state_dict.items():
         if key.startswith("convs.") and key.endswith(".lin.weight"):
@@ -2596,6 +2756,14 @@ def _resolve_edge_encoded_dims_for_model(
     """Encoded dims (input al GATConv) inferidas del checkpoint para variantes
     con encoder MLP. Devuelve None si no aplica."""
     ckpt_dims = _infer_edge_encoded_dims_from_state_dict(state_dict)
+    return ckpt_dims or None
+
+
+def _resolve_edge_encoder_hidden_dims_for_model(
+    state_dict: Optional[Dict[str, torch.Tensor]],
+) -> Optional[Dict[Tuple[str, str, str], int]]:
+    """Hidden dims inferidas del checkpoint para reconstrucción estricta."""
+    ckpt_dims = _infer_edge_encoder_hidden_dims_from_state_dict(state_dict)
     return ckpt_dims or None
 
 
@@ -2932,6 +3100,77 @@ def _list_gnn_model_files_for_baseline() -> List[str]:
     )
 
 
+def _gnn_model_filename_matches_graph_hash(
+    model_path: str,
+    graph_hash: object,
+) -> bool:
+    graph_text = _comparison_hash_text(graph_hash)
+    if not graph_text:
+        return False
+    name = os.path.basename(str(model_path)).lower()
+    for prefix_len in (16, 12, 8):
+        if len(graph_text) >= prefix_len and graph_text[:prefix_len] in name:
+            return True
+    return False
+
+
+def _gnn_model_meta_matches_graph_identity(
+    model_path: str,
+    graph_identity: Mapping[str, object],
+) -> bool:
+    graph_candidates = [
+        graph_identity.get("graph_hash"),
+        graph_identity.get("graph_file_hash"),
+    ]
+    graph_candidates = [
+        value for value in graph_candidates if _comparison_hash_text(value)
+    ]
+    if not graph_candidates:
+        return False
+
+    meta = _load_hparams_for_model(model_path)
+    meta_candidates: List[object] = []
+    if isinstance(meta, dict):
+        meta_candidates.extend(
+            [
+                meta.get("graph_hash"),
+                meta.get("graph_file_hash"),
+                meta.get("pilot_graph_hash"),
+            ]
+        )
+
+    for meta_hash in meta_candidates:
+        if any(
+            _comparison_graph_hash_matches(meta_hash, graph_hash)
+            for graph_hash in graph_candidates
+        ):
+            return True
+
+    return any(
+        _gnn_model_filename_matches_graph_hash(model_path, graph_hash)
+        for graph_hash in graph_candidates
+    )
+
+
+def _list_gnn_model_files_for_evaluation(
+    graph_obj: Dict[str, object],
+) -> List[str]:
+    graph_identity = _resolve_graph_identity_for_loaded_graph(graph_obj or {})
+    model_files = _list_gnn_model_files_for_baseline()
+    if not model_files:
+        return []
+    if (
+        not graph_identity.get("graph_hash")
+        and not graph_identity.get("graph_file_hash")
+    ):
+        return []
+    return [
+        path
+        for path in model_files
+        if _gnn_model_meta_matches_graph_identity(path, graph_identity)
+    ]
+
+
 def _coerce_optional_float(value: object) -> Optional[float]:
     try:
         out = float(value)
@@ -2969,6 +3208,21 @@ def _mask_name_to_split(mask_name: str) -> str:
     return text[:-5] if text.endswith("_mask") else text
 
 
+def _positive_class_probabilities_from_result(result: Mapping[str, object]) -> np.ndarray:
+    y_prob = result.get("probs") if isinstance(result, Mapping) else None
+    try:
+        y_prob_np = (
+            y_prob.detach().cpu().numpy()
+            if torch.is_tensor(y_prob)
+            else np.asarray(y_prob)
+        ).astype(float)
+        if y_prob_np.ndim == 2 and y_prob_np.shape[1] > 1:
+            return y_prob_np[:, 1].astype(float).ravel()
+        return y_prob_np.astype(float).ravel()
+    except Exception:
+        return np.asarray([], dtype=float)
+
+
 def _comparison_tau_from_val_result(
     val_result: Optional[Dict[str, object]],
     *,
@@ -2982,19 +3236,14 @@ def _comparison_tau_from_val_result(
                 y_true_np = y_true.detach().cpu().numpy().astype(int).ravel()
             else:
                 y_true_np = np.asarray(y_true).astype(int).ravel()
-            if torch.is_tensor(y_prob):
-                y_prob_np = y_prob.detach().cpu().numpy()
-            else:
-                y_prob_np = np.asarray(y_prob)
-            if y_prob_np.ndim == 2 and y_prob_np.shape[1] > 1:
-                y_prob1 = y_prob_np[:, 1].astype(float).ravel()
-            else:
-                y_prob1 = y_prob_np.astype(float).ravel()
+            y_prob1 = _positive_class_probabilities_from_result(
+                {"probs": y_prob}
+            )
             if y_true_np.size and y_true_np.size == y_prob1.size:
                 from sklearn.metrics import precision_recall_curve
 
                 prec, rec, thr = precision_recall_curve(y_true_np, y_prob1)
-                prec_, rec_, thr_ = prec[1:], rec[1:], thr
+                prec_, rec_, thr_ = prec[:-1], rec[:-1], thr
                 if len(thr_) and len(prec_):
                     fbeta = 2.0 * prec_ * rec_ / np.clip(prec_ + rec_, 1e-12, None)
                     if np.isfinite(fbeta).any():
@@ -3068,22 +3317,13 @@ def _brier_score_from_result(result: Mapping[str, object]) -> Optional[float]:
         if value is not None:
             return value
     y_true = result.get("true") if isinstance(result, Mapping) else None
-    y_prob = result.get("probs") if isinstance(result, Mapping) else None
     try:
         y_true_np = (
             y_true.detach().cpu().numpy()
             if torch.is_tensor(y_true)
             else np.asarray(y_true)
         ).astype(int).ravel()
-        y_prob_np = (
-            y_prob.detach().cpu().numpy()
-            if torch.is_tensor(y_prob)
-            else np.asarray(y_prob)
-        ).astype(float)
-        if y_prob_np.ndim == 2 and y_prob_np.shape[1] > 1:
-            prob1 = y_prob_np[:, 1]
-        else:
-            prob1 = y_prob_np.ravel()
+        prob1 = _positive_class_probabilities_from_result(result)
         if y_true_np.size and y_true_np.size == prob1.size:
             return float(np.mean((np.clip(prob1, 0.0, 1.0) - y_true_np) ** 2))
     except Exception:
@@ -3099,7 +3339,14 @@ def _gnn_eval_result_to_comparison_row(
     tau: float,
     meta: Mapping[str, object],
     calibration_method: str = "softmax_raw",
+    sample_counts: Optional[Mapping[str, int]] = None,
+    tau_source: str = "val_threshold_far_target",
+    calibration_info: Optional[Mapping[str, object]] = None,
+    threshold_strategy: str = "far",
+    far_target: float = 0.20,
 ) -> Dict[str, object]:
+    sample_counts = dict(sample_counts or {})
+    calibration_info = dict(calibration_info or {})
     report = result.get("report") or {}
     pos_report = report.get("Accidente (1)", {}) if isinstance(report, dict) else {}
     true = result.get("true")
@@ -3116,6 +3363,8 @@ def _gnn_eval_result_to_comparison_row(
     return {
         "model": "GNN checkpoint",
         "baseline": "gnn_checkpoint",
+        "model_family": "gnn",
+        "feature_view": "graph",
         "split": _mask_name_to_split(mask_name),
         "status": "completed",
         "reason": "",
@@ -3124,9 +3373,9 @@ def _gnn_eval_result_to_comparison_row(
         "samples": int(y_true_np.size),
         "positives": int(y_true_np.sum()) if y_true_np.size else 0,
         "positive_rate": float(y_true_np.mean()) if y_true_np.size else 0.0,
-        "train_samples": None,
-        "val_samples": None,
-        "test_samples": None,
+        "train_samples": sample_counts.get("train"),
+        "val_samples": sample_counts.get("val"),
+        "test_samples": sample_counts.get("test"),
         "epochs_run": None,
         "best_epoch": meta.get("best_epoch"),
         "best_val_auprc": _coerce_optional_float(meta.get("best_val_auprc")),
@@ -3146,8 +3395,14 @@ def _gnn_eval_result_to_comparison_row(
         "fn": counts["fn"],
         "brier_score": _brier_score_from_result(result),
         "tau": float(tau),
-        "tau_source": "val_f1_beta1",
+        "tau_source": str(tau_source),
+        "threshold_strategy": str(threshold_strategy),
+        "far_target": float(far_target),
         "calibration_method": str(calibration_method),
+        "calibration_mask_source": calibration_info.get("calibration_mask_source"),
+        "threshold_mask_source": calibration_info.get("threshold_mask_source"),
+        "calibration_count": calibration_info.get("calibration_count"),
+        "threshold_count": calibration_info.get("threshold_count"),
     }
 
 
@@ -3156,15 +3411,21 @@ def _gnn_checkpoint_skip_rows_for_comparison(
     model_path: str,
     reason: str,
     meta: Optional[Mapping[str, object]] = None,
-    masks: Sequence[str] = ("val_mask", "test_mask"),
+    masks: Sequence[str] = ("test_mask",),
+    sample_counts: Optional[Mapping[str, int]] = None,
+    threshold_strategy: str = "far",
+    far_target: float = 0.20,
 ) -> List[Dict[str, object]]:
     meta = meta or {}
+    sample_counts = dict(sample_counts or {})
     rows: List[Dict[str, object]] = []
     for mask_name in masks:
         rows.append(
             {
                 "model": "GNN checkpoint",
                 "baseline": "gnn_checkpoint",
+                "model_family": "gnn",
+                "feature_view": "graph",
                 "split": _mask_name_to_split(mask_name),
                 "status": "skipped",
                 "reason": reason,
@@ -3173,9 +3434,9 @@ def _gnn_checkpoint_skip_rows_for_comparison(
                 "samples": 0,
                 "positives": 0,
                 "positive_rate": 0.0,
-                "train_samples": None,
-                "val_samples": None,
-                "test_samples": None,
+                "train_samples": sample_counts.get("train"),
+                "val_samples": sample_counts.get("val"),
+                "test_samples": sample_counts.get("test"),
                 "epochs_run": None,
                 "best_epoch": meta.get("best_epoch"),
                 "best_val_auprc": _coerce_optional_float(meta.get("best_val_auprc")),
@@ -3196,7 +3457,13 @@ def _gnn_checkpoint_skip_rows_for_comparison(
                 "brier_score": None,
                 "tau": _checkpoint_tau_from_meta(meta),
                 "tau_source": "metadata_or_default",
+                "threshold_strategy": str(threshold_strategy),
+                "far_target": float(far_target),
                 "calibration_method": "not_applied",
+                "calibration_mask_source": None,
+                "threshold_mask_source": None,
+                "calibration_count": None,
+                "threshold_count": None,
             }
         )
     return rows
@@ -3211,11 +3478,18 @@ def _evaluate_gnn_checkpoint_for_comparison(
     batch_size: int,
     num_neighbors: Optional[object] = None,
     progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    threshold_strategy: str = "far",
+    far_target: float = 0.20,
 ) -> List[Dict[str, object]]:
     from src import gnn_main as graph_main
 
     node_type = "pm"
     meta = _load_hparams_for_model(model_path)
+    strategy_raw = str(threshold_strategy or "far").strip().lower()
+    if strategy_raw in {"f1", "f_beta", "f-beta"}:
+        strategy_raw = "fbeta"
+    threshold_strategy = strategy_raw if strategy_raw in {"far", "fbeta"} else "far"
+    far_target = float(np.clip(float(far_target), 0.0, 1.0))
 
     def _notify(**payload: object) -> None:
         if progress_callback is None:
@@ -3237,6 +3511,8 @@ def _evaluate_gnn_checkpoint_for_comparison(
                 model_path=model_path,
                 reason="El checkpoint no contiene state_dict evaluable.",
                 meta=meta,
+                threshold_strategy=threshold_strategy,
+                far_target=far_target,
             )
 
         is_ok, msg = _check_model_graph_compat(
@@ -3251,6 +3527,8 @@ def _evaluate_gnn_checkpoint_for_comparison(
                 model_path=model_path,
                 reason=str(msg or "Checkpoint incompatible con el grafo actual."),
                 meta=meta,
+                threshold_strategy=threshold_strategy,
+                far_target=far_target,
             )
 
         if isinstance(device, str) and device in {"Auto", "CPU", "MPS", "CUDA"}:
@@ -3281,6 +3559,8 @@ def _evaluate_gnn_checkpoint_for_comparison(
                 model_path=model_path,
                 reason="El checkpoint temporal no tiene SequenceIndex disponible.",
                 meta=meta,
+                threshold_strategy=threshold_strategy,
+                far_target=far_target,
             )
 
         graph_num_nodes = int(
@@ -3322,24 +3602,34 @@ def _evaluate_gnn_checkpoint_for_comparison(
             ),
             edge_types=model_edge_types,
             edge_feature_dims=_resolve_edge_feature_dims_for_model(state_dict, graph_data),
+            edge_encoder_hidden_dims=_resolve_edge_encoder_hidden_dims_for_model(state_dict),
             edge_encoded_dims=_resolve_edge_encoded_dims_for_model(state_dict),
             edge_encoder_kinds=_resolve_edge_encoder_kinds_for_model(state_dict),
         )
         model.load_state_dict(state_dict, strict=True)
         model.eval()
 
-        available_masks = _list_available_masks(graph_data, node_type=node_type)
-        wanted_masks = [
-            mask
-            for mask in ("val_mask", "test_mask")
-            if mask in available_masks
-            and bool(graph_data[node_type][mask].sum().item() > 0)
-        ]
-        if not wanted_masks:
+        sample_counts: Dict[str, int] = {}
+        for split_name in ("train", "val", "test"):
+            mask_tensor = getattr(graph_data[node_type], f"{split_name}_mask", None)
+            try:
+                sample_counts[split_name] = (
+                    int(mask_tensor.detach().cpu().bool().sum().item())
+                    if torch.is_tensor(mask_tensor)
+                    else 0
+                )
+            except Exception:
+                sample_counts[split_name] = 0
+
+        eval_masks = _test_only_eval_masks(graph_data, node_type=node_type)
+        if not eval_masks:
             return _gnn_checkpoint_skip_rows_for_comparison(
                 model_path=model_path,
-                reason="No hay val_mask/test_mask no vacias para evaluar.",
+                reason="No hay test_mask no vacia para evaluar.",
                 meta=meta,
+                sample_counts=sample_counts,
+                threshold_strategy=threshold_strategy,
+                far_target=far_target,
             )
 
         effective_neighbors = num_neighbors if num_neighbors not in (None, "") else meta.get("num_neighbors")
@@ -3347,54 +3637,168 @@ def _evaluate_gnn_checkpoint_for_comparison(
         tau = tau_fallback if tau_fallback is not None else 0.5
         platt_model = None
         calibration_method = "softmax_raw"
-        if "val_mask" in wanted_masks:
+        tau_source = "metadata_or_default"
+        calibration_info: Dict[str, object] = {
+            "calibration_mask_source": None,
+            "threshold_mask_source": None,
+            "calibration_count": None,
+            "threshold_count": None,
+        }
+        if sample_counts.get("val", 0) > 0:
             _notify(event="gnn_checkpoint_calibrating", model=os.path.basename(str(model_path)))
-            val_results = graph_main.test(
-                model,
-                graph_data,
-                node_type=node_type,
-                threshold=None,
-                masks=["val_mask"],
-                batch_size=int(batch_size),
-                num_neighbors=effective_neighbors,
-            )
-            val_result_for_tau = (
-                val_results.get("val_mask") if isinstance(val_results, dict) else None
-            )
-            if val_result_for_tau and bool(getattr(graph_main, "AUTOCALIBRATE_PROBS", False)):
-                try:
-                    y_true_val = val_result_for_tau["true"].detach().cpu().numpy().astype(int).ravel()
-                    y_prob_val = val_result_for_tau["probs"].detach().cpu().numpy()
-                    y_prob1_val_raw = (
-                        y_prob_val[:, 1].astype(float).ravel()
-                        if y_prob_val.ndim == 2 and y_prob_val.shape[1] > 1
-                        else y_prob_val.astype(float).ravel()
+            val_split = None
+            try:
+                val_split = _split_val_mask_for_calibration_threshold(
+                    graph_data,
+                    graph_obj.get("pm_index") if isinstance(graph_obj, dict) else None,
+                    node_type=node_type,
+                )
+            except Exception as exc:
+                _notify(
+                    event="gnn_checkpoint_calibration_fallback",
+                    model=os.path.basename(str(model_path)),
+                    reason=str(exc),
+                )
+
+            val_result_for_tau = None
+            if isinstance(val_split, Mapping):
+                calib_idx = val_split["calib_idx"]
+                threshold_idx = val_split["threshold_idx"]
+                calibration_info = {
+                    "calibration_mask_source": val_split.get("calibration_mask_source"),
+                    "threshold_mask_source": val_split.get("threshold_mask_source"),
+                    "calibration_count": int(val_split.get("calib_count", 0) or 0),
+                    "threshold_count": int(val_split.get("threshold_count", 0) or 0),
+                }
+                if bool(getattr(graph_main, "AUTOCALIBRATE_PROBS", False)):
+                    calib_results = graph_main.test(
+                        model,
+                        graph_data,
+                        node_type=node_type,
+                        threshold=None,
+                        node_indices=calib_idx,
+                        mask_name="val_calib",
+                        batch_size=int(batch_size),
+                        num_neighbors=effective_neighbors,
                     )
-                    y_prob1_val, platt_model = graph_main._platt_scale_probabilities(
-                        y_true_val,
-                        y_prob1_val_raw,
+                    calib_result = (
+                        calib_results.get("val_calib")
+                        if isinstance(calib_results, dict)
+                        else None
                     )
-                    if platt_model is not None:
-                        calibration_method = "platt_scaling"
-                        val_result_for_tau = dict(val_result_for_tau)
-                        val_result_for_tau["probs"] = np.column_stack(
-                            [
-                                np.clip(1.0 - y_prob1_val, 0.0, 1.0),
-                                np.clip(y_prob1_val, 0.0, 1.0),
-                            ]
+                    if calib_result:
+                        try:
+                            y_true_calib = calib_result["true"].detach().cpu().numpy().astype(int).ravel()
+                            y_prob1_calib_raw = _positive_class_probabilities_from_result(
+                                calib_result
+                            )
+                            _, platt_model = graph_main._platt_scale_probabilities(
+                                y_true_calib,
+                                y_prob1_calib_raw,
+                            )
+                            if platt_model is not None:
+                                calibration_method = "platt_scaling"
+                                _notify(
+                                    event="gnn_checkpoint_platt",
+                                    model=os.path.basename(str(model_path)),
+                                    calibration_method=calibration_method,
+                                )
+                        except Exception:
+                            platt_model = None
+                            calibration_method = "softmax_raw"
+                threshold_results = graph_main.test(
+                    model,
+                    graph_data,
+                    node_type=node_type,
+                    threshold=None,
+                    node_indices=threshold_idx,
+                    mask_name="val_threshold",
+                    batch_size=int(batch_size),
+                    num_neighbors=effective_neighbors,
+                    calibration_model=platt_model,
+                )
+                val_result_for_tau = (
+                    threshold_results.get("val_threshold")
+                    if isinstance(threshold_results, dict)
+                    else None
+                )
+                tau_source = (
+                    "val_threshold_far_target"
+                    if threshold_strategy == "far"
+                    else "val_threshold_fbeta_beta_1"
+                )
+            else:
+                val_results = graph_main.test(
+                    model,
+                    graph_data,
+                    node_type=node_type,
+                    threshold=None,
+                    masks=["val_mask"],
+                    batch_size=int(batch_size),
+                    num_neighbors=effective_neighbors,
+                )
+                val_result_for_tau = (
+                    val_results.get("val_mask") if isinstance(val_results, dict) else None
+                )
+                calibration_info = {
+                    "calibration_mask_source": "val_mask",
+                    "threshold_mask_source": "val_mask",
+                    "calibration_count": sample_counts.get("val"),
+                    "threshold_count": sample_counts.get("val"),
+                }
+                tau_source = (
+                    "val_mask_far_target_fallback"
+                    if threshold_strategy == "far"
+                    else "val_mask_fbeta_beta_1_fallback"
+                )
+                if val_result_for_tau and bool(getattr(graph_main, "AUTOCALIBRATE_PROBS", False)):
+                    try:
+                        y_true_val = val_result_for_tau["true"].detach().cpu().numpy().astype(int).ravel()
+                        y_prob1_val_raw = _positive_class_probabilities_from_result(
+                            val_result_for_tau
                         )
-                        _notify(
-                            event="gnn_checkpoint_platt",
-                            model=os.path.basename(str(model_path)),
-                            calibration_method=calibration_method,
+                        y_prob1_val, platt_model = graph_main._platt_scale_probabilities(
+                            y_true_val,
+                            y_prob1_val_raw,
                         )
-                except Exception:
-                    platt_model = None
-                    calibration_method = "softmax_raw"
-            tau = _comparison_tau_from_val_result(
-                val_result_for_tau,
-                fallback_tau=tau_fallback,
-            )
+                        if platt_model is not None:
+                            calibration_method = "platt_scaling"
+                            val_result_for_tau = dict(val_result_for_tau)
+                            val_result_for_tau["probs"] = np.column_stack(
+                                [
+                                    np.clip(1.0 - y_prob1_val, 0.0, 1.0),
+                                    np.clip(y_prob1_val, 0.0, 1.0),
+                                ]
+                            )
+                            _notify(
+                                event="gnn_checkpoint_platt",
+                                model=os.path.basename(str(model_path)),
+                                calibration_method=calibration_method,
+                            )
+                    except Exception:
+                        platt_model = None
+                        calibration_method = "softmax_raw"
+                if platt_model is not None:
+                    calibration_info["calibration_mask_source"] = "val_mask_fallback"
+                    calibration_info["threshold_mask_source"] = "val_mask_fallback"
+            if threshold_strategy == "far" and val_result_for_tau:
+                y_true_tau = val_result_for_tau.get("true")
+                if torch.is_tensor(y_true_tau):
+                    y_true_tau_np = y_true_tau.detach().cpu().numpy().astype(int).ravel()
+                else:
+                    y_true_tau_np = np.asarray(y_true_tau if y_true_tau is not None else [], dtype=int).ravel()
+                y_prob_tau = _positive_class_probabilities_from_result(val_result_for_tau)
+                tau, _far_info = _select_threshold_for_far_target(
+                    y_true_tau_np,
+                    y_prob_tau,
+                    far_target=float(far_target),
+                    mode="max_sens_under_far",
+                )
+            else:
+                tau = _comparison_tau_from_val_result(
+                    val_result_for_tau,
+                    fallback_tau=tau_fallback,
+                )
         _notify(
             event="gnn_checkpoint_tau",
             model=os.path.basename(str(model_path)),
@@ -3406,24 +3810,14 @@ def _evaluate_gnn_checkpoint_for_comparison(
             graph_data,
             node_type=node_type,
             threshold=float(tau),
-            masks=wanted_masks,
+            masks=eval_masks,
             batch_size=int(batch_size),
             num_neighbors=effective_neighbors,
             calibration_model=platt_model,
         )
 
         rows: List[Dict[str, object]] = []
-        for mask in ("val_mask", "test_mask"):
-            if mask not in wanted_masks:
-                rows.extend(
-                    _gnn_checkpoint_skip_rows_for_comparison(
-                        model_path=model_path,
-                        reason=f"{mask} no existe o esta vacia.",
-                        meta=meta,
-                        masks=(mask,),
-                    )
-                )
-                continue
+        for mask in eval_masks:
             result = eval_results.get(mask) if isinstance(eval_results, dict) else None
             if not result:
                 rows.extend(
@@ -3432,6 +3826,9 @@ def _evaluate_gnn_checkpoint_for_comparison(
                         reason=f"No se obtuvieron resultados para {mask}.",
                         meta=meta,
                         masks=(mask,),
+                        sample_counts=sample_counts,
+                        threshold_strategy=threshold_strategy,
+                        far_target=far_target,
                     )
                 )
                 continue
@@ -3443,6 +3840,11 @@ def _evaluate_gnn_checkpoint_for_comparison(
                     tau=float(tau),
                     meta=meta,
                     calibration_method=calibration_method,
+                    sample_counts=sample_counts,
+                    tau_source=tau_source,
+                    calibration_info=calibration_info,
+                    threshold_strategy=threshold_strategy,
+                    far_target=far_target,
                 )
             )
         _notify(
@@ -3457,14 +3859,31 @@ def _evaluate_gnn_checkpoint_for_comparison(
             model_path=model_path,
             reason=f"Error evaluando checkpoint: {exc}",
             meta=meta,
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
         )
+
+
+def _comparison_test_only_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "split" not in df.columns:
+        return df.reset_index(drop=True)
+    split_text = df["split"].astype(str).str.strip().str.lower()
+    return df[split_text.eq("test")].reset_index(drop=True)
 
 
 def _display_mlp_baseline_results(df: pd.DataFrame) -> None:
     if df is None or df.empty:
         return
+    df = _comparison_test_only_dataframe(df)
+    if df.empty:
+        st.info("No hay filas `test` para mostrar en esta comparación.")
+        return
     display_cols = [
         "model",
+        "model_family",
+        "feature_view",
         "split",
         "status",
         "auprc",
@@ -3482,13 +3901,21 @@ def _display_mlp_baseline_results(df: pd.DataFrame) -> None:
         "fp",
         "fn",
         "tau",
+        "tau_source",
+        "threshold_strategy",
+        "far_target",
         "calibration_method",
+        "calibration_mask_source",
+        "threshold_mask_source",
+        "calibration_count",
+        "threshold_count",
         "samples",
         "positives",
         "positive_rate",
         "best_epoch",
         "epochs_run",
-        "tau_source",
+        "fit_seconds",
+        "backend",
         "reason",
         "model_path",
     ]
@@ -3506,6 +3933,7 @@ def _display_mlp_baseline_results(df: pd.DataFrame) -> None:
         "fn": "FN",
         "accuracy": "accuracy",
         "tau": "tau",
+        "far_target": "FAR_target",
     }
     available = [col for col in display_cols if col in df.columns]
     display_df = df[available].rename(columns=rename_cols)
@@ -3518,6 +3946,9 @@ def _render_mlp_baseline_results_chart(
     key: str = "gnn_mlp_baseline_chart_metrics",
 ) -> None:
     if df is None or df.empty:
+        return
+    df = _comparison_test_only_dataframe(df)
+    if df.empty:
         return
     metric_options = {
         "MCC": "mcc",
@@ -4348,7 +4779,6 @@ def _build_pm_induced_heterodata(
     for required_edge_type in (
         (node_type, "spatial", node_type),
         (node_type, "temporal", node_type),
-        (node_type, "spatial_back", node_type),
         (node_type, "st_fwd", node_type),
     ):
         if required_edge_type not in out.edge_types:
@@ -5483,6 +5913,9 @@ def _train_gnn_with_best_params(
     deterministic_sampling: Optional[bool] = None,
     sampling_seed: Optional[int] = None,
     disable_hard_undersampling: Optional[bool] = None,
+    positive_sampler_target_fraction: Optional[float] = None,
+    positive_sampler_hard_window_minutes: Optional[int] = None,
+    positive_sampler_hard_negatives_per_positive: Optional[int] = None,
     cluster_gcn_num_parts: Optional[int] = None,
     cluster_gcn_parts_per_epoch: Optional[int] = None,
     graphsaint_mode: Optional[str] = None,
@@ -5541,54 +5974,41 @@ def _train_gnn_with_best_params(
     elif hp_files:
         choice_index = len(hp_files)
 
-    original_input = builtins.input
-
-    def _auto_input(prompt: str = "") -> str:
-        norm = (
-            unicodedata.normalize("NFKD", prompt)
-            .encode("ascii", "ignore")
-            .decode("ascii")
-            .lower()
-        )
-        if "seleccione el numero del archivo" in norm:
-            return str(max(choice_index, 0))
-        if "reutilizar estos" in norm:
-            return "s"
-        return "0"
-
-    builtins.input = _auto_input
-    try:
-        graph_main.run_gat_training(
-            graph_obj,
-            force_use_graphsmote=bool(use_graphsmote),
-            early_stop=bool(early_stop),
-            early_stop_patience=int(early_stop_patience),
-            early_stop_min_delta=float(early_stop_min_delta),
-            max_epochs=int(max_epochs),
-            train_sampler_mode=train_sampler_mode,
-            deterministic_sampling=deterministic_sampling,
-            sampling_seed=sampling_seed,
-            disable_hard_undersampling=disable_hard_undersampling,
-            cluster_gcn_num_parts=cluster_gcn_num_parts,
-            cluster_gcn_parts_per_epoch=cluster_gcn_parts_per_epoch,
-            graphsaint_mode=graphsaint_mode,
-            graphsaint_batch_size=graphsaint_batch_size,
-            graphsaint_num_steps=graphsaint_num_steps,
-            graphsaint_walk_length=graphsaint_walk_length,
-            rl_action_space=rl_action_space,
-            rl_initial_p=rl_initial_p,
-            rl_min_p=rl_min_p,
-            rl_max_p=rl_max_p,
-            rl_min_keep=rl_min_keep,
-            rl_positive_only=rl_positive_only,
-            rl_similarity_pretrain_epochs=rl_similarity_pretrain_epochs,
-            rl_lambda_simi=rl_lambda_simi,
-            eval_neighbors_mode=eval_neighbors_mode,
-            eval_num_neighbors=eval_num_neighbors,
-            checkpoint_metric=checkpoint_metric,
-        )
-    finally:
-        builtins.input = original_input
+    graph_main.run_gat_training(
+        graph_obj,
+        force_use_graphsmote=bool(use_graphsmote),
+        early_stop=bool(early_stop),
+        early_stop_patience=int(early_stop_patience),
+        early_stop_min_delta=float(early_stop_min_delta),
+        max_epochs=int(max_epochs),
+        train_sampler_mode=train_sampler_mode,
+        deterministic_sampling=deterministic_sampling,
+        sampling_seed=sampling_seed,
+        disable_hard_undersampling=disable_hard_undersampling,
+        positive_sampler_target_fraction=positive_sampler_target_fraction,
+        positive_sampler_hard_window_minutes=positive_sampler_hard_window_minutes,
+        positive_sampler_hard_negatives_per_positive=positive_sampler_hard_negatives_per_positive,
+        cluster_gcn_num_parts=cluster_gcn_num_parts,
+        cluster_gcn_parts_per_epoch=cluster_gcn_parts_per_epoch,
+        graphsaint_mode=graphsaint_mode,
+        graphsaint_batch_size=graphsaint_batch_size,
+        graphsaint_num_steps=graphsaint_num_steps,
+        graphsaint_walk_length=graphsaint_walk_length,
+        rl_action_space=rl_action_space,
+        rl_initial_p=rl_initial_p,
+        rl_min_p=rl_min_p,
+        rl_max_p=rl_max_p,
+        rl_min_keep=rl_min_keep,
+        rl_positive_only=rl_positive_only,
+        rl_similarity_pretrain_epochs=rl_similarity_pretrain_epochs,
+        rl_lambda_simi=rl_lambda_simi,
+        eval_neighbors_mode=eval_neighbors_mode,
+        eval_num_neighbors=eval_num_neighbors,
+        checkpoint_metric=checkpoint_metric,
+        hparams_path=str(best_params_path) if best_params_path else None,
+        hparams_index=int(choice_index) if not best_params_path else None,
+        reuse_hparams=True,
+    )
 
     model_path = _select_latest_gat_model(
         use_graphsmote=use_graphsmote, graph_obj=graph_obj
@@ -5692,6 +6112,7 @@ def _evaluate_gnn_model_far_target(
         ),
         edge_types=model_edge_types,
         edge_feature_dims=_resolve_edge_feature_dims_for_model(state_dict, graph_data),
+        edge_encoder_hidden_dims=_resolve_edge_encoder_hidden_dims_for_model(state_dict),
         edge_encoded_dims=_resolve_edge_encoded_dims_for_model(state_dict),
         edge_encoder_kinds=_resolve_edge_encoder_kinds_for_model(state_dict),
     )
@@ -5994,17 +6415,44 @@ def _load_optuna_params_from_csv(path: str) -> Dict[str, object]:
     return df.iloc[0].to_dict()
 
 
+def _normalize_gnn_train_sampler_mode(value: object) -> str:
+    raw = str(value or "neighbor").strip().lower()
+    key = raw.replace("-", "_").replace(" ", "_")
+    if "positive" in key or "pos_aware" in key:
+        return "positive_aware"
+    if "rio" in key or "rsrl" in key or "rl_top_p" in key:
+        return "rl_top_p"
+    if "cluster" in key:
+        return "cluster_gcn"
+    if "graphsaint" in key or "saint" in key:
+        return "graphsaint"
+    return "neighbor"
+
+
 def _network_config_to_hparams(
     cfg: Dict[str, object], *, use_graphsmote: bool
 ) -> Dict[str, object]:
     # Defaults alineados con RECOMMENDED_NETWORK_DEFAULTS para clase rara (~0.3%):
     # FocalLoss(α=0.75, γ=1.5), hidden=48, dropout=0.35, lr=1e-4, wd=5e-3,
     # scheduler=plateau_restart. Calibración v2 para evitar overfit de epoch-1.
+    train_sampler_mode = _normalize_gnn_train_sampler_mode(
+        cfg.get("train_sampler_mode", "neighbor")
+    )
+    rl_action_space = str(cfg.get("rl_action_space", "discrete")).strip().lower()
+    if rl_action_space in {"continuous", "actor", "actor_critic"}:
+        rl_action_space = "continuous_actor"
+    if rl_action_space not in {"discrete", "continuous_actor"}:
+        rl_action_space = "discrete"
+    try:
+        seq_length = int(cfg.get("seq_length", cfg.get("sequence_length", SEQ_LENGTH)))
+    except Exception:
+        seq_length = int(SEQ_LENGTH)
     params: Dict[str, object] = {
         "gnn_variant": _normalize_ui_gnn_variant(cfg.get("gnn_variant", GNN_VARIANT)),
         "hidden_channels": int(cfg.get("hidden_channels", 48)),
         "num_heads": int(cfg.get("num_heads", 4)),
         "num_layers": int(cfg.get("num_layers", 2)),
+        "seq_length": int(seq_length),
         "dropout": float(cfg.get("dropout", 0.35)),
         "aggr1": cfg.get("aggr1", "sum"),
         "aggr2": cfg.get("aggr2", "sum"),
@@ -6025,6 +6473,41 @@ def _network_config_to_hparams(
         "focal_alpha": float(cfg.get("focal_alpha", 0.75)),
         "loss_weight_mode": str(cfg.get("loss_weight_mode", "uniform")),
         "batch_size": int(cfg.get("batch_size", 512)),
+        "train_sampler_mode": train_sampler_mode,
+        "deterministic_sampling": _coerce_bool(
+            cfg.get("deterministic_sampling"), True
+        ),
+        "sampling_seed": int(cfg.get("sampling_seed", SEED)),
+        "disable_hard_undersampling": _coerce_bool(
+            cfg.get("disable_hard_undersampling"), True
+        ),
+        "positive_sampler_target_fraction": float(
+            cfg.get("positive_sampler_target_fraction", 0.02)
+        ),
+        "positive_sampler_hard_window_minutes": int(
+            cfg.get("positive_sampler_hard_window_minutes", 60)
+        ),
+        "positive_sampler_hard_negatives_per_positive": int(
+            cfg.get("positive_sampler_hard_negatives_per_positive", 4)
+        ),
+        "cluster_gcn_num_parts": int(cfg.get("cluster_gcn_num_parts", 0)),
+        "cluster_gcn_parts_per_epoch": int(
+            cfg.get("cluster_gcn_parts_per_epoch", 0)
+        ),
+        "graphsaint_mode": str(cfg.get("graphsaint_mode", "node")),
+        "graphsaint_batch_size": int(cfg.get("graphsaint_batch_size", 0)),
+        "graphsaint_num_steps": int(cfg.get("graphsaint_num_steps", 0)),
+        "graphsaint_walk_length": int(cfg.get("graphsaint_walk_length", 0)),
+        "rl_action_space": rl_action_space,
+        "rl_initial_p": float(cfg.get("rl_initial_p", 0.5)),
+        "rl_min_p": float(cfg.get("rl_min_p", 0.05)),
+        "rl_max_p": float(cfg.get("rl_max_p", 1.0)),
+        "rl_min_keep": int(cfg.get("rl_min_keep", 1)),
+        "rl_positive_only": _coerce_bool(cfg.get("rl_positive_only"), True),
+        "rl_similarity_pretrain_epochs": int(
+            cfg.get("rl_similarity_pretrain_epochs", 3)
+        ),
+        "rl_lambda_simi": float(cfg.get("rl_lambda_simi", 2.0)),
         # JSON-serializa lista plana o dict por relación; _resolve_num_neighbors
         # en gnn_main.py mapea dict (string keys) → tuple (edge_type) automáticamente.
         "num_neighbors": json.dumps(cfg.get("num_neighbors", [15, 10])),
@@ -6462,6 +6945,62 @@ def _build_edge_feature_extras(
     selected_arrays = [feat_dict.get(name, zeros) for name in feature_names]
     extras = np.stack(selected_arrays, axis=1)
     return np.nan_to_num(extras, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _build_bidirectional_spatial_edges(
+    spatial_edges: pd.DataFrame,
+    feat_mat_delta: np.ndarray,
+    raw_globals: pd.DataFrame,
+    portico_col: str,
+    selected_physical_features: Sequence[str],
+) -> Tuple[List[int], List[int], np.ndarray]:
+    delta_mat = np.asarray(feat_mat_delta, dtype=float)
+    if delta_mat.ndim == 1:
+        delta_mat = delta_mat.reshape(-1, 1)
+    delta_dim = int(delta_mat.shape[1]) if delta_mat.ndim == 2 else 0
+    feature_names = list(selected_physical_features or [])
+    attr_dim = delta_dim + len(feature_names)
+
+    if spatial_edges is None or spatial_edges.empty:
+        return [], [], np.zeros((0, attr_dim), dtype=float)
+
+    src = spatial_edges["node_idx_src"].to_numpy(dtype=int)
+    dst = spatial_edges["node_idx_dst"].to_numpy(dtype=int)
+    if src.size == 0:
+        return [], [], np.zeros((0, attr_dim), dtype=float)
+
+    fwd_delta = delta_mat[dst] - delta_mat[src]
+    fwd_extra = _build_edge_feature_extras(
+        spatial_edges,
+        raw_globals,
+        portico_col,
+        feature_names,
+    )
+    fwd_attr = np.concatenate([fwd_delta, fwd_extra], axis=1)
+
+    reverse_edges = pd.DataFrame(
+        {
+            "portico_src": spatial_edges["portico_dst"].values,
+            "portico_dst": spatial_edges["portico_src"].values,
+            "ts_min": spatial_edges["ts_min"].values,
+            "dist_km": spatial_edges["dist_km"].values,
+        }
+    )
+    rev_delta = delta_mat[src] - delta_mat[dst]
+    rev_extra = _build_edge_feature_extras(
+        reverse_edges,
+        raw_globals,
+        portico_col,
+        feature_names,
+    )
+    rev_attr = np.concatenate([rev_delta, rev_extra], axis=1)
+
+    bidir_src = np.concatenate([src, dst]).astype(int).tolist()
+    bidir_dst = np.concatenate([dst, src]).astype(int).tolist()
+    bidir_attr = np.concatenate([fwd_attr, rev_attr], axis=0)
+    return bidir_src, bidir_dst, np.nan_to_num(
+        bidir_attr, nan=0.0, posinf=0.0, neginf=0.0
+    )
 
 
 def _compute_normalization_stats_from_train(
@@ -9734,7 +10273,10 @@ def _edge_feature_family_from_df(df: Optional[pd.DataFrame]) -> str:
     }
     if columns.intersection(snapshot_markers):
         return "snapshot"
-    if any(col.startswith(("flow_cat_", "mix_cat_")) for col in columns):
+    if any(
+        col.startswith(("flow_cat_", "speed_mean_cat_", "density_cat_", "mix_cat_"))
+        for col in columns
+    ):
         return "snapshot"
     return "classic"
 
@@ -12419,7 +12961,6 @@ def render_graph_builder():
         tab_graph,
         tab_visual,
         tab_network,
-        tab_network_builder,
         tab_optimization,
         tab_balance,
         tab_training,
@@ -12436,7 +12977,6 @@ def render_graph_builder():
             "Graph",
             "Visual Graph",
             "Network",
-            "Network Builder",
             "Optimization",
             "Balance",
             "Training",
@@ -12482,9 +13022,6 @@ def render_graph_builder():
 
     with tab_network:
         _render_network_tab()
-
-    with tab_network_builder:
-        _render_network_builder_tab()
 
     with tab_optimization:
         _render_optimization_tab()
@@ -14495,25 +15032,6 @@ def _render_balance_tab() -> None:
                             progress_text.caption(" | ".join(parts))
 
 
-                        import builtins  # Fix UnboundLocalError
-                        import contextlib
-                        original_input = builtins.input
-                        
-                        def _auto_input(prompt: str = "") -> str:
-                            norm = (
-                                unicodedata.normalize("NFKD", prompt)
-                                .encode("ascii", "ignore")
-                                .decode("ascii")
-                                .lower()
-                            )
-                            if "seleccione el numero del archivo" in norm:
-                                return str(hp_choice)
-                            if "reutilizar estos" in norm:
-                                return "s" if train_reuse_hparams else "n"
-                            return "0"
-
-                        builtins.input = _auto_input
-                        
                         try:
                             with contextlib.redirect_stdout(stdout_proxy), contextlib.redirect_stderr(stdout_proxy):
                                 graph_main.run_gat_training(
@@ -14527,13 +15045,13 @@ def _render_balance_tab() -> None:
                                     progress_callback=_progress_cb,
                                     optimizer_overrides=optimizer_overrides,
                                     train_decoders_only=True,
+                                    hparams_index=int(hp_choice) if train_reuse_hparams else 0,
+                                    reuse_hparams=bool(train_reuse_hparams),
                                 )
                         except Exception as exc:
                             st.error(f"Error al entrenar el modelo: {exc}")
-                            builtins.input = original_input # Restore input safely if error
                             return
                         finally:
-                            builtins.input = original_input
                             root_logger.removeHandler(log_handler)
 
                     latest_model = None
@@ -15071,11 +15589,6 @@ def _render_balance_tab() -> None:
 
             with st.spinner("Ejecutando GraphSMOTE..."):
                 try:
-                    import contextlib
-                    import builtins
-                    original_input = builtins.input
-                    builtins.input = lambda _: "0"
-                    
                     with contextlib.redirect_stdout(stdout_proxy_smote), contextlib.redirect_stderr(stdout_proxy_smote):
                         augmented = graphsmote_mod.run_graphsmote(
                             model,
@@ -15094,7 +15607,6 @@ def _render_balance_tab() -> None:
                     st.error(f"Error en GraphSMOTE: {exc}")
                     return
                 finally:
-                    builtins.input = original_input
                     root_logger.removeHandler(log_handler_smote)
 
             st.session_state["balanced_graph"] = {
@@ -15404,11 +15916,6 @@ def _render_balance_tab() -> None:
 
             with st.spinner("Ejecutando ImGAGN (Entrenamiento de Generador)..."):
                 try:
-                    import contextlib
-                    import builtins
-                    original_input = builtins.input
-                    builtins.input = lambda _: "0"
-                    
                     with contextlib.redirect_stdout(stdout_proxy), contextlib.redirect_stderr(stdout_proxy):
                         result = imgagn_mod.train_imgagn(
                             graph_data,
@@ -15422,7 +15929,6 @@ def _render_balance_tab() -> None:
                     st.error(f"Error en ImGAGN: {exc}")
                     return
                 finally:
-                    builtins.input = original_input
                     root_logger.removeHandler(log_handler)
 
             x_aug = result.get("x_aug")
@@ -15631,6 +16137,14 @@ def _supported_gnn_variants() -> List[str]:
     ]
 
 
+def _network_visible_gnn_variants() -> List[str]:
+    return [
+        "gat_edge_mlp_gru",
+        "gat_edge_mlp",
+        "gat_snapshot",
+    ]
+
+
 def _normalize_ui_gnn_variant(value: Optional[object]) -> str:
     options = set(_supported_gnn_variants())
     fallback = "gat_snapshot"
@@ -15808,10 +16322,6 @@ EDGE_ENCODER_RECOMMENDATION_BY_RELATION: Dict[str, Tuple[str, str]] = {
         "layernorm_mlp",
         "Mezcla `delta_features` con features físicas de escalas distintas "
         "(km, gradientes); LayerNorm estabiliza.",
-    ),
-    "spatial_back": (
-        "layernorm_mlp",
-        "Misma física que `spatial`, distinta dirección.",
     ),
     "st_fwd": (
         "mlp_residual",
@@ -16100,7 +16610,7 @@ def _render_gnn_variant_selector(
     default_variant: Optional[object] = None,
     context_label: str = "Network",
 ) -> str:
-    options = _supported_gnn_variants()
+    options = _network_visible_gnn_variants()
     labels = _gnn_variant_ui_labels()
     current = _normalize_ui_gnn_variant(default_variant or _get_ui_selected_gnn_variant())
     idx = options.index(current) if current in options else 0
@@ -16120,6 +16630,71 @@ def _render_gnn_variant_selector(
     return selected_norm
 
 
+def _sequence_index_stats(sequence_index: Optional[object]) -> Dict[str, Optional[int]]:
+    stats: Dict[str, Optional[int]] = {
+        "sequence_length": None,
+        "sequence_count": None,
+    }
+    if sequence_index is None:
+        return stats
+    seq_rows = getattr(sequence_index, "sequence_rows", None)
+    if seq_rows is None:
+        return stats
+    try:
+        shape = tuple(int(v) for v in getattr(seq_rows, "shape", ()))
+        if len(shape) != 2:
+            shape = tuple(int(v) for v in np.asarray(seq_rows).shape)
+        if len(shape) == 2:
+            stats["sequence_count"] = int(shape[0])
+            stats["sequence_length"] = int(shape[1])
+    except Exception:
+        return stats
+    return stats
+
+
+def _graph_sequence_stats(graph_obj: Optional[Dict[str, object]]) -> Dict[str, object]:
+    stats: Dict[str, object] = {
+        "sequence_length": None,
+        "sequence_count": None,
+        "source": None,
+    }
+    if not isinstance(graph_obj, dict):
+        return stats
+
+    index_stats = _sequence_index_stats(graph_obj.get("sequence_index"))
+    if index_stats["sequence_length"] is not None:
+        stats.update(index_stats)
+        stats["source"] = "SequenceIndex"
+        return stats
+
+    sequence_config = graph_obj.get("sequence_config")
+    config_length = None
+    if isinstance(sequence_config, dict):
+        config_length = sequence_config.get("sequence_length")
+    elif sequence_config is not None:
+        config_length = getattr(sequence_config, "sequence_length", None)
+    try:
+        if config_length is not None:
+            stats["sequence_length"] = int(config_length)
+            stats["source"] = "sequence_config"
+            return stats
+    except Exception:
+        pass
+
+    metadata = graph_obj.get("metadata")
+    if isinstance(metadata, dict):
+        labeling = metadata.get("labeling")
+        if isinstance(labeling, dict):
+            try:
+                metadata_length = labeling.get("sequence_length")
+                if metadata_length is not None:
+                    stats["sequence_length"] = int(metadata_length)
+                    stats["source"] = "metadata.labeling"
+            except Exception:
+                pass
+    return stats
+
+
 def _render_gnn_strategy_reference_panel(
     *,
     context_label: str,
@@ -16128,19 +16703,11 @@ def _render_gnn_strategy_reference_panel(
     active_variant_override: Optional[str] = None,
     expanded: bool = False,
 ) -> None:
-    sequence_index = None
-    if isinstance(graph_obj, dict):
-        sequence_index = graph_obj.get("sequence_index")
-
-    seq_len = None
-    seq_count = None
-    if sequence_index is not None and getattr(sequence_index, "sequence_rows", None) is not None:
-        try:
-            seq_len = int(sequence_index.sequence_rows.shape[1])
-            seq_count = int(sequence_index.sequence_rows.shape[0])
-        except Exception:
-            seq_len = None
-            seq_count = None
+    seq_stats = _graph_sequence_stats(graph_obj)
+    seq_len = seq_stats.get("sequence_length")
+    seq_count = seq_stats.get("sequence_count")
+    seq_source = seq_stats.get("source")
+    effective_seq_len = int(seq_len) if seq_len is not None else int(SEQ_LENGTH)
 
     active_variant = _normalize_ui_gnn_variant(
         (model_meta or {}).get("gnn_variant")
@@ -16169,10 +16736,16 @@ def _render_gnn_strategy_reference_panel(
             f"- `GNN_VARIANT` (activo): **{active_variant}**  \n"
             f"- `GNN_VARIANT` (`config.py`): `{config_variant}`  \n"
             f"- `GNN_TEMPORAL_CACHE_STRATEGY`: **{cache_strategy}**  \n"
-            f"- `SEQ_LENGTH`: **{int(SEQ_LENGTH)}** snapshots  \n"
+            f"- `L_FEATURES_GRU`: **{effective_seq_len}** snapshots  \n"
+            f"- `SEQ_LENGTH` (`config.py`, fallback): `{int(SEQ_LENGTH)}` snapshots  \n"
             f"- `GUARD_BAND_MINUTES`: **{int(GUARD_BAND_MINUTES)}** min  \n"
             f"- `HORIZON_MINUTES`: **{int(HORIZON_MINUTES)}** min"
         )
+        if seq_len is not None and int(seq_len) != int(SEQ_LENGTH):
+            st.info(
+                f"Network usará L={int(seq_len)} desde {seq_source}; "
+                f"`config.py` mantiene SEQ_LENGTH={int(SEQ_LENGTH)} solo como fallback."
+            )
         st.caption(
             "Interpretación del etiquetado: positivo si existe accidente en el intervalo "
             "(t + guard_band, t + guard_band + horizon]. Para '5 minutos antes' estricto, "
@@ -16181,7 +16754,15 @@ def _render_gnn_strategy_reference_panel(
 
         if seq_len is not None and seq_count is not None:
             st.caption(
-                f"SequenceIndex detectado en el grafo: {seq_count} secuencias, longitud L={seq_len}."
+                f"SequenceIndex detectado en el grafo: {int(seq_count)} secuencias, longitud L={int(seq_len)}."
+            )
+        elif seq_len is not None:
+            st.caption(
+                f"Longitud temporal detectada desde {seq_source}: L={int(seq_len)}."
+            )
+            st.caption(
+                "Para entrenar GRU se requiere `SequenceIndex`; la longitud sin "
+                "secuencias completas sólo se usa como fallback visual/configurable."
             )
         else:
             st.caption(
@@ -16240,36 +16821,60 @@ def _render_gnn_mlp_baseline_panel(
     graph_obj: Dict[str, object],
     graph_data: HeteroData,
 ) -> None:
-    st.markdown("#### Baseline MLP sin grafo")
+    st.markdown("#### Baselines tabulares sin grafo")
     st.caption(
-        "Entrena MLPs con los mismos `x/y` y las mismas mascaras `train/val/test` del grafo cargado, "
-        "sin `edge_index`, sin NeighborLoader y sin GraphSMOTE."
+        "Entrena MLP, XGBoost y SVM con los mismos `x/y` y las mismas mascaras `train/val/test` "
+        "del grafo cargado, sin `edge_index`, sin NeighborLoader y sin GraphSMOTE."
     )
     sequence_index = graph_obj.get("sequence_index")
     if sequence_index is not None and getattr(sequence_index, "sequence_rows", None) is not None:
         try:
             seq_rows = getattr(sequence_index, "sequence_rows")
             st.caption(
-                f"MLP temporal detectado: {int(seq_rows.shape[0])} secuencias, "
+                f"Vista temporal detectada: {int(seq_rows.shape[0])} secuencias, "
                 f"L={int(seq_rows.shape[1])}."
             )
         except Exception:
-            st.caption("MLP temporal detectado, pero no se pudo leer el tamano de `sequence_rows`.")
+            st.caption("Vista temporal detectada, pero no se pudo leer el tamano de `sequence_rows`.")
     else:
-        st.caption("No se detecto `sequence_index`; el MLP temporal quedara marcado como skipped.")
+        st.caption("No se detecto `sequence_index`; los baselines temporales quedaran marcados como skipped.")
 
-    col_base_a, col_base_b = st.columns(2)
-    run_current = col_base_a.checkbox(
+    col_mlp, col_xgb, col_svm = st.columns(3)
+    run_current = col_mlp.checkbox(
         "MLP actual",
         value=True,
         key="gnn_mlp_baseline_current",
         help="Usa solo data['pm'].x del nodo objetivo.",
     )
-    run_temporal = col_base_b.checkbox(
+    run_temporal = col_mlp.checkbox(
         "MLP temporal",
         value=True,
         key="gnn_mlp_baseline_temporal",
         help="Concatena la ventana temporal desde sequence_index.sequence_rows sin usar aristas.",
+    )
+    run_xgboost_current = col_xgb.checkbox(
+        "XGBoost actual",
+        value=True,
+        key="gnn_xgboost_baseline_current",
+        help="XGBClassifier sobre data['pm'].x con scale_pos_weight automatico.",
+    )
+    run_xgboost_temporal = col_xgb.checkbox(
+        "XGBoost temporal",
+        value=True,
+        key="gnn_xgboost_baseline_temporal",
+        help="XGBClassifier sobre la ventana temporal concatenada cuando existe sequence_index.",
+    )
+    run_svm_current = col_svm.checkbox(
+        "SVM actual",
+        value=True,
+        key="gnn_svm_baseline_current",
+        help="SVM lineal balanceada sobre data['pm'].x.",
+    )
+    run_svm_temporal = col_svm.checkbox(
+        "SVM temporal",
+        value=True,
+        key="gnn_svm_baseline_temporal",
+        help="SVM lineal balanceada sobre la ventana temporal concatenada cuando existe sequence_index.",
     )
 
     col_epochs, col_patience, col_batch = st.columns(3)
@@ -16298,6 +16903,7 @@ def _render_gnn_mlp_baseline_panel(
             value=4096,
             step=512,
             key="gnn_mlp_baseline_batch_size",
+            help="Batch usado por MLP y SVM; XGBoost se entrena con su API tabular.",
         )
     )
 
@@ -16324,7 +16930,7 @@ def _render_gnn_mlp_baseline_panel(
             value=int(min(BATCH_SIZE, 256)),
             step=16,
             key="gnn_mlp_baseline_gnn_eval_batch_size",
-            help="Batch usado para evaluar el checkpoint GNN en val/test.",
+            help="Batch usado para calibrar en validación y evaluar el checkpoint GNN en test.",
         )
     )
     gnn_eval_num_neighbors = col_gnn_neighbors.text_input(
@@ -16333,12 +16939,67 @@ def _render_gnn_mlp_baseline_panel(
         key="gnn_mlp_baseline_gnn_eval_neighbors",
         help="Opcional. Vacío usa el perfil guardado en el checkpoint o config.py.",
     )
+    threshold_strategy_label = st.selectbox(
+        "Estrategia de umbral para Comparación",
+        ["FAR <= target (igual Evaluación Modelo)", "F-beta en validación"],
+        index=0,
+        key="gnn_mlp_baseline_threshold_strategy",
+        help=(
+            "Define cómo se elige tau para MLP, XGBoost, SVM y el checkpoint GNN. "
+            "FAR replica el protocolo operacional de Evaluación Modelo; F-beta queda como análisis alternativo."
+        ),
+    )
+    threshold_strategy = (
+        "fbeta"
+        if str(threshold_strategy_label).startswith("F-beta")
+        else "far"
+    )
+    comparison_far_target = 0.20
+    comparison_fbeta_beta = 1.0
+    if threshold_strategy == "far":
+        comparison_far_target = float(
+            st.number_input(
+                "FAR target Comparación",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(st.session_state.get("gnn_eval_far_target", 0.20)),
+                step=0.01,
+                key="gnn_mlp_baseline_far_target",
+                help=(
+                    "Máximo FP/(FP+TN) permitido al seleccionar tau en validación. "
+                    "Use el mismo valor que Evaluación Modelo para comparar TP/FP de forma consistente."
+                ),
+            )
+        )
+    else:
+        comparison_fbeta_beta = float(
+            st.number_input(
+                "Beta F-beta Comparación",
+                min_value=0.05,
+                max_value=5.0,
+                value=1.0,
+                step=0.05,
+                key="gnn_mlp_baseline_fbeta_beta",
+                help=(
+                    "Beta usado para maximizar F-beta en validación. "
+                    "Valores menores priorizan precisión; mayores priorizan recall. No replica Evaluación Modelo."
+                ),
+            )
+        )
 
     selected_baselines = []
     if run_current:
         selected_baselines.append("current")
     if run_temporal:
         selected_baselines.append("temporal")
+    if run_xgboost_current:
+        selected_baselines.append("xgboost_current")
+    if run_xgboost_temporal:
+        selected_baselines.append("xgboost_temporal")
+    if run_svm_current:
+        selected_baselines.append("svm_current")
+    if run_svm_temporal:
+        selected_baselines.append("svm_temporal")
 
     current_graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
     current_session_token = _comparison_session_token(graph_obj)
@@ -16347,13 +17008,13 @@ def _render_gnn_mlp_baseline_panel(
     progress_bar = st.progress(0.0)
     progress_text = st.empty()
     run_baseline = st.button(
-        "Ejecutar MLP sin grafo",
+        "Ejecutar comparación tabular",
         key="gnn_mlp_baseline_run",
         help="Entrena los baselines seleccionados y guarda la comparacion en Resultados/gnn_mlp_baselines.",
     )
     if run_baseline:
         if not selected_baselines:
-            st.warning("Seleccione al menos un baseline MLP.")
+            st.warning("Seleccione al menos un baseline tabular.")
         else:
             from src.gnn_mlp_baseline import run_gnn_mlp_baselines
 
@@ -16390,14 +17051,20 @@ def _render_gnn_mlp_baseline_panel(
                     progress_text.caption(f"{model_name}: cargando checkpoint GNN.")
                 elif event_type == "gnn_checkpoint_calibrating":
                     progress_bar.progress(0.25)
-                    progress_text.caption(f"{model_name}: calibrando Platt/tau en val_mask.")
+                    progress_text.caption(f"{model_name}: calibrando Platt/tau en validación.")
+                elif event_type == "gnn_checkpoint_calibration_fallback":
+                    progress_bar.progress(0.30)
+                    progress_text.caption(
+                        f"{model_name}: usando val_mask como fallback de calibración "
+                        f"({event.get('reason', 'sin detalle')})."
+                    )
                 elif event_type == "gnn_checkpoint_platt":
                     progress_bar.progress(0.40)
-                    progress_text.caption(f"{model_name}: Platt scaling ajustado en val_mask.")
+                    progress_text.caption(f"{model_name}: Platt scaling ajustado en validación.")
                 elif event_type == "gnn_checkpoint_tau":
                     progress_bar.progress(0.50)
                     progress_text.caption(
-                        f"{model_name}: evaluando val/test con tau="
+                        f"{model_name}: evaluando test con tau="
                         f"{float(event.get('tau', 0.5) or 0.5):.6f} "
                         f"({event.get('calibration_method', 'softmax_raw')})"
                     )
@@ -16410,7 +17077,7 @@ def _render_gnn_mlp_baseline_panel(
                     )
 
             try:
-                with st.spinner("Entrenando baselines MLP sin grafo..."):
+                with st.spinner("Entrenando baselines tabulares sin grafo..."):
                     baseline_df = run_gnn_mlp_baselines(
                         graph_obj,
                         baselines=tuple(selected_baselines),
@@ -16421,14 +17088,17 @@ def _render_gnn_mlp_baseline_panel(
                         save_dir=Path(RESULTADOS_DIR) / "gnn_mlp_baselines",
                         graph_hash=current_graph_hash,
                         progress_callback=_progress_cb,
+                        threshold_strategy=threshold_strategy,
+                        far_target=float(comparison_far_target),
+                        fbeta_beta=float(comparison_fbeta_beta),
                     )
             except Exception as exc:
-                st.error(f"Error al ejecutar baseline MLP sin grafo: {exc}")
+                st.error(f"Error al ejecutar comparación tabular sin grafo: {exc}")
             else:
                 artifact_path = baseline_df.attrs.get("artifact_path")
                 comparison_df = baseline_df.copy()
                 if selected_checkpoint != "(sin GNN)":
-                    progress_text.caption("Evaluando checkpoint GNN seleccionado en val/test...")
+                    progress_text.caption("Calibrando en validación y evaluando checkpoint GNN en test...")
                     gnn_rows = _evaluate_gnn_checkpoint_for_comparison(
                         model_path=str(selected_checkpoint),
                         graph_obj=graph_obj,
@@ -16437,6 +17107,8 @@ def _render_gnn_mlp_baseline_panel(
                         batch_size=int(gnn_eval_batch_size),
                         num_neighbors=gnn_eval_num_neighbors.strip() or None,
                         progress_callback=_progress_cb,
+                        threshold_strategy=threshold_strategy,
+                        far_target=float(comparison_far_target),
                     )
                     if gnn_rows:
                         comparison_df = pd.concat(
@@ -16462,7 +17134,7 @@ def _render_gnn_mlp_baseline_panel(
                 if artifact_path:
                     st.success(f"Resultados guardados: {artifact_path}")
                 else:
-                    st.success("Baseline MLP sin grafo finalizado.")
+                    st.success("Comparación tabular sin grafo finalizada.")
 
     previous_df = st.session_state.get("gnn_mlp_baseline_results")
     if isinstance(previous_df, pd.DataFrame) and not previous_df.empty:
@@ -16479,9 +17151,9 @@ def _render_gnn_mlp_baseline_panel(
                 current_graph_hash,
             )
         if belongs_to_current_graph:
-            st.markdown("##### Comparacion")
+            st.markdown("##### Comparacion (solo test)")
             _display_mlp_baseline_results(previous_df)
-            st.markdown("##### Visualizacion")
+            st.markdown("##### Visualizacion (solo test)")
             _render_mlp_baseline_results_chart(previous_df)
             artifact_path = st.session_state.get("gnn_mlp_baseline_artifact_path")
             if artifact_path:
@@ -16492,8 +17164,8 @@ def _render_gnn_mlp_baseline_panel(
             )
 
     st.caption(
-        "Lectura rapida: MLP temporal > GNN sugiere que el grafo/sampler perjudica; "
-        "GNN > ambos MLP sugiere aporte espacial/temporal; ambos malos apunta a features, labels, split o desbalance."
+        "Lectura rapida: un baseline tabular > GNN sugiere que el grafo/sampler perjudica; "
+        "GNN > baselines tabulares sugiere aporte espacial/temporal; todos malos apunta a features, labels, split o desbalance."
     )
 
 
@@ -16547,9 +17219,9 @@ def _render_gnn_mlp_baseline_history_panel(graph_obj: Dict[str, object]) -> None
         st.info("La corrida seleccionada no contiene filas para visualizar.")
         return
 
-    st.markdown("##### Comparacion guardada")
+    st.markdown("##### Comparacion guardada (solo test)")
     _display_mlp_baseline_results(selected_df)
-    st.markdown("##### Visualizacion guardada")
+    st.markdown("##### Visualizacion guardada (solo test)")
     _render_mlp_baseline_results_chart(
         selected_df,
         key="gnn_mlp_baseline_history_chart_metrics",
@@ -16793,6 +17465,43 @@ def _render_training_tab() -> None:
     else:
         st.caption(f"Se reutilizaran los hiperparametros: {hp_choice}.")
 
+    if network_option and hp_choice == network_option and isinstance(network_cfg, dict):
+        network_sampler_labels = {
+            "neighbor": "NeighborLoader (nativo)",
+            "positive_aware": "Positive-aware NeighborLoader",
+            "cluster_gcn": "Cluster-GCN (nativo)",
+            "graphsaint": "GraphSAINT (nativo)",
+            "rl_top_p": "RioGNN top-p RL",
+        }
+        network_sampler_mode = _normalize_gnn_train_sampler_mode(
+            network_cfg.get("train_sampler_mode", "neighbor")
+        )
+        network_sampler_label = network_sampler_labels.get(network_sampler_mode)
+        if network_sampler_label:
+            st.session_state["gnn_train_sampler_mode"] = network_sampler_label
+        network_sampling_state_keys = {
+            "deterministic_sampling": "gnn_train_det_sampling",
+            "sampling_seed": "gnn_train_sampling_seed",
+            "disable_hard_undersampling": "gnn_train_disable_hard",
+            "positive_sampler_target_fraction": "gnn_train_positive_fraction",
+            "positive_sampler_hard_window_minutes": "gnn_train_positive_window",
+            "positive_sampler_hard_negatives_per_positive": "gnn_train_positive_hard_per_pos",
+            "rl_action_space": "gnn_train_rl_action_space",
+            "rl_initial_p": "gnn_train_rl_initial_p",
+            "rl_min_p": "gnn_train_rl_min_p",
+            "rl_max_p": "gnn_train_rl_max_p",
+            "rl_min_keep": "gnn_train_rl_min_keep",
+            "rl_positive_only": "gnn_train_rl_positive_only",
+            "rl_similarity_pretrain_epochs": "gnn_train_rl_pretrain_epochs",
+            "rl_lambda_simi": "gnn_train_rl_lambda_simi",
+        }
+        for cfg_key, state_key in network_sampling_state_keys.items():
+            if cfg_key in network_cfg:
+                st.session_state[state_key] = network_cfg[cfg_key]
+        st.caption(
+            f"Sampler desde Network: {network_sampler_label or network_sampler_mode}."
+        )
+
     # Selección automática de dispositivo
     eval_device = _render_training_device_status()
     st.markdown("#### Early stopping")
@@ -16878,6 +17587,7 @@ def _render_training_tab() -> None:
     st.markdown("#### Sampling y Fidelity (comparación con full-batch)")
     fidelity_targets = [
         "NeighborLoader (nativo)",
+        "Positive-aware NeighborLoader",
         "Cluster-GCN (nativo)",
         "GraphSAINT (nativo)",
         "RioGNN top-p RL",
@@ -16887,6 +17597,8 @@ def _render_training_tab() -> None:
         "Cluster-GCN (seed partitions)": "Cluster-GCN (nativo)",
         "GraphSAINT (seed sampling)": "GraphSAINT (nativo)",
         "RioGNN top-p RL": "RioGNN top-p RL",
+        "positive_aware": "Positive-aware NeighborLoader",
+        "Positive-aware NeighborLoader": "Positive-aware NeighborLoader",
     }
     legacy_fidelity = st.session_state.get("gnn_train_fidelity_target_sampler")
     if isinstance(legacy_fidelity, str) and legacy_fidelity in legacy_sampler_labels:
@@ -16947,6 +17659,7 @@ def _render_training_tab() -> None:
 
     sampler_options = {
         "NeighborLoader (nativo)": "neighbor",
+        "Positive-aware NeighborLoader": "positive_aware",
         "Cluster-GCN (nativo)": "cluster_gcn",
         "GraphSAINT (nativo)": "graphsaint",
         "RioGNN top-p RL": "rl_top_p",
@@ -16958,6 +17671,7 @@ def _render_training_tab() -> None:
         help=(
             "Define cómo se construyen los batches de entrenamiento con samplers nativos de PyG. "
             "NeighborLoader: baseline rápido. "
+            "Positive-aware: mantiene NeighborLoader pero ordena seeds para que cada batch tenga señal positiva y negativos duros topológicos. "
             "Cluster-GCN: usa `ClusterData/ClusterLoader` para particionar y muestrear por clústeres. "
             "GraphSAINT: usa `GraphSAINT*Sampler` para muestreo estocástico de nodos/aristas/caminatas. "
             "RioGNN top-p RL: filtra vecinos por similitud label-aware y thresholds RSRL por relación/capa."
@@ -16995,6 +17709,66 @@ def _render_training_tab() -> None:
             "Útil para comparar de forma más limpia el efecto puro del sampler."
         ),
     )
+
+    positive_sampler_target_fraction_train = float(
+        st.session_state.get("gnn_train_positive_fraction", 0.02)
+    )
+    positive_sampler_hard_window_minutes_train = int(
+        st.session_state.get("gnn_train_positive_window", 60)
+    )
+    positive_sampler_hard_negatives_per_positive_train = int(
+        st.session_state.get("gnn_train_positive_hard_per_pos", 4)
+    )
+    if train_sampler_mode == "positive_aware":
+        pos_col_a, pos_col_b, pos_col_c = st.columns(3)
+        with pos_col_a:
+            positive_sampler_target_fraction_train = float(
+                st.number_input(
+                    "Positive-aware fracción positiva",
+                    min_value=0.001,
+                    max_value=0.50,
+                    value=float(positive_sampler_target_fraction_train),
+                    step=0.005,
+                    format="%.3f",
+                    key="gnn_train_positive_fraction",
+                    help=(
+                        "Fracción objetivo de semillas positivas por batch. "
+                        "Default 0.02: con batch_size=512 fuerza unos 10 positivos por batch. "
+                        "Subirlo aumenta recall/gradiente positivo pero puede distorsionar la prevalencia; "
+                        "no lo interpretes como prevalencia real de validación/test."
+                    ),
+                )
+            )
+        with pos_col_b:
+            positive_sampler_hard_window_minutes_train = int(
+                st.number_input(
+                    "Ventana temporal hard negatives (min)",
+                    min_value=0,
+                    value=int(positive_sampler_hard_window_minutes_train),
+                    step=5,
+                    key="gnn_train_positive_window",
+                    help=(
+                        "Busca negativos de train del mismo pórtico dentro de ±N minutos de cada positivo. "
+                        "Default 60 min. Una ventana muy alta mete negativos fáciles/lejanos; "
+                        "0 desactiva el componente temporal y conserva hard negatives espaciales."
+                    ),
+                )
+            )
+        with pos_col_c:
+            positive_sampler_hard_negatives_per_positive_train = int(
+                st.number_input(
+                    "Hard negatives por positivo",
+                    min_value=0,
+                    value=int(positive_sampler_hard_negatives_per_positive_train),
+                    step=1,
+                    key="gnn_train_positive_hard_per_pos",
+                    help=(
+                        "Cantidad máxima de negativos duros topológicos que se intentan mezclar por cada positivo del batch. "
+                        "Default 4. Si lo subes demasiado, el batch se vuelve local y menos diverso; "
+                        "0 usa positivos balanceados con negativos aleatorios."
+                    ),
+                )
+            )
 
     cluster_gcn_num_parts_train = 64
     cluster_gcn_parts_per_epoch_train = 0
@@ -17283,6 +18057,7 @@ def _render_training_tab() -> None:
 
     use_graphsmote_effective = bool(use_graphsmote_train)
     training_checkpoint_path = None
+    training_metrics_history_path = None
     training_stop_flag_path = None
     training_stop_state_key = None
     training_test_flag_path = None
@@ -17311,6 +18086,7 @@ def _render_training_tab() -> None:
         ckpt_dir = Path(RESULTADOS_DIR) / "gnn_train_checkpoints" / f"{variant_tag}_{config_hash}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         training_checkpoint_path = ckpt_dir / "checkpoint.pt"
+        training_metrics_history_path = ckpt_dir / "metrics_history.jsonl"
         training_stop_flag_path = ckpt_dir / "stop.request"
         training_stop_state_key = f"gnn_train_stop_requested_{config_hash}"
         training_test_flag_path = ckpt_dir / "test.request"
@@ -17329,6 +18105,9 @@ def _render_training_tab() -> None:
                 best_monitor_ckpt = ckpt.get("best_monitor_value", best_val_loss_ckpt)
                 best_val = ckpt.get("best_val_f1")
                 run_id = ckpt.get("run_id")
+                metrics_history_from_ckpt = ckpt.get("metrics_history_path")
+                if metrics_history_from_ckpt:
+                    training_metrics_history_path = Path(str(metrics_history_from_ckpt))
                 last_val_loss = ckpt.get("last_val_loss")
                 last_val_f1 = ckpt.get("last_val_f1")
                 last_val_auc = ckpt.get("last_val_auc")
@@ -17439,6 +18218,8 @@ def _render_training_tab() -> None:
     if reset_training and training_checkpoint_path is not None:
         try:
             training_checkpoint_path.unlink(missing_ok=True)
+            if training_metrics_history_path is not None:
+                Path(training_metrics_history_path).unlink(missing_ok=True)
             st.success("Checkpoint eliminado. El entrenamiento iniciará desde cero.")
             training_pending = False
         except Exception as exc:
@@ -17498,16 +18279,7 @@ def _render_training_tab() -> None:
         patience_text = live_container.caption("Patience 0/0")
         epoch_progress_bar = live_container.progress(0)
         epoch_progress_text = live_container.caption("Batch 0/0")
-        batch_cols = live_container.columns(5)
-        metric_batch_loss = batch_cols[0].empty()
-        metric_batch_cls = batch_cols[1].empty()
-        metric_batch_edge = batch_cols[2].empty()
-        metric_batch_l2 = batch_cols[3].empty()
-        metric_batch_lr = batch_cols[4].empty()
-        metric_batch_loss.metric("Batch loss", "N/A")
-        metric_batch_cls.metric("Batch CLS", "N/A")
-        metric_batch_edge.metric("Batch Edge", "N/A")
-        metric_batch_l2.metric("Batch L2_Att", "N/A")
+        metric_batch_lr = live_container.empty()
         metric_batch_lr.metric("Batch LR", "N/A")
         action_cols = live_container.columns([0.50, 0.25, 0.25])
         action_status = action_cols[0].empty()
@@ -17570,14 +18342,26 @@ def _render_training_tab() -> None:
         root_logger.addHandler(log_handler)
         stdout_proxy = StreamlitStdout(log_container)
 
+        persisted_metrics: List[Dict[str, object]] = []
+        persisted_test_results: List[Dict[str, object]] = []
+        persisted_run_id: Optional[str] = None
+        if training_pending and training_metrics_history_path is not None:
+            (
+                persisted_metrics,
+                persisted_test_results,
+                persisted_run_id,
+            ) = _load_gnn_training_history(training_metrics_history_path)
+            if training_status.get("run_id"):
+                persisted_run_id = str(training_status.get("run_id"))
+
         live_state = {
-            "run_id": None,
-            "metrics": [],
+            "run_id": persisted_run_id,
+            "metrics": list(persisted_metrics),
             "last_chart_update": 0.0,
             "has_json": False,
             "current_epoch": None,
             "stopped_by_user": False,
-            "test_results": [],
+            "test_results": list(persisted_test_results),
         }
 
         def _update_charts() -> None:
@@ -17621,6 +18405,8 @@ def _render_training_tab() -> None:
                     {
                         "epoch": row.get("epoch"),
                         "best_epoch": row.get("best_epoch"),
+                        "target": row.get("eval_target"),
+                        "auto": row.get("automatic"),
                         "Accuracy": row.get("accuracy"),
                         "Recall": row.get("recall"),
                         "Precision": row.get("precision"),
@@ -17635,7 +18421,7 @@ def _render_training_tab() -> None:
             with live_test_placeholder.container():
                 st.markdown("#### Test intermedio en test_mask")
                 st.caption(
-                    "Resultados calculados con el mejor checkpoint disponible del entrenamiento actual."
+                    "Resultados diagnosticos; no alimentan early stopping, seleccion de checkpoint ni umbral."
                 )
                 st.dataframe(result_df, width="stretch")
                 last = rows[-1]
@@ -17671,6 +18457,11 @@ def _render_training_tab() -> None:
                     if last.get("mcc") is not None else "N/A",
                 )
 
+        if live_state["metrics"]:
+            _update_charts()
+        if live_state["test_results"]:
+            _render_live_test_results()
+
         def _handle_training_event(payload: dict) -> None:
             if payload.get("scope") != "gnn_training":
                 return
@@ -17678,7 +18469,6 @@ def _render_training_tab() -> None:
             run_id = payload.get("run_id")
             if live_state["run_id"] is None:
                 live_state["run_id"] = run_id
-                live_state["metrics"] = []
             elif run_id and run_id != live_state["run_id"]:
                 return
             if event in {"epoch", "train_end", "train_batch"}:
@@ -17732,10 +18522,6 @@ def _render_training_tab() -> None:
                 live_state["current_epoch"] = None
                 epoch_progress_bar.progress(0.0)
                 epoch_progress_text.caption("Batch 0/0")
-                metric_batch_loss.metric("Batch loss", "N/A")
-                metric_batch_cls.metric("Batch CLS", "N/A")
-                metric_batch_edge.metric("Batch Edge", "N/A")
-                metric_batch_l2.metric("Batch L2_Att", "N/A")
                 metric_batch_lr.metric("Batch LR", "N/A")
                 metric_val_loss.metric("Val loss", "N/A")
                 metric_best_monitor.metric("Best monitor", "N/A")
@@ -17758,19 +18544,7 @@ def _render_training_tab() -> None:
                 else:
                     epoch_progress_text.caption("Batch 0/0")
 
-                train_loss = payload.get("train_loss")
-                train_cls_loss = payload.get("train_cls_loss")
-                train_edge_loss = payload.get("train_edge_loss")
-                train_l2_att_loss = payload.get("train_l2_att_loss")
                 lr = payload.get("lr")
-                if train_loss is not None:
-                    metric_batch_loss.metric("Batch loss", f"{train_loss:.4f}")
-                if train_cls_loss is not None:
-                    metric_batch_cls.metric("Batch CLS", f"{train_cls_loss:.4f}")
-                if train_edge_loss is not None:
-                    metric_batch_edge.metric("Batch Edge", f"{train_edge_loss:.4f}")
-                if train_l2_att_loss is not None:
-                    metric_batch_l2.metric("Batch L2_Att", f"{train_l2_att_loss:.4f}")
                 if lr is not None:
                     metric_batch_lr.metric("Batch LR", f"{lr:.2e}")
                 ram_mb = _get_ram_mb()
@@ -18067,22 +18841,6 @@ def _render_training_tab() -> None:
                 else:
                     hp_choice_index = idx
 
-        original_input = builtins.input
-
-        def _auto_input(prompt: str = "") -> str:
-            norm = (
-                unicodedata.normalize("NFKD", prompt)
-                .encode("ascii", "ignore")
-                .decode("ascii")
-                .lower()
-            )
-            if "seleccione el numero del archivo" in norm:
-                return str(max(hp_choice_index, 0))
-            if "reutilizar estos" in norm:
-                return "s" if reuse_hparams else "n"
-            return "0"
-
-        builtins.input = _auto_input
         train_start_ts = time.time()
         with st.spinner("Entrenando modelo GNN..."):
             try:
@@ -18098,10 +18856,25 @@ def _render_training_tab() -> None:
                         accumulation_steps=int(accumulation_steps_train),
                         resume_state_path=str(training_checkpoint_path) if training_pending and training_checkpoint_path else None,
                         save_state_path=str(training_checkpoint_path) if training_checkpoint_path else None,
+                        metrics_history_path=(
+                            str(training_metrics_history_path)
+                            if training_metrics_history_path is not None
+                            else None
+                        ),
+                        test_eval_interval_epochs=2,
                         train_sampler_mode=str(train_sampler_mode),
                         deterministic_sampling=bool(deterministic_sampling_train),
                         sampling_seed=int(sampling_seed_train),
                         disable_hard_undersampling=bool(disable_hard_undersampling_train),
+                        positive_sampler_target_fraction=float(
+                            positive_sampler_target_fraction_train
+                        ),
+                        positive_sampler_hard_window_minutes=int(
+                            positive_sampler_hard_window_minutes_train
+                        ),
+                        positive_sampler_hard_negatives_per_positive=int(
+                            positive_sampler_hard_negatives_per_positive_train
+                        ),
                         cluster_gcn_num_parts=int(cluster_gcn_num_parts_train),
                         cluster_gcn_parts_per_epoch=int(cluster_gcn_parts_per_epoch_train),
                         graphsaint_mode=str(graphsaint_mode_train),
@@ -18121,6 +18894,17 @@ def _render_training_tab() -> None:
                         checkpoint_metric=str(checkpoint_metric_train),
                         should_stop=_should_stop_training,
                         should_test=_consume_test_training_request,
+                        hparams_path=(
+                            str(selected_hp_path)
+                            if reuse_hparams and selected_hp_path is not None
+                            else None
+                        ),
+                        hparams_index=(
+                            int(hp_choice_index)
+                            if reuse_hparams and selected_hp_path is None
+                            else None
+                        ),
+                        reuse_hparams=bool(reuse_hparams),
                     )
             except Exception as exc:
                 exc_text = str(exc).strip() or repr(exc)
@@ -18142,7 +18926,6 @@ def _render_training_tab() -> None:
                     )
                 return
             finally:
-                builtins.input = original_input
                 root_logger.removeHandler(log_handler)
                 root_logger.removeHandler(json_handler)
                 st.session_state.pop("gnn_train_active_stop_flag_path", None)
@@ -18607,6 +19390,13 @@ def _perform_model_evaluation(
     threshold_strategy: str = "manual",
     far_target: float = 0.20,
     pm_index: Optional[object] = None,
+    graph_hash: Optional[str] = None,
+    xai_enabled: bool = False,
+    xai_layer: str = "auto",
+    xai_percentile: float = 0.95,
+    xai_k_heads: int = 3,
+    xai_max_edges: int = 500,
+    xai_visual_metric: str = "mean_attention",
 ) -> None:
     try:
         from src import gnn_main as graph_main
@@ -18792,6 +19582,7 @@ def _perform_model_evaluation(
             ),
             edge_types=model_edge_types,
             edge_feature_dims=_resolve_edge_feature_dims_for_model(state_dict, graph_data),
+            edge_encoder_hidden_dims=_resolve_edge_encoder_hidden_dims_for_model(state_dict),
             edge_encoded_dims=_resolve_edge_encoded_dims_for_model(state_dict),
             edge_encoder_kinds=_resolve_edge_encoder_kinds_for_model(state_dict),
         )
@@ -19218,6 +20009,63 @@ def _perform_model_evaluation(
             force=True,
         )
 
+        def _prediction_df_from_eval_result(mask_name: str, m_res: Mapping[str, object]) -> Optional[pd.DataFrame]:
+            preds = m_res.get("preds")
+            probs = m_res.get("probs")
+            true = m_res.get("true")
+            node_idx = m_res.get("node_idx")
+            if preds is None or probs is None or true is None or node_idx is None:
+                return None
+            try:
+                preds_np = preds.detach().cpu().numpy() if hasattr(preds, "detach") else np.asarray(preds)
+                probs_np = probs.detach().cpu().numpy() if hasattr(probs, "detach") else np.asarray(probs)
+                true_np = true.detach().cpu().numpy() if hasattr(true, "detach") else np.asarray(true)
+                node_np = node_idx.detach().cpu().numpy() if hasattr(node_idx, "detach") else np.asarray(node_idx)
+            except Exception:
+                return None
+            n = min(len(preds_np), len(true_np), len(node_np), probs_np.shape[0] if getattr(probs_np, "ndim", 0) > 1 else len(probs_np))
+            if n <= 0:
+                return None
+            preds_np = preds_np[:n].astype(int)
+            true_np = true_np[:n].astype(int)
+            node_np = node_np[:n].astype(int)
+            prob1_np = probs_np[:n, 1] if getattr(probs_np, "ndim", 1) > 1 and probs_np.shape[1] > 1 else probs_np[:n]
+
+            def _etype(yt: int, yp: int) -> str:
+                if yt == 1 and yp == 1:
+                    return "TP"
+                if yt == 0 and yp == 0:
+                    return "TN"
+                if yt == 0 and yp == 1:
+                    return "FP"
+                if yt == 1 and yp == 0:
+                    return "FN"
+                return "unknown"
+
+            return pd.DataFrame(
+                {
+                    "node_idx": node_np,
+                    "mask": str(mask_name),
+                    "y_true": true_np,
+                    "y_pred": preds_np,
+                    "prob1": prob1_np.astype(float),
+                    "error_type": [_etype(int(yt), int(yp)) for yt, yp in zip(true_np, preds_np)],
+                }
+            )
+
+        prediction_tables: Dict[str, pd.DataFrame] = {}
+        for mask_name, m_res in results.items():
+            pred_df = _prediction_df_from_eval_result(mask_name, m_res)
+            if pred_df is not None:
+                m_res["prediction_df"] = pred_df
+                prediction_tables[str(mask_name)] = pred_df
+        if prediction_tables:
+            st.session_state["gnn_eval_prediction_df"] = prediction_tables.get(
+                "test_mask",
+                next(iter(prediction_tables.values())),
+            )
+            st.session_state["gnn_eval_prediction_tables"] = prediction_tables
+
         # Mostrar Reportes
         sample_note = (
             f"Subset aleatorio de hasta {int(max_nodes_per_mask)} nodos."
@@ -19300,6 +20148,91 @@ def _perform_model_evaluation(
                 st.markdown("**Reporte Completo**")
                 st.dataframe(pd.DataFrame(rep).transpose())
 
+        if xai_enabled:
+            progress_ui.update(
+                0.985,
+                "Calculando explicabilidad del grafo",
+                step_id="xai_start",
+                detail=(
+                    f"layer={xai_layer} | percentile={float(xai_percentile):.2f} "
+                    f"| min_heads={int(xai_k_heads)}"
+                ),
+                event_type="xai_start",
+                force=True,
+            )
+            try:
+                from src.gnn_xai import compute_gnn_xai_graph, save_gnn_xai_result
+
+                xai_mask = "test_mask" if "test_mask" in results else next(iter(results.keys()))
+                xai_node_indices = results[xai_mask].get("node_idx")
+                temporal_module = getattr(model, "temporal_head", None)
+                if temporal_module is not None:
+                    try:
+                        temporal_module.reset_cache()
+                    except Exception:
+                        pass
+                    try:
+                        graph_main._prime_temporal_cache_if_needed(
+                            model,
+                            graph_data,
+                            node_type=node_type,
+                            context=f"xai:{xai_mask}",
+                        )
+                    except Exception:
+                        pass
+                xai_result = compute_gnn_xai_graph(
+                    model=model,
+                    graph=graph_data,
+                    pm_index=pm_index,
+                    mask_name=str(xai_mask),
+                    node_indices=xai_node_indices,
+                    batch_size=eval_batch_size,
+                    num_neighbors=num_neighbors,
+                    percentile=float(xai_percentile),
+                    k_heads=int(xai_k_heads),
+                    layer=xai_layer,
+                    node_type=node_type,
+                    threshold=float(eval_threshold),
+                    calibration_model=platt_model,
+                    temporal_module=temporal_module,
+                    device=device,
+                    model_path=model_path,
+                    graph_hash=graph_hash,
+                )
+                output_dir = save_gnn_xai_result(xai_result)
+                st.session_state["gnn_xai_last_result"] = xai_result
+                st.session_state["gnn_xai_last_dir"] = str(output_dir)
+                st.session_state["gnn_xai_last_manifest"] = dict(xai_result.manifest)
+
+                with st.expander("Explicabilidad del grafo", expanded=True):
+                    st.caption(
+                        f"Resultado guardado en `{output_dir}`. "
+                        f"Nodos={len(xai_result.nodes_df):,} | aristas relevantes={len(xai_result.edges_df):,}."
+                    )
+                    if not xai_result.summary_df.empty:
+                        st.markdown("**Resumen por capa y relación**")
+                        st.dataframe(xai_result.summary_df, width="stretch")
+                    if not xai_result.edges_df.empty:
+                        metric = str(xai_visual_metric)
+                        sort_col = metric if metric in xai_result.edges_df.columns else "mean_attention"
+                        preview = xai_result.edges_df.sort_values(sort_col, ascending=False).head(
+                            int(max(1, xai_max_edges))
+                        )
+                        st.markdown("**Aristas relevantes**")
+                        st.dataframe(preview, width="stretch")
+                    else:
+                        st.info("No se encontraron aristas que superen los filtros XAI seleccionados.")
+                progress_ui.update(
+                    0.995,
+                    "Explicabilidad del grafo lista",
+                    step_id="xai_done",
+                    detail=f"Aristas relevantes={len(xai_result.edges_df):,}",
+                    event_type="xai_done",
+                )
+            except Exception as exc:
+                st.warning(f"No se pudo calcular XAI del grafo: {exc}")
+                st.exception(exc)
+
         # Liberar tensores grandes si no se necesitan.
         for m_res in results.values():
             m_res.pop("preds", None)
@@ -19329,18 +20262,41 @@ def _render_evaluation_tab() -> None:
         return
 
     # 1. Selección de Modelo
-    model_files = sorted(
-        glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt"))
-    )
+    graph_identity = _resolve_graph_identity_for_loaded_graph(loaded_graph)
+    graph_hash = graph_identity.get("graph_hash")
+    if graph_hash:
+        st.caption(
+            f"Filtro activo: modelos asociados al grafo `{graph_hash[:16]}` "
+            f"({graph_identity.get('graph_hash_source') or 'fuente no especificada'})."
+        )
+    else:
+        st.warning(
+            "No se pudo resolver `graph_hash` para el grafo cargado. "
+            "No se listarán modelos para evitar evaluar checkpoints de otro grafo."
+        )
+        return
+
+    model_files = _list_gnn_model_files_for_evaluation(loaded_graph)
     if not model_files:
-        st.warning("No se encontraron modelos guardados en Results/.")
+        st.warning(
+            "No se encontraron modelos GNN asociados al grafo cargado en memoria."
+        )
         return
 
     model_opts = ["(seleccione)"] + model_files
+    current_model = st.session_state.get("gnn_eval_model_path")
+    model_index = (
+        model_opts.index(current_model) if current_model in model_opts else 0
+    )
+    if current_model and current_model not in model_opts:
+        st.session_state["gnn_eval_model_path"] = "(seleccione)"
     selected_model_path = st.selectbox(
         "Seleccione Modelo GNN para evaluar",
         options=model_opts,
-        format_func=lambda x: "(seleccione)" if x == "(seleccione)" else os.path.basename(x),
+        format_func=lambda x: "(seleccione)"
+        if x == "(seleccione)"
+        else os.path.basename(x),
+        index=model_index,
         key="gnn_eval_model_path",
     )
 
@@ -19518,6 +20474,92 @@ def _render_evaluation_tab() -> None:
             ),
         )
 
+    st.markdown("#### Explicabilidad del grafo")
+    xai_enabled = st.checkbox(
+        "Calcular XAI después de evaluar",
+        value=False,
+        key="gnn_eval_xai_enabled",
+        help=(
+            "Activa el análisis de atención por arista unido a predicción por nodo. "
+            "Úselo tras una evaluación final; en grafos grandes aumenta tiempo y memoria."
+        ),
+    )
+    try:
+        xai_num_layers = int(meta.get("num_layers", 1)) if isinstance(meta, dict) else 1
+    except Exception:
+        xai_num_layers = 1
+    xai_num_layers = max(1, xai_num_layers)
+    try:
+        xai_num_heads = int(meta.get("num_heads") or 3) if isinstance(meta, dict) else 3
+    except Exception:
+        xai_num_heads = 3
+    xai_num_heads = max(1, xai_num_heads)
+    xai_layer_options = [f"conv{i}" for i in range(1, xai_num_layers + 1)]
+    xai_default_layer = "conv2" if "conv2" in xai_layer_options else xai_layer_options[-1]
+    xai_col_a, xai_col_b, xai_col_c = st.columns(3)
+    with xai_col_a:
+        xai_layer = st.selectbox(
+            "Capa de atención",
+            options=xai_layer_options,
+            index=xai_layer_options.index(xai_default_layer),
+            key="gnn_eval_xai_layer",
+            help=(
+                "Selecciona la capa GNN desde la que se extraen pesos de atención. "
+                "Por defecto usa conv2 si existe, si no la última; usar capas tempranas puede enfatizar vecindad local."
+            ),
+        )
+    with xai_col_b:
+        xai_percentile = st.slider(
+            "Percentil de atención",
+            min_value=0.50,
+            max_value=0.99,
+            value=0.95,
+            step=0.01,
+            key="gnn_eval_xai_percentile",
+            help=(
+                "Umbral relativo para conservar aristas con atención alta. "
+                "Rango 0.50-0.99; valores bajos muestran ruido, valores muy altos pueden dejar el grafo casi vacío."
+            ),
+        )
+    with xai_col_c:
+        xai_k_heads = st.number_input(
+            "Mínimo de cabezales",
+            min_value=1,
+            max_value=xai_num_heads,
+            value=min(3, xai_num_heads),
+            step=1,
+            key="gnn_eval_xai_k_heads",
+            help=(
+                "Número mínimo de cabezales de atención que deben superar el percentil. "
+                "Aumentarlo exige consenso entre cabezales; usarlo mayor que los heads del modelo no es válido."
+            ),
+        )
+    xai_col_d, xai_col_e = st.columns(2)
+    with xai_col_d:
+        xai_max_edges = st.number_input(
+            "Máximo de aristas a visualizar",
+            min_value=10,
+            max_value=20000,
+            value=500,
+            step=50,
+            key="gnn_eval_xai_max_edges",
+            help=(
+                "Limita la tabla y el grafo visual para mantener la UI fluida. "
+                "No cambia el cálculo guardado; valores altos pueden hacer ilegible la visualización."
+            ),
+        )
+    with xai_col_e:
+        xai_visual_metric = st.selectbox(
+            "Métrica visual",
+            ["mean_attention", "max_attention", "prob1", "error_type"],
+            index=0,
+            key="gnn_eval_xai_visual_metric",
+            help=(
+                "Define cómo se ordenan y colorean los resultados XAI. "
+                "mean/max_attention priorizan aristas; prob1/error_type priorizan el estado predictivo de nodos."
+            ),
+        )
+
     if st.button("Ejecutar Evaluacion en Grafo Actual"):
         graph_data_eval = graph_data
         if force_cpu_graph:
@@ -19549,6 +20591,13 @@ def _render_evaluation_tab() -> None:
             batch_size=int(eval_batch_size),
             num_neighbors=num_neighbors_val,
             pm_index=loaded_graph.get("pm_index"),
+            graph_hash=_resolve_graph_hash_for_loaded_graph(dict(loaded_graph)),
+            xai_enabled=bool(xai_enabled),
+            xai_layer=str(xai_layer),
+            xai_percentile=float(xai_percentile),
+            xai_k_heads=int(xai_k_heads),
+            xai_max_edges=int(xai_max_edges),
+            xai_visual_metric=str(xai_visual_metric),
         )
 
 
@@ -19668,7 +20717,6 @@ GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS: Tuple[Tuple[str, object], ...] = (
         {
             "temporal": (25, 25),
             "spatial": (3, 3),
-            "spatial_back": (3, 3),
         },
     ),
 )
@@ -19802,7 +20850,7 @@ def _render_optuna_neighbor_profiles_controls(
                 value=default_txt,
                 key=f"{key_prefix}_neighbor_profile_{name}",
                 help=(
-                    "JSON con claves de relación: temporal, spatial y spatial_back."
+                    "JSON con claves de relación: temporal, spatial y st_fwd."
                     if isinstance(_clone_optuna_neighbor_profile(default_profile), Mapping)
                     else None
                 ),
@@ -21705,6 +22753,15 @@ def _materialize_sampler_hparams_variant(
     params["disable_hard_undersampling"] = bool(
         cfg.get("disable_hard_undersampling", False)
     )
+    params["positive_sampler_target_fraction"] = float(
+        cfg.get("positive_sampler_target_fraction", 0.02)
+    )
+    params["positive_sampler_hard_window_minutes"] = int(
+        cfg.get("positive_sampler_hard_window_minutes", 60)
+    )
+    params["positive_sampler_hard_negatives_per_positive"] = int(
+        cfg.get("positive_sampler_hard_negatives_per_positive", 4)
+    )
     params["cluster_gcn_num_parts"] = int(cfg.get("cluster_gcn_num_parts", 0))
     params["cluster_gcn_parts_per_epoch"] = int(
         cfg.get("cluster_gcn_parts_per_epoch", 0)
@@ -21777,7 +22834,7 @@ def _render_sampler_fidelity_experiment(
     with st.expander("¿Qué ajustas y qué efecto tiene?", expanded=False):
         st.markdown(
             "- `num_neighbors`: define cuántos vecinos toma por capa; valores más altos acercan a full-batch pero consumen más memoria.\n"
-            "- `train_sampler_mode`: `neighbor`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia cómo se muestrea el subgrafo de entrenamiento.\n"
+            "- `train_sampler_mode`: `neighbor`, `positive_aware`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia cómo se muestrea el subgrafo de entrenamiento.\n"
             "- `deterministic_sampling` + `sampling_seed`: estabiliza reproducibilidad del experimento.\n"
             "- `disable_hard_undersampling`: evita sesgo por hard-mining cuando buscas fidelidad al baseline.\n"
             "- `eval_neighbors_mode`: `exhaustive` evalúa con vecindario completo para comparar en condiciones cercanas a full-batch."
@@ -22567,7 +23624,7 @@ def _render_sampler_memory_budget_experiment(
         st.markdown(
             "- `batch_size`: principal palanca de consumo de VRAM/Unified Memory por iteración.\n"
             "- `num_neighbors`: define expansión del subgrafo por capa; impacta memoria y latencia.\n"
-            "- `train_sampler_mode`: `neighbor`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia patrón de seeds/subgrafos.\n"
+            "- `train_sampler_mode`: `neighbor`, `positive_aware`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia patrón de seeds/subgrafos.\n"
             "- `backend`: permite perfilar explícitamente en `CUDA` o `MPS` (stack Apple/MLX vía PyTorch)."
         )
 
@@ -23383,10 +24440,17 @@ def _gnn_builder_graph_info(loaded_graph: Optional[Dict[str, object]]) -> Dict[s
         except Exception:
             pass
     sequence_index = (loaded_graph or {}).get("sequence_index") if isinstance(loaded_graph, dict) else None
+    seq_stats = _graph_sequence_stats(loaded_graph)
     graph_info["has_sequence_index"] = bool(
         sequence_index is not None
         and getattr(sequence_index, "sequence_rows", None) is not None
     )
+    if seq_stats.get("sequence_length") is not None:
+        graph_info["sequence_length"] = int(seq_stats["sequence_length"])
+    if seq_stats.get("sequence_count") is not None:
+        graph_info["sequence_count"] = int(seq_stats["sequence_count"])
+    if seq_stats.get("source"):
+        graph_info["sequence_length_source"] = str(seq_stats["source"])
     return graph_info
 
 
@@ -23556,7 +24620,7 @@ def _gnn_builder_render_editor() -> NetworkArchitecture:
             max_value=12,
             step=1,
             key="gnn_builder_num_layers",
-            help="Cada capa es un bloque HeteroConv sobre spatial/temporal/spatial_back/st_fwd.",
+            help="Cada capa es un bloque HeteroConv sobre spatial/temporal/st_fwd.",
         )
         st.selectbox(
             "Temporal head",
@@ -27003,10 +28067,24 @@ RECOMMENDED_NETWORK_DEFAULTS: Dict[str, object] = {
     "use_residual": True,
     "use_relation_self_loops": False,
     "batch_size": 512,
+    "train_sampler_mode": "positive_aware",
+    "deterministic_sampling": True,
+    "sampling_seed": SEED,
+    "disable_hard_undersampling": True,
+    "positive_sampler_target_fraction": 0.02,
+    "positive_sampler_hard_window_minutes": 60,
+    "positive_sampler_hard_negatives_per_positive": 4,
+    "rl_action_space": "discrete",
+    "rl_initial_p": 0.5,
+    "rl_min_p": 0.05,
+    "rl_max_p": 1.0,
+    "rl_min_keep": 1,
+    "rl_positive_only": True,
+    "rl_similarity_pretrain_epochs": 3,
+    "rl_lambda_simi": 2.0,
     "num_neighbors": {
         "temporal": [25, 25],
         "spatial": [3, 3],
-        "spatial_back": [3, 3],
     },
     "optimizer": "AdamW",
     "lr_scheduler": "plateau_restart",
@@ -27082,13 +28160,33 @@ def _render_network_tab() -> None:
             for edge_type in graph_data.edge_types
         )
     )
+    sequence_stats = _graph_sequence_stats(loaded_graph)
+    feature_sequence_length = sequence_stats.get("sequence_length")
+    feature_sequence_count = sequence_stats.get("sequence_count")
+    sequence_length_source = sequence_stats.get("source") or "config.py fallback"
+    network_sequence_length = (
+        int(feature_sequence_length)
+        if feature_sequence_length is not None
+        else int(SEQ_LENGTH)
+    )
 
-    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+    metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
     metrics_col1.metric("Input features", in_channels)
     metrics_col2.metric("PM nodes", pm_nodes)
     metrics_col3.metric("Edges", total_edges)
+    metrics_col4.metric(
+        "Feature seq L",
+        network_sequence_length if feature_sequence_length is not None else "N/A",
+    )
+    sequence_count_text = (
+        f" | secuencias={int(feature_sequence_count)}"
+        if feature_sequence_count is not None
+        else ""
+    )
     st.caption(
-        f"edge_attr_dim={edge_feature_dim} | clases={num_classes} | tipos de aristas={len(graph_data.edge_types)}"
+        f"edge_attr_dim={edge_feature_dim} | clases={num_classes} | "
+        f"tipos de aristas={len(graph_data.edge_types)} | "
+        f"GRU L={network_sequence_length} desde {sequence_length_source}{sequence_count_text}"
     )
 
     # Detectar nombres de relación reales del grafo (para UI asimétrica de vecindario y preset).
@@ -27119,6 +28217,9 @@ def _render_network_tab() -> None:
                 rel: ([25, 25] if rel == "temporal" else [3, 3])
                 for rel in relation_names
             }
+            new_cfg["seq_length"] = int(network_sequence_length)
+            new_cfg["sequence_length"] = int(network_sequence_length)
+            new_cfg["sequence_length_source"] = str(sequence_length_source)
             st.session_state["gnn_network_config"] = new_cfg
             # Limpiar widget keys para que tomen los nuevos defaults en el rerun.
             for k in list(st.session_state.keys()):
@@ -27221,7 +28322,239 @@ def _render_network_tab() -> None:
             key="gnn_net_batch",
         )
 
-    st.markdown("**Vecindario (NeighborLoader)**")
+    st.markdown("**Muestreo de entrenamiento**")
+    sampler_options = {
+        "NeighborLoader (nativo)": "neighbor",
+        "Positive-aware NeighborLoader": "positive_aware",
+        "RioGNN top-p RL": "rl_top_p",
+    }
+    sampler_label_by_mode = {
+        mode: label for label, mode in sampler_options.items()
+    }
+    existing_sampler_mode = _normalize_gnn_train_sampler_mode(
+        existing_cfg.get(
+            "train_sampler_mode",
+            RECOMMENDED_NETWORK_DEFAULTS["train_sampler_mode"],
+        )
+    )
+    sampler_default_label = sampler_label_by_mode.get(
+        existing_sampler_mode,
+        "NeighborLoader (nativo)",
+    )
+    sampler_label = st.selectbox(
+        "Sampler de entrenamiento",
+        list(sampler_options.keys()),
+        index=list(sampler_options.keys()).index(sampler_default_label),
+        key="gnn_net_train_sampler_mode",
+        help=(
+            "NeighborLoader usa el muestreo estándar de PyG. "
+            "Positive-aware usa NeighborLoader pero fuerza señal positiva estable por batch y mezcla negativos duros topológicos. "
+            "RioGNN top-p RL usa el loader `rl_top_p`: filtra vecinos por similitud "
+            "label-aware y ajusta thresholds RSRL por relación/capa."
+        ),
+    )
+    train_sampler_mode = sampler_options[sampler_label]
+
+    samp_col_a, samp_col_b, samp_col_c = st.columns(3)
+    with samp_col_a:
+        deterministic_sampling = st.checkbox(
+            "Sampling determinístico",
+            value=_coerce_bool(
+                existing_cfg.get("deterministic_sampling"),
+                bool(RECOMMENDED_NETWORK_DEFAULTS["deterministic_sampling"]),
+            ),
+            key="gnn_net_deterministic_sampling",
+            help="Fija la semilla del sampler para repetir batches entre corridas.",
+        )
+    with samp_col_b:
+        sampling_seed = int(
+            st.number_input(
+                "Sampling seed",
+                min_value=0,
+                value=int(existing_cfg.get("sampling_seed", SEED)),
+                step=1,
+                key="gnn_net_sampling_seed",
+                disabled=not deterministic_sampling,
+            )
+        )
+    with samp_col_c:
+        disable_hard_undersampling = st.checkbox(
+            "Desactivar hard-undersampling",
+            value=_coerce_bool(
+                existing_cfg.get("disable_hard_undersampling"),
+                bool(RECOMMENDED_NETWORK_DEFAULTS["disable_hard_undersampling"]),
+            ),
+            key="gnn_net_disable_hard",
+            help="Evita mezclar el efecto del sampler con el hard-undersampling automático.",
+        )
+
+    positive_sampler_target_fraction = float(
+        existing_cfg.get(
+            "positive_sampler_target_fraction",
+            RECOMMENDED_NETWORK_DEFAULTS["positive_sampler_target_fraction"],
+        )
+    )
+    positive_sampler_hard_window_minutes = int(
+        existing_cfg.get(
+            "positive_sampler_hard_window_minutes",
+            RECOMMENDED_NETWORK_DEFAULTS["positive_sampler_hard_window_minutes"],
+        )
+    )
+    positive_sampler_hard_negatives_per_positive = int(
+        existing_cfg.get(
+            "positive_sampler_hard_negatives_per_positive",
+            RECOMMENDED_NETWORK_DEFAULTS["positive_sampler_hard_negatives_per_positive"],
+        )
+    )
+    if train_sampler_mode == "positive_aware":
+        pos_col_a, pos_col_b, pos_col_c = st.columns(3)
+        with pos_col_a:
+            positive_sampler_target_fraction = float(
+                st.number_input(
+                    "Positive-aware fracción positiva",
+                    min_value=0.001,
+                    max_value=0.50,
+                    value=float(positive_sampler_target_fraction),
+                    step=0.005,
+                    format="%.3f",
+                    key="gnn_net_positive_fraction",
+                    help=(
+                        "Fracción objetivo de semillas positivas por batch. "
+                        "Default 0.02: con batch_size=512 son cerca de 10 positivos por batch. "
+                        "Subirlo puede mejorar recall inicial pero sobreexpone positivos; "
+                        "no lo uses para inferir prevalencia real."
+                    ),
+                )
+            )
+        with pos_col_b:
+            positive_sampler_hard_window_minutes = int(
+                st.number_input(
+                    "Ventana temporal hard negatives (min)",
+                    min_value=0,
+                    value=int(positive_sampler_hard_window_minutes),
+                    step=5,
+                    key="gnn_net_positive_window",
+                    help=(
+                        "Selecciona negativos de train del mismo pórtico dentro de ±N minutos de un positivo. "
+                        "Default 60 min. Ventanas muy grandes diluyen el concepto de hard negative; "
+                        "0 desactiva solo el componente temporal."
+                    ),
+                )
+            )
+        with pos_col_c:
+            positive_sampler_hard_negatives_per_positive = int(
+                st.number_input(
+                    "Hard negatives por positivo",
+                    min_value=0,
+                    value=int(positive_sampler_hard_negatives_per_positive),
+                    step=1,
+                    key="gnn_net_positive_hard_per_pos",
+                    help=(
+                        "Número de negativos duros a intentar por positivo del batch. "
+                        "Default 4. Demasiado alto reduce diversidad global; "
+                        "0 deja el balance positivo con negativos aleatorios."
+                    ),
+                )
+            )
+
+    rl_action_space = str(RECOMMENDED_NETWORK_DEFAULTS["rl_action_space"])
+    rl_initial_p = float(RECOMMENDED_NETWORK_DEFAULTS["rl_initial_p"])
+    rl_min_p = float(RECOMMENDED_NETWORK_DEFAULTS["rl_min_p"])
+    rl_max_p = float(RECOMMENDED_NETWORK_DEFAULTS["rl_max_p"])
+    rl_min_keep = int(RECOMMENDED_NETWORK_DEFAULTS["rl_min_keep"])
+    rl_positive_only = bool(RECOMMENDED_NETWORK_DEFAULTS["rl_positive_only"])
+    rl_similarity_pretrain_epochs = int(
+        RECOMMENDED_NETWORK_DEFAULTS["rl_similarity_pretrain_epochs"]
+    )
+    rl_lambda_simi = float(RECOMMENDED_NETWORK_DEFAULTS["rl_lambda_simi"])
+    if train_sampler_mode == "rl_top_p":
+        existing_rl_action_space = str(
+            existing_cfg.get("rl_action_space", "discrete")
+        )
+        if existing_rl_action_space not in {"discrete", "continuous_actor"}:
+            existing_rl_action_space = "discrete"
+        rl_col_a, rl_col_b, rl_col_c = st.columns(3)
+        with rl_col_a:
+            rl_action_space = st.selectbox(
+                "RioGNN acción RSRL",
+                ["discrete", "continuous_actor"],
+                index=["discrete", "continuous_actor"].index(existing_rl_action_space),
+                key="gnn_net_rl_action_space",
+                help="`discrete` usa grilla recursiva; `continuous_actor` usa actor-critic acotado.",
+            )
+            rl_initial_p = float(
+                st.number_input(
+                    "RioGNN p inicial",
+                    min_value=0.01,
+                    max_value=1.0,
+                    value=float(existing_cfg.get("rl_initial_p", 0.5)),
+                    step=0.05,
+                    key="gnn_net_rl_initial_p",
+                )
+            )
+        with rl_col_b:
+            rl_min_p = float(
+                st.number_input(
+                    "RioGNN p mínimo",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(existing_cfg.get("rl_min_p", 0.05)),
+                    step=0.01,
+                    key="gnn_net_rl_min_p",
+                )
+            )
+            rl_max_p = float(
+                st.number_input(
+                    "RioGNN p máximo",
+                    min_value=0.01,
+                    max_value=1.0,
+                    value=float(existing_cfg.get("rl_max_p", 1.0)),
+                    step=0.05,
+                    key="gnn_net_rl_max_p",
+                )
+            )
+        with rl_col_c:
+            rl_min_keep = int(
+                st.number_input(
+                    "RioGNN min_keep",
+                    min_value=0,
+                    value=int(existing_cfg.get("rl_min_keep", 1)),
+                    step=1,
+                    key="gnn_net_rl_min_keep",
+                )
+            )
+            rl_similarity_pretrain_epochs = int(
+                st.number_input(
+                    "Pretrain similitud",
+                    min_value=0,
+                    value=int(existing_cfg.get("rl_similarity_pretrain_epochs", 3)),
+                    step=1,
+                    key="gnn_net_rl_pretrain_epochs",
+                )
+            )
+        rl_positive_only = st.checkbox(
+            "RioGNN stats sólo positivos si existen",
+            value=_coerce_bool(existing_cfg.get("rl_positive_only"), True),
+            key="gnn_net_rl_positive_only",
+            help="Calcula stats del controlador sobre centros positivos de train cuando hay positivos disponibles.",
+        )
+        rl_lambda_simi = float(
+            st.number_input(
+                "RioGNN lambda_simi",
+                min_value=0.0,
+                value=float(existing_cfg.get("rl_lambda_simi", 2.0)),
+                step=0.25,
+                key="gnn_net_rl_lambda_simi",
+                help="Peso de la pérdida auxiliar label-aware usada por el scorer del sampler.",
+            )
+        )
+        if rl_min_p > rl_max_p:
+            st.warning(
+                "RioGNN p mínimo es mayor que p máximo; se intercambiarán al guardar."
+            )
+            rl_min_p, rl_max_p = rl_max_p, rl_min_p
+
+    st.markdown("**Vecindario / top-p caps**")
 
     def _parse_int_list(text: str, fallback: List[int]) -> List[int]:
         try:
@@ -27249,7 +28582,8 @@ def _render_network_tab() -> None:
         help=(
             "Uniforme: misma fanout para todos los tipos de arista (ej. [15,10]). "
             "Asimétrico: fanout distinto por tipo, recomendado cuando los degrees "
-            "varían fuerte entre relaciones (ej. temporal denso, spatial con pocos pórticos)."
+            "varían fuerte entre relaciones (ej. temporal denso, spatial con pocos pórticos). "
+            "Con RioGNN top-p RL estos valores actúan como caps por relación/capa."
         ),
     )
 
@@ -27276,7 +28610,6 @@ def _render_network_tab() -> None:
             per_rel_default = {
                 "temporal": [25, 25],
                 "spatial": [3, 3],
-                "spatial_back": [3, 3],
                 "st_fwd": [25, 25],
             }
         num_neighbors = {}
@@ -27599,12 +28932,37 @@ def _render_network_tab() -> None:
         "hidden_channels": int(hidden_channels),
         "num_heads": int(num_heads),
         "num_layers": int(num_layers),
+        "seq_length": int(network_sequence_length),
+        "sequence_length": int(network_sequence_length),
+        "sequence_length_source": str(sequence_length_source),
+        "sequence_count": (
+            int(feature_sequence_count)
+            if feature_sequence_count is not None
+            else None
+        ),
         "dropout": float(dropout),
         "aggr1": aggr1,
         "aggr2": aggr2,
         "use_checkpointing": bool(use_checkpointing),
         "use_residual": bool(use_residual),
         "use_relation_self_loops": bool(use_relation_self_loops),
+        "train_sampler_mode": str(train_sampler_mode),
+        "deterministic_sampling": bool(deterministic_sampling),
+        "sampling_seed": int(sampling_seed),
+        "disable_hard_undersampling": bool(disable_hard_undersampling),
+        "positive_sampler_target_fraction": float(positive_sampler_target_fraction),
+        "positive_sampler_hard_window_minutes": int(positive_sampler_hard_window_minutes),
+        "positive_sampler_hard_negatives_per_positive": int(
+            positive_sampler_hard_negatives_per_positive
+        ),
+        "rl_action_space": str(rl_action_space),
+        "rl_initial_p": float(rl_initial_p),
+        "rl_min_p": float(rl_min_p),
+        "rl_max_p": float(rl_max_p),
+        "rl_min_keep": int(rl_min_keep),
+        "rl_positive_only": bool(rl_positive_only),
+        "rl_similarity_pretrain_epochs": int(rl_similarity_pretrain_epochs),
+        "rl_lambda_simi": float(rl_lambda_simi),
         "num_neighbors": num_neighbors,
         "optimizer": optimizer_name,
         "lr_scheduler": str(lr_scheduler),
@@ -27676,6 +29034,7 @@ def _render_network_tab() -> None:
                     "type": f"EdgeEncoder ({kind_et})",
                     "heads": "-",
                     "hidden": hidden_et,
+                    "seq_len": "-",
                     "emb_dim": encoded_et,
                 }
             )
@@ -27686,6 +29045,7 @@ def _render_network_tab() -> None:
                 "type": variant_spec["conv_type"],
                 "heads": int(num_heads),
                 "hidden": int(hidden_channels),
+                "seq_len": "-",
                 "emb_dim": int(emb_dim),
             }
         )
@@ -27696,25 +29056,28 @@ def _render_network_tab() -> None:
                 "type": variant_spec["temporal_label"],
                 "heads": "-",
                 "hidden": int(emb_dim),
+                "seq_len": int(network_sequence_length),
                 "emb_dim": int(emb_dim),
             }
         )
     layers_df = pd.DataFrame(layer_rows)
     # Evita conflictos Arrow por mezcla de int/str en columnas como `layer` o `heads`.
-    for col in ("layer", "heads"):
+    for col in ("layer", "heads", "seq_len"):
         if col in layers_df.columns:
             layers_df[col] = layers_df[col].astype(str)
     st.dataframe(layers_df, width="stretch")
 
     sequence_index = loaded_graph.get("sequence_index")
-    has_sequence_index = (
-        sequence_index is not None
-        and getattr(sequence_index, "sequence_rows", None) is not None
-    )
+    has_sequence_index = _has_valid_sequence_index(sequence_index)
     if variant_spec["temporal_kind"] != "snapshot" and not has_sequence_index:
+        st.warning(
+            "La variante temporal requiere `SequenceIndex` con secuencias completas. "
+            f"Network muestra L={network_sequence_length}, pero el grafo cargado no tiene "
+            "targets temporales válidos para entrenar GRU."
+        )
+    elif variant_spec["temporal_kind"] != "snapshot":
         st.caption(
-            "Aviso: la variante temporal requiere `SequenceIndex`; sin secuencias, el modelo "
-            "no podrá explotar la ventana temporal."
+            f"GRU usará L={network_sequence_length}, el mismo largo detectado en las features del grafo."
         )
 
     dot_lines = [
@@ -27750,7 +29113,7 @@ def _render_network_tab() -> None:
     if variant_spec["temporal_kind"] != "snapshot":
         dot_lines.append(
             "temporal [label=\"Temporal head\\n"
-            f"{variant_spec['temporal_label']}\\nL={int(SEQ_LENGTH)}\" fillcolor=\"#E9FFF1\"];"
+            f"{variant_spec['temporal_label']}\\nL={int(network_sequence_length)}\" fillcolor=\"#E9FFF1\"];"
         )
     dot_lines.append(f"output [label=\"Output\\nclasses={num_classes}\"];")
     dot_lines.append("input -> layer1;")
@@ -30942,7 +32305,7 @@ def _render_create_graph():
 
     else: # Manual
         if st.session_state.df_port is not None:
-            # We recreate a simple manual selector here instead of 'seleccionar_tramo_y_porticos' which uses input()
+            # We recreate a simple manual selector here instead of the legacy console selector.
             df_port = st.session_state.df_port
             autopista = None
             if "autopista" in df_port.columns:
@@ -31248,7 +32611,7 @@ def _render_create_graph():
     
     # EDGE CONFIG
     st.markdown("#### Configuración de Aristas")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1:
         build_temporal = st.checkbox(
             "Temporales",
@@ -31263,8 +32626,9 @@ def _render_create_graph():
             "Espaciales",
             value=True,
             help=(
-                "Conecta pórticos consecutivos en la misma franja temporal. Default: activado. "
-                "Desactivarlo reduce la semántica vial del grafo."
+                "Conecta pórticos consecutivos en ambas direcciones dentro de la misma "
+                "franja temporal. Default: activado. Desactivarlo reduce la semántica "
+                "vial del grafo."
             ),
         )
     with c3:
@@ -31274,15 +32638,6 @@ def _render_create_graph():
             help=(
                 "Conecta un pórtico en t con el pórtico siguiente en t+Δ. Default: desactivado. "
                 "Puede aumentar dependencia futura aparente si se interpreta sin revisar dirección temporal."
-            ),
-        )
-    with c4:
-        build_spatial_back = st.checkbox(
-            "Espacial (Back)",
-            value=False,
-            help=(
-                "Agrega aristas espaciales inversas. Default: desactivado. "
-                "Úselo solo si la hipótesis permite influencia upstream/backward."
             ),
         )
     
@@ -31952,7 +33307,6 @@ def _render_create_graph():
             edge_feature_sources = dict(
                 raw_globals.attrs.get("edge_feature_sources", {})
             )
-            EXTRA_SPATIAL = len(selected_physical_features)
 
             # Temporal
             # Las aristas temporales no usan features físicas (solo el delta
@@ -31991,14 +33345,11 @@ def _render_create_graph():
             spatial_src: List[int] = []
             spatial_dst: List[int] = []
             spatial_attr: Optional[np.ndarray] = None
-            spatial_back_src: List[int] = []
-            spatial_back_dst: List[int] = []
-            spatial_back_attr: Optional[np.ndarray] = None
             stfwd_src: List[int] = []
             stfwd_dst: List[int] = []
             stfwd_attr: Optional[np.ndarray] = None
 
-            if build_spatial or build_spatial_back or build_st_fwd:
+            if build_spatial or build_st_fwd:
                 portico_sequences = []
                 df_port_s = df_port_use.sort_values(
                     ["calzada", "eje", "orden"],
@@ -32028,7 +33379,7 @@ def _render_create_graph():
                         "No se generaron secuencias de pórticos para aristas espaciales."
                     )
                 else:
-                    if build_spatial or build_spatial_back:
+                    if build_spatial:
                         s_edges = pd.merge(
                             df_pm.rename(
                                 columns={
@@ -32052,73 +33403,30 @@ def _render_create_graph():
                             how="inner",
                         )
 
-                        spatial_src = s_edges["node_idx_src"].tolist()
-                        spatial_dst = s_edges["node_idx_dst"].tolist()
+                        (
+                            spatial_src,
+                            spatial_dst,
+                            spatial_attr,
+                        ) = _build_bidirectional_spatial_edges(
+                            s_edges,
+                            feat_mat_delta,
+                            raw_globals,
+                            portico_col,
+                            selected_physical_features,
+                        )
 
                         if spatial_src:
-                            delta_s = (
-                                feat_mat_delta[spatial_dst]
-                                - feat_mat_delta[spatial_src]
+                            data[
+                                ("pm", "spatial", "pm")
+                            ].edge_index = torch.tensor(
+                                [spatial_src, spatial_dst],
+                                dtype=torch.long,
                             )
-                            extras = _build_edge_feature_extras(
-                                s_edges,
-                                raw_globals,
-                                portico_col,
-                                selected_physical_features,
+                            data[
+                                ("pm", "spatial", "pm")
+                            ].edge_attr = torch.tensor(
+                                spatial_attr, dtype=float_type
                             )
-
-                            spatial_attr = np.concatenate(
-                                [delta_s, extras], axis=1
-                            )
-
-                            if build_spatial:
-                                data[
-                                    ("pm", "spatial", "pm")
-                                ].edge_index = torch.tensor(
-                                    [spatial_src, spatial_dst],
-                                    dtype=torch.long,
-                                )
-                                data[
-                                    ("pm", "spatial", "pm")
-                                ].edge_attr = torch.tensor(
-                                    spatial_attr, dtype=float_type
-                                )
-
-                            if build_spatial_back:
-                                spatial_back_src = spatial_dst
-                                spatial_back_dst = spatial_src
-                                delta_back = (
-                                    feat_mat_delta[spatial_back_dst]
-                                    - feat_mat_delta[spatial_back_src]
-                                )
-                                back_edges = pd.DataFrame(
-                                    {
-                                        "portico_src": s_edges["portico_dst"].values,
-                                        "portico_dst": s_edges["portico_src"].values,
-                                        "ts_min": s_edges["ts_min"].values,
-                                        "dist_km": s_edges["dist_km"].values,
-                                    }
-                                )
-                                back_extras = _build_edge_feature_extras(
-                                    back_edges,
-                                    raw_globals,
-                                    portico_col,
-                                    selected_physical_features,
-                                )
-                                spatial_back_attr = np.concatenate(
-                                    [delta_back, back_extras], axis=1
-                                )
-                                data[
-                                    ("pm", "spatial_back", "pm")
-                                ].edge_index = torch.tensor(
-                                    [spatial_back_src, spatial_back_dst],
-                                    dtype=torch.long,
-                                )
-                                data[
-                                    ("pm", "spatial_back", "pm")
-                                ].edge_attr = torch.tensor(
-                                    spatial_back_attr, dtype=float_type
-                                )
 
                     if build_st_fwd:
                         if "next_ts_min" not in df_pm.columns:
@@ -32373,8 +33681,7 @@ def _render_create_graph():
                          "temporal_filter": f"Key={time_sel_key}" + (" (06-10)" if time_sel_key=='2' else (" (18-22)" if time_sel_key=='3' else " (All)")),
                          "edges": {
                              "temporal": bool(build_temporal),
-                             "spatial_fwd": bool(build_spatial),
-                             "spatial_back": bool(build_spatial_back),
+                             "spatial_bidirectional": bool(build_spatial),
                              "st_fwd": bool(build_st_fwd),
                              "physical_features": selected_physical_features if 'selected_physical_features' in locals() else [],
                              "delta_features": delta_feature_cols if 'delta_feature_cols' in locals() else []

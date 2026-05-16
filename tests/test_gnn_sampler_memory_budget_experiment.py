@@ -133,8 +133,6 @@ def _make_probe_graph() -> HeteroData:
     graph[("pm", "spatial", "pm")].edge_attr = torch.randn(src.numel(), 3)
     graph[("pm", "temporal", "pm")].edge_index = torch.stack([src, dst], dim=0)
     graph[("pm", "temporal", "pm")].edge_attr = torch.randn(src.numel(), 3)
-    graph[("pm", "spatial_back", "pm")].edge_index = torch.stack([dst, src], dim=0)
-    graph[("pm", "spatial_back", "pm")].edge_attr = torch.randn(src.numel(), 3)
     graph[("pm", "st_fwd", "pm")].edge_index = torch.stack([src, dst], dim=0)
     graph[("pm", "st_fwd", "pm")].edge_attr = torch.randn(src.numel(), 3)
     return graph
@@ -164,7 +162,6 @@ def test_optuna_neighbor_profile_defaults_include_asymmetric():
     assert profiles["asymmetric"] == {
         "temporal": [25, 25],
         "spatial": [3, 3],
-        "spatial_back": [3, 3],
     }
 
 
@@ -173,14 +170,12 @@ def test_optuna_asymmetric_neighbor_profile_resolves_per_edge_type():
     edge_types = [
         ("pm", "temporal", "pm"),
         ("pm", "spatial", "pm"),
-        ("pm", "spatial_back", "pm"),
     ]
 
     resolved = gnn_main._resolve_num_neighbors(profile_json, [15, 10], edge_types)
 
     assert resolved[("pm", "temporal", "pm")] == [25, 25]
     assert resolved[("pm", "spatial", "pm")] == [3, 3]
-    assert resolved[("pm", "spatial_back", "pm")] == [3, 3]
 
 
 def test_build_sampler_memory_loader_cluster_gcn_is_native():

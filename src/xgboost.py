@@ -242,7 +242,7 @@ def _export_balanced_train_csv(Xb: np.ndarray, yb: np.ndarray, feature_names: Li
 def _pick_threshold_from_val(y_true_val: np.ndarray, y_prob1_val: np.ndarray, beta: float = 0.5) -> Tuple[float, Dict[str, float]]:
     from sklearn.metrics import precision_recall_curve
     prec, rec, thr = precision_recall_curve(y_true_val.astype(int), y_prob1_val.astype(float))
-    prec_, rec_, thr_ = prec[1:], rec[1:], thr
+    prec_, rec_, thr_ = prec[:-1], rec[:-1], thr
     beta2 = beta ** 2
     if len(prec_) == 0:
         return 0.5, {"precision": 0.0, "recall": 0.0, "fbeta": 0.0}

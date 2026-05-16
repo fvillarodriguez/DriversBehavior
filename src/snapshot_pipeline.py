@@ -521,7 +521,7 @@ def discretize_vehicle_flows(
     if carril_col:
         lf = lf.with_columns(pl.col(carril_col).alias("lane"))
     if cat_col:
-        lf = lf.with_columns(pl.col(cat_col).alias("cat"))
+        lf = lf.with_columns(pl.col(cat_col).cast(pl.Utf8).alias("cat"))
 
     # Filter
     lf = lf.filter(pl.col("ts").is_not_null() & pl.col("speed").is_not_null())
@@ -549,15 +549,6 @@ def discretize_vehicle_flows(
         (pl.col("speed") <= config.slow_speed_kmh).mean().alias("slow_pct")
     ]
     
-    # Conditional Aggs for Categories
-    # We can't easily pivot dynamically in lazy API without knowing values.
-    # Assuming standard categories [1,2,3,4,5] or similar?
-    # Original used pivot.
-    # Here we might need to Collect -> Pivot -> Join back?
-    # Or strict manual categories (e.g. 1..10)
-    # Let's try collecting keys first? No, that defeats efficiency.
-    # Strategy: Compute base metrics first. Then compute category counts via separate group_by + Pivot.
-    
     # Lane metrics
     # lane_speed_mean_std -> std() of (mean speed per lane)
     # This is nested aggregation.
@@ -580,57 +571,68 @@ def discretize_vehicle_flows(
         ])
         base_grouped = base_grouped.join(lane_stats, on=["portico", "snapshot_time"], how="left")
     
-    # Category Stats (Sub-branch) - Pivoting
-    if cat_col:
-        # We need counts per category
-        cat_counts = lf.group_by(["portico", "snapshot_time", "cat"]).len()
-        # Collect to pivot because categories are data-dependent
-        # Or assumes known categories?
-        # Let's collect just the counts to pivot in memory (small)
-        # Then join
-        # ACTUALLY, we can return the LazyFrame up to this point and do the pivot on the collected,
-        # but the function Discretize expects to return a DataFrame.
-        # So we collect here.
-        pass
-
     # For simplicity and robustness with categories, we collect the base and logic.
     df_base = base_grouped.collect()
     
     if cat_col:
-        # Separate pipeline for pivot to avoid collecting full data
-        cat_counts_df = lf.group_by(["portico", "snapshot_time", "cat"]).len().collect()
-        if not cat_counts_df.is_empty():
-            pivoted = cat_counts_df.pivot(
+        cat_stats_df = (
+            lf.filter(pl.col("cat").is_not_null())
+            .group_by(["portico", "snapshot_time", "cat"])
+            .agg([
+                pl.len().alias("flow"),
+                pl.col("speed").mean().alias("speed_mean"),
+            ])
+            .collect()
+        )
+        if not cat_stats_df.is_empty():
+            flow_pivot = cat_stats_df.pivot(
                 index=["portico", "snapshot_time"],
                 on="cat",
-                values="len",
-                aggregate_function="sum" 
+                values="flow",
+                aggregate_function="sum"
             ).fill_null(0)
-            
-            # Rename columns to flow_cat_{cat}
-            # and compute mix
-            total_flow = pivoted.select(pl.all().exclude(["portico", "snapshot_time"])).sum_horizontal()
-            
-            new_cols = []
-            mix_cols = []
-            
-            # We assume columns are the categories
-            cat_keys = [c for c in pivoted.columns if c not in ["portico", "snapshot_time"]]
+
+            speed_pivot = cat_stats_df.pivot(
+                index=["portico", "snapshot_time"],
+                on="cat",
+                values="speed_mean",
+                aggregate_function="first"
+            )
+
+            cat_keys = [c for c in flow_pivot.columns if c not in ["portico", "snapshot_time"]]
+            flow_rename = {k: f"flow_cat_{k}" for k in cat_keys}
+            speed_rename = {k: f"speed_mean_cat_{k}" for k in cat_keys}
+            flow_pivot = flow_pivot.rename(flow_rename)
+            speed_pivot = speed_pivot.rename(speed_rename)
+            pivoted = flow_pivot.join(
+                speed_pivot,
+                on=["portico", "snapshot_time"],
+                how="left",
+            )
+
+            flow_cols = [f"flow_cat_{k}" for k in cat_keys]
+            pivoted = pivoted.with_columns(
+                pl.sum_horizontal([pl.col(c) for c in flow_cols]).alias("_cat_flow_total")
+            )
+
             for k in cat_keys:
-                pivoted = pivoted.rename({k: f"flow_cat_{k}"})
-                # Mix
-                # We interpret mix as share
-                # mix = col / total
-                # We can add expressions
-                pass
-            
-            # Add mix columns
-            # This is easier with eager execution
-            for k in cat_keys:
-                # safe divide?
-                pivoted = pivoted.with_columns(
-                     (pl.col(f"flow_cat_{k}") / pl.max_horizontal(total_flow, pl.lit(1))).alias(f"mix_cat_{k}")
+                flow_col = f"flow_cat_{k}"
+                speed_col = f"speed_mean_cat_{k}"
+                safe_speed = (
+                    pl.when(pl.col(speed_col).is_null() | (pl.col(speed_col) == 0))
+                    .then(1.0)
+                    .otherwise(pl.col(speed_col))
                 )
+                pivoted = pivoted.with_columns(
+                    [
+                        (
+                            pl.col(flow_col)
+                            / pl.max_horizontal(pl.col("_cat_flow_total"), pl.lit(1.0))
+                        ).alias(f"mix_cat_{k}"),
+                        (pl.col(flow_col) / safe_speed).alias(f"density_cat_{k}"),
+                    ]
+                )
+            pivoted = pivoted.drop("_cat_flow_total")
 
             df_base = df_base.join(pivoted, on=["portico", "snapshot_time"], how="left")
             

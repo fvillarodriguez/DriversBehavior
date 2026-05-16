@@ -1,4 +1,5 @@
 import pytest
+import json
 
 from src import graph_builder_app as app
 
@@ -61,3 +62,80 @@ def test_gnn_live_training_chart_frames_keep_requested_series_only():
     assert list(frames["operational"].columns) == ["FAR", "TPR"]
     assert frames["operational"].loc[2, "TPR"] == pytest.approx(0.61)
     assert frames["operational"].loc[2, "FAR"] == pytest.approx(0.08)
+
+
+def test_gnn_training_history_loader_ignores_bad_lines_and_preserves_curves(tmp_path):
+    history_path = tmp_path / "metrics_history.jsonl"
+    rows = [
+        {
+            "scope": "gnn_training",
+            "event": "train_start",
+            "run_id": "run-a",
+        },
+        {
+            "scope": "gnn_training",
+            "event": "epoch",
+            "run_id": "run-a",
+            "epoch": 2,
+            "train_loss": 0.4,
+            "val_loss": 0.5,
+            "val_auprc": 0.2,
+        },
+        "{bad json",
+        {
+            "scope": "gnn_training",
+            "event": "epoch",
+            "run_id": "run-a",
+            "epoch": 1,
+            "train_loss": 0.6,
+            "val_loss": 0.7,
+            "val_auprc": 0.1,
+        },
+        {
+            "scope": "gnn_training",
+            "event": "epoch",
+            "run_id": "run-a",
+            "epoch": 2,
+            "train_loss": 0.3,
+            "val_loss": 0.45,
+            "val_auprc": 0.25,
+        },
+        {
+            "scope": "gnn_training",
+            "event": "test_result",
+            "run_id": "run-a",
+            "epoch": 2,
+            "eval_target": "current_epoch",
+            "automatic": True,
+            "auprc": 0.22,
+        },
+    ]
+    history_path.write_text(
+        "\n".join(
+            row if isinstance(row, str) else json.dumps(row)
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+
+    metrics, test_results, run_id = app._load_gnn_training_history(history_path)
+    frames = app._build_gnn_live_training_chart_frames(
+        metrics
+        + [
+            {
+                "epoch": 3,
+                "train_loss": 0.2,
+                "val_loss": 0.4,
+                "val_auprc": 0.3,
+            }
+        ]
+    )
+
+    assert run_id == "run-a"
+    assert [row["epoch"] for row in metrics] == [1, 2]
+    assert metrics[1]["train_loss"] == pytest.approx(0.3)
+    assert len(test_results) == 1
+    assert test_results[0]["eval_target"] == "current_epoch"
+    assert list(frames["loss"].index) == [1, 2, 3]
+    assert frames["loss"].loc[2, "Train Loss"] == pytest.approx(0.3)
+    assert frames["ranking"].loc[3, "AUPRC"] == pytest.approx(0.3)

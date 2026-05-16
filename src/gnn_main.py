@@ -9,7 +9,7 @@ from typing import Callable, Optional, Union, List, Dict, Tuple
 
 import pandas as pd
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import numpy as np
 import torch 
 from src.gnn_mps_scatter import install_gnn_mps_scatter_policy
@@ -98,17 +98,65 @@ def _json_clean(obj):
             return None
     return obj
 
-def _emit_training_event(event: str, run_id: str, **payload) -> None:
+_PERSISTED_TRAINING_EVENTS = {
+    "train_start",
+    "epoch",
+    "test_result",
+    "test_error",
+    "train_end",
+}
+
+
+def _default_training_metrics_history_path(save_state_path: Optional[str]) -> Optional[str]:
+    if not save_state_path:
+        return None
+    return os.path.join(os.path.dirname(os.path.abspath(str(save_state_path))), "metrics_history.jsonl")
+
+
+def _append_training_history_event(history_path: Optional[str], payload: Dict[str, object]) -> None:
+    if not history_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(str(history_path))) or ".", exist_ok=True)
+        clean_payload = _json_clean(_json_safe(payload))
+        with open(str(history_path), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(clean_payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        logger.warning(f"No se pudo persistir historial de entrenamiento GNN: {exc}")
+
+
+def _reset_training_history(history_path: Optional[str]) -> None:
+    if not history_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(str(history_path))) or ".", exist_ok=True)
+        with open(str(history_path), "w", encoding="utf-8"):
+            pass
+    except Exception as exc:
+        logger.warning(f"No se pudo reiniciar historial de entrenamiento GNN: {exc}")
+
+
+def _emit_training_event(
+    event: str,
+    run_id: str,
+    *,
+    history_path: Optional[str] = None,
+    **payload,
+) -> None:
     try:
         data = {
             "scope": "gnn_training",
             "event": event,
             "run_id": run_id,
-            "ts": datetime.utcnow().isoformat() + "Z",
+            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        if history_path:
+            data["metrics_history_path"] = str(history_path)
         data.update(payload)
         data = _json_clean(_json_safe(data))
         logger.info(json.dumps(data))
+        if history_path and event in _PERSISTED_TRAINING_EVENTS:
+            _append_training_history_event(history_path, data)
     except Exception:
         pass
 
@@ -140,6 +188,8 @@ def _summarize_binary_test_result(
     best_epoch: int,
     threshold: Optional[float],
     checkpoint_path: Optional[str],
+    eval_target: str = "best_checkpoint",
+    automatic: bool = False,
 ) -> Dict[str, object]:
     report = result.get("report") or {}
     pos_report = report.get("Accidente (1)", {}) if isinstance(report, dict) else {}
@@ -150,6 +200,8 @@ def _summarize_binary_test_result(
     summary = {
         "epoch": int(epoch),
         "best_epoch": int(best_epoch),
+        "eval_target": str(eval_target),
+        "automatic": bool(automatic),
         "checkpoint_path": checkpoint_path,
         "threshold": float(threshold) if threshold is not None else None,
         "accuracy": report.get("accuracy") if isinstance(report, dict) else None,
@@ -222,6 +274,8 @@ def _test_best_checkpoint_during_training(
             best_epoch=int(best_epoch),
             threshold=threshold,
             checkpoint_path=str(best_checkpoint_path),
+            eval_target="best_checkpoint",
+            automatic=False,
         )
     finally:
         try:
@@ -235,6 +289,59 @@ def _test_best_checkpoint_during_training(
                 model.use_checkpointing = previous_checkpointing
         finally:
             del current_state
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
+def _test_current_model_during_training(
+    *,
+    model,
+    base_graph,
+    node_type: str,
+    batch_size: int,
+    num_neighbors,
+    threshold: Optional[float],
+    device: torch.device,
+    epoch: int,
+    best_epoch: int,
+    automatic: bool,
+) -> Dict[str, object]:
+    was_training = bool(model.training)
+    previous_checkpointing = getattr(model, "use_checkpointing", None)
+    try:
+        if previous_checkpointing is not None:
+            model.use_checkpointing = False
+        model.to(device)
+        results = test(
+            model,
+            base_graph,
+            node_type=node_type,
+            batch_size=batch_size,
+            masks=["test_mask"],
+            threshold=threshold,
+            num_neighbors=num_neighbors,
+        )
+        if not results or "test_mask" not in results:
+            raise RuntimeError("No se obtuvieron resultados sobre test_mask.")
+        return _summarize_binary_test_result(
+            results["test_mask"],
+            epoch=int(epoch),
+            best_epoch=int(best_epoch),
+            threshold=threshold,
+            checkpoint_path=None,
+            eval_target="current_epoch",
+            automatic=bool(automatic),
+        )
+    finally:
+        try:
+            if was_training:
+                model.train()
+            else:
+                model.eval()
+            if previous_checkpointing is not None:
+                model.use_checkpointing = previous_checkpointing
+        finally:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1267,6 +1374,11 @@ def _normalize_train_sampler_mode(value: object) -> str:
     return {
         "neighbor": "neighbor",
         "neighborloader": "neighbor",
+        "positive_aware": "positive_aware",
+        "positiveaware": "positive_aware",
+        "pos_aware": "positive_aware",
+        "positive_aware_neighbor": "positive_aware",
+        "positive_aware_neighborloader": "positive_aware",
         "cluster_gcn": "cluster_gcn",
         "clustergcn": "cluster_gcn",
         "graphsaint": "graphsaint",
@@ -1275,6 +1387,381 @@ def _normalize_train_sampler_mode(value: object) -> str:
         "rio_gnn": "rl_top_p",
         "rsrl": "rl_top_p",
     }.get(key, "neighbor")
+
+
+def _pm_index_to_lookup(
+    pm_index: Optional[object],
+    *,
+    num_nodes: int,
+) -> Tuple[List[Optional[str]], torch.Tensor, bool]:
+    ports: List[Optional[str]] = [None] * int(num_nodes)
+    ts_min = torch.full((int(num_nodes),), -1, dtype=torch.long)
+    if pm_index is None:
+        return ports, ts_min, False
+
+    reverse = getattr(pm_index, "_rev", None)
+    if reverse is None and isinstance(pm_index, dict):
+        sample_keys = list(pm_index.keys())[:8]
+        if sample_keys and all(isinstance(k, (int, np.integer)) for k in sample_keys):
+            reverse = pm_index
+        else:
+            reverse = {}
+            for key, idx in pm_index.items():
+                try:
+                    reverse[int(idx)] = key
+                except Exception:
+                    continue
+    if reverse is None or not hasattr(reverse, "items"):
+        return ports, ts_min, False
+
+    found = False
+    for idx_raw, value in reverse.items():
+        try:
+            idx = int(idx_raw)
+        except Exception:
+            continue
+        if idx < 0 or idx >= int(num_nodes):
+            continue
+        portico = None
+        ts_value = None
+        if isinstance(value, dict):
+            portico = value.get("portico", value.get("portico_id", value.get("pm")))
+            ts_value = value.get("ts_min", value.get("timestamp_min", value.get("t")))
+        elif isinstance(value, (list, tuple)) and len(value) >= 2:
+            portico = value[0]
+            ts_value = value[1]
+        if portico is None or ts_value is None:
+            continue
+        try:
+            ts_int = int(round(float(ts_value)))
+        except Exception:
+            continue
+        ports[idx] = str(portico)
+        ts_min[idx] = int(ts_int)
+        found = True
+    return ports, ts_min, bool(found)
+
+
+def _shuffle_1d(values: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    values = values.detach().cpu().long().view(-1)
+    if values.numel() <= 1:
+        return values.clone()
+    order = torch.randperm(int(values.numel()), generator=generator)
+    return values[order]
+
+
+def _repeat_shuffled_1d(
+    values: torch.Tensor,
+    needed: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    values = values.detach().cpu().long().view(-1)
+    needed = int(max(0, needed))
+    if needed <= 0 or values.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+    chunks: List[torch.Tensor] = []
+    remaining = int(needed)
+    while remaining > 0:
+        shuffled = _shuffle_1d(values, generator)
+        take = min(int(remaining), int(shuffled.numel()))
+        chunks.append(shuffled[:take])
+        remaining -= take
+    return torch.cat(chunks).long() if chunks else torch.empty(0, dtype=torch.long)
+
+
+def _positive_aware_spatial_hard_negatives(
+    graph_cpu: HeteroData,
+    *,
+    node_type: str,
+    train_neg_mask: torch.Tensor,
+    pos_mask: torch.Tensor,
+    ts_min: torch.Tensor,
+    has_pm_index: bool,
+) -> torch.Tensor:
+    candidates: List[torch.Tensor] = []
+    for edge_type in graph_cpu.edge_types:
+        if not isinstance(edge_type, tuple) or len(edge_type) < 3:
+            continue
+        src_type, rel, dst_type = edge_type
+        if src_type != node_type or dst_type != node_type:
+            continue
+        if "spatial" not in str(rel).strip().lower():
+            continue
+        edge_index = getattr(graph_cpu[edge_type], "edge_index", None)
+        if edge_index is None or edge_index.numel() == 0:
+            continue
+        edge_index = edge_index.detach().cpu().long()
+        src = edge_index[0]
+        dst = edge_index[1]
+        valid = torch.ones(src.numel(), dtype=torch.bool)
+        if has_pm_index and ts_min.numel() > 0:
+            src_ts = ts_min[src]
+            dst_ts = ts_min[dst]
+            valid = (src_ts >= 0) & (src_ts == dst_ts)
+        src_pos_dst_neg = valid & pos_mask[src] & train_neg_mask[dst]
+        dst_pos_src_neg = valid & pos_mask[dst] & train_neg_mask[src]
+        if src_pos_dst_neg.any():
+            candidates.append(dst[src_pos_dst_neg])
+        if dst_pos_src_neg.any():
+            candidates.append(src[dst_pos_src_neg])
+    if not candidates:
+        return torch.empty(0, dtype=torch.long)
+    return torch.unique(torch.cat(candidates).long())
+
+
+def _positive_aware_temporal_hard_negatives(
+    *,
+    pos_idx: torch.Tensor,
+    neg_idx: torch.Tensor,
+    ports: List[Optional[str]],
+    ts_min: torch.Tensor,
+    window_minutes: int,
+) -> torch.Tensor:
+    if pos_idx.numel() == 0 or neg_idx.numel() == 0 or ts_min.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+    by_port: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    rows_by_port: Dict[str, List[Tuple[int, int]]] = {}
+    for idx in neg_idx.detach().cpu().long().tolist():
+        port = ports[int(idx)] if 0 <= int(idx) < len(ports) else None
+        ts_value = int(ts_min[int(idx)].item()) if 0 <= int(idx) < int(ts_min.numel()) else -1
+        if port is None or ts_value < 0:
+            continue
+        rows_by_port.setdefault(str(port), []).append((ts_value, int(idx)))
+    for port, rows in rows_by_port.items():
+        rows.sort(key=lambda item: item[0])
+        by_port[port] = (
+            np.asarray([item[0] for item in rows], dtype=np.int64),
+            np.asarray([item[1] for item in rows], dtype=np.int64),
+        )
+
+    window = max(0, int(window_minutes))
+    selected: List[np.ndarray] = []
+    for pos in pos_idx.detach().cpu().long().tolist():
+        pos_i = int(pos)
+        port = ports[pos_i] if 0 <= pos_i < len(ports) else None
+        ts_value = int(ts_min[pos_i].item()) if 0 <= pos_i < int(ts_min.numel()) else -1
+        if port is None or ts_value < 0:
+            continue
+        pair = by_port.get(str(port))
+        if pair is None:
+            continue
+        times, nodes = pair
+        lo = int(np.searchsorted(times, ts_value - window, side="left"))
+        hi = int(np.searchsorted(times, ts_value + window, side="right"))
+        if hi > lo:
+            selected.append(nodes[lo:hi])
+    if not selected:
+        return torch.empty(0, dtype=torch.long)
+    return torch.unique(torch.as_tensor(np.concatenate(selected), dtype=torch.long))
+
+
+def build_positive_aware_seed_order(
+    graph_cpu: HeteroData,
+    *,
+    pm_index: Optional[object] = None,
+    batch_size: int,
+    sampling_seed: int,
+    epoch: int = 1,
+    target_positive_fraction: float = 0.02,
+    hard_negative_window_minutes: int = 60,
+    hard_negatives_per_positive: int = 4,
+    node_type: str = "pm",
+) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """Build a deterministic, positive-aware seed order for NeighborLoader."""
+    if node_type not in graph_cpu.node_types:
+        return torch.empty(0, dtype=torch.long), {"fallback_reason": "missing_node_type"}
+    if not hasattr(graph_cpu[node_type], "train_mask"):
+        return torch.empty(0, dtype=torch.long), {"fallback_reason": "missing_train_mask"}
+
+    train_mask = graph_cpu[node_type].train_mask.detach().cpu().bool().view(-1)
+    y = getattr(graph_cpu[node_type], "y", None)
+    if y is None:
+        train_idx = train_mask.nonzero(as_tuple=False).view(-1).long()
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(sampling_seed) + int(epoch) * 9973)
+        return _shuffle_1d(train_idx, gen), {
+            "fallback_reason": "missing_labels",
+            "train_seed_count": int(train_idx.numel()),
+        }
+    y = y.detach().cpu().view(-1).long()
+    num_nodes = int(train_mask.numel())
+    train_idx = train_mask.nonzero(as_tuple=False).view(-1).long()
+    pos_idx = (train_mask & (y == 1)).nonzero(as_tuple=False).view(-1).long()
+    neg_idx = (train_mask & (y != 1)).nonzero(as_tuple=False).view(-1).long()
+
+    gen = torch.Generator(device="cpu")
+    effective_seed = int(sampling_seed) + int(epoch) * 9973
+    gen.manual_seed(int(effective_seed))
+
+    batch_size = max(1, int(batch_size))
+    target_fraction = float(target_positive_fraction)
+    if not math.isfinite(target_fraction) or target_fraction <= 0.0:
+        target_fraction = 0.02
+    target_fraction = max(0.0, min(0.5, float(target_fraction)))
+    pos_per_batch = max(1, int(round(float(batch_size) * target_fraction)))
+    pos_per_batch = min(int(batch_size), int(pos_per_batch))
+    neg_slots = max(0, int(batch_size) - int(pos_per_batch))
+
+    stats: Dict[str, object] = {
+        "sampler_impl": "positive_aware_neighbor",
+        "sampling_seed": int(sampling_seed),
+        "effective_seed": int(effective_seed),
+        "epoch": int(epoch),
+        "batch_size": int(batch_size),
+        "target_positive_fraction": float(target_fraction),
+        "pos_per_batch": int(pos_per_batch),
+        "train_node_count": int(train_idx.numel()),
+        "train_positive_count": int(pos_idx.numel()),
+        "train_negative_count": int(neg_idx.numel()),
+        "hard_negative_window_minutes": int(max(0, int(hard_negative_window_minutes))),
+        "hard_negatives_per_positive": int(max(0, int(hard_negatives_per_positive))),
+    }
+
+    if train_idx.numel() == 0:
+        stats["fallback_reason"] = "empty_train_mask"
+        return train_idx, stats
+    if pos_idx.numel() == 0:
+        seed_order = _shuffle_1d(train_idx, gen)
+        stats.update(
+            {
+                "fallback_reason": "no_train_positives",
+                "batch_count": int(math.ceil(float(seed_order.numel()) / float(batch_size))),
+                "seed_slot_count": int(seed_order.numel()),
+                "positive_seed_slots": 0,
+                "negative_seed_slots": int(seed_order.numel()),
+            }
+        )
+        return seed_order, stats
+    if neg_idx.numel() == 0 or neg_slots == 0:
+        seed_order = _repeat_shuffled_1d(pos_idx, int(pos_idx.numel()), gen)
+        stats.update(
+            {
+                "fallback_reason": "no_train_negatives",
+                "batch_count": int(math.ceil(float(seed_order.numel()) / float(batch_size))),
+                "seed_slot_count": int(seed_order.numel()),
+                "positive_seed_slots": int(seed_order.numel()),
+                "negative_seed_slots": 0,
+            }
+        )
+        return seed_order, stats
+
+    ports, ts_min, has_pm_index = _pm_index_to_lookup(pm_index, num_nodes=num_nodes)
+    train_neg_mask = train_mask & (y != 1)
+    pos_mask = train_mask & (y == 1)
+    temporal_hard = (
+        _positive_aware_temporal_hard_negatives(
+            pos_idx=pos_idx,
+            neg_idx=neg_idx,
+            ports=ports,
+            ts_min=ts_min,
+            window_minutes=int(hard_negative_window_minutes),
+        )
+        if has_pm_index
+        else torch.empty(0, dtype=torch.long)
+    )
+    spatial_hard = (
+        _positive_aware_spatial_hard_negatives(
+            graph_cpu,
+            node_type=node_type,
+            train_neg_mask=train_neg_mask,
+            pos_mask=pos_mask,
+            ts_min=ts_min,
+            has_pm_index=has_pm_index,
+        )
+        if has_pm_index
+        else torch.empty(0, dtype=torch.long)
+    )
+    hard_idx = torch.unique(torch.cat([temporal_hard, spatial_hard]).long()) if (
+        temporal_hard.numel() or spatial_hard.numel()
+    ) else torch.empty(0, dtype=torch.long)
+    if hard_idx.numel() > 0:
+        hard_idx = hard_idx[train_neg_mask[hard_idx]]
+
+    hard_slots = 0
+    if hard_idx.numel() > 0:
+        hard_slots = min(
+            int(neg_slots),
+            int(max(0, int(hard_negatives_per_positive))) * int(pos_per_batch),
+        )
+    easy_slots = int(neg_slots) - int(hard_slots)
+    if easy_slots <= 0 and neg_idx.numel() > 0:
+        if hard_slots > 0:
+            hard_slots -= 1
+        easy_slots = int(neg_slots) - int(hard_slots)
+
+    is_hard = torch.zeros(num_nodes, dtype=torch.bool)
+    if hard_idx.numel() > 0:
+        is_hard[hard_idx] = True
+    easy_idx = neg_idx[~is_hard[neg_idx]]
+    if easy_idx.numel() == 0:
+        easy_idx = neg_idx
+    if hard_slots <= 0:
+        hard_idx = torch.empty(0, dtype=torch.long)
+        easy_slots = int(neg_slots)
+
+    batches_from_neg = int(math.ceil(float(neg_idx.numel()) / float(max(1, neg_slots))))
+    batches_from_pos = int(math.ceil(float(pos_idx.numel()) / float(max(1, pos_per_batch))))
+    batch_count = max(1, batches_from_neg, batches_from_pos)
+    total_pos_slots = int(batch_count) * int(pos_per_batch)
+    total_hard_slots = int(batch_count) * int(hard_slots)
+    total_easy_slots = int(batch_count) * int(max(0, easy_slots))
+
+    pos_order = _repeat_shuffled_1d(pos_idx, total_pos_slots, gen)
+    hard_order = _repeat_shuffled_1d(hard_idx, total_hard_slots, gen)
+    easy_order = _repeat_shuffled_1d(easy_idx, total_easy_slots, gen)
+    fill_order = _repeat_shuffled_1d(neg_idx, int(batch_count) * int(neg_slots), gen)
+
+    batches: List[torch.Tensor] = []
+    pos_ptr = 0
+    hard_ptr = 0
+    easy_ptr = 0
+    fill_ptr = 0
+    for _ in range(int(batch_count)):
+        parts: List[torch.Tensor] = []
+        if pos_per_batch > 0:
+            parts.append(pos_order[pos_ptr: pos_ptr + pos_per_batch])
+            pos_ptr += int(pos_per_batch)
+        if hard_slots > 0:
+            parts.append(hard_order[hard_ptr: hard_ptr + hard_slots])
+            hard_ptr += int(hard_slots)
+        if easy_slots > 0:
+            parts.append(easy_order[easy_ptr: easy_ptr + easy_slots])
+            easy_ptr += int(easy_slots)
+        batch = torch.cat([part for part in parts if part.numel() > 0]).long()
+        if batch.numel() < batch_size:
+            need = int(batch_size) - int(batch.numel())
+            if fill_ptr + need > int(fill_order.numel()):
+                fill_order = torch.cat([fill_order, _repeat_shuffled_1d(neg_idx, need, gen)])
+            batch = torch.cat([batch, fill_order[fill_ptr: fill_ptr + need].long()])
+            fill_ptr += need
+        if batch.numel() > 1:
+            batch = batch[torch.randperm(int(batch.numel()), generator=gen)]
+        batches.append(batch.long())
+    seed_order = torch.cat(batches).long() if batches else train_idx.long()
+
+    positive_slots = int((y[seed_order] == 1).sum().item()) if seed_order.numel() else 0
+    negative_slots = int(seed_order.numel()) - positive_slots
+    stats.update(
+        {
+            "pm_index_available": bool(has_pm_index),
+            "temporal_hard_negative_candidates": int(temporal_hard.numel()),
+            "spatial_hard_negative_candidates": int(spatial_hard.numel()),
+            "hard_negative_candidates": int(hard_idx.numel()),
+            "hard_negatives_per_batch": int(hard_slots),
+            "random_negatives_per_batch": int(max(0, easy_slots)),
+            "batch_count": int(batch_count),
+            "seed_slot_count": int(seed_order.numel()),
+            "unique_seed_count": int(torch.unique(seed_order).numel()) if seed_order.numel() else 0,
+            "positive_seed_slots": int(positive_slots),
+            "negative_seed_slots": int(negative_slots),
+            "actual_positive_fraction": (
+                float(positive_slots) / float(max(1, int(seed_order.numel())))
+            ),
+            "fallback_reason": None if bool(has_pm_index) else "missing_pm_index_hard_negatives_random",
+        }
+    )
+    return seed_order, stats
+
 
 def _build_native_sampler_loader(
     *,
@@ -1366,6 +1853,56 @@ def _build_native_sampler_loader(
             return loader, None
         except Exception as exc:
             return None, f"RioGNN top-p RL falló: {exc}"
+
+    if mode == "positive_aware":
+        try:
+            seed_order, sampler_stats = build_positive_aware_seed_order(
+                graph_cpu,
+                pm_index=cfg.get("pm_index"),
+                batch_size=max(1, int(batch_size)),
+                sampling_seed=int(seed),
+                epoch=int(_safe_cast(cfg.get("positive_sampler_epoch"), int, 1)),
+                target_positive_fraction=float(
+                    _safe_cast(
+                        cfg.get("positive_sampler_target_fraction"),
+                        float,
+                        0.02,
+                    )
+                ),
+                hard_negative_window_minutes=int(
+                    _safe_cast(
+                        cfg.get("positive_sampler_hard_window_minutes"),
+                        int,
+                        60,
+                    )
+                ),
+                hard_negatives_per_positive=int(
+                    _safe_cast(
+                        cfg.get("positive_sampler_hard_negatives_per_positive"),
+                        int,
+                        4,
+                    )
+                ),
+                node_type=node_type,
+            )
+            if seed_order.numel() == 0:
+                return None, "Positive-aware no encontró semillas de train disponibles."
+            loader = NeighborLoader(
+                graph_cpu,
+                input_nodes=(node_type, seed_order.detach().cpu().long()),
+                num_neighbors=resolved_neighbors,
+                batch_size=max(1, int(batch_size)),
+                shuffle=False,
+            )
+            try:
+                setattr(loader, "sampler_impl", "positive_aware_neighbor")
+                setattr(loader, "positive_sampler_stats", _json_safe(sampler_stats))
+                setattr(loader, "positive_sampler_seed_count", int(seed_order.numel()))
+            except Exception:
+                pass
+            return loader, None
+        except Exception as exc:
+            return None, f"Positive-aware NeighborLoader falló: {exc}"
 
     if mode == "neighbor":
         try:
@@ -1660,7 +2197,12 @@ def _archive_legacy_gnn_anomaly_files(keep: int = 3):
     except Exception:
         pass
 
-def run_gnn_anomaly_pipeline(loaded_obj):
+def run_gnn_anomaly_pipeline(
+    loaded_obj,
+    *,
+    model_path: Optional[str] = None,
+    model_index: Optional[int] = None,
+):
     """
     Reporte de evaluación del modelo GAT entrenado sobre el grafo cargado.
     - Selecciona umbral por F_beta en validación (beta=F_BETA_THRESHOLD).
@@ -1698,17 +2240,22 @@ def run_gnn_anomaly_pipeline(loaded_obj):
         f1 = meta.get('best_val_f1', float('nan'))
         ep = meta.get('best_epoch', '—')
         print(f"  [{i:>2}] {m['variant']:<18} {arch.get('num_layers','?'):>5} {arch.get('num_heads','?'):>6} {arch.get('hidden_channels','?'):>7}  {f1 if f1 is not None else float('nan'):.4f}  {ep!s:>5}  {m['time']}")
-    try:
-        sel = input("Seleccione un modelo a evaluar (Enter=último): ").strip()
-        if sel:
-            idx = int(sel) - 1
-            if not (0 <= idx < len(models)):
-                raise ValueError
-            chosen = models[idx]
+    chosen = models[-1]
+    if model_path:
+        match = [m for m in models if os.path.abspath(str(m.get("path"))) == os.path.abspath(str(model_path))]
+        if match:
+            chosen = match[0]
         else:
-            chosen = models[-1]
-    except Exception:
-        chosen = models[-1]
+            logger.warning(f"Modelo solicitado no encontrado en Resultados: {model_path}. Usando último disponible.")
+    elif model_index is not None:
+        try:
+            idx = int(model_index) - 1
+            if 0 <= idx < len(models):
+                chosen = models[idx]
+            else:
+                logger.warning(f"model_index fuera de rango ({model_index}). Usando último disponible.")
+        except Exception:
+            logger.warning(f"model_index inválido ({model_index}). Usando último disponible.")
 
     # Instanciar modelo con la arquitectura del modelo elegido
     num_classes = 2
@@ -1931,19 +2478,17 @@ def run_gnn_anomaly_pipeline(loaded_obj):
     variant_msg = 'GAT ' + '+'.join(variant_flags)
     print(f"\n✅ Reporte GAT finalizado. Variante: {variant_msg}.")
 
-def run_gnn_anomaly_hpo_then_train(loaded_obj):
+def run_gnn_anomaly_hpo_then_train(loaded_obj, use_graphsmote: Optional[bool] = None):
     """
     Búsqueda de hiperparámetros para GNN (Anomalías) y entrenamiento automático posterior.
     Respeta la elección de GraphSMOTE y la aplica tanto a la búsqueda como al entrenamiento.
     """
-    try:
-        use_smote_in = input("¿Incluir GraphSMOTE en la búsqueda/entrenamiento? (s/n): ").strip().lower()
-    except Exception:
-        use_smote_in = 'n'
-    use_graphsmote = use_smote_in in ('s', 'si', 'y', 'yes')
+    if use_graphsmote is None:
+        use_graphsmote = False
+        logger.info("GraphSMOTE no especificado para HPO+train de anomalías; usando False.")
 
     # Búsqueda (forzada con el flag elegido)
-    best_params = search_hyperparameters(loaded_obj, use_graphsmote_search=use_graphsmote)
+    best_params = search_hyperparameters(loaded_obj, use_graphsmote_search=bool(use_graphsmote))
     if not best_params:
         print("❌ No se obtuvieron hiperparámetros.")
         return
@@ -1952,7 +2497,7 @@ def run_gnn_anomaly_hpo_then_train(loaded_obj):
     # Entrenamiento forzando el mismo flag de GraphSMOTE y etiquetando propósito 'Anomaly'
     if isinstance(loaded_obj, dict):
         loaded_obj['purpose'] = 'Anomaly'
-    run_gat_training(loaded_obj, force_use_graphsmote=use_graphsmote, purpose='Anomaly')
+    run_gat_training(loaded_obj, force_use_graphsmote=bool(use_graphsmote), purpose='Anomaly')
 
 # --------------------------------------------------------------------------- #
 # SETUP LOGGING
@@ -2217,6 +2762,11 @@ def _update_val_loss_monitor(
 def _normalize_checkpoint_metric(metric: object) -> str:
     raw = str(metric or "val_objective_score").strip().lower()
     key = raw.replace(" ", "_").replace("-", "_")
+    compact = key.replace("@", "_at_")
+    if compact.startswith("val_recall_at_") or compact.startswith("val_precision_at_"):
+        return compact
+    if compact.startswith("recall_at_") or compact.startswith("precision_at_"):
+        return f"val_{compact}"
     aliases = {
         "objective": "val_objective_score",
         "objective_score": "val_objective_score",
@@ -2326,7 +2876,7 @@ def pick_threshold_from_val(y_true_val, y_prob1_val, *, mode="fbeta", beta=0.5, 
     # Curva PR
     prec, rec, thr = precision_recall_curve(y_true_val, y_prob1_val)
     # Alinear: thr tiene len = len(prec)-1 = len(rec)-1
-    prec_, rec_, thr_ = prec[1:], rec[1:], thr
+    prec_, rec_, thr_ = prec[:-1], rec[:-1], thr
 
     if top_k is not None and mode == "topk":
         order = np.argsort(-y_prob1_val)
@@ -3090,6 +3640,41 @@ def _score_from_objective_metrics(
         return _safe(accuracy)
     return _safe(f1)
 
+
+def _coerce_hyperparam_value(value):
+    if isinstance(value, str):
+        text = value.strip()
+        lower = text.lower()
+        if lower in ("true", "false"):
+            return lower == "true"
+        if not text:
+            return value
+        try:
+            if re.fullmatch(r"[-+]?\d+", text):
+                return int(text)
+            if re.fullmatch(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text):
+                return float(text)
+        except Exception:
+            return value
+    return value
+
+
+def _load_hyperparams_csv(path: str) -> dict:
+    df_hp = pd.read_csv(path)
+    if any(str(c).startswith("params_") for c in df_hp.columns):
+        df_hp.rename(columns=lambda c: str(c).replace("params_", ""), inplace=True)
+    if df_hp.empty:
+        raise ValueError(f"Archivo de hiperparámetros vacío: {path}")
+    if "value" in df_hp.columns:
+        try:
+            row = df_hp.loc[df_hp["value"].idxmax()].to_dict()
+        except Exception:
+            row = df_hp.iloc[0].to_dict()
+    else:
+        row = df_hp.iloc[0].to_dict()
+    return {k: _coerce_hyperparam_value(v) for k, v in row.items()}
+
+
 def run_gat_training(
     loaded_obj,
     force_use_graphsmote: Optional[bool] = None,
@@ -3110,6 +3695,9 @@ def run_gat_training(
     deterministic_sampling: Optional[bool] = None,
     sampling_seed: Optional[int] = None,
     disable_hard_undersampling: Optional[bool] = None,
+    positive_sampler_target_fraction: Optional[float] = None,
+    positive_sampler_hard_window_minutes: Optional[int] = None,
+    positive_sampler_hard_negatives_per_positive: Optional[int] = None,
     cluster_gcn_num_parts: Optional[int] = None,
     cluster_gcn_parts_per_epoch: Optional[int] = None,
     graphsaint_mode: Optional[str] = None,
@@ -3129,8 +3717,14 @@ def run_gat_training(
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
     checkpoint_metric: Optional[str] = None,
+    metrics_history_path: Optional[str] = None,
+    test_eval_interval_epochs: Optional[int] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     should_test: Optional[Callable[[], bool]] = None,
+    hparams_path: Optional[str] = None,
+    hparams_index: Optional[int] = None,
+    reuse_hparams: bool = True,
+    allow_hpo_search: bool = True,
 ):
     """
     Entrenamiento GAT completo con:
@@ -3157,13 +3751,6 @@ def run_gat_training(
         except Exception as exc:
             logger.warning(f"No se pudo ejecutar ImGAGN automático: {exc}")
 
-    # Preguntar al usuario si desea usar GraphSMOTE (o forzar desde el caller)
-    if force_use_graphsmote is None:
-        use_graphsmote_input = input("¿Desea utilizar aumentación de nodos sintéticos (GraphSMOTE)? (s/n): ").strip().lower()
-        use_graphsmote = use_graphsmote_input in ('s', 'si', 'y', 'yes')
-    else:
-        use_graphsmote = bool(force_use_graphsmote)
-
     # Detect if graph is already balanced (synthetic nodes present)
     graph_has_synthetics = False
     try:
@@ -3171,6 +3758,15 @@ def run_gat_training(
             graph_has_synthetics = bool(data["pm"].is_synthetic.sum().item() > 0)
     except Exception:
         graph_has_synthetics = False
+
+    if force_use_graphsmote is None:
+        use_graphsmote = bool(graph_has_synthetics)
+        logger.info(
+            "GraphSMOTE no fue especificado; usando detección automática del grafo "
+            f"(synthetics={graph_has_synthetics})."
+        )
+    else:
+        use_graphsmote = bool(force_use_graphsmote)
     skip_graphsmote_augment = bool(use_graphsmote and graph_has_synthetics and not train_decoders_only)
     enable_graphsmote_augment = bool(use_graphsmote and not skip_graphsmote_augment)
     
@@ -3206,51 +3802,56 @@ def run_gat_training(
     hp_files = [f for f in hp_files_sorted if ("_GraphSMOTE" in os.path.basename(f)) == use_graphsmote]
 
     best_params = None
-    if not hp_files:
+    selected_hp_path = None
+    if hparams_path:
+        selected_hp_path = str(hparams_path)
+        if not os.path.exists(selected_hp_path):
+            logger.error(f"Archivo de hiperparámetros no encontrado: {selected_hp_path}")
+            return
+    elif hp_files and bool(reuse_hparams):
+        if hparams_index is not None:
+            if int(hparams_index) == 0:
+                selected_hp_path = None
+            elif 1 <= int(hparams_index) <= len(hp_files):
+                selected_hp_path = hp_files[int(hparams_index) - 1]
+            else:
+                logger.error(f"hparams_index fuera de rango: {hparams_index}")
+                return
+        else:
+            selected_hp_path = hp_files[-1]
+
+    if selected_hp_path:
+        try:
+            logger.info(f"Cargando hiperparámetros desde: {os.path.basename(selected_hp_path)}")
+            best_params = _load_hyperparams_csv(selected_hp_path)
+        except Exception as exc:
+            logger.error(f"No se pudo cargar '{os.path.basename(selected_hp_path)}': {exc}")
+            return
+    elif not hp_files:
         logger.info("No se encontraron archivos de hiperparámetros compatibles. Iniciando nueva búsqueda...")
-        best_params = search_hyperparameters(loaded_obj, use_graphsmote_search=use_graphsmote, optimizer_overrides=optimizer_overrides)
+        if not allow_hpo_search:
+            logger.error("No hay hiperparámetros compatibles y allow_hpo_search=False.")
+            return
+        best_params = search_hyperparameters(
+            loaded_obj,
+            use_graphsmote_search=use_graphsmote,
+            optimizer_overrides=optimizer_overrides,
+            reuse_existing=bool(reuse_hparams),
+        )
     else:
-        print("--- Selección de Hiperparámetros ---")
         variant_lbl = "GraphSMOTE" if use_graphsmote else "Base"
         if _has_imgagn(loaded_obj):
             variant_lbl += " + ImGAGN"
-        print(f"Archivos de hiperparámetros disponibles (filtrados por variante: {variant_lbl}):")
-        for i, f in enumerate(hp_files, 1):
-            print(f"  [{i}] {os.path.basename(f)}")
-        print("  [0] Iniciar nueva búsqueda de hiperparámetros")
-        
-        try:
-            sel_str = input("Seleccione el número del archivo a usar (o 0 para una nueva búsqueda): ").strip()
-            sel = int(sel_str)
-
-            if sel == 0:
-                logger.info("Iniciando nueva búsqueda de hiperparámetros...")
-                best_params = search_hyperparameters(loaded_obj, use_graphsmote_search=use_graphsmote, optimizer_overrides=optimizer_overrides)
-            elif 1 <= sel <= len(hp_files):
-                hp_path = hp_files[sel - 1]
-                logger.info(f"Cargando hiperparámetros desde: {os.path.basename(hp_path)}")
-                df_hp = pd.read_csv(hp_path)
-
-                if any(c.startswith('params_') for c in df_hp.columns):
-                    df_hp.rename(columns=lambda c: c.replace('params_', ''), inplace=True)
-
-                best_params = df_hp.loc[df_hp['value'].idxmax()].to_dict()
-                
-                for k, v in list(best_params.items()):
-                    if isinstance(v, str) and v.lower() in ('true','false'):
-                        best_params[k] = (v.lower() == 'true')
-                    else:
-                        try:
-                            if isinstance(v, str) and v.replace('.','',1).isdigit():
-                                best_params[k] = float(v) if ('.' in v) else int(v)
-                        except Exception:
-                            pass
-            else:
-                raise ValueError("Selección fuera de rango.")
-
-        except (ValueError, IndexError) as e:
-            logger.error(f"Selección inválida: {e}. Abortando entrenamiento.")
+        if not allow_hpo_search:
+            logger.error(f"reuse_hparams=False para variante {variant_lbl}, pero allow_hpo_search=False.")
             return
+        logger.info(f"Iniciando nueva búsqueda de hiperparámetros para variante: {variant_lbl}.")
+        best_params = search_hyperparameters(
+            loaded_obj,
+            use_graphsmote_search=use_graphsmote,
+            optimizer_overrides=optimizer_overrides,
+            reuse_existing=bool(reuse_hparams),
+        )
 
     if not best_params:
         logger.error("No se pudieron obtener los hiperparámetros. Abortando.")
@@ -3306,6 +3907,11 @@ def run_gat_training(
     sampler_aliases = {
         "neighbor": "neighbor",
         "neighborloader": "neighbor",
+        "positive_aware": "positive_aware",
+        "positiveaware": "positive_aware",
+        "pos_aware": "positive_aware",
+        "positive_aware_neighbor": "positive_aware",
+        "positive_aware_neighborloader": "positive_aware",
         "cluster_gcn": "cluster_gcn",
         "clustergcn": "cluster_gcn",
         "graphsaint": "graphsaint",
@@ -3330,6 +3936,48 @@ def run_gat_training(
         disable_hard_undersampling
         if disable_hard_undersampling is not None
         else best_params.get("disable_hard_undersampling", False)
+    )
+    positive_sampler_target_fraction_resolved = float(
+        _safe_cast(
+            positive_sampler_target_fraction
+            if positive_sampler_target_fraction is not None
+            else best_params.get("positive_sampler_target_fraction"),
+            float,
+            0.02,
+        )
+    )
+    if (
+        not math.isfinite(float(positive_sampler_target_fraction_resolved))
+        or positive_sampler_target_fraction_resolved <= 0.0
+    ):
+        positive_sampler_target_fraction_resolved = 0.02
+    positive_sampler_target_fraction_resolved = max(
+        0.0,
+        min(0.5, float(positive_sampler_target_fraction_resolved)),
+    )
+    positive_sampler_hard_window_minutes_resolved = int(
+        max(
+            0,
+            _safe_cast(
+                positive_sampler_hard_window_minutes
+                if positive_sampler_hard_window_minutes is not None
+                else best_params.get("positive_sampler_hard_window_minutes"),
+                int,
+                60,
+            ),
+        )
+    )
+    positive_sampler_hard_negatives_per_positive_resolved = int(
+        max(
+            0,
+            _safe_cast(
+                positive_sampler_hard_negatives_per_positive
+                if positive_sampler_hard_negatives_per_positive is not None
+                else best_params.get("positive_sampler_hard_negatives_per_positive"),
+                int,
+                4,
+            ),
+        )
     )
 
     cluster_gcn_num_parts_resolved = int(
@@ -3437,6 +4085,11 @@ def run_gat_training(
     best_params["deterministic_sampling"] = bool(deterministic_sampling_resolved)
     best_params["sampling_seed"] = int(sampling_seed_resolved)
     best_params["disable_hard_undersampling"] = bool(disable_hard_undersampling_resolved)
+    best_params["positive_sampler_target_fraction"] = float(positive_sampler_target_fraction_resolved)
+    best_params["positive_sampler_hard_window_minutes"] = int(positive_sampler_hard_window_minutes_resolved)
+    best_params["positive_sampler_hard_negatives_per_positive"] = int(
+        positive_sampler_hard_negatives_per_positive_resolved
+    )
     best_params["cluster_gcn_num_parts"] = int(cluster_gcn_num_parts_resolved)
     best_params["cluster_gcn_parts_per_epoch"] = int(cluster_gcn_parts_per_epoch_resolved)
     best_params["graphsaint_mode"] = str(graphsaint_mode_resolved)
@@ -3458,12 +4111,16 @@ def run_gat_training(
 
     logger.info(
         "Sampling config | mode=%s | deterministic=%s | seed=%d | disable_hard=%s | "
+        "positive_target=%.4f | positive_window_min=%d | positive_hard_per_pos=%d | "
         "cluster_parts=%d | cluster_parts_epoch=%d | saint_mode=%s | saint_batch=%d | saint_steps=%d | saint_walk=%d | "
         "eval_neighbors_mode=%s | eval_num_neighbors=%s",
         train_sampler_mode_resolved,
         deterministic_sampling_resolved,
         sampling_seed_resolved,
         disable_hard_undersampling_resolved,
+        positive_sampler_target_fraction_resolved,
+        positive_sampler_hard_window_minutes_resolved,
+        positive_sampler_hard_negatives_per_positive_resolved,
         cluster_gcn_num_parts_resolved,
         cluster_gcn_parts_per_epoch_resolved,
         graphsaint_mode_resolved,
@@ -3857,6 +4514,8 @@ def run_gat_training(
             )
         return graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1)
 
+    pm_index_for_sampler = loaded_obj.get("pm_index") if isinstance(loaded_obj, dict) else None
+
     def create_loader(
         graph_to_load,
         use_undersampling=False,
@@ -3891,8 +4550,22 @@ def run_gat_training(
             num_neighbors_cfg = NUM_NEIGHBORS
 
         if train_sampler_mode_resolved != "neighbor":
+            sampler_seed_for_epoch = (
+                int(sampling_seed_resolved)
+                if train_sampler_mode_resolved == "positive_aware"
+                else int(sampling_seed_resolved) + int(epoch_idx) * 9973
+            )
             native_cfg = {
                 "train_sampler_mode": str(train_sampler_mode_resolved),
+                "pm_index": pm_index_for_sampler,
+                "positive_sampler_epoch": int(epoch_idx),
+                "positive_sampler_target_fraction": float(positive_sampler_target_fraction_resolved),
+                "positive_sampler_hard_window_minutes": int(
+                    positive_sampler_hard_window_minutes_resolved
+                ),
+                "positive_sampler_hard_negatives_per_positive": int(
+                    positive_sampler_hard_negatives_per_positive_resolved
+                ),
                 "cluster_gcn_num_parts": int(cluster_gcn_num_parts_resolved),
                 "cluster_gcn_parts_per_epoch": int(cluster_gcn_parts_per_epoch_resolved),
                 "graphsaint_mode": str(graphsaint_mode_resolved),
@@ -3910,13 +4583,13 @@ def run_gat_training(
                 "rl_backtracking": bool(rl_backtracking_resolved),
                 "num_layers": int(best_params.get("num_layers", 2)),
                 "deterministic_sampling": bool(deterministic_sampling_resolved),
-                "sampling_seed": int(sampling_seed_resolved) + int(epoch_idx) * 9973,
+                "sampling_seed": int(sampler_seed_for_epoch),
             }
             native_loader, native_error = _build_native_sampler_loader(
                 graph_cpu=graph_cpu,
                 sampler_config=native_cfg,
                 batch_size=int(batch_size_hp),
-                sampling_seed=int(sampling_seed_resolved) + int(epoch_idx) * 9973,
+                sampling_seed=int(sampler_seed_for_epoch),
                 base_seeds=base_seeds,
                 num_neighbors_cfg=num_neighbors_cfg,
                 deterministic=bool(deterministic_sampling_resolved),
@@ -3992,6 +4665,9 @@ def run_gat_training(
     train_loader = rebuild_train_loader(train_graph, epoch_idx=1)
     train_sampler_impl = str(getattr(train_loader, "sampler_impl", "neighbor_native"))
     best_params["sampler_impl"] = train_sampler_impl
+    positive_sampler_stats = getattr(train_loader, "positive_sampler_stats", None)
+    if positive_sampler_stats is not None:
+        best_params["positive_sampler_stats"] = _json_safe(positive_sampler_stats)
 
     max_epochs = int(max_epochs) if max_epochs is not None else int(MAX_EPOCHS)
     objective_metric = _normalize_objective_metric(best_params.get("objective_metric", "F1"))
@@ -4017,6 +4693,35 @@ def run_gat_training(
     best_params["monitor_mode"] = monitor_mode
     best_params["lr_scheduler"] = lr_scheduler
 
+    if save_state_path is None and resume_state_path:
+        save_state_path = resume_state_path
+
+    resume_metadata_ckpt = None
+    if resume_state_path:
+        try:
+            if os.path.exists(resume_state_path):
+                resume_metadata_ckpt = torch.load(
+                    resume_state_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+        except Exception:
+            resume_metadata_ckpt = None
+    if isinstance(resume_metadata_ckpt, dict):
+        if resume_metadata_ckpt.get("run_id"):
+            run_id = str(resume_metadata_ckpt.get("run_id"))
+        if metrics_history_path is None and resume_metadata_ckpt.get("metrics_history_path"):
+            metrics_history_path = str(resume_metadata_ckpt.get("metrics_history_path"))
+    if metrics_history_path is None:
+        metrics_history_path = _default_training_metrics_history_path(save_state_path)
+    if metrics_history_path and not resume_state_path:
+        _reset_training_history(metrics_history_path)
+
+    try:
+        test_eval_interval_epochs_resolved = max(0, int(test_eval_interval_epochs or 0))
+    except Exception:
+        test_eval_interval_epochs_resolved = 0
+
     has_val_mask = hasattr(base_graph["pm"], "val_mask")
     val_mask_count = int(base_graph["pm"].val_mask.sum().item()) if has_val_mask else 0
     if val_mask_count == 0:
@@ -4028,7 +4733,12 @@ def run_gat_training(
     _emit_training_event(
         "train_start",
         run_id,
+        history_path=metrics_history_path,
         total=max_epochs,
+        resume_state_path=str(resume_state_path) if resume_state_path else None,
+        save_state_path=str(save_state_path) if save_state_path else None,
+        metrics_history_path=str(metrics_history_path) if metrics_history_path else None,
+        test_eval_interval_epochs=int(test_eval_interval_epochs_resolved),
         device=str(device),
         gnn_variant=_normalize_gnn_variant(gnn_variant),
         variant_tag=_variant_tags(use_graphsmote, loaded_obj, gnn_variant=gnn_variant),
@@ -4043,10 +4753,10 @@ def run_gat_training(
         num_neighbors=loader_num_neighbors,
         smote_every_n_epochs=int(smote_every_override),
         target_pos_ratio=float(target_pos_ratio_override),
-            accumulation_steps=int(accumulation_steps),
-            train_sampler_mode=str(train_sampler_mode_resolved),
-            sampler_impl=str(train_sampler_impl),
-            deterministic_sampling=bool(deterministic_sampling_resolved),
+        accumulation_steps=int(accumulation_steps),
+        train_sampler_mode=str(train_sampler_mode_resolved),
+        sampler_impl=str(train_sampler_impl),
+        deterministic_sampling=bool(deterministic_sampling_resolved),
         sampling_seed=int(sampling_seed_resolved),
         disable_hard_undersampling=bool(disable_hard_undersampling_resolved),
         cluster_gcn_num_parts=int(cluster_gcn_num_parts_resolved),
@@ -4061,6 +4771,12 @@ def run_gat_training(
         rl_max_p=float(rl_max_p_resolved),
         rl_min_keep=int(rl_min_keep_resolved),
         rl_lambda_simi=float(rl_lambda_simi_resolved) if rl_sampler_controller is not None else 0.0,
+        positive_sampler_target_fraction=float(positive_sampler_target_fraction_resolved),
+        positive_sampler_hard_window_minutes=int(positive_sampler_hard_window_minutes_resolved),
+        positive_sampler_hard_negatives_per_positive=int(
+            positive_sampler_hard_negatives_per_positive_resolved
+        ),
+        positive_sampler_stats=_json_safe(positive_sampler_stats),
         eval_neighbors_mode=str(eval_neighbors_mode_resolved),
         eval_num_neighbors=eval_num_neighbors_resolved,
         objective_metric=str(objective_metric),
@@ -4079,9 +4795,6 @@ def run_gat_training(
     )
     batch_scheduler = scheduler if _lr_scheduler_steps_per_batch(lr_scheduler) else None
 
-    if save_state_path is None and resume_state_path:
-        save_state_path = resume_state_path
-
     start_epoch = 1
     resume_best_val_loss = _initial_monitor_value("min")
     resume_best_val_f1 = 0.0
@@ -4092,6 +4805,8 @@ def run_gat_training(
     resume_best_val_f05 = None
     resume_best_val_tau = None
     resume_best_val_accuracy = None
+    resume_best_val_recall_at_k = {}
+    resume_best_val_precision_at_k = {}
     resume_best_val_objective = float("-inf")
     resume_best_epoch = 0
     resume_patience_counter = 0
@@ -4126,6 +4841,8 @@ def run_gat_training(
                     resume_best_val_f05 = ckpt.get("best_val_f05")
                     resume_best_val_tau = ckpt.get("best_val_tau")
                     resume_best_val_accuracy = ckpt.get("best_val_accuracy")
+                    resume_best_val_recall_at_k = ckpt.get("best_val_recall_at_k") or {}
+                    resume_best_val_precision_at_k = ckpt.get("best_val_precision_at_k") or {}
                     try:
                         resume_best_val_objective = float(
                             ckpt.get("best_val_objective_score", ckpt.get("best_val_f1", float("-inf")))
@@ -4191,6 +4908,8 @@ def run_gat_training(
     best_val_f05 = resume_best_val_f05
     best_val_tau = resume_best_val_tau
     best_val_accuracy = resume_best_val_accuracy
+    best_val_recall_at_k = dict(resume_best_val_recall_at_k or {})
+    best_val_precision_at_k = dict(resume_best_val_precision_at_k or {})
     best_val_objective_score = float(resume_best_val_objective)
     if not math.isfinite(best_val_objective_score):
         best_val_objective_score = float("-inf")
@@ -4291,6 +5010,9 @@ def run_gat_training(
             if undersampling_strategy == 'hard' and epoch <= hard_sampling_warmup:
                 strategy_now = 'random'
             train_loader = rebuild_train_loader(train_graph, strategy_override=strategy_now, epoch_idx=epoch)
+        positive_sampler_stats = getattr(train_loader, "positive_sampler_stats", None)
+        if positive_sampler_stats is not None:
+            best_params["positive_sampler_stats"] = _json_safe(positive_sampler_stats)
         # Refresco para modo ONLINE
         if enable_graphsmote_augment and use_graphsmote and GRAPHSMOTE_MODE == 'online' and epoch % smote_every_override == 0:
             logger.info(f"Epoch {epoch}: Refrescando nodos sintéticos (Online Mode)...")
@@ -4317,6 +5039,9 @@ def run_gat_training(
             if undersampling_strategy == 'hard' and epoch <= hard_sampling_warmup:
                 strategy_now = 'random'
             train_loader = rebuild_train_loader(train_graph, strategy_override=strategy_now, epoch_idx=epoch)  # Recargar el loader con configuración original
+            positive_sampler_stats = getattr(train_loader, "positive_sampler_stats", None)
+            if positive_sampler_stats is not None:
+                best_params["positive_sampler_stats"] = _json_safe(positive_sampler_stats)
 
         # Rutina de entrenamiento
         model.train()
@@ -4336,6 +5061,10 @@ def run_gat_training(
         
         lambda_edge = float(best_params.get('lambda_edge', 1e-6))
         lambda_l2_att = float(best_params.get('lambda_l2_att', 0.0))
+        ranking_loss_mode = str(best_params.get("ranking_loss_mode", "none"))
+        ranking_loss_weight = float(_safe_cast(best_params.get("ranking_loss_weight"), float, 0.0))
+        ranking_loss_margin = float(_safe_cast(best_params.get("ranking_loss_margin"), float, 0.1))
+        ranking_loss_max_pairs = int(_safe_cast(best_params.get("ranking_loss_max_pairs"), int, 4096))
 
         _prime_temporal_cache_if_needed(model, train_graph, node_type='pm', context=f"train_epoch_{epoch}")
         
@@ -4355,7 +5084,11 @@ def run_gat_training(
                                           suppress_missing_att_warning=suppress_missing_att_warning,
                                           batch_callback=batch_event_cb,
                                           accumulation_steps=accumulation_steps,
-                                          loss_weight_mode=str(best_params.get('loss_weight_mode', 'uniform')))
+                                          loss_weight_mode=str(best_params.get('loss_weight_mode', 'uniform')),
+                                          ranking_loss_mode=ranking_loss_mode,
+                                          ranking_loss_weight=ranking_loss_weight,
+                                          ranking_loss_margin=ranking_loss_margin,
+                                          ranking_loss_max_pairs=ranking_loss_max_pairs)
         if writer is not None:
             writer.add_scalar("Loss/train", loss, epoch)
 
@@ -4406,6 +5139,8 @@ def run_gat_training(
         val_tau = None
         val_far = None
         val_f05 = None
+        val_recall_at_k = {}
+        val_precision_at_k = {}
         val_objective_score = None
         if val_res and val_key in val_res:
             y_true_val = val_res[val_key]['true'].numpy().ravel()
@@ -4462,6 +5197,8 @@ def run_gat_training(
             val_auc = val_res[val_key].get('auc')
             val_auprc = val_res[val_key].get('auprc')
             val_mcc = val_res[val_key].get('mcc')
+            val_recall_at_k = val_res[val_key].get('recall_at_k') or {}
+            val_precision_at_k = val_res[val_key].get('precision_at_k') or {}
 
             if score_f1 is None:
                 score_f1 = float(val_f1 or 0.0)
@@ -4567,6 +5304,10 @@ def run_gat_training(
             "val_accuracy": val_accuracy,
             "val_objective_score": val_objective_score,
         }
+        for k_val, recall_val in (val_recall_at_k or {}).items():
+            current_monitor_values[f"val_recall_at_{int(k_val)}"] = recall_val
+        for k_val, precision_val in (val_precision_at_k or {}).items():
+            current_monitor_values[f"val_precision_at_{int(k_val)}"] = precision_val
         monitor_value = _metric_value_for_monitor(monitor_metric, current_monitor_values)
         is_best, best_monitor_value, patience_counter = _update_metric_monitor(
             monitor_value=monitor_value,
@@ -4586,6 +5327,8 @@ def run_gat_training(
             best_val_f05 = float(val_f05) if val_f05 is not None else None
             best_val_tau = float(val_tau) if val_tau is not None else None
             best_val_accuracy = float(val_accuracy) if val_accuracy is not None else None
+            best_val_recall_at_k = dict(val_recall_at_k or {})
+            best_val_precision_at_k = dict(val_precision_at_k or {})
             best_epoch = epoch
             # Guardar modelo: copia única y alias estable
             try:
@@ -4625,6 +5368,8 @@ def run_gat_training(
                     'best_val_f05': best_val_f05,
                     'best_val_tau': best_val_tau,
                     'best_val_accuracy': best_val_accuracy,
+                    'best_val_recall_at_k': _json_safe(best_val_recall_at_k),
+                    'best_val_precision_at_k': _json_safe(best_val_precision_at_k),
                     'best_epoch': int(best_epoch),
                     'objective_metric': str(objective_metric),
                     'objective_threshold_beta': float(objective_threshold_beta),
@@ -4639,6 +5384,7 @@ def run_gat_training(
                     'smote_every_n_epochs_used': int(smote_every_override),
                     'num_neighbors_effective': loader_num_neighbors,
                     'sampler_impl': str(best_params.get("sampler_impl", train_sampler_impl)),
+                    'positive_sampler_stats': _json_safe(positive_sampler_stats),
                     'rl_sampler_state': (
                         rl_sampler_controller.state_dict_serializable()
                         if rl_sampler_controller is not None
@@ -4730,6 +5476,7 @@ def run_gat_training(
         _emit_training_event(
             "epoch",
             run_id,
+            history_path=metrics_history_path,
             epoch=int(epoch),
             total=int(max_epochs),
             gnn_variant=_normalize_gnn_variant(gnn_variant),
@@ -4751,6 +5498,8 @@ def run_gat_training(
             val_far=val_far,
             val_f05=val_f05,
             val_tau=val_tau,
+            val_recall_at_k=_json_safe(val_recall_at_k),
+            val_precision_at_k=_json_safe(val_precision_at_k),
             val_mask=val_key,
             best_val_loss=best_val_loss,
             best_val_f1=best_val_f1,
@@ -4762,6 +5511,8 @@ def run_gat_training(
             best_val_f05=best_val_f05,
             best_val_tau=best_val_tau,
             best_val_accuracy=best_val_accuracy,
+            best_val_recall_at_k=_json_safe(best_val_recall_at_k),
+            best_val_precision_at_k=_json_safe(best_val_precision_at_k),
             best_epoch=best_epoch,
             monitor_metric=monitor_metric,
             monitor_mode=monitor_mode,
@@ -4781,6 +5532,7 @@ def run_gat_training(
             lambda_l2_att=lambda_l2_att,
             train_sampler_mode=str(train_sampler_mode_resolved),
             sampler_impl=str(best_params.get("sampler_impl", train_sampler_impl)),
+            positive_sampler_stats=_json_safe(positive_sampler_stats),
             rl_update=rl_update_payload,
             rl_thresholds=(
                 rl_sampler_controller.thresholds_serializable()
@@ -4813,6 +5565,8 @@ def run_gat_training(
                     "best_val_f05": float(best_val_f05) if best_val_f05 is not None else None,
                     "best_val_tau": float(best_val_tau) if best_val_tau is not None else None,
                     "best_val_accuracy": float(best_val_accuracy) if best_val_accuracy is not None else None,
+                    "best_val_recall_at_k": _json_safe(best_val_recall_at_k),
+                    "best_val_precision_at_k": _json_safe(best_val_precision_at_k),
                     "best_epoch": int(best_epoch),
                     "monitor_metric": monitor_metric,
                     "monitor_mode": monitor_mode,
@@ -4821,6 +5575,7 @@ def run_gat_training(
                     "best_monitor_value": float(best_monitor_value),
                     "patience_counter": int(patience_counter),
                     "run_id": run_id,
+                    "metrics_history_path": str(metrics_history_path) if metrics_history_path else None,
                     "graph_hash": graph_hash,
                     "graph_file_hash": graph_file_hash,
                     "graph_hash_source": graph_hash_source,
@@ -4831,6 +5586,7 @@ def run_gat_training(
                     "objective_threshold_beta": float(objective_threshold_beta),
                     "train_sampler_mode": str(train_sampler_mode_resolved),
                     "sampler_impl": str(best_params.get("sampler_impl", train_sampler_impl)),
+                    "positive_sampler_stats": _json_safe(positive_sampler_stats),
                     "rl_sampler_state": (
                         rl_sampler_controller.state_dict_serializable()
                         if rl_sampler_controller is not None
@@ -4840,6 +5596,7 @@ def run_gat_training(
                     "sampling_seed": int(sampling_seed_resolved),
                     "eval_neighbors_mode": str(eval_neighbors_mode_resolved),
                     "eval_num_neighbors": eval_num_neighbors_resolved,
+                    "test_eval_interval_epochs": int(test_eval_interval_epochs_resolved),
                     "last_val_loss": float(val_loss),
                     "last_val_f1": float(val_f1) if val_f1 is not None else None,
                     "last_val_objective_score": float(val_objective_score) if val_objective_score is not None else None,
@@ -4857,6 +5614,62 @@ def run_gat_training(
                 logger.warning(f"No se pudo guardar checkpoint: {exc}")
 
         last_completed_epoch = int(epoch)
+
+        if (
+            test_eval_interval_epochs_resolved > 0
+            and int(epoch) % int(test_eval_interval_epochs_resolved) == 0
+        ):
+            test_threshold = None
+            try:
+                if val_tau is not None and math.isfinite(float(val_tau)):
+                    test_threshold = float(val_tau)
+            except Exception:
+                test_threshold = None
+            _emit_training_event(
+                "test_start",
+                run_id,
+                epoch=int(epoch),
+                total=int(max_epochs),
+                best_epoch=int(best_epoch),
+                eval_target="current_epoch",
+                automatic=True,
+                checkpoint_path=None,
+                threshold=test_threshold,
+            )
+            try:
+                test_summary = _test_current_model_during_training(
+                    model=model,
+                    base_graph=base_graph,
+                    node_type="pm",
+                    batch_size=int(batch_size_hp),
+                    num_neighbors=eval_neighbors_cfg,
+                    threshold=test_threshold,
+                    device=device,
+                    epoch=int(epoch),
+                    best_epoch=int(best_epoch),
+                    automatic=True,
+                )
+                _emit_training_event(
+                    "test_result",
+                    run_id,
+                    history_path=metrics_history_path,
+                    total=int(max_epochs),
+                    **test_summary,
+                )
+            except Exception as exc:
+                logger.warning(f"No se pudo ejecutar test automatico en epoch {epoch}: {exc}")
+                _emit_training_event(
+                    "test_error",
+                    run_id,
+                    history_path=metrics_history_path,
+                    epoch=int(epoch),
+                    total=int(max_epochs),
+                    best_epoch=int(best_epoch),
+                    eval_target="current_epoch",
+                    automatic=True,
+                    checkpoint_path=None,
+                    error=str(exc),
+                )
 
         if _training_test_requested(should_test):
             best_checkpoint_for_test = None
@@ -4879,6 +5692,8 @@ def run_gat_training(
                 epoch=int(epoch),
                 total=int(max_epochs),
                 best_epoch=int(best_epoch),
+                eval_target="best_checkpoint",
+                automatic=False,
                 checkpoint_path=best_checkpoint_for_test,
                 threshold=test_threshold,
             )
@@ -4902,6 +5717,7 @@ def run_gat_training(
                 _emit_training_event(
                     "test_result",
                     run_id,
+                    history_path=metrics_history_path,
                     total=int(max_epochs),
                     **test_summary,
                 )
@@ -4910,9 +5726,12 @@ def run_gat_training(
                 _emit_training_event(
                     "test_error",
                     run_id,
+                    history_path=metrics_history_path,
                     epoch=int(epoch),
                     total=int(max_epochs),
                     best_epoch=int(best_epoch),
+                    eval_target="best_checkpoint",
+                    automatic=False,
                     checkpoint_path=best_checkpoint_for_test,
                     error=str(exc),
                 )
@@ -4964,8 +5783,10 @@ def run_gat_training(
     _emit_training_event(
         "train_end",
         run_id,
+        history_path=metrics_history_path,
         epochs_run=epochs_run,
         total=int(max_epochs),
+        metrics_history_path=str(metrics_history_path) if metrics_history_path else None,
         best_val_loss=best_val_loss,
         best_val_f1=best_val_f1,
         best_val_objective_score=best_val_objective_score,
@@ -4988,6 +5809,9 @@ def run_gat_training(
         graph_hash_source=graph_hash_source,
         stopped_early=stopped_early,
         stopped_by_user=stopped_by_user,
+        train_sampler_mode=str(train_sampler_mode_resolved),
+        sampler_impl=str(best_params.get("sampler_impl", train_sampler_impl)),
+        positive_sampler_stats=_json_safe(positive_sampler_stats),
     )
     if stopped_by_user:
         logger.info(
@@ -5084,7 +5908,7 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             'wide':       [30, 20],
             # Fanout asimétrico por tipo de arista (claves string =
             # nombre de relación; _resolve_num_neighbors mapea a tuple).
-            'asymmetric': {'temporal': [25, 25], 'spatial': [3, 3], 'spatial_back': [3, 3]},
+            'asymmetric': {'temporal': [25, 25], 'spatial': [3, 3]},
         }
         neighbor_choice = trial.suggest_categorical('num_neighbors_choice', list(neighbor_candidates.keys()))
         neighbor_profile = neighbor_candidates[neighbor_choice]
@@ -5372,12 +6196,16 @@ def objective(trial, device, use_graphsmote_search=False, optimizer_overrides=No
             torch.cuda.empty_cache()
         return 0.0
 
-def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_overrides=None):
+def search_hyperparameters(
+    loaded_obj,
+    use_graphsmote_search=None,
+    optimizer_overrides=None,
+    reuse_existing: bool = True,
+):
     global data, sequence_index_global, sequence_config_global
-    # Si la elección no viene desde el menú de entrenamiento, preguntar al usuario.
     if use_graphsmote_search is None:
-        use_graphsmote_input = input("¿Desea que la búsqueda de hiperparámetros incluya GraphSMOTE? (s/n): ").strip().lower()
-        use_graphsmote_search = use_graphsmote_input in ('s', 'si', 'y', 'yes')
+        use_graphsmote_search = False
+        logger.info("use_graphsmote_search no especificado; usando False por defecto no interactivo.")
 
     if use_graphsmote_search:
         logger.info("La búsqueda de hiperparámetros incluirá opciones de GraphSMOTE.")
@@ -5423,14 +6251,11 @@ def search_hyperparameters(loaded_obj, use_graphsmote_search=None, optimizer_ove
                 logger.info("Se encontraron archivos de HPO previos para este grafo y variante.")
                 logger.info(f"Cargando el archivo más reciente: {os.path.basename(latest_hpo_file)}")
                 try:
-                    df_hp = pd.read_csv(latest_hpo_file)
-                    best_params = df_hp.loc[0].to_dict()
-                    reuse = input(f"¿Desea reutilizar estos hiperparámetros (F1: {best_params.get('value', 'N/A'):.4f})? (s/n, por defecto 's'): ").strip().lower()
-                    if reuse in ('', 's', 'si', 'y', 'yes'):
+                    best_params = _load_hyperparams_csv(latest_hpo_file)
+                    if bool(reuse_existing):
                         logger.info("Reutilizando hiperparámetros existentes.")
                         return best_params
-                    else:
-                        logger.info("Descartando resultados previos. Iniciando nueva búsqueda.")
+                    logger.info("reuse_existing=False. Iniciando nueva búsqueda.")
                 except Exception as e:
                     logger.error(f"No se pudo cargar o procesar '{os.path.basename(latest_hpo_file)}': {e}. Iniciando nueva búsqueda.")
 
@@ -5966,14 +6791,32 @@ def run_imgagn_pipeline(loaded_obj, retrain_gat: bool = True):
         logger.error(f"Error al aplicar el grafo ImGAGN aumentado: {e}")
         return
 
-def run_gat_testing(loaded_obj):
+def run_gat_testing(
+    loaded_obj,
+    *,
+    use_graphsmote: Optional[bool] = None,
+    hparams_path: Optional[str] = None,
+    hparams_index: Optional[int] = None,
+    apply_prior_shift: bool = False,
+    p_real: float = 0.01,
+    analyze_xai: bool = False,
+    xai_k_heads: int = 3,
+    xai_percentile: float = 0.95,
+):
     """
     Carga un modelo GAT pre-entrenado y sus hiperparámetros para evaluarlo
     en el conjunto de datos de un grafo cargado.
     """
-    # Preguntar al usuario si el modelo fue entrenado con GraphSMOTE para filtrar los hiperparámetros
-    use_graphsmote_input = input("¿El modelo a testear fue entrenado con GraphSMOTE? (s/n): ").strip().lower()
-    use_graphsmote = use_graphsmote_input in ('s', 'si', 'y', 'yes')
+    if use_graphsmote is None:
+        try:
+            use_graphsmote = bool(
+                "pm" in loaded_obj["data"].node_types
+                and hasattr(loaded_obj["data"]["pm"], "is_synthetic")
+                and loaded_obj["data"]["pm"].is_synthetic.sum().item() > 0
+            )
+        except Exception:
+            use_graphsmote = False
+        logger.info(f"GraphSMOTE no especificado para test; usando detección automática: {use_graphsmote}.")
 
     # 1. Determinar dispositivo y cargar datos
     # Selection automática de dispositivo
@@ -6000,24 +6843,18 @@ def run_gat_testing(loaded_obj):
         print("  Asegúrese de que su elección sobre GraphSMOTE sea correcta o entrene un modelo primero.")
         return
 
-    print("Archivos de hiperparámetros disponibles (filtrados):")
-    for i, f in enumerate(hp_files, 1):
-        print(f"  [{i}] {os.path.basename(f)}")
-    
     try:
-        sel_str = input("Seleccione el número del archivo CSV de hiperparámetros (o presione Enter para usar el más reciente): ").strip()
-        if not sel_str:
-            sel = len(hp_files) - 1
-            print(f"Usando el archivo más reciente: {os.path.basename(hp_files[sel])}")
+        hp_files = sorted(hp_files, key=os.path.getmtime)
+        if hparams_path:
+            hp_path = str(hparams_path)
+        elif hparams_index is not None:
+            sel = int(hparams_index) - 1
+            if not (0 <= sel < len(hp_files)):
+                raise ValueError("hparams_index fuera de rango.")
+            hp_path = hp_files[sel]
         else:
-            sel = int(sel_str) - 1
-
-        if not (0 <= sel < len(hp_files)):
-            raise ValueError("Selección fuera de rango.")
-        
-        hp_path = hp_files[sel]
-        df_hp = pd.read_csv(hp_path)
-        best_params = df_hp.to_dict(orient='records')[0]
+            hp_path = hp_files[-1]
+        best_params = _load_hyperparams_csv(hp_path)
         
         # Conversión de tipos (igual que en run_gat_training)
         if 'hidden_channels' in best_params:
@@ -6149,13 +6986,11 @@ def run_gat_testing(loaded_obj):
         else:
             y_prob1_val, platt_model = _platt_scale_probabilities(y_true_val, y_prob1_val_raw)
 
-        # --- Calibración por Prior Shift (Opcional) ---
-        apply_prior_shift = input("¿Desea aplicar calibración por prior shift? (s/n, default: n): ").strip().lower()
-        if apply_prior_shift in ('s', 'si', 'y', 'yes'):
+        # --- Calibración por Prior Shift (opcional, controlada por parámetro) ---
+        if bool(apply_prior_shift):
             try:
                 p_train = initial_results['train_mask']['true'].float().mean().item()
-                p_real_str = input(f"Prevalencia en train (p_train) es {p_train:.4f}. Ingrese la prevalencia real esperada (p_real, default: 0.01): ").strip()
-                p_real = float(p_real_str) if p_real_str else 0.01
+                p_real = float(p_real)
                 
                 logger.info(f"Aplicando prior shift: p_train={p_train:.4f}, p_real={p_real:.4f}")
                 y_prob1_val_adjusted = prior_shift_adjust(p_train, p_real, y_prob1_val)
@@ -6202,28 +7037,68 @@ def run_gat_testing(loaded_obj):
     
     print("✅ Testeo finalizado.")
 
-    # Preguntar si se desea analizar las aristas
-    analyze_choice = input("\n¿Desea analizar las aristas más relevantes basadas en la atención del modelo? (s/n): ").strip().lower()
-    if analyze_choice in ('s', 'si', 'y', 'yes'):
+    if bool(analyze_xai):
         try:
-            k_heads_str = input(f"Ingrese el número mínimo de cabezales de atención que deben coincidir (k, default: 3): ").strip()
-            k_heads = int(k_heads_str) if k_heads_str else 3
-            
-            percentile_str = input(f"Ingrese el percentil de atención para el umbral (0.0 a 1.0, default: 0.95): ").strip()
-            percentile = float(percentile_str) if percentile_str else 0.95
-
-            analyze_and_save_relevant_edges(model, data, loaded_obj, device, k_heads=k_heads, percentile=percentile)
-        except ValueError:
-            logger.error("Entrada inválida. Abortando análisis de aristas.")
+            analyze_and_save_relevant_edges(
+                model,
+                data,
+                loaded_obj,
+                device,
+                k_heads=int(xai_k_heads),
+                percentile=float(xai_percentile),
+                threshold=tau,
+                calibration_model=platt_model,
+            )
         except Exception as e:
             logger.error(f"Ocurrió un error inesperado durante el análisis de aristas: {e}")
 
-def analyze_and_save_relevant_edges(model, data, loaded_obj, device, k_heads=3, percentile=0.95):
+def analyze_and_save_relevant_edges(
+    model,
+    data,
+    loaded_obj,
+    device,
+    k_heads=3,
+    percentile=0.95,
+    threshold: Optional[float] = None,
+    calibration_model: Optional[object] = None,
+    layer: str = "auto",
+):
     """
     Analiza las atenciones del modelo entrenado, extrae las aristas más relevantes
     y las guarda en un archivo CSV. Usa checkpointing para reducir memoria.
     """
     logger.info("--- Iniciando análisis de aristas relevantes basado en atención ---")
+    try:
+        from src.gnn_xai import compute_gnn_xai_graph, save_gnn_xai_result
+
+        result = compute_gnn_xai_graph(
+            model=model,
+            graph=data,
+            pm_index=loaded_obj.get("pm_index") if isinstance(loaded_obj, dict) else None,
+            mask_name="test_mask",
+            batch_size=BATCH_SIZE,
+            num_neighbors=NUM_NEIGHBORS,
+            percentile=float(percentile),
+            k_heads=int(k_heads),
+            layer=layer,
+            threshold=threshold,
+            calibration_model=calibration_model,
+            temporal_module=getattr(model, "temporal_head", None),
+            device=device,
+            model_path=None,
+            graph_hash=(
+                _resolve_graph_identity(loaded_obj).get("graph_hash")
+                if isinstance(loaded_obj, dict)
+                else None
+            ),
+        )
+        output_dir = save_gnn_xai_result(result)
+        logger.info(f"✅ XAI GNN guardado en -> {output_dir}")
+        return result
+    except Exception as exc:
+        logger.error(f"No se pudo calcular XAI GNN reutilizable: {exc}", exc_info=True)
+        return None
+
     model.eval()
     
     # Guardar estado original y desactivar checkpointing, ya que no aporta beneficios
@@ -6406,7 +7281,12 @@ def analyze_and_save_relevant_edges(model, data, loaded_obj, device, k_heads=3, 
     else:
         logger.info("No se encontraron aristas relevantes en ninguna relación para guardar.")
 
-def test_graphsmote(loaded_obj):
+def test_graphsmote(
+    loaded_obj,
+    *,
+    target_ratio: Optional[float] = None,
+    k: Optional[int] = None,
+):
     """
     Aplica GraphSMOTE a un grafo cargado para generar nodos y aristas sintéticos,
     y guarda el grafo aumentado en un nuevo archivo .pt.
@@ -6437,7 +7317,7 @@ def test_graphsmote(loaded_obj):
         num_layers=2
     ).to(device)
 
-    # 3. Parámetros interactivos para la aumentación
+    # 3. Parámetros explícitos para la aumentación
     # --- CORREGIDO: Calcular ratio sobre el conjunto de entrenamiento ---
     train_mask = data['pm'].train_mask
     if train_mask.sum() > 0:
@@ -6447,14 +7327,10 @@ def test_graphsmote(loaded_obj):
         actual_ratio = 0.0
         logger.warning("La máscara de entrenamiento está vacía. El ratio actual es 0.")
 
-    try:
-        ratio_str = input(f"Ingrese el ratio de positivos deseado (e.g., 0.4 para 40%, actual en train: {actual_ratio:.4f}): ").strip()
-        target_ratio = float(ratio_str)
-        k_str = input(f"Ingrese el número de vecinos para SMOTE (k, e.g., 5, default: {GRAPHSMOTE_K}): ").strip()
-        k = int(k_str) if k_str else GRAPHSMOTE_K
-    except ValueError:
-        logger.error("Entrada inválida. Usando valores por defecto.")
+    if target_ratio is None:
         target_ratio = TARGET_POS_RATIO
+        logger.info(f"target_ratio no especificado; usando default {target_ratio}. Ratio train actual={actual_ratio:.4f}.")
+    if k is None:
         k = GRAPHSMOTE_K
 
     # --- AÑADIDO: Entrenar los decodificadores z->x necesarios ---
@@ -6511,7 +7387,14 @@ def test_graphsmote(loaded_obj):
         logger.info("No se generaron nodos sintéticos. El grafo no fue modificado.")
         return loaded_obj
 
-def test_imgagn(loaded_obj):
+def test_imgagn(
+    loaded_obj,
+    *,
+    lambda1_ratio: float = 1.0,
+    topk_links: int = 5,
+    epochs: int = 30,
+    d_steps: int = 20,
+):
     """
     Aplica ImGAGN al grafo cargado para generar nodos (minoría) y aristas
     sintéticas de forma interactiva, y guarda el grafo aumentado en un nuevo .pt.
@@ -6542,24 +7425,17 @@ def test_imgagn(loaded_obj):
         logger.error("La máscara de entrenamiento está vacía; no se puede ejecutar ImGAGN.")
         return loaded_obj
 
-    # 3) Parámetros interactivos de ImGAGN (análogos a GraphSMOTE: ratio y k)
+    # 3) Parámetros explícitos de ImGAGN (análogos a GraphSMOTE: ratio y k)
     #    lambda1_ratio controla cuántos nodos nuevos: (n_min + ng) / n_maj
     try:
-        # Ratio deseado entre minoría y mayoría en el set de entrenamiento
         n_min = int(((train_mask == True) & (y_bin == 1)).sum().item())
         n_maj = int(((train_mask == True) & (y_bin == 0)).sum().item())
         cur_lambda = (n_min / max(1, n_maj)) if n_maj > 0 else 0.0
-        ratio_str = input(f"Ingrese lambda1_ratio deseado (actual≈{cur_lambda:.3f}, ej. 1.0): ").strip()
-        lambda1_ratio = float(ratio_str) if ratio_str else 1.0
-
-        topk_str = input("Ingrese topk_links para nuevas aristas (ej. 5): ").strip()
-        topk_links = int(topk_str) if topk_str else 5
-
-        epochs_str = input("Epochs de entrenamiento (ej. 20, Enter=por defecto 30): ").strip()
-        epochs = int(epochs_str) if epochs_str else 30
-
-        dsteps_str = input("Pasos del Discriminador por epoch (ej. 20, Enter=por defecto 20): ").strip()
-        d_steps = int(dsteps_str) if dsteps_str else 20
+        logger.info(
+            "Parámetros ImGAGN explícitos: "
+            f"lambda1_ratio={lambda1_ratio}, topk_links={topk_links}, "
+            f"epochs={epochs}, d_steps={d_steps}; lambda actual≈{cur_lambda:.3f}"
+        )
     except ValueError:
         logger.error("Entrada inválida. Usando parámetros por defecto para ImGAGN.")
         lambda1_ratio = 1.0

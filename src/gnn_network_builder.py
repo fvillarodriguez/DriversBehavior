@@ -48,7 +48,6 @@ SUPPORTED_NORMS: Tuple[str, ...] = ("none", "layer_norm")
 DEFAULT_EDGE_TYPES: Tuple[Tuple[str, str, str], ...] = (
     ("pm", "spatial", "pm"),
     ("pm", "temporal", "pm"),
-    ("pm", "spatial_back", "pm"),
     ("pm", "st_fwd", "pm"),
 )
 

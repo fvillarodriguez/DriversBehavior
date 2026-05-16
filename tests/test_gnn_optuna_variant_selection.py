@@ -18,6 +18,23 @@ class _FakeStreamlit:
         return None
 
 
+class _FakeStreamlitVariantSelector(_FakeStreamlit):
+    def __init__(self, session_state=None):
+        super().__init__(session_state)
+        self.selectbox_calls = []
+
+    def selectbox(self, label, options, **kwargs):
+        self.selectbox_calls.append(
+            {
+                "label": label,
+                "options": list(options),
+                "index": kwargs.get("index"),
+                "key": kwargs.get("key"),
+            }
+        )
+        return list(options)[kwargs.get("index", 0)]
+
+
 def _make_tiny_graph() -> HeteroData:
     data = HeteroData()
     data["pm"].x = torch.zeros((8, 3), dtype=torch.float32)
@@ -54,6 +71,26 @@ def _patch_collect_settings_dependencies(monkeypatch, session_state):
     monkeypatch.setattr(app, "_warn_legacy_temporal_split", lambda *args, **kwargs: None)
     monkeypatch.setattr(app, "get_auto_device", lambda: torch.device("cpu"))
     return fake_st
+
+
+def test_network_gnn_variant_selector_only_shows_visible_variants(monkeypatch):
+    fake_st = _FakeStreamlitVariantSelector()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    selected = app._render_gnn_variant_selector(
+        key="gnn_variant_selector_network",
+        default_variant="gat_gru",
+        context_label="Network",
+    )
+
+    assert fake_st.selectbox_calls[0]["label"] == "GNN_VARIANT (Network)"
+    assert fake_st.selectbox_calls[0]["options"] == [
+        "gat_edge_mlp_gru",
+        "gat_edge_mlp",
+        "gat_snapshot",
+    ]
+    assert selected == "gat_edge_mlp_gru"
+    assert fake_st.session_state["gnn_ui_variant"] == "gat_edge_mlp_gru"
 
 
 def test_collect_optuna_ray_settings_includes_selected_gnn_variant(monkeypatch):

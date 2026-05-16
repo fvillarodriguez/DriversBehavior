@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,9 +30,59 @@ class _GraphTensors:
     graph_hash: str
 
 
+@dataclass(frozen=True)
+class _BaselineSpec:
+    key: str
+    model_family: str
+    feature_view: str
+    model_name: str
+
+
+_BASELINE_SPECS: Dict[str, _BaselineSpec] = {
+    "current": _BaselineSpec(
+        key="current",
+        model_family="mlp",
+        feature_view="current",
+        model_name="MLP actual",
+    ),
+    "temporal": _BaselineSpec(
+        key="temporal",
+        model_family="mlp",
+        feature_view="temporal",
+        model_name="MLP temporal",
+    ),
+    "xgboost_current": _BaselineSpec(
+        key="xgboost_current",
+        model_family="xgboost",
+        feature_view="current",
+        model_name="XGBoost actual",
+    ),
+    "xgboost_temporal": _BaselineSpec(
+        key="xgboost_temporal",
+        model_family="xgboost",
+        feature_view="temporal",
+        model_name="XGBoost temporal",
+    ),
+    "svm_current": _BaselineSpec(
+        key="svm_current",
+        model_family="svm",
+        feature_view="current",
+        model_name="SVM actual",
+    ),
+    "svm_temporal": _BaselineSpec(
+        key="svm_temporal",
+        model_family="svm",
+        feature_view="temporal",
+        model_name="SVM temporal",
+    ),
+}
+
+
 class _FeatureView:
     baseline: str
     model_name: str
+    model_family: str
+    feature_view: str
     input_dim: int
 
     def split_indices(self, split: str, masks: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -47,6 +98,8 @@ class _FeatureView:
 class _CurrentFeatureView(_FeatureView):
     baseline = "current"
     model_name = "MLP actual"
+    model_family = "mlp"
+    feature_view = "current"
 
     def __init__(self, x: torch.Tensor, y: torch.Tensor) -> None:
         self.x = x
@@ -69,6 +122,8 @@ class _CurrentFeatureView(_FeatureView):
 class _TemporalFeatureView(_FeatureView):
     baseline = "temporal"
     model_name = "MLP temporal"
+    model_family = "mlp"
+    feature_view = "temporal"
 
     def __init__(
         self,
@@ -114,6 +169,25 @@ class _TemporalFeatureView(_FeatureView):
     def labels(self, indices: torch.Tensor) -> torch.Tensor:
         rows = self.target_rows.index_select(0, indices.to(torch.long))
         return self.y.index_select(0, rows)
+
+
+class _NamedFeatureView(_FeatureView):
+    def __init__(self, base: _FeatureView, spec: _BaselineSpec) -> None:
+        self._base = base
+        self.baseline = spec.key
+        self.model_name = spec.model_name
+        self.model_family = spec.model_family
+        self.feature_view = spec.feature_view
+        self.input_dim = int(base.input_dim)
+
+    def split_indices(self, split: str, masks: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        return self._base.split_indices(split, masks)
+
+    def features(self, indices: torch.Tensor) -> torch.Tensor:
+        return self._base.features(indices)
+
+    def labels(self, indices: torch.Tensor) -> torch.Tensor:
+        return self._base.labels(indices)
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -370,7 +444,7 @@ def _pick_tau_fbeta(y_true: np.ndarray, y_prob: np.ndarray, *, beta: float = 1.0
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         prec, rec, thr = precision_recall_curve(y_true.astype(int), y_prob.astype(float))
-    prec_, rec_, thr_ = prec[1:], rec[1:], thr
+    prec_, rec_, thr_ = prec[:-1], rec[:-1], thr
     if len(thr_) == 0 or len(prec_) == 0:
         return 0.5
     beta2 = float(beta) ** 2
@@ -379,6 +453,94 @@ def _pick_tau_fbeta(y_true: np.ndarray, y_prob: np.ndarray, *, beta: float = 1.0
         return 0.5
     idx = int(np.nanargmax(fbeta))
     return _safe_float(thr_[idx], default=0.5)
+
+
+def _normalize_threshold_strategy(value: object) -> str:
+    text = str(value or "far").strip().lower()
+    aliases = {
+        "auto": "far",
+        "auto_far": "far",
+        "far_target": "far",
+        "far <= target": "far",
+        "recall@far": "far",
+        "f1": "fbeta",
+        "f_beta": "fbeta",
+        "f-beta": "fbeta",
+    }
+    text = aliases.get(text, text)
+    return text if text in {"far", "fbeta"} else "far"
+
+
+def _pick_tau_far_target(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    *,
+    far_target: float = 0.20,
+) -> tuple[float, Dict[str, float]]:
+    y_true_i = np.asarray(y_true, dtype=int).ravel()
+    y_prob_f = np.asarray(y_prob, dtype=float).ravel()
+    if y_true_i.size == 0 or y_true_i.size != y_prob_f.size or np.unique(y_true_i).size < 2:
+        return 0.5, {"far": float("nan"), "sens": float("nan")}
+
+    thresholds = np.unique(np.clip(y_prob_f, 0.0, 1.0))
+    thresholds = np.r_[thresholds, np.nextafter(1.0, 2.0)]
+    target = float(np.clip(far_target, 0.0, 1.0))
+    best_tau = 0.5
+    best_far = float("inf")
+    best_sens = -1.0
+    best_precision = -1.0
+
+    for tau in thresholds:
+        pred = (y_prob_f >= float(tau)).astype(int)
+        tp = float(((pred == 1) & (y_true_i == 1)).sum())
+        tn = float(((pred == 0) & (y_true_i == 0)).sum())
+        fp = float(((pred == 1) & (y_true_i == 0)).sum())
+        fn = float(((pred == 0) & (y_true_i == 1)).sum())
+        far = fp / max(fp + tn, 1.0)
+        if far > target + 1e-12:
+            continue
+        sens = tp / max(tp + fn, 1.0)
+        precision = tp / max(tp + fp, 1.0)
+        if (
+            sens > best_sens + 1e-12
+            or (abs(sens - best_sens) <= 1e-12 and precision > best_precision + 1e-12)
+            or (
+                abs(sens - best_sens) <= 1e-12
+                and abs(precision - best_precision) <= 1e-12
+                and far > best_far
+            )
+        ):
+            best_tau = float(tau)
+            best_far = float(far)
+            best_sens = float(sens)
+            best_precision = float(precision)
+
+    if best_sens < 0.0:
+        return _pick_tau_fbeta(y_true_i, y_prob_f, beta=1.0), {
+            "far": float("nan"),
+            "sens": float("nan"),
+        }
+    return best_tau, {
+        "far": _safe_float(best_far),
+        "sens": _safe_float(best_sens),
+        "precision": _safe_float(best_precision),
+    }
+
+
+def _select_tau_from_validation(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    *,
+    threshold_strategy: str = "far",
+    far_target: float = 0.20,
+    fbeta_beta: float = 1.0,
+) -> tuple[float, str, Dict[str, float]]:
+    strategy = _normalize_threshold_strategy(threshold_strategy)
+    if strategy == "fbeta":
+        tau = _pick_tau_fbeta(y_true, y_prob, beta=float(fbeta_beta))
+        return tau, f"val_mask_fbeta_beta_{float(fbeta_beta):g}", {"fbeta_beta": float(fbeta_beta)}
+    tau, info = _pick_tau_far_target(y_true, y_prob, far_target=float(far_target))
+    return tau, "val_mask_far_target", info
 
 
 def _threshold_metrics(y_true: np.ndarray, y_prob: np.ndarray, *, tau: float) -> Dict[str, float]:
@@ -445,12 +607,28 @@ def _skip_rows(
     reason: str,
     graph_hash: str,
     splits: Sequence[str] = ("val", "test"),
+    sample_counts: Optional[Mapping[str, int]] = None,
+    model_family: str = "",
+    feature_view: str = "",
+    backend: str = "",
+    fit_seconds: float = 0.0,
+    threshold_strategy: str = "far",
+    far_target: float = 0.20,
+    tau_source: str = "metadata_or_default",
+    calibration_method: str = "not_applied",
+    calibration_mask_source: Optional[str] = None,
+    threshold_mask_source: Optional[str] = None,
+    calibration_count: Optional[int] = None,
+    threshold_count: Optional[int] = None,
 ) -> list[Dict[str, object]]:
     rows: list[Dict[str, object]] = []
+    counts = dict(sample_counts or {})
     for split in splits:
         row = {
             "model": model_name,
             "baseline": baseline,
+            "model_family": model_family,
+            "feature_view": feature_view,
             "split": split,
             "status": "skipped",
             "reason": reason,
@@ -458,13 +636,23 @@ def _skip_rows(
             "samples": 0,
             "positives": 0,
             "positive_rate": 0.0,
-            "train_samples": 0,
-            "val_samples": 0,
-            "test_samples": 0,
+            "train_samples": int(counts.get("train", 0)),
+            "val_samples": int(counts.get("val", 0)),
+            "test_samples": int(counts.get("test", 0)),
             "epochs_run": 0,
             "best_epoch": 0,
             "best_val_auprc": 0.0,
             "train_loss": 0.0,
+            "fit_seconds": _safe_float(fit_seconds),
+            "backend": backend,
+            "tau_source": tau_source,
+            "threshold_strategy": _normalize_threshold_strategy(threshold_strategy),
+            "far_target": _safe_float(far_target),
+            "calibration_method": calibration_method,
+            "calibration_mask_source": calibration_mask_source,
+            "threshold_mask_source": threshold_mask_source,
+            "calibration_count": calibration_count,
+            "threshold_count": threshold_count,
         }
         row.update(_threshold_metrics(np.asarray([], dtype=np.int64), np.asarray([], dtype=np.float64), tau=0.5))
         rows.append(row)
@@ -484,11 +672,25 @@ def _metric_row(
     best_epoch: int,
     best_val_auprc: float,
     train_loss: float,
+    model_family: Optional[str] = None,
+    feature_view: Optional[str] = None,
+    backend: str = "",
+    fit_seconds: float = 0.0,
+    threshold_strategy: str = "far",
+    far_target: float = 0.20,
+    tau_source: str = "val_mask_far_target",
+    calibration_method: str = "not_applied",
+    calibration_mask_source: Optional[str] = None,
+    threshold_mask_source: Optional[str] = "val_mask",
+    calibration_count: Optional[int] = None,
+    threshold_count: Optional[int] = None,
 ) -> Dict[str, object]:
     metrics = _threshold_metrics(y_true, y_prob, tau=tau)
     row: Dict[str, object] = {
         "model": view.model_name,
         "baseline": view.baseline,
+        "model_family": str(model_family or getattr(view, "model_family", "")),
+        "feature_view": str(feature_view or getattr(view, "feature_view", "")),
         "split": split,
         "status": "completed",
         "reason": "",
@@ -503,6 +705,16 @@ def _metric_row(
         "best_epoch": int(best_epoch),
         "best_val_auprc": _safe_float(best_val_auprc),
         "train_loss": _safe_float(train_loss),
+        "fit_seconds": _safe_float(fit_seconds),
+        "backend": backend,
+        "tau_source": str(tau_source),
+        "threshold_strategy": _normalize_threshold_strategy(threshold_strategy),
+        "far_target": _safe_float(far_target),
+        "calibration_method": str(calibration_method),
+        "calibration_mask_source": calibration_mask_source,
+        "threshold_mask_source": threshold_mask_source,
+        "calibration_count": calibration_count,
+        "threshold_count": threshold_count,
     }
     row.update(metrics)
     return row
@@ -523,6 +735,9 @@ def _train_one_baseline(
     device: torch.device,
     seed: int,
     progress_callback: Optional[BaselineProgress],
+    threshold_strategy: str = "far",
+    far_target: float = 0.20,
+    fbeta_beta: float = 1.0,
 ) -> list[Dict[str, object]]:
     split_idx = {split: view.split_indices(split, tensors.masks) for split in ("train", "val", "test")}
     sample_counts = {split: int(idx.numel()) for split, idx in split_idx.items()}
@@ -532,6 +747,12 @@ def _train_one_baseline(
             model_name=view.model_name,
             reason="train_mask no selecciona muestras para este baseline.",
             graph_hash=tensors.graph_hash,
+            sample_counts=sample_counts,
+            model_family="mlp",
+            feature_view=str(getattr(view, "feature_view", "")),
+            backend="torch",
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
         )
     if sample_counts["val"] <= 0:
         return _skip_rows(
@@ -539,6 +760,12 @@ def _train_one_baseline(
             model_name=view.model_name,
             reason="val_mask no selecciona muestras para este baseline.",
             graph_hash=tensors.graph_hash,
+            sample_counts=sample_counts,
+            model_family="mlp",
+            feature_view=str(getattr(view, "feature_view", "")),
+            backend="torch",
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
         )
 
     _emit(
@@ -572,6 +799,7 @@ def _train_one_baseline(
     last_train_loss = 0.0
     max_epochs = max(1, int(epochs))
     early_patience = max(1, int(patience))
+    fit_start = time.perf_counter()
     for epoch in range(1, max_epochs + 1):
         last_train_loss = _train_epoch(
             model,
@@ -617,6 +845,7 @@ def _train_one_baseline(
         model.load_state_dict(best_state)
     if not math.isfinite(best_val_auprc):
         best_val_auprc = 0.0
+    fit_seconds = time.perf_counter() - fit_start
 
     val_prob, val_y = _collect_probabilities(
         model,
@@ -625,7 +854,14 @@ def _train_one_baseline(
         batch_size=int(batch_size),
         device=device,
     )
-    tau = _pick_tau_fbeta(val_y, val_prob, beta=1.0)
+    tau, tau_source, _tau_info = _select_tau_from_validation(
+        val_y,
+        val_prob,
+        threshold_strategy=threshold_strategy,
+        far_target=far_target,
+        fbeta_beta=fbeta_beta,
+    )
+    threshold_count = int(sample_counts.get("val", 0))
     rows = [
         _metric_row(
             view=view,
@@ -639,6 +875,18 @@ def _train_one_baseline(
             best_epoch=best_epoch,
             best_val_auprc=best_val_auprc,
             train_loss=last_train_loss,
+            model_family="mlp",
+            feature_view=str(getattr(view, "feature_view", "")),
+            backend="torch",
+            fit_seconds=fit_seconds,
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
+            tau_source=tau_source,
+            calibration_method="not_applied",
+            calibration_mask_source=None,
+            threshold_mask_source="val_mask",
+            calibration_count=None,
+            threshold_count=threshold_count,
         )
     ]
     if sample_counts["test"] > 0:
@@ -662,6 +910,18 @@ def _train_one_baseline(
                 best_epoch=best_epoch,
                 best_val_auprc=best_val_auprc,
                 train_loss=last_train_loss,
+                model_family="mlp",
+                feature_view=str(getattr(view, "feature_view", "")),
+                backend="torch",
+                fit_seconds=fit_seconds,
+                threshold_strategy=threshold_strategy,
+                far_target=far_target,
+                tau_source=tau_source,
+                calibration_method="not_applied",
+                calibration_mask_source=None,
+                threshold_mask_source="val_mask",
+                calibration_count=None,
+                threshold_count=threshold_count,
             )
         )
     else:
@@ -672,14 +932,20 @@ def _train_one_baseline(
                 reason="test_mask no selecciona muestras para este baseline.",
                 graph_hash=tensors.graph_hash,
                 splits=("test",),
+                sample_counts=sample_counts,
+                model_family="mlp",
+                feature_view=str(getattr(view, "feature_view", "")),
+                backend="torch",
+                fit_seconds=fit_seconds,
+                threshold_strategy=threshold_strategy,
+                far_target=far_target,
+                tau_source=tau_source,
+                calibration_method="not_applied",
+                calibration_mask_source=None,
+                threshold_mask_source="val_mask",
+                calibration_count=None,
+                threshold_count=threshold_count,
             )
-        )
-        rows[-1].update(
-            {
-                "train_samples": sample_counts["train"],
-                "val_samples": sample_counts["val"],
-                "test_samples": sample_counts["test"],
-            }
         )
 
     _emit(
@@ -690,6 +956,316 @@ def _train_one_baseline(
         best_epoch=best_epoch,
         best_val_auprc=float(best_val_auprc),
         epochs_run=epochs_run,
+    )
+    return rows
+
+
+def _view_arrays(view: _FeatureView, indices: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    x = view.features(indices).detach().cpu().numpy().astype(np.float32, copy=False)
+    y = view.labels(indices).detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    return x, y
+
+
+def _scale_pos_weight(y_train: np.ndarray) -> float:
+    y_arr = np.asarray(y_train, dtype=int)
+    positives = int((y_arr == 1).sum())
+    negatives = int((y_arr == 0).sum())
+    if positives <= 0:
+        return 1.0
+    return max(1.0, float(negatives / positives))
+
+
+def _build_tabular_estimator(
+    spec: _BaselineSpec,
+    *,
+    y_train: np.ndarray,
+    batch_size: int,
+    seed: int,
+) -> tuple[object, str]:
+    if spec.model_family == "xgboost":
+        from src.model_training import _import_external_xgboost
+
+        xgb = _import_external_xgboost()
+        estimator = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            min_child_weight=1.0,
+            reg_alpha=0.0,
+            reg_lambda=1.0,
+            gamma=0.0,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            tree_method="hist",
+            n_jobs=1,
+            random_state=int(seed),
+            scale_pos_weight=_scale_pos_weight(y_train),
+            verbosity=0,
+        )
+        return estimator, "xgboost"
+
+    if spec.model_family == "svm":
+        from src.mlx_svm import MLXAcceleratedSVMClassifier
+
+        estimator = MLXAcceleratedSVMClassifier(
+            C=1.0,
+            kernel="linear",
+            probability=True,
+            class_weight="balanced",
+            random_state=int(seed),
+            epochs=20,
+            batch_size=max(1, int(batch_size)),
+            require_mlx=False,
+        )
+        return estimator, "mlx_svm"
+
+    raise ValueError(f"Familia tabular no soportada: {spec.model_family}")
+
+
+def _positive_probability(estimator: object, x: np.ndarray) -> np.ndarray:
+    if x.shape[0] <= 0:
+        return np.asarray([], dtype=np.float64)
+    if hasattr(estimator, "predict_proba"):
+        proba = np.asarray(estimator.predict_proba(x), dtype=float)
+        if proba.ndim == 2 and proba.shape[1] > 0:
+            classes = getattr(estimator, "classes_", None)
+            pos_idx = 1 if proba.shape[1] > 1 else 0
+            if classes is not None:
+                try:
+                    class_list = list(classes)
+                    if 1 in class_list:
+                        pos_idx = int(class_list.index(1))
+                except Exception:
+                    pos_idx = 1 if proba.shape[1] > 1 else 0
+            out = proba[:, min(pos_idx, proba.shape[1] - 1)]
+        else:
+            out = np.asarray(proba, dtype=float).reshape(-1)
+    elif hasattr(estimator, "decision_function"):
+        scores = np.asarray(estimator.decision_function(x), dtype=float).reshape(-1)
+        out = 1.0 / (1.0 + np.exp(-np.clip(scores, -40.0, 40.0)))
+    else:
+        pred = np.asarray(estimator.predict(x), dtype=float).reshape(-1)
+        out = np.clip(pred, 0.0, 1.0)
+    return np.clip(np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+
+
+def _collect_tabular_probabilities(
+    estimator: object,
+    view: _FeatureView,
+    split_idx: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray]:
+    x, y = _view_arrays(view, split_idx)
+    return _positive_probability(estimator, x).astype(np.float64, copy=False), y
+
+
+def _train_one_tabular_baseline(
+    view: _FeatureView,
+    tensors: _GraphTensors,
+    spec: _BaselineSpec,
+    *,
+    batch_size: int,
+    seed: int,
+    progress_callback: Optional[BaselineProgress],
+    threshold_strategy: str = "far",
+    far_target: float = 0.20,
+    fbeta_beta: float = 1.0,
+) -> list[Dict[str, object]]:
+    split_idx = {split: view.split_indices(split, tensors.masks) for split in ("train", "val", "test")}
+    sample_counts = {split: int(idx.numel()) for split, idx in split_idx.items()}
+    if sample_counts["train"] <= 0:
+        return _skip_rows(
+            baseline=spec.key,
+            model_name=spec.model_name,
+            reason="train_mask no selecciona muestras para este baseline.",
+            graph_hash=tensors.graph_hash,
+            sample_counts=sample_counts,
+            model_family=spec.model_family,
+            feature_view=spec.feature_view,
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
+        )
+    if sample_counts["val"] <= 0:
+        return _skip_rows(
+            baseline=spec.key,
+            model_name=spec.model_name,
+            reason="val_mask no selecciona muestras para este baseline.",
+            graph_hash=tensors.graph_hash,
+            sample_counts=sample_counts,
+            model_family=spec.model_family,
+            feature_view=spec.feature_view,
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
+        )
+
+    x_train, y_train = _view_arrays(view, split_idx["train"])
+    if np.unique(y_train).size < 2:
+        reason = f"{spec.model_name} requiere dos clases en train_mask."
+        _emit(
+            progress_callback,
+            event="baseline_skipped",
+            baseline=spec.key,
+            model=spec.model_name,
+            reason=reason,
+        )
+        return _skip_rows(
+            baseline=spec.key,
+            model_name=spec.model_name,
+            reason=reason,
+            graph_hash=tensors.graph_hash,
+            sample_counts=sample_counts,
+            model_family=spec.model_family,
+            feature_view=spec.feature_view,
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
+        )
+
+    _emit(
+        progress_callback,
+        event="baseline_start",
+        baseline=spec.key,
+        model=spec.model_name,
+        train_samples=sample_counts["train"],
+        val_samples=sample_counts["val"],
+        test_samples=sample_counts["test"],
+    )
+
+    backend = spec.model_family
+    fit_start = time.perf_counter()
+    try:
+        estimator, backend = _build_tabular_estimator(
+            spec,
+            y_train=y_train,
+            batch_size=batch_size,
+            seed=seed,
+        )
+        estimator.fit(x_train, y_train)
+        backend = str(getattr(estimator, "backend_", backend))
+        fit_seconds = time.perf_counter() - fit_start
+        val_prob, val_y = _collect_tabular_probabilities(estimator, view, split_idx["val"])
+        best_val_auprc = _safe_auprc(val_y, val_prob)
+        tau, tau_source, _tau_info = _select_tau_from_validation(
+            val_y,
+            val_prob,
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
+            fbeta_beta=fbeta_beta,
+        )
+    except Exception as exc:
+        fit_seconds = time.perf_counter() - fit_start
+        reason = f"Error entrenando {spec.model_name}: {exc}"
+        _emit(
+            progress_callback,
+            event="baseline_skipped",
+            baseline=spec.key,
+            model=spec.model_name,
+            reason=reason,
+        )
+        return _skip_rows(
+            baseline=spec.key,
+            model_name=spec.model_name,
+            reason=reason,
+            graph_hash=tensors.graph_hash,
+            sample_counts=sample_counts,
+            model_family=spec.model_family,
+            feature_view=spec.feature_view,
+            backend=backend,
+            fit_seconds=fit_seconds,
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
+        )
+
+    rows = [
+        _metric_row(
+            view=view,
+            split="val",
+            y_true=val_y,
+            y_prob=val_prob,
+            tau=tau,
+            graph_hash=tensors.graph_hash,
+            sample_counts=sample_counts,
+            epochs_run=1,
+            best_epoch=1,
+            best_val_auprc=best_val_auprc,
+            train_loss=0.0,
+            model_family=spec.model_family,
+            feature_view=spec.feature_view,
+            backend=backend,
+            fit_seconds=fit_seconds,
+            threshold_strategy=threshold_strategy,
+            far_target=far_target,
+            tau_source=tau_source,
+            calibration_method="not_applied",
+            calibration_mask_source=None,
+            threshold_mask_source="val_mask",
+            calibration_count=None,
+            threshold_count=int(sample_counts.get("val", 0)),
+        )
+    ]
+    if sample_counts["test"] > 0:
+        test_prob, test_y = _collect_tabular_probabilities(estimator, view, split_idx["test"])
+        rows.append(
+            _metric_row(
+                view=view,
+                split="test",
+                y_true=test_y,
+                y_prob=test_prob,
+                tau=tau,
+                graph_hash=tensors.graph_hash,
+                sample_counts=sample_counts,
+                epochs_run=1,
+                best_epoch=1,
+                best_val_auprc=best_val_auprc,
+                train_loss=0.0,
+                model_family=spec.model_family,
+                feature_view=spec.feature_view,
+                backend=backend,
+                fit_seconds=fit_seconds,
+                threshold_strategy=threshold_strategy,
+                far_target=far_target,
+                tau_source=tau_source,
+                calibration_method="not_applied",
+                calibration_mask_source=None,
+                threshold_mask_source="val_mask",
+                calibration_count=None,
+                threshold_count=int(sample_counts.get("val", 0)),
+            )
+        )
+    else:
+        rows.extend(
+            _skip_rows(
+                baseline=spec.key,
+                model_name=spec.model_name,
+                reason="test_mask no selecciona muestras para este baseline.",
+                graph_hash=tensors.graph_hash,
+                splits=("test",),
+                sample_counts=sample_counts,
+                model_family=spec.model_family,
+                feature_view=spec.feature_view,
+                backend=backend,
+                fit_seconds=fit_seconds,
+                threshold_strategy=threshold_strategy,
+                far_target=far_target,
+                tau_source=tau_source,
+                calibration_method="not_applied",
+                calibration_mask_source=None,
+                threshold_mask_source="val_mask",
+                calibration_count=None,
+                threshold_count=int(sample_counts.get("val", 0)),
+            )
+        )
+
+    _emit(
+        progress_callback,
+        event="baseline_done",
+        baseline=spec.key,
+        model=spec.model_name,
+        best_epoch=1,
+        best_val_auprc=float(best_val_auprc),
+        epochs_run=1,
     )
     return rows
 
@@ -710,8 +1286,11 @@ def run_gnn_mlp_baselines(
     graph_hash: Optional[str] = None,
     progress_callback: Optional[BaselineProgress] = None,
     seed: int = SEED,
+    threshold_strategy: str = "far",
+    far_target: float = 0.20,
+    fbeta_beta: float = 1.0,
 ) -> pd.DataFrame:
-    """Train topology-free MLP baselines on the loaded GNN graph tensors."""
+    """Train topology-free tabular baselines on the loaded GNN graph tensors."""
     requested = tuple(dict.fromkeys(str(b).strip().lower() for b in baselines if str(b).strip()))
     if not requested:
         raise ValueError("Debe seleccionar al menos un baseline.")
@@ -719,11 +1298,74 @@ def run_gnn_mlp_baselines(
     tensors = _extract_graph_tensors(loaded_obj, graph_hash=graph_hash)
     device_resolved = _resolve_device(device)
     batch_size = max(1, int(batch_size))
+    threshold_strategy = _normalize_threshold_strategy(threshold_strategy)
+    far_target = float(np.clip(float(far_target), 0.0, 1.0))
+    fbeta_beta = max(float(fbeta_beta), 1e-6)
     rows: list[Dict[str, object]] = []
+    current_view: _FeatureView = _CurrentFeatureView(tensors.x, tensors.y)
+    temporal_view: Optional[_TemporalFeatureView] = None
+    temporal_reason: Optional[str] = None
 
     for baseline in requested:
-        if baseline == "current":
-            view: _FeatureView = _CurrentFeatureView(tensors.x, tensors.y)
+        spec = _BASELINE_SPECS.get(baseline)
+        if spec is None:
+            rows.extend(
+                _skip_rows(
+                    baseline=baseline,
+                    model_name=str(baseline),
+                    reason=f"Baseline no reconocido: {baseline}",
+                    graph_hash=tensors.graph_hash,
+                    threshold_strategy=threshold_strategy,
+                    far_target=far_target,
+                )
+            )
+            continue
+
+        if spec.feature_view == "current":
+            base_view: Optional[_FeatureView] = current_view
+        elif spec.feature_view == "temporal":
+            if temporal_view is None and temporal_reason is None:
+                temporal_view, temporal_reason = _temporal_view_from_loaded_obj(loaded_obj, tensors)
+            base_view = temporal_view
+            if base_view is None:
+                reason = temporal_reason or "sequence_index no disponible."
+                rows.extend(
+                    _skip_rows(
+                        baseline=spec.key,
+                        model_name=spec.model_name,
+                        reason=reason,
+                        graph_hash=tensors.graph_hash,
+                        model_family=spec.model_family,
+                        feature_view=spec.feature_view,
+                        threshold_strategy=threshold_strategy,
+                        far_target=far_target,
+                    )
+                )
+                _emit(
+                    progress_callback,
+                    event="baseline_skipped",
+                    baseline=spec.key,
+                    model=spec.model_name,
+                    reason=reason,
+                )
+                continue
+        else:
+            rows.extend(
+                _skip_rows(
+                    baseline=spec.key,
+                    model_name=spec.model_name,
+                    reason=f"Vista de features no reconocida: {spec.feature_view}",
+                    graph_hash=tensors.graph_hash,
+                    model_family=spec.model_family,
+                    feature_view=spec.feature_view,
+                    threshold_strategy=threshold_strategy,
+                    far_target=far_target,
+                )
+            )
+            continue
+
+        if spec.model_family == "mlp":
+            view = base_view
             rows.extend(
                 _train_one_baseline(
                     view,
@@ -739,54 +1381,40 @@ def run_gnn_mlp_baselines(
                     device=device_resolved,
                     seed=seed,
                     progress_callback=progress_callback,
+                    threshold_strategy=threshold_strategy,
+                    far_target=far_target,
+                    fbeta_beta=fbeta_beta,
                 )
             )
             continue
 
-        if baseline == "temporal":
-            view_temporal, reason = _temporal_view_from_loaded_obj(loaded_obj, tensors)
-            if view_temporal is None:
-                rows.extend(
-                    _skip_rows(
-                        baseline="temporal",
-                        model_name="MLP temporal",
-                        reason=reason or "sequence_index no disponible.",
-                        graph_hash=tensors.graph_hash,
-                    )
-                )
-                _emit(
-                    progress_callback,
-                    event="baseline_skipped",
-                    baseline="temporal",
-                    model="MLP temporal",
-                    reason=reason or "sequence_index no disponible.",
-                )
-                continue
+        if spec.model_family in {"xgboost", "svm"}:
+            view = _NamedFeatureView(base_view, spec)
             rows.extend(
-                _train_one_baseline(
-                    view_temporal,
+                _train_one_tabular_baseline(
+                    view,
                     tensors,
-                    epochs=epochs,
-                    patience=patience,
+                    spec,
                     batch_size=batch_size,
-                    hidden_dim=hidden_dim,
-                    num_layers=num_layers,
-                    dropout=dropout,
-                    lr=lr,
-                    weight_decay=weight_decay,
-                    device=device_resolved,
                     seed=seed,
                     progress_callback=progress_callback,
+                    threshold_strategy=threshold_strategy,
+                    far_target=far_target,
+                    fbeta_beta=fbeta_beta,
                 )
             )
             continue
 
         rows.extend(
             _skip_rows(
-                baseline=baseline,
-                model_name=str(baseline),
-                reason=f"Baseline no reconocido: {baseline}",
+                baseline=spec.key,
+                model_name=spec.model_name,
+                reason=f"Familia de baseline no reconocida: {spec.model_family}",
                 graph_hash=tensors.graph_hash,
+                model_family=spec.model_family,
+                feature_view=spec.feature_view,
+                threshold_strategy=threshold_strategy,
+                far_target=far_target,
             )
         )
 

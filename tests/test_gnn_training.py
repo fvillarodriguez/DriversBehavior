@@ -497,7 +497,6 @@ def _install_fast_training_mocks(monkeypatch, tmp_path, val_losses, prob_sequenc
     )
     monkeypatch.setattr(gnn_main, "test", fake_test)
     monkeypatch.setattr(gnn_main, "_get_repo_version", lambda: "test")
-    monkeypatch.setattr("builtins.input", lambda prompt="": "1")
     return test_criteria, saved_paths
 
 
@@ -632,6 +631,63 @@ def test_run_gat_training_honors_manual_stop_after_checkpoint(tmp_path, monkeypa
     assert saved_ckpt["last_val_loss"] == pytest.approx(0.80)
 
 
+def test_run_gat_training_persists_history_and_reuses_run_id_on_resume(tmp_path, monkeypatch):
+    loaded_obj = {"data": _make_small_training_graph(), "filename": "demo_graph.pt"}
+    _write_fast_hparams(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    history_path = tmp_path / "metrics_history.jsonl"
+    _install_fast_training_mocks(
+        monkeypatch,
+        tmp_path,
+        val_losses=[0.90, 0.80],
+        prob_sequences=[
+            [0.9, 0.2],
+            [0.1, 0.95],
+        ],
+    )
+
+    gnn_main.run_gat_training(
+        loaded_obj,
+        force_use_graphsmote=False,
+        early_stop=False,
+        max_epochs=2,
+        save_state_path=str(checkpoint_path),
+        metrics_history_path=str(history_path),
+    )
+
+    first_ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    first_run_id = first_ckpt["run_id"]
+    assert first_ckpt["metrics_history_path"] == str(history_path)
+
+    _install_fast_training_mocks(
+        monkeypatch,
+        tmp_path,
+        val_losses=[0.70],
+        prob_sequences=[[0.1, 0.95]],
+    )
+    gnn_main.run_gat_training(
+        loaded_obj,
+        force_use_graphsmote=False,
+        early_stop=False,
+        max_epochs=3,
+        resume_state_path=str(checkpoint_path),
+        save_state_path=str(checkpoint_path),
+        metrics_history_path=str(history_path),
+    )
+
+    events = [
+        json.loads(line)
+        for line in history_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    run_ids = {event["run_id"] for event in events}
+    epoch_events = [event for event in events if event.get("event") == "epoch"]
+
+    assert run_ids == {first_run_id}
+    assert [event["epoch"] for event in epoch_events] == [1, 2, 3]
+    assert {event["event"] for event in events} >= {"train_start", "epoch", "train_end"}
+
+
 def test_run_gat_training_runs_requested_test_and_continues(tmp_path, monkeypatch):
     loaded_obj = {"data": _make_small_training_graph(), "filename": "demo_graph.pt"}
     _write_fast_hparams(tmp_path)
@@ -716,6 +772,111 @@ def test_run_gat_training_runs_requested_test_and_continues(tmp_path, monkeypatc
 
     assert val_calls == 4
     assert test_calls == 1
+
+
+def test_run_gat_training_auto_tests_current_epoch_without_changing_monitor(tmp_path, monkeypatch):
+    loaded_obj = {"data": _make_small_training_graph(), "filename": "demo_graph.pt"}
+    _write_fast_hparams(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    history_path = tmp_path / "metrics_history.jsonl"
+    _install_fast_training_mocks(
+        monkeypatch,
+        tmp_path,
+        val_losses=[0.90, 0.80, 0.70, 0.60],
+        prob_sequences=[
+            [0.1, 0.95],
+            [0.1, 0.95],
+            [0.1, 0.95],
+            [0.1, 0.95],
+        ],
+    )
+
+    val_calls = 0
+    test_calls = 0
+    test_thresholds = []
+
+    def fake_test(*args, masks=None, threshold=None, **kwargs):
+        del args, kwargs
+        nonlocal val_calls, test_calls
+        y_true = torch.tensor([0, 1], dtype=torch.long)
+        probs = torch.tensor([[0.9, 0.1], [0.05, 0.95]], dtype=torch.float32)
+        if masks == ["test_mask"]:
+            test_calls += 1
+            test_thresholds.append(threshold)
+            return {
+                "test_mask": {
+                    "true": y_true,
+                    "probs": probs,
+                    "report": {
+                        "Accidente (1)": {
+                            "f1-score": 0.80,
+                            "precision": 0.75,
+                            "recall": 0.86,
+                        },
+                        "macro avg": {"f1-score": 0.82},
+                        "accuracy": 0.85,
+                    },
+                    "cm": [[1, 0], [0, 1]],
+                    "auc": 0.90,
+                    "auprc": 0.88,
+                    "mcc": 0.70,
+                    "far": 0.05,
+                }
+            }
+
+        val_calls += 1
+        return {
+            "val_mask": {
+                "true": y_true,
+                "probs": probs,
+                "report": {
+                    "Accidente (1)": {
+                        "f1-score": 1.0,
+                        "precision": 1.0,
+                        "recall": 1.0,
+                    },
+                    "macro avg": {"f1-score": 1.0},
+                    "accuracy": 1.0,
+                },
+                "cm": [[1, 0], [0, 1]],
+                "auc": 1.0,
+                "auprc": 1.0,
+                "mcc": 1.0,
+                "loss": 1.0 - 0.1 * val_calls,
+            }
+        }
+
+    monkeypatch.setattr(gnn_main, "test", fake_test)
+
+    gnn_main.run_gat_training(
+        loaded_obj,
+        force_use_graphsmote=False,
+        early_stop=False,
+        max_epochs=4,
+        save_state_path=str(checkpoint_path),
+        metrics_history_path=str(history_path),
+        test_eval_interval_epochs=2,
+    )
+
+    saved_ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    events = [
+        json.loads(line)
+        for line in history_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    auto_tests = [
+        event
+        for event in events
+        if event.get("event") == "test_result" and event.get("automatic") is True
+    ]
+
+    assert val_calls == 4
+    assert test_calls == 2
+    assert all(threshold is not None for threshold in test_thresholds)
+    assert saved_ckpt["best_epoch"] == 1
+    assert saved_ckpt["best_monitor_value"] == pytest.approx(1.0)
+    assert [event["epoch"] for event in auto_tests] == [2, 4]
+    assert {event["eval_target"] for event in auto_tests} == {"current_epoch"}
 
 
 def test_run_gat_training_resumes_old_val_loss_checkpoint_with_new_monitor(tmp_path, monkeypatch):

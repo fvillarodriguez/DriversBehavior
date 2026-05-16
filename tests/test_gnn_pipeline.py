@@ -24,6 +24,7 @@ from src.graph_builder_app import (
     _infer_edge_feature_dim,
     _apply_temporal_split_to_graph,
     _attach_graph_metadata_hash,
+    _build_bidirectional_spatial_edges,
     _build_edge_feature_extras,
     _build_raw_global_edge_features,
     _compute_normalization_stats_from_train,
@@ -547,6 +548,51 @@ def test_edge_feature_extras_recompute_directional_and_st_fwd_gradients():
     assert st_fwd[0].tolist() == pytest.approx([2.0, 55.0, -7.5, 0.25])
 
 
+def test_bidirectional_spatial_edges_recompute_reverse_attributes():
+    df_raw = pd.DataFrame(
+        {
+            "portico": ["A", "B"],
+            "ts_min": [0, 0],
+            "flow_total": [100.0, 150.0],
+            "speed_mean": [50.0, 40.0],
+            "slow_pct": [0.10, 0.30],
+            "mix_cat_2": [0.10, 0.20],
+        }
+    )
+    raw_globals = _build_raw_global_edge_features(df_raw, "portico")
+    spatial_edges = pd.DataFrame(
+        {
+            "portico_src": ["A"],
+            "portico_dst": ["B"],
+            "ts_min": [0],
+            "dist_km": [2.0],
+            "node_idx_src": [0],
+            "node_idx_dst": [1],
+        }
+    )
+    feat_mat_delta = np.array([[1.0, 10.0], [4.0, 7.0]])
+
+    src, dst, attr = _build_bidirectional_spatial_edges(
+        spatial_edges,
+        feat_mat_delta,
+        raw_globals,
+        "portico",
+        ["dist_km", "grad_q", "grad_v", "grad_slow_pct"],
+    )
+
+    assert src == [0, 1]
+    assert dst == [1, 0]
+    np.testing.assert_allclose(
+        attr,
+        np.array(
+            [
+                [3.0, -3.0, 2.0, 25.0, -5.0, 0.10],
+                [-3.0, 3.0, 2.0, -25.0, 5.0, -0.10],
+            ]
+        ),
+    )
+
+
 def test_attach_graph_metadata_hash_records_reproducibility_payload():
     data = HeteroData()
     data["pm"].x = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
@@ -663,7 +709,19 @@ def test_network_config_translation():
     cfg = {
         "hidden_channels": 64,
         "smote_k": 5,
-        "target_pos_ratio": 0.4
+        "target_pos_ratio": 0.4,
+        "train_sampler_mode": "RioGNN top-p RL",
+        "deterministic_sampling": True,
+        "sampling_seed": 123,
+        "disable_hard_undersampling": True,
+        "rl_action_space": "continuous_actor",
+        "rl_initial_p": 0.4,
+        "rl_min_p": 0.1,
+        "rl_max_p": 0.9,
+        "rl_min_keep": 2,
+        "rl_positive_only": False,
+        "rl_similarity_pretrain_epochs": 1,
+        "rl_lambda_simi": 1.25,
     }
     
     # Case 1: Use GraphSMOTE = True
@@ -676,5 +734,17 @@ def test_network_config_translation():
     hparams_no_smote = _network_config_to_hparams(cfg, use_graphsmote=False)
     assert hparams_no_smote["use_graphsmote"] is False
     assert "smote_k" not in hparams_no_smote # Should not be present or not used
+    assert hparams_no_smote["train_sampler_mode"] == "rl_top_p"
+    assert hparams_no_smote["deterministic_sampling"] is True
+    assert hparams_no_smote["sampling_seed"] == 123
+    assert hparams_no_smote["disable_hard_undersampling"] is True
+    assert hparams_no_smote["rl_action_space"] == "continuous_actor"
+    assert hparams_no_smote["rl_initial_p"] == 0.4
+    assert hparams_no_smote["rl_min_p"] == 0.1
+    assert hparams_no_smote["rl_max_p"] == 0.9
+    assert hparams_no_smote["rl_min_keep"] == 2
+    assert hparams_no_smote["rl_positive_only"] is False
+    assert hparams_no_smote["rl_similarity_pretrain_epochs"] == 1
+    assert hparams_no_smote["rl_lambda_simi"] == 1.25
     
     

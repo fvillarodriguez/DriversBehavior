@@ -72,9 +72,8 @@
       <thead><tr><th>Relation</th><th>Definition</th><th>Semantics</th><th>Attributes</th></tr></thead>
       <tbody>
         <tr><td><code>temporal</code></td><td>\(P_{i,t}\to P_{i,t+1}\)</td><td>Local persistence at the same gantry.</td><td>\(\Delta x\) block; physical channels are zero-filled.</td></tr>
-        <tr><td><code>spatial</code></td><td>\(P_{i,t}\to P_{i+1,t}\)</td><td>Downstream propagation at the same timestamp.</td><td>\(\Delta x\), distance, gradients, shock-wave features, and congestion indicators.</td></tr>
+        <tr><td><code>spatial</code></td><td>\(P_{i,t}\leftrightarrow P_{i+1,t}\)</td><td>Bidirectional spatial propagation at the same timestamp.</td><td>\(\Delta x\), distance, gradients, shock-wave features, and congestion indicators recomputed per direction.</td></tr>
         <tr><td><code>st_fwd</code></td><td>\(P_{i,t}\to P_{i+1,t+1}\)</td><td>Experimental space-time propagation.</td><td>Gradients between the current gantry and next gantry in the next bin.</td></tr>
-        <tr><td><code>spatial_back</code></td><td>Reverse of <code>spatial</code></td><td>Spatial diffusion in the opposite direction when enabled.</td><td>Directional gradients are recomputed, not simply copied.</td></tr>
       </tbody>
     </table>
 
@@ -228,7 +227,7 @@
     <p class="reveal"><strong>Main module:</strong> <code>src/graphsmote.py</code>. <strong>Integration:</strong> <code>src/gnn_main.py</code>, <code>src/train_pretrain.py</code>, <code>src/graph_builder_app.py</code>, and <code>src/config.py</code>. Zhao, Zhang, and Wang formulate GraphSMOTE for transductive semi-supervised classification on a homogeneous graph \(G=\{V,A,F\}\), with one adjacency matrix \(A\), node features \(F\), a GraphSAGE extractor, embedding-space SMOTE, a bilinear edge generator, and loss \(L_{node}+\lambda L_{edge}\). The local pipeline requires re-specification because it operates on a temporal, relational gantry-minute graph with physical edge attributes, purged chronological splits, and extremely low positive prevalence.</p>
 
     <h4 class="reveal">Change 1 · From homogeneous graph to <code>HeteroData</code></h4>
-    <p class="reveal">The original formulation operates on \(A\in\mathbb{R}^{n\times n}\). Here, typed <code>pm</code>\(\to\)<code>pm</code> relations are preserved: <code>spatial</code>, <code>temporal</code>, <code>st_fwd</code>, and, when enabled, <code>spatial_back</code>. Therefore <code>RelEdgeGen</code> does not learn one global \(S\), but one matrix \(S_r\) per relation.</p>
+    <p class="reveal">The original formulation operates on \(A\in\mathbb{R}^{n\times n}\). Here, typed <code>pm</code>\(\to\)<code>pm</code> relations are preserved: <code>spatial</code>, <code>temporal</code>, and <code>st_fwd</code>. Therefore <code>RelEdgeGen</code> does not learn one global \(S\), but one matrix \(S_r\) per relation.</p>
     <div class="lab-eq has-inspector reveal">
       <div class="formula">\[ s_r(u,v)=\mathbf{z}_u^\top S_r\mathbf{z}_v,\qquad r=(\texttt{src},\texttt{rel},\texttt{dst}) \]</div>
       <div class="num">(6.7)</div>

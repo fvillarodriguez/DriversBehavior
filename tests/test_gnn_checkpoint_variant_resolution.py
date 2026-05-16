@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -68,6 +70,76 @@ def test_checkpoint_edge_types_rebuild_without_legacy_st_fwd():
     assert unexpected == []
 
 
+def test_edge_encoder_hidden_dims_rebuild_for_strict_load():
+    HeteroData = pytest.importorskip("torch_geometric.data").HeteroData
+    edge_types = (
+        ("pm", "temporal", "pm"),
+        ("pm", "spatial", "pm"),
+    )
+    edge_feature_dims = {
+        ("pm", "temporal", "pm"): 3,
+        ("pm", "spatial", "pm"): 4,
+    }
+    edge_encoder_hidden_dims = {
+        ("pm", "temporal", "pm"): 5,
+        ("pm", "spatial", "pm"): 6,
+    }
+    edge_encoded_dims = {
+        ("pm", "temporal", "pm"): 2,
+        ("pm", "spatial", "pm"): 2,
+    }
+    edge_encoder_kinds = {
+        ("pm", "temporal", "pm"): "time2vec",
+        ("pm", "spatial", "pm"): "layernorm_mlp",
+    }
+    graph = HeteroData()
+    graph["pm"].x = torch.zeros((4, 3), dtype=torch.float32)
+    for edge_type, dim in edge_feature_dims.items():
+        graph[edge_type].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        graph[edge_type].edge_attr = torch.zeros((0, dim), dtype=torch.float32)
+
+    model = gnn_main._build_gnn_model(
+        in_channels=3,
+        hidden_channels=4,
+        out_channels=2,
+        num_heads=2,
+        dropout=0.0,
+        edge_feature_dim=4,
+        num_layers=1,
+        gnn_variant="gat_edge_mlp",
+        num_nodes=4,
+        edge_types=edge_types,
+        edge_feature_dims=edge_feature_dims,
+        edge_encoder_hidden_dims=edge_encoder_hidden_dims,
+        edge_encoded_dims=edge_encoded_dims,
+        edge_encoder_kinds=edge_encoder_kinds,
+    )
+    state_dict = model.state_dict()
+
+    resolved_hidden_dims = app._resolve_edge_encoder_hidden_dims_for_model(state_dict)
+    rebuilt = gnn_main._build_gnn_model(
+        in_channels=3,
+        hidden_channels=4,
+        out_channels=2,
+        num_heads=2,
+        dropout=0.0,
+        edge_feature_dim=4,
+        num_layers=1,
+        gnn_variant="gat_edge_mlp",
+        num_nodes=4,
+        edge_types=app._resolve_checkpoint_edge_types_for_model(state_dict, graph),
+        edge_feature_dims=app._resolve_edge_feature_dims_for_model(state_dict, graph),
+        edge_encoder_hidden_dims=resolved_hidden_dims,
+        edge_encoded_dims=app._resolve_edge_encoded_dims_for_model(state_dict),
+        edge_encoder_kinds=app._resolve_edge_encoder_kinds_for_model(state_dict),
+    )
+
+    assert resolved_hidden_dims == edge_encoder_hidden_dims
+    missing, unexpected = rebuilt.load_state_dict(state_dict, strict=True)
+    assert missing == []
+    assert unexpected == []
+
+
 def test_checkpoint_graph_compat_blocks_missing_checkpoint_edge_type():
     HeteroData = pytest.importorskip("torch_geometric.data").HeteroData
     graph = HeteroData()
@@ -97,6 +169,49 @@ def test_trained_model_eval_final_masks_are_test_only():
 
     graph["pm"].test_mask = torch.zeros(3, dtype=torch.bool)
     assert app._test_only_eval_masks(graph) == []
+
+
+def test_eval_model_list_filters_by_loaded_graph_hash(tmp_path: Path, monkeypatch):
+    graph_hash = "a" * 64
+    other_hash = "b" * 64
+    matching = tmp_path / "gat_model_BEST_GNN_gat_snapshot_matching.pt"
+    other = tmp_path / "gat_model_BEST_GNN_gat_snapshot_other.pt"
+    legacy_name_match = (
+        tmp_path / f"gat_model_BEST_GNN_gat_snapshot_20260101_000000_{graph_hash[:8]}.pt"
+    )
+    untagged = tmp_path / "gat_model_BEST_GNN_gat_snapshot_legacy.pt"
+    for path in (matching, other, legacy_name_match, untagged):
+        path.write_bytes(b"checkpoint")
+
+    matching.with_name(f"{matching.stem}_hparams.json").write_text(
+        json.dumps({"graph_hash": graph_hash}),
+        encoding="utf-8",
+    )
+    other.with_name(f"{other.stem}_hparams.json").write_text(
+        json.dumps({"graph_hash": other_hash}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(app, "RESULTADOS_DIR", str(tmp_path))
+
+    files = app._list_gnn_model_files_for_evaluation({"graph_hash": graph_hash})
+
+    assert str(matching) in files
+    assert str(legacy_name_match) in files
+    assert str(other) not in files
+    assert str(untagged) not in files
+
+
+def test_eval_model_list_is_empty_without_loaded_graph_hash(tmp_path: Path, monkeypatch):
+    model_path = tmp_path / "gat_model_BEST_GNN_gat_snapshot.pt"
+    model_path.write_bytes(b"checkpoint")
+    model_path.with_name(f"{model_path.stem}_hparams.json").write_text(
+        json.dumps({"graph_hash": "a" * 64}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app, "RESULTADOS_DIR", str(tmp_path))
+
+    assert app._list_gnn_model_files_for_evaluation({}) == []
 
 
 def test_checkpoint_temporal_state_overrides_snapshot_metadata():

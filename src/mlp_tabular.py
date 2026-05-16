@@ -120,7 +120,7 @@ def _simple_smote(X: np.ndarray, y: np.ndarray, *, random_state: int = 0) -> Tup
 
 def _pick_threshold_from_val(y_true_val: np.ndarray, y_prob1_val: np.ndarray, beta: float = 0.5) -> Tuple[float, Dict[str, float]]:
     prec, rec, thr = precision_recall_curve(y_true_val.astype(int), y_prob1_val.astype(float))
-    prec_, rec_, thr_ = prec[1:], rec[1:], thr
+    prec_, rec_, thr_ = prec[:-1], rec[:-1], thr
     beta2 = beta ** 2
     # Manejo de casos degenerados (p.ej., validación con una sola clase)
     if len(prec_) == 0 or len(thr_) == 0:

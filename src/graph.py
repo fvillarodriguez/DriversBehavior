@@ -751,13 +751,11 @@ def build_graph() -> Optional[str]:
     build_temporal = 's' #in input("  - ¿Construir aristas 'temporales'? [s/n]: ").strip().lower()
     build_spatial = 's' #in input("  - ¿Construir aristas 'espaciales'? [s/n]: ").strip().lower()
     build_st_fwd = False #in input("  - ¿Construir aristas 'st_fwd' (espacio-temporales)? [s/n]: ").strip().lower()
-    build_spatial_back = False #in input("  - ¿Construir aristas 'spatial_back' (inversas)? [s/n]: ").strip().lower()
 
     # Inicializar listas de aristas
     temporal_src, temporal_dst, temporal_attr = [], [], []
     spatial_src, spatial_dst, spatial_attr = [], [], []
     stfwd_src, stfwd_dst, stfwd_attr = [], [], []
-    spatial_back_src, spatial_back_dst, spatial_back_attr = [], [], []
 
     if build_temporal:
         print("  - Calculando aristas 'temporales' (vectorizado)...")
@@ -814,10 +812,10 @@ def build_graph() -> Optional[str]:
                     right_on=['ts_min', 'portico_dst'],
                     how='inner' # Usar inner join para asegurar que ambos nodos existan en el mismo ts
                 )
-                spatial_src = spatial_edges['node_idx_src'].tolist()
-                spatial_dst = spatial_edges['node_idx_dst'].tolist()
-                print(f"    · Aristas espaciales: {len(spatial_src)}")
-                delta_norm_spatial = feat_mat[spatial_dst] - feat_mat[spatial_src]
+                spatial_src_fwd = spatial_edges['node_idx_src'].to_numpy(dtype=int)
+                spatial_dst_fwd = spatial_edges['node_idx_dst'].to_numpy(dtype=int)
+                print(f"    · Aristas espaciales base: {len(spatial_src_fwd)}")
+                delta_norm_spatial = feat_mat[spatial_dst_fwd] - feat_mat[spatial_src_fwd]
                 # Unir valores crudos para gradientes y shock
                 src_vals = raw_globals.rename(columns={
                     portico_col: 'portico_src',
@@ -843,15 +841,61 @@ def build_graph() -> Optional[str]:
                 grad_v = dv / (dkm + 1e-9)
                 shock_speed = dq / (dk + 1e-9)
                 shock_indicator = np.maximum(0.0, dk) * np.maximum(0.0, -dq)
-                extra = np.stack([grad_q, grad_k, grad_v, shock_speed, shock_indicator, np.nan_to_num(dkm, nan=0.0)], axis=1)
-                spatial_attr = np.concatenate([np.array(delta_norm_spatial, dtype=np.float32), extra.astype(np.float32)], axis=1)
+                extra = np.stack(
+                    [
+                        grad_q,
+                        grad_k,
+                        grad_v,
+                        shock_speed,
+                        shock_indicator,
+                        np.nan_to_num(dkm, nan=0.0),
+                    ],
+                    axis=1,
+                )
+                spatial_attr_fwd = np.concatenate(
+                    [
+                        np.array(delta_norm_spatial, dtype=np.float32),
+                        extra.astype(np.float32),
+                    ],
+                    axis=1,
+                )
 
-                if build_spatial_back:
-                    # Invertir para `spatial_back`
-                    print("  - Calculando aristas 'spatial_back' (inversas)...")
-                    spatial_back_src = spatial_dst
-                    spatial_back_dst = spatial_src
-                    spatial_back_attr = -spatial_attr
+                reverse_delta = feat_mat[spatial_src_fwd] - feat_mat[spatial_dst_fwd]
+                reverse_extra = np.stack(
+                    [
+                        -grad_q,
+                        -grad_k,
+                        -grad_v,
+                        (-dq) / ((-dk) + 1e-9),
+                        np.maximum(0.0, -dk) * np.maximum(0.0, dq),
+                        np.nan_to_num(dkm, nan=0.0),
+                    ],
+                    axis=1,
+                )
+                spatial_src = (
+                    np.concatenate([spatial_src_fwd, spatial_dst_fwd])
+                    .astype(int)
+                    .tolist()
+                )
+                spatial_dst = (
+                    np.concatenate([spatial_dst_fwd, spatial_src_fwd])
+                    .astype(int)
+                    .tolist()
+                )
+                spatial_attr = np.concatenate(
+                    [
+                        spatial_attr_fwd,
+                        np.concatenate(
+                            [
+                                np.array(reverse_delta, dtype=np.float32),
+                                reverse_extra.astype(np.float32),
+                            ],
+                            axis=1,
+                        ),
+                    ],
+                    axis=0,
+                )
+                print(f"    · Aristas espaciales bidireccionales: {len(spatial_src)}")
 
             if build_st_fwd:
                 print("  - Calculando aristas 'st_fwd' (vectorizado)...")
@@ -890,8 +934,6 @@ def build_graph() -> Optional[str]:
         _add("spatial", spatial_src, spatial_dst, spatial_attr)
     if build_temporal:
         _add("temporal", temporal_src, temporal_dst, temporal_attr)
-    if build_spatial_back:
-        _add("spatial_back", spatial_back_src, spatial_back_dst, spatial_back_attr)
     if build_st_fwd:
         _add("st_fwd",  stfwd_src,    stfwd_dst,    stfwd_attr)
 
