@@ -530,6 +530,11 @@ def train_minibatch(
         if scheduler is not None:
             writer.add_scalar('LearningRate', scheduler.get_last_lr()[0], epoch)
 
+    try:
+        setattr(loader, "last_train_ranking_loss", float(avg_ranking_loss))
+    except Exception:
+        pass
+
     return avg_loss, avg_cls_loss, avg_edge_loss, avg_l2_att_loss
 
 # ================================

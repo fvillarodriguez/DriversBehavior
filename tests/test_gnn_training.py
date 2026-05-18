@@ -599,6 +599,55 @@ def test_run_gat_training_can_fallback_to_val_loss_monitor(tmp_path, monkeypatch
     assert meta["best_epoch"] == 2
 
 
+def test_run_gat_training_honors_explicit_ranking_loss_overrides(tmp_path, monkeypatch):
+    loaded_obj = {"data": _make_small_training_graph(), "filename": "demo_graph.pt"}
+    _write_fast_hparams(tmp_path)
+    _install_fast_training_mocks(
+        monkeypatch,
+        tmp_path,
+        val_losses=[0.90],
+        prob_sequences=[[0.9, 0.2]],
+    )
+    train_kwargs = {}
+
+    def fake_train_minibatch(*args, **kwargs):
+        train_kwargs.update(kwargs)
+        try:
+            setattr(args[1], "last_train_ranking_loss", 0.123)
+        except Exception:
+            pass
+        return 0.5, 0.5, 0.0, 0.0
+
+    monkeypatch.setattr(gnn_main, "train_minibatch", fake_train_minibatch)
+    progress_events = []
+
+    gnn_main.run_gat_training(
+        loaded_obj,
+        force_use_graphsmote=False,
+        early_stop=False,
+        max_epochs=1,
+        progress_callback=lambda **payload: progress_events.append(dict(payload)),
+        ranking_loss_mode="pairwise_softplus",
+        ranking_loss_weight=0.10,
+        ranking_loss_margin=0.2,
+        ranking_loss_max_pairs=2048,
+    )
+
+    assert train_kwargs["ranking_loss_mode"] == "pairwise_softplus"
+    assert train_kwargs["ranking_loss_weight"] == pytest.approx(0.10)
+    assert train_kwargs["ranking_loss_margin"] == pytest.approx(0.2)
+    assert train_kwargs["ranking_loss_max_pairs"] == 2048
+    assert progress_events[-1]["train_ranking_loss"] == pytest.approx(0.123)
+
+    hparams_files = sorted(tmp_path.glob("gat_model_BEST*_hparams.json"))
+    assert hparams_files
+    meta = json.loads(hparams_files[-1].read_text(encoding="utf-8"))
+    assert meta["ranking_loss_mode"] == "pairwise_softplus"
+    assert meta["ranking_loss_weight"] == pytest.approx(0.10)
+    assert meta["ranking_loss_margin"] == pytest.approx(0.2)
+    assert meta["ranking_loss_max_pairs"] == 2048
+
+
 def test_run_gat_training_honors_manual_stop_after_checkpoint(tmp_path, monkeypatch):
     loaded_obj = {"data": _make_small_training_graph(), "filename": "demo_graph.pt"}
     _write_fast_hparams(tmp_path)

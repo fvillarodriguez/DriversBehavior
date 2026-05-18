@@ -13,6 +13,7 @@ def test_gnn_live_training_chart_frames_keep_requested_series_only():
             "train_cls_loss": 0.40,
             "train_edge_loss": 0.01,
             "train_l2_att_loss": 0.02,
+            "train_ranking_loss": 0.03,
             "val_accuracy": 0.88,
             "val_recall_pos": 0.61,
             "val_precision_pos": 0.73,
@@ -31,6 +32,7 @@ def test_gnn_live_training_chart_frames_keep_requested_series_only():
             "train_loss": 0.50,
             "val_loss": 0.60,
             "train_cls_loss": 0.48,
+            "train_ranking_loss": 0.04,
             "val_accuracy": 0.84,
             "val_recall_pos": 0.57,
             "val_precision_pos": 0.70,
@@ -43,10 +45,11 @@ def test_gnn_live_training_chart_frames_keep_requested_series_only():
 
     frames = app._build_gnn_live_training_chart_frames(metrics)
 
-    assert list(frames["loss"].columns) == ["Train Loss", "Val Loss"]
+    assert list(frames["loss"].columns) == ["Train Loss", "Rank Loss", "Val Loss"]
     assert "train_cls_loss" not in frames["loss"].columns
     assert "train_edge_loss" not in frames["loss"].columns
     assert "train_l2_att_loss" not in frames["loss"].columns
+    assert frames["loss"].loc[2, "Rank Loss"] == pytest.approx(0.03)
 
     assert list(frames["classification"].columns) == [
         "Accuracy",
@@ -78,6 +81,7 @@ def test_gnn_training_history_loader_ignores_bad_lines_and_preserves_curves(tmp_
             "run_id": "run-a",
             "epoch": 2,
             "train_loss": 0.4,
+            "train_ranking_loss": 0.04,
             "val_loss": 0.5,
             "val_auprc": 0.2,
         },
@@ -88,6 +92,7 @@ def test_gnn_training_history_loader_ignores_bad_lines_and_preserves_curves(tmp_
             "run_id": "run-a",
             "epoch": 1,
             "train_loss": 0.6,
+            "train_ranking_loss": 0.06,
             "val_loss": 0.7,
             "val_auprc": 0.1,
         },
@@ -97,6 +102,7 @@ def test_gnn_training_history_loader_ignores_bad_lines_and_preserves_curves(tmp_
             "run_id": "run-a",
             "epoch": 2,
             "train_loss": 0.3,
+            "train_ranking_loss": 0.03,
             "val_loss": 0.45,
             "val_auprc": 0.25,
         },
@@ -125,6 +131,7 @@ def test_gnn_training_history_loader_ignores_bad_lines_and_preserves_curves(tmp_
             {
                 "epoch": 3,
                 "train_loss": 0.2,
+                "train_ranking_loss": 0.02,
                 "val_loss": 0.4,
                 "val_auprc": 0.3,
             }
@@ -138,4 +145,5 @@ def test_gnn_training_history_loader_ignores_bad_lines_and_preserves_curves(tmp_
     assert test_results[0]["eval_target"] == "current_epoch"
     assert list(frames["loss"].index) == [1, 2, 3]
     assert frames["loss"].loc[2, "Train Loss"] == pytest.approx(0.3)
+    assert frames["loss"].loc[2, "Rank Loss"] == pytest.approx(0.03)
     assert frames["ranking"].loc[3, "AUPRC"] == pytest.approx(0.3)

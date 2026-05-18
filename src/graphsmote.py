@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Union, List, Tuple, Dict
+from typing import Optional, Union, List, Tuple, Dict, Any
 import random
 import torch
 import torch.nn.functional as F
@@ -22,6 +22,25 @@ from src.config import BIDIRECCTION, GRAPHSMOTE_CONECT
 import logging
 from tqdm import tqdm
 logger = logging.getLogger(__name__)
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("[GraphSMOTE] %s inválido; usando %.3f.", name, default)
+        return float(default)
+
+GRAPHSMOTE_SYNTHETIC_FEATURE_MODE = os.environ.get(
+    "GRAPHSMOTE_SYNTHETIC_FEATURE_MODE",
+    "z2x",
+).strip().lower()
+GRAPHSMOTE_Z2X_MINORITY_WEIGHT = _env_float("GRAPHSMOTE_Z2X_MINORITY_WEIGHT", 1.0)
+GRAPHSMOTE_Z2X_EARLY_STOP_METRIC = os.environ.get(
+    "GRAPHSMOTE_Z2X_EARLY_STOP_METRIC",
+    "val_loss",
+).strip().lower()
+
+_SYNTHETIC_FEATURE_MODES = {"z2x", "feature_interp", "oracle_copy"}
 
 # ============================================================
 # Limpieza de aristas sin romper edge_attr
@@ -101,6 +120,183 @@ def _delta_from_node_features(src_x: torch.Tensor, dst_x: torch.Tensor, delta_id
         return dst_x.index_select(1, delta_idx) - src_x.index_select(1, delta_idx)
     except Exception:
         return dst_x - src_x
+
+def _resolve_synthetic_feature_mode(mode: Optional[str]) -> str:
+    resolved = str(mode or GRAPHSMOTE_SYNTHETIC_FEATURE_MODE or "z2x").strip().lower()
+    if resolved not in _SYNTHETIC_FEATURE_MODES:
+        logger.warning(
+            "[GraphSMOTE] synthetic_feature_mode=%r no soportado; usando 'z2x'.",
+            resolved,
+        )
+        resolved = "z2x"
+    return resolved
+
+def _as_feature_matrix(x: torch.Tensor) -> torch.Tensor:
+    return x.view(-1, 1) if x.dim() == 1 else x
+
+def _safe_quantile_float(values: torch.Tensor, q: float) -> Optional[float]:
+    if values is None or values.numel() == 0:
+        return None
+    return float(torch.quantile(values.detach().cpu().float(), float(q)).item())
+
+def _feature_manifold_quality(
+    x_syn: torch.Tensor,
+    x_pos_reference: torch.Tensor,
+    x_train_reference: Optional[torch.Tensor] = None,
+) -> Dict[str, Any]:
+    """Quality diagnostics for synthetic node features against real train positives."""
+    quality: Dict[str, Any] = {}
+    x_syn = _as_feature_matrix(x_syn.detach().cpu().float())
+    x_pos = _as_feature_matrix(x_pos_reference.detach().cpu().float())
+    x_train = (
+        _as_feature_matrix(x_train_reference.detach().cpu().float())
+        if x_train_reference is not None and x_train_reference.numel() > 0
+        else x_pos
+    )
+    if x_syn.numel() == 0 or x_pos.numel() == 0:
+        return quality
+
+    eps = 1e-6
+    train_mean = x_train.mean(dim=0)
+    train_std = x_train.std(dim=0).clamp_min(eps)
+    z_syn = (x_syn - train_mean) / train_std
+    z_pos = (x_pos - train_mean) / train_std
+
+    pos_min = x_pos.min(dim=0).values
+    pos_max = x_pos.max(dim=0).values
+    train_min = x_train.min(dim=0).values
+    train_max = x_train.max(dim=0).values
+    outside_pos = (x_syn < pos_min) | (x_syn > pos_max)
+    outside_train = (x_syn < train_min) | (x_syn > train_max)
+
+    l2_to_pos = torch.cdist(z_syn, z_pos, p=2.0).min(dim=1).values
+    syn_norm = F.normalize(z_syn, p=2, dim=1, eps=eps)
+    pos_norm = F.normalize(z_pos, p=2, dim=1, eps=eps)
+    cosine_dist = (1.0 - (syn_norm @ pos_norm.T).max(dim=1).values).clamp_min(0.0)
+
+    quality.update(
+        {
+            "synthetic_count": int(x_syn.shape[0]),
+            "train_positive_count": int(x_pos.shape[0]),
+            "nan_count": int(torch.isnan(x_syn).sum().item()),
+            "inf_count": int(torch.isinf(x_syn).sum().item()),
+            "feature_outside_train_minmax_frac": float(outside_train.float().mean().item()),
+            "feature_outside_train_positive_minmax_frac": float(outside_pos.float().mean().item()),
+            "min_l2_to_train_positive_mean": float(l2_to_pos.mean().item()),
+            "min_l2_to_train_positive_median": _safe_quantile_float(l2_to_pos, 0.50),
+            "min_l2_to_train_positive_p95": _safe_quantile_float(l2_to_pos, 0.95),
+            "min_cosine_distance_to_train_positive_mean": float(cosine_dist.mean().item()),
+            "min_cosine_distance_to_train_positive_p95": _safe_quantile_float(cosine_dist, 0.95),
+        }
+    )
+
+    if x_pos.shape[0] >= 2:
+        pos_l2 = torch.cdist(z_pos, z_pos, p=2.0)
+        diag = torch.eye(pos_l2.shape[0], dtype=torch.bool)
+        pos_l2 = pos_l2.masked_fill(diag, float("inf"))
+        loo_l2 = pos_l2.min(dim=1).values
+
+        pos_cos = pos_norm @ pos_norm.T
+        pos_cos = pos_cos.masked_fill(diag, float("-inf"))
+        loo_cos = (1.0 - pos_cos.max(dim=1).values).clamp_min(0.0)
+
+        ref_l2_p95 = _safe_quantile_float(loo_l2, 0.95)
+        ref_cos_p95 = _safe_quantile_float(loo_cos, 0.95)
+        syn_l2_p95 = quality["min_l2_to_train_positive_p95"]
+        syn_cos_p95 = quality["min_cosine_distance_to_train_positive_p95"]
+        quality.update(
+            {
+                "real_positive_loo_l2_p95": ref_l2_p95,
+                "real_positive_loo_cosine_p95": ref_cos_p95,
+                "synthetic_l2_p95_to_real_positive_loo_p95_ratio": (
+                    float(syn_l2_p95 / max(ref_l2_p95, eps))
+                    if syn_l2_p95 is not None and ref_l2_p95 is not None
+                    else None
+                ),
+                "synthetic_cosine_p95_to_real_positive_loo_p95_ratio": (
+                    float(syn_cos_p95 / max(ref_cos_p95, eps))
+                    if syn_cos_p95 is not None and ref_cos_p95 is not None
+                    else None
+                ),
+            }
+        )
+    l2_ratio = quality.get("synthetic_l2_p95_to_real_positive_loo_p95_ratio")
+    cosine_ratio = quality.get("synthetic_cosine_p95_to_real_positive_loo_p95_ratio")
+    quality["feature_manifold_gate_ok"] = bool(
+        quality["nan_count"] == 0
+        and quality["inf_count"] == 0
+        and quality["feature_outside_train_positive_minmax_frac"] == 0.0
+        and (l2_ratio is None or l2_ratio <= 1.25)
+        and (cosine_ratio is None or cosine_ratio <= 1.25)
+    )
+    quality["feature_manifold_gate_policy"] = (
+        "finite and inside train-positive minmax; synthetic p95 nearest-positive "
+        "<= 1.25x real-positive leave-one-out p95 when available"
+    )
+    return quality
+
+def _sanitize_synthetic_features(
+    x_syn: torch.Tensor,
+    x_reference: torch.Tensor,
+) -> torch.Tensor:
+    """Replace non-finite synthetic values and clamp to the real positive train range."""
+    x_syn = _as_feature_matrix(x_syn)
+    x_ref = _as_feature_matrix(x_reference.to(device=x_syn.device, dtype=x_syn.dtype))
+    if x_ref.numel() == 0:
+        return torch.nan_to_num(x_syn)
+
+    ref_mean = x_ref.mean(dim=0)
+    finite = torch.isfinite(x_syn)
+    x_syn = torch.where(finite, x_syn, ref_mean.unsqueeze(0).expand_as(x_syn))
+
+    ref_min = x_ref.min(dim=0).values
+    ref_max = x_ref.max(dim=0).values
+    return torch.maximum(torch.minimum(x_syn, ref_max), ref_min)
+
+def _project_synthetic_features_from_smote(
+    *,
+    node_type: str,
+    syn_z: torch.Tensor,
+    x_source: torch.Tensor,
+    y_source: torch.Tensor,
+    parent_info: Optional[Dict[str, torch.Tensor]],
+    minority_class: int,
+    z2x_decoders,
+    feature_mode: Optional[str],
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Create synthetic node features using the requested source:
+    z2x decoder, feature-space interpolation from SMOTE parents, or oracle copy.
+    """
+    mode = _resolve_synthetic_feature_mode(feature_mode)
+    x_source = _as_feature_matrix(x_source.to(device=syn_z.device, dtype=torch.float32))
+    y_source = y_source.to(device=syn_z.device)
+    pos_source = x_source[y_source == int(minority_class)]
+    if pos_source.numel() == 0:
+        pos_source = x_source
+
+    if mode == "z2x":
+        if z2x_decoders is None:
+            raise ValueError("synthetic_feature_mode='z2x' requiere z2x_decoders.")
+        with torch.no_grad():
+            x_syn = z2x_decoders.project_one(node_type, syn_z).to(dtype=x_source.dtype)
+    else:
+        if parent_info is None:
+            raise ValueError(f"synthetic_feature_mode='{mode}' requiere parent_info de SMOTE.")
+        base_idx = parent_info["base_idx"].to(device=syn_z.device).long()
+        neighbor_idx = parent_info["neighbor_idx"].to(device=syn_z.device).long()
+        alpha = parent_info["alpha"].to(device=syn_z.device, dtype=x_source.dtype).view(-1, 1)
+        x_a = x_source.index_select(0, base_idx)
+        if mode == "oracle_copy":
+            x_syn = x_a.clone()
+        else:
+            x_b = x_source.index_select(0, neighbor_idx)
+            x_syn = (1.0 - alpha) * x_a + alpha * x_b
+
+    x_syn = _sanitize_synthetic_features(x_syn, pos_source)
+    quality = _feature_manifold_quality(x_syn, pos_source, x_source)
+    quality["synthetic_feature_mode"] = mode
+    return x_syn, quality
 
 # ============================================================
 # 1) Edge generator bilineal por relación
@@ -542,6 +738,8 @@ def train_z2x_decoders(
     mixup_k: int = 5,
     mixup_ratio: float = 1.0,
     mixup_weight: float = 1.0,
+    minority_recon_weight: Optional[float] = None,
+    early_stop_metric: Optional[str] = None,
 ):
     """
     Entrena un decodificador z->x por tipo usando z extraído en modo eval.
@@ -612,7 +810,30 @@ def train_z2x_decoders(
 
     dec = Z2XDecoders(dims_per_type).to(device)
     opt = torch.optim.AdamW(dec.parameters(), lr=lr, weight_decay=weight_decay)
-    crit = torch.nn.SmoothL1Loss() if loss_type == "huber" else torch.nn.MSELoss()
+    crit = (
+        torch.nn.SmoothL1Loss(reduction="none")
+        if loss_type == "huber"
+        else torch.nn.MSELoss(reduction="none")
+    )
+    if minority_recon_weight is None:
+        minority_recon_weight = float(GRAPHSMOTE_Z2X_MINORITY_WEIGHT)
+    minority_recon_weight = float(max(1.0, minority_recon_weight))
+    early_stop_metric = str(early_stop_metric or GRAPHSMOTE_Z2X_EARLY_STOP_METRIC or "val_loss").strip().lower()
+
+    def _reconstruction_loss(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        sample_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        per_elem = crit(pred, target)
+        if per_elem.dim() > 1:
+            per_sample = per_elem.view(per_elem.size(0), -1).mean(dim=1)
+        else:
+            per_sample = per_elem.view(-1)
+        if sample_weights is not None:
+            weights = sample_weights.to(device=per_sample.device, dtype=per_sample.dtype).view(-1)
+            return (per_sample * weights).sum() / weights.sum().clamp_min(1e-12)
+        return per_sample.mean()
 
     # Precompute device tensors and masks per type
     z_all = {}
@@ -735,7 +956,17 @@ def train_z2x_decoders(
             z = z_all[ntype].index_select(0, train_idx[ntype])
             x = x_all[ntype].index_select(0, train_idx[ntype])
             xhat = dec.project_one(ntype, z)
-            loss = crit(xhat, x)
+            weights = None
+            min_label = minority_classes.get(ntype, None)
+            if (
+                minority_recon_weight > 1.0
+                and min_label is not None
+                and y_all[ntype] is not None
+            ):
+                y_train_batch = y_all[ntype].index_select(0, train_idx[ntype])
+                weights = torch.ones(y_train_batch.numel(), device=device, dtype=xhat.dtype)
+                weights[y_train_batch == int(min_label)] = float(minority_recon_weight)
+            loss = _reconstruction_loss(xhat, x, weights)
             loss.backward()
             total_train_loss += float(loss.item())
 
@@ -766,7 +997,7 @@ def train_z2x_decoders(
                 x_mix = (1.0 - alpha_t) * x_a + alpha_t * x_b
 
                 xhat_mix = dec.project_one(ntype, z_mix)
-                mloss = float(mixup_weight) * crit(xhat_mix, x_mix)
+                mloss = float(mixup_weight) * _reconstruction_loss(xhat_mix, x_mix)
                 mloss.backward()
                 total_mixup_loss += float(mloss.item())
 
@@ -789,7 +1020,7 @@ def train_z2x_decoders(
                     z = z_all[ntype].index_select(0, val_idx[ntype])
                     x = x_all[ntype].index_select(0, val_idx[ntype])
                     xhat = dec.project_one(ntype, z)
-                    loss = crit(xhat, x)
+                    loss = _reconstruction_loss(xhat, x)
                     vloss += float(loss.item())
                     vcount += 1
 
@@ -798,9 +1029,9 @@ def train_z2x_decoders(
                         y_val = y_all[ntype].index_select(0, val_idx[ntype])
                         min_mask = (y_val == int(min_label))
                         if min_mask.any():
-                            v_min_losses.append(float(crit(xhat[min_mask], x[min_mask]).item()))
+                            v_min_losses.append(float(_reconstruction_loss(xhat[min_mask], x[min_mask]).item()))
                         if (~min_mask).any():
-                            v_maj_losses.append(float(crit(xhat[~min_mask], x[~min_mask]).item()))
+                            v_maj_losses.append(float(_reconstruction_loss(xhat[~min_mask], x[~min_mask]).item()))
                 if vcount > 0:
                     total_val_loss = vloss / vcount
                 if v_min_losses:
@@ -809,10 +1040,16 @@ def train_z2x_decoders(
                     val_loss_majority = sum(v_maj_losses) / len(v_maj_losses)
 
             # Early stopping check
-            if total_val_loss is not None:
-                improved = (best_val - total_val_loss) > min_delta
+            monitor_val = total_val_loss
+            if early_stop_metric in {"val_loss_minority", "minority", "minority_val_loss"}:
+                monitor_val = val_loss_minority if val_loss_minority is not None else total_val_loss
+            elif early_stop_metric in {"weighted_val_loss", "val_loss_weighted"}:
+                if total_val_loss is not None and val_loss_minority is not None:
+                    monitor_val = 0.5 * total_val_loss + 0.5 * val_loss_minority
+            if monitor_val is not None:
+                improved = (best_val - monitor_val) > min_delta
                 if improved:
-                    best_val = total_val_loss
+                    best_val = monitor_val
                     best_state = {k: v.detach().cpu().clone() for k, v in dec.state_dict().items()}
                     epochs_no_improve = 0
                 else:
@@ -826,6 +1063,8 @@ def train_z2x_decoders(
             "val_loss": total_val_loss if total_val_loss is not None else None,
             "val_loss_minority": val_loss_minority,
             "val_loss_majority": val_loss_majority,
+            "minority_recon_weight": float(minority_recon_weight),
+            "early_stop_metric": early_stop_metric,
         })
 
         if (log_every is not None) and (log_every > 0) and (epoch % log_every == 0):
@@ -935,41 +1174,97 @@ class RelEdgeAttrDecoder(torch.nn.Module):
 
     Entrenado con aristas reales como supervisión, permite reemplazar el
     zero-fill (o delta truncado) que aplicaba GraphSMOTE a las aristas
-    sintéticas. Esto cierra el gap donde una fracción del vector de
-    edge_attr quedaba en cero porque la dimensión del delta de features
-    (`delta_feature_idx`) era menor que `edge_attr_dim`.
+    sintéticas. Cada relación conserva su propia dimensión de `edge_attr`;
+    esto evita mezclar, por ejemplo, atributos temporales y espaciales con
+    anchos distintos.
     """
 
     def __init__(
         self,
         rels,
         z_dim_dict: Dict[str, int],
-        edge_attr_dim: int,
+        edge_attr_dims_by_rel: Dict[str, int],
         hidden_dim: int = 128,
+        clip_predictions: bool = True,
     ):
         super().__init__()
-        self.edge_attr_dim = int(edge_attr_dim)
+        self.edge_attr_dims_by_rel = {str(k): int(v) for k, v in edge_attr_dims_by_rel.items()}
+        self.edge_attr_stats: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.clip_predictions = bool(clip_predictions)
         self.heads = torch.nn.ModuleDict()
         for (src, rel, dst) in rels:
             key = f"{src}:{rel}:{dst}"
+            if key not in self.edge_attr_dims_by_rel:
+                continue
             in_dim = int(z_dim_dict[src]) + int(z_dim_dict[dst])
+            out_dim = self.edge_attr_dims_by_rel[key]
             self.heads[key] = torch.nn.Sequential(
                 torch.nn.Linear(in_dim, hidden_dim),
                 torch.nn.GELU(),
                 torch.nn.Linear(hidden_dim, hidden_dim),
                 torch.nn.GELU(),
-                torch.nn.Linear(hidden_dim, edge_attr_dim),
+                torch.nn.Linear(hidden_dim, out_dim),
             )
 
     def forward(self, z_src: torch.Tensor, z_dst: torch.Tensor, key: str) -> torch.Tensor:
         x = torch.cat([z_src, z_dst], dim=-1)
         return self.heads[key](x)
 
+    def set_edge_attr_stats(
+        self,
+        key: str,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        min_value: torch.Tensor,
+        max_value: torch.Tensor,
+    ) -> None:
+        self.edge_attr_stats[key] = {
+            "mean": mean.detach().clone(),
+            "std": std.detach().clone().clamp_min(1e-6),
+            "min": min_value.detach().clone(),
+            "max": max_value.detach().clone(),
+        }
+
+    def _stats_for(
+        self,
+        key: str,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        stats = self.edge_attr_stats.get(key)
+        if stats is None:
+            return None
+        out: Dict[str, torch.Tensor] = {}
+        for stat_name, tensor in stats.items():
+            t = tensor
+            if device is not None:
+                t = t.to(device)
+            if dtype is not None and t.is_floating_point():
+                t = t.to(dtype=dtype)
+            out[stat_name] = t
+        return out
+
+    def normalize_target(self, key: str, target: torch.Tensor) -> torch.Tensor:
+        stats = self._stats_for(key, device=target.device, dtype=target.dtype)
+        if stats is None:
+            return target
+        return (target - stats["mean"]) / stats["std"]
+
+    def denormalize_prediction(self, key: str, pred: torch.Tensor) -> torch.Tensor:
+        stats = self._stats_for(key, device=pred.device, dtype=pred.dtype)
+        if stats is None:
+            return pred
+        out = pred * stats["std"] + stats["mean"]
+        if self.clip_predictions:
+            out = torch.minimum(torch.maximum(out, stats["min"]), stats["max"])
+        return out
+
     @torch.no_grad()
     def predict(self, z_src: torch.Tensor, z_dst: torch.Tensor, key: str) -> torch.Tensor:
         was_training = self.training
         self.eval()
-        out = self.forward(z_src, z_dst, key)
+        out = self.denormalize_prediction(key, self.forward(z_src, z_dst, key))
         if was_training:
             self.train()
         return out
@@ -1010,34 +1305,53 @@ def train_edge_attr_decoders(
     z_dict = get_embeddings_minibatch(model, data, num_neighbors=num_neighbors)
     z_dim_dict = {ntype: int(z.shape[1]) for ntype, z in z_dict.items()}
 
-    # 2) Detect edge_attr_dim: primer edge_type con edge_attr no vacío
-    edge_attr_dim = None
+    # 2) Detectar edge_attr_dim por relación. No asumir dimensión global:
+    # temporal y spatial pueden tener anchos distintos en el grafo real.
+    edge_attr_dims_by_rel: Dict[str, int] = {}
     for et in data.edge_types:
+        src, rel, dst = et
         e_store = data[et]
         if hasattr(e_store, "edge_attr") and e_store.edge_attr is not None and e_store.edge_attr.numel() > 0:
-            edge_attr_dim = int(e_store.edge_attr.shape[1]) if e_store.edge_attr.dim() > 1 else 1
-            break
-    if edge_attr_dim is None:
+            key = f"{src}:{rel}:{dst}"
+            edge_attr_dims_by_rel[key] = int(e_store.edge_attr.shape[1]) if e_store.edge_attr.dim() > 1 else 1
+    if not edge_attr_dims_by_rel:
         logger.info("[EdgeAttrDec] grafo sin edge_attr; saltando entrenamiento.")
         return None
 
     decoder = RelEdgeAttrDecoder(
-        data.edge_types, z_dim_dict, edge_attr_dim, hidden_dim=hidden_dim
+        data.edge_types, z_dim_dict, edge_attr_dims_by_rel, hidden_dim=hidden_dim
     ).to(device)
+    if not decoder.heads:
+        logger.info("[EdgeAttrDec] no hay relaciones con dimensiones entrenables; saltando entrenamiento.")
+        return None
     opt = torch.optim.AdamW(decoder.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = torch.nn.HuberLoss()
 
     # 3) Construir splits train/val por tipo de relación
     rng = np.random.RandomState(seed)
     per_rel: Dict[str, Dict[str, torch.Tensor]] = {}
+    rel_diagnostics: Dict[str, Dict[str, int]] = {}
     for (src, rel, dst) in data.edge_types:
+        key = f"{src}:{rel}:{dst}"
+        if key not in decoder.heads:
+            continue
         e_store = data[(src, rel, dst)]
         if not hasattr(e_store, "edge_attr") or e_store.edge_attr is None or e_store.edge_attr.numel() == 0:
+            continue
+        if src not in z_dict or dst not in z_dict:
+            logger.warning(f"[EdgeAttrDec] faltan embeddings para '{key}'; saltando relación.")
             continue
         ei = e_store.edge_index.cpu()
         ea = e_store.edge_attr.cpu().float()
         if ea.dim() == 1:
             ea = ea.unsqueeze(1)
+        expected_dim = int(edge_attr_dims_by_rel[key])
+        if ea.size(1) != expected_dim:
+            logger.warning(
+                f"[EdgeAttrDec] edge_attr dim inesperada en '{key}': "
+                f"{ea.size(1)} != {expected_dim}; saltando relación."
+            )
+            continue
 
         # Filtros: train_mask del origen + excluir sintéticos si el grafo está aumentado
         mask = torch.ones(ei.shape[1], dtype=torch.bool)
@@ -1056,10 +1370,27 @@ def train_edge_attr_decoders(
 
         idx = rng.permutation(n)
         n_val = max(1, int(round(n * val_split)))
+        if n_val >= n:
+            n_val = max(0, n - 1)
         val_sel = torch.from_numpy(idx[:n_val])
         tr_sel = torch.from_numpy(idx[n_val:])
+        if tr_sel.numel() == 0:
+            logger.info(f"[EdgeAttrDec] '{key}' sin aristas train tras split; saltando relación.")
+            continue
 
-        key = f"{src}:{rel}:{dst}"
+        ea_train_cpu = ea_filt[tr_sel].float()
+        scale_mean = ea_train_cpu.mean(dim=0)
+        scale_std = ea_train_cpu.std(dim=0, unbiased=False).clamp_min(1e-6)
+        scale_min = ea_train_cpu.min(dim=0).values
+        scale_max = ea_train_cpu.max(dim=0).values
+        decoder.set_edge_attr_stats(
+            key,
+            scale_mean.to(device),
+            scale_std.to(device),
+            scale_min.to(device),
+            scale_max.to(device),
+        )
+
         per_rel[key] = {
             "ei_train": ei_filt[:, tr_sel].to(device),
             "ea_train": ea_filt[tr_sel].to(device),
@@ -1069,6 +1400,17 @@ def train_edge_attr_decoders(
             "z_dst_full": z_dict[dst].to(device),
             "n_train": int(tr_sel.numel()),
             "n_val": int(val_sel.numel()),
+        }
+        rel_diagnostics[key] = {
+            "edge_attr_dim": int(expected_dim),
+            "n_edges_filtered": int(n),
+            "n_train": int(tr_sel.numel()),
+            "n_val": int(val_sel.numel()),
+            "normalized_target": True,
+            "clip_predictions_to_train_minmax": bool(decoder.clip_predictions),
+            "target_std_min": float(scale_std.min().item()),
+            "target_std_median": float(scale_std.median().item()),
+            "target_std_max": float(scale_std.max().item()),
         }
 
     if not per_rel:
@@ -1100,6 +1442,7 @@ def train_edge_attr_decoders(
                 target = ea[b]
                 if target.dtype != pred.dtype:
                     target = target.to(pred.dtype)
+                target = decoder.normalize_target(key, target)
                 loss = loss_fn(pred, target)
                 opt.zero_grad()
                 loss.backward()
@@ -1119,6 +1462,7 @@ def train_edge_attr_decoders(
                 z_dst_v = store["z_dst_full"][ei_v[1]]
                 pred_v = decoder(z_src_v, z_dst_v, key)
                 target_v = ea_v.to(pred_v.dtype)
+                target_v = decoder.normalize_target(key, target_v)
                 vl = float(loss_fn(pred_v, target_v).item())
                 val_losses_ep.append(vl)
                 last_val_per_rel[key] = vl
@@ -1144,6 +1488,8 @@ def train_edge_attr_decoders(
             _json.dump(history, f, indent=2)
         with open(os.path.join(save_dir, "val_loss_by_rel.json"), "w") as f:
             _json.dump({k: float(v) for k, v in last_val_per_rel.items()}, f, indent=2)
+        with open(os.path.join(save_dir, "relation_diagnostics.json"), "w") as f:
+            _json.dump(rel_diagnostics, f, indent=2)
     except Exception as exc:
         logger.warning(f"[EdgeAttrDec] persistencia falló: {exc}")
 
@@ -1162,7 +1508,8 @@ def _smote_in_z_space(
     rng: np.random.RandomState,
     *,
     return_renormalized: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_parent_info: bool = False,
+) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]]:
     """
     Interpolación SMOTE en el espacio de embeddings (Zhao et al. 2021, Eq. 4):
 
@@ -1176,18 +1523,31 @@ def _smote_in_z_space(
     en la que el encoder fue entrenado (`get_embeddings_minibatch` siempre
     normaliza, así que el decoder z->x espera embeddings unitarios).
 
-    Devuelve `(syn_z [n_samples, d], syn_labels [n_samples])`. Si no hay
-    suficientes minoritarios para hacer kNN, devuelve tensores vacíos.
+    Devuelve `(syn_z [n_samples, d], syn_labels [n_samples])`. Si
+    `return_parent_info=True`, añade un dict con `base_idx`, `neighbor_idx` y
+    `alpha`, todos alineados con el tensor `z` recibido. Si no hay suficientes
+    minoritarios para hacer kNN, devuelve tensores vacíos.
     """
+    def _empty_result():
+        empty_z = torch.empty(0, z.size(1), device=z.device, dtype=z.dtype)
+        empty_y = torch.empty(0, dtype=y.dtype, device=y.device)
+        if not return_parent_info:
+            return empty_z, empty_y
+        empty_long = torch.empty(0, dtype=torch.long, device=z.device)
+        empty_alpha = torch.empty(0, dtype=z.dtype, device=z.device)
+        return empty_z, empty_y, {
+            "base_idx": empty_long,
+            "neighbor_idx": empty_long.clone(),
+            "alpha": empty_alpha,
+        }
+
     if z.dim() != 2:
         raise ValueError(f"_smote_in_z_space espera z de shape [N,d], recibió {tuple(z.shape)}")
     if n_samples <= 0:
-        return (
-            torch.empty(0, z.size(1), device=z.device, dtype=z.dtype),
-            torch.empty(0, dtype=y.dtype, device=y.device),
-        )
+        return _empty_result()
 
     minority_mask = (y == int(minority_class))
+    minority_input_idx = torch.nonzero(minority_mask, as_tuple=True)[0].to(z.device)
     pos_emb = z[minority_mask]
     n_pos = pos_emb.size(0)
 
@@ -1196,10 +1556,7 @@ def _smote_in_z_space(
             f"[GraphSMOTE] Solo {n_pos} muestra(s) de la clase minoritaria {minority_class}; "
             "no se puede interpolar."
         )
-        return (
-            torch.empty(0, z.size(1), device=z.device, dtype=z.dtype),
-            torch.empty(0, dtype=y.dtype, device=y.device),
-        )
+        return _empty_result()
 
     k_eff = min(int(k), n_pos - 1)
     if k_eff < int(k):
@@ -1230,6 +1587,15 @@ def _smote_in_z_space(
     syn_labels = torch.full(
         (int(n_samples),), int(minority_class), dtype=y.dtype, device=y.device
     )
+    if return_parent_info:
+        parent_info = {
+            "base_idx": minority_input_idx.index_select(0, base_t).detach(),
+            "neighbor_idx": minority_input_idx.index_select(0, j_t).detach(),
+            "alpha": torch.from_numpy(alpha).to(z.device, dtype=z.dtype).detach(),
+            "base_pos_idx": base_t.detach(),
+            "neighbor_pos_idx": j_t.detach(),
+        }
+        return syn_z, syn_labels, parent_info
     return syn_z, syn_labels
 
 # ============================================================
@@ -1263,6 +1629,7 @@ def run_graphsmote(
     save_path=None,
     progress_callback: Optional[callable] = None,
     force_cpu: bool = True,
+    synthetic_feature_mode: Optional[str] = None,
 ):
     device = next(model.parameters()).device
     data = data.to(device)
@@ -1316,6 +1683,7 @@ def run_graphsmote(
         # Restringir SMOTE al subset de entrenamiento si existe train_mask
         z_smote = z_node
         y_smote = y_node
+        x_smote = data[node_type].x.to(z_node.device)
         try:
             if hasattr(data[node_type], "train_mask"):
                 train_mask = data[node_type].train_mask.to(z_node.device)
@@ -1325,27 +1693,39 @@ def run_graphsmote(
                 if train_idx.numel() > 0:
                     z_smote = z_node.index_select(0, train_idx)
                     y_smote = y_node.index_select(0, train_idx)
+                    x_smote = data[node_type].x.to(z_node.device).index_select(0, train_idx)
         except Exception:
             # Si falla, se usa el conjunto completo por compatibilidad
             z_smote = z_node
             y_smote = y_node
+            x_smote = data[node_type].x.to(z_node.device)
 
         rng = np.random.RandomState(int(random_state) if random_state is not None else SEED)
-        syn_z, syn_labels = _smote_in_z_space(
+        syn_z, syn_labels, parent_info = _smote_in_z_space(
             z_smote, y_smote,
             minority_class=int(minority_class),
             k=int(k_smote),
             n_samples=int(n_samples),
             rng=rng,
             return_renormalized=True,  # match decoder training distribution
+            return_parent_info=True,
         )
 
         if syn_z.numel() == 0:
             print(f"GraphSMOTE did not generate any new {node_type} samples.")
             continue
 
-        with torch.no_grad():
-            syn_x = z2x_decoders.project_one(node_type, syn_z)
+        syn_x, feature_quality = _project_synthetic_features_from_smote(
+            node_type=node_type,
+            syn_z=syn_z,
+            x_source=x_smote,
+            y_source=y_smote,
+            parent_info=parent_info,
+            minority_class=int(minority_class),
+            z2x_decoders=z2x_decoders,
+            feature_mode=synthetic_feature_mode,
+        )
+        logger.info("[GraphSMOTE] synthetic feature quality (%s): %s", node_type, feature_quality)
 
         if syn_x.numel() == 0:
             print(f"GraphSMOTE did not generate any new {node_type} samples after decoding.")
@@ -1357,7 +1737,7 @@ def run_graphsmote(
         # features y labels (alinear dispositivo con los tensores base)
         base_x = augmented_data[node_type].x
         base_y = augmented_data[node_type].y
-        syn_x = syn_x.to(base_x.device)
+        syn_x = syn_x.to(device=base_x.device, dtype=base_x.dtype)
         syn_labels = syn_labels.to(base_y.device)
         augmented_data[node_type].x = torch.cat([base_x, syn_x], dim=0)
         augmented_data[node_type].y = torch.cat([base_y, syn_labels], dim=0)
@@ -1608,7 +1988,9 @@ def _synthesize_minority_nodes_from_embeddings(
     k: int,
     rng: np.random.RandomState,
     z2x_decoders,
-    device
+    device,
+    *,
+    synthetic_feature_mode: Optional[str] = None,
 ):
     """
     Devuelve: dict con tensores nuevos para 'pm'.x, .y y un índice booleano de nuevos nodos.
@@ -1644,7 +2026,7 @@ def _synthesize_minority_nodes_from_embeddings(
     # sobre embeddings unitarios).
     z_train = F.normalize(z_pm, p=2, dim=1, eps=1e-12)
 
-    syn_z, syn_labels = _smote_in_z_space(
+    syn_z, syn_labels, parent_info = _smote_in_z_space(
         z_train.to(z_pm.device),
         y_train,
         minority_class=1,
@@ -1652,6 +2034,7 @@ def _synthesize_minority_nodes_from_embeddings(
         n_samples=int(n_to_add),
         rng=rng,
         return_renormalized=True,
+        return_parent_info=True,
     )
 
     if syn_z.numel() == 0:
@@ -1659,9 +2042,19 @@ def _synthesize_minority_nodes_from_embeddings(
 
     syn_z = syn_z.to(device)
 
-    # Decode back to feature space
-    with torch.no_grad():
-        x_syn = z2x_decoders.project_one('pm', syn_z).cpu()
+    x_train = data['pm'].x[train_mask].to(device)
+    x_syn, feature_quality = _project_synthetic_features_from_smote(
+        node_type='pm',
+        syn_z=syn_z,
+        x_source=x_train,
+        y_source=y_train.to(device),
+        parent_info=parent_info,
+        minority_class=1,
+        z2x_decoders=z2x_decoders,
+        feature_mode=synthetic_feature_mode,
+    )
+    logger.info("[GraphSMOTE] synthetic feature quality (pm): %s", feature_quality)
+    x_syn = x_syn.cpu()
 
     y_syn = syn_labels.to(dtype=data['pm'].y.dtype, device='cpu')
 
@@ -1669,6 +2062,12 @@ def _synthesize_minority_nodes_from_embeddings(
         'x_syn': x_syn,
         'y_syn': y_syn,
         'n_new': int(syn_z.size(0)),
+        'z_syn': syn_z.detach().cpu(),
+        'smote_parent_base_idx': parent_info['base_idx'].detach().cpu(),
+        'smote_parent_neighbor_idx': parent_info['neighbor_idx'].detach().cpu(),
+        'smote_alpha': parent_info['alpha'].detach().cpu(),
+        'synthetic_feature_mode': _resolve_synthetic_feature_mode(synthetic_feature_mode),
+        'synthetic_feature_quality': feature_quality,
     }
 
 # 2.4. Generación de aristas para sintéticos (usando tu edge generator)
@@ -1773,6 +2172,13 @@ def _generate_edges_for_synthetics(
                     z_dst_e = z[new_ei[1].long()]
                     ea = edge_attr_decoder.predict(z_src_e, z_dst_e, key)
                     if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
+                        expected_dim = e_store.edge_attr.shape[1] if e_store.edge_attr.dim() > 1 else 1
+                        got_dim = ea.shape[1] if ea.dim() > 1 else 1
+                        if got_dim != expected_dim:
+                            raise ValueError(
+                                f"edge_attr_decoder produjo dim {got_dim}; se esperaba {expected_dim}"
+                            )
+                    if hasattr(e_store, 'edge_attr') and e_store.edge_attr is not None:
                         ea = ea.to(dtype=e_store.edge_attr.dtype, device=base_device)
                     new_ea = ea
                 except Exception as exc:
@@ -1845,6 +2251,7 @@ def augment_graph_offline_once(
     seed: int = 0,
     num_neighbors=EMB_NUM_NEIGHBORS,
     edge_attr_decoder: Optional["RelEdgeAttrDecoder"] = None,
+    synthetic_feature_mode: Optional[str] = None,
 ):
     rng = np.random.RandomState(seed)
     try:
@@ -1863,7 +2270,14 @@ def augment_graph_offline_once(
 
     # 2) Síntesis
     syn = _synthesize_minority_nodes_from_embeddings(
-        data, z_pm, target_pos_ratio, k, rng, z2x_decoders, device
+        data,
+        z_pm,
+        target_pos_ratio,
+        k,
+        rng,
+        z2x_decoders,
+        device,
+        synthetic_feature_mode=synthetic_feature_mode,
     )
     if syn is None:
         if save_path:
@@ -1879,7 +2293,7 @@ def augment_graph_offline_once(
             pass
 
     N = aug['pm'].num_nodes
-    x_new = torch.cat([aug['pm'].x.cpu(), syn['x_syn']], dim=0)
+    x_new = torch.cat([aug['pm'].x.cpu(), syn['x_syn'].to(dtype=aug['pm'].x.dtype)], dim=0)
     y_new = torch.cat([aug['pm'].y.cpu(), syn['y_syn']], dim=0)
     aug['pm'].x = x_new
     aug['pm'].y = y_new
@@ -1927,7 +2341,15 @@ def augment_graph_offline_once(
     new_idx = torch.zeros(aug['pm'].num_nodes, dtype=torch.bool)
     new_idx[N:] = True
     registry = {
-        'pm': {'n_new': syn['n_new'], 'new_idx': new_idx}
+        'pm': {
+            'n_new': syn['n_new'],
+            'new_idx': new_idx,
+            'synthetic_feature_mode': syn.get('synthetic_feature_mode'),
+            'synthetic_feature_quality': syn.get('synthetic_feature_quality', {}),
+            'smote_parent_base_idx': syn.get('smote_parent_base_idx'),
+            'smote_parent_neighbor_idx': syn.get('smote_parent_neighbor_idx'),
+            'smote_alpha': syn.get('smote_alpha'),
+        }
     }
     return aug.cpu(), registry
 
@@ -1944,6 +2366,7 @@ def refresh_synthetics_online(
     seed: int = 0,
     num_neighbors=EMB_NUM_NEIGHBORS,
     edge_attr_decoder: Optional["RelEdgeAttrDecoder"] = None,
+    synthetic_feature_mode: Optional[str] = None,
 ):
     """
     Parte siempre del grafo BASE (solo reales) y vuelve a sintetizar,
@@ -1961,6 +2384,7 @@ def refresh_synthetics_online(
         seed=seed,
         num_neighbors=num_neighbors,
         edge_attr_decoder=edge_attr_decoder,
+        synthetic_feature_mode=synthetic_feature_mode,
     )
     return augmented, registry
 def _first_hop_neighbors_of_accidents(

@@ -3717,6 +3717,10 @@ def run_gat_training(
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
     checkpoint_metric: Optional[str] = None,
+    ranking_loss_mode: Optional[str] = None,
+    ranking_loss_weight: Optional[float] = None,
+    ranking_loss_margin: Optional[float] = None,
+    ranking_loss_max_pairs: Optional[int] = None,
     metrics_history_path: Optional[str] = None,
     test_eval_interval_epochs: Optional[int] = None,
     should_stop: Optional[Callable[[], bool]] = None,
@@ -4081,6 +4085,62 @@ def run_gat_training(
     if eval_neighbors_mode_resolved == "custom" and eval_num_neighbors_resolved is None:
         eval_num_neighbors_resolved = best_params.get("num_neighbors")
 
+    ranking_raw = (
+        ranking_loss_mode
+        if ranking_loss_mode is not None
+        else best_params.get("ranking_loss_mode", "none")
+    )
+    ranking_key = str(ranking_raw or "none").strip().lower().replace("-", "_")
+    ranking_aliases = {
+        "": "none",
+        "none": "none",
+        "off": "none",
+        "disabled": "none",
+        "pairwise": "pairwise_softplus",
+        "pairwise_softplus": "pairwise_softplus",
+        "softplus": "pairwise_softplus",
+        "topk": "topk_pairwise",
+        "topk_pairwise": "topk_pairwise",
+        "top_k_pairwise": "topk_pairwise",
+    }
+    ranking_loss_mode_resolved = ranking_aliases.get(ranking_key, "none")
+    ranking_loss_weight_resolved = float(
+        _safe_cast(
+            ranking_loss_weight
+            if ranking_loss_weight is not None
+            else best_params.get("ranking_loss_weight"),
+            float,
+            0.0,
+        )
+    )
+    if not math.isfinite(float(ranking_loss_weight_resolved)) or ranking_loss_weight_resolved < 0.0:
+        ranking_loss_weight_resolved = 0.0
+    if ranking_loss_mode_resolved == "none":
+        ranking_loss_weight_resolved = 0.0
+    ranking_loss_margin_resolved = float(
+        _safe_cast(
+            ranking_loss_margin
+            if ranking_loss_margin is not None
+            else best_params.get("ranking_loss_margin"),
+            float,
+            0.1,
+        )
+    )
+    if not math.isfinite(float(ranking_loss_margin_resolved)):
+        ranking_loss_margin_resolved = 0.1
+    ranking_loss_max_pairs_resolved = int(
+        max(
+            1,
+            _safe_cast(
+                ranking_loss_max_pairs
+                if ranking_loss_max_pairs is not None
+                else best_params.get("ranking_loss_max_pairs"),
+                int,
+                4096,
+            ),
+        )
+    )
+
     best_params["train_sampler_mode"] = train_sampler_mode_resolved
     best_params["deterministic_sampling"] = bool(deterministic_sampling_resolved)
     best_params["sampling_seed"] = int(sampling_seed_resolved)
@@ -4108,6 +4168,10 @@ def run_gat_training(
     best_params["rl_backtracking"] = bool(rl_backtracking_resolved)
     best_params["eval_neighbors_mode"] = str(eval_neighbors_mode_resolved)
     best_params["eval_num_neighbors"] = eval_num_neighbors_resolved
+    best_params["ranking_loss_mode"] = str(ranking_loss_mode_resolved)
+    best_params["ranking_loss_weight"] = float(ranking_loss_weight_resolved)
+    best_params["ranking_loss_margin"] = float(ranking_loss_margin_resolved)
+    best_params["ranking_loss_max_pairs"] = int(ranking_loss_max_pairs_resolved)
 
     logger.info(
         "Sampling config | mode=%s | deterministic=%s | seed=%d | disable_hard=%s | "
@@ -4129,6 +4193,13 @@ def run_gat_training(
         graphsaint_walk_length_resolved,
         eval_neighbors_mode_resolved,
         eval_num_neighbors_resolved,
+    )
+    logger.info(
+        "Ranking loss config | mode=%s | weight=%.4f | margin=%.4f | max_pairs=%d",
+        ranking_loss_mode_resolved,
+        ranking_loss_weight_resolved,
+        ranking_loss_margin_resolved,
+        ranking_loss_max_pairs_resolved,
     )
 
     data.edge_attr_dict = { et: getattr(data[et], 'edge_attr', None) for et in data.edge_types }
@@ -4779,6 +4850,10 @@ def run_gat_training(
         positive_sampler_stats=_json_safe(positive_sampler_stats),
         eval_neighbors_mode=str(eval_neighbors_mode_resolved),
         eval_num_neighbors=eval_num_neighbors_resolved,
+        ranking_loss_mode=str(ranking_loss_mode_resolved),
+        ranking_loss_weight=float(ranking_loss_weight_resolved),
+        ranking_loss_margin=float(ranking_loss_margin_resolved),
+        ranking_loss_max_pairs=int(ranking_loss_max_pairs_resolved),
         objective_metric=str(objective_metric),
         objective_threshold_beta=float(objective_threshold_beta),
         monitor_metric=monitor_metric,
@@ -4816,11 +4891,44 @@ def run_gat_training(
             if os.path.exists(resume_state_path):
                 ckpt = torch.load(resume_state_path, map_location=device, weights_only=False)
                 if isinstance(ckpt, dict) and "model_state" in ckpt:
-                    model.load_state_dict(ckpt["model_state"], strict=False)
-                    if ckpt.get("optimizer_state"):
+                    incoming_state = ckpt["model_state"]
+                    partial_model_load = False
+                    if isinstance(incoming_state, dict):
+                        current_state = model.state_dict()
+                        compatible_state = {}
+                        skipped_model_keys = {}
+                        for key, value in incoming_state.items():
+                            current_value = current_state.get(key)
+                            if current_value is not None and hasattr(value, "shape") and tuple(value.shape) == tuple(current_value.shape):
+                                compatible_state[key] = value
+                            else:
+                                partial_model_load = True
+                                skipped_model_keys[key] = {
+                                    "checkpoint_shape": list(value.shape) if hasattr(value, "shape") else None,
+                                    "model_shape": list(current_value.shape) if current_value is not None and hasattr(current_value, "shape") else None,
+                                }
+                        if skipped_model_keys:
+                            logger.warning(
+                                "Warm-start parcial: se omitieron %d tensor(es) incompatibles del checkpoint. Primeras claves: %s",
+                                len(skipped_model_keys),
+                                list(skipped_model_keys.keys())[:12],
+                            )
+                        incoming_state = compatible_state
+                    load_info = model.load_state_dict(incoming_state, strict=False)
+                    if getattr(load_info, "missing_keys", None) or getattr(load_info, "unexpected_keys", None):
+                        logger.info(
+                            "Warm-start load_state_dict: missing=%d unexpected=%d",
+                            len(getattr(load_info, "missing_keys", []) or []),
+                            len(getattr(load_info, "unexpected_keys", []) or []),
+                        )
+                    if ckpt.get("optimizer_state") and not partial_model_load:
                         optimizer.load_state_dict(ckpt["optimizer_state"])
-                    if ckpt.get("scheduler_state"):
+                    elif ckpt.get("optimizer_state") and partial_model_load:
+                        logger.info("Warm-start parcial: no se restaura optimizer_state por incompatibilidad de modelo.")
+                    if ckpt.get("scheduler_state") and not partial_model_load:
                         scheduler.load_state_dict(ckpt["scheduler_state"])
+                    elif ckpt.get("scheduler_state") and partial_model_load:
+                        logger.info("Warm-start parcial: no se restaura scheduler_state por incompatibilidad de modelo.")
                     if rl_sampler_controller is not None and ckpt.get("rl_sampler_state"):
                         try:
                             rl_sampler_controller.load_state_dict_serializable(ckpt.get("rl_sampler_state"))
@@ -5061,10 +5169,10 @@ def run_gat_training(
         
         lambda_edge = float(best_params.get('lambda_edge', 1e-6))
         lambda_l2_att = float(best_params.get('lambda_l2_att', 0.0))
-        ranking_loss_mode = str(best_params.get("ranking_loss_mode", "none"))
-        ranking_loss_weight = float(_safe_cast(best_params.get("ranking_loss_weight"), float, 0.0))
-        ranking_loss_margin = float(_safe_cast(best_params.get("ranking_loss_margin"), float, 0.1))
-        ranking_loss_max_pairs = int(_safe_cast(best_params.get("ranking_loss_max_pairs"), int, 4096))
+        ranking_loss_mode = str(ranking_loss_mode_resolved)
+        ranking_loss_weight = float(ranking_loss_weight_resolved)
+        ranking_loss_margin = float(ranking_loss_margin_resolved)
+        ranking_loss_max_pairs = int(ranking_loss_max_pairs_resolved)
 
         _prime_temporal_cache_if_needed(model, train_graph, node_type='pm', context=f"train_epoch_{epoch}")
         
@@ -5089,6 +5197,7 @@ def run_gat_training(
                                           ranking_loss_weight=ranking_loss_weight,
                                           ranking_loss_margin=ranking_loss_margin,
                                           ranking_loss_max_pairs=ranking_loss_max_pairs)
+        train_ranking_loss = getattr(train_loader, "last_train_ranking_loss", None)
         if writer is not None:
             writer.add_scalar("Loss/train", loss, epoch)
 
@@ -5443,6 +5552,7 @@ def run_gat_training(
                     epoch=epoch,
                     total=max_epochs,
                     val_loss=val_loss,
+                    train_ranking_loss=train_ranking_loss,
                     best_val_loss=best_val_loss,
                     val_f1=val_f1,
                     best_val_f1=best_val_f1,
@@ -5485,6 +5595,11 @@ def run_gat_training(
             train_cls_loss=cls_loss,
             train_edge_loss=edge_loss,
             train_l2_att_loss=l2_att_loss,
+            train_ranking_loss=train_ranking_loss,
+            ranking_loss_mode=str(ranking_loss_mode_resolved),
+            ranking_loss_weight=float(ranking_loss_weight_resolved),
+            ranking_loss_margin=float(ranking_loss_margin_resolved),
+            ranking_loss_max_pairs=int(ranking_loss_max_pairs_resolved),
             val_loss=val_loss,
             val_f1=val_f1,
             val_f1_pos=val_f1_pos,
@@ -5587,6 +5702,10 @@ def run_gat_training(
                     "train_sampler_mode": str(train_sampler_mode_resolved),
                     "sampler_impl": str(best_params.get("sampler_impl", train_sampler_impl)),
                     "positive_sampler_stats": _json_safe(positive_sampler_stats),
+                    "ranking_loss_mode": str(ranking_loss_mode_resolved),
+                    "ranking_loss_weight": float(ranking_loss_weight_resolved),
+                    "ranking_loss_margin": float(ranking_loss_margin_resolved),
+                    "ranking_loss_max_pairs": int(ranking_loss_max_pairs_resolved),
                     "rl_sampler_state": (
                         rl_sampler_controller.state_dict_serializable()
                         if rl_sampler_controller is not None
@@ -5597,6 +5716,11 @@ def run_gat_training(
                     "eval_neighbors_mode": str(eval_neighbors_mode_resolved),
                     "eval_num_neighbors": eval_num_neighbors_resolved,
                     "test_eval_interval_epochs": int(test_eval_interval_epochs_resolved),
+                    "last_train_ranking_loss": (
+                        float(train_ranking_loss)
+                        if train_ranking_loss is not None and math.isfinite(float(train_ranking_loss))
+                        else None
+                    ),
                     "last_val_loss": float(val_loss),
                     "last_val_f1": float(val_f1) if val_f1 is not None else None,
                     "last_val_objective_score": float(val_objective_score) if val_objective_score is not None else None,
@@ -5812,6 +5936,10 @@ def run_gat_training(
         train_sampler_mode=str(train_sampler_mode_resolved),
         sampler_impl=str(best_params.get("sampler_impl", train_sampler_impl)),
         positive_sampler_stats=_json_safe(positive_sampler_stats),
+        ranking_loss_mode=str(ranking_loss_mode_resolved),
+        ranking_loss_weight=float(ranking_loss_weight_resolved),
+        ranking_loss_margin=float(ranking_loss_margin_resolved),
+        ranking_loss_max_pairs=int(ranking_loss_max_pairs_resolved),
     )
     if stopped_by_user:
         logger.info(

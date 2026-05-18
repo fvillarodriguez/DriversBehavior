@@ -232,6 +232,7 @@ except Exception:
 GNN_LIVE_CHART_SERIES: Dict[str, Tuple[Tuple[str, str], ...]] = {
     "loss": (
         ("train_loss", "Train Loss"),
+        ("train_ranking_loss", "Rank Loss"),
         ("val_loss", "Val Loss"),
     ),
     "classification": (
@@ -251,6 +252,7 @@ GNN_LIVE_CHART_SERIES: Dict[str, Tuple[Tuple[str, str], ...]] = {
 }
 GNN_LIVE_CHART_COLOR_MAP: Dict[str, str] = {
     "Train Loss": "#1b3a6b",
+    "Rank Loss": "#6b3a7a",
     "Val Loss": "#d4541a",
     "Accuracy": "#1b3a6b",
     "Recall": "#3b7a57",
@@ -313,6 +315,7 @@ def _load_gnn_training_history(
         "train_cls_loss",
         "train_edge_loss",
         "train_l2_att_loss",
+        "train_ranking_loss",
         "val_f1",
         "val_f1_pos",
         "val_f1_macro",
@@ -5933,6 +5936,10 @@ def _train_gnn_with_best_params(
     eval_neighbors_mode: Optional[str] = None,
     eval_num_neighbors: Optional[object] = None,
     checkpoint_metric: Optional[str] = None,
+    ranking_loss_mode: Optional[str] = None,
+    ranking_loss_weight: Optional[float] = None,
+    ranking_loss_margin: Optional[float] = None,
+    ranking_loss_max_pairs: Optional[int] = None,
 ) -> Optional[str]:
     try:
         from src import gnn_main as graph_main
@@ -6005,6 +6012,10 @@ def _train_gnn_with_best_params(
         eval_neighbors_mode=eval_neighbors_mode,
         eval_num_neighbors=eval_num_neighbors,
         checkpoint_metric=checkpoint_metric,
+        ranking_loss_mode=ranking_loss_mode,
+        ranking_loss_weight=ranking_loss_weight,
+        ranking_loss_margin=ranking_loss_margin,
+        ranking_loss_max_pairs=ranking_loss_max_pairs,
         hparams_path=str(best_params_path) if best_params_path else None,
         hparams_index=int(choice_index) if not best_params_path else None,
         reuse_hparams=True,
@@ -6472,6 +6483,10 @@ def _network_config_to_hparams(
         "focal_gamma": float(cfg.get("focal_gamma", 1.5)),
         "focal_alpha": float(cfg.get("focal_alpha", 0.75)),
         "loss_weight_mode": str(cfg.get("loss_weight_mode", "uniform")),
+        "ranking_loss_mode": str(cfg.get("ranking_loss_mode", "none")),
+        "ranking_loss_weight": float(cfg.get("ranking_loss_weight", 0.0)),
+        "ranking_loss_margin": float(cfg.get("ranking_loss_margin", 0.1)),
+        "ranking_loss_max_pairs": int(cfg.get("ranking_loss_max_pairs", 4096)),
         "batch_size": int(cfg.get("batch_size", 512)),
         "train_sampler_mode": train_sampler_mode,
         "deterministic_sampling": _coerce_bool(
@@ -17433,6 +17448,46 @@ def _render_training_tab() -> None:
 
     if network_cfg:
         st.caption("Configuracion de Network disponible para este entrenamiento.")
+    training_relation_names: List[str] = []
+    for et in graph_data.edge_types:
+        if isinstance(et, tuple) and len(et) >= 2:
+            training_relation_names.append(str(et[1]))
+        else:
+            training_relation_names.append(str(et))
+    training_sequence_stats = _graph_sequence_stats(graph_obj)
+    if st.button(
+        "Aplicar receta ganadora: 5% positive-aware + pairwise ranking",
+        key="gnn_train_apply_winning_posaware_rank",
+        help=(
+            "Prepara Training para la receta con mejor AUPRC observada: "
+            "usa hparams desde Network, sin self-loops, sampler positive-aware "
+            "con 5% positivos por batch, ventana temporal=60 min, hard negatives=0, "
+            "ranking pairwise w=0.10, margin=0.10 y checkpoint por AUPRC."
+        ),
+    ):
+        recipe_cfg = _apply_gnn_winning_ranking_posaware_recipe(
+            dict(network_cfg or RECOMMENDED_NETWORK_DEFAULTS),
+            relation_names=training_relation_names,
+            sequence_length=(
+                int(training_sequence_stats["sequence_length"])
+                if training_sequence_stats.get("sequence_length") is not None
+                else None
+            ),
+            sequence_count=(
+                int(training_sequence_stats["sequence_count"])
+                if training_sequence_stats.get("sequence_count") is not None
+                else None
+            ),
+            sequence_length_source=(
+                str(training_sequence_stats["source"])
+                if training_sequence_stats.get("source") is not None
+                else None
+            ),
+        )
+        st.session_state["gnn_network_config"] = recipe_cfg
+        _sync_gnn_winning_ranking_posaware_training_state()
+        st.success("Receta aplicada. Se usará Network (config actual) al entrenar.")
+        st.rerun()
     hp_files = _list_hpo_files_for_training(
         use_graphsmote=None, graph_obj=graph_obj
     )
@@ -17494,6 +17549,10 @@ def _render_training_tab() -> None:
             "rl_positive_only": "gnn_train_rl_positive_only",
             "rl_similarity_pretrain_epochs": "gnn_train_rl_pretrain_epochs",
             "rl_lambda_simi": "gnn_train_rl_lambda_simi",
+            "ranking_loss_mode": "gnn_train_ranking_loss_mode",
+            "ranking_loss_weight": "gnn_train_ranking_loss_weight",
+            "ranking_loss_margin": "gnn_train_ranking_loss_margin",
+            "ranking_loss_max_pairs": "gnn_train_ranking_loss_max_pairs",
         }
         for cfg_key, state_key in network_sampling_state_keys.items():
             if cfg_key in network_cfg:
@@ -17769,6 +17828,72 @@ def _render_training_tab() -> None:
                     ),
                 )
             )
+
+    st.markdown("#### Ranking loss")
+    ranking_loss_modes_train = ["none", "pairwise_softplus", "topk_pairwise"]
+    ranking_loss_mode_train = str(
+        st.session_state.get("gnn_train_ranking_loss_mode", "none")
+    )
+    if ranking_loss_mode_train not in ranking_loss_modes_train:
+        ranking_loss_mode_train = "none"
+    rank_col_a, rank_col_b, rank_col_c, rank_col_d = st.columns(4)
+    with rank_col_a:
+        ranking_loss_mode_train = st.selectbox(
+            "ranking_loss_mode",
+            ranking_loss_modes_train,
+            index=ranking_loss_modes_train.index(ranking_loss_mode_train),
+            key="gnn_train_ranking_loss_mode",
+            help=(
+                "`none` mantiene el entrenamiento clásico. `pairwise_softplus` "
+                "ordena positivos sobre negativos dentro de cada batch; requiere "
+                "señal positiva estable, por eso combina bien con positive-aware. "
+                "`topk_pairwise` se concentra en negativos con score alto."
+            ),
+        )
+    with rank_col_b:
+        ranking_loss_weight_train = float(
+            st.number_input(
+                "ranking_loss_weight",
+                min_value=0.0,
+                max_value=10.0,
+                value=float(st.session_state.get("gnn_train_ranking_loss_weight", 0.0)),
+                step=0.05,
+                format="%.4f",
+                key="gnn_train_ranking_loss_weight",
+                help=(
+                    "Peso de ranking sobre la loss total. La receta ganadora usa 0.10; "
+                    "valores altos pueden mejorar recall a costa de FAR/precisión."
+                ),
+            )
+        )
+    with rank_col_c:
+        ranking_loss_margin_train = float(
+            st.number_input(
+                "ranking_loss_margin",
+                min_value=0.0,
+                max_value=10.0,
+                value=float(st.session_state.get("gnn_train_ranking_loss_margin", 0.1)),
+                step=0.05,
+                format="%.4f",
+                key="gnn_train_ranking_loss_margin",
+                help="Margen para variantes pairwise con margen; 0.10 es el default seguro.",
+            )
+        )
+    with rank_col_d:
+        ranking_loss_max_pairs_train = int(
+            st.number_input(
+                "ranking_loss_max_pairs",
+                min_value=1,
+                max_value=1_000_000,
+                value=int(st.session_state.get("gnn_train_ranking_loss_max_pairs", 4096)),
+                step=512,
+                key="gnn_train_ranking_loss_max_pairs",
+                help=(
+                    "Máximo de pares positivo/negativo por batch. 4096 limita memoria "
+                    "sin apagar la señal pairwise en la receta ganadora."
+                ),
+            )
+        )
 
     cluster_gcn_num_parts_train = 64
     cluster_gcn_parts_per_epoch_train = 0
@@ -18080,6 +18205,8 @@ def _render_training_tab() -> None:
             f"{variant_tag}|{graph_hash}|{hp_label}|{max_epochs_train}|{SEED}|{checkpoint_metric_train}|"
             f"{train_sampler_mode}|{deterministic_sampling_train}|{sampling_seed_train}|"
             f"{disable_hard_undersampling_train}|{eval_neighbors_mode_train}|{eval_num_neighbors_train}|"
+            f"{ranking_loss_mode_train}|{ranking_loss_weight_train}|{ranking_loss_margin_train}|"
+            f"{ranking_loss_max_pairs_train}|"
             f"{scheduler_sig}"
         )
         config_hash = hashlib.sha1(config_sig.encode("utf-8")).hexdigest()[:10]
@@ -18116,6 +18243,7 @@ def _render_training_tab() -> None:
                 last_val_far = ckpt.get("last_val_far")
                 last_val_objective = ckpt.get("last_val_objective_score")
                 last_val_tau = ckpt.get("last_val_tau")
+                last_train_ranking_loss = ckpt.get("last_train_ranking_loss")
                 training_pending = epoch_done < max_epochs_ckpt
                 training_status = {
                     "epoch": epoch_done,
@@ -18145,6 +18273,8 @@ def _render_training_tab() -> None:
                 metrics_parts = []
                 if last_val_loss is not None:
                     metrics_parts.append(f"val_loss={float(last_val_loss):.4f}")
+                if last_train_ranking_loss is not None:
+                    metrics_parts.append(f"rank_loss={float(last_train_ranking_loss):.4f}")
                 if last_val_f1 is not None:
                     metrics_parts.append(f"val_f1={float(last_val_f1):.4f}")
                 if last_val_auc is not None:
@@ -18629,6 +18759,7 @@ def _render_training_tab() -> None:
                     "train_cls_loss": payload.get("train_cls_loss"),
                     "train_edge_loss": payload.get("train_edge_loss"),
                     "train_l2_att_loss": payload.get("train_l2_att_loss"),
+                    "train_ranking_loss": payload.get("train_ranking_loss"),
                     "val_f1": payload.get("val_f1"),
                     "val_f1_pos": payload.get("val_f1_pos"),
                     "val_f1_macro": payload.get("val_f1_macro"),
@@ -18892,6 +19023,10 @@ def _render_training_tab() -> None:
                         eval_neighbors_mode=str(eval_neighbors_mode_train),
                         eval_num_neighbors=eval_num_neighbors_train,
                         checkpoint_metric=str(checkpoint_metric_train),
+                        ranking_loss_mode=str(ranking_loss_mode_train),
+                        ranking_loss_weight=float(ranking_loss_weight_train),
+                        ranking_loss_margin=float(ranking_loss_margin_train),
+                        ranking_loss_max_pairs=int(ranking_loss_max_pairs_train),
                         should_stop=_should_stop_training,
                         should_test=_consume_test_training_request,
                         hparams_path=(
@@ -28074,6 +28209,10 @@ RECOMMENDED_NETWORK_DEFAULTS: Dict[str, object] = {
     "positive_sampler_target_fraction": 0.02,
     "positive_sampler_hard_window_minutes": 60,
     "positive_sampler_hard_negatives_per_positive": 4,
+    "ranking_loss_mode": "none",
+    "ranking_loss_weight": 0.0,
+    "ranking_loss_margin": 0.1,
+    "ranking_loss_max_pairs": 4096,
     "rl_action_space": "discrete",
     "rl_initial_p": 0.5,
     "rl_min_p": 0.05,
@@ -28100,6 +28239,69 @@ RECOMMENDED_NETWORK_DEFAULTS: Dict[str, object] = {
     "final_lambda_H": 1e-2,
     "checkpoint_metric": "val_auprc",
 }
+
+GNN_WINNING_RANKING_POSAWARE_RECIPE: Dict[str, object] = {
+    "use_relation_self_loops": False,
+    "train_sampler_mode": "positive_aware",
+    "deterministic_sampling": True,
+    "sampling_seed": SEED,
+    "disable_hard_undersampling": True,
+    "positive_sampler_target_fraction": 0.05,
+    "positive_sampler_hard_window_minutes": 60,
+    "positive_sampler_hard_negatives_per_positive": 0,
+    "ranking_loss_mode": "pairwise_softplus",
+    "ranking_loss_weight": 0.10,
+    "ranking_loss_margin": 0.1,
+    "ranking_loss_max_pairs": 4096,
+    "checkpoint_metric": "val_auprc",
+}
+
+GNN_WINNING_RANKING_POSAWARE_TRAIN_STATE: Dict[str, object] = {
+    "gnn_train_hp_choice": "Network (config actual)",
+    "gnn_train_checkpoint_metric": "val_auprc",
+    "gnn_train_checkpoint_metric_label": "AUPRC",
+    "gnn_train_sampler_mode": "Positive-aware NeighborLoader",
+    "gnn_train_det_sampling": True,
+    "gnn_train_sampling_seed": SEED,
+    "gnn_train_disable_hard": True,
+    "gnn_train_positive_fraction": 0.05,
+    "gnn_train_positive_window": 60,
+    "gnn_train_positive_hard_per_pos": 0,
+    "gnn_train_ranking_loss_mode": "pairwise_softplus",
+    "gnn_train_ranking_loss_weight": 0.10,
+    "gnn_train_ranking_loss_margin": 0.1,
+    "gnn_train_ranking_loss_max_pairs": 4096,
+}
+
+
+def _apply_gnn_winning_ranking_posaware_recipe(
+    cfg: Optional[Dict[str, object]] = None,
+    *,
+    relation_names: Optional[Sequence[str]] = None,
+    sequence_length: Optional[int] = None,
+    sequence_count: Optional[int] = None,
+    sequence_length_source: Optional[str] = None,
+) -> Dict[str, object]:
+    recipe_cfg = dict(cfg or RECOMMENDED_NETWORK_DEFAULTS)
+    recipe_cfg.update(GNN_WINNING_RANKING_POSAWARE_RECIPE)
+    if relation_names and not isinstance(recipe_cfg.get("num_neighbors"), dict):
+        recipe_cfg["num_neighbors"] = {
+            str(rel): ([25, 25] if str(rel) == "temporal" else [3, 3])
+            for rel in relation_names
+        }
+    if sequence_length is not None:
+        recipe_cfg["seq_length"] = int(sequence_length)
+        recipe_cfg["sequence_length"] = int(sequence_length)
+    if sequence_count is not None:
+        recipe_cfg["sequence_count"] = int(sequence_count)
+    if sequence_length_source is not None:
+        recipe_cfg["sequence_length_source"] = str(sequence_length_source)
+    return recipe_cfg
+
+
+def _sync_gnn_winning_ranking_posaware_training_state() -> None:
+    for key, value in GNN_WINNING_RANKING_POSAWARE_TRAIN_STATE.items():
+        st.session_state[key] = value
 
 
 def _load_persisted_network_config() -> Optional[Dict[str, object]]:
@@ -28198,7 +28400,7 @@ def _render_network_tab() -> None:
             relation_names.append(str(et))
 
     # Preset de defaults recomendados (clase rara ~0.3%).
-    preset_col, _ = st.columns([0.45, 0.55])
+    preset_col, recipe_col = st.columns([0.45, 0.55])
     with preset_col:
         if st.button(
             "Cargar defaults recomendados (clase rara ~0.3%)",
@@ -28225,6 +28427,45 @@ def _render_network_tab() -> None:
             for k in list(st.session_state.keys()):
                 if isinstance(k, str) and k.startswith("gnn_net_") and k != "gnn_net_load_recommended":
                     del st.session_state[k]
+            st.rerun()
+    with recipe_col:
+        if st.button(
+            "Cargar receta ganadora: 5% positive-aware + pairwise ranking",
+            key="gnn_net_load_winning_posaware_rank",
+            help=(
+                "Aplica la receta del mejor experimento manual: sin self-loops, "
+                "Positive-aware con 5% positivos por batch, ventana temporal=60 min, "
+                "hard negatives=0, ranking pairwise softplus con peso 0.10, "
+                "margin=0.10 y checkpoint por AUPRC. "
+                "No cambia la prevalencia real de validación/test."
+            ),
+        ):
+            base_cfg = dict(st.session_state.get("gnn_network_config") or RECOMMENDED_NETWORK_DEFAULTS)
+            new_cfg = _apply_gnn_winning_ranking_posaware_recipe(
+                base_cfg,
+                relation_names=relation_names,
+                sequence_length=int(network_sequence_length),
+                sequence_count=(
+                    int(feature_sequence_count)
+                    if feature_sequence_count is not None
+                    else None
+                ),
+                sequence_length_source=str(sequence_length_source),
+            )
+            if not isinstance(new_cfg.get("num_neighbors"), dict):
+                new_cfg["num_neighbors"] = {
+                    rel: ([25, 25] if rel == "temporal" else [3, 3])
+                    for rel in relation_names
+                }
+            st.session_state["gnn_network_config"] = new_cfg
+            for k in list(st.session_state.keys()):
+                if (
+                    isinstance(k, str)
+                    and k.startswith("gnn_net_")
+                    and k not in {"gnn_net_load_recommended", "gnn_net_load_winning_posaware_rank"}
+                ):
+                    del st.session_state[k]
+            _sync_gnn_winning_ranking_posaware_training_state()
             st.rerun()
 
     existing_cfg = st.session_state.get("gnn_network_config", {})
@@ -28730,6 +28971,74 @@ def _render_network_tab() -> None:
                 key="gnn_net_focal_alpha",
             )
 
+    st.markdown("**Ranking loss**")
+    ranking_loss_modes = ["none", "pairwise_softplus", "topk_pairwise"]
+    ranking_loss_mode = str(existing_cfg.get("ranking_loss_mode", "none"))
+    if ranking_loss_mode not in ranking_loss_modes:
+        ranking_loss_mode = "none"
+    rank_col_a, rank_col_b, rank_col_c, rank_col_d = st.columns(4)
+    with rank_col_a:
+        ranking_loss_mode = st.selectbox(
+            "ranking_loss_mode",
+            ranking_loss_modes,
+            index=ranking_loss_modes.index(ranking_loss_mode),
+            key="gnn_net_ranking_loss_mode",
+            help=(
+                "`none` desactiva ranking. `pairwise_softplus` empuja logits de positivos "
+                "por encima de negativos dentro del batch supervisado. `topk_pairwise` "
+                "enfatiza negativos con mayor score. Úsalo con batches que contengan "
+                "positivos y negativos, típicamente positive-aware."
+            ),
+        )
+    with rank_col_b:
+        ranking_loss_weight = float(
+            st.number_input(
+                "ranking_loss_weight",
+                min_value=0.0,
+                max_value=10.0,
+                value=float(existing_cfg.get("ranking_loss_weight", 0.0)),
+                step=0.05,
+                format="%.4f",
+                key="gnn_net_ranking_loss_weight",
+                help=(
+                    "Peso de la pérdida auxiliar de ranking. La receta ganadora usa 0.10. "
+                    "Si es muy alto puede dominar Focal/CrossEntropy y subir falsos positivos."
+                ),
+            )
+        )
+    with rank_col_c:
+        ranking_loss_margin = float(
+            st.number_input(
+                "ranking_loss_margin",
+                min_value=0.0,
+                max_value=10.0,
+                value=float(existing_cfg.get("ranking_loss_margin", 0.1)),
+                step=0.05,
+                format="%.4f",
+                key="gnn_net_ranking_loss_margin",
+                help=(
+                    "Margen usado por variantes pairwise con margen. En `pairwise_softplus` "
+                    "queda disponible para compatibilidad; 0.10 es el default seguro."
+                ),
+            )
+        )
+    with rank_col_d:
+        ranking_loss_max_pairs = int(
+            st.number_input(
+                "ranking_loss_max_pairs",
+                min_value=1,
+                max_value=1_000_000,
+                value=int(existing_cfg.get("ranking_loss_max_pairs", 4096)),
+                step=512,
+                key="gnn_net_ranking_loss_max_pairs",
+                help=(
+                    "Límite de pares positivo/negativo por batch para controlar memoria. "
+                    "4096 fue suficiente en la receta ganadora; valores enormes pueden "
+                    "subir costo sin mejorar señal."
+                ),
+            )
+        )
+
     lambda_H_fixed = float(existing_cfg.get("lambda_H_fixed", 1e-4))
     initial_lambda_H = float(existing_cfg.get("initial_lambda_H", 1e-4))
     final_lambda_H = float(existing_cfg.get("final_lambda_H", 1e-2))
@@ -28972,6 +29281,10 @@ def _render_network_tab() -> None:
         "loss_weight_mode": loss_weight_mode,
         "focal_gamma": float(focal_gamma),
         "focal_alpha": float(focal_alpha),
+        "ranking_loss_mode": str(ranking_loss_mode),
+        "ranking_loss_weight": float(ranking_loss_weight),
+        "ranking_loss_margin": float(ranking_loss_margin),
+        "ranking_loss_max_pairs": int(ranking_loss_max_pairs),
         "lambda_l2_att": float(lambda_l2_att),
         "lambda_H_mode": lambda_H_mode,
         "lambda_H_fixed": float(lambda_H_fixed),

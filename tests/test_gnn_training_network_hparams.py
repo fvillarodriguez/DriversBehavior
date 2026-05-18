@@ -25,12 +25,16 @@ def test_network_hparams_are_discoverable_for_training_prompt(tmp_path, monkeypa
     assert row["graph_hash"] == graph_hash
     assert row["hparams_source"] == "Network"
     assert row["optimizer"] == "AdamW"
-    assert row["lr_scheduler"] == "one_cycle"
-    assert row["lr"] == 3e-4
-    assert row["weight_decay"] == 1e-4
+    assert row["lr_scheduler"] == "plateau_restart"
+    assert row["lr"] == 1e-4
+    assert row["weight_decay"] == 5e-3
     assert row["checkpoint_metric"] == "val_auprc"
     assert bool(row["use_residual"]) is True
     assert bool(row["use_relation_self_loops"]) is False
+    assert row["ranking_loss_mode"] == "none"
+    assert row["ranking_loss_weight"] == 0.0
+    assert row["ranking_loss_margin"] == 0.1
+    assert row["ranking_loss_max_pairs"] == 4096
 
     graph_filtered = app._list_hpo_files_for_training(
         use_graphsmote=False,
@@ -43,6 +47,30 @@ def test_network_hparams_are_discoverable_for_training_prompt(tmp_path, monkeypa
 
     assert path in graph_filtered
     assert path in prompt_files
+
+
+def test_winning_positive_aware_ranking_recipe_exports_expected_hparams():
+    recipe = app._apply_gnn_winning_ranking_posaware_recipe(
+        {"gnn_variant": "gat_edge_mlp_gru", "hidden_channels": 48},
+        relation_names=["temporal", "spatial"],
+        sequence_length=12,
+        sequence_count=100,
+        sequence_length_source="SequenceIndex",
+    )
+    params = app._network_config_to_hparams(recipe, use_graphsmote=False)
+
+    assert params["use_relation_self_loops"] is False
+    assert params["train_sampler_mode"] == "positive_aware"
+    assert params["positive_sampler_target_fraction"] == 0.05
+    assert params["positive_sampler_hard_window_minutes"] == 60
+    assert params["positive_sampler_hard_negatives_per_positive"] == 0
+    assert params["disable_hard_undersampling"] is True
+    assert params["ranking_loss_mode"] == "pairwise_softplus"
+    assert params["ranking_loss_weight"] == 0.10
+    assert params["ranking_loss_margin"] == 0.1
+    assert params["ranking_loss_max_pairs"] == 4096
+    assert params["checkpoint_metric"] == "val_auprc"
+    assert params["seq_length"] == 12
 
 
 def test_network_exports_sequence_length_from_loaded_graph_sequence_index():

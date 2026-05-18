@@ -164,21 +164,60 @@
 
     <h4 class="reveal">Mini-batch loss</h4>
     <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ \mathcal{L}=\mathcal{L}_{cls}+\lambda_H\mathcal{L}_{H}+\lambda_{edge}\mathcal{L}_{edge}+\lambda_{att}\mathcal{L}_{att} \]</div>
+      <div class="formula">\[ \mathcal{L}=\mathcal{L}_{cls}+\lambda_{rank}\mathcal{L}_{rank}+\lambda_H\mathcal{L}_{H}+\lambda_{edge}\mathcal{L}_{edge}+\lambda_{att}\mathcal{L}_{att}+\lambda_{simi}\mathcal{L}_{simi} \]</div>
       <div class="num">(6.4)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
           <dt>ℒ<sub>cls</sub></dt><dd>Binary classification loss on seed <code>pm</code> nodes.</dd>
+          <dt>ℒ<sub>rank</sub></dt><dd>Auxiliary positive-versus-negative ranking over supervised seeds.</dd>
           <dt>ℒ<sub>H</sub></dt><dd>Probability entropy regularizer governed by <code>lambda_H</code>.</dd>
           <dt>ℒ<sub>edge</sub></dt><dd>Edge reconstruction with real positives and sampled negatives.</dd>
           <dt>ℒ<sub>att</sub></dt><dd>L² regularization on attentions captured with <code>XAI=1</code>.</dd>
+          <dt>ℒ<sub>simi</sub></dt><dd>Label-aware loss used by <code>rl_top_p</code>.</dd>
         </dl>
         <h5>Implementation</h5>
         <span class="impl">src/train_pretrain.py · train_minibatch</span>
       </aside>
     </div>
     <p class="reveal">Gradient accumulation scales only the backward pass: <code>loss_for_backward = raw_loss / accumulation_steps</code>. Live events and <code>train_loss</code> aggregate unscaled <code>raw_loss</code>, so the reported curve remains comparable when <code>accumulation_steps</code> changes. The loop also uses <code>grad_clip</code> and AMP on CUDA.</p>
+
+    <h4 class="reveal">Positive-aware sampler and pairwise ranking</h4>
+    <p class="reveal"><code>train_sampler_mode</code> accepts <code>neighbor</code>, <code>cluster_gcn</code>, <code>graphsaint</code>, <code>rl_top_p</code>, and <code>positive_aware</code>. The recommended manual configuration for rare events uses <code>positive_aware</code> with <code>pairwise_softplus</code>: it does not modify the graph or validation/test prevalence; it only orders training seeds and adds an auxiliary loss to improve positive-versus-negative ranking.</p>
+    <p class="reveal"><code>src/gnn_main.py::build_positive_aware_seed_order</code> uses only <code>train_mask</code>. It separates positives and negatives, computes <code>pos_per_batch=max(1, round(batch_size * positive_sampler_target_fraction))</code>, fills the batch with negatives, and passes that order to <code>NeighborLoader</code> with <code>shuffle=False</code>. The loader still expands neighbors from the full graph with <code>num_neighbors</code>; therefore the sampler changes supervised exposure, not the relations available for message passing.</p>
+    <p class="reveal">Hard negatives can be found in two ways: same-gantry negatives within ±<code>positive_sampler_hard_window_minutes</code> minutes of a positive, and train negatives spatially connected to a positive at the same timestamp. The recommended manual configuration uses <code>positive_sampler_hard_negatives_per_positive=0</code>, so it preserves 5% positive exposure per batch while keeping negatives as a reproducible random sample.</p>
+    <div class="lab-eq has-inspector reveal">
+      <div class="formula">\[ \mathcal{L}_{rank}=\frac{1}{|\mathcal{P}|}\sum_{d\in\mathcal{P}}\mathrm{softplus}(-d),\qquad d=s^+ - s^- \]</div>
+      <div class="num">(6.rank)</div>
+      <aside class="eq-inspector">
+        <h5>Implementation</h5>
+        <p><code>src/train_pretrain.py::_binary_ranking_loss</code> uses positive-class logits. If a batch lacks at least one positive and one negative, it returns zero and <code>train_ranking_loss</code> exposes that condition.</p>
+      </aside>
+    </div>
+    <table class="lab-table reveal">
+      <thead><tr><th>Sampler parameter</th><th>Value used</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>train_sampler_mode</code></td><td><code>positive_aware</code></td><td>Activates seed ordering over <code>NeighborLoader</code> without removing edges or subsampling the graph.</td></tr>
+        <tr><td><code>positive_sampler_target_fraction</code></td><td><code>0.05</code></td><td>Target fraction of positive seeds per batch; this is training exposure, not real prevalence.</td></tr>
+        <tr><td><code>positive_sampler_hard_window_minutes</code></td><td><code>60</code></td><td>Temporal window for same-gantry hard negative candidates. With hard negatives per positive equal to zero it injects no examples, but remains traceable.</td></tr>
+        <tr><td><code>positive_sampler_hard_negatives_per_positive</code></td><td><code>0</code></td><td>Number of hard negatives per positive. Large values reduce diversity and may increase false alarms.</td></tr>
+        <tr><td><code>deterministic_sampling</code> / <code>sampling_seed</code></td><td><code>True</code> / configurable</td><td>Reproduces seed order; each epoch uses <code>sampling_seed + epoch * 9973</code>.</td></tr>
+        <tr><td><code>disable_hard_undersampling</code></td><td><code>True</code></td><td>Avoids mixing this sampler with automatic hard undersampling.</td></tr>
+        <tr><td><code>num_neighbors</code></td><td>configurable</td><td>Controls expansion context and memory, not the positive ratio.</td></tr>
+        <tr><td><code>use_relation_self_loops</code></td><td><code>False</code></td><td>Compares on observed relations, without added relational self-loops.</td></tr>
+        <tr><td><code>checkpoint_metric</code></td><td><code>val_auprc</code></td><td>Selects checkpoints by ranking under extreme imbalance.</td></tr>
+      </tbody>
+    </table>
+    <table class="lab-table reveal">
+      <thead><tr><th>Ranking parameter</th><th>Value used</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>ranking_loss_mode</code></td><td><code>pairwise_softplus</code></td><td>Smoothly penalizes pairs where the positive logit does not exceed the negative logit. <code>none</code> disables the loss; <code>topk_pairwise</code> compares against highest-score negatives.</td></tr>
+        <tr><td><code>ranking_loss_weight</code></td><td><code>0.10</code></td><td><code>lambda_rank</code> weight in total loss; high values can improve recall/ranking but degrade calibration or precision.</td></tr>
+        <tr><td><code>ranking_loss_margin</code></td><td><code>0.10</code></td><td>Margin used by hinge/margin variants. In <code>pairwise_softplus</code>, it is persisted for configuration compatibility but is not used by the current computation.</td></tr>
+        <tr><td><code>ranking_loss_max_pairs</code></td><td><code>4096</code></td><td>Caps positive-negative pairs per batch to control memory and cost.</td></tr>
+        <tr><td><code>train_ranking_loss</code></td><td>metric</td><td>Confirms whether valid pairs exist and the auxiliary loss is active.</td></tr>
+      </tbody>
+    </table>
 
     <h4 class="reveal">Validation-loss monitor and BEST checkpoint</h4>
     <p class="reveal">Final training in <code>Graph Neural Networks &gt; Training</code> selects <code>BEST</code> by minimum validation loss. F1, F0.5, AUPRC, FAR, and MCC remain diagnostic metrics for audit and threshold analysis, but they no longer reset patience or decide the final checkpoint.</p>
