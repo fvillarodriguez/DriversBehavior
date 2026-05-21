@@ -3745,15 +3745,10 @@ def run_gat_training(
     data = loaded_obj['data']
 
     if AUTO_IMGAGN_PRETRAIN and not _has_imgagn(loaded_obj):
-        logger.info("AUTO_IMGAGN_PRETRAIN habilitado: ejecutando ImGAGN previo al entrenamiento GAT.")
-        try:
-            augmented_obj = run_imgagn_pipeline(dict(loaded_obj), retrain_gat=False)
-            if isinstance(augmented_obj, dict) and 'data' in augmented_obj:
-                loaded_obj = augmented_obj
-                data = loaded_obj['data']
-                logger.info("Grafo sustituido por versión aumentada mediante ImGAGN.")
-        except Exception as exc:
-            logger.warning(f"No se pudo ejecutar ImGAGN automático: {exc}")
+        logger.warning(
+            "AUTO_IMGAGN_PRETRAIN está deshabilitado: ImGAGN homogéneo fue retirado. "
+            "Genere el grafo desde Balance -> ImGAGN relacional parent-anchored."
+        )
 
     # Detect if graph is already balanced (synthetic nodes present)
     graph_has_synthetics = False
@@ -6535,6 +6530,10 @@ def run_imgagn_hpo(loaded_obj):
     Optimiza la métrica proxy 'best_train_recall' reportada por ImGAGN.
     Guarda CSV con el mejor trial y el estudio completo en 'Resultados/'.
     """
+    raise RuntimeError(
+        "run_imgagn_hpo homogéneo fue retirado. "
+        "Use Balance -> ImGAGN relacional parent-anchored para generar el grafo aumentado."
+    )
     # Dispositivo
     # Selection automática de dispositivo
     device = get_auto_device()
@@ -6732,6 +6731,10 @@ def run_imgagn_pipeline(loaded_obj, retrain_gat: bool = True):
     Encadena: (1) cargar o buscar mejores hparams de ImGAGN, (2) generar grafo aumentado,
     (3) guardar y (4) re-entrenar GAT sobre el grafo aumentado.
     """
+    raise RuntimeError(
+        "run_imgagn_pipeline homogéneo fue retirado. "
+        "Use Balance -> ImGAGN relacional parent-anchored; no se crean aristas ('pm','imgagn','pm')."
+    )
     # 1) Intentar reutilizar HPO previo
     graph_identity = _resolve_graph_identity(loaded_obj)
     graph_hash = graph_identity.get("graph_hash")
@@ -7528,6 +7531,10 @@ def test_imgagn(
     sintéticas de forma interactiva, y guarda el grafo aumentado en un nuevo .pt.
     Similar a test_graphsmote pero usando el pipeline de ImGAGN directamente.
     """
+    raise RuntimeError(
+        "test_imgagn homogéneo fue retirado. "
+        "Use src.imgagn_relational.build_relational_imgagn_graph."
+    )
     logger.info("--- Iniciando Test de ImGAGN ---")
 
     # 1) Dispositivo
@@ -7674,3 +7681,109 @@ def test_imgagn(
     except Exception as e:
         logger.error(f"Error al aplicar el grafo ImGAGN (TEST): {e}")
         return loaded_obj
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point — `python -m src.gnn_main ...`
+#
+# Thin shim around run_gat_training() so the same training pipeline can be
+# launched non-interactively from SLURM batch jobs (e.g. Rockfish HPC).
+# Only the kwargs most commonly tuned per-run are exposed; advanced overrides
+# can be added when needed.
+# ---------------------------------------------------------------------------
+
+
+def _cli_load_graph(path: str):
+    if not path:
+        raise SystemExit("--graph es obligatorio")
+    if not os.path.exists(path):
+        raise SystemExit(f"--graph no existe: {path}")
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(obj, dict) and "data" in obj:
+        if "filename" not in obj:
+            obj["filename"] = os.path.basename(path)
+        return obj
+    return {"data": obj, "filename": os.path.basename(path)}
+
+
+def _cli_parse_args(argv: Optional[List[str]] = None):
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="python -m src.gnn_main",
+        description="Headless GAT training entry-point (used by Rockfish sbatch jobs).",
+    )
+    p.add_argument("--graph", required=True, help="Ruta al .pt del grafo construido")
+    p.add_argument("--hparams", default=None, help="Ruta al CSV de hiperparámetros Optuna")
+    p.add_argument("--hparams-index", type=int, default=0)
+    p.add_argument("--purpose", default="rockfish_run", help="Etiqueta para nombrar checkpoints")
+    p.add_argument("--max-epochs", type=int, default=None)
+    es = p.add_mutually_exclusive_group()
+    es.add_argument("--early-stop", dest="early_stop", action="store_true", default=None)
+    es.add_argument("--no-early-stop", dest="early_stop", action="store_false")
+    p.add_argument("--early-stop-patience", type=int, default=None)
+    p.add_argument("--early-stop-min-delta", type=float, default=None)
+    p.add_argument("--accumulation-steps", type=int, default=None)
+    p.add_argument(
+        "--train-sampler-mode",
+        choices=["neighbor", "cluster", "saint_node", "saint_edge", "saint_rw"],
+        default=None,
+    )
+    smote = p.add_mutually_exclusive_group()
+    smote.add_argument("--force-use-graphsmote", dest="force_use_graphsmote", action="store_true", default=None)
+    smote.add_argument("--no-graphsmote", dest="force_use_graphsmote", action="store_false")
+    p.add_argument("--save-state-path", default=None)
+    p.add_argument("--resume-state-path", default=None)
+    p.add_argument("--seed", type=int, default=None, help="Sampling seed (no global torch seed)")
+    return p.parse_args(argv)
+
+
+def _cli_main(argv: Optional[List[str]] = None) -> int:
+    args = _cli_parse_args(argv)
+    loaded = _cli_load_graph(args.graph)
+
+    kwargs: Dict[str, object] = {
+        "purpose": args.purpose,
+        "reuse_hparams": True,
+        "allow_hpo_search": False,
+    }
+    if args.hparams:
+        kwargs["hparams_path"] = args.hparams
+        kwargs["hparams_index"] = args.hparams_index
+    if args.max_epochs is not None:
+        kwargs["max_epochs"] = args.max_epochs
+    if args.early_stop is not None:
+        kwargs["early_stop"] = args.early_stop
+    if args.early_stop_patience is not None:
+        kwargs["early_stop_patience"] = args.early_stop_patience
+    if args.early_stop_min_delta is not None:
+        kwargs["early_stop_min_delta"] = args.early_stop_min_delta
+    if args.accumulation_steps is not None:
+        kwargs["accumulation_steps"] = args.accumulation_steps
+    if args.train_sampler_mode is not None:
+        kwargs["train_sampler_mode"] = args.train_sampler_mode
+    if args.force_use_graphsmote is not None:
+        kwargs["force_use_graphsmote"] = bool(args.force_use_graphsmote)
+    if args.save_state_path:
+        kwargs["save_state_path"] = args.save_state_path
+    if args.resume_state_path:
+        kwargs["resume_state_path"] = args.resume_state_path
+    if args.seed is not None:
+        kwargs["sampling_seed"] = args.seed
+        kwargs["deterministic_sampling"] = True
+
+    try:
+        from src.config import get_device_diagnostics
+        print("[gnn_main] device diagnostics:", json.dumps(get_device_diagnostics(), default=str))
+    except Exception:
+        pass
+
+    result = run_gat_training(loaded, **kwargs)
+    if isinstance(result, dict):
+        summary = {k: v for k, v in result.items() if k != "model"}
+        print("[gnn_main] training summary:", json.dumps(summary, default=str)[:2000])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli_main())

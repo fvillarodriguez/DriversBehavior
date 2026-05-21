@@ -86,6 +86,7 @@ from src.config import (
     GRAPHSMOTE_K,
     SAVE_AUG_GRAPH_PATH,
     DECODER_EPOCHS,
+    PRETRAIN_EDGE_EPOCHS,
     GUARD_BAND_MINUTES,
     HORIZON_MINUTES,
     INCLUDE_DOWNSTREAM_IN_LABEL,
@@ -2882,7 +2883,7 @@ def _list_graph_files_for_eval() -> List[str]:
         "graph_*.pt",
         "graph_smote_*.pt",
         "graph_aug*.pt",
-        "graph_imgagn_*.pt",
+        "graph_imgagn_relational_*.pt",
         "highway_graph_*.pt",
     ]
     files: List[str] = []
@@ -2893,7 +2894,15 @@ def _list_graph_files_for_eval() -> List[str]:
             p for p in glob.glob(os.path.join(RESULTADOS_DIR, "*.pt"))
             if "graph" in os.path.basename(p).lower()
         ]
-    files = sorted(set(files), key=os.path.getmtime, reverse=True)
+    files = [
+        path
+        for path in set(files)
+        if not (
+            os.path.basename(path).startswith("graph_imgagn_")
+            and not os.path.basename(path).startswith("graph_imgagn_relational_")
+        )
+    ]
+    files = sorted(files, key=os.path.getmtime, reverse=True)
     return files
 
 def _load_graph_data_for_eval(path: str) -> Optional[HeteroData]:
@@ -5766,141 +5775,10 @@ def _apply_imgagn_to_graph(
     best_params: Dict[str, object],
     device: torch.device,
 ) -> HeteroData:
-    from src.imgagn import train_imgagn, ImGAGNConfig
-
-    cfg = ImGAGNConfig(
-        dz=int(best_params.get("imgagn_dz", 64)),
-        hidden_g=int(best_params.get("imgagn_hidden_g", 128)),
-        topk_links=int(best_params.get("imgagn_topk", 5)),
-        lambda1_ratio=float(best_params.get("imgagn_lambda1", 1.0)),
-        epochs=int(best_params.get("imgagn_epochs", 100)),
-        lr_g=float(best_params.get("imgagn_lr_g", 1e-3)),
-        lr_d=float(best_params.get("imgagn_lr_d", 1e-3)),
-        alpha_reg=float(best_params.get("imgagn_alpha_reg", 1e-4)),
-        beta_reg=float(best_params.get("imgagn_beta_reg", 1e-4)),
-        device=str(device),
-        show_progress=False,
+    raise RuntimeError(
+        "ImGAGN homogéneo fue retirado del flujo productivo. "
+        "Use Balance -> ImGAGN relacional parent-anchored para generar grafos relacionales."
     )
-
-    res = train_imgagn(
-        data,
-        train_mask=data["pm"].train_mask,
-        y_binary=data["pm"].y,
-        cfg=cfg,
-        target_ntype="pm",
-    )
-    if not isinstance(res, dict) or "x_aug" not in res:
-        return data
-
-    data_aug = data.clone()
-    spatial_key = ("pm", "spatial", "pm")
-    orig_spatial_ei = None
-    orig_spatial_ea = None
-    if spatial_key in data_aug.edge_types:
-        try:
-            orig_spatial_ei = data_aug[spatial_key].edge_index
-            orig_spatial_ea = getattr(data_aug[spatial_key], "edge_attr", None)
-        except Exception:
-            orig_spatial_ei = None
-            orig_spatial_ea = None
-    data_aug["pm"].x = res["x_aug"].to(device)
-    if spatial_key in data_aug.edge_types:
-        edge_index_aug = res["edge_index_aug"].to(device)
-        data_aug[spatial_key].edge_index = edge_index_aug
-        edge_attr_aug = res.get("edge_attr_aug")
-        if edge_attr_aug is not None:
-            data_aug[spatial_key].edge_attr = edge_attr_aug.to(device)
-        else:
-            # Re-align edge_attr for ImGAGN-augmented edges to avoid length mismatch
-            if orig_spatial_ea is not None:
-                try:
-                    if orig_spatial_ea.dim() == 1:
-                        orig_spatial_ea = orig_spatial_ea.view(-1, 1)
-                    edge_dim = int(orig_spatial_ea.shape[1])
-                    if (
-                        orig_spatial_ei is None
-                        or orig_spatial_ei.size(1) != orig_spatial_ea.size(0)
-                    ):
-                        data_aug[spatial_key].edge_attr = torch.zeros(
-                            (edge_index_aug.size(1), edge_dim),
-                            dtype=orig_spatial_ea.dtype,
-                            device=device,
-                        )
-                    else:
-                        orig_src = orig_spatial_ei[0].detach().cpu().tolist()
-                        orig_dst = orig_spatial_ei[1].detach().cpu().tolist()
-                        mapping = {
-                            (orig_src[i], orig_dst[i]): i
-                            for i in range(len(orig_src))
-                        }
-                        aug_src = edge_index_aug[0].detach().cpu().tolist()
-                        aug_dst = edge_index_aug[1].detach().cpu().tolist()
-                        idx_list = [
-                            mapping.get((s, d), -1)
-                            for s, d in zip(aug_src, aug_dst)
-                        ]
-                        idx = torch.tensor(idx_list, device=device)
-                        edge_attr_aug = torch.zeros(
-                            (edge_index_aug.size(1), edge_dim),
-                            dtype=orig_spatial_ea.dtype,
-                            device=device,
-                        )
-                        mask = idx >= 0
-                        if mask.any():
-                            edge_attr_aug[mask] = orig_spatial_ea.to(device)[idx[mask]]
-                        data_aug[spatial_key].edge_attr = edge_attr_aug
-                except Exception:
-                    data_aug[spatial_key].edge_attr = None
-
-    gen_slice = res.get("gen_slice")
-    if gen_slice is not None:
-        n_new = int(gen_slice.stop - gen_slice.start)
-        if n_new > 0:
-            old_mask = data_aug["pm"].train_mask.to(device)
-            new_train = torch.ones(n_new, dtype=torch.bool, device=device)
-            data_aug["pm"].train_mask = torch.cat(
-                [old_mask, new_train], dim=0
-            )
-            data_aug["pm"].val_mask = torch.cat(
-                [
-                    data_aug["pm"].val_mask.to(device),
-                    torch.zeros(n_new, dtype=torch.bool, device=device),
-                ],
-                dim=0,
-            )
-            data_aug["pm"].test_mask = torch.cat(
-                [
-                    data_aug["pm"].test_mask.to(device),
-                    torch.zeros(n_new, dtype=torch.bool, device=device),
-                ],
-                dim=0,
-            )
-            data_aug["pm"].y = torch.cat(
-                [
-                    data_aug["pm"].y.to(device),
-                    torch.ones(n_new, dtype=torch.long, device=device),
-                ],
-                dim=0,
-            )
-            try:
-                is_synth = getattr(data_aug["pm"], "is_synthetic", None)
-                if is_synth is None:
-                    is_synth = torch.zeros(
-                        data_aug["pm"].y.size(0) - n_new,
-                        dtype=torch.bool,
-                        device=device,
-                    )
-                else:
-                    is_synth = is_synth.to(device)
-                data_aug["pm"].is_synthetic = torch.cat(
-                    [is_synth, torch.ones(n_new, dtype=torch.bool, device=device)],
-                    dim=0,
-                )
-            except Exception:
-                pass
-
-    data_aug["pm"].num_nodes = data_aug["pm"].x.size(0)
-    return data_aug
 
 
 def _train_gnn_with_best_params(
@@ -7692,6 +7570,12 @@ def _run_optuna_search(
 
     use_graphsmote = (balancing_strategy == "Opt. balance con GraphSMOTE")
     use_imgagn = (balancing_strategy == "Opt. balance con ImGAGN")
+    if use_imgagn:
+        raise RuntimeError(
+            "La optimización con ImGAGN homogéneo fue retirada. "
+            "Genere manualmente el grafo con Balance -> ImGAGN relacional parent-anchored "
+            "y luego entrene/evalúe sobre ese grafo."
+        )
     gnn_variant_fixed = _normalize_ui_gnn_variant(
         (objective_settings or {}).get("gnn_variant", GNN_VARIANT)
     )
@@ -12687,7 +12571,7 @@ def _render_optimization_tab() -> None:
         graph_obj = dict(loaded_graph)
         if use_balanced and balanced_graph is not None:
             graph_obj["data"] = balanced_graph.get("data")
-            if balanced_graph.get("source") == "ImGAGN":
+            if "ImGAGN" in str(balanced_graph.get("source", "")):
                 fn = graph_obj.get("filename", "graph")
                 if "_ImGAGN" not in fn:
                     graph_obj["filename"] = (
@@ -14614,6 +14498,1026 @@ def _render_feature_selection_tab() -> None:
     )
 
 
+def _load_gnn_encoder_for_graphsmote(
+    *,
+    model_path: str,
+    graph_data: HeteroData,
+    graph_obj: Mapping[str, object],
+    device: torch.device,
+) -> Tuple[torch.nn.Module, Dict[str, object], Dict[str, torch.Tensor]]:
+    """Reconstruye un checkpoint GNN como encoder para GraphSMOTE.
+
+    Balance solo necesita embeddings del encoder; no ejecuta entrenamiento ni
+    evaluación final. La carga sigue la misma reconstrucción estricta usada por
+    Evaluación Modelo para respetar edge encoders y heads temporales.
+    """
+    from src import gnn_main as graph_main
+
+    node_type = "pm"
+    meta = _load_hparams_for_model(model_path)
+    loaded = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(loaded, torch.nn.Module):
+        model = loaded.to(device)
+        state_dict = model.state_dict()
+        if hasattr(model, "use_checkpointing"):
+            model.use_checkpointing = False
+        model.eval()
+        return model, meta, state_dict
+
+    if isinstance(loaded, dict) and (
+        "model_state" in loaded or "state_dict" in loaded
+    ):
+        state_dict = loaded.get("model_state") or loaded.get("state_dict")
+    elif isinstance(loaded, dict):
+        state_dict = loaded
+    else:
+        raise TypeError("El checkpoint no contiene un state_dict GNN evaluable.")
+    if not isinstance(state_dict, dict):
+        raise TypeError("El checkpoint no contiene un state_dict GNN evaluable.")
+
+    is_ok, msg = _check_model_graph_compat(
+        model_path,
+        graph_data,
+        node_type=node_type,
+        meta=meta,
+        state_dict=state_dict,
+    )
+    if not is_ok:
+        raise ValueError(str(msg or "Checkpoint incompatible con el grafo actual."))
+
+    arch = _infer_arch_from_state_dict(state_dict)
+    hidden_channels = int(meta.get("hidden_channels", arch["hidden_channels"]))
+    num_heads = int(meta.get("num_heads", arch["num_heads"]))
+    num_layers = int(meta.get("num_layers", arch["num_layers"]))
+    dropout = float(meta.get("dropout", 0.0))
+    out_channels = int(meta.get("out_channels", 0) or 0)
+    if out_channels <= 0:
+        try:
+            out_channels = int(len(torch.unique(graph_data[node_type].y)))
+        except Exception:
+            out_channels = 2
+
+    sequence_index = _resolve_sequence_index_for_checkpoint(
+        graph_obj.get("sequence_index"),
+        state_dict,
+    )
+    temporal_kind = _checkpoint_temporal_kind(state_dict)
+    if temporal_kind is not None and sequence_index is None:
+        raise ValueError(
+            "El checkpoint incluye un head temporal, pero el grafo cargado no "
+            "tiene SequenceIndex compatible."
+        )
+    graph_num_nodes = int(
+        getattr(graph_data[node_type], "num_nodes", graph_data[node_type].x.shape[0])
+    )
+    model_num_nodes = (
+        _temporal_num_nodes_from_state_dict(state_dict, graph_num_nodes)
+        if temporal_kind is not None
+        else graph_num_nodes
+    )
+    gnn_variant = _resolve_gnn_variant_for_checkpoint(model_path, meta, state_dict)
+    model_edge_types = _resolve_checkpoint_edge_types_for_model(
+        state_dict,
+        graph_data,
+    )
+    model = graph_main._build_gnn_model(
+        in_channels=int(graph_data[node_type].x.shape[1]),
+        hidden_channels=hidden_channels,
+        out_channels=out_channels,
+        num_heads=num_heads,
+        dropout=dropout,
+        edge_feature_dim=int(_infer_edge_feature_dim(graph_data)),
+        num_layers=num_layers,
+        aggr1=str(meta.get("aggr1", "sum")),
+        aggr2=str(meta.get("aggr2", "sum")),
+        use_checkpointing=False,
+        gnn_variant=gnn_variant,
+        sequence_index=sequence_index,
+        num_nodes=model_num_nodes,
+        device=device,
+        use_residual=_coerce_bool(meta.get("use_residual", arch.get("use_residual", False))),
+        use_relation_self_loops=_coerce_bool(meta.get("use_relation_self_loops"), True),
+        require_temporal_head=(
+            temporal_kind is not None or _gnn_variant_requires_sequence_index(gnn_variant)
+        ),
+        edge_types=model_edge_types,
+        edge_feature_dims=_resolve_edge_feature_dims_for_model(state_dict, graph_data),
+        edge_encoder_hidden_dims=_resolve_edge_encoder_hidden_dims_for_model(state_dict),
+        edge_encoded_dims=_resolve_edge_encoded_dims_for_model(state_dict),
+        edge_encoder_kinds=_resolve_edge_encoder_kinds_for_model(state_dict),
+    )
+    model.load_state_dict(state_dict, strict=True)
+    if hasattr(model, "use_checkpointing"):
+        model.use_checkpointing = False
+    model.eval()
+    return model, meta, state_dict
+
+
+def _graphsmote_validation_summary(
+    base_graph: HeteroData,
+    augmented_graph: HeteroData,
+    registry: Optional[Mapping[str, object]],
+    *,
+    node_type: str = "pm",
+) -> Dict[str, object]:
+    base_nodes = int(getattr(base_graph[node_type], "num_nodes", base_graph[node_type].x.shape[0]))
+    aug_nodes = int(getattr(augmented_graph[node_type], "num_nodes", augmented_graph[node_type].x.shape[0]))
+    synth_mask = getattr(augmented_graph[node_type], "is_synthetic", None)
+    if torch.is_tensor(synth_mask):
+        synth_mask_cpu = synth_mask.detach().cpu().bool()
+    else:
+        synth_mask_cpu = torch.zeros(aug_nodes, dtype=torch.bool)
+        if aug_nodes > base_nodes:
+            synth_mask_cpu[base_nodes:] = True
+
+    def _mask_count(mask_name: str) -> int:
+        mask = getattr(augmented_graph[node_type], mask_name, None)
+        if not torch.is_tensor(mask):
+            return 0
+        mask_cpu = mask.detach().cpu().bool()
+        return int((synth_mask_cpu & mask_cpu).sum().item())
+
+    edge_rows: List[Dict[str, object]] = []
+    edge_attr_ok = True
+    edge_attr_dims_by_rel: Dict[str, int] = {}
+    for edge_type in augmented_graph.edge_types:
+        store = augmented_graph[edge_type]
+        edge_index = getattr(store, "edge_index", None)
+        edge_attr = getattr(store, "edge_attr", None)
+        edge_count = int(edge_index.shape[1]) if torch.is_tensor(edge_index) and edge_index.dim() == 2 else 0
+        attr_rows = None
+        attr_dim = None
+        aligned = True
+        if torch.is_tensor(edge_attr):
+            attr_rows = int(edge_attr.shape[0])
+            attr_dim = int(edge_attr.shape[1]) if edge_attr.dim() > 1 else 1
+            aligned = attr_rows == edge_count
+            edge_attr_ok = edge_attr_ok and aligned
+            edge_attr_dims_by_rel[str(edge_type[1])] = attr_dim
+        edge_rows.append(
+            {
+                "relacion": str(edge_type[1]),
+                "edge_type": f"{edge_type[0]}:{edge_type[1]}:{edge_type[2]}",
+                "edges": edge_count,
+                "edge_attr_rows": attr_rows,
+                "edge_attr_dim": attr_dim,
+                "alineado": aligned,
+            }
+        )
+
+    reg_pm = {}
+    if isinstance(registry, Mapping):
+        reg_pm = registry.get(node_type, {}) or {}
+    feature_quality = {}
+    if isinstance(reg_pm, Mapping):
+        feature_quality = reg_pm.get("synthetic_feature_quality", {}) or {}
+
+    return {
+        "base_nodes": base_nodes,
+        "augmented_nodes": aug_nodes,
+        "synthetic_nodes": int(synth_mask_cpu.sum().item()),
+        "synthetic_train": _mask_count("train_mask"),
+        "synthetic_val": _mask_count("val_mask"),
+        "synthetic_test": _mask_count("test_mask"),
+        "edge_attr_ok": bool(edge_attr_ok),
+        "edge_attr_dims_by_rel": edge_attr_dims_by_rel,
+        "edge_rows": edge_rows,
+        "feature_quality": feature_quality,
+        "synthetic_feature_mode": (
+            reg_pm.get("synthetic_feature_mode") if isinstance(reg_pm, Mapping) else None
+        ),
+    }
+
+
+def _render_graphsmote_validation_summary(summary: Mapping[str, object]) -> None:
+    st.markdown("#### Validación del grafo aumentado")
+    cols = st.columns(4)
+    cols[0].metric("Nodos base", summary.get("base_nodes", "N/A"))
+    cols[1].metric("Nodos aumentados", summary.get("augmented_nodes", "N/A"))
+    cols[2].metric("Sintéticos", summary.get("synthetic_nodes", "N/A"))
+    cols[3].metric("Modo features", summary.get("synthetic_feature_mode") or "N/A")
+
+    mask_cols = st.columns(3)
+    mask_cols[0].metric("Sintéticos train", summary.get("synthetic_train", "N/A"))
+    mask_cols[1].metric("Sintéticos val", summary.get("synthetic_val", "N/A"))
+    mask_cols[2].metric("Sintéticos test", summary.get("synthetic_test", "N/A"))
+    if int(summary.get("synthetic_val") or 0) == 0 and int(summary.get("synthetic_test") or 0) == 0:
+        st.success("Máscaras correctas: los sintéticos quedaron solo en train_mask.")
+    else:
+        st.error("Hay sintéticos en val_mask/test_mask. No use este grafo para entrenar.")
+
+    edge_rows = summary.get("edge_rows")
+    if isinstance(edge_rows, list) and edge_rows:
+        st.dataframe(pd.DataFrame(edge_rows), width="stretch")
+    dims = summary.get("edge_attr_dims_by_rel") or {}
+    temporal_dim = dims.get("temporal") if isinstance(dims, Mapping) else None
+    spatial_dim = dims.get("spatial") if isinstance(dims, Mapping) else None
+    if temporal_dim == 66 and spatial_dim == 73 and summary.get("edge_attr_ok"):
+        st.success("edge_attr correcto: temporal=66, spatial=73 y filas alineadas con edge_index.")
+    elif summary.get("edge_attr_ok"):
+        st.warning(
+            f"edge_attr alineado, pero dimensiones observadas: temporal={temporal_dim}, spatial={spatial_dim}."
+        )
+    else:
+        st.error("edge_attr no está alineado con edge_index en al menos una relación.")
+
+    quality = summary.get("feature_quality") or {}
+    if isinstance(quality, Mapping) and quality:
+        q_cols = st.columns(4)
+        q_cols[0].metric("Gate manifold", "OK" if quality.get("feature_manifold_gate_ok") else "REVISAR")
+        outside_frac = _metric_float(quality.get("feature_outside_train_positive_minmax_frac"))
+        q_cols[1].metric(
+            "Fuera rango +train",
+            f"{outside_frac:.6f}" if outside_frac is not None else "N/A",
+        )
+        l2_ratio = _metric_float(quality.get("synthetic_l2_p95_to_real_positive_loo_p95_ratio"))
+        cos_ratio = _metric_float(quality.get("synthetic_cosine_p95_to_real_positive_loo_p95_ratio"))
+        q_cols[2].metric("L2 p95 ratio", f"{l2_ratio:.3f}" if l2_ratio is not None else "N/A")
+        q_cols[3].metric("Cosine p95 ratio", f"{cos_ratio:.3f}" if cos_ratio is not None else "N/A")
+        with st.expander("Diagnóstico completo de features sintéticas", expanded=False):
+            st.json(dict(quality))
+
+
+def _render_graphsmote_graph_generator_panel(
+    *,
+    balance_graph_obj: Mapping[str, object],
+    graph_data: HeteroData,
+) -> None:
+    node_type = "pm"
+    y = graph_data[node_type].y.detach().cpu()
+    train_mask = graph_data[node_type].train_mask.detach().cpu().bool()
+    train_count = int(train_mask.sum().item())
+    train_pos = int(((y == 1) & train_mask).sum().item())
+    current_ratio = train_pos / max(train_count, 1)
+
+    st.caption(
+        "Balance genera un grafo aumentado para Training. No entrena ni evalúa "
+        "el predictor final en esta pestaña."
+    )
+    data_cols = st.columns(4)
+    data_cols[0].metric("Nodos pm", int(graph_data[node_type].num_nodes))
+    data_cols[1].metric("Train", train_count)
+    data_cols[2].metric("Accidentes train", train_pos)
+    data_cols[3].metric("Prevalencia train", f"{current_ratio:.6f}")
+
+    if hasattr(graph_data[node_type], "is_synthetic"):
+        existing_syn = int(graph_data[node_type].is_synthetic.detach().cpu().bool().sum().item())
+        if existing_syn > 0:
+            st.error(
+                f"El grafo cargado ya contiene {existing_syn} nodos sintéticos. "
+                "Cargue el grafo base antes de volver a generar GraphSMOTE."
+            )
+            return
+
+    model_files = _list_gnn_model_files_for_evaluation(dict(balance_graph_obj))
+    if not model_files:
+        model_files = _list_gnn_model_files_for_baseline()
+        if model_files:
+            st.warning(
+                "No encontré checkpoints filtrados para este grafo; se muestran checkpoints GNN globales."
+            )
+    preferred_model = os.path.join(
+        RESULTADOS_DIR,
+        "gat_model_BEST_GNN_gat_edge_mlp_gru_20260515_172330_533b8548.pt",
+    )
+    if preferred_model not in model_files and os.path.exists(preferred_model):
+        model_files = [preferred_model] + [path for path in model_files if path != preferred_model]
+    if not model_files:
+        st.error("No hay checkpoints GNN disponibles en Resultados/. Entrene un encoder en Training primero.")
+        return
+
+    model_default = st.session_state.get("gnn_graphsmote_encoder_model")
+    model_index = 0
+    if model_default in model_files:
+        model_index = model_files.index(model_default)
+    encoder_model = st.selectbox(
+        "Encoder base para generar embeddings",
+        options=model_files,
+        index=model_index,
+        format_func=lambda path: os.path.basename(path),
+        key="gnn_graphsmote_encoder_model",
+    )
+    meta = _load_hparams_for_model(encoder_model) if encoder_model else {}
+    if meta:
+        variant = meta.get("gnn_variant") or _infer_gnn_variant_from_model_path(encoder_model)
+        st.caption(
+            f"Checkpoint: `{os.path.basename(encoder_model)}` | "
+            f"variant={variant or 'N/A'} | hidden={meta.get('hidden_channels', 'N/A')} | "
+            f"heads={meta.get('num_heads', 'N/A')} | layers={meta.get('num_layers', 'N/A')}"
+        )
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        target_pos_ratio = st.number_input(
+            "target_pos_ratio train",
+            min_value=0.0001,
+            max_value=0.05,
+            value=0.003,
+            step=0.0001,
+            format="%.4f",
+            key="gnn_graphsmote_target_pos_ratio",
+        )
+        smote_k = st.number_input(
+            "k SMOTE",
+            min_value=1,
+            value=3,
+            step=1,
+            key="gnn_graphsmote_k",
+        )
+    with col_b:
+        edge_topk = st.number_input(
+            "topK aristas sintéticas",
+            min_value=1,
+            value=int(GRAPHSMOTE_K),
+            step=1,
+            key="gnn_graphsmote_edge_topk",
+        )
+        edge_gen_epochs = st.number_input(
+            "epochs RelEdgeGen",
+            min_value=0,
+            value=int(PRETRAIN_EDGE_EPOCHS),
+            step=1,
+            key="gnn_graphsmote_edge_gen_epochs",
+        )
+    with col_c:
+        edge_attr_epochs = st.number_input(
+            "epochs edge_attr decoder",
+            min_value=1,
+            value=1,
+            step=1,
+            key="gnn_graphsmote_edge_attr_epochs",
+        )
+        random_state = st.number_input(
+            "seed",
+            min_value=0,
+            value=int(SEED),
+            step=1,
+            key="gnn_graphsmote_seed",
+        )
+
+    conn_cols = st.columns(3)
+    with conn_cols[0]:
+        conect_mode = st.radio(
+            "Conexión",
+            ["Top-K TRAIN real", "Vecinos de accidentes (1-hop)"],
+            horizontal=False,
+            key="gnn_graphsmote_connect_mode",
+        )
+    with conn_cols[1]:
+        bidirectional = st.checkbox(
+            "Bidireccional",
+            value=False,
+            key="gnn_graphsmote_bidir",
+        )
+    with conn_cols[2]:
+        force_cpu = st.checkbox(
+            "Forzar CPU",
+            value=True,
+            key="gnn_graphsmote_force_cpu",
+        )
+        st.caption("Features sintéticas: `feature_interp`")
+
+    with st.expander("Avanzado", expanded=False):
+        neighbor_mode = st.radio(
+            "Vecinos para embeddings",
+            ["Auto", "Manual"],
+            horizontal=True,
+            key="gnn_graphsmote_neighbors_mode",
+        )
+        auto_neighbors = _auto_neighbor_count(graph_data)
+        if neighbor_mode == "Auto":
+            smote_num_neighbors = auto_neighbors
+            st.caption(f"Auto seleccionado: {auto_neighbors} vecino(s) por capa.")
+        else:
+            smote_num_neighbors = st.number_input(
+                "num_neighbors",
+                min_value=1,
+                max_value=8,
+                value=int(auto_neighbors),
+                step=1,
+                key="gnn_graphsmote_neighbors_manual",
+            )
+        edge_attr_hidden = st.number_input(
+            "hidden_dim edge_attr decoder",
+            min_value=16,
+            value=128,
+            step=16,
+            key="gnn_graphsmote_edge_attr_hidden",
+        )
+        edge_attr_lr = st.number_input(
+            "lr edge_attr decoder",
+            min_value=1e-6,
+            max_value=1e-1,
+            value=1e-3,
+            step=1e-4,
+            format="%.6f",
+            key="gnn_graphsmote_edge_attr_lr",
+        )
+        edge_gen_lr = st.number_input(
+            "lr RelEdgeGen",
+            min_value=1e-6,
+            max_value=1e-1,
+            value=1e-3,
+            step=1e-4,
+            format="%.6f",
+            key="gnn_graphsmote_edge_gen_lr",
+        )
+    if "smote_num_neighbors" not in locals():
+        smote_num_neighbors = _auto_neighbor_count(graph_data)
+
+    default_name = f"graph_aug_graphsmote_v3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+    save_path = st.text_input(
+        "Ruta de salida del grafo aumentado",
+        value=os.path.join(RESULTADOS_DIR, default_name),
+        key="gnn_graphsmote_save_path",
+    )
+
+    if st.button("Generar grafo aumentado GraphSMOTE", key="gnn_graphsmote_generate_aug"):
+        if not encoder_model:
+            st.error("Seleccione un checkpoint encoder.")
+            return
+        if not os.path.exists(encoder_model):
+            st.error(f"No existe el checkpoint: {encoder_model}")
+            return
+
+        device = torch.device("cpu") if force_cpu else get_auto_device()
+        save_path_obj = Path(str(save_path)).expanduser()
+        if not save_path_obj.is_absolute():
+            save_path_obj = ROOT_DIR / save_path_obj
+        save_path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            import src.graphsmote as graphsmote_mod
+            from src.train_pretrain import pretrain_edge_generator
+        except Exception as exc:
+            st.error(f"No se pudo cargar GraphSMOTE: {exc}")
+            return
+
+        graphsmote_mod.BIDIRECCTION = 1 if bidirectional else 0
+        graphsmote_mod.GRAPHSMOTE_CONECT = 1 if conect_mode == "Top-K TRAIN real" else 0
+        graphsmote_mod.GRAPHSMOTE_K = int(edge_topk)
+        graphsmote_mod.GRAPHSMOTE_SYNTHETIC_FEATURE_MODE = "feature_interp"
+
+        progress_text = st.empty()
+        with st.expander("Logs de generación GraphSMOTE", expanded=False):
+            log_display = st.empty()
+        log_handler = StreamlitLogHandler(log_display)
+        log_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s", "%H:%M:%S"))
+        root_logger = logging.getLogger()
+        root_logger.addHandler(log_handler)
+        stdout_proxy = StreamlitStdout(log_display)
+
+        try:
+            with st.spinner("Generando grafo aumentado con GraphSMOTE..."):
+                with contextlib.redirect_stdout(stdout_proxy), contextlib.redirect_stderr(stdout_proxy):
+                    base_graph_for_aug = graph_data.clone()
+                    if force_cpu:
+                        base_graph_for_aug = base_graph_for_aug.cpu()
+                    progress_text.caption("Cargando encoder base...")
+                    model, meta_loaded, state_dict = _load_gnn_encoder_for_graphsmote(
+                        model_path=encoder_model,
+                        graph_data=base_graph_for_aug,
+                        graph_obj=balance_graph_obj,
+                        device=device,
+                    )
+                    h_dim = int(
+                        getattr(model, "hidden_channels", meta_loaded.get("hidden_channels", 128))
+                    )
+                    h_heads = int(getattr(model, "num_heads", meta_loaded.get("num_heads", 4)))
+                    z_dim = int(h_dim * h_heads)
+                    z_dim_dict = {ntype: z_dim for ntype in base_graph_for_aug.node_types}
+
+                    edge_gen = graphsmote_mod.RelEdgeGen(z_dim_dict, base_graph_for_aug.edge_types).to(device)
+                    edge_report_dir = os.path.join(
+                        RESULTADOS_DIR,
+                        "graphsmote_generators",
+                        "edge_gen",
+                        _sanitize_path_token(Path(encoder_model).stem),
+                    )
+                    os.makedirs(edge_report_dir, exist_ok=True)
+                    edge_report_path = os.path.join(edge_report_dir, "edge_gen_auc.json")
+                    if int(edge_gen_epochs) > 0:
+                        progress_text.caption("Entrenando generador relacional de aristas...")
+                        pretrain_edge_generator(
+                            encoder=model,
+                            edge_gen=edge_gen,
+                            data=base_graph_for_aug,
+                            device=device,
+                            pretrain_epochs=int(edge_gen_epochs),
+                            optimizer=torch.optim.Adam(edge_gen.parameters(), lr=float(edge_gen_lr)),
+                            criterion=torch.nn.BCEWithLogitsLoss(),
+                            report_path=edge_report_path,
+                        )
+                    else:
+                        st.warning("RelEdgeGen quedó sin preentrenamiento; úselo solo para diagnóstico.")
+
+                    has_edge_attr = any(
+                        hasattr(base_graph_for_aug[et], "edge_attr")
+                        and base_graph_for_aug[et].edge_attr is not None
+                        and base_graph_for_aug[et].edge_attr.numel() > 0
+                        for et in base_graph_for_aug.edge_types
+                    )
+                    edge_attr_decoder = None
+                    if has_edge_attr:
+                        progress_text.caption("Entrenando decoder relacional de atributos de arista...")
+                        edge_attr_dir = os.path.join(
+                            RESULTADOS_DIR,
+                            "edge_attr_decoders",
+                            _sanitize_path_token(Path(encoder_model).stem),
+                        )
+                        edge_attr_decoder = graphsmote_mod.train_edge_attr_decoders(
+                            model,
+                            base_graph_for_aug,
+                            device=device,
+                            epochs=int(edge_attr_epochs),
+                            lr=float(edge_attr_lr),
+                            hidden_dim=int(edge_attr_hidden),
+                            save_dir=edge_attr_dir,
+                            seed=int(random_state),
+                            num_neighbors=int(smote_num_neighbors),
+                            show_progress=False,
+                        )
+                        if edge_attr_decoder is None:
+                            raise RuntimeError(
+                                "No se pudo entrenar edge_attr_decoder relacional; "
+                                "se aborta para evitar caer a delta legacy."
+                            )
+
+                    progress_text.caption("Sintetizando nodos, features y aristas...")
+                    augmented, registry = graphsmote_mod.augment_graph_offline_once(
+                        model=model,
+                        data=base_graph_for_aug,
+                        device=device,
+                        target_pos_ratio=float(target_pos_ratio),
+                        z2x_decoders=None,
+                        k=int(smote_k),
+                        edge_gen=edge_gen,
+                        save_path=str(save_path_obj),
+                        seed=int(random_state),
+                        num_neighbors=int(smote_num_neighbors),
+                        edge_attr_decoder=edge_attr_decoder,
+                        synthetic_feature_mode="feature_interp",
+                    )
+        except Exception as exc:
+            st.error(f"Error generando grafo GraphSMOTE: {exc}")
+            return
+        finally:
+            root_logger.removeHandler(log_handler)
+
+        summary = _graphsmote_validation_summary(graph_data, augmented, registry, node_type=node_type)
+        st.session_state["balanced_graph"] = {
+            "data": augmented,
+            "source": "GraphSMOTE V3 feature_interp",
+            "params": {
+                "encoder_model": encoder_model,
+                "target_pos_ratio": float(target_pos_ratio),
+                "smote_k": int(smote_k),
+                "edge_topk": int(edge_topk),
+                "edge_gen_epochs": int(edge_gen_epochs),
+                "edge_attr_epochs": int(edge_attr_epochs),
+                "synthetic_feature_mode": "feature_interp",
+                "save_path": str(save_path_obj),
+            },
+            "augmentation_registry": registry,
+        }
+        st.session_state["gnn_graphsmote_last_aug_summary"] = summary
+        st.session_state["gnn_graphsmote_last_aug_path"] = str(save_path_obj)
+        st.success(f"Grafo aumentado guardado en: {save_path_obj}")
+
+        try:
+            entry = _collect_gnn_context()
+            entry.update(
+                {
+                    "type": "Balance",
+                    "balance": {
+                        "strategy": "GraphSMOTE V3 feature_interp",
+                        "params": st.session_state["balanced_graph"]["params"],
+                        "validation": {
+                            k: v
+                            for k, v in summary.items()
+                            if k not in {"edge_rows", "feature_quality"}
+                        },
+                    },
+                }
+            )
+            _append_gnn_history(entry)
+        except Exception as exc:
+            print(f"Log error: {exc}")
+
+    last_summary = st.session_state.get("gnn_graphsmote_last_aug_summary")
+    last_path = st.session_state.get("gnn_graphsmote_last_aug_path")
+    if last_path:
+        st.caption(f"Último grafo aumentado: `{last_path}`")
+    if isinstance(last_summary, Mapping):
+        _render_graphsmote_validation_summary(last_summary)
+
+
+def _render_imgagn_relational_panel(
+    *,
+    balance_graph_obj: Dict[str, Any],
+    graph_data: HeteroData,
+) -> None:
+    from dataclasses import asdict
+
+    from src.imgagn_relational import (
+        RelationalImGAGNConfig,
+        build_relational_imgagn_graph,
+        to_cpu_graph_object,
+    )
+
+    st.markdown("### ImGAGN relacional parent-anchored")
+    st.caption(
+        "Genera sintéticos solo en train_mask, anclados a un padre positivo dominante, "
+        "y preserva explícitamente las relaciones temporal y spatial."
+    )
+
+    required_edges = {("pm", "temporal", "pm"), ("pm", "spatial", "pm")}
+    missing_edges = [edge for edge in required_edges if edge not in graph_data.edge_types]
+    if balance_graph_obj.get("sequence_index") is None:
+        st.error("ImGAGN relacional requiere sequence_index del grafo snapshot.")
+        return
+    if missing_edges:
+        st.error(
+            "ImGAGN relacional requiere las relaciones temporal y spatial. "
+            f"Faltantes: {missing_edges}"
+        )
+        return
+
+    pm = graph_data["pm"]
+    synth_existing = 0
+    if hasattr(pm, "is_synthetic"):
+        try:
+            synth_existing = int(pm.is_synthetic.detach().cpu().bool().sum().item())
+        except Exception:
+            synth_existing = 0
+    if synth_existing > 0:
+        st.warning(
+            "El grafo cargado ya contiene nodos sintéticos. "
+            "Cargue el grafo original antes de ejecutar ImGAGN relacional."
+        )
+        return
+
+    train_mask = pm.train_mask.detach().cpu().bool()
+    y = pm.y.detach().cpu().long()
+    train_count = int(train_mask.sum().item())
+    train_pos = int(((y == 1) & train_mask).sum().item())
+    train_ratio = float(train_pos / max(train_count, 1))
+    temporal_dim = int(graph_data[("pm", "temporal", "pm")].edge_attr.shape[1])
+    spatial_dim = int(graph_data[("pm", "spatial", "pm")].edge_attr.shape[1])
+
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("PM", f"{int(pm.num_nodes):,}")
+    metric_cols[1].metric("Train", f"{train_count:,}")
+    metric_cols[2].metric("Train positivos", f"{train_pos:,}")
+    metric_cols[3].metric("Prevalencia train", f"{train_ratio:.5f}")
+    metric_cols[4].metric("edge_attr", f"T{temporal_dim} / S{spatial_dim}")
+
+    with st.expander("Preset metodológico", expanded=False):
+        st.markdown(
+            "- `target_pos_ratio=0.003`: eleva la prevalencia positiva solo en entrenamiento.\n"
+            "- `dz=64`, `hidden_g=256`, `hidden_d=64`, `dropout=0.25`.\n"
+            "- `epochs=30`, `d_steps=1`, `temperature=0.30`, `entropy_weight=0.00`.\n"
+            "- `lr_g=1e-3`, `lr_d=5e-4`.\n"
+            "- `early_stopping_patience=5`: checkpoint por menor `tabsyndex_loss` interno de train.\n"
+            "- `tabsyndex_loss`: KS continuas + chi2 categóricas + correlaciones + detectabilidad + utilidad lineal.\n"
+            "- `spatial_copy_k=3`, `seed=19092086`.\n"
+            "- No crea relación `imgagn`; añade aristas por relación `temporal` y `spatial`."
+        )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        target_pos_ratio = st.number_input(
+            "target_pos_ratio",
+            min_value=0.0001,
+            max_value=0.5,
+            value=0.003,
+            step=0.0005,
+            format="%.4f",
+            key="gnn_imgagn_rel_target_ratio",
+        )
+        dz = st.number_input(
+            "dz",
+            min_value=8,
+            max_value=512,
+            value=64,
+            step=8,
+            key="gnn_imgagn_rel_dz",
+        )
+        hidden_g = st.number_input(
+            "hidden_g",
+            min_value=16,
+            max_value=1024,
+            value=256,
+            step=16,
+            key="gnn_imgagn_rel_hidden_g",
+        )
+    with col2:
+        hidden_d = st.number_input(
+            "hidden_d",
+            min_value=16,
+            max_value=1024,
+            value=64,
+            step=16,
+            key="gnn_imgagn_rel_hidden_d",
+        )
+        dropout = st.number_input(
+            "dropout",
+            min_value=0.0,
+            max_value=0.9,
+            value=0.25,
+            step=0.05,
+            key="gnn_imgagn_rel_dropout",
+        )
+        epochs = st.number_input(
+            "epochs",
+            min_value=1,
+            max_value=500,
+            value=30,
+            step=1,
+            key="gnn_imgagn_rel_epochs",
+        )
+    with col3:
+        d_steps = st.number_input(
+            "d_steps",
+            min_value=1,
+            max_value=20,
+            value=1,
+            step=1,
+            key="gnn_imgagn_rel_d_steps",
+        )
+        temperature = st.number_input(
+            "temperature",
+            min_value=0.05,
+            max_value=5.0,
+            value=0.30,
+            step=0.05,
+            key="gnn_imgagn_rel_temperature",
+        )
+        entropy_weight = st.number_input(
+            "entropy_weight",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.00,
+            step=0.01,
+            key="gnn_imgagn_rel_entropy",
+        )
+
+    col4, col5, col6, col7 = st.columns(4)
+    with col4:
+        lr_g = st.number_input(
+            "lr_g",
+            min_value=1e-6,
+            max_value=1e-1,
+            value=1e-3,
+            step=1e-4,
+            format="%.6f",
+            key="gnn_imgagn_rel_lr_g",
+        )
+    with col5:
+        lr_d = st.number_input(
+            "lr_d",
+            min_value=1e-6,
+            max_value=1e-1,
+            value=5e-4,
+            step=1e-4,
+            format="%.6f",
+            key="gnn_imgagn_rel_lr_d",
+        )
+    with col6:
+        spatial_copy_k = st.number_input(
+            "spatial_copy_k",
+            min_value=0,
+            max_value=20,
+            value=3,
+            step=1,
+            key="gnn_imgagn_rel_spatial_k",
+        )
+    with col7:
+        seed = st.number_input(
+            "seed",
+            min_value=0,
+            value=19092086,
+            step=1,
+            key="gnn_imgagn_rel_seed",
+        )
+
+    col8, col9, col10, col11, col12 = st.columns(5)
+    with col8:
+        batch_size = st.number_input(
+            "batch_size",
+            min_value=32,
+            max_value=65536,
+            value=4096,
+            step=32,
+            key="gnn_imgagn_rel_batch",
+        )
+    with col9:
+        early_stopping_patience = st.number_input(
+            "early_stopping_patience",
+            min_value=0,
+            max_value=100,
+            value=5,
+            step=1,
+            key="gnn_imgagn_rel_early_patience",
+            help=(
+                "Paciencia sobre tabsyndex_loss calculado en un holdout interno tomado solo desde train_mask. "
+                "Use 0 para guardar checkpoint sin detener temprano."
+            ),
+        )
+    with col10:
+        quality_eval_every = st.number_input(
+            "quality_eval_every",
+            min_value=1,
+            max_value=20,
+            value=1,
+            step=1,
+            key="gnn_imgagn_rel_quality_eval_every",
+            help="Frecuencia de cálculo de métricas TabSynDex-like. Por defecto se evalúa en cada época.",
+        )
+    with col11:
+        distribution_eval_sample_size = st.number_input(
+            "distribution_eval_sample_size",
+            min_value=32,
+            max_value=20000,
+            value=2048,
+            step=32,
+            key="gnn_imgagn_rel_dist_eval_sample",
+            help="Máximo de filas reales/sintéticas usadas en KS, chi2, correlaciones y clasificadores.",
+        )
+    with col12:
+        classifier_eval_steps = st.number_input(
+            "classifier_eval_steps",
+            min_value=0,
+            max_value=200,
+            value=25,
+            step=5,
+            key="gnn_imgagn_rel_classifier_eval_steps",
+            help="Pasos del clasificador lineal interno para detectabilidad real-vs-sintético y utilidad.",
+        )
+
+    device = get_auto_device()
+    st.caption(f"Dispositivo generación: {device}")
+
+    default_name = f"graph_imgagn_relational_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+    save_path = st.text_input(
+        "Ruta de guardado del grafo balanceado",
+        value=os.path.join(RESULTADOS_DIR, default_name),
+        key="gnn_imgagn_rel_save_path",
+    )
+
+    if st.button("Generar grafo ImGAGN relacional", key="gnn_imgagn_rel_run"):
+        cfg = RelationalImGAGNConfig(
+            target_pos_ratio=float(target_pos_ratio),
+            dz=int(dz),
+            hidden_g=int(hidden_g),
+            hidden_d=int(hidden_d),
+            dropout=float(dropout),
+            epochs=int(epochs),
+            d_steps=int(d_steps),
+            lr_g=float(lr_g),
+            lr_d=float(lr_d),
+            temperature=float(temperature),
+            entropy_weight=float(entropy_weight),
+            spatial_copy_k=int(spatial_copy_k),
+            seed=int(seed),
+            batch_size=int(batch_size),
+            early_stopping_patience=int(early_stopping_patience),
+            quality_eval_every=int(quality_eval_every),
+            distribution_eval_sample_size=int(distribution_eval_sample_size),
+            classifier_eval_steps=int(classifier_eval_steps),
+        )
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+        loss_chart = st.empty()
+        loss_history_rows: List[Dict[str, Any]] = []
+
+        def _progress_cb(epoch: int, total: int, metrics: Dict[str, Any]) -> None:
+            progress_bar.progress(min(float(epoch) / max(float(total), 1.0), 1.0))
+            loss_history_rows.append(dict(metrics))
+            try:
+                chart_df = pd.DataFrame(loss_history_rows)
+                if not chart_df.empty and "epoch" in chart_df.columns:
+                    chart_cols = [
+                        col
+                        for col in ("loss_d", "loss_g", "adversarial_val_loss", "val_loss")
+                        if col in chart_df.columns
+                    ]
+                    if chart_cols:
+                        plot_df = chart_df.set_index("epoch")[chart_cols].apply(
+                            pd.to_numeric,
+                            errors="coerce",
+                        )
+                        plot_df = plot_df.rename(columns={"val_loss": "tabsyndex_loss"})
+                        loss_chart.line_chart(plot_df, width="stretch")
+            except Exception:
+                pass
+            caption_parts = [
+                f"Epoch {epoch}/{total}",
+                f"loss_D={float(metrics.get('loss_d', 0.0)):.4f}",
+                f"loss_G={float(metrics.get('loss_g', 0.0)):.4f}",
+            ]
+            if metrics.get("val_loss") is not None:
+                caption_parts.append(f"tabsyndex_loss={float(metrics.get('val_loss', 0.0)):.4f}")
+            if metrics.get("tabsyndex_score") is not None:
+                caption_parts.append(f"tabsyndex={float(metrics.get('tabsyndex_score', 0.0)):.3f}")
+            if metrics.get("ks_mean") is not None:
+                caption_parts.append(f"KS={float(metrics.get('ks_mean', 0.0)):.3f}")
+            if metrics.get("detect_auc") is not None:
+                caption_parts.append(f"detect_auc={float(metrics.get('detect_auc', 0.0)):.3f}")
+            if metrics.get("best_epoch") is not None:
+                caption_parts.append(f"best_epoch={int(metrics.get('best_epoch'))}")
+            if metrics.get("early_stop_counter") is not None:
+                caption_parts.append(
+                    "patience="
+                    f"{int(metrics.get('early_stop_counter', 0))}/"
+                    f"{int(metrics.get('early_stopping_patience', early_stopping_patience))}"
+                )
+            caption_parts.append(f"parents_eff={float(metrics.get('effective_parents', 0.0)):.2f}")
+            if metrics.get("early_stopped"):
+                caption_parts.append("early_stop=True")
+            progress_text.caption(
+                " | ".join(caption_parts)
+            )
+
+        try:
+            save_path_obj = Path(save_path)
+            validation_path = (
+                Path(RESULTADOS_DIR)
+                / "imgagn_relational_validations"
+                / f"{save_path_obj.stem}_validation.json"
+            )
+            checkpoint_path = (
+                Path(RESULTADOS_DIR)
+                / "imgagn_relational_validations"
+                / f"{save_path_obj.stem}_best_checkpoint.pt"
+            )
+            with st.spinner("Generando sintéticos relacionales con ImGAGN..."):
+                result = build_relational_imgagn_graph(
+                    balance_graph_obj,
+                    cfg,
+                    device=device,
+                    progress_callback=_progress_cb,
+                    validation_artifact_path=validation_path,
+                    checkpoint_artifact_path=checkpoint_path,
+                )
+            save_obj = to_cpu_graph_object(result.graph_obj)
+            save_obj["relational_validation"] = result.validation
+            save_obj["imgagn_best_params"] = result.graph_obj.get("imgagn_best_params", asdict(cfg))
+            save_obj["filename"] = save_path_obj.name
+            save_path_obj.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(save_obj, save_path_obj)
+
+            st.session_state["balanced_graph"] = {
+                "data": save_obj["data"],
+                "graph_obj": save_obj,
+                "sequence_index": save_obj.get("sequence_index"),
+                "source": "ImGAGN relacional parent-anchored",
+                "params": {
+                    **asdict(cfg),
+                    "save_path": str(save_path_obj),
+                    "mode": "relational_parent_anchored",
+                    "checkpoint_path": result.build_meta.get("imgagn_feature_quality", {}).get("checkpoint_path"),
+                },
+                "imgagn_best_params": save_obj.get("imgagn_best_params"),
+                "relational_validation": result.validation,
+            }
+            st.success(f"Grafo ImGAGN relacional guardado en: {save_path_obj}")
+            st.json(
+                {
+                    "synthetic_count": result.build_meta.get("synthetic_count"),
+                    "parents_unique": result.build_meta.get("parents_unique"),
+                    "temporal_added": result.build_meta.get("temporal_relation", {}).get("added_edges"),
+                    "spatial_added": result.build_meta.get("spatial_relation", {}).get("added_edges"),
+                    "validation_ok": result.validation.get("ok"),
+                    "validation_artifact": result.validation.get("artifact_path"),
+                    "best_epoch": result.build_meta.get("imgagn_feature_quality", {}).get("best_epoch"),
+                    "best_tabsyndex_loss": result.build_meta.get("imgagn_feature_quality", {}).get("best_tabsyndex_loss"),
+                    "best_tabsyndex_score": result.build_meta.get("imgagn_feature_quality", {}).get("best_tabsyndex_score"),
+                    "early_stopped": result.build_meta.get("imgagn_feature_quality", {}).get("early_stopped"),
+                    "checkpoint_path": result.build_meta.get("imgagn_feature_quality", {}).get("checkpoint_path"),
+                }
+            )
+
+            try:
+                entry = _collect_gnn_context()
+                entry.update(
+                    {
+                        "type": "Balance",
+                        "balance": {
+                            "strategy": "ImGAGN relacional parent-anchored",
+                            "params": st.session_state["balanced_graph"]["params"],
+                            "validation": result.validation,
+                            "build_meta": result.build_meta,
+                        },
+                    }
+                )
+                _append_gnn_history(entry)
+            except Exception as exc:
+                print(f"Log error: {exc}")
+        except Exception as exc:
+            st.error(f"Error en ImGAGN relacional: {exc}")
+
+
 def _render_balance_tab() -> None:
     st.subheader("Balance (GNN)")
 
@@ -14645,1449 +15549,22 @@ def _render_balance_tab() -> None:
 
     method = st.radio(
         "Metodo de balance",
-        ["GraphSMOTE", "ImGAGN"],
+        ["GraphSMOTE", "ImGAGN relacional parent-anchored"],
         horizontal=True,
         key="gnn_balance_method",
     )
 
     if method == "GraphSMOTE":
-        node_types = list(graph_data.node_types)
-        node_type = st.selectbox(
-            "Tipo de nodo",
-            node_types,
-            index=node_types.index("pm")
-            if "pm" in node_types
-            else 0,
-            key="gnn_smote_node_type",
+        _render_graphsmote_graph_generator_panel(
+            balance_graph_obj=balance_graph_obj,
+            graph_data=graph_data,
         )
-        if node_type != "pm":
-            st.warning(
-                "GraphSMOTE actualmente solo esta soportado para nodos 'pm'."
-            )
-            return
-        if "gnn_smote_minority" not in st.session_state:
-            st.session_state["gnn_smote_minority"] = 1
-        minority_class = st.number_input(
-            "Clase minoritaria",
-            min_value=0,
-            step=1,
-            key="gnn_smote_minority",
-        )
-        optuna_files = sorted(
-            glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv")),
-            key=os.path.getmtime,
-            reverse=True,
-        )
-        optuna_choice = st.selectbox(
-            "Parametros Optuna (opcional)",
-            options=["(ninguno)"] + optuna_files,
-            format_func=lambda x: "(ninguno)"
-            if x == "(ninguno)"
-            else os.path.basename(x),
-            key="gnn_smote_optuna_file",
-        )
-        if st.button("Aplicar Optuna a Balance", key="gnn_smote_apply_optuna"):
-            if optuna_choice == "(ninguno)":
-                st.warning("Seleccione un archivo de Optuna.")
-            else:
-                params = _load_optuna_params_from_csv(optuna_choice)
-                if "smote_k" in params:
-                    try:
-                        st.session_state["gnn_smote_k"] = int(params["smote_k"])
-                    except Exception:
-                        pass
-                if (
-                    "target_pos_ratio" in params
-                    and hasattr(graph_data[node_type], "train_mask")
-                    and hasattr(graph_data[node_type], "y")
-                ):
-                    try:
-                        n_syn = _compute_n_syn_from_ratio(
-                            graph_data[node_type].y,
-                            graph_data[node_type].train_mask,
-                            int(minority_class),
-                            float(params["target_pos_ratio"]),
-                        )
-                        if n_syn > 0:
-                            st.session_state["gnn_smote_n_samples"] = int(n_syn)
-                    except Exception:
-                        pass
-                st.success("Parametros Optuna aplicados.")
-                st.rerun()
-        if "gnn_smote_n_samples" not in st.session_state:
-            st.session_state["gnn_smote_n_samples"] = 500
-        n_samples = st.number_input(
-            "Nuevos nodos sinteticos",
-            min_value=1,
-            step=50,
-            key="gnn_smote_n_samples",
-        )
-        if "gnn_smote_k" not in st.session_state:
-            st.session_state["gnn_smote_k"] = int(GRAPHSMOTE_K)
-        k_smote = st.number_input(
-            "k_smote",
-            min_value=1,
-            step=1,
-            key="gnn_smote_k",
-        )
-        if "gnn_smote_k_edges" not in st.session_state:
-            st.session_state["gnn_smote_k_edges"] = 5
-        k_neighbors_edges = st.number_input(
-            "k_neighbors_edges",
-            min_value=1,
-            step=1,
-            key="gnn_smote_k_edges",
-        )
-        random_state = st.number_input(
-            "random_state",
-            min_value=0,
-            value=int(SEED),
-            step=1,
-            key="gnn_smote_seed",
-        )
-        add_to_train_mask = st.checkbox(
-            "Agregar sinteticos a train_mask",
-            value=True,
-            key="gnn_smote_add_train",
-            help="Al activar esta opción, los nuevos nodos sintéticos se marcan como parte del conjunto de entrenamiento. Esto permite que los modelos posteriores 'vean' y aprendan de estos ejemplos balanceados.",
-        )
-        conect_mode = st.radio(
-            "Conexion de sinteticos",
-            ["Top-K TRAIN real", "Vecinos de accidentes (1-hop)"],
-            horizontal=True,
-            key="gnn_smote_conect_mode",
-            help="**Top-K TRAIN real**: Conecta c/u de los nodos sintéticos a los K nodos reales más similares (según embeddings).\n**Vecinos de accidentes (1-hop)**: Conecta c/u de los nodos sintéticos a los nodos padre (replica vecindarios).\n\n Siempre en train."
-        )
-        bidirectional = st.checkbox(
-            "Aristas bidireccionales (real <-> sintetico)",
-            value=False,
-            key="gnn_smote_bidir",
-        )
-        force_cpu_smote = st.checkbox(
-            "Forzar CPU en GraphSMOTE",
-            value=True,
-            key="gnn_smote_force_cpu",
-            help=(
-                "Usa CPU para k-NN/cache y edge-gen (estable para grafos grandes). "
-                "Si se desactiva, se intenta usar MPS/CUDA donde sea posible "
-                "(k-NN puede seguir en CPU segun tamanio)."
-            ),
-        )
-
-        #st.markdown("#### Modelo embeddings")
-        with st.expander("Modelo embeddings"):
-            st.write(
-                "GraphSMOTE necesita un GNN entrenado para generar embeddings y "
-                "decodificadores z->x. El entrenamiento guarda el modelo y hparams.json asociado."
-            )
-            st.write(
-                "Para usarlo aqui: (1.-Entrenar nuevo) entrena el modelo con el grafo en memoria, "
-                "(2.-Cargar existente) selecciona el archivo .pt y (3.-Aplicar) ejecuta Balancear con GraphSMOTE."
-            )
-
-            tab_train, tab_load = st.tabs(["Entrenar nuevo", "Cargar existente"])
-            model_path = None
-
-            with tab_train:
-                # GraphSMOTE siempre activo para generar embeddings robustos y decodificadores
-                train_use_smote = True
-                #st.info("ℹ️ GraphSMOTE activo por defecto: Se entrenarán decodificadores z→x.")
-                train_reuse_hparams = st.checkbox(
-                    "Reutilizar hiperparametros guardados si existen",
-                    value=True,
-                    key="gnn_smote_train_reuse_hparams",
-                    help=(
-                        "Si se activa, el entrenamiento reutiliza el ultimo archivo "
-                        "optuna_hyperparams_*.csv compatible. Si se desactiva, "
-                        "se fuerza una nueva busqueda de hiperparametros."
-                    ),
-                )
-
-                optimizer_overrides = {}
-                if not train_reuse_hparams:
-                    with st.expander("Configuración del Optimizador (Búsqueda)", expanded=True):
-                        st.info(
-                            "**Objetivo**: Maximizar **F0.5-score** (Prioridad Precisión sobre Recall).\n"
-                            "**Pruning**: AUPRC se usa para descartar entrenamientos malos.\n"
-                            "Los parámetros mostrados aquí fijan la búsqueda (anulando el rango Optuna)."
-                        )
-                        opt_name = st.selectbox(
-                            "Optimizador",
-                            ["(Auto)", "Adam", "AdamW", "RAdam", "Lion"],
-                            key="gnn_hpo_opt_name",
-                        )
-                        if opt_name != "(Auto)":
-                            optimizer_overrides["optimizer"] = opt_name
-                        scheduler_override_choices = st.multiselect(
-                            "lr_scheduler choices",
-                            list(GNN_LR_SCHEDULER_LABELS.keys()),
-                            default=[
-                                "one_cycle",
-                                "cosine_warm_restarts",
-                                "plateau_restart",
-                            ],
-                            key="gnn_hpo_lr_scheduler_choices",
-                            format_func=lambda value: GNN_LR_SCHEDULER_LABELS.get(str(value), str(value)),
-                            help=GNN_LR_SCHEDULER_HELP,
-                        )
-                        if scheduler_override_choices:
-                            optimizer_overrides["lr_scheduler_choices"] = [
-                                str(value) for value in scheduler_override_choices
-                            ]
-                        
-                        lr_val = st.text_input("Learning Rate (vacio=Auto)", value="", key="gnn_hpo_lr")
-                        if lr_val.strip():
-                            try:
-                                optimizer_overrides["lr"] = float(lr_val)
-                            except:
-                                st.warning("LR inválido, se usará Auto")
-                        
-                        wd_val = st.text_input("Weight Decay (vacio=Auto)", value="", key="gnn_hpo_wd")
-                        if wd_val.strip():
-                             try:
-                                optimizer_overrides["weight_decay"] = float(wd_val)
-                             except:
-                                st.warning("Weight Decay inválido, se usará Auto")
-                        
-                        clip_val = st.text_input("Gradient Clip (vacio=Auto)", value="", key="gnn_hpo_clip")
-                        if clip_val.strip():
-                             try:
-                                optimizer_overrides["grad_clip"] = float(clip_val)
-                             except:
-                                st.warning("Clip inválido, se usará Auto")
-                #st.markdown("#### Vecinos (GraphSMOTE)")
-                neighbor_mode = st.radio(
-                    "Selección de vecinos",
-                    ["Auto", "Manual"],
-                    horizontal=True,
-                    key="gnn_smote_neighbors_mode",
-                )
-                auto_neighbors = _auto_neighbor_count(graph_data)
-                if neighbor_mode == "Auto":
-                    st.caption(
-                        f"Auto seleccionado: {auto_neighbors} vecinos por capa."
-                    )
-                    smote_num_neighbors = auto_neighbors
-                else:
-                    smote_num_neighbors = st.number_input(
-                        "number of neighbors",
-                        min_value=1,
-                        max_value=4,
-                        value=int(auto_neighbors),
-                        step=1,
-                        key="gnn_smote_neighbors_manual",
-                    )
-                #st.markdown("#### Early stopping")
-                max_epochs_smote = st.number_input(
-                    "max_epochs",
-                    min_value=1,
-                    value=30,
-                    step=10,
-                    key="gnn_smote_max_epochs",
-                )
-                early_stop_smote = st.checkbox(
-                    "Early stopping",
-                    value=True,
-                    key="gnn_smote_early_stop",
-                )
-                early_patience_smote = st.number_input(
-                    "patience",
-                    min_value=1,
-                    value=20,
-                    step=1,
-                    key="gnn_smote_early_patience",
-                    disabled=not early_stop_smote,
-                )
-                early_min_delta_smote = st.number_input(
-                    "min_delta",
-                    min_value=0.0,
-                    value=0.00100,
-                    step=0.0001,
-                    format="%.6f",
-                    key="gnn_smote_early_min_delta",
-                    disabled=not early_stop_smote,
-                )
-                
-                latest_model = None
-                if st.button("Entrenar nuevo modelo Embedding", key="gnn_smote_train_model"):
-                    graph_obj = dict(balance_graph_obj)
-                    graph_obj["data"] = graph_data
-                    if not graph_obj.get("filename"):
-                        graph_path = st.session_state.get("graph_path")
-                        if graph_path:
-                            graph_obj["filename"] = os.path.basename(graph_path)
-
-                    def _has_imgagn(obj: dict) -> bool:
-                        try:
-                            return bool(obj.get("imgagn_best_params")) or (
-                                "ImGAGN" in str(obj.get("filename", ""))
-                            )
-                        except Exception:
-                            return False
-
-                    def _list_hpo_files(
-                        use_graphsmote: bool, obj: dict
-                    ) -> list[str]:
-                        all_hp_files = sorted(
-                            glob.glob(
-                                os.path.join(
-                                    RESULTADOS_DIR, "optuna_hyperparams_*.csv"
-                                )
-                            ),
-                            key=os.path.getmtime,
-                        )
-                        want_imgagn = _has_imgagn(obj)
-
-                        def _score_hp(path: str) -> tuple:
-                            name = os.path.basename(path)
-                            has_smote = "_GraphSMOTE" in name
-                            has_imgagn = "_ImGAGN" in name
-                            has_base = "_Base" in name
-                            ok_smote = (has_smote == use_graphsmote)
-                            ok_imgagn = (has_imgagn == want_imgagn)
-                            base_pref = (has_base and not use_graphsmote)
-                            return (
-                                int(ok_smote),
-                                int(ok_imgagn),
-                                int(base_pref),
-                                os.path.getmtime(path),
-                            )
-
-                        hp_files_sorted = sorted(all_hp_files, key=_score_hp)
-                        return [
-                            f
-                            for f in hp_files_sorted
-                            if ("_GraphSMOTE" in os.path.basename(f))
-                            == use_graphsmote
-                        ]
-
-                    hp_files = _list_hpo_files(
-                        bool(train_use_smote), graph_obj
-                    )
-                    hp_choice = (
-                        len(hp_files)
-                        if train_reuse_hparams and hp_files
-                        else 0
-                    )
-
-                    try:
-                        from src import gnn_main as graph_main
-                    except Exception as exc:
-                        st.error(f"No se pudo cargar el entrenador GNN: {exc}")
-                        return
-
-                    with st.spinner("Entrenando modelo GNN..."):
-                        progress_text = st.empty()
-                        progress_bar = st.progress(0)
-                        
-                        with st.expander("Logs de Entrenamiento (En vivo)", expanded=True):
-                            log_container = st.empty()
-                        
-                        log_handler = StreamlitLogHandler(log_container)
-                        log_handler.setFormatter(
-                            logging.Formatter(
-                                "%(asctime)s - %(message)s",
-                                datefmt="%H:%M:%S",
-                            )
-                        )
-                        root_logger = logging.getLogger()
-                        root_logger.addHandler(log_handler)
-                        stdout_proxy = StreamlitStdout(log_container)
-
-
-                        # --- Modern Progress Bar (Decoder Training) ---
-                        st.markdown("##### Progreso en vivo (Decodificador z->x)")
-                        m_col1, m_col2, m_col3 = st.columns(3)
-                        meter_epoch = m_col1.empty()
-                        meter_loss_train = m_col2.empty()
-                        meter_loss_val = m_col3.empty()
-                        
-                        meter_epoch.metric("Epoch", "0/0")
-                        meter_loss_train.metric("Train Loss", "—")
-                        meter_loss_val.metric("Val Loss", "—")
-
-                        def _progress_cb(
-                            *,
-                            epoch: int,
-                            total: int,
-                            **kwargs,
-                        ) -> None:
-                            total_safe = max(int(total or 1), 1)
-                            progress_bar.progress(min(epoch / total_safe, 1.0))
-                            
-                            # 1. Update Modern Metrics
-                            meter_epoch.metric("Epoch", f"{epoch}/{total_safe}")
-                            
-                            train_loss = kwargs.get("train_loss")
-                            val_loss = kwargs.get("val_loss")
-                            val_f1 = kwargs.get("val_f1")
-                            best_val_f1 = kwargs.get("best_val_f1")
-                            
-                            if train_loss is not None:
-                                meter_loss_train.metric("Train Loss", f"{train_loss:.4f}")
-                            if val_loss is not None:
-                                meter_loss_val.metric("Val Loss", f"{val_loss:.4f}")
-
-                            # 2. Update Legacy Caption (Log-like)
-                            parts = [f"Epoch {epoch}/{total_safe}"]
-                            if val_f1 is not None:
-                                parts.append(f"val_f1={val_f1:.4f}")
-                            if best_val_f1 is not None:
-                                parts.append(f"best_f1={best_val_f1:.4f}")
-                            if train_loss is not None:
-                                parts.append(f"loss={train_loss:.4f}")
-                            if val_loss is not None:
-                                parts.append(f"val_loss={val_loss:.4f}")
-                            
-                            p_counter = kwargs.get("patience_counter")
-                            p_limit = kwargs.get("patience")
-                            if p_counter is not None and p_limit is not None:
-                                parts.append(f"patience={p_counter}/{p_limit}")
-                            
-                            progress_text.caption(" | ".join(parts))
-
-
-                        try:
-                            with contextlib.redirect_stdout(stdout_proxy), contextlib.redirect_stderr(stdout_proxy):
-                                graph_main.run_gat_training(
-                                    graph_obj,
-                                    force_use_graphsmote=bool(train_use_smote),
-                                    early_stop=bool(early_stop_smote),
-                                    early_stop_patience=int(early_patience_smote),
-                                    early_stop_min_delta=float(early_min_delta_smote),
-                                    max_epochs=int(max_epochs_smote),
-                                    smote_num_neighbors=smote_num_neighbors,
-                                    progress_callback=_progress_cb,
-                                    optimizer_overrides=optimizer_overrides,
-                                    train_decoders_only=True,
-                                    hparams_index=int(hp_choice) if train_reuse_hparams else 0,
-                                    reuse_hparams=bool(train_reuse_hparams),
-                                )
-                        except Exception as exc:
-                            st.error(f"Error al entrenar el modelo: {exc}")
-                            return
-                        finally:
-                            root_logger.removeHandler(log_handler)
-
-                    latest_model = None
-                    latest_candidates = glob.glob(
-                        os.path.join(RESULTADOS_DIR, "GraphSMOTE_embeddings_model*.pt")
-                    )
-                    if latest_candidates:
-                        latest_model = max(
-                            latest_candidates, key=os.path.getmtime
-                        )
-                    if latest_model:
-                        st.session_state[
-                            "gnn_smote_model_default"
-                        ] = latest_model
-                        st.session_state["gnn_smote_model_file"] = latest_model
-                    st.success(
-                        "Entrenamiento finalizado. Modelo listo para balancear."
-                    )
-                    st.info(
-                        "Paso siguiente: ajusta el nombre del grafo balanceado y pulsa "
-                        "'Balancear con GraphSMOTE'."
-                    )
-
-            with tab_load:
-                model_files = sorted(
-                    glob.glob(
-                        os.path.join(
-                            RESULTADOS_DIR, "GraphSMOTE_embeddings_model*.pt"
-                        )
-                    )
-                )
-                model_default = st.session_state.get("gnn_smote_model_default")
-                model_opts = ["(ninguno)"] + model_files
-                model_index = 0
-                if model_default in model_opts:
-                    model_index = model_opts.index(model_default)
-                model_path = st.selectbox(
-                    "Seleccione Modelo GNN para generar embbedings",
-                    options=model_opts,
-                    format_func=lambda x: "(ninguno)"
-                    if x == "(ninguno)"
-                    else os.path.basename(x),
-                    index=model_index,
-                    key="gnn_smote_model_file",
-                )
-
-                confirm_delete = st.checkbox(
-                    "Confirmar borrado del modelo seleccionado",
-                    value=False,
-                    key="gnn_smote_confirm_delete",
-                )
-                if st.button(
-                    "Borrar modelo seleccionado", key="gnn_smote_delete_model"
-                ):
-                    if not model_path or model_path == "(ninguno)":
-                        st.error("Seleccione un modelo para borrar.")
-                    elif not confirm_delete:
-                        st.warning("Confirme el borrado antes de continuar.")
-                    else:
-                        try:
-                            model_path_obj = Path(model_path).resolve()
-                            resultados_dir = Path(RESULTADOS_DIR).resolve()
-                            if resultados_dir not in model_path_obj.parents:
-                                st.error(
-                                    "Solo se pueden borrar modelos dentro de Resultados."
-                                )
-                            elif not model_path_obj.exists():
-                                st.error("El archivo seleccionado no existe.")
-                            else:
-                                hparams_path = model_path_obj.with_name(
-                                    model_path_obj.stem + "_hparams.json"
-                                )
-                                model_path_obj.unlink()
-                                if hparams_path.exists():
-                                    hparams_path.unlink()
-                                st.session_state["gnn_smote_model_file"] = (
-                                    "(ninguno)"
-                                )
-                                st.success("Modelo borrado.")
-                                st.rerun()
-                        except Exception as exc:
-                            st.error(f"No se pudo borrar el modelo: {exc}")
-                
-                if st.button("Validar modelo seleccionado", key="gnn_smote_validate_model_btn"):
-                    st.markdown("---")
-                    st.subheader("Calidad del Modelo")
-
-                    # Intentar cargar metadatos primero
-                    meta = {}
-                    if model_path and model_path != "(ninguno)" and os.path.exists(model_path):
-                        try:
-                            hparams_path = Path(model_path).with_name(Path(model_path).stem + "_hparams.json")
-                            if hparams_path.exists():
-                                with open(hparams_path, "r") as f:
-                                    meta = json.load(f)
-                        except Exception:
-                            pass
-
-                    use_gs = meta.get("use_graphsmote", False)
-                    z2x_summary = {}
-
-                    # 1. Panel Calidad z->x (Solo si usa GraphSMOTE)
-                    if use_gs:
-                        st.markdown("#### Calidad z→x (Decodificador)")
-                        z2x_base_dir = st.session_state.get(
-                            "gnn_smote_save_dir",
-                            os.path.join(RESULTADOS_DIR, "z2x_decoders"),
-                        )
-                        z2x_dir = _resolve_z2x_dir(z2x_base_dir, model_path)
-                        history_path = os.path.join(z2x_dir, "history.json")
-                        st.caption(f"Directorio z2x: {z2x_dir}")
-                        
-                        if os.path.exists(history_path):
-                            try:
-                                with open(history_path, "r") as f:
-                                    hist_data = json.load(f)
-
-                                if isinstance(hist_data, list) and len(hist_data) > 0:
-                                    df_hist = pd.DataFrame(hist_data)
-                                    if "epoch" not in df_hist.columns:
-                                        df_hist["epoch"] = list(range(1, len(df_hist) + 1))
-
-                                    # Convertir todas las columnas numéricas (algunas pueden ser None)
-                                    numeric_cols = [
-                                        "train_loss",
-                                        "val_loss",
-                                        "mixup_loss",
-                                        "val_loss_minority",
-                                        "val_loss_majority",
-                                    ]
-                                    for c in numeric_cols:
-                                        if c in df_hist.columns:
-                                            df_hist[c] = pd.to_numeric(df_hist[c], errors="coerce")
-
-                                    # Resúmenes para tarjetas
-                                    if "val_loss" in df_hist.columns and df_hist["val_loss"].notna().any():
-                                        z2x_summary["best_val_loss"] = float(df_hist["val_loss"].min())
-                                        best_idx = int(df_hist["val_loss"].idxmin())
-                                        z2x_summary["best_epoch"] = int(df_hist.loc[best_idx, "epoch"])
-                                    if "train_loss" in df_hist.columns and df_hist["train_loss"].notna().any():
-                                        z2x_summary["best_train_loss"] = float(df_hist["train_loss"].min())
-                                    if "val_loss_minority" in df_hist.columns and df_hist["val_loss_minority"].notna().any():
-                                        z2x_summary["best_val_loss_minority"] = float(df_hist["val_loss_minority"].min())
-                                    if "val_loss_majority" in df_hist.columns and df_hist["val_loss_majority"].notna().any():
-                                        z2x_summary["best_val_loss_majority"] = float(df_hist["val_loss_majority"].min())
-
-                                    df_hist = df_hist.set_index("epoch")
-
-                                    # Tarjetas de métricas (incluyendo desagregación por clase)
-                                    metric_cols = st.columns(3)
-                                    with metric_cols[0]:
-                                        bv = z2x_summary.get("best_val_loss")
-                                        st.metric("Mejor Val Loss (z→x)", f"{bv:.6f}" if bv is not None else "N/A")
-                                    with metric_cols[1]:
-                                        bvm = z2x_summary.get("best_val_loss_minority")
-                                        st.metric("Mejor Val Loss minoritaria", f"{bvm:.6f}" if bvm is not None else "N/A")
-                                    with metric_cols[2]:
-                                        bvM = z2x_summary.get("best_val_loss_majority")
-                                        st.metric("Mejor Val Loss mayoritaria", f"{bvM:.6f}" if bvM is not None else "N/A")
-
-                                    if (
-                                        z2x_summary.get("best_val_loss_minority") is not None
-                                        and z2x_summary.get("best_val_loss_majority") is not None
-                                    ):
-                                        ratio = z2x_summary["best_val_loss_minority"] / max(
-                                            z2x_summary["best_val_loss_majority"], 1e-12
-                                        )
-                                        if ratio > 5.0:
-                                            st.warning(
-                                                f"La reconstrucción minoritaria es {ratio:.1f}× peor que la mayoritaria. "
-                                                "El decoder no representa bien la región crítica — los `syn_x` "
-                                                "estarán fuera de distribución. Considera entrenar más epochs, "
-                                                "subir mixup_ratio, o revisar la calidad del encoder."
-                                            )
-
-                                    # Curvas principales: train vs val
-                                    main_cols = [c for c in ("train_loss", "val_loss") if c in df_hist.columns]
-                                    if main_cols:
-                                        st.caption("Curvas de entrenamiento vs. validación")
-                                        st.line_chart(df_hist[main_cols])
-
-                                    # Curvas desagregadas por clase
-                                    class_cols = [c for c in ("val_loss_minority", "val_loss_majority") if c in df_hist.columns]
-                                    if class_cols and any(df_hist[c].notna().any() for c in class_cols):
-                                        st.caption("Validación desagregada por clase")
-                                        st.line_chart(df_hist[class_cols])
-
-                                    # Curva de mixup
-                                    if "mixup_loss" in df_hist.columns and df_hist["mixup_loss"].notna().any():
-                                        st.caption("Mixup loss (puntos sintéticos durante el entrenamiento del decoder)")
-                                        st.line_chart(df_hist[["mixup_loss"]])
-                                else:
-                                    st.warning("El historial de entrenamiento z→x está vacío o tiene formato incorrecto.")
-                            except Exception as e:
-                                st.error(f"Error cargando historial z→x: {e}")
-                        else:
-                            decoder_files = sorted(glob.glob(os.path.join(z2x_dir, "*.pt")))
-                            if decoder_files:
-                                st.info(
-                                    "No se encontró historial z→x en el directorio actual. "
-                                    "Se detectaron decodificadores entrenados, pero falta "
-                                    "history.json para mostrar la curva."
-                                )
-                                st.caption(
-                                    f"Decodificadores detectados: {len(decoder_files)}"
-                                )
-                            else:
-                                st.warning(
-                                    "No se encontró historial de entrenamiento z→x. "
-                                    "Posiblemente el modelo se entrenó sin GraphSMOTE, o los archivos se movieron."
-                                )
-
-                        # Reporte AUC del Edge Generator (link prediction)
-                        edge_gen_path = os.path.join(z2x_dir, "edge_gen_auc.json")
-                        if os.path.exists(edge_gen_path):
-                            st.markdown("##### RelEdgeGen — link prediction")
-                            try:
-                                with open(edge_gen_path, "r") as f:
-                                    eg_payload = json.load(f)
-                                macro = eg_payload.get("macro") or {}
-                                per_rel = eg_payload.get("per_relation") or {}
-                                cols_eg = st.columns(3)
-                                with cols_eg[0]:
-                                    auc_val = macro.get("auc")
-                                    st.metric(
-                                        "AUC macro (post-pretrain)",
-                                        f"{auc_val:.3f}" if isinstance(auc_val, (int, float)) else "N/A",
-                                    )
-                                with cols_eg[1]:
-                                    ap_val = macro.get("ap")
-                                    st.metric(
-                                        "AP macro",
-                                        f"{ap_val:.3f}" if isinstance(ap_val, (int, float)) else "N/A",
-                                    )
-                                with cols_eg[2]:
-                                    st.metric(
-                                        "# relaciones evaluadas",
-                                        macro.get("n_relations", "N/A"),
-                                    )
-                                if isinstance(auc_val, (int, float)) and auc_val < 0.6:
-                                    st.warning(
-                                        f"AUC macro={auc_val:.3f} < 0.6 — el generador de aristas "
-                                        "no aprendió señal. Los nodos sintéticos quedarán mal "
-                                        "conectados. Sube `PRETRAIN_EDGE_EPOCHS` o `lambda_edge`."
-                                    )
-                                if per_rel:
-                                    df_eg = pd.DataFrame(per_rel).T
-                                    df_eg.index.name = "relación"
-                                    st.dataframe(df_eg, use_container_width=True)
-                            except Exception as e:
-                                st.error(f"Error cargando reporte de edge generator: {e}")
-                    else:
-                        st.info("Este modelo no fue entrenado con GraphSMOTE activos (z→x no disponible).")
-
-                    # 2. Resumen de Embedding
-                    if meta.get("train_decoders_only"):
-                        st.markdown("#### Resumen de Embedding (z→x)")
-                    else:
-                        st.markdown("#### Resumen de Embedding (Calidad GNN)")
-                   
-                    if meta:
-                        if meta.get("train_decoders_only"):
-                            st.caption(
-                                "Modelo embeddings-only: no hay metricas F1/AUPRC del GNN. "
-                                "Se resume la calidad del decodificador z->x."
-                            )
-                            col_val, col_train, col_epoch = st.columns(3)
-                            with col_val:
-                                val_loss = z2x_summary.get("best_val_loss")
-                                st.metric(
-                                    "Best Val Loss (z→x)",
-                                    f"{val_loss:.6f}" if val_loss is not None else "N/A",
-                                )
-                            with col_train:
-                                train_loss = z2x_summary.get("best_train_loss")
-                                st.metric(
-                                    "Best Train Loss (z→x)",
-                                    f"{train_loss:.6f}" if train_loss is not None else "N/A",
-                                )
-                            with col_epoch:
-                                st.metric(
-                                    "Best Epoch (z→x)",
-                                    z2x_summary.get("best_epoch", "N/A"),
-                                )
-                        else:
-                            col_f1, col_auprc, col_epoch = st.columns(3)
-                            with col_f1:
-                                f1 = meta.get("best_val_f1")
-                                st.metric("GNN Best Val F1", f"{f1:.4f}" if f1 is not None else "N/A")
-                            with col_auprc:
-                                auprc = meta.get("best_val_auprc")
-                                if auprc is None: auprc = meta.get("auprc")
-                                st.metric("GNN Best Val AUPRC", f"{auprc:.4f}" if auprc is not None else "N/A")
-                            with col_epoch:
-                                st.metric("Best Epoch", meta.get("best_epoch", "N/A"))
-                    else:
-                        if model_path == "(ninguno)":
-                            st.warning("Seleccione un modelo válido.")
-                        else:
-                            st.warning("No se encontraron metadatos (_hparams.json) para este modelo.")
-
-            model_path_effective = model_path
-            if (
-                (not model_path_effective or model_path_effective == "(ninguno)")
-                and st.session_state.get("gnn_smote_model_default")
-            ):
-                model_path_effective = st.session_state.get(
-                    "gnn_smote_model_default"
-                )
-            if model_path_effective and model_path_effective != "(ninguno)":
-                st.caption(
-                    f"Modelo embeddings activo: {os.path.basename(model_path_effective)}"
-                )
-
-            edge_feature_dim = 0
-            for edge_type in graph_data.edge_types:
-                store = graph_data[edge_type]
-                if hasattr(store, "edge_attr") and store.edge_attr is not None:
-                    edge_attr = store.edge_attr
-                    edge_feature_dim = (
-                        int(edge_attr.shape[1])
-                        if edge_attr.dim() > 1
-                        else 1
-                    )
-                    break
-            in_channels = int(graph_data[node_type].x.shape[1])
-            
-            # Detectar modo (Snapshot vs Flow) usando metadatos originales
-            loaded_obj = st.session_state.get("loaded_graph", {})
-            if isinstance(loaded_obj, dict) and loaded_obj.get("sequence_config") is not None:
-                feature_mode = "Snapshot Features (Secuencias Temporales)"
-            else:
-                feature_mode = "Flow 5 min (Variables de Flujo y Cluster)"
-            st.caption("---------")
-            st.caption(
-                f"**Configuración del Grafo en memoria:**\n\n"
-                f"* **Tipo:** {feature_mode}\n"
-                f"* **Features de Nodo (in_channels={in_channels}):** Dimensiones de entrada por nodo.\n"
-                f"* **Features de Arista (edge_feature_dim={edge_feature_dim}):** Atributos de conexión."
-            )
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            hidden_channels = st.number_input(
-                "hidden_channels",
-                min_value=1,
-                value=128,
-                step=16,
-                key="gnn_smote_hidden",
-            )
-            num_heads = st.number_input(
-                "num_heads",
-                min_value=1,
-                value=4,
-                step=1,
-                key="gnn_smote_heads",
-            )
-            num_layers = st.number_input(
-                "num_layers",
-                min_value=1,
-                value=2,
-                step=1,
-                key="gnn_smote_layers",
-            )
-        with col_b:
-            dropout = st.number_input(
-                "dropout",
-                min_value=0.0,
-                max_value=0.9,
-                value=0.2,
-                step=0.05,
-                key="gnn_smote_dropout",
-            )
-            out_channels = st.number_input(
-                "out_channels",
-                min_value=1,
-                value=2,
-                step=1,
-                key="gnn_smote_out",
-            )
-            # Selección automática de dispositivo
-            device = get_auto_device()
-            st.caption(f"Dispositivo: {device}")
-
-        # Fixed directory for decoders
-        z2x_base_dir = os.path.join(RESULTADOS_DIR, "z2x_decoders")
-        z2x_dir = _resolve_z2x_dir(z2x_base_dir, model_path_effective)
-        st.caption(f"Directorio z2x (modelo): {z2x_dir}")
-        default_name = f"graph_smote_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
-        save_path = st.text_input(
-            "Ruta de guardado del grafo balanceado",
-            value=os.path.join(RESULTADOS_DIR, default_name),
-            key="gnn_smote_save_path",
-        )
-
-        if st.button("Balancear con GraphSMOTE", key="gnn_smote_run"):
-            if (
-                not model_path_effective
-                or model_path_effective == "(ninguno)"
-            ):
-                st.error("Seleccione un modelo GNN entrenado.")
-                return
-            if not hasattr(graph_data[node_type], "train_mask"):
-                st.error("El grafo no tiene train_mask para balancear.")
-                return
-            if not hasattr(graph_data[node_type], "y"):
-                st.error("El grafo no tiene etiquetas 'y' para balancear.")
-                return
-
-            try:
-                import src.graphsmote as graphsmote_mod
-            except Exception as exc:
-                st.error(f"No se pudo cargar GraphSMOTE: {exc}")
-                return
-
-            graphsmote_mod.BIDIRECCTION = 1 if bidirectional else 0
-            graphsmote_mod.GRAPHSMOTE_CONECT = (
-                1 if conect_mode == "Top-K TRAIN real" else 0
-            )
-
-            try:
-                from src.gat_model import HeteroGAT
-            except Exception as exc:
-                st.error(f"No se pudo cargar el modelo GAT: {exc}")
-                return
-
-            try:
-                # 1. Intentar cargar metadatos para sincronizar arquitectura
-                meta_hparams = {}
-                hparams_path = Path(model_path_effective).with_name(
-                    Path(model_path_effective).stem + "_hparams.json"
-                )
-                if hparams_path.exists():
-                    try:
-                        with open(hparams_path, "r") as f:
-                            meta_hparams = json.load(f)
-                        st.info(f"Metadatos detectados. Sincronizando arquitectura desde {hparams_path.name}")
-                    except Exception as e:
-                        st.warning(f"No se pudo cargar {hparams_path.name}: {e}")
-
-                # 2. Cargar objeto del modelo
-                model_obj = torch.load(
-                    model_path_effective,
-                    map_location=torch.device("cpu"),
-                    weights_only=False,
-                )
-            except Exception as exc:
-                st.error(f"No se pudo cargar el modelo: {exc}")
-                return
-
-            model = None
-            state_dict = None
-            if isinstance(model_obj, torch.nn.Module):
-                model = model_obj
-            elif isinstance(model_obj, dict):
-                if isinstance(model_obj.get("model"), torch.nn.Module):
-                    model = model_obj.get("model")
-                else:
-                    state_dict = (
-                        model_obj.get("model_state")
-                        or model_obj.get("state_dict")
-                        or model_obj # Fallback directo para state_dict
-                    )
-            
-            if model is None:
-                # 3. Instanciar el modelo con hiperparámetros (Prioridad Meta > UI)
-                h_channels = int(meta_hparams.get('hidden_channels', hidden_channels))
-                h_heads = int(meta_hparams.get('num_heads', num_heads))
-                h_layers = int(meta_hparams.get('num_layers', num_layers))
-                h_dropout = float(meta_hparams.get('dropout', dropout))
-                h_aggr1 = meta_hparams.get('aggr1', 'sum')
-                h_aggr2 = meta_hparams.get('aggr2', 'sum')
-                # out_channels suele ser num_classes. Intentamos detectarlo.
-                h_out = int(meta_hparams.get('out_channels', 0))
-                if h_out == 0:
-                    # Si no está en meta, intentar detectar del grafo actual
-                    try:
-                        h_out = len(torch.unique(graph_data[node_type].y))
-                    except:
-                        h_out = int(out_channels) # Fallback UI
-                
-                model = HeteroGAT(
-                    in_channels=in_channels,
-                    hidden_channels=h_channels,
-                    out_channels=h_out,
-                    num_heads=h_heads,
-                    dropout=h_dropout,
-                    edge_feature_dim=int(edge_feature_dim),
-                    num_layers=h_layers,
-                    aggr1=h_aggr1,
-                    aggr2=h_aggr2,
-                    use_checkpointing=False,
-                    edge_feature_dims=_resolve_edge_feature_dims_for_model(
-                        state_dict, graph_data
-                    ),
-                )
-                missing, unexpected = model.load_state_dict(
-                    state_dict, strict=True
-                )
-                if missing or unexpected:
-                    st.warning(
-                        f"Estado cargado con diferencias. missing={len(missing)} unexpected={len(unexpected)}"
-                    )
-
-            model = model.to(device)
-            model.eval()
-
-            nodes_to_smote = [
-                {
-                    "node_type": node_type,
-                    "minority_class": int(minority_class),
-                    "n_samples": int(n_samples),
-                }
-            ]
-            progress_bar_smote = st.progress(0)
-            progress_text_smote = st.empty()
-            
-            with st.expander("Logs de GraphSMOTE (En vivo)", expanded=False):
-                log_display_smote = st.empty()
-            
-            log_handler_smote = StreamlitLogHandler(log_display_smote)
-            log_handler_smote.setFormatter(logging.Formatter("%(asctime)s - %(message)s", "%H:%M:%S"))
-            root_logger = logging.getLogger()
-            root_logger.addHandler(log_handler_smote)
-            stdout_proxy_smote = StreamlitStdout(log_display_smote)
-
-            def _progress_cb_smote(epoch, total, train_loss, val_loss):
-                frac = min(epoch / max(1, total), 1.0)
-                progress_bar_smote.progress(frac)
-                parts = [f"Epoch {epoch}/{total}"]
-                parts.append(f"train_loss={train_loss:.6f}")
-                if val_loss is not None:
-                    parts.append(f"val_loss={val_loss:.6f}")
-                progress_text_smote.caption(" | ".join(parts))
-
-            with st.spinner("Ejecutando GraphSMOTE..."):
-                try:
-                    with contextlib.redirect_stdout(stdout_proxy_smote), contextlib.redirect_stderr(stdout_proxy_smote):
-                        augmented = graphsmote_mod.run_graphsmote(
-                            model,
-                            graph_data,
-                            nodes_to_smote,
-                            int(k_smote),
-                            int(k_neighbors_edges),
-                            int(random_state),
-                            save_dir=z2x_dir,
-                            add_to_train_mask=bool(add_to_train_mask),
-                            save_path=save_path,
-                            progress_callback=_progress_cb_smote,
-                            force_cpu=bool(force_cpu_smote),
-                        )
-                except Exception as exc:
-                    st.error(f"Error en GraphSMOTE: {exc}")
-                    return
-                finally:
-                    root_logger.removeHandler(log_handler_smote)
-
-            st.session_state["balanced_graph"] = {
-                "data": augmented,
-                "source": "GraphSMOTE",
-                "params": {
-                    "node_type": node_type,
-                    "minority_class": int(minority_class),
-                    "n_samples": int(n_samples),
-                    "k_smote": int(k_smote),
-                    "k_neighbors_edges": int(k_neighbors_edges),
-                },
-            }
-            st.success(
-                f"Balance GraphSMOTE completado. Nodos: {augmented[node_type].num_nodes}"
-            )
-            
-            # --- LOG HISTORY ---
-            try:
-                 entry = _collect_gnn_context()
-                 entry.update({
-                     "type": "Balance",
-                     "balance": {
-                         "strategy": "GraphSMOTE",
-                         "params": {
-                             "k_smote": int(k_smote),
-                             "new_samples": int(n_samples),
-                             "k_neighbors_edges": int(k_neighbors_edges),
-                             "minority_class": int(minority_class),
-                         }
-                     }
-                 })
-                 _append_gnn_history(entry)
-            except Exception as e:
-                 print(f"Log error: {e}")
-            # -------------------
-
-    else:
-        node_types = list(graph_data.node_types)
-        target_ntype = st.selectbox(
-            "Tipo de nodo",
-            node_types,
-            index=node_types.index("pm")
-            if "pm" in node_types
-            else 0,
-            key="gnn_imgagn_target",
-        )
-        minority_class = st.number_input(
-            "Clase minoritaria",
-            min_value=0,
-            value=1,
-            step=1,
-            key="gnn_imgagn_minority",
-        )
-        # Selección automática de dispositivo
-        device = get_auto_device()
-        st.caption(f"Dispositivo: {device}")
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            dz = st.number_input(
-                "dz",
-                min_value=10,
-                value=100,
-                step=10,
-                key="gnn_imgagn_dz",
-            )
-            hidden_g = st.number_input(
-                "hidden_g",
-                min_value=16,
-                value=200,
-                step=10,
-                key="gnn_imgagn_hidden_g",
-            )
-            n_hidden_g = st.number_input(
-                "n_hidden_g",
-                min_value=1,
-                value=1,
-                step=1,
-                key="gnn_imgagn_n_hidden_g",
-            )
-            topk_links = st.number_input(
-                "topk_links",
-                min_value=1,
-                value=5,
-                step=1,
-                key="gnn_imgagn_topk",
-            )
-        with col2:
-            emb_dim = st.number_input(
-                "emb_dim",
-                min_value=16,
-                value=128,
-                step=16,
-                key="gnn_imgagn_emb_dim",
-            )
-            hid_d = st.number_input(
-                "hid_d",
-                min_value=16,
-                value=128,
-                step=16,
-                key="gnn_imgagn_hid_d",
-            )
-            dropout = st.number_input(
-                "dropout",
-                min_value=0.0,
-                max_value=0.9,
-                value=0.2,
-                step=0.05,
-                key="gnn_imgagn_dropout",
-            )
-            lambda1_ratio = st.number_input(
-                "lambda1_ratio",
-                min_value=0.1,
-                value=1.0,
-                step=0.1,
-                key="gnn_imgagn_lambda1",
-            )
-        with col3:
-            d_steps = st.number_input(
-                "d_steps",
-                min_value=1,
-                value=50,
-                step=1,
-                key="gnn_imgagn_d_steps",
-            )
-            epochs = st.number_input(
-                "epochs",
-                min_value=1,
-                value=100,
-                step=5,
-                key="gnn_imgagn_epochs",
-            )
-            lr_g = st.number_input(
-                "lr_g",
-                min_value=1e-5,
-                value=1e-3,
-                step=1e-5,
-                format="%.5f",
-                key="gnn_imgagn_lr_g",
-            )
-            lr_d = st.number_input(
-                "lr_d",
-                min_value=1e-5,
-                value=1e-3,
-                step=1e-5,
-                format="%.5f",
-                key="gnn_imgagn_lr_d",
-            )
-
-        col4, col5, col6 = st.columns(3)
-        with col4:
-            wd = st.number_input(
-                "wd",
-                min_value=0.0,
-                value=5e-4,
-                step=1e-4,
-                format="%.5f",
-                key="gnn_imgagn_wd",
-            )
-            alpha_reg = st.number_input(
-                "alpha_reg",
-                min_value=0.0,
-                value=1e-4,
-                step=1e-5,
-                format="%.5f",
-                key="gnn_imgagn_alpha",
-            )
-            beta_reg = st.number_input(
-                "beta_reg",
-                min_value=0.0,
-                value=1e-4,
-                step=1e-5,
-                format="%.5f",
-                key="gnn_imgagn_beta",
-            )
-        with col5:
-            margin_mm = st.number_input(
-                "margin_mm",
-                min_value=0.1,
-                value=1.0,
-                step=0.1,
-                key="gnn_imgagn_margin",
-            )
-            grad_clip = st.number_input(
-                "grad_clip",
-                min_value=0.5,
-                value=2.0,
-                step=0.5,
-                key="gnn_imgagn_grad",
-            )
-            max_new_nodes = st.number_input(
-                "max_new_nodes",
-                min_value=1,
-                value=100000,
-                step=1000,
-                key="gnn_imgagn_max_new",
-            )
-        with col6:
-            use_neighbor_loader = st.checkbox(
-                "use_neighbor_loader",
-                value=True,
-                key="gnn_imgagn_use_loader",
-            )
-            batch_size = st.number_input(
-                "batch_size",
-                min_value=32,
-                value=512,
-                step=32,
-                key="gnn_imgagn_batch",
-            )
-            num_neighbors_raw = st.text_input(
-                "num_neighbors (por capa, ej: 10,5,5)",
-                value="10,5,5",
-                key="gnn_imgagn_neighbors",
-            )
-
-        show_progress = st.checkbox(
-            "Mostrar progreso",
-            value=True,
-            key="gnn_imgagn_progress",
-        )
-
-        default_name_imgagn = f"graph_imgagn_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
-        save_path_imgagn = st.text_input(
-            "Ruta de guardado del grafo balanceado (ImGAGN)",
-            value=os.path.join(RESULTADOS_DIR, default_name_imgagn),
-            key="gnn_imgagn_save_path",
-        )
-
-        if st.button("Balancear con ImGAGN", key="gnn_imgagn_run"):
-            if not hasattr(graph_data[target_ntype], "train_mask"):
-                st.error("El grafo no tiene train_mask para balancear.")
-                return
-            if not hasattr(graph_data[target_ntype], "y"):
-                st.error("El grafo no tiene etiquetas 'y' para balancear.")
-                return
-            y = graph_data[target_ntype].y
-            y_binary = (y == int(minority_class)).long()
-
-            num_neighbors = None
-            if num_neighbors_raw.strip():
-                try:
-                    num_neighbors = [
-                        int(n) for n in num_neighbors_raw.split(",") if n.strip()
-                    ]
-                except ValueError:
-                    st.error("num_neighbors debe ser una lista de enteros.")
-                    return
-
-            try:
-                import src.imgagn as imgagn_mod
-            except Exception as exc:
-                st.error(f"No se pudo cargar ImGAGN: {exc}")
-                return
-
-            cfg = imgagn_mod.ImGAGNConfig(
-                dz=int(dz),
-                hidden_g=int(hidden_g),
-                n_hidden_g=int(n_hidden_g),
-                topk_links=int(topk_links),
-                emb_dim=int(emb_dim),
-                hid_d=int(hid_d),
-                dropout=float(dropout),
-                lambda1_ratio=float(lambda1_ratio),
-                d_steps=int(d_steps),
-                epochs=int(epochs),
-                lr_g=float(lr_g),
-                lr_d=float(lr_d),
-                wd=float(wd),
-                alpha_reg=float(alpha_reg),
-                beta_reg=float(beta_reg),
-                margin_mm=float(margin_mm),
-                grad_clip=float(grad_clip),
-                device=str(device),
-                use_neighbor_loader=bool(use_neighbor_loader),
-                batch_size=int(batch_size),
-                num_neighbors=num_neighbors,
-                max_new_nodes=int(max_new_nodes),
-                show_progress=bool(show_progress),
-            )
-
-            progress_bar = st.progress(0)
-            progress_text = st.empty()
-            log_container = st.empty()
-
-            with st.expander("Logs de ImGAGN (En vivo)", expanded=False):
-                log_display = st.empty()
-            
-            log_handler = StreamlitLogHandler(log_display)
-            log_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s", "%H:%M:%S"))
-            root_logger = logging.getLogger()
-            root_logger.addHandler(log_handler)
-            stdout_proxy = StreamlitStdout(log_display)
-
-            def _progress_cb(epoch, total, loss_d, loss_g, recall):
-                if not show_progress:
-                    return
-                frac = min(epoch / max(1, total), 1.0)
-                progress_bar.progress(frac)
-                parts = [f"Epoch {epoch}/{total}"]
-                parts.append(f"loss_D={loss_d:.4f}")
-                parts.append(f"loss_G={loss_g:.4f}")
-                if recall is not None:
-                    parts.append(f"recall={recall:.4f}")
-                progress_text.caption(" | ".join(parts))
-
-            with st.spinner("Ejecutando ImGAGN (Entrenamiento de Generador)..."):
-                try:
-                    with contextlib.redirect_stdout(stdout_proxy), contextlib.redirect_stderr(stdout_proxy):
-                        result = imgagn_mod.train_imgagn(
-                            graph_data,
-                            graph_data[target_ntype].train_mask,
-                            y_binary,
-                            cfg=cfg,
-                            target_ntype=target_ntype,
-                            progress_callback=_progress_cb
-                        )
-                except Exception as exc:
-                    st.error(f"Error en ImGAGN: {exc}")
-                    return
-                finally:
-                    root_logger.removeHandler(log_handler)
-
-            x_aug = result.get("x_aug")
-            edge_index_aug = result.get("edge_index_aug")
-            if x_aug is None or edge_index_aug is None:
-                st.error("ImGAGN no devolvio grafo aumentado.")
-                return
-
-            # Mantener consistencia de dispositivo con el grafo original
-            try:
-                target_device = graph_data[target_ntype].x.device
-            except Exception:
-                target_device = x_aug.device
-            if x_aug.device != target_device:
-                x_aug = x_aug.to(target_device)
-            if edge_index_aug.device != target_device:
-                edge_index_aug = edge_index_aug.to(target_device)
-            if y_binary.device != target_device:
-                y_binary = y_binary.to(target_device)
-
-            n_original = graph_data[target_ntype].num_nodes
-            n_aug = x_aug.size(0)
-            n_new = max(0, n_aug - n_original)
-            y_aug = torch.cat(
-                [
-                    y_binary,
-                    torch.ones(
-                        n_new, dtype=y_binary.dtype, device=target_device
-                    ),
-                ],
-                dim=0,
-            )
-            train_mask_base = graph_data[target_ntype].train_mask
-            val_mask_base = (
-                graph_data[target_ntype].val_mask
-                if hasattr(graph_data[target_ntype], "val_mask")
-                else torch.zeros(n_original, dtype=torch.bool)
-            )
-            test_mask_base = (
-                graph_data[target_ntype].test_mask
-                if hasattr(graph_data[target_ntype], "test_mask")
-                else torch.zeros(n_original, dtype=torch.bool)
-            )
-            if train_mask_base.device != target_device:
-                train_mask_base = train_mask_base.to(target_device)
-            if val_mask_base.device != target_device:
-                val_mask_base = val_mask_base.to(target_device)
-            if test_mask_base.device != target_device:
-                test_mask_base = test_mask_base.to(target_device)
-            train_mask_aug = torch.cat(
-                [
-                    train_mask_base,
-                    torch.ones(n_new, dtype=torch.bool, device=target_device),
-                ],
-                dim=0,
-            )
-            val_mask_aug = torch.cat(
-                [
-                    val_mask_base,
-                    torch.zeros(n_new, dtype=torch.bool, device=target_device),
-                ],
-                dim=0,
-            )
-            test_mask_aug = torch.cat(
-                [
-                    test_mask_base,
-                    torch.zeros(n_new, dtype=torch.bool, device=target_device),
-                ],
-                dim=0,
-            )
-
-            data_aug = graph_data.clone()
-            data_aug[target_ntype].x = x_aug
-            data_aug[target_ntype].y = y_aug
-            data_aug[target_ntype].train_mask = train_mask_aug
-            data_aug[target_ntype].val_mask = val_mask_aug
-            data_aug[target_ntype].test_mask = test_mask_aug
-            data_aug[target_ntype].is_synthetic = torch.cat(
-                [
-                    torch.zeros(
-                        n_original, dtype=torch.bool, device=target_device
-                    ),
-                    torch.ones(n_new, dtype=torch.bool, device=target_device),
-                ],
-                dim=0,
-            )
-            data_aug[target_ntype].num_nodes = x_aug.size(0)
-            data_aug[(target_ntype, "imgagn", target_ntype)].edge_index = edge_index_aug
-
-            best_recall = None
-            try:
-                if "best_train_recall" in result:
-                    if torch.is_tensor(result["best_train_recall"]):
-                        best_recall = float(result["best_train_recall"].item())
-                    else:
-                        best_recall = float(result["best_train_recall"])
-            except Exception:
-                best_recall = None
-
-            imgagn_meta = {
-                "config": cfg.__dict__ if hasattr(cfg, "__dict__") else cfg,
-                "seed": int(result.get("seed", SEED)) if isinstance(result, dict) else int(SEED),
-                "best_train_recall": best_recall,
-            }
-
-            st.session_state["balanced_graph"] = {
-                "data": data_aug,
-                "source": "ImGAGN",
-                "params": {"target_ntype": target_ntype},
-                "imgagn_best_params": imgagn_meta,
-            }
-
-            # --- LOG HISTORY ---
-            try:
-                 entry = _collect_gnn_context()
-                 entry.update({
-                     "type": "Balance",
-                     "balance": {
-                         "strategy": "ImGAGN",
-                         "params": {
-                             "dz": int(dz),
-                             "epochs": int(epochs),
-                             "max_new_nodes": int(max_new_nodes),
-                             "minority_class": int(minority_class),
-                             "best_train_recall": best_recall,
-                             "seed": imgagn_meta.get("seed"),
-                         }
-                     }
-                 })
-                 _append_gnn_history(entry)
-            except Exception as e:
-                 print(f"Log error: {e}")
-            # -------------------
-
-            if save_path_imgagn:
-                try:
-                    torch.save(data_aug.cpu(), save_path_imgagn)
-                    st.info(f"Grafo balanceado guardado en: {save_path_imgagn}")
-                except Exception as e:
-                    st.error(f"Error al guardar grafo: {e}")
-
-            st.success(
-                f"Balance ImGAGN completado. Nodos: {data_aug[target_ntype].num_nodes}"
-            )
+        return
+
+    _render_imgagn_relational_panel(
+        balance_graph_obj=balance_graph_obj,
+        graph_data=graph_data,
+    )
 
 
 def _gnn_strategy_catalog_rows() -> List[Dict[str, str]]:
@@ -17326,7 +16803,7 @@ def _render_training_tab() -> None:
         balanced_files = sorted(
             glob.glob(os.path.join(RESULTADOS_DIR, "graph_smote_*.pt"))
             + glob.glob(os.path.join(RESULTADOS_DIR, "graph_aug.pt"))
-            + glob.glob(os.path.join(RESULTADOS_DIR, "graph_imgagn_*.pt")),
+            + glob.glob(os.path.join(RESULTADOS_DIR, "graph_imgagn_relational_*.pt")),
             key=os.path.getmtime,
             reverse=True
         )
@@ -17342,12 +16819,29 @@ def _render_training_tab() -> None:
             )
             if st.button("Cargar grafo balanceado", key="gnn_train_load_saved_balanced"):
                 try:
-                    loaded_data = torch.load(selected_file, map_location="cpu", weights_only=False)
-                    source_tag = "GraphSMOTE" if "smote" in selected_file.lower() or "aug" in selected_file.lower() else "ImGAGN"
+                    loaded_obj = torch.load(selected_file, map_location="cpu", weights_only=False)
+                    if isinstance(loaded_obj, dict) and isinstance(loaded_obj.get("data"), HeteroData):
+                        loaded_data = loaded_obj["data"]
+                        source_tag = (
+                            "ImGAGN relacional parent-anchored"
+                            if loaded_obj.get("imgagn_best_params")
+                            else "GraphSMOTE"
+                        )
+                    elif isinstance(loaded_obj, HeteroData):
+                        loaded_data = loaded_obj
+                        source_tag = "GraphSMOTE" if "smote" in selected_file.lower() or "aug" in selected_file.lower() else "Balanceado"
+                        loaded_obj = {"data": loaded_data}
+                    else:
+                        st.error("El archivo seleccionado no contiene un HeteroData compatible.")
+                        return
                     st.session_state["balanced_graph"] = {
                         "data": loaded_data,
                         "source": f"{source_tag} (Cargado)",
                         "params": {"file": os.path.basename(selected_file)},
+                        "graph_obj": loaded_obj if isinstance(loaded_obj, dict) else None,
+                        "sequence_index": loaded_obj.get("sequence_index") if isinstance(loaded_obj, dict) else None,
+                        "imgagn_best_params": loaded_obj.get("imgagn_best_params") if isinstance(loaded_obj, dict) else None,
+                        "relational_validation": loaded_obj.get("relational_validation") if isinstance(loaded_obj, dict) else None,
                     }
                     st.success(f"Grafo cargado exitosamente desde {os.path.basename(selected_file)}")
                     st.rerun()
@@ -17360,10 +16854,19 @@ def _render_training_tab() -> None:
     graph_obj = dict(loaded_graph)
     graph_source_label = "Original"
     if use_balanced and balanced_graph is not None:
+        balanced_graph_obj = balanced_graph.get("graph_obj")
+        if isinstance(balanced_graph_obj, dict):
+            for key, value in balanced_graph_obj.items():
+                if key != "data":
+                    graph_obj[key] = value
         graph_obj["data"] = balanced_graph.get("data")
+        if balanced_graph.get("sequence_index") is not None:
+            graph_obj["sequence_index"] = balanced_graph.get("sequence_index")
         if "ImGAGN" in str(balanced_graph.get("source", "")):
             if balanced_graph.get("imgagn_best_params"):
                 graph_obj["imgagn_best_params"] = balanced_graph["imgagn_best_params"]
+            if balanced_graph.get("relational_validation"):
+                graph_obj["relational_validation"] = balanced_graph["relational_validation"]
             fn = graph_obj.get("filename", "graph")
             if "_ImGAGN" not in fn:
                 graph_obj["filename"] = fn.replace(".pt", "_ImGAGN.pt") if fn.endswith(".pt") else f"{fn}_ImGAGN"
@@ -17383,6 +16886,12 @@ def _render_training_tab() -> None:
         return
     if "pm" not in graph_data.node_types:
         st.warning("El grafo no contiene nodos 'pm'.")
+        return
+    if ("pm", "imgagn", "pm") in graph_data.edge_types:
+        st.error(
+            "El grafo contiene la relación homogénea ('pm','imgagn','pm'), "
+            "que ya no es una ruta operativa. Use Balance -> ImGAGN relacional parent-anchored."
+        )
         return
 
     required_edges = {("pm", "spatial", "pm"), ("pm", "temporal", "pm")}
@@ -17445,6 +16954,32 @@ def _render_training_tab() -> None:
     if "_GraphSMOTE" in str(graph_obj.get("filename", "")):
         detected_smote = True
     use_graphsmote_train = bool(detected_smote)
+    imgagn_params_for_training = graph_obj.get("imgagn_best_params")
+    imgagn_mode_for_training = (
+        str(imgagn_params_for_training.get("mode", "")).lower()
+        if isinstance(imgagn_params_for_training, Mapping)
+        else ""
+    )
+    use_imgagn_relational_train = (
+        imgagn_mode_for_training == "relational_parent_anchored"
+        or "imgagn relacional" in str(graph_source_label).lower()
+        or "graph_imgagn_relational_" in str(graph_obj.get("filename", "")).lower()
+    )
+    if isinstance(imgagn_params_for_training, Mapping):
+        use_imgagn_relational_train = use_imgagn_relational_train and (
+            imgagn_mode_for_training == "relational_parent_anchored"
+        )
+    if (
+        "ImGAGN" in str(graph_source_label)
+        and not use_imgagn_relational_train
+    ):
+        st.error(
+            "Se detectó un grafo ImGAGN sin metadata relacional parent-anchored. "
+            "Los grafos ImGAGN homogéneos quedaron como artefactos históricos y no son operativos."
+        )
+        return
+    if use_imgagn_relational_train:
+        use_graphsmote_train = False
 
     if network_cfg:
         st.caption("Configuracion de Network disponible para este entrenamiento.")
@@ -17488,6 +17023,67 @@ def _render_training_tab() -> None:
         _sync_gnn_winning_ranking_posaware_training_state()
         st.success("Receta aplicada. Se usará Network (config actual) al entrenar.")
         st.rerun()
+
+    imgagn_warm_start_checkpoint_path: Optional[str] = None
+    if use_imgagn_relational_train:
+        st.markdown("#### Preset ImGAGN relacional")
+        st.caption(
+            "Warm-start conservador desde checkpoint base; no activa GraphSMOTE ni "
+            "reconstruye aristas homogéneas."
+        )
+        if st.button(
+            "Aplicar preset ImGAGN relacional warm-start",
+            key="gnn_train_apply_imgagn_rel_warm_start",
+            help=(
+                "Configura una corrida corta y conservadora para adaptar el checkpoint "
+                "base al grafo ImGAGN relacional."
+            ),
+        ):
+            st.session_state["gnn_train_max_epochs"] = 1
+            st.session_state["gnn_train_early_stop"] = True
+            st.session_state["gnn_train_early_patience"] = 1
+            st.session_state["gnn_train_checkpoint_metric_label"] = "AUPRC"
+            st.session_state["gnn_train_sampler_mode"] = "NeighborLoader (nativo)"
+            st.session_state["gnn_train_det_sampling"] = True
+            st.session_state["gnn_train_sampling_seed"] = 19092086
+            st.session_state["gnn_train_disable_hard"] = True
+            st.session_state["gnn_train_eval_neighbors_mode"] = "Custom"
+            st.session_state["gnn_train_eval_neighbors_custom"] = "15,8"
+            st.success("Preset aplicado para ImGAGN relacional.")
+            st.rerun()
+
+        preferred = [
+            "gat_model_BEST_GNN_gat_edge_mlp_gru_20260516_204829_533b8548.pt",
+            "gat_model_BEST_GNN_gat_edge_mlp_gru_20260515_172330_533b8548.pt",
+        ]
+        candidate_paths: List[str] = []
+        for name in preferred:
+            path = os.path.join(RESULTADOS_DIR, name)
+            if os.path.exists(path):
+                candidate_paths.append(path)
+        candidate_paths.extend(
+            sorted(
+                glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST_GNN_gat_edge_mlp_gru_*.pt")),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+        )
+        candidate_paths = list(dict.fromkeys(candidate_paths))
+        warm_start_enabled = st.checkbox(
+            "Usar warm-start desde checkpoint base",
+            value=True,
+            key="gnn_train_imgagn_rel_warm_start_enabled",
+        )
+        if warm_start_enabled and candidate_paths:
+            selected_warm = st.selectbox(
+                "Checkpoint base warm-start",
+                candidate_paths,
+                format_func=lambda x: os.path.basename(x),
+                key="gnn_train_imgagn_rel_warm_start_model",
+            )
+            imgagn_warm_start_checkpoint_path = str(selected_warm)
+        elif warm_start_enabled:
+            st.warning("No se encontraron checkpoints base GAT+edge_mlp+GRU en Resultados/.")
     hp_files = _list_hpo_files_for_training(
         use_graphsmote=None, graph_obj=graph_obj
     )
@@ -18192,7 +17788,11 @@ def _render_training_tab() -> None:
     training_status = {}
     try:
         graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj)
-        variant_tag = "GraphSMOTE" if use_graphsmote_effective else "Base"
+        variant_tag = (
+            "GraphSMOTE"
+            if use_graphsmote_effective
+            else ("ImGAGN" if use_imgagn_relational_train else "Base")
+        )
         hp_label = hp_choice
         if hp_choice == "Auto (mas reciente)":
             hp_label = "auto"
@@ -18361,6 +17961,37 @@ def _render_training_tab() -> None:
         except Exception as exc:
             st.error(f"No se pudo cargar el entrenador GNN: {exc}")
             return
+
+        resume_state_path_for_run = (
+            str(training_checkpoint_path)
+            if training_pending and training_checkpoint_path
+            else None
+        )
+        if (
+            not training_pending
+            and use_imgagn_relational_train
+            and imgagn_warm_start_checkpoint_path
+            and training_checkpoint_path is not None
+        ):
+            try:
+                from src.imgagn_relational import create_warm_start_resume_state
+
+                warm_state_path = Path(training_checkpoint_path).parent / "warm_start_from_base.pt"
+                resume_state_path_for_run = str(
+                    create_warm_start_resume_state(
+                        source_checkpoint=imgagn_warm_start_checkpoint_path,
+                        output_path=warm_state_path,
+                        monitor_metric=str(checkpoint_metric_train),
+                        max_epochs=int(max_epochs_train),
+                    )
+                )
+                st.info(
+                    "Warm-start ImGAGN relacional preparado desde "
+                    f"{os.path.basename(imgagn_warm_start_checkpoint_path)}."
+                )
+            except Exception as exc:
+                st.error(f"No se pudo preparar warm-start ImGAGN relacional: {exc}")
+                return
 
         if training_stop_flag_path is not None:
             try:
@@ -18926,6 +18557,8 @@ def _render_training_tab() -> None:
             use_graphsmote_effective = "_GraphSMOTE" in os.path.basename(selected_hp_path)
         elif network_option and hp_choice == network_option and network_hparams_path:
             use_graphsmote_effective = "_GraphSMOTE" in os.path.basename(network_hparams_path)
+        if use_imgagn_relational_train:
+            use_graphsmote_effective = False
 
         hp_files_for_prompt = _list_hpo_files_for_gnn_training_prompt(
             use_graphsmote=use_graphsmote_effective, graph_obj=graph_obj
@@ -18985,7 +18618,7 @@ def _render_training_tab() -> None:
                         max_epochs=int(max_epochs_train),
                         progress_callback=_progress_cb,
                         accumulation_steps=int(accumulation_steps_train),
-                        resume_state_path=str(training_checkpoint_path) if training_pending and training_checkpoint_path else None,
+                        resume_state_path=resume_state_path_for_run,
                         save_state_path=str(training_checkpoint_path) if training_checkpoint_path else None,
                         metrics_history_path=(
                             str(training_metrics_history_path)
@@ -21975,20 +21608,21 @@ def _prepare_graph_for_sampler_memory_probe(
         if variant == "ImGAGN":
             has_imgagn_marker = False
             if isinstance(loaded_obj, dict):
-                has_imgagn_marker = bool(loaded_obj.get("imgagn_best_params"))
+                params = loaded_obj.get("imgagn_best_params")
+                has_imgagn_marker = bool(params)
+                if isinstance(params, Mapping):
+                    has_imgagn_marker = (
+                        str(params.get("mode", "")).lower()
+                        == "relational_parent_anchored"
+                    )
             if (
                 not has_imgagn_marker
                 and isinstance(source_path, str)
-                and "imgagn" in source_path.lower()
-            ):
-                has_imgagn_marker = True
-            if (
-                not has_imgagn_marker
-                and ("pm", "imgagn", "pm") in getattr(candidate, "edge_types", [])
+                and "graph_imgagn_relational_" in os.path.basename(source_path).lower()
             ):
                 has_imgagn_marker = True
             if not has_imgagn_marker:
-                return False, "sin marcadores de ImGAGN"
+                return False, "sin marcadores de ImGAGN relacional"
         return True, "ok"
 
     candidate_paths: List[str] = []
@@ -22014,9 +21648,8 @@ def _prepare_graph_for_sampler_memory_probe(
                 candidate_paths.append(str(raw))
         pattern_paths = []
         for pattern in (
-            "graph_imgagn_*.pt",
-            "*ImGAGN*.pt",
-            "highway_graph_ImGAGN_AUG_*.pt",
+            "graph_imgagn_relational_*.pt",
+            "*imgagn_relational*.pt",
         ):
             pattern_paths.extend(glob.glob(os.path.join(RESULTADOS_DIR, pattern)))
         pattern_paths = sorted(pattern_paths, key=os.path.getmtime, reverse=True)
@@ -22070,8 +21703,8 @@ def _prepare_graph_for_sampler_memory_probe(
         )
     else:
         notes.append(
-            "[ALERTA] ImGAGN activo, pero no se encontró un grafo aumentado "
-            "compatible (`graph_imgagn_*.pt` / `*ImGAGN*.pt`). "
+            "[ALERTA] ImGAGN relacional activo, pero no se encontró un grafo aumentado "
+            "compatible (`graph_imgagn_relational_*.pt`). "
             "Se usará el grafo original y la memoria puede quedar subestimada."
         )
     return graph_data, notes
@@ -26463,18 +26096,19 @@ def _render_gnn_experiments_tab() -> None:
             sample_val_nodes = 0
 
         st.markdown("### Estrategias de Balanceo")
+        strategy_options = [
+            "Sin balancear",
+            "Opt. balance con GraphSMOTE",
+        ]
+        legacy_selected = st.session_state.get("gnn_exp_balancing_strategies")
+        if isinstance(legacy_selected, list) and "Opt. balance con ImGAGN" in legacy_selected:
+            st.session_state["gnn_exp_balancing_strategies"] = [
+                item for item in legacy_selected if item in strategy_options
+            ] or ["Sin balancear"]
         balancing_strategies = st.multiselect(
             "Seleccionar estrategias",
-            [
-                "Sin balancear",
-                "Opt. balance con GraphSMOTE",
-                "Opt. balance con ImGAGN",
-            ],
-            default=[
-                "Sin balancear",
-                "Opt. balance con GraphSMOTE",
-                "Opt. balance con ImGAGN",
-            ],
+            strategy_options,
+            default=strategy_options,
             key="gnn_exp_balancing_strategies",
         )
         if not balancing_strategies:
@@ -30243,7 +29877,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
     graph_source_label = "Original"
     if use_balanced and balanced_graph is not None:
         graph_obj["data"] = balanced_graph.get("data")
-        if balanced_graph.get("source") == "ImGAGN":
+        if "ImGAGN" in str(balanced_graph.get("source", "")):
             fn = graph_obj.get("filename", "graph")
             if "_ImGAGN" not in fn:
                 graph_obj["filename"] = fn.replace(".pt", "_ImGAGN.pt") if fn.endswith(".pt") else f"{fn}_ImGAGN"
@@ -30400,12 +30034,13 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
         sample_val_nodes = 0
 
     st.markdown("### Estrategia de Balanceo")
+    if st.session_state.get("gnn_balancing_strategy") == "Opt. balance con ImGAGN":
+        st.session_state["gnn_balancing_strategy"] = "Sin balancear"
     balancing_strategy = st.radio(
         "Seleccione la estrategia de balanceo:",
         [
             "Sin balancear",
             "Opt. balance con GraphSMOTE",
-            "Opt. balance con ImGAGN",
         ],
         index=0,
         key="gnn_balancing_strategy",
@@ -31612,7 +31247,7 @@ def _render_ray_tune_tab() -> None:
     graph_obj = dict(loaded_graph)
     if use_balanced and balanced_graph is not None:
         graph_obj["data"] = balanced_graph.get("data")
-        if balanced_graph.get("source") == "ImGAGN":
+        if "ImGAGN" in str(balanced_graph.get("source", "")):
             fn = graph_obj.get("filename", "graph")
             if "_ImGAGN" not in fn:
                 graph_obj["filename"] = fn.replace(".pt", "_ImGAGN.pt") if fn.endswith(".pt") else f"{fn}_ImGAGN"

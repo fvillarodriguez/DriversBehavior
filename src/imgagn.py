@@ -332,6 +332,10 @@ def train_imgagn(
     y_binary: 0=majority, 1=minority, defined on the target node set.
     Returns: dict with model states and the augmented graph tensors.
     """
+    raise RuntimeError(
+        "train_imgagn homogéneo fue retirado del flujo productivo. "
+        "Use src.imgagn_relational.build_relational_imgagn_graph."
+    )
     set_seed(SEED)
     device = torch.device(cfg.device)
 

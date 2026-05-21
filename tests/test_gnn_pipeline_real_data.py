@@ -16,7 +16,6 @@ from src.graphsmote import (
     augment_graph_offline_once,
     train_z2x_decoders,
 )
-from src.imgagn import ImGAGNConfig, train_imgagn
 from src.train_pretrain import pretrain_edge_generator
 from src.utils import (
     add_accident_target,
@@ -463,67 +462,6 @@ def _apply_graphsmote_full(
     return aug
 
 
-def _apply_imgagn_simple(
-    data: HeteroData, device: torch.device
-) -> Optional[HeteroData]:
-    y = data["pm"].y
-    if y.unique().numel() < 2:
-        return None
-    cfg = ImGAGNConfig(
-        dz=32,
-        hidden_g=64,
-        topk_links=3,
-        lambda1_ratio=1.0,
-        epochs=1,
-        d_steps=1,
-        lr_g=1e-3,
-        lr_d=1e-3,
-        device=str(device),
-        show_progress=False,
-    )
-    res = train_imgagn(
-        data=data,
-        train_mask=data["pm"].train_mask,
-        y_binary=y,
-        cfg=cfg,
-        target_ntype="pm",
-    )
-    if not isinstance(res, dict) or "x_aug" not in res:
-        return None
-
-    data_aug = data.clone()
-    x_aug = res["x_aug"]
-    n_old = data_aug["pm"].x.size(0)
-    n_new = x_aug.size(0) - n_old
-    if n_new <= 0:
-        return None
-
-    data_aug["pm"].x = x_aug
-    data_aug["pm"].y = torch.cat(
-        [data_aug["pm"].y, torch.ones(n_new, dtype=data_aug["pm"].y.dtype)],
-        dim=0,
-    )
-    data_aug["pm"].train_mask = torch.cat(
-        [data_aug["pm"].train_mask, torch.ones(n_new, dtype=torch.bool)],
-        dim=0,
-    )
-    data_aug["pm"].val_mask = torch.cat(
-        [data_aug["pm"].val_mask, torch.zeros(n_new, dtype=torch.bool)],
-        dim=0,
-    )
-    data_aug["pm"].test_mask = torch.cat(
-        [data_aug["pm"].test_mask, torch.zeros(n_new, dtype=torch.bool)],
-        dim=0,
-    )
-    spatial_key = ("pm", "spatial", "pm")
-    if spatial_key in data_aug.edge_types:
-        data_aug[spatial_key].edge_index = res["edge_index_aug"]
-        edge_attr_aug = res.get("edge_attr_aug")
-        if edge_attr_aug is not None:
-            data_aug[spatial_key].edge_attr = edge_attr_aug
-    return data_aug
-
-
 @pytest.mark.integration
 def test_gnn_pipeline_real_data() -> None:
     """
@@ -532,7 +470,7 @@ def test_gnn_pipeline_real_data() -> None:
     - Feature selection
     - Graph construction
     - Lightweight optimization (2 configs)
-    - Train/test for: no balance, GraphSMOTE, ImGAGN
+    - Train/test for: no balance, GraphSMOTE
     """
     if not _is_enabled():
         pytest.skip(f"Set {REAL_DATA_ENV}=1 to run this real-data pipeline test.")
@@ -661,7 +599,7 @@ def test_gnn_pipeline_real_data() -> None:
         {"hidden_channels": 32, "num_heads": 2, "num_layers": 2, "dropout": 0.2},
     ]
 
-    strategies = ["none", "graphsmote", "imgagn"]
+    strategies = ["none", "graphsmote"]
     results = {}
 
     for strategy in strategies:
@@ -670,11 +608,6 @@ def test_gnn_pipeline_real_data() -> None:
             graph_variant = _apply_graphsmote_full(data, configs[0], device)
             if graph_variant is None:
                 _log("graphsmote_skipped=1")
-                continue
-        elif strategy == "imgagn":
-            graph_variant = _apply_imgagn_simple(data, device)
-            if graph_variant is None:
-                _log("imgagn_skipped=1")
                 continue
         else:
             graph_variant = data

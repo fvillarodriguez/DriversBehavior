@@ -1,0 +1,52 @@
+#!/bin/bash
+#SBATCH --job-name={{JOB_NAME}}
+#SBATCH --partition={{PARTITION}}
+#SBATCH --account={{ACCOUNT}}
+#SBATCH --qos={{QOS}}
+#SBATCH --gres=gpu:{{GPUS}}
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task={{CPUS}}
+#SBATCH --mem={{MEM_GB}}G
+#SBATCH --time={{TIME}}
+#SBATCH --output={{LOG_DIR}}/{{JOB_NAME}}_%j.out
+#SBATCH --error={{LOG_DIR}}/{{JOB_NAME}}_%j.err
+#SBATCH --mail-type={{MAIL_TYPE}}
+#SBATCH --mail-user={{MAIL_USER}}
+
+set -euo pipefail
+
+mkdir -p "{{LOG_DIR}}"
+
+module purge
+module load {{PYTHON_MODULE}}
+module load {{CUDA_MODULE}}
+
+# shellcheck disable=SC1091
+source "{{REMOTE_VENV}}/bin/activate"
+
+cd "{{REMOTE_REPO}}"
+
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="{{REMOTE_REPO}}:${PYTHONPATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.8"
+export TESIS_DATA_DIR="{{REMOTE_DATA}}"
+export TESIS_RESULTS_DIR="{{REMOTE_RESULTS}}"
+
+echo "===== Rockfish GNN job ====="
+echo "Host    : $(hostname)"
+echo "Job ID  : ${SLURM_JOB_ID:-unknown}"
+echo "GPU IDs : ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "Repo    : {{REMOTE_REPO}}"
+echo "Data    : {{REMOTE_DATA}}"
+echo "Results : {{REMOTE_RESULTS}}"
+echo "Time    : $(date -Is)"
+echo "----- nvidia-smi -----"
+nvidia-smi || true
+echo "----- python ---------"
+python --version
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'avail', torch.cuda.is_available())"
+echo "============================"
+
+srun python {{CLI_ARGS}}
+
+echo "===== job finished at $(date -Is) ====="
