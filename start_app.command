@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+# Avoid macOS stalls while reading stale/corrupt bytecode caches in the local venv.
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+
 PIP_INSTALL_LOG="${ROOT_DIR}/.venv/start_app_pip_install.log"
 
 run_pip_install_requirements() {

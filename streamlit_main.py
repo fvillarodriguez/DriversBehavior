@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import sys
 import warnings
+import importlib
 from pathlib import Path
 from typing import Callable, Dict
 import psutil
@@ -67,31 +68,15 @@ def _patch_sklearn_parallel_warning_noise() -> None:
     func_wrapper.__call__ = _sumo_quiet_sklearn_funcwrapper_call
 
 
-_patch_sklearn_parallel_warning_noise()
-
 import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import src.flow_database_app as flow_database_app
-import src.clustering_tabs_app as clustering_tabs_app
-import src.cluster_accident_app as cluster_accident_app
-import src.events_map_app as events_map_app
-import src.experiments_live_app as experiments_live_app
-import src.files_app as files_app
-import src.sumo_simulation_app as sumo_simulation_app
-import src.test_page as test_page
-import src.drift_detection_app as drift_detection_app
-import src.github_sync_app as github_sync_app
-import src.notification_system as notification_system
-import src.multi_agent_rl_app as multi_agent_rl_app
-import src.latex_viewer_app as latex_viewer_app
-import src.nlp_severity_app as nlp_severity_app
-import src.documentation_app as documentation_app
-import src.dask_cluster_app as dask_cluster_app
-import src.rockfish_cluster_app as rockfish_cluster_app
+
+def _load_page_module(module_name: str):
+    return importlib.import_module(module_name)
 
 
 def _render_home() -> None:
@@ -133,52 +118,75 @@ def main() -> None:
     # Wrappers to provide unique function names for st.Page URL inference
     
     def p_flow_database():
+        flow_database_app = _load_page_module("src.flow_database_app")
         flow_database_app.main(set_page_config=False, show_exit_button=False)
         
     def p_files():
+        files_app = _load_page_module("src.files_app")
         files_app.main(set_page_config=False, show_exit_button=False)
         
     def p_github():
+        github_sync_app = _load_page_module("src.github_sync_app")
         github_sync_app.main(set_page_config=False, show_exit_button=False)
         
     def p_clustering():
+        _patch_sklearn_parallel_warning_noise()
+        clustering_tabs_app = _load_page_module("src.clustering_tabs_app")
         clustering_tabs_app.main(set_page_config=False, show_exit_button=False)
         
     def p_crash():
+        _patch_sklearn_parallel_warning_noise()
+        cluster_accident_app = _load_page_module("src.cluster_accident_app")
         cluster_accident_app.main(set_page_config=False, show_exit_button=False)
 
     def p_nlp_severity():
+        nlp_severity_app = _load_page_module("src.nlp_severity_app")
         nlp_severity_app.main(set_page_config=False, show_exit_button=False)
 
     def p_drift():
+        _patch_sklearn_parallel_warning_noise()
+        drift_detection_app = _load_page_module("src.drift_detection_app")
         drift_detection_app.main(set_page_config=False, show_exit_button=False)
         
     def p_events():
+        events_map_app = _load_page_module("src.events_map_app")
         events_map_app.main(set_page_config=False, show_exit_button=False)
         
     def p_experiments():
+        experiments_live_app = _load_page_module("src.experiments_live_app")
         experiments_live_app.main(set_page_config=False)
         
     def p_sumo():
+        sumo_simulation_app = _load_page_module("src.sumo_simulation_app")
         sumo_simulation_app.main(set_page_config=False, show_exit_button=False)
         
     def p_marl():
+        multi_agent_rl_app = _load_page_module("src.multi_agent_rl_app")
         multi_agent_rl_app.main(set_page_config=False, show_exit_button=False)
 
     def p_test():
+        test_page = _load_page_module("src.test_page")
         test_page.main(set_page_config=False, show_exit_button=False)
         
     def p_latex():
+        latex_viewer_app = _load_page_module("src.latex_viewer_app")
         latex_viewer_app.Latex(set_page_config=False, show_exit_button=False)
 
     def p_documentacion():
+        documentation_app = _load_page_module("src.documentation_app")
         documentation_app.main(set_page_config=False, show_exit_button=False)
 
     def p_dask_cluster():
+        dask_cluster_app = _load_page_module("src.dask_cluster_app")
         dask_cluster_app.main(set_page_config=False, show_exit_button=False)
 
     def p_rockfish_cluster():
+        rockfish_cluster_app = _load_page_module("src.rockfish_cluster_app")
         rockfish_cluster_app.main(set_page_config=False, show_exit_button=False)
+
+    def p_notify():
+        notification_system = _load_page_module("src.notification_system")
+        notification_system.render_notification_config()
 
     ps_databases = st.Page(p_flow_database, title="Flow database", icon=":material/database:")
     ps_files = st.Page(p_files, title="Files", icon=":material/folder:")
@@ -195,7 +203,7 @@ def main() -> None:
     ps_exp = st.Page(p_experiments, title="Experiments Live", icon=":material/science:")
     ps_sumo = st.Page(p_sumo, title="Simulacion SUMO", icon=":material/directions_car:")
     
-    ps_notify = st.Page(notification_system.render_notification_config, title="Notification system", icon=":material/notifications:")
+    ps_notify = st.Page(p_notify, title="Notification system", icon=":material/notifications:")
     ps_dask = st.Page(p_dask_cluster, title="Dask Cluster", icon=":material/account_tree:")
     ps_rockfish = st.Page(p_rockfish_cluster, title="Rockfish Cluster", icon=":material/dns:")
     ps_test = st.Page(p_test, title="Test", icon=":material/bug_report:")

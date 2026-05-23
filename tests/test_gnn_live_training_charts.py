@@ -1,7 +1,43 @@
 import pytest
 import json
+import zipfile
 
 from src import graph_builder_app as app
+
+
+def test_saved_balanced_graph_listing_skips_truncated_torch_archives(tmp_path, monkeypatch):
+    valid_path = tmp_path / "graph_imgagn_relational_valid.pt"
+    corrupt_path = tmp_path / "graph_imgagn_relational_corrupt.pt"
+    app.torch.save({"data": app.HeteroData()}, valid_path)
+    with zipfile.ZipFile(corrupt_path, "w") as zf:
+        zf.writestr("graph_imgagn_relational_corrupt/version", "3\n")
+        zf.writestr("graph_imgagn_relational_corrupt/byteorder", "little")
+
+    monkeypatch.setattr(app, "RESULTADOS_DIR", str(tmp_path))
+
+    valid, invalid = app._list_saved_balanced_graph_files()
+
+    assert valid == [str(valid_path)]
+    assert invalid == [str(corrupt_path)]
+
+
+def test_atomic_torch_save_does_not_replace_destination_with_incomplete_archive(tmp_path, monkeypatch):
+    target = tmp_path / "graph_imgagn_relational_target.pt"
+    app.torch.save({"data": app.HeteroData()}, target)
+    original_size = target.stat().st_size
+
+    def fake_save(_obj, path):
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("bad/version", "3\n")
+            zf.writestr("bad/byteorder", "little")
+
+    monkeypatch.setattr(app.torch, "save", fake_save)
+
+    with pytest.raises(RuntimeError, match="data.pkl"):
+        app._torch_save_atomic({"data": app.HeteroData()}, target)
+
+    assert target.stat().st_size == original_size
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_gnn_live_training_chart_frames_keep_requested_series_only():

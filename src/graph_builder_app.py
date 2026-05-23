@@ -2905,6 +2905,86 @@ def _list_graph_files_for_eval() -> List[str]:
     files = sorted(files, key=os.path.getmtime, reverse=True)
     return files
 
+
+def _torch_archive_has_pickle_payload(path: str | Path) -> bool:
+    path_obj = Path(path)
+    if not path_obj.exists() or path_obj.stat().st_size <= 0:
+        return False
+    try:
+        if not zipfile.is_zipfile(path_obj):
+            return True
+        with zipfile.ZipFile(path_obj, "r") as zf:
+            return any(name == "data.pkl" or name.endswith("/data.pkl") for name in zf.namelist())
+    except Exception:
+        return False
+
+
+def _torch_save_atomic(obj: object, path: str | Path) -> Path:
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path_obj.with_name(f".{path_obj.name}.{os.getpid()}.tmp")
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        torch.save(obj, tmp_path)
+        if not _torch_archive_has_pickle_payload(tmp_path):
+            raise RuntimeError(
+                "El archivo temporal PyTorch quedó incompleto: falta data.pkl."
+            )
+        os.replace(tmp_path, path_obj)
+    except Exception:
+        with contextlib.suppress(Exception):
+            tmp_path.unlink()
+        raise
+    return path_obj
+
+
+def _list_saved_balanced_graph_files() -> Tuple[List[str], List[str]]:
+    patterns = [
+        "graph_smote_*.pt",
+        "graph_aug.pt",
+        "graph_imgagn_relational_*.pt",
+    ]
+    candidates: List[str] = []
+    for pattern in patterns:
+        candidates.extend(glob.glob(os.path.join(RESULTADOS_DIR, pattern)))
+    valid: List[str] = []
+    invalid: List[str] = []
+    for path in sorted(set(candidates), key=os.path.getmtime, reverse=True):
+        if _torch_archive_has_pickle_payload(path):
+            valid.append(path)
+        else:
+            invalid.append(path)
+    return valid, invalid
+
+
+def _load_saved_balanced_graph(path: str | Path) -> Tuple[Dict[str, Any], HeteroData, str]:
+    if not _torch_archive_has_pickle_payload(path):
+        raise ValueError(
+            "El archivo seleccionado parece incompleto o corrupto: falta data.pkl. "
+            "Genere nuevamente el grafo desde Balance."
+        )
+    loaded_obj = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(loaded_obj, dict) and isinstance(loaded_obj.get("data"), HeteroData):
+        loaded_data = loaded_obj["data"]
+        source_tag = (
+            "ImGAGN relacional parent-anchored"
+            if loaded_obj.get("imgagn_best_params")
+            else "GraphSMOTE"
+        )
+        return loaded_obj, loaded_data, source_tag
+    if isinstance(loaded_obj, HeteroData):
+        loaded_data = loaded_obj
+        selected_file = str(path).lower()
+        source_tag = (
+            "GraphSMOTE"
+            if "smote" in selected_file or "aug" in selected_file
+            else "Balanceado"
+        )
+        return {"data": loaded_data}, loaded_data, source_tag
+    raise ValueError("El archivo seleccionado no contiene un HeteroData compatible.")
+
+
 def _load_graph_data_for_eval(path: str) -> Optional[HeteroData]:
     try:
         obj = torch.load(path, map_location="cpu", weights_only=False)
@@ -15464,8 +15544,7 @@ def _render_imgagn_relational_panel(
             save_obj["relational_validation"] = result.validation
             save_obj["imgagn_best_params"] = result.graph_obj.get("imgagn_best_params", asdict(cfg))
             save_obj["filename"] = save_path_obj.name
-            save_path_obj.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(save_obj, save_path_obj)
+            _torch_save_atomic(save_obj, save_path_obj)
 
             st.session_state["balanced_graph"] = {
                 "data": save_obj["data"],
@@ -16800,13 +16879,12 @@ def _render_training_tab() -> None:
     else:
         # Buscar grafos balanceados guardados
         st.info("No hay grafo balanceado en memoria.")
-        balanced_files = sorted(
-            glob.glob(os.path.join(RESULTADOS_DIR, "graph_smote_*.pt"))
-            + glob.glob(os.path.join(RESULTADOS_DIR, "graph_aug.pt"))
-            + glob.glob(os.path.join(RESULTADOS_DIR, "graph_imgagn_relational_*.pt")),
-            key=os.path.getmtime,
-            reverse=True
-        )
+        balanced_files, invalid_balanced_files = _list_saved_balanced_graph_files()
+        if invalid_balanced_files:
+            st.warning(
+                "Se omitieron grafos balanceados incompletos o corruptos: "
+                + ", ".join(os.path.basename(path) for path in invalid_balanced_files[:5])
+            )
         
         if balanced_files:
             #st.markdown("---")
@@ -16819,21 +16897,7 @@ def _render_training_tab() -> None:
             )
             if st.button("Cargar grafo balanceado", key="gnn_train_load_saved_balanced"):
                 try:
-                    loaded_obj = torch.load(selected_file, map_location="cpu", weights_only=False)
-                    if isinstance(loaded_obj, dict) and isinstance(loaded_obj.get("data"), HeteroData):
-                        loaded_data = loaded_obj["data"]
-                        source_tag = (
-                            "ImGAGN relacional parent-anchored"
-                            if loaded_obj.get("imgagn_best_params")
-                            else "GraphSMOTE"
-                        )
-                    elif isinstance(loaded_obj, HeteroData):
-                        loaded_data = loaded_obj
-                        source_tag = "GraphSMOTE" if "smote" in selected_file.lower() or "aug" in selected_file.lower() else "Balanceado"
-                        loaded_obj = {"data": loaded_data}
-                    else:
-                        st.error("El archivo seleccionado no contiene un HeteroData compatible.")
-                        return
+                    loaded_obj, loaded_data, source_tag = _load_saved_balanced_graph(selected_file)
                     st.session_state["balanced_graph"] = {
                         "data": loaded_data,
                         "source": f"{source_tag} (Cargado)",
