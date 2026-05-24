@@ -4,9 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-# Avoid macOS stalls while reading stale/corrupt bytecode caches in the local venv.
-export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
-
 PIP_INSTALL_LOG="${ROOT_DIR}/.venv/start_app_pip_install.log"
 
 run_pip_install_requirements() {
@@ -37,6 +34,45 @@ repair_macos_hidden_python_metadata() {
       chflags nohidden "$site_packages_dir"/*.pth >/dev/null 2>&1 || true
     fi
   done
+}
+
+repair_torch_geometric_eager_imports() {
+  if [ ! -x ".venv/bin/python" ]; then
+    return
+  fi
+
+  .venv/bin/python - <<'PY'
+from pathlib import Path
+import site
+
+old = """import torch_geometric.utils
+import torch_geometric.data
+import torch_geometric.sampler
+import torch_geometric.loader
+import torch_geometric.transforms
+import torch_geometric.datasets
+import torch_geometric.nn
+import torch_geometric.explain
+import torch_geometric.profile"""
+
+new = """# Import utilities before experimental.py; experimental imports from utils for
+# TorchScript compatibility and otherwise hits a circular import.
+import torch_geometric.utils
+
+# Avoid importing the entire PyG surface at package import time. In this local
+# Streamlit app, top-level torch_geometric imports were eagerly loading datasets,
+# nn, explain, profile and the transformers stack before the UI could render.
+# Submodules remain available through explicit imports such as
+# `from torch_geometric.data import HeteroData`."""
+
+for site_dir in map(Path, site.getsitepackages()):
+    init_path = site_dir / "torch_geometric" / "__init__.py"
+    if not init_path.exists():
+        continue
+    text = init_path.read_text()
+    if old in text:
+        init_path.write_text(text.replace(old, new))
+PY
 }
 
 create_env() {
@@ -161,6 +197,8 @@ else
 fi
 
 repair_dask_runtime_if_needed
+
+repair_torch_geometric_eager_imports
 
 load_env_file() {
   local env_file="$1"

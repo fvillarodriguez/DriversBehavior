@@ -94,7 +94,7 @@ def test_enrich_payload_result_rows_matches_adaptive_arf_by_prediction_year():
     enriched = live_app._enrich_payload_result_rows(rows, roc_payload, yearly=False)
 
     assert enriched[0]["bias2"] == pytest.approx(0.16)
-    assert enriched[0]["variance"] == pytest.approx(0.24)
+    assert enriched[0]["variance"] == pytest.approx(0.0)
     assert enriched[0]["noise"] == pytest.approx(0.0)
 
 

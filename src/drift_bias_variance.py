@@ -137,7 +137,9 @@ def compute_bias_variance_noise_from_roc_items(
             continue
         mean_prob = min(max(sum(obs_scores) / float(len(obs_scores)), 0.0), 1.0)
         bias2_total += (mean_prob - y_val) ** 2
-        variance_total += mean_prob * (1.0 - mean_prob)
+        variance_total += sum((score - mean_prob) ** 2 for score in obs_scores) / float(
+            len(obs_scores)
+        )
         noise_total += y_val * (1.0 - y_val)
         n_obs += 1
 
@@ -203,16 +205,17 @@ def enrich_drift_rows_with_bias_variance(
     roc_payload: Sequence[Mapping[str, Any]],
     *,
     yearly: bool,
+    overwrite_existing: bool = False,
 ) -> list[dict[str, Any]]:
     out = [dict(row) for row in rows if isinstance(row, Mapping)]
     if not out:
         return out
     if not roc_payload:
         for row in out:
-            if is_missing_numeric(row.get("brier_score")):
+            if overwrite_existing or is_missing_numeric(row.get("brier_score")):
                 row["brier_score"] = float("nan")
             for col in BIAS_VARIANCE_NOISE_COLUMNS:
-                if is_missing_numeric(row.get(col)):
+                if overwrite_existing or is_missing_numeric(row.get(col)):
                     row[col] = float("nan")
         return out
 
@@ -220,18 +223,18 @@ def enrich_drift_rows_with_bias_variance(
     brier_lookup = build_brier_score_lookup(roc_payload)
     for row in out:
         row_key = drift_row_group_key(row, yearly=yearly)
-        if is_missing_numeric(row.get("brier_score")):
+        if overwrite_existing or is_missing_numeric(row.get("brier_score")):
             row["brier_score"] = brier_lookup.get(row_key)
         if is_missing_numeric(row.get("brier_score")):
             row["brier_score"] = float("nan")
         metrics = decomposition_lookup.get(row_key)
         if not isinstance(metrics, dict):
             for col in BIAS_VARIANCE_NOISE_COLUMNS:
-                if is_missing_numeric(row.get(col)):
+                if overwrite_existing or is_missing_numeric(row.get(col)):
                     row[col] = float("nan")
             continue
         for col in BIAS_VARIANCE_NOISE_COLUMNS:
-            if is_missing_numeric(row.get(col)):
+            if overwrite_existing or is_missing_numeric(row.get(col)):
                 row[col] = metrics.get(col)
         for col in BIAS_VARIANCE_NOISE_COLUMNS:
             if is_missing_numeric(row.get(col)):

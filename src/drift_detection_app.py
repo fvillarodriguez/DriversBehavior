@@ -3436,6 +3436,7 @@ def _build_smote_key(
     time_col: Optional[str],
     sampling_strategy: float,
     k_neighbors: int,
+    random_state: int,
 ) -> str:
     signature_cols = [str(target_col)] + list(feature_cols)
     if time_col and time_col in train_df.columns:
@@ -3448,6 +3449,7 @@ def _build_smote_key(
         "time_col": None if time_col is None else str(time_col),
         "sampling_strategy": float(sampling_strategy),
         "k_neighbors": int(k_neighbors),
+        "random_state": int(random_state),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
     return f"smote_{digest[:16]}"
@@ -4081,6 +4083,7 @@ def _assemble_recalibration_outputs_from_checkpoints(
                 yearly_results.to_dict(orient="records"),
                 roc_payload,
                 yearly=True,
+                overwrite_existing=True,
             )
         )
     if not adaptive_results.empty:
@@ -4089,6 +4092,7 @@ def _assemble_recalibration_outputs_from_checkpoints(
                 adaptive_results.to_dict(orient="records"),
                 roc_payload,
                 yearly=False,
+                overwrite_existing=True,
             )
         )
     roc_curves = build_average_roc_curves(roc_payload)
@@ -4685,6 +4689,7 @@ def _load_or_create_smote_artifact(
         time_col=time_col,
         sampling_strategy=float(sampling_strategy),
         k_neighbors=int(k_neighbors),
+        random_state=int(random_state),
     )
     artifact_path = smote_cache_dir / f"{smote_key}.duckdb"
     if artifact_path.exists():

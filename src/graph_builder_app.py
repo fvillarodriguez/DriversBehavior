@@ -22,7 +22,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -1631,6 +1631,77 @@ def _dedupe_portico_values(values: Sequence[object]) -> List[str]:
         out.append(_format_portico_value(value))
         seen.add(key)
     return out
+
+
+def _catalog_portico_values(df_port: Optional[pd.DataFrame] = None) -> List[str]:
+    if df_port is None or df_port.empty:
+        try:
+            df_port = load_porticos()
+        except Exception:
+            return []
+    if df_port is None or df_port.empty:
+        return []
+
+    portico_col = _find_column_by_keywords(
+        df_port, ["portico", "cod_portico", "id_portico"]
+    )
+    if not portico_col:
+        return []
+
+    values: List[str] = []
+    seen = set()
+    for value in df_port[portico_col].tolist():
+        key = _normalize_portico_key(value)
+        if not key or key in seen:
+            continue
+        values.append(key)
+        seen.add(key)
+    return values
+
+
+def _filter_porticos_to_catalog(
+    porticos: Sequence[object],
+    df_port: Optional[pd.DataFrame],
+) -> Tuple[List[str], List[str]]:
+    raw_porticos = _dedupe_portico_values(porticos)
+    catalog_keys = set(_catalog_portico_values(df_port))
+    if not raw_porticos or not catalog_keys:
+        return raw_porticos, []
+
+    kept: List[str] = []
+    discarded: List[str] = []
+    for portico in raw_porticos:
+        key = _normalize_portico_key(portico)
+        if key in catalog_keys:
+            kept.append(portico)
+        else:
+            discarded.append(portico)
+    return kept, discarded
+
+
+def _resolve_generation_porticos_filter(
+    df_port: Optional[pd.DataFrame],
+    requested_porticos: Optional[Sequence[object]] = None,
+) -> List[str]:
+    catalog_values = _catalog_portico_values(df_port)
+    if not catalog_values:
+        return []
+
+    if not requested_porticos:
+        return catalog_values
+
+    requested_keys = {
+        key
+        for key in (_normalize_portico_key(value) for value in requested_porticos)
+        if key
+    }
+    if not requested_keys:
+        return []
+    return [
+        value
+        for value in catalog_values
+        if _normalize_portico_key(value) in requested_keys
+    ]
 
 
 def _resolve_portico_interval_by_endpoints(
@@ -10911,6 +10982,75 @@ def _find_column_name(columns: Sequence[str], keywords: Sequence[str]) -> Option
     return None
 
 
+def _duckdb_portico_filter_clause(
+    columns: Sequence[str],
+    porticos_filter: Optional[Sequence[object]],
+) -> Tuple[str, List[object]]:
+    portico_col = _find_column_name(columns, ["portico", "cod_portico", "PORTICO"])
+    portico_values: List[str] = []
+    if porticos_filter:
+        seen = set()
+        for value in porticos_filter:
+            key = _normalize_portico_key(value)
+            if key and key not in seen:
+                portico_values.append(key.upper())
+                seen.add(key)
+    if not portico_col or not portico_values:
+        return "", []
+
+    placeholders = ", ".join(["?"] * len(portico_values))
+    portico_expr = (
+        "upper(regexp_replace(trim(CAST("
+        f"{_quote_duckdb_identifier(portico_col)} AS VARCHAR)), '[.]0$', ''))"
+    )
+    return f"{portico_expr} IN ({placeholders})", portico_values
+
+
+def _filter_flow_frame_to_porticos(
+    flujos_df: Union[pd.DataFrame, pl.DataFrame, pl.LazyFrame],
+    porticos_filter: Optional[Sequence[object]],
+) -> Union[pd.DataFrame, pl.DataFrame, pl.LazyFrame]:
+    if not porticos_filter:
+        return flujos_df
+
+    allowed_values = [
+        key.upper()
+        for key in (_normalize_portico_key(value) for value in porticos_filter)
+        if key
+    ]
+    if not allowed_values:
+        return flujos_df
+
+    if isinstance(flujos_df, pd.DataFrame):
+        portico_col = _find_column_by_keywords(
+            flujos_df, ["portico", "cod_portico", "id_portico"]
+        )
+        if not portico_col:
+            return flujos_df
+        work = flujos_df.copy()
+        keys = work[portico_col].map(_normalize_portico_key).str.upper()
+        return work[keys.isin(set(allowed_values))].copy()
+
+    cols = (
+        list(flujos_df.collect_schema().names())
+        if isinstance(flujos_df, pl.LazyFrame)
+        else list(flujos_df.columns)
+    )
+    portico_col = _find_column_name(cols, ["portico", "cod_portico", "PORTICO"])
+    if not portico_col:
+        return flujos_df
+
+    expr = (
+        pl.col(portico_col)
+        .cast(pl.Utf8)
+        .str.strip_chars()
+        .str.replace(r"[.]0$", "")
+        .str.to_uppercase()
+        .is_in(allowed_values)
+    )
+    return flujos_df.filter(expr)
+
+
 def _pick_feature_duckdb_table(
     tables: Sequence[str],
     preferred: Sequence[str],
@@ -11011,23 +11151,12 @@ def _duckdb_feature_filter_parts(
             clauses.append(f"{hour_expr} >= ? AND {hour_expr} < ?")
             params.extend([start_minute // 60, end_minute // 60])
 
-    portico_col = _find_column_name(columns, ["portico", "cod_portico", "PORTICO"])
-    portico_values = []
-    if porticos_filter:
-        seen = set()
-        for value in porticos_filter:
-            key = _normalize_portico_key(value)
-            if key and key not in seen:
-                portico_values.append(key.upper())
-                seen.add(key)
-    if portico_col and portico_values:
-        placeholders = ", ".join(["?"] * len(portico_values))
-        portico_expr = (
-            "upper(regexp_replace(trim(CAST("
-            f"{_quote_duckdb_identifier(portico_col)} AS VARCHAR)), '[.]0$', ''))"
-        )
-        clauses.append(f"{portico_expr} IN ({placeholders})")
-        params.extend(portico_values)
+    portico_clause, portico_params = _duckdb_portico_filter_clause(
+        columns, porticos_filter
+    )
+    if portico_clause:
+        clauses.append(portico_clause)
+        params.extend(portico_params)
 
     return clauses, params
 
@@ -11463,14 +11592,20 @@ def _feature_portico_sequence_from_source(
             end_date=params.get("end_date"),
             porticos_filter=porticos_filter,
         )
-        ordered = _order_feature_porticos_by_reference(porticos, df_port)
+        filtered_porticos, discarded_porticos = _filter_porticos_to_catalog(
+            porticos, df_port
+        )
+        ordered = _order_feature_porticos_by_reference(filtered_porticos, df_port)
         return {
             "porticos": ordered,
             "source": duckdb_path,
             "table": resolved_table,
             "portico_col": portico_col,
-            "method": "DuckDB DISTINCT",
+            "method": "DuckDB DISTINCT + Porticos.csv",
             "configured_filter_count": configured_filter_count,
+            "raw_portico_count": len(_dedupe_portico_values(porticos)),
+            "discarded_portico_count": len(discarded_porticos),
+            "discarded_porticos": discarded_porticos,
         }
 
     csv_path = feature_config.get("csv_path") if isinstance(feature_config, dict) else None
@@ -11481,15 +11616,21 @@ def _feature_portico_sequence_from_source(
             end_date=params.get("end_date"),
             porticos_filter=porticos_filter,
         )
-        ordered = _order_feature_porticos_by_reference(porticos, df_port)
+        filtered_porticos, discarded_porticos = _filter_porticos_to_catalog(
+            porticos, df_port
+        )
+        ordered = _order_feature_porticos_by_reference(filtered_porticos, df_port)
         method = "DuckDB read_csv_auto DISTINCT" if duckdb is not None else "Pandas usecols"
         return {
             "porticos": ordered,
             "source": str(csv_path),
             "table": None,
             "portico_col": portico_col,
-            "method": method,
+            "method": f"{method} + Porticos.csv",
             "configured_filter_count": configured_filter_count,
+            "raw_portico_count": len(_dedupe_portico_values(porticos)),
+            "discarded_portico_count": len(discarded_porticos),
+            "discarded_porticos": discarded_porticos,
         }
 
     if isinstance(df_pm_cache, pd.DataFrame) and not df_pm_cache.empty:
@@ -11510,14 +11651,20 @@ def _feature_portico_sequence_from_source(
         else:
             work = df_pm_cache
         porticos = work[portico_col].dropna().unique().tolist()
-        ordered = _order_feature_porticos_by_reference(porticos, df_port)
+        filtered_porticos, discarded_porticos = _filter_porticos_to_catalog(
+            porticos, df_port
+        )
+        ordered = _order_feature_porticos_by_reference(filtered_porticos, df_port)
         return {
             "porticos": ordered,
             "source": "df_pm_cache",
             "table": None,
             "portico_col": portico_col,
-            "method": "memoria",
+            "method": "memoria + Porticos.csv",
             "configured_filter_count": configured_filter_count,
+            "raw_portico_count": len(_dedupe_portico_values(porticos)),
+            "discarded_portico_count": len(discarded_porticos),
+            "discarded_porticos": discarded_porticos,
         }
 
     raise ValueError(
@@ -11771,6 +11918,30 @@ def run_feature_generation_workflow(params):
              st.error("Librería duckdb no encontrada. Instale `duckdb`.")
              return None
 
+        catalog_df_port: Optional[pd.DataFrame] = None
+        catalog_porticos_filter: List[str] = []
+        if source_choice == "Generar nuevas":
+            catalog_df_port = st.session_state.get("df_port")
+            if catalog_df_port is None or catalog_df_port.empty:
+                try:
+                    catalog_df_port = load_porticos()
+                    st.session_state.df_port = catalog_df_port
+                except Exception as exc:
+                    st.error(
+                        "No se pudo cargar Porticos.csv para filtrar la generación "
+                        f"de features: {exc}"
+                    )
+                    return None
+            catalog_porticos_filter = _resolve_generation_porticos_filter(
+                catalog_df_port, gen_params.get("porticos_filter")
+            )
+            if not catalog_porticos_filter:
+                st.error(
+                    "No hay pórticos válidos de Porticos.csv para generar features."
+                )
+                return None
+            gen_params["catalog_porticos_filter"] = catalog_porticos_filter
+
         # --- BATCH MODE ---
         if use_batches and source_choice == "Generar nuevas":
             con = None
@@ -11833,7 +12004,11 @@ def run_feature_generation_workflow(params):
                 dt_m = gen_params.get("dt_minutes", int(DT_MINUTES))
                 snap_config = None
                 builder = None
-                df_p = None
+                df_p = (
+                    catalog_df_port.copy()
+                    if isinstance(catalog_df_port, pd.DataFrame)
+                    else None
+                )
                 overlap_minutes = 0
                 if force_snapshot:
                     snap_config = SnapshotConfig()
@@ -11850,7 +12025,6 @@ def run_feature_generation_workflow(params):
                     builder = SnapshotFeatureBuilder(snap_config)
                     overlap_steps = max(snap_config.window_steps, 2)
                     overlap_minutes = int(overlap_steps * snap_config.dt_minutes)
-                    df_p = st.session_state.get("df_port")
                     if df_p is None:
                         df_p = load_porticos()
                 if df_p is None:
@@ -11880,6 +12054,19 @@ def run_feature_generation_workflow(params):
                     select_cols = [c for c in desired_cols if c in cols]
                     if select_cols:
                         select_clause = ", ".join(select_cols)
+                catalog_portico_clause, catalog_portico_params = (
+                    _duckdb_portico_filter_clause(cols, catalog_porticos_filter)
+                )
+                if not catalog_portico_clause:
+                    st.error(
+                        "No se pudo aplicar el filtro de Porticos.csv: "
+                        "la fuente de flujos no contiene columna PORTICO."
+                    )
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+                    return None
                 for idx, (r_start, r_end, label) in enumerate(ranges):
                     status.text(f"Procesando lote {idx+1}/{len(ranges)}: {label}")
                     progress.progress(idx / len(ranges))
@@ -11894,9 +12081,10 @@ def run_feature_generation_workflow(params):
                     q = (
                         f"SELECT {select_clause} FROM {table_name} "
                         f"WHERE try_cast(FECHA as TIMESTAMP) >= '{query_start}' "
-                        f"AND try_cast(FECHA as TIMESTAMP) < '{r_end}'"
+                        f"AND try_cast(FECHA as TIMESTAMP) < '{r_end}' "
+                        f"AND {catalog_portico_clause}"
                     )
-                    batch_df = con.execute(q).pl() # Polars Fetch
+                    batch_df = con.execute(q, catalog_portico_params).pl() # Polars Fetch
                     
                     if not batch_df.is_empty():
                         # Define flow_pd for Cluster compatibility (downstream)
@@ -12203,10 +12391,21 @@ def run_feature_generation_workflow(params):
                         ]
                         if select_cols:
                             select_clause = ", ".join(select_cols)
+                    catalog_portico_clause, catalog_portico_params = (
+                        _duckdb_portico_filter_clause(cols, catalog_porticos_filter)
+                    )
+                    if not catalog_portico_clause:
+                        st.error(
+                            "No se pudo aplicar el filtro de Porticos.csv: "
+                            "la fuente de flujos no contiene columna PORTICO."
+                        )
+                        con.close()
+                        return None
                     query = (
                         f"SELECT {select_clause} FROM {FLOW_TABLE_NAME}"
                     )
                     conditions = []
+                    query_params: List[object] = []
 
                     if gen_params.get("start_date"):
                         conditions.append(
@@ -12222,15 +12421,20 @@ def run_feature_generation_workflow(params):
                             "try_cast(FECHA as TIMESTAMP) < "
                             f"'{end_dt.strftime('%Y-%m-%d')}'"
                         )
+                    conditions.append(catalog_portico_clause)
+                    query_params.extend(catalog_portico_params)
 
                     if conditions:
                         query += " WHERE " + " AND ".join(conditions)
                         status.text(f"Cargando DuckDB filtrado: {query}")
 
-                    df_flows = con.execute(query).pl()
+                    df_flows = con.execute(query, query_params).pl()
                     con.close()
                 else:
                     df_flows = pl.read_csv(selected_raw_path)
+                    df_flows = _filter_flow_frame_to_porticos(
+                        df_flows, catalog_porticos_filter
+                    )
             except Exception as e:
                 st.error(f"Error cargando flujos completo: {e}")
                 return None
@@ -32289,6 +32493,9 @@ def _render_create_graph():
             configured_filter_count = int(
                 feature_portico_info.get("configured_filter_count") or 0
             )
+            discarded_portico_count = int(
+                feature_portico_info.get("discarded_portico_count") or 0
+            )
             st.success(
                 "Tramo inferido desde features: "
                 f"{len(porticos_from_features)} pórticos."
@@ -32302,6 +32509,20 @@ def _render_create_graph():
                 st.caption(
                     "Filtro de carga respetado: "
                     f"{configured_filter_count} pórticos configurados."
+                )
+            if discarded_portico_count:
+                discarded_preview = list(
+                    feature_portico_info.get("discarded_porticos") or []
+                )[:12]
+                suffix = (
+                    f" Ejemplos: {', '.join(map(str, discarded_preview))}."
+                    if discarded_preview
+                    else ""
+                )
+                st.caption(
+                    "Filtro Porticos.csv aplicado: "
+                    f"{discarded_portico_count} pórticos externos descartados."
+                    + suffix
                 )
             st.dataframe(
                 pd.DataFrame(

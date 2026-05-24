@@ -2543,6 +2543,52 @@ def test_load_or_create_smote_artifact_reuses_exact_signature(tmp_path, monkeypa
     assert np.array_equal(y_first, y_second)
 
 
+def test_load_or_create_smote_artifact_keys_include_random_state(tmp_path):
+    pytest.importorskip("imblearn")
+
+    train_df = pd.DataFrame(
+        {
+            "interval_start": pd.date_range("2018-01-01 00:00:00", periods=8, freq="5min"),
+            "x1": [0.0, 0.2, 0.1, -0.1, 1.0, 1.2, 1.1, 0.9],
+            "x2": [1.0, 0.9, 1.1, 1.2, -0.2, -0.1, -0.3, -0.4],
+            "target": [0, 0, 0, 0, 1, 1, 1, 1],
+        }
+    )
+    X = train_df[["x1", "x2"]].copy()
+    y = train_df["target"].astype(int).to_numpy()
+
+    _, _, fit_info_first = drift_app._load_or_create_smote_artifact(
+        run_id="run_unit",
+        train_df=train_df,
+        X=X,
+        y=y,
+        feature_cols=["x1", "x2"],
+        target_col="target",
+        time_col="interval_start",
+        sampling_strategy=1.0,
+        k_neighbors=3,
+        random_state=11,
+        smote_cache_dir=tmp_path,
+        smote_cache_registry={},
+    )
+    _, _, fit_info_second = drift_app._load_or_create_smote_artifact(
+        run_id="run_unit",
+        train_df=train_df,
+        X=X,
+        y=y,
+        feature_cols=["x1", "x2"],
+        target_col="target",
+        time_col="interval_start",
+        sampling_strategy=1.0,
+        k_neighbors=3,
+        random_state=12,
+        smote_cache_dir=tmp_path,
+        smote_cache_registry={},
+    )
+
+    assert fit_info_first["artifact_key"] != fit_info_second["artifact_key"]
+
+
 def test_train_model_with_internal_validation_smote_refits_on_full_training_data():
     pytest.importorskip("imblearn")
 
@@ -5139,6 +5185,54 @@ def test_parse_repetition_seeds_and_multi_seed_logging(tmp_path, monkeypatch):
     assert appendix_mean["A.6"]["n_repetitions"].eq(2).all()
     assert appendix_mean["A.6"]["seed_list"].str.contains("3").all()
     assert {"pr_auc", "brier_score", "bias2", "variance", "noise", "f1"} <= set(appendix_mean["A.6"].columns)
+
+
+def test_yearly_recalibration_multi_seed_mean_tables_are_additive(tmp_path, monkeypatch):
+    monkeypatch.setattr(drift_app, "RESULTS_DIR", tmp_path)
+
+    df = generate_synthetic_article_dataset(years=(2018, 2019, 2020), rows_per_year=180, random_state=37)
+    features = [
+        "flow_light",
+        "flow_heavy",
+        "speed_light",
+        "speed_heavy",
+        "density_light",
+        "density_heavy",
+        "x1",
+        "x2",
+        "x3",
+    ]
+
+    outputs = run_recalibration_experiments(
+        df,
+        feature_cols=features,
+        model_names=["Random Forest"],
+        strategies=["static", "period_aligned", "cumulative"],
+        validation_size=0.2,
+        folds=2,
+        random_state=13,
+        fast_mode=True,
+        grid_limit=2,
+        repetition_seeds=(3, 5),
+    )
+
+    appendix_mean = outputs["appendix_tables_mean"]
+    nonzero_variance_seen = False
+    for key in ["A.6", "A.7", "A.8"]:
+        table = appendix_mean[key]
+        assert not table.empty
+        assert table["n_repetitions"].eq(2).all()
+        assert table["seed_list"].str.contains("3").all()
+        assert table["seed_list"].str.contains("5").all()
+        residual = (
+            table["brier_score"]
+            - table["bias2"]
+            - table["variance"]
+            - table["noise"]
+        ).abs()
+        assert float(residual.max()) == pytest.approx(0.0, abs=1e-12)
+        nonzero_variance_seen = nonzero_variance_seen or bool(table["variance"].abs().gt(1e-12).any())
+    assert nonzero_variance_seen
 
 
 def test_persisted_recalibration_json_keeps_full_records(tmp_path, monkeypatch):
