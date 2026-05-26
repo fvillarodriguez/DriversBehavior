@@ -15,7 +15,9 @@ from plotly.subplots import make_subplots
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
-MODEL_HISTORY_DIR = RESULTS_DIR / "model_history"
+CRASH_RESULTS_DIR = RESULTS_DIR / "crash_prediction"
+MODEL_HISTORY_DIR = CRASH_RESULTS_DIR / "model_history"
+LEGACY_MODEL_HISTORY_DIR = RESULTS_DIR / "model_history"
 THESIS_DESIGN_ROOT = Path.home() / ".codex" / "skills" / "tesis-doctoral-design"
 
 DEFAULT_RUN_IDS = [
@@ -1092,11 +1094,14 @@ def _build_report_html(
 def generate_report(
     *,
     model_history_dir: Path = MODEL_HISTORY_DIR,
-    results_dir: Path = RESULTS_DIR,
+    results_dir: Path = CRASH_RESULTS_DIR,
     run_ids: Sequence[str] = DEFAULT_RUN_IDS,
     design_root: Path = THESIS_DESIGN_ROOT,
     output_stem: str = OUTPUT_STEM,
 ) -> ReportArtifacts:
+    if model_history_dir == MODEL_HISTORY_DIR and not model_history_dir.exists() and LEGACY_MODEL_HISTORY_DIR.exists():
+        model_history_dir = LEGACY_MODEL_HISTORY_DIR
+    results_dir.mkdir(parents=True, exist_ok=True)
     full_history_df = build_history_dataframe(model_history_dir=model_history_dir, run_ids=run_ids)
     latest_context_df = full_history_df.loc[full_history_df["is_latest_for_context"]].copy().reset_index(drop=True)
     latest_context_df["is_pareto_frontier"] = _pareto_frontier_mask(latest_context_df)

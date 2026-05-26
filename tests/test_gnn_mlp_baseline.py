@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -77,6 +78,9 @@ def _make_sequence_index() -> _SequenceIndex:
 
 
 def _run_fast(loaded_obj, baselines, **kwargs):
+    save_dir = kwargs.pop("save_dir", None)
+    if save_dir is None:
+        save_dir = Path(tempfile.mkdtemp(prefix="gnn_mlp_baseline_test_")) / "gnn" / "baselines" / "mlp"
     return run_gnn_mlp_baselines(
         loaded_obj,
         baselines=baselines,
@@ -87,7 +91,7 @@ def _run_fast(loaded_obj, baselines, **kwargs):
         num_layers=1,
         dropout=0.0,
         device="cpu",
-        save_dir=None,
+        save_dir=save_dir,
         seed=123,
         **kwargs,
     )
@@ -446,8 +450,8 @@ def test_gnn_mlp_history_filters_results_by_loaded_graph_hash(tmp_path: Path, mo
 
     graph_hash = "a" * 64
     other_hash = "b" * 64
-    history_dir = tmp_path / "gnn_mlp_baselines"
-    history_dir.mkdir()
+    history_dir = tmp_path / "gnn" / "baselines" / "mlp"
+    history_dir.mkdir(parents=True)
 
     pd.DataFrame(
         [

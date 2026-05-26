@@ -188,6 +188,10 @@ def main() -> None:
         notification_system = _load_page_module("src.notification_system")
         notification_system.render_notification_config()
 
+    def p_trc_paper():
+        trc_paper_app = _load_page_module("src.trc_paper_app")
+        trc_paper_app.main(set_page_config=False, show_exit_button=False)
+
     ps_databases = st.Page(p_flow_database, title="Flow database", icon=":material/database:")
     ps_files = st.Page(p_files, title="Files", icon=":material/folder:")
     ps_github = st.Page(p_github, title="GitHub Sync", icon=":material/sync:")
@@ -210,6 +214,7 @@ def main() -> None:
     ps_latex = st.Page(p_latex, title="LaTeX", icon=":material/picture_as_pdf:")
     ps_docs = st.Page(p_documentacion, title="Documentación", icon=":material/description:")
     ps_home = st.Page(_render_home, title="Inicio", icon=":material/home:", default=True)
+    ps_trc_paper = st.Page(p_trc_paper, title="TRC Paper Pipeline", icon=":material/science:")
 
     # --- NAVIGATION SETUP ---
     pg = st.navigation(
@@ -218,6 +223,7 @@ def main() -> None:
             "Data & Gestión": [ps_databases, ps_files, ps_github],
             "Análisis & Modelos": [ps_clustering, ps_crash, ps_nlp_sev, ps_drift, ps_gnn, ps_marl],
             "Simulación & Vizualización": [ps_events, ps_exp, ps_sumo],
+            "Publicaciones": [ps_trc_paper],
             "Configuración": [ps_notify, ps_dask, ps_rockfish, ps_test, ps_latex],
         }
     )

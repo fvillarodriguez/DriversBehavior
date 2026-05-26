@@ -74,6 +74,7 @@ from src.snapshot_sequences import (
     build_sequence_index,
 )
 from src import notification_system
+from src.gnn_artifacts import gnn_dir, gnn_glob, gnn_path, resolve_gnn_artifact
 from src.config import (
     BATCH_SIZE,
     ACCUMULATION_STEPS,
@@ -129,14 +130,14 @@ from src.gnn_network_builder import (
 )
 
 FEATURE_SELECTION_DIR = Path(RESULTADOS_DIR)
-HISTORY_PATH = Path(RESULTADOS_DIR) / "gnn_history.jsonl"
-GNN_OPTUNA_LIVE_DIR = Path(RESULTADOS_DIR) / "gnn_optuna_live"
-GNN_EVAL_LIVE_DIR = Path(RESULTADOS_DIR) / "gnn_eval_live"
-GNN_NETWORK_LIBRARY_DIR = Path(RESULTADOS_DIR) / "gnn_network_architectures"
-# Copia estable de la última configuración guardada desde el tab Network. Los
+HISTORY_PATH = gnn_path("root", "gnn_history.jsonl", resultados_dir=RESULTADOS_DIR)
+GNN_OPTUNA_LIVE_DIR = gnn_dir("hpo_optuna", RESULTADOS_DIR) / "live_runs"
+GNN_EVAL_LIVE_DIR = gnn_dir("evaluation", RESULTADOS_DIR) / "live_runs"
+GNN_NETWORK_LIBRARY_DIR = gnn_dir("network_architectures", RESULTADOS_DIR)
+# Copia estable de la Ãºltima configuraciÃ³n guardada desde el tab Network. Los
 # `network_config_<timestamp>.json` quedan como historial; este archivo es el
-# que se relee al volver a abrir la app para restaurar la selección del usuario.
-GNN_NETWORK_CONFIG_LATEST_PATH = Path(RESULTADOS_DIR) / "network_config_latest.json"
+# que se relee al volver a abrir la app para restaurar la selecciÃ³n del usuario.
+GNN_NETWORK_CONFIG_LATEST_PATH = gnn_path("network_configs", "network_config_latest.json", resultados_dir=RESULTADOS_DIR)
 GNN_LR_SCHEDULER_LABELS: Dict[str, str] = {
     "one_cycle": "OneCycleLR",
     "cosine_warm_restarts": "CosineAnnealingWarmRestarts",
@@ -670,7 +671,7 @@ class StreamlitStdout:
         if current_time - self.last_update > self.update_interval:
             if not _has_streamlit_script_context():
                 return
-            # Mostrar logs en orden inverso (más recientes arriba) dentro de un div con scroll
+            # Mostrar logs en orden inverso (mÃ¡s recientes arriba) dentro de un div con scroll
             reversed_lines = html.escape("\n".join(reversed(self.lines)))
             html_content = f"""
             <div style="
@@ -1199,7 +1200,7 @@ def _init_gnn_experiment_db(
     meta: Optional[Dict[str, object]] = None,
 ) -> Optional[Path]:
     try:
-        results_dir = Path(RESULTADOS_DIR)
+        results_dir = gnn_dir("experiments_results", RESULTADOS_DIR, create=True)
         results_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         slug = _slugify(experiment_name) or "experiment"
@@ -1300,7 +1301,7 @@ def _append_gnn_experiment_best(
 
 
 def _list_gnn_experiment_result_files() -> List[Path]:
-    results_dir = Path(RESULTADOS_DIR)
+    results_dir = gnn_dir("experiments_results", RESULTADOS_DIR)
     if not results_dir.exists():
         return []
     return sorted(
@@ -1387,7 +1388,7 @@ def _delete_gnn_history_entry(run_id: str) -> bool:
     return False
 
 def _collect_gnn_context() -> Dict[str, object]:
-    """Recopila el contexto actual de la aplicación para el historial."""
+    """Recopila el contexto actual de la aplicaciÃ³n para el historial."""
     context = {}
     
     # 1. Dataset (Eventos)
@@ -1429,7 +1430,7 @@ def _render_history_tab() -> None:
     with c_head:
         st.subheader("GNN Experiment History")
     with c_btn:
-        if st.button("🔄 Actualizar", key="hist_refresh_btn"):
+        if st.button("ðŸ”„ Actualizar", key="hist_refresh_btn"):
             st.rerun()
 
     c_clear_btn, c_clear_chk = st.columns([1, 3])
@@ -1440,7 +1441,7 @@ def _render_history_tab() -> None:
             key="hist_clear_confirm",
         )
     with c_clear_btn:
-        if st.button("🧹 Borrar historial", key="hist_clear_btn", disabled=not confirm_clear):
+        if st.button("ðŸ§¹ Borrar historial", key="hist_clear_btn", disabled=not confirm_clear):
             try:
                 if HISTORY_PATH.exists():
                     HISTORY_PATH.unlink()
@@ -1528,7 +1529,7 @@ def _render_history_tab() -> None:
         with st.expander(title):
             c_del, c_info = st.columns([1, 5])
             with c_del:
-                if st.button("🗑️ Eliminar", key=f"del_hist_{run_id}_{idx}"):
+                if st.button("ðŸ—‘ï¸ Eliminar", key=f"del_hist_{run_id}_{idx}"):
                     if _delete_gnn_history_entry(run_id):
                         st.success("Entrada eliminada.")
                         st.rerun()
@@ -1586,7 +1587,7 @@ def _ts_min_to_dt(ts_min: Optional[int]) -> Optional[pd.Timestamp]:
 
 def _ensure_porticos_loaded() -> Optional[pd.DataFrame]:
     if st.session_state.get("df_port") is None:
-        with st.spinner("Cargando pórticos automáticamente..."):
+        with st.spinner("Cargando pÃ³rticos automÃ¡ticamente..."):
             df_port = load_porticos()
             if df_port is not None:
                 st.session_state.df_port = df_port
@@ -1710,18 +1711,18 @@ def _resolve_portico_interval_by_endpoints(
     p_end: object,
 ) -> List[str]:
     if df_port is None or df_port.empty:
-        raise ValueError("No hay pórticos disponibles para resolver el intervalo.")
+        raise ValueError("No hay pÃ³rticos disponibles para resolver el intervalo.")
 
     portico_col = _find_column_by_keywords(
         df_port, ["portico", "cod_portico", "id_portico"]
     )
     if not portico_col:
-        raise ValueError("Porticos.csv no contiene una columna de pórtico.")
+        raise ValueError("Porticos.csv no contiene una columna de pÃ³rtico.")
 
     start_key = _normalize_portico_key(p_start)
     end_key = _normalize_portico_key(p_end)
     if not start_key or not end_key:
-        raise ValueError("Ingrese pórtico de inicio y pórtico de término.")
+        raise ValueError("Ingrese pÃ³rtico de inicio y pÃ³rtico de tÃ©rmino.")
 
     work = df_port.copy()
     work["_portico_key"] = work[portico_col].map(_normalize_portico_key)
@@ -1803,7 +1804,7 @@ def _resolve_portico_interval_by_endpoints(
             return candidates[0][2]
 
     raise ValueError(
-        "Los pórticos de inicio y término no comparten una secuencia ordenada "
+        "Los pÃ³rticos de inicio y tÃ©rmino no comparten una secuencia ordenada "
         "en Porticos.csv."
     )
 
@@ -1813,11 +1814,11 @@ def _render_tramo_selector(
     key_prefix: str,
 ) -> Tuple[Optional[List[str]], Optional[str]]:
     if df_port is None or df_port.empty:
-        st.warning("No hay pórticos disponibles para definir el tramo.")
+        st.warning("No hay pÃ³rticos disponibles para definir el tramo.")
         return None, None
 
     tramo_mode = st.radio(
-        "Definición del Grafo (Tramo)",
+        "DefiniciÃ³n del Grafo (Tramo)",
         ["Manual", "Puntos Negros (Reporte)"],
         index=0,
         key=f"{key_prefix}_tramo_mode",
@@ -1845,7 +1846,7 @@ def _render_tramo_selector(
             if st.button("Calcular nuevo reporte", key=f"{key_prefix}_pn_calc_report"):
                 acc_df = st.session_state.get("df_acc")
                 if acc_df is None or acc_df.empty:
-                    st.warning("Cargue accidentes en la pestaña Eventos.")
+                    st.warning("Cargue accidentes en la pestaÃ±a Eventos.")
                 else:
                     stats = _compute_puntos_negros_report(acc_df, df_port)
                     if stats is None or stats.empty:
@@ -1909,7 +1910,7 @@ def _render_tramo_selector(
                             deduplicate_slice=True,
                         )
                         st.info(
-                            "Pórticos seleccionados "
+                            "PÃ³rticos seleccionados "
                             f"({len(porticos_a_incluir)}): {porticos_a_incluir}"
                         )
                 except Exception as e:
@@ -1919,7 +1920,7 @@ def _render_tramo_selector(
         manual_mode_key = f"{key_prefix}_manual_mode"
         manual_mode = st.radio(
             "Modo manual",
-            ["Selector avanzado", "Solo inicio y término"],
+            ["Selector avanzado", "Solo inicio y tÃ©rmino"],
             horizontal=True,
             key=manual_mode_key,
         )
@@ -1929,17 +1930,17 @@ def _render_tramo_selector(
             st.session_state[manual_state_key] = manual_mode
             st.session_state.pop(manual_key, None)
 
-        if manual_mode == "Solo inicio y término":
+        if manual_mode == "Solo inicio y tÃ©rmino":
             c_start, c_end = st.columns(2)
             with c_start:
                 p_start_raw = st.text_input(
-                    "Pórtico inicio",
+                    "PÃ³rtico inicio",
                     key=f"{key_prefix}_portico_start_raw",
                     placeholder="Ej: 12",
                 )
             with c_end:
                 p_end_raw = st.text_input(
-                    "Pórtico término",
+                    "PÃ³rtico tÃ©rmino",
                     key=f"{key_prefix}_portico_end_raw",
                     placeholder="Ej: 18",
                 )
@@ -1952,20 +1953,20 @@ def _render_tramo_selector(
                     st.session_state[manual_key] = porticos_a_incluir
                     st.success(
                         "Intervalo manual seleccionado: "
-                        f"{len(porticos_a_incluir)} pórticos"
+                        f"{len(porticos_a_incluir)} pÃ³rticos"
                     )
                 except ValueError as exc:
                     st.session_state.pop(manual_key, None)
                     st.error(str(exc))
             else:
                 st.caption(
-                    "Ingrese ambos pórticos para filtrar todos los pórticos "
+                    "Ingrese ambos pÃ³rticos para filtrar todos los pÃ³rticos "
                     "del intervalo."
                 )
 
             if manual_key in st.session_state:
                 porticos_a_incluir = st.session_state[manual_key]
-                st.write(f"Selección actual: {porticos_a_incluir}")
+                st.write(f"SelecciÃ³n actual: {porticos_a_incluir}")
             return porticos_a_incluir, preselected_time_choice
 
         autopista = None
@@ -1975,7 +1976,7 @@ def _render_tramo_selector(
             )
             autopista_map = {
                 "C": "Ruta 5 (Central)",
-                "NO": "General Velásquez",
+                "NO": "General VelÃ¡squez",
             }
             if autopista_options:
                 auto_key = f"{key_prefix}_autopista"
@@ -2052,7 +2053,7 @@ def _render_tramo_selector(
         porticos_disp = list(pd.Index(portico_series).drop_duplicates())
 
         if not porticos_disp:
-            st.warning("No hay pórticos disponibles para esta calzada.")
+            st.warning("No hay pÃ³rticos disponibles para esta calzada.")
             p_start = None
             p_end = None
         else:
@@ -2069,7 +2070,7 @@ def _render_tramo_selector(
                 if st.session_state.get(start_key) not in porticos_disp:
                     st.session_state[start_key] = porticos_disp[0]
                 p_start = st.selectbox(
-                    "Pórtico Inicio", porticos_disp, key=start_key
+                    "PÃ³rtico Inicio", porticos_disp, key=start_key
                 )
             with c2:
                 try:
@@ -2082,7 +2083,7 @@ def _render_tramo_selector(
                 end_key = f"{key_prefix}_portico_end"
                 if st.session_state.get(end_key) not in end_options:
                     st.session_state[end_key] = end_options[-1]
-                p_end = st.selectbox("Pórtico Fin", end_options, key=end_key)
+                p_end = st.selectbox("PÃ³rtico Fin", end_options, key=end_key)
 
         if p_start and p_end and st.button(
             "Confirmar Tramo", key=f"{key_prefix}_confirm_tramo"
@@ -2099,14 +2100,14 @@ def _render_tramo_selector(
                 )
                 st.success(
                     "Tramo manual seleccionado: "
-                    f"{len(porticos_a_incluir)} pórticos"
+                    f"{len(porticos_a_incluir)} pÃ³rticos"
                 )
             except ValueError:
-                st.error("Error calculando rango de pórticos")
+                st.error("Error calculando rango de pÃ³rticos")
 
         if manual_key in st.session_state:
             porticos_a_incluir = st.session_state[manual_key]
-            st.write(f"Selección actual: {porticos_a_incluir}")
+            st.write(f"SelecciÃ³n actual: {porticos_a_incluir}")
 
     return porticos_a_incluir, preselected_time_choice
 
@@ -2123,7 +2124,7 @@ def _apply_tramo_filter(
     porticos_norm = _normalize_portico_series(pd.Series(porticos_filter))
     porticos_norm = list(pd.Index(porticos_norm).dropna().drop_duplicates())
     if not porticos_norm:
-        msg = "No hay pórticos válidos en el tramo seleccionado."
+        msg = "No hay pÃ³rticos vÃ¡lidos en el tramo seleccionado."
         if status is not None:
             status.warning(msg)
         else:
@@ -2134,7 +2135,7 @@ def _apply_tramo_filter(
         df_pm, ["portico", "cod_portico", "id_portico"]
     )
     if not portico_col:
-        msg = "Columna de pórtico no encontrada en features."
+        msg = "Columna de pÃ³rtico no encontrada en features."
         if status is not None:
             status.warning(msg)
         else:
@@ -2421,7 +2422,7 @@ def _sanitize_path_token(value: object) -> str:
 
 
 def _resolve_z2x_dir(base_dir: str, model_path: Optional[str]) -> str:
-    base_dir = base_dir or os.path.join(RESULTADOS_DIR, "z2x_decoders")
+    base_dir = base_dir or str(gnn_path("models_graphsmote", "z2x_decoders", resultados_dir=RESULTADOS_DIR, create_parent=True))
     if not model_path or model_path == "(ninguno)":
         return base_dir
     model_path_obj = Path(model_path)
@@ -2498,7 +2499,7 @@ def _process_event_files(
 
 def _infer_edge_feature_dim(graph_data: HeteroData) -> int:
     """Maximum raw feature dim across edge types (compat: legacy callers usaban
-    un único escalar). Para el dim por tipo usar `_infer_edge_feature_dims`."""
+    un Ãºnico escalar). Para el dim por tipo usar `_infer_edge_feature_dims`."""
     best = 0
     for edge_type in graph_data.edge_types:
         store = graph_data[edge_type]
@@ -2515,7 +2516,7 @@ def _infer_edge_feature_dims(
     graph_data: HeteroData,
 ) -> Dict[Tuple[str, str, str], int]:
     """Return `{edge_type: raw_feature_dim}` for each relation in the graph.
-    Edge types sin `edge_attr` o vacías reportan 0."""
+    Edge types sin `edge_attr` o vacÃ­as reportan 0."""
     dims: Dict[Tuple[str, str, str], int] = {}
     for edge_type in graph_data.edge_types:
         store = graph_data[edge_type]
@@ -2533,12 +2534,12 @@ def _infer_edge_feature_dims(
 def _infer_edge_encoder_kinds_from_state_dict(
     state_dict: Optional[Dict[str, torch.Tensor]],
 ) -> Dict[Tuple[str, str, str], str]:
-    """Detecta el *tipo* de encoder por arista mirando qué parámetros existen:
+    """Detecta el *tipo* de encoder por arista mirando quÃ© parÃ¡metros existen:
 
-    - `time2vec`     → `edge_attr_encoders.<key>.linear_w` (Parameter 1-d).
-    - `layernorm_mlp`→ `edge_attr_encoders.<key>.norm.weight` (LayerNorm).
-    - `mlp_residual` → `edge_attr_encoders.<key>.skip.weight` (Linear skip).
-    - `mlp`          → cae si solo aparece `edge_attr_encoders.<key>.net.0.weight`.
+    - `time2vec`     â†’ `edge_attr_encoders.<key>.linear_w` (Parameter 1-d).
+    - `layernorm_mlp`â†’ `edge_attr_encoders.<key>.norm.weight` (LayerNorm).
+    - `mlp_residual` â†’ `edge_attr_encoders.<key>.skip.weight` (Linear skip).
+    - `mlp`          â†’ cae si solo aparece `edge_attr_encoders.<key>.net.0.weight`.
 
     Si el checkpoint no es de un `HeteroGATWithEdgeEncoder`, devuelve {}.
     """
@@ -2577,15 +2578,15 @@ def _infer_edge_encoder_kinds_from_state_dict(
 def _infer_edge_feature_dims_from_state_dict(
     state_dict: Optional[Dict[str, torch.Tensor]],
 ) -> Dict[Tuple[str, str, str], int]:
-    """Detecta el `in_dim` raw por tipo de arista en el checkpoint, agnóstico
+    """Detecta el `in_dim` raw por tipo de arista en el checkpoint, agnÃ³stico
     al tipo de encoder.
 
     Inspecciona, en orden:
-      - `edge_attr_encoders.<key>.linear_w.shape[0]`  → Time2Vec (in_dim).
-      - `edge_attr_encoders.<key>.norm.weight.shape[0]` → LayerNormMLP.
-      - `edge_attr_encoders.<key>.skip.weight.shape[1]` → MLPResidual.
-      - `edge_attr_encoders.<key>.mlp.0.weight.shape[1]` → MLPResidual fallback.
-      - `edge_attr_encoders.<key>.net.0.weight.shape[1]` → MLP/LayerNormMLP.
+      - `edge_attr_encoders.<key>.linear_w.shape[0]`  â†’ Time2Vec (in_dim).
+      - `edge_attr_encoders.<key>.norm.weight.shape[0]` â†’ LayerNormMLP.
+      - `edge_attr_encoders.<key>.skip.weight.shape[1]` â†’ MLPResidual.
+      - `edge_attr_encoders.<key>.mlp.0.weight.shape[1]` â†’ MLPResidual fallback.
+      - `edge_attr_encoders.<key>.net.0.weight.shape[1]` â†’ MLP/LayerNormMLP.
       - Fallback sin encoder: `convs.*.lin_edge.weight.shape[1]`.
     """
     if not isinstance(state_dict, dict):
@@ -2635,7 +2636,7 @@ def _infer_edge_encoded_dims_from_state_dict(
     state_dict: Optional[Dict[str, torch.Tensor]],
 ) -> Dict[Tuple[str, str, str], int]:
     """Encoded edge_dim por tipo (output del encoder = input al GATConv). Para
-    cada `kind` se mira la última proyección lineal del encoder:
+    cada `kind` se mira la Ãºltima proyecciÃ³n lineal del encoder:
       - mlp / layernorm_mlp: `net.3.weight.shape[0]`
       - mlp_residual:        `mlp.3.weight.shape[0]` (o `skip.weight.shape[0]`)
       - time2vec:            `proj.weight.shape[0]`
@@ -2673,7 +2674,7 @@ def _infer_edge_encoder_hidden_dims_from_state_dict(
 
     Es necesario para reconstruir checkpoints `gat_edge_mlp*` con `strict=True`:
     el `hidden_dim` del encoder no se deduce de `in_dim`/`encoded_dim` y puede
-    venir de Optuna o de una configuración per-type.
+    venir de Optuna o de una configuraciÃ³n per-type.
     """
     if not isinstance(state_dict, dict):
         return {}
@@ -2812,7 +2813,7 @@ def _resolve_edge_feature_dims_for_model(
     """Combine: si el checkpoint tiene encoders por tipo, usar esos `in_dim`
     (necesario para `strict=True` load); en caso contrario inferir desde el
     grafo. Para variantes sin encoder MLP (GATConv directo) este resultado
-    sigue siendo válido porque también se usa como `edge_dim` del GATConv."""
+    sigue siendo vÃ¡lido porque tambiÃ©n se usa como `edge_dim` del GATConv."""
     dims: Dict[Tuple[str, str, str], int] = {}
     try:
         dims.update(_infer_edge_feature_dims(graph_data))
@@ -2837,7 +2838,7 @@ def _resolve_edge_encoded_dims_for_model(
 def _resolve_edge_encoder_hidden_dims_for_model(
     state_dict: Optional[Dict[str, torch.Tensor]],
 ) -> Optional[Dict[Tuple[str, str, str], int]]:
-    """Hidden dims inferidas del checkpoint para reconstrucción estricta."""
+    """Hidden dims inferidas del checkpoint para reconstrucciÃ³n estricta."""
     ckpt_dims = _infer_edge_encoder_hidden_dims_from_state_dict(state_dict)
     return ckpt_dims or None
 
@@ -2927,14 +2928,14 @@ def _check_model_graph_compat(
 
     if expected_in is not None and current_in is not None and int(expected_in) != int(current_in):
         return False, (
-            "El modelo fue entrenado con un número distinto de features. "
+            "El modelo fue entrenado con un nÃºmero distinto de features. "
             f"Checkpoint in_channels={int(expected_in)} vs grafo actual in_channels={int(current_in)}."
         )
     # Con dims por tipo el escalar deja de ser un signal fiable: el checkpoint
-    # puede tener distintos `in_dim` por relación y el `max` calculado para
-    # `_infer_edge_feature_dim` no tiene por qué coincidir. La incompatibilidad
-    # real (encoder weight shape mismatch) la detectará `load_state_dict` con
-    # strict=True después; aquí solo cortamos cuando el checkpoint era un único
+    # puede tener distintos `in_dim` por relaciÃ³n y el `max` calculado para
+    # `_infer_edge_feature_dim` no tiene por quÃ© coincidir. La incompatibilidad
+    # real (encoder weight shape mismatch) la detectarÃ¡ `load_state_dict` con
+    # strict=True despuÃ©s; aquÃ­ solo cortamos cuando el checkpoint era un Ãºnico
     # escalar (sin encoders por tipo) y ese escalar no encaja.
     ckpt_dims_per_type = _infer_edge_feature_dims_from_state_dict(state_dict)
     if (
@@ -2944,27 +2945,19 @@ def _check_model_graph_compat(
         and int(expected_edge) > int(current_edge)
     ):
         return False, (
-            "El modelo fue entrenado con un número distinto de edge features. "
+            "El modelo fue entrenado con un nÃºmero distinto de edge features. "
             f"Checkpoint edge_feature_dim={int(expected_edge)} vs grafo actual edge_feature_dim={int(current_edge)}."
         )
     return True, None
 
 def _list_graph_files_for_eval() -> List[str]:
-    patterns = [
-        "graph_*.pt",
-        "graph_smote_*.pt",
-        "graph_aug*.pt",
-        "graph_imgagn_relational_*.pt",
-        "highway_graph_*.pt",
-    ]
     files: List[str] = []
-    for pattern in patterns:
-        files.extend(glob.glob(os.path.join(RESULTADOS_DIR, pattern)))
-    if not files:
-        files = [
-            p for p in glob.glob(os.path.join(RESULTADOS_DIR, "*.pt"))
-            if "graph" in os.path.basename(p).lower()
-        ]
+    files.extend(gnn_glob("graphs_base", "highway_graph_*.pt", RESULTADOS_DIR))
+    files.extend(gnn_glob("graphs_base", "graph_*.pt", RESULTADOS_DIR))
+    files.extend(gnn_glob("graphs_graphsmote", "graph_*.pt", RESULTADOS_DIR))
+    files.extend(gnn_glob("graphs_graphsmote", "highway_graph_SMOTE*.pt", RESULTADOS_DIR))
+    files.extend(gnn_glob("graphs_imgagn", "graph_imgagn_relational_*.pt", RESULTADOS_DIR))
+    files.extend(gnn_glob("graphs_imgagn", "highway_graph_ImGAGN*.pt", RESULTADOS_DIR))
     files = [
         path
         for path in set(files)
@@ -3000,7 +2993,7 @@ def _torch_save_atomic(obj: object, path: str | Path) -> Path:
         torch.save(obj, tmp_path)
         if not _torch_archive_has_pickle_payload(tmp_path):
             raise RuntimeError(
-                "El archivo temporal PyTorch quedó incompleto: falta data.pkl."
+                "El archivo temporal PyTorch quedÃ³ incompleto: falta data.pkl."
             )
         os.replace(tmp_path, path_obj)
     except Exception:
@@ -3014,11 +3007,18 @@ def _list_saved_balanced_graph_files() -> Tuple[List[str], List[str]]:
     patterns = [
         "graph_smote_*.pt",
         "graph_aug.pt",
+        "graph_aug*.pt",
+        "highway_graph_SMOTE*.pt",
+    ]
+    imgagn_patterns = [
         "graph_imgagn_relational_*.pt",
+        "highway_graph_ImGAGN*.pt",
     ]
     candidates: List[str] = []
     for pattern in patterns:
-        candidates.extend(glob.glob(os.path.join(RESULTADOS_DIR, pattern)))
+        candidates.extend(gnn_glob("graphs_graphsmote", pattern, RESULTADOS_DIR))
+    for pattern in imgagn_patterns:
+        candidates.extend(gnn_glob("graphs_imgagn", pattern, RESULTADOS_DIR))
     valid: List[str] = []
     invalid: List[str] = []
     for path in sorted(set(candidates), key=os.path.getmtime, reverse=True):
@@ -3256,11 +3256,7 @@ def _load_hparams_for_model(model_path: str) -> Dict[str, object]:
 
 
 def _list_gnn_model_files_for_baseline() -> List[str]:
-    return sorted(
-        glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")),
-        key=os.path.getmtime,
-        reverse=True,
-    )
+    return gnn_glob("models_gat", "gat_model_BEST*.pt", RESULTADOS_DIR, sort_mtime=True, reverse=True)
 
 
 def _gnn_model_filename_matches_graph_hash(
@@ -3359,7 +3355,7 @@ def _coerce_bool(value: object, default: bool = False) -> bool:
             pass
         return bool(value)
     text = str(value).strip().lower()
-    if text in {"1", "true", "t", "yes", "y", "s", "si", "sí"}:
+    if text in {"1", "true", "t", "yes", "y", "s", "si", "sÃ­"}:
         return True
     if text in {"0", "false", "f", "no", "n", ""}:
         return False
@@ -4041,7 +4037,7 @@ def _display_mlp_baseline_results(df: pd.DataFrame) -> None:
         return
     df = _comparison_test_only_dataframe(df)
     if df.empty:
-        st.info("No hay filas `test` para mostrar en esta comparación.")
+        st.info("No hay filas `test` para mostrar en esta comparaciÃ³n.")
         return
     display_cols = [
         "model",
@@ -4186,11 +4182,11 @@ def _render_mlp_baseline_results_chart(
             labels={
                 "model_split": "Modelo / split",
                 "value": "Valor",
-                "metric": "Métrica",
+                "metric": "MÃ©trica",
             },
             height=max(360, 170 * min(len(selected_labels), 5)),
         )
-        fig.update_layout(legend_title_text="Métrica", margin=dict(l=10, r=10, t=35, b=10))
+        fig.update_layout(legend_title_text="MÃ©trica", margin=dict(l=10, r=10, t=35, b=10))
         fig.update_xaxes(tickangle=-25)
         fig.update_yaxes(matches=None)
         st.plotly_chart(fig, width="stretch")
@@ -4205,7 +4201,7 @@ def _render_mlp_baseline_results_chart(
 
 
 def _gnn_mlp_baseline_results_dir() -> Path:
-    return Path(RESULTADOS_DIR) / "gnn_mlp_baselines"
+    return gnn_dir("baselines_mlp", RESULTADOS_DIR, create=True)
 
 
 def _comparison_hash_text(value: object) -> str:
@@ -5139,10 +5135,7 @@ def _select_latest_gat_model(
     use_graphsmote: bool,
     graph_obj: Dict[str, object],
 ) -> Optional[str]:
-    files = sorted(
-        glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")),
-        key=os.path.getmtime,
-    )
+    files = gnn_glob("models_gat", "gat_model_BEST*.pt", RESULTADOS_DIR, sort_mtime=True)
     if not files:
         return None
     want_imgagn = bool(graph_obj.get("imgagn_best_params")) or (
@@ -5260,10 +5253,7 @@ def _list_hpo_files_for_training(
     use_imgagn: Optional[bool] = None,
     graph_obj: Dict[str, object],
 ) -> List[str]:
-    all_hp_files = sorted(
-        glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv")),
-        key=os.path.getmtime,
-    )
+    all_hp_files = gnn_glob("hpo_optuna", "optuna_hyperparams_*.csv", RESULTADOS_DIR, sort_mtime=True)
     if not all_hp_files:
         return []
     graph_hash = _resolve_graph_hash_for_loaded_graph(graph_obj or {})
@@ -5351,10 +5341,7 @@ def _list_hpo_files_for_gnn_training_prompt(
     ``run_gat_training`` will print, not against the UI's graph-hash-filtered
     list.
     """
-    all_hp_files = sorted(
-        glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv")),
-        key=os.path.getmtime,
-    )
+    all_hp_files = gnn_glob("hpo_optuna", "optuna_hyperparams_*.csv", RESULTADOS_DIR, sort_mtime=True)
     want_imgagn = bool((graph_obj or {}).get("imgagn_best_params")) or (
         "ImGAGN" in str((graph_obj or {}).get("filename", ""))
     )
@@ -5927,7 +5914,7 @@ def _apply_imgagn_to_graph(
     device: torch.device,
 ) -> HeteroData:
     raise RuntimeError(
-        "ImGAGN homogéneo fue retirado del flujo productivo. "
+        "ImGAGN homogÃ©neo fue retirado del flujo productivo. "
         "Use Balance -> ImGAGN relacional parent-anchored para generar grafos relacionales."
     )
 
@@ -5975,10 +5962,7 @@ def _train_gnn_with_best_params(
     except Exception:
         return None
 
-    all_hp_files = sorted(
-        glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv")),
-        key=os.path.getmtime,
-    )
+    all_hp_files = gnn_glob("hpo_optuna", "optuna_hyperparams_*.csv", RESULTADOS_DIR, sort_mtime=True)
     want_imgagn = bool(graph_obj.get("imgagn_best_params")) or (
         "ImGAGN" in str(graph_obj.get("filename", ""))
     )
@@ -6158,7 +6142,7 @@ def _evaluate_gnn_model_far_target(
     )
     if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
         raise ValueError(
-            f"El checkpoint requiere temporal_head, pero la variante reconstruida ({gnn_variant}) no lo creó."
+            f"El checkpoint requiere temporal_head, pero la variante reconstruida ({gnn_variant}) no lo creÃ³."
         )
 
     model.load_state_dict(state_dict, strict=True)
@@ -6473,8 +6457,8 @@ def _network_config_to_hparams(
     cfg: Dict[str, object], *, use_graphsmote: bool
 ) -> Dict[str, object]:
     # Defaults alineados con RECOMMENDED_NETWORK_DEFAULTS para clase rara (~0.3%):
-    # FocalLoss(α=0.75, γ=1.5), hidden=48, dropout=0.35, lr=1e-4, wd=5e-3,
-    # scheduler=plateau_restart. Calibración v2 para evitar overfit de epoch-1.
+    # FocalLoss(Î±=0.75, Î³=1.5), hidden=48, dropout=0.35, lr=1e-4, wd=5e-3,
+    # scheduler=plateau_restart. CalibraciÃ³n v2 para evitar overfit de epoch-1.
     train_sampler_mode = _normalize_gnn_train_sampler_mode(
         cfg.get("train_sampler_mode", "neighbor")
     )
@@ -6552,8 +6536,8 @@ def _network_config_to_hparams(
             cfg.get("rl_similarity_pretrain_epochs", 3)
         ),
         "rl_lambda_simi": float(cfg.get("rl_lambda_simi", 2.0)),
-        # JSON-serializa lista plana o dict por relación; _resolve_num_neighbors
-        # en gnn_main.py mapea dict (string keys) → tuple (edge_type) automáticamente.
+        # JSON-serializa lista plana o dict por relaciÃ³n; _resolve_num_neighbors
+        # en gnn_main.py mapea dict (string keys) â†’ tuple (edge_type) automÃ¡ticamente.
         "num_neighbors": json.dumps(cfg.get("num_neighbors", [15, 10])),
         "checkpoint_metric": str(cfg.get("checkpoint_metric", "val_auprc")),
         "use_graphsmote": bool(use_graphsmote),
@@ -6597,12 +6581,13 @@ def _save_network_hparams(
     graph_hash_source = graph_identity.get("graph_hash_source")
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
     variant_tag = "_GraphSMOTE" if use_graphsmote else "_Base"
-    path = os.path.join(
-        RESULTADOS_DIR,
+    path = str(gnn_path(
+        "hpo_optuna",
         f"optuna_hyperparams_network_{timestamp}{hash_tag}{variant_tag}.csv",
-    )
+        resultados_dir=RESULTADOS_DIR,
+        create_parent=True,
+    ))
     try:
-        os.makedirs(RESULTADOS_DIR, exist_ok=True)
         params = _network_config_to_hparams(cfg, use_graphsmote=use_graphsmote)
         params["hparams_source"] = "Network"
         if graph_hash:
@@ -7047,6 +7032,559 @@ def _build_bidirectional_spatial_edges(
     )
 
 
+def _available_memory_bytes() -> Optional[int]:
+    if psutil is None:
+        return None
+    try:
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def _torch_dtype_nbytes(dtype: torch.dtype) -> int:
+    try:
+        return int(torch.empty((), dtype=dtype).element_size())
+    except Exception:
+        return 4
+
+
+def _validate_pm_key_uniqueness(df_pm: pd.DataFrame, portico_col: str) -> None:
+    required = {portico_col, "ts_min"}
+    missing = [col for col in required if col not in df_pm.columns]
+    if missing:
+        raise KeyError(
+            "df_pm no contiene columnas requeridas para construir aristas: "
+            + ", ".join(missing)
+        )
+    duplicated = df_pm.duplicated([portico_col, "ts_min"], keep=False)
+    if bool(duplicated.any()):
+        sample = (
+            df_pm.loc[duplicated, [portico_col, "ts_min"]]
+            .head(10)
+            .to_dict("records")
+        )
+        raise ValueError(
+            "Se detectaron claves PM duplicadas (portico, ts_min); "
+            f"no se puede construir un grafo global consistente. Ejemplos: {sample}"
+        )
+
+
+def _build_portico_sequence_frame(df_port_use: pd.DataFrame) -> pd.DataFrame:
+    portico_sequences: List[Tuple[object, object, float]] = []
+    if df_port_use is None or df_port_use.empty:
+        return pd.DataFrame(
+            columns=["portico_src", "portico_dst", "dist_km"]
+        )
+    df_port_s = df_port_use.sort_values(
+        ["calzada", "eje", "orden"],
+        ascending=[False, True, True],
+    )
+    for (_, _), group in df_port_s.groupby(["calzada", "eje"]):
+        ports = group["portico"].tolist()
+        kms = (
+            group["km"].astype(float).tolist()
+            if "km" in group.columns
+            else [0.0] * len(ports)
+        )
+        for idx in range(len(ports) - 1):
+            dkm = abs(float(kms[idx + 1]) - float(kms[idx]))
+            portico_sequences.append((ports[idx], ports[idx + 1], dkm))
+    return pd.DataFrame(
+        portico_sequences,
+        columns=["portico_src", "portico_dst", "dist_km"],
+    )
+
+
+def _estimate_chunk_target_rows(
+    *,
+    num_rows: int,
+    delta_dim: int,
+    physical_dim: int,
+    portico_count: int,
+    build_temporal: bool,
+    build_spatial: bool,
+    build_st_fwd: bool,
+    requested_target_rows: Optional[int] = None,
+) -> Dict[str, object]:
+    if requested_target_rows is not None and int(requested_target_rows) > 0:
+        target = int(requested_target_rows)
+        return {
+            "target_rows": max(1, target),
+            "strategy": "manual",
+            "available_memory_mb": None,
+            "budget_mb": None,
+            "estimated_bytes_per_source_row": None,
+        }
+
+    available = _available_memory_bytes()
+    fallback_budget = 256 * 1024 * 1024
+    if available is None:
+        budget = fallback_budget
+    else:
+        budget = int(max(64 * 1024 * 1024, min(available * 0.10, 768 * 1024 * 1024)))
+
+    max_attr_dim = max(int(delta_dim), int(delta_dim) + int(physical_dim))
+    relations_per_source = 0
+    if build_temporal:
+        relations_per_source += 1
+    if build_spatial:
+        relations_per_source += 2
+    if build_st_fwd:
+        relations_per_source += 1
+    relations_per_source = max(1, relations_per_source)
+
+    bytes_per_source_row = (
+        256
+        + relations_per_source * (2 * 8 + max_attr_dim * 4)
+        + max(1, int(portico_count)) * 8
+    )
+    target = int(budget // max(1, bytes_per_source_row))
+    target = max(1_000, min(target, 500_000, max(1, int(num_rows))))
+    return {
+        "target_rows": int(target),
+        "strategy": "auto_available_memory",
+        "available_memory_mb": None
+        if available is None
+        else round(available / (1024 * 1024), 2),
+        "budget_mb": round(budget / (1024 * 1024), 2),
+        "estimated_bytes_per_source_row": int(bytes_per_source_row),
+    }
+
+
+def _build_time_chunks(
+    df_pm_edges: pd.DataFrame,
+    *,
+    ts_col: str = "ts_min",
+    target_rows: int,
+) -> List[Dict[str, int]]:
+    if df_pm_edges is None or df_pm_edges.empty:
+        return []
+    counts = df_pm_edges.groupby(ts_col, sort=True).size()
+    chunks: List[Dict[str, int]] = []
+    start_ts: Optional[int] = None
+    prev_ts: Optional[int] = None
+    row_count = 0
+    ts_count = 0
+    target = max(1, int(target_rows))
+    for raw_ts, raw_count in counts.items():
+        ts = int(raw_ts)
+        count = int(raw_count)
+        if row_count > 0 and row_count + count > target:
+            chunks.append(
+                {
+                    "start_ts": int(start_ts),
+                    "end_ts": int(prev_ts),
+                    "row_count": int(row_count),
+                    "timestamp_count": int(ts_count),
+                }
+            )
+            start_ts = ts
+            row_count = 0
+            ts_count = 0
+        if start_ts is None:
+            start_ts = ts
+        prev_ts = ts
+        row_count += count
+        ts_count += 1
+    if row_count > 0 and start_ts is not None and prev_ts is not None:
+        chunks.append(
+            {
+                "start_ts": int(start_ts),
+                "end_ts": int(prev_ts),
+                "row_count": int(row_count),
+                "timestamp_count": int(ts_count),
+            }
+        )
+    return chunks
+
+
+def _write_edge_shard(
+    tmp_dir: Path,
+    *,
+    relation: str,
+    chunk_idx: int,
+    src: Sequence[int] | np.ndarray,
+    dst: Sequence[int] | np.ndarray,
+    attr: np.ndarray,
+) -> Optional[Dict[str, object]]:
+    src_arr = np.asarray(src, dtype=np.int64)
+    dst_arr = np.asarray(dst, dtype=np.int64)
+    if src_arr.size == 0:
+        return None
+    attr_arr = np.asarray(attr, dtype=np.float32)
+    if attr_arr.ndim == 1:
+        attr_arr = attr_arr.reshape(-1, 1)
+    if attr_arr.shape[0] != src_arr.shape[0]:
+        raise ValueError(
+            f"edge_attr desalineado para {relation}: "
+            f"{attr_arr.shape[0]} atributos vs {src_arr.shape[0]} aristas."
+        )
+
+    prefix = tmp_dir / f"{relation}_{chunk_idx:05d}_{src_arr.size}"
+    src_path = str(prefix) + "_src.npy"
+    dst_path = str(prefix) + "_dst.npy"
+    attr_path = str(prefix) + "_attr.npy"
+    np.save(src_path, src_arr, allow_pickle=False)
+    np.save(dst_path, dst_arr, allow_pickle=False)
+    np.save(attr_path, attr_arr, allow_pickle=False)
+    return {
+        "relation": relation,
+        "chunk_idx": int(chunk_idx),
+        "count": int(src_arr.size),
+        "attr_dim": int(attr_arr.shape[1]) if attr_arr.ndim == 2 else 0,
+        "src_path": src_path,
+        "dst_path": dst_path,
+        "attr_path": attr_path,
+    }
+
+
+def _estimate_final_edge_bytes(
+    shards: Sequence[Dict[str, object]],
+    *,
+    edge_attr_dtype: torch.dtype,
+) -> int:
+    attr_nbytes = _torch_dtype_nbytes(edge_attr_dtype)
+    total = 0
+    for shard in shards:
+        count = int(shard.get("count") or 0)
+        attr_dim = int(shard.get("attr_dim") or 0)
+        total += count * (2 * 8 + attr_dim * attr_nbytes)
+    return int(total)
+
+
+def _assemble_edge_shards(
+    data: HeteroData,
+    shards: Sequence[Dict[str, object]],
+    *,
+    edge_attr_dtype: torch.dtype,
+) -> Dict[str, int]:
+    edge_counts: Dict[str, int] = {}
+    relations = ["spatial", "temporal", "st_fwd"]
+    for relation in relations:
+        rel_shards = [
+            shard for shard in shards if shard.get("relation") == relation
+        ]
+        if not rel_shards:
+            continue
+        total_edges = int(sum(int(shard["count"]) for shard in rel_shards))
+        attr_dims = {int(shard.get("attr_dim") or 0) for shard in rel_shards}
+        if len(attr_dims) != 1:
+            raise ValueError(
+                f"Dimensiones edge_attr inconsistentes para {relation}: "
+                f"{sorted(attr_dims)}"
+            )
+        attr_dim = int(next(iter(attr_dims)))
+        edge_index = torch.empty((2, total_edges), dtype=torch.long)
+        edge_attr = torch.empty(
+            (total_edges, attr_dim),
+            dtype=edge_attr_dtype,
+        )
+        offset = 0
+        for shard in rel_shards:
+            end = offset + int(shard["count"])
+            src_arr = np.load(str(shard["src_path"]), mmap_mode="r")
+            dst_arr = np.load(str(shard["dst_path"]), mmap_mode="r")
+            attr_arr = np.load(str(shard["attr_path"]), mmap_mode="r")
+            edge_index[0, offset:end] = torch.as_tensor(
+                src_arr.copy(), dtype=torch.long
+            )
+            edge_index[1, offset:end] = torch.as_tensor(
+                dst_arr.copy(), dtype=torch.long
+            )
+            if attr_dim:
+                edge_attr[offset:end] = torch.as_tensor(
+                    attr_arr.copy(), dtype=edge_attr_dtype
+                )
+            offset = end
+            del src_arr, dst_arr, attr_arr
+
+        edge_type = ("pm", relation, "pm")
+        data[edge_type].edge_index = edge_index
+        data[edge_type].edge_attr = edge_attr
+        edge_counts[str(edge_type)] = total_edges
+    return edge_counts
+
+
+def _validate_graph_edge_stores(data: HeteroData) -> None:
+    for edge_type in data.edge_types:
+        store = data[edge_type]
+        edge_index = getattr(store, "edge_index", None)
+        if edge_index is None:
+            continue
+        if edge_index.dim() != 2 or int(edge_index.size(0)) != 2:
+            raise ValueError(
+                f"edge_index invalido para {edge_type}: {tuple(edge_index.shape)}"
+            )
+        num_edges = int(edge_index.size(1))
+        if num_edges:
+            src_type, _, dst_type = edge_type
+            num_src = int(data[src_type].num_nodes)
+            num_dst = int(data[dst_type].num_nodes)
+            src = edge_index[0]
+            dst = edge_index[1]
+            if int(src.min().item()) < 0 or int(dst.min().item()) < 0:
+                raise ValueError(f"{edge_type} contiene indices negativos.")
+            if (
+                int(src.max().item()) >= num_src
+                or int(dst.max().item()) >= num_dst
+            ):
+                raise ValueError(
+                    f"{edge_type} contiene indices fuera de rango "
+                    f"(num_src={num_src}, num_dst={num_dst})."
+                )
+        edge_attr = getattr(store, "edge_attr", None)
+        if edge_attr is not None and int(edge_attr.size(0)) != num_edges:
+            raise ValueError(
+                f"edge_attr desalineado para {edge_type}: "
+                f"{int(edge_attr.size(0))} vs {num_edges}."
+            )
+
+
+def _build_chunked_pm_edge_stores(
+    data: HeteroData,
+    *,
+    df_pm_edges: pd.DataFrame,
+    df_port_use: pd.DataFrame,
+    feat_mat_delta: np.ndarray,
+    raw_globals: pd.DataFrame,
+    portico_col: str,
+    selected_physical_features: Sequence[str],
+    dt_feat_minutes: int,
+    build_temporal: bool,
+    build_spatial: bool,
+    build_st_fwd: bool,
+    edge_attr_dtype: torch.dtype,
+    target_rows: Optional[int] = None,
+) -> Dict[str, object]:
+    _validate_pm_key_uniqueness(df_pm_edges, portico_col)
+    df_seq = _build_portico_sequence_frame(df_port_use)
+    warning = (
+        "no_portico_sequences"
+        if df_seq.empty and (build_spatial or build_st_fwd)
+        else None
+    )
+
+    delta_mat = np.asarray(feat_mat_delta, dtype=np.float32)
+    if delta_mat.ndim == 1:
+        delta_mat = delta_mat.reshape(-1, 1)
+    chunk_plan = _estimate_chunk_target_rows(
+        num_rows=len(df_pm_edges),
+        delta_dim=int(delta_mat.shape[1]) if delta_mat.ndim == 2 else 0,
+        physical_dim=len(list(selected_physical_features or [])),
+        portico_count=int(df_pm_edges[portico_col].nunique())
+        if portico_col in df_pm_edges.columns
+        else 1,
+        build_temporal=build_temporal,
+        build_spatial=build_spatial,
+        build_st_fwd=build_st_fwd,
+        requested_target_rows=target_rows,
+    )
+    chunks = _build_time_chunks(
+        df_pm_edges,
+        target_rows=int(chunk_plan["target_rows"]),
+    )
+    shards: List[Dict[str, object]] = []
+    chunk_summaries: List[Dict[str, int]] = []
+    base_cols = [portico_col, "ts_min", "node_idx"]
+
+    with tempfile.TemporaryDirectory(prefix="gnn_edge_chunks_") as tmp_name:
+        tmp_dir = Path(tmp_name)
+        for chunk_idx, chunk in enumerate(chunks):
+            start_ts = int(chunk["start_ts"])
+            end_ts = int(chunk["end_ts"])
+            halo_end_ts = end_ts + max(0, int(dt_feat_minutes))
+            source_mask = (
+                (df_pm_edges["ts_min"] >= start_ts)
+                & (df_pm_edges["ts_min"] <= end_ts)
+            )
+            halo_mask = (
+                (df_pm_edges["ts_min"] >= start_ts)
+                & (df_pm_edges["ts_min"] <= halo_end_ts)
+            )
+            source_df = df_pm_edges.loc[source_mask, base_cols].copy()
+            halo_df = df_pm_edges.loc[halo_mask, base_cols].copy()
+            rel_counts = {"temporal": 0, "spatial": 0, "st_fwd": 0}
+
+            if build_temporal and not source_df.empty:
+                src_frame = source_df.copy()
+                src_frame["next_ts_min"] = (
+                    src_frame["ts_min"].astype(int) + int(dt_feat_minutes)
+                )
+                t_edges = pd.merge(
+                    src_frame,
+                    halo_df,
+                    left_on=[portico_col, "next_ts_min"],
+                    right_on=[portico_col, "ts_min"],
+                    suffixes=("_src", "_dst"),
+                )
+                if not t_edges.empty:
+                    src = t_edges["node_idx_src"].to_numpy(dtype=np.int64)
+                    dst = t_edges["node_idx_dst"].to_numpy(dtype=np.int64)
+                    attr = delta_mat[dst] - delta_mat[src]
+                    shard = _write_edge_shard(
+                        tmp_dir,
+                        relation="temporal",
+                        chunk_idx=chunk_idx,
+                        src=src,
+                        dst=dst,
+                        attr=attr,
+                    )
+                    if shard is not None:
+                        shards.append(shard)
+                        rel_counts["temporal"] = int(shard["count"])
+
+            if build_spatial and not source_df.empty and not df_seq.empty:
+                s_edges = pd.merge(
+                    source_df.rename(
+                        columns={
+                            portico_col: "portico_src",
+                            "node_idx": "node_idx_src",
+                        }
+                    ),
+                    df_seq,
+                    on="portico_src",
+                    how="inner",
+                )
+                s_edges = pd.merge(
+                    s_edges,
+                    source_df.rename(
+                        columns={
+                            portico_col: "portico_dst",
+                            "node_idx": "node_idx_dst",
+                        }
+                    ),
+                    left_on=["ts_min", "portico_dst"],
+                    right_on=["ts_min", "portico_dst"],
+                    how="inner",
+                )
+                if not s_edges.empty:
+                    src, dst, attr = _build_bidirectional_spatial_edges(
+                        s_edges,
+                        delta_mat,
+                        raw_globals,
+                        portico_col,
+                        selected_physical_features,
+                    )
+                    shard = _write_edge_shard(
+                        tmp_dir,
+                        relation="spatial",
+                        chunk_idx=chunk_idx,
+                        src=src,
+                        dst=dst,
+                        attr=attr,
+                    )
+                    if shard is not None:
+                        shards.append(shard)
+                        rel_counts["spatial"] = int(shard["count"])
+
+            if build_st_fwd and not source_df.empty and not df_seq.empty:
+                st_src = source_df.copy().rename(
+                    columns={
+                        portico_col: "portico_src",
+                        "node_idx": "node_idx_src",
+                        "ts_min": "ts_min_src",
+                    }
+                )
+                st_src["next_ts_min"] = (
+                    st_src["ts_min_src"].astype(int) + int(dt_feat_minutes)
+                )
+                st_dst = halo_df.rename(
+                    columns={
+                        portico_col: "portico_dst",
+                        "node_idx": "node_idx_dst",
+                        "ts_min": "ts_min_dst",
+                    }
+                )
+                st_edges = pd.merge(
+                    st_src,
+                    df_seq,
+                    on="portico_src",
+                    how="inner",
+                )
+                st_edges = pd.merge(
+                    st_edges,
+                    st_dst,
+                    left_on=["next_ts_min", "portico_dst"],
+                    right_on=["ts_min_dst", "portico_dst"],
+                    how="inner",
+                )
+                if not st_edges.empty:
+                    src = st_edges["node_idx_src"].to_numpy(dtype=np.int64)
+                    dst = st_edges["node_idx_dst"].to_numpy(dtype=np.int64)
+                    delta_st = delta_mat[dst] - delta_mat[src]
+                    extras = _build_edge_feature_extras(
+                        st_edges,
+                        raw_globals,
+                        portico_col,
+                        selected_physical_features,
+                        src_ts_col="ts_min_src",
+                        dst_ts_col="ts_min_dst",
+                    )
+                    attr = np.concatenate([delta_st, extras], axis=1)
+                    shard = _write_edge_shard(
+                        tmp_dir,
+                        relation="st_fwd",
+                        chunk_idx=chunk_idx,
+                        src=src,
+                        dst=dst,
+                        attr=attr,
+                    )
+                    if shard is not None:
+                        shards.append(shard)
+                        rel_counts["st_fwd"] = int(shard["count"])
+
+            chunk_summaries.append(
+                {
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "halo_end_ts": int(halo_end_ts),
+                    "source_rows": int(len(source_df)),
+                    "halo_rows": int(len(halo_df)),
+                    "temporal_edges": int(rel_counts["temporal"]),
+                    "spatial_edges": int(rel_counts["spatial"]),
+                    "st_fwd_edges": int(rel_counts["st_fwd"]),
+                }
+            )
+            del source_df, halo_df
+
+        final_edge_bytes = _estimate_final_edge_bytes(
+            shards,
+            edge_attr_dtype=edge_attr_dtype,
+        )
+        available = _available_memory_bytes()
+        if available is not None and final_edge_bytes > int(available * 0.85):
+            raise MemoryError(
+                "La construccion por partes redujo el pico de memoria, pero el "
+                "HeteroData final completo no cabe con la RAM disponible: "
+                f"aristas estimadas={final_edge_bytes / (1024 ** 3):.2f} GB, "
+                f"RAM disponible={available / (1024 ** 3):.2f} GB."
+            )
+
+        edge_counts = _assemble_edge_shards(
+            data,
+            shards,
+            edge_attr_dtype=edge_attr_dtype,
+        )
+        gc.collect()
+
+    return {
+        "mode": "chunked",
+        "warning": warning,
+        "strategy": chunk_plan.get("strategy"),
+        "target_rows": int(chunk_plan["target_rows"]),
+        "chunk_count": int(len(chunks)),
+        "chunks": chunk_summaries,
+        "edge_counts_before_clean": edge_counts,
+        "final_edge_tensor_estimate_mb": round(
+            final_edge_bytes / (1024 * 1024), 2
+        ),
+        "available_memory_mb_at_assembly": None
+        if available is None
+        else round(available / (1024 * 1024), 2),
+        "auto_plan": chunk_plan,
+    }
+
+
 def _compute_normalization_stats_from_train(
     df_pm: pd.DataFrame,
     feature_cols: Sequence[str],
@@ -7054,7 +7592,7 @@ def _compute_normalization_stats_from_train(
 ) -> Tuple[np.ndarray, np.ndarray]:
     mask = np.asarray(train_mask, dtype=bool)
     if mask.shape[0] != len(df_pm) or not mask.any():
-        raise ValueError("train_mask purgado vacío o incompatible para normalización.")
+        raise ValueError("train_mask purgado vacÃ­o o incompatible para normalizaciÃ³n.")
     train_stats_df = df_pm.loc[mask, list(feature_cols)]
     mu = train_stats_df.mean().values
     sigma = train_stats_df.std(ddof=0).fillna(0.0).values + 1e-9
@@ -7279,20 +7817,20 @@ def _split_val_mask_for_calibration_threshold(
 ) -> Dict[str, object]:
     if pm_index is None:
         raise ValueError(
-            "La separación val_calib/val_threshold requiere pm_index con timestamps."
+            "La separaciÃ³n val_calib/val_threshold requiere pm_index con timestamps."
         )
     num_nodes = int(getattr(graph_data[node_type], "num_nodes", graph_data[node_type].x.shape[0]))
     ts_arr = _extract_ts_min_from_pm_index(pm_index, num_nodes)
     if ts_arr is None:
         raise ValueError(
-            "La separación val_calib/val_threshold requiere timestamps `ts_min` en pm_index."
+            "La separaciÃ³n val_calib/val_threshold requiere timestamps `ts_min` en pm_index."
         )
     val_mask = getattr(graph_data[node_type], val_mask_attr, None)
     if val_mask is None:
-        raise ValueError("No existe val_mask para separar calibración y umbral.")
+        raise ValueError("No existe val_mask para separar calibraciÃ³n y umbral.")
     val_idx = torch.nonzero(val_mask.detach().cpu().bool(), as_tuple=False).view(-1).numpy()
     if val_idx.size < 4:
-        raise ValueError("val_mask es demasiado pequeño para dividir calibración y umbral.")
+        raise ValueError("val_mask es demasiado pequeÃ±o para dividir calibraciÃ³n y umbral.")
     y = graph_data[node_type].y.detach().cpu().numpy()
     valid_ts_mask = np.isfinite(ts_arr[val_idx])
     val_idx = val_idx[valid_ts_mask]
@@ -7333,7 +7871,7 @@ def _split_val_mask_for_calibration_threshold(
             }
     raise ValueError(
         "No se pudo separar val_mask en val_calib y val_threshold con ambas clases. "
-        "Aumente validación o reconstruya el split temporal."
+        "Aumente validaciÃ³n o reconstruya el split temporal."
     )
 
 
@@ -7357,6 +7895,7 @@ def _update_hash_with_tensor(hasher: "hashlib._Hash", value: object) -> None:
 
 _GRAPH_HASH_NON_SEMANTIC_METADATA_KEYS = {
     "graph_hash",
+    "construction",
     "created_at",
     "stats_path",
     "filename",
@@ -7522,8 +8061,8 @@ def _warn_legacy_temporal_split(split_info: Optional[Dict[str, object]]) -> None
         return
     st.warning(
         "El grafo no contiene metadata de horizonte para split purgado; "
-        "se aplicó compatibilidad legacy con embargo 0. Reconstruya el grafo "
-        "para obtener evaluación temporal estricta."
+        "se aplicÃ³ compatibilidad legacy con embargo 0. Reconstruya el grafo "
+        "para obtener evaluaciÃ³n temporal estricta."
     )
 
 
@@ -7723,9 +8262,9 @@ def _run_optuna_search(
     use_imgagn = (balancing_strategy == "Opt. balance con ImGAGN")
     if use_imgagn:
         raise RuntimeError(
-            "La optimización con ImGAGN homogéneo fue retirada. "
+            "La optimizaciÃ³n con ImGAGN homogÃ©neo fue retirada. "
             "Genere manualmente el grafo con Balance -> ImGAGN relacional parent-anchored "
-            "y luego entrene/evalúe sobre ese grafo."
+            "y luego entrene/evalÃºe sobre ese grafo."
         )
     gnn_variant_fixed = _normalize_ui_gnn_variant(
         (objective_settings or {}).get("gnn_variant", GNN_VARIANT)
@@ -7808,13 +8347,13 @@ def _run_optuna_search(
     if graph_hash:
         study_base = f"{study_base}_{graph_hash[:16]}"
     study_name = re.sub(r"[^A-Za-z0-9_\\-]", "_", study_base)
-    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    gnn_dir("hpo_optuna", RESULTADOS_DIR, create=True)
     
     if storage_path:
         storage_url = f"sqlite:///{storage_path}"
     else:
         # Fallback to default shared storage if no specific path provided
-        default_storage_path = os.path.join(RESULTADOS_DIR, "optuna_studies.db")
+        default_storage_path = str(gnn_path("hpo_optuna", "optuna_studies.db", resultados_dir=RESULTADOS_DIR, create_parent=True))
         storage_url = f"sqlite:///{default_storage_path}"
             
     try:
@@ -9063,16 +9602,19 @@ def _run_optuna_search(
         if stop_flag_key and st.session_state.get(stop_flag_key):
             try:
                 status_text.markdown(
-                    f"**Progreso Optuna: Ensayo {completed} de {n_trials}** · "
+                    f"**Progreso Optuna: Ensayo {completed} de {n_trials}** Â· "
                     "Detencion solicitada. Cerrando iteracion..."
                 )
                 study.stop()
             except Exception:
                 pass
         try:
-            live_path = os.path.join(
-                RESULTADOS_DIR, f"optuna_full_study_live_{study.study_name}.csv"
-            )
+            live_path = str(gnn_path(
+                "hpo_optuna",
+                f"optuna_full_study_live_{study.study_name}.csv",
+                resultados_dir=RESULTADOS_DIR,
+                create_parent=True,
+            ))
             study.trials_dataframe().to_csv(live_path, index=False)
         except Exception:
             pass
@@ -9155,12 +9697,14 @@ def _run_optuna_search(
         if "_ImGAGN" not in variant_tag:
             variant_tag = f"{variant_tag}_ImGAGN" if variant_tag else "_ImGAGN"
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
-    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    gnn_dir("hpo_optuna", RESULTADOS_DIR, create=True)
 
-    best_params_path = os.path.join(
-        RESULTADOS_DIR,
+    best_params_path = str(gnn_path(
+        "hpo_optuna",
         f"optuna_hyperparams_{timestamp}{hash_tag}{variant_tag}.csv",
-    )
+        resultados_dir=RESULTADOS_DIR,
+        create_parent=True,
+    ))
     pd.DataFrame([best_params]).to_csv(best_params_path, index=False)
 
     trials_df = study.trials_dataframe()
@@ -9169,10 +9713,12 @@ def _run_optuna_search(
     trials_df["graph_file_hash"] = graph_file_hash
     trials_df["graph_hash_source"] = graph_hash_source
     trials_df["gnn_variant"] = gnn_variant_fixed
-    full_study_path = os.path.join(
-        RESULTADOS_DIR,
+    full_study_path = str(gnn_path(
+        "hpo_optuna",
         f"optuna_full_study_{timestamp}{hash_tag}{variant_tag}.csv",
-    )
+        resultados_dir=RESULTADOS_DIR,
+        create_parent=True,
+    ))
     trials_df.to_csv(full_study_path, index=False)
     if live_tracker is not None:
         live_tracker.mark_run_completed(
@@ -9511,7 +10057,7 @@ def _run_ray_tune_search(
             ray.init(ignore_reinit_error=True, include_dashboard=False)
 
         n_trials = int(optuna_settings.get("n_trials", 1))
-        storage_dir = Path(RESULTADOS_DIR).resolve() / "ray_tune"
+        storage_dir = gnn_dir("hpo_ray_tune", RESULTADOS_DIR, create=True).resolve()
         storage_path = f"file://{storage_dir.as_posix()}"
 
         def _report(metrics: Dict[str, Any]) -> None:
@@ -9671,12 +10217,14 @@ def _run_ray_tune_search(
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
-        os.makedirs(RESULTADOS_DIR, exist_ok=True)
+        gnn_dir("hpo_optuna", RESULTADOS_DIR, create=True)
 
-        best_params_path = os.path.join(
-            RESULTADOS_DIR,
+        best_params_path = str(gnn_path(
+            "hpo_optuna",
             f"optuna_hyperparams_raytune_{timestamp}{hash_tag}{variant_tag}.csv",
-        )
+            resultados_dir=RESULTADOS_DIR,
+            create_parent=True,
+        ))
         pd.DataFrame([best_params]).to_csv(best_params_path, index=False)
 
         trials_df = None
@@ -9699,10 +10247,12 @@ def _run_ray_tune_search(
             trials_df["graph_file_hash"] = graph_file_hash
             trials_df["graph_hash_source"] = graph_hash_source
             trials_df["gnn_variant"] = gnn_variant_fixed
-            full_study_path = os.path.join(
-                RESULTADOS_DIR,
+            full_study_path = str(gnn_path(
+                "hpo_optuna",
                 f"optuna_full_study_raytune_{timestamp}{hash_tag}{variant_tag}.csv",
-            )
+                resultados_dir=RESULTADOS_DIR,
+                create_parent=True,
+            ))
             trials_df.to_csv(full_study_path, index=False)
             try:
                 range_analysis = _optuna_analyze_ranges(
@@ -10689,9 +11239,9 @@ def _compute_puntos_negros_report(
         (hours >= 6) & (hours < 10),
         (hours >= 18) & (hours < 22),
     ]
-    choices = ["Mañana (06-10h)", "Tarde (18-22h)"]
+    choices = ["MaÃ±ana (06-10h)", "Tarde (18-22h)"]
     df_acc["franja_horaria"] = np.select(
-        conditions, choices, default="Resto del día"
+        conditions, choices, default="Resto del dÃ­a"
     )
 
     stats = (
@@ -10703,9 +11253,9 @@ def _compute_puntos_negros_report(
         return None
 
     horas_map = {
-        "Mañana (06-10h)": 4.0,
+        "MaÃ±ana (06-10h)": 4.0,
         "Tarde (18-22h)": 4.0,
-        "Resto del día": 16.0,
+        "Resto del dÃ­a": 16.0,
     }
     stats["horas_franja"] = stats["franja_horaria"].map(horas_map)
     stats["accidentes_por_hora"] = (
@@ -11169,7 +11719,7 @@ def _duckdb_feature_metadata(
     include_count: bool = True,
 ) -> Tuple[str, List[str], int]:
     if duckdb is None:
-        raise RuntimeError("Librería duckdb no encontrada. Instale `duckdb`.")
+        raise RuntimeError("LibrerÃ­a duckdb no encontrada. Instale `duckdb`.")
     con = duckdb.connect(str(path), read_only=True)
     try:
         tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
@@ -11231,7 +11781,7 @@ def _load_duckdb_feature_frame(
     selected_columns: Optional[Sequence[str]] = None,
 ) -> Tuple[pd.DataFrame, str, int]:
     if duckdb is None:
-        raise RuntimeError("Librería duckdb no encontrada. Instale `duckdb`.")
+        raise RuntimeError("LibrerÃ­a duckdb no encontrada. Instale `duckdb`.")
 
     target_table, cols, _ = _duckdb_feature_metadata(
         path, preferred_tables, table_name=table_name, include_count=False
@@ -11465,7 +12015,7 @@ def _query_duckdb_feature_porticos(
     porticos_filter: Optional[Sequence[object]] = None,
 ) -> Tuple[List[str], str, str]:
     if duckdb is None:
-        raise RuntimeError("Librería duckdb no encontrada. Instale `duckdb`.")
+        raise RuntimeError("LibrerÃ­a duckdb no encontrada. Instale `duckdb`.")
 
     target_table, cols, _ = _duckdb_feature_metadata(
         path, preferred_tables, table_name=table_name, include_count=False
@@ -11474,7 +12024,7 @@ def _query_duckdb_feature_porticos(
         cols, ["portico", "cod_portico", "id_portico", "PORTICO"]
     )
     if not portico_col:
-        raise ValueError("La tabla de features no contiene columna de pórtico.")
+        raise ValueError("La tabla de features no contiene columna de pÃ³rtico.")
 
     clauses, params = _duckdb_feature_filter_parts(
         cols,
@@ -11519,7 +12069,7 @@ def _query_csv_feature_porticos_with_duckdb(
         cols, ["portico", "cod_portico", "id_portico", "PORTICO"]
     )
     if not portico_col:
-        raise ValueError("El CSV de features no contiene columna de pórtico.")
+        raise ValueError("El CSV de features no contiene columna de pÃ³rtico.")
 
     if duckdb is None:
         df_port = pd.read_csv(str(path), usecols=[portico_col])
@@ -11638,7 +12188,7 @@ def _feature_portico_sequence_from_source(
             df_pm_cache, ["portico", "cod_portico", "id_portico"]
         )
         if not portico_col:
-            raise ValueError("Las features en memoria no contienen columna de pórtico.")
+            raise ValueError("Las features en memoria no contienen columna de pÃ³rtico.")
         if porticos_filter:
             filter_keys = {
                 key
@@ -11896,14 +12446,14 @@ def run_feature_generation_workflow(params):
                         )
                 else:
                     st.warning(
-                        "⚠️ No se encontró columna de pórtico/tiempo ni etiquetas de cluster en "
+                        "âš ï¸ No se encontrÃ³ columna de pÃ³rtico/tiempo ni etiquetas de cluster en "
                         f"'{os.path.basename(cluster_file)}'."
                     )
     
     # Status Containers
     status = st.empty()
     progress = st.progress(0)
-    status.info("Iniciando generación de features...")
+    status.info("Iniciando generaciÃ³n de features...")
 
     try:
         df_pm = None
@@ -11915,7 +12465,7 @@ def run_feature_generation_workflow(params):
              return None
         
         if (use_batches or flow_source == "Base de Datos (DuckDB)") and duckdb is None:
-             st.error("Librería duckdb no encontrada. Instale `duckdb`.")
+             st.error("LibrerÃ­a duckdb no encontrada. Instale `duckdb`.")
              return None
 
         catalog_df_port: Optional[pd.DataFrame] = None
@@ -11928,7 +12478,7 @@ def run_feature_generation_workflow(params):
                     st.session_state.df_port = catalog_df_port
                 except Exception as exc:
                     st.error(
-                        "No se pudo cargar Porticos.csv para filtrar la generación "
+                        "No se pudo cargar Porticos.csv para filtrar la generaciÃ³n "
                         f"de features: {exc}"
                     )
                     return None
@@ -11937,7 +12487,7 @@ def run_feature_generation_workflow(params):
             )
             if not catalog_porticos_filter:
                 st.error(
-                    "No hay pórticos válidos de Porticos.csv para generar features."
+                    "No hay pÃ³rticos vÃ¡lidos de Porticos.csv para generar features."
                 )
                 return None
             gen_params["catalog_porticos_filter"] = catalog_porticos_filter
@@ -11984,7 +12534,7 @@ def run_feature_generation_workflow(params):
                      min_max = con.execute(f"SELECT MIN(FECHA), MAX(FECHA) FROM {table_name}").fetchone()
 
                 if min_max[0] is None:
-                     st.error("Sin fechas válidas en los datos.")
+                     st.error("Sin fechas vÃ¡lidas en los datos.")
                      con.close(); return None
                 
                 start_t = pd.to_datetime(min_max[0])
@@ -12339,7 +12889,7 @@ def run_feature_generation_workflow(params):
                     progress.empty()
                     return df_pm
                 else:
-                    st.warning("No se generaron features en ningún lote.")
+                    st.warning("No se generaron features en ningÃºn lote.")
                     # con_feat.close() Removed
                     try:
                          if os.path.exists(features_db_path):
@@ -12440,7 +12990,7 @@ def run_feature_generation_workflow(params):
                 return None
 
             if df_flows is None or df_flows.is_empty():
-                st.error("Flujos vacíos.")
+                st.error("Flujos vacÃ­os.")
                 return None
 
             flow_pd = (
@@ -12600,8 +13150,8 @@ def run_feature_generation_workflow(params):
                 )
                 if df_pm is None or df_pm.empty:
                     status.error(
-                        "Features vacías tras filtrar por tramo. "
-                        "Verifique la selección."
+                        "Features vacÃ­as tras filtrar por tramo. "
+                        "Verifique la selecciÃ³n."
                     )
                     return None
 
@@ -12623,16 +13173,16 @@ def run_feature_generation_workflow(params):
                     if cluster_features_df is None:
                         if cluster_compute_failed:
                             st.warning(
-                                "⚠️ No se pudieron calcular variables de cluster con las etiquetas."
+                                "âš ï¸ No se pudieron calcular variables de cluster con las etiquetas."
                             )
                         elif cluster_label_mode:
                             st.warning(
-                                "⚠️ Se detectaron etiquetas de cluster por patente, "
+                                "âš ï¸ Se detectaron etiquetas de cluster por patente, "
                                 "pero no se pudieron calcular variables sin flujos."
                             )
                         else:
                             st.warning(
-                                "⚠️ No se encontraron variables de cluster válidas para unir."
+                                "âš ï¸ No se encontraron variables de cluster vÃ¡lidas para unir."
                             )
                     else:
                         p_col = cluster_portico_col or _find_column_by_keywords(
@@ -12643,7 +13193,7 @@ def run_feature_generation_workflow(params):
                         )
                         if not p_col or not t_col:
                             st.warning(
-                                "⚠️ Las variables de cluster no contienen portico e intervalo."
+                                "âš ï¸ Las variables de cluster no contienen portico e intervalo."
                             )
                         else:
                             cluster_ready = _prepare_cluster_features_df(
@@ -12654,7 +13204,7 @@ def run_feature_generation_workflow(params):
                             )
                             if cluster_ready.empty:
                                 st.warning(
-                                    "⚠️ No se encontraron coincidencias entre clusters y pórticos/tiempo."
+                                    "âš ï¸ No se encontraron coincidencias entre clusters y pÃ³rticos/tiempo."
                                 )
                             else:
                                 drop_cols = []
@@ -12719,7 +13269,7 @@ def run_feature_generation_workflow(params):
                                 ]
                                 if not cluster_vars:
                                     st.warning(
-                                        "⚠️ No se encontraron variables de cluster para unir."
+                                        "âš ï¸ No se encontraron variables de cluster para unir."
                                     )
                                 else:
                                     df_pm = _merge_on_portico_ts(
@@ -12820,10 +13370,10 @@ def run_feature_generation_workflow(params):
             return df_pm
 
     except Exception as e:
-        status.error(f"Error en workflow de generación: {e}")
+        status.error(f"Error en workflow de generaciÃ³n: {e}")
         st.session_state["feature_notice"] = {
             "kind": "error",
-            "text": f"Error en workflow de generación: {e}",
+            "text": f"Error en workflow de generaciÃ³n: {e}",
         }
         return None
 
@@ -12848,7 +13398,7 @@ def _render_optimization_tab() -> None:
         loaded_graph = st.session_state.get("loaded_graph")
         balanced_graph = st.session_state.get("balanced_graph")
         if loaded_graph is None:
-            st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+            st.warning("No hay grafo cargado en memoria. Use la pestaÃ±a Graph.")
             return None, None
 
         use_balanced = bool(st.session_state.get("gnn_optuna_use_balanced", False))
@@ -12919,7 +13469,7 @@ def _render_optimization_tab() -> None:
             gnn_variant=selected_gnn_variant,
             space_signature=space_signature,
         )
-        storage_dir = Path(RESULTADOS_DIR).resolve() / "ray_tune" / f"raytune_{study_name}"
+        storage_dir = gnn_dir("hpo_ray_tune", RESULTADOS_DIR, create=True).resolve() / f"raytune_{study_name}"
         pending, done_trials, last_update, status_counts = _ray_tune_pending(
             storage_dir=storage_dir,
             target_trials=n_trials,
@@ -12928,7 +13478,7 @@ def _render_optimization_tab() -> None:
             pending_details = f"Ray Tune pendiente: {done_trials}/{n_trials} trials completados."
             if last_update:
                 last_update_str = datetime.fromtimestamp(last_update).strftime("%Y-%m-%d %H:%M:%S")
-                pending_details += f" | Última actualización: {last_update_str}"
+                pending_details += f" | Ãšltima actualizaciÃ³n: {last_update_str}"
             if status_counts:
                 status_text = ", ".join(f"{k}:{v}" for k, v in sorted(status_counts.items()))
                 pending_details += f" | Estados: {status_text}"
@@ -12960,9 +13510,12 @@ def _render_optimization_tab() -> None:
                     space_signature=_search_space_signature_from_state(),
                 )
                 optuna.delete_study(study_name=study_name, storage=storage_url)
-                live_path = os.path.join(
-                    RESULTADOS_DIR, f"optuna_full_study_live_{study_name}.csv"
-                )
+                live_path = str(gnn_path(
+                    "hpo_optuna",
+                    f"optuna_full_study_live_{study_name}.csv",
+                    resultados_dir=RESULTADOS_DIR,
+                    create_parent=True,
+                ))
                 if os.path.exists(live_path):
                     try:
                         os.remove(live_path)
@@ -12981,7 +13534,7 @@ def _render_optimization_tab() -> None:
                 gnn_variant=selected_gnn_variant,
                 space_signature=_search_space_signature_from_state(),
             )
-            storage_dir = Path(RESULTADOS_DIR).resolve() / "ray_tune" / f"raytune_{study_name}"
+            storage_dir = gnn_dir("hpo_ray_tune", RESULTADOS_DIR, create=True).resolve() / f"raytune_{study_name}"
             try:
                 if storage_dir.exists():
                     shutil.rmtree(storage_dir)
@@ -13164,7 +13717,7 @@ def render_graph_builder():
             "Balance",
             "Training",
             "Comparación",
-            "Evaluación Modelo",
+            "EvaluaciÃ³n Modelo",
             "History",
             "Experiments",
         ]
@@ -13231,10 +13784,10 @@ def _render_in_memory_graph():
     loaded_graph = st.session_state.get("loaded_graph")
     
     if loaded_graph is None:
-        st.warning("⚠️ No hay ningún grafo cargado en memoria.")
+        st.warning("âš ï¸ No hay ningÃºn grafo cargado en memoria.")
         st.info("Puedes crear un nuevo grafo o cargar uno existente desde las opciones anteriores.")
     else:
-        st.success(f"✅ Grafo cargado: **{loaded_graph.get('filename', 'Sin nombre')}**")
+        st.success(f"âœ… Grafo cargado: **{loaded_graph.get('filename', 'Sin nombre')}**")
         
         # Display metadata
         col1, col2 = st.columns(2)
@@ -13254,7 +13807,7 @@ def _render_in_memory_graph():
                     pm_count = len(pm_index)
                 except TypeError:
                     pm_count = len(getattr(pm_index, "_rev", []))
-                st.markdown(f"**Índice PM:** {pm_count} nodos.")
+                st.markdown(f"**Ãndice PM:** {pm_count} nodos.")
 
         graph_data = loaded_graph.get("data")
 
@@ -13265,7 +13818,7 @@ def _render_in_memory_graph():
 
 def _render_feature_engineering():
     st.markdown("### Feature Engineering")
-    #st.info("Configure la generación de variables (features) para los nodos del grafo.")
+    #st.info("Configure la generaciÃ³n de variables (features) para los nodos del grafo.")
 
     # Source Selection
     source = st.radio(
@@ -13297,7 +13850,7 @@ def _render_feature_engineering():
                 )
                 if porticos_filter:
                     st.caption(
-                        f"Tramo seleccionado: {len(porticos_filter)} pórticos."
+                        f"Tramo seleccionado: {len(porticos_filter)} pÃ³rticos."
                     )
                     st.session_state["feature_tramo_porticos"] = porticos_filter
 
@@ -13306,7 +13859,7 @@ def _render_feature_engineering():
         df_pm_cache = st.session_state.get("df_pm_cache")
         if isinstance(df_pm_cache, pd.DataFrame) and not df_pm_cache.empty:
             st.success(
-                f"✅ Features en memoria disponibles: {len(df_pm_cache)} registros."
+                f"âœ… Features en memoria disponibles: {len(df_pm_cache)} registros."
             )
 
             show_n = st.number_input(
@@ -13330,7 +13883,7 @@ def _render_feature_engineering():
                 )
             else:
                 st.warning(
-                    "⚠️ No hay features en memoria. Se generaran o cargaran en la proxima construccion."
+                    "âš ï¸ No hay features en memoria. Se generaran o cargaran en la proxima construccion."
                 )
 
     # --- CARGAR EXISTENTE ---
@@ -13353,7 +13906,7 @@ def _render_feature_engineering():
         for fpath in duckdb_files:
             fname = os.path.basename(fpath)
             # Label as DuckDB File
-            duckdb_options.append(("duckdb", fpath, f"📊 {fname} (DuckDB)"))
+            duckdb_options.append(("duckdb", fpath, f"ðŸ“Š {fname} (DuckDB)"))
         
         # Also list CSV files as fallback
         csv_files = sorted(glob.glob(os.path.join(RESULTADOS_DIR, "features_*.csv")), reverse=True)
@@ -13362,11 +13915,11 @@ def _render_feature_engineering():
         # Build combined options
         options = duckdb_options
         for f in csv_files:
-            options.append(("csv", f, f"📄 {os.path.basename(f)} (CSV)"))
+            options.append(("csv", f, f"ðŸ“„ {os.path.basename(f)} (CSV)"))
         
         if options:
             selected_opt = st.selectbox(
-                "Selecciona versión de Features",
+                "Selecciona versiÃ³n de Features",
                 options,
                 format_func=lambda x: x[2],
                 key="feature_source_select"
@@ -13504,8 +14057,8 @@ def _render_feature_engineering():
                                 st.session_state.get("feature_config")
                             ):
                                 st.error(
-                                    "Features vacías tras filtrar por tramo. "
-                                    "Verifique la selección."
+                                    "Features vacÃ­as tras filtrar por tramo. "
+                                    "Verifique la selecciÃ³n."
                                 )
                             else:
                                 st.warning(
@@ -13549,7 +14102,7 @@ def _render_feature_engineering():
     elif source == "Generar nuevas":
         # Force DuckDB Source as per requirement
         if not DEFAULT_DUCKDB_FILE.exists():
-             st.warning(f"⚠️ La base de datos de flujos no existe en {DEFAULT_DUCKDB_FILE}. Por favor vaya a 'Base de Datos Flujos' en el menú y cargue datos.")
+             st.warning(f"âš ï¸ La base de datos de flujos no existe en {DEFAULT_DUCKDB_FILE}. Por favor vaya a 'Base de Datos Flujos' en el menÃº y cargue datos.")
         else:
              st.markdown(f"Usando Base de Datos Central: {DEFAULT_DUCKDB_FILE}")
         
@@ -13569,7 +14122,7 @@ def _render_feature_engineering():
                 key="feat_end_date",
             )
 
-        st.markdown("#### Configuración de Variables")
+        st.markdown("#### ConfiguraciÃ³n de Variables")
         
         # 1. Toggles
         c_tog1, c_tog2 = st.columns(2)
@@ -13674,13 +14227,13 @@ def _render_feature_engineering():
             # Snapshot Params
             c3, c4, c5 = st.columns(3)
             with c3:
-                seq_len = st.number_input("Largo Secuencia (steps)", min_value=1, value=10, key="fp_seq", help="Cantidad de pasos de tiempo (granularidad) hacia atrás que el modelo usará como input.")
+                seq_len = st.number_input("Largo Secuencia (steps)", min_value=1, value=10, key="fp_seq", help="Cantidad de pasos de tiempo (granularidad) hacia atrÃ¡s que el modelo usarÃ¡ como input.")
             with c4:
-                win_min = st.number_input("Ventana Agregación (min)", min_value=1, value=30, key="fp_win", help="Ventana de tiempo para agregar estadísticas (e.g. media móvil).")
-                guard_min = st.number_input("Guard Band (min)", min_value=0, value=0, key="fp_guard", help="Tiempo de separación entre el fin de los datos de input y el inicio del evento objetivo.")
+                win_min = st.number_input("Ventana AgregaciÃ³n (min)", min_value=1, value=30, key="fp_win", help="Ventana de tiempo para agregar estadÃ­sticas (e.g. media mÃ³vil).")
+                guard_min = st.number_input("Guard Band (min)", min_value=0, value=0, key="fp_guard", help="Tiempo de separaciÃ³n entre el fin de los datos de input y el inicio del evento objetivo.")
             with c5:
                 # dt_min is from common
-                slow_v = st.number_input("Velocidad Lenta (km/h)", min_value=0.0, value=30.0, key="fp_slow", help="Umbral de velocidad bajo el cual se considera congestión.")
+                slow_v = st.number_input("Velocidad Lenta (km/h)", min_value=0.0, value=30.0, key="fp_slow", help="Umbral de velocidad bajo el cual se considera congestiÃ³n.")
                 hor_min = st.number_input("Horizonte (min)", min_value=1, value=5, key="fp_hor", help="Tiempo a futuro desde el input para predecir el evento (Target).")
 
             st.markdown("#### Variables Snapshot")
@@ -13764,14 +14317,14 @@ def _render_feature_engineering():
             st.markdown(
                 f"""
             <div style="background-color: #f0f2f6; padding: 15px; border-radius: 5px; font-size: 0.9em;">
-            <strong>Guía de Ajuste de Parámetros Temporales:</strong>
+            <strong>GuÃ­a de Ajuste de ParÃ¡metros Temporales:</strong>
             <ul style="margin-top: 5px; padding-left: 20px;">
-                <li><b>Granularidad (dt):</b> Define la resolución temporal. <i>Menor valor</i> (e.g. 1 min) captura cambios rápidos pero aumenta el ruido y el cómputo. <i>Mayor valor</i> (e.g. 15 min) suaviza la señal.</li>
-                <li><b>Largo Secuencia:</b> Cuánto "pasado" observa el modelo. Con <i>dt={int(dt_min)}</i> y <i>Largo={int(seq_len)}</i>, el modelo mira {seq_minutes} minutos hacia atrás.</li>
-                <li><b>Ventana Agregación:</b> Suaviza métricas antes de generar features. Con <i>{int(win_min)} min</i> se agrega sobre ese rango temporal.</li>
+                <li><b>Granularidad (dt):</b> Define la resoluciÃ³n temporal. <i>Menor valor</i> (e.g. 1 min) captura cambios rÃ¡pidos pero aumenta el ruido y el cÃ³mputo. <i>Mayor valor</i> (e.g. 15 min) suaviza la seÃ±al.</li>
+                <li><b>Largo Secuencia:</b> CuÃ¡nto "pasado" observa el modelo. Con <i>dt={int(dt_min)}</i> y <i>Largo={int(seq_len)}</i>, el modelo mira {seq_minutes} minutos hacia atrÃ¡s.</li>
+                <li><b>Ventana AgregaciÃ³n:</b> Suaviza mÃ©tricas antes de generar features. Con <i>{int(win_min)} min</i> se agrega sobre ese rango temporal.</li>
                 <li><b>Guard Band:</b> Tiempo "ciego" entre el fin de la ventana de input y el inicio de la etiqueta. Con <i>{int(guard_min)} min</i> se excluye ese margen.</li>
                 <li><b>Horizonte:</b> Rango temporal posterior al fin del input donde se busca el accidente. Con <i>{int(hor_min)} min</i> se etiqueta si ocurre un accidente en ese rango.</li>
-                <li><b>Velocidad Lenta:</b> Umbral para definir congestión. Con <i>{float(slow_v):g} km/h</i> se activan features de congestión.</li>
+                <li><b>Velocidad Lenta:</b> Umbral para definir congestiÃ³n. Con <i>{float(slow_v):g} km/h</i> se activan features de congestiÃ³n.</li>
             </ul>
             <div style="margin-top: 8px;">
                 <strong>Etiquetado de accidentes:</strong> se etiqueta la ventana previa al accidente. Para cada fila en <i>ts_min</i> (inicio del intervalo),
@@ -13779,7 +14332,7 @@ def _render_feature_engineering():
                 <i>{int(dt_min)} min</i> corresponde al fin del intervalo y se suma el guard band + horizonte.
             </div>
             <div style="margin-top: 6px;">
-                <strong>Ejemplo:</strong> si la fila es <i>{example_input_start_str} → {example_input_end_str}</i>, la ventana positiva es
+                <strong>Ejemplo:</strong> si la fila es <i>{example_input_start_str} â†’ {example_input_end_str}</i>, la ventana positiva es
                 <i>{example_label_start_str}</i> a <i>{example_label_end_str}</i>. Si ocurre un accidente a las <i>{example_acc_str}</i>,
                 entonces esa fila se etiqueta como positiva.
             </div>
@@ -13789,7 +14342,7 @@ def _render_feature_engineering():
             )
 
             st.markdown("---")
-            if st.button("🚀 Generar Snapshot Features", type="primary", key="btn_run_snapshot"):
+            if st.button("ðŸš€ Generar Snapshot Features", type="primary", key="btn_run_snapshot"):
                 # Prepare Params for Snapshot
                 snap_params = {
                     "use_batches": use_batches_effective,
@@ -13829,9 +14382,9 @@ def _render_feature_engineering():
                              # Get the most recent entry
                              last_entry = sorted(entries, key=lambda x: x.get("timestamp", ""), reverse=True)[0]
                              if notification_system.send_notification_email("Feature Engineering (Snapshot)", last_entry):
-                                 st.toast("Email de notificación enviado.", icon="📧")
+                                 st.toast("Email de notificaciÃ³n enviado.", icon="ðŸ“§")
                              else:
-                                 st.error("Error enviando email de notificación.")
+                                 st.error("Error enviando email de notificaciÃ³n.")
                 else:
                      if notify_enabled:
                          err_notice = st.session_state.get("feature_notice", {})
@@ -13844,7 +14397,7 @@ def _render_feature_engineering():
 
         # --- TAB 2: FLOW 5 MIN ---
         with tab_flow:
-            st.caption("Genera métricas descriptivas, de congestión y clusters.")
+            st.caption("Genera mÃ©tricas descriptivas, de congestiÃ³n y clusters.")
             
             # Flow Params
             col1, col2 = st.columns(2)
@@ -13874,7 +14427,7 @@ def _render_feature_engineering():
                     "Smooth Speed": "smooth_v"
                 }
                 metrics_selected = st.multiselect(
-                    "Variables por Categoría",
+                    "Variables por CategorÃ­a",
                     list(metric_options.keys()),
                     default=["Flow", "Speed (Mean)", "Density"],
                     key="feat_metrics_v2",
@@ -13905,7 +14458,7 @@ def _render_feature_engineering():
                     "Missing Rate": "missing_rate"
                 }
                 global_selected = st.multiselect(
-                    "Indicadores Globales (Congestión)",
+                    "Indicadores Globales (CongestiÃ³n)",
                     list(global_options.keys()),
                     default=["Congestion Index", "V/C Ratio", "Slow Share (50%)"],
                     key="feat_global_v2",
@@ -13914,7 +14467,7 @@ def _render_feature_engineering():
                 # Categories
                 cat_options = ["Light", "Heavy", "Motorcycles"]
                 cats_selected = st.multiselect(
-                    "Tipos de vehículo",
+                    "Tipos de vehÃ­culo",
                     cat_options,
                     default=["Light", "Heavy"],
                     key="feat_cats",
@@ -13973,11 +14526,11 @@ def _render_feature_engineering():
                     st.checkbox(
                         "Debug cluster (mostrar trazas)",
                         key="gnn_debug_cluster",
-                        help="Muestra información de debug cuando falla el cálculo de clusters.",
+                        help="Muestra informaciÃ³n de debug cuando falla el cÃ¡lculo de clusters.",
                     )
 
             st.markdown("---")
-            if st.button("🚀 Generar Flow Features", type="primary", key="btn_run_flow"):
+            if st.button("ðŸš€ Generar Flow Features", type="primary", key="btn_run_flow"):
                  # Prepare Params for Flow
                  flow_params = {
                     "use_batches": use_batches_effective,
@@ -14014,9 +14567,9 @@ def _render_feature_engineering():
                          if entries:
                              last_entry = sorted(entries, key=lambda x: x.get("timestamp", ""), reverse=True)[0]
                              if notification_system.send_notification_email("Feature Engineering (Flow)", last_entry):
-                                 st.toast("Email de notificación enviado.", icon="📧")
+                                 st.toast("Email de notificaciÃ³n enviado.", icon="ðŸ“§")
                              else:
-                                 st.error("Error enviando email de notificación.")
+                                 st.error("Error enviando email de notificaciÃ³n.")
                  else:
                      if notify_enabled:
                          err_notice = st.session_state.get("feature_notice", {})
@@ -14147,7 +14700,7 @@ def _render_feature_selection_tab() -> None:
         )
         portico_col = buscar_columna(features_work, "portico") or "portico"
         if portico_col not in features_work.columns:
-            st.warning("No se encontro columna de pórtico para etiquetar.")
+            st.warning("No se encontro columna de pÃ³rtico para etiquetar.")
             return
         features_work[portico_col] = _normalize_portico_series(
             features_work[portico_col]
@@ -14471,7 +15024,7 @@ def _render_feature_selection_tab() -> None:
         graph_data = graph_obj.get("data") if isinstance(graph_obj, dict) else None
         if not isinstance(graph_data, HeteroData):
             st.warning(
-                "Cargue un grafo en la pestaña Graph para calcular Gradientes (GNN)."
+                "Cargue un grafo en la pestaÃ±a Graph para calcular Gradientes (GNN)."
             )
         else:
             num_graph_features = int(graph_data["pm"].x.shape[1])
@@ -14792,8 +15345,8 @@ def _load_gnn_encoder_for_graphsmote(
     """Reconstruye un checkpoint GNN como encoder para GraphSMOTE.
 
     Balance solo necesita embeddings del encoder; no ejecuta entrenamiento ni
-    evaluación final. La carga sigue la misma reconstrucción estricta usada por
-    Evaluación Modelo para respetar edge encoders y heads temporales.
+    evaluaciÃ³n final. La carga sigue la misma reconstrucciÃ³n estricta usada por
+    EvaluaciÃ³n Modelo para respetar edge encoders y heads temporales.
     """
     from src import gnn_main as graph_main
 
@@ -14974,21 +15527,21 @@ def _graphsmote_validation_summary(
 
 
 def _render_graphsmote_validation_summary(summary: Mapping[str, object]) -> None:
-    st.markdown("#### Validación del grafo aumentado")
+    st.markdown("#### ValidaciÃ³n del grafo aumentado")
     cols = st.columns(4)
     cols[0].metric("Nodos base", summary.get("base_nodes", "N/A"))
     cols[1].metric("Nodos aumentados", summary.get("augmented_nodes", "N/A"))
-    cols[2].metric("Sintéticos", summary.get("synthetic_nodes", "N/A"))
+    cols[2].metric("SintÃ©ticos", summary.get("synthetic_nodes", "N/A"))
     cols[3].metric("Modo features", summary.get("synthetic_feature_mode") or "N/A")
 
     mask_cols = st.columns(3)
-    mask_cols[0].metric("Sintéticos train", summary.get("synthetic_train", "N/A"))
-    mask_cols[1].metric("Sintéticos val", summary.get("synthetic_val", "N/A"))
-    mask_cols[2].metric("Sintéticos test", summary.get("synthetic_test", "N/A"))
+    mask_cols[0].metric("SintÃ©ticos train", summary.get("synthetic_train", "N/A"))
+    mask_cols[1].metric("SintÃ©ticos val", summary.get("synthetic_val", "N/A"))
+    mask_cols[2].metric("SintÃ©ticos test", summary.get("synthetic_test", "N/A"))
     if int(summary.get("synthetic_val") or 0) == 0 and int(summary.get("synthetic_test") or 0) == 0:
-        st.success("Máscaras correctas: los sintéticos quedaron solo en train_mask.")
+        st.success("MÃ¡scaras correctas: los sintÃ©ticos quedaron solo en train_mask.")
     else:
-        st.error("Hay sintéticos en val_mask/test_mask. No use este grafo para entrenar.")
+        st.error("Hay sintÃ©ticos en val_mask/test_mask. No use este grafo para entrenar.")
 
     edge_rows = summary.get("edge_rows")
     if isinstance(edge_rows, list) and edge_rows:
@@ -15003,7 +15556,7 @@ def _render_graphsmote_validation_summary(summary: Mapping[str, object]) -> None
             f"edge_attr alineado, pero dimensiones observadas: temporal={temporal_dim}, spatial={spatial_dim}."
         )
     else:
-        st.error("edge_attr no está alineado con edge_index en al menos una relación.")
+        st.error("edge_attr no estÃ¡ alineado con edge_index en al menos una relaciÃ³n.")
 
     quality = summary.get("feature_quality") or {}
     if isinstance(quality, Mapping) and quality:
@@ -15018,7 +15571,7 @@ def _render_graphsmote_validation_summary(summary: Mapping[str, object]) -> None
         cos_ratio = _metric_float(quality.get("synthetic_cosine_p95_to_real_positive_loo_p95_ratio"))
         q_cols[2].metric("L2 p95 ratio", f"{l2_ratio:.3f}" if l2_ratio is not None else "N/A")
         q_cols[3].metric("Cosine p95 ratio", f"{cos_ratio:.3f}" if cos_ratio is not None else "N/A")
-        with st.expander("Diagnóstico completo de features sintéticas", expanded=False):
+        with st.expander("DiagnÃ³stico completo de features sintÃ©ticas", expanded=False):
             st.json(dict(quality))
 
 
@@ -15035,8 +15588,8 @@ def _render_graphsmote_graph_generator_panel(
     current_ratio = train_pos / max(train_count, 1)
 
     st.caption(
-        "Balance genera un grafo aumentado para Training. No entrena ni evalúa "
-        "el predictor final en esta pestaña."
+        "Balance genera un grafo aumentado para Training. No entrena ni evalÃºa "
+        "el predictor final en esta pestaÃ±a."
     )
     data_cols = st.columns(4)
     data_cols[0].metric("Nodos pm", int(graph_data[node_type].num_nodes))
@@ -15048,7 +15601,7 @@ def _render_graphsmote_graph_generator_panel(
         existing_syn = int(graph_data[node_type].is_synthetic.detach().cpu().bool().sum().item())
         if existing_syn > 0:
             st.error(
-                f"El grafo cargado ya contiene {existing_syn} nodos sintéticos. "
+                f"El grafo cargado ya contiene {existing_syn} nodos sintÃ©ticos. "
                 "Cargue el grafo base antes de volver a generar GraphSMOTE."
             )
             return
@@ -15058,16 +15611,17 @@ def _render_graphsmote_graph_generator_panel(
         model_files = _list_gnn_model_files_for_baseline()
         if model_files:
             st.warning(
-                "No encontré checkpoints filtrados para este grafo; se muestran checkpoints GNN globales."
+                "No encontrÃ© checkpoints filtrados para este grafo; se muestran checkpoints GNN globales."
             )
-    preferred_model = os.path.join(
-        RESULTADOS_DIR,
+    preferred_model = str(gnn_path(
+        "models_gat",
         "gat_model_BEST_GNN_gat_edge_mlp_gru_20260515_172330_533b8548.pt",
-    )
+        resultados_dir=RESULTADOS_DIR,
+    ))
     if preferred_model not in model_files and os.path.exists(preferred_model):
         model_files = [preferred_model] + [path for path in model_files if path != preferred_model]
     if not model_files:
-        st.error("No hay checkpoints GNN disponibles en Resultados/. Entrene un encoder en Training primero.")
+        st.error("No hay checkpoints GNN disponibles en Resultados/gnn/models/gat/. Entrene un encoder en Training primero.")
         return
 
     model_default = st.session_state.get("gnn_graphsmote_encoder_model")
@@ -15110,7 +15664,7 @@ def _render_graphsmote_graph_generator_panel(
         )
     with col_b:
         edge_topk = st.number_input(
-            "topK aristas sintéticas",
+            "topK aristas sintÃ©ticas",
             min_value=1,
             value=int(GRAPHSMOTE_K),
             step=1,
@@ -15142,7 +15696,7 @@ def _render_graphsmote_graph_generator_panel(
     conn_cols = st.columns(3)
     with conn_cols[0]:
         conect_mode = st.radio(
-            "Conexión",
+            "ConexiÃ³n",
             ["Top-K TRAIN real", "Vecinos de accidentes (1-hop)"],
             horizontal=False,
             key="gnn_graphsmote_connect_mode",
@@ -15159,7 +15713,7 @@ def _render_graphsmote_graph_generator_panel(
             value=True,
             key="gnn_graphsmote_force_cpu",
         )
-        st.caption("Features sintéticas: `feature_interp`")
+        st.caption("Features sintÃ©ticas: `feature_interp`")
 
     with st.expander("Avanzado", expanded=False):
         neighbor_mode = st.radio(
@@ -15212,7 +15766,7 @@ def _render_graphsmote_graph_generator_panel(
     default_name = f"graph_aug_graphsmote_v3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
     save_path = st.text_input(
         "Ruta de salida del grafo aumentado",
-        value=os.path.join(RESULTADOS_DIR, default_name),
+        value=str(gnn_path("graphs_graphsmote", default_name, resultados_dir=RESULTADOS_DIR, create_parent=True)),
         key="gnn_graphsmote_save_path",
     )
 
@@ -15243,7 +15797,7 @@ def _render_graphsmote_graph_generator_panel(
         graphsmote_mod.GRAPHSMOTE_SYNTHETIC_FEATURE_MODE = "feature_interp"
 
         progress_text = st.empty()
-        with st.expander("Logs de generación GraphSMOTE", expanded=False):
+        with st.expander("Logs de generaciÃ³n GraphSMOTE", expanded=False):
             log_display = st.empty()
         log_handler = StreamlitLogHandler(log_display)
         log_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s", "%H:%M:%S"))
@@ -15273,7 +15827,7 @@ def _render_graphsmote_graph_generator_panel(
 
                     edge_gen = graphsmote_mod.RelEdgeGen(z_dim_dict, base_graph_for_aug.edge_types).to(device)
                     edge_report_dir = os.path.join(
-                        RESULTADOS_DIR,
+                        str(gnn_dir("models_graphsmote", RESULTADOS_DIR, create=True)),
                         "graphsmote_generators",
                         "edge_gen",
                         _sanitize_path_token(Path(encoder_model).stem),
@@ -15293,7 +15847,7 @@ def _render_graphsmote_graph_generator_panel(
                             report_path=edge_report_path,
                         )
                     else:
-                        st.warning("RelEdgeGen quedó sin preentrenamiento; úselo solo para diagnóstico.")
+                        st.warning("RelEdgeGen quedÃ³ sin preentrenamiento; Ãºselo solo para diagnÃ³stico.")
 
                     has_edge_attr = any(
                         hasattr(base_graph_for_aug[et], "edge_attr")
@@ -15305,7 +15859,7 @@ def _render_graphsmote_graph_generator_panel(
                     if has_edge_attr:
                         progress_text.caption("Entrenando decoder relacional de atributos de arista...")
                         edge_attr_dir = os.path.join(
-                            RESULTADOS_DIR,
+                            str(gnn_dir("models_graphsmote", RESULTADOS_DIR, create=True)),
                             "edge_attr_decoders",
                             _sanitize_path_token(Path(encoder_model).stem),
                         )
@@ -15391,7 +15945,7 @@ def _render_graphsmote_graph_generator_panel(
     last_summary = st.session_state.get("gnn_graphsmote_last_aug_summary")
     last_path = st.session_state.get("gnn_graphsmote_last_aug_path")
     if last_path:
-        st.caption(f"Último grafo aumentado: `{last_path}`")
+        st.caption(f"Ãšltimo grafo aumentado: `{last_path}`")
     if isinstance(last_summary, Mapping):
         _render_graphsmote_validation_summary(last_summary)
 
@@ -15411,8 +15965,8 @@ def _render_imgagn_relational_panel(
 
     st.markdown("### ImGAGN relacional parent-anchored")
     st.caption(
-        "Genera sintéticos solo en train_mask, anclados a un padre positivo dominante, "
-        "y preserva explícitamente las relaciones temporal y spatial."
+        "Genera sintÃ©ticos solo en train_mask, anclados a un padre positivo dominante, "
+        "y preserva explÃ­citamente las relaciones temporal y spatial."
     )
 
     required_edges = {("pm", "temporal", "pm"), ("pm", "spatial", "pm")}
@@ -15436,7 +15990,7 @@ def _render_imgagn_relational_panel(
             synth_existing = 0
     if synth_existing > 0:
         st.warning(
-            "El grafo cargado ya contiene nodos sintéticos. "
+            "El grafo cargado ya contiene nodos sintÃ©ticos. "
             "Cargue el grafo original antes de ejecutar ImGAGN relacional."
         )
         return
@@ -15456,16 +16010,16 @@ def _render_imgagn_relational_panel(
     metric_cols[3].metric("Prevalencia train", f"{train_ratio:.5f}")
     metric_cols[4].metric("edge_attr", f"T{temporal_dim} / S{spatial_dim}")
 
-    with st.expander("Preset metodológico", expanded=False):
+    with st.expander("Preset metodolÃ³gico", expanded=False):
         st.markdown(
             "- `target_pos_ratio=0.003`: eleva la prevalencia positiva solo en entrenamiento.\n"
             "- `dz=64`, `hidden_g=256`, `hidden_d=64`, `dropout=0.25`.\n"
             "- `epochs=30`, `d_steps=1`, `temperature=0.30`, `entropy_weight=0.00`.\n"
             "- `lr_g=1e-3`, `lr_d=5e-4`.\n"
             "- `early_stopping_patience=5`: checkpoint por menor `tabsyndex_loss` interno de train.\n"
-            "- `tabsyndex_loss`: KS continuas + chi2 categóricas + correlaciones + detectabilidad + utilidad lineal.\n"
+            "- `tabsyndex_loss`: KS continuas + chi2 categÃ³ricas + correlaciones + detectabilidad + utilidad lineal.\n"
             "- `spatial_copy_k=3`, `seed=19092086`.\n"
-            "- No crea relación `imgagn`; añade aristas por relación `temporal` y `spatial`."
+            "- No crea relaciÃ³n `imgagn`; aÃ±ade aristas por relaciÃ³n `temporal` y `spatial`."
         )
 
     col1, col2, col3 = st.columns(3)
@@ -15616,7 +16170,7 @@ def _render_imgagn_relational_panel(
             value=1,
             step=1,
             key="gnn_imgagn_rel_quality_eval_every",
-            help="Frecuencia de cálculo de métricas TabSynDex-like. Por defecto se evalúa en cada época.",
+            help="Frecuencia de cÃ¡lculo de mÃ©tricas TabSynDex-like. Por defecto se evalÃºa en cada Ã©poca.",
         )
     with col11:
         distribution_eval_sample_size = st.number_input(
@@ -15626,7 +16180,7 @@ def _render_imgagn_relational_panel(
             value=2048,
             step=32,
             key="gnn_imgagn_rel_dist_eval_sample",
-            help="Máximo de filas reales/sintéticas usadas en KS, chi2, correlaciones y clasificadores.",
+            help="MÃ¡ximo de filas reales/sintÃ©ticas usadas en KS, chi2, correlaciones y clasificadores.",
         )
     with col12:
         classifier_eval_steps = st.number_input(
@@ -15636,16 +16190,16 @@ def _render_imgagn_relational_panel(
             value=25,
             step=5,
             key="gnn_imgagn_rel_classifier_eval_steps",
-            help="Pasos del clasificador lineal interno para detectabilidad real-vs-sintético y utilidad.",
+            help="Pasos del clasificador lineal interno para detectabilidad real-vs-sintÃ©tico y utilidad.",
         )
 
     device = get_auto_device()
-    st.caption(f"Dispositivo generación: {device}")
+    st.caption(f"Dispositivo generaciÃ³n: {device}")
 
     default_name = f"graph_imgagn_relational_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
     save_path = st.text_input(
         "Ruta de guardado del grafo balanceado",
-        value=os.path.join(RESULTADOS_DIR, default_name),
+        value=str(gnn_path("graphs_imgagn", default_name, resultados_dir=RESULTADOS_DIR, create_parent=True)),
         key="gnn_imgagn_rel_save_path",
     )
 
@@ -15726,16 +16280,14 @@ def _render_imgagn_relational_panel(
         try:
             save_path_obj = Path(save_path)
             validation_path = (
-                Path(RESULTADOS_DIR)
-                / "imgagn_relational_validations"
+                gnn_dir("imgagn_validations", RESULTADOS_DIR, create=True)
                 / f"{save_path_obj.stem}_validation.json"
             )
             checkpoint_path = (
-                Path(RESULTADOS_DIR)
-                / "imgagn_relational_validations"
+                gnn_dir("imgagn_validations", RESULTADOS_DIR, create=True)
                 / f"{save_path_obj.stem}_best_checkpoint.pt"
             )
-            with st.spinner("Generando sintéticos relacionales con ImGAGN..."):
+            with st.spinner("Generando sintÃ©ticos relacionales con ImGAGN..."):
                 result = build_relational_imgagn_graph(
                     balance_graph_obj,
                     cfg,
@@ -15807,7 +16359,7 @@ def _render_balance_tab() -> None:
     balance_graph_obj = st.session_state.get("loaded_graph")
     if balance_graph_obj is None:
         st.warning(
-            "No hay grafo cargado en memoria. Cargue o construya un grafo en la pestaña Graph."
+            "No hay grafo cargado en memoria. Cargue o construya un grafo en la pestaÃ±a Graph."
         )
         return
 
@@ -15871,7 +16423,7 @@ def _gnn_strategy_catalog_rows() -> List[Dict[str, str]]:
             "spatial_encoder": "HeteroGAT (GATConv)",
             "temporal_head": "Transformer",
             "edge_processing": "edge_attr directo",
-            "notes": "Self-attention temporal con posición aprendible.",
+            "notes": "Self-attention temporal con posiciÃ³n aprendible.",
         },
         {
             "variant": "gat_attnpool",
@@ -15885,7 +16437,7 @@ def _gnn_strategy_catalog_rows() -> List[Dict[str, str]]:
             "spatial_encoder": "HeteroGAT + Edge MLP",
             "temporal_head": "No / GRU / Transformer",
             "edge_processing": "MLP por tipo de arista",
-            "notes": "Aprende representación de deltas antes de atención.",
+            "notes": "Aprende representaciÃ³n de deltas antes de atenciÃ³n.",
         },
         {
             "variant": "gnn_edge_aware / *_gru / *_transformer",
@@ -16018,110 +16570,110 @@ EDGE_ENCODER_KIND_OPTIONS = ["mlp", "mlp_residual", "layernorm_mlp", "time2vec"]
 
 
 # Metadata orientativa para la UI: cada entrada describe el encoder, su
-# fórmula, costo relativo de parámetros, cuándo usarlo y cuándo evitarlo.
+# fÃ³rmula, costo relativo de parÃ¡metros, cuÃ¡ndo usarlo y cuÃ¡ndo evitarlo.
 EDGE_ENCODER_KIND_INFO: Dict[str, Dict[str, str]] = {
     "mlp": {
         "label": "MLP (baseline)",
         "summary": "Baseline. No asume nada sobre la estructura de las features.",
-        "formula": "Linear(in→h) → ReLU → Dropout → Linear(h→out)",
-        "params": "Bajo (~2·in·h + 2·h·out)",
+        "formula": "Linear(inâ†’h) â†’ ReLU â†’ Dropout â†’ Linear(hâ†’out)",
+        "params": "Bajo (~2Â·inÂ·h + 2Â·hÂ·out)",
         "use_when": (
             "Default seguro. Punto de partida cuando no tienes evidencia para "
-            "elegir algo más específico."
+            "elegir algo mÃ¡s especÃ­fico."
         ),
         "avoid_when": (
-            "Si las features mezclan escalas muy distintas o son periódicas — "
+            "Si las features mezclan escalas muy distintas o son periÃ³dicas â€” "
             "otros encoders modelan eso mejor."
         ),
     },
     "mlp_residual": {
         "label": "MLP + Residual (skip)",
-        "summary": "MLP con skip lineal — el MLP solo aprende el delta sobre la señal cruda.",
-        "formula": "MLP(x) + Linear_skip(x → out)",
-        "params": "Medio (+ in·out vs. mlp)",
+        "summary": "MLP con skip lineal â€” el MLP solo aprende el delta sobre la seÃ±al cruda.",
+        "formula": "MLP(x) + Linear_skip(x â†’ out)",
+        "params": "Medio (+ inÂ·out vs. mlp)",
         "use_when": (
-            "Features crudas ya informativas y/o muchas (≥ 8). Útil cuando "
-            "quieres que el modelo pueda «pasar» la señal sin pelearla. "
+            "Features crudas ya informativas y/o muchas (â‰¥ 8). Ãštil cuando "
+            "quieres que el modelo pueda Â«pasarÂ» la seÃ±al sin pelearla. "
             "Buen candidato para aristas espaciales con varias features."
         ),
         "avoid_when": (
             "Cuando in_dim es muy chico (3-5); el skip casi no aporta y solo "
-            "añade parámetros."
+            "aÃ±ade parÃ¡metros."
         ),
     },
     "layernorm_mlp": {
         "label": "LayerNorm + MLP",
         "summary": "LayerNorm sobre raw edge_attr antes del MLP. Estabiliza cuando hay escalas mixtas.",
         "formula": "MLP(LayerNorm(x))",
-        "params": "Bajo (+ 2·in vs. mlp)",
+        "params": "Bajo (+ 2Â·in vs. mlp)",
         "use_when": (
-            "Features con escalas muy distintas (p. ej. delta-features ≈ ±10, "
-            "`dist_km` ≈ 0-50, gradientes ≈ ±100). Suele converger más rápido "
-            "y dar AUPRC más estable."
+            "Features con escalas muy distintas (p. ej. delta-features â‰ˆ Â±10, "
+            "`dist_km` â‰ˆ 0-50, gradientes â‰ˆ Â±100). Suele converger mÃ¡s rÃ¡pido "
+            "y dar AUPRC mÃ¡s estable."
         ),
         "avoid_when": (
-            "Cuando las features ya están normalizadas en construcción del "
-            "grafo — la LayerNorm sobra y añade ruido."
+            "Cuando las features ya estÃ¡n normalizadas en construcciÃ³n del "
+            "grafo â€” la LayerNorm sobra y aÃ±ade ruido."
         ),
     },
     "time2vec": {
-        "label": "Time2Vec (periódico)",
+        "label": "Time2Vec (periÃ³dico)",
         "summary": (
-            "Codificación periódica feature-wise. `hidden_dim` se interpreta "
-            "como k (número de componentes; típico 4-8)."
+            "CodificaciÃ³n periÃ³dica feature-wise. `hidden_dim` se interpreta "
+            "como k (nÃºmero de componentes; tÃ­pico 4-8)."
         ),
-        "formula": "[w·x + b, sin(w₁·x + φ₁), …, sin(w_{k-1}·x + φ_{k-1})] → Linear(in·k → out)",
-        "params": "Alto (~ in·k·out, crece con k)",
+        "formula": "[wÂ·x + b, sin(wâ‚Â·x + Ï†â‚), â€¦, sin(w_{k-1}Â·x + Ï†_{k-1})] â†’ Linear(inÂ·k â†’ out)",
+        "params": "Alto (~ inÂ·kÂ·out, crece con k)",
         "use_when": (
             "Features continuas con estacionalidad o magnitudes muy variables, "
             "principalmente `dt` en la arista temporal. Captura la "
             "periodicidad que MLP ignora."
         ),
         "avoid_when": (
-            "Para features físicas no periódicas (km, gradientes). Aumenta "
-            "parámetros sin beneficio y puede sobreajustar."
+            "Para features fÃ­sicas no periÃ³dicas (km, gradientes). Aumenta "
+            "parÃ¡metros sin beneficio y puede sobreajustar."
         ),
     },
 }
 
 
-# Heurísticas de qué encoder casa mejor con cada tipo de arista. Si el usuario
-# elige otra cosa lo respetamos — esto es solo orientación.
+# HeurÃ­sticas de quÃ© encoder casa mejor con cada tipo de arista. Si el usuario
+# elige otra cosa lo respetamos â€” esto es solo orientaciÃ³n.
 EDGE_ENCODER_RECOMMENDATION_BY_RELATION: Dict[str, Tuple[str, str]] = {
     "temporal": (
         "time2vec",
-        "Solo lleva `delta_features` con `dt` implícito; Time2Vec captura "
+        "Solo lleva `delta_features` con `dt` implÃ­cito; Time2Vec captura "
         "estacionalidad que MLP ignora.",
     ),
     "spatial": (
         "layernorm_mlp",
-        "Mezcla `delta_features` con features físicas de escalas distintas "
+        "Mezcla `delta_features` con features fÃ­sicas de escalas distintas "
         "(km, gradientes); LayerNorm estabiliza.",
     ),
     "st_fwd": (
         "mlp_residual",
         "Combina componentes espaciales y temporales; el skip preserva la "
-        "señal cruda sin sacrificar capacidad.",
+        "seÃ±al cruda sin sacrificar capacidad.",
     ),
 }
 
 
 def _edge_encoder_kind_help_markdown() -> str:
-    """Bloque markdown con la guía completa de los 4 encoders. Lo usamos
+    """Bloque markdown con la guÃ­a completa de los 4 encoders. Lo usamos
     dentro del expander avanzado para que el usuario tenga toda la info a un
-    click sin abandonar la pestaña."""
-    lines = ["**Guía de selección — encoders por tipo de arista**", ""]
+    click sin abandonar la pestaÃ±a."""
+    lines = ["**GuÃ­a de selecciÃ³n â€” encoders por tipo de arista**", ""]
     for kind in EDGE_ENCODER_KIND_OPTIONS:
         info = EDGE_ENCODER_KIND_INFO.get(kind)
         if not info:
             continue
-        lines.append(f"### `{kind}` — {info['label']}")
+        lines.append(f"### `{kind}` â€” {info['label']}")
         lines.append(info["summary"])
         lines.append("")
-        lines.append(f"- **Fórmula:** `{info['formula']}`")
-        lines.append(f"- **Parámetros:** {info['params']}")
-        lines.append(f"- **Cuándo usarlo:** {info['use_when']}")
-        lines.append(f"- **Evítalo cuando:** {info['avoid_when']}")
+        lines.append(f"- **FÃ³rmula:** `{info['formula']}`")
+        lines.append(f"- **ParÃ¡metros:** {info['params']}")
+        lines.append(f"- **CuÃ¡ndo usarlo:** {info['use_when']}")
+        lines.append(f"- **EvÃ­talo cuando:** {info['avoid_when']}")
         lines.append("")
     return "\n".join(lines)
 
@@ -16129,16 +16681,16 @@ def _edge_encoder_kind_help_markdown() -> str:
 def _edge_encoder_recommendation(
     relation_name: str, current_kind: str
 ) -> Optional[str]:
-    """Devuelve una caption corta para una relación dada, indicando el kind
-    recomendado y por qué. Si el usuario ya eligió el recomendado, lo confirma
+    """Devuelve una caption corta para una relaciÃ³n dada, indicando el kind
+    recomendado y por quÃ©. Si el usuario ya eligiÃ³ el recomendado, lo confirma
     en lugar de sugerir."""
     rec = EDGE_ENCODER_RECOMMENDATION_BY_RELATION.get(str(relation_name).lower())
     if not rec:
         return None
     recommended, reason = rec
     if str(current_kind).lower() == recommended:
-        return f"OK: `{recommended}` suele ser la mejor opción aquí — {reason}"
-    return f"Sugerencia: `{recommended}` suele rendir mejor para `{relation_name}` — {reason}"
+        return f"OK: `{recommended}` suele ser la mejor opciÃ³n aquÃ­ â€” {reason}"
+    return f"Sugerencia: `{recommended}` suele rendir mejor para `{relation_name}` â€” {reason}"
 
 
 def _edge_type_search_key(edge_type: object) -> str:
@@ -16396,8 +16948,8 @@ def _render_gnn_variant_selector(
         key=key,
         format_func=lambda v: labels.get(str(v), str(v)),
         help=(
-            "Selecciona la variante del experimento. La elección se guarda en la sesión y "
-            "se exporta con la configuración de Network."
+            "Selecciona la variante del experimento. La elecciÃ³n se guarda en la sesiÃ³n y "
+            "se exporta con la configuraciÃ³n de Network."
         ),
     )
     selected_norm = _normalize_ui_gnn_variant(selected)
@@ -16493,18 +17045,18 @@ def _render_gnn_strategy_reference_panel(
     active_variant_tag = (model_meta or {}).get("variant_tag")
     cache_strategy = str(GNN_TEMPORAL_CACHE_STRATEGY)
 
-    with st.expander(f"Guía de estrategias GNN ({context_label})", expanded=expanded):
+    with st.expander(f"GuÃ­a de estrategias GNN ({context_label})", expanded=expanded):
         st.markdown(
-            "Esta guía resume las variantes GNN implementadas para experimentos comparables "
-            "en secuencias temporales. La comparación científica debe mantener fijo el grafo, "
+            "Esta guÃ­a resume las variantes GNN implementadas para experimentos comparables "
+            "en secuencias temporales. La comparaciÃ³n cientÃ­fica debe mantener fijo el grafo, "
             "los splits temporales, el `SequenceIndex` y la semilla."
         )
 
-        st.markdown("#### Configuración temporal activa (UI / config.py)")
+        st.markdown("#### ConfiguraciÃ³n temporal activa (UI / config.py)")
         if active_variant != config_variant:
             st.caption(
-                "La variante activa mostrada (modelo cargado o selección de UI) difiere de "
-                "`config.py`. Al exportar desde Network, la selección de la UI se guarda como "
+                "La variante activa mostrada (modelo cargado o selecciÃ³n de UI) difiere de "
+                "`config.py`. Al exportar desde Network, la selecciÃ³n de la UI se guarda como "
                 "`gnn_variant`."
             )
         st.markdown(
@@ -16518,11 +17070,11 @@ def _render_gnn_strategy_reference_panel(
         )
         if seq_len is not None and int(seq_len) != int(SEQ_LENGTH):
             st.info(
-                f"Network usará L={int(seq_len)} desde {seq_source}; "
+                f"Network usarÃ¡ L={int(seq_len)} desde {seq_source}; "
                 f"`config.py` mantiene SEQ_LENGTH={int(SEQ_LENGTH)} solo como fallback."
             )
         st.caption(
-            "Interpretación del etiquetado: positivo si existe accidente en el intervalo "
+            "InterpretaciÃ³n del etiquetado: positivo si existe accidente en el intervalo "
             "(t + guard_band, t + guard_band + horizon]. Para '5 minutos antes' estricto, "
             "use guard_band=5 y horizon=5."
         )
@@ -16537,12 +17089,12 @@ def _render_gnn_strategy_reference_panel(
             )
             st.caption(
                 "Para entrenar GRU se requiere `SequenceIndex`; la longitud sin "
-                "secuencias completas sólo se usa como fallback visual/configurable."
+                "secuencias completas sÃ³lo se usa como fallback visual/configurable."
             )
         else:
             st.caption(
-                "No se detectó `SequenceIndex` en el grafo actual. Las variantes con head temporal "
-                "caerán a comportamiento snapshot o no podrán explotar secuencias."
+                "No se detectÃ³ `SequenceIndex` en el grafo actual. Las variantes con head temporal "
+                "caerÃ¡n a comportamiento snapshot o no podrÃ¡n explotar secuencias."
             )
 
         if model_meta:
@@ -16558,22 +17110,22 @@ def _render_gnn_strategy_reference_panel(
         st.markdown("#### Variantes implementadas")
         st.dataframe(pd.DataFrame(_gnn_strategy_catalog_rows()), width="stretch")
 
-        st.markdown("#### Estrategias temporales (idea → detalle)")
+        st.markdown("#### Estrategias temporales (idea â†’ detalle)")
         st.markdown(
             "- `snapshot`: usa solo el embedding del snapshot actual (baseline espacial).  \n"
             "- `GRU`: resume la ventana temporal en el hidden final (estable y barato).  \n"
-            "- `Transformer`: modela interacciones entre tiempos con self-attention y posición aprendible.  \n"
+            "- `Transformer`: modela interacciones entre tiempos con self-attention y posiciÃ³n aprendible.  \n"
             "- `AttnPool`: calcula pesos temporales suaves sin Transformer completo (ablation ligera)."
         )
 
-        st.markdown("#### Estrategia de caché temporal")
+        st.markdown("#### Estrategia de cachÃ© temporal")
         st.markdown(
-            "- `global_epoch` (recomendado para paper): realiza un forward global del encoder por época y "
-            "puebla el caché de embeddings, mejorando consistencia de secuencias.  \n"
-            "- `incremental`: actualiza el caché batch a batch; es más liviano, pero depende del muestreo."
+            "- `global_epoch` (recomendado para paper): realiza un forward global del encoder por Ã©poca y "
+            "puebla el cachÃ© de embeddings, mejorando consistencia de secuencias.  \n"
+            "- `incremental`: actualiza el cachÃ© batch a batch; es mÃ¡s liviano, pero depende del muestreo."
         )
 
-        st.markdown("#### Protocolo de comparación recomendado")
+        st.markdown("#### Protocolo de comparaciÃ³n recomendado")
         st.markdown(
             "1. `gat_snapshot` (baseline)  \n"
             "2. `gat_gru`  \n"
@@ -16582,7 +17134,7 @@ def _render_gnn_strategy_reference_panel(
             "5. `gnn_edge_aware_gru` o `gnn_edge_aware_transformer`"
         )
         st.caption(
-            "Métricas sugeridas: AUPRC/PR-AUC (principal), ROC-AUC, Recall@FAR objetivo y MCC."
+            "MÃ©tricas sugeridas: AUPRC/PR-AUC (principal), ROC-AUC, Recall@FAR objetivo y MCC."
         )
 
         st.code(
@@ -16705,23 +17257,23 @@ def _render_gnn_mlp_baseline_panel(
             value=int(min(BATCH_SIZE, 256)),
             step=16,
             key="gnn_mlp_baseline_gnn_eval_batch_size",
-            help="Batch usado para calibrar en validación y evaluar el checkpoint GNN en test.",
+            help="Batch usado para calibrar en validaciÃ³n y evaluar el checkpoint GNN en test.",
         )
     )
     gnn_eval_num_neighbors = col_gnn_neighbors.text_input(
         "num_neighbors GNN eval",
         value="",
         key="gnn_mlp_baseline_gnn_eval_neighbors",
-        help="Opcional. Vacío usa el perfil guardado en el checkpoint o config.py.",
+        help="Opcional. VacÃ­o usa el perfil guardado en el checkpoint o config.py.",
     )
     threshold_strategy_label = st.selectbox(
-        "Estrategia de umbral para Comparación",
-        ["FAR <= target (igual Evaluación Modelo)", "F-beta en validación"],
+        "Estrategia de umbral para ComparaciÃ³n",
+        ["FAR <= target (igual EvaluaciÃ³n Modelo)", "F-beta en validaciÃ³n"],
         index=0,
         key="gnn_mlp_baseline_threshold_strategy",
         help=(
-            "Define cómo se elige tau para MLP, XGBoost, SVM y el checkpoint GNN. "
-            "FAR replica el protocolo operacional de Evaluación Modelo; F-beta queda como análisis alternativo."
+            "Define cÃ³mo se elige tau para MLP, XGBoost, SVM y el checkpoint GNN. "
+            "FAR replica el protocolo operacional de EvaluaciÃ³n Modelo; F-beta queda como anÃ¡lisis alternativo."
         ),
     )
     threshold_strategy = (
@@ -16734,30 +17286,30 @@ def _render_gnn_mlp_baseline_panel(
     if threshold_strategy == "far":
         comparison_far_target = float(
             st.number_input(
-                "FAR target Comparación",
+                "FAR target ComparaciÃ³n",
                 min_value=0.0,
                 max_value=1.0,
                 value=float(st.session_state.get("gnn_eval_far_target", 0.20)),
                 step=0.01,
                 key="gnn_mlp_baseline_far_target",
                 help=(
-                    "Máximo FP/(FP+TN) permitido al seleccionar tau en validación. "
-                    "Use el mismo valor que Evaluación Modelo para comparar TP/FP de forma consistente."
+                    "MÃ¡ximo FP/(FP+TN) permitido al seleccionar tau en validaciÃ³n. "
+                    "Use el mismo valor que EvaluaciÃ³n Modelo para comparar TP/FP de forma consistente."
                 ),
             )
         )
     else:
         comparison_fbeta_beta = float(
             st.number_input(
-                "Beta F-beta Comparación",
+                "Beta F-beta ComparaciÃ³n",
                 min_value=0.05,
                 max_value=5.0,
                 value=1.0,
                 step=0.05,
                 key="gnn_mlp_baseline_fbeta_beta",
                 help=(
-                    "Beta usado para maximizar F-beta en validación. "
-                    "Valores menores priorizan precisión; mayores priorizan recall. No replica Evaluación Modelo."
+                    "Beta usado para maximizar F-beta en validaciÃ³n. "
+                    "Valores menores priorizan precisiÃ³n; mayores priorizan recall. No replica EvaluaciÃ³n Modelo."
                 ),
             )
         )
@@ -16783,9 +17335,9 @@ def _render_gnn_mlp_baseline_panel(
     progress_bar = st.progress(0.0)
     progress_text = st.empty()
     run_baseline = st.button(
-        "Ejecutar comparación tabular",
+        "Ejecutar comparaciÃ³n tabular",
         key="gnn_mlp_baseline_run",
-        help="Entrena los baselines seleccionados y guarda la comparacion en Resultados/gnn_mlp_baselines.",
+        help="Entrena los baselines seleccionados y guarda la comparacion en Resultados/gnn/baselines/mlp.",
     )
     if run_baseline:
         if not selected_baselines:
@@ -16826,16 +17378,16 @@ def _render_gnn_mlp_baseline_panel(
                     progress_text.caption(f"{model_name}: cargando checkpoint GNN.")
                 elif event_type == "gnn_checkpoint_calibrating":
                     progress_bar.progress(0.25)
-                    progress_text.caption(f"{model_name}: calibrando Platt/tau en validación.")
+                    progress_text.caption(f"{model_name}: calibrando Platt/tau en validaciÃ³n.")
                 elif event_type == "gnn_checkpoint_calibration_fallback":
                     progress_bar.progress(0.30)
                     progress_text.caption(
-                        f"{model_name}: usando val_mask como fallback de calibración "
+                        f"{model_name}: usando val_mask como fallback de calibraciÃ³n "
                         f"({event.get('reason', 'sin detalle')})."
                     )
                 elif event_type == "gnn_checkpoint_platt":
                     progress_bar.progress(0.40)
-                    progress_text.caption(f"{model_name}: Platt scaling ajustado en validación.")
+                    progress_text.caption(f"{model_name}: Platt scaling ajustado en validaciÃ³n.")
                 elif event_type == "gnn_checkpoint_tau":
                     progress_bar.progress(0.50)
                     progress_text.caption(
@@ -16846,7 +17398,7 @@ def _render_gnn_mlp_baseline_panel(
                 elif event_type == "gnn_checkpoint_done":
                     progress_bar.progress(1.0)
                     progress_text.caption(
-                        f"{model_name}: evaluación GNN finalizada con tau="
+                        f"{model_name}: evaluaciÃ³n GNN finalizada con tau="
                         f"{float(event.get('tau', 0.5) or 0.5):.6f} "
                         f"({event.get('calibration_method', 'softmax_raw')})"
                     )
@@ -16860,7 +17412,7 @@ def _render_gnn_mlp_baseline_panel(
                         patience=baseline_patience,
                         batch_size=baseline_batch_size,
                         device=get_auto_device(),
-                        save_dir=Path(RESULTADOS_DIR) / "gnn_mlp_baselines",
+                        save_dir=gnn_dir("baselines_mlp", RESULTADOS_DIR, create=True),
                         graph_hash=current_graph_hash,
                         progress_callback=_progress_cb,
                         threshold_strategy=threshold_strategy,
@@ -16868,12 +17420,12 @@ def _render_gnn_mlp_baseline_panel(
                         fbeta_beta=float(comparison_fbeta_beta),
                     )
             except Exception as exc:
-                st.error(f"Error al ejecutar comparación tabular sin grafo: {exc}")
+                st.error(f"Error al ejecutar comparaciÃ³n tabular sin grafo: {exc}")
             else:
                 artifact_path = baseline_df.attrs.get("artifact_path")
                 comparison_df = baseline_df.copy()
                 if selected_checkpoint != "(sin GNN)":
-                    progress_text.caption("Calibrando en validación y evaluando checkpoint GNN en test...")
+                    progress_text.caption("Calibrando en validaciÃ³n y evaluando checkpoint GNN en test...")
                     gnn_rows = _evaluate_gnn_checkpoint_for_comparison(
                         model_path=str(selected_checkpoint),
                         graph_obj=graph_obj,
@@ -16909,7 +17461,7 @@ def _render_gnn_mlp_baseline_panel(
                 if artifact_path:
                     st.success(f"Resultados guardados: {artifact_path}")
                 else:
-                    st.success("Comparación tabular sin grafo finalizada.")
+                    st.success("ComparaciÃ³n tabular sin grafo finalizada.")
 
     previous_df = st.session_state.get("gnn_mlp_baseline_results")
     if isinstance(previous_df, pd.DataFrame) and not previous_df.empty:
@@ -16935,7 +17487,7 @@ def _render_gnn_mlp_baseline_panel(
                 st.caption(f"CSV: `{artifact_path}`")
         else:
             st.caption(
-                "La última ejecución en sesión pertenece a otro grafo o a otra fuente de comparación."
+                "La Ãºltima ejecuciÃ³n en sesiÃ³n pertenece a otro grafo o a otra fuente de comparaciÃ³n."
             )
 
     st.caption(
@@ -16980,7 +17532,7 @@ def _render_gnn_mlp_baseline_history_panel(graph_obj: Dict[str, object]) -> None
         entry_keys.append(entry_key)
 
     selected_key = st.selectbox(
-        "Corrida histórica",
+        "Corrida histÃ³rica",
         entry_keys,
         index=0,
         key="gnn_mlp_baseline_history_selected_path",
@@ -17007,11 +17559,11 @@ def _render_gnn_mlp_baseline_history_panel(graph_obj: Dict[str, object]) -> None
 
 
 def _render_comparison_tab() -> None:
-    st.subheader("Comparación")
+    st.subheader("ComparaciÃ³n")
     loaded_graph = st.session_state.get("loaded_graph")
     balanced_graph = st.session_state.get("balanced_graph")
     if loaded_graph is None:
-        st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+        st.warning("No hay grafo cargado en memoria. Use la pestaÃ±a Graph.")
         return
 
     graph_obj = dict(loaded_graph)
@@ -17045,7 +17597,7 @@ def _render_comparison_tab() -> None:
     val_count = int(graph_data["pm"].val_mask.sum().item()) if hasattr(graph_data["pm"], "val_mask") else 0
     test_count = int(graph_data["pm"].test_mask.sum().item()) if hasattr(graph_data["pm"], "test_mask") else 0
     st.markdown(
-        f"**Grafo para comparación:** {graph_source_label}  \n"
+        f"**Grafo para comparaciÃ³n:** {graph_source_label}  \n"
         f"- Nodos PM: {pm_nodes}  \n"
         f"- Split: train={train_count}, val={val_count}, test={test_count}"
     )
@@ -17064,7 +17616,7 @@ def _render_training_tab() -> None:
     balanced_graph = st.session_state.get("balanced_graph")
 
     if loaded_graph is None:
-        st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+        st.warning("No hay grafo cargado en memoria. Use la pestaÃ±a Graph.")
         return
 
     use_balanced = False
@@ -17092,7 +17644,7 @@ def _render_training_tab() -> None:
         
         if balanced_files:
             #st.markdown("---")
-            #st.markdown("### 📥 Cargar Grafo Balanceado Guardado")
+            #st.markdown("### ðŸ“¥ Cargar Grafo Balanceado Guardado")
             selected_file = st.selectbox(
                 "Seleccionar grafo balanceado guardado",
                 balanced_files,
@@ -17157,7 +17709,7 @@ def _render_training_tab() -> None:
         return
     if ("pm", "imgagn", "pm") in graph_data.edge_types:
         st.error(
-            "El grafo contiene la relación homogénea ('pm','imgagn','pm'), "
+            "El grafo contiene la relaciÃ³n homogÃ©nea ('pm','imgagn','pm'), "
             "que ya no es una ruta operativa. Use Balance -> ImGAGN relacional parent-anchored."
         )
         return
@@ -17242,8 +17794,8 @@ def _render_training_tab() -> None:
         and not use_imgagn_relational_train
     ):
         st.error(
-            "Se detectó un grafo ImGAGN sin metadata relacional parent-anchored. "
-            "Los grafos ImGAGN homogéneos quedaron como artefactos históricos y no son operativos."
+            "Se detectÃ³ un grafo ImGAGN sin metadata relacional parent-anchored. "
+            "Los grafos ImGAGN homogÃ©neos quedaron como artefactos histÃ³ricos y no son operativos."
         )
         return
     if use_imgagn_relational_train:
@@ -17289,7 +17841,7 @@ def _render_training_tab() -> None:
         )
         st.session_state["gnn_network_config"] = recipe_cfg
         _sync_gnn_winning_ranking_posaware_training_state()
-        st.success("Receta aplicada. Se usará Network (config actual) al entrenar.")
+        st.success("Receta aplicada. Se usarÃ¡ Network (config actual) al entrenar.")
         st.rerun()
 
     imgagn_warm_start_checkpoint_path: Optional[str] = None
@@ -17297,7 +17849,7 @@ def _render_training_tab() -> None:
         st.markdown("#### Preset ImGAGN relacional")
         st.caption(
             "Warm-start conservador desde checkpoint base; no activa GraphSMOTE ni "
-            "reconstruye aristas homogéneas."
+            "reconstruye aristas homogÃ©neas."
         )
         if st.button(
             "Aplicar preset ImGAGN relacional warm-start",
@@ -17326,14 +17878,18 @@ def _render_training_tab() -> None:
         ]
         candidate_paths: List[str] = []
         for name in preferred:
-            path = os.path.join(RESULTADOS_DIR, name)
+            path = str(gnn_path("models_gat", name, resultados_dir=RESULTADOS_DIR))
             if os.path.exists(path):
                 candidate_paths.append(path)
         candidate_paths.extend(
             sorted(
-                glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST_GNN_gat_edge_mlp_gru_*.pt")),
-                key=os.path.getmtime,
-                reverse=True,
+                gnn_glob(
+                    "models_gat",
+                    "gat_model_BEST_GNN_gat_edge_mlp_gru_*.pt",
+                    RESULTADOS_DIR,
+                    sort_mtime=True,
+                    reverse=True,
+                ),
             )
         )
         candidate_paths = list(dict.fromkeys(candidate_paths))
@@ -17425,7 +17981,7 @@ def _render_training_tab() -> None:
             f"Sampler desde Network: {network_sampler_label or network_sampler_mode}."
         )
 
-    # Selección automática de dispositivo
+    # SelecciÃ³n automÃ¡tica de dispositivo
     eval_device = _render_training_device_status()
     st.markdown("#### Early stopping")
     checkpoint_metric_options = {
@@ -17504,10 +18060,10 @@ def _render_training_tab() -> None:
         value=int(ACCUMULATION_STEPS),
         step=1,
         key="gnn_train_accumulation_steps",
-        help="Acumula gradientes por N batches antes de actualizar (reduce memoria efectiva). Ej.: batch_size=128 y accumulation_steps=4 → actualiza cada 4 batches, batch efectivo 512.",
+        help="Acumula gradientes por N batches antes de actualizar (reduce memoria efectiva). Ej.: batch_size=128 y accumulation_steps=4 â†’ actualiza cada 4 batches, batch efectivo 512.",
     )
 
-    st.markdown("#### Sampling y Fidelity (comparación con full-batch)")
+    st.markdown("#### Sampling y Fidelity (comparaciÃ³n con full-batch)")
     fidelity_targets = [
         "NeighborLoader (nativo)",
         "Positive-aware NeighborLoader",
@@ -17538,15 +18094,15 @@ def _render_training_tab() -> None:
         fidelity_targets,
         key="gnn_train_fidelity_target_sampler",
         help=(
-            "Elige sobre qué sampler nativo quieres aplicar el preset de alta fidelidad. "
-            "El preset fuerza evaluación interna exhaustive, determinismo y desactiva hard-undersampling."
+            "Elige sobre quÃ© sampler nativo quieres aplicar el preset de alta fidelidad. "
+            "El preset fuerza evaluaciÃ³n interna exhaustive, determinismo y desactiva hard-undersampling."
         ),
     )
     apply_fidelity_preset = st.button(
         "Aplicar preset Full-batch fidelity",
         key="gnn_train_apply_fidelity_preset",
         help=(
-            "Configura automáticamente una receta para aproximar resultados full-batch "
+            "Configura automÃ¡ticamente una receta para aproximar resultados full-batch "
             "sobre el sampler seleccionado."
         ),
     )
@@ -17576,7 +18132,7 @@ def _render_training_tab() -> None:
             st.session_state["gnn_train_graphsaint_batch"] = 4096
             st.session_state["gnn_train_graphsaint_steps"] = 16
             st.session_state["gnn_train_graphsaint_walk"] = 3
-        st.session_state["gnn_train_eval_neighbors_mode"] = "Exhaustive (-1 por capa, más fiel)"
+        st.session_state["gnn_train_eval_neighbors_mode"] = "Exhaustive (-1 por capa, mÃ¡s fiel)"
         st.session_state["gnn_train_eval_neighbors_custom"] = "15,10"
         st.rerun()
 
@@ -17592,23 +18148,23 @@ def _render_training_tab() -> None:
         list(sampler_options.keys()),
         key="gnn_train_sampler_mode",
         help=(
-            "Define cómo se construyen los batches de entrenamiento con samplers nativos de PyG. "
-            "NeighborLoader: baseline rápido. "
-            "Positive-aware: mantiene NeighborLoader pero ordena seeds para que cada batch tenga señal positiva y negativos duros topológicos. "
-            "Cluster-GCN: usa `ClusterData/ClusterLoader` para particionar y muestrear por clústeres. "
-            "GraphSAINT: usa `GraphSAINT*Sampler` para muestreo estocástico de nodos/aristas/caminatas. "
-            "RioGNN top-p RL: filtra vecinos por similitud label-aware y thresholds RSRL por relación/capa."
+            "Define cÃ³mo se construyen los batches de entrenamiento con samplers nativos de PyG. "
+            "NeighborLoader: baseline rÃ¡pido. "
+            "Positive-aware: mantiene NeighborLoader pero ordena seeds para que cada batch tenga seÃ±al positiva y negativos duros topolÃ³gicos. "
+            "Cluster-GCN: usa `ClusterData/ClusterLoader` para particionar y muestrear por clÃºsteres. "
+            "GraphSAINT: usa `GraphSAINT*Sampler` para muestreo estocÃ¡stico de nodos/aristas/caminatas. "
+            "RioGNN top-p RL: filtra vecinos por similitud label-aware y thresholds RSRL por relaciÃ³n/capa."
         ),
     )
     train_sampler_mode = sampler_options[sampler_label]
 
     deterministic_sampling_train = st.checkbox(
-        "Sampling determinístico",
+        "Sampling determinÃ­stico",
         value=bool(st.session_state.get("gnn_train_det_sampling", True)),
         key="gnn_train_det_sampling",
         help=(
             "Fija la aleatoriedad del sampler para repetir resultados entre corridas. "
-            "Útil cuando comparas contra full-batch o cuando haces debugging."
+            "Ãštil cuando comparas contra full-batch o cuando haces debugging."
         ),
     )
     sampling_seed_train = int(
@@ -17619,17 +18175,17 @@ def _render_training_tab() -> None:
             step=1,
             key="gnn_train_sampling_seed",
             disabled=not deterministic_sampling_train,
-            help="Semilla usada por el sampler por época (si determinístico está activo).",
+            help="Semilla usada por el sampler por Ã©poca (si determinÃ­stico estÃ¡ activo).",
         )
     )
 
     disable_hard_undersampling_train = st.checkbox(
-        "Desactivar hard-undersampling automático",
+        "Desactivar hard-undersampling automÃ¡tico",
         value=bool(st.session_state.get("gnn_train_disable_hard", True)),
         key="gnn_train_disable_hard",
         help=(
             "Evita que el entrenamiento fuerce negativos 'hard' cuando detecta fuerte desbalance. "
-            "Útil para comparar de forma más limpia el efecto puro del sampler."
+            "Ãštil para comparar de forma mÃ¡s limpia el efecto puro del sampler."
         ),
     )
 
@@ -17647,7 +18203,7 @@ def _render_training_tab() -> None:
         with pos_col_a:
             positive_sampler_target_fraction_train = float(
                 st.number_input(
-                    "Positive-aware fracción positiva",
+                    "Positive-aware fracciÃ³n positiva",
                     min_value=0.001,
                     max_value=0.50,
                     value=float(positive_sampler_target_fraction_train),
@@ -17655,10 +18211,10 @@ def _render_training_tab() -> None:
                     format="%.3f",
                     key="gnn_train_positive_fraction",
                     help=(
-                        "Fracción objetivo de semillas positivas por batch. "
+                        "FracciÃ³n objetivo de semillas positivas por batch. "
                         "Default 0.02: con batch_size=512 fuerza unos 10 positivos por batch. "
                         "Subirlo aumenta recall/gradiente positivo pero puede distorsionar la prevalencia; "
-                        "no lo interpretes como prevalencia real de validación/test."
+                        "no lo interpretes como prevalencia real de validaciÃ³n/test."
                     ),
                 )
             )
@@ -17671,8 +18227,8 @@ def _render_training_tab() -> None:
                     step=5,
                     key="gnn_train_positive_window",
                     help=(
-                        "Busca negativos de train del mismo pórtico dentro de ±N minutos de cada positivo. "
-                        "Default 60 min. Una ventana muy alta mete negativos fáciles/lejanos; "
+                        "Busca negativos de train del mismo pÃ³rtico dentro de Â±N minutos de cada positivo. "
+                        "Default 60 min. Una ventana muy alta mete negativos fÃ¡ciles/lejanos; "
                         "0 desactiva el componente temporal y conserva hard negatives espaciales."
                     ),
                 )
@@ -17686,7 +18242,7 @@ def _render_training_tab() -> None:
                     step=1,
                     key="gnn_train_positive_hard_per_pos",
                     help=(
-                        "Cantidad máxima de negativos duros topológicos que se intentan mezclar por cada positivo del batch. "
+                        "Cantidad mÃ¡xima de negativos duros topolÃ³gicos que se intentan mezclar por cada positivo del batch. "
                         "Default 4. Si lo subes demasiado, el batch se vuelve local y menos diverso; "
                         "0 usa positivos balanceados con negativos aleatorios."
                     ),
@@ -17708,9 +18264,9 @@ def _render_training_tab() -> None:
             index=ranking_loss_modes_train.index(ranking_loss_mode_train),
             key="gnn_train_ranking_loss_mode",
             help=(
-                "`none` mantiene el entrenamiento clásico. `pairwise_softplus` "
+                "`none` mantiene el entrenamiento clÃ¡sico. `pairwise_softplus` "
                 "ordena positivos sobre negativos dentro de cada batch; requiere "
-                "señal positiva estable, por eso combina bien con positive-aware. "
+                "seÃ±al positiva estable, por eso combina bien con positive-aware. "
                 "`topk_pairwise` se concentra en negativos con score alto."
             ),
         )
@@ -17726,7 +18282,7 @@ def _render_training_tab() -> None:
                 key="gnn_train_ranking_loss_weight",
                 help=(
                     "Peso de ranking sobre la loss total. La receta ganadora usa 0.10; "
-                    "valores altos pueden mejorar recall a costa de FAR/precisión."
+                    "valores altos pueden mejorar recall a costa de FAR/precisiÃ³n."
                 ),
             )
         )
@@ -17753,8 +18309,8 @@ def _render_training_tab() -> None:
                 step=512,
                 key="gnn_train_ranking_loss_max_pairs",
                 help=(
-                    "Máximo de pares positivo/negativo por batch. 4096 limita memoria "
-                    "sin apagar la señal pairwise en la receta ganadora."
+                    "MÃ¡ximo de pares positivo/negativo por batch. 4096 limita memoria "
+                    "sin apagar la seÃ±al pairwise en la receta ganadora."
                 ),
             )
         )
@@ -17773,21 +18329,21 @@ def _render_training_tab() -> None:
                     key="gnn_train_cluster_parts",
                     help=(
                         "Cantidad de particiones del grafo PM para ordenar semillas por bloques. "
-                        "Más partes = batches más locales."
+                        "MÃ¡s partes = batches mÃ¡s locales."
                     ),
                 )
             )
         with col_cluster_b:
             cluster_gcn_parts_per_epoch_train = int(
                 st.number_input(
-                    "Cluster-GCN parts por época (0=todas)",
+                    "Cluster-GCN parts por Ã©poca (0=todas)",
                     min_value=0,
                     value=int(st.session_state.get("gnn_train_cluster_parts_epoch", 0)),
                     step=1,
                     key="gnn_train_cluster_parts_epoch",
                     help=(
-                        "Cuántas particiones recorrer en cada época. "
-                        "0 usa todas; valores menores reducen costo por época."
+                        "CuÃ¡ntas particiones recorrer en cada Ã©poca. "
+                        "0 usa todas; valores menores reducen costo por Ã©poca."
                     ),
                 )
             )
@@ -17804,7 +18360,7 @@ def _render_training_tab() -> None:
         rl_col_a, rl_col_b, rl_col_c = st.columns(3)
         with rl_col_a:
             rl_action_space_train = st.selectbox(
-                "RioGNN acción RSRL",
+                "RioGNN acciÃ³n RSRL",
                 ["discrete", "continuous_actor"],
                 index=0,
                 key="gnn_train_rl_action_space",
@@ -17823,7 +18379,7 @@ def _render_training_tab() -> None:
         with rl_col_b:
             rl_min_p_train = float(
                 st.number_input(
-                    "RioGNN p mínimo",
+                    "RioGNN p mÃ­nimo",
                     min_value=0.0,
                     max_value=1.0,
                     value=float(st.session_state.get("gnn_train_rl_min_p", 0.05)),
@@ -17833,7 +18389,7 @@ def _render_training_tab() -> None:
             )
             rl_max_p_train = float(
                 st.number_input(
-                    "RioGNN p máximo",
+                    "RioGNN p mÃ¡ximo",
                     min_value=0.01,
                     max_value=1.0,
                     value=float(st.session_state.get("gnn_train_rl_max_p", 1.0)),
@@ -17861,7 +18417,7 @@ def _render_training_tab() -> None:
                 )
             )
         rl_positive_only_train = st.checkbox(
-            "RioGNN stats sólo positivos si existen",
+            "RioGNN stats sÃ³lo positivos si existen",
             value=bool(st.session_state.get("gnn_train_rl_positive_only", True)),
             key="gnn_train_rl_positive_only",
             help="Calcula las stats RL sobre centros positivos de train cuando hay positivos disponibles.",
@@ -17873,7 +18429,7 @@ def _render_training_tab() -> None:
                 value=float(st.session_state.get("gnn_train_rl_lambda_simi", 2.0)),
                 step=0.25,
                 key="gnn_train_rl_lambda_simi",
-                help="Peso de la pérdida auxiliar label-aware sumada al loss de entrenamiento.",
+                help="Peso de la pÃ©rdida auxiliar label-aware sumada al loss de entrenamiento.",
             )
         )
 
@@ -17909,7 +18465,7 @@ def _render_training_tab() -> None:
                     value=int(st.session_state.get("gnn_train_graphsaint_batch", 4096)),
                     step=64,
                     key="gnn_train_graphsaint_batch",
-                    help="Tamaño de muestra por paso de GraphSAINT (nodos/aristas según el modo).",
+                    help="TamaÃ±o de muestra por paso de GraphSAINT (nodos/aristas segÃºn el modo).",
                 )
             )
             graphsaint_num_steps_train = int(
@@ -17919,7 +18475,7 @@ def _render_training_tab() -> None:
                     value=int(st.session_state.get("gnn_train_graphsaint_steps", 16)),
                     step=1,
                     key="gnn_train_graphsaint_steps",
-                    help="Número de submuestras GraphSAINT nativas por época.",
+                    help="NÃºmero de submuestras GraphSAINT nativas por Ã©poca.",
                 )
             )
         with col_saint_b:
@@ -17936,17 +18492,17 @@ def _render_training_tab() -> None:
             )
 
     eval_mode_labels = {
-        "Mismo que train (rápido)": "same",
-        "Exhaustive (-1 por capa, más fiel)": "exhaustive",
+        "Mismo que train (rÃ¡pido)": "same",
+        "Exhaustive (-1 por capa, mÃ¡s fiel)": "exhaustive",
         "Custom": "custom",
     }
     eval_neighbors_mode_label = st.selectbox(
-        "Vecinos para validación interna",
+        "Vecinos para validaciÃ³n interna",
         list(eval_mode_labels.keys()),
         key="gnn_train_eval_neighbors_mode",
         help=(
-            "Controla la fidelidad de métricas de validación durante entrenamiento. "
-            "Exhaustive se parece más a full-batch, pero usa más memoria/tiempo."
+            "Controla la fidelidad de mÃ©tricas de validaciÃ³n durante entrenamiento. "
+            "Exhaustive se parece mÃ¡s a full-batch, pero usa mÃ¡s memoria/tiempo."
         ),
     )
     eval_neighbors_mode_train = eval_mode_labels[eval_neighbors_mode_label]
@@ -17958,7 +18514,7 @@ def _render_training_tab() -> None:
             value=str(st.session_state.get("gnn_train_eval_neighbors_custom", "15,10")),
             key="gnn_train_eval_neighbors_custom",
             help=(
-                "Perfil de vecinos por capa SOLO para validación interna. "
+                "Perfil de vecinos por capa SOLO para validaciÃ³n interna. "
                 "Formato: CSV (15,10) o guiones (15-10)."
             ),
         )
@@ -17971,12 +18527,12 @@ def _render_training_tab() -> None:
             if not eval_num_neighbors_train:
                 eval_num_neighbors_train = None
         except Exception:
-            st.error("Formato inválido en eval num_neighbors custom. Se usará configuración por defecto.")
+            st.error("Formato invÃ¡lido en eval num_neighbors custom. Se usarÃ¡ configuraciÃ³n por defecto.")
             eval_num_neighbors_train = None
 
-    st.markdown("#### Evaluación automática")
+    st.markdown("#### EvaluaciÃ³n automÃ¡tica")
     auto_eval = st.checkbox(
-        "Evaluar automáticamente al terminar",
+        "Evaluar automÃ¡ticamente al terminar",
         value=True,
         key="gnn_train_auto_eval",
     )
@@ -17985,7 +18541,7 @@ def _render_training_tab() -> None:
         eval_graph_options.append("Grafo balanceado cargado")
     eval_graph_options.append("Cargar grafo desde archivo")
     eval_graph_choice = st.selectbox(
-        "Grafo para evaluación",
+        "Grafo para evaluaciÃ³n",
         eval_graph_options,
         index=0,
         key="gnn_train_eval_graph_choice",
@@ -18032,7 +18588,7 @@ def _render_training_tab() -> None:
                     )
                 )
                 st.caption(
-                    f"Grafo evaluación: {eval_graph_label} | PM nodes: {eval_pm} | Aristas: {eval_edges}"
+                    f"Grafo evaluaciÃ³n: {eval_graph_label} | PM nodes: {eval_pm} | Aristas: {eval_edges}"
                 )
             except Exception:
                 pass
@@ -18078,7 +18634,7 @@ def _render_training_tab() -> None:
             f"{scheduler_sig}"
         )
         config_hash = hashlib.sha1(config_sig.encode("utf-8")).hexdigest()[:10]
-        ckpt_dir = Path(RESULTADOS_DIR) / "gnn_train_checkpoints" / f"{variant_tag}_{config_hash}"
+        ckpt_dir = gnn_dir("training_checkpoints", RESULTADOS_DIR, create=True) / f"{variant_tag}_{config_hash}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         training_checkpoint_path = ckpt_dir / "checkpoint.pt"
         training_metrics_history_path = ckpt_dir / "metrics_history.jsonl"
@@ -18128,7 +18684,7 @@ def _render_training_tab() -> None:
                 ).strftime("%Y-%m-%d %H:%M:%S")
                 training_details = (
                     f"Checkpoint detectado: {epoch_done}/{max_epochs_ckpt} epochs "
-                    f"| Última actualización: {last_update}"
+                    f"| Ãšltima actualizaciÃ³n: {last_update}"
                 )
                 if best_monitor_ckpt is not None and math.isfinite(float(best_monitor_ckpt)):
                     training_details += (
@@ -18158,7 +18714,7 @@ def _render_training_tab() -> None:
                 if last_val_tau is not None:
                     metrics_parts.append(f"val_tau={float(last_val_tau):.4f}")
                 if metrics_parts:
-                    training_details += " | Últimas métricas: " + ", ".join(metrics_parts)
+                    training_details += " | Ãšltimas mÃ©tricas: " + ", ".join(metrics_parts)
                 if run_id:
                     training_details += f" | run_id={run_id}"
                 if max_epochs_train < max_epochs_ckpt:
@@ -18218,7 +18774,7 @@ def _render_training_tab() -> None:
             training_checkpoint_path.unlink(missing_ok=True)
             if training_metrics_history_path is not None:
                 Path(training_metrics_history_path).unlink(missing_ok=True)
-            st.success("Checkpoint eliminado. El entrenamiento iniciará desde cero.")
+            st.success("Checkpoint eliminado. El entrenamiento iniciarÃ¡ desde cero.")
             training_pending = False
         except Exception as exc:
             st.error(f"No se pudo eliminar el checkpoint: {exc}")
@@ -19036,9 +19592,9 @@ def _render_training_tab() -> None:
                      else "Entrenamiento GNN Finalizado"
                  )
                  if notification_system.send_notification_email(subject, entry):
-                     st.toast("Notificación enviada por email.", icon="📧")
+                     st.toast("NotificaciÃ³n enviada por email.", icon="ðŸ“§")
                  else:
-                     st.warning("No se pudo enviar la notificación por email.")
+                     st.warning("No se pudo enviar la notificaciÃ³n por email.")
 
             if training_was_stopped:
                 st.info(
@@ -19047,11 +19603,11 @@ def _render_training_tab() -> None:
             else:
                 st.success(f"Entrenamiento finalizado. Modelo: {os.path.basename(model_path)}")
             
-            # EVALUACIÓN AUTOMÁTICA (Enviada al placeholder superior)
+            # EVALUACIÃ“N AUTOMÃTICA (Enviada al placeholder superior)
             if auto_eval:
                 with eval_results_placeholder:
                     st.markdown("---")
-                    st.subheader("Evaluación Automática")
+                    st.subheader("EvaluaciÃ³n AutomÃ¡tica")
                     if eval_graph_data is None:
                         st.warning("No hay grafo disponible para evaluar.")
                     else:
@@ -19062,7 +19618,7 @@ def _render_training_tab() -> None:
                         )
                         if not ok:
                             st.warning(
-                                f"Evaluación automática bloqueada por desajuste de dimensiones. {msg}"
+                                f"EvaluaciÃ³n automÃ¡tica bloqueada por desajuste de dimensiones. {msg}"
                             )
                         else:
                             _perform_model_evaluation(
@@ -19083,8 +19639,8 @@ def _render_training_tab() -> None:
         else:
             if model_path and not is_fresh_model:
                 st.warning(
-                    "El entrenamiento no generó un modelo nuevo. "
-                    "Se detectó un modelo previo, pero la ejecución pudo abortar antes de entrenar."
+                    "El entrenamiento no generÃ³ un modelo nuevo. "
+                    "Se detectÃ³ un modelo previo, pero la ejecuciÃ³n pudo abortar antes de entrenar."
                 )
             else:
                 st.warning("Entrenamiento completado, pero no se encontro modelo guardado.")
@@ -19170,7 +19726,7 @@ class _GNNGraphEvaluationProgress:
             "live_status": {},
         }
 
-        st.markdown("#### Progreso de evaluación")
+        st.markdown("#### Progreso de evaluaciÃ³n")
         st.caption(f"Run live: `{self.run_dir}`")
         metric_cols = st.columns(6)
         self._metric_model = metric_cols[0].empty()
@@ -19182,15 +19738,15 @@ class _GNNGraphEvaluationProgress:
         self._bar = st.progress(0.0)
         self._status_slot = st.empty()
         self._detail_slot = st.empty()
-        with st.expander("Detalle live de la evaluación", expanded=True):
+        with st.expander("Detalle live de la evaluaciÃ³n", expanded=True):
             self._events_slot = st.empty()
             self._raw_slot = st.empty()
         self.update(
             0.0,
-            "Inicializando evaluación",
+            "Inicializando evaluaciÃ³n",
             step_id="run_start",
             detail=(
-                f"Máscaras: {', '.join(self.masks) if self.masks else 'auto'} | "
+                f"MÃ¡scaras: {', '.join(self.masks) if self.masks else 'auto'} | "
                 f"batch_size={self.batch_size} | dispositivo={self.device}"
             ),
             event_type="run_start",
@@ -19228,12 +19784,12 @@ class _GNNGraphEvaluationProgress:
         self._metric_model.metric("Modelo", self.model_name[:24])
         self._metric_status.metric("Estado", str(self.state.get("status") or "running"))
         self._metric_progress.metric("Progreso", pct_text)
-        self._metric_mask.metric("Máscara", current_mask[:24])
+        self._metric_mask.metric("MÃ¡scara", current_mask[:24])
         self._metric_batch.metric("Batch", batch_text[:24])
         self._metric_memory.metric("Memoria", memory_text[:24])
         self._bar.progress(ratio)
         self._status_slot.info(
-            f"{pct_text} | {live_status.get('message') or 'Ejecutando evaluación'}"
+            f"{pct_text} | {live_status.get('message') or 'Ejecutando evaluaciÃ³n'}"
         )
         detail = str(live_status.get("detail") or "")
         self._detail_slot.caption(
@@ -19394,7 +19950,7 @@ def _make_gnn_eval_progress_callback(
         processed_nodes = int(event.get("processed_nodes") or 0)
         batch_text = f"{batch_index}/{batch_total}"
         detail = (
-            f"máscara {mask_index}/{mask_total}"
+            f"mÃ¡scara {mask_index}/{mask_total}"
             f" | nodos {processed_nodes:,}/{node_count:,}"
             f" | batches {batch_text}"
         )
@@ -19433,11 +19989,16 @@ def _perform_model_evaluation(
     xai_k_heads: int = 3,
     xai_max_edges: int = 500,
     xai_visual_metric: str = "mean_attention",
+    xai_explanation_methods: Optional[List[str]] = None,
+    xai_explain_max_nodes: int = 0,
+    xai_explain_top_features: int = 0,
+    xai_integrated_gradients_steps: int = 16,
+    xai_feature_names: Optional[Sequence[str]] = None,
 ) -> None:
     try:
         from src import gnn_main as graph_main
     except Exception as exc:
-        st.error(f"No se pudieron cargar módulos necesarios: {exc}")
+        st.error(f"No se pudieron cargar mÃ³dulos necesarios: {exc}")
         return
 
     node_type = "pm"
@@ -19457,14 +20018,14 @@ def _perform_model_evaluation(
     if isinstance(meta, dict):
         purpose_text = str(meta.get("purpose") or "General").strip() or "General"
     
-    # Detalle de lo que se evalúa
+    # Detalle de lo que se evalÃºa
     st.caption(f"Evaluando modelo: {os.path.basename(model_path)} en dispositivo: {device}")
     if not eval_masks:
         progress_ui.fail(
-            "Evaluación bloqueada",
-            detail="No se encontró test_mask no vacío para la evaluación final.",
+            "EvaluaciÃ³n bloqueada",
+            detail="No se encontrÃ³ test_mask no vacÃ­o para la evaluaciÃ³n final.",
         )
-        st.warning("No se encontró `test_mask` no vacío para evaluar el modelo entrenado.")
+        st.warning("No se encontrÃ³ `test_mask` no vacÃ­o para evaluar el modelo entrenado.")
         return
     ignored_masks = [
         str(mask)
@@ -19473,9 +20034,9 @@ def _perform_model_evaluation(
     ]
     if ignored_masks:
         st.caption(
-            "La evaluación final se limita a `test_mask`; "
+            "La evaluaciÃ³n final se limita a `test_mask`; "
             f"{', '.join(ignored_masks)} solo se ignora como split final. "
-            "`val_mask` puede usarse internamente para calibración."
+            "`val_mask` puede usarse internamente para calibraciÃ³n."
         )
 
     try:
@@ -19517,7 +20078,7 @@ def _perform_model_evaluation(
         )
         if not is_ok:
             progress_ui.fail(
-                "Evaluación bloqueada por incompatibilidad grafo-modelo",
+                "EvaluaciÃ³n bloqueada por incompatibilidad grafo-modelo",
                 detail=str(msg),
             )
             st.error(f"{msg} Use el mismo grafo/feature set del entrenamiento o reentrene el modelo.")
@@ -19556,8 +20117,8 @@ def _perform_model_evaluation(
         checkpoint_temporal_kind = _checkpoint_temporal_kind(state_dict)
         if checkpoint_temporal_kind is not None and sequence_index_for_model is None:
             progress_ui.fail(
-                "Evaluación bloqueada por SequenceIndex faltante",
-                detail="El checkpoint incluye un head temporal sin índice temporal disponible.",
+                "EvaluaciÃ³n bloqueada por SequenceIndex faltante",
+                detail="El checkpoint incluye un head temporal sin Ã­ndice temporal disponible.",
             )
             st.error(
                 "El checkpoint incluye un head temporal, pero no contiene ni recibe "
@@ -19624,12 +20185,12 @@ def _perform_model_evaluation(
         )
         if checkpoint_temporal_kind is not None and getattr(model, "temporal_head", None) is None:
             progress_ui.fail(
-                "Evaluación bloqueada por arquitectura temporal incompatible",
-                detail=f"La variante reconstruida ({gnn_variant}) no creó temporal_head.",
+                "EvaluaciÃ³n bloqueada por arquitectura temporal incompatible",
+                detail=f"La variante reconstruida ({gnn_variant}) no creÃ³ temporal_head.",
             )
             st.error(
                 "El checkpoint requiere `temporal_head`, pero la arquitectura reconstruida "
-                f"({gnn_variant}) no lo creó. Verifique la variante GNN y el SequenceIndex."
+                f"({gnn_variant}) no lo creÃ³. Verifique la variante GNN y el SequenceIndex."
             )
             return
         
@@ -19647,7 +20208,7 @@ def _perform_model_evaluation(
             "Modelo listo para inferencia",
             step_id="model_ready",
             detail=(
-                f"Máscaras seleccionadas: {', '.join(eval_masks) if eval_masks else 'auto'} "
+                f"MÃ¡scaras seleccionadas: {', '.join(eval_masks) if eval_masks else 'auto'} "
                 f"| num_neighbors={num_neighbors if num_neighbors is not None else 'config'}"
             ),
             event_type="model_ready",
@@ -19662,7 +20223,7 @@ def _perform_model_evaluation(
         if strategy in far_strategies:
             progress_ui.update(
                 0.50,
-                "Preparando calibración de umbral FAR",
+                "Preparando calibraciÃ³n de umbral FAR",
                 step_id="threshold_calibration_start",
                 detail=f"Objetivo FAR={float(far_target):.2f}; se requiere val_mask temporal divisible.",
                 event_type="threshold_calibration_start",
@@ -19675,7 +20236,7 @@ def _perform_model_evaluation(
                 )
             except Exception as exc:
                 progress_ui.fail(
-                    "Calibración FAR bloqueada",
+                    "CalibraciÃ³n FAR bloqueada",
                     detail=str(exc),
                 )
                 st.error(str(exc))
@@ -19701,9 +20262,9 @@ def _perform_model_evaluation(
             if max_nodes_per_mask > 0:
                 progress_ui.update(
                     0.52,
-                    "Muestreando nodos de calibración/umbral",
+                    "Muestreando nodos de calibraciÃ³n/umbral",
                     step_id="threshold_sample_start",
-                    detail=f"Máximo {int(max_nodes_per_mask):,} nodos con ambas clases cuando sea posible.",
+                    detail=f"MÃ¡ximo {int(max_nodes_per_mask):,} nodos con ambas clases cuando sea posible.",
                     event_type="threshold_sample_start",
                     mask="val_calib/val_threshold",
                 )
@@ -19711,10 +20272,10 @@ def _perform_model_evaluation(
                 threshold_idx = _cap_split_indices(threshold_idx, split_seed=int(seed) + 17)
             if calib_idx.numel() == 0 or threshold_idx.numel() == 0:
                 progress_ui.fail(
-                    "Calibración FAR bloqueada",
-                    detail="val_calib o val_threshold quedó vacío tras muestreo.",
+                    "CalibraciÃ³n FAR bloqueada",
+                    detail="val_calib o val_threshold quedÃ³ vacÃ­o tras muestreo.",
                 )
-                st.error("val_calib o val_threshold quedó vacío tras muestreo.")
+                st.error("val_calib o val_threshold quedÃ³ vacÃ­o tras muestreo.")
                 return
             calib_callback = _make_gnn_eval_progress_callback(
                 progress_ui,
@@ -19736,12 +20297,12 @@ def _perform_model_evaluation(
             calib_key = "val_calib" if calib_results and "val_calib" in calib_results else None
             if not calib_key:
                 progress_ui.fail(
-                    "Calibración Platt sin resultados",
-                    detail="No se pudo obtener predicción en val_calib.",
+                    "CalibraciÃ³n Platt sin resultados",
+                    detail="No se pudo obtener predicciÃ³n en val_calib.",
                 )
                 st.error(
                     "No se pudo obtener resultados en val_calib para calibrar probabilidades. "
-                    "Revisa la máscara y vuelve a ejecutar."
+                    "Revisa la mÃ¡scara y vuelve a ejecutar."
                 )
                 return
             y_true_calib = calib_results[calib_key]["true"].numpy().ravel()
@@ -19756,7 +20317,7 @@ def _perform_model_evaluation(
                         0.61,
                         "Platt scaling ajustado",
                         step_id="platt_ready",
-                        detail="Calibrador entrenado en val_calib; tau se seleccionará en val_threshold.",
+                        detail="Calibrador entrenado en val_calib; tau se seleccionarÃ¡ en val_threshold.",
                         event_type="platt_ready",
                         mask=calib_key,
                     )
@@ -19766,7 +20327,7 @@ def _perform_model_evaluation(
                     )
                 else:
                     st.caption(
-                        "Platt scaling activo en configuración, pero no se pudo ajustar "
+                        "Platt scaling activo en configuraciÃ³n, pero no se pudo ajustar "
                         "en val_calib; se usan probabilidades softmax crudas."
                     )
             threshold_callback = _make_gnn_eval_progress_callback(
@@ -19794,8 +20355,8 @@ def _perform_model_evaluation(
             )
             if not threshold_key:
                 progress_ui.fail(
-                    "Selección FAR sin resultados",
-                    detail="No se pudo obtener predicción en val_threshold.",
+                    "SelecciÃ³n FAR sin resultados",
+                    detail="No se pudo obtener predicciÃ³n en val_threshold.",
                 )
                 st.error("No se pudo obtener resultados en val_threshold para seleccionar FAR.")
                 return
@@ -19870,7 +20431,7 @@ def _perform_model_evaluation(
                     0.60,
                     "Ajustando Platt scaling",
                     step_id="platt_start",
-                    detail="Calibrador de probabilidades sobre val_calib; el umbral manual se aplicará a probas calibradas.",
+                    detail="Calibrador de probabilidades sobre val_calib; el umbral manual se aplicarÃ¡ a probas calibradas.",
                     event_type="platt_start",
                     mask="val_calib",
                 )
@@ -19912,17 +20473,17 @@ def _perform_model_evaluation(
                             0.66,
                             "Platt scaling ajustado",
                             step_id="platt_ready",
-                            detail="Calibrador entrenado en val_calib; inferencia final usará probabilidades calibradas.",
+                            detail="Calibrador entrenado en val_calib; inferencia final usarÃ¡ probabilidades calibradas.",
                             event_type="platt_ready",
                             mask=platt_key,
                         )
                         st.caption(
                             "Platt scaling activo: calibrador ajustado en val_calib "
-                            "antes de la evaluación final."
+                            "antes de la evaluaciÃ³n final."
                         )
                     else:
                         st.caption(
-                            "Platt scaling activo en configuración, pero no se pudo ajustar "
+                            "Platt scaling activo en configuraciÃ³n, pero no se pudo ajustar "
                             "en val_calib; se usan probabilidades softmax crudas."
                         )
                     for m_res in platt_results.values():
@@ -19942,12 +20503,12 @@ def _perform_model_evaluation(
         eval_end_ratio = 0.92
         progress_ui.update(
             eval_start_ratio,
-            "Iniciando evaluación de máscaras",
+            "Iniciando evaluaciÃ³n de mÃ¡scaras",
             step_id="graph_eval_start",
             detail=(
-                f"Máscaras={', '.join(eval_masks) if eval_masks else 'auto'} | "
+                f"MÃ¡scaras={', '.join(eval_masks) if eval_masks else 'auto'} | "
                 f"tau={float(eval_threshold):.6f} | batch_size={eval_batch_size} | "
-                f"calibración={'Platt' if platt_model is not None else 'softmax crudo'}"
+                f"calibraciÃ³n={'Platt' if platt_model is not None else 'softmax crudo'}"
             ),
             event_type="graph_eval_start",
             force=True,
@@ -19965,9 +20526,9 @@ def _perform_model_evaluation(
                 )
                 progress_ui.update(
                     mask_start,
-                    f"Muestreando máscara {mask}",
+                    f"Muestreando mÃ¡scara {mask}",
                     step_id="mask_sample_start",
-                    detail=f"Máscara {mask_idx}/{total_masks}; límite={int(max_nodes_per_mask):,} nodos.",
+                    detail=f"MÃ¡scara {mask_idx}/{total_masks}; lÃ­mite={int(max_nodes_per_mask):,} nodos.",
                     event_type="mask_sample_start",
                     mask=mask,
                 )
@@ -19982,16 +20543,16 @@ def _perform_model_evaluation(
                 if sampled_idx is None or sampled_idx.numel() == 0:
                     progress_ui.update(
                         mask_end,
-                        f"Máscara sin nodos evaluables: {mask}",
+                        f"MÃ¡scara sin nodos evaluables: {mask}",
                         step_id="mask_skipped",
-                        detail=f"Máscara {mask_idx}/{total_masks}; no se generó muestra válida.",
+                        detail=f"MÃ¡scara {mask_idx}/{total_masks}; no se generÃ³ muestra vÃ¡lida.",
                         event_type="mask_skipped",
                         mask=mask,
                     )
                     continue
                 eval_callback = _make_gnn_eval_progress_callback(
                     progress_ui,
-                    phase_label="Evaluando máscara",
+                    phase_label="Evaluando mÃ¡scara",
                     start_ratio=mask_start,
                     end_ratio=mask_end,
                     display_mask_index=mask_idx,
@@ -20013,7 +20574,7 @@ def _perform_model_evaluation(
         else:
             eval_callback = _make_gnn_eval_progress_callback(
                 progress_ui,
-                phase_label="Evaluando máscara",
+                phase_label="Evaluando mÃ¡scara",
                 start_ratio=eval_start_ratio,
                 end_ratio=eval_end_ratio,
             )
@@ -20031,14 +20592,14 @@ def _perform_model_evaluation(
 
         if not results:
             progress_ui.fail(
-                "Evaluación sin resultados",
-                detail="No se obtuvieron métricas para las máscaras disponibles.",
+                "EvaluaciÃ³n sin resultados",
+                detail="No se obtuvieron mÃ©tricas para las mÃ¡scaras disponibles.",
             )
-            st.warning("No se obtuvieron resultados (¿faltan mascaras en el grafo?)")
+            st.warning("No se obtuvieron resultados (Â¿faltan mascaras en el grafo?)")
             return
         progress_ui.update(
             0.94,
-            "Métricas calculadas",
+            "MÃ©tricas calculadas",
             step_id="metrics_ready",
             detail=f"Splits con resultados: {len(results)}",
             event_type="metrics_ready",
@@ -20106,28 +20667,28 @@ def _perform_model_evaluation(
         sample_note = (
             f"Subset aleatorio de hasta {int(max_nodes_per_mask)} nodos."
             if max_nodes_per_mask and max_nodes_per_mask > 0
-            else "Todos los nodos de la máscara."
+            else "Todos los nodos de la mÃ¡scara."
         )
         threshold_note = f"{eval_threshold:.6f} ({threshold_strategy})"
         calibration_note = "Platt scaling" if platt_model is not None else "softmax crudo"
         progress_ui.update(
             0.97,
-            "Renderizando reportes de evaluación",
+            "Renderizando reportes de evaluaciÃ³n",
             step_id="render_results",
-            detail="Preparando métricas principales, matrices de confusión y reportes completos.",
+            detail="Preparando mÃ©tricas principales, matrices de confusiÃ³n y reportes completos.",
             event_type="render_results",
         )
         for mask_name, m_res in results.items():
             with st.expander(f"Resultado Split: {mask_name}", expanded=True):
                 st.markdown("**Uso**: validar rendimiento del modelo en el split seleccionado.")
-                st.markdown(f"**Propósito**: {purpose_text}.")
+                st.markdown(f"**PropÃ³sito**: {purpose_text}.")
                 st.markdown(
-                    "**Objetivo**: medir la capacidad de clasificación (Accidente vs No Accidente), "
+                    "**Objetivo**: medir la capacidad de clasificaciÃ³n (Accidente vs No Accidente), "
                     "ajustar/validar el umbral y comparar splits."
                 )
                 st.caption(
-                    f"Cómo se hace: inferencia sobre `{mask_name}` | umbral={threshold_note} "
-                    f"| calibración: {calibration_note} | muestreo: {sample_note}"
+                    f"CÃ³mo se hace: inferencia sobre `{mask_name}` | umbral={threshold_note} "
+                    f"| calibraciÃ³n: {calibration_note} | muestreo: {sample_note}"
                 )
                 st.markdown("**Metricas principales**")
                 col1, col2, col3, col4, col5 = st.columns(5)
@@ -20157,7 +20718,7 @@ def _perform_model_evaluation(
                 )
                 st.caption(
                     "Ratio falsas alarmas = FP / (FP + TN). "
-                    "Brier score = error cuadrático medio de la probabilidad de Accidente=1."
+                    "Brier score = error cuadrÃ¡tico medio de la probabilidad de Accidente=1."
                 )
 
                 if m_res.get("auc") is not None:
@@ -20171,7 +20732,7 @@ def _perform_model_evaluation(
                 if brier_val is not None:
                     st.write(f"- **Brier score**: {brier_val:.4f}")
 
-                st.markdown("**Matriz de Confusión**")
+                st.markdown("**Matriz de ConfusiÃ³n**")
                 cm = m_res.get("cm")
                 if cm is not None:
                     df_cm = pd.DataFrame(
@@ -20234,6 +20795,11 @@ def _perform_model_evaluation(
                     device=device,
                     model_path=model_path,
                     graph_hash=graph_hash,
+                    explanation_methods=xai_explanation_methods,
+                    explain_max_nodes=int(xai_explain_max_nodes or 0),
+                    explain_top_features=int(xai_explain_top_features or 0),
+                    integrated_gradients_steps=int(xai_integrated_gradients_steps or 1),
+                    feature_names=xai_feature_names,
                 )
                 output_dir = save_gnn_xai_result(xai_result)
                 st.session_state["gnn_xai_last_result"] = xai_result
@@ -20246,8 +20812,21 @@ def _perform_model_evaluation(
                         f"Nodos={len(xai_result.nodes_df):,} | aristas relevantes={len(xai_result.edges_df):,}."
                     )
                     if not xai_result.summary_df.empty:
-                        st.markdown("**Resumen por capa y relación**")
+                        st.markdown("**Resumen por capa y relaciÃ³n**")
                         st.dataframe(xai_result.summary_df, width="stretch")
+                    explanations_df = getattr(xai_result, "explanations_df", pd.DataFrame())
+                    if explanations_df is not None and not explanations_df.empty:
+                        st.markdown("**Explicaciones por perturbaciÃ³n**")
+                        st.caption(
+                            "Estas filas miden cambios de probabilidad al intervenir relaciones o features; "
+                            "sirven para auditar fidelidad del modelo, no como prueba causal directa."
+                        )
+                        st.dataframe(
+                            explanations_df.sort_values("score", ascending=False).head(
+                                int(max(1, xai_max_edges))
+                            ),
+                            width="stretch",
+                        )
                     if not xai_result.edges_df.empty:
                         metric = str(xai_visual_metric)
                         sort_col = metric if metric in xai_result.edges_df.columns else "mean_attention"
@@ -20275,20 +20854,20 @@ def _perform_model_evaluation(
             m_res.pop("probs", None)
             m_res.pop("true", None)
         progress_ui.complete(
-            "Evaluación de grafo finalizada",
+            "EvaluaciÃ³n de grafo finalizada",
             detail=f"Splits evaluados: {len(results)} | tau={float(eval_threshold):.6f}",
         )
 
     except Exception as exc:
-        progress_ui.fail("Error durante evaluación", detail=str(exc))
-        st.error(f"Error durante evaluación: {exc}")
+        progress_ui.fail("Error durante evaluaciÃ³n", detail=str(exc))
+        st.error(f"Error durante evaluaciÃ³n: {exc}")
         st.exception(exc)
 
 def _render_evaluation_tab() -> None:
-    st.subheader("Evaluación Modelo (GNN)")
+    st.subheader("EvaluaciÃ³n Modelo (GNN)")
     loaded_graph = st.session_state.get("loaded_graph")
     if loaded_graph is None:
-        st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+        st.warning("No hay grafo cargado en memoria. Use la pestaÃ±a Graph.")
         return
 
     graph_data = loaded_graph.get("data")
@@ -20297,7 +20876,7 @@ def _render_evaluation_tab() -> None:
         st.warning("El grafo no contiene nodos 'pm'.")
         return
 
-    # 1. Selección de Modelo
+    # 1. SelecciÃ³n de Modelo
     graph_identity = _resolve_graph_identity_for_loaded_graph(loaded_graph)
     graph_hash = graph_identity.get("graph_hash")
     if graph_hash:
@@ -20308,7 +20887,7 @@ def _render_evaluation_tab() -> None:
     else:
         st.warning(
             "No se pudo resolver `graph_hash` para el grafo cargado. "
-            "No se listarán modelos para evitar evaluar checkpoints de otro grafo."
+            "No se listarÃ¡n modelos para evitar evaluar checkpoints de otro grafo."
         )
         return
 
@@ -20373,33 +20952,32 @@ def _render_evaluation_tab() -> None:
     # 3. Archivos involucrados
     with st.expander("Archivos asociados", expanded=False):
         stem = Path(selected_model_path).stem
-        pattern = os.path.join(RESULTADOS_DIR, f"{stem}*")
-        associated = glob.glob(pattern)
+        associated = sorted(Path(selected_model_path).parent.glob(f"{stem}*"))
         for f in associated:
             st.write(f"- {os.path.basename(f)}")
 
     _render_gnn_strategy_reference_panel(
-        context_label="Evaluación",
+        context_label="EvaluaciÃ³n",
         graph_obj=loaded_graph,
         model_meta=meta if isinstance(meta, dict) else None,
         expanded=False,
     )
 
-    # 4. Evaluación
+    # 4. EvaluaciÃ³n
     st.markdown("---")
-    st.markdown("#### Configuración de evaluación")
+    st.markdown("#### ConfiguraciÃ³n de evaluaciÃ³n")
 
     available_masks = _list_available_masks(graph_data, node_type=node_type)
     if not available_masks:
-        st.warning("No se encontraron máscaras en el grafo para evaluar.")
+        st.warning("No se encontraron mÃ¡scaras en el grafo para evaluar.")
         return
     selected_masks = _test_only_eval_masks(graph_data, node_type=node_type)
     if not selected_masks:
-        st.warning("No se encontró `test_mask` no vacío para evaluar el modelo entrenado.")
+        st.warning("No se encontrÃ³ `test_mask` no vacÃ­o para evaluar el modelo entrenado.")
         return
     st.caption(
-        "Evaluación final fija: `test_mask`. "
-        "`val_mask` solo se usa internamente para calibración de umbral/probabilidad cuando corresponde."
+        "EvaluaciÃ³n final fija: `test_mask`. "
+        "`val_mask` solo se usa internamente para calibraciÃ³n de umbral/probabilidad cuando corresponde."
     )
 
     mask_counts = {}
@@ -20410,7 +20988,7 @@ def _render_evaluation_tab() -> None:
             mask_counts[m] = 0
     if mask_counts:
         summary = " | ".join(f"{k}={v}" for k, v in mask_counts.items())
-        st.caption(f"Nodos por máscara: {summary}")
+        st.caption(f"Nodos por mÃ¡scara: {summary}")
 
     too_large = any(v > 500_000 for v in mask_counts.values())
     if "gnn_eval_max_nodes" not in st.session_state:
@@ -20473,51 +21051,51 @@ def _render_evaluation_tab() -> None:
         tau_default = 0.5
 
     threshold_mode = st.selectbox(
-        "Umbral de decisión",
+        "Umbral de decisiÃ³n",
         ["Auto (FAR <= target)", "Manual (override)"],
         index=0,
         key="gnn_eval_threshold_mode",
-        help="Auto calibra el umbral con la máscara de validación para mantener FAR bajo el target.",
+        help="Auto calibra el umbral con la mÃ¡scara de validaciÃ³n para mantener FAR bajo el target.",
     )
     eval_threshold = None
     threshold_strategy = "far"
     far_target = float(st.session_state.get("gnn_eval_far_target", 0.20))
     if threshold_mode == "Auto (FAR <= target)":
         far_target = st.slider(
-            "FAR target (máx)",
+            "FAR target (mÃ¡x)",
             min_value=0.0,
             max_value=1.0,
             value=float(far_target),
             step=0.01,
             key="gnn_eval_far_target",
             help=(
-                "Máxima tasa de falsas alarmas permitida al calibrar el umbral en val_mask. "
+                "MÃ¡xima tasa de falsas alarmas permitida al calibrar el umbral en val_mask. "
                 "Default: 0.20. Valores muy bajos pueden sacrificar sensibilidad y ocultar accidentes."
             ),
         )
     else:
         threshold_strategy = "manual"
         eval_threshold = st.slider(
-            "Umbral de decisión (Override)",
+            "Umbral de decisiÃ³n (Override)",
             min_value=0.01,
             max_value=0.99,
             value=tau_default,
             step=0.01,
             key="gnn_eval_threshold",
             help=(
-                "Probabilidad mínima para clasificar Accidente=1. Default: tau del modelo. "
-                "Cambiarlo sin calibración en validación puede invalidar comparaciones entre modelos."
+                "Probabilidad mÃ­nima para clasificar Accidente=1. Default: tau del modelo. "
+                "Cambiarlo sin calibraciÃ³n en validaciÃ³n puede invalidar comparaciones entre modelos."
             ),
         )
 
     st.markdown("#### Explicabilidad del grafo")
     xai_enabled = st.checkbox(
-        "Calcular XAI después de evaluar",
+        "Calcular XAI despuÃ©s de evaluar",
         value=False,
         key="gnn_eval_xai_enabled",
         help=(
-            "Activa el análisis de atención por arista unido a predicción por nodo. "
-            "Úselo tras una evaluación final; en grafos grandes aumenta tiempo y memoria."
+            "Activa el anÃ¡lisis de atenciÃ³n por arista unido a predicciÃ³n por nodo. "
+            "Ãšselo tras una evaluaciÃ³n final; en grafos grandes aumenta tiempo y memoria."
         ),
     )
     try:
@@ -20535,45 +21113,45 @@ def _render_evaluation_tab() -> None:
     xai_col_a, xai_col_b, xai_col_c = st.columns(3)
     with xai_col_a:
         xai_layer = st.selectbox(
-            "Capa de atención",
+            "Capa de atenciÃ³n",
             options=xai_layer_options,
             index=xai_layer_options.index(xai_default_layer),
             key="gnn_eval_xai_layer",
             help=(
-                "Selecciona la capa GNN desde la que se extraen pesos de atención. "
-                "Por defecto usa conv2 si existe, si no la última; usar capas tempranas puede enfatizar vecindad local."
+                "Selecciona la capa GNN desde la que se extraen pesos de atenciÃ³n. "
+                "Por defecto usa conv2 si existe, si no la Ãºltima; usar capas tempranas puede enfatizar vecindad local."
             ),
         )
     with xai_col_b:
         xai_percentile = st.slider(
-            "Percentil de atención",
+            "Percentil de atenciÃ³n",
             min_value=0.50,
             max_value=0.99,
             value=0.95,
             step=0.01,
             key="gnn_eval_xai_percentile",
             help=(
-                "Umbral relativo para conservar aristas con atención alta. "
-                "Rango 0.50-0.99; valores bajos muestran ruido, valores muy altos pueden dejar el grafo casi vacío."
+                "Umbral relativo para conservar aristas con atenciÃ³n alta. "
+                "Rango 0.50-0.99; valores bajos muestran ruido, valores muy altos pueden dejar el grafo casi vacÃ­o."
             ),
         )
     with xai_col_c:
         xai_k_heads = st.number_input(
-            "Mínimo de cabezales",
+            "MÃ­nimo de cabezales",
             min_value=1,
             max_value=xai_num_heads,
             value=min(3, xai_num_heads),
             step=1,
             key="gnn_eval_xai_k_heads",
             help=(
-                "Número mínimo de cabezales de atención que deben superar el percentil. "
-                "Aumentarlo exige consenso entre cabezales; usarlo mayor que los heads del modelo no es válido."
+                "NÃºmero mÃ­nimo de cabezales de atenciÃ³n que deben superar el percentil. "
+                "Aumentarlo exige consenso entre cabezales; usarlo mayor que los heads del modelo no es vÃ¡lido."
             ),
         )
     xai_col_d, xai_col_e = st.columns(2)
     with xai_col_d:
         xai_max_edges = st.number_input(
-            "Máximo de aristas a visualizar",
+            "MÃ¡ximo de aristas a visualizar",
             min_value=10,
             max_value=20000,
             value=500,
@@ -20581,18 +21159,78 @@ def _render_evaluation_tab() -> None:
             key="gnn_eval_xai_max_edges",
             help=(
                 "Limita la tabla y el grafo visual para mantener la UI fluida. "
-                "No cambia el cálculo guardado; valores altos pueden hacer ilegible la visualización."
+                "No cambia el cÃ¡lculo guardado; valores altos pueden hacer ilegible la visualizaciÃ³n."
             ),
         )
     with xai_col_e:
         xai_visual_metric = st.selectbox(
-            "Métrica visual",
+            "MÃ©trica visual",
             ["mean_attention", "max_attention", "prob1", "error_type"],
             index=0,
             key="gnn_eval_xai_visual_metric",
             help=(
-                "Define cómo se ordenan y colorean los resultados XAI. "
+                "Define cÃ³mo se ordenan y colorean los resultados XAI. "
                 "mean/max_attention priorizan aristas; prob1/error_type priorizan el estado predictivo de nodos."
+            ),
+        )
+    xai_method_options = {
+        "relation_ablation": "Perturbacion de relaciones",
+        "feature_ablation": "Perturbacion de features",
+        "input_gradient": "Gradiente por feature",
+        "integrated_gradients": "Integrated Gradients",
+    }
+    xai_explanation_methods = st.multiselect(
+        "Metodos XAI avanzados",
+        options=list(xai_method_options.keys()),
+        default=["relation_ablation"],
+        format_func=lambda value: xai_method_options.get(str(value), str(value)),
+        key="gnn_eval_xai_explanation_methods",
+        help=(
+            "Agrega explicabilidad por intervencion despues de la evaluacion. "
+            "relation_ablation mide cuanto cambia prob1 al quitar o aislar cada relacion; "
+            "feature_ablation mide cuanto cambia prob1 al neutralizar features seleccionadas. "
+            "input_gradient e integrated_gradients atribuyen la salida de Accidente=1 a features de nodo. "
+            "Aumenta el tiempo de computo y no debe leerse como causalidad fisica directa."
+        ),
+    )
+    xai_adv_col_a, xai_adv_col_b, xai_adv_col_c = st.columns(3)
+    with xai_adv_col_a:
+        xai_explain_max_nodes = st.number_input(
+            "Max nodos XAI avanzado",
+            min_value=0,
+            max_value=1000,
+            value=64,
+            step=8,
+            key="gnn_eval_xai_explain_max_nodes",
+            help=(
+                "Cantidad maxima de nodos objetivo para calcular perturbaciones. "
+                "0 desactiva los metodos avanzados aunque esten seleccionados; valores altos pueden ralentizar la evaluacion."
+            ),
+        )
+    with xai_adv_col_b:
+        xai_explain_top_features = st.number_input(
+            "Top features a perturbar",
+            min_value=0,
+            max_value=64,
+            value=8,
+            step=1,
+            key="gnn_eval_xai_explain_top_features",
+            help=(
+                "Numero de columnas de entrada usadas por feature_ablation, input_gradient e integrated_gradients. "
+                "En perturbacion se eligen por magnitud media en el batch; en gradientes se reportan las top features por atribucion."
+            ),
+        )
+    with xai_adv_col_c:
+        xai_integrated_gradients_steps = st.number_input(
+            "Pasos Integrated Gradients",
+            min_value=1,
+            max_value=128,
+            value=16,
+            step=1,
+            key="gnn_eval_xai_integrated_gradients_steps",
+            help=(
+                "Cantidad de puntos entre baseline cero y entrada real para integrated_gradients. "
+                "Valores altos suavizan la atribucion pero multiplican el costo de inferencia; solo aplica si ese metodo esta seleccionado."
             ),
         )
 
@@ -20634,6 +21272,11 @@ def _render_evaluation_tab() -> None:
             xai_k_heads=int(xai_k_heads),
             xai_max_edges=int(xai_max_edges),
             xai_visual_metric=str(xai_visual_metric),
+            xai_explanation_methods=list(xai_explanation_methods),
+            xai_explain_max_nodes=int(xai_explain_max_nodes),
+            xai_explain_top_features=int(xai_explain_top_features),
+            xai_integrated_gradients_steps=int(xai_integrated_gradients_steps),
+            xai_feature_names=list(loaded_graph.get("feature_cols") or []),
         )
 
 
@@ -20757,7 +21400,7 @@ GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS: Tuple[Tuple[str, object], ...] = (
     ),
 )
 GNN_OPTUNA_NEIGHBOR_PROFILE_LABELS: Dict[str, str] = {
-    "asymmetric": "asimétrico",
+    "asymmetric": "asimÃ©trico",
 }
 SAMPLER_CLUSTER_GCN_PROFILE_PRESETS: Tuple[Tuple[str, Tuple[int, int]], ...] = (
     ("highway_stable", (64, 0)),
@@ -20877,7 +21520,7 @@ def _render_optuna_neighbor_profiles_controls(
     with st.expander("Perfiles de vecinos", expanded=True):
         st.caption(
             "Define perfiles para NeighborLoader. Los perfiles planos usan una "
-            "lista por capa; el perfil asimétrico usa JSON por relación."
+            "lista por capa; el perfil asimÃ©trico usa JSON por relaciÃ³n."
         )
         for name, default_profile in GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS:
             default_txt = _format_optuna_neighbor_profile(default_profile)
@@ -20886,7 +21529,7 @@ def _render_optuna_neighbor_profiles_controls(
                 value=default_txt,
                 key=f"{key_prefix}_neighbor_profile_{name}",
                 help=(
-                    "JSON con claves de relación: temporal, spatial y st_fwd."
+                    "JSON con claves de relaciÃ³n: temporal, spatial y st_fwd."
                     if isinstance(_clone_optuna_neighbor_profile(default_profile), Mapping)
                     else None
                 ),
@@ -20901,7 +21544,7 @@ def _render_optuna_neighbor_profiles_controls(
             default=profile_names,
             format_func=_optuna_neighbor_profile_label,
             key=f"{key_prefix}_neighbor_profiles_enabled",
-            help="Selecciona qué perfiles entran al grid de Optuna.",
+            help="Selecciona quÃ© perfiles entran al grid de Optuna.",
         )
     return {
         name: profile_map[name]
@@ -20937,7 +21580,7 @@ def _render_sampler_neighbor_profiles_controls(
             options=default_enabled,
             default=default_enabled,
             key=f"{key_prefix}_neighbor_profiles_enabled",
-            help="Selecciona qué perfiles entran al grid del experimento.",
+            help="Selecciona quÃ© perfiles entran al grid del experimento.",
         )
     ordered_profiles = [
         profile_map[name]
@@ -21004,7 +21647,7 @@ def _render_sampler_cluster_gcn_profiles_controls(
             options=default_enabled,
             default=default_enabled,
             key=f"{key_prefix}_cluster_profiles_enabled",
-            help="Selecciona qué perfiles entran al grid del experimento.",
+            help="Selecciona quÃ© perfiles entran al grid del experimento.",
         )
     num_parts: List[int] = []
     parts_per_epoch: List[int] = []
@@ -21105,7 +21748,7 @@ def _render_sampler_graphsaint_profiles_controls(
             options=default_enabled,
             default=default_enabled,
             key=f"{key_prefix}_graphsaint_profiles_enabled",
-            help="Selecciona qué perfiles entran al grid del experimento.",
+            help="Selecciona quÃ© perfiles entran al grid del experimento.",
         )
     modes: List[str] = []
     batches: List[int] = []
@@ -21781,7 +22424,7 @@ def _prepare_graph_for_sampler_memory_probe(
 ) -> Tuple[HeteroData, List[str]]:
     notes: List[str] = []
     if "pm" not in graph_data.node_types:
-        notes.append("No se detectó nodo 'pm'; se usa grafo original para el probe.")
+        notes.append("No se detectÃ³ nodo 'pm'; se usa grafo original para el probe.")
         return graph_data, notes
 
     want_graphsmote = bool(use_graphsmote) or _metric_bool(
@@ -21808,7 +22451,7 @@ def _prepare_graph_for_sampler_memory_probe(
     elif want_imgagn and want_graphsmote:
         variant = "ImGAGN"
         notes.append(
-            "Se detectó GraphSMOTE e ImGAGN simultáneamente; el probe priorizará ImGAGN."
+            "Se detectÃ³ GraphSMOTE e ImGAGN simultÃ¡neamente; el probe priorizarÃ¡ ImGAGN."
         )
 
     has_synthetic = False
@@ -21821,7 +22464,7 @@ def _prepare_graph_for_sampler_memory_probe(
         has_synthetic = False
     if has_synthetic:
         notes.append(
-            f"{variant} detectado: el grafo ya contiene nodos sintéticos."
+            f"{variant} detectado: el grafo ya contiene nodos sintÃ©ticos."
         )
         return graph_data, notes
 
@@ -21858,12 +22501,12 @@ def _prepare_graph_for_sampler_memory_probe(
         except Exception:
             synth_count = 0
         if synth_count <= 0:
-            return False, "sin nodos sintéticos"
+            return False, "sin nodos sintÃ©ticos"
         try:
             base_feats = int(graph_data["pm"].x.shape[1])
             cand_feats = int(candidate["pm"].x.shape[1])
             if base_feats != cand_feats:
-                return False, f"dimensión de features distinta ({cand_feats} != {base_feats})"
+                return False, f"dimensiÃ³n de features distinta ({cand_feats} != {base_feats})"
         except Exception:
             pass
         try:
@@ -21898,13 +22541,13 @@ def _prepare_graph_for_sampler_memory_probe(
         for raw in (
             base_params.get("graph_aug_path"),
             SAVE_AUG_GRAPH_PATH,
-            os.path.join(RESULTADOS_DIR, "graph_aug.pt"),
+            str(gnn_path("graphs_graphsmote", "graph_aug.pt", resultados_dir=RESULTADOS_DIR)),
         ):
             if raw:
                 candidate_paths.append(str(raw))
         pattern_paths: List[str] = []
         for pattern in ("graph_aug*.pt", "graph_smote_*.pt", "*GraphSMOTE*.pt"):
-            pattern_paths.extend(glob.glob(os.path.join(RESULTADOS_DIR, pattern)))
+            pattern_paths.extend(gnn_glob("graphs_graphsmote", pattern, RESULTADOS_DIR))
         pattern_paths = sorted(pattern_paths, key=os.path.getmtime, reverse=True)
         candidate_paths.extend(pattern_paths)
     else:
@@ -21919,7 +22562,7 @@ def _prepare_graph_for_sampler_memory_probe(
             "graph_imgagn_relational_*.pt",
             "*imgagn_relational*.pt",
         ):
-            pattern_paths.extend(glob.glob(os.path.join(RESULTADOS_DIR, pattern)))
+            pattern_paths.extend(gnn_glob("graphs_imgagn", pattern, RESULTADOS_DIR))
         pattern_paths = sorted(pattern_paths, key=os.path.getmtime, reverse=True)
         candidate_paths.extend(pattern_paths)
 
@@ -21936,7 +22579,7 @@ def _prepare_graph_for_sampler_memory_probe(
             loaded_data = _extract_heterodata(loaded_obj)
             if loaded_data is None:
                 notes.append(
-                    f"Se ignoró {os.path.basename(path)}: no contiene HeteroData compatible."
+                    f"Se ignorÃ³ {os.path.basename(path)}: no contiene HeteroData compatible."
                 )
                 continue
             ok, reason = _is_compatible_augmented_graph(
@@ -21946,7 +22589,7 @@ def _prepare_graph_for_sampler_memory_probe(
             )
             if not ok:
                 notes.append(
-                    f"Se ignoró {os.path.basename(path)}: {reason}."
+                    f"Se ignorÃ³ {os.path.basename(path)}: {reason}."
                 )
                 continue
             try:
@@ -21955,7 +22598,7 @@ def _prepare_graph_for_sampler_memory_probe(
                 synth_count = 0
             notes.append(
                 f"{variant} para probe cargado desde "
-                f"{os.path.basename(path)} (sintéticos={synth_count})."
+                f"{os.path.basename(path)} (sintÃ©ticos={synth_count})."
             )
             return loaded_data, notes
         except Exception as exc:
@@ -21965,15 +22608,15 @@ def _prepare_graph_for_sampler_memory_probe(
 
     if variant == "GraphSMOTE":
         notes.append(
-            "[ALERTA] GraphSMOTE activo, pero no se encontró un grafo aumentado "
+            "[ALERTA] GraphSMOTE activo, pero no se encontrÃ³ un grafo aumentado "
             "compatible (`graph_aug.pt` / `graph_smote_*.pt`). "
-            "Se omite aumentación en vivo por estabilidad (evita segfault en MPS)."
+            "Se omite aumentaciÃ³n en vivo por estabilidad (evita segfault en MPS)."
         )
     else:
         notes.append(
-            "[ALERTA] ImGAGN relacional activo, pero no se encontró un grafo aumentado "
+            "[ALERTA] ImGAGN relacional activo, pero no se encontrÃ³ un grafo aumentado "
             "compatible (`graph_imgagn_relational_*.pt`). "
-            "Se usará el grafo original y la memoria puede quedar subestimada."
+            "Se usarÃ¡ el grafo original y la memoria puede quedar subestimada."
         )
     return graph_data, notes
 
@@ -21988,9 +22631,9 @@ def _build_sampler_memory_loader(
     from src import gnn_main as graph_main
 
     if "pm" not in graph_cpu.node_types:
-        return None, "No se encontró tipo de nodo 'pm'."
+        return None, "No se encontrÃ³ tipo de nodo 'pm'."
     if not hasattr(graph_cpu["pm"], "train_mask"):
-        return None, "No se encontró train_mask para 'pm'."
+        return None, "No se encontrÃ³ train_mask para 'pm'."
 
     base_seeds = graph_cpu["pm"].train_mask.nonzero(as_tuple=False).view(-1).cpu()
     if base_seeds.numel() == 0:
@@ -22078,13 +22721,13 @@ def _probe_sampler_memory_usage_subprocess(
                 detail = stderr or stdout or f"return_code={proc.returncode}"
                 result["status"] = "crash"
                 result["error"] = (
-                    "Probe en subproceso terminó con error/segfault "
+                    "Probe en subproceso terminÃ³ con error/segfault "
                     f"(code={proc.returncode}): {detail}"
                 )
                 return result
             if not os.path.exists(output_path):
                 result["status"] = "error"
-                result["error"] = "Probe en subproceso no generó salida."
+                result["error"] = "Probe en subproceso no generÃ³ salida."
                 return result
             with open(output_path, "r", encoding="utf-8") as fh:
                 loaded = json.load(fh)
@@ -22093,11 +22736,11 @@ def _probe_sampler_memory_usage_subprocess(
                 result["isolation_mode"] = "subprocess_mps"
                 return result
             result["status"] = "error"
-            result["error"] = "Salida inválida del subproceso."
+            result["error"] = "Salida invÃ¡lida del subproceso."
             return result
     except subprocess.TimeoutExpired:
         result["status"] = "timeout"
-        result["error"] = "Probe en subproceso excedió el tiempo límite."
+        result["error"] = "Probe en subproceso excediÃ³ el tiempo lÃ­mite."
     except Exception as exc:
         result["status"] = "error"
         result["error"] = str(exc)
@@ -22641,7 +23284,7 @@ def _search_sampler_batch_for_budget(
         ):
             best_row = row
 
-    # Exploración adaptativa: saltos grandes cuando el uso es bajo y refinamiento
+    # ExploraciÃ³n adaptativa: saltos grandes cuando el uso es bajo y refinamiento
     # progresivo cuando nos acercamos al presupuesto.
     current_idx = 0
     current_row = _probe_idx(
@@ -22679,8 +23322,8 @@ def _search_sampler_batch_for_budget(
             current_row = next_row
             continue
 
-        # Si excede o falla, refinamos entre el último punto válido y el fallido
-        # usando saltos menores (pasos más cortos cerca de altos porcentajes).
+        # Si excede o falla, refinamos entre el Ãºltimo punto vÃ¡lido y el fallido
+        # usando saltos menores (pasos mÃ¡s cortos cerca de altos porcentajes).
         low_idx = (
             int(best_under_idx)
             if best_under_idx is not None
@@ -22845,8 +23488,11 @@ def _materialize_sampler_hparams_variant(
         f"{run_id}_{sampler_config.get('config_idx', 0)}_{sampler_config.get('config_name', 'sampler')}"
     ) or "sampler"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    out_path = Path(RESULTADOS_DIR) / (
-        f"optuna_hyperparams_{timestamp}_{cfg_slug}{hash_tag}{variant_tag}.csv"
+    out_path = gnn_path(
+        "hpo_optuna",
+        f"optuna_hyperparams_{timestamp}_{cfg_slug}{hash_tag}{variant_tag}.csv",
+        resultados_dir=RESULTADOS_DIR,
+        create_parent=True,
     )
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -22865,15 +23511,15 @@ def _render_sampler_fidelity_experiment(
     st.markdown("### Sampler Fidelity vs Full-batch")
     st.caption(
         "Este experimento entrena una referencia y luego compara configuraciones de sampler "
-        "para encontrar la opción más cercana a full-batch."
+        "para encontrar la opciÃ³n mÃ¡s cercana a full-batch."
     )
-    with st.expander("¿Qué ajustas y qué efecto tiene?", expanded=False):
+    with st.expander("Â¿QuÃ© ajustas y quÃ© efecto tiene?", expanded=False):
         st.markdown(
-            "- `num_neighbors`: define cuántos vecinos toma por capa; valores más altos acercan a full-batch pero consumen más memoria.\n"
-            "- `train_sampler_mode`: `neighbor`, `positive_aware`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia cómo se muestrea el subgrafo de entrenamiento.\n"
+            "- `num_neighbors`: define cuÃ¡ntos vecinos toma por capa; valores mÃ¡s altos acercan a full-batch pero consumen mÃ¡s memoria.\n"
+            "- `train_sampler_mode`: `neighbor`, `positive_aware`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia cÃ³mo se muestrea el subgrafo de entrenamiento.\n"
             "- `deterministic_sampling` + `sampling_seed`: estabiliza reproducibilidad del experimento.\n"
             "- `disable_hard_undersampling`: evita sesgo por hard-mining cuando buscas fidelidad al baseline.\n"
-            "- `eval_neighbors_mode`: `exhaustive` evalúa con vecindario completo para comparar en condiciones cercanas a full-batch."
+            "- `eval_neighbors_mode`: `exhaustive` evalÃºa con vecindario completo para comparar en condiciones cercanas a full-batch."
         )
 
     variant_label_to_flags = {
@@ -22910,7 +23556,7 @@ def _render_sampler_fidelity_experiment(
 
     hp_labels = [os.path.basename(path) for path in hp_files]
     selected_label = st.selectbox(
-        "Hiperparámetros base",
+        "HiperparÃ¡metros base",
         hp_labels,
         index=len(hp_labels) - 1,
         key="gnn_exp_sampler_fidelity_base_hparams",
@@ -22922,7 +23568,7 @@ def _render_sampler_fidelity_experiment(
     )
     base_params = _load_optuna_params_from_csv(selected_hparams_path)
     if not base_params:
-        st.error("No se pudieron leer los hiperparámetros base.")
+        st.error("No se pudieron leer los hiperparÃ¡metros base.")
         return
 
     base_neighbors = _coerce_neighbor_profile(
@@ -22963,7 +23609,7 @@ def _render_sampler_fidelity_experiment(
             ["exhaustive", "same", "custom"],
             index=0,
             key="gnn_exp_sampler_ref_eval_mode",
-            help="`exhaustive` se recomienda para aproximar comparación full-batch.",
+            help="`exhaustive` se recomienda para aproximar comparaciÃ³n full-batch.",
         )
     ref_eval_custom = None
     if ref_eval_mode == "custom":
@@ -22971,7 +23617,7 @@ def _render_sampler_fidelity_experiment(
             "eval num_neighbors referencia (custom)",
             value=",".join(str(v) for v in base_neighbors),
             key="gnn_exp_sampler_ref_eval_custom",
-            help="Solo aplica cuando eval referencia está en `custom`.",
+            help="Solo aplica cuando eval referencia estÃ¡ en `custom`.",
         )
 
     st.markdown("**Grid de Samplers**")
@@ -22986,7 +23632,7 @@ def _render_sampler_fidelity_experiment(
         list(sampler_labels.keys()),
         default=list(sampler_labels.keys()),
         key="gnn_exp_sampler_modes",
-        help="Se evaluarán todas las combinaciones configuradas para estos samplers.",
+        help="Se evaluarÃ¡n todas las combinaciones configuradas para estos samplers.",
     )
     if not selected_sampler_labels:
         st.warning("Selecciona al menos un sampler.")
@@ -23014,7 +23660,7 @@ def _render_sampler_fidelity_experiment(
             value=int(SEED),
             step=1,
             key="gnn_exp_sampler_seed",
-            help="Semilla base para sampler y variación entre repeticiones.",
+            help="Semilla base para sampler y variaciÃ³n entre repeticiones.",
         )
     with col_sampling_c:
         disable_hard_undersampling = st.checkbox(
@@ -23042,7 +23688,7 @@ def _render_sampler_fidelity_experiment(
             ["same", "exhaustive", "custom"],
             index=1,
             key="gnn_exp_sampler_eval_mode",
-            help="`exhaustive` compara candidatos en condiciones más cercanas a full-batch.",
+            help="`exhaustive` compara candidatos en condiciones mÃ¡s cercanas a full-batch.",
         )
     with col_eval_b:
         eval_custom_txt = st.text_input(
@@ -23056,23 +23702,23 @@ def _render_sampler_fidelity_experiment(
     col_rep_a, col_rep_b = st.columns(2)
     with col_rep_a:
         repeats = st.number_input(
-            "Repeticiones por configuración",
+            "Repeticiones por configuraciÃ³n",
             min_value=1,
             max_value=10,
             value=1,
             step=1,
             key="gnn_exp_sampler_repeats",
-            help="Permite medir estabilidad de cada configuración.",
+            help="Permite medir estabilidad de cada configuraciÃ³n.",
         )
     with col_rep_b:
         far_target = st.slider(
-            "FAR target para evaluación",
+            "FAR target para evaluaciÃ³n",
             min_value=0.0,
             max_value=0.5,
             value=0.2,
             step=0.01,
             key="gnn_exp_sampler_far_target",
-            help="Se usa para calibrar umbral antes de medir desempeño final.",
+            help="Se usa para calibrar umbral antes de medir desempeÃ±o final.",
         )
 
     st.markdown("**Entrenamiento**")
@@ -23084,7 +23730,7 @@ def _render_sampler_fidelity_experiment(
             value=200,
             step=10,
             key="gnn_exp_sampler_max_epochs",
-            help="Límite de epochs para cada corrida del experimento.",
+            help="LÃ­mite de epochs para cada corrida del experimento.",
         )
     with col_train_b:
         early_stop_train = st.checkbox(
@@ -23111,7 +23757,7 @@ def _render_sampler_fidelity_experiment(
         format="%.6f",
         key="gnn_exp_sampler_min_delta",
         disabled=not early_stop_train,
-        help="Mejora mínima para resetear paciencia.",
+        help="Mejora mÃ­nima para resetear paciencia.",
     )
 
     st.markdown("**Pesos del score de fidelidad**")
@@ -23312,7 +23958,7 @@ def _render_sampler_fidelity_experiment(
             reference_cfg, fallback_layers=base_layers
         )
         if not ref_hp_path:
-            ref_train_error = "No se pudo generar archivo de hiperparámetros para referencia."
+            ref_train_error = "No se pudo generar archivo de hiperparÃ¡metros para referencia."
         else:
             try:
                 ref_model_path = _train_gnn_with_best_params(
@@ -23406,12 +24052,12 @@ def _render_sampler_fidelity_experiment(
 
         if ref_status != "ok":
             st.error(
-                "La referencia falló. Revisa `train_error`/`eval_error` en resultados."
+                "La referencia fallÃ³. Revisa `train_error`/`eval_error` en resultados."
             )
             results_df = pd.DataFrame(all_rows)
             st.dataframe(results_df, width="stretch")
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_csv = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+            out_csv = gnn_path("experiments_results", f"gnn_experiments_results_{stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True)
             results_df.to_csv(out_csv, index=False)
             st.warning(f"Resultados parciales guardados en {out_csv}")
             return
@@ -23456,7 +24102,7 @@ def _render_sampler_fidelity_experiment(
             )
 
             if not hp_variant_path:
-                train_error = "No se pudo generar archivo de hiperparámetros."
+                train_error = "No se pudo generar archivo de hiperparÃ¡metros."
             else:
                 try:
                     model_path = _train_gnn_with_best_params(
@@ -23599,14 +24245,14 @@ def _render_sampler_fidelity_experiment(
         st.dataframe(results_df, width="stretch")
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_csv = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+        out_csv = gnn_path("experiments_results", f"gnn_experiments_results_{stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True)
         results_df.to_csv(out_csv, index=False)
         st.success(f"Resultados guardados en {out_csv}")
 
         if best_row:
             _append_gnn_experiment_best(exp_db_path, best_row)
             st.success(
-                f"Mejor configuración: {best_row.get('config_name')} | "
+                f"Mejor configuraciÃ³n: {best_row.get('config_name')} | "
                 f"fidelity_score={float(best_row.get('fidelity_score', float('nan'))):.6f}"
             )
             st.json(
@@ -23653,15 +24299,15 @@ def _render_sampler_memory_budget_experiment(
 ) -> None:
     st.markdown("### Sampler Memory Budget (95% VRAM)")
     st.caption(
-        "Busca automáticamente la configuración de muestreo que maximiza uso de memoria "
+        "Busca automÃ¡ticamente la configuraciÃ³n de muestreo que maximiza uso de memoria "
         "sin sobrepasar el presupuesto objetivo."
     )
-    with st.expander("¿Qué controla este experimento y por qué sirve para CUDA/Apple?", expanded=False):
+    with st.expander("Â¿QuÃ© controla este experimento y por quÃ© sirve para CUDA/Apple?", expanded=False):
         st.markdown(
-            "- `batch_size`: principal palanca de consumo de VRAM/Unified Memory por iteración.\n"
-            "- `num_neighbors`: define expansión del subgrafo por capa; impacta memoria y latencia.\n"
-            "- `train_sampler_mode`: `neighbor`, `positive_aware`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia patrón de seeds/subgrafos.\n"
-            "- `backend`: permite perfilar explícitamente en `CUDA` o `MPS` (stack Apple/MLX vía PyTorch)."
+            "- `batch_size`: principal palanca de consumo de VRAM/Unified Memory por iteraciÃ³n.\n"
+            "- `num_neighbors`: define expansiÃ³n del subgrafo por capa; impacta memoria y latencia.\n"
+            "- `train_sampler_mode`: `neighbor`, `positive_aware`, `cluster_gcn`, `graphsaint`, `rl_top_p`; cambia patrÃ³n de seeds/subgrafos.\n"
+            "- `backend`: permite perfilar explÃ­citamente en `CUDA` o `MPS` (stack Apple/MLX vÃ­a PyTorch)."
         )
 
     variant_label_to_flags = {
@@ -23675,7 +24321,7 @@ def _render_sampler_memory_budget_experiment(
         index=0,
         horizontal=True,
         key="gnn_exp_sampler_mem_base_variant",
-        help="Selecciona la variante de hiperparámetros base a evaluar.",
+        help="Selecciona la variante de hiperparÃ¡metros base a evaluar.",
     )
     variant_flags = variant_label_to_flags.get(
         str(base_variant),
@@ -23697,7 +24343,7 @@ def _render_sampler_memory_budget_experiment(
 
     hp_labels = [os.path.basename(path) for path in hp_files]
     selected_label = st.selectbox(
-        "Hiperparámetros base",
+        "HiperparÃ¡metros base",
         hp_labels,
         index=len(hp_labels) - 1,
         key="gnn_exp_sampler_mem_base_hparams",
@@ -23709,7 +24355,7 @@ def _render_sampler_memory_budget_experiment(
     )
     base_params = _load_optuna_params_from_csv(selected_hparams_path)
     if not base_params:
-        st.error("No se pudieron leer los hiperparámetros base.")
+        st.error("No se pudieron leer los hiperparÃ¡metros base.")
         return
 
     base_neighbors = _coerce_neighbor_profile(
@@ -23758,7 +24404,7 @@ def _render_sampler_memory_budget_experiment(
             value=0.95,
             step=0.01,
             key="gnn_exp_sampler_mem_target",
-            help="Fracción máxima de memoria permitida. 0.95 equivale a 95%.",
+            help="FracciÃ³n mÃ¡xima de memoria permitida. 0.95 equivale a 95%.",
         )
     with col_hw_d:
         probe_steps = st.number_input(
@@ -23768,15 +24414,15 @@ def _render_sampler_memory_budget_experiment(
             value=3,
             step=1,
             key="gnn_exp_sampler_mem_steps",
-            help="Cantidad de mini-batches para medir pico de memoria por configuración.",
+            help="Cantidad de mini-batches para medir pico de memoria por configuraciÃ³n.",
         )
     fidelity_full_epoch = st.checkbox(
         "Modo fidelity (epoch completo)",
         value=False,
         key="gnn_exp_sampler_mem_fidelity_mode",
         help=(
-            "Replica mejor el pipeline de training: cada medición usa todos los "
-            "mini-batches de train del sampler y luego validación. Incrementa costo."
+            "Replica mejor el pipeline de training: cada mediciÃ³n usa todos los "
+            "mini-batches de train del sampler y luego validaciÃ³n. Incrementa costo."
         ),
     )
     if bool(fidelity_full_epoch):
@@ -23787,7 +24433,7 @@ def _render_sampler_memory_budget_experiment(
 
     st.markdown("**Grid de muestreo**")
     st.caption(
-        "Implementación del probe: Neighbor=`NeighborLoader`, "
+        "ImplementaciÃ³n del probe: Neighbor=`NeighborLoader`, "
         "Cluster-GCN=`ClusterLoader` nativo, GraphSAINT=`GraphSAINT*Sampler` nativo, "
         "RioGNN=`rl_top_p` label-aware."
     )
@@ -23802,7 +24448,7 @@ def _render_sampler_memory_budget_experiment(
         list(sampler_labels.keys()),
         default=list(sampler_labels.keys()),
         key="gnn_exp_sampler_mem_modes",
-        help="Se evalúan las combinaciones de los samplers seleccionados.",
+        help="Se evalÃºan las combinaciones de los samplers seleccionados.",
     )
     if not selected_sampler_labels:
         st.warning("Selecciona al menos un sampler.")
@@ -23829,31 +24475,31 @@ def _render_sampler_memory_budget_experiment(
             value=int(SEED),
             step=1,
             key="gnn_exp_sampler_mem_seed",
-            help="Semilla base para construcción de batches/seeds.",
+            help="Semilla base para construcciÃ³n de batches/seeds.",
         )
     with col_sampling_c:
         evaluate_all_configs = st.checkbox(
             "Evaluar todas las combinaciones",
             value=True,
             key="gnn_exp_sampler_mem_all_cfg",
-            help="Si está activo, no se truncará el grid de configuraciones.",
+            help="Si estÃ¡ activo, no se truncarÃ¡ el grid de configuraciones.",
         )
     max_configs = st.number_input(
-        "Máximo configuraciones (si no evalúas todas)",
+        "MÃ¡ximo configuraciones (si no evalÃºas todas)",
         min_value=1,
         max_value=1000,
         value=24,
         step=1,
         key="gnn_exp_sampler_mem_max_cfg",
         disabled=bool(evaluate_all_configs),
-        help="Solo aplica cuando `Evaluar todas las combinaciones` está desactivado.",
+        help="Solo aplica cuando `Evaluar todas las combinaciones` estÃ¡ desactivado.",
     )
     adaptive_jump_sizes_txt = st.text_input(
         "Saltos adaptativos (separados por ';')",
         value="1;2;3;4;5;6;7;8;9;10",
         key="gnn_exp_sampler_mem_adaptive_jumps",
         help=(
-            "Cada valor es un múltiplo del `batch_size step` del rango a optimizar. "
+            "Cada valor es un mÃºltiplo del `batch_size step` del rango a optimizar. "
             "Ejemplo: con step=128, salto 3 => +384 batch_size."
         ),
     )
@@ -23878,7 +24524,7 @@ def _render_sampler_memory_budget_experiment(
             value=max(32, int(base_batch // 2)),
             step=1,
             key="gnn_exp_sampler_mem_batch_min",
-            help="Límite inferior de búsqueda para batch_size.",
+            help="LÃ­mite inferior de bÃºsqueda para batch_size.",
         )
     with col_batch_b:
         batch_max = st.number_input(
@@ -23887,7 +24533,7 @@ def _render_sampler_memory_budget_experiment(
             value=max(int(base_batch), 4096),
             step=1,
             key="gnn_exp_sampler_mem_batch_max",
-            help="Límite superior de búsqueda para batch_size.",
+            help="LÃ­mite superior de bÃºsqueda para batch_size.",
         )
     with col_batch_c:
         batch_step = st.number_input(
@@ -23896,7 +24542,7 @@ def _render_sampler_memory_budget_experiment(
             value=128,
             step=1,
             key="gnn_exp_sampler_mem_batch_step",
-            help="Granularidad de búsqueda; menor step aumenta precisión y costo.",
+            help="Granularidad de bÃºsqueda; menor step aumenta precisiÃ³n y costo.",
         )
 
     if "Cluster-GCN" in selected_sampler_labels and (
@@ -23947,17 +24593,17 @@ def _render_sampler_memory_budget_experiment(
     total_configs = len(candidate_configs)
     if (not bool(evaluate_all_configs)) and len(candidate_configs) > int(max_configs):
         st.warning(
-            f"Se truncará de {len(candidate_configs)} a {int(max_configs)} configuraciones para limitar costo."
+            f"Se truncarÃ¡ de {len(candidate_configs)} a {int(max_configs)} configuraciones para limitar costo."
         )
         candidate_configs = candidate_configs[: int(max_configs)]
     elif bool(evaluate_all_configs):
         st.caption(
-            f"Se evaluarán todas las combinaciones del grid: {total_configs}."
+            f"Se evaluarÃ¡n todas las combinaciones del grid: {total_configs}."
         )
 
     st.caption(f"Configuraciones candidatas: {len(candidate_configs)}")
     st.caption(
-        "Búsqueda adaptativa en batch_size activa: "
+        "BÃºsqueda adaptativa en batch_size activa: "
         f"saltos={adaptive_jump_options} x step({int(batch_step)}) "
         f"=> deltas={adaptive_jump_deltas}. "
         "Uso bajo => saltos grandes; uso alto => saltos cortos."
@@ -23999,7 +24645,7 @@ def _render_sampler_memory_budget_experiment(
             return
 
         if backend_choice == "CUDA" and not torch.cuda.is_available():
-            st.error("CUDA no está disponible en este entorno.")
+            st.error("CUDA no estÃ¡ disponible en este entorno.")
             return
         if (
             backend_choice == "MPS"
@@ -24008,7 +24654,7 @@ def _render_sampler_memory_budget_experiment(
                 or not torch.backends.mps.is_available()
             )
         ):
-            st.error("MPS no está disponible en este entorno.")
+            st.error("MPS no estÃ¡ disponible en este entorno.")
             return
         device = _resolve_eval_device(backend_choice)
         if isinstance(device, str):
@@ -24016,7 +24662,7 @@ def _render_sampler_memory_budget_experiment(
         if device.type == "mps":
             st.caption(
                 "Modo estabilidad MPS activo: cada probe corre en subproceso aislado. "
-                "Si PyTorch/PyG falla, se marca la combinación como `crash` sin cerrar la app."
+                "Si PyTorch/PyG falla, se marca la combinaciÃ³n como `crash` sin cerrar la app."
             )
 
         user_total_bytes = int(max(float(vram_total_gb), 0.1) * (1024 ** 3))
@@ -24027,7 +24673,7 @@ def _render_sampler_memory_budget_experiment(
         effective_total_bytes = min(int(user_total_bytes), int(detected_total_bytes))
         budget_bytes = int(effective_total_bytes * float(vram_target_fraction))
         if budget_bytes <= 0:
-            st.error("El presupuesto calculado es inválido.")
+            st.error("El presupuesto calculado es invÃ¡lido.")
             return
 
         batch_candidates = _parse_batch_candidates(
@@ -24036,7 +24682,7 @@ def _render_sampler_memory_budget_experiment(
             int(batch_step),
         )
         if not batch_candidates:
-            st.error("No se pudo construir un rango válido de batch_size.")
+            st.error("No se pudo construir un rango vÃ¡lido de batch_size.")
             return
 
         experiment_name = "GNN Sampler Memory Budget"
@@ -24078,7 +24724,7 @@ def _render_sampler_memory_budget_experiment(
 
         prep_status = st.empty()
         prep_status.markdown(
-            "Preparando pipeline de memoria (train + validación) según hiperparámetros base..."
+            "Preparando pipeline de memoria (train + validaciÃ³n) segÃºn hiperparÃ¡metros base..."
         )
         with st.spinner("Preparando grafo efectivo para el probe de memoria..."):
             probe_graph_data, prep_notes = _prepare_graph_for_sampler_memory_probe(
@@ -24199,7 +24845,7 @@ def _render_sampler_memory_budget_experiment(
         st.dataframe(summary_df, width="stretch")
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_csv = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+        out_csv = gnn_path("experiments_results", f"gnn_experiments_results_{stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True)
         pd.DataFrame(all_probe_rows).to_csv(out_csv, index=False)
         st.success(f"Resultados guardados en {out_csv}")
 
@@ -24209,12 +24855,12 @@ def _render_sampler_memory_budget_experiment(
             is_under = selected_row is best_under
             if is_under:
                 st.success(
-                    "Mejor configuración bajo presupuesto encontrada "
+                    "Mejor configuraciÃ³n bajo presupuesto encontrada "
                     f"(uso={float(selected_row.get('memory_peak_fraction_budget', 0.0)) * 100:.2f}%)."
                 )
             else:
                 st.warning(
-                    "No hubo configuración bajo presupuesto; se muestra la más cercana por encima del límite."
+                    "No hubo configuraciÃ³n bajo presupuesto; se muestra la mÃ¡s cercana por encima del lÃ­mite."
                 )
             sampling_params = {
                 "train_sampler_mode": selected_row.get("train_sampler_mode"),
@@ -24237,7 +24883,7 @@ def _render_sampler_memory_budget_experiment(
                 "deterministic_sampling": selected_row.get("deterministic_sampling"),
                 "sampling_seed": selected_row.get("sampling_seed"),
             }
-            st.markdown("### Parámetros recomendados de muestreo")
+            st.markdown("### ParÃ¡metros recomendados de muestreo")
             st.json(
                 {
                     "sampling_params": sampling_params,
@@ -24258,7 +24904,7 @@ def _render_sampler_memory_budget_experiment(
                 }
             )
         else:
-            st.warning("No se pudo seleccionar una configuración final válida.")
+            st.warning("No se pudo seleccionar una configuraciÃ³n final vÃ¡lida.")
 
         try:
             entry = _collect_gnn_context()
@@ -24290,12 +24936,12 @@ def _render_gnn_architecture_pilot_experiment() -> Dict[str, object]:
         "Busca configuraciones en un subgrafo inducido estratificado y reentrena "
         "los finalistas sobre el grafo completo."
     )
-    with st.expander("Protocolo metodológico", expanded=False):
+    with st.expander("Protocolo metodolÃ³gico", expanded=False):
         st.markdown(
             "- El piloto solo toma nodos `train` y `val`; `test` queda fuera del subgrafo.\n"
             "- El muestreo se estratifica por split, clase y bins temporales.\n"
             "- Para variantes temporales se agregan nodos de contexto de secuencia, pero no quedan supervisados salvo que fueran seleccionados.\n"
-            "- Los finalistas se reentrenan en el grafo completo y recién ahí se evalúan en `test`."
+            "- Los finalistas se reentrenan en el grafo completo y reciÃ©n ahÃ­ se evalÃºan en `test`."
         )
     col_a, col_b, col_c = st.columns(3)
     with col_a:
@@ -24306,7 +24952,7 @@ def _render_gnn_architecture_pilot_experiment() -> Dict[str, object]:
             value=0.10,
             step=0.01,
             key="gnn_exp_arch_pilot_fraction",
-            help="Fracción de train y val usada para construir el subgrafo piloto.",
+            help="FracciÃ³n de train y val usada para construir el subgrafo piloto.",
         )
         pilot_seed = st.number_input(
             "pilot_seed",
@@ -24573,7 +25219,7 @@ def _gnn_builder_render_library_controls() -> None:
     with col_select:
         if architectures:
             labels = [
-                f"{arch.name} · {str((arch.metadata or {}).get('path', '')).split('/')[-1]}"
+                f"{arch.name} Â· {str((arch.metadata or {}).get('path', '')).split('/')[-1]}"
                 for arch in architectures
             ]
             selected_label = st.selectbox(
@@ -24583,7 +25229,7 @@ def _gnn_builder_render_library_controls() -> None:
             )
             selected_arch = architectures[labels.index(selected_label)]
         else:
-            st.info("Aún no hay arquitecturas guardadas.")
+            st.info("AÃºn no hay arquitecturas guardadas.")
 
     with col_new:
         if st.button("Nueva default", key="gnn_builder_new_default", width="stretch"):
@@ -24647,7 +25293,7 @@ def _gnn_builder_render_editor() -> NetworkArchitecture:
     col_meta_a, col_meta_b = st.columns([0.7, 0.3])
     with col_meta_a:
         st.text_input("Nombre", key="gnn_builder_name")
-        st.text_area("Descripción", key="gnn_builder_description", height=80)
+        st.text_area("DescripciÃ³n", key="gnn_builder_description", height=80)
     with col_meta_b:
         st.checkbox("Favorita", key="gnn_builder_favorite")
         st.number_input(
@@ -24662,7 +25308,7 @@ def _gnn_builder_render_editor() -> NetworkArchitecture:
             "Temporal head",
             list(SUPPORTED_TEMPORAL_HEADS),
             key="gnn_builder_temporal_type",
-            help="La integración temporal real se conectará en gnn_main.py; aquí se valida el contrato.",
+            help="La integraciÃ³n temporal real se conectarÃ¡ en gnn_main.py; aquÃ­ se valida el contrato.",
         )
 
     num_layers = max(1, int(st.session_state.get("gnn_builder_num_layers", 1)))
@@ -24686,7 +25332,7 @@ def _gnn_builder_render_editor() -> NetworkArchitecture:
                     value=int(st.session_state.get(f"{prefix}_hidden", 64)),
                     step=8,
                     key=f"{prefix}_hidden",
-                    help="Canales por head, igual que PyG. La dimensión real de salida es hidden_channels * num_heads.",
+                    help="Canales por head, igual que PyG. La dimensiÃ³n real de salida es hidden_channels * num_heads.",
                 )
             with col_b:
                 st.number_input(
@@ -24699,7 +25345,7 @@ def _gnn_builder_render_editor() -> NetworkArchitecture:
                 )
                 current_aggr = st.session_state.get(f"{prefix}_aggr", "mean")
                 st.selectbox(
-                    "Agregación relaciones",
+                    "AgregaciÃ³n relaciones",
                     list(SUPPORTED_AGGREGATIONS),
                     index=_gnn_builder_option_index(SUPPORTED_AGGREGATIONS, current_aggr),
                     key=f"{prefix}_aggr",
@@ -24707,7 +25353,7 @@ def _gnn_builder_render_editor() -> NetworkArchitecture:
             with col_c:
                 current_activation = st.session_state.get(f"{prefix}_activation", "relu")
                 st.selectbox(
-                    "Activación",
+                    "ActivaciÃ³n",
                     list(SUPPORTED_ACTIVATIONS),
                     index=_gnn_builder_option_index(SUPPORTED_ACTIVATIONS, current_activation),
                     key=f"{prefix}_activation",
@@ -24732,7 +25378,7 @@ def _gnn_builder_render_editor() -> NetworkArchitecture:
                     "Residual",
                     value=bool(st.session_state.get(f"{prefix}_residual", True)),
                     key=f"{prefix}_residual",
-                    help="Si cambia la dimensión, el modelo usa una proyección lineal automática.",
+                    help="Si cambia la dimensiÃ³n, el modelo usa una proyecciÃ³n lineal automÃ¡tica.",
                 )
 
     st.markdown("#### Heads de salida")
@@ -24771,12 +25417,12 @@ def _gnn_builder_render_editor() -> NetworkArchitecture:
                     "MLP hidden (csv)",
                     value=str(st.session_state.get(f"{prefix}_hidden", "")),
                     key=f"{prefix}_hidden",
-                    help="Ej: 64,32. Vacío deja Linear directo a clases.",
+                    help="Ej: 64,32. VacÃ­o deja Linear directo a clases.",
                 )
             with col_c:
                 current_activation = st.session_state.get(f"{prefix}_activation", "relu")
                 st.selectbox(
-                    "Activación",
+                    "ActivaciÃ³n",
                     list(SUPPORTED_ACTIVATIONS),
                     index=_gnn_builder_option_index(SUPPORTED_ACTIVATIONS, current_activation),
                     key=f"{prefix}_activation",
@@ -24817,9 +25463,9 @@ def _gnn_builder_render_preview(
     col_d.metric("Heads salida", len(arch.heads))
 
     if validation.is_valid:
-        st.success("Arquitectura válida.")
+        st.success("Arquitectura vÃ¡lida.")
     else:
-        st.error("Arquitectura inválida.")
+        st.error("Arquitectura invÃ¡lida.")
         for error in validation.errors:
             st.warning(error)
     for warning in validation.warnings:
@@ -24890,7 +25536,7 @@ def _render_network_builder_tab() -> None:
     st.subheader("Network Builder")
     st.caption(
         "Constructor avanzado de arquitecturas GNN. Guarda presets JSON portables; "
-        "la integración directa con Training se hará usando el hash/JSON guardado."
+        "la integraciÃ³n directa con Training se harÃ¡ usando el hash/JSON guardado."
     )
     _gnn_builder_init_state()
     loaded_graph = st.session_state.get("loaded_graph")
@@ -24901,9 +25547,9 @@ def _render_network_builder_tab() -> None:
         col_a.metric("Input features", graph_info.get("in_channels", "N/A"))
         col_b.metric("Clases", graph_info.get("out_channels", "N/A"))
         col_c.metric("edge_attr_dim", graph_info.get("edge_feature_dim", "N/A"))
-        col_d.metric("SequenceIndex", "Sí" if graph_info.get("has_sequence_index") else "No")
+        col_d.metric("SequenceIndex", "SÃ­" if graph_info.get("has_sequence_index") else "No")
     else:
-        st.info("Puedes diseñar sin grafo cargado. Carga un grafo en la pestaña Graph para validar dimensiones y secuencias.")
+        st.info("Puedes diseÃ±ar sin grafo cargado. Carga un grafo en la pestaÃ±a Graph para validar dimensiones y secuencias.")
 
     _gnn_builder_render_library_controls()
     editor_mode = st.radio(
@@ -24949,7 +25595,7 @@ def _render_network_builder_tab() -> None:
                 cfg["architecture_hash"] = architecture_hash(arch)
                 cfg["architecture_name"] = arch.name
                 st.session_state["gnn_network_config"] = cfg
-                st.success("Arquitectura marcada como actual en la sesión.")
+                st.success("Arquitectura marcada como actual en la sesiÃ³n.")
     with col_export:
         export_path = GNN_NETWORK_LIBRARY_DIR / f"{_gnn_builder_slug(arch.name)}_export.json"
         if st.button("Exportar JSON", key="gnn_builder_export_json", width="stretch"):
@@ -25084,7 +25730,7 @@ def _write_gnn_architecture_pilot_metadata(
     run_id: str,
     metadata: Dict[str, object],
 ) -> str:
-    out_path = Path(RESULTADOS_DIR) / f"gnn_architecture_pilot_{run_id}_metadata.json"
+    out_path = gnn_path("experiments_results", f"gnn_architecture_pilot_{run_id}_metadata.json", resultados_dir=RESULTADOS_DIR, create_parent=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(_json_safe_gnn_value(metadata), fh, indent=2, ensure_ascii=False)
@@ -25279,7 +25925,7 @@ def _run_gnn_architecture_pilot_experiment(
                 run_counter += 1
                 status_box.markdown(
                     f"Piloto {run_counter}/{total_pilot_runs}: "
-                    f"{variant_norm} · {balancing_strategy} · {objective_metric}"
+                    f"{variant_norm} Â· {balancing_strategy} Â· {objective_metric}"
                 )
                 progress.progress(min(run_counter / total_pilot_runs, 1.0))
                 log_container = st.empty() if render_ui else None
@@ -25382,7 +26028,7 @@ def _run_gnn_architecture_pilot_experiment(
         st.markdown("### Ranking piloto")
         st.dataframe(pd.DataFrame(ranked_pilot), width="stretch")
     if not finalists:
-        raise ValueError("No hay finalistas piloto válidos para reentrenar en full.")
+        raise ValueError("No hay finalistas piloto vÃ¡lidos para reentrenar en full.")
 
     full_rows: List[Dict[str, object]] = []
     total_full_runs = max(1, len(finalists) * max(1, int(full_repeats)))
@@ -25399,7 +26045,7 @@ def _run_gnn_architecture_pilot_experiment(
             full_counter += 1
             full_status.markdown(
                 f"Full {full_counter}/{total_full_runs}: "
-                f"{finalist.get('gnn_variant')} · rank piloto {finalist.get('pilot_rank')} · rep {repeat_idx}"
+                f"{finalist.get('gnn_variant')} Â· rank piloto {finalist.get('pilot_rank')} Â· rep {repeat_idx}"
             )
             full_progress.progress(min(full_counter / total_full_runs, 1.0))
             graph_train_obj = dict(graph_obj)
@@ -25517,7 +26163,7 @@ def _run_gnn_architecture_pilot_experiment(
     final_rows = pilot_rows + _sort_gnn_architecture_full_rows(full_rows)
     results_df = pd.DataFrame(final_rows)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    res_path = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+    res_path = gnn_path("experiments_results", f"gnn_experiments_results_{stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True)
     results_df.to_csv(res_path, index=False)
     if render_ui:
         st.markdown("### Resultados finales")
@@ -25684,7 +26330,7 @@ def _run_gnn_best_variant_experiment(
             f"## Variante GNN {variant_idx}/{len(selected_variants)}: `{variant_norm}`"
         )
         _render_gnn_strategy_reference_panel(
-            context_label=f"Experiments · {variant_norm}",
+            context_label=f"Experiments Â· {variant_norm}",
             graph_obj=graph_obj,
             active_variant_override=variant_norm,
             expanded=False,
@@ -25702,7 +26348,7 @@ def _run_gnn_best_variant_experiment(
             for obj_idx, objective_metric in enumerate(objective_metrics, start=1):
                 with st.expander(
                     (
-                        f"{variant_norm} · {balancing_strategy} · "
+                        f"{variant_norm} Â· {balancing_strategy} Â· "
                         f"Objetivo {obj_idx}/{len(objective_metrics)}: {objective_metric}"
                     ),
                     expanded=True,
@@ -25714,7 +26360,7 @@ def _run_gnn_best_variant_experiment(
                     )
                     stop_col_a, stop_col_b = st.columns([0.8, 0.2])
                     with stop_col_b:
-                        if st.button("Detener iteración", key=stop_key):
+                        if st.button("Detener iteraciÃ³n", key=stop_key):
                             st.session_state[stop_key] = True
 
                     with st.expander("Logs de Optuna (En vivo)", expanded=False):
@@ -25951,7 +26597,7 @@ def _run_gnn_best_variant_experiment(
             st.dataframe(summary, width="stretch")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    res_path = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+    res_path = gnn_path("experiments_results", f"gnn_experiments_results_{stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True)
     results_df.to_csv(res_path, index=False)
     st.success(f"Resultados guardados en {res_path}")
 
@@ -26008,7 +26654,7 @@ def _render_gnn_experiments_tab() -> None:
             if st.button("Importar y Extraer", key="gnn_exp_import_run"):
                 try:
                     with zipfile.ZipFile(uploaded_zip, "r") as zf:
-                        zf.extractall(Path(RESULTADOS_DIR))
+                        zf.extractall(gnn_dir("experiments_results", RESULTADOS_DIR, create=True))
                     st.success("Experimento importado exitosamente.")
                     st.cache_data.clear()
                     st.rerun()
@@ -26016,7 +26662,7 @@ def _render_gnn_experiments_tab() -> None:
                     st.error(f"Error importando ZIP: {exc}")
 
     with tab_past:
-        st.subheader("Visualización y Exportación")
+        st.subheader("VisualizaciÃ³n y ExportaciÃ³n")
         past_files = _list_gnn_experiment_result_files()
         if not past_files:
             st.info("No hay resultados previos.")
@@ -26039,7 +26685,7 @@ def _render_gnn_experiments_tab() -> None:
                 with col_export:
                     if timestamp:
                         related_files = sorted(
-                            Path(RESULTADOS_DIR).glob(f"*{timestamp}*")
+                            gnn_dir("experiments_results", RESULTADOS_DIR).glob(f"*{timestamp}*")
                         )
                         if related_files:
                             try:
@@ -26074,7 +26720,7 @@ def _render_gnn_experiments_tab() -> None:
         loaded_graph = st.session_state.get("loaded_graph")
         balanced_graph = st.session_state.get("balanced_graph")
         if loaded_graph is None:
-            st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+            st.warning("No hay grafo cargado en memoria. Use la pestaÃ±a Graph.")
             return
 
         use_balanced = False
@@ -26219,7 +26865,7 @@ def _render_gnn_experiments_tab() -> None:
                     "mejores candidatos pasan al entrenamiento full."
                 )
             else:
-                st.markdown("### Búsqueda de Mejor Variante GNN")
+                st.markdown("### BÃºsqueda de Mejor Variante GNN")
                 st.caption(
                     "Ejecuta Optuna + entrenamiento + test para cada variante seleccionada "
                     "sobre el mismo grafo y con las mismas opciones de balanceo/objetivo/sampling."
@@ -26241,8 +26887,8 @@ def _render_gnn_experiments_tab() -> None:
                 format_func=lambda v: labels.get(str(v), str(v)),
                 key="gnn_exp_variant_candidates",
                 help=(
-                    "Cada variante corre su propia optimización de hiperparámetros y luego "
-                    "entrenamiento/evaluación final."
+                    "Cada variante corre su propia optimizaciÃ³n de hiperparÃ¡metros y luego "
+                    "entrenamiento/evaluaciÃ³n final."
                 ),
             )
             if not selected_variants:
@@ -26664,7 +27310,7 @@ def _render_gnn_experiments_tab() -> None:
             key="gnn_exp_beta",
         )
         far_target = st.slider(
-            "FAR target para evaluación (test)",
+            "FAR target para evaluaciÃ³n (test)",
             min_value=0.0,
             max_value=0.5,
             value=0.2,
@@ -27097,9 +27743,9 @@ def _render_gnn_experiments_tab() -> None:
                 ["uniform", "distance"],
                 default=["uniform", "distance"],
                 help=(
-                    "Ponderación por distancia accidente→pórtico aguas arriba. "
+                    "PonderaciÃ³n por distancia accidenteâ†’pÃ³rtico aguas arriba. "
                     "uniform = status quo (peso 1.0); "
-                    "distance = clip(1 − dist/5km, 0.2, 1.0)."
+                    "distance = clip(1 âˆ’ dist/5km, 0.2, 1.0)."
                 ),
                 key="gnn_exp_loss_weight_mode",
             )
@@ -27223,7 +27869,7 @@ def _render_gnn_experiments_tab() -> None:
             "Continuar con experimento en memoria",
             value=has_active_run,
             disabled=not has_active_run,
-            help="Si está marcado, continúa el experimento previo. Si no, inicia uno nuevo.",
+            help="Si estÃ¡ marcado, continÃºa el experimento previo. Si no, inicia uno nuevo.",
             key="gnn_exp_continue_checkbox"
         )
         
@@ -27541,12 +28187,12 @@ def _render_gnn_experiments_tab() -> None:
                         stop_due_to_no_red = False
                         for iteration in range(1, int(rec_max_iters) + 1):
                             st.markdown(
-                                f"#### Objetivo {idx}/{len(objective_metrics)}: {objective_metric} · Iteracion {iteration}"
+                                f"#### Objetivo {idx}/{len(objective_metrics)}: {objective_metric} Â· Iteracion {iteration}"
                             )
                             red_found = False
                             for optimizer_name in optimizer_order:
                                     with st.expander(
-                                        f"{balancing_strategy} · {objective_metric} · Iter {iteration} · {optimizer_name}",
+                                        f"{balancing_strategy} Â· {objective_metric} Â· Iter {iteration} Â· {optimizer_name}",
                                         expanded=True,
                                     ):
                                         # Check if already done
@@ -27575,7 +28221,7 @@ def _render_gnn_experiments_tab() -> None:
                                         if optimizer_name == "Optuna":
                                             stop_col_a, stop_col_b = st.columns([0.8, 0.2])
                                             with stop_col_b:
-                                                if st.button("Detener iteración", key=stop_key):
+                                                if st.button("Detener iteraciÃ³n", key=stop_key):
                                                     st.session_state[stop_key] = True
                                         log_label = (
                                             "Logs de Optuna (En vivo)"
@@ -27849,7 +28495,7 @@ def _render_gnn_experiments_tab() -> None:
                             )
                     else:
                         with st.expander(
-                            f"{balancing_strategy} · Objetivo {idx}/{len(objective_metrics)}: {objective_metric}",
+                            f"{balancing_strategy} Â· Objetivo {idx}/{len(objective_metrics)}: {objective_metric}",
                             expanded=True,
                         ):
                             status_text = st.empty()
@@ -27857,7 +28503,7 @@ def _render_gnn_experiments_tab() -> None:
                             stop_key = f"gnn_exp_optuna_stop_{run_id}_{balance_idx}_{idx}"
                             stop_col_a, stop_col_b = st.columns([0.8, 0.2])
                             with stop_col_b:
-                                if st.button("Detener iteración", key=stop_key):
+                                if st.button("Detener iteraciÃ³n", key=stop_key):
                                     st.session_state[stop_key] = True
                             with st.expander("Logs de Optuna (En vivo)", expanded=False):
                                 log_container = st.empty()
@@ -28046,7 +28692,7 @@ def _render_gnn_experiments_tab() -> None:
                 results_df = pd.DataFrame(results)
                 st.dataframe(results_df, width="stretch")
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                res_path = Path(RESULTADOS_DIR) / f"gnn_experiments_results_{stamp}.csv"
+                res_path = gnn_path("experiments_results", f"gnn_experiments_results_{stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True)
                 results_df.to_csv(res_path, index=False)
                 st.success(f"Resultados guardados en {res_path}")
 
@@ -28078,20 +28724,20 @@ def _render_gnn_experiments_tab() -> None:
                     st.warning(f"No se pudo guardar en historial: {exc}")
 
 
-# Defaults recomendados para predicción de clase rara (~0.3% positivos, ~258 muestras).
-# Calibración v2: pensada para evitar overfitting de epoch-1 con un ratio
+# Defaults recomendados para predicciÃ³n de clase rara (~0.3% positivos, ~258 muestras).
+# CalibraciÃ³n v2: pensada para evitar overfitting de epoch-1 con un ratio
 # params/positivos < 2000:1.
 #   - Variante con edge MLP encoder y head temporal GRU (aprovecha edge_attr 12-dim).
 #   - 2 capas: evita oversmoothing (clase rara se diluye con +profundidad).
 #   - hidden=48, heads=4, dropout=0.35: capacidad moderada (~400k params totales)
-#     en lugar de 1.5M; reduce drásticamente el riesgo de memorización.
+#     en lugar de 1.5M; reduce drÃ¡sticamente el riesgo de memorizaciÃ³n.
 #   - FocalLoss(alpha=0.75, gamma=1.5): menos agresiva que (0.95, 2.0); el peso
 #     extremo sobre positivos generaba gradientes ~400x desbalanceados.
-#   - lr=1e-4 + weight_decay=5e-3: más conservador y con regularización L2 fuerte.
+#   - lr=1e-4 + weight_decay=5e-3: mÃ¡s conservador y con regularizaciÃ³n L2 fuerte.
 #   - scheduler plateau_restart (ReduceLROnPlateau): baja LR cuando val deja de
 #     mejorar; one_cycle no encaja porque su warmup sube el LR justo cuando ya
-#     deberíamos estar bajándolo.
-#   - Vecindario asimétrico: temporal denso, spatial reducido (4 pórticos en cadena).
+#     deberÃ­amos estar bajÃ¡ndolo.
+#   - Vecindario asimÃ©trico: temporal denso, spatial reducido (4 pÃ³rticos en cadena).
 RECOMMENDED_NETWORK_DEFAULTS: Dict[str, object] = {
     "gnn_variant": "gat_edge_mlp_gru",
     "hidden_channels": 48,
@@ -28209,10 +28855,10 @@ def _sync_gnn_winning_ranking_posaware_training_state() -> None:
 def _load_persisted_network_config() -> Optional[Dict[str, object]]:
     """Lee `network_config_latest.json` si existe.
 
-    El botón "Guardar configuracion" del tab Network escribe esta copia estable
-    además del snapshot con timestamp. Al recargar la app, `session_state` está
-    vacío y los widgets caerían a `RECOMMENDED_NETWORK_DEFAULTS`; esta función
-    permite restaurar la última selección del usuario.
+    El botÃ³n "Guardar configuracion" del tab Network escribe esta copia estable
+    ademÃ¡s del snapshot con timestamp. Al recargar la app, `session_state` estÃ¡
+    vacÃ­o y los widgets caerÃ­an a `RECOMMENDED_NETWORK_DEFAULTS`; esta funciÃ³n
+    permite restaurar la Ãºltima selecciÃ³n del usuario.
     """
     path = GNN_NETWORK_CONFIG_LATEST_PATH
     try:
@@ -28229,8 +28875,8 @@ def _load_persisted_network_config() -> Optional[Dict[str, object]]:
 def _render_network_tab() -> None:
     st.subheader("Network (GNN)")
 
-    # Restaura la última configuración persistida si la sesión todavía no la
-    # tiene cargada (caso típico: el usuario cierra la app y la vuelve a abrir).
+    # Restaura la Ãºltima configuraciÃ³n persistida si la sesiÃ³n todavÃ­a no la
+    # tiene cargada (caso tÃ­pico: el usuario cierra la app y la vuelve a abrir).
     if "gnn_network_config" not in st.session_state:
         persisted = _load_persisted_network_config()
         if persisted:
@@ -28239,7 +28885,7 @@ def _render_network_tab() -> None:
 
     loaded_graph = st.session_state.get("loaded_graph")
     if loaded_graph is None:
-        st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+        st.warning("No hay grafo cargado en memoria. Use la pestaÃ±a Graph.")
         return
 
     graph_data = loaded_graph.get("data")
@@ -28293,7 +28939,7 @@ def _render_network_tab() -> None:
         f"GRU L={network_sequence_length} desde {sequence_length_source}{sequence_count_text}"
     )
 
-    # Detectar nombres de relación reales del grafo (para UI asimétrica de vecindario y preset).
+    # Detectar nombres de relaciÃ³n reales del grafo (para UI asimÃ©trica de vecindario y preset).
     relation_names: List[str] = []
     for et in graph_data.edge_types:
         if isinstance(et, tuple) and len(et) >= 2:
@@ -28309,8 +28955,8 @@ def _render_network_tab() -> None:
             key="gnn_net_load_recommended",
             help=(
                 "Pre-rellena: gat_edge_mlp_gru, hidden=48, heads=4, layers=2, "
-                "dropout=0.35, lr=1e-4, weight_decay=5e-3, FocalLoss(α=0.75, γ=1.5), "
-                "scheduler=plateau_restart, num_neighbors asimétrico por tipo de "
+                "dropout=0.35, lr=1e-4, weight_decay=5e-3, FocalLoss(Î±=0.75, Î³=1.5), "
+                "scheduler=plateau_restart, num_neighbors asimÃ©trico por tipo de "
                 "arista (temporal denso, spatial reducido). Calibrado para evitar "
                 "overfit de epoch-1 con clase rara (~0.3%)."
             ),
@@ -28339,7 +28985,7 @@ def _render_network_tab() -> None:
                 "Positive-aware con 5% positivos por batch, ventana temporal=60 min, "
                 "hard negatives=0, ranking pairwise softplus con peso 0.10, "
                 "margin=0.10 y checkpoint por AUPRC. "
-                "No cambia la prevalencia real de validación/test."
+                "No cambia la prevalencia real de validaciÃ³n/test."
             ),
         ):
             base_cfg = dict(st.session_state.get("gnn_network_config") or RECOMMENDED_NETWORK_DEFAULTS)
@@ -28490,10 +29136,10 @@ def _render_network_tab() -> None:
         index=list(sampler_options.keys()).index(sampler_default_label),
         key="gnn_net_train_sampler_mode",
         help=(
-            "NeighborLoader usa el muestreo estándar de PyG. "
-            "Positive-aware usa NeighborLoader pero fuerza señal positiva estable por batch y mezcla negativos duros topológicos. "
+            "NeighborLoader usa el muestreo estÃ¡ndar de PyG. "
+            "Positive-aware usa NeighborLoader pero fuerza seÃ±al positiva estable por batch y mezcla negativos duros topolÃ³gicos. "
             "RioGNN top-p RL usa el loader `rl_top_p`: filtra vecinos por similitud "
-            "label-aware y ajusta thresholds RSRL por relación/capa."
+            "label-aware y ajusta thresholds RSRL por relaciÃ³n/capa."
         ),
     )
     train_sampler_mode = sampler_options[sampler_label]
@@ -28501,7 +29147,7 @@ def _render_network_tab() -> None:
     samp_col_a, samp_col_b, samp_col_c = st.columns(3)
     with samp_col_a:
         deterministic_sampling = st.checkbox(
-            "Sampling determinístico",
+            "Sampling determinÃ­stico",
             value=_coerce_bool(
                 existing_cfg.get("deterministic_sampling"),
                 bool(RECOMMENDED_NETWORK_DEFAULTS["deterministic_sampling"]),
@@ -28528,7 +29174,7 @@ def _render_network_tab() -> None:
                 bool(RECOMMENDED_NETWORK_DEFAULTS["disable_hard_undersampling"]),
             ),
             key="gnn_net_disable_hard",
-            help="Evita mezclar el efecto del sampler con el hard-undersampling automático.",
+            help="Evita mezclar el efecto del sampler con el hard-undersampling automÃ¡tico.",
         )
 
     positive_sampler_target_fraction = float(
@@ -28554,7 +29200,7 @@ def _render_network_tab() -> None:
         with pos_col_a:
             positive_sampler_target_fraction = float(
                 st.number_input(
-                    "Positive-aware fracción positiva",
+                    "Positive-aware fracciÃ³n positiva",
                     min_value=0.001,
                     max_value=0.50,
                     value=float(positive_sampler_target_fraction),
@@ -28562,7 +29208,7 @@ def _render_network_tab() -> None:
                     format="%.3f",
                     key="gnn_net_positive_fraction",
                     help=(
-                        "Fracción objetivo de semillas positivas por batch. "
+                        "FracciÃ³n objetivo de semillas positivas por batch. "
                         "Default 0.02: con batch_size=512 son cerca de 10 positivos por batch. "
                         "Subirlo puede mejorar recall inicial pero sobreexpone positivos; "
                         "no lo uses para inferir prevalencia real."
@@ -28578,7 +29224,7 @@ def _render_network_tab() -> None:
                     step=5,
                     key="gnn_net_positive_window",
                     help=(
-                        "Selecciona negativos de train del mismo pórtico dentro de ±N minutos de un positivo. "
+                        "Selecciona negativos de train del mismo pÃ³rtico dentro de Â±N minutos de un positivo. "
                         "Default 60 min. Ventanas muy grandes diluyen el concepto de hard negative; "
                         "0 desactiva solo el componente temporal."
                     ),
@@ -28593,7 +29239,7 @@ def _render_network_tab() -> None:
                     step=1,
                     key="gnn_net_positive_hard_per_pos",
                     help=(
-                        "Número de negativos duros a intentar por positivo del batch. "
+                        "NÃºmero de negativos duros a intentar por positivo del batch. "
                         "Default 4. Demasiado alto reduce diversidad global; "
                         "0 deja el balance positivo con negativos aleatorios."
                     ),
@@ -28619,7 +29265,7 @@ def _render_network_tab() -> None:
         rl_col_a, rl_col_b, rl_col_c = st.columns(3)
         with rl_col_a:
             rl_action_space = st.selectbox(
-                "RioGNN acción RSRL",
+                "RioGNN acciÃ³n RSRL",
                 ["discrete", "continuous_actor"],
                 index=["discrete", "continuous_actor"].index(existing_rl_action_space),
                 key="gnn_net_rl_action_space",
@@ -28638,7 +29284,7 @@ def _render_network_tab() -> None:
         with rl_col_b:
             rl_min_p = float(
                 st.number_input(
-                    "RioGNN p mínimo",
+                    "RioGNN p mÃ­nimo",
                     min_value=0.0,
                     max_value=1.0,
                     value=float(existing_cfg.get("rl_min_p", 0.05)),
@@ -28648,7 +29294,7 @@ def _render_network_tab() -> None:
             )
             rl_max_p = float(
                 st.number_input(
-                    "RioGNN p máximo",
+                    "RioGNN p mÃ¡ximo",
                     min_value=0.01,
                     max_value=1.0,
                     value=float(existing_cfg.get("rl_max_p", 1.0)),
@@ -28676,7 +29322,7 @@ def _render_network_tab() -> None:
                 )
             )
         rl_positive_only = st.checkbox(
-            "RioGNN stats sólo positivos si existen",
+            "RioGNN stats sÃ³lo positivos si existen",
             value=_coerce_bool(existing_cfg.get("rl_positive_only"), True),
             key="gnn_net_rl_positive_only",
             help="Calcula stats del controlador sobre centros positivos de train cuando hay positivos disponibles.",
@@ -28688,12 +29334,12 @@ def _render_network_tab() -> None:
                 value=float(existing_cfg.get("rl_lambda_simi", 2.0)),
                 step=0.25,
                 key="gnn_net_rl_lambda_simi",
-                help="Peso de la pérdida auxiliar label-aware usada por el scorer del sampler.",
+                help="Peso de la pÃ©rdida auxiliar label-aware usada por el scorer del sampler.",
             )
         )
         if rl_min_p > rl_max_p:
             st.warning(
-                "RioGNN p mínimo es mayor que p máximo; se intercambiarán al guardar."
+                "RioGNN p mÃ­nimo es mayor que p mÃ¡ximo; se intercambiarÃ¡n al guardar."
             )
             rl_min_p, rl_max_p = rl_max_p, rl_min_p
 
@@ -28713,20 +29359,20 @@ def _render_network_tab() -> None:
         except Exception:
             neighbor_default = [15, 10]
 
-    # Modo de vecindario: uniforme (misma fanout para todos los tipos) o asimétrico
+    # Modo de vecindario: uniforme (misma fanout para todos los tipos) o asimÃ©trico
     # (fanout distinto por tipo, recomendado para grafos con degrees muy distintos).
-    default_mode = "asimétrico" if isinstance(neighbor_default, dict) else "uniforme"
+    default_mode = "asimÃ©trico" if isinstance(neighbor_default, dict) else "uniforme"
     neighbor_mode = st.radio(
         "Modo de vecindario",
-        options=["uniforme", "asimétrico"],
-        index=["uniforme", "asimétrico"].index(default_mode),
+        options=["uniforme", "asimÃ©trico"],
+        index=["uniforme", "asimÃ©trico"].index(default_mode),
         horizontal=True,
         key="gnn_net_neighbor_mode",
         help=(
             "Uniforme: misma fanout para todos los tipos de arista (ej. [15,10]). "
-            "Asimétrico: fanout distinto por tipo, recomendado cuando los degrees "
-            "varían fuerte entre relaciones (ej. temporal denso, spatial con pocos pórticos). "
-            "Con RioGNN top-p RL estos valores actúan como caps por relación/capa."
+            "AsimÃ©trico: fanout distinto por tipo, recomendado cuando los degrees "
+            "varÃ­an fuerte entre relaciones (ej. temporal denso, spatial con pocos pÃ³rticos). "
+            "Con RioGNN top-p RL estos valores actÃºan como caps por relaciÃ³n/capa."
         ),
     )
 
@@ -28749,7 +29395,7 @@ def _render_network_tab() -> None:
         if isinstance(neighbor_default, dict):
             per_rel_default = neighbor_default
         else:
-            # Defaults asimétricos típicos para grafo de tráfico.
+            # Defaults asimÃ©tricos tÃ­picos para grafo de trÃ¡fico.
             per_rel_default = {
                 "temporal": [25, 25],
                 "spatial": [3, 3],
@@ -28769,7 +29415,7 @@ def _render_network_tab() -> None:
                     key=f"gnn_net_neighbors_{rel}",
                 )
                 num_neighbors[rel] = _parse_int_list(txt, rel_default)
-        st.caption(f"Perfil asimétrico activo: {num_neighbors}")
+        st.caption(f"Perfil asimÃ©trico activo: {num_neighbors}")
 
     st.markdown("**Optimizador y loss**")
     col_opt1, col_opt2, col_opt3 = st.columns(3)
@@ -28827,8 +29473,8 @@ def _render_network_tab() -> None:
             ),
             help=(
                 "uniform: cada nodo positivo pesa 1.0 (status quo).\n"
-                "distance: peso = clip(1 - dist_accidente_pórtico/5km, 0.2, 1.0); "
-                "accidentes más cercanos al pórtico aguas arriba pesan más."
+                "distance: peso = clip(1 - dist_accidente_pÃ³rtico/5km, 0.2, 1.0); "
+                "accidentes mÃ¡s cercanos al pÃ³rtico aguas arriba pesan mÃ¡s."
             ),
             key="gnn_net_loss_weight_mode",
         )
@@ -28888,8 +29534,8 @@ def _render_network_tab() -> None:
             help=(
                 "`none` desactiva ranking. `pairwise_softplus` empuja logits de positivos "
                 "por encima de negativos dentro del batch supervisado. `topk_pairwise` "
-                "enfatiza negativos con mayor score. Úsalo con batches que contengan "
-                "positivos y negativos, típicamente positive-aware."
+                "enfatiza negativos con mayor score. Ãšsalo con batches que contengan "
+                "positivos y negativos, tÃ­picamente positive-aware."
             ),
         )
     with rank_col_b:
@@ -28903,7 +29549,7 @@ def _render_network_tab() -> None:
                 format="%.4f",
                 key="gnn_net_ranking_loss_weight",
                 help=(
-                    "Peso de la pérdida auxiliar de ranking. La receta ganadora usa 0.10. "
+                    "Peso de la pÃ©rdida auxiliar de ranking. La receta ganadora usa 0.10. "
                     "Si es muy alto puede dominar Focal/CrossEntropy y subir falsos positivos."
                 ),
             )
@@ -28934,9 +29580,9 @@ def _render_network_tab() -> None:
                 step=512,
                 key="gnn_net_ranking_loss_max_pairs",
                 help=(
-                    "Límite de pares positivo/negativo por batch para controlar memoria. "
+                    "LÃ­mite de pares positivo/negativo por batch para controlar memoria. "
                     "4096 fue suficiente en la receta ganadora; valores enormes pueden "
-                    "subir costo sin mejorar señal."
+                    "subir costo sin mejorar seÃ±al."
                 ),
             )
         )
@@ -28982,10 +29628,10 @@ def _render_network_tab() -> None:
     )
 
     # --- Edge encoder por tipo de arista (C) ----------------------------------
-    # Cada relación tiene su propio `EdgeAttrEncoder`. Por defecto los hparams
+    # Cada relaciÃ³n tiene su propio `EdgeAttrEncoder`. Por defecto los hparams
     # se derivan del `in_dim` raw real del grafo (lo que evita el zero-padding
     # legacy). El usuario puede sobreescribir el *tipo* de encoder y sus
-    # hiperparámetros por tipo.
+    # hiperparÃ¡metros por tipo.
     edge_feature_dims_by_type = _infer_edge_feature_dims(graph_data)
     edge_encoder_overrides: Dict[str, Dict[str, object]] = {}
     if variant_spec["uses_edge_mlp"] == "yes":
@@ -28995,36 +29641,36 @@ def _render_network_tab() -> None:
             expanded=False,
         ):
             st.caption(
-                "Cada relación tiene su propio encoder, y puedes elegir el **tipo** "
-                "de transformación por relación. Tras quitar el zero-padding del "
-                "grafo, `in_dim` también puede diferir: la temporal solo lleva "
-                "`delta_features` y las espaciales también incluyen las features físicas."
+                "Cada relaciÃ³n tiene su propio encoder, y puedes elegir el **tipo** "
+                "de transformaciÃ³n por relaciÃ³n. Tras quitar el zero-padding del "
+                "grafo, `in_dim` tambiÃ©n puede diferir: la temporal solo lleva "
+                "`delta_features` y las espaciales tambiÃ©n incluyen las features fÃ­sicas."
             )
 
-            # Tabla compacta de referencia: una fila por encoder con qué hace,
-            # complejidad y cuándo encaja. La versión markdown larga queda en
+            # Tabla compacta de referencia: una fila por encoder con quÃ© hace,
+            # complejidad y cuÃ¡ndo encaja. La versiÃ³n markdown larga queda en
             # un sub-expander para no abrumar.
             reference_df = pd.DataFrame(
                 [
                     {
                         "kind": kind,
                         "label": info["label"],
-                        "fórmula": info["formula"],
+                        "fÃ³rmula": info["formula"],
                         "params": info["params"],
-                        "cuándo usarlo": info["use_when"],
+                        "cuÃ¡ndo usarlo": info["use_when"],
                         "evitarlo cuando": info["avoid_when"],
                     }
                     for kind, info in EDGE_ENCODER_KIND_INFO.items()
                 ]
             )
-            st.markdown("**Referencia rápida de los 4 encoders**")
+            st.markdown("**Referencia rÃ¡pida de los 4 encoders**")
             st.dataframe(reference_df, width="stretch", hide_index=True)
             with st.expander(
-                "Guía detallada de selección", expanded=False
+                "GuÃ­a detallada de selecciÃ³n", expanded=False
             ):
                 st.markdown(_edge_encoder_kind_help_markdown())
                 st.caption(
-                    "Heurísticas por relación (orientativas, puedes ignorarlas):"
+                    "HeurÃ­sticas por relaciÃ³n (orientativas, puedes ignorarlas):"
                 )
                 heur_rows = []
                 for rel_name, (rec_kind, rec_reason) in (
@@ -29032,7 +29678,7 @@ def _render_network_tab() -> None:
                 ):
                     heur_rows.append(
                         {
-                            "relación": rel_name,
+                            "relaciÃ³n": rel_name,
                             "encoder sugerido": rec_kind,
                             "motivo": rec_reason,
                         }
@@ -29042,7 +29688,7 @@ def _render_network_tab() -> None:
                 )
 
             st.markdown("---")
-            st.markdown("**Configuración por tipo de arista**")
+            st.markdown("**ConfiguraciÃ³n por tipo de arista**")
             for et, in_dim_et in edge_feature_dims_by_type.items():
                 rel_label = et[1] if isinstance(et, tuple) and len(et) >= 2 else str(et)
                 et_key = str(et)
@@ -29058,7 +29704,7 @@ def _render_network_tab() -> None:
                     )
                 )
                 default_dropout = float(prior.get("dropout", float(dropout) * 0.5))
-                st.markdown(f"**`{rel_label}`** — in_dim raw = `{int(in_dim_et)}`")
+                st.markdown(f"**`{rel_label}`** â€” in_dim raw = `{int(in_dim_et)}`")
                 col_k, col_h, col_e, col_d = st.columns([0.30, 0.23, 0.23, 0.24])
                 with col_k:
                     enc_kind_et = st.selectbox(
@@ -29066,7 +29712,7 @@ def _render_network_tab() -> None:
                         options=EDGE_ENCODER_KIND_OPTIONS,
                         index=EDGE_ENCODER_KIND_OPTIONS.index(default_kind_raw),
                         format_func=lambda k: (
-                            f"{k} — {EDGE_ENCODER_KIND_INFO[k]['label']}"
+                            f"{k} â€” {EDGE_ENCODER_KIND_INFO[k]['label']}"
                             if k in EDGE_ENCODER_KIND_INFO else k
                         ),
                         help=(
@@ -29088,10 +29734,10 @@ def _render_network_tab() -> None:
                         value=int(default_hidden),
                         step=1 if is_t2v else 4,
                         help=(
-                            "k = número de componentes Time2Vec por feature "
-                            "(linear + k-1 periódicos). Típico 4-8."
+                            "k = nÃºmero de componentes Time2Vec por feature "
+                            "(linear + k-1 periÃ³dicos). TÃ­pico 4-8."
                             if is_t2v
-                            else "Tamaño de la capa oculta del MLP."
+                            else "TamaÃ±o de la capa oculta del MLP."
                         ),
                         key=f"gnn_net_edge_hidden_{rel_label}",
                     )
@@ -29102,7 +29748,7 @@ def _render_network_tab() -> None:
                         max_value=512,
                         value=int(max(default_encoded, 1)),
                         step=1,
-                        help="Dimensión del edge_attr que recibe GATConv.",
+                        help="DimensiÃ³n del edge_attr que recibe GATConv.",
                         key=f"gnn_net_edge_encoded_{rel_label}",
                     )
                 with col_d:
@@ -29116,12 +29762,12 @@ def _render_network_tab() -> None:
                         key=f"gnn_net_edge_dropout_{rel_label}",
                     )
 
-                # Resumen + sugerencia dinámica por relación.
+                # Resumen + sugerencia dinÃ¡mica por relaciÃ³n.
                 kind_info = EDGE_ENCODER_KIND_INFO.get(enc_kind_et, {})
                 if kind_info:
                     st.caption(
-                        f"`{enc_kind_et}` · {kind_info['summary']} "
-                        f"Fórmula: `{kind_info['formula']}`."
+                        f"`{enc_kind_et}` Â· {kind_info['summary']} "
+                        f"FÃ³rmula: `{kind_info['formula']}`."
                     )
                 recommendation = _edge_encoder_recommendation(rel_label, enc_kind_et)
                 if recommendation:
@@ -29204,7 +29850,7 @@ def _render_network_tab() -> None:
         if st.button("Guardar configuracion", key="gnn_net_save"):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             out_path = os.path.join(
-                RESULTADOS_DIR, f"network_config_{timestamp}.json"
+                str(gnn_dir("network_configs", RESULTADOS_DIR, create=True)), f"network_config_{timestamp}.json"
             )
             try:
                 with open(out_path, "w") as fh:
@@ -29236,7 +29882,7 @@ def _render_network_tab() -> None:
     if variant_spec["uses_edge_mlp"] == "yes":
         # Una fila por tipo de arista, reflejando que hay un encoder
         # independiente (con sus propios pesos y posiblemente su propio
-        # *tipo* — mlp / mlp_residual / layernorm_mlp / time2vec) por relación.
+        # *tipo* â€” mlp / mlp_residual / layernorm_mlp / time2vec) por relaciÃ³n.
         for et, in_dim_et in edge_feature_dims_by_type.items():
             rel_label = et[1] if isinstance(et, tuple) and len(et) >= 2 else str(et)
             override = (edge_encoder_overrides or {}).get(str(et), {})
@@ -29288,11 +29934,11 @@ def _render_network_tab() -> None:
         st.warning(
             "La variante temporal requiere `SequenceIndex` con secuencias completas. "
             f"Network muestra L={network_sequence_length}, pero el grafo cargado no tiene "
-            "targets temporales válidos para entrenar GRU."
+            "targets temporales vÃ¡lidos para entrenar GRU."
         )
     elif variant_spec["temporal_kind"] != "snapshot":
         st.caption(
-            f"GRU usará L={network_sequence_length}, el mismo largo detectado en las features del grafo."
+            f"GRU usarÃ¡ L={network_sequence_length}, el mismo largo detectado en las features del grafo."
         )
 
     dot_lines = [
@@ -29302,7 +29948,7 @@ def _render_network_tab() -> None:
         f"input [label=\"Input\\nF={in_channels}\"];",
     ]
     # Caja edge_attr y EdgeAttrEncoder por tipo de arista, para reflejar que
-    # cada relación tiene su propio MLP con `in_dim` y pesos distintos.
+    # cada relaciÃ³n tiene su propio MLP con `in_dim` y pesos distintos.
     edge_mlp_node_ids: List[Tuple[str, str]] = []
     if variant_spec["uses_edge_mlp"] == "yes":
         def _safe_id(name: str) -> str:
@@ -29354,13 +30000,13 @@ def _render_network_tab() -> None:
     st.graphviz_chart("\n".join(dot_lines))
 
     st.markdown("**TensorBoard**")
-    st.code("tensorboard --logdir Resultados/runs_attention", language="bash")
+    st.code("tensorboard --logdir Resultados/gnn/training/tensorboard", language="bash")
 
     st.markdown("**Vista torchview**")
     if variant_spec["is_edge_aware"] == "yes":
         st.info(
-            "La vista torchview detallada de este tab está implementada para variantes "
-            "basadas en `HeteroGAT`. Para `gnn_edge_aware*`, use el diagrama esquemático "
+            "La vista torchview detallada de este tab estÃ¡ implementada para variantes "
+            "basadas en `HeteroGAT`. Para `gnn_edge_aware*`, use el diagrama esquemÃ¡tico "
             "de capas mostrado arriba."
         )
         return
@@ -29572,7 +30218,7 @@ def _compute_optuna_study_name(
     if graph_hash:
         study_base = f"{study_base}_{graph_hash[:16]}"
     study_name = re.sub(r"[^A-Za-z0-9_\\-]", "_", study_base)
-    storage_path = os.path.join(RESULTADOS_DIR, "optuna_studies.db")
+    storage_path = str(gnn_path("hpo_optuna", "optuna_studies.db", resultados_dir=RESULTADOS_DIR, create_parent=True))
     storage_url = f"sqlite:///{storage_path}"
     return study_name, storage_url
 
@@ -29939,15 +30585,15 @@ def _collect_optuna_ray_settings(
     if "rl_top_p" in sampler_modes and not rl_action_spaces:
         errors.append("Seleccione al menos un action_space para RioGNN top-p RL.")
 
-    # Espacio de búsqueda v2 (Acción 6): rangos estrechados para clase rara (~0.3%).
+    # Espacio de bÃºsqueda v2 (AcciÃ³n 6): rangos estrechados para clase rara (~0.3%).
     # Rationale: evitar zonas que reproducen el overfit de epoch-1.
-    #   - hidden_max bajado de 128 → 96 (capacidad excesiva memoriza 258 positivos).
-    #   - layers_max bajado de 5 → 3 (>3 capas ⇒ oversmoothing).
-    #   - dropout_min subido de 0.05 → 0.2 (regularización mínima razonable).
-    #   - lr_max bajado de 1e-2 → 3e-4 (LR alto + FocalLoss agresiva ⇒ inestabilidad).
-    #   - wd_min subido de 1e-6 → 1e-4, wd_max subido de 5e-3 → 1e-2 (regularización fuerte).
-    #   - focal_alpha_max bajado de 0.95 → 0.85 (α=0.95 da gradiente ~400x desbalanceado).
-    #   - focal_gamma_max bajado de 3.0 → 2.0 (γ>2 amplifica ruido en positivos difíciles).
+    #   - hidden_max bajado de 128 â†’ 96 (capacidad excesiva memoriza 258 positivos).
+    #   - layers_max bajado de 5 â†’ 3 (>3 capas â‡’ oversmoothing).
+    #   - dropout_min subido de 0.05 â†’ 0.2 (regularizaciÃ³n mÃ­nima razonable).
+    #   - lr_max bajado de 1e-2 â†’ 3e-4 (LR alto + FocalLoss agresiva â‡’ inestabilidad).
+    #   - wd_min subido de 1e-6 â†’ 1e-4, wd_max subido de 5e-3 â†’ 1e-2 (regularizaciÃ³n fuerte).
+    #   - focal_alpha_max bajado de 0.95 â†’ 0.85 (Î±=0.95 da gradiente ~400x desbalanceado).
+    #   - focal_gamma_max bajado de 3.0 â†’ 2.0 (Î³>2 amplifica ruido en positivos difÃ­ciles).
     hidden_min = int(_get_state("gnn_optuna_hidden_min", 32))
     hidden_max = int(_get_state("gnn_optuna_hidden_max", 96))
     hidden_step = int(_get_state("gnn_optuna_hidden_step", 16))
@@ -30122,7 +30768,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
     loaded_graph = st.session_state.get("loaded_graph")
     balanced_graph = st.session_state.get("balanced_graph")
     if loaded_graph is None:
-        st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+        st.warning("No hay grafo cargado en memoria. Use la pestaÃ±a Graph.")
         return
 
     use_balanced = False
@@ -30503,7 +31149,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
         value=1.0,
         step=0.1,
         key="gnn_optuna_beta",
-        help="Controla cómo se selecciona el umbral de decisión en validación (maximizando F-beta).\n\n• Beta = 1.0: Balanceado (F1).\n• Beta > 1.0: Prioriza Recall (detectar más accidentes, acepta más falsas alarmas).\n• Beta < 1.0: Prioriza Precisión (minimiza falsas alarmas, más estricto).",
+        help="Controla cÃ³mo se selecciona el umbral de decisiÃ³n en validaciÃ³n (maximizando F-beta).\n\nâ€¢ Beta = 1.0: Balanceado (F1).\nâ€¢ Beta > 1.0: Prioriza Recall (detectar mÃ¡s accidentes, acepta mÃ¡s falsas alarmas).\nâ€¢ Beta < 1.0: Prioriza PrecisiÃ³n (minimiza falsas alarmas, mÃ¡s estricto).",
     )
     st.caption(
         "El umbral se optimiza en validacion usando F-beta; "
@@ -30616,7 +31262,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             help="0 = sin limite.",
         )
     
-    # Selección automática de dispositivo
+    # SelecciÃ³n automÃ¡tica de dispositivo
     optuna_device = get_auto_device()
     st.caption(f"Dispositivo para Optuna: {optuna_device}")
 
@@ -30686,7 +31332,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             help="Agrupa variables relacionadas para muestrearlas juntas en cada trial.",
         )
 
-    st.markdown("**Espacio de búsqueda**")
+    st.markdown("**Espacio de bÃºsqueda**")
     selected_gnn_variant = _render_optuna_gnn_variant_selector(graph_obj=graph_obj)
     selected_variant_spec = _describe_gnn_variant(selected_gnn_variant)
     with st.expander("Arquitectura"):
@@ -30803,7 +31449,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
                 [False, True],
                 default=[False],
                 key="gnn_optuna_relation_self_loops",
-                help="Optimiza si se añaden self-loops por relación cuando la capa lo soporta.",
+                help="Optimiza si se aÃ±aden self-loops por relaciÃ³n cuando la capa lo soporta.",
             )
         aggr_choices = ["sum", "mean"]
         aggr1 = st.multiselect(
@@ -30822,14 +31468,14 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
         if selected_variant_spec["uses_edge_mlp"] == "yes":
             st.markdown("**EdgeAttrEncoder (GAT + MLP aristas)**")
             st.caption(
-                "Estos hiperparámetros se activan solo para variantes `gat_edge_mlp*`. "
+                "Estos hiperparÃ¡metros se activan solo para variantes `gat_edge_mlp*`. "
                 "Optuna/Ray los guarda como `edge_encoder_per_type` para reconstruir "
                 "el modelo ganador en Training."
             )
             edge_dims = _infer_edge_feature_dims(graph_data)
             if not edge_dims:
                 st.warning(
-                    "El grafo no expone `edge_attr`; el EdgeAttrEncoder no tendrá "
+                    "El grafo no expone `edge_attr`; el EdgeAttrEncoder no tendrÃ¡ "
                     "features de arista que transformar."
                 )
             edge_mode = st.radio(
@@ -30839,8 +31485,8 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
                 horizontal=True,
                 key="gnn_optuna_edge_encoder_mode",
                 help=(
-                    "Por tipo optimiza kind/hidden/encoded/dropout para cada relación. "
-                    "Compartido usa un único set de hiperparámetros para todas."
+                    "Por tipo optimiza kind/hidden/encoded/dropout para cada relaciÃ³n. "
+                    "Compartido usa un Ãºnico set de hiperparÃ¡metros para todas."
                 ),
             )
 
@@ -30945,14 +31591,14 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
                     rel_label = _edge_type_display_label(edge_type)
                     spec = _default_edge_encoder_search_spec(in_dim)
                     st.markdown(
-                        f"**edge_attr[{rel_label}]** · in_dim raw = `{int(in_dim or 0)}`"
+                        f"**edge_attr[{rel_label}]** Â· in_dim raw = `{int(in_dim or 0)}`"
                     )
                     st.multiselect(
                         f"edge_encoder_kind opciones [{rel_label}]",
                         EDGE_ENCODER_KIND_OPTIONS,
                         default=list(spec["kind_choices"]),
                         key=f"gnn_optuna_edge_kind_choices_{edge_key}",
-                        help="Tipos candidatos para esta relación.",
+                        help="Tipos candidatos para esta relaciÃ³n.",
                     )
                     _render_edge_range_controls(
                         f"gnn_optuna_edge_{edge_key}",
@@ -30960,7 +31606,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
                     )
 
     # Compatibilidad: migra claves legacy de perfiles hacia la UI nueva
-    # sin perder la integración con el payload existente de Optuna/Ray.
+    # sin perder la integraciÃ³n con el payload existente de Optuna/Ray.
     neighbor_profile_names = _optuna_neighbor_profile_names()
     for name, default_profile in GNN_OPTUNA_NEIGHBOR_PROFILE_PRESETS:
         ui_key = f"gnn_optuna_neighbor_profile_{name}"
@@ -31048,7 +31694,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             options=list(sampler_label_to_mode.keys()),
             default=default_labels,
             key="gnn_optuna_sampler_modes_ui",
-            help="Selecciona qué estrategias de muestreo nativas evaluará Optuna/Ray en los trials.",
+            help="Selecciona quÃ© estrategias de muestreo nativas evaluarÃ¡ Optuna/Ray en los trials.",
         )
         selected_sampler_modes = [
             sampler_label_to_mode[label]
@@ -31105,7 +31751,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             str(int(v)) for v in cluster_parts_per_epoch
         )
         if not cluster_num_parts or not cluster_parts_per_epoch:
-            st.warning("Debe configurar al menos un perfil válido para Cluster-GCN.")
+            st.warning("Debe configurar al menos un perfil vÃ¡lido para Cluster-GCN.")
 
     # Bootstrap de perfiles GraphSAINT desde claves legacy.
     if "graphsaint" in selected_sampler_modes:
@@ -31191,7 +31837,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
             or not graphsaint_num_steps
             or not graphsaint_walk_lengths
         ):
-            st.warning("Debe configurar al menos un perfil válido para GraphSAINT.")
+            st.warning("Debe configurar al menos un perfil vÃ¡lido para GraphSAINT.")
 
     if "rl_top_p" in selected_sampler_modes:
         with st.expander("RioGNN top-p RL"):
@@ -31203,7 +31849,7 @@ def _render_optuna_tab(*, show_run_controls: bool = True) -> None:
                     ["discrete", "continuous_actor"],
                 ),
                 key="gnn_optuna_rl_action_spaces",
-                help="Optuna probará RSRL discreto y/o actor continuo acotado.",
+                help="Optuna probarÃ¡ RSRL discreto y/o actor continuo acotado.",
             )
             if not rl_action_spaces:
                 st.warning("Debe seleccionar al menos un action_space para RioGNN top-p RL.")
@@ -31461,13 +32107,13 @@ def _render_optuna_gnn_variant_selector(
         key="gnn_optuna_gnn_variant",
         format_func=lambda value: labels.get(str(value), str(value)),
         help=(
-            "Define la arquitectura GNN fija que optimizará este estudio. "
+            "Define la arquitectura GNN fija que optimizarÃ¡ este estudio. "
             "Valores esperados: una de las variantes soportadas "
             "(snapshot, GRU, Transformer, edge-MLP o edge-aware). "
-            "La elección cambia el modelo construido, el nombre del estudio, "
+            "La elecciÃ³n cambia el modelo construido, el nombre del estudio, "
             "los CSV guardados y los metadatos de Optuna; no se muestrea como "
-            "hiperparámetro dentro de un mismo study. Las variantes temporales "
-            "requieren un SequenceIndex válido en el grafo."
+            "hiperparÃ¡metro dentro de un mismo study. Las variantes temporales "
+            "requieren un SequenceIndex vÃ¡lido en el grafo."
         ),
     )
     selected_variant = _normalize_ui_gnn_variant(selected)
@@ -31486,7 +32132,7 @@ def _render_optuna_gnn_variant_selector(
     ):
         st.warning(
             "La variante seleccionada requiere SequenceIndex. Esta corrida se "
-            "bloqueará hasta cargar o construir un grafo con secuencias temporales."
+            "bloquearÃ¡ hasta cargar o construir un grafo con secuencias temporales."
         )
     return selected_variant
 
@@ -31497,7 +32143,7 @@ def _render_ray_tune_tab() -> None:
     loaded_graph = st.session_state.get("loaded_graph")
     balanced_graph = st.session_state.get("balanced_graph")
     if loaded_graph is None:
-        st.warning("No hay grafo cargado en memoria. Use la pestaña Graph.")
+        st.warning("No hay grafo cargado en memoria. Use la pestaÃ±a Graph.")
         return
 
     use_balanced = bool(st.session_state.get("gnn_optuna_use_balanced", False))
@@ -31764,7 +32410,7 @@ def _render_ray_tune_tab() -> None:
         return
 
     # --- Construir search_space desde Optuna ---
-    # Espacio v2 (Acción 6): rangos estrechados para clase rara (~0.3%).
+    # Espacio v2 (AcciÃ³n 6): rangos estrechados para clase rara (~0.3%).
     # Ver _collect_optuna_ray_settings() para el rationale completo.
     hidden_min = int(_get_state("gnn_optuna_hidden_min", 32))
     hidden_max = int(_get_state("gnn_optuna_hidden_max", 96))
@@ -32264,9 +32910,9 @@ def _render_load_graph():
     st.write("Cargue un grafo previamente construido (.pt) desde la carpeta de Resultados.")
     
     # List available graphs
-    graph_files = sorted(glob.glob(os.path.join(RESULTADOS_DIR, "highway_graph_*.pt")), key=os.path.getmtime, reverse=True)
+    graph_files = gnn_glob("graphs_base", "highway_graph_*.pt", RESULTADOS_DIR, sort_mtime=True, reverse=True)
     if not graph_files:
-        st.warning(f"No se encontraron grafos en {RESULTADOS_DIR}")
+        st.warning(f"No se encontraron grafos en {gnn_dir('graphs_base', RESULTADOS_DIR)}")
         return
 
     selected_file = st.selectbox("Seleccione un archivo de grafo:", graph_files, format_func=os.path.basename)
@@ -32298,11 +32944,11 @@ def _render_load_graph():
                     st.error(f"Error al cargar: {e}")
 
 def _render_create_graph():
-    st.markdown("#### Selección de Datos")
+    st.markdown("#### SelecciÃ³n de Datos")
     
     # LOAD PORTICOS
     if 'df_port' not in st.session_state or st.session_state.df_port is None:
-        with st.spinner("Cargando pórticos automáticamente..."):
+        with st.spinner("Cargando pÃ³rticos automÃ¡ticamente..."):
             df_port = load_porticos() # Tries Datos/Porticos.csv by default
             if df_port is not None:
                 st.session_state.df_port = df_port
@@ -32311,7 +32957,7 @@ def _render_create_graph():
 
     if st.session_state.df_port is not None:
         st.markdown(
-            "Archivo de Pórticos cargado: `Datos/Porticos.csv`"
+            "Archivo de PÃ³rticos cargado: `Datos/Porticos.csv`"
         )
         events_label = None
         if (
@@ -32367,10 +33013,10 @@ def _render_create_graph():
     # -----------------------------
     
     # TRAMO SELECTION
-    # st.markdown("#### Definición del Grafo (Tramo)")
+    # st.markdown("#### DefiniciÃ³n del Grafo (Tramo)")
     
     tramo_mode = st.radio(
-        "Definición del Grafo (Tramo)",
+        "DefiniciÃ³n del Grafo (Tramo)",
         ["Manual", "Puntos Negros (Reporte)", "Desde Features"],
         index=0,
         key="gnn_tramo_mode",
@@ -32397,10 +33043,10 @@ def _render_create_graph():
                 acc_df = st.session_state.get("df_acc")
                 if acc_df is None or acc_df.empty:
                     st.warning(
-                        "Cargue accidentes en la pestaña Eventos."
+                        "Cargue accidentes en la pestaÃ±a Eventos."
                     )
                 elif st.session_state.df_port is None:
-                    st.warning("No hay pórticos cargados.")
+                    st.warning("No hay pÃ³rticos cargados.")
                 else:
                     stats = _compute_puntos_negros_report(
                         acc_df, st.session_state.df_port
@@ -32463,7 +33109,7 @@ def _render_create_graph():
                                 max_anterior=4, max_posterior=0,
                                 prefer_family=True, deduplicate_slice=True
                             )
-                            st.info(f"Pórticos seleccionados ({len(porticos_a_incluir)}): {porticos_a_incluir}")
+                            st.info(f"PÃ³rticos seleccionados ({len(porticos_a_incluir)}): {porticos_a_incluir}")
                 except Exception as e:
                     st.error(f"Error leyendo reporte: {e}")
 
@@ -32498,17 +33144,17 @@ def _render_create_graph():
             )
             st.success(
                 "Tramo inferido desde features: "
-                f"{len(porticos_from_features)} pórticos."
+                f"{len(porticos_from_features)} pÃ³rticos."
             )
             st.caption(
                 f"Fuente: `{source_label}`"
                 + (f" | Tabla: `{table_label}`" if table_label else "")
-                + f" | Columna: `{portico_col_label}` | Método: {method_label}"
+                + f" | Columna: `{portico_col_label}` | MÃ©todo: {method_label}"
             )
             if configured_filter_count:
                 st.caption(
                     "Filtro de carga respetado: "
-                    f"{configured_filter_count} pórticos configurados."
+                    f"{configured_filter_count} pÃ³rticos configurados."
                 )
             if discarded_portico_count:
                 discarded_preview = list(
@@ -32521,7 +33167,7 @@ def _render_create_graph():
                 )
                 st.caption(
                     "Filtro Porticos.csv aplicado: "
-                    f"{discarded_portico_count} pórticos externos descartados."
+                    f"{discarded_portico_count} pÃ³rticos externos descartados."
                     + suffix
                 )
             st.dataframe(
@@ -32534,7 +33180,7 @@ def _render_create_graph():
                 width="stretch",
             )
         else:
-            st.warning("La fuente de features no contiene pórticos detectables.")
+            st.warning("La fuente de features no contiene pÃ³rticos detectables.")
 
     else: # Manual
         if st.session_state.df_port is not None:
@@ -32547,7 +33193,7 @@ def _render_create_graph():
                 )
                 AUTOPISTA_MAP = {
                     "C": "Ruta 5 (Central)",
-                    "NO": "General Velásquez",
+                    "NO": "General VelÃ¡squez",
                 }
                 if autopista_options:
                     if (
@@ -32635,7 +33281,7 @@ def _render_create_graph():
             porticos_disp = list(pd.Index(portico_series).drop_duplicates())
             
             if not porticos_disp:
-                st.warning("No hay pórticos disponibles para esta calzada.")
+                st.warning("No hay pÃ³rticos disponibles para esta calzada.")
                 p_start = None
                 p_end = None
             else:
@@ -32655,7 +33301,7 @@ def _render_create_graph():
                             porticos_disp[0]
                         )
                     p_start = st.selectbox(
-                        "Pórtico Inicio",
+                        "PÃ³rtico Inicio",
                         porticos_disp,
                         key="gnn_portico_start",
                     )
@@ -32675,7 +33321,7 @@ def _render_create_graph():
                             end_options[-1]
                         )
                     p_end = st.selectbox(
-                        "Pórtico Fin",
+                        "PÃ³rtico Fin",
                         end_options,
                         key="gnn_portico_end",
                     )
@@ -32691,13 +33337,13 @@ def _render_create_graph():
                     if idx_s > idx_e: idx_s, idx_e = idx_e, idx_s
                     porticos_a_incluir = p_list[idx_s : idx_e+1]
                     st.session_state.manual_porticos = porticos_a_incluir
-                    st.success(f"Tramo manual seleccionado: {len(porticos_a_incluir)} pórticos")
+                    st.success(f"Tramo manual seleccionado: {len(porticos_a_incluir)} pÃ³rticos")
                 except ValueError:
-                    st.error("Error calculando rango de pórticos")
+                    st.error("Error calculando rango de pÃ³rticos")
             
             if 'manual_porticos' in st.session_state:
                 porticos_a_incluir = st.session_state.manual_porticos
-                st.write(f"Selección actual: {porticos_a_incluir}")
+                st.write(f"SelecciÃ³n actual: {porticos_a_incluir}")
 
     # ACCIDENTS
     if 'df_acc' not in st.session_state:
@@ -32715,7 +33361,7 @@ def _render_create_graph():
             value=True,
             key="gnn_use_events_tab",
             help=(
-                "Usa los eventos ya procesados en la pestaña Eventos como fuente de etiquetas. "
+                "Usa los eventos ya procesados en la pestaÃ±a Eventos como fuente de etiquetas. "
                 "Default: activado cuando existen eventos en memoria. Cambiarlo puede mezclar "
                 "fuentes de accidentes y alterar labels/splits."
             ),
@@ -32764,7 +33410,7 @@ def _render_create_graph():
     st.markdown("#### Filtro Temporal")
     time_options = {
         '1': 'Sin filtro (Todos)',
-        '2': 'Punta Mañana (06:00 - 10:00)',
+        '2': 'Punta MaÃ±ana (06:00 - 10:00)',
         '3': 'Punta Tarde (18:00 - 22:00)'
     }
     def_idx = 0
@@ -32778,13 +33424,13 @@ def _render_create_graph():
         index=def_idx,
         help=(
             "Filtra los snapshots/flows usados para construir nodos. "
-            "Default: sin filtro salvo preselección por punto negro. "
+            "Default: sin filtro salvo preselecciÃ³n por punto negro. "
             "Un filtro estrecho puede dejar train/val/test sin nodos tras el embargo."
         ),
     )
 
     # NODE CONFIG
-    st.markdown("#### Configuración de Nodos")
+    st.markdown("#### ConfiguraciÃ³n de Nodos")
     feature_config_for_nodes = st.session_state.get("feature_config", {})
     df_pm_cache_for_nodes = st.session_state.get("df_pm_cache")
     node_feature_preview = _resolve_graph_node_feature_preview(
@@ -32804,7 +33450,7 @@ def _render_create_graph():
             st.metric("Variables disponibles", len(node_available))
         st.caption(
             f"Fuente: {node_feature_preview.get('source_label', '-')}"
-            f" | Selección: {node_feature_preview.get('selection_source', '-')}"
+            f" | SelecciÃ³n: {node_feature_preview.get('selection_source', '-')}"
         )
         if node_feature_preview.get("error"):
             st.warning(
@@ -32838,19 +33484,19 @@ def _render_create_graph():
             )
         else:
             st.info(
-                "Las variables de nodo aparecerán al cargar/configurar features "
-                "o al guardar una selección de variables."
+                "Las variables de nodo aparecerÃ¡n al cargar/configurar features "
+                "o al guardar una selecciÃ³n de variables."
             )
     
     # EDGE CONFIG
-    st.markdown("#### Configuración de Aristas")
+    st.markdown("#### ConfiguraciÃ³n de Aristas")
     c1, c2, c3 = st.columns(3)
     with c1:
         build_temporal = st.checkbox(
             "Temporales",
             value=True,
             help=(
-                "Conecta cada pórtico con su siguiente timestamp. Default: activado. "
+                "Conecta cada pÃ³rtico con su siguiente timestamp. Default: activado. "
                 "Desactivarlo elimina dependencia temporal directa y cambia la tarea GNN."
             ),
         )
@@ -32859,8 +33505,8 @@ def _render_create_graph():
             "Espaciales",
             value=True,
             help=(
-                "Conecta pórticos consecutivos en ambas direcciones dentro de la misma "
-                "franja temporal. Default: activado. Desactivarlo reduce la semántica "
+                "Conecta pÃ³rticos consecutivos en ambas direcciones dentro de la misma "
+                "franja temporal. Default: activado. Desactivarlo reduce la semÃ¡ntica "
                 "vial del grafo."
             ),
         )
@@ -32869,8 +33515,8 @@ def _render_create_graph():
             "Espacio-Temporal (Fwd)",
             value=False,
             help=(
-                "Conecta un pórtico en t con el pórtico siguiente en t+Δ. Default: desactivado. "
-                "Puede aumentar dependencia futura aparente si se interpreta sin revisar dirección temporal."
+                "Conecta un pÃ³rtico en t con el pÃ³rtico siguiente en t+Î”. Default: desactivado. "
+                "Puede aumentar dependencia futura aparente si se interpreta sin revisar direcciÃ³n temporal."
             ),
         )
     
@@ -32892,12 +33538,12 @@ def _render_create_graph():
         if edge_family_hint == "snapshot"
         else CLASSIC_EDGE_PHYSICAL_FEATURES
     )
-    with st.expander("Features Físicas de Arista", expanded=False):
+    with st.expander("Features FÃ­sicas de Arista", expanded=False):
         selected_physical_features = st.multiselect(
-            "Seleccione variables físicas a incluir en aristas espaciales:",
+            "Seleccione variables fÃ­sicas a incluir en aristas espaciales:",
             options=PHYSICAL_FEATURES_OPTIONS,
             default=PHYSICAL_FEATURES_OPTIONS,
-            help="Seleccione qué atributos físicos incluir en las aristas espaciales/st_fwd."
+            help="Seleccione quÃ© atributos fÃ­sicos incluir en las aristas espaciales/st_fwd."
         )
 
     # Delta Features Selector (node feature deltas for edge_attr)
@@ -32948,21 +33594,21 @@ def _render_create_graph():
         if edge_family_hint == "snapshot"
         else list(delta_feature_options)
     )
-    with st.expander("Features Delta de Arista (Δ nodo→nodo)", expanded=False):
+    with st.expander("Features Delta de Arista (Î” nodoâ†’nodo)", expanded=False):
         st.multiselect(
-            "Seleccione variables de nodo para calcular Δ en las aristas:",
+            "Seleccione variables de nodo para calcular Î” en las aristas:",
             options=delta_feature_options,
             default=default_delta_feature_options,
             key="edge_delta_features",
             help=(
                 "Estas variables se usan para construir edge_attr como diferencia "
                 "entre nodos. En Snapshot el default usa un subconjunto compacto "
-                "de velocidad, flujo y congestión; en Flow usa todas las features."
+                "de velocidad, flujo y congestiÃ³n; en Flow usa todas las features."
             ),
         )
         if not delta_feature_options:
             st.caption(
-                "Las opciones aparecerán al seleccionar o generar features en memoria."
+                "Las opciones aparecerÃ¡n al seleccionar o generar features en memoria."
             )
     st.session_state["edge_delta_options_available"] = bool(delta_feature_options)
 
@@ -32972,14 +33618,33 @@ def _render_create_graph():
         key="gnn_debug_labels",
         help=(
             "Muestra conteos y rangos temporales usados para etiquetas. Default: desactivado. "
-            "Sirve para auditar alineación; no cambia el grafo ni las métricas."
+            "Sirve para auditar alineaciÃ³n; no cambia el grafo ni las mÃ©tricas."
         ),
+    )
+
+    with st.expander("Construccion por partes", expanded=False):
+        edge_chunk_target_rows_input = st.number_input(
+            "Filas objetivo por chunk (0 = automatico)",
+            min_value=0,
+            max_value=5_000_000,
+            value=0,
+            step=50_000,
+            key="gnn_edge_chunk_target_rows",
+            help=(
+                "Control avanzado para limitar memoria durante la construccion "
+                "de aristas. Use 0 para estimacion automatica."
+            ),
+        )
+    edge_chunk_target_rows = (
+        None
+        if int(edge_chunk_target_rows_input or 0) <= 0
+        else int(edge_chunk_target_rows_input)
     )
 
     # BUILD BUTTON
     if st.button("Construir Grafo", type="primary"):
         if st.session_state.df_port is None:
-            st.error("Faltan pórticos.")
+            st.error("Faltan pÃ³rticos.")
             return
         if porticos_a_incluir is None:
             st.error("Falta seleccionar tramo.")
@@ -33016,10 +33681,10 @@ def _render_create_graph():
                             st.session_state.df_port,
                         )
                     except Exception as exc:
-                        st.error(f"Falló la carga de accidentes: {exc}")
+                        st.error(f"FallÃ³ la carga de accidentes: {exc}")
                         return
                     if loaded_acc is None:
-                        st.error("Falló la carga de accidentes.")
+                        st.error("FallÃ³ la carga de accidentes.")
                         return
                     st.session_state.df_acc = loaded_acc
                     st.session_state.accidents_df = loaded_acc
@@ -33039,7 +33704,7 @@ def _render_create_graph():
         
         # --- EXECUTION LOGIC (Ported from src/graph.py) ---
         status = st.empty()
-        status.info("Iniciando construcción...")
+        status.info("Iniciando construcciÃ³n...")
         progress = st.progress(0)
         
         try:
@@ -33049,7 +33714,7 @@ def _render_create_graph():
             )
             porticos_norm = list(pd.Index(porticos_norm).dropna().drop_duplicates())
             if not porticos_norm:
-                st.error("No hay pórticos válidos en el tramo seleccionado.")
+                st.error("No hay pÃ³rticos vÃ¡lidos en el tramo seleccionado.")
                 return
             porticos_a_incluir = porticos_norm
 
@@ -33119,7 +33784,7 @@ def _render_create_graph():
                 df_pm = run_feature_generation_workflow(feat_cfg)
             
             if df_pm is None or df_pm.empty:
-                st.error("No se pudieron obtener features. Verifique la configuración en 'Feature Engineering'.")
+                st.error("No se pudieron obtener features. Verifique la configuraciÃ³n en 'Feature Engineering'.")
                 return
             feature_mode = params.get("feature_mode")
             if not feature_mode:
@@ -33167,10 +33832,10 @@ def _render_create_graph():
                 df_pm = df_pm[df_pm[portico_col].isin(porticos_a_incluir)].copy()
                 status.text(f"Filtrado por tramo: {initial_len} -> {len(df_pm)} registros.")
             else:
-                 st.warning("Columna de pórtico no encontrada en features.")
+                 st.warning("Columna de pÃ³rtico no encontrada en features.")
 
             if df_pm.empty:
-                st.error("Features vacías tras filtrar por tramo. Verifique nombres de pórticos.")
+                st.error("Features vacÃ­as tras filtrar por tramo. Verifique nombres de pÃ³rticos.")
                 return
             if debug_labels and portico_col and "ultimo_portico" in df_acc_use.columns:
                 feat_ports = _normalize_portico_series(df_pm[portico_col])
@@ -33197,7 +33862,7 @@ def _render_create_graph():
             
             # ... Resume existing logic ...
             if df_pm.empty:
-                st.error("Dataset vacío después de filtros.")
+                st.error("Dataset vacÃ­o despuÃ©s de filtros.")
                 return
             
             df_pm = df_pm.reset_index(drop=True)
@@ -33395,7 +34060,7 @@ def _render_create_graph():
                     return
                 feature_cols = selected_in_df
                 status.text(
-                    f"Aplicando selección de variables: {len(feature_cols)}"
+                    f"Aplicando selecciÃ³n de variables: {len(feature_cols)}"
                 )
 
             # Delta features (edge_attr) selection
@@ -33453,15 +34118,21 @@ def _render_create_graph():
                 or not test_mask.any()
             ):
                 st.error(
-                    "El split temporal purgado dejó train/val/test vacío o inválido. "
-                    "Amplíe el rango temporal de features o ajuste TRAIN_RATIO/VAL_RATIO "
-                    "para mantener nodos suficientes después del embargo por horizonte."
+                    "El split temporal purgado dejÃ³ train/val/test vacÃ­o o invÃ¡lido. "
+                    "AmplÃ­e el rango temporal de features o ajuste TRAIN_RATIO/VAL_RATIO "
+                    "para mantener nodos suficientes despuÃ©s del embargo por horizonte."
                 )
                 return
 
             train_ts_cutoff = split_metadata["train_ts_cutoff"]
             val_ts_cutoff = split_metadata["val_ts_cutoff"]
-            df_pm_raw_for_edges = df_pm.copy()
+            raw_globals = _build_raw_global_edge_features(df_pm, portico_col)
+            raw_feature_family = str(
+                raw_globals.attrs.get("raw_feature_family", "classic")
+            )
+            edge_feature_sources = dict(
+                raw_globals.attrs.get("edge_feature_sources", {})
+            )
 
             # Compute stats strictly on purged train split.
             try:
@@ -33493,6 +34164,7 @@ def _render_create_graph():
                 feat_mat_delta = feat_mat[:, delta_feature_idx]
             else:
                 feat_mat_delta = np.zeros((feat_mat.shape[0], 0))
+            feat_mat_delta = np.asarray(feat_mat_delta, dtype=np.float32)
             
             progress.progress(60)
             status.text("Vectorizando nodos y aristas...")
@@ -33517,222 +34189,55 @@ def _render_create_graph():
                 )
             except Exception:
                 pass
+            df_pm_edges = df_pm[
+                [portico_col, "ts_min", "node_idx", "future_label"]
+            ].copy()
+            del feat_mat
+            gc.collect()
             
-            # 2. Edges
-            # USEFUL: We can reuse the logic. I will implement a simplified version or copy it.
-            # I'll implement the temporal and spatial core logic.
-            
-            # Determine Extra Spatial Dimensions based on selection
-            # Default options if not defined (safe fallback)
+            # 2. Edges: chunked construction with global node ids.
             if 'selected_physical_features' not in locals():
                 selected_physical_features = (
                     SNAPSHOT_EDGE_PHYSICAL_FEATURES
                     if feature_mode == "Snapshot"
                     else CLASSIC_EDGE_PHYSICAL_FEATURES
                 )
-            
-            raw_globals = _build_raw_global_edge_features(
-                df_pm_raw_for_edges, portico_col
+
+            construction_metadata = _build_chunked_pm_edge_stores(
+                data,
+                df_pm_edges=df_pm_edges,
+                df_port_use=df_port_use,
+                feat_mat_delta=feat_mat_delta,
+                raw_globals=raw_globals,
+                portico_col=portico_col,
+                selected_physical_features=selected_physical_features,
+                dt_feat_minutes=dt_feat_minutes,
+                build_temporal=build_temporal,
+                build_spatial=build_spatial,
+                build_st_fwd=build_st_fwd,
+                edge_attr_dtype=float_type,
+                target_rows=edge_chunk_target_rows,
             )
-            raw_feature_family = str(
-                raw_globals.attrs.get("raw_feature_family", "classic")
-            )
-            edge_feature_sources = dict(
-                raw_globals.attrs.get("edge_feature_sources", {})
-            )
-
-            # Temporal
-            # Las aristas temporales no usan features físicas (solo el delta
-            # entre dos snapshots del mismo pórtico). Antes hacíamos
-            # zero-padding con EXTRA_SPATIAL columnas para que el `edge_dim` del
-            # GATConv fuese homogéneo entre relaciones; ahora cada relación
-            # tiene su propio `EdgeAttrEncoder` con `in_dim` por tipo, así que
-            # el padding deja de ser necesario.
-            temporal_attr = None
-            temporal_src, temporal_dst = [], []
-            if build_temporal:
-                df_pm["next_ts_min"] = df_pm["ts_min"] + int(dt_feat_minutes)
-                t_edges = pd.merge(
-                    df_pm[[portico_col, "ts_min", "node_idx", "next_ts_min"]],
-                    df_pm[[portico_col, "ts_min", "node_idx"]],
-                    left_on=[portico_col, "next_ts_min"],
-                    right_on=[portico_col, "ts_min"],
-                    suffixes=("_src", "_dst"),
+            if construction_metadata.get("warning") == "no_portico_sequences":
+                st.warning(
+                    "No se generaron secuencias de porticos para aristas espaciales."
                 )
-                temporal_src = t_edges["node_idx_src"].tolist()
-                temporal_dst = t_edges["node_idx_dst"].tolist()
+            del feat_mat_delta
+            df_pm = df_pm_edges
+            gc.collect()
 
-                delta = (
-                    feat_mat_delta[temporal_dst]
-                    - feat_mat_delta[temporal_src]
-                )
-                temporal_attr = np.asarray(delta, dtype=float)
-
-                data[("pm", "temporal", "pm")].edge_index = torch.tensor(
-                    [temporal_src, temporal_dst], dtype=torch.long
-                )
-                data[("pm", "temporal", "pm")].edge_attr = torch.tensor(
-                    temporal_attr, dtype=float_type
-                )
-
-            spatial_src: List[int] = []
-            spatial_dst: List[int] = []
-            spatial_attr: Optional[np.ndarray] = None
-            stfwd_src: List[int] = []
-            stfwd_dst: List[int] = []
-            stfwd_attr: Optional[np.ndarray] = None
-
-            if build_spatial or build_st_fwd:
-                portico_sequences = []
-                df_port_s = df_port_use.sort_values(
-                    ["calzada", "eje", "orden"],
-                    ascending=[False, True, True],
-                )
-                for (calz, eje), g in df_port_s.groupby(
-                    ["calzada", "eje"]
-                ):
-                    s_ports = g["portico"].tolist()
-                    kms = (
-                        g["km"].astype(float).tolist()
-                        if "km" in g.columns
-                        else [0] * len(s_ports)
-                    )
-                    for i in range(len(s_ports) - 1):
-                        dkm = abs(kms[i + 1] - kms[i])
-                        portico_sequences.append(
-                            (s_ports[i], s_ports[i + 1], dkm)
-                        )
-                df_seq = pd.DataFrame(
-                    portico_sequences,
-                    columns=["portico_src", "portico_dst", "dist_km"],
-                )
-
-                if df_seq.empty:
-                    st.warning(
-                        "No se generaron secuencias de pórticos para aristas espaciales."
-                    )
-                else:
-                    if build_spatial:
-                        s_edges = pd.merge(
-                            df_pm.rename(
-                                columns={
-                                    portico_col: "portico_src",
-                                    "node_idx": "node_idx_src",
-                                }
-                            ),
-                            df_seq,
-                            on="portico_src",
-                        )
-                        s_edges = pd.merge(
-                            s_edges,
-                            df_pm.rename(
-                                columns={
-                                    portico_col: "portico_dst",
-                                    "node_idx": "node_idx_dst",
-                                }
-                            ),
-                            left_on=["ts_min", "portico_dst"],
-                            right_on=["ts_min", "portico_dst"],
-                            how="inner",
-                        )
-
-                        (
-                            spatial_src,
-                            spatial_dst,
-                            spatial_attr,
-                        ) = _build_bidirectional_spatial_edges(
-                            s_edges,
-                            feat_mat_delta,
-                            raw_globals,
-                            portico_col,
-                            selected_physical_features,
-                        )
-
-                        if spatial_src:
-                            data[
-                                ("pm", "spatial", "pm")
-                            ].edge_index = torch.tensor(
-                                [spatial_src, spatial_dst],
-                                dtype=torch.long,
-                            )
-                            data[
-                                ("pm", "spatial", "pm")
-                            ].edge_attr = torch.tensor(
-                                spatial_attr, dtype=float_type
-                            )
-
-                    if build_st_fwd:
-                        if "next_ts_min" not in df_pm.columns:
-                            df_pm["next_ts_min"] = (
-                                df_pm["ts_min"] + int(dt_feat_minutes)
-                            )
-                        st_src = df_pm[
-                            [portico_col, "ts_min", "node_idx", "next_ts_min"]
-                        ].rename(
-                            columns={
-                                portico_col: "portico_src",
-                                "node_idx": "node_idx_src",
-                                "ts_min": "ts_min_src",
-                            }
-                        )
-                        st_dst = df_pm[
-                            [portico_col, "ts_min", "node_idx"]
-                        ].rename(
-                            columns={
-                                portico_col: "portico_dst",
-                                "node_idx": "node_idx_dst",
-                                "ts_min": "ts_min_dst",
-                            }
-                        )
-                        st_edges = pd.merge(
-                            st_src,
-                            df_seq,
-                            on="portico_src",
-                        )
-                        st_edges = pd.merge(
-                            st_edges,
-                            st_dst,
-                            left_on=["next_ts_min", "portico_dst"],
-                            right_on=["ts_min_dst", "portico_dst"],
-                            how="inner",
-                        )
-
-                        stfwd_src = st_edges["node_idx_src"].tolist()
-                        stfwd_dst = st_edges["node_idx_dst"].tolist()
-                        if stfwd_src:
-                            delta_st = (
-                                feat_mat_delta[stfwd_dst]
-                                - feat_mat_delta[stfwd_src]
-                            )
-                            extras = _build_edge_feature_extras(
-                                st_edges,
-                                raw_globals,
-                                portico_col,
-                                selected_physical_features,
-                                src_ts_col="ts_min_src",
-                                dst_ts_col="ts_min_dst",
-                            )
-                            stfwd_attr = np.concatenate(
-                                [
-                                    delta_st,
-                                    extras,
-                                ],
-                                axis=1,
-                            )
-                            data[
-                                ("pm", "st_fwd", "pm")
-                            ].edge_index = torch.tensor(
-                                [stfwd_src, stfwd_dst], dtype=torch.long
-                            )
-                            data[
-                                ("pm", "st_fwd", "pm")
-                            ].edge_attr = torch.tensor(
-                                stfwd_attr, dtype=float_type
-                            )
-            
             # Clean edges
             for store in data.edge_stores:
-                _safe_clean_edges(store, data[store._key[0]].num_nodes, data[store._key[2]].num_nodes)
+                _safe_clean_edges(
+                    store,
+                    data[store._key[0]].num_nodes,
+                    data[store._key[2]].num_nodes,
+                )
+            _validate_graph_edge_stores(data)
+            construction_metadata["edge_counts_after_clean"] = {
+                str(edge_type): int(data[edge_type].edge_index.size(1))
+                for edge_type in data.edge_types
+            }
             
             data['pm'].train_mask = torch.from_numpy(train_mask)
             data['pm'].val_mask = torch.from_numpy(val_mask)
@@ -33743,7 +34248,7 @@ def _render_create_graph():
             pm_map = df_pm.set_index([portico_col, 'ts_min'])['node_idx'].to_dict()
             pm_rev = {v: k for k, v in pm_map.items()}
             pm_index = PMIndex(pm_map, pm_rev)
-            # Esquema por tipo: cada relación puede tener su propio set de
+            # Esquema por tipo: cada relaciÃ³n puede tener su propio set de
             # features (sin padding). La temporal solo lleva `delta_features`;
             # las espaciales llevan `delta_features + physical_features`.
             _delta_cols = (
@@ -33775,8 +34280,8 @@ def _render_create_graph():
                 "raw_feature_family": raw_feature_family
                 if 'raw_feature_family' in locals()
                 else "classic",
-                # `edge_attr_schema` se mantiene como unión (compatibilidad con
-                # consumidores legacy); la versión por tipo está en
+                # `edge_attr_schema` se mantiene como uniÃ³n (compatibilidad con
+                # consumidores legacy); la versiÃ³n por tipo estÃ¡ en
                 # `edge_attr_schema_per_type`.
                 "edge_attr_schema": list(_delta_cols) + list(_phys_cols),
                 "edge_attr_schema_per_type": edge_attr_schema_per_type,
@@ -33842,6 +34347,7 @@ def _render_create_graph():
                 "split": split_metadata,
                 "normalization": normalization_summary,
                 "edge_config": edge_config,
+                "construction": construction_metadata,
             }
             graph_metadata, graph_hash = _attach_graph_metadata_hash(
                 data=data,
@@ -33855,7 +34361,7 @@ def _render_create_graph():
             period_tag = "stream_build"
             timestamp = datetime.now().strftime('%d%m%Y_%H%M')
             filename = f"highway_graph_{period_tag}_{timestamp}.pt"
-            output_path = os.path.join(RESULTADOS_DIR, filename)
+            output_path = str(gnn_path("graphs_base", filename, resultados_dir=RESULTADOS_DIR, create_parent=True))
 
             torch.save({
                 "data": data,

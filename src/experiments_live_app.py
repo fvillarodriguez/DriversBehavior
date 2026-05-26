@@ -34,6 +34,7 @@ from src.clustering import (
     DYNAMIC_GMM_WINDOW_SUMMARY_TABLE_NAME,
 )
 from src.pipeline_dask_runtime import EXECUTION_BACKEND_LOCAL
+from src.gnn_artifacts import gnn_dir
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_RESULTS_DIR = ROOT_DIR / "Resultados"
@@ -45,7 +46,7 @@ NLP_PAPER_RUNS_DIR = RESULTS_DIR / "nlp_in_severity" / "paper_replication"
 NLP_LANGUAGE_MODELING_LIVE_DIR = RESULTS_DIR / "nlp_in_severity" / "language_modeling_live"
 MODEL_HISTORY_DIR = RESULTS_DIR / "model_history"
 MODEL_OPTUNA_BATCH_LIVE_DIR = MODEL_HISTORY_DIR / "optuna_batch_live"
-GNN_OPTUNA_LIVE_DIR = RESULTS_DIR / "gnn_optuna_live"
+GNN_OPTUNA_LIVE_DIR = gnn_dir("hpo_optuna", RESULTS_DIR) / "live_runs"
 PAPER_MODEL_CODES = ("M1", "M2", "M3")
 THESIS_CHART_COLORS = {
     "paper": "#fdfcfa",
@@ -730,9 +731,9 @@ def _list_model_optuna_batch_manifest_files() -> list[Path]:
 
 def _list_gnn_optuna_manifest_files() -> list[Path]:
     live_dir = GNN_OPTUNA_LIVE_DIR
-    default_live_dir = DEFAULT_RESULTS_DIR / "gnn_optuna_live"
+    default_live_dir = gnn_dir("hpo_optuna", DEFAULT_RESULTS_DIR) / "live_runs"
     if RESULTS_DIR != DEFAULT_RESULTS_DIR and live_dir == default_live_dir:
-        live_dir = RESULTS_DIR / "gnn_optuna_live"
+        live_dir = gnn_dir("hpo_optuna", RESULTS_DIR) / "live_runs"
     if not live_dir.exists():
         return []
     return sorted(

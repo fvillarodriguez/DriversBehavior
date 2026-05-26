@@ -46,7 +46,9 @@ from utils import (
 PLATE_CLEAN_COL = "plate_clean"
 LANE_CLEAN_COL = "lane_numeric"
 
-CLUSTER_DB_PATH = ROOT_DIR / "Resultados" / "cluster_features.duckdb"
+RESULTS_DIR = ROOT_DIR / "Resultados"
+CLUSTERING_RESULTS_DIR = RESULTS_DIR / "clustering"
+CLUSTER_DB_PATH = CLUSTERING_RESULTS_DIR / "cluster_features.duckdb"
 CLUSTER_TABLE_NAME = "cluster_features"
 CLUSTER_BATCH_TABLE_NAME = "cluster_features_batches"
 CLUSTER_META_TABLE_NAME = "cluster_features_meta"
@@ -141,10 +143,33 @@ def build_ttc_feature_metadata(
 
 
 def list_cluster_feature_db_paths() -> List[Path]:
-    output_dir = ROOT_DIR / "Resultados"
-    if not output_dir.exists():
-        return []
-    return sorted(output_dir.glob("cluster_features*.duckdb"))
+    return _glob_clustering_results("cluster_features*.duckdb")
+
+
+def _clustering_result_dirs() -> List[Path]:
+    dirs = [CLUSTERING_RESULTS_DIR, RESULTS_DIR]
+    unique: List[Path] = []
+    seen: set[str] = set()
+    for path in dirs:
+        key = str(path)
+        if key not in seen:
+            unique.append(path)
+            seen.add(key)
+    return unique
+
+
+def _glob_clustering_results(pattern: str) -> List[Path]:
+    files: List[Path] = []
+    for directory in _clustering_result_dirs():
+        if directory.exists():
+            files.extend(directory.glob(pattern))
+    unique = {str(path.resolve()): path for path in files}
+    return sorted(unique.values(), key=lambda path: (path.name, str(path)))
+
+
+def _ensure_clustering_results_dir() -> Path:
+    CLUSTERING_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    return CLUSTERING_RESULTS_DIR
 
 
 def _normalize_feature_db_suffix(value: str) -> str:
@@ -1453,10 +1478,12 @@ def _require_joblib():
 
 
 def list_dynamic_gmm_db_paths(output_dir: Optional[Path] = None) -> List[Path]:
-    target_dir = output_dir or (ROOT_DIR / "Resultados")
-    if not target_dir.exists():
-        return []
-    return sorted(target_dir.glob("dynamic_gmm_*.duckdb"))
+    if output_dir is not None:
+        target_dir = Path(output_dir)
+        if not target_dir.exists():
+            return []
+        return sorted(target_dir.glob("dynamic_gmm_*.duckdb"))
+    return _glob_clustering_results("dynamic_gmm_*.duckdb")
 
 
 def list_dynamic_gmm_checkpoint_db_paths(output_dir: Optional[Path] = None) -> List[Path]:
@@ -2778,7 +2805,7 @@ def save_dynamic_gmm_results(
     output_dir: Optional[Path] = None,
     stem: Optional[str] = None,
 ) -> Tuple[Path, Path]:
-    target_dir = output_dir or (ROOT_DIR / "Resultados")
+    target_dir = Path(output_dir) if output_dir is not None else _ensure_clustering_results_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     run_stem = stem or f"dynamic_gmm_{pd.Timestamp.now():%Y%m%d_%H%M%S_%f}"
     model_path = target_dir / f"{run_stem}.joblib"
@@ -3176,7 +3203,7 @@ def run_dynamic_gmm_clustering(
         }
 
     _ensure_duckdb_available()
-    target_dir = output_dir or (ROOT_DIR / "Resultados")
+    target_dir = Path(output_dir) if output_dir is not None else _ensure_clustering_results_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     duckdb_path = Path(incremental_db_path) if incremental_db_path is not None else target_dir / f"{run_stem}.duckdb"
     model_path = duckdb_path.with_suffix(".joblib")
@@ -3737,16 +3764,14 @@ def compute_gmm_metrics(
 
 
 def save_cluster_features(features_df: pd.DataFrame) -> Path:
-    output_dir = ROOT_DIR / "Resultados"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     path = output_dir / "cluster_features.csv"
     features_df.to_csv(path, index=False)
     return path
 
 
 def save_cluster_metrics(metrics_df: pd.DataFrame) -> Path:
-    output_dir = ROOT_DIR / "Resultados"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     path = output_dir / "cluster_metrics.csv"
     metrics_df.to_csv(path, index=False)
     return path
@@ -3796,8 +3821,7 @@ def _cluster_descriptive_filename(method: str, k: Optional[int]) -> str:
 def save_cluster_labels(
     cluster_df: pd.DataFrame, method: str, k: Optional[int] = None
 ) -> Path:
-    output_dir = ROOT_DIR / "Resultados"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     path = output_dir / _cluster_label_filename(method, k)
     cluster_df.to_csv(path, index=False)
     return path
@@ -3828,8 +3852,7 @@ def build_cluster_descriptive(clustered_df: pd.DataFrame, feature_cols: List[str
 def save_cluster_summary(
     summary_df: pd.DataFrame, method: str, k: Optional[int] = None
 ) -> Path:
-    output_dir = ROOT_DIR / "Resultados"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     path = output_dir / _cluster_summary_filename(method, k)
     summary_df.to_csv(path, index=False)
     return path
@@ -3838,26 +3861,19 @@ def save_cluster_summary(
 def save_cluster_descriptive(
     stats_df: pd.DataFrame, method: str, k: Optional[int] = None
 ) -> Path:
-    output_dir = ROOT_DIR / "Resultados"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     path = output_dir / _cluster_descriptive_filename(method, k)
     stats_df.to_csv(path, index=False)
     return path
 
 
 def list_cluster_summary_files() -> List[Path]:
-    output_dir = ROOT_DIR / "Resultados"
-    if not output_dir.exists():
-        return []
-    candidates = sorted(output_dir.glob("cluster_summary*.csv"))
+    candidates = _glob_clustering_results("cluster_summary*.csv")
     return [path for path in candidates if _parse_cluster_summary_file(path) is not None]
 
 
 def list_cluster_label_files() -> List[Path]:
-    output_dir = ROOT_DIR / "Resultados"
-    if not output_dir.exists():
-        return []
-    candidates = sorted(output_dir.glob("cluster_*.csv"))
+    candidates = _glob_clustering_results("cluster_*.csv")
     return [path for path in candidates if _parse_cluster_label_file(path) is not None]
 
 
@@ -3927,7 +3943,11 @@ def handle_cluster_statistics() -> None:
         return
     method, k_value = summary_info
 
-    labels_path = ROOT_DIR / "Resultados" / _cluster_label_filename(method, k_value)
+    labels_path = CLUSTERING_RESULTS_DIR / _cluster_label_filename(method, k_value)
+    if not labels_path.exists():
+        legacy_path = RESULTS_DIR / _cluster_label_filename(method, k_value)
+        if legacy_path.exists():
+            labels_path = legacy_path
     if labels_path.exists():
         clustered = pd.read_csv(labels_path)
         feature_cols = _choose_feature_columns(clustered)
@@ -4165,8 +4185,7 @@ def build_cluster_visualization_html(
 
 
 def save_cluster_visualization_html(html: str, k: int) -> Path:
-    output_dir = ROOT_DIR / "Resultados"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     path = output_dir / f"cluster_visualization_k{k}.html"
     path.write_text(html, encoding="utf-8")
     return path
@@ -4706,7 +4725,7 @@ def _clusterize_in_batches(
         print("⚠️ No se encontraron rangos para procesar.")
         return pd.DataFrame(), []
 
-    batch_dir = ROOT_DIR / "Resultados" / "cluster_batches"
+    batch_dir = _ensure_clustering_results_dir() / "cluster_batches"
     batch_dir.mkdir(parents=True, exist_ok=True)
 
     batch_conn = None
@@ -4874,7 +4893,7 @@ def _clusterize_in_batches(
             (pd.read_csv(path) for path in batch_paths),
             ignore_index=True,
         )
-    consolidated_path = ROOT_DIR / "Resultados" / "cluster_features_batches.csv"
+    consolidated_path = _ensure_clustering_results_dir() / "cluster_features_batches.csv"
     all_batches.to_csv(consolidated_path, index=False)
     batch_paths.append(consolidated_path)
 

@@ -12,6 +12,7 @@ import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
+CLUSTERING_RESULTS_DIR = RESULTS_DIR / "clustering"
 CLUSTER_LABEL_PATTERN = re.compile(
     r"^cluster_(?P<method>kmeans|gmm|hdbscan)(?:_k(?P<k>\d+))?(?:.*)?\.csv$"
 )
@@ -23,9 +24,12 @@ def load_cluster_file(path: Path) -> pd.DataFrame:
 
 
 def list_cluster_files() -> list[Path]:
-    if not RESULTS_DIR.exists():
-        return []
-    candidates = sorted(RESULTS_DIR.glob("cluster_*.csv"))
+    candidates: list[Path] = []
+    for directory in (CLUSTERING_RESULTS_DIR, RESULTS_DIR):
+        if directory.exists():
+            candidates.extend(directory.glob("cluster_*.csv"))
+    unique = {str(path.resolve()): path for path in candidates}
+    candidates = sorted(unique.values(), key=lambda path: (path.name, str(path)))
     return [path for path in candidates if CLUSTER_LABEL_PATTERN.match(path.name)]
 
 
@@ -86,7 +90,7 @@ def main() -> None:
 
     file_names = [path.name for path in files]
     selected_name = st.sidebar.selectbox("Archivo de clusters", file_names)
-    selected_path = RESULTS_DIR / selected_name
+    selected_path = next(path for path in files if path.name == selected_name)
 
     if not CLUSTER_LABEL_PATTERN.match(selected_path.name):
         st.error("El nombre del archivo no coincide con el formato esperado.")

@@ -29,7 +29,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -3487,7 +3487,12 @@ def _persist_manifest(path: Path, manifest: Dict[str, Any]) -> None:
 
 
 def _persist_recalibration_live_status(path: Path, payload: Dict[str, Any]) -> None:
-    _atomic_write_json(path, payload)
+    try:
+        _atomic_write_json(path, payload)
+    except PermissionError:
+        # Live status is diagnostic only; OneDrive/AV can briefly lock the file on
+        # Windows, and that should not abort a long experiment block.
+        return
 
 
 def _append_recalibration_live_event(path: Path, payload: Dict[str, Any]) -> None:
@@ -4238,6 +4243,33 @@ def _append_execution_log(
     for key, value in context.items():
         entry[str(key)] = _normalize_log_value(value)
     log_rows.append(entry)
+
+
+_EXECUTION_LOG_METADATA_RESERVED_KEYS = {
+    "strategy",
+    "model",
+    "base_model",
+    "detector_variant",
+    "drift",
+    "retrain_rows",
+    "retrain_positive_rows",
+    "balance_mode",
+    "study_id",
+    "run_seed",
+    "run_order",
+    "n_train",
+    "n_test",
+    "n_stream",
+    "min_retrain_size",
+}
+
+
+def _sanitize_execution_log_metadata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in dict(metadata or {}).items()
+        if str(key) not in _EXECUTION_LOG_METADATA_RESERVED_KEYS
+    }
 
 
 def _group_seed_metadata(df: pd.DataFrame, group_cols: Sequence[str]) -> pd.DataFrame:
@@ -6472,7 +6504,7 @@ def run_yearly_strategy(
                         ),
                     )
                 except ModelTrainingSkipped as exc:
-                    skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+                    skip_metadata = _sanitize_execution_log_metadata(getattr(exc, "metadata", {}) or {})
                     skip_phase = "nnet_final_refit_skipped"
                     if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
                         skip_phase = "nnet_trial_invalid"
@@ -6958,7 +6990,7 @@ def run_adaptive_strategy(
                 training_time_sec=float(fit_time),
             )
         except ModelTrainingSkipped as exc:
-            skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+            skip_metadata = _sanitize_execution_log_metadata(getattr(exc, "metadata", {}) or {})
             skip_phase = "nnet_final_refit_skipped"
             if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
                 skip_phase = "nnet_trial_invalid"
@@ -7302,7 +7334,7 @@ def run_adaptive_strategy(
                         )
                         action_taken = "retrain"
                     except ModelTrainingSkipped as exc:
-                        skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+                        skip_metadata = _sanitize_execution_log_metadata(getattr(exc, "metadata", {}) or {})
                         skip_phase = "nnet_final_refit_skipped"
                         if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
                             skip_phase = "nnet_trial_invalid"
@@ -7919,7 +7951,7 @@ def run_kswin_strategy(
                     fit_warning_count=int(bundle.get("fit_warning_count", 0)),
                 )
         except ModelTrainingSkipped as exc:
-            skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+            skip_metadata = _sanitize_execution_log_metadata(getattr(exc, "metadata", {}) or {})
             skip_phase = "nnet_final_refit_skipped"
             if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
                 skip_phase = "nnet_trial_invalid"
@@ -8414,7 +8446,7 @@ def run_kswin_strategy(
                             run_order=run_order,
                         )
                     except ModelTrainingSkipped as exc:
-                        skip_metadata = dict(getattr(exc, "metadata", {}) or {})
+                        skip_metadata = _sanitize_execution_log_metadata(getattr(exc, "metadata", {}) or {})
                         skip_phase = "nnet_final_refit_skipped"
                         if str(skip_metadata.get("reason", "")) == "no_valid_tuning_trial":
                             skip_phase = "nnet_trial_invalid"

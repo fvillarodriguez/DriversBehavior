@@ -1,0 +1,102 @@
+# Default configuration for the TRC umbrella paper pipeline.
+#
+# All paths are resolved relative to the project root (the directory that
+# contains Datos/, Resultados/, and src/). The helper paths_resolve(...) in
+# src/trc_paper/lib/io.py turns these strings into absolute paths regardless
+# of the current working directory.
+#
+# Override with --configfile src/trc_paper/config/k8_sensitivity.yaml for K=8.
+
+paths:
+  flow_db: "Datos/flujos.duckdb"
+  porticos_csv: "Datos/Porticos.csv"
+  events_db: "Datos/eventos.duckdb"
+  results_root: "Resultados/trc_paper"
+  logs_root: "Resultados/trc_paper/logs"
+
+dynamic_gmm:
+  k: 5
+  window_days: 7
+  window_step_days: 1
+  date_start: "2018-01-01"
+  date_end: "2024-09-30"
+  covariance_type: "full"
+  random_state: 42
+  confidence_threshold_proba: 0.7
+  min_window_passes: 5
+  feature_cols:
+    - avg_speed_kmh
+    - avg_relative_speed
+    - avg_headway_s
+    - conflict_rate
+    - lane_prop_1
+    - lane_prop_2
+    - lane_change_rate
+  train_params:
+    min_total_passes: 20
+    min_days_active: 1
+    min_months_active: 1
+  include_membership_probabilities: true
+  ttc_mode: "dynamic"
+  assignment_scope: "all"
+  # Checkpoint behavior: resume from disk if a compatible run exists
+  resume_existing: true
+  parallel_jobs: 4
+
+# Macroscopic entropy H_{p,τ}
+entropy:
+  delta_minutes_primary: 15
+  delta_minutes_sensitivity: [5, 60]
+  spatial_unit: "portico"              # portico | segment | both
+  include_unknown_class: true          # treat cluster_label=-1 as state "U"
+
+# Markov transition matrix
+markov:
+  step: "1W"                            # pandas offset alias
+  steps_sensitivity: ["1D", "1M"]
+  subpopulation: "frequent"             # frequent | all | stratified
+  bootstrap:
+    n_replicas: 1000
+    method: "cluster_by_plate"
+    block_length_weeks: 4               # for Politis-Romano stationary bootstrap
+  detailed_balance_test: true
+  homogeneity_test:
+    method: "chi2_robust_leskela"
+    splits:
+      - {label: "pre_covid",        start: "2018-01-01", end: "2020-03-17"}
+      - {label: "lockdown_1",       start: "2020-03-18", end: "2020-07-28"}
+      - {label: "paso_a_paso",      start: "2020-07-29", end: "2021-03-31"}
+      - {label: "lockdown_2",       start: "2021-04-01", end: "2021-12-31"}
+      - {label: "post_covid",       start: "2022-01-01", end: "2024-09-30"}
+      - {label: "year_2018",        start: "2018-01-01", end: "2018-12-31"}
+      - {label: "year_2019",        start: "2019-01-01", end: "2019-12-31"}
+      - {label: "year_2020",        start: "2020-01-01", end: "2020-12-31"}
+      - {label: "year_2021",        start: "2021-01-01", end: "2021-12-31"}
+      - {label: "year_2022",        start: "2022-01-01", end: "2022-12-31"}
+      - {label: "year_2023",        start: "2023-01-01", end: "2023-12-31"}
+      - {label: "year_2024",        start: "2024-01-01", end: "2024-09-30"}
+
+# Event matching for entropy validation
+event_matching:
+  event_types_include:
+    - "accidente"
+    - "averia_mayor"
+    - "objeto_calzada"
+  spatial_window_km: 1.0
+  temporal_window_pre_minutes: 30
+  temporal_window_post_minutes: 60
+  control_strategy: "matched_random_intervals"
+  matches_per_event: 4
+
+# Baselines and comparators
+baselines:
+  velocity_entropy_xie2024: true
+  shannon_velocity_discretized: true
+  kmeans_dynamic_same_window: true
+
+# Reporting
+output:
+  figures_dpi: 600
+  figures_format: ["pdf", "png"]
+  tables_format: ["tex", "csv"]
+  seed_for_synthetic_sample: 42

@@ -174,12 +174,14 @@ def test_trained_model_eval_final_masks_are_test_only():
 def test_eval_model_list_filters_by_loaded_graph_hash(tmp_path: Path, monkeypatch):
     graph_hash = "a" * 64
     other_hash = "b" * 64
-    matching = tmp_path / "gat_model_BEST_GNN_gat_snapshot_matching.pt"
-    other = tmp_path / "gat_model_BEST_GNN_gat_snapshot_other.pt"
+    model_dir = tmp_path / "gnn" / "models" / "gat"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    matching = model_dir / "gat_model_BEST_GNN_gat_snapshot_matching.pt"
+    other = model_dir / "gat_model_BEST_GNN_gat_snapshot_other.pt"
     legacy_name_match = (
-        tmp_path / f"gat_model_BEST_GNN_gat_snapshot_20260101_000000_{graph_hash[:8]}.pt"
+        model_dir / f"gat_model_BEST_GNN_gat_snapshot_20260101_000000_{graph_hash[:8]}.pt"
     )
-    untagged = tmp_path / "gat_model_BEST_GNN_gat_snapshot_legacy.pt"
+    untagged = model_dir / "gat_model_BEST_GNN_gat_snapshot_legacy.pt"
     for path in (matching, other, legacy_name_match, untagged):
         path.write_bytes(b"checkpoint")
 
@@ -203,7 +205,9 @@ def test_eval_model_list_filters_by_loaded_graph_hash(tmp_path: Path, monkeypatc
 
 
 def test_eval_model_list_is_empty_without_loaded_graph_hash(tmp_path: Path, monkeypatch):
-    model_path = tmp_path / "gat_model_BEST_GNN_gat_snapshot.pt"
+    model_dir = tmp_path / "gnn" / "models" / "gat"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / "gat_model_BEST_GNN_gat_snapshot.pt"
     model_path.write_bytes(b"checkpoint")
     model_path.with_name(f"{model_path.stem}_hparams.json").write_text(
         json.dumps({"graph_hash": "a" * 64}),

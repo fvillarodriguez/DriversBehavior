@@ -1,0 +1,260 @@
+"""
+Snakefile — TRC umbrella paper pipeline.
+
+Usage:
+    # From the project root (the directory that contains Datos/, Resultados/, src/):
+    snakemake --snakefile src/trc_paper/workflow/Snakefile \\
+              --configfile src/trc_paper/config/default.yaml -n
+    snakemake --snakefile src/trc_paper/workflow/Snakefile \\
+              --configfile src/trc_paper/config/default.yaml --cores 4 all
+
+Outputs go to <project_root>/Resultados/trc_paper/<sub>.
+"""
+
+from pathlib import Path
+
+# --------------------------------------------------------------------- paths
+# workflow/ is at src/trc_paper/workflow/, so project root is three parents up.
+PROJECT_ROOT = Path(workflow.basedir).parent.parent.parent.resolve()
+PACKAGE_DIR = Path(workflow.basedir).parent.resolve()    # src/trc_paper
+RESULTS = PROJECT_ROOT / config["paths"]["results_root"]
+LOGS = PROJECT_ROOT / config["paths"]["logs_root"]
+SCRIPTS = PACKAGE_DIR
+CONFIG_DEFAULT = PACKAGE_DIR / "config" / "default.yaml"
+
+K = config["dynamic_gmm"]["k"]
+RUN_TAG = f"k{K}_{config['dynamic_gmm']['date_start']}_{config['dynamic_gmm']['date_end']}"
+PYTHON = str(PROJECT_ROOT / ".venv" / "bin" / "python")
+
+# --------------------------------------------------------------------- rules
+
+rule all:
+    input:
+        RESULTS / f"validation/{RUN_TAG}_validation.json",
+        RESULTS / f"dynamic_gmm/{RUN_TAG}_assignments.duckdb",
+        RESULTS / f"entropy/{RUN_TAG}_H_portico_15min.parquet",
+        RESULTS / f"markov/{RUN_TAG}_P_global.parquet",
+        RESULTS / f"markov/{RUN_TAG}_homogeneity.json",
+        RESULTS / f"markov/{RUN_TAG}_stationary.json",
+        RESULTS / f"covid/{RUN_TAG}_decomposition.json",
+        RESULTS / f"events/{RUN_TAG}_matched_pairs.parquet",
+        RESULTS / f"integration/{RUN_TAG}_h_bound.json",
+
+
+rule validate_data:
+    """Phase 0 — verify input data integrity, coverage, port mappings."""
+    input:
+        flow_db = PROJECT_ROOT / config["paths"]["flow_db"],
+        porticos = PROJECT_ROOT / config["paths"]["porticos_csv"],
+        events = PROJECT_ROOT / config["paths"]["events_db"],
+    output:
+        report = RESULTS / f"validation/{RUN_TAG}_validation.json",
+    log:
+        LOGS / f"validate_data_{RUN_TAG}.log",
+    params:
+        date_start = config["dynamic_gmm"]["date_start"],
+        date_end = config["dynamic_gmm"]["date_end"],
+    shell:
+        """
+        {PYTHON} {SCRIPTS}/validate_data.py \
+            --flow-db {input.flow_db} \
+            --porticos-csv {input.porticos} \
+            --events-db {input.events} \
+            --date-start {params.date_start} \
+            --date-end {params.date_end} \
+            --output {output.report} \
+            2>&1 | tee {log}
+        """
+
+
+rule dynamic_assignments:
+    """Phase 0 — regenerate dynamic_assignments for the requested K and date range."""
+    input:
+        flow_db = PROJECT_ROOT / config["paths"]["flow_db"],
+        validation = RESULTS / f"validation/{RUN_TAG}_validation.json",
+    output:
+        assignments_db = RESULTS / f"dynamic_gmm/{RUN_TAG}_assignments.duckdb",
+        model_joblib = RESULTS / f"dynamic_gmm/{RUN_TAG}_model.joblib",
+        run_metadata = RESULTS / f"dynamic_gmm/{RUN_TAG}_run.json",
+    log:
+        LOGS / f"dynamic_gmm_{RUN_TAG}.log",
+    threads:
+        config["dynamic_gmm"].get("parallel_jobs", 4)
+    shell:
+        """
+        {PYTHON} {SCRIPTS}/run_dynamic_gmm.py \
+            --config {CONFIG_DEFAULT} \
+            --k {K} \
+            --output-db {output.assignments_db} \
+            --output-model {output.model_joblib} \
+            --output-metadata {output.run_metadata} \
+            --parallel-jobs {threads} \
+            2>&1 | tee {log}
+        """
+
+
+rule entropy_portico:
+    """Exp. 2 — compute H_{p,τ} at the primary discretization (15 min) by pórtico."""
+    input:
+        assignments_db = RESULTS / f"dynamic_gmm/{RUN_TAG}_assignments.duckdb",
+        flow_db = PROJECT_ROOT / config["paths"]["flow_db"],
+    output:
+        h_15min = RESULTS / f"entropy/{RUN_TAG}_H_portico_15min.parquet",
+        h_5min = RESULTS / f"entropy/{RUN_TAG}_H_portico_5min.parquet",
+        h_60min = RESULTS / f"entropy/{RUN_TAG}_H_portico_60min.parquet",
+        summary = RESULTS / f"entropy/{RUN_TAG}_H_summary.json",
+    log:
+        LOGS / f"entropy_{RUN_TAG}.log",
+    shell:
+        """
+        {PYTHON} {SCRIPTS}/compute_entropy.py \
+            --assignments-db {input.assignments_db} \
+            --flow-db {input.flow_db} \
+            --output-15min {output.h_15min} \
+            --output-5min {output.h_5min} \
+            --output-60min {output.h_60min} \
+            --output-summary {output.summary} \
+            2>&1 | tee {log}
+        """
+
+
+rule markov_matrix:
+    """Exp. 1 — estimate soft Markov transition P_{ij} at week step."""
+    input:
+        assignments_db = RESULTS / f"dynamic_gmm/{RUN_TAG}_assignments.duckdb",
+    output:
+        p_global = RESULTS / f"markov/{RUN_TAG}_P_global.parquet",
+        p_bootstrap = RESULTS / f"markov/{RUN_TAG}_P_bootstrap.parquet",
+        summary = RESULTS / f"markov/{RUN_TAG}_P_summary.json",
+    log:
+        LOGS / f"markov_{RUN_TAG}.log",
+    shell:
+        """
+        {PYTHON} {SCRIPTS}/markov_matrix.py \
+            --assignments-db {input.assignments_db} \
+            --step {config[markov][step]} \
+            --subpopulation {config[markov][subpopulation]} \
+            --bootstrap-replicas {config[markov][bootstrap][n_replicas]} \
+            --output-global {output.p_global} \
+            --output-bootstrap {output.p_bootstrap} \
+            --output-summary {output.summary} \
+            2>&1 | tee {log}
+        """
+
+
+rule homogeneity_test:
+    """Exp. 1 — test temporal homogeneity of P across splits."""
+    input:
+        assignments_db = RESULTS / f"dynamic_gmm/{RUN_TAG}_assignments.duckdb",
+        p_global = RESULTS / f"markov/{RUN_TAG}_P_global.parquet",
+    output:
+        result = RESULTS / f"markov/{RUN_TAG}_homogeneity.json",
+        p_per_split = RESULTS / f"markov/{RUN_TAG}_P_per_split.parquet",
+    log:
+        LOGS / f"homogeneity_{RUN_TAG}.log",
+    shell:
+        """
+        {PYTHON} {SCRIPTS}/homogeneity_test.py \
+            --assignments-db {input.assignments_db} \
+            --p-global {input.p_global} \
+            --output-result {output.result} \
+            --output-p-per-split {output.p_per_split} \
+            --config {CONFIG_DEFAULT} \
+            2>&1 | tee {log}
+        """
+
+
+rule stationary_asymmetry:
+    """Exp. 1 — stationary distribution π and Kolmogorov detailed-balance test."""
+    input:
+        p_global = RESULTS / f"markov/{RUN_TAG}_P_global.parquet",
+    output:
+        result = RESULTS / f"markov/{RUN_TAG}_stationary.json",
+        figure_data = RESULTS / f"markov/{RUN_TAG}_asymmetry_pairs.parquet",
+    log:
+        LOGS / f"stationary_{RUN_TAG}.log",
+    shell:
+        """
+        {PYTHON} {SCRIPTS}/stationary_asymmetry.py \
+            --p-global {input.p_global} \
+            --output-result {output.result} \
+            --output-pairs {output.figure_data} \
+            2>&1 | tee {log}
+        """
+
+
+rule covid_decomposition:
+    """Exp. 1+3 — decompose P across pre/lockdown/post phases."""
+    input:
+        p_per_split = RESULTS / f"markov/{RUN_TAG}_P_per_split.parquet",
+        h_15min = RESULTS / f"entropy/{RUN_TAG}_H_portico_15min.parquet",
+    output:
+        result = RESULTS / f"covid/{RUN_TAG}_decomposition.json",
+        timeline = RESULTS / f"covid/{RUN_TAG}_share_timeline.parquet",
+    log:
+        LOGS / f"covid_{RUN_TAG}.log",
+    shell:
+        """
+        {PYTHON} {SCRIPTS}/covid_decomposition.py \
+            --p-per-split {input.p_per_split} \
+            --h-15min {input.h_15min} \
+            --output-result {output.result} \
+            --output-timeline {output.timeline} \
+            --config {CONFIG_DEFAULT} \
+            2>&1 | tee {log}
+        """
+
+
+rule event_matching:
+    """Exp. 2 — match entropy fluctuations against operational events."""
+    input:
+        h_15min = RESULTS / f"entropy/{RUN_TAG}_H_portico_15min.parquet",
+        events_db = PROJECT_ROOT / config["paths"]["events_db"],
+        porticos = PROJECT_ROOT / config["paths"]["porticos_csv"],
+    output:
+        matched = RESULTS / f"events/{RUN_TAG}_matched_pairs.parquet",
+        summary = RESULTS / f"events/{RUN_TAG}_event_summary.json",
+    log:
+        LOGS / f"events_{RUN_TAG}.log",
+    shell:
+        """
+        {PYTHON} {SCRIPTS}/event_matching.py \
+            --h-15min {input.h_15min} \
+            --events-db {input.events_db} \
+            --porticos-csv {input.porticos} \
+            --output-matched {output.matched} \
+            --output-summary {output.summary} \
+            --config {CONFIG_DEFAULT} \
+            2>&1 | tee {log}
+        """
+
+
+rule integration_h_bound:
+    """Phase 3 — verify the H-bound theorem relating entropy of π to mean H_{p,τ}."""
+    input:
+        stationary = RESULTS / f"markov/{RUN_TAG}_stationary.json",
+        h_15min = RESULTS / f"entropy/{RUN_TAG}_H_portico_15min.parquet",
+        homogeneity = RESULTS / f"markov/{RUN_TAG}_homogeneity.json",
+    output:
+        result = RESULTS / f"integration/{RUN_TAG}_h_bound.json",
+        crosstab = RESULTS / f"integration/{RUN_TAG}_crosstab.parquet",
+    log:
+        LOGS / f"integration_{RUN_TAG}.log",
+    shell:
+        """
+        {PYTHON} {SCRIPTS}/integration_h_bound.py \
+            --stationary {input.stationary} \
+            --h-15min {input.h_15min} \
+            --homogeneity {input.homogeneity} \
+            --output-result {output.result} \
+            --output-crosstab {output.crosstab} \
+            2>&1 | tee {log}
+        """
+
+
+# --------------------------------------------------------------- conveniences
+
+rule clean:
+    """Remove all generated outputs (use with care)."""
+    shell:
+        "rm -rf {RESULTS} {LOGS}"

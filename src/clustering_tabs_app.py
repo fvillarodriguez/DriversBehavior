@@ -20,6 +20,7 @@ import streamlit as st
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT_DIR / "src"
 RESULTS_DIR = ROOT_DIR / "Resultados"
+CLUSTERING_RESULTS_DIR = RESULTS_DIR / "clustering"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 if str(ROOT_DIR) not in sys.path:
@@ -81,8 +82,8 @@ REQUIRED_FEATURE_COLS = {
     "lane_prop_2",
     "lane_change_rate",
 }
-RUN_LOG_PATH = RESULTS_DIR / "cluster_run_log.jsonl"
-COLOR_MAP_PATH = RESULTS_DIR / "cluster_color_map.csv"
+RUN_LOG_PATH = CLUSTERING_RESULTS_DIR / "cluster_run_log.jsonl"
+COLOR_MAP_PATH = CLUSTERING_RESULTS_DIR / "cluster_color_map.csv"
 DYNAMIC_GMM_PLATE_PAGE_SIZE = 10
 CLUSTER_LABEL_PATTERN = re.compile(
     r"^cluster_(?P<method>kmeans|gmm|hdbscan)(?:_k(?P<k>\d+))?(?:.*)?\.csv$"
@@ -172,6 +173,36 @@ FEATURE_DETAILS = {
         ("n_years_active", "Numero de años calendario distintos con actividad para la patente."),
     ],
 }
+
+
+def _clustering_result_dirs() -> list[Path]:
+    dirs = [CLUSTERING_RESULTS_DIR, RESULTS_DIR]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in dirs:
+        key = str(path)
+        if key not in seen:
+            unique.append(path)
+            seen.add(key)
+    return unique
+
+
+def _ensure_clustering_results_dir() -> Path:
+    CLUSTERING_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    return CLUSTERING_RESULTS_DIR
+
+
+def _glob_clustering_results(pattern: str) -> list[Path]:
+    files: list[Path] = []
+    for directory in _clustering_result_dirs():
+        if directory.exists():
+            files.extend(directory.glob(pattern))
+    unique = {str(path.resolve()): path for path in files}
+    return sorted(unique.values(), key=lambda path: (path.name, str(path)))
+
+
+def _find_named_path(paths: list[Path], name: str) -> Path:
+    return next(path for path in paths if path.name == name)
 
 
 class StreamlitProgress:
@@ -485,9 +516,9 @@ def _save_metrics_snapshot(
     k_min: int,
     k_max: int,
 ) -> Path:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = RESULTS_DIR / f"cluster_metrics_{method}_k{k_min}-{k_max}_{stamp}.csv"
+    path = output_dir / f"cluster_metrics_{method}_k{k_min}-{k_max}_{stamp}.csv"
     metrics_df.to_csv(path, index=False)
     return path
 
@@ -495,10 +526,10 @@ def _save_metrics_snapshot(
 def _save_gmm_comparison_metrics(
     metrics_df: pd.DataFrame, ks: list[int]
 ) -> Path:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     ks_label = "-".join(str(k) for k in ks)
-    path = RESULTS_DIR / f"cluster_metrics_gmm_compare_k{ks_label}_{stamp}.csv"
+    path = output_dir / f"cluster_metrics_gmm_compare_k{ks_label}_{stamp}.csv"
     metrics_df.to_csv(path, index=False)
     return path
 
@@ -517,10 +548,10 @@ def _save_gmm_comparison_quality(
     if not rows:
         return None
     combined = pd.concat(rows, ignore_index=True)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     ks_label = "-".join(str(k) for k in ks)
-    path = RESULTS_DIR / f"cluster_quality_gmm_compare_k{ks_label}_{stamp}.csv"
+    path = output_dir / f"cluster_quality_gmm_compare_k{ks_label}_{stamp}.csv"
     combined.to_csv(path, index=False)
     return path
 
@@ -532,9 +563,9 @@ def _save_k_optimo_results(
     k_max: int,
     k_step: int,
 ) -> Path:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_clustering_results_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = RESULTS_DIR / (
+    path = output_dir / (
         f"cluster_k_optimo_{method}_k{k_min}-{k_max}_s{k_step}_{stamp}.csv"
     )
     results_df.to_csv(path, index=False)
@@ -960,7 +991,7 @@ def _render_feature_loader() -> Optional[pd.DataFrame]:
         names = [path.name for path in db_paths]
         selected = st.selectbox("Archivo de variables", names)
         if st.button("Cargar variables"):
-            path = RESULTS_DIR / selected
+            path = _find_named_path(db_paths, selected)
             try:
                 df, feature_config = load_cluster_feature_bundle_duckdb(path)
             except ImportError as exc:
@@ -1965,7 +1996,7 @@ def _render_dynamic_gmm_controls(
             else:
                 st.caption(f"Destino de resultados: {dynamic_output_dir} (se creara)")
         else:
-            st.caption(f"Destino de resultados: {RESULTS_DIR}")
+            st.caption(f"Destino de resultados: {CLUSTERING_RESULTS_DIR}")
 
         db_paths = (
             list_dynamic_gmm_db_paths(output_dir=dynamic_output_dir)
@@ -3252,9 +3283,7 @@ def _explorer_load_features(path: Path) -> pd.DataFrame:
 
 
 def _explorer_list_feature_dbs() -> list[Path]:
-    if not RESULTS_DIR.exists():
-        return []
-    return sorted(RESULTS_DIR.glob("cluster_features*.duckdb"))
+    return _glob_clustering_results("cluster_features*.duckdb")
 
 
 def _render_feature_explorer_tab() -> None:
@@ -3270,7 +3299,7 @@ def _render_feature_explorer_tab() -> None:
     selected_name = st.selectbox(
         "Archivos de variables", file_names, key="feature_explorer_file"
     )
-    selected_path = RESULTS_DIR / selected_name
+    selected_path = _find_named_path(db_paths, selected_name)
  
     try:
         df = _explorer_load_features(selected_path)
@@ -3383,9 +3412,7 @@ def _viz_load_cluster_file(path: Path) -> pd.DataFrame:
 
 
 def _viz_list_cluster_files() -> list[Path]:
-    if not RESULTS_DIR.exists():
-        return []
-    candidates = sorted(RESULTS_DIR.glob("cluster_*.csv"))
+    candidates = _glob_clustering_results("cluster_*.csv")
     return [path for path in candidates if CLUSTER_LABEL_PATTERN.match(path.name)]
 
 
@@ -3508,7 +3535,7 @@ def _render_cluster_visualization_tab() -> None:
     selected_name = st.selectbox(
         "Archivos de clusters", file_names, key="cluster_viz_file"
     )
-    selected_path = RESULTS_DIR / selected_name
+    selected_path = _find_named_path(files, selected_name)
 
     if not CLUSTER_LABEL_PATTERN.match(selected_path.name):
         st.error("El nombre del archivo no coincide con el formato esperado.")
@@ -3722,9 +3749,7 @@ def _render_cluster_visualization_tab() -> None:
 
 
 def _char_list_summary_files() -> list[Path]:
-    if not RESULTS_DIR.exists():
-        return []
-    candidates = sorted(RESULTS_DIR.glob("cluster_summary*.csv"))
+    candidates = _glob_clustering_results("cluster_summary*.csv")
     return [path for path in candidates if SUMMARY_PATTERN.match(path.name)]
 
 
@@ -4046,9 +4071,7 @@ def _render_gmm_comparison_loader() -> None:
         feature_file = selected_entry.get("feature_file")
         rows_used = selected_entry.get("rows")
     else:
-        metrics_files = sorted(
-            RESULTS_DIR.glob("cluster_metrics_gmm_compare_*.csv")
-        )
+        metrics_files = _glob_clustering_results("cluster_metrics_gmm_compare_*.csv")
         if not metrics_files:
             st.info("No hay comparaciones guardadas para cargar.")
             return
@@ -4058,10 +4081,8 @@ def _render_gmm_comparison_loader() -> None:
             metrics_names,
             key="char_gmm_saved_metrics",
         )
-        metrics_path = str(RESULTS_DIR / selected_metrics)
-        quality_files = sorted(
-            RESULTS_DIR.glob("cluster_quality_gmm_compare_*.csv")
-        )
+        metrics_path = str(_find_named_path(metrics_files, selected_metrics))
+        quality_files = _glob_clustering_results("cluster_quality_gmm_compare_*.csv")
         if quality_files:
             quality_names = [path.name for path in quality_files]
             selected_quality = st.selectbox(
@@ -4070,7 +4091,7 @@ def _render_gmm_comparison_loader() -> None:
                 key="char_gmm_saved_quality",
             )
             if selected_quality != "(ninguno)":
-                quality_path = str(RESULTS_DIR / selected_quality)
+                quality_path = str(_find_named_path(quality_files, selected_quality))
 
     if not metrics_path:
         st.warning("No se encontro el archivo de metricas.")
@@ -4186,7 +4207,7 @@ def _render_gmm_comparison_section() -> None:
         file_names,
         key="char_gmm_feature_file",
     )
-    source_path = RESULTS_DIR / selected_name
+    source_path = _find_named_path(db_paths, selected_name)
     try:
         features_df = _explorer_load_features(source_path)
     except ImportError as exc:
@@ -4766,7 +4787,7 @@ def _render_cluster_characterization_summary() -> None:
         file_names,
         key="cluster_char_summary_file",
     )
-    selected_path = RESULTS_DIR / selected_name
+    selected_path = _find_named_path(summary_files, selected_name)
 
     try:
         summary_df = pd.read_csv(selected_path)
@@ -5013,7 +5034,14 @@ def _render_cluster_characterization_summary() -> None:
 
     descriptive_name = _char_descriptive_filename(method, k_value)
     if descriptive_name:
-        descriptive_path = RESULTS_DIR / descriptive_name
+        descriptive_path = next(
+            (
+                path
+                for path in _glob_clustering_results(descriptive_name)
+                if path.name == descriptive_name
+            ),
+            CLUSTERING_RESULTS_DIR / descriptive_name,
+        )
         if descriptive_path.exists():
             with st.expander("Estadistica descriptiva", expanded=False):
                 try:

@@ -12,6 +12,7 @@ import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT_DIR / "Resultados"
+CLUSTERING_RESULTS_DIR = RESULTS_DIR / "clustering"
 TABLE_NAME = "cluster_features"
 
 
@@ -37,9 +38,12 @@ def load_features(path: Path) -> pd.DataFrame:
 
 
 def list_feature_dbs() -> list[Path]:
-    if not RESULTS_DIR.exists():
-        return []
-    return sorted(RESULTS_DIR.glob("cluster_features*.duckdb"))
+    files: list[Path] = []
+    for directory in (CLUSTERING_RESULTS_DIR, RESULTS_DIR):
+        if directory.exists():
+            files.extend(directory.glob("cluster_features*.duckdb"))
+    unique = {str(path.resolve()): path for path in files}
+    return sorted(unique.values(), key=lambda path: (path.name, str(path)))
 
 
 def main() -> None:
@@ -57,7 +61,7 @@ def main() -> None:
 
     file_names = [path.name for path in db_paths]
     selected_name = st.sidebar.selectbox("Archivo de variables", file_names)
-    selected_path = RESULTS_DIR / selected_name
+    selected_path = next(path for path in db_paths if path.name == selected_name)
 
     try:
         df = load_features(selected_path)

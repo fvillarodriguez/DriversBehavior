@@ -1,0 +1,11 @@
+# Sensitivity configuration: K=8 cluster count.
+# Inherits structure from default.yaml — override only the differing fields by
+# loading both with
+# `--configfile src/trc_paper/config/default.yaml --configfile src/trc_paper/config/k8_sensitivity.yaml`.
+
+dynamic_gmm:
+  k: 8
+
+paths:
+  results_root: "Resultados/trc_paper_k8"
+  logs_root: "Resultados/trc_paper_k8/logs"

@@ -397,7 +397,9 @@ def _write_fast_hparams(tmp_path, *, checkpoint_metric=None):
     if checkpoint_metric is not None:
         row["checkpoint_metric"] = checkpoint_metric
 
-    hp_path = tmp_path / "optuna_hyperparams_Base.csv"
+    hp_dir = tmp_path / "gnn" / "hpo" / "optuna"
+    hp_dir.mkdir(parents=True, exist_ok=True)
+    hp_path = hp_dir / "optuna_hyperparams_Base.csv"
     pd.DataFrame([row]).to_csv(hp_path, index=False)
     return hp_path
 
@@ -541,7 +543,7 @@ def test_run_gat_training_defaults_to_objective_for_best_checkpoint(tmp_path, mo
     assert epoch_events[-1]["best_monitor_value"] == pytest.approx(1.0)
     assert epoch_events[-1]["patience_counter"] == 2
 
-    hparams_files = sorted(tmp_path.glob("gat_model_BEST*_hparams.json"))
+    hparams_files = sorted((tmp_path / "gnn" / "models" / "gat").glob("gat_model_BEST*_hparams.json"))
     assert hparams_files
     meta = json.loads(hparams_files[-1].read_text(encoding="utf-8"))
     assert meta["monitor_metric"] == "val_objective_score"
@@ -590,7 +592,7 @@ def test_run_gat_training_can_fallback_to_val_loss_monitor(tmp_path, monkeypatch
     assert epoch_events[-1]["best_val_loss"] == pytest.approx(0.80)
     assert epoch_events[-1]["best_monitor_value"] == pytest.approx(0.80)
 
-    hparams_files = sorted(tmp_path.glob("gat_model_BEST*_hparams.json"))
+    hparams_files = sorted((tmp_path / "gnn" / "models" / "gat").glob("gat_model_BEST*_hparams.json"))
     assert hparams_files
     meta = json.loads(hparams_files[-1].read_text(encoding="utf-8"))
     assert meta["monitor_metric"] == "val_loss"
@@ -639,7 +641,7 @@ def test_run_gat_training_honors_explicit_ranking_loss_overrides(tmp_path, monke
     assert train_kwargs["ranking_loss_max_pairs"] == 2048
     assert progress_events[-1]["train_ranking_loss"] == pytest.approx(0.123)
 
-    hparams_files = sorted(tmp_path.glob("gat_model_BEST*_hparams.json"))
+    hparams_files = sorted((tmp_path / "gnn" / "models" / "gat").glob("gat_model_BEST*_hparams.json"))
     assert hparams_files
     meta = json.loads(hparams_files[-1].read_text(encoding="utf-8"))
     assert meta["ranking_loss_mode"] == "pairwise_softplus"

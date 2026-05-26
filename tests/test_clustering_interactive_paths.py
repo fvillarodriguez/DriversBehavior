@@ -223,3 +223,33 @@ def test_handle_clusterization_hdbscan_unpacks_scaled_features(monkeypatch, tmp_
     assert captured["method"] == "hdbscan"
     assert captured["k"] is None
     assert captured["clustered"]["cluster_label"].tolist() == [0, -1, 1, 1]
+
+
+def test_clustering_outputs_use_subfolder_and_list_legacy(monkeypatch, tmp_path):
+    results_dir = tmp_path / "Resultados"
+    clustering_dir = results_dir / "clustering"
+    monkeypatch.setattr(clustering, "RESULTS_DIR", results_dir)
+    monkeypatch.setattr(clustering, "CLUSTERING_RESULTS_DIR", clustering_dir)
+    monkeypatch.setattr(
+        clustering,
+        "CLUSTER_DB_PATH",
+        clustering_dir / "cluster_features.duckdb",
+    )
+
+    legacy = results_dir / "cluster_features_legacy.duckdb"
+    current = clustering_dir / "cluster_features_current.duckdb"
+    legacy.parent.mkdir(parents=True)
+    current.parent.mkdir(parents=True)
+    legacy.touch()
+    current.touch()
+
+    saved = clustering.save_cluster_summary(
+        pd.DataFrame({"cluster_label": [0], "cluster_size": [1]}),
+        "gmm",
+        5,
+    )
+
+    assert saved.parent == clustering_dir
+    assert saved.name == "cluster_summary_gmm_k5.csv"
+    assert legacy in clustering.list_cluster_feature_db_paths()
+    assert current in clustering.list_cluster_feature_db_paths()

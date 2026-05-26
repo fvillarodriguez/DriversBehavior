@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# tensorboard --logdir=Resultados/runs_attention
+# tensorboard --logdir=Resultados/gnn/training/tensorboard
 import os, math, glob, gc, sys, time, uuid
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1' # --- FIX for MPS Fallback ---
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", # Asignador seguro de CUDA
@@ -53,6 +53,7 @@ from src.gnn_rl_sampler import (
     pretrain_label_aware_similarity,
     relation_max_degrees,
 )
+from src.gnn_artifacts import gnn_dir, gnn_glob, gnn_path, resolve_gnn_artifact
 from src.gat_model import HeteroGAT, HeteroGATWithEdgeEncoder, HeteroEdgeAware
 from src.temporal_head import TemporalAggregator
 from src.temporal_heads import TemporalGRUHead, TemporalTransformerHead, TemporalAttnPoolHead
@@ -697,13 +698,13 @@ def _find_best_model_path(
     if want_variant is None and isinstance(best_params, dict):
         want_variant = best_params.get("gnn_variant")
     tag = _model_tag_suffix(use_graphsmote, loaded_obj, gnn_variant=want_variant)
-    exact = os.path.join(RESULTADOS_DIR, f"gat_model_BEST{tag}.pt")
+    exact = str(gnn_path("models_gat", f"gat_model_BEST{tag}.pt", resultados_dir=RESULTADOS_DIR))
     if os.path.exists(exact):
         return exact
     # Fallback: filter among any BEST files
-    files = sorted(glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")), key=os.path.getmtime)
+    files = gnn_glob("models_gat", "gat_model_BEST*.pt", RESULTADOS_DIR, sort_mtime=True)
     if not files:
-        base = os.path.join(RESULTADOS_DIR, "gat_model_BEST.pt")
+        base = str(gnn_path("models_gat", "gat_model_BEST.pt", resultados_dir=RESULTADOS_DIR))
         return base if os.path.exists(base) else None
     preferred = []
     want_variant_component = _gnn_variant_tag_component(want_variant)
@@ -789,7 +790,7 @@ def _infer_arch_from_state_dict(sd: dict) -> dict:
     }
 
 def _gather_gat_models_listing() -> list[dict]:
-    files = sorted(glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")), key=os.path.getmtime)
+    files = gnn_glob("models_gat", "gat_model_BEST*.pt", RESULTADOS_DIR, sort_mtime=True)
     # Deduplicar: si existe una versión única con timestamp/hash, ocultar alias sin timestamp
     # Ej.: gat_model_BEST_GraphSMOTE_YYYYmmdd_HHMMSS_abcd1234.pt → oculta gat_model_BEST_GraphSMOTE.pt
     import re
@@ -2173,13 +2174,12 @@ def _archive_legacy_gnn_anomaly_files(keep: int = 3):
     This avoids clutter and 'gradual removal' of legacy outputs without deleting them.
     """
     try:
-        os.makedirs(RESULTADOS_DIR, exist_ok=True)
-        legacy_dir = os.path.join(RESULTADOS_DIR, 'legacy')
+        legacy_dir = str(gnn_dir("legacy", RESULTADOS_DIR, create=True))
         os.makedirs(legacy_dir, exist_ok=True)
 
         patterns = [
-            os.path.join(RESULTADOS_DIR, 'results_gnn_anomaly_*.csv'),
-            os.path.join(RESULTADOS_DIR, 'preds_gnn_anomaly_*.csv'),
+            str(gnn_path("evaluation", "results_gnn_anomaly_*.csv", resultados_dir=RESULTADOS_DIR)),
+            str(gnn_path("evaluation", "preds_gnn_anomaly_*.csv", resultados_dir=RESULTADOS_DIR)),
         ]
         for pat in patterns:
             files = sorted(glob.glob(pat), key=os.path.getmtime, reverse=True)
@@ -2212,9 +2212,10 @@ def run_gnn_anomaly_pipeline(
     anomalías.
     """
     # Detección automática de variante GraphSMOTE según modelos disponibles
-    model_candidates = sorted(glob.glob(os.path.join(RESULTADOS_DIR, "gat_model_BEST*.pt")), key=os.path.getmtime)
-    if not model_candidates and os.path.exists(os.path.join(RESULTADOS_DIR, "gat_model_BEST.pt")):
-        model_candidates = [os.path.join(RESULTADOS_DIR, "gat_model_BEST.pt")]
+    model_candidates = gnn_glob("models_gat", "gat_model_BEST*.pt", RESULTADOS_DIR, sort_mtime=True)
+    global_best = str(gnn_path("models_gat", "gat_model_BEST.pt", resultados_dir=RESULTADOS_DIR))
+    if not model_candidates and os.path.exists(global_best):
+        model_candidates = [global_best]
     if model_candidates:
         latest = os.path.basename(model_candidates[-1])
         use_graphsmote = ("_GraphSMOTE" in latest)
@@ -2370,7 +2371,7 @@ def run_gnn_anomaly_pipeline(
     tag_suffix = ("_" + "_".join(tag_parts)) if tag_parts else ""
     # Prefijo adicional más claro para usuarios (reporte GAT)
     report_prefix = "gat_report"
-    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    gnn_dir("evaluation", RESULTADOS_DIR, create=True)
     unified = []
 
     def export_split(split_key: str, label: str):
@@ -2403,17 +2404,17 @@ def run_gnn_anomaly_pipeline(
         out_df = pd.DataFrame({'portico': porticos, 'ts_min': tsmins, 'y_true': ytrue, 'prob1': probs, 'y_pred': ypred})
         out_df['split'] = label
         # Exportar con nombre más claro (gat_report_*)
-        out_path = os.path.join(RESULTADOS_DIR, f"preds_{report_prefix}_{label}{tag_suffix}_{ts_stamp}.csv")
+        out_path = str(gnn_path("evaluation", f"preds_{report_prefix}_{label}{tag_suffix}_{ts_stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
         try:
             out_df.to_csv(out_path, index=False)
         except Exception:
             # Fallback a legacy si falla por cualquier motivo
-            out_path = os.path.join(RESULTADOS_DIR, f"preds_gnn_anomaly_{label}{tag_suffix}_{ts_stamp}.csv")
+            out_path = str(gnn_path("evaluation", f"preds_gnn_anomaly_{label}{tag_suffix}_{ts_stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
             out_df.to_csv(out_path, index=False)
         # Opcional: compatibilidad histórica (gnn_anomaly_*) que duplica archivos
         if EXPORT_LEGACY_GAT_CSV:
             try:
-                out_path_legacy = os.path.join(RESULTADOS_DIR, f"preds_gnn_anomaly_{label}{tag_suffix}_{ts_stamp}.csv")
+                out_path_legacy = str(gnn_path("evaluation", f"preds_gnn_anomaly_{label}{tag_suffix}_{ts_stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
                 if os.path.abspath(out_path_legacy) != os.path.abspath(out_path):
                     out_df.to_csv(out_path_legacy, index=False)
             except Exception:
@@ -2438,16 +2439,16 @@ def run_gnn_anomaly_pipeline(
     export_split('test_mask', 'test')
 
     # Guardar resultados unificados
-    res_path = os.path.join(RESULTADOS_DIR, f"results_{report_prefix}{tag_suffix}_{ts_stamp}.csv")
+    res_path = str(gnn_path("evaluation", f"results_{report_prefix}{tag_suffix}_{ts_stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
     try:
         pd.DataFrame(unified).to_csv(res_path, index=False)
     except Exception:
-        res_path = os.path.join(RESULTADOS_DIR, f"results_gnn_anomaly{tag_suffix}_{ts_stamp}.csv")
+        res_path = str(gnn_path("evaluation", f"results_gnn_anomaly{tag_suffix}_{ts_stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
         pd.DataFrame(unified).to_csv(res_path, index=False)
     # Opcional: también escribir con prefijo legacy (duplica archivos)
     if EXPORT_LEGACY_GAT_CSV:
         try:
-            res_path_legacy = os.path.join(RESULTADOS_DIR, f"results_gnn_anomaly{tag_suffix}_{ts_stamp}.csv")
+            res_path_legacy = str(gnn_path("evaluation", f"results_gnn_anomaly{tag_suffix}_{ts_stamp}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
             if os.path.abspath(res_path_legacy) != os.path.abspath(res_path):
                 pd.DataFrame(unified).to_csv(res_path_legacy, index=False)
         except Exception:
@@ -2502,8 +2503,10 @@ def run_gnn_anomaly_hpo_then_train(loaded_obj, use_graphsmote: Optional[bool] = 
 # --------------------------------------------------------------------------- #
 # SETUP LOGGING
 # --------------------------------------------------------------------------- #
-def setup_logging(log_dir=os.path.join(RESULTADOS_DIR,"logs")):
+def setup_logging(log_dir=None):
     """Configura el logging para guardar en archivo y mostrar en consola."""
+    if log_dir is None:
+        log_dir = str(gnn_path("root", "logs", resultados_dir=RESULTADOS_DIR, create_parent=True))
     logger = logging.getLogger()
     if logger.hasHandlers():
         return logger
@@ -3495,9 +3498,21 @@ def _calculate_graph_hash(graph_filename=None, graph_path=None):
     if graph_filename:
         candidates.append(graph_filename)
         base_name = os.path.basename(graph_filename)
-        candidates.append(os.path.join(RESULTADOS_DIR, base_name))
+        resolved = resolve_gnn_artifact(
+            base_name,
+            RESULTADOS_DIR,
+            ("graphs_base", "graphs_graphsmote", "graphs_imgagn"),
+        )
+        if resolved is not None:
+            candidates.append(str(resolved))
         if graph_filename != base_name:
-            candidates.append(os.path.join(RESULTADOS_DIR, graph_filename))
+            resolved = resolve_gnn_artifact(
+                graph_filename,
+                RESULTADOS_DIR,
+                ("graphs_base", "graphs_graphsmote", "graphs_imgagn"),
+            )
+            if resolved is not None:
+                candidates.append(str(resolved))
 
     resolved_path = None
     for cand in candidates:
@@ -3780,7 +3795,7 @@ def run_gat_training(
         logger.info(f"Propósito de entrenamiento: {purpose}")
 
     # 2) Selección o búsqueda de hiperparámetros
-    all_hp_files = sorted(glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv")), key=os.path.getmtime)
+    all_hp_files = gnn_glob("hpo_optuna", "optuna_hyperparams_*.csv", RESULTADOS_DIR, sort_mtime=True)
 
     # Filtrar por GraphSMOTE e ImGAGN (preferencias) y ordenar por coincidencia + fecha
     want_imgagn = _has_imgagn(loaded_obj)
@@ -4202,7 +4217,10 @@ def run_gat_training(
     # 3) SummaryWriter + hparams
     writer = None
     if SummaryWriter is not None:
-        writer = SummaryWriter(log_dir=os.path.join(RESULTADOS_DIR, "runs_attention"), flush_secs=30)
+        writer = SummaryWriter(
+            log_dir=str(gnn_dir("training_tensorboard", RESULTADOS_DIR, create=True)),
+            flush_secs=30,
+        )
     else:
         logger.warning("TensorBoard no esta instalado; se omite SummaryWriter.")
     hparam_payload = {}
@@ -4273,22 +4291,28 @@ def run_gat_training(
         base_prefix = "GraphSMOTE_embeddings_model"
         # Clean tag_suffix to avoid double "GraphSMOTE" if we want, or just append. 
         # Simpler: just use the requested prefix + timestamp/hash.
-        best_model_path = os.path.join(RESULTADOS_DIR, f"{base_prefix}.pt")
-        best_model_path_unique = os.path.join(
-            RESULTADOS_DIR,
+        best_model_path = str(gnn_path("models_graphsmote", f"{base_prefix}.pt", resultados_dir=RESULTADOS_DIR, create_parent=True))
+        best_model_path_unique = str(gnn_path(
+            "models_graphsmote",
             f"{base_prefix}_{ts_stamp_save}{hash_tag8}.pt",
-        )
+            resultados_dir=RESULTADOS_DIR,
+            create_parent=True,
+        ))
     else:
-        best_model_path = os.path.join(RESULTADOS_DIR, f"gat_model_BEST{tag_suffix}.pt")
-        best_model_path_unique = os.path.join(
-            RESULTADOS_DIR,
+        best_model_path = str(gnn_path("models_gat", f"gat_model_BEST{tag_suffix}.pt", resultados_dir=RESULTADOS_DIR, create_parent=True))
+        best_model_path_unique = str(gnn_path(
+            "models_gat",
             f"gat_model_BEST{tag_suffix}_{ts_stamp_save}{hash_tag8}.pt",
-        )
-    z2x_run_dir = os.path.join(
-        RESULTADOS_DIR,
+            resultados_dir=RESULTADOS_DIR,
+            create_parent=True,
+        ))
+    z2x_run_dir = str(gnn_path(
+        "models_graphsmote",
         "z2x_decoders",
         os.path.splitext(os.path.basename(best_model_path_unique))[0],
-    )
+        resultados_dir=RESULTADOS_DIR,
+        create_parent=True,
+    ))
 
     # --- Pre-entrenamiento de decodificadores si se usa GraphSMOTE ---
     z2x_decoders = None
@@ -4516,7 +4540,7 @@ def run_gat_training(
                 target_pos_ratio=target_pos_ratio_override,
                 k=GRAPHSMOTE_K,
                 edge_gen=edge_gen,
-                save_path=SAVE_AUG_GRAPH_PATH,
+                save_path=str(gnn_path("graphs_graphsmote", "graph_aug.pt", resultados_dir=RESULTADOS_DIR, create_parent=True)),
                 seed=GS_SEED,
                 num_neighbors=smote_num_neighbors,
                 edge_attr_decoder=edge_attr_decoder,
@@ -5442,7 +5466,7 @@ def run_gat_training(
                     # Alias actualizado (último mejor para variante)
                     torch.save(model.state_dict(), best_model_path)
                     # Alias global (independiente de variante)
-                    best_model_global = os.path.join(RESULTADOS_DIR, "gat_model_BEST.pt")
+                    best_model_global = str(gnn_path("models_gat", "gat_model_BEST.pt", resultados_dir=RESULTADOS_DIR, create_parent=True))
                     torch.save(model.state_dict(), best_model_global)
             except Exception as e:
                 logger.error(f"No se pudo guardar el modelo en disco: {e}")
@@ -5524,7 +5548,7 @@ def run_gat_training(
                         pass
                     # Sidecar para alias global
                     try:
-                        meta_path_global = os.path.join(RESULTADOS_DIR, "gat_model_BEST_hparams.json")
+                        meta_path_global = str(gnn_path("models_gat", "gat_model_BEST_hparams.json", resultados_dir=RESULTADOS_DIR, create_parent=True))
                         with open(meta_path_global, 'w') as f:
                             _json.dump(meta, f)
                     except Exception:
@@ -6343,8 +6367,13 @@ def search_hyperparameters(
 
     if graph_hash:
         # Buscar todos los HPO del mismo grafo y luego filtrar por variante
-        pattern_any = os.path.join(RESULTADOS_DIR, f"optuna_hyperparams_*{graph_hash[:16]}*.csv")
-        candidates = sorted(glob.glob(pattern_any), key=os.path.getmtime, reverse=True)
+        candidates = gnn_glob(
+            "hpo_optuna",
+            f"optuna_hyperparams_*{graph_hash[:16]}*.csv",
+            RESULTADOS_DIR,
+            sort_mtime=True,
+            reverse=True,
+        )
         if candidates:
             # Filtrar por SMOTE y por ImGAGN si aplica; preferir coincidencias exactas de variante
             want_smote = bool(use_graphsmote_search)
@@ -6403,14 +6432,14 @@ def search_hyperparameters(
     sampler = optuna.samplers.TPESampler(seed=SEED, multivariate=True, group=True)
     pruner  = optuna.pruners.HyperbandPruner(min_resource=3, max_resource=NUM_EPOCHS_OPTUNA, reduction_factor=3)
 
-    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    gnn_dir("hpo_optuna", RESULTADOS_DIR, create=True)
     study_base = "gnn_optuna_main"
     if graph_hash:
         study_base = f"{study_base}_{graph_hash[:16]}"
     variant_tag = _variant_tags(use_graphsmote_search, loaded_obj, gnn_variant=GNN_VARIANT)
     study_base = f"{study_base}{variant_tag}"
     study_name = re.sub(r"[^A-Za-z0-9_\\-]", "_", study_base)
-    storage_path = os.path.join(RESULTADOS_DIR, "optuna_studies.db")
+    storage_path = str(gnn_path("hpo_optuna", "optuna_studies.db", resultados_dir=RESULTADOS_DIR, create_parent=True))
     storage_url = f"sqlite:///{storage_path}"
     try:
         storage = optuna.storages.RDBStorage(
@@ -6448,9 +6477,12 @@ def search_hyperparameters(
         remaining_trials = max(0, int(N_TRIALS) - int(done_trials))
         def _save_live(study_obj, _trial):
             try:
-                live_path = os.path.join(
-                    RESULTADOS_DIR, f"optuna_full_study_live_{study_obj.study_name}.csv"
-                )
+                live_path = str(gnn_path(
+                    "hpo_optuna",
+                    f"optuna_full_study_live_{study_obj.study_name}.csv",
+                    resultados_dir=RESULTADOS_DIR,
+                    create_parent=True,
+                ))
                 study_obj.trials_dataframe().to_csv(live_path, index=False)
             except Exception:
                 pass
@@ -6505,9 +6537,9 @@ def search_hyperparameters(
     # Etiquetas de variante
     variant_tag = _variant_tags(use_graphsmote_search, loaded_obj, gnn_variant=best_params.get('gnn_variant', GNN_VARIANT))
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
-    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    gnn_dir("hpo_optuna", RESULTADOS_DIR, create=True)
 
-    best_params_path = os.path.join(RESULTADOS_DIR, f"optuna_hyperparams_{timestamp}{hash_tag}{variant_tag}.csv")
+    best_params_path = str(gnn_path("hpo_optuna", f"optuna_hyperparams_{timestamp}{hash_tag}{variant_tag}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
     pd.DataFrame([best_params]).to_csv(best_params_path, index=False)
     logger.info(f"Hiperparámetros top guardados en -> {os.path.basename(best_params_path)}")
 
@@ -6518,7 +6550,7 @@ def search_hyperparameters(
     trials_df['graph_hash_source'] = graph_hash_source
     trials_df['gnn_variant'] = _normalize_gnn_variant(best_params.get('gnn_variant', GNN_VARIANT))
     trials_df['variant_tag'] = variant_tag
-    full_study_path = os.path.join(RESULTADOS_DIR, f"optuna_full_study_{timestamp}{hash_tag}{variant_tag}.csv")
+    full_study_path = str(gnn_path("hpo_optuna", f"optuna_full_study_{timestamp}{hash_tag}{variant_tag}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
     trials_df.to_csv(full_study_path, index=False)
     logger.info(f"Estudio completo guardado en -> {os.path.basename(full_study_path)}")
 
@@ -6567,12 +6599,12 @@ def run_imgagn_hpo(loaded_obj):
     # Optuna: sampler y pruner razonables
     sampler = optuna.samplers.TPESampler(seed=SEED, multivariate=True, group=True)
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=2)
-    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    gnn_dir("hpo_imgagn", RESULTADOS_DIR, create=True)
     study_base = "imgagn_optuna"
     if graph_hash:
         study_base = f"{study_base}_{graph_hash[:16]}"
     study_name = re.sub(r"[^A-Za-z0-9_\\-]", "_", study_base)
-    storage_path = os.path.join(RESULTADOS_DIR, "optuna_studies.db")
+    storage_path = str(gnn_path("hpo_optuna", "optuna_studies.db", resultados_dir=RESULTADOS_DIR, create_parent=True))
     storage_url = f"sqlite:///{storage_path}"
     try:
         storage = optuna.storages.RDBStorage(
@@ -6670,9 +6702,12 @@ def run_imgagn_hpo(loaded_obj):
         remaining_trials = max(0, int(N_TRIALS) - int(done_trials))
         def _save_live(study_obj, _trial):
             try:
-                live_path = os.path.join(
-                    RESULTADOS_DIR, f"imgagn_full_study_live_{study_obj.study_name}.csv"
-                )
+                live_path = str(gnn_path(
+                    "hpo_imgagn",
+                    f"imgagn_full_study_live_{study_obj.study_name}.csv",
+                    resultados_dir=RESULTADOS_DIR,
+                    create_parent=True,
+                ))
                 study_obj.trials_dataframe().to_csv(live_path, index=False)
             except Exception:
                 pass
@@ -6705,13 +6740,13 @@ def run_imgagn_hpo(loaded_obj):
     best_params['graph_hash_source'] = graph_hash_source
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
-    os.makedirs(RESULTADOS_DIR, exist_ok=True)
+    gnn_dir("hpo_imgagn", RESULTADOS_DIR, create=True)
 
-    best_path = os.path.join(RESULTADOS_DIR, f"imgagn_hyperparams_{timestamp}{hash_tag}.csv")
+    best_path = str(gnn_path("hpo_imgagn", f"imgagn_hyperparams_{timestamp}{hash_tag}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
     pd.DataFrame([best_params]).to_csv(best_path, index=False)
     logger.info(f"[ImGAGN] Hiperparámetros top guardados en -> {os.path.basename(best_path)}")
 
-    full_path = os.path.join(RESULTADOS_DIR, f"imgagn_full_study_{timestamp}{hash_tag}.csv")
+    full_path = str(gnn_path("hpo_imgagn", f"imgagn_full_study_{timestamp}{hash_tag}.csv", resultados_dir=RESULTADOS_DIR, create_parent=True))
     trials_df = study.trials_dataframe()
     trials_df['graph_hash'] = graph_hash
     trials_df['graph_file_hash'] = graph_file_hash
@@ -6741,7 +6776,7 @@ def run_imgagn_pipeline(loaded_obj, retrain_gat: bool = True):
     graph_file_hash = graph_identity.get("graph_file_hash")
     graph_hash_source = graph_identity.get("graph_hash_source")
     hash_tag = f"_{graph_hash[:16]}" if graph_hash else ""
-    existing = sorted(glob.glob(os.path.join(RESULTADOS_DIR, f"imgagn_hyperparams_*{hash_tag}.csv")))
+    existing = gnn_glob("hpo_imgagn", f"imgagn_hyperparams_*{hash_tag}.csv", RESULTADOS_DIR)
 
     best_params = None
     if existing:
@@ -6904,7 +6939,7 @@ def run_imgagn_pipeline(loaded_obj, retrain_gat: bool = True):
         # 5) Guardar y entrenar GAT
         timestamp = datetime.now().strftime('%d%m%Y_%H%M%S')
         filename = f"highway_graph_ImGAGN_AUG_{timestamp}.pt"
-        out_path = os.path.join(RESULTADOS_DIR, filename)
+        out_path = str(gnn_path("graphs_imgagn", filename, resultados_dir=RESULTADOS_DIR, create_parent=True))
         save_obj = dict(loaded_obj)
         save_obj['data'] = data_aug
         save_obj['filename'] = filename
@@ -6958,7 +6993,7 @@ def run_gat_testing(
 
     # 2. Cargar hiperparámetros
     print("--- Carga de Hiperparámetros para Testeo ---")
-    all_hp_files = sorted(glob.glob(os.path.join(RESULTADOS_DIR, "optuna_hyperparams_*.csv"))) + sorted(glob.glob(os.path.join(RESULTADOS_DIR, "grid_search_results_*.csv")))
+    all_hp_files = gnn_glob("hpo_optuna", "optuna_hyperparams_*.csv", RESULTADOS_DIR)
     
     # Filtrar archivos de hiperparámetros
     if use_graphsmote:
@@ -7406,7 +7441,7 @@ def analyze_and_save_relevant_edges(
         df_relevant = pd.DataFrame(all_relevant_edges)
         timestamp = datetime.now().strftime('%d%m%Y_%H%M')
         filename = f"relevant_edges_{timestamp}_k{k_heads}_p{int(percentile*100)}.csv"
-        output_path = os.path.join(RESULTADOS_DIR, filename)
+        output_path = str(gnn_path("xai", filename, resultados_dir=RESULTADOS_DIR, create_parent=True))
         df_relevant.to_csv(output_path, index=False)
         logger.info(f"✅ Aristas relevantes guardadas en -> {output_path}")
     else:
@@ -7493,7 +7528,7 @@ def test_graphsmote(
         # 5. Guardar el grafo aumentado
         timestamp = datetime.now().strftime('%d%m%Y_%H%M%S')
         filename = f"highway_graph_SMOTE_TEST_{timestamp}.pt"
-        output_path = os.path.join(RESULTADOS_DIR, filename)
+        output_path = str(gnn_path("graphs_graphsmote", filename, resultados_dir=RESULTADOS_DIR, create_parent=True))
 
         # El grafo aumentado ya tiene el flag 'is_synthetic'
         save_obj = {
@@ -7666,7 +7701,7 @@ def test_imgagn(
         # Guardar
         timestamp = datetime.now().strftime('%d%m%Y_%H%M%S')
         filename = f"highway_graph_ImGAGN_TEST_{timestamp}.pt"
-        out_path = os.path.join(RESULTADOS_DIR, filename)
+        out_path = str(gnn_path("graphs_imgagn", filename, resultados_dir=RESULTADOS_DIR, create_parent=True))
         save_obj = dict(loaded_obj)
         save_obj['data'] = data_aug
         save_obj['filename'] = filename

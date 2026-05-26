@@ -18,8 +18,9 @@ import torch
 from torch_geometric.data import HeteroData
 
 from src.config import RESULTADOS_DIR, SEED
+from src.gnn_artifacts import gnn_path
 
-HISTORY_PATH = Path(RESULTADOS_DIR) / "gnn_history.jsonl"
+HISTORY_PATH = gnn_path("root", "gnn_history.jsonl", resultados_dir=RESULTADOS_DIR)
 
 
 def _to_cpu(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -745,6 +746,36 @@ def build_xai_graph_figure(
     return fig
 
 
+def _render_xai_explanations(explanations_df: pd.DataFrame, max_rows: int) -> None:
+    if explanations_df is None or explanations_df.empty:
+        return
+    st.markdown("**Explicaciones por perturbacion**")
+    st.caption(
+        "delta_prob1 mide el cambio de riesgo al intervenir relaciones o features. "
+        "Estas mediciones auditan fidelidad del modelo; no prueban causalidad fisica por si solas."
+    )
+    sort_col = "score" if "score" in explanations_df.columns else "delta_prob1"
+    view = explanations_df.sort_values(sort_col, ascending=False).head(max(1, int(max_rows)))
+    st.dataframe(view, width="stretch")
+    group_cols = [col for col in ("method", "relation", "feature_name", "error_type") if col in explanations_df.columns]
+    if group_cols and "score" in explanations_df.columns:
+        summary = (
+            explanations_df.groupby(group_cols, dropna=False)
+            .agg(
+                explanation_count=("score", "count"),
+                mean_score=("score", "mean"),
+                mean_delta_prob1=("delta_prob1", "mean"),
+                crossed_threshold=("crossed_threshold", "sum")
+                if "crossed_threshold" in explanations_df.columns
+                else ("score", "count"),
+            )
+            .reset_index()
+            .sort_values("mean_score", ascending=False)
+        )
+        st.markdown("**Resumen de perturbaciones**")
+        st.dataframe(summary, width="stretch")
+
+
 def _render_xai_visual_graph_mode(loaded_obj: Dict[str, object]) -> None:
     result, source = _load_xai_result_for_visual_graph(loaded_obj)
     if result is None:
@@ -753,13 +784,16 @@ def _render_xai_visual_graph_mode(loaded_obj: Dict[str, object]) -> None:
     nodes_df = getattr(result, "nodes_df", pd.DataFrame())
     edges_df = getattr(result, "edges_df", pd.DataFrame())
     summary_df = getattr(result, "summary_df", pd.DataFrame())
+    explanations_df = getattr(result, "explanations_df", pd.DataFrame())
     manifest = getattr(result, "manifest", {}) or {}
     st.caption(
         f"Resultado XAI: {source} | mask={manifest.get('mask_name', 'N/A')} "
-        f"| nodos={len(nodes_df):,} | aristas={len(edges_df):,}"
+        f"| nodos={len(nodes_df):,} | aristas={len(edges_df):,} "
+        f"| explicaciones={len(explanations_df):,}"
     )
     if edges_df.empty:
         st.warning("El resultado XAI no contiene aristas relevantes.")
+        _render_xai_explanations(explanations_df, max_rows=500)
         return
 
     relations = (
@@ -870,6 +904,7 @@ def _render_xai_visual_graph_mode(loaded_obj: Dict[str, object]) -> None:
     if not summary_df.empty:
         st.markdown("**Resumen por relación**")
         st.dataframe(summary_df, width="stretch")
+    _render_xai_explanations(explanations_df, max_rows=int(max_edges))
 
 
 def render_visual_graph_tab(loaded_obj: Optional[Dict[str, object]] = None) -> None:

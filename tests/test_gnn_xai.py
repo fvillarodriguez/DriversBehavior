@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import pytest
+import numpy as np
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("torch_geometric")
 from torch_geometric.data import HeteroData
 
 from src.gat_model import HeteroGAT, HeteroGATWithEdgeEncoder
-from src.gnn_xai import compute_gnn_xai_graph
+from src.gnn_xai import compute_gnn_xai_graph, load_gnn_xai_result, save_gnn_xai_result
 
 
 EDGE_TYPES = (("pm", "spatial", "pm"), ("pm", "temporal", "pm"))
@@ -56,6 +57,13 @@ def _base_model(edge_dim: int = 4) -> HeteroGAT:
     )
     model.eval()
     return model
+
+
+class _IdentityCalibrator:
+    def predict_proba(self, values):
+        prob1 = np.asarray(values, dtype=float).reshape(-1)
+        prob1 = np.clip(prob1, 0.0, 1.0)
+        return np.column_stack([1.0 - prob1, prob1])
 
 
 def test_compute_gnn_xai_graph_returns_minimum_columns_and_filters_edges():
@@ -172,3 +180,126 @@ def test_compute_gnn_xai_graph_uses_encoded_edge_attrs_for_edge_encoder_variant(
     assert not result.nodes_df.empty
     assert not result.edges_df.empty
     assert {"mean_attention", "source_prob1", "dest_prob1"}.issubset(result.edges_df.columns)
+
+
+def test_compute_gnn_xai_graph_returns_advanced_explanations():
+    data = _dummy_xai_graph(edge_dim=4)
+    model = _base_model(edge_dim=4)
+
+    result = compute_gnn_xai_graph(
+        model=model,
+        graph=data,
+        node_indices=torch.arange(6),
+        batch_size=6,
+        num_neighbors=[-1, -1],
+        percentile=0.0,
+        k_heads=1,
+        layer="conv1",
+        threshold=0.5,
+        explanation_methods=["relation_ablation", "feature_ablation"],
+        explain_max_nodes=3,
+        explain_top_features=2,
+        feature_names=["flow", "speed", "density"],
+    )
+
+    assert result.explanations_df is not None
+    assert not result.explanations_df.empty
+    assert {"relation_ablation", "feature_ablation"}.issubset(
+        set(result.explanations_df["method"].astype(str))
+    )
+    assert result.explanations_df["score"].notna().all()
+    assert result.explanations_df["delta_prob1"].notna().all()
+    feature_rows = result.explanations_df[result.explanations_df["method"] == "feature_ablation"]
+    assert feature_rows["feature_name"].notna().any()
+    assert int(result.manifest["explanation_count"]) == len(result.explanations_df)
+    assert result.manifest["schema_version"] == "2.0"
+
+
+def test_save_load_gnn_xai_result_round_trips_explanations(tmp_path):
+    data = _dummy_xai_graph(edge_dim=4)
+    model = _base_model(edge_dim=4)
+
+    result = compute_gnn_xai_graph(
+        model=model,
+        graph=data,
+        node_indices=torch.arange(6),
+        batch_size=6,
+        num_neighbors=[-1, -1],
+        percentile=0.0,
+        k_heads=1,
+        layer="conv1",
+        threshold=0.5,
+        explanation_methods=["relation_ablation"],
+        explain_max_nodes=2,
+    )
+
+    out_dir = save_gnn_xai_result(result, tmp_path / "xai_result")
+    loaded = load_gnn_xai_result(out_dir)
+
+    assert loaded.explanations_df is not None
+    assert len(loaded.explanations_df) == len(result.explanations_df)
+    assert loaded.manifest["files"].get("explanations")
+
+
+def test_compute_gnn_xai_graph_keeps_calibration_for_advanced_explanations():
+    data = _dummy_xai_graph(edge_dim=4)
+    model = _base_model(edge_dim=4)
+
+    result = compute_gnn_xai_graph(
+        model=model,
+        graph=data,
+        node_indices=torch.arange(6),
+        batch_size=6,
+        num_neighbors=[-1, -1],
+        percentile=0.0,
+        k_heads=1,
+        layer="conv1",
+        threshold=0.5,
+        calibration_model=_IdentityCalibrator(),
+        explanation_methods=["relation_ablation"],
+        explain_max_nodes=2,
+    )
+
+    assert result.explanations_df is not None
+    assert not result.explanations_df.empty
+    assert result.explanations_df["base_prob1"].between(0.0, 1.0).all()
+    assert result.explanations_df["perturbed_prob1"].between(0.0, 1.0).all()
+
+
+def test_compute_gnn_xai_graph_returns_gradient_feature_attributions_without_mutating_graph():
+    data = _dummy_xai_graph(edge_dim=4)
+    original_x = data["pm"].x.clone()
+    model = _base_model(edge_dim=4)
+
+    result = compute_gnn_xai_graph(
+        model=model,
+        graph=data,
+        node_indices=torch.arange(6),
+        batch_size=6,
+        num_neighbors=[-1, -1],
+        percentile=0.0,
+        k_heads=1,
+        layer="conv1",
+        threshold=0.5,
+        explanation_methods=["input_gradient", "integrated_gradients"],
+        explain_max_nodes=2,
+        explain_top_features=2,
+        integrated_gradients_steps=3,
+        feature_names=["flow", "speed", "density"],
+    )
+
+    assert torch.equal(data["pm"].x, original_x)
+    assert not data["pm"].x.requires_grad
+    assert result.explanations_df is not None
+    gradient_rows = result.explanations_df[
+        result.explanations_df["method"].isin(["input_gradient", "integrated_gradients"])
+    ]
+    assert not gradient_rows.empty
+    assert {"input_gradient", "integrated_gradients"}.issubset(
+        set(gradient_rows["method"].astype(str))
+    )
+    assert gradient_rows["attribution"].notna().all()
+    assert gradient_rows["score"].notna().all()
+    ig_rows = gradient_rows[gradient_rows["method"] == "integrated_gradients"]
+    assert set(ig_rows["gradient_steps"].dropna().astype(int)) == {3}
+    assert result.manifest["integrated_gradients_steps"] == 3

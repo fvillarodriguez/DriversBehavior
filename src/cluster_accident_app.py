@@ -109,10 +109,13 @@ try:
 except ImportError:
     psutil = None
 
-RESULTS_DIR = ROOT_DIR / "Resultados"
+DEFAULT_RESULTS_DIR = ROOT_DIR / "Resultados"
+RESULTS_DIR = DEFAULT_RESULTS_DIR
+CLUSTERING_RESULTS_DIR = RESULTS_DIR / "clustering"
+CRASH_RESULTS_DIR = RESULTS_DIR / "crash_prediction"
 DATA_DIR = ROOT_DIR / "Datos"
-HISTORY_PATH = RESULTS_DIR / "experiment_history.jsonl"
-MODELS_DIR = RESULTS_DIR / "model_history"
+HISTORY_PATH = CRASH_RESULTS_DIR / "experiment_history.jsonl"
+MODELS_DIR = CRASH_RESULTS_DIR / "model_history"
 DYNAMIC_GMM_ASSIGNMENT_TABLE_NAME = "dynamic_assignments"
 DYNAMIC_GMM_METADATA_TABLE_NAME = "dynamic_metadata"
 CLUSTER_LABEL_PATTERN = re.compile(
@@ -192,6 +195,99 @@ COMBINED_TRAMO_SELECTION = (
     COMBINED_TRAMO_PORTICOS[-1],
 )
 COMBINED_TRAMO_LABEL = "15 -> 14 -> 12 -> 11 (3 tramos)"
+
+
+def _unique_paths(paths: Sequence[Path]) -> List[Path]:
+    unique = {str(path.resolve()): path for path in paths}
+    return sorted(unique.values(), key=lambda path: (path.name, str(path)))
+
+
+def _crash_results_dir() -> Path:
+    if Path(RESULTS_DIR) != DEFAULT_RESULTS_DIR and Path(CRASH_RESULTS_DIR) == DEFAULT_RESULTS_DIR / "crash_prediction":
+        return Path(RESULTS_DIR) / "crash_prediction"
+    return Path(CRASH_RESULTS_DIR)
+
+
+def _clustering_results_dir() -> Path:
+    if Path(RESULTS_DIR) != DEFAULT_RESULTS_DIR and Path(CLUSTERING_RESULTS_DIR) == DEFAULT_RESULTS_DIR / "clustering":
+        return Path(RESULTS_DIR) / "clustering"
+    return Path(CLUSTERING_RESULTS_DIR)
+
+
+def _crash_result_dirs() -> List[Path]:
+    dirs = [_crash_results_dir(), Path(RESULTS_DIR)]
+    unique: List[Path] = []
+    seen: set[str] = set()
+    for path in dirs:
+        key = str(path)
+        if key not in seen:
+            unique.append(path)
+            seen.add(key)
+    return unique
+
+
+def _glob_crash_results(pattern: str) -> List[Path]:
+    files: List[Path] = []
+    for directory in _crash_result_dirs():
+        if directory.exists():
+            files.extend(directory.glob(pattern))
+    unique = _unique_paths(files)
+    crash_root = _crash_results_dir().resolve()
+    return sorted(
+        unique,
+        key=lambda path: (
+            path.name,
+            0
+            if str(path.resolve()).startswith(str(crash_root))
+            else 1,
+            str(path),
+        ),
+    )
+
+
+def _crash_output_path(filename: str) -> Path:
+    return _ensure_crash_results_dir() / filename
+
+
+def _ensure_crash_results_dir() -> Path:
+    output_dir = _crash_results_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _find_named_path(paths: Sequence[Path], name: str) -> Path:
+    return next(path for path in paths if path.name == name)
+
+
+def _cluster_result_dirs() -> List[Path]:
+    dirs = [_clustering_results_dir(), Path(RESULTS_DIR)]
+    unique: List[Path] = []
+    seen: set[str] = set()
+    for path in dirs:
+        key = str(path)
+        if key not in seen:
+            unique.append(path)
+            seen.add(key)
+    return unique
+
+
+def _glob_cluster_results(pattern: str) -> List[Path]:
+    files: List[Path] = []
+    for directory in _cluster_result_dirs():
+        if directory.exists():
+            files.extend(directory.glob(pattern))
+    unique = _unique_paths(files)
+    cluster_root = _clustering_results_dir().resolve()
+    return sorted(
+        unique,
+        key=lambda path: (
+            path.name,
+            0
+            if str(path.resolve()).startswith(str(cluster_root))
+            else 1,
+            str(path),
+        ),
+    )
 
 
 class _StreamlitProgress:
@@ -799,9 +895,7 @@ def _list_cluster_label_files() -> List[Path]:
     try:
         from src import cluster_visualization_app as cluster_vis
     except Exception:
-        if not RESULTS_DIR.exists():
-            return []
-        candidates = sorted(RESULTS_DIR.glob("cluster_*.csv"))
+        candidates = _glob_cluster_results("cluster_*.csv")
         return [path for path in candidates if CLUSTER_LABEL_PATTERN.match(path.name)]
     return cluster_vis.list_cluster_files()
 
@@ -1582,36 +1676,32 @@ def _class_distribution(series: pd.Series) -> pd.DataFrame:
 
 
 def _list_balanced_files() -> List[Path]:
-    if not RESULTS_DIR.exists():
-        return []
-    return sorted(RESULTS_DIR.glob("accident_balanced_*.csv"))
+    return _glob_crash_results("accident_balanced_*.csv")
 
 
 def _list_flow_feature_files() -> List[Path]:
-    if not RESULTS_DIR.exists():
-        return []
     patterns = ["accident_flow_features_*.duckdb", "flow_features_*.duckdb"]
     files: List[Path] = []
     for pattern in patterns:
-        files.extend(RESULTS_DIR.glob(pattern))
-    unique = {path.name: path for path in files}
+        files.extend(_glob_crash_results(pattern))
+    unique: Dict[str, Path] = {}
+    for path in files:
+        unique.setdefault(path.name, path)
     return sorted(unique.values(), key=lambda path: path.name)
 
 
 def _list_cluster_feature_files() -> List[Path]:
-    if not RESULTS_DIR.exists():
-        return []
     patterns = ["accident_cluster_features_*.duckdb"]
     files: List[Path] = []
     for pattern in patterns:
-        files.extend(RESULTS_DIR.glob(pattern))
-    unique = {path.name: path for path in files}
+        files.extend(_glob_crash_results(pattern))
+    unique: Dict[str, Path] = {}
+    for path in files:
+        unique.setdefault(path.name, path)
     return sorted(unique.values(), key=lambda path: path.name)
 
 
 def _list_experiment_result_files() -> List[Path]:
-    if not RESULTS_DIR.exists():
-        return []
     patterns = [
         "experiments_results_*.csv",
         "find_samples_sizes_results_*.csv",
@@ -1622,16 +1712,17 @@ def _list_experiment_result_files() -> List[Path]:
     ]
     files: List[Path] = []
     for pattern in patterns:
-        files.extend(RESULTS_DIR.glob(pattern))
+        files.extend(_glob_crash_results(pattern))
 
-    calibration_root = RESULTS_DIR / "calibration_experiment_runs"
-    if calibration_root.exists():
-        for run_dir in calibration_root.glob("calibration_sweep_*"):
-            if not run_dir.is_dir():
-                continue
-            history_file = _calibration_sweep_history_file_for_run(run_dir)
-            if history_file is not None:
-                files.append(history_file)
+    for results_dir in _crash_result_dirs():
+        calibration_root = results_dir / "calibration_experiment_runs"
+        if calibration_root.exists():
+            for run_dir in calibration_root.glob("calibration_sweep_*"):
+                if not run_dir.is_dir():
+                    continue
+                history_file = _calibration_sweep_history_file_for_run(run_dir)
+                if history_file is not None:
+                    files.append(history_file)
 
     unique = {str(path): path for path in files}
     return sorted(
@@ -1658,11 +1749,15 @@ def _calibration_sweep_run_dir_from_result_path(path: Path) -> Optional[Path]:
     run_dir = path.parent.parent
     if not CALIBRATION_SWEEP_RUN_RE.match(run_dir.name):
         return None
-    try:
-        run_dir.resolve().relative_to(
-            (RESULTS_DIR / "calibration_experiment_runs").resolve()
-        )
-    except ValueError:
+    for results_dir in _crash_result_dirs():
+        try:
+            run_dir.resolve().relative_to(
+                (results_dir / "calibration_experiment_runs").resolve()
+            )
+            break
+        except ValueError:
+            continue
+    else:
         return None
     return run_dir
 
@@ -1824,59 +1919,60 @@ def _calibration_sweep_checkpoint_status_label(status: object) -> str:
 def _list_calibration_sweep_checkpoints(
     checkpoint_root: Optional[Path] = None,
 ) -> List[Dict[str, object]]:
-    root = (
-        Path(checkpoint_root)
+    roots = (
+        [Path(checkpoint_root)]
         if checkpoint_root is not None
-        else RESULTS_DIR / "calibration_experiment_runs"
+        else [directory / "calibration_experiment_runs" for directory in _crash_result_dirs()]
     )
-    if not root.exists():
-        return []
 
     items: List[Dict[str, object]] = []
-    for run_dir in root.glob("calibration_sweep_*"):
-        if not run_dir.is_dir():
+    for root in roots:
+        if not root.exists():
             continue
-        manifest_path = run_dir / "manifest.json"
-        manifest = _read_json_file(manifest_path)
-        run_id = str(manifest.get("run_id") or run_dir.name)
-        status = str(manifest.get("result_status") or manifest.get("status") or "missing")
-        updated_at = str(
-            manifest.get("completed_at")
-            or manifest.get("updated_at")
-            or manifest.get("created_at")
-            or ""
-        )
-        history_file = _calibration_sweep_history_file_for_run(run_dir)
-        label = (
-            _experiment_result_option_label(history_file)
-            if history_file is not None
-            else " | ".join(
-                part
-                for part in [
-                    "Calibración score + threshold",
-                    updated_at.replace("T", " ") if updated_at else "",
-                    _calibration_sweep_checkpoint_status_label(status),
-                    run_id,
-                ]
-                if str(part).strip()
+        for run_dir in root.glob("calibration_sweep_*"):
+            if not run_dir.is_dir():
+                continue
+            manifest_path = run_dir / "manifest.json"
+            manifest = _read_json_file(manifest_path)
+            run_id = str(manifest.get("run_id") or run_dir.name)
+            status = str(manifest.get("result_status") or manifest.get("status") or "missing")
+            updated_at = str(
+                manifest.get("completed_at")
+                or manifest.get("updated_at")
+                or manifest.get("created_at")
+                or ""
             )
-        )
-        progress = dict(manifest.get("progress") or {})
-        items.append(
-            {
-                "run_id": run_id,
-                "run_dir": str(run_dir),
-                "manifest_path": str(manifest_path) if manifest_path.exists() else None,
-                "status": status,
-                "status_label": _calibration_sweep_checkpoint_status_label(status),
-                "updated_at": updated_at,
-                "label": label,
-                "history_file": str(history_file) if history_file is not None else None,
-                "completed_steps": int(progress.get("completed_steps") or 0),
-                "total_steps": int(progress.get("total_steps") or 0),
-                "current_step_id": progress.get("current_step_id"),
-            }
-        )
+            history_file = _calibration_sweep_history_file_for_run(run_dir)
+            label = (
+                _experiment_result_option_label(history_file)
+                if history_file is not None
+                else " | ".join(
+                    part
+                    for part in [
+                        "Calibración score + threshold",
+                        updated_at.replace("T", " ") if updated_at else "",
+                        _calibration_sweep_checkpoint_status_label(status),
+                        run_id,
+                    ]
+                    if str(part).strip()
+                )
+            )
+            progress = dict(manifest.get("progress") or {})
+            items.append(
+                {
+                    "run_id": run_id,
+                    "run_dir": str(run_dir),
+                    "manifest_path": str(manifest_path) if manifest_path.exists() else None,
+                    "status": status,
+                    "status_label": _calibration_sweep_checkpoint_status_label(status),
+                    "updated_at": updated_at,
+                    "label": label,
+                    "history_file": str(history_file) if history_file is not None else None,
+                    "completed_steps": int(progress.get("completed_steps") or 0),
+                    "total_steps": int(progress.get("total_steps") or 0),
+                    "current_step_id": progress.get("current_step_id"),
+                }
+            )
 
     def _sort_key(item: Dict[str, object]) -> Tuple[str, str]:
         updated_at = str(item.get("updated_at") or "")
@@ -1893,15 +1989,17 @@ def _experiment_result_related_files(path: Path, timestamp: Optional[str]) -> Li
             file_path for file_path in run_dir.rglob("*") if file_path.is_file()
         )
     if timestamp:
-        return sorted(RESULTS_DIR.glob(f"*{timestamp}*"))
+        return _glob_crash_results(f"*{timestamp}*")
     return []
 
 
 def _experiment_export_arcname(path: Path) -> str:
-    try:
-        return str(path.relative_to(RESULTS_DIR))
-    except ValueError:
-        return path.name
+    for results_dir in _crash_result_dirs():
+        try:
+            return str(path.relative_to(results_dir))
+        except ValueError:
+            continue
+    return path.name
 
 
 def _experiment_export_zip_name(path: Path, timestamp: Optional[str]) -> str:
@@ -1951,10 +2049,10 @@ def _save_flow_features(
     df: pd.DataFrame,
     cluster_choice: Optional[str],
 ) -> Path:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_crash_results_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = _cluster_choice_suffix(cluster_choice)
-    path = RESULTS_DIR / f"accident_flow_features_{suffix}_{stamp}.duckdb"
+    path = output_dir / f"accident_flow_features_{suffix}_{stamp}.duckdb"
     _write_df_to_duckdb(df, path, "flow_features")
     return path
 
@@ -1963,10 +2061,10 @@ def _save_cluster_features(
     df: pd.DataFrame,
     cluster_choice: Optional[str],
 ) -> Path:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = _ensure_crash_results_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = _cluster_choice_suffix(cluster_choice)
-    path = RESULTS_DIR / f"accident_cluster_features_{suffix}_{stamp}.duckdb"
+    path = output_dir / f"accident_cluster_features_{suffix}_{stamp}.duckdb"
     _write_df_to_duckdb(df, path, "cluster_features")
     return path
 
@@ -2038,9 +2136,23 @@ def _feature_selection_id(
 
 
 def _feature_selection_paths(feature_id: str) -> Tuple[Path, Path]:
-    json_path = RESULTS_DIR / f"feature_selection_{feature_id}.json"
-    csv_path = RESULTS_DIR / f"feature_selection_{feature_id}_importance.csv"
+    json_path = _crash_output_path(f"feature_selection_{feature_id}.json")
+    csv_path = _crash_output_path(f"feature_selection_{feature_id}_importance.csv")
     return json_path, csv_path
+
+
+def _legacy_crash_output_path(filename: str) -> Path:
+    return RESULTS_DIR / filename
+
+
+def _existing_crash_output_path(filename: str) -> Path:
+    preferred = _crash_output_path(filename)
+    if preferred.exists():
+        return preferred
+    legacy = _legacy_crash_output_path(filename)
+    if legacy.exists():
+        return legacy
+    return preferred
 
 
 def _feature_list_signature(features: List[str]) -> str:
@@ -2061,9 +2173,16 @@ def _optuna_result_id(feature_id: str, feature_cols: List[str]) -> str:
 
 
 def _optuna_result_paths(optuna_id: str) -> Tuple[Path, Path]:
-    json_path = RESULTS_DIR / f"optuna_{optuna_id}.json"
-    csv_path = RESULTS_DIR / f"optuna_{optuna_id}_trials.csv"
+    json_path = _crash_output_path(f"optuna_{optuna_id}.json")
+    csv_path = _crash_output_path(f"optuna_{optuna_id}_trials.csv")
     return json_path, csv_path
+
+
+def _existing_optuna_result_paths(optuna_id: str) -> Tuple[Path, Path]:
+    return (
+        _existing_crash_output_path(f"optuna_{optuna_id}.json"),
+        _existing_crash_output_path(f"optuna_{optuna_id}_trials.csv"),
+    )
 
 
 def _normalize_optuna_balance_mode(value: object) -> str:
@@ -3064,16 +3183,14 @@ def _optuna_variant_frame_path(
                 calibration_suffix = _slugify(
                     _normalize_calibration_method(calibration_method)
                 )
-                return (
-                    RESULTS_DIR
-                    / f"optuna_{optuna_id}_{suffix}_{balance_suffix}_{calibration_suffix}_{frame_suffix}.csv"
+                return _crash_output_path(
+                    f"optuna_{optuna_id}_{suffix}_{balance_suffix}_{calibration_suffix}_{frame_suffix}.csv"
                 )
-            return (
-                RESULTS_DIR
-                / f"optuna_{optuna_id}_{suffix}_{balance_suffix}_{frame_suffix}.csv"
+            return _crash_output_path(
+                f"optuna_{optuna_id}_{suffix}_{balance_suffix}_{frame_suffix}.csv"
             )
-        return RESULTS_DIR / f"optuna_{optuna_id}_{suffix}_{frame_suffix}.csv"
-    return RESULTS_DIR / f"optuna_{optuna_id}_{frame_suffix}.csv"
+        return _crash_output_path(f"optuna_{optuna_id}_{suffix}_{frame_suffix}.csv")
+    return _crash_output_path(f"optuna_{optuna_id}_{frame_suffix}.csv")
 
 
 def _optuna_variant_json_path(
@@ -3936,7 +4053,7 @@ def _load_optuna_variant_json(
 def _load_optuna_result_from_disk(
     optuna_id: str,
 ) -> Tuple[Optional[Dict[str, object]], Optional[pd.DataFrame]]:
-    json_path, csv_path = _optuna_result_paths(optuna_id)
+    json_path, csv_path = _existing_optuna_result_paths(optuna_id)
     payload: Optional[Dict[str, object]] = None
     trials_df: Optional[pd.DataFrame] = None
     if json_path.exists():
@@ -4316,7 +4433,7 @@ def _optuna_previous_result_options_from_entry(
 def _list_optuna_previous_result_options() -> List[Dict[str, object]]:
     options: List[Dict[str, object]] = []
     try:
-        candidates = sorted(RESULTS_DIR.glob("optuna_*.json"), reverse=True)
+        candidates = sorted(_glob_crash_results("optuna_*.json"), reverse=True)
     except Exception:
         return options
 
@@ -5042,7 +5159,7 @@ def _persist_optuna_results(
     trials_json_path = str(trials_json) if trials_json else None
     if trials_df is not None and not trials_df.empty:
         try:
-            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            _ensure_crash_results_dir()
             trials_path = _optuna_trials_path(
                 optuna_id,
                 model_choice,
@@ -5096,7 +5213,7 @@ def _persist_optuna_results(
     pareto_front_csv = None
     if pareto_front_df is not None and not pareto_front_df.empty:
         try:
-            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            _ensure_crash_results_dir()
             pareto_path = _optuna_variant_frame_path(
                 optuna_id,
                 model_choice=model_choice,
@@ -5124,7 +5241,7 @@ def _persist_optuna_results(
     if best_summary_payload:
         if not best_summary_json_path:
             try:
-                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                _ensure_crash_results_dir()
                 best_summary_file = _optuna_variant_json_path(
                     optuna_id,
                     model_choice=model_choice,
@@ -5310,11 +5427,11 @@ def _json_default(value: object) -> object:
 
 
 def _history_db_path() -> Path:
-    return RESULTS_DIR / "crash_prediction_history.sqlite"
+    return _crash_output_path("crash_prediction_history.sqlite")
 
 
 def _history_stage_artifacts_dir(stage: str) -> Path:
-    path = RESULTS_DIR / "history_artifacts" / (_slugify(stage) or "record")
+    path = _crash_results_dir() / "history_artifacts" / (_slugify(stage) or "record")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -6196,7 +6313,7 @@ def _seed_history_db_from_legacy_once() -> None:
                     legacy_ref=run_id,
                 )
 
-        for json_path in sorted(RESULTS_DIR.glob("feature_selection_*.json")):
+        for json_path in sorted(_glob_crash_results("feature_selection_*.json")):
             if json_path.name.endswith("_importance.json"):
                 continue
             try:
@@ -6241,7 +6358,7 @@ def _seed_history_db_from_legacy_once() -> None:
                 legacy_ref=feature_id,
             )
 
-        for optuna_json_path in sorted(RESULTS_DIR.glob("optuna_*.json")):
+        for optuna_json_path in sorted(_glob_crash_results("optuna_*.json")):
             optuna_id = optuna_json_path.stem.replace("optuna_", "", 1)
             entry, _trials_df = _load_optuna_store_entry_from_disk(optuna_id)
             if not isinstance(entry, dict) or not isinstance(entry.get("results"), dict):
@@ -7034,10 +7151,10 @@ def _init_experiment_db(
     meta: Optional[Dict[str, object]] = None,
 ) -> Optional[Path]:
     try:
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        output_dir = _ensure_crash_results_dir()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         slug = _slugify(experiment_name) or "experiment"
-        path = RESULTS_DIR / f"experiment_live_{slug}_{stamp}.sqlite"
+        path = output_dir / f"experiment_live_{slug}_{stamp}.sqlite"
         con = sqlite3.connect(path)
         cur = con.cursor()
         cur.execute(
@@ -7185,7 +7302,7 @@ def _seed_controlled_comparison_live_db(
 
 def _append_history_entry(entry: Dict[str, object]) -> None:
     try:
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        _ensure_crash_results_dir()
         with HISTORY_PATH.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(entry, ensure_ascii=True, default=_json_default)
@@ -10843,7 +10960,7 @@ def _render_calibration_sweep_experiment() -> None:
         for label in selected_objective_labels
         if label in objective_options
     ]
-    checkpoint_root = RESULTS_DIR / "calibration_experiment_runs"
+    checkpoint_root = _crash_results_dir() / "calibration_experiment_runs"
     checkpoint_entries = _list_calibration_sweep_checkpoints(
         checkpoint_root=checkpoint_root
     )
@@ -12212,7 +12329,10 @@ def _render_base_cluster_xai_block(
 def _load_feature_selection_from_disk(
     feature_id: str,
 ) -> Tuple[Optional[Dict[str, object]], Optional[pd.DataFrame]]:
-    json_path, csv_path = _feature_selection_paths(feature_id)
+    json_path = _existing_crash_output_path(f"feature_selection_{feature_id}.json")
+    csv_path = _existing_crash_output_path(
+        f"feature_selection_{feature_id}_importance.csv"
+    )
     payload: Optional[Dict[str, object]] = None
     importance_df: Optional[pd.DataFrame] = None
     if json_path.exists():
@@ -12278,7 +12398,7 @@ def _persist_feature_selection(
     if not (selected_changed or importance_changed or prev == {}):
         return None
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_crash_results_dir()
     json_path, csv_path = _feature_selection_paths(feature_id)
     saved_at = datetime.now().isoformat()
     payload = {
@@ -15546,9 +15666,9 @@ def _render_cluster_features_section(
             "Exportar variables de cluster",
             key=f"{key_prefix}_cluster_export_btn",
         ):
-            out_path = RESULTS_DIR / f"{export_name.strip()}.duckdb"
+            out_path = _crash_output_path(f"{export_name.strip()}.duckdb")
             try:
-                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                _ensure_crash_results_dir()
                 _write_df_to_duckdb(features_df, out_path, "cluster_features")
             except Exception as exc:
                 st.error(f"No se pudo exportar: {exc}")
@@ -15580,7 +15700,7 @@ def _render_cluster_features_section(
                 try:
                     with st.spinner("Cargando variables de cluster existentes..."):
                         progress.progress(10)
-                        path = RESULTS_DIR / selected
+                        path = _find_named_path(feature_files, selected)
                         if path.suffix.lower() != ".duckdb":
                             st.error("Solo se permiten archivos .duckdb.")
                             return
@@ -15656,7 +15776,7 @@ def _render_cluster_features_section(
         "Calcular variables de cluster",
         key=f"{key_prefix}_cluster_calc_btn",
     ):
-        cluster_path = RESULTS_DIR / cluster_choice
+        cluster_path = _find_named_path(_list_cluster_label_files(), cluster_choice)
         try:
             cluster_labels = _load_cluster_labels(cluster_path)
             if flow_df is None or flow_df.empty:
@@ -15832,7 +15952,7 @@ def _open_macos_duckdb_file_selector(
 ) -> Tuple[Optional[Path], Optional[str]]:
     import subprocess
 
-    initial = initial_dir if initial_dir.exists() else RESULTS_DIR
+    initial = initial_dir if initial_dir.exists() else _crash_results_dir()
     if not initial.exists():
         initial = ROOT_DIR
     script = [
@@ -15884,7 +16004,7 @@ def _open_duckdb_file_selector(
         root.withdraw()
         root.attributes("-topmost", True)
         root.update()
-        initial = initial_dir if initial_dir.exists() else RESULTS_DIR
+        initial = initial_dir if initial_dir.exists() else _crash_results_dir()
         selected = filedialog.askopenfilename(
             title="Seleccionar DuckDB de GMM dinamico",
             initialdir=str(initial),
@@ -17977,9 +18097,9 @@ def _render_variables_tab() -> None:
             key="flow_features_export_name",
         )
         if st.button("Exportar variables"):
-            out_path = RESULTS_DIR / f"{export_name.strip()}.duckdb"
+            out_path = _crash_output_path(f"{export_name.strip()}.duckdb")
             try:
-                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                _ensure_crash_results_dir()
                 _write_df_to_duckdb(features_df, out_path, "flow_features")
             except Exception as exc:
                 st.error(f"No se pudo exportar: {exc}")
@@ -18089,7 +18209,7 @@ def _render_variables_tab() -> None:
                     try:
                         with st.spinner("Cargando features existentes..."):
                             progress.progress(5)
-                            path = RESULTS_DIR / selected
+                            path = _find_named_path(feature_files, selected)
                             if path.suffix.lower() != ".duckdb":
                                 st.error("Solo se permiten archivos .duckdb.")
                                 return
@@ -18251,7 +18371,7 @@ def _render_variables_tab() -> None:
             )
             if dynamic_origin == "Resultados":
                 dynamic_candidates, dynamic_path_error = _list_dynamic_gmm_db_paths(
-                    RESULTS_DIR
+                    _clustering_results_dir()
                 )
                 if dynamic_path_error:
                     st.warning(
@@ -18281,7 +18401,7 @@ def _render_variables_tab() -> None:
                         selected_path, selector_error = _open_duckdb_file_selector(
                             current_external.parent
                             if current_external is not None
-                            else RESULTS_DIR
+                            else _clustering_results_dir()
                         )
                         if selector_error:
                             st.warning(selector_error)
@@ -18466,7 +18586,7 @@ def _render_variables_tab() -> None:
             return
 
         # Step 0: Create persistent DB and attach sources.
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        output_dir = _ensure_crash_results_dir()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         if include_cluster_vars and cluster_source == "dynamic_gmm":
             suffix = _cluster_choice_suffix(
@@ -18475,7 +18595,7 @@ def _render_variables_tab() -> None:
         else:
             suffix = _cluster_choice_suffix(cluster_choice) if include_cluster_vars else "sin_cluster"
         features_db_name = f"accident_flow_features_{suffix}_{stamp}.duckdb"
-        features_db_path = RESULTS_DIR / features_db_name
+        features_db_path = output_dir / features_db_name
         
         con_feat = duckdb.connect(str(features_db_path))
         selected_porticos = _tramo_portico_codes(tramo_tuple)
@@ -18551,7 +18671,9 @@ def _render_variables_tab() -> None:
                     return
             else:
                 try:
-                    cluster_labels_df = _load_cluster_labels(RESULTS_DIR / cluster_choice)
+                    cluster_labels_df = _load_cluster_labels(
+                        _find_named_path(_list_cluster_label_files(), cluster_choice)
+                    )
                 except Exception as exc:
                     st.error(f"Error cargando clusters: {exc}")
                     con_feat.close()
@@ -18883,7 +19005,7 @@ def _render_variables_tab() -> None:
                         ),
                     },
                     cluster_label_path=(
-                        RESULTS_DIR / cluster_choice
+                        _find_named_path(_list_cluster_label_files(), cluster_choice)
                         if include_cluster_vars
                         and cluster_source == "static_csv"
                         and cluster_choice not in {"(sin clusters)", "(ninguno)"}
@@ -22456,7 +22578,9 @@ def _render_balance_tab() -> None:
                     st.warning("Seleccione un archivo de Resultados.")
                 else:
                     try:
-                        loaded_df = pd.read_csv(RESULTS_DIR / selected_balanced)
+                        loaded_df = pd.read_csv(
+                            _find_named_path(balanced_files, selected_balanced)
+                        )
                     except Exception as exc:
                         st.error(f"No se pudo cargar {selected_balanced}: {exc}")
                     else:
@@ -22876,27 +23000,31 @@ def _render_balance_tab() -> None:
             col_exp1, col_exp2, col_exp3 = st.columns(3)
             with col_exp1:
                 if balanced_base is not None and st.button("Exportar Base"):
-                    out_path = RESULTS_DIR / f"{export_name.strip()}_base.csv"
+                    out_path = _crash_output_path(f"{export_name.strip()}_base.csv")
                     try:
-                        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                        _ensure_crash_results_dir()
                         balanced_base.to_csv(out_path, index=False)
                         st.success(f"Base exportado en {out_path}")
                     except Exception as exc:
                         st.error(f"Error: {exc}")
             with col_exp2:
                 if balanced_cluster_only is not None and st.button("Exportar Cluster"):
-                    out_path = RESULTS_DIR / f"{export_name.strip()}_cluster_only.csv"
+                    out_path = _crash_output_path(
+                        f"{export_name.strip()}_cluster_only.csv"
+                    )
                     try:
-                        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                        _ensure_crash_results_dir()
                         balanced_cluster_only.to_csv(out_path, index=False)
                         st.success(f"Cluster exportado en {out_path}")
                     except Exception as exc:
                         st.error(f"Error: {exc}")
             with col_exp3:
                 if balanced_cluster is not None and st.button("Exportar Base + Cluster"):
-                    out_path = RESULTS_DIR / f"{export_name.strip()}_base_cluster.csv"
+                    out_path = _crash_output_path(
+                        f"{export_name.strip()}_base_cluster.csv"
+                    )
                     try:
-                        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                        _ensure_crash_results_dir()
                         balanced_cluster.to_csv(out_path, index=False)
                         st.success(f"Base + Cluster exportado en {out_path}")
                     except Exception as exc:
@@ -28952,6 +29080,7 @@ def _render_find_samples_sizes_experiment() -> None:
                 pass
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = _ensure_crash_results_dir()
         model_path = None
         if best_idx is not None and 0 <= best_idx < len(eval_models):
             best_model = eval_models[best_idx]
@@ -28959,7 +29088,7 @@ def _render_find_samples_sizes_experiment() -> None:
                 try:
                     import joblib  # type: ignore
                     model_path = str(
-                        RESULTS_DIR / f"find_samples_sizes_model_{stamp}.joblib"
+                        output_dir / f"find_samples_sizes_model_{stamp}.joblib"
                     )
                     joblib.dump(best_model, model_path)
                 except Exception as exc:
@@ -29005,9 +29134,9 @@ def _render_find_samples_sizes_experiment() -> None:
                 st.dataframe(cm_df, width="stretch")
             _append_experiment_best(exp_db_path, dict(best_row))
 
-        res_path = RESULTS_DIR / f"find_samples_sizes_results_{stamp}.csv"
+        res_path = output_dir / f"find_samples_sizes_results_{stamp}.csv"
         res_df.to_csv(res_path, index=False)
-        cand_path = RESULTS_DIR / f"find_samples_sizes_candidates_{stamp}.csv"
+        cand_path = output_dir / f"find_samples_sizes_candidates_{stamp}.csv"
         candidates_df.to_csv(cand_path, index=False)
         st.success(f"Resultados guardados en {res_path}")
         st.caption(f"Candidatos guardados en {cand_path}")
@@ -29998,7 +30127,7 @@ def _render_best_highway_section_experiment() -> None:
                 st.dataframe(cm_df, width="stretch")
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        res_path = RESULTS_DIR / f"best_highway_section_results_{stamp}.csv"
+        res_path = _crash_output_path(f"best_highway_section_results_{stamp}.csv")
         res_df.to_csv(res_path, index=False)
         st.success(f"Resultados guardados en {res_path}")
 
@@ -30632,7 +30761,7 @@ def _render_best_highway_section_controlled_experiment() -> None:
             st.caption(f"DB live: {exp_db_path}")
 
         runner = ExperimentsRunner(random_state=int(random_state))
-        checkpoint_root = RESULTS_DIR / "best_highway_section_controlled_runs"
+        checkpoint_root = _crash_results_dir() / "best_highway_section_controlled_runs"
         total_segments = int(len(segments_df))
         progress_bar = st.progress(0, text="Preparando barrido controlado por tramo...")
         summary_frames: List[pd.DataFrame] = []
@@ -30871,9 +31000,15 @@ def _render_best_highway_section_controlled_experiment() -> None:
                 summary_df.loc[rank_df.index, "rank_global"] = rank_df["rank_global"]
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        summary_path = RESULTS_DIR / f"best_highway_section_controlled_summary_{stamp}.csv"
-        curves_path = RESULTS_DIR / f"best_highway_section_controlled_curves_{stamp}.csv"
-        detail_path = RESULTS_DIR / f"best_highway_section_controlled_grid_{stamp}.csv"
+        summary_path = _crash_output_path(
+            f"best_highway_section_controlled_summary_{stamp}.csv"
+        )
+        curves_path = _crash_output_path(
+            f"best_highway_section_controlled_curves_{stamp}.csv"
+        )
+        detail_path = _crash_output_path(
+            f"best_highway_section_controlled_grid_{stamp}.csv"
+        )
         summary_df.to_csv(summary_path, index=False)
         curves_df.to_csv(curves_path, index=False)
         grid_results_df.to_csv(detail_path, index=False)
@@ -31982,7 +32117,7 @@ def _render_best_highway_section_k_experiment() -> None:
                 st.dataframe(cm_df, width="stretch")
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        res_path = RESULTS_DIR / f"best_highway_section_k_results_{stamp}.csv"
+        res_path = _crash_output_path(f"best_highway_section_k_results_{stamp}.csv")
         res_df.to_csv(res_path, index=False)
         st.success(f"Resultados guardados en {res_path}")
 
@@ -33155,7 +33290,7 @@ def _render_controlled_comparison_experiment() -> None:
 
     checkpoint_mode = "Start fresh"
     checkpoint_preview: Optional[Dict[str, object]] = None
-    checkpoint_root = RESULTS_DIR / "controlled_comparison_runs"
+    checkpoint_root = _crash_results_dir() / "controlled_comparison_runs"
 
     st.caption(
         "Variables detectadas: "
@@ -33686,11 +33821,13 @@ def _render_controlled_comparison_experiment() -> None:
             _append_experiment_best(exp_db_path, record_out)
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        summary_path = RESULTS_DIR / f"controlled_comparison_summary_{stamp}.csv"
-        curves_path = RESULTS_DIR / f"controlled_comparison_curves_{stamp}.csv"
-        detail_path = RESULTS_DIR / f"controlled_comparison_grid_{stamp}.csv"
+        summary_path = _crash_output_path(
+            f"controlled_comparison_summary_{stamp}.csv"
+        )
+        curves_path = _crash_output_path(f"controlled_comparison_curves_{stamp}.csv")
+        detail_path = _crash_output_path(f"controlled_comparison_grid_{stamp}.csv")
         ablation_deltas_path = (
-            RESULTS_DIR / f"controlled_comparison_ablation_deltas_{stamp}.csv"
+            _crash_output_path(f"controlled_comparison_ablation_deltas_{stamp}.csv")
         )
         summary_df.to_csv(summary_path, index=False)
         curves_df.to_csv(curves_path, index=False)
@@ -33760,8 +33897,10 @@ def _render_experiments_tab() -> None:
                 try:
                     import zipfile
                     with zipfile.ZipFile(uploaded_zip, "r") as z:
-                        z.extractall(RESULTS_DIR)
-                    st.success(f"Experimentos importados exitosamente en {RESULTS_DIR}")
+                        z.extractall(_ensure_crash_results_dir())
+                    st.success(
+                        f"Experimentos importados exitosamente en {_crash_results_dir()}"
+                    )
                     # Clear cache to refresh file lists
                     st.cache_data.clear() 
                     st.rerun()
@@ -33915,17 +34054,14 @@ def _render_experiments_tab() -> None:
                         detail_df = pd.DataFrame()
                         ablation_deltas_df = pd.DataFrame()
                         if timestamp:
-                            curves_path = (
-                                RESULTS_DIR
-                                / f"{controlled_prefix}_curves_{timestamp}.csv"
+                            curves_path = _existing_crash_output_path(
+                                f"{controlled_prefix}_curves_{timestamp}.csv"
                             )
-                            detail_path = (
-                                RESULTS_DIR
-                                / f"{controlled_prefix}_grid_{timestamp}.csv"
+                            detail_path = _existing_crash_output_path(
+                                f"{controlled_prefix}_grid_{timestamp}.csv"
                             )
-                            ablation_deltas_path = (
-                                RESULTS_DIR
-                                / f"{controlled_prefix}_ablation_deltas_{timestamp}.csv"
+                            ablation_deltas_path = _existing_crash_output_path(
+                                f"{controlled_prefix}_ablation_deltas_{timestamp}.csv"
                             )
                             if curves_path.exists():
                                 try:

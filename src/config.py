@@ -273,7 +273,9 @@ GRAPHSMOTE_K =  5               # k-NN para síntesis
 PRETRAIN_EDGE_EPOCHS = 5        # épocas para pre-entrenar generador de aristas
 SMOTE_EVERY_N_EPOCHS = 5        # refresco en modo online
 GS_SEED = SEED                  # semilla reproducible para SMOTE
-SAVE_AUG_GRAPH_PATH = os.path.join(RESULTADOS_DIR, "graph_aug.pt")
+SAVE_AUG_GRAPH_PATH = os.path.join(
+    RESULTADOS_DIR, "gnn", "graphs", "balanced", "graphsmote", "graph_aug.pt"
+)
 GRAPHSMOTE_CONECT = 0           # 1 = método actual (Top-K por edge_gen sobre TRAIN reales);
                                 # 0 = conectar a vecinos (1-hop) de nodos reales con clase=1
 

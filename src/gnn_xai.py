@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from src.config import BATCH_SIZE, NUM_NEIGHBORS, RESULTADOS_DIR, SEED
+from src.gnn_artifacts import gnn_dir
 
 try:  # pragma: no cover - exercised in environments with torch_geometric.
     from torch_geometric.loader import NeighborLoader
@@ -30,6 +31,7 @@ class GNNXAIResult:
     edges_df: pd.DataFrame
     summary_df: pd.DataFrame
     manifest: Dict[str, Any]
+    explanations_df: Optional[pd.DataFrame] = None
 
 
 def _utc_now() -> str:
@@ -276,6 +278,22 @@ def _call_model(
     edge_attr_dict: Mapping[EdgeType, torch.Tensor],
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     out = model(batch.x_dict, batch.edge_index_dict, dict(edge_attr_dict))
+    return _coerce_model_output(out)
+
+
+def _call_model_inputs(
+    model: torch.nn.Module,
+    x_dict: Mapping[str, torch.Tensor],
+    edge_index_dict: Mapping[EdgeType, torch.Tensor],
+    edge_attr_dict: Mapping[EdgeType, torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    out = model(dict(x_dict), dict(edge_index_dict), dict(edge_attr_dict))
+    return _coerce_model_output(out)
+
+
+def _coerce_model_output(
+    out: object,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     if isinstance(out, tuple) and len(out) == 3:
         logits_dict, embeddings_dict, attentions = out
         return dict(logits_dict), dict(embeddings_dict), dict(attentions or {})
@@ -298,6 +316,620 @@ def _calibrate_probabilities(probs: np.ndarray, calibration_model: Optional[obje
         return np.column_stack([1.0 - prob1, prob1])
     except Exception:
         return probs
+
+
+def _prob1_from_logits(logits: torch.Tensor, calibration_model: Optional[object]) -> np.ndarray:
+    logits_cpu = logits.detach().cpu()
+    probs = F.softmax(logits_cpu, dim=-1).numpy()
+    probs = _calibrate_probabilities(probs, calibration_model)
+    return probs[:, 1] if probs.shape[1] > 1 else probs[:, 0]
+
+
+def _target_logits_from_outputs(
+    logits_dict: Mapping[str, torch.Tensor],
+    embeddings_dict: Mapping[str, torch.Tensor],
+    *,
+    temporal_module: Optional[torch.nn.Module],
+    node_type: str,
+    node_n_id: torch.Tensor,
+    target_bs: int,
+) -> torch.Tensor:
+    if temporal_module is not None:
+        emb = embeddings_dict.get(node_type)
+        if emb is None:
+            raise RuntimeError(f"El modelo no devolvio embeddings para node_type={node_type!r}.")
+        return temporal_module(emb, node_n_id.to(emb.device), target_bs)
+    logits = logits_dict.get(node_type)
+    if logits is None:
+        raise RuntimeError(f"El modelo no devolvio logits para node_type={node_type!r}.")
+    return logits[:target_bs]
+
+
+def _snapshot_temporal_cache(temporal_module: Optional[torch.nn.Module]) -> Optional[torch.Tensor]:
+    if temporal_module is None:
+        return None
+    cache = getattr(temporal_module, "embedding_cache", None)
+    if isinstance(cache, torch.Tensor):
+        return cache.detach().clone()
+    return None
+
+
+def _restore_temporal_cache(
+    temporal_module: Optional[torch.nn.Module],
+    snapshot: Optional[torch.Tensor],
+) -> None:
+    if temporal_module is None or snapshot is None:
+        return
+    cache = getattr(temporal_module, "embedding_cache", None)
+    if not isinstance(cache, torch.Tensor):
+        return
+    if tuple(cache.shape) != tuple(snapshot.shape):
+        try:
+            temporal_module.embedding_cache = snapshot.to(device=cache.device, dtype=cache.dtype).clone()
+        except Exception:
+            return
+    else:
+        cache.copy_(snapshot.to(device=cache.device, dtype=cache.dtype))
+
+
+def _empty_edge_attr_like(edge_attr: Optional[torch.Tensor], edge_index: torch.Tensor) -> Optional[torch.Tensor]:
+    if edge_attr is None:
+        return None
+    if edge_attr.dim() <= 1:
+        return edge_attr.new_zeros((0,))
+    return edge_attr.new_zeros((0, int(edge_attr.size(1))))
+
+
+def _ablate_relation_inputs(
+    batch: Any,
+    edge_attr_dict: Mapping[EdgeType, torch.Tensor],
+    relation_to_remove: EdgeType,
+) -> Tuple[Dict[str, torch.Tensor], Dict[EdgeType, torch.Tensor], Dict[EdgeType, torch.Tensor]]:
+    x_dict = dict(batch.x_dict)
+    edge_index_dict = dict(batch.edge_index_dict)
+    edge_attrs = dict(edge_attr_dict)
+    edge_index = edge_index_dict.get(relation_to_remove)
+    if edge_index is None:
+        return x_dict, edge_index_dict, edge_attrs
+    edge_index_dict[relation_to_remove] = edge_index.new_zeros((2, 0))
+    if relation_to_remove in edge_attrs:
+        empty_attr = _empty_edge_attr_like(edge_attrs.get(relation_to_remove), edge_index)
+        if empty_attr is not None:
+            edge_attrs[relation_to_remove] = empty_attr
+    return x_dict, edge_index_dict, edge_attrs
+
+
+def _keep_only_relation_inputs(
+    batch: Any,
+    edge_attr_dict: Mapping[EdgeType, torch.Tensor],
+    relation_to_keep: EdgeType,
+) -> Tuple[Dict[str, torch.Tensor], Dict[EdgeType, torch.Tensor], Dict[EdgeType, torch.Tensor]]:
+    x_dict = dict(batch.x_dict)
+    edge_index_dict = dict(batch.edge_index_dict)
+    edge_attrs = dict(edge_attr_dict)
+    for edge_type, edge_index in list(edge_index_dict.items()):
+        edge_type_t = tuple(edge_type)
+        if edge_type_t == relation_to_keep:
+            continue
+        edge_index_dict[edge_type_t] = edge_index.new_zeros((2, 0))
+        if edge_type_t in edge_attrs:
+            empty_attr = _empty_edge_attr_like(edge_attrs.get(edge_type_t), edge_index)
+            if empty_attr is not None:
+                edge_attrs[edge_type_t] = empty_attr
+    return x_dict, edge_index_dict, edge_attrs
+
+
+def _ablate_feature_inputs(
+    batch: Any,
+    *,
+    node_type: str,
+    feature_idx: int,
+) -> Tuple[Dict[str, torch.Tensor], Dict[EdgeType, torch.Tensor], Dict[EdgeType, torch.Tensor]]:
+    x_dict = dict(batch.x_dict)
+    edge_index_dict = dict(batch.edge_index_dict)
+    edge_attrs = _as_edge_attr_dict(batch)
+    x = x_dict.get(node_type)
+    if x is None or x.dim() != 2 or feature_idx < 0 or feature_idx >= int(x.size(1)):
+        return x_dict, edge_index_dict, edge_attrs
+    x_ablated = x.clone()
+    x_ablated[:, int(feature_idx)] = 0
+    x_dict[node_type] = x_ablated
+    return x_dict, edge_index_dict, edge_attrs
+
+
+def _select_feature_indices(
+    x: torch.Tensor,
+    *,
+    target_bs: int,
+    feature_names: Optional[Sequence[str]],
+    top_k: int,
+) -> List[Tuple[int, str]]:
+    if x is None or x.dim() != 2 or top_k <= 0:
+        return []
+    n_features = int(x.size(1))
+    if n_features <= 0:
+        return []
+    x_target = x[: max(1, int(target_bs))].detach().float().cpu()
+    scores = torch.nan_to_num(x_target.abs(), nan=0.0, posinf=0.0, neginf=0.0).mean(dim=0)
+    k = min(int(top_k), n_features)
+    if k <= 0:
+        return []
+    _, indices = torch.topk(scores, k=k)
+    names = list(feature_names or [])
+    out: List[Tuple[int, str]] = []
+    for idx in indices.tolist():
+        name = names[idx] if 0 <= idx < len(names) else f"x_{idx}"
+        out.append((int(idx), str(name)))
+    return out
+
+
+def _predict_ablation_prob1(
+    model: torch.nn.Module,
+    *,
+    x_dict: Mapping[str, torch.Tensor],
+    edge_index_dict: Mapping[EdgeType, torch.Tensor],
+    edge_attr_dict: Mapping[EdgeType, torch.Tensor],
+    temporal_module: Optional[torch.nn.Module],
+    node_type: str,
+    node_n_id: torch.Tensor,
+    target_bs: int,
+    calibration_model: Optional[object],
+) -> np.ndarray:
+    snapshot = _snapshot_temporal_cache(temporal_module)
+    try:
+        logits_dict, embeddings_dict, _ = _call_model_inputs(model, x_dict, edge_index_dict, edge_attr_dict)
+        logits_target = _target_logits_from_outputs(
+            logits_dict,
+            embeddings_dict,
+            temporal_module=temporal_module,
+            node_type=node_type,
+            node_n_id=node_n_id,
+            target_bs=target_bs,
+        )
+        return _prob1_from_logits(logits_target, calibration_model)
+    finally:
+        _restore_temporal_cache(temporal_module, snapshot)
+
+
+def _build_explanation_row(
+    *,
+    method: str,
+    node_row: Mapping[str, Any],
+    base_prob1: float,
+    perturbed_prob1: float,
+    threshold: Optional[float],
+    relation: Optional[str] = None,
+    feature_idx: Optional[int] = None,
+    feature_name: Optional[str] = None,
+    sufficient_prob1: Optional[float] = None,
+) -> Dict[str, Any]:
+    delta = float(perturbed_prob1 - base_prob1)
+    tau = 0.5 if threshold is None else float(threshold)
+    crossed = (base_prob1 >= tau and perturbed_prob1 < tau) or (base_prob1 < tau and perturbed_prob1 >= tau)
+    suff_score = np.nan
+    if sufficient_prob1 is not None:
+        suff_score = float(max(0.0, 1.0 - abs(float(base_prob1) - float(sufficient_prob1))))
+    return {
+        "method": str(method),
+        "node_idx": int(node_row.get("node_idx")),
+        "portico": node_row.get("portico"),
+        "ts_min": node_row.get("ts_min"),
+        "mask": node_row.get("mask"),
+        "y_true": node_row.get("y_true"),
+        "y_pred": node_row.get("y_pred"),
+        "error_type": node_row.get("error_type"),
+        "relation": relation,
+        "feature_idx": feature_idx,
+        "feature_name": feature_name,
+        "base_prob1": float(base_prob1),
+        "perturbed_prob1": float(perturbed_prob1),
+        "sufficient_prob1": None if sufficient_prob1 is None else float(sufficient_prob1),
+        "delta_prob1": delta,
+        "score": abs(delta),
+        "necessity": float(max(0.0, float(base_prob1) - float(perturbed_prob1))),
+        "sufficiency": suff_score,
+        "threshold": tau,
+        "crossed_threshold": bool(crossed),
+    }
+
+
+def _build_feature_attribution_row(
+    *,
+    method: str,
+    node_row: Mapping[str, Any],
+    base_prob1: float,
+    threshold: Optional[float],
+    feature_idx: int,
+    feature_name: str,
+    attribution: float,
+    target_class: int,
+    gradient_steps: Optional[int] = None,
+) -> Dict[str, Any]:
+    tau = 0.5 if threshold is None else float(threshold)
+    return {
+        "method": str(method),
+        "node_idx": int(node_row.get("node_idx")),
+        "portico": node_row.get("portico"),
+        "ts_min": node_row.get("ts_min"),
+        "mask": node_row.get("mask"),
+        "y_true": node_row.get("y_true"),
+        "y_pred": node_row.get("y_pred"),
+        "error_type": node_row.get("error_type"),
+        "relation": None,
+        "feature_idx": int(feature_idx),
+        "feature_name": str(feature_name),
+        "base_prob1": float(base_prob1),
+        "perturbed_prob1": np.nan,
+        "sufficient_prob1": np.nan,
+        "delta_prob1": np.nan,
+        "score": abs(float(attribution)),
+        "necessity": np.nan,
+        "sufficiency": np.nan,
+        "threshold": tau,
+        "crossed_threshold": False,
+        "attribution": float(attribution),
+        "target_class": int(target_class),
+        "gradient_steps": None if gradient_steps is None else int(gradient_steps),
+    }
+
+
+def _top_feature_attribution_rows(
+    *,
+    method: str,
+    selected_rows: Sequence[Mapping[str, Any]],
+    base_prob1: np.ndarray,
+    attributions: torch.Tensor,
+    threshold: Optional[float],
+    feature_names: Optional[Sequence[str]],
+    top_features: int,
+    target_class: int,
+    gradient_steps: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    if attributions is None or attributions.dim() != 2 or top_features <= 0:
+        return []
+    names = list(feature_names or [])
+    rows: List[Dict[str, Any]] = []
+    selected_count = min(len(selected_rows), int(attributions.size(0)), len(base_prob1))
+    if selected_count <= 0:
+        return rows
+    k = min(int(top_features), int(attributions.size(1)))
+    if k <= 0:
+        return rows
+    attr_cpu = torch.nan_to_num(
+        attributions[:selected_count].detach().float().cpu(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    for pos in range(selected_count):
+        _, indices = torch.topk(attr_cpu[pos].abs(), k=k)
+        for feature_idx in indices.tolist():
+            feature_name = names[feature_idx] if 0 <= feature_idx < len(names) else f"x_{feature_idx}"
+            rows.append(
+                _build_feature_attribution_row(
+                    method=method,
+                    node_row=selected_rows[pos],
+                    base_prob1=float(base_prob1[pos]),
+                    threshold=threshold,
+                    feature_idx=int(feature_idx),
+                    feature_name=str(feature_name),
+                    attribution=float(attr_cpu[pos, feature_idx].item()),
+                    target_class=target_class,
+                    gradient_steps=gradient_steps,
+                )
+            )
+    return rows
+
+
+def _gradient_feature_attributions(
+    *,
+    model: torch.nn.Module,
+    batch: Any,
+    edge_attr_dict: Mapping[EdgeType, torch.Tensor],
+    temporal_module: Optional[torch.nn.Module],
+    node_type: str,
+    node_n_id: torch.Tensor,
+    target_bs: int,
+    selected_count: int,
+    target_class: int = 1,
+) -> Optional[torch.Tensor]:
+    x = batch.x_dict.get(node_type)
+    if x is None or x.dim() != 2 or selected_count <= 0:
+        return None
+    x_grad = x.detach().clone().requires_grad_(True)
+    x_dict = dict(batch.x_dict)
+    x_dict[node_type] = x_grad
+    snapshot = _snapshot_temporal_cache(temporal_module)
+    try:
+        with torch.enable_grad():
+            model.zero_grad(set_to_none=True)
+            if temporal_module is not None:
+                temporal_module.zero_grad(set_to_none=True)
+            logits_dict, embeddings_dict, _ = _call_model_inputs(
+                model,
+                x_dict,
+                batch.edge_index_dict,
+                edge_attr_dict,
+            )
+            logits_target = _target_logits_from_outputs(
+                logits_dict,
+                embeddings_dict,
+                temporal_module=temporal_module,
+                node_type=node_type,
+                node_n_id=node_n_id,
+                target_bs=target_bs,
+            )
+            if logits_target.numel() == 0:
+                return None
+            cls = min(max(0, int(target_class)), int(logits_target.size(1)) - 1)
+            score = logits_target[:selected_count, cls].sum()
+            score.backward()
+            grad = x_grad.grad
+            if grad is None:
+                return None
+            return (grad[:selected_count].detach() * x_grad[:selected_count].detach()).cpu()
+    finally:
+        _restore_temporal_cache(temporal_module, snapshot)
+        try:
+            model.zero_grad(set_to_none=True)
+            if temporal_module is not None:
+                temporal_module.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+
+
+def _integrated_gradient_feature_attributions(
+    *,
+    model: torch.nn.Module,
+    batch: Any,
+    edge_attr_dict: Mapping[EdgeType, torch.Tensor],
+    temporal_module: Optional[torch.nn.Module],
+    node_type: str,
+    node_n_id: torch.Tensor,
+    target_bs: int,
+    selected_count: int,
+    steps: int,
+    target_class: int = 1,
+) -> Optional[torch.Tensor]:
+    x = batch.x_dict.get(node_type)
+    if x is None or x.dim() != 2 or selected_count <= 0:
+        return None
+    effective_steps = max(1, int(steps or 1))
+    x_input = x.detach()
+    baseline = torch.zeros_like(x_input)
+    total_grad = torch.zeros_like(x_input[:selected_count])
+    alphas = torch.linspace(
+        1.0 / float(effective_steps),
+        1.0,
+        steps=effective_steps,
+        device=x_input.device,
+        dtype=x_input.dtype,
+    )
+    for alpha in alphas:
+        x_scaled = (baseline + alpha * (x_input - baseline)).detach().clone().requires_grad_(True)
+        x_dict = dict(batch.x_dict)
+        x_dict[node_type] = x_scaled
+        snapshot = _snapshot_temporal_cache(temporal_module)
+        try:
+            with torch.enable_grad():
+                model.zero_grad(set_to_none=True)
+                if temporal_module is not None:
+                    temporal_module.zero_grad(set_to_none=True)
+                logits_dict, embeddings_dict, _ = _call_model_inputs(
+                    model,
+                    x_dict,
+                    batch.edge_index_dict,
+                    edge_attr_dict,
+                )
+                logits_target = _target_logits_from_outputs(
+                    logits_dict,
+                    embeddings_dict,
+                    temporal_module=temporal_module,
+                    node_type=node_type,
+                    node_n_id=node_n_id,
+                    target_bs=target_bs,
+                )
+                if logits_target.numel() == 0:
+                    continue
+                cls = min(max(0, int(target_class)), int(logits_target.size(1)) - 1)
+                score = logits_target[:selected_count, cls].sum()
+                score.backward()
+                if x_scaled.grad is not None:
+                    total_grad += x_scaled.grad[:selected_count].detach()
+        finally:
+            _restore_temporal_cache(temporal_module, snapshot)
+            try:
+                model.zero_grad(set_to_none=True)
+                if temporal_module is not None:
+                    temporal_module.zero_grad(set_to_none=True)
+            except Exception:
+                pass
+    avg_grad = total_grad / float(effective_steps)
+    return ((x_input[:selected_count] - baseline[:selected_count]) * avg_grad).detach().cpu()
+
+
+def _batch_advanced_explanations(
+    *,
+    model: torch.nn.Module,
+    batch: Any,
+    edge_attr_dict: Mapping[EdgeType, torch.Tensor],
+    logits_dict: Mapping[str, torch.Tensor],
+    embeddings_dict: Mapping[str, torch.Tensor],
+    temporal_module: Optional[torch.nn.Module],
+    node_type: str,
+    node_rows: Sequence[Mapping[str, Any]],
+    target_bs: int,
+    threshold: Optional[float],
+    calibration_model: Optional[object],
+    explanation_methods: Sequence[str],
+    feature_names: Optional[Sequence[str]],
+    top_features: int,
+    explain_limit: int,
+    integrated_gradients_steps: int,
+) -> List[Dict[str, Any]]:
+    methods = {str(m).strip().lower() for m in explanation_methods if str(m).strip()}
+    if not methods or explain_limit <= 0 or target_bs <= 0:
+        return []
+    node_n_id = getattr(batch[node_type], "n_id").detach().cpu()
+    logits_target = _target_logits_from_outputs(
+        logits_dict,
+        embeddings_dict,
+        temporal_module=temporal_module,
+        node_type=node_type,
+        node_n_id=node_n_id,
+        target_bs=target_bs,
+    )
+    base_prob1 = _prob1_from_logits(logits_target, calibration_model)
+    selected_count = min(int(target_bs), int(explain_limit), len(node_rows), len(base_prob1))
+    if selected_count <= 0:
+        return []
+    selected_rows = list(node_rows[:selected_count])
+    rows: List[Dict[str, Any]] = []
+    target_class = 1
+
+    if "relation_ablation" in methods:
+        for edge_type in getattr(batch, "edge_types", []):
+            edge_type_t = tuple(edge_type)
+            relation = str(edge_type_t[1]) if len(edge_type_t) >= 2 else str(edge_type_t)
+            try:
+                x_dict, edge_index_dict, edge_attrs = _ablate_relation_inputs(batch, edge_attr_dict, edge_type_t)
+                perturbed = _predict_ablation_prob1(
+                    model,
+                    x_dict=x_dict,
+                    edge_index_dict=edge_index_dict,
+                    edge_attr_dict=edge_attrs,
+                    temporal_module=temporal_module,
+                    node_type=node_type,
+                    node_n_id=node_n_id,
+                    target_bs=target_bs,
+                    calibration_model=calibration_model,
+                )
+                x_keep, edge_index_keep, edge_attrs_keep = _keep_only_relation_inputs(batch, edge_attr_dict, edge_type_t)
+                sufficient = _predict_ablation_prob1(
+                    model,
+                    x_dict=x_keep,
+                    edge_index_dict=edge_index_keep,
+                    edge_attr_dict=edge_attrs_keep,
+                    temporal_module=temporal_module,
+                    node_type=node_type,
+                    node_n_id=node_n_id,
+                    target_bs=target_bs,
+                    calibration_model=calibration_model,
+                )
+            except Exception:
+                continue
+            for pos, node_row in enumerate(selected_rows):
+                if pos >= len(perturbed) or pos >= len(sufficient):
+                    continue
+                rows.append(
+                    _build_explanation_row(
+                        method="relation_ablation",
+                        node_row=node_row,
+                        base_prob1=float(base_prob1[pos]),
+                        perturbed_prob1=float(perturbed[pos]),
+                        sufficient_prob1=float(sufficient[pos]),
+                        threshold=threshold,
+                        relation=relation,
+                    )
+                )
+
+    if "feature_ablation" in methods:
+        feature_candidates = _select_feature_indices(
+            batch.x_dict.get(node_type),
+            target_bs=target_bs,
+            feature_names=feature_names,
+            top_k=int(top_features or 0),
+        )
+        for feature_idx, feature_name in feature_candidates:
+            try:
+                x_dict, edge_index_dict, edge_attrs = _ablate_feature_inputs(
+                    batch,
+                    node_type=node_type,
+                    feature_idx=int(feature_idx),
+                )
+                perturbed = _predict_ablation_prob1(
+                    model,
+                    x_dict=x_dict,
+                    edge_index_dict=edge_index_dict,
+                    edge_attr_dict=edge_attrs,
+                    temporal_module=temporal_module,
+                    node_type=node_type,
+                    node_n_id=node_n_id,
+                    target_bs=target_bs,
+                    calibration_model=calibration_model,
+                )
+            except Exception:
+                continue
+            for pos, node_row in enumerate(selected_rows):
+                if pos >= len(perturbed):
+                    continue
+                rows.append(
+                    _build_explanation_row(
+                        method="feature_ablation",
+                        node_row=node_row,
+                        base_prob1=float(base_prob1[pos]),
+                        perturbed_prob1=float(perturbed[pos]),
+                        threshold=threshold,
+                        feature_idx=int(feature_idx),
+                        feature_name=str(feature_name),
+                    )
+                )
+
+    if "input_gradient" in methods and top_features > 0:
+        attr = _gradient_feature_attributions(
+            model=model,
+            batch=batch,
+            edge_attr_dict=edge_attr_dict,
+            temporal_module=temporal_module,
+            node_type=node_type,
+            node_n_id=node_n_id,
+            target_bs=target_bs,
+            selected_count=selected_count,
+            target_class=target_class,
+        )
+        if attr is not None:
+            rows.extend(
+                _top_feature_attribution_rows(
+                    method="input_gradient",
+                    selected_rows=selected_rows,
+                    base_prob1=base_prob1,
+                    attributions=attr,
+                    threshold=threshold,
+                    feature_names=feature_names,
+                    top_features=int(top_features or 0),
+                    target_class=target_class,
+                )
+            )
+
+    if "integrated_gradients" in methods and top_features > 0:
+        attr = _integrated_gradient_feature_attributions(
+            model=model,
+            batch=batch,
+            edge_attr_dict=edge_attr_dict,
+            temporal_module=temporal_module,
+            node_type=node_type,
+            node_n_id=node_n_id,
+            target_bs=target_bs,
+            selected_count=selected_count,
+            steps=int(integrated_gradients_steps or 1),
+            target_class=target_class,
+        )
+        if attr is not None:
+            rows.extend(
+                _top_feature_attribution_rows(
+                    method="integrated_gradients",
+                    selected_rows=selected_rows,
+                    base_prob1=base_prob1,
+                    attributions=attr,
+                    threshold=threshold,
+                    feature_names=feature_names,
+                    top_features=int(top_features or 0),
+                    target_class=target_class,
+                    gradient_steps=int(integrated_gradients_steps or 1),
+                )
+            )
+
+    return rows
 
 
 def _predict_batch_nodes(
@@ -588,6 +1220,11 @@ def compute_gnn_xai_graph(
     device: Optional[object] = None,
     model_path: Optional[object] = None,
     graph_hash: Optional[str] = None,
+    explanation_methods: Optional[Sequence[str]] = None,
+    explain_max_nodes: int = 0,
+    explain_top_features: int = 0,
+    integrated_gradients_steps: int = 16,
+    feature_names: Optional[Sequence[str]] = None,
 ) -> GNNXAIResult:
     """Compute graph XAI attention joined with node-level predictions.
 
@@ -650,6 +1287,9 @@ def compute_gnn_xai_graph(
 
     node_rows_by_id: Dict[int, Dict[str, Any]] = {}
     edge_rows: List[Dict[str, Any]] = []
+    explanation_rows: List[Dict[str, Any]] = []
+    methods = tuple(str(m).strip().lower() for m in (explanation_methods or []) if str(m).strip())
+    remaining_explain_nodes = max(0, int(explain_max_nodes or 0))
 
     with torch.no_grad():
         for batch in loader:
@@ -715,6 +1355,32 @@ def compute_gnn_xai_graph(
                     k_heads=effective_k_heads,
                 )
             )
+            if methods and remaining_explain_nodes > 0:
+                explain_rows = _batch_advanced_explanations(
+                    model=model,
+                    batch=batch,
+                    edge_attr_dict=edge_attr_dict,
+                    logits_dict=logits_dict,
+                    embeddings_dict=embeddings_dict,
+                    temporal_module=temporal_module,
+                    node_type=node_type,
+                    node_rows=rows[:target_bs],
+                    target_bs=target_bs,
+                    threshold=threshold,
+                    calibration_model=calibration_model,
+                    explanation_methods=methods,
+                    feature_names=feature_names,
+                    top_features=int(explain_top_features or 0),
+                    explain_limit=remaining_explain_nodes,
+                    integrated_gradients_steps=int(integrated_gradients_steps or 1),
+                )
+                explanation_rows.extend(explain_rows)
+                explained_ids = {
+                    int(row["node_idx"])
+                    for row in explain_rows
+                    if row.get("node_idx") is not None
+                }
+                remaining_explain_nodes = max(0, remaining_explain_nodes - len(explained_ids))
 
     nodes_df = pd.DataFrame(list(node_rows_by_id.values()))
     if nodes_df.empty:
@@ -743,10 +1409,41 @@ def compute_gnn_xai_graph(
         edges_df = _deduplicate_edges(edges_df)
     edges_df = _join_predictions(edges_df, nodes_df)
     summary_df = _summary(edges_df)
+    explanations_df = pd.DataFrame(explanation_rows)
+    if explanations_df.empty:
+        explanations_df = pd.DataFrame(
+            columns=[
+                "method",
+                "node_idx",
+                "portico",
+                "ts_min",
+                "mask",
+                "y_true",
+                "y_pred",
+                "error_type",
+                "relation",
+                "feature_idx",
+                "feature_name",
+                "base_prob1",
+                "perturbed_prob1",
+                "sufficient_prob1",
+                "delta_prob1",
+                "score",
+                "necessity",
+                "sufficiency",
+                "threshold",
+                "crossed_threshold",
+                "attribution",
+                "target_class",
+                "gradient_steps",
+            ]
+        )
+    else:
+        explanations_df = explanations_df.sort_values("score", ascending=False).reset_index(drop=True)
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     manifest = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "created_at": _utc_now(),
         "run_id": run_id,
         "model_path": str(model_path) if model_path is not None else None,
@@ -755,17 +1452,23 @@ def compute_gnn_xai_graph(
         "mask_name": str(mask_name),
         "node_count": int(len(nodes_df)),
         "edge_count": int(len(edges_df)),
+        "explanation_count": int(len(explanations_df)),
         "batch_size": effective_batch_size,
         "num_neighbors": str(resolved_neighbors),
         "percentile": effective_percentile,
         "k_heads": effective_k_heads,
         "layer": str(layer),
         "threshold": None if threshold is None else float(threshold),
+        "explanation_methods": list(methods),
+        "explain_max_nodes": int(explain_max_nodes or 0),
+        "explain_top_features": int(explain_top_features or 0),
+        "integrated_gradients_steps": int(integrated_gradients_steps or 1),
         "seed": int(SEED),
         "files": {
             "manifest": "manifest.json",
             "nodes": "nodes.parquet",
             "edges": "edges.parquet",
+            "explanations": "explanations.parquet",
             "summary": "summary.csv",
         },
     }
@@ -774,6 +1477,7 @@ def compute_gnn_xai_graph(
         edges_df=edges_df,
         summary_df=summary_df,
         manifest=manifest,
+        explanations_df=explanations_df,
     )
 
 
@@ -791,12 +1495,18 @@ def save_gnn_xai_result(
     result: GNNXAIResult,
     output_dir: Optional[object] = None,
 ) -> Path:
-    base = Path(output_dir) if output_dir is not None else Path(RESULTADOS_DIR) / "gnn_xai" / str(result.manifest.get("run_id"))
+    base = (
+        Path(output_dir)
+        if output_dir is not None
+        else gnn_dir("xai", RESULTADOS_DIR, create=True) / str(result.manifest.get("run_id"))
+    )
     base.mkdir(parents=True, exist_ok=True)
     manifest = dict(result.manifest)
     files = dict(manifest.get("files") or {})
     files["nodes"] = _write_parquet_with_csv_fallback(result.nodes_df, base / "nodes.parquet")
     files["edges"] = _write_parquet_with_csv_fallback(result.edges_df, base / "edges.parquet")
+    explanations_df = result.explanations_df if result.explanations_df is not None else pd.DataFrame()
+    files["explanations"] = _write_parquet_with_csv_fallback(explanations_df, base / "explanations.parquet")
     result.summary_df.to_csv(base / "summary.csv", index=False)
     files["summary"] = "summary.csv"
     files["manifest"] = "manifest.json"
@@ -822,11 +1532,23 @@ def load_gnn_xai_result(result_dir: object) -> GNNXAIResult:
     files = dict(manifest.get("files") or {})
     nodes_name = files.get("nodes", "nodes.parquet")
     edges_name = files.get("edges", "edges.parquet")
+    explanations_name = files.get("explanations")
     summary_name = files.get("summary", "summary.csv")
     nodes_df = _read_table(base / nodes_name)
     edges_df = _read_table(base / edges_name)
+    explanations_df = (
+        _read_table(base / explanations_name)
+        if explanations_name and (base / explanations_name).exists()
+        else pd.DataFrame()
+    )
     summary_df = _read_table(base / summary_name)
-    return GNNXAIResult(nodes_df=nodes_df, edges_df=edges_df, summary_df=summary_df, manifest=manifest)
+    return GNNXAIResult(
+        nodes_df=nodes_df,
+        edges_df=edges_df,
+        summary_df=summary_df,
+        manifest=manifest,
+        explanations_df=explanations_df,
+    )
 
 
 def find_latest_gnn_xai_result(
@@ -835,7 +1557,7 @@ def find_latest_gnn_xai_result(
     graph_hash: Optional[str] = None,
     model_path: Optional[object] = None,
 ) -> Optional[Path]:
-    root = Path(base_dir) if base_dir is not None else Path(RESULTADOS_DIR) / "gnn_xai"
+    root = Path(base_dir) if base_dir is not None else gnn_dir("xai", RESULTADOS_DIR)
     if not root.exists():
         return None
     model_path_str = str(model_path) if model_path is not None else None

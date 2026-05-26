@@ -6,8 +6,10 @@ from src import graph_builder_app as app
 
 
 def test_saved_balanced_graph_listing_skips_truncated_torch_archives(tmp_path, monkeypatch):
-    valid_path = tmp_path / "graph_imgagn_relational_valid.pt"
-    corrupt_path = tmp_path / "graph_imgagn_relational_corrupt.pt"
+    graph_dir = tmp_path / "gnn" / "graphs" / "balanced" / "imgagn"
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    valid_path = graph_dir / "graph_imgagn_relational_valid.pt"
+    corrupt_path = graph_dir / "graph_imgagn_relational_corrupt.pt"
     app.torch.save({"data": app.HeteroData()}, valid_path)
     with zipfile.ZipFile(corrupt_path, "w") as zf:
         zf.writestr("graph_imgagn_relational_corrupt/version", "3\n")

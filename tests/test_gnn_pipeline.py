@@ -25,6 +25,7 @@ from src.graph_builder_app import (
     _apply_temporal_split_to_graph,
     _attach_graph_metadata_hash,
     _build_bidirectional_spatial_edges,
+    _build_chunked_pm_edge_stores,
     _build_edge_feature_extras,
     _build_raw_global_edge_features,
     _compute_normalization_stats_from_train,
@@ -591,6 +592,235 @@ def test_bidirectional_spatial_edges_recompute_reverse_attributes():
             ]
         ),
     )
+
+
+def _chunked_edge_fixture():
+    rows = []
+    for portico_idx, portico in enumerate(["A", "B", "C"]):
+        for ts in [0, 5, 10]:
+            rows.append(
+                {
+                    "portico": portico,
+                    "ts_min": ts,
+                    "node_idx": len(rows),
+                    "flow_total": 100.0 + 10.0 * portico_idx + ts,
+                    "speed_mean": 60.0 - 5.0 * portico_idx - ts / 10.0,
+                    "slow_pct": 0.05 * portico_idx + ts / 100.0,
+                    "mix_cat_2": 0.10 + 0.01 * portico_idx,
+                }
+            )
+    df_pm = pd.DataFrame(rows)
+    porticos = pd.DataFrame(
+        {
+            "portico": ["A", "B", "C"],
+            "calzada": ["N", "N", "N"],
+            "eje": ["E", "E", "E"],
+            "orden": [1, 2, 3],
+            "km": [0.0, 2.0, 5.0],
+        }
+    )
+    feat_mat_delta = df_pm[["flow_total", "speed_mean"]].to_numpy(dtype=np.float32)
+    raw_globals = _build_raw_global_edge_features(df_pm, "portico")
+    return df_pm, porticos, feat_mat_delta, raw_globals
+
+
+def _build_reference_monolithic_edges(
+    df_pm: pd.DataFrame,
+    porticos: pd.DataFrame,
+    feat_mat_delta: np.ndarray,
+    raw_globals: pd.DataFrame,
+) -> HeteroData:
+    data = HeteroData()
+    data["pm"].x = torch.zeros((len(df_pm), 1), dtype=torch.float32)
+    selected_physical = ["dist_km", "grad_q", "grad_v", "grad_slow_pct"]
+    df_seq = pd.DataFrame(
+        {
+            "portico_src": ["A", "B"],
+            "portico_dst": ["B", "C"],
+            "dist_km": [2.0, 3.0],
+        }
+    )
+
+    work = df_pm[["portico", "ts_min", "node_idx"]].copy()
+    work["next_ts_min"] = work["ts_min"] + 5
+    temporal = pd.merge(
+        work,
+        df_pm[["portico", "ts_min", "node_idx"]],
+        left_on=["portico", "next_ts_min"],
+        right_on=["portico", "ts_min"],
+        suffixes=("_src", "_dst"),
+    )
+    t_src = temporal["node_idx_src"].to_numpy(dtype=np.int64)
+    t_dst = temporal["node_idx_dst"].to_numpy(dtype=np.int64)
+    data["pm", "temporal", "pm"].edge_index = torch.tensor(
+        np.vstack([t_src, t_dst]), dtype=torch.long
+    )
+    data["pm", "temporal", "pm"].edge_attr = torch.tensor(
+        feat_mat_delta[t_dst] - feat_mat_delta[t_src],
+        dtype=torch.float32,
+    )
+
+    spatial = pd.merge(
+        df_pm[["portico", "ts_min", "node_idx"]].rename(
+            columns={"portico": "portico_src", "node_idx": "node_idx_src"}
+        ),
+        df_seq,
+        on="portico_src",
+    )
+    spatial = pd.merge(
+        spatial,
+        df_pm[["portico", "ts_min", "node_idx"]].rename(
+            columns={"portico": "portico_dst", "node_idx": "node_idx_dst"}
+        ),
+        left_on=["ts_min", "portico_dst"],
+        right_on=["ts_min", "portico_dst"],
+    )
+    s_src, s_dst, s_attr = _build_bidirectional_spatial_edges(
+        spatial,
+        feat_mat_delta,
+        raw_globals,
+        "portico",
+        selected_physical,
+    )
+    data["pm", "spatial", "pm"].edge_index = torch.tensor(
+        np.vstack([s_src, s_dst]), dtype=torch.long
+    )
+    data["pm", "spatial", "pm"].edge_attr = torch.tensor(
+        s_attr, dtype=torch.float32
+    )
+
+    st_src = df_pm[["portico", "ts_min", "node_idx"]].rename(
+        columns={
+            "portico": "portico_src",
+            "node_idx": "node_idx_src",
+            "ts_min": "ts_min_src",
+        }
+    )
+    st_src["next_ts_min"] = st_src["ts_min_src"] + 5
+    st_dst = df_pm[["portico", "ts_min", "node_idx"]].rename(
+        columns={
+            "portico": "portico_dst",
+            "node_idx": "node_idx_dst",
+            "ts_min": "ts_min_dst",
+        }
+    )
+    st_edges = pd.merge(st_src, df_seq, on="portico_src")
+    st_edges = pd.merge(
+        st_edges,
+        st_dst,
+        left_on=["next_ts_min", "portico_dst"],
+        right_on=["ts_min_dst", "portico_dst"],
+    )
+    st_src_idx = st_edges["node_idx_src"].to_numpy(dtype=np.int64)
+    st_dst_idx = st_edges["node_idx_dst"].to_numpy(dtype=np.int64)
+    st_attr = np.concatenate(
+        [
+            feat_mat_delta[st_dst_idx] - feat_mat_delta[st_src_idx],
+            _build_edge_feature_extras(
+                st_edges,
+                raw_globals,
+                "portico",
+                selected_physical,
+                src_ts_col="ts_min_src",
+                dst_ts_col="ts_min_dst",
+            ),
+        ],
+        axis=1,
+    )
+    data["pm", "st_fwd", "pm"].edge_index = torch.tensor(
+        np.vstack([st_src_idx, st_dst_idx]), dtype=torch.long
+    )
+    data["pm", "st_fwd", "pm"].edge_attr = torch.tensor(
+        st_attr, dtype=torch.float32
+    )
+    return data
+
+
+def _build_chunked_fixture_graph(target_rows: int) -> tuple[HeteroData, dict]:
+    df_pm, porticos, feat_mat_delta, raw_globals = _chunked_edge_fixture()
+    data = HeteroData()
+    data["pm"].x = torch.zeros((len(df_pm), 1), dtype=torch.float32)
+    meta = _build_chunked_pm_edge_stores(
+        data,
+        df_pm_edges=df_pm[["portico", "ts_min", "node_idx"]],
+        df_port_use=porticos,
+        feat_mat_delta=feat_mat_delta,
+        raw_globals=raw_globals,
+        portico_col="portico",
+        selected_physical_features=[
+            "dist_km",
+            "grad_q",
+            "grad_v",
+            "grad_slow_pct",
+        ],
+        dt_feat_minutes=5,
+        build_temporal=True,
+        build_spatial=True,
+        build_st_fwd=True,
+        edge_attr_dtype=torch.float32,
+        target_rows=target_rows,
+    )
+    return data, meta
+
+
+def _sorted_edges(data: HeteroData, edge_type):
+    edge_index = data[edge_type].edge_index.detach().cpu().numpy()
+    edge_attr = data[edge_type].edge_attr.detach().cpu().numpy()
+    order = np.lexsort((edge_index[1], edge_index[0]))
+    return edge_index[:, order], edge_attr[order]
+
+
+def test_chunked_edge_builder_matches_monolithic_and_crosses_boundaries():
+    df_pm, porticos, feat_mat_delta, raw_globals = _chunked_edge_fixture()
+    expected = _build_reference_monolithic_edges(
+        df_pm, porticos, feat_mat_delta, raw_globals
+    )
+    chunked, meta = _build_chunked_fixture_graph(target_rows=3)
+
+    assert meta["mode"] == "chunked"
+    assert meta["chunk_count"] == 3
+    assert meta["edge_counts_before_clean"]["('pm', 'temporal', 'pm')"] == 6
+
+    for edge_type in expected.edge_types:
+        exp_ei, exp_attr = _sorted_edges(expected, edge_type)
+        got_ei, got_attr = _sorted_edges(chunked, edge_type)
+        np.testing.assert_array_equal(got_ei, exp_ei)
+        np.testing.assert_allclose(got_attr, exp_attr, rtol=1e-6, atol=1e-6)
+
+
+def test_chunked_edge_builder_is_invariant_to_target_rows():
+    chunked_small, _ = _build_chunked_fixture_graph(target_rows=3)
+    chunked_large, _ = _build_chunked_fixture_graph(target_rows=1000)
+
+    for edge_type in chunked_large.edge_types:
+        small_ei, small_attr = _sorted_edges(chunked_small, edge_type)
+        large_ei, large_attr = _sorted_edges(chunked_large, edge_type)
+        np.testing.assert_array_equal(small_ei, large_ei)
+        np.testing.assert_allclose(small_attr, large_attr, rtol=1e-6, atol=1e-6)
+
+
+def test_chunked_edge_builder_rejects_duplicate_pm_keys():
+    df_pm, porticos, feat_mat_delta, raw_globals = _chunked_edge_fixture()
+    duplicated = pd.concat([df_pm, df_pm.iloc[[0]]], ignore_index=True)
+    data = HeteroData()
+    data["pm"].x = torch.zeros((len(duplicated), 1), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="duplicadas"):
+        _build_chunked_pm_edge_stores(
+            data,
+            df_pm_edges=duplicated[["portico", "ts_min", "node_idx"]],
+            df_port_use=porticos,
+            feat_mat_delta=np.vstack([feat_mat_delta, feat_mat_delta[[0]]]),
+            raw_globals=raw_globals,
+            portico_col="portico",
+            selected_physical_features=["dist_km"],
+            dt_feat_minutes=5,
+            build_temporal=True,
+            build_spatial=True,
+            build_st_fwd=True,
+            edge_attr_dtype=torch.float32,
+            target_rows=3,
+        )
 
 
 def test_attach_graph_metadata_hash_records_reproducibility_payload():

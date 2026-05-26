@@ -272,6 +272,25 @@ def test_default_controlled_comparison_search_space_includes_nn_options():
     assert nn_space["optimizer_name"] == ["adamw", "adam", "rmsprop"]
 
 
+def test_crash_prediction_outputs_use_subfolder_and_list_legacy(monkeypatch, tmp_path):
+    results_dir = tmp_path / "Resultados"
+    crash_dir = results_dir / "crash_prediction"
+    monkeypatch.setattr(app, "RESULTS_DIR", results_dir)
+    monkeypatch.setattr(app, "CRASH_RESULTS_DIR", crash_dir)
+
+    legacy = results_dir / "accident_flow_features_legacy.duckdb"
+    current = crash_dir / "accident_flow_features_current.duckdb"
+    legacy.parent.mkdir(parents=True)
+    current.parent.mkdir(parents=True)
+    legacy.touch()
+    current.touch()
+
+    assert app._feature_selection_paths("demo")[0].parent == crash_dir
+    listed = app._list_flow_feature_files()
+    assert legacy in listed
+    assert current in listed
+
+
 def test_history_infer_optuna_feature_set_label_detects_base_cluster_mix():
     assert app._history_infer_optuna_feature_set_label(["flow_light", "speed_light"]) == "Base"
     assert app._history_infer_optuna_feature_set_label(
@@ -1375,7 +1394,11 @@ def test_persist_optuna_results_keeps_multiobjective_metadata_and_pareto_csv(
     assert variant["pruning_proxy_score"] == pytest.approx(0.61)
     assert variant["decision_threshold"] == pytest.approx(0.37)
     assert variant["pareto_front_csv"]
-    assert (tmp_path / Path(str(variant["pareto_front_csv"])).name).exists()
+    assert (
+        tmp_path
+        / "crash_prediction"
+        / Path(str(variant["pareto_front_csv"])).name
+    ).exists()
 
     payload, _ = app._load_optuna_result_from_disk("optuna_test_id")
     assert payload is not None
@@ -1673,7 +1696,9 @@ def test_persist_optuna_results_writes_trials_json_and_best_summary(
     )
 
     payload = json.loads(
-        (tmp_path / "optuna_optuna_base_id.json").read_text(encoding="utf-8")
+        (tmp_path / "crash_prediction" / "optuna_optuna_base_id.json").read_text(
+            encoding="utf-8"
+        )
     )
     payload_variant = app._get_optuna_model_result_variant(
         payload["results"],
@@ -1783,7 +1808,9 @@ def test_persist_optuna_results_stores_feature_set_context(
     ]
 
     payload = json.loads(
-        (tmp_path / f"optuna_{optuna_id}.json").read_text(encoding="utf-8")
+        (tmp_path / "crash_prediction" / f"optuna_{optuna_id}.json").read_text(
+            encoding="utf-8"
+        )
     )
     payload_variant = app._get_optuna_model_result_variant(
         payload["results"],

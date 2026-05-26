@@ -739,7 +739,7 @@ def _gen_logs_section() -> str:
     root = _project_root()
     # Prefer explicit .log files, also surface TensorBoard runs directory
     logs = _list_files(root, patterns=["**/*.log"], recursive=True)
-    runs_dir = os.path.join(root, "Resultados", "runs_attention")
+    runs_dir = os.path.join(root, "Resultados", "gnn", "training", "tensorboard")
     runs_note = ""
     if os.path.isdir(runs_dir):
         runs_note = f"<p>TensorBoard: <code>{html.escape(os.path.relpath(runs_dir, root))}</code> (sugerido: <code>tensorboard --logdir={html.escape(runs_dir)}</code>)</p>"

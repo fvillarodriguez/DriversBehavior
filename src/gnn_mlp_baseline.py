@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
 
 from src.config import RESULTADOS_DIR, SEED, get_auto_device
+from src.gnn_artifacts import gnn_dir
 from src.mlp_tabular import MLPNet
 
 
@@ -1282,7 +1283,7 @@ def run_gnn_mlp_baselines(
     lr: float = 3e-4,
     weight_decay: float = 1e-4,
     device: Optional[object] = None,
-    save_dir: Optional[Path | str] = Path(RESULTADOS_DIR) / "gnn_mlp_baselines",
+    save_dir: Optional[Path | str] = None,
     graph_hash: Optional[str] = None,
     progress_callback: Optional[BaselineProgress] = None,
     seed: int = SEED,
@@ -1420,12 +1421,11 @@ def run_gnn_mlp_baselines(
 
     df = pd.DataFrame(rows)
     artifact_path: Optional[Path] = None
-    if save_dir is not None:
-        out_dir = Path(save_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_hash = re.sub(r"[^0-9a-zA-Z_.-]+", "_", tensors.graph_hash or "unknown")
-        artifact_path = out_dir / f"mlp_baseline_{ts}_{safe_hash[:16]}.csv"
-        df.to_csv(artifact_path, index=False)
-        df.attrs["artifact_path"] = str(artifact_path)
+    out_dir = Path(save_dir) if save_dir is not None else gnn_dir("baselines_mlp", RESULTADOS_DIR, create=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_hash = re.sub(r"[^0-9a-zA-Z_.-]+", "_", tensors.graph_hash or "unknown")
+    artifact_path = out_dir / f"mlp_baseline_{ts}_{safe_hash[:16]}.csv"
+    df.to_csv(artifact_path, index=False)
+    df.attrs["artifact_path"] = str(artifact_path)
     return df
