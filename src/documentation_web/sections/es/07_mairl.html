@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>§ 7 · MA-AIRL</title>
+<title>§ 7 · Reward Learning</title>
 <link rel="stylesheet" href="{{CSS_HREF}}" />
 <script>
   window.MathJax = {
@@ -24,86 +24,77 @@
     <header class="lab-section-head" data-stagger>
       <div class="num reveal">07</div>
       <div>
-        <span class="meta reveal">Capítulo · Multi-agent adversarial IRL</span>
-        <h2 class="reveal">Implementación de MA-AIRL</h2>
+        <span class="meta reveal">Capítulo · Reward Learning con SUMO FCD</span>
+        <h2 class="reveal">Manual operativo de MA-AIRL</h2>
       </div>
     </header>
 
-    <h3 class="reveal">Objetivo y alcance</h3>
-    <p class="reveal">Implementación funcional de Multi-Agent Adversarial IRL siguiendo el marco de <code>src/MAIRL.pdf</code>. Para cada cluster de conductores se aprende una política estocástica y una función de recompensa que expliquen las demostraciones, y se exportan parámetros de <code>vType</code> para SUMO. La arquitectura está dividida en núcleo (<code>src/marl_core.py</code>) e interfaz (<code>src/multi_agent_rl_app.py</code>).</p>
+    <h3 class="reveal">Qué hace esta UI</h3>
+    <p class="reveal">La página <strong>Reward Learning</strong> aprende políticas y recompensas que explican trayectorias expertas generadas por SUMO. La implementación activa exige transiciones reales \(s,a,s'\) desde muestras consecutivas de FCD; no entrena MA-AIRL con AVI ni con el antiguo fallback \(s'=s\). El flujo vive en <code>src/multi_agent_rl_app.py</code>, el núcleo en <code>src/marl_core.py</code> y la reconstrucción FCD en <code>src/SUMO.py::build_sumo_fcd_transition_dataset</code>.</p>
 
-    <h3 class="reveal">Datos y estado</h3>
-    <p class="reveal">La entrada son CSV de clusters con <code>cluster_label</code>. Cada fila es una muestra experta con estado \(s\) formado por columnas numéricas seleccionadas (por defecto: <code>avg_speed_kmh</code>, <code>avg_headway_s</code>, <code>lane_change_rate</code>). Se estandariza con un <code>StandardScaler</code> propio y se separa por agente (cluster).</p>
+    <h3 class="reveal">Pestañas</h3>
+    <table class="reveal">
+      <thead><tr><th>Pestaña</th><th>Función</th><th>Resultado esperado</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Configuración</strong></td><td>Genera/importa FCD, selecciona estado, define políticas y artefactos SUMO.</td><td><code>mairl_transition_df</code> con <code>source="sumo_fcd"</code>.</td></tr>
+        <tr><td><strong>Entrenamiento</strong></td><td>Ejecuta <em>MA-AIRL (SUMO FCD)</em> o el baseline <em>CEM (legacy)</em>.</td><td>Curvas de <code>disc_loss</code>, <code>policy_loss</code> y <code>reward_mean</code>.</td></tr>
+        <tr><td><strong>Análisis</strong></td><td>Inspecciona métricas y acciones aprendidas por política compartida.</td><td>Tabla de métricas y <code>policy_actions</code>.</td></tr>
+      </tbody>
+    </table>
 
-    <h3 class="reveal">Acciones proxy</h3>
-    <p class="reveal">Como el CSV no contiene acciones reales, se construye un proxy: las métricas se mapean a parámetros de <em>car-following</em> (<code>maxSpeed</code>, <code>accel</code>, <code>decel</code>, <code>minGap</code>, <code>sigma</code>, <code>impatience</code>), se aplican transformaciones heurísticas y se recortan a <code>PARAM_BOUNDS</code>. Las acciones se normalizan a \([-1,1]\) para entrenamiento estable.</p>
+    <h3 class="reveal">Flujo de configuración</h3>
+    <ol class="reveal">
+      <li><strong>Trayectorias expertas desde SUMO FCD.</strong> Indica <code>.sumocfg</code>, <code>tripinfo.xml</code>, <code>sumo_fcd.xml</code> y el periodo FCD. <em>Ejecutar SUMO y construir transiciones FCD</em> llama a <code>sumo</code>/<code>sumo-gui</code> con <code>--fcd-output</code> y <code>--fcd-output.acceleration true</code>. <em>Importar FCD existente</em> parsea directamente un XML FCD ya generado.</li>
+      <li><strong>Features del estado.</strong> Después de reconstruir transiciones, la UI lista columnas <code>state_*</code>, <code>flow_context_*</code> y <code>vms_active</code>. Los defaults salen de <code>DEFAULT_STATE_COLS</code>: velocidad, carril, headway, velocidad relativa, contexto de flujo y VMS.</li>
+      <li><strong>Clústeres opcionales.</strong> Los archivos <code>Resultados/cluster_*.csv</code> sirven para análisis o nombres de políticas; no reemplazan el FCD experto.</li>
+      <li><strong>Parámetros SUMO.</strong> Duración, paso, GUI y estrategia de emisión apoyan corridas y rutas SUMO, pero no cambian un dataset FCD ya importado.</li>
+      <li><strong>Diagnóstico AVI y pórticos.</strong> Reconstruye transiciones AVI parciales para inspección. La UI las separa explícitamente del entrenamiento MA-AIRL.</li>
+      <li><strong>Políticas compartidas.</strong> La configuración se deriva de <code>agent_id</code>; el usuario puede ajustar número y nombres antes de entrenar/exportar.</li>
+    </ol>
 
-    <h3 class="reveal">Modelos</h3>
-    <p class="reveal">Por agente se instancian tres redes:</p>
-    <ul class="reveal">
-      <li><strong>Política gaussiana</strong> \( q_\theta(a\mid s) \) (MLP que produce \(\mu\) y \(\log\sigma\)).</li>
-      <li><strong>Recompensa</strong> \( g_\omega(s,a) \) (MLP sobre estado-acción).</li>
-      <li><strong>Potencial</strong> \( h_\phi(s) \).</li>
-    </ul>
+    <div class="lab-callout ochre reveal">
+      <div class="label">Contrato de entrada</div>
+      <p><code>is_sumo_fcd_transition_dataset</code> exige <code>source="sumo_fcd"</code>. Si las transiciones están vacías, vienen de AVI o no tienen esa procedencia, el botón de entrenamiento MA-AIRL rechaza la corrida.</p>
+    </div>
+
+    <h3 class="reveal">Dataset experto</h3>
+    <p class="reveal"><code>build_sumo_fcd_transition_dataset</code> recorre el XML FCD con <code>iterparse</code>, ordena muestras por vehículo y tiempo, y forma una transición por cada par consecutivo. La tabla resultante contiene identificadores (<code>trajectory_id</code>, <code>agent_id</code>), estado/siguiente estado (<code>state_speed_kmh</code>, <code>next_speed_kmh</code>, carril, posición, coordenadas, headway), contexto de flujo y acciones observadas (<code>action_delta_speed_kmh</code>, <code>action_accel_m_s2</code>, <code>action_lane_change</code>).</p>
+
+    <h3 class="reveal">Entrenamiento MA-AIRL</h3>
+    <p class="reveal">En <em>MA-AIRL (SUMO FCD)</em>, la UI usa <code>temporal_split == "train"</code> cuando existe, instancia <code>MAIRLManager</code> y ejecuta <code>train_step(batch_size)</code> durante las iteraciones indicadas. Los controles son <em>Iteraciones</em>, <em>Batch size</em>, \(\gamma\), <em>LR Policy</em>, <em>LR Reward</em>, <em>Hidden units</em> y <em>Device</em>; <code>auto</code> resuelve <code>cuda</code>, <code>mps</code> o <code>cpu</code>.</p>
+
     <div class="lab-eq has-inspector reveal">
       <div class="formula">\[ f_{\omega,\phi}(s,a,s') = g_\omega(s,a) + \gamma\,h_\phi(s') - h_\phi(s) \]</div>
       <div class="num">(7.1)</div>
       <aside class="eq-inspector">
         <h5>Variables</h5>
         <dl>
-          <dt>g<sub>ω</sub>(s,a)</dt><dd>Recompensa parametrizada — qué tan buena es la acción <em>a</em> en el estado <em>s</em>.</dd>
-          <dt>h<sub>φ</sub>(s)</dt><dd>Función potencial sobre el estado, hace <em>shaping</em> sin alterar la política óptima.</dd>
-          <dt>γ</dt><dd>Factor de descuento.</dd>
-          <dt>f<sub>ω,φ</sub></dt><dd>Recompensa formada — entrada al discriminador.</dd>
+          <dt>g<sub>ω</sub>(s,a)</dt><dd>Red de recompensa sobre estado y acción.</dd>
+          <dt>h<sub>φ</sub>(s)</dt><dd>Potencial de estado usado para shaping.</dd>
+          <dt>q<sub>θ</sub>(a∣s)</dt><dd>Política gaussiana aprendida por agente.</dd>
         </dl>
         <h5>Implementación</h5>
-        <span class="impl">src/marl_core.py · MAIRLAgent.f</span>
+        <span class="impl">src/marl_core.py · MAIRLAgent.f · MAIRLManager.train_step</span>
       </aside>
     </div>
 
-    <h3 class="reveal">Discriminador y objetivos</h3>
-    <div class="lab-eq has-inspector reveal">
-      <div class="formula">\[ D_\omega(s,a) = \frac{\exp(f_\omega(s,a))}{\exp(f_\omega(s,a)) + q_\theta(a\mid s)} \]</div>
-      <div class="num">(7.2)</div>
-      <aside class="eq-inspector">
-        <h5>Variables</h5>
-        <dl>
-          <dt>D<sub>ω</sub>(s,a)</dt><dd>Probabilidad de que (s,a) provenga del experto, según el discriminador.</dd>
-          <dt>q<sub>θ</sub>(a∣s)</dt><dd>Probabilidad de la acción bajo la política aprendida.</dd>
-        </dl>
-        <h5>Implementación</h5>
-        <span class="impl">src/marl_core.py · MAIRL training loop (no explicit D function)</span>
-      </aside>
-    </div>
-    <p class="reveal">El discriminador maximiza \( \mathbb{E}_{X_E}[\log D] + \mathbb{E}_{X_\pi}[\log(1-D)] \); la política maximiza \( \mathbb{E}_{X_\pi}[f_\omega(s,a) - \log q_\theta(a\mid s)] \) (Ec. 12 del paper).</p>
+    <p class="reveal">Por cada <code>agent_id</code>, el manager crea una política gaussiana \(q_\theta(a\mid s)\), una red de recompensa \(g_\omega(s,a)\) y un potencial \(h_\phi(s)\). En cada iteración muestrea transiciones expertas y acciones de política, actualiza recompensa/potencial con la pérdida adversarial y luego actualiza la política con la recompensa formada.</p>
 
-    <div class="lab-callout ochre reveal">
-      <div class="label">Trayectorias SUMO FCD</div>
-      <p>La implementación activa construye \(s, a, s'\) desde muestras consecutivas de <a href="https://sumo.dlr.de/docs/Simulation/Output/FCDOutput.html">SUMO FCDOutput</a>. SUMOPy se conserva como <a href="https://sumo.dlr.de/docs/Contributed/SUMOPy/index.html">referencia conceptual</a>, pero no se añade como dependencia por su stack histórico Python 2.7/wxPython.</p>
-    </div>
+    <h3 class="reveal">Métricas y exportación</h3>
+    <p class="reveal">La UI guarda <code>disc_loss</code>, <code>policy_loss</code>, <code>reward_mean</code>, <code>agents</code> y <code>transitions</code> en <code>st.session_state["mairl_metrics_log"]</code>. El botón <em>Exportar perfiles MA-AIRL</em> escribe <code>simulación/mairl_policy_profiles.json</code> con <code>feature_cols</code>, <code>action_cols</code> y <code>policy_actions</code> desnormalizadas desde el estado medio de cada política.</p>
 
-    <h3 class="reveal">Exportación a SUMO</h3>
-    <p class="reveal">Al finalizar el entrenamiento, se evalúa la política en el estado medio y se desnormalizan los parámetros a los rangos SUMO. El archivo generado es <code>mairl_vtypes.add.xml</code>, con un <code>vType</code> por cluster.</p>
-
-    <h3 class="reveal">UI y métricas</h3>
-    <p class="reveal">La interfaz ofrece un selector de algoritmo: <em>MA-AIRL (SUMO FCD)</em> frente a <em>CEM (legacy)</em>, importación/generación de <code>sumo_fcd.xml</code>, y controles de batch size, \(\gamma\), learning rates, tamaño de red y dispositivo. Durante el entrenamiento se reportan <code>disc_loss</code>, <code>policy_loss</code> y <code>reward_mean</code>.</p>
-
-    <h3 class="reveal">Limitaciones y próximos pasos</h3>
+    <h3 class="reveal">Limitaciones actuales</h3>
     <ul class="reveal">
-      <li>La fidelidad de \(s'\) y acciones reales depende del periodo FCD; el valor por defecto es 1 segundo.</li>
-      <li>El headway se estima por tiempo, edge, carril y posición dentro del FCD.</li>
-      <li>No hay fallback a \(s'=s\): MA-AIRL requiere transiciones FCD válidas.</li>
+      <li>La fidelidad de \(s'\) y de las acciones depende del periodo FCD; el default de la UI es 1 segundo.</li>
+      <li>Headway y velocidad relativa se estiman dentro del FCD por tiempo, edge, carril y posición.</li>
+      <li>AVI es diagnóstico, no fuente de entrenamiento MA-AIRL.</li>
+      <li><em>CEM (legacy)</em> sigue disponible como comparación heurística, no como flujo MA-AIRL principal.</li>
     </ul>
-
-    <div class="lab-callout sage reveal">
-      <div class="label">Próximamente · Visualizador de políticas</div>
-      <p>Esta sección incluirá curvas de pérdida discriminador/política por cluster, un explorador de la recompensa aprendida \(g_\omega\) sobre el espacio (s,a), y un comparador SUMO vs MA-AIRL con los <code>vType</code> exportados.</p>
-    </div>
 
   </section>
 
   <footer class="lab-coda">
-    <span>Capítulo § 7 · 2 ecuaciones · 1 callout</span>
+    <span>Capítulo § 7 · Manual UI · SUMO FCD</span>
     <span>Compilado desde <code style="font-family:var(--font-mono);font-size:11.5px;">docs/sections/mairl_implementation_es.tex</code></span>
   </footer>
 
@@ -111,10 +102,10 @@
 
 <aside class="lab-margin" aria-label="Notas al margen">
   <div class="pinned">
-    <span class="label">MA-AIRL</span>
-    <p>Multi-Agent Adversarial Inverse Reinforcement Learning: aprende simultáneamente una política y una recompensa que <em>expliquen</em> las demostraciones, sin asumir una función de recompensa conocida.</p>
-    <p><strong>Por cluster.</strong> Una política y una recompensa por cluster de conductores — captura comportamientos heterogéneos en una sola corrida.</p>
-    <p><strong>SUMO export.</strong> El producto final son parámetros de <code style="font-family:var(--font-mono);font-size:11.5px;">vType</code> que pueden cargarse directamente en una simulación SUMO para reproducir la heterogeneidad observada.</p>
+    <span class="label">Reward Learning</span>
+    <p><strong>Entrada obligatoria.</strong> MA-AIRL opera sobre FCD de SUMO convertido a transiciones \(s,a,s'\).</p>
+    <p><strong>Salida actual.</strong> El artefacto exportado por la UI es <code style="font-family:var(--font-mono);font-size:11.5px;">simulación/mairl_policy_profiles.json</code>.</p>
+    <p><strong>Separación clave.</strong> AVI y clusters son ayudas de diagnóstico/organización; no sustituyen el FCD experto.</p>
   </div>
 </aside>
 
